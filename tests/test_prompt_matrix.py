@@ -1,6 +1,7 @@
 """Tests for prompt matrix resolution: family_of + PromptMatrixResolver."""
 
 import textwrap
+from dataclasses import replace
 from unittest.mock import patch
 
 import pytest
@@ -793,24 +794,28 @@ class TestLocationPrimaryResolution:
 
 
 class TestPhaseConfigContextTokens:
-    """Tests for model_max_context_tokens merge in get_phase_config()."""
+    """Tests for model_max_context_tokens merge in get_phase_config().
+
+    Since U1 ``summarization`` is the only override slot; the legacy phase
+    names resolve to the single model (identity).
+    """
 
     def test_base_value_inherited_when_no_override(self):
-        """Phase config inherits base model_max_context_tokens when override omits it."""
+        """Resolved config inherits base model_max_context_tokens when unset."""
         config = LLMConfig(model="gpt-4o", model_max_context_tokens=128000)
-        phase = config.get_phase_config("strategic")
+        phase = config.get_phase_config("summarization")
         assert phase.model_max_context_tokens == 128000
 
     def test_override_replaces_base(self):
-        """Phase override's model_max_context_tokens replaces base value."""
+        """The override's model_max_context_tokens replaces the base value."""
         config = LLMConfig(
             model="gpt-4o",
             model_max_context_tokens=128000,
-            tactical=PhaseLLMOverride(
+            summarization=PhaseLLMOverride(
                 model="gpt-4o-mini", model_max_context_tokens=32000
             ),
         )
-        phase = config.get_phase_config("tactical")
+        phase = config.get_phase_config("summarization")
         assert phase.model_max_context_tokens == 32000
         assert phase.model == "gpt-4o-mini"
 
@@ -819,9 +824,9 @@ class TestPhaseConfigContextTokens:
         config = LLMConfig(
             model="gpt-4o",
             model_max_context_tokens=128000,
-            strategic=PhaseLLMOverride(temperature=0.5),
+            summarization=PhaseLLMOverride(temperature=0.5),
         )
-        phase = config.get_phase_config("strategic")
+        phase = config.get_phase_config("summarization")
         assert phase.model_max_context_tokens == 128000
         assert phase.temperature == 0.5
 
@@ -829,29 +834,30 @@ class TestPhaseConfigContextTokens:
         """When base has no model_max_context_tokens, override can set it."""
         config = LLMConfig(
             model="gpt-4o",
-            tactical=PhaseLLMOverride(model_max_context_tokens=32000),
+            summarization=PhaseLLMOverride(model_max_context_tokens=32000),
         )
         assert config.model_max_context_tokens is None
-        phase = config.get_phase_config("tactical")
+        phase = config.get_phase_config("summarization")
         assert phase.model_max_context_tokens == 32000
 
     def test_no_override_returns_self(self):
-        """Phase without override returns self (identity)."""
+        """No override returns self (identity) — and so do the legacy names."""
         config = LLMConfig(model="gpt-4o", model_max_context_tokens=128000)
-        phase = config.get_phase_config("tactical")
-        assert phase is config
+        assert config.get_phase_config("summarization") is config
+        assert config.get_phase_config("strategic") is config
+        assert config.get_phase_config("tactical") is config
 
     def test_resolved_config_has_no_phase_fields(self):
-        """Resolved phase config has strategic/tactical/summarization=None."""
+        """Resolved config carries no override of its own (and no tier fields)."""
         config = LLMConfig(
             model="gpt-4o",
             model_max_context_tokens=128000,
-            strategic=PhaseLLMOverride(model_max_context_tokens=200000),
+            summarization=PhaseLLMOverride(model_max_context_tokens=200000),
         )
-        phase = config.get_phase_config("strategic")
-        assert phase.strategic is None
-        assert phase.tactical is None
+        phase = config.get_phase_config("summarization")
         assert phase.summarization is None
+        assert not hasattr(phase, "strategic")
+        assert not hasattr(phase, "tactical")
 
 
 # =============================================================================
@@ -860,45 +866,48 @@ class TestPhaseConfigContextTokens:
 
 
 class TestLLMReuseEquality:
-    """Tests that LLM reuse compares full config, not just model name."""
+    """LLM reuse compares the full resolved config, not just the model name.
+
+    ``_create_phase_llms`` reuses the main client for summarization when the
+    resolved override equals ``replace(llm, summarization=None)``.
+    """
+
+    @staticmethod
+    def _main(config):
+        return replace(config, summarization=None)
 
     def test_same_model_same_settings_are_equal(self):
-        """Identical configs should be equal (enabling reuse)."""
+        """An override that resolves to the main config is equal (reuse)."""
         config = LLMConfig(
-            model="gpt-4o", temperature=0.3, model_max_context_tokens=128000
+            model="gpt-4o",
+            temperature=0.3,
+            model_max_context_tokens=128000,
+            summarization=PhaseLLMOverride(model="gpt-4o"),
         )
-        strategic = config.get_phase_config("strategic")
-        tactical = config.get_phase_config("tactical")
-        assert strategic == tactical
+        assert config.get_phase_config("summarization") == self._main(config)
 
     def test_same_model_different_context_tokens_not_equal(self):
         """Same model but different context tokens should NOT be equal."""
         config = LLMConfig(
             model="gpt-4o",
             model_max_context_tokens=128000,
-            tactical=PhaseLLMOverride(model_max_context_tokens=32000),
+            summarization=PhaseLLMOverride(model_max_context_tokens=32000),
         )
-        strategic = config.get_phase_config("strategic")
-        tactical = config.get_phase_config("tactical")
-        assert strategic != tactical
+        assert config.get_phase_config("summarization") != self._main(config)
 
     def test_same_model_different_temperature_not_equal(self):
         """Same model but different temperature should NOT be equal."""
         config = LLMConfig(
             model="gpt-4o",
             temperature=0.3,
-            tactical=PhaseLLMOverride(temperature=0.0),
+            summarization=PhaseLLMOverride(temperature=0.0),
         )
-        strategic = config.get_phase_config("strategic")
-        tactical = config.get_phase_config("tactical")
-        assert strategic != tactical
+        assert config.get_phase_config("summarization") != self._main(config)
 
     def test_different_models_not_equal(self):
         """Different models are obviously not equal."""
         config = LLMConfig(
             model="gpt-4o",
-            tactical=PhaseLLMOverride(model="gpt-4o-mini"),
+            summarization=PhaseLLMOverride(model="gpt-4o-mini"),
         )
-        strategic = config.get_phase_config("strategic")
-        tactical = config.get_phase_config("tactical")
-        assert strategic != tactical
+        assert config.get_phase_config("summarization") != self._main(config)

@@ -3,6 +3,7 @@
   "$id": "https://example.com/agent-config.schema.json",
   "title": "Universal Agent Configuration",
   "description": "Configuration schema for the Universal Agent in the workspace-centric architecture",
+  "$comment": "U1 (universal experts): an expert has ONE llm.model. The per-phase tiers llm.strategic / llm.tactical / llm.subagent were removed from this schema; the loader still accepts them in any authored layer (bundled YAML, DB expert, job/thread override, frozen resolved_config) and maps them with a deprecation warning — strategic/tactical lift into llm.model when the layer sets no llm.model (strategic wins; an explicit llm.model in the same layer wins over both), subagent moves to subagents.llm. See knowledge-base/knowledge/features/universal_experts_and_subagents.md §1.1.",
   "type": "object",
   "required": ["agent_id", "display_name", "llm", "workspace", "tools", "connections"],
   "properties": {
@@ -48,12 +49,12 @@
     },
     "llm": {
       "type": "object",
-      "description": "LLM configuration with optional phase-specific overrides",
+      "description": "LLM configuration: one model per expert (runs every phase and session turn) plus an optional summarization override. Legacy llm.strategic/tactical/subagent keys are accepted by the loader and mapped (see the top-level $comment) but are no longer schema keys.",
       "required": ["model"],
       "properties": {
         "model": {
           "type": "string",
-          "description": "Default model identifier (used when no phase override)",
+          "description": "Model identifier — the single model every phase runs on",
           "examples": ["RedHatAI/gemma-4-31B-it-FP8-Dynamic", "gpt-4o", "claude-sonnet-4-20250514", "gemini-2.0-flash", "codex/gpt-5.4", "codex/gpt-5.3-codex", "codex/gpt-5.3-codex-spark"]
         },
         "provider": {
@@ -127,21 +128,9 @@
           "default": null,
           "description": "Override max output tokens (auto-detected if null)"
         },
-        "strategic": {
-          "$ref": "#/$defs/llmPhaseOverride",
-          "description": "LLM overrides for strategic (planning) phases. Uses more capable models for high-level decisions."
-        },
-        "tactical": {
-          "$ref": "#/$defs/llmPhaseOverride",
-          "description": "LLM overrides for tactical (execution) phases. Can use faster/cheaper models for task execution."
-        },
         "summarization": {
           "$ref": "#/$defs/llmPhaseOverride",
           "description": "LLM overrides for context summarization. Can use different model for compacting conversation history."
-        },
-        "subagent": {
-          "$ref": "#/$defs/llmPhaseOverride",
-          "description": "LLM overrides for throwaway light subagents spawned via spawn_subagent (delegation.mode: light). Lets a top-tier parent spawn a mid-tier reader (e.g. opus → sonnet). Falls back to the tactical tier, then base, when unset."
         }
       }
     },
@@ -2280,7 +2269,7 @@
         },
         "light": {
           "type": "object",
-          "description": "Light-backend knobs (used only when mode is 'light'). Throwaway readers that read sources and return a distilled string; per-reader git worktree, discarded never merged. The reader MODEL is set via llm.subagent (a first-class tier alongside strategic/tactical), not here.",
+          "description": "Light-backend knobs (used only when mode is 'light'). Throwaway readers that read sources and return a distilled string; per-reader git worktree, discarded never merged. The reader MODEL is set via subagents.llm (the roster-wide partial; a legacy llm.subagent maps there), not here.",
           "properties": {
             "enabled": {
               "type": "boolean",
@@ -2339,7 +2328,7 @@
   "$defs": {
     "llmPhaseOverride": {
       "type": "object",
-      "description": "Phase-specific LLM overrides. Only specified fields override the base config.",
+      "description": "Partial LLM overrides (llm.summarization). Only specified fields override the base config.",
       "properties": {
         "model": {
           "type": "string",

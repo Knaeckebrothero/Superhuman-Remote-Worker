@@ -852,7 +852,7 @@ def create_execute_node(
         prepared_messages = []
 
         # Get phase-aware system prompt (todos, memory, and knowledge are injected as transient messages below)
-        phase_llm_config = config.llm.get_phase_config(phase_name)
+        phase_llm_config = config.llm  # one model for every phase (U1)
         full_system = get_phase_system_prompt(
             config=config,
             is_strategic=is_strategic,
@@ -1530,7 +1530,7 @@ def create_execute_node(
         auditor = get_archiver()
         llm_audit_id = None
         phase_str = "strategic" if is_strategic else "tactical"
-        phase_model = config.llm.get_phase_config(phase_str).model
+        phase_model = config.llm.model
         model_kwargs = strategic_model_kwargs if is_strategic else tactical_model_kwargs
         if auditor:
             llm_audit_id = auditor.audit_llm_call(
@@ -5396,13 +5396,11 @@ def build_phase_alternation_graph(
         # Per-family image-token estimator config (matrix settings.image_tokens).
         image_tokens=config.limits.image_tokens,
     )
-    strategic_config = config.llm.get_phase_config("strategic")
-    tactical_config = config.llm.get_phase_config("tactical")
+    # One model for every phase (U1): the default token counter serves both
+    # phases — ContextManager.set_current_phase falls back to it.
     context_mgr = ContextManager(
         config=context_config,
         model=config.llm.model,
-        strategic_model=strategic_config.model,
-        tactical_model=tactical_config.model,
         summarization_call_timeout=config.auxiliary.summarization_call_timeout,
     )
 

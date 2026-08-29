@@ -138,18 +138,18 @@ class TestPhaseOverrideCredentialInjection:
         assert result["llm"]["strategic"]["api_key"] == CODEX_API_KEY
 
     @pytest.mark.asyncio
-    async def test_blob_delivery_injects_phase_pin_transport(self, patched_main):
-        """eec20eeb regression (blob-delivery path).
+    async def test_blob_delivery_credentials_the_lifted_legacy_pin(self, patched_main):
+        """eec20eeb regression on the blob-delivery path, post-U1 shape.
 
-        ``serialize_resolved_config`` emits the phase blocks with explicit
-        ``base_url: None`` / ``provider: None`` leaves. ``inject_blob_credentials``
-        only stripped None at the TOP level of ``llm``, so the nested phase
-        leaves survived and defeated ``_inject_model_credentials``'s
-        ``setdefault`` (a present-but-None key is not overwritten). Codex phase
-        pins therefore shipped without transport and the agent fell back to
-        api.openai.com → 401. The base model worked (its top-level None WAS
-        stripped), masking the gap. This exercises the REAL resolve_config blob
-        through the REAL injector — the path jobs actually use.
+        ``serialize_resolved_config`` used to emit the phase blocks with explicit
+        ``base_url: None`` leaves that defeated ``_inject_model_credentials``'s
+        ``setdefault``, so codex phase pins shipped without transport and 401'd
+        against api.openai.com. Since U1 a legacy ``llm.strategic``/``tactical``
+        pin does not survive as a nested block at all: ``resolve_config`` lifts
+        it into the single ``llm.model`` BEFORE injection, so the ordinary
+        top-level branch routes it and there is no nested None leaf left to
+        bite. Exercises the REAL resolve_config blob through the REAL injector —
+        the path jobs actually use.
         """
         from orchestrator.services.config_resolver import (
             inject_blob_credentials,
@@ -166,20 +166,22 @@ class TestPhaseOverrideCredentialInjection:
             },
             expert_type="worker",
         )
-        # Precondition: serialize emits the None transport leaves that trigger
-        # the bug (guards against the fixture silently changing shape).
-        assert "base_url" in blob["agent"]["llm"]["strategic"]
-        assert blob["agent"]["llm"]["strategic"]["base_url"] is None
+        # The pin IS the model now; no phase block remains to carry a None leaf.
+        assert blob["agent"]["llm"]["model"] == "gpt-5.3-codex-spark"
+        assert "strategic" not in blob["agent"]["llm"]
+        assert "tactical" not in blob["agent"]["llm"]
+        # Precondition: transport-less before injection (the base has no URL).
+        assert blob["agent"]["llm"].get("base_url") is None
 
         delivered = await inject_blob_credentials(
             blob, lambda co: main._inject_dispatch_credentials(_job(), co)
         )
 
         llm = delivered["agent"]["llm"]
-        assert llm["strategic"]["base_url"] == CODEX_BASE_URL
-        assert llm["strategic"]["api_key"] == CODEX_API_KEY
-        assert llm["tactical"]["base_url"] == CODEX_BASE_URL
-        assert llm["tactical"]["api_key"] == CODEX_API_KEY
+        assert llm["model"] == "gpt-5.3-codex-spark"
+        assert llm["base_url"] == CODEX_BASE_URL
+        assert llm["api_key"] == CODEX_API_KEY
+        assert llm["provider"] == "openai"
 
     @pytest.mark.asyncio
     async def test_auxiliary_override_also_injected(self, patched_main):

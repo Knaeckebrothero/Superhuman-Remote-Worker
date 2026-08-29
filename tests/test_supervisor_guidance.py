@@ -588,11 +588,11 @@ class TestExecuteRendersGuidance:
         config.agent_id = "test-agent"
         config.extra = {}
         config.llm.model = "test-model"
-        phase_cfg = MagicMock()
-        phase_cfg.model = "test-model"
-        phase_cfg.timeout = 10.0
-        phase_cfg.model_max_context_tokens = 100000
-        config.llm.get_phase_config.return_value = phase_cfg
+        # U1: the execute node reads the single config.llm directly (one model
+        # for every phase, no per-phase resolution), so the fields the node
+        # consults live on it rather than on a get_phase_config() result.
+        config.llm.timeout = 10.0
+        config.llm.model_max_context_tokens = 100000
         config.limits.model_max_context_tokens = 100000
         config.limits.response_validation.enabled = False
         config.context_management.max_summary_length = 500

@@ -23,6 +23,7 @@ from src.core.loader import (
     deep_merge,
     load_agent_config_from_dict,
     load_and_merge_config,
+    normalize_llm_tiers,
     resolve_config_path,
     serialize_resolved_config,
 )
@@ -53,6 +54,9 @@ def _raw_leaf_llm_keys(config_path: str) -> set:
     try:
         with open(config_path, "r", encoding="utf-8") as f:
             raw = yaml.safe_load(f) or {}
+        # Same layer-local mapping load_and_merge_config applies to this file,
+        # so a lifted legacy block counts as explicit here too.
+        raw = normalize_llm_tiers(raw, source=str(config_path))
         return set((raw.get("llm") or {}).keys())
     except Exception:
         return set()
@@ -113,8 +117,11 @@ def resolve_config(
             bundled_leaf = dict(raw_leaf)
             bundled_leaf.pop("$extends", None)
             # Read straight off disk, so it bypasses load_and_merge_config's
-            # normalisation and needs its own.
+            # normalisation and needs its own (tool policy + legacy llm tiers).
             bundled_leaf = normalize_tool_policy(bundled_leaf)
+            bundled_leaf = normalize_llm_tiers(
+                bundled_leaf, source=f"bundled-leaf:{base_config_name}"
+            )
     except Exception:
         raw_leaf = {}
 
@@ -128,9 +135,12 @@ def resolve_config(
     # Default-model floor: replace the base placeholder model before the expert
     # merges (the expert/request still override it).
     if base_defaults:
+        base_defaults = normalize_llm_tiers(
+            normalize_tool_policy(base_defaults), source="base-defaults"
+        )
         if base_defaults.get("llm"):
             explicit_llm_keys |= set(base_defaults["llm"].keys())
-        data = deep_merge(data, normalize_tool_policy(base_defaults))
+        data = deep_merge(data, base_defaults)
 
     if bundled_leaf:
         if bundled_leaf.get("llm"):
@@ -142,13 +152,23 @@ def resolve_config(
     # agent-side _apply_db_expert; the caller picks base_config_name by type.
     prompts_override: dict = {}
     if expert_row is not None:
-        from src.core.expert_resolution import build_expert_config
+        from src.core.expert_resolution import (
+            build_expert_config,
+            expert_layer_source,
+        )
 
         expert_cfg = expert_row.get("config") or {}
         if isinstance(expert_cfg, str):
             import json
 
             expert_cfg = json.loads(expert_cfg)
+        # The explicit llm keys must reflect the LIFTED shape (a legacy
+        # strategic pin's params are explicit for the matrix, not family
+        # defaults). build_expert_config normalises the row itself with the
+        # same source label, so the deprecation warning logs once.
+        expert_cfg = normalize_llm_tiers(
+            expert_cfg, source=expert_layer_source(expert_row)
+        )
         explicit_llm_keys |= set((expert_cfg.get("llm") or {}).keys())
         data, prompts_override = build_expert_config(data, expert_row)
         # decision 7: mark the DB-authored persona so the render path fences it.
@@ -167,12 +187,20 @@ def resolve_config(
     # that mentions a category wins it wholesale" rule carries unchanged.
     # Server-generated request fragments (_critic_config_override,
     # the campaign-loop {"loop": ["loop_plan"]}) ride this same path and need
-    # no special handling.
-    for layer in (project_overrides, db_overrides, user_settings, request_override):
+    # no special handling. The legacy llm tiers are mapped per layer for the
+    # same reason: a job override's strategic pin resolves against THAT
+    # layer's own llm.model, never against a lower layer's.
+    for _source, layer in (
+        ("project-override", project_overrides),
+        ("db-override", db_overrides),
+        ("user-settings", user_settings),
+        ("request-override", request_override),
+    ):
         if layer:
+            layer = normalize_llm_tiers(normalize_tool_policy(layer), source=_source)
             if layer.get("llm"):
                 explicit_llm_keys |= set(layer["llm"].keys())
-            data = deep_merge(data, normalize_tool_policy(layer))
+            data = deep_merge(data, layer)
 
     _apply_settings_matrix(data, explicit_llm_keys, deployment_dir)
 
@@ -248,8 +276,7 @@ def unrouted_model_slots(blob: dict) -> list[str]:
 
     _check(llm, "llm")
     if isinstance(llm, dict):
-        for _phase in ("strategic", "tactical"):
-            _check(llm.get(_phase), f"llm.{_phase}")
+        _check(llm.get("summarization"), "llm.summarization")
     _check(agent.get("auxiliary"), "auxiliary")
     return problems
 
@@ -283,13 +310,15 @@ async def inject_blob_credentials(
     # base_url=None defaults that would otherwise block injection). Mirrors
     # _inject_thread_dispatch_credentials' own None-stripping.
     #
-    # This MUST reach the nested phase blocks (llm.strategic / llm.tactical /
-    # llm.summarization), not just the top-level section. serialize_resolved_config
-    # emits those with explicit base_url=None / provider=None leaves; a
-    # present-but-None key defeats the injector's setdefault, so endpoint-backed
-    # phase pins (e.g. codex models) shipped without transport and 401'd against
-    # api.openai.com while the base model — whose top-level None WAS stripped —
-    # worked, masking the gap (incident: job eec20eeb / "Research 01").
+    # This MUST reach the nested override blocks (llm.summarization today; the
+    # strategic/tactical tiers it was written for are lifted into llm.model by
+    # the loader since U1), not just the top-level section.
+    # serialize_resolved_config emits those with explicit base_url=None /
+    # provider=None leaves; a present-but-None key defeats the injector's
+    # setdefault, so endpoint-backed phase pins (e.g. codex models) shipped
+    # without transport and 401'd against api.openai.com while the base model —
+    # whose top-level None WAS stripped — worked, masking the gap (incident:
+    # job eec20eeb / "Research 01").
     def _strip_none_keys(d: dict) -> None:
         for _k in [_k for _k, _v in d.items() if _v is None]:
             del d[_k]

@@ -60,6 +60,7 @@ from ..core.skill_resolution import (
     APP_GUIDE_LOADER_TOOL,
     app_guide_health_snapshot,
 )
+from ..core.loader import normalize_llm_tiers
 from ..core.tool_policy import (
     normalize_tool_policy,
     validate_tool_override_fragment,
@@ -4335,7 +4336,7 @@ async def _attach_session_inner(
             config_name,
         )
 
-    llm = _agent._tactical_llm or _agent._llm
+    llm = _agent._llm
     if _hydrated:
         # The resolved llm carries the final model + injected transport.
         llm = create_llm(
@@ -4360,7 +4361,10 @@ async def _attach_session_inner(
         # rather than the orchestrator's merged fragment, so it needs its own
         # normalisation — otherwise `canvas: false` never becomes the `[]` that
         # _apply_session_tool_group_markers matches on, and the group stays on.
-        config_override = normalize_tool_policy(config_override)
+        # Same seam for a legacy llm.strategic/tactical/subagent block.
+        config_override = normalize_llm_tiers(
+            normalize_tool_policy(config_override), source="thread-override"
+        )
         base_dict = dataclasses.asdict(effective_config)
         merged = deep_merge(base_dict, config_override)
         _apply_session_tool_group_markers(merged, config_override)
@@ -14943,7 +14947,9 @@ async def _handle_config_update(
 
         # Live `config.update` is the same raw-override shape as the legacy
         # attach path above; normalise before both the merge and the markers.
-        effective_override = normalize_tool_policy(effective_override)
+        effective_override = normalize_llm_tiers(
+            normalize_tool_policy(effective_override), source="thread-override"
+        )
         base_dict = dataclasses.asdict(_session.config)
         merged = deep_merge(base_dict, effective_override)
         _apply_session_tool_group_markers(merged, effective_override)

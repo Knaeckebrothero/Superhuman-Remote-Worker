@@ -681,17 +681,16 @@ class TestPhaseAndMultimodal:
         assert ctx._current_phase == "strategic"
 
     def test_get_phase_multimodal_with_llm_config(self):
-        """With llm_config and phase, should use phase-specific config."""
+        """With llm_config and a phase set, reads the single model's flag (U1:
+        one model runs every phase, so no per-phase resolution happens)."""
         llm_config = MagicMock()
-        phase_cfg = MagicMock()
-        phase_cfg.multimodal = True
-        llm_config.get_phase_config.return_value = phase_cfg
+        llm_config.multimodal = True
 
         ctx = ToolContext()
         ctx._llm_config = llm_config
         ctx.set_current_phase("tactical")
         assert ctx.get_phase_multimodal() is True
-        llm_config.get_phase_config.assert_called_once_with("tactical")
+        llm_config.get_phase_config.assert_not_called()
 
     def test_get_phase_multimodal_fallback_config(self):
         """Without llm_config, should fall back to config['multimodal']."""

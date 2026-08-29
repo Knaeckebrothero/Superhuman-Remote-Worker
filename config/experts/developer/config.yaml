@@ -25,8 +25,8 @@ llm:
 # writes) so they can run tests/spikes; the guardrail that the *production*
 # implementation stays single-threaded and yours is by PROMPT, not tool-stripping
 # (allow_writes stays true — we monitor rather than lock down). Reader MODEL comes
-# from the llm.subagent tier (falls back to llm.tactical; per-job override via
-# config_override.llm.subagent).
+# from subagents.llm (falls back to the parent's llm.model; per-job override via
+# config_override.subagents.llm).
 delegation:
   enabled: true
   mode: light

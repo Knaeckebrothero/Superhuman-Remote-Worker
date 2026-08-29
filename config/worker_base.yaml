@@ -30,17 +30,17 @@ llm:
   # — the single source of truth for model-dependent settings.
   # Do not set model_max_context_tokens here.
   #
-  # Per-phase model tiers (optional, set per-expert or per-job — same override
-  # path for all of them):
-  #   strategic:     planning phases  (usually the most capable model)
-  #   tactical:      execution phases (faster/cheaper)
-  #   summarization: context compaction
-  #   subagent:      throwaway light subagents (spawn_subagent, delegation.mode:
-  #                  light) — lets a top-tier parent spawn a mid-tier reader,
-  #                  e.g. opus → sonnet, gpt-5.5 → gpt-5-mini. Falls back to the
-  #                  tactical tier, then base, when unset. Example:
-  #     subagent:
+  # One model per expert: `model` runs every phase (U1 collapsed the old
+  # strategic/tactical tiers). The only remaining override is
+  #   summarization: context compaction (optional, same override path)
+  # The light-subagent reader model is `subagents.llm` (a top-level
+  # `subagents:` block), e.g. a top-tier parent spawning a mid-tier reader:
+  #   subagents:
+  #     llm:
   #       model: claude-haiku-4-5-20251001
+  # Legacy `llm.strategic` / `llm.tactical` / `llm.subagent` keys are still
+  # accepted in any layer and mapped (with a deprecation warning) — see
+  # universal_experts_and_subagents.md §1.1.
 
 workspace:
   structure:
@@ -470,8 +470,8 @@ delegation:
   #           string; per-reader worktree, discarded never merged, no freeze.
   mode: heavy
   # Light-backend knobs (used only when mode: light). The reader MODEL is set
-  # via the `llm.subagent` tier (see the llm: block above), not here — so a
-  # top-tier parent can spawn a mid-tier reader (opus → sonnet, gpt → gpt-mini).
+  # via `subagents.llm` (see the llm: block above), not here — so a top-tier
+  # parent can spawn a mid-tier reader (opus → sonnet, gpt → gpt-mini).
   light:
     enabled: true
     max_iterations: 10       # Per-reader ReAct loop cap

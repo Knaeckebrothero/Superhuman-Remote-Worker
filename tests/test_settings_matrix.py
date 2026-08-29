@@ -498,21 +498,27 @@ class TestTopPTopKDataclasses:
         assert override.top_k == 20
 
     def test_get_phase_config_merges(self):
-        """Phase override merges top_p/top_k correctly."""
+        """The summarization override merges top_p/top_k correctly."""
         base = LLMConfig(top_p=0.95, top_k=40)
-        base.strategic = PhaseLLMOverride(top_p=0.8)
-        resolved = base.get_phase_config("strategic")
+        base.summarization = PhaseLLMOverride(top_p=0.8)
+        resolved = base.get_phase_config("summarization")
         assert resolved.top_p == 0.8  # overridden
         assert resolved.top_k == 40  # inherited from base
 
     def test_get_phase_config_inherits_when_none(self):
-        """Phase override with None inherits base values."""
+        """Override fields left None inherit base values."""
         base = LLMConfig(top_p=0.95, top_k=40)
-        base.tactical = PhaseLLMOverride(temperature=0.5)
-        resolved = base.get_phase_config("tactical")
+        base.summarization = PhaseLLMOverride(temperature=0.5)
+        resolved = base.get_phase_config("summarization")
         assert resolved.top_p == 0.95
         assert resolved.top_k == 40
         assert resolved.temperature == 0.5
+
+    def test_legacy_phase_names_resolve_to_the_single_model(self):
+        """U1: strategic/tactical are not override slots any more."""
+        base = LLMConfig(top_p=0.95, top_k=40)
+        assert base.get_phase_config("strategic") is base
+        assert base.get_phase_config("tactical") is base
 
     def test_parse_llm_config_with_top_p_top_k(self):
         data = {"model": "test", "top_p": 0.9, "top_k": 50}
@@ -1179,22 +1185,28 @@ class TestExtraBodyPassthrough:
         base = _parse_llm_config(
             {
                 "model": "gpt-5.5",
-                "tactical": {
+                "summarization": {
                     "model": "MiniMax-M3",
                     "extra_body": {"reasoning_split": True},
                 },
             }
         )
         assert base.extra_body is None
-        tactical = base.get_phase_config("tactical")
-        assert tactical.extra_body == {"reasoning_split": True}
+        summarization = base.get_phase_config("summarization")
+        assert summarization.extra_body == {"reasoning_split": True}
 
-    def test_phase_budget_resolves_extra_body_per_family(self):
-        """A tactical MiniMax override on a non-MiniMax base picks up the
-        family extra_body via _PHASE_PARAM_KEYS."""
-        budget = loader.resolve_phase_model_budget(
-            base_model="gpt-5.5",
-            strategic_override=None,
-            tactical_override=PhaseLLMOverride(model="MiniMax-M3"),
+    def test_legacy_tactical_block_folds_into_the_single_model(self):
+        """U1 merged-dict rule at the parse seam: a raw llm dict still carrying
+        a tactical pin resolves to that model, extra_body and all."""
+        cfg = _parse_llm_config(
+            {
+                "model": "gpt-5.5",
+                "tactical": {
+                    "model": "MiniMax-M3",
+                    "extra_body": {"reasoning_split": True},
+                },
+            }
         )
-        assert budget["params"]["tactical"]["extra_body"] == {"reasoning_split": True}
+        assert cfg.model == "MiniMax-M3"
+        assert cfg.extra_body == {"reasoning_split": True}
+        assert not hasattr(cfg, "tactical")

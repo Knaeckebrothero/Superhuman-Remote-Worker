@@ -826,57 +826,56 @@ class TestSpawnSubagentScaffolding:
 
 
 # ===========================================================================
-# TestSubagentModelTier — the `llm.subagent` phase-model tier that lets a
-# top-tier parent spawn a mid-tier reader (opus → sonnet). Parallel to
-# strategic/tactical/summarization; per-job overridable via config_override.
+# TestLegacySubagentTierCompat — the pre-U1 `llm.subagent` tier maps to
+# `subagents.llm` (U1 tier collapse); the light backend overlays that partial
+# on the parent's ONE model. Per-job override: config_override.subagents.llm.
 # ===========================================================================
 
 
-class TestSubagentModelTier:
-    """llm.subagent parses, resolves, and stays out of the main-graph path."""
+class TestLegacySubagentTierCompat:
+    """llm.subagent still parses — as subagents.llm — and never touches LLMConfig."""
 
-    def test_subagent_tier_parses_and_resolves(self):
-        from src.core.loader import LLMConfig, _parse_phase_override
+    def test_subagent_tier_maps_to_subagents_llm(self):
+        from src.core.loader import load_agent_config_from_dict
+
+        cfg = load_agent_config_from_dict(
+            {
+                "agent_id": "a",
+                "display_name": "A",
+                "llm": {
+                    "model": "claude-opus-4-8",
+                    "subagent": {"model": "claude-sonnet-5"},
+                },
+            }
+        )
+        assert cfg.llm.model == "claude-opus-4-8"  # the parent model is untouched
+        assert not hasattr(cfg.llm, "subagent")
+        # Rides config.extra (→ tool_config) until the roster is a parsed field.
+        assert cfg.extra["subagents"]["llm"] == {"model": "claude-sonnet-5"}
+
+    def test_reader_inherits_parent_transport(self):
+        """A model-only partial inherits the parent's provider/base_url etc."""
+        from src.core.loader import LLMConfig
+        from src.tools.delegation.spawn_subagent import _resolve_subagent_config
 
         llm = LLMConfig(
-            model="claude-opus-4-8",
-            subagent=_parse_phase_override({"model": "claude-sonnet-5"}),
+            model="base", provider="anthropic", base_url="https://api.example"
         )
-        assert llm.subagent is not None
-        assert llm.get_phase_config("subagent").model == "claude-sonnet-5"
-
-    def test_subagent_inherits_base_when_only_model_set(self):
-        """A model-only subagent override inherits base provider/base_url etc."""
-        from src.core.loader import LLMConfig, _parse_phase_override
-
-        llm = LLMConfig(
-            model="base",
-            provider="anthropic",
-            base_url="https://api.example",
-            subagent=_parse_phase_override({"model": "claude-sonnet-5"}),
-        )
-        resolved = llm.get_phase_config("subagent")
+        resolved = _resolve_subagent_config(llm, {"model": "claude-sonnet-5"})
         assert resolved.model == "claude-sonnet-5"
         assert resolved.provider == "anthropic"
         assert resolved.base_url == "https://api.example"
+        assert llm.model == "base"  # parent config not mutated
 
-    def test_tactical_fallback_available_when_subagent_unset(self):
-        """Light backend prefers tactical when no subagent tier is configured."""
-        from src.core.loader import LLMConfig, _parse_phase_override
+    def test_no_roster_partial_runs_the_parent_model(self):
+        """No tactical fallback any more — there is one model, so the reader
+        runs the parent's own config (by identity)."""
+        from src.core.loader import LLMConfig
+        from src.tools.delegation.spawn_subagent import _resolve_subagent_config
 
-        llm = LLMConfig(model="base", tactical=_parse_phase_override({"model": "tac"}))
-        assert llm.subagent is None
-        # get_phase_config("subagent") returns base (no override) ...
-        assert llm.get_phase_config("subagent").model == "base"
-        # ... so the light backend falls back to the (cheaper) tactical tier.
-        assert llm.get_phase_config("tactical").model == "tac"
-
-    def test_subagent_excluded_from_main_graph_phase_overrides(self):
-        """A subagent-only config must not trigger the main graph's phase LLMs."""
-        from src.core.loader import LLMConfig, _parse_phase_override
-
-        llm = LLMConfig(model="base", subagent=_parse_phase_override({"model": "s"}))
-        assert llm.has_phase_overrides() is False
+        llm = LLMConfig(model="base")
+        assert _resolve_subagent_config(llm, {}) is llm
+        assert _resolve_subagent_config(llm, None) is llm
 
 
 # ===========================================================================

@@ -17,7 +17,7 @@ calling this tool N times in a turn; the parent's tool node gathers those calls,
 so N readers run concurrently for free (bounded by `delegation.light.max_parallel`
 via a shared semaphore, and each given a unique index → unique worktree + port
 range). Per call: acquire an isolated reader env (Phase 2) → build the reader LLM
-from the `llm.subagent` tier (Phase 0) → run the bounded ReAct loop (Phase 1) →
+from the `subagents.llm` partial (Phase 0) → run the bounded ReAct loop (Phase 1) →
 release the env → return the result string. No freeze, no merge.
 
 See knowledge-base/knowledge/issues/delegation_light_mode_missing.md for the design + plan.
@@ -30,7 +30,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from ...core.archiver import archive_llm_request
-from ...core.loader import create_llm
+from ...core.loader import _parse_phase_override, create_llm
 from ..context import ToolContext
 from .light_runner import run_light_subagent
 from .reader_env import acquire_reader_env, release_reader_env
@@ -110,19 +110,28 @@ SPAWN_SUBAGENT_METADATA: Dict[str, Dict[str, Any]] = {
 }
 
 
-def _resolve_subagent_config(llm_cfg: Any) -> Optional[Any]:
-    """Resolve the reader's LLM config from the `llm.subagent` tier.
+def _resolve_subagent_config(
+    llm_cfg: Any, subagents_llm: Optional[Dict[str, Any]] = None
+) -> Optional[Any]:
+    """Resolve the reader's LLM config: the parent's ``llm`` overlaid with the
+    roster-wide ``subagents.llm`` partial (model / provider / transport / params).
 
-    Fallback chain: `llm.subagent` → `llm.tactical` → base. Lets a top-tier
-    parent spawn a mid-tier reader (opus → sonnet) while defaulting to the
-    cheaper tactical tier when no subagent tier is configured.
+    U1 replaced the ``llm.subagent`` tier with ``subagents.llm``; the loader's
+    compat mapping moves a legacy tier there, so pre-U1 experts and job
+    overrides keep pinning a cheaper reader (opus → sonnet). No partial → the
+    reader runs the parent's own model (the tactical fallback went with the
+    tiers: there is one model).
     """
     if llm_cfg is None:
         return None
-    if getattr(llm_cfg, "subagent", None) is not None:
-        return llm_cfg.get_phase_config("subagent")
-    # No dedicated tier → prefer tactical (cheaper than strategic), else base.
-    return llm_cfg.get_phase_config("tactical")
+    override = (
+        _parse_phase_override(subagents_llm)
+        if isinstance(subagents_llm, dict)
+        else None
+    )
+    if override is None:
+        return llm_cfg
+    return llm_cfg.with_override(override)
 
 
 def _format_result(role: str, task: str, result: str, *, failed: bool = False) -> str:
@@ -160,7 +169,15 @@ def _make_light_spawn(context: ToolContext, light_config: Dict[str, Any]):
             return "Error: task_description is required and must be non-empty."
 
         parent_tool_names = list(getattr(context, "_resolved_tool_names", []) or [])
-        subagent_cfg = _resolve_subagent_config(getattr(context, "_llm_config", None))
+        # Roster-wide reader partial. `subagents` rides tool_config via
+        # config.extra until the roster becomes a parsed field; a legacy
+        # `llm.subagent` tier is already mapped there by the loader.
+        subagents_llm = (
+            (getattr(context, "config", None) or {}).get("subagents") or {}
+        ).get("llm") or {}
+        subagent_cfg = _resolve_subagent_config(
+            getattr(context, "_llm_config", None), subagents_llm
+        )
         if subagent_cfg is None:
             return "Error: spawn_subagent has no LLM config to build a reader."
         limits = getattr(context, "_limits", None)

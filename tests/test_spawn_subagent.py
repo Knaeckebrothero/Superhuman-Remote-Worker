@@ -2,7 +2,7 @@
 
 Two layers:
 - unit: orchestration with acquire/create_llm/run/release mocked — resolves the
-  subagent model tier, validates input, wraps the result, releases the env even
+  `subagents.llm` reader pin, validates input, wraps the result, releases the env even
   on error, assigns a unique index per call, and bounds concurrency by
   max_parallel.
 - integration: a real reader env (git repo + FilesystemTestBackend) driven by a
@@ -19,7 +19,7 @@ from langchain_core.messages import AIMessage
 import pytest
 
 import src.tools.delegation.spawn_subagent as spawn_mod
-from src.core.loader import LLMConfig, _parse_phase_override
+from src.core.loader import LLMConfig
 from src.tools.context import ToolContext
 from src.tools.delegation.spawn_subagent import (
     _format_result,
@@ -34,22 +34,22 @@ from tests._fs_backend import FilesystemTestBackend
 
 
 class TestResolveSubagentConfig:
-    def test_uses_subagent_tier_when_set(self):
-        llm = LLMConfig(
-            model="opus", subagent=_parse_phase_override({"model": "sonnet"})
-        )
-        assert _resolve_subagent_config(llm).model == "sonnet"
+    def test_uses_subagents_llm_pin_when_set(self):
+        llm = LLMConfig(model="opus")
+        assert _resolve_subagent_config(llm, {"model": "sonnet"}).model == "sonnet"
 
-    def test_falls_back_to_tactical(self):
-        llm = LLMConfig(model="base", tactical=_parse_phase_override({"model": "tac"}))
-        assert _resolve_subagent_config(llm).model == "tac"
+    def test_pin_inherits_parent_transport(self):
+        llm = LLMConfig(model="opus", base_url="http://router/v1", api_key="k")
+        resolved = _resolve_subagent_config(llm, {"model": "sonnet"})
+        assert (resolved.base_url, resolved.api_key) == ("http://router/v1", "k")
 
     def test_falls_back_to_base(self):
         llm = LLMConfig(model="base")
+        assert _resolve_subagent_config(llm, {}).model == "base"
         assert _resolve_subagent_config(llm).model == "base"
 
     def test_none_config(self):
-        assert _resolve_subagent_config(None) is None
+        assert _resolve_subagent_config(None, {"model": "sonnet"}) is None
 
 
 class TestFormatResult:
@@ -68,13 +68,15 @@ class TestFormatResult:
 
 
 def _light_ctx(**over):
-    """A bare light-mode context carrying a real subagent LLM tier."""
+    """A bare light-mode context carrying a `subagents.llm` reader pin (the
+    shape the loader's tier compat produces from a legacy `llm.subagent`)."""
     ns = SimpleNamespace(
-        config={"delegation": {"mode": "light", "light": {"max_parallel": 2}}},
+        config={
+            "delegation": {"mode": "light", "light": {"max_parallel": 2}},
+            "subagents": {"llm": {"model": "sonnet"}},
+        },
         _resolved_tool_names=["read_file"],
-        _llm_config=LLMConfig(
-            model="opus", subagent=_parse_phase_override({"model": "sonnet"})
-        ),
+        _llm_config=LLMConfig(model="opus"),
         _limits=None,
     )
     for k, v in over.items():
@@ -123,7 +125,7 @@ class TestLightOrchestration:
         assert out.startswith("[subagent done] — role: reader")
         assert wired["acquired"] == [0]
         assert wired["released"] == [0]
-        # Built the reader LLM from the subagent tier, not the base model.
+        # Built the reader LLM from subagents.llm, not the parent model.
         assert wired["created_with"] == ["sonnet"]
 
     @pytest.mark.asyncio
@@ -358,7 +360,7 @@ class TestMeteredLLM:
         assert len(rows) == 1
         assert rows[0]["job_id"] == "parent-job"
         assert rows[0]["call_type"] == "subagent"
-        assert rows[0]["model"] == "base"  # ctx has no subagent tier → base fallback
+        assert rows[0]["model"] == "base"  # ctx has no subagents.llm → parent model
 
 
 # --- config plumbing (Phase 5 regression) ------------------------------------

@@ -217,10 +217,11 @@ def test_redact_strips_secrets_from_blob_for_persist():
 # --- fail-fast: transport-less pinned models (Option D) ---------------------
 
 
-def test_unrouted_model_slots_flags_transportless_phase_pin():
+def test_unrouted_model_slots_flags_transportless_summarization_pin():
     """A pinned model with NO base_url / api_key / provider after injection would
     silently fall back to api.openai.com and 401/404 (eec20eeb). Flag it so
-    dispatch can fail fast with an actionable error instead."""
+    dispatch can fail fast with an actionable error instead. Since U1 the
+    model-bearing slots are llm, llm.summarization and auxiliary."""
     from orchestrator.services.config_resolver import unrouted_model_slots
 
     blob = {
@@ -228,21 +229,48 @@ def test_unrouted_model_slots_flags_transportless_phase_pin():
             "llm": {
                 "model": "gemma",
                 "base_url": "http://router/v1",  # base: routed
-                "strategic": {"model": "gpt-5.5"},  # UNROUTED — no transport
-                "tactical": {  # routed via provider + key
-                    "model": "gpt-5.4-mini",
-                    "provider": "openai",
-                    "api_key": "sk-x",
-                },
+                "summarization": {"model": "gpt-5.5"},  # UNROUTED — no transport
             },
             "auxiliary": {"model": "aux", "base_url": "http://aux/v1"},  # routed
         }
     }
     problems = unrouted_model_slots(blob)
-    assert any("strategic" in p and "gpt-5.5" in p for p in problems)
-    assert not any("tactical" in p for p in problems)
+    assert any("summarization" in p and "gpt-5.5" in p for p in problems)
     assert not any(p.startswith("llm model") for p in problems)
     assert not any("auxiliary" in p for p in problems)
+
+    routed = {
+        "agent": {
+            "llm": {
+                "model": "gemma",
+                "base_url": "http://router/v1",
+                "summarization": {  # routed via provider + key
+                    "model": "gpt-5.4-mini",
+                    "provider": "openai",
+                    "api_key": "sk-x",
+                },
+            }
+        }
+    }
+    assert unrouted_model_slots(routed) == []
+
+
+def test_unrouted_model_slots_sees_lifted_legacy_pin_at_top_level():
+    """A legacy transport-less tactical pin in the request override is lifted
+    into llm.model by resolve_config, so the fail-fast names the TOP-LEVEL slot
+    (the nested phase check is gone with the tiers)."""
+    from orchestrator.services.config_resolver import unrouted_model_slots
+
+    blob = resolve_config(
+        base_config_name="defaults",
+        request_override={"llm": {"tactical": {"model": "orphan-pin"}}},
+        expert_type="worker",
+    )
+    assert blob["agent"]["llm"]["model"] == "orphan-pin"
+    assert "tactical" not in blob["agent"]["llm"]
+    problems = unrouted_model_slots(blob)
+    assert "llm model 'orphan-pin'" in problems
+    assert not any("tactical" in p for p in problems)
 
 
 def test_unrouted_model_slots_empty_when_all_routed():
@@ -254,10 +282,10 @@ def test_unrouted_model_slots_empty_when_all_routed():
 
 def test_unrouted_model_slots_ignores_slots_without_a_model():
     """Empty/absent model sections are not failures (the base may legitimately
-    omit a phase pin)."""
+    omit a summarization override)."""
     from orchestrator.services.config_resolver import unrouted_model_slots
 
-    blob = {"agent": {"llm": {"model": "m", "base_url": "u", "strategic": {}}}}
+    blob = {"agent": {"llm": {"model": "m", "base_url": "u", "summarization": {}}}}
     assert unrouted_model_slots(blob) == []
 
 

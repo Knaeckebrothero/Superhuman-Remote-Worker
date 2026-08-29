@@ -17,8 +17,8 @@ tags:
 
 # Light subagent delegation: throwaway in-process evidence gatherers via
 # spawn_subagent. Verification fan-out is the driving use case — subagents
-# gather evidence, the critic renders the verdict. Reader model = llm.subagent
-# tier (falls back to llm.tactical).
+# gather evidence, the critic renders the verdict. Reader model = subagents.llm
+# (falls back to the parent's llm.model).
 delegation:
   enabled: true
   mode: light

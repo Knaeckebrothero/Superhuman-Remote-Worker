@@ -18,7 +18,7 @@ import math
 import os
 import time
 import zipfile
-from dataclasses import asdict
+from dataclasses import asdict, replace as _dc_replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
@@ -38,14 +38,9 @@ from .core.loader import (
     get_all_tool_names,
     resolve_config_path,
     resolve_model_settings,
-    resolve_phase_model_budget,
     supports_parallel_tool_calls,
 )
-from .core.loader import (
-    CONTEXT_THRESHOLD_FRACTION,
-    MESSAGE_COUNT_MIN_FRACTION,
-    get_project_root,
-)
+from .core.loader import get_project_root
 from .core.phase_snapshot import PhaseSnapshotManager
 from .core.state import UniversalAgentState, create_initial_state
 from .core.workspace import (
@@ -555,143 +550,39 @@ class UniversalAgent:
         logger.info(f"{self.config.display_name} initialized successfully")
 
     def _create_phase_llms(self) -> None:
-        """Create phase-specific LLMs based on configuration.
+        """Create the job's LLM client(s) from the single ``llm.model``.
 
-        If phase overrides are configured, creates separate LLMs for:
-        - Strategic phase (planning, high-level decisions)
-        - Tactical phase (execution)
-        - Summarization (context compaction)
-
-        If no overrides configured, reuses the same LLM for all phases.
+        U1 collapsed the strategic/tactical tiers: every phase runs the one
+        configured model, so ``_llm`` / ``_strategic_llm`` / ``_tactical_llm``
+        are the same client (the two phase attributes stay until U2 collapses
+        the phase bindings). ``llm.summarization`` is the only remaining
+        override — it gets its own client only when it resolves to a config
+        that differs from the main model's.
         """
         llm_config = self.config.llm
         limits = self.config.limits
         # Reset each call (idempotent across boot-time + per-job recreation).
+        # Still the warning surface read when the resolved config is frozen,
+        # even though the phase-model reconciliation that used to fill it went
+        # with the tiers.
         self._model_config_warnings: List[str] = []
 
-        if llm_config.has_phase_overrides():
-            # Create phase-specific LLMs
-            strategic_config = llm_config.get_phase_config("strategic")
-            tactical_config = llm_config.get_phase_config("tactical")
-            summarization_config = llm_config.get_phase_config("summarization")
+        self._llm = create_llm(llm_config, limits=limits)
+        self._strategic_llm = self._llm
+        self._tactical_llm = self._llm
+        logger.info(f"Created LLM for all phases: {llm_config.model}")
 
-            # Phase models resolve their OWN family params + window instead of
-            # inheriting the base/primary slot (gemma by default). The shared
-            # context budget is the min of the two phase windows (single shared
-            # history). See knowledge-history/done/context_budget_uses_base_model_not_phase_models.md.
-            # NOTE: this overwrites the matrix/DB-derived `limits` window leaves —
-            # the phase-min is authoritative for a job whose inference models are
-            # the phase models, so it supersedes any base-family admin override.
-            budget = resolve_phase_model_budget(
-                base_model=llm_config.model,
-                strategic_override=llm_config.strategic,
-                tactical_override=llm_config.tactical,
-                summarization_override=llm_config.summarization,
-                deployment_dir=self.config._deployment_dir,
-            )
-            effective_multimodal = budget["effective_multimodal"]
-
-            # Overlay own-family params + own window + reconciled multimodal onto
-            # each OVERRIDDEN phase's (distinct) config. MUST run before the `==`
-            # reuse comparisons below so same-family phases still dedupe and
-            # cross-family ones correctly diverge. Phases without an override
-            # share `self.config.llm` (get_phase_config returns self) and are left
-            # untouched here — they genuinely run the base model + base params.
-            _phase_cfgs = {
-                "strategic": strategic_config,
-                "tactical": tactical_config,
-                "summarization": summarization_config,
-            }
-            for _phase, _vals in budget["params"].items():
-                _cfg = _phase_cfgs[_phase]
-                for _k, _v in _vals.items():
-                    setattr(_cfg, _k, _v)
-                _win = budget["windows"].get(_phase)
-                if _win:
-                    # Own window so the HTTP-layer 413 preflight uses the model's
-                    # TRUE window, not the inherited base 131072.
-                    _cfg.model_max_context_tokens = int(_win)
-                _cfg.multimodal = effective_multimodal
-
-            # Reconcile multimodal on the PERSISTENT config so the per-tool image
-            # gate (get_phase_multimodal -> self.config.llm.get_phase_config) and
-            # the client flag agree: a non-multimodal phase model can never be
-            # handed an image the other phase left on the shared history.
-            llm_config.multimodal = effective_multimodal
-            for _ov in (
-                llm_config.strategic,
-                llm_config.tactical,
-                llm_config.summarization,
-            ):
-                if _ov is not None and _ov.multimodal is not None:
-                    _ov.multimodal = effective_multimodal
-
-            # Raise the shared compaction budget to the phase min (escapes the
-            # gemma-derived 131072 cap). `limits` is self.config.limits — mutating
-            # it in place is seen by create_llm below and the ContextManager built
-            # later in build_phase_alternation_graph.
-            _min = budget["min_window"]
-            if _min:
-                limits.model_max_context_tokens = int(_min)
-                limits.context_threshold_tokens = int(_min * CONTEXT_THRESHOLD_FRACTION)
-                limits.message_count_min_tokens = int(_min * MESSAGE_COUNT_MIN_FRACTION)
-
-            # Surface mismatch warnings (backend: log + frozen-config blob).
-            self._model_config_warnings = [m for _lvl, m in budget["warnings"]]
-            for _lvl, _msg in budget["warnings"]:
-                (logger.warning if _lvl == "warning" else logger.info)(
-                    f"Phase model config: {_msg}"
-                )
-
-            self._strategic_llm = create_llm(strategic_config, limits=limits)
-            logger.info(
-                f"Created strategic LLM: {strategic_config.model} "
-                f"(window={strategic_config.model_max_context_tokens}, "
-                f"budget={limits.model_max_context_tokens})"
-            )
-
-            # Optimization: reuse LLM if fully identical config (not just model name)
-            if tactical_config == strategic_config:
-                self._tactical_llm = self._strategic_llm
-                logger.info(
-                    f"Tactical LLM: reusing strategic ({tactical_config.model})"
-                )
-            else:
-                self._tactical_llm = create_llm(tactical_config, limits=limits)
-                logger.info(f"Created tactical LLM: {tactical_config.model}")
-
-            if not llm_config.summarization:
-                # No explicit summarization override — reuse strategic LLM
-                # (avoids creating a separate LLM with potentially unreachable base config)
-                self._summarization_llm = self._strategic_llm
-                logger.info(
-                    f"Summarization LLM: reusing strategic ({strategic_config.model}) (no override)"
-                )
-            elif summarization_config == strategic_config:
-                self._summarization_llm = self._strategic_llm
-                logger.info(
-                    f"Summarization LLM: reusing strategic ({summarization_config.model})"
-                )
-            elif summarization_config == tactical_config:
-                self._summarization_llm = self._tactical_llm
-                logger.info(
-                    f"Summarization LLM: reusing tactical ({summarization_config.model})"
-                )
-            else:
-                self._summarization_llm = create_llm(
-                    summarization_config, limits=limits
-                )
-                logger.info(f"Created summarization LLM: {summarization_config.model}")
-
-            # Base LLM defaults to strategic for backwards compatibility
-            self._llm = self._strategic_llm
-        else:
-            # No phase overrides - single LLM for all phases
-            self._llm = create_llm(llm_config, limits=limits)
-            self._strategic_llm = self._llm
-            self._tactical_llm = self._llm
+        summarization_config = llm_config.get_phase_config("summarization")
+        if summarization_config is llm_config or summarization_config == _dc_replace(
+            llm_config, summarization=None
+        ):
+            # No override, or one that resolves to the main model — reuse the
+            # client rather than opening a second one to the same endpoint.
             self._summarization_llm = self._llm
-            logger.info(f"Created single LLM for all phases: {llm_config.model}")
+            logger.info(f"Summarization LLM: reusing main ({llm_config.model})")
+        else:
+            self._summarization_llm = create_llm(summarization_config, limits=limits)
+            logger.info(f"Created summarization LLM: {summarization_config.model}")
 
         # Create AuxiliaryLLM for support tasks (summarization, memory, curation)
         self._initialize_auxiliary_llm(llm_config, limits)
@@ -3128,6 +3019,7 @@ class UniversalAgent:
                 _apply_settings_matrix,
                 deep_merge,
                 load_agent_config_from_dict,
+                normalize_llm_tiers,
             )
             from .core.tool_policy import normalize_tool_policy
             import dataclasses
@@ -3135,8 +3027,13 @@ class UniversalAgent:
             # Non-hydrated dispatch delivers the request-layer override raw, so
             # the agent is where its tool policy has to be resolved. (On the
             # orchestrator-resolved path config_override is None and the blob
-            # already carries canonical lists.)
-            config_override = normalize_tool_policy(metadata["config_override"])
+            # already carries canonical lists.) Same seam for a legacy
+            # llm.strategic/tactical pin: the whole block — model plus the
+            # transport the dispatcher injected into it — lifts to llm.model.
+            config_override = normalize_llm_tiers(
+                normalize_tool_policy(metadata["config_override"]),
+                source="job-override",
+            )
             logger.info(
                 f"Applying inline config override: {list(config_override.keys())}"
             )
@@ -4397,22 +4294,14 @@ class UniversalAgent:
         # overwhelming the agent loop with 20+ simultaneous tool calls).
         # parallel_tool_calls is an OpenAI Chat Completions param — suppressed
         # for providers/models that reject it (Google GenAI's GenerateContentConfig,
-        # OpenAI o-series). Strategic and tactical phases can use different
-        # providers, so gate each phase independently.
-        strategic_cfg = self.config.llm.get_phase_config("strategic")
-        tactical_cfg = self.config.llm.get_phase_config("tactical")
-
-        strategic_bind_kwargs = {}
-        if supports_parallel_tool_calls(strategic_cfg.provider, strategic_cfg.model):
-            strategic_bind_kwargs["parallel_tool_calls"] = (
-                strategic_cfg.parallel_tool_calls
-            )
-
-        tactical_bind_kwargs = {}
-        if supports_parallel_tool_calls(tactical_cfg.provider, tactical_cfg.model):
-            tactical_bind_kwargs["parallel_tool_calls"] = (
-                tactical_cfg.parallel_tool_calls
-            )
+        # OpenAI o-series). One model runs every phase (U1), so a single gate
+        # serves both phase bindings.
+        llm_cfg = self.config.llm
+        bind_kwargs = {}
+        if supports_parallel_tool_calls(llm_cfg.provider, llm_cfg.model):
+            bind_kwargs["parallel_tool_calls"] = llm_cfg.parallel_tool_calls
+        strategic_bind_kwargs = bind_kwargs
+        tactical_bind_kwargs = bind_kwargs
 
         # Phase-filter tools: each LLM only sees tools declared for its phase.
         # The ToolNode keeps the full list (LLM schema binding is primary enforcement).

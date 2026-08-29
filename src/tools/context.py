@@ -1334,18 +1334,18 @@ class ToolContext:
             self._current_turn_count = turn_count
 
     def get_phase_multimodal(self) -> bool:
-        """Get the effective multimodal setting for the current phase.
+        """Get the effective multimodal setting for the running model.
 
-        If an LLMConfig is available and phase is set, uses the phase-specific
-        config (which may override the base multimodal setting). Otherwise
-        falls back to the static config value.
+        One model runs every phase (U1), so with an LLMConfig attached and a
+        phase set this is simply ``llm.multimodal``. Otherwise falls back to
+        the static tool-config value (which the worker/session wiring seeds
+        from the same field).
 
         Returns:
-            True if the current phase's model supports multimodal input
+            True if the model supports multimodal input
         """
         if self._llm_config is not None and self._current_phase is not None:
-            phase_config = self._llm_config.get_phase_config(self._current_phase)
-            return phase_config.multimodal
+            return self._llm_config.multimodal
         return self.get_config("multimodal", False)
 
     # ── Browser session lifecycle ────────────────────────────────────

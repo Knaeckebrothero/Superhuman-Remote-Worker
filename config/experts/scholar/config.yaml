@@ -22,8 +22,8 @@ scholar:
 
 # Light subagent delegation: throwaway in-process readers via spawn_subagent.
 # Research fan-out is the driving use case — the parent delegates the reading
-# and authors the synthesis. The reader MODEL comes from the llm.subagent tier
-# (falls back to llm.tactical; override per job via config_override.llm.subagent).
+# and authors the synthesis. The reader MODEL comes from subagents.llm (falls
+# back to the parent's llm.model; override per job via config_override.subagents.llm).
 delegation:
   enabled: true
   mode: light
