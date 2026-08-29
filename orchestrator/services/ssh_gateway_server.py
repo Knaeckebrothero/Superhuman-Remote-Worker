@@ -19,12 +19,21 @@ callbacks are synchronous and must answer before the upstream is known good:
   subsystem     -> defer the reply, then CHANNEL_FAILURE, because SFTP and
                    JetBrains clients never render stderr.
 
-Only the first half is wired here, and the second cannot be until Task 7:
-deferring a subsystem reply means returning ``None`` from
-``subsystem_requested`` and answering later, but the answer depends on a
-resolved upstream, and nothing resolves an upstream until ``_upstream``
-exists. Both halves currently reach the same ``_session_factory``; when
-Task 7 lands the dial, the subsystem path gets its deferred answer there.
+Both halves are wired now that the dial exists. The subsystem half works by
+returning ``None`` from ``subsystem_requested``, which asyncssh reads as "no
+answer yet" (``channel.py``'s ``_service_next_request`` only reports a
+response when the handler returns something other than ``None`` -- the same
+mechanism asyncssh itself uses to defer x11 and agent-forwarding replies).
+The answer is then delivered from a task once the upstream is known good.
+The ordering matters and is the reason this could not land before the dial
+did: ``_report_response(True)`` is what CALLS ``session_started`` and so
+starts ``_session_factory``, meaning the deferred reply has to resolve the
+upstream itself rather than leaving it to the session.
+
+Getting this wrong is not cosmetic. An optimistic SUCCESS followed by a
+dying channel is what an sftp client reports as ``SFTPConnectionLost`` (and
+OpenSSH's ``sftp`` as a bare "Connection closed"); a deferred
+CHANNEL_FAILURE is one clean ``ChannelOpenError`` naming the channel.
 
 THREE PIECES OF WIRING HERE ARE LOAD-BEARING AND HAVE NO OTHER ENFORCER.
 Each is a sibling module's capability that is inert until this file calls
@@ -53,12 +62,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 import asyncssh
-from asyncssh.constants import OPEN_ADMINISTRATIVELY_PROHIBITED
+from asyncssh.constants import (
+    OPEN_ADMINISTRATIVELY_PROHIBITED,
+    OPEN_CONNECT_FAILED,
+)
 from asyncssh.sftp import MIN_SFTP_VERSION
 
 from services.ssh_gateway_client import (
@@ -190,12 +203,17 @@ class GatewayContext:
     mark_key_used: Optional[Callable] = None
 
     # Not every field is optional in the same sense, and the uniform
-    # ``Optional[Callable]`` typing hides that. ``resolve`` and ``limiter``
-    # are REQUIRED -- a connection cannot authorize or bound anything
-    # without them. The three audit callables are genuinely optional (audit
-    # is best effort by design, and every call site guards them), and
-    # ``ca``/``config`` are not touched by this module at all yet.
-    REQUIRED_FIELDS = ("resolve", "limiter")
+    # ``Optional[Callable]`` typing hides that. ``resolve``, ``limiter`` and
+    # ``ca`` are REQUIRED -- a connection cannot authorize, bound, or reach
+    # a workspace without them. ``ca`` joined the list when the upstream
+    # dial landed: ``connect_upstream`` mints this connection's certificate
+    # off it, so an unbound one used to surface as an AttributeError
+    # escaping ``_session_factory`` into asyncssh's task reaper, which tears
+    # the connection down with nothing for the user or the operator to read.
+    # The three audit callables are genuinely optional (audit is best effort
+    # by design, and every call site guards them), and ``config`` is not
+    # touched by this module at all.
+    REQUIRED_FIELDS = ("resolve", "limiter", "ca")
 
     def missing_required(self) -> tuple[str, ...]:
         """Names of required fields this context never had bound."""
@@ -205,7 +223,8 @@ class GatewayContext:
 
 
 class _GatewayProxyProcess(ProxyProcess):
-    """A ``ProxyProcess`` that reports its own channel's close.
+    """A ``ProxyProcess`` that reports its own channel's close, and that
+    defers a subsystem reply until the upstream is known good.
 
     asyncssh's channel cleanup calls ``connection_lost`` on the session
     exactly once (``channel.py``'s ``_cleanup``), and wraps it in its own
@@ -221,19 +240,84 @@ class _GatewayProxyProcess(ProxyProcess):
         allow_scp,
         *,
         on_channel_closed: Callable[[], None],
+        open_upstream: Callable,
+        note_channel_type: Callable,
     ):
         super().__init__(process_factory, sftp_factory, sftp_version, allow_scp)
         self._on_channel_closed = on_channel_closed
-        self._channel_slot_released = False
+        self._open_upstream = open_upstream
+        self._note_channel_type = note_channel_type
+        # Serves two purposes deliberately: it makes the slot release
+        # idempotent, and it is how the deferred subsystem reply below knows
+        # there is no longer anyone to answer.
+        self._channel_closed = False
 
     def connection_lost(self, exc: Optional[Exception]) -> None:
-        if not self._channel_slot_released:
-            self._channel_slot_released = True
+        if not self._channel_closed:
+            self._channel_closed = True
             try:
                 self._on_channel_closed()
             except Exception:  # pragma: no cover - defensive
                 logger.exception("ssh gateway: failed to release a channel slot")
         super().connection_lost(exc)
+
+    def subsystem_requested(self, subsystem: str) -> Optional[bool]:
+        """Defer the reply until the workspace has actually answered.
+
+        Returning ``None`` tells asyncssh "no answer yet"
+        (``channel.py``'s ``_service_next_request`` reports a response only
+        for a non-``None`` result), and ``_settle_subsystem`` delivers the
+        real one later. sftp and JetBrains clients never render stderr, so
+        the shell path's optimistic SUCCESS would leave them with a channel
+        that simply dies -- ``SFTPConnectionLost``, with no reason anywhere.
+        """
+        if not super().subsystem_requested(subsystem):
+            return False
+        # Recorded even though the session may never start: 'they asked for
+        # sftp and were turned away' is exactly what the audit table's
+        # ``channels`` column is for, and on a refusal ``_session_factory``
+        # -- which does the same recording for the shell path -- is never
+        # reached at all.
+        self._note_channel_type(self)
+        report = getattr(self._chan, "_report_response", None)
+        if report is None:
+            # Degrade to the shell path's strategy rather than hanging: a
+            # deferral nobody can ever answer would leave every sftp client
+            # waiting on a reply that never comes. Loud, because the only
+            # way to get here is an asyncssh that renamed the mechanism out
+            # from under us -- the whole mechanism is exercised against the
+            # real library by
+            # test_a_refused_workspace_fails_sftp_with_a_channel_open_failure.
+            logger.error(
+                "ssh gateway: cannot defer a subsystem reply; answering "
+                "optimistically instead, so a refusal will reach sftp "
+                "clients as a dropped channel"
+            )
+            return True
+        self._conn.create_task(self._settle_subsystem(report), self._chan.logger)
+        return None
+
+    async def _settle_subsystem(self, report: Callable[[bool], None]) -> None:
+        """Answer a deferred subsystem request once the upstream is known.
+
+        ``report(True)`` is what calls ``session_started``, which starts
+        ``_session_factory`` -- which resolves the same, now cached,
+        upstream. ``report(False)`` sends CHANNEL_FAILURE and starts
+        nothing.
+        """
+        try:
+            await self._open_upstream()
+        except Exception as exc:
+            logger.info("ssh gateway: refusing a subsystem channel: %r", exc)
+            allowed = False
+        else:
+            allowed = True
+        if self._channel_closed:
+            # The peer went away mid-dial. Reporting True here would ask
+            # asyncssh to start a session on a channel it has already torn
+            # down; reporting anything at all is pointless.
+            return
+        report(allowed)
 
 
 class GatewaySSHServer(asyncssh.SSHServer):
@@ -251,6 +335,12 @@ class GatewaySSHServer(asyncssh.SSHServer):
 
         self._target: Optional[SshTarget] = None
         self._resolve_lock = asyncio.Lock()
+        # The INBOUND connection, kept because ``forward_tunneled_connection``
+        # is a method on ``SSHServerConnection`` (connection.py:7255), not on
+        # the upstream client connection.
+        self._conn = None
+        self._upstream_conn = None
+        self._upstream_lock = asyncio.Lock()
         self._attached_workspace: Optional[str] = None
         self._attachment_id: Optional[str] = None
         self._channel_types: list[str] = []
@@ -270,6 +360,17 @@ class GatewaySSHServer(asyncssh.SSHServer):
         return list(self._channel_types)
 
     # --- authentication ---------------------------------------------------
+
+    def connection_made(self, conn) -> None:
+        """Keep the inbound connection, as asyncssh's own docs instruct.
+
+        ``direct-tcpip`` is forwarded with
+        ``SSHServerConnection.forward_tunneled_connection(upstream, host,
+        port)`` -- a method on THIS connection that takes the upstream as an
+        argument, not a method on the upstream. Getting that backwards is an
+        AttributeError at the first ``ssh -L``.
+        """
+        self._conn = conn
 
     def begin_auth(self, username: str) -> bool:
         """Always require authentication. Records the handle only; resolving
@@ -427,6 +528,8 @@ class GatewaySSHServer(asyncssh.SSHServer):
             MIN_SFTP_VERSION,
             False,
             on_channel_closed=self._channel_closed,
+            open_upstream=self._upstream,
+            note_channel_type=self._note_channel_type,
         )
 
     def _channel_closed(self) -> None:
@@ -450,6 +553,24 @@ class GatewaySSHServer(asyncssh.SSHServer):
         while self._open_channels > 0:
             self._channel_closed()
         self._release_attachment()
+        self._close_upstream()
+
+    def _close_upstream(self) -> None:
+        """Drop this connection's SSH connection to the workspace.
+
+        Nothing else ever closes it: without this, every gateway connection
+        leaves a live inner-hop connection holding one of the workspace
+        sshd's ``MaxSessions`` slots until the gateway pod restarts.
+        Synchronous ``close()`` rather than ``wait_closed()`` because
+        ``connection_lost`` is a synchronous asyncssh callback.
+        """
+        connection, self._upstream_conn = self._upstream_conn, None
+        if connection is None:
+            return
+        try:
+            connection.close()
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("ssh gateway: failed to close an upstream connection")
 
     def _release_attachment(self) -> None:
         workspace_id, self._attached_workspace = self._attached_workspace, None
@@ -651,20 +772,189 @@ class GatewaySSHServer(asyncssh.SSHServer):
             )
 
     async def _upstream(self):
-        """Resolve, attach, and connect.
+        """Resolve, attach, and connect -- once per CONNECTION.
 
-        The dial itself lands with Task 7's connection lifecycle; raising
-        here keeps the contract explicit rather than returning something
-        ``proxy_session`` would fail on obscurely. Everything before the
-        raise is live: resolution, the workspace attachment cap, and the
-        audit row all run on the first channel open.
+        One dial, not one per channel: each dial mints a certificate and
+        costs a full SSH handshake against the workspace, and a JetBrains
+        client opens several channels at once. ``_attached_target`` already
+        makes resolution and the attachment charge once-per-connection; this
+        lock does the same for the dial itself.
+
+        A dial failure becomes ``TargetUnavailable("unreachable")`` rather
+        than escaping: an exception out of here reaches ``_session_factory``,
+        which does not catch it, and from there asyncssh's task reaper,
+        which tears the whole connection down with an opaque internal error.
+        The reason survives in the log instead -- at ``error`` for a host-key
+        mismatch, which is a security signal (the fingerprint the
+        provisioner attested through the Kubernetes API no longer matches
+        the pod answering) rather than an outage.
         """
-        await self._attached_target()
-        raise NotImplementedError(
-            "the upstream dial lands with Task 7's connection lifecycle"
+        connection = self._upstream_conn
+        if connection is not None:
+            return connection
+        if self._connection_closed:
+            # A deferred subsystem reply can still be in flight after the
+            # peer has gone. Dialling a workspace for a client that no
+            # longer exists is pure waste.
+            raise TargetUnavailable("unreachable")
+
+        target = await self._attached_target()
+
+        async with self._upstream_lock:
+            if self._upstream_conn is not None:
+                return self._upstream_conn
+            try:
+                connection = await connect_upstream(self._context, target)
+            except asyncssh.HostKeyNotVerifiable as exc:
+                logger.error(
+                    "ssh gateway: workspace %s presented an unexpected host "
+                    "key; refusing the inner hop: %r",
+                    target.thread_id,
+                    exc,
+                )
+                raise TargetUnavailable("unreachable") from exc
+            except Exception as exc:
+                logger.warning(
+                    "ssh gateway: could not open the inner hop to workspace %s: %r",
+                    target.thread_id,
+                    exc,
+                )
+                raise TargetUnavailable("unreachable") from exc
+
+            if self._connection_closed:
+                # Same shape as the attach-slot leak: ``connection_lost``
+                # ran while the dial was in flight, found ``_upstream_conn``
+                # still None, and closed nothing. This is the only place
+                # that connection can be given back.
+                connection.close()
+                raise TargetUnavailable("unreachable")
+
+            self._upstream_conn = connection
+            return connection
+
+    def _forward_connection(self, dest_host: str, dest_port: int):
+        """direct-tcpip, returned as an AWAITABLE rather than a callable.
+
+        asyncssh's ``_process_direct_tcpip_open`` (connection.py:6394-6417)
+        inspects what ``connection_requested`` returned before awaiting
+        anything: a callable is wrapped in ``SSHTCPStreamSession`` and later
+        invoked as ``handler(reader, writer)``, so returning a function here
+        never dials at all. A coroutine falls through to
+        ``chan.process_open``, which awaits it (channel.py:485) before the
+        channel-open confirmation is sent -- exactly the ordering this needs.
+        """
+        return self._open_forwarded_connection(dest_host, dest_port)
+
+    async def _open_forwarded_connection(self, dest_host: str, dest_port: int):
+        """Dial upstream, then splice the forwarded channel onto it.
+
+        Every refusal is converted to ``ChannelOpenError``:
+        ``_finish_open_request`` catches that and nothing else
+        (channel.py:511), so any other exception kills the whole connection
+        instead of the one channel. The reason travels in the failure, which
+        is where an ``ssh -L`` client prints it.
+        """
+        try:
+            upstream = await self._upstream()
+        except TargetDenied:
+            raise asyncssh.ChannelOpenError(
+                OPEN_ADMINISTRATIVELY_PROHIBITED, REFUSAL_MESSAGES["denied"][0]
+            ) from None
+        except TargetUnavailable as exc:
+            message, _ = REFUSAL_MESSAGES.get(
+                exc.state, REFUSAL_MESSAGES["unreachable"]
+            )
+            raise asyncssh.ChannelOpenError(OPEN_CONNECT_FAILED, message) from None
+        except AttachmentLimitReached:
+            raise asyncssh.ChannelOpenError(
+                OPEN_ADMINISTRATIVELY_PROHIBITED, ATTACHMENT_LIMIT_MESSAGE
+            ) from None
+        except GatewayMisconfigured:
+            raise asyncssh.ChannelOpenError(
+                OPEN_ADMINISTRATIVELY_PROHIBITED, MISCONFIGURED_MESSAGE
+            ) from None
+
+        if self._conn is None:  # pragma: no cover - defensive
+            # connection_made is asyncssh's own contract; a listener that
+            # never fired it cannot forward anything.
+            raise asyncssh.ChannelOpenError(
+                OPEN_ADMINISTRATIVELY_PROHIBITED, MISCONFIGURED_MESSAGE
+            )
+        return await self._conn.forward_tunneled_connection(
+            upstream, dest_host, dest_port
         )
 
-    def _forward_connection(self, dest_host, dest_port):
-        raise NotImplementedError(
-            "direct-tcpip forwarding lands with Task 7's connection lifecycle"
-        )
+
+# --- the inner hop --------------------------------------------------------
+
+# The workspace's host key is pinned by fingerprint, so asyncssh must be given
+# an EMPTY known-hosts tuple rather than None. Passing None disables validation
+# entirely and ``validate_host_public_key`` is never called at all -- verified
+# on 2.24.0 against a real loopback server, and pinned by
+# ``test_known_hosts_none_is_the_negative_control``, which connects with a
+# deliberately WRONG fingerprint and succeeds once this constant is None.
+# ``canvas_ssh.py`` and ``docker_provisioner.py`` carry the same constant for
+# the same reason.
+EMPTY_KNOWN_HOSTS = ((), (), (), (), (), (), ())
+
+# The single Unix user every workspace image bakes in
+# (docker/Dockerfile.workspace). Also the certificate's only principal --
+# see ssh_gateway_ca's module docstring for what that does and does not
+# scope.
+WORKSPACE_PRINCIPAL = "agent-host"
+
+# Bounds on the inner hop. Without them a pod that black-holes packets hangs
+# the user's channel forever -- and, on the subsystem path, hangs a DEFERRED
+# reply, so the client waits on an answer that never comes rather than
+# failing. Sized like canvas_ssh.py's pinned transport, which dials the same
+# workspaces.
+UPSTREAM_CONNECT_TIMEOUT_SECONDS = 10
+UPSTREAM_LOGIN_TIMEOUT_SECONDS = 15
+
+
+class _PinnedClient(asyncssh.SSHClient):
+    """Validates the workspace host key against the fingerprint the
+    provisioner attested through the Kubernetes API -- not an SSH scan.
+
+    Deliberately omits ``super().__init__()``: ``SSHClient`` defines none,
+    and asyncssh only ever calls the callbacks below.
+    """
+
+    def __init__(self, expected_fingerprint: str):
+        self._expected = expected_fingerprint
+
+    def validate_host_public_key(self, host, addr, port, key) -> bool:
+        del host, addr, port
+        return secrets.compare_digest(key.get_fingerprint("sha256"), self._expected)
+
+
+async def connect_upstream(context: GatewayContext, target: SshTarget):
+    """Open the inner hop with a freshly minted, short-lived certificate.
+
+    Nothing here is cached or reused: the gateway holds a CA, not a standing
+    credential, so every dial mints its own keypair and certificate and the
+    blast radius of a compromised gateway is "can mint until the CA is
+    rotated" rather than "holds a key that opens every workspace forever".
+
+    ``target.pod_ip`` is a misnomer carried from the orchestrator's API: it
+    holds a Kubernetes Service DNS name, and must not be validated as an IP.
+    """
+    key, cert = context.ca.mint(WORKSPACE_PRINCIPAL)
+    expected = target.host_key_fingerprint
+    return await asyncssh.connect(
+        target.pod_ip,
+        port=target.pod_port,
+        username=WORKSPACE_PRINCIPAL,
+        client_keys=[(key, cert)],
+        known_hosts=EMPTY_KNOWN_HOSTS,
+        # Client-side option, unlike on a listener: "host-key algorithms
+        # this client will accept FROM a server". Workspaces also generate
+        # an RSA host key, and negotiating it would fail a pin recorded
+        # against the ed25519 one. See ssh_gateway_config.SERVER_HOST_KEY_ALGS
+        # for the server-side half of this distinction.
+        server_host_key_algs=["ssh-ed25519"],
+        client_factory=lambda: _PinnedClient(expected),
+        encoding=None,
+        connect_timeout=UPSTREAM_CONNECT_TIMEOUT_SECONDS,
+        login_timeout=UPSTREAM_LOGIN_TIMEOUT_SECONDS,
+    )

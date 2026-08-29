@@ -23,6 +23,7 @@ fingerprint)`` shape.
 """
 
 import asyncio
+import inspect
 
 import asyncssh
 import pytest
@@ -47,10 +48,20 @@ HANDLE = "s-7f3a91c2"
 CLIENT_IP = "203.0.113.9"
 
 
+class FakeCa:
+    """Stands in for ``SshUserCa``. Present in every context below because
+    ``ca`` is a REQUIRED field once the upstream dial exists -- a context
+    without one refuses every channel as misconfigured, which would make
+    these tests fail for the wrong reason."""
+
+    def mint(self, principal, **kwargs):
+        return object(), object()
+
+
 def _context(**overrides) -> GatewayContext:
     base = dict(
         config=None,
-        ca=None,
+        ca=FakeCa(),
         limiter=None,
         resolve=None,
         record_attach=None,
@@ -476,20 +487,29 @@ def test_session_requested_uses_asyncssh_min_sftp_version():
 
 
 def test_connection_requested_refuses_before_reaching_the_forwarder():
-    """_forward_connection is a Task 7 stub that raises NotImplementedError.
-    A non-loopback destination must be refused by the clamp *before* it, so
-    this returning False (rather than raising) is what proves the clamp
-    actually guards the stub."""
+    """A non-loopback destination must be refused by the clamp *before* the
+    forwarder, so this returning False (rather than an awaitable that would
+    go on to dial) is what proves the clamp actually guards it."""
     server = GatewaySSHServer(_context(), CLIENT_IP)
     assert server.connection_requested("169.254.169.254", 80, "orig", 1) is False
 
 
 def test_connection_requested_reaches_the_forwarder_for_loopback():
     """The other half of the test above: without this, "returns False" would
-    be indistinguishable from "the clamp refuses everything"."""
+    be indistinguishable from "the clamp refuses everything".
+
+    An AWAITABLE, not a callable: asyncssh wraps a callable in
+    ``SSHTCPStreamSession`` and calls it as ``handler(reader, writer)``
+    instead of awaiting it, so the dial would never happen. See
+    tests/test_ssh_gateway_upstream.py's
+    ``test_forward_connection_is_awaited_not_called``."""
     server = GatewaySSHServer(_context(), CLIENT_IP)
-    with pytest.raises(NotImplementedError):
-        server.connection_requested("127.0.0.1", 8080, "orig", 1)
+    forwarder = server.connection_requested("127.0.0.1", 8080, "orig", 1)
+    try:
+        assert inspect.isawaitable(forwarder)
+        assert not callable(forwarder)
+    finally:
+        forwarder.close()
 
 
 # --- lazy resolution, attachment audit, attachment cap --------------------
@@ -625,7 +645,7 @@ async def test_the_workspace_attachment_cap_refuses_with_a_readable_reason():
 
 
 @pytest.mark.asyncio
-async def test_connection_lost_closes_the_attachment_and_detaches():
+async def test_connection_lost_closes_the_attachment_and_detaches(monkeypatch):
     closed = []
 
     async def _resolve(handle, fingerprint):
@@ -651,10 +671,15 @@ async def test_connection_lost_closes_the_attachment_and_detaches():
         )
     )
     await server._attached_target()
-    # Task 7 owns the actual dial; _upstream raising here is the seam, and
-    # the channel type must already be recorded by the time it does.
-    with pytest.raises(NotImplementedError):
-        await server._session_factory(FakeProcess(subsystem="sftp"))
+
+    # A workspace that cannot be dialled: the channel type must already be
+    # recorded by the time the dial is tried, so the audit row still says
+    # "they asked for sftp".
+    async def _dial_fails(context, target):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(mod, "connect_upstream", _dial_fails)
+    await server._session_factory(FakeProcess(subsystem="sftp"))
 
     server.connection_lost(None)
     await _drain_background_tasks()
@@ -935,13 +960,18 @@ async def test_drain_is_a_no_op_with_nothing_in_flight():
 
 
 def test_missing_required_names_only_the_fields_a_connection_needs():
-    """The uniform Optional[Callable] typing hides that resolve/limiter are
-    required while the three audit callables genuinely are not."""
-    assert _context().missing_required() == ("resolve", "limiter")
+    """The uniform Optional[Callable] typing hides that resolve/limiter/ca
+    are required while the three audit callables genuinely are not. ``ca``
+    joined the list with the upstream dial: ``connect_upstream`` mints this
+    connection's certificate off it."""
+    assert _context(ca=None).missing_required() == ("resolve", "limiter", "ca")
     assert _context(resolve=lambda *a: None).missing_required() == ("limiter",)
     assert (
         _context(resolve=lambda *a: None, limiter=_limiter()).missing_required() == ()
     )
+    assert _context(
+        resolve=lambda *a: None, limiter=_limiter(), ca=None
+    ).missing_required() == ("ca",)
 
 
 @pytest.mark.asyncio
