@@ -403,6 +403,80 @@ class TestDelegationConfigPlumbing:
         cfg = self._load(expert)
         assert "delegation" not in cfg.extra
 
+    @pytest.mark.parametrize("expert", ["scholar", "critic"])
+    def test_subagents_absent_from_extra(self, expert):
+        """WP3: `subagents` is a parsed field (SubagentsConfig) like
+        `delegation`, so it too must be injected into tool_config explicitly."""
+        from src.core.loader import SubagentsConfig
+
+        cfg = self._load(expert)
+        assert isinstance(cfg.subagents, SubagentsConfig)
+        assert "subagents" not in cfg.extra
+        assert "tags" not in cfg.extra
+
+    def test_tool_config_carries_subagents(self):
+        """The injected shape is asdict(SubagentsConfig) — {default, llm,
+        roster} — and the light runner reads its `llm` partial from it."""
+        from dataclasses import asdict
+
+        from src.core.loader import LLMConfig, load_agent_config_from_dict
+
+        cfg = self._load("scholar")
+        tool_config = {**cfg.extra, "subagents": asdict(cfg.subagents)}
+        assert tool_config["subagents"] == {"default": None, "llm": {}, "roster": {}}
+        # A roster-wide pin travels the same way.
+        pinned = load_agent_config_from_dict(
+            {
+                "agent_id": "p",
+                "display_name": "P",
+                "llm": {"model": "base"},
+                "subagents": {"llm": {"model": "claude-haiku-4-5"}},
+            }
+        )
+        tool_config = {**pinned.extra, "subagents": asdict(pinned.subagents)}
+        assert tool_config["subagents"]["llm"] == {"model": "claude-haiku-4-5"}
+        resolved = _resolve_subagent_config(
+            LLMConfig(model="base"), tool_config["subagents"]["llm"]
+        )
+        assert resolved.model == "claude-haiku-4-5"
+
+    def test_inherit_sentinel_is_no_model_override_for_the_light_runner(self):
+        """`subagents.llm.model: inherit` means the parent's model — for the
+        overlay that is simply no model key (the rest of the partial applies)."""
+        from src.core.loader import LLMConfig
+
+        llm = LLMConfig(model="base", provider="anthropic")
+        assert _resolve_subagent_config(llm, {"model": "inherit"}) is llm
+        resolved = _resolve_subagent_config(
+            llm, {"model": "inherit", "temperature": 0.5}
+        )
+        assert resolved.model == "base"
+        assert resolved.provider == "anthropic"
+        assert resolved.temperature == 0.5
+
+    def test_delegation_roster_keys_default_and_clamp(self):
+        """WP3: DelegationConfig gains max_concurrent (default 4, floor 1) and
+        run_in_background_default (default false); the worker overlay carries
+        the same values and the light knobs are untouched."""
+        from src.core.loader import load_agent_config_from_dict
+
+        cfg = self._load("defaults")
+        assert cfg.delegation.max_concurrent == 4
+        assert cfg.delegation.run_in_background_default is False
+        assert cfg.delegation.light.get("max_parallel") == 3
+        clamped = load_agent_config_from_dict(
+            {
+                "agent_id": "p",
+                "display_name": "P",
+                "delegation": {"max_concurrent": 0, "run_in_background_default": 1},
+            }
+        )
+        assert clamped.delegation.max_concurrent == 1
+        assert clamped.delegation.run_in_background_default is True
+        absent = load_agent_config_from_dict({"agent_id": "p", "display_name": "P"})
+        assert absent.delegation.max_concurrent == 4
+        assert absent.delegation.run_in_background_default is False
+
     @pytest.mark.asyncio
     @pytest.mark.parametrize("expert", ["scholar", "critic"])
     async def test_agent_tool_config_dispatches_light_backend(self, expert):
@@ -414,6 +488,7 @@ class TestDelegationConfigPlumbing:
             **cfg.extra,
             "agent_id": cfg.agent_id,
             "delegation": asdict(cfg.delegation),
+            "subagents": asdict(cfg.subagents),
         }
         ctx = ToolContext(config=tool_config)
         (tool,) = create_spawn_subagent_tools(ctx)

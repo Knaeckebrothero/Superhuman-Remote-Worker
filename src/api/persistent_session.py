@@ -1909,6 +1909,10 @@ class PersistentSession:
             # "delegation" is a parsed/known config field, so it is NOT part
             # of config.extra (mirrors agent.py's worker tool_config).
             "delegation": _dc_asdict(self.config.delegation),
+            # Built-in subagents (U1): roster-wide llm + resolved roster, a
+            # parsed field like `delegation` (mirrors agent.py).
+            "subagents": _dc_asdict(self.config.subagents),
+            "tags": list(self.config.tags),
             "cloud_mount": {
                 "active": bool(
                     self.cloud_mount_manager and self.cloud_mount_manager.active

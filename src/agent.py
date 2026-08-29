@@ -2924,6 +2924,17 @@ class UniversalAgent:
                 _apply_settings_matrix(
                     merged_config_data, raw_expert_llm_keys, deployment_dir
                 )
+                # Materialise the subagent roster like load_agent_config()
+                # does (disk refs; a stale ref must not kill a running pod).
+                if merged_config_data.get("subagents") is not None:
+                    from .core.subagent_roster import resolve_subagent_roster
+
+                    merged_config_data = resolve_subagent_roster(
+                        merged_config_data,
+                        db_refs={},
+                        deployment_dir=deployment_dir,
+                        on_missing="drop",
+                    )
 
                 self.config = load_agent_config_from_dict(
                     merged_config_data, deployment_dir=deployment_dir
@@ -3975,6 +3986,12 @@ class UniversalAgent:
             # config field, so it is NOT part of config.extra — inject the
             # typed config back in explicitly or the tools see an empty dict.
             "delegation": asdict(self.config.delegation),
+            # Same for the built-in subagents (U1): the roster-wide llm the
+            # light runner reads today and the resolved roster the roster
+            # runtime (U3) will read. Plain dict — no dataclass instances in
+            # the tool-visible config.
+            "subagents": asdict(self.config.subagents),
+            "tags": list(self.config.tags),
         }
         # Build job metadata for delegation tool access
         job_metadata = {

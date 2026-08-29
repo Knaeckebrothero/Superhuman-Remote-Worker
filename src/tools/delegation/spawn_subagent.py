@@ -30,7 +30,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from ...core.archiver import archive_llm_request
-from ...core.loader import _parse_phase_override, create_llm
+from ...core.loader import INHERIT_MODEL, _parse_phase_override, create_llm
 from ..context import ToolContext
 from .light_runner import run_light_subagent
 from .reader_env import acquire_reader_env, release_reader_env
@@ -124,11 +124,13 @@ def _resolve_subagent_config(
     """
     if llm_cfg is None:
         return None
-    override = (
-        _parse_phase_override(subagents_llm)
-        if isinstance(subagents_llm, dict)
-        else None
-    )
+    partial = dict(subagents_llm) if isinstance(subagents_llm, dict) else {}
+    # `model: inherit` means "the parent's model" — for this overlay that is
+    # simply no model override (the roster resolver replaces the sentinel on
+    # roster entries; the roster-wide partial keeps it verbatim).
+    if partial.get("model") == INHERIT_MODEL:
+        partial.pop("model")
+    override = _parse_phase_override(partial) if partial else None
     if override is None:
         return llm_cfg
     return llm_cfg.with_override(override)
@@ -169,9 +171,11 @@ def _make_light_spawn(context: ToolContext, light_config: Dict[str, Any]):
             return "Error: task_description is required and must be non-empty."
 
         parent_tool_names = list(getattr(context, "_resolved_tool_names", []) or [])
-        # Roster-wide reader partial. `subagents` rides tool_config via
-        # config.extra until the roster becomes a parsed field; a legacy
-        # `llm.subagent` tier is already mapped there by the loader.
+        # Roster-wide reader partial: tool_config["subagents"] is
+        # asdict(config.subagents) — {"default", "llm", "roster"} — injected
+        # by agent.py / persistent_session.py next to "delegation" (a parsed
+        # field, so never in config.extra). A legacy `llm.subagent` tier is
+        # already mapped to subagents.llm by the loader.
         subagents_llm = (
             (getattr(context, "config", None) or {}).get("subagents") or {}
         ).get("llm") or {}

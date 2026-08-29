@@ -28,6 +28,7 @@ deliberately frozen.
 
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 
@@ -74,6 +75,18 @@ _NOTE_IGNORED = {
     "scholar",
     "curator",
 }
+#: Keys later work packages added to an overlay ON TOP of the frozen
+#: baseline (role -> dotted paths, with the WP that added them). They are
+#: deleted from the post-split dict before the neutrality comparison, so the
+#: split's proof stays exact while the overlays keep evolving — and asserted
+#: PRESENT first, so a stale entry here cannot hide a real leak.
+_POST_SPLIT_OVERLAY_ADDITIONS: dict[str, tuple[str, ...]] = {
+    # WP3: the roster runtime knobs on DelegationConfig (schema + overlay
+    # values; the dataclass defaults are identical, so the effective-config
+    # identity below holds without an exclusion).
+    "worker": ("delegation.max_concurrent", "delegation.run_in_background_default"),
+    "session": (),
+}
 
 
 def _bundled_configs() -> list[tuple[str, Path, str | None]]:
@@ -107,6 +120,20 @@ def _dotted_present(data: dict, dotted: str) -> bool:
             return False
         node = node[part]
     return True
+
+
+def _without_post_split_additions(data: dict, role: str) -> dict:
+    """``data`` minus the overlay keys added after the baseline was frozen
+    (each one must actually be present — see ``_POST_SPLIT_OVERLAY_ADDITIONS``)."""
+    out = copy.deepcopy(data)
+    for dotted in _POST_SPLIT_OVERLAY_ADDITIONS.get(role, ()):
+        assert _dotted_present(out, dotted), f"{dotted} is listed as added but absent"
+        *parents, leaf = dotted.split(".")
+        node = out
+        for part in parents:
+            node = node[part]
+        del node[leaf]
+    return out
 
 
 def _effective(config_path: str, deployment_dir: str | None) -> dict:
@@ -157,13 +184,16 @@ def test_pre_split_fixture_is_the_a8950251_base(role):
 @pytest.mark.parametrize("role", sorted(_PRE_SPLIT))
 def test_role_base_merged_dict_is_identical_to_the_pre_split_base(role):
     pre = load_and_merge_config(str(_PRE_SPLIT[role]))
-    post = load_role_base(role)
+    post = _without_post_split_additions(load_role_base(role), role)
     assert post == pre
     assert json.dumps(post, sort_keys=True) == json.dumps(pre, sort_keys=True)
     # and by public name / re-rooting, the same dict again
     root_path, _ = resolve_config_path(ROLE_ROOTS[role])
-    assert load_and_merge_config(root_path) == pre
-    assert load_and_merge_config(root_path, role=role) == pre
+    assert _without_post_split_additions(load_and_merge_config(root_path), role) == pre
+    assert (
+        _without_post_split_additions(load_and_merge_config(root_path, role=role), role)
+        == pre
+    )
 
 
 @pytest.mark.parametrize("role", sorted(_PRE_SPLIT))
@@ -192,8 +222,10 @@ def test_bundled_expert_merged_dict_is_identical(name, pre_split_leaves):
     tmp_leaf, _, role = pre_split_leaves[name]
     leaf = next(p for n, p, _ in _BUNDLED if n == name)
     pre = load_and_merge_config(str(tmp_leaf))
-    post = load_and_merge_config(str(leaf))
-    post_role = load_and_merge_config(str(leaf), role=role)
+    post = _without_post_split_additions(load_and_merge_config(str(leaf)), role)
+    post_role = _without_post_split_additions(
+        load_and_merge_config(str(leaf), role=role), role
+    )
     assert post == pre, name
     assert post_role == pre, name
     assert json.dumps(post, sort_keys=True) == json.dumps(pre, sort_keys=True)
@@ -481,3 +513,66 @@ def test_unknown_role_is_refused_everywhere():
         load_and_merge_config(
             str(_CONFIG / "experts" / "critic" / "config.yaml"), role="officer"
         )
+
+
+# ---------------------------------------------------------------------------
+# 4. The subagent library (WP3) — config/subagents/<name>/config.yaml
+# ---------------------------------------------------------------------------
+
+_LIBRARY = sorted(
+    p for p in _CONFIG.glob("subagents/*/config.yaml") if p.parent.name != "__pycache__"
+)
+_LIBRARY_IDS = [p.parent.name for p in _LIBRARY]
+
+
+def test_the_library_is_discovered():
+    """Guard the guard: the shipped explorer entry must be in the sweep."""
+    assert "explorer" in _LIBRARY_IDS
+
+
+@pytest.mark.parametrize("name", _LIBRARY_IDS)
+def test_library_entry_resolves_in_the_subagent_role(name, subagent_ignored):
+    """A library entry is a roster target: on the subagent overlay it keeps
+    its own read-only tools, carries the `subagent` tag, inherits the
+    parent's model by default, and parses like any config."""
+    leaf = next(p for p in _LIBRARY if p.parent.name == name)
+    own = yaml.safe_load(leaf.read_text(encoding="utf-8"))
+    assert canonical_config_name(str(own["$extends"])) == EXPERT_BASE
+    assert chain_root(str(leaf)) == EXPERT_BASE
+    assert "subagent" in own["tags"]
+    assert own["description"].strip()
+    data = load_and_merge_config(str(leaf), role="subagent")
+    assert data["agent_id"] == own["agent_id"]
+    assert data[IGNORE_KEYS_DIRECTIVE] == subagent_ignored
+    for dotted in subagent_ignored:
+        assert not _dotted_present(data, dotted), f"{name}: {dotted} survived"
+    assert data["llm"]["model"] == "inherit"
+    assert data["interactive"]["permission_mode"] == "autonomous"
+    assert data["memory"]["enabled"] is False
+    # Never wider than the overlay's floor, group by group.
+    floor = load_role_base("subagent")["tools"]
+    for group, names in data["tools"].items():
+        assert set(names) <= set(floor.get(group, [])), f"{name}: tools.{group}"
+    cfg = load_agent_config(str(leaf), str(leaf.parent), role="subagent")
+    assert cfg.agent_id == own["agent_id"]
+    assert "subagent" in cfg.tags
+    assert IGNORE_KEYS_DIRECTIVE not in cfg.extra and "tags" not in cfg.extra
+
+
+@pytest.mark.parametrize("name", _LIBRARY_IDS)
+def test_library_entry_is_read_only_when_loaded_standalone(name):
+    """Standalone (no role) the entry sits on expert_base, which grants writes
+    and a browser — the entry must restate its read-only groups so a
+    `--config <name>` boot or the grants snapshot never sees more than the
+    subagent overlay's floor."""
+    from src.core.loader import get_all_tool_names
+
+    leaf = next(p for p in _LIBRARY if p.parent.name == name)
+    floor_path, floor_dir = resolve_config_path(ROLE_ROOTS["subagent"])
+    floor = set(get_all_tool_names(load_agent_config(floor_path, floor_dir)))
+    standalone = set(get_all_tool_names(load_agent_config(str(leaf), str(leaf.parent))))
+    assert standalone <= floor, sorted(standalone - floor)
+    assert standalone, "an empty toolset would make this vacuous"
+    # And by the two `$ref` spellings, the same file.
+    assert resolve_config_path(f"subagents/{name}")[0] == str(leaf)
+    assert resolve_config_path(name)[0] == str(leaf)

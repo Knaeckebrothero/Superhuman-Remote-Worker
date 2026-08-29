@@ -82,8 +82,19 @@ def _expert_config_names() -> list[str]:
     )
 
 
+def _library_config_names() -> list[str]:
+    """Every subagent-library entry, discovered, keyed by its ``$ref`` spelling
+    (``subagents/<name>``; ``resolve_config_path`` finds it through the
+    directory branch, so the bare name never shadows a bundled expert)."""
+    return sorted(
+        f"subagents/{p.parent.name}"
+        for p in _CONFIG_DIR.glob("subagents/*/config.yaml")
+        if p.parent.name != "__pycache__"
+    )
+
+
 def _all_config_names() -> list[str]:
-    return _STANDALONE_CONFIGS + _expert_config_names()
+    return _STANDALONE_CONFIGS + _expert_config_names() + _library_config_names()
 
 
 def _resolved_tool_grants(config_name: str) -> list[str]:

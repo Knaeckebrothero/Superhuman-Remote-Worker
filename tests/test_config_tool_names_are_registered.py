@@ -42,6 +42,15 @@ def _expert_config_names() -> list[str]:
     )
 
 
+def _library_config_names() -> list[str]:
+    """Every subagent-library entry (``config/subagents/<name>``), discovered."""
+    return sorted(
+        f"subagents/{p.parent.name}"
+        for p in _CONFIG_DIR.glob("subagents/*/config.yaml")
+        if p.parent.name != "__pycache__"
+    )
+
+
 def _config_tool_names(config_name: str) -> list[tuple[str, str]]:
     path, _ = resolve_config_path(config_name)
     tools = (load_and_merge_config(path) or {}).get("tools") or {}
@@ -54,7 +63,9 @@ def _config_tool_names(config_name: str) -> list[tuple[str, str]]:
     ]
 
 
-@pytest.mark.parametrize("config_name", _BASE_CONFIGS + _expert_config_names())
+@pytest.mark.parametrize(
+    "config_name", _BASE_CONFIGS + _expert_config_names() + _library_config_names()
+)
 def test_config_tool_names_all_exist_in_registry(config_name):
     unknown = [
         f"tools.{category}: {name}"

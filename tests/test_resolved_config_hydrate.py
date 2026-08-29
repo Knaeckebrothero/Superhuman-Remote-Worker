@@ -16,6 +16,7 @@ from orchestrator.services.config_resolver import resolve_config
 from src.agent import UniversalAgent
 from src.api.models import JobResumeRequest, JobStartRequest
 from src.core.loader import (
+    SubagentsConfig,
     get_all_tool_names,
     load_agent_config,
     resolve_config_path,
@@ -135,3 +136,54 @@ async def test_resume_without_delivery_blob_keeps_database_fallback():
     assert agent.config.agent_id == "developer"
     assert "run_command" in get_all_tool_names(agent.config)
     get_db_config.assert_awaited_once()
+
+
+def test_from_resolved_hydrates_a_materialised_roster():
+    """U1 WP3: the orchestrator materialises ``subagents.roster`` into the
+    blob; the agent hydrates it as ``config.subagents`` (a parsed field, not
+    ``extra``) with every entry a ready-to-parse child config."""
+    blob = resolve_config(
+        base_config_name="worker_base",
+        expert_row={
+            "expert_type": "worker",
+            "name": "lead",
+            "config": {
+                "llm": {"model": "claude-opus-4-1"},
+                "subagents": {
+                    "default": "explorer",
+                    "roster": {
+                        "explorer": {"$ref": "subagents/explorer"},
+                        "implementer": {
+                            "description": "Implements one bounded change.",
+                            "tools": {"workspace": ["read_file", "write_file"]},
+                        },
+                    },
+                },
+            },
+            "prompts": {},
+        },
+        expert_type="worker",
+    )
+    assert set(blob["agent"]["subagents"]["roster"]) == {"explorer", "implementer"}
+
+    agent = UniversalAgent.from_resolved(blob)
+
+    subagents = agent.config.subagents
+    assert isinstance(subagents, SubagentsConfig)
+    assert subagents.default == "explorer"
+    assert set(subagents.roster) == {"explorer", "implementer"}
+    assert subagents.roster["explorer"]["_ref_kind"] == "library"
+    assert subagents.roster["implementer"]["tools"]["workspace"] == [
+        "read_file",
+        "write_file",
+    ]
+    # Both children inherited the parent's model at resolve time.
+    assert subagents.roster["explorer"]["llm"]["model"] == "claude-opus-4-1"
+    assert "subagents" not in agent.config.extra
+    # And each entry is a config in its own right (what the roster runtime parses).
+    from src.core.loader import load_agent_config_from_dict
+
+    child = load_agent_config_from_dict(subagents.roster["implementer"])
+    assert child.agent_id == "implementer"
+    assert child.tools.workspace == ["read_file", "write_file"]
+    assert child.interactive.permission_mode == "autonomous"

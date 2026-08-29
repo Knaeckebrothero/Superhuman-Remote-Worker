@@ -38,10 +38,17 @@ $ignore_keys:
   - verification
   - scholar
   - curator
-  # The phase loop and its bounds — a child is a headless session, no phases.
+  # The phase loop and its bounds — a child is a headless session (D3), no
+  # phases: neither the settings nor the phase-loop tool group
+  # (next_phase_todos / todo_complete / job_complete ...) an expert authors
+  # for its worker role reach a child.
   - phase_settings
-  # Children get no delegation of their own (D7: depth 1).
+  - tools.core
+  # Children get no delegation of their own (D7: depth 1) — neither the
+  # settings block nor the tool group (a `$ref: critic` child would otherwise
+  # inherit the critic's spawn_subagent grant).
   - delegation
+  - tools.delegation
   # Agent-to-human email — only the parent talks to people.
   - communication
   # Persistent-session lifecycle blocks: the always-on officer and the
@@ -54,6 +61,16 @@ $ignore_keys:
 
 agent_id: subagent_base
 display_name: Framework Subagent Base
+
+llm:
+  # A child runs on its PARENT's model unless a layer above pins one: the
+  # roster resolver (src/core/subagent_roster.py) replaces `inherit` with the
+  # parent's llm.model + transport at resolve time and marks the entry so a
+  # later parent model change is re-synced. A `$ref`'d expert that pins its
+  # own llm.model, the roster-wide `subagents.llm`, or the entry's own
+  # `llm.model` all sit above this and win. expert_base's placeholder model
+  # is never what a child silently runs on.
+  model: inherit
 
 # `workspace.structure` is not declared here on purpose — it is in the ignore
 # list above (a child scaffolds nothing in its parent's tree).

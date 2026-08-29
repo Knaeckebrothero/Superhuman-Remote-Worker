@@ -211,6 +211,10 @@ delegation:
   default_timeout: 7200      # Default timeout per delegation in seconds (2h)
   max_timeout: 14400          # Maximum allowed timeout (4h)
   allowed_configs: []        # Which configs children can use (empty = any)
+  # Roster runtime knobs (universal_experts_and_subagents.md §0 D7; the
+  # `delegate_agent` runtime lands in U3, the keys are config since U1):
+  max_concurrent: 4          # Concurrently running children per parent (>= 1)
+  run_in_background_default: false   # Default for a call that does not say run_in_background
   # Backend for the shared `spawn_subagent` tool. The agent-facing name and
   # schema are identical either way — the backend is operator-selected, not the
   # model's choice:

@@ -3061,6 +3061,17 @@ def _load_expert_config(config_name: str):
     # such as `session_base`, the overlay + expert_base pair).
     raw_llm_keys: set = authored_llm_keys(config_path)
     _apply_settings_matrix(merged_config_data, raw_llm_keys, deployment_dir)
+    # Materialise the subagent roster like load_agent_config() does (disk
+    # refs only; an unresolvable ref drops with a warning, never a 500).
+    if merged_config_data.get("subagents") is not None:
+        from ..core.subagent_roster import resolve_subagent_roster
+
+        merged_config_data = resolve_subagent_roster(
+            merged_config_data,
+            db_refs={},
+            deployment_dir=deployment_dir,
+            on_missing="drop",
+        )
     return load_agent_config_from_dict(
         merged_config_data, deployment_dir=deployment_dir
     )

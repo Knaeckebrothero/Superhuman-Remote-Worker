@@ -40,6 +40,7 @@ _PROMPT_GLOBS = [
     "config/experts/*/strategic.txt",
     "config/experts/*/tactical.txt",
     "config/experts/*/persona.txt",
+    "config/subagents/*/persona.txt",
     "config/prompts/systemprompt*.txt",
     "config/prompts/strategic*.txt",
     "config/prompts/tactical*.txt",

@@ -18,6 +18,10 @@ config/
 │   └── <expert>/
 │       ├── config.yaml              # Expert overlay (`$extends: worker_base` or `session_base`)
 │       └── model_config_matrix.yaml # Expert-level matrix override (optional)
+├── subagents/                   # Subagent library — small experts a roster references by name (see subagents/README.md)
+│   └── <name>/
+│       ├── config.yaml              # `$extends: expert_base`, `tags: [subagent]`, read-only tools, `llm: {model: inherit}`
+│       └── persona.txt              # Prompt files next to the config, like an expert's
 ├── prompts/                     # Prompt templates (system prompt, phase prompts)
 │   ├── systemprompt.txt         # Main system prompt
 │   ├── persona.txt              # Agent persona/identity prompt

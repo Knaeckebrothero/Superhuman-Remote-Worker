@@ -141,11 +141,12 @@ class TestPopulation:
     def test_the_declaration_scan_actually_found_the_configs(self):
         """A scan that silently found nothing would make every test below pass."""
         files = {rel for rel, _, _ in _DECLARATIONS}
-        assert len(files) == 14, f"expected 14 configs declaring tools:, got {files}"
+        assert len(files) == 15, f"expected 15 configs declaring tools:, got {files}"
         assert "config/expert_base.yaml" in files
         assert "config/overlays/worker.yaml" in files
         assert "config/overlays/session.yaml" in files
         assert "config/overlays/subagent.yaml" in files
+        assert "config/subagents/explorer/config.yaml" in files
         assert any("experts/centurion" in f for f in files)
         # 148 after job_control/job_inspection became descriptor-owned groups;
         # 149 with the Centurion's explicit knowledge grant
@@ -155,9 +156,11 @@ class TestPopulation:
         # it there advertised tools the pod never binds; 137 after the U1 root
         # split: the two self-contained bases (21 + 23 declarations) became
         # expert_base (17 shared groups) + the worker / session / subagent
-        # overlays (4 + 6 + 13 role-owned groups).
-        assert len(_DECLARATIONS) == 137, (
-            f"expected 137 raw declarations, got {len(_DECLARATIONS)}"
+        # overlays (4 + 6 + 13 role-owned groups); 143 with the subagent
+        # library's explorer entry (6 read-only groups restated so it is
+        # read-only standalone too — config/subagents/README.md).
+        assert len(_DECLARATIONS) == 143, (
+            f"expected 143 raw declarations, got {len(_DECLARATIONS)}"
         )
 
     def test_every_shipped_declaration_is_already_a_list(self):
@@ -693,8 +696,11 @@ class TestShippedConfigsResolveUnchanged:
     @pytest.mark.parametrize("config_name", _all_config_names())
     def test_merged_config_matches_the_raw_yaml_chain(self, config_name):
         """Normalising inside ``load_and_merge_config`` must not perturb the
-        ``$extends`` merge: the result has to equal a merge of the raw files."""
-        from src.core.loader import deep_merge
+        ``$extends`` merge: the result has to equal a merge of the raw files
+        (with the merged chain's ``$ignore_keys`` honoured — the subagent
+        overlay prunes ``tools.delegation``, and that pruning is the loader's
+        documented step, not a perturbation)."""
+        from src.core.loader import deep_merge, prune_ignored_keys
 
         path, _ = resolve_config_path(config_name)
 
@@ -708,7 +714,7 @@ class TestShippedConfigsResolveUnchanged:
             return data
 
         assert (load_and_merge_config(path) or {}).get("tools") == (
-            raw_chain(path).get("tools")
+            prune_ignored_keys(raw_chain(path)).get("tools")
         )
 
 

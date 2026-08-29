@@ -15,6 +15,7 @@ and the shell tool group bound only ``shell_read``.
 import dataclasses
 
 from src.core.loader import (
+    SubagentsConfig,
     get_all_tool_names,
     load_agent_config,
     load_agent_config_from_dict,
@@ -103,3 +104,46 @@ def test_round_trip_is_idempotent_for_a_config_with_no_extra():
     restored = _round_trip(config)
 
     assert "extra" not in restored.extra
+
+
+def test_tags_and_subagents_survive_the_round_trip_and_stay_out_of_extra():
+    """U1 WP3: ``tags`` and ``subagents`` are parsed fields. ``asdict`` emits
+    them at the top level; the loader must take them back as the typed
+    fields — never bury them in ``extra`` (which is what happened to
+    ``subagents`` before WP3, when the light runner read it from there)."""
+    config = _session_config()
+    config.tags = ["session", "assistant"]
+    config.subagents = SubagentsConfig(
+        default="explorer",
+        llm={"model": "claude-haiku-4-5"},
+        roster={
+            "explorer": {
+                "agent_id": "explorer",
+                "display_name": "Explorer",
+                "llm": {"model": "claude-haiku-4-5"},
+                "tools": {"workspace": ["read_file"]},
+                "isolation": "shared",
+            }
+        },
+    )
+
+    restored = _round_trip(config)
+
+    assert restored.tags == ["session", "assistant"]
+    assert restored.subagents == config.subagents
+    assert isinstance(restored.subagents, SubagentsConfig)
+    assert "tags" not in restored.extra
+    assert "subagents" not in restored.extra
+
+
+def test_default_tags_and_subagents_round_trip_empty():
+    """The empty shapes must not turn into extra keys either."""
+    config = _session_config()
+    assert config.tags == []
+    assert config.subagents == SubagentsConfig()
+
+    restored = _round_trip(config)
+
+    assert restored.tags == []
+    assert restored.subagents == SubagentsConfig()
+    assert "subagents" not in restored.extra and "tags" not in restored.extra

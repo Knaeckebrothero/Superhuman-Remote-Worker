@@ -128,6 +128,32 @@ def to_export_bundle(source: dict) -> dict:
     return bundle
 
 
+def with_role_tag(expert_type: str | None, tags: Any) -> list[str]:
+    """``tags ∪ {expert_type}`` — the role tag every DB row carries (U1 B.4).
+
+    Pure and tolerant: ``tags`` may be ``None``, a bare string or any
+    iterable; entries are stripped strings, order preserved, duplicates and
+    blanks dropped, the role appended last when missing. ``expert_type`` is
+    the primary role (the CHECK constraint stays); the tag is additive
+    metadata so the list filters (``?type=subagent``, the editor chips) never
+    hide a row for lacking it. Used by create / update / duplicate / import
+    and ``load_seed_bundle`` (WP4) — no SQL involved.
+    """
+    if isinstance(tags, str):
+        tags = [tags]
+    out: list[str] = []
+    for tag in tags or []:
+        if tag is None:
+            continue
+        text = str(tag).strip()
+        if text and text not in out:
+            out.append(text)
+    role = str(expert_type or "").strip()
+    if role and role not in out:
+        out.append(role)
+    return out
+
+
 def expert_layer_source(row: dict) -> str:
     """Label of a DB expert row as a config layer — the ``source`` the loader's
     legacy-tier deprecation log de-duplicates on (``db-expert:<name>``)."""

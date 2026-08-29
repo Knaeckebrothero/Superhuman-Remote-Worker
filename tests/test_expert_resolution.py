@@ -4,6 +4,7 @@ import json
 
 from src.core.loader import deep_merge
 from src.core.expert_resolution import (
+    with_role_tag,
     build_expert_config,
     canonical_key,
     expert_precedence_key,
@@ -227,3 +228,18 @@ def test_to_export_bundle_round_trips_all_prompt_segments():
     }
     bundle = to_export_bundle(row)
     assert bundle["prompts"] == row["prompts"]
+
+
+def test_with_role_tag_appends_the_role_once_and_keeps_order():
+    """U1 B.4: every DB row carries its expert_type as a tag — additive,
+    order-preserving, never duplicated, tolerant of sloppy input."""
+    assert with_role_tag("worker", ["research", "worker"]) == ["research", "worker"]
+    assert with_role_tag("session", ["b", "a"]) == ["b", "a", "session"]
+    assert with_role_tag("worker", None) == ["worker"]
+    assert with_role_tag("worker", "review") == ["review", "worker"]
+    assert with_role_tag("worker", [" review ", "", None, "review"]) == [
+        "review",
+        "worker",
+    ]
+    assert with_role_tag(None, ["x"]) == ["x"]
+    assert with_role_tag("subagent", ("a", "subagent", "b")) == ["a", "subagent", "b"]

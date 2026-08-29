@@ -27,7 +27,7 @@ from src.api.persistent_session import (
     OfficerKnowledgeBindingError,
     PersistentSession,
 )
-from src.core.loader import DelegationConfig, OfficerConfig
+from src.core.loader import DelegationConfig, OfficerConfig, SubagentsConfig
 from src.services.knowledge.bindings import KnowledgeBinding, build_knowledge_bindings
 from src.tools.registry import (
     apply_officer_tool_ceiling,
@@ -80,6 +80,10 @@ def _make_config(**overrides):
     cfg.instruction_files = []
     cfg.tools = MagicMock()
     cfg.delegation = DelegationConfig()
+    # U1 WP3: `subagents` / `tags` are parsed fields the session asdict()s
+    # into tool_config next to `delegation`.
+    cfg.subagents = SubagentsConfig()
+    cfg.tags = []
     if "officer" in overrides:
         cfg.officer = overrides["officer"]
     return cfg

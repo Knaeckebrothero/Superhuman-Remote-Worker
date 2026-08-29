@@ -33,6 +33,7 @@ from src.core.loader import (
     resolve_config_path,
     serialize_resolved_config,
 )
+from src.core.subagent_roster import resolve_subagent_roster
 from src.core.tool_policy import normalize_tool_policy
 
 # Prompt segments a DB/forked expert may override — one family-agnostic version
@@ -75,6 +76,7 @@ def resolve_config(
     capture: Optional[dict] = None,
     skills: Optional[dict] = None,
     grant_strip: Optional[Callable[[dict], dict]] = None,
+    db_refs: Optional[dict] = None,
 ) -> dict:
     """Resolve the full agent config to a ``serialize_resolved_config``-shaped blob.
 
@@ -83,6 +85,14 @@ def resolve_config(
         bundled base -> base_defaults -> expert fragment
         -> project_experts.config_override -> DB config_overrides (0022)
         -> user persistent_agent settings -> request config_override
+
+    The ``subagents.roster`` is materialised AFTER those layers (so a request
+    override's ``subagents.roster.<name>.llm.model`` deep-merges into the
+    entry first) and BEFORE the capture / grant strip (so the PDP sees the
+    resolved entries, not ``{$ref: critic}``). ``db_refs`` is the caller's
+    prefetched ``{expert_uuid: row}`` map for UUID ``$ref``s; an entry that
+    cannot be resolved is dropped and recorded in ``agent._roster_warnings``
+    — dispatch never fails a job over its roster.
 
     ``base_defaults`` sits just above the bundled base and *below* the expert:
     use it for the system/user **default model** selection (model names only), so
@@ -226,6 +236,19 @@ def resolve_config(
     # after the request layers, so a job/thread override cannot re-introduce
     # what the role does not read (e.g. `workspace.backend` for a subagent).
     data = prune_ignored_keys(data)
+
+    # Roster materialisation: every `subagents.roster` entry becomes its fully
+    # merged subagent-role config (pruning point 3 of 3 runs per entry inside).
+    # The parent's llm is final here — an `inherit` entry copies the model the
+    # request layers selected. The parent's own matrix pass below never
+    # touches the roster; each entry ran its own for its model family.
+    if data.get("subagents") is not None:
+        data = resolve_subagent_roster(
+            data,
+            db_refs=db_refs or {},
+            deployment_dir=deployment_dir,
+            on_missing="drop",
+        )
 
     _apply_settings_matrix(data, explicit_llm_keys, deployment_dir)
 

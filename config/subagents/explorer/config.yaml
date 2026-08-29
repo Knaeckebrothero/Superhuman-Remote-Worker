@@ -1,0 +1,69 @@
+# yaml-language-server: $schema=../../schema.json
+# Explorer — the read-only investigator any expert can delegate to.
+#
+# A subagent-library entry (see ../README.md). Referenced from an expert's
+# roster as
+#   subagents:
+#     roster:
+#       explorer: {$ref: subagents/explorer}      # or {$ref: explorer}
+# and materialised on the subagent overlay:
+#   expert_base <- overlays/subagent <- this file <- the entry's sibling keys
+#   <- job / thread override (subagents.roster.explorer.*)
+# Same schema as any expert; the subagent overlay's ignored keys
+# (workspace.backend, autonomy, verification, ...) never apply.
+$extends: expert_base
+
+agent_id: explorer
+display_name: Explorer
+description: |
+  Read-only investigator. Answers ONE bounded question about the workspace,
+  the attached sources or the web: locates files, traces references, reads
+  and distils, and returns a compact evidence-backed report with paths and
+  line references. Never edits, never runs commands, never delegates.
+icon: travel_explore
+color: "#89b4fa"
+tags:
+  - subagent
+
+llm:
+  # Runs on whatever the parent runs on. A roster entry (or the roster-wide
+  # subagents.llm) pins a cheaper model instead when the parent's is overkill.
+  model: inherit
+
+tools:
+  # The subagent overlay's read-only floor, restated here so this entry is
+  # read-only when loaded standalone too (the tool-grants snapshot, a
+  # `--config explorer` boot resolve it on expert_base, not on the overlay).
+  workspace:
+    - read_file
+    - use_skill
+    - list_files
+    - search_files
+    - file_exists
+    - get_document_info
+  research:
+    - web_search
+    - extract_webpage
+    - search_papers
+    - get_paper_info
+  browser_direct: []
+  citation:
+    - list_sources
+    - get_citation
+    - list_citations
+    - get_annotations
+    - search_library
+  knowledge:
+    - kb_read
+    - kb_list
+    - kb_search
+    - kb_related
+    - kb_contradictions
+    - kb_provenance
+    - kb_unanswered
+  git:
+    - git_log
+    - git_show
+    - git_diff
+    - git_status
+    - git_tags

@@ -62,9 +62,13 @@ def _make_config(**overrides):
     cfg.tools = MagicMock()
     # Real dataclass, not a MagicMock: _setup_tools passes it through
     # dataclasses.asdict() to inject delegation settings into tool_config.
-    from src.core.loader import DelegationConfig
+    from src.core.loader import DelegationConfig, SubagentsConfig
 
     cfg.delegation = overrides.get("delegation", DelegationConfig())
+    # Same for the built-in subagents + tags (U1 WP3): parsed fields the
+    # session injects into tool_config next to `delegation`.
+    cfg.subagents = overrides.get("subagents", SubagentsConfig())
+    cfg.tags = overrides.get("tags", [])
     return cfg
 
 

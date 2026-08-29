@@ -156,7 +156,8 @@ def test_merged_dict_rule_strategic_wins():
     assert cfg.llm.summarization is None
     assert not hasattr(cfg.llm, "strategic")
     assert not hasattr(cfg.llm, "tactical")
-    assert cfg.extra["subagents"]["llm"] == {"model": "reader"}
+    assert cfg.subagents.llm == {"model": "reader"}  # parsed field since WP3
+    assert "subagents" not in cfg.extra
 
 
 def test_merged_dict_rule_tactical_when_no_strategic_model():
@@ -274,9 +275,10 @@ def test_thread_override_legacy_subagent():
     )
     assert "subagent" not in blob["agent"]["llm"]
     assert blob["agent"]["subagents"]["llm"] == {"model": "reader-model"}
-    # …and it survives hydration on the agent side (extra until WP3).
+    # …and it survives hydration on the agent side as the parsed field.
     cfg = load_config_from_resolved(blob)
-    assert cfg.extra["subagents"]["llm"] == {"model": "reader-model"}
+    assert cfg.subagents.llm == {"model": "reader-model"}
+    assert "subagents" not in cfg.extra
 
 
 # --- logging ----------------------------------------------------------------

@@ -57,8 +57,33 @@
       "items": {
         "type": "string"
       },
-      "description": "Tags for categorization and filtering in expert discovery",
-      "examples": [["research", "academic"], ["documentation", "writing"]]
+      "description": "Metadata for categorization and filtering in expert discovery — a soft UI filter, never read for behaviour (U1 D4). Role tags (worker / session / subagent) mark the roles an expert is meant for: the orchestrator derives a bundled expert's role tag from its $extends chain root and a DB expert's from expert_type; `subagent` is authored (library entries under config/subagents/ carry it). Every expert stays usable in every role.",
+      "examples": [["research", "academic"], ["subagent"], ["documentation", "writing"]]
+    },
+    "subagents": {
+      "type": "object",
+      "description": "Built-in subagents (universal_experts_and_subagents.md §1.1). `roster` names the children this expert may delegate to: inline small experts (same schema as an expert, resolved on the subagent role overlay) or `$ref` entries — a bundled expert dir name (`critic`), a library entry (`subagents/explorer` / `explorer`) or a DB expert id — with sibling keys deep-merged over the referenced expert. `llm` is the roster-wide model default (below every entry's own `llm`, above the base and the `$ref` target). A job/thread override deep-merges into `subagents.roster.<name>`. Entries are materialised at resolve time (merged chain, settings matrix per entry, parent-only keys pruned); a referenced expert's own `subagents` block is dropped (depth 1). See config/subagents/README.md.",
+      "properties": {
+        "default": {
+          "type": ["string", "null"],
+          "description": "Roster entry a `delegate_agent` call falls back to when it names no `subagent_type`"
+        },
+        "llm": {
+          "$ref": "#/$defs/llmPhaseOverride",
+          "description": "Roster-wide LLM partial (model / provider / transport / params) applied to every entry that does not pin its own `llm` key. `model: inherit` = the parent's model. A legacy `llm.subagent` tier maps here."
+        },
+        "roster": {
+          "type": "object",
+          "description": "Subagent name -> inline entry or `$ref` entry. The name is the child's agent_id and the `subagent_type` the parent passes to `delegate_agent`.",
+          "propertyNames": {
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]*$"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/subagentRosterEntry"
+          }
+        }
+      },
+      "additionalProperties": false
     },
     "llm": {
       "type": "object",
@@ -2320,6 +2345,17 @@
             }
           },
           "additionalProperties": false
+        },
+        "max_concurrent": {
+          "type": "integer",
+          "default": 4,
+          "minimum": 1,
+          "description": "Roster runtime (D7): how many `delegate_agent` children may run concurrently per parent. Values below 1 are raised to 1 by the loader."
+        },
+        "run_in_background_default": {
+          "type": "boolean",
+          "default": false,
+          "description": "Roster runtime: the `run_in_background` a `delegate_agent` call gets when it does not say. false = the result returns as the tool result; true = the child's completion re-enters the parent as a message."
         }
       },
       "additionalProperties": false
@@ -2339,6 +2375,61 @@
   },
   "additionalProperties": true,
   "$defs": {
+    "subagentRosterEntry": {
+      "type": "object",
+      "description": "One `subagents.roster` entry. Inline: any expert-schema key (the entry resolves on the subagent overlay: expert_base <- overlays/subagent <- these keys). Reference: `$ref` plus optional sibling keys deep-merged over the referenced expert. Keys that do not apply to a child (workspace.backend, autonomy, verification, phase_settings, delegation, tools.delegation, communication, scholar, curator, officer, headless — the subagent overlay's `$ignore_keys`) are pruned, never errors. `isolation`, `write_policy`, `return` and the child budgets under `limits` are U3 runtime keys carried verbatim on the resolved entry in U1.",
+      "properties": {
+        "$ref": {
+          "type": "string",
+          "description": "A bundled expert dir name (`critic` / `experts/critic`), a library entry (`explorer` / `subagents/explorer`) or a DB expert id (UUID). Never a path. Sibling keys override the referenced expert."
+        },
+        "description": {
+          "type": "string",
+          "description": "What this child is for — the text the parent model sees next to the `subagent_type`. Required in spirit for inline entries."
+        },
+        "llm": {
+          "$ref": "#/$defs/llmPhaseOverride",
+          "description": "The child's model / transport / params. `model: inherit` (the subagent overlay's default) = the parent's model + transport, materialised at resolve time."
+        },
+        "tools": {
+          "$ref": "#/properties/tools",
+          "description": "The child's tool groups. Unqualified children get the subagent overlay's read-only floor; a `$ref` to a fuller expert keeps that expert's tools (minus `delegation`)."
+        },
+        "prompts": {
+          "type": "object",
+          "additionalProperties": { "type": ["string", "null"] },
+          "description": "Prompt files or text. Inline entries name files resolved against the parent expert's directory (`_deployment_dir` on the resolved entry); a DB-referenced expert's prompt text is inlined by the resolver. Read by the roster runtime (U3)."
+        },
+        "isolation": {
+          "type": "string",
+          "enum": ["shared", "worktree"],
+          "description": "U3: where the child works — the parent's tree (`shared`) or its own git worktree. A per-call `isolation` may override."
+        },
+        "write_policy": {
+          "type": "string",
+          "enum": ["none", "scratch_only", "owned_paths", "full"],
+          "description": "U3: what the child may write (owned paths come from the brief)."
+        },
+        "limits": {
+          "type": "object",
+          "description": "The ordinary `limits` keys plus the child budgets the roster runtime enforces (U3): max_turns, max_tokens, return_budget_tokens, stale_idle_s, stale_in_tool_s. Operator-owned, never model-facing parameters.",
+          "properties": {
+            "max_turns": { "type": "integer", "minimum": 1 },
+            "max_tokens": { "type": "integer", "minimum": 1000 },
+            "return_budget_tokens": { "type": "integer", "minimum": 100 },
+            "stale_idle_s": { "type": "number", "minimum": 0 },
+            "stale_in_tool_s": { "type": "number", "minimum": 0 }
+          },
+          "additionalProperties": true
+        },
+        "return": {
+          "type": "string",
+          "enum": ["summary", "structured", "evidence", "diff"],
+          "description": "U3: the shape of what the child hands back to the parent."
+        }
+      },
+      "additionalProperties": true
+    },
     "llmPhaseOverride": {
       "type": "object",
       "description": "Partial LLM overrides (llm.summarization). Only specified fields override the base config.",

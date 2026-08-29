@@ -850,8 +850,10 @@ class TestLegacySubagentTierCompat:
         )
         assert cfg.llm.model == "claude-opus-4-8"  # the parent model is untouched
         assert not hasattr(cfg.llm, "subagent")
-        # Rides config.extra (→ tool_config) until the roster is a parsed field.
-        assert cfg.extra["subagents"]["llm"] == {"model": "claude-sonnet-5"}
+        # A parsed field (SubagentsConfig) since WP3 — injected into
+        # tool_config by agent.py / persistent_session.py, never in extra.
+        assert cfg.subagents.llm == {"model": "claude-sonnet-5"}
+        assert "subagents" not in cfg.extra
 
     def test_reader_inherits_parent_transport(self):
         """A model-only partial inherits the parent's provider/base_url etc."""

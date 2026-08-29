@@ -358,6 +358,81 @@ def normalize_llm_tiers(fragment: Any, *, source: str, merged: bool = False) -> 
     return out
 
 
+# =============================================================================
+# Subagent roster: the ``inherit`` model sentinel (U1 — universal experts)
+# =============================================================================
+#
+# A roster entry (``subagents.roster.<name>``) may say ``llm: {model: inherit}``
+# — "run on whatever the parent runs on". The roster resolver
+# (``src/core/subagent_roster.py``) materialises that into the parent's model
+# plus its transport keys and marks the entry; the marker lets every later
+# reader of an already-materialised roster (a job override merged on the
+# agent's fallback path, a live session model switch, U3's spawn) re-sync the
+# entry against the parent's CURRENT ``llm`` instead of a stale copy.
+
+#: The ``llm.model`` value that means "the parent's model".
+INHERIT_MODEL = "inherit"
+#: Marker on a materialised roster entry whose model came from the parent.
+ROSTER_INHERIT_MARKER = "_inherit_llm"
+#: The parent ``llm`` keys an inheriting entry copies: model identity plus the
+#: transport that reaches it (a per-model context window pinned by an admin
+#: travels with the model too — the family default would be the wrong window).
+LLM_INHERITED_KEYS = (
+    "model",
+    "provider",
+    "base_url",
+    "api_key",
+    "model_max_context_tokens",
+)
+
+
+def inherit_parent_llm(entry_llm: Dict[str, Any], parent_llm: Any) -> Set[str]:
+    """Copy the parent's model identity + transport into ``entry_llm``.
+
+    Two cases. Same model (first materialisation, or a re-sync where the
+    parent still runs the model the entry copied): only non-``None`` parent
+    values are copied — a serialized parent carries explicit ``base_url:
+    None`` leaves that must never clear an endpoint injected into the entry.
+    Parent model CHANGED (a fallback-path job override, a live session model
+    switch): the whole identity is replaced and a key the new parent lacks
+    is dropped from the entry too — transport belongs to a model, and the old
+    router would misroute the new one. The marker is set so the copy can be
+    refreshed again. Returns the keys copied — the roster resolver adds them
+    to the entry's explicit llm keys so the settings matrix keeps them.
+    Mutates ``entry_llm``.
+    """
+    copied: Set[str] = set()
+    if not isinstance(parent_llm, dict) or not parent_llm.get("model"):
+        return copied
+    current = entry_llm.get("model")
+    model_changed = current not in (None, INHERIT_MODEL, parent_llm.get("model"))
+    for key in LLM_INHERITED_KEYS:
+        value = parent_llm.get(key)
+        if value is not None:
+            entry_llm[key] = copy.deepcopy(value)
+            copied.add(key)
+        elif model_changed:
+            entry_llm.pop(key, None)
+    entry_llm[ROSTER_INHERIT_MARKER] = True
+    return copied
+
+
+def sync_inherited_roster_llm(roster: Any, parent_llm: Any) -> None:
+    """Re-copy the parent's model + transport into every roster entry that
+    inherited its model (marker-driven; entries with a pinned model are left
+    alone). Runs on every merged dict that is parsed into ``AgentConfig`` so a
+    late parent model change (fallback-path job override, live session
+    ``config.update``) is reflected by the entries. Mutates in place."""
+    if not isinstance(roster, dict):
+        return
+    for entry in roster.values():
+        if not isinstance(entry, dict):
+            continue
+        llm = entry.get("llm")
+        if isinstance(llm, dict) and llm.get(ROSTER_INHERIT_MARKER):
+            inherit_parent_llm(llm, parent_llm)
+
+
 def get_project_root() -> Path:
     """Get the project root directory.
 
@@ -2223,6 +2298,41 @@ class DelegationConfig:
     # allow_writes). Kept as a plain dict — the light factory reads it with
     # .get() defaults, so unknown/missing keys are fine.
     light: Dict[str, Any] = field(default_factory=dict)
+    # --- roster runtime (universal_experts_and_subagents.md §0 D7) ----------
+    # Per-parent cap on concurrently running `delegate_agent` children (U3
+    # runtime; schema + config key since U1). Always >= 1.
+    max_concurrent: int = 4
+    # Default for a `delegate_agent` call that does not say run_in_background.
+    run_in_background_default: bool = False
+    # NOTE: max_depth / default_timeout / max_timeout / allowed_configs / mode
+    # / light belong to the delegate_work + light-runner generation and go
+    # with them in U3 (D2: one subagent kind, depth fixed at 1).
+
+
+@dataclass
+class SubagentsConfig:
+    """The expert's built-in subagents (universal_experts_and_subagents.md §1.1).
+
+    ``roster`` maps a subagent name to its RESOLVED config dict — the fully
+    merged subagent-role config (``expert_base <- overlays/subagent <- $ref
+    chain <- inline keys <- job/thread override``, settings matrix applied per
+    entry, parent-only keys pruned) produced by
+    ``src/core/subagent_roster.resolve_subagent_roster``. Entries are raw
+    dicts, not nested ``AgentConfig``s: ``dataclasses.asdict`` round-trips
+    them, they freeze into ``jobs.resolved_config`` as-is, and the roster
+    runtime (U3) calls ``load_agent_config_from_dict(entry)`` per child. The
+    U3-only keys (``isolation``, ``write_policy``, ``return``, the child
+    ``limits``) ride each entry verbatim.
+
+    ``llm`` is the roster-wide LLM partial (the "subagent model" picker):
+    below every entry's own ``llm``, above the base. A legacy ``llm.subagent``
+    tier is mapped here by ``normalize_llm_tiers``. ``default`` names the
+    entry a ``delegate_agent`` call falls back to.
+    """
+
+    default: Optional[str] = None
+    llm: Dict[str, Any] = field(default_factory=dict)
+    roster: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass
@@ -2256,6 +2366,12 @@ class AgentConfig:
     # user/session knob (default standard) resolved to a per-family max edge at
     # the image seam. See knowledge-base/knowledge/issues/session_turn_hard_fails_on_transient_llm_outage.md.
     image_quality: str = "standard"
+    # Metadata only — a soft UI filter (D4). Role tags (`worker` / `session`
+    # / `subagent`) are authored or derived from the chain root / expert_type
+    # by the orchestrator; nothing reads tags for behaviour.
+    tags: List[str] = field(default_factory=list)
+    # Built-in subagents: roster-wide llm + resolved roster (see SubagentsConfig).
+    subagents: SubagentsConfig = field(default_factory=SubagentsConfig)
 
     # Additional agent-specific config (preserved from JSON)
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -2334,6 +2450,88 @@ def _parse_llm_config(llm_data: Dict[str, Any]) -> LLMConfig:
         extra_body=llm_data.get("extra_body"),
         summarization=_parse_phase_override(llm_data.get("summarization")),
     )
+
+
+def _parse_tags(raw: Any) -> List[str]:
+    """``tags`` as an order-preserving, de-duplicated list of strings.
+
+    A bare string is one tag; anything that is not a list/tuple/str is
+    ignored (metadata must never fail a load).
+    """
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return []
+    out: List[str] = []
+    for tag in raw:
+        if tag is None:
+            continue
+        text = str(tag).strip()
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
+def _parse_delegation_config(delegation_data: Any) -> DelegationConfig:
+    """Parse the ``delegation`` block (shared by both loader entry points)."""
+    if not isinstance(delegation_data, dict):
+        delegation_data = {}
+    raw_max_concurrent = delegation_data.get("max_concurrent")
+    try:
+        max_concurrent = 4 if raw_max_concurrent is None else int(raw_max_concurrent)
+    except (TypeError, ValueError):
+        max_concurrent = 4
+    if max_concurrent < 1:
+        logger.warning(
+            "delegation.max_concurrent=%r is below the floor of 1 — using 1",
+            delegation_data.get("max_concurrent"),
+        )
+        max_concurrent = 1
+    return DelegationConfig(
+        enabled=delegation_data.get("enabled", False),
+        max_depth=delegation_data.get("max_depth", 1),
+        default_timeout=delegation_data.get("default_timeout", 7200),
+        max_timeout=delegation_data.get("max_timeout", 14400),
+        allowed_configs=delegation_data.get("allowed_configs", []),
+        mode=delegation_data.get("mode", "heavy"),
+        light=delegation_data.get("light", {}) or {},
+        max_concurrent=max_concurrent,
+        run_in_background_default=bool(
+            delegation_data.get("run_in_background_default", False)
+        ),
+    )
+
+
+def _parse_subagents_config(raw: Any, parent_llm: Any) -> SubagentsConfig:
+    """Parse the ``subagents`` block of an already-resolved config dict.
+
+    No resolution happens here — a roster reaching a loader entry point is
+    expected to be materialised already (``resolve_subagent_roster`` runs in
+    ``load_agent_config`` and the orchestrator resolver). Entries are copied
+    verbatim; a non-mapping entry is dropped with a warning. Entries that
+    inherited the parent's model are re-synced against ``parent_llm`` (the
+    merged dict's ``llm``) so a late parent model change carries through.
+    """
+    if not isinstance(raw, dict):
+        return SubagentsConfig()
+    default = raw.get("default")
+    default = str(default) if default else None
+    llm = raw.get("llm")
+    llm = copy.deepcopy(llm) if isinstance(llm, dict) else {}
+    roster: Dict[str, Dict[str, Any]] = {}
+    roster_raw = raw.get("roster")
+    if isinstance(roster_raw, dict):
+        for name, entry in roster_raw.items():
+            if isinstance(entry, dict):
+                roster[str(name)] = copy.deepcopy(entry)
+            else:
+                logger.warning(
+                    "subagents.roster.%s: entry must be a mapping, got %s — dropped",
+                    name,
+                    type(entry).__name__,
+                )
+    sync_inherited_roster_llm(roster, parent_llm)
+    return SubagentsConfig(default=default, llm=llm, roster=roster)
 
 
 def _parse_memory_config(data: Dict[str, Any]) -> MemoryConfig:
@@ -2563,6 +2761,18 @@ def load_agent_config(
     raw_expert_llm_keys = authored_llm_keys(config_path)
     _apply_settings_matrix(data, raw_expert_llm_keys, deployment_dir)
 
+    # Materialise the subagent roster (disk path: bundled / library `$ref`s
+    # only — a DB expert id cannot be seen from here and is dropped with a
+    # warning; an unknown disk ref is an authoring error and raises). Runs
+    # after the matrix so an entry that inherits the parent's model copies
+    # the final one. Lazy import: the roster module builds on this one.
+    if data.get("subagents") is not None:
+        from src.core.subagent_roster import resolve_subagent_roster
+
+        data = resolve_subagent_roster(
+            data, db_refs={}, deployment_dir=deployment_dir, on_missing="raise"
+        )
+
     # Validate required fields
     required = ["agent_id", "display_name"]
     missing = [field for field in required if field not in data]
@@ -2722,16 +2932,7 @@ def load_agent_config(
     ]
 
     # Parse delegation config
-    delegation_data = data.get("delegation", {})
-    delegation_config = DelegationConfig(
-        enabled=delegation_data.get("enabled", False),
-        max_depth=delegation_data.get("max_depth", 1),
-        default_timeout=delegation_data.get("default_timeout", 7200),
-        max_timeout=delegation_data.get("max_timeout", 14400),
-        allowed_configs=delegation_data.get("allowed_configs", []),
-        mode=delegation_data.get("mode", "heavy"),
-        light=delegation_data.get("light", {}) or {},
-    )
+    delegation_config = _parse_delegation_config(data.get("delegation", {}))
 
     # Parse autonomy level
     autonomy = data.get("autonomy", "partial")
@@ -2771,6 +2972,8 @@ def load_agent_config(
         "officer",
         "autonomy",
         "image_quality",
+        "tags",
+        "subagents",
     }
     extra = {k: v for k, v in data.items() if k not in known_fields}
 
@@ -2814,6 +3017,8 @@ def load_agent_config(
         officer=officer_config,
         autonomy=autonomy,
         image_quality=image_quality,
+        tags=_parse_tags(data.get("tags")),
+        subagents=_parse_subagents_config(data.get("subagents"), llm_data),
         extra=extra,
         _deployment_dir=deployment_dir,
     )
@@ -2996,16 +3201,7 @@ def load_agent_config_from_dict(
     ]
 
     # Parse delegation config
-    delegation_data = data.get("delegation", {})
-    delegation_config = DelegationConfig(
-        enabled=delegation_data.get("enabled", False),
-        max_depth=delegation_data.get("max_depth", 1),
-        default_timeout=delegation_data.get("default_timeout", 7200),
-        max_timeout=delegation_data.get("max_timeout", 14400),
-        allowed_configs=delegation_data.get("allowed_configs", []),
-        mode=delegation_data.get("mode", "heavy"),
-        light=delegation_data.get("light", {}) or {},
-    )
+    delegation_config = _parse_delegation_config(data.get("delegation", {}))
 
     # Parse autonomy level
     autonomy = data.get("autonomy", "partial")
@@ -3045,6 +3241,8 @@ def load_agent_config_from_dict(
         "officer",
         "autonomy",
         "image_quality",
+        "tags",
+        "subagents",
         # Both are emitted by ``dataclasses.asdict(AgentConfig)`` and are
         # therefore present whenever a caller round-trips a live config (the
         # session ``config.update`` path does exactly that). Without them here
@@ -3107,6 +3305,8 @@ def load_agent_config_from_dict(
         officer=officer_config,
         autonomy=autonomy,
         image_quality=image_quality,
+        tags=_parse_tags(data.get("tags")),
+        subagents=_parse_subagents_config(data.get("subagents"), llm_data),
         extra=extra,
         _deployment_dir=deployment_dir,
     )
@@ -3165,6 +3365,14 @@ def load_uploaded_config(uploaded_config_path: Path) -> Dict[str, Any]:
     # Apply settings matrix: uploaded llm keys are the explicit overrides
     uploaded_llm_keys = set((uploaded_data.get("llm") or {}).keys())
     _apply_settings_matrix(merged, uploaded_llm_keys)
+
+    # An uploaded config may carry a roster: materialise it like the disk
+    # path does (bundled / library refs; an unresolvable ref is dropped with
+    # a warning rather than failing the job that uploaded it).
+    if merged.get("subagents") is not None:
+        from src.core.subagent_roster import resolve_subagent_roster
+
+        merged = resolve_subagent_roster(merged, db_refs={}, on_missing="drop")
 
     logger.info(
         f"Merged uploaded config with defaults: "
@@ -5540,13 +5748,28 @@ def serialize_resolved_config(config: AgentConfig, model: str = "") -> dict:
     for k, v in extra.items():
         if k not in agent_dict:  # Don't overwrite standard fields
             agent_dict[k] = v
-    # Strip API keys from LLM configs
-    for key in ["api_key"]:
-        agent_dict.get("llm", {}).pop(key, None)
-        for phase in ["summarization"]:
-            override = agent_dict.get("llm", {}).get(phase)
-            if isinstance(override, dict):
-                override.pop(key, None)
+
+    # Strip API keys from every LLM slot: the main llm, its summarization
+    # override, the roster-wide subagents.llm and each roster entry's llm
+    # (+ that entry's summarization override). The blob is persisted; the
+    # dispatcher re-injects credentials into the delivery copy.
+    def _strip_llm_secrets(llm_block: Any) -> None:
+        if not isinstance(llm_block, dict):
+            return
+        llm_block.pop("api_key", None)
+        summarization = llm_block.get("summarization")
+        if isinstance(summarization, dict):
+            summarization.pop("api_key", None)
+
+    _strip_llm_secrets(agent_dict.get("llm"))
+    subagents = agent_dict.get("subagents")
+    if isinstance(subagents, dict):
+        _strip_llm_secrets(subagents.get("llm"))
+        roster = subagents.get("roster")
+        if isinstance(roster, dict):
+            for entry in roster.values():
+                if isinstance(entry, dict):
+                    _strip_llm_secrets(entry.get("llm"))
 
     # Resolve all prompts to full text
     prompt_resolver = PromptMatrixResolver(config._deployment_dir, model_family)
