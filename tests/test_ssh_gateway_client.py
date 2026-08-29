@@ -348,7 +348,10 @@ async def test_live_payload_missing_a_field_refuses_instead_of_crashing(monkeypa
 # Review Important 3.2: the live guard is type-blind. A frozen dataclass
 # performs no runtime validation, so a "live" state with a null pod_ip, or a
 # bool/float/out-of-range pod_port, still produced a usable-looking
-# SshTarget.
+# SshTarget. thread_id joined this guard once connect_upstream started
+# minting each certificate's principal from it directly (Task 9 review):
+# SshUserCa.mint raising on an empty principal is a fail-closed backstop,
+# not the readable refusal this module otherwise promises.
 # ---------------------------------------------------------------------------
 
 
@@ -365,6 +368,8 @@ async def test_live_payload_missing_a_field_refuses_instead_of_crashing(monkeypa
         {"pod_port": "30022"},
         {"host_key_fingerprint": None},
         {"host_key_fingerprint": ""},
+        {"thread_id": None},
+        {"thread_id": ""},
     ],
     ids=[
         "pod_ip-null",
@@ -376,6 +381,8 @@ async def test_live_payload_missing_a_field_refuses_instead_of_crashing(monkeypa
         "pod_port-numeric-string",
         "fingerprint-null",
         "fingerprint-empty",
+        "thread_id-null",
+        "thread_id-empty",
     ],
 )
 async def test_live_payload_with_an_invalid_field_refuses_instead_of_returning_a_target(

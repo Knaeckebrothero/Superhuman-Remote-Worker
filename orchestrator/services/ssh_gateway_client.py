@@ -310,11 +310,16 @@ def _is_valid_port(value: Any) -> bool:
 def _is_valid_identifier(value: Any) -> bool:
     """True if ``value`` is a non-empty string.
 
-    Used for ``pod_ip`` and ``host_key_fingerprint``: a frozen dataclass
-    performs no runtime type validation, so a "live" response with a null,
-    empty, or non-string value for either would otherwise construct a
-    usable-looking ``SshTarget`` that a caller then dials or pins against
-    garbage instead of getting the readable refusal this module promises.
+    Used for ``pod_ip``, ``host_key_fingerprint``, and ``thread_id``: a
+    frozen dataclass performs no runtime type validation, so a "live"
+    response with a null, empty, or non-string value for any of them would
+    otherwise construct a usable-looking ``SshTarget`` that a caller then
+    dials or pins against garbage instead of getting the readable refusal
+    this module promises. ``thread_id`` earns the same check as the other
+    two now that ``connect_upstream`` mints each certificate's principal
+    from it directly -- ``SshUserCa.mint`` raising on an empty principal is
+    a fail-closed backstop, not validation, and a null/non-string value
+    would reach it unchecked otherwise.
     """
     return isinstance(value, str) and bool(value)
 
@@ -368,15 +373,17 @@ async def resolve_target(config, handle: str, fingerprint: str) -> SshTarget:
         pod_ip = payload["pod_ip"]
         pod_port = payload["pod_port"]
         host_key_fingerprint = payload["host_key_fingerprint"]
+        thread_id = payload["thread_id"]
         if not (
             _is_valid_identifier(pod_ip)
             and _is_valid_port(pod_port)
             and _is_valid_identifier(host_key_fingerprint)
+            and _is_valid_identifier(thread_id)
         ):
             raise TargetUnavailable("unreachable")
 
         return SshTarget(
-            thread_id=payload["thread_id"],
+            thread_id=thread_id,
             user_id=payload["user_id"],
             pod_ip=pod_ip,
             pod_port=pod_port,

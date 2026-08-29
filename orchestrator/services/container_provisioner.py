@@ -12633,6 +12633,19 @@ class ContainerProvisioner:
                             # not required. The entrypoint already treats
                             # its absence as "certificate auth unavailable",
                             # not fatal.
+                            # Kubernetes has no per-item "optional": this
+                            # also relaxes the pre-existing "ssh-publickey"
+                            # item, which predates this feature and used to
+                            # be required. A genuinely missing/deleted
+                            # Secret (not just a missing key within it) no
+                            # longer produces a named kubelet
+                            # CreateContainerConfigError; the pod instead
+                            # starts with an empty ssh-pubkey volume and
+                            # whatever consumes it (sshd's AuthorizedKeysFile)
+                            # times out ssh-auth-readiness after ~30s
+                            # instead. If you're debugging one of those
+                            # timeouts, check whether the secret itself
+                            # still exists before looking anywhere else.
                             "optional": True,
                             "defaultMode": 0o600,
                         },
