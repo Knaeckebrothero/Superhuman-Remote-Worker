@@ -27,6 +27,12 @@ if str(_ORCH) not in sys.path:
     sys.path.insert(0, str(_ORCH))
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
+from services.capability_credentials import CapabilityCredentials  # noqa: E402
+
+
+def _credentials(model, base_url=None, api_key=None):
+    return CapabilityCredentials(model=model, base_url=base_url, api_key=api_key)
+
 
 def _mock_db() -> MagicMock:
     """A postgres_db double whose pool-reading methods are awaitable no-ops."""
@@ -61,7 +67,7 @@ class TestTranscribeService:
             patch("services.transcribe.AsyncOpenAI", cls),
             patch(
                 "services.transcribe.resolve_capability_credentials",
-                AsyncMock(return_value=("whisper-1", None, "sk-key")),
+                AsyncMock(return_value=_credentials("whisper-1", None, "sk-key")),
             ),
         ):
             text = await transcribe_thread_audio(
@@ -105,7 +111,7 @@ class TestTranscribeService:
             patch("services.transcribe.AsyncOpenAI", cls),
             patch(
                 "services.transcribe.resolve_capability_credentials",
-                AsyncMock(return_value=("whisper-1", None, None)),
+                AsyncMock(return_value=_credentials("whisper-1", None, None)),
             ),
         ):
             with pytest.raises(TranscriptionError):
@@ -142,7 +148,7 @@ class TestTranscribeService:
             patch("services.transcribe.AsyncOpenAI", cls),
             patch(
                 "services.transcribe.resolve_capability_credentials",
-                AsyncMock(return_value=("whisper-1", None, "sk-key")),
+                AsyncMock(return_value=_credentials("whisper-1", None, "sk-key")),
             ),
         ):
             with pytest.raises(TranscriptionError):
@@ -177,7 +183,7 @@ class TestTranscribeService:
             patch("services.transcribe.AsyncOpenAI", cls),
             patch(
                 "services.transcribe.resolve_capability_credentials",
-                AsyncMock(return_value=("whisper-1", None, "sk-key")),
+                AsyncMock(return_value=_credentials("whisper-1", None, "sk-key")),
             ),
         ):
             text = await transcribe_thread_audio(
@@ -199,7 +205,7 @@ class TestTranscribeService:
             patch("services.transcribe.AsyncOpenAI", cls),
             patch(
                 "services.transcribe.resolve_capability_credentials",
-                AsyncMock(return_value=("whisper-1", None, "sk-key")),
+                AsyncMock(return_value=_credentials("whisper-1", None, "sk-key")),
             ),
         ):
             text = await transcribe_thread_audio(
@@ -221,7 +227,7 @@ class TestTranscribeService:
             patch("services.transcribe.AsyncOpenAI", cls),
             patch(
                 "services.transcribe.resolve_capability_credentials",
-                AsyncMock(return_value=("whisper-1", None, "sk-key")),
+                AsyncMock(return_value=_credentials("whisper-1", None, "sk-key")),
             ),
         ):
             text = await transcribe_thread_audio(
@@ -241,7 +247,7 @@ class TestTranscribeService:
             patch("services.transcribe.AsyncOpenAI", cls),
             patch(
                 "services.transcribe.resolve_capability_credentials",
-                AsyncMock(return_value=("whisper-1", None, "sk-key")),
+                AsyncMock(return_value=_credentials("whisper-1", None, "sk-key")),
             ),
         ):
             text = await transcribe_thread_audio(
@@ -261,7 +267,7 @@ class TestTranscribeService:
             patch("services.transcribe.AsyncOpenAI", cls),
             patch(
                 "services.transcribe.resolve_capability_credentials",
-                AsyncMock(return_value=("whisper-1", None, "sk-key")),
+                AsyncMock(return_value=_credentials("whisper-1", None, "sk-key")),
             ),
         ):
             text = await transcribe_thread_audio(
@@ -421,7 +427,7 @@ class TestTranscribeMetering:
             patch("services.transcribe.AsyncOpenAI", cls),
             patch(
                 "services.transcribe.resolve_capability_credentials",
-                AsyncMock(return_value=("whisper-1", None, "sk-key")),
+                AsyncMock(return_value=_credentials("whisper-1", None, "sk-key")),
             ),
         ):
             text = await transcribe_thread_audio(
@@ -454,7 +460,7 @@ class TestTranscribeMetering:
             patch("services.transcribe.AsyncOpenAI", cls),
             patch(
                 "services.transcribe.resolve_capability_credentials",
-                AsyncMock(return_value=("whisper-1", None, "sk-key")),
+                AsyncMock(return_value=_credentials("whisper-1", None, "sk-key")),
             ),
         ):
             text = await transcribe_thread_audio(
@@ -479,7 +485,7 @@ class TestTranscribeMetering:
             patch("services.transcribe.AsyncOpenAI", cls),
             patch(
                 "services.transcribe.resolve_capability_credentials",
-                AsyncMock(return_value=("whisper-1", None, "sk-key")),
+                AsyncMock(return_value=_credentials("whisper-1", None, "sk-key")),
             ),
         ):
             text = await transcribe_thread_audio(

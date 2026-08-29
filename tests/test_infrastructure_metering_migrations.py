@@ -336,7 +336,15 @@ APP_IMAGE_DELIVERY_ROWS_EVENT_ROLE = (
     ROOT
     / "orchestrator/database/migrations/app/0211_image_delivery_rows_event_role.sql"
 )
-APP_CURRENT_MIGRATION_HEAD = APP_IMAGE_DELIVERY_ROWS_EVENT_ROLE
+# Research search/fetch capability resolution. Renumbered twice: 0205 -> 0210 during
+# the 2026-08-30 rebase (0205 was taken by 0205_experts_role_tags_backfill.sql), then
+# 0210 -> 0212 during the 2026-09-01 rebase onto the rewritten develop, where 0210 and
+# 0211 had both been taken upstream. Two migrations sharing a prefix hard-fails the
+# duplicate-prefix check and the runner.
+APP_SEARCH_FETCH_CAPABILITIES = (
+    ROOT / "orchestrator/database/migrations/app/0212_search_fetch_capabilities.sql"
+)
+APP_CURRENT_MIGRATION_HEAD = APP_SEARCH_FETCH_CAPABILITIES
 AUDIT_EXPANSION = (
     ROOT
     / "orchestrator/database/migrations/audit/0003_infrastructure_usage_events_v2.sql"

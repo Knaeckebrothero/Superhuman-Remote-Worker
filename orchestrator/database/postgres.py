@@ -43036,7 +43036,7 @@ class PostgresDB:
           ``orchestrator/services/readiness.py:16-21``: a chat-capable LLM
           can always run auxiliary tasks. Operators who want a strictly-
           separate auxiliary model still pass ``capabilities=['auxiliary']``.
-        - ``capability='embedding'`` (or whisper/tts/vision) — wrapped as
+        - ``capability='embedding'`` (or whisper/tts/vision/search/fetch) — wrapped as
           a singleton ``[capability]``.
 
         Raises ``ValueError`` if neither is provided or any value is outside
@@ -43451,7 +43451,16 @@ class PostgresDB:
     # when the admin pin is missing or dangling. Whisper/tts gained catalog
     # rows in v1.1; non-catalog kinds (none today) would pass through unchanged.
     _CATALOG_CAPABILITIES = frozenset(
-        {"chat", "auxiliary", "embedding", "vision", "whisper", "tts"}
+        {
+            "chat",
+            "auxiliary",
+            "embedding",
+            "vision",
+            "whisper",
+            "tts",
+            "search",
+            "fetch",
+        }
     )
 
     async def resolve_default_for_capability(self, capability: str) -> str | None:

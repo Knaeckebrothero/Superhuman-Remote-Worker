@@ -26,6 +26,18 @@ if str(_ORCH) not in sys.path:
     sys.path.insert(0, str(_ORCH))
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
+from services.capability_credentials import CapabilityCredentials  # noqa: E402
+
+
+def _credentials(model, base_url=None, api_key=None, *, provider=None, params=None):
+    return CapabilityCredentials(
+        model=model,
+        base_url=base_url,
+        api_key=api_key,
+        provider=provider,
+        params=params or {},
+    )
+
 
 @pytest.fixture(autouse=True)
 def _clear_tts_caches():
@@ -87,7 +99,8 @@ def _caps(tts=("kokoro-strix", None, "sk-key"), aux=("gemma-aux", None, "sk-key"
     """AsyncMock for _resolve_capability_credentials keyed on capability."""
 
     def _resolve(*, capability, **_):
-        return {"tts": tts, "auxiliary": aux}.get(capability)
+        value = {"tts": tts, "auxiliary": aux}.get(capability)
+        return _credentials(*value) if isinstance(value, tuple) else value
 
     return AsyncMock(side_effect=_resolve)
 
@@ -107,7 +120,7 @@ class TestGenerateMessageTts:
             patch("services.tts.AsyncOpenAI", cls),
             patch(
                 "services.tts._resolve_capability_credentials",
-                AsyncMock(return_value=("tts-1", None, "sk-key")),
+                AsyncMock(return_value=_credentials("tts-1", None, "sk-key")),
             ),
         ):
             result = await generate_message_tts(
@@ -167,7 +180,7 @@ class TestGenerateMessageTts:
             patch("services.tts.AsyncOpenAI", cls),
             patch(
                 "services.tts._resolve_capability_credentials",
-                AsyncMock(return_value=("tts-1", None, "sk-key")),
+                AsyncMock(return_value=_credentials("tts-1", None, "sk-key")),
             ),
         ):
             with pytest.raises(TtsSynthesisError):
@@ -191,7 +204,7 @@ class TestGenerateMessageTts:
             patch("services.tts.AsyncOpenAI", cls),
             patch(
                 "services.tts._resolve_capability_credentials",
-                AsyncMock(return_value=("tts-1", None, None)),  # no api_key
+                AsyncMock(return_value=_credentials("tts-1", None, None)),  # no api_key
             ),
         ):
             with pytest.raises(TtsSynthesisError):
@@ -216,7 +229,7 @@ class TestGenerateMessageTts:
             patch("services.tts.AsyncOpenAI", cls),
             patch(
                 "services.tts._resolve_capability_credentials",
-                AsyncMock(return_value=("tts-1", None, "sk-key")),
+                AsyncMock(return_value=_credentials("tts-1", None, "sk-key")),
             ),
         ):
             result = await generate_message_tts(
@@ -239,14 +252,18 @@ class TestGenerateMessageTts:
 
         cls, client = _mock_openai(speech=b"AUDIO")
         db = _mock_db()
-        db.resolve_catalog_model = AsyncMock(
-            return_value={"params_json": {"voice": "af_heart"}}
-        )
         with (
             patch("services.tts.AsyncOpenAI", cls),
             patch(
                 "services.tts._resolve_capability_credentials",
-                AsyncMock(return_value=("kokoro-strix", None, "sk-key")),
+                AsyncMock(
+                    return_value=_credentials(
+                        "kokoro-strix",
+                        None,
+                        "sk-key",
+                        params={"voice": "af_heart"},
+                    )
+                ),
             ),
         ):
             result = await generate_message_tts(
@@ -258,6 +275,7 @@ class TestGenerateMessageTts:
             )
         assert result is not None
         assert client.audio.speech.create.call_args.kwargs["voice"] == "af_heart"
+        db.resolve_catalog_model.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_falls_back_to_default_voice_without_params(self):
@@ -269,7 +287,7 @@ class TestGenerateMessageTts:
             patch("services.tts.AsyncOpenAI", cls),
             patch(
                 "services.tts._resolve_capability_credentials",
-                AsyncMock(return_value=("kokoro-strix", None, "sk-key")),
+                AsyncMock(return_value=_credentials("kokoro-strix", None, "sk-key")),
             ),
         ):
             await generate_message_tts(
@@ -295,7 +313,7 @@ class TestSynthesizeVoicePreview:
             patch("services.tts.AsyncOpenAI", cls),
             patch(
                 "services.tts._resolve_capability_credentials",
-                AsyncMock(return_value=("kokoro-strix", None, "sk-key")),
+                AsyncMock(return_value=_credentials("kokoro-strix", None, "sk-key")),
             ),
         ):
             audio = await synthesize_voice_preview(
@@ -318,7 +336,7 @@ class TestSynthesizeVoicePreview:
             patch("services.tts.AsyncOpenAI", cls),
             patch(
                 "services.tts._resolve_capability_credentials",
-                AsyncMock(return_value=("kokoro-strix", None, "sk-key")),
+                AsyncMock(return_value=_credentials("kokoro-strix", None, "sk-key")),
             ),
         ):
             await synthesize_voice_preview(
@@ -338,7 +356,7 @@ class TestSynthesizeVoicePreview:
             patch("services.tts.AsyncOpenAI", cls),
             patch(
                 "services.tts._resolve_capability_credentials",
-                AsyncMock(return_value=("kokoro-strix", None, "sk-key")),
+                AsyncMock(return_value=_credentials("kokoro-strix", None, "sk-key")),
             ),
         ):
             await synthesize_voice_preview(
@@ -360,7 +378,7 @@ class TestSynthesizeVoicePreview:
             patch("services.tts.AsyncOpenAI", cls),
             patch(
                 "services.tts._resolve_capability_credentials",
-                AsyncMock(return_value=("kokoro-strix", None, "sk-key")),
+                AsyncMock(return_value=_credentials("kokoro-strix", None, "sk-key")),
             ),
         ):
             await synthesize_voice_preview(
@@ -387,7 +405,7 @@ class TestSynthesizeVoicePreview:
             patch("services.tts.AsyncOpenAI", cls),
             patch(
                 "services.tts._resolve_capability_credentials",
-                AsyncMock(return_value=("kokoro-strix", None, "sk-key")),
+                AsyncMock(return_value=_credentials("kokoro-strix", None, "sk-key")),
             ),
         ):
             await synthesize_voice_preview(
@@ -428,7 +446,7 @@ class TestSynthesizeVoicePreview:
             patch("services.tts.AsyncOpenAI", cls),
             patch(
                 "services.tts._resolve_capability_credentials",
-                AsyncMock(return_value=("kokoro-strix", None, "sk-key")),
+                AsyncMock(return_value=_credentials("kokoro-strix", None, "sk-key")),
             ),
         ):
             with pytest.raises(TtsSynthesisError):
@@ -475,7 +493,7 @@ class TestVoiceSelectionAndInstructions:
             patch("services.tts.AsyncOpenAI", cls),
             patch(
                 "services.tts._resolve_capability_credentials",
-                AsyncMock(return_value=("gpt-4o-mini-tts", None, "sk-key")),
+                AsyncMock(return_value=_credentials("gpt-4o-mini-tts", None, "sk-key")),
             ),
         ):
             await generate_message_tts(
@@ -501,7 +519,7 @@ class TestVoiceSelectionAndInstructions:
             patch("services.tts.AsyncOpenAI", cls),
             patch(
                 "services.tts._resolve_capability_credentials",
-                AsyncMock(return_value=("kokoro", None, "sk-key")),
+                AsyncMock(return_value=_credentials("kokoro", None, "sk-key")),
             ),
         ):
             await generate_message_tts(
@@ -519,14 +537,18 @@ class TestVoiceSelectionAndInstructions:
 
         cls, client = _mock_openai(speech=b"AUDIO")
         db = _mock_db()
-        db.resolve_catalog_model = AsyncMock(
-            return_value={"params_json": {"voices": {"en": "alloy", "de": "onyx"}}}
-        )
         with (
             patch("services.tts.AsyncOpenAI", cls),
             patch(
                 "services.tts._resolve_capability_credentials",
-                AsyncMock(return_value=("gpt-4o-mini-tts", None, "sk-key")),
+                AsyncMock(
+                    return_value=_credentials(
+                        "gpt-4o-mini-tts",
+                        None,
+                        "sk-key",
+                        params={"voices": {"en": "alloy", "de": "onyx"}},
+                    )
+                ),
             ),
         ):
             await generate_message_tts(
@@ -537,6 +559,7 @@ class TestVoiceSelectionAndInstructions:
                 postgres_db=db,
             )
         assert client.audio.speech.create.call_args.kwargs["voice"] == "onyx"
+        db.resolve_catalog_model.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_instructions_passed_through_when_set(self):
@@ -544,16 +567,21 @@ class TestVoiceSelectionAndInstructions:
 
         cls, client = _mock_openai(speech=b"AUDIO")
         db = _mock_db()
-        db.resolve_catalog_model = AsyncMock(
-            return_value={
-                "params_json": {"voice": "sage", "instructions": "warm and unhurried"}
-            }
-        )
         with (
             patch("services.tts.AsyncOpenAI", cls),
             patch(
                 "services.tts._resolve_capability_credentials",
-                AsyncMock(return_value=("gpt-4o-mini-tts", None, "sk-key")),
+                AsyncMock(
+                    return_value=_credentials(
+                        "gpt-4o-mini-tts",
+                        None,
+                        "sk-key",
+                        params={
+                            "voice": "sage",
+                            "instructions": "warm and unhurried",
+                        },
+                    )
+                ),
             ),
         ):
             await generate_message_tts(
@@ -566,6 +594,7 @@ class TestVoiceSelectionAndInstructions:
         kwargs = client.audio.speech.create.call_args.kwargs
         assert kwargs["voice"] == "sage"
         assert kwargs["instructions"] == "warm and unhurried"
+        db.resolve_catalog_model.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_no_instructions_kwarg_when_unset(self):
@@ -578,7 +607,7 @@ class TestVoiceSelectionAndInstructions:
             patch("services.tts.AsyncOpenAI", cls),
             patch(
                 "services.tts._resolve_capability_credentials",
-                AsyncMock(return_value=("tts-1", None, "sk-key")),
+                AsyncMock(return_value=_credentials("tts-1", None, "sk-key")),
             ),
         ):
             await generate_message_tts(
@@ -1273,7 +1302,7 @@ class TestTtsMetering:
             patch("services.tts.AsyncOpenAI", cls),
             patch(
                 "services.tts._resolve_capability_credentials",
-                AsyncMock(return_value=("kokoro", None, "sk-key")),
+                AsyncMock(return_value=_credentials("kokoro", None, "sk-key")),
             ),
         ):
             result = await generate_message_tts(
@@ -1308,7 +1337,7 @@ class TestTtsMetering:
             patch("services.tts.AsyncOpenAI", cls),
             patch(
                 "services.tts._resolve_capability_credentials",
-                AsyncMock(return_value=("kokoro", None, "sk-key")),
+                AsyncMock(return_value=_credentials("kokoro", None, "sk-key")),
             ),
         ):
             result = await generate_message_tts(
@@ -1334,7 +1363,7 @@ class TestTtsMetering:
             patch("services.tts.AsyncOpenAI", cls),
             patch(
                 "services.tts._resolve_capability_credentials",
-                AsyncMock(return_value=("kokoro", None, "sk-key")),
+                AsyncMock(return_value=_credentials("kokoro", None, "sk-key")),
             ),
         ):
             result = await generate_message_tts(

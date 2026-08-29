@@ -83,6 +83,8 @@ class TestCatalogConstants:
             "vision",
             "whisper",
             "tts",
+            "search",
+            "fetch",
         )
 
     def test_provider_kinds_locked(self):
@@ -514,6 +516,8 @@ class TestReadinessAccessors:
             "embedding": 1,
             "whisper": 0,
             "tts": 0,
+            "search": 0,
+            "fetch": 0,
         }
 
     @pytest.mark.asyncio

@@ -124,6 +124,12 @@ _ELEVENLABS_BASE_URL = "https://api.elevenlabs.io"
 # (Phase 5).
 ELEVENLABS_DEFAULT_VOICE = "EXAVITQu4vr4xnSDxMaL"
 
+# Tavily's deployment secret is a seed input only. The endpoint stores the
+# encrypted credential so dispatch can deliver it per job/session.
+TAVILY_ENDPOINT_LABEL = "Tavily"
+TAVILY_MODEL_ID = "tavily"
+_TAVILY_BASE_URL = "https://api.tavily.com"
+
 # Fallback used when CODEX_PROXY_URL is unset. Mirrors the runtime fallback
 # in ``orchestrator.main._get_codex_subscription_models`` so login flows that
 # work without the env var also wire up a transport row.
@@ -156,7 +162,16 @@ def _resolve_secret_value(entry: dict[str, Any], *, context: str) -> str | None:
     return None
 
 
-_CAPABILITY_ENUM = ("chat", "auxiliary", "embedding", "vision", "whisper", "tts")
+_CAPABILITY_ENUM = (
+    "chat",
+    "auxiliary",
+    "embedding",
+    "vision",
+    "whisper",
+    "tts",
+    "search",
+    "fetch",
+)
 
 
 def _resolve_capabilities_from_entry(
@@ -611,6 +626,65 @@ async def ensure_elevenlabs_tts_endpoint(db: PostgresDB) -> bool:
         return False
 
 
+async def ensure_tavily_search_endpoint(db: PostgresDB) -> bool:
+    """Convert a legacy ``TAVILY_API_KEY`` into catalog-backed web providers.
+
+    The seed is deliberately one-shot. Any existing search row means an admin
+    already made a choice. An existing well-known endpoint with no model is a
+    tombstone left by an admin-deleted catalog row and is not recreated.
+    Defaults are filled only when empty, so no operator selection is clobbered.
+
+    Returns True only when a new Tavily catalog row was inserted. Failures are
+    best-effort and never abort orchestrator startup.
+    """
+
+    api_key = (os.environ.get("TAVILY_API_KEY") or "").strip()
+    if not api_key:
+        return False
+    try:
+        if await db.list_models(capabilities=["search"]):
+            return False
+
+        for endpoint in await db.list_system_llm_endpoints():
+            if endpoint.get("label") == TAVILY_ENDPOINT_LABEL:
+                return False
+
+        endpoint = await db.create_system_llm_endpoint(
+            label=TAVILY_ENDPOINT_LABEL,
+            base_url=_TAVILY_BASE_URL,
+            api_key=api_key,
+            key_prefix=api_key[:8],
+        )
+        inserted = await db.create_model(
+            provider_kind="endpoint",
+            provider_ref=str(endpoint["id"]),
+            model_id=TAVILY_MODEL_ID,
+            display_label="Tavily",
+            capabilities=["search", "fetch"],
+            family="tavily",
+            params_json={
+                "provider": "tavily",
+                "ops": ["search", "extract", "crawl", "map"],
+            },
+            enabled=True,
+            seeded_from="env:TAVILY_API_KEY",
+            on_conflict_do_nothing=True,
+        )
+        if inserted is None:
+            return False
+
+        for capability in ("search", "fetch"):
+            if not await db.get_default_llm_model(capability):
+                await db.set_default_llm_model(capability, TAVILY_MODEL_ID)
+        logger.info(
+            "ensure_tavily_search_endpoint: registered Tavily search/fetch provider"
+        )
+        return True
+    except Exception:
+        logger.exception("ensure_tavily_search_endpoint: wiring failed")
+        return False
+
+
 async def run(payload_path: Path) -> SeedReport:
     """Open a DB connection, apply the seed, and report."""
     payload = load_payload(payload_path)
@@ -623,6 +697,9 @@ async def run(payload_path: Path) -> SeedReport:
     await db.connect()
     try:
         report = await seed(db, payload)
+        # Legacy Tavily upgrades ride the same boot Job as catalog seeding. The
+        # orchestrator Deployment intentionally does not mount this secret.
+        await ensure_tavily_search_endpoint(db)
     finally:
         await db.close()
     report.log()

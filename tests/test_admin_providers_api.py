@@ -108,6 +108,7 @@ class TestDefaultModelKinds:
         # an audio model without each user setting their own preference.
         # Dispatch injects WHISPER_*/TTS_* env vars for the agent at job-start.
         assert {"whisper", "tts"}.issubset(VALID_DEFAULT_MODEL_KINDS)
+        assert {"search", "fetch"}.issubset(VALID_DEFAULT_MODEL_KINDS)
 
 
 # ---------------------------------------------------------------------------

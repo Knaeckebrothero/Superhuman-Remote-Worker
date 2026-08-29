@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from .base import Page, Result, SearchAdapter
+from .brave import BraveAdapter
 from .errors import (
     ProviderAuthError,
     ProviderError,
@@ -16,10 +17,11 @@ from .errors import (
     ProviderUnavailableError,
 )
 from .tavily import TavilyAdapter
+from .searxng import SearxngAdapter
 
 logger = logging.getLogger(__name__)
 
-ADAPTER_NAMES = frozenset({"tavily"})
+ADAPTER_NAMES = frozenset({"brave", "searxng", "tavily"})
 
 
 def create_search_adapter(config: Any) -> SearchAdapter | None:
@@ -42,6 +44,18 @@ def create_search_adapter(config: Any) -> SearchAdapter | None:
             base_url=config.get("base_url"),
             ops=ops,
         )
+    if provider == "searxng":
+        return SearxngAdapter(
+            api_key=config.get("api_key"),
+            base_url=config.get("base_url"),
+            ops=ops,
+        )
+    if provider == "brave":
+        return BraveAdapter(
+            api_key=config.get("api_key"),
+            base_url=config.get("base_url"),
+            ops=ops,
+        )
 
     logger.warning("Unknown research provider %r; no web tools constructed", provider)
     return None
@@ -49,6 +63,7 @@ def create_search_adapter(config: Any) -> SearchAdapter | None:
 
 __all__ = [
     "ADAPTER_NAMES",
+    "BraveAdapter",
     "Page",
     "ProviderAuthError",
     "ProviderError",
@@ -58,6 +73,7 @@ __all__ = [
     "ProviderUnavailableError",
     "Result",
     "SearchAdapter",
+    "SearxngAdapter",
     "TavilyAdapter",
     "create_search_adapter",
 ]

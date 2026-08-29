@@ -1,71 +1,112 @@
-"""Per-user model + credential resolution for capability-scoped LLM calls.
-
-Shared by the TTS (``services/tts.py``) and speech-to-text
-(``services/transcribe.py``) paths. Resolution mirrors the dispatcher's
-per-user chain (user setting > system default), then resolves the model's
-endpoint/provider into a ``(model, base_url, api_key)`` triple the OpenAI
-client can use directly.
-"""
+"""Per-user catalog and credential resolution for capability-scoped calls."""
 
 from __future__ import annotations
 
-import logging
-from typing import Any, Optional
+from dataclasses import dataclass, field
+from typing import Any
 
 from src.core.model_registry import (
     UnknownModelError,
     resolve_model as _resolve_model,
 )
 
-logger = logging.getLogger(__name__)
+
+@dataclass(frozen=True, slots=True)
+class CapabilityCredentials:
+    """One resolved catalog row plus the transport needed to call it."""
+
+    model: str
+    base_url: str | None = None
+    api_key: str | None = None
+    provider: str | None = None
+    params: dict[str, Any] = field(default_factory=dict)
+    catalog_id: str | None = None
 
 
 async def resolve_capability_credentials(
     *,
     capability: str,
     user_settings: dict[str, Any],
-    user_id: str,
+    user_id: str | None,
     resolved_keys: dict[str, str],
     postgres_db,
-) -> Optional[tuple[str, Optional[str], Optional[str]]]:
-    """Pick a model for ``capability`` and return (model, base_url, api_key).
+    setting_key: str | None = None,
+) -> CapabilityCredentials | None:
+    """Resolve a capability selection to its parsed catalog row and transport.
 
-    Resolution mirrors ``_inject_env_key_credentials`` in main.py:
-      1. user_settings[default_<capability>_model]
-      2. system default for the capability
-      3. endpoint-anchored model → use endpoint base_url + api_key
-      4. built-in model → use api_key from resolved_keys[provider]
-
-    Returns ``None`` when no model is configured for the capability.
+    Selection is user setting, then the system capability resolver. Catalog
+    rows are fetched through ``resolve_catalog_model`` so JSONB ``params_json``
+    is normalized by ``postgres._row_to_model`` before provider selection.
+    ``setting_key`` lets a second slot reuse this exact chain without inventing
+    another credential mechanism.
     """
-    user_key = f"default_{capability}_model"
-    model_id: Optional[str] = user_settings.get(user_key)
+
+    user_key = setting_key or f"default_{capability}_model"
+    model_id = user_settings.get(user_key)
     if not model_id:
-        model_id = await postgres_db.resolve_default_for_capability(capability)
+        default_kind = user_key.removeprefix("default_").removesuffix("_model")
+        model_id = await postgres_db.resolve_default_for_capability(default_kind)
     if not model_id:
         return None
 
-    base_url: Optional[str] = None
-    api_key: Optional[str] = None
+    row = await postgres_db.resolve_catalog_model(model_id, capability=capability)
+    if row is not None:
+        params_value = row.get("params_json")
+        params = dict(params_value) if isinstance(params_value, dict) else {}
+        configured_provider = params.get("provider")
+        provider = (
+            configured_provider.strip()
+            if isinstance(configured_provider, str) and configured_provider.strip()
+            else None
+        )
+        provider_ref = row.get("provider_ref")
+        if provider is None and row.get("provider_kind") == "system":
+            provider = str(provider_ref) if provider_ref else None
 
-    meta = None
+        base_url = row.get("endpoint_base_url")
+        api_key = row.get("api_key")
+        # A system catalog transport may be overridden by a per-user/project
+        # provider key. Endpoint rows remain authoritative for their own key.
+        if row.get("provider_kind") == "system" and provider_ref:
+            api_key = resolved_keys.get(str(provider_ref), api_key)
+
+        return CapabilityCredentials(
+            model=str(model_id),
+            base_url=str(base_url) if base_url else None,
+            api_key=str(api_key) if api_key else None,
+            provider=provider,
+            params=params,
+            catalog_id=str(row["catalog_id"]) if row.get("catalog_id") else None,
+        )
+
+    # Compatibility for a model resolved outside the DB catalog. The default
+    # resolver is catalog-backed, but explicit legacy user settings can survive
+    # an upgrade and should retain their previous transport behavior.
     try:
-        meta = await _resolve_model(model_id, user_id=user_id, capability=capability)
+        meta = await _resolve_model(
+            model_id,
+            user_id=user_id,
+            capability=capability,
+        )
     except UnknownModelError:
         meta = None
 
-    if (
-        meta is not None
-        and meta.origin in ("custom", "system", "catalog")
-        and meta.endpoint_id
-    ):
-        endpoint_row = await postgres_db.get_user_llm_endpoint(meta.endpoint_id)
-        if endpoint_row:
-            base_url = endpoint_row.get("base_url")
-            api_key = endpoint_row.get("api_key")
-    else:
-        provider = meta.api_key_ref if meta is not None else None
-        if provider and provider in resolved_keys:
-            api_key = resolved_keys[provider]
+    base_url = None
+    api_key = None
+    provider = None
+    if meta is not None:
+        provider = meta.api_key_ref or meta.provider
+        if meta.endpoint_id:
+            endpoint_row = await postgres_db.get_user_llm_endpoint(meta.endpoint_id)
+            if endpoint_row:
+                base_url = endpoint_row.get("base_url")
+                api_key = endpoint_row.get("api_key")
+        elif meta.api_key_ref:
+            api_key = resolved_keys.get(meta.api_key_ref)
 
-    return model_id, base_url, api_key
+    return CapabilityCredentials(
+        model=str(model_id),
+        base_url=str(base_url) if base_url else None,
+        api_key=str(api_key) if api_key else None,
+        provider=provider,
+    )

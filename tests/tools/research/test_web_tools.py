@@ -198,6 +198,24 @@ class TestCreateWebTools:
             "map_website",
         }
 
+    def test_search_only_provider_constructs_exactly_web_search(
+        self, mock_tool_context
+    ):
+        mock_tool_context.config = {
+            "research": {
+                "search": {
+                    "provider": "searxng",
+                    "base_url": "https://search.internal",
+                    "api_key": None,
+                    "ops": ["search"],
+                }
+            }
+        }
+
+        assert [tool.name for tool in create_web_tools(mock_tool_context)] == [
+            "web_search"
+        ]
+
 
 # ── web_search ─────────────────────────────────────────────────────
 

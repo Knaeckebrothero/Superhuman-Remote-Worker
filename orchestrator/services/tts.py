@@ -572,20 +572,6 @@ def _detect_language(text: str) -> str:
     return "de" if hits >= max(2, len(words) // 20) else "en"
 
 
-async def _resolve_tts_params(model_id: str, postgres_db) -> dict:
-    """The catalog row's ``params_json`` for a TTS model (``voice`` /
-    per-language ``voices`` / ``instructions`` / ``provider``), or ``{}`` when
-    there's no catalog row or the lookup fails (both non-fatal)."""
-    try:
-        row = await postgres_db.resolve_catalog_model(model_id, capability="tts")
-        params = (row or {}).get("params_json")
-        if isinstance(params, dict):
-            return params
-    except Exception:
-        logger.debug("Could not read params_json for TTS model %s", model_id)
-    return {}
-
-
 def _pick_voice(params: dict, language: str, user_voice: Optional[str]) -> str:
     """Voice resolution priority (knowledge-base/knowledge/features/voice_experience_roadmap.md):
     explicit user choice (``default_tts_voice``) → admin single ``voice`` →
@@ -870,12 +856,10 @@ async def _resolve_elevenlabs_context(
     )
     if tts_creds is None:
         return None, None
-    tts_model, _tts_base_url, tts_api_key = tts_creds
-    tts_params = await _resolve_tts_params(tts_model, postgres_db)
-    backend = _resolve_tts_provider(tts_model, tts_params.get("provider"))
+    backend = _resolve_tts_provider(tts_creds.model, tts_creds.provider)
     if backend != "elevenlabs":
         return backend, None
-    key = (tts_api_key or os.environ.get("ELEVENLABS_API_KEY") or "").strip()
+    key = (tts_creds.api_key or os.environ.get("ELEVENLABS_API_KEY") or "").strip()
     return backend, (key or None)
 
 
@@ -1219,12 +1203,12 @@ async def generate_message_tts(
     if tts_creds is None:
         logger.info("No TTS model configured for user %s", user_id)
         return None
-    tts_model, tts_base_url, tts_api_key = tts_creds
+    tts_model = tts_creds.model
     # Voice picked from the *content's* language (not the UI language) with the
     # user's explicit choice and admin per-language map layered on; ``language``
     # from the request is a fallback hint only. ``instructions`` is the style
     # prompt for instruction-capable models (gpt-4o-mini-tts).
-    tts_params = await _resolve_tts_params(tts_model, postgres_db)
+    tts_params = tts_creds.params
     detected_language = _detect_language(content) or language
     user_voice = (user_settings.get("default_tts_voice") or "").strip() or None
     voice = _pick_voice(tts_params, detected_language, user_voice)
@@ -1240,13 +1224,12 @@ async def generate_message_tts(
             postgres_db=postgres_db,
         )
         if aux_creds is not None:
-            aux_model, aux_base_url, aux_api_key = aux_creds
             custom_prompt, reasoning_level = _read_aloud_prefs(user_settings)
             speech_input = await _formulate_for_speech(
                 content,
-                model=aux_model,
-                base_url=aux_base_url,
-                api_key=aux_api_key,
+                model=aux_creds.model,
+                base_url=aux_creds.base_url,
+                api_key=aux_creds.api_key,
                 ledger=ledger,
                 user_id=user_id,
                 ref_id=ref_id,
@@ -1270,8 +1253,8 @@ async def generate_message_tts(
         speech_input,
         model=tts_model,
         voice=voice,
-        base_url=tts_base_url,
-        api_key=tts_api_key,
+        base_url=tts_creds.base_url,
+        api_key=tts_creds.api_key,
         instructions=instructions,
         provider=tts_params.get("provider"),
     )
@@ -1366,9 +1349,9 @@ async def synthesize_voice_preview(
     if tts_creds is None:
         logger.info("No TTS model configured for user %s (voice preview)", user_id)
         return None
-    tts_model, tts_base_url, tts_api_key = tts_creds
+    tts_model = tts_creds.model
 
-    tts_params = await _resolve_tts_params(tts_model, postgres_db)
+    tts_params = tts_creds.params
     lang = "de" if (language or "").lower().startswith("de") else "en"
     spoken = (text or "").strip()[:_PREVIEW_TEXT_MAX] or _PREVIEW_TEXT[lang]
     candidate = (voice or "").strip() or None
@@ -1386,8 +1369,8 @@ async def synthesize_voice_preview(
         spoken,
         model=tts_model,
         voice=resolved_voice,
-        base_url=tts_base_url,
-        api_key=tts_api_key,
+        base_url=tts_creds.base_url,
+        api_key=tts_creds.api_key,
         instructions=instructions,
         provider=tts_params.get("provider"),
     )
@@ -1834,12 +1817,11 @@ async def plan_tts_chunks(
             postgres_db=postgres_db,
         )
         if aux_creds is not None:
-            aux_model, aux_base_url, aux_api_key = aux_creds
             chunks = await _llm_clean_and_chunk(
                 content,
-                model=aux_model,
-                base_url=aux_base_url,
-                api_key=aux_api_key,
+                model=aux_creds.model,
+                base_url=aux_creds.base_url,
+                api_key=aux_creds.api_key,
                 ledger=ledger,
                 user_id=user_id,
                 ref_id=ref_id,
@@ -1955,7 +1937,7 @@ async def stream_tts_chunks(
 
     # No aux model (or no key) → deterministic markdown-stripped split, streamed
     # out as-is. Still incremental for the client, just not LLM-rewritten.
-    aux_key = aux_creds[2] if aux_creds else None
+    aux_key = aux_creds.api_key if aux_creds else None
     if not aux_creds or not aux_key:
         for c in _fallback_chunks():
             yield {"type": "chunk", "index": index, "text": c, "rewritten": False}
@@ -1963,9 +1945,10 @@ async def stream_tts_chunks(
         yield {"type": "done", "total": index, "rewritten": False}
         return
 
-    aux_model, aux_base_url, aux_api_key = aux_creds
+    aux_model = aux_creds.model
+    aux_base_url = aux_creds.base_url
     client = AsyncOpenAI(
-        api_key=aux_api_key,
+        api_key=aux_creds.api_key,
         base_url=aux_base_url,
         timeout=_STREAM_MAX_TOTAL,
         max_retries=0,

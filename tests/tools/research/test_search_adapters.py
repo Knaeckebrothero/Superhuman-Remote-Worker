@@ -3,9 +3,11 @@
 from types import ModuleType
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 
 from src.tools.research.search import (
+    BraveAdapter,
     Page,
     ProviderAuthError,
     ProviderQuotaError,
@@ -13,6 +15,7 @@ from src.tools.research.search import (
     ProviderRequestError,
     ProviderUnavailableError,
     Result,
+    SearxngAdapter,
     TavilyAdapter,
 )
 
@@ -33,6 +36,15 @@ def _client(module, name, response):
     instance.invoke.return_value = response
     getattr(module, name).return_value = instance
     return instance
+
+
+def _http_client(response: httpx.Response):
+    client = MagicMock()
+    client.get.return_value = response
+    manager = MagicMock()
+    manager.__enter__.return_value = client
+    manager.__exit__.return_value = False
+    return manager, client
 
 
 def test_tavily_declared_ops_return_normalized_shapes(tavily_module):
@@ -162,3 +174,142 @@ def test_model_supplied_fetch_url_is_only_a_provider_argument(tavily_module):
     assert instance.invoke.call_args.args[0]["urls"] == [
         "http://169.254.169.254/latest/meta-data"
     ]
+
+
+def test_searxng_search_returns_normalized_results():
+    response = httpx.Response(
+        200,
+        json={
+            "results": [
+                {
+                    "title": "SearX result",
+                    "url": "https://result.example/page",
+                    "content": "Snippet",
+                }
+            ]
+        },
+        request=httpx.Request("GET", "https://search.internal/search"),
+    )
+    manager, client = _http_client(response)
+    adapter = SearxngAdapter(base_url="https://search.internal")
+
+    with patch("src.tools.research.search.searxng.httpx.Client", return_value=manager):
+        results = adapter.search("query", 5)
+
+    assert results == [
+        Result(
+            title="SearX result",
+            url="https://result.example/page",
+            snippet="Snippet",
+        )
+    ]
+    assert client.get.call_args.args[0] == "https://search.internal/search"
+
+
+def test_brave_search_returns_normalized_results():
+    response = httpx.Response(
+        200,
+        json={
+            "web": {
+                "results": [
+                    {
+                        "title": "Brave result",
+                        "url": "https://result.example/page",
+                        "description": "Snippet",
+                    }
+                ]
+            }
+        },
+        request=httpx.Request("GET", "https://brave.internal/res/v1/web/search"),
+    )
+    manager, client = _http_client(response)
+    adapter = BraveAdapter(base_url="https://brave.internal", api_key="brave-key")
+
+    with patch("src.tools.research.search.brave.httpx.Client", return_value=manager):
+        results = adapter.search("query", 5, time_range="week")
+
+    assert results == [
+        Result(
+            title="Brave result",
+            url="https://result.example/page",
+            snippet="Snippet",
+        )
+    ]
+    assert client.get.call_args.args[0] == ("https://brave.internal/res/v1/web/search")
+    assert client.get.call_args.kwargs["params"]["freshness"] == "pw"
+
+
+@pytest.mark.parametrize(
+    "adapter",
+    [
+        SearxngAdapter(base_url="https://search.internal"),
+        BraveAdapter(base_url="https://brave.internal", api_key="brave-key"),
+    ],
+)
+@pytest.mark.parametrize("op", ["extract", "crawl", "map"])
+def test_search_only_adapters_raise_for_undeclared_ops(adapter, op):
+    with pytest.raises(ProviderRequestError):
+        if op == "extract":
+            adapter.extract(["https://example.com"])
+        else:
+            getattr(adapter, op)("https://example.com")
+
+
+@pytest.mark.parametrize(
+    ("adapter", "module_path"),
+    [
+        (
+            SearxngAdapter(base_url="https://search.internal"),
+            "src.tools.research.search.searxng.httpx.Client",
+        ),
+        (
+            BraveAdapter(base_url="https://brave.internal", api_key="brave-key"),
+            "src.tools.research.search.brave.httpx.Client",
+        ),
+    ],
+)
+def test_http_search_adapters_classify_rate_limits(adapter, module_path):
+    response = httpx.Response(
+        429,
+        request=httpx.Request("GET", "https://provider.internal/search"),
+    )
+    manager, _ = _http_client(response)
+
+    with (
+        patch(module_path, return_value=manager),
+        pytest.raises(ProviderRateLimitError),
+    ):
+        adapter.search("query", 5)
+
+
+@pytest.mark.parametrize(
+    ("adapter", "module_path", "expected_origin"),
+    [
+        (
+            SearxngAdapter(base_url="https://search.internal/root"),
+            "src.tools.research.search.searxng.httpx.Client",
+            "https://search.internal/root/search",
+        ),
+        (
+            BraveAdapter(base_url="https://brave.internal/api", api_key="brave-key"),
+            "src.tools.research.search.brave.httpx.Client",
+            "https://brave.internal/api/res/v1/web/search",
+        ),
+    ],
+)
+def test_search_query_never_changes_http_request_origin(
+    adapter, module_path, expected_origin
+):
+    response = httpx.Response(
+        200,
+        json={"results": []} if adapter.provider == "searxng" else {"web": {}},
+        request=httpx.Request("GET", expected_origin),
+    )
+    manager, client = _http_client(response)
+    influenced_query = "http://169.254.169.254/latest/meta-data"
+
+    with patch(module_path, return_value=manager):
+        adapter.search(influenced_query, 5)
+
+    assert client.get.call_args.args[0] == expected_origin
+    assert client.get.call_args.kwargs["params"]["q"] == influenced_query

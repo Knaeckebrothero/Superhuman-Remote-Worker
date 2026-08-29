@@ -4691,6 +4691,9 @@ async def _inject_dispatch_credentials(
         user_id=user_id_str,
         project_id=project_id_str,
     )
+    user_settings: dict[str, Any] = {}
+    if user_id_str:
+        user_settings = await postgres_db.get_user_settings(user_id_str) or {}
 
     config_override = config_override or {}
     llm_over = config_override.setdefault("llm", {})
@@ -4812,7 +4815,6 @@ async def _inject_dispatch_credentials(
             )
 
     if job.get("user_id"):
-        user_settings = await postgres_db.get_user_settings(str(job["user_id"]))
         aux_model = user_settings.get("default_auxiliary_model")
         if not aux_model:
             aux_model = await postgres_db.resolve_default_for_capability("auxiliary")
@@ -5008,6 +5010,13 @@ async def _inject_dispatch_credentials(
     else:
         for key in [key for key in _emb_env if key.startswith("KB_EMBEDDING_")]:
             del _emb_env[key]
+
+    await _inject_search_credentials(
+        config_override,
+        user_settings=user_settings,
+        user_id=user_id_str,
+        resolved_keys=resolved_keys,
+    )
 
     return config_override
 
@@ -13532,6 +13541,69 @@ async def _inject_env_key_credentials(
         env_keys.setdefault(f"{prefix}_API_KEY", resolved_keys[provider])
 
 
+async def _inject_search_credentials(
+    config_override: dict[str, Any],
+    *,
+    user_settings: dict[str, Any],
+    user_id: str | None,
+    resolved_keys: dict[str, str],
+) -> dict[str, Any]:
+    """Inject catalog-resolved search/fetch adapters into research config.
+
+    Transport credentials stay in the per-dispatch override and are stripped
+    before persistence by ``redact_config_override``. Adapter selection comes
+    only from parsed ``params_json`` returned by the shared capability resolver.
+    """
+
+    from services.capability_credentials import resolve_capability_credentials
+
+    research = config_override.setdefault("research", {})
+    for capability in ("search", "fetch"):
+        creds = await resolve_capability_credentials(
+            capability=capability,
+            user_settings=user_settings,
+            user_id=user_id,
+            resolved_keys=resolved_keys,
+            postgres_db=postgres_db,
+        )
+        if creds is None:
+            research.pop(capability, None)
+            continue
+
+        ops_value = creds.params.get("ops")
+        ops = (
+            [str(op) for op in ops_value if isinstance(op, str)]
+            if isinstance(ops_value, list)
+            else []
+        )
+        if not creds.provider or not ops:
+            research.pop(capability, None)
+            logger.warning(
+                "Dispatch: %s model %r has no valid params_json.provider/ops; "
+                "web tools for that capability are disabled",
+                capability,
+                creds.model,
+            )
+            continue
+
+        research[capability] = {
+            "provider": creds.provider,
+            "base_url": creds.base_url,
+            "api_key": creds.api_key,
+            "ops": ops,
+        }
+        logger.info(
+            "Dispatch: injected %s provider %s (%s)",
+            capability,
+            creds.provider,
+            creds.model,
+        )
+
+    if not research:
+        config_override.pop("research", None)
+    return config_override
+
+
 async def _inject_system_kb_embedding_profile(env_keys: dict[str, Any]) -> str | None:
     """Inject the stable, system-owned embedding profile for knowledge bases.
 
@@ -13751,6 +13823,13 @@ async def _inject_thread_dispatch_credentials(
             del env_keys_block[key]
     if not env_keys_block:
         config_override.pop("env_keys", None)
+
+    await _inject_search_credentials(
+        config_override,
+        user_settings=user_settings,
+        user_id=user_id,
+        resolved_keys=resolved_keys,
+    )
 
     return config_override
 
@@ -15514,7 +15593,16 @@ class ConfigOverrideUpdate(BaseModel):
     notes: str | None = None
 
 
-LLM_MODEL_CAPABILITIES = ("chat", "vision", "embedding", "auxiliary", "whisper", "tts")
+LLM_MODEL_CAPABILITIES = (
+    "chat",
+    "vision",
+    "embedding",
+    "auxiliary",
+    "whisper",
+    "tts",
+    "search",
+    "fetch",
+)
 
 
 class AdminDefaultModelSet(BaseModel):
@@ -15538,12 +15626,14 @@ VALID_CATALOG_CAPABILITIES = (
     "vision",
     "whisper",
     "tts",
+    "search",
+    "fetch",
 )
 VALID_CATALOG_PROVIDER_KINDS = ("system", "endpoint")
 
 
 CatalogCapabilityLiteral = Literal[
-    "chat", "auxiliary", "embedding", "vision", "whisper", "tts"
+    "chat", "auxiliary", "embedding", "vision", "whisper", "tts", "search", "fetch"
 ]
 
 
@@ -15645,6 +15735,8 @@ VALID_DEFAULT_MODEL_KINDS = {
     "auxiliary",
     "whisper",
     "tts",
+    "search",
+    "fetch",
 }
 
 # System-scoped API keys only cover shared providers. Codex auth is
@@ -15670,6 +15762,8 @@ class UserSettingsUpdate(BaseModel):
     default_vision_model: str | None = None
     default_whisper_model: str | None = None
     default_tts_model: str | None = None
+    default_search_model: str | None = None
+    default_fetch_model: str | None = None
     default_tts_voice: str | None = None
     default_session_model: str | None = None
     # NOTE: per-phase model defaults (default_strategic_model /
@@ -16177,6 +16271,17 @@ async def lifespan(app: FastAPI):
             )
             audit_ready = False
     logger.info("Database migrations applied")
+
+    # Promote the legacy Tavily secret before any bundled SearXNG seed. This
+    # preserves Tavily as primary on upgrades and leaves SearXNG available for
+    # the optional fallback slot.
+    try:
+        from seed.llm_config import ensure_tavily_search_endpoint
+
+        if await ensure_tavily_search_endpoint(postgres_db):
+            logger.info("Tavily search provider registered from TAVILY_API_KEY")
+    except Exception:
+        logger.warning("ensure_tavily_search_endpoint failed at startup", exc_info=True)
 
     # Auto-wire the ElevenLabs TTS provider when ELEVENLABS_API_KEY is present,
     # so the read-aloud voice provider appears with no manual Admin step (same
@@ -65746,7 +65851,8 @@ async def list_available_models(
 
     - ``groups`` (chat-capability rows, grouped by provider)
     - ``auxiliary_models`` / ``vision_models`` / ``embedding_models`` /
-      ``whisper_models`` / ``tts_models`` (one helper list per capability)
+      ``whisper_models`` / ``tts_models`` / ``search_models`` /
+      ``fetch_models`` (one helper list per capability)
 
     Every row carries ``configured: true`` because the catalog only
     contains rows whose transport (system_api_keys row or system endpoint)
@@ -65775,6 +65881,8 @@ async def list_available_models(
     embedding: list[dict[str, Any]] = []
     whisper: list[dict[str, Any]] = []
     tts: list[dict[str, Any]] = []
+    search: list[dict[str, Any]] = []
+    fetch: list[dict[str, Any]] = []
 
     configured_providers: set[str] = set()
 
@@ -65802,6 +65910,10 @@ async def list_available_models(
             whisper.append(helper_entry)
         if "tts" in capabilities_set:
             tts.append(helper_entry)
+        if "search" in capabilities_set:
+            search.append(helper_entry)
+        if "fetch" in capabilities_set:
+            fetch.append(helper_entry)
         # Chat-only path: register the row in its provider group. Embedding-/
         # whisper-/tts-only rows skip this path so the chat dropdowns don't
         # show non-chat models.
@@ -65858,6 +65970,8 @@ async def list_available_models(
         "vision_models": vision,
         "whisper_models": whisper,
         "tts_models": tts,
+        "search_models": search,
+        "fetch_models": fetch,
         "embedding_models": embedding,
         "configured_providers": sorted(configured_providers),
         "reasoning_by_model": reasoning_by_model,
