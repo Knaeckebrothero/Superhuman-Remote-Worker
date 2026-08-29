@@ -1,40 +1,73 @@
 import subprocess
-import tempfile
-from pathlib import Path
 
 import asyncssh
 import pytest
 
 from services.ssh_gateway_config import (
+    ENCRYPTION_ALGS,
     KEX_ALGS,
     MAC_ALGS,
     SERVER_HOST_KEY_ALGS,
     SIGNATURE_ALGS,
+    GatewayConfig,
     load_config,
+    narrow_signature_algorithms,
     server_options,
 )
 
-# A real Ed25519 host key, generated once for the whole module (same
-# module-level tempfile.mkdtemp() pattern tests/conftest.py already uses for
-# WORKSPACE_PATH). load_config now opens and parses every configured host
-# key to enforce SERVER_HOST_KEY_ALGS == ["ssh-ed25519"] (fix round 1 below),
-# so BASE_ENV's host key must be a real, valid key on disk rather than the
-# placeholder path this file used before that check existed.
-_KEY_DIR = Path(tempfile.mkdtemp(prefix="ssh_gateway_config_test_"))
-_ED25519_HOST_KEY = _KEY_DIR / "ed25519"
-subprocess.run(
-    ["ssh-keygen", "-t", "ed25519", "-N", "", "-f", str(_ED25519_HOST_KEY)],
-    check=True,
-    capture_output=True,
-)
-
+# Placeholder paths -- both are overwritten with real, valid Ed25519 keys by
+# the autouse `_real_keys_for_base_env` fixture below, before any test in
+# this file executes. load_config now opens and parses both the host key(s)
+# (_require_ed25519_host_key) and the CA key (load_user_ca, via Task 1's
+# SshUserCa), so a fake path here would fail every test that doesn't
+# specifically want to exercise that failure.
 BASE_ENV = {
-    "SSH_GATEWAY_HOST_KEYS": str(_ED25519_HOST_KEY),
-    "SSH_GATEWAY_USER_CA": "/run/secrets/gw/user-ca",
+    "SSH_GATEWAY_HOST_KEYS": "",
+    "SSH_GATEWAY_USER_CA": "",
     "ORCHESTRATOR_URL": "http://orchestrator:8085",
     "MCP_INTERNAL_KEY": "internal",
     "SSH_GATEWAY_ALLOWED_ORIGINS": "https://cockpit.srw.works",
 }
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _real_keys_for_base_env(tmp_path_factory):
+    """Generate the real Ed25519 host key and CA key BASE_ENV needs, lazily.
+
+    Fixtures only run when a test that depends on them is about to execute
+    -- never during mere collection -- so a bare `--collect-only` does not
+    mint a private key or leak a directory, unlike the module-level
+    `subprocess.run(...)`/`tempfile.mkdtemp()` this file used before. Uses
+    `tmp_path_factory` (session-scoped by nature) rather than the
+    function-scoped `tmp_path`, and follows pytest's normal temp-dir
+    retention/cleanup policy rather than a bare, uncleaned `mkdtemp()` --
+    matching Task 1's sibling suite (`test_ssh_gateway_ca.py`), which
+    generates its CA key through a `tmp_path`-based fixture rather than at
+    import time.
+
+    Session-scoped and autouse: runs once for the whole file, mutates
+    BASE_ENV's dict in place before the first test body executes, so every
+    other test in this file keeps referencing plain `BASE_ENV`/`{**BASE_ENV,
+    ...}` with no signature changes needed.
+    """
+    key_dir = tmp_path_factory.mktemp("ssh_gateway_config")
+
+    host_key = key_dir / "host_ed25519"
+    subprocess.run(
+        ["ssh-keygen", "-t", "ed25519", "-N", "", "-f", str(host_key)],
+        check=True,
+        capture_output=True,
+    )
+
+    ca_key = key_dir / "user_ca_ed25519"
+    subprocess.run(
+        ["ssh-keygen", "-t", "ed25519", "-N", "", "-f", str(ca_key)],
+        check=True,
+        capture_output=True,
+    )
+
+    BASE_ENV["SSH_GATEWAY_HOST_KEYS"] = str(host_key)
+    BASE_ENV["SSH_GATEWAY_USER_CA"] = str(ca_key)
 
 
 def test_no_sha1_anywhere():
@@ -55,7 +88,7 @@ def test_fido_types_are_accepted():
 
 
 def test_requires_a_host_key():
-    with pytest.raises(ValueError, match="host key"):
+    with pytest.raises(ValueError, match="SSH_GATEWAY_HOST_KEYS"):
         load_config({**BASE_ENV, "SSH_GATEWAY_HOST_KEYS": ""})
 
 
@@ -94,12 +127,11 @@ def test_server_options_pin_every_algorithm_list():
 def test_server_host_key_algs_have_no_sha1_or_plain_rsa():
     """SERVER_HOST_KEY_ALGS is the fifth pinned list; test_no_sha1_anywhere
     above does not cover it (it was never imported in the brief's own test).
-    Fix round 1 makes this exact rather than just "no known-weak names":
     RSA is not offered as a fallback at all (see
     test_load_config_rejects_a_non_ed25519_host_key for why), so the only
     algorithm this gateway's own inbound identity ever advertises is
     ssh-ed25519."""
-    assert SERVER_HOST_KEY_ALGS == ["ssh-ed25519"]
+    assert SERVER_HOST_KEY_ALGS == ("ssh-ed25519",)
     for name in SERVER_HOST_KEY_ALGS:
         assert "sha1" not in name.lower()
     assert "ssh-rsa" not in SERVER_HOST_KEY_ALGS
@@ -111,6 +143,34 @@ def test_requires_the_user_ca_path():
     instead of at the first connection."""
     with pytest.raises(ValueError, match="[Cc][Aa]"):
         load_config({**BASE_ENV, "SSH_GATEWAY_USER_CA": ""})
+
+
+def test_load_config_rejects_a_non_ed25519_ca(tmp_path):
+    """Task 1's SshUserCa.__init__ already refuses a non-Ed25519 CA key;
+    load_config must actually call it (via load_user_ca) rather than just
+    checking the path string is non-empty, or a wrong-type CA passes startup
+    and fails at the first attempted mint -- verbatim the failure mode
+    _require_ed25519_host_key exists to close for host keys, one field
+    over."""
+    rsa_ca_path = tmp_path / "rsa_ca"
+    subprocess.run(
+        ["ssh-keygen", "-t", "rsa", "-b", "3072", "-N", "", "-f", str(rsa_ca_path)],
+        check=True,
+        capture_output=True,
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        load_config({**BASE_ENV, "SSH_GATEWAY_USER_CA": str(rsa_ca_path)})
+
+    assert "ed25519" in str(exc_info.value).lower()
+
+
+def test_load_config_rejects_a_missing_ca_file():
+    """load_user_ca opens the file directly and load_config lets it raise
+    (no wrapping) -- a missing CA file surfaces as OSError, not ValueError,
+    which is still fail-closed at startup rather than at first connection."""
+    with pytest.raises(OSError):
+        load_config({**BASE_ENV, "SSH_GATEWAY_USER_CA": "/nonexistent/path/gone"})
 
 
 def test_internal_key_never_appears_in_repr():
@@ -162,13 +222,14 @@ async def test_server_options_are_accepted_by_asyncssh():
     either.
 
     The second assertion is the property SERVER_HOST_KEY_ALGS exists to
-    describe, and the one that actually matters: not that the constant is
-    the right list of strings, but that the config this module accepts
-    causes the real, installed asyncssh to advertise exactly {ssh-ed25519}
-    as its host-key algorithm during KEX. See
-    test_load_config_rejects_a_non_ed25519_host_key for the negative control
-    that shows this assertion (and the config it depends on) actually
-    discriminates.
+    describe: that the config this module accepts causes the real, installed
+    asyncssh to advertise exactly {ssh-ed25519} as its host-key algorithm
+    during KEX, GIVEN NO `<path>-cert.pub` SIDECAR NEXT TO THE HOST KEY.
+    A sidecar there is auto-paired by asyncssh's key loading and would add
+    `ssh-ed25519-cert-v01@openssh.com` too (confirmed empirically) -- not a
+    weak algorithm, so not a defect, just outside what this fixture creates
+    and worth being precise about rather than claiming "the only thing ever
+    advertised."
     """
     opts = server_options(load_config(BASE_ENV))
 
@@ -181,7 +242,7 @@ async def test_server_options_are_accepted_by_asyncssh():
 
 
 def test_load_config_rejects_a_non_ed25519_host_key(tmp_path):
-    """SERVER_HOST_KEY_ALGS says ["ssh-ed25519"], but asyncssh has no
+    """SERVER_HOST_KEY_ALGS says ("ssh-ed25519",), but asyncssh has no
     server-side option that can enforce it (see that constant's comment in
     ssh_gateway_config.py): a server's advertised host-key algorithms come
     straight from the *type* of key material loaded via `server_host_keys`,
@@ -205,3 +266,131 @@ def test_load_config_rejects_a_non_ed25519_host_key(tmp_path):
     message = str(exc_info.value)
     assert "ed25519" in message.lower()
     assert str(rsa_path) in message
+
+
+def test_algorithm_policy_lists_are_immutable():
+    """A caller mutating the list server_options() returns must not corrupt
+    the module's own policy constants for every other connection -- tuples
+    close this by construction rather than by convention."""
+    assert isinstance(SIGNATURE_ALGS, tuple)
+    assert isinstance(KEX_ALGS, tuple)
+    assert isinstance(MAC_ALGS, tuple)
+    assert isinstance(ENCRYPTION_ALGS, tuple)
+    assert isinstance(SERVER_HOST_KEY_ALGS, tuple)
+
+    opts = server_options(load_config(BASE_ENV))
+    with pytest.raises(AttributeError):
+        opts["signature_algs"].append("evil")
+
+
+def test_server_options_pins_password_kbdint_and_host_based_auth_off():
+    """Only public-key auth is meant to reach this gateway. These three are
+    False today only because the not-yet-written SSHServer subclass's
+    inherited validate_password/validate_kbdint_response/
+    validate_host_based_user_key return False/None by default -- pinning
+    them here means a later subclass adding one of those methods for an
+    unrelated reason cannot silently open password/kbdint/host-based auth on
+    a listener with no MaxAuthTries."""
+    opts = server_options(load_config(BASE_ENV))
+    assert opts["password_auth"] is False
+    assert opts["kbdint_auth"] is False
+    assert opts["host_based_auth"] is False
+
+
+def _gateway_config_kwargs(**overrides):
+    base = dict(
+        host_key_paths=("/x",),
+        user_ca_path="/y",
+        orchestrator_url="http://z",
+        internal_key="k",
+        allowed_origins=("https://a",),
+    )
+    base.update(overrides)
+    return base
+
+
+def test_gateway_config_rejects_non_positive_caps():
+    """login_timeout=-5, max_channels_per_connection=0,
+    preauth_rate_per_minute=-1 all constructed a GatewayConfig without
+    complaint before this fix, and login_timeout flows straight into
+    asyncssh's run_server."""
+    for field_name, bad_value in (
+        ("login_timeout", -5),
+        ("login_timeout", 0),
+        ("keepalive_interval", -1),
+        ("max_preauth_connections", 0),
+        ("preauth_rate_per_minute", -1),
+        ("max_channels_per_connection", 0),
+        ("max_attachments_per_workspace", 0),
+    ):
+        with pytest.raises(ValueError, match=field_name):
+            GatewayConfig(**_gateway_config_kwargs(**{field_name: bad_value}))
+
+
+def test_gateway_config_accepts_the_positive_defaults():
+    """Negative control for the above: construction must still succeed with
+    ordinary positive values (the dataclass defaults)."""
+    config = GatewayConfig(**_gateway_config_kwargs())
+    assert config.login_timeout == 20
+    assert config.max_channels_per_connection == 12
+
+
+def _sign_and_verify(key, pub, algorithm: bytes, data: bytes) -> bool:
+    return pub.verify(data, key.sign(data, algorithm))
+
+
+def test_narrow_signature_algorithms_rejects_sha1_rsa_but_keeps_sha2():
+    """signature_algs never reaches SSHKey.verify() server-side (see
+    narrow_signature_algorithms's own docstring for the full citation
+    trail); the only way to actually refuse a SHA-1 RSA signature is to
+    narrow the key object itself. Both directions in one test: narrowing
+    must reject what it's supposed to reject AND keep what it's supposed to
+    keep, or a helper that narrows too aggressively would break every RSA
+    key using SIGNATURE_ALGS's own rsa-sha2-256/512 entries."""
+    key = asyncssh.generate_private_key("ssh-rsa", key_size=3072)
+    pub = key.convert_to_public()
+    data = b"session-id-and-auth-message"
+
+    narrow_signature_algorithms(pub)
+
+    assert _sign_and_verify(key, pub, b"ssh-rsa", data) is False
+    assert _sign_and_verify(key, pub, b"rsa-sha2-256", data) is True
+
+
+def test_unnarrowed_rsa_key_accepts_sha1_as_the_negative_control():
+    """Without narrow_signature_algorithms, the exact vulnerability
+    Important 1 identified: an RSA key accepts a SHA-1 ssh-rsa signature
+    exactly as readily as rsa-sha2-256, with SIGNATURE_ALGS excluding
+    ssh-rsa having no effect on this at all. This is what proves the test
+    above is discriminating -- if narrow_signature_algorithms silently
+    became a no-op, its rejection assertion would start matching this
+    test's acceptance instead."""
+    key = asyncssh.generate_private_key("ssh-rsa", key_size=3072)
+    pub = key.convert_to_public()
+    data = b"session-id-and-auth-message"
+
+    assert _sign_and_verify(key, pub, b"ssh-rsa", data) is True
+    assert _sign_and_verify(key, pub, b"rsa-sha2-256", data) is True
+
+
+class _ReadOnlyAlgsKey:
+    """A minimal stand-in for an SSHKey whose sig_algorithms/
+    all_sig_algorithms cannot actually be changed -- simulating a future
+    asyncssh where narrowing silently has no effect, to prove
+    narrow_signature_algorithms notices rather than reporting success."""
+
+    sig_algorithms = (b"ssh-rsa", b"rsa-sha2-256")
+    all_sig_algorithms = frozenset({b"ssh-rsa", b"rsa-sha2-256"})
+
+    def __setattr__(self, name, value):
+        pass  # silently swallow -- exactly the failure mode being guarded against
+
+
+def test_narrow_signature_algorithms_fails_loudly_if_narrowing_has_no_effect():
+    """The main risk of mutating an instance attribute: if a future asyncssh
+    makes all_sig_algorithms/sig_algorithms read-only, or otherwise silently
+    swallows the assignment, narrow_signature_algorithms must not let that
+    pass quietly -- an operator would otherwise believe SHA-1 was excluded
+    when it was not."""
+    with pytest.raises(AssertionError, match="had no effect"):
+        narrow_signature_algorithms(_ReadOnlyAlgsKey())

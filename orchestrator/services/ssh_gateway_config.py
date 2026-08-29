@@ -2,11 +2,9 @@
 
 Every algorithm list here is pinned rather than inherited. asyncssh's defaults
 are meaningfully weaker than OpenSSH 10.2's: they include
-diffie-hellman-group14-sha1, hmac-sha1, umac-64-etm@openssh.com, and — most
-importantly — register ``ssh-rsa`` with ``default=True``, so a gateway that does
-not pin ``signature_algs`` accepts SHA-1 RSA signatures that OpenSSH disabled in
-8.8 (2021). Every string below was checked against the installed asyncssh
-2.24.0's own algorithm registries (``asyncssh.kex.get_kex_algs()``,
+diffie-hellman-group14-sha1, hmac-sha1, umac-64-etm@openssh.com, and register
+``ssh-rsa`` with ``default=True``. Every string below was checked against the
+installed asyncssh 2.24.0's own algorithm registries (``asyncssh.kex.get_kex_algs()``,
 ``asyncssh.mac.get_mac_algs()``, ``asyncssh.encryption.get_encryption_algs()``,
 ``asyncssh.public_key.get_public_key_algs()``) rather than assumed from the
 spelling in a design doc — see tests/test_ssh_gateway_config.py's
@@ -14,6 +12,25 @@ spelling in a design doc — see tests/test_ssh_gateway_config.py's
 coroutine ``asyncssh.run_server`` uses to parse these kwargs
 (``SSHServerConnectionOptions.construct``, confirmed by reading
 ``connection.py``'s ``run_server`` source), unmocked.
+
+CORRECTION (fix round 2): pinning ``signature_algs`` does NOT stop a SHA-1
+``ssh-rsa`` signature from authenticating -- an earlier version of this
+docstring claimed otherwise, and that was wrong. Server-side,
+``signature_algs`` is consulted only for ``_select_algs``'s config-name
+validation and to build the advisory ``server-sig-algs`` extension sent to
+the client (``connection.py:1992``); a client that ignores that hint
+authenticates anyway, because ``SSHServerConnection.validate_public_key``
+calls ``key.verify()`` directly (``connection.py:6217``) and
+``SSHKey.verify()`` checks only the connecting KEY's own fixed
+``all_sig_algorithms`` (``public_key.py:587``), never
+``options.signature_algs``. Confirmed empirically: an RSA key accepts and
+verifies a ``ssh-rsa``-signed blob even with SIGNATURE_ALGS excluding it
+entirely (see `test_unnarrowed_rsa_key_accepts_sha1_as_the_negative_control`
+in tests/test_ssh_gateway_config.py). Pinning ``signature_algs`` here is
+still correct config hygiene, just not what excludes a SHA-1 RSA
+*authentication* signature -- ``narrow_signature_algorithms()`` below,
+applied to a specific connecting key, is what actually does that, and it is
+inert until a caller invokes it (see its own docstring).
 
 ``SERVER_HOST_KEY_ALGS`` is the one list in this module that ``server_options``
 below does NOT hand to asyncssh, and that is not an oversight. Read its own
@@ -28,7 +45,9 @@ from typing import Mapping, Optional
 
 import asyncssh
 
-SIGNATURE_ALGS = [
+from services.ssh_gateway_ca import load_user_ca
+
+SIGNATURE_ALGS = (
     "ssh-ed25519",
     "sk-ssh-ed25519@openssh.com",
     "sk-ecdsa-sha2-nistp256@openssh.com",
@@ -37,26 +56,26 @@ SIGNATURE_ALGS = [
     "ecdsa-sha2-nistp256",
     "ecdsa-sha2-nistp384",
     "ecdsa-sha2-nistp521",
-]
+)
 
-KEX_ALGS = [
+KEX_ALGS = (
     "mlkem768x25519-sha256",
     "curve25519-sha256",
     "curve25519-sha256@libssh.org",
     "diffie-hellman-group16-sha512",
     "diffie-hellman-group18-sha512",
-]
+)
 
-ENCRYPTION_ALGS = [
+ENCRYPTION_ALGS = (
     "aes256-gcm@openssh.com",
     "aes128-gcm@openssh.com",
     "chacha20-poly1305@openssh.com",
-]
+)
 
-MAC_ALGS = [
+MAC_ALGS = (
     "hmac-sha2-256-etm@openssh.com",
     "hmac-sha2-512-etm@openssh.com",
-]
+)
 
 # Ed25519 only. RSA is deliberately not offered as a fallback -- see why
 # below -- so there is exactly one entry.
@@ -103,13 +122,78 @@ MAC_ALGS = [
 # opens and parses every configured host key and refuses anything whose
 # algorithm is not `ssh-ed25519`, before any key ever reaches
 # `server_options()`/`run_server`. That is why RSA is not offered as a
-# fallback host key at all, unlike SIGNATURE_ALGS/SERVER host-key
-# *client-auth* algorithms further up this module, where RSA survives as
-# `rsa-sha2-256`/`rsa-sha2-512` because `signature_algs` genuinely is
-# enforceable by asyncssh. OpenSSH has supported Ed25519 host keys since 6.5
-# (2014) and JetBrains's own SSH stack does too, so this excludes no client
-# this gateway must serve in 2026.
-SERVER_HOST_KEY_ALGS = ["ssh-ed25519"]
+# fallback host key at all -- there is no lever anywhere in the options
+# layer to keep only its SHA-2 variants for a host key, unlike a specific
+# *connecting user's* authentication key, where `narrow_signature_
+# algorithms()` (below) can narrow that one key instance to keep
+# `rsa-sha2-256`/`rsa-sha2-512` while dropping `ssh-rsa` -- a per-connection
+# operation with no host-key equivalent, since the server's host-key set is
+# fixed for the life of the process, not chosen fresh per connection.
+# CORRECTION (fix round 2): an earlier version of this comment claimed
+# `signature_algs` itself is what lets RSA survive on the auth side. It does
+# not enforce that or anything else against an inbound signature -- see the
+# module docstring's correction and `narrow_signature_algorithms`'s
+# docstring for what actually does. OpenSSH has supported Ed25519 host keys
+# since 6.5 (2014) and JetBrains's own SSH stack does too, so dropping RSA
+# here excludes no client this gateway must serve in 2026.
+SERVER_HOST_KEY_ALGS = ("ssh-ed25519",)
+
+_SIGNATURE_ALGS_BYTES = frozenset(alg.encode("ascii") for alg in SIGNATURE_ALGS)
+
+
+def narrow_signature_algorithms(key: asyncssh.SSHKey) -> None:
+    """Narrow ``key``'s own signature algorithms to intersect with SIGNATURE_ALGS.
+
+    INERT UNTIL A CALLER INVOKES IT -- nothing in this codebase calls this
+    yet. ``signature_algs`` (the config kwarg server_options() hands to
+    ``asyncssh.run_server``) does NOT gate which signature algorithm
+    asyncssh accepts when verifying an inbound client authentication
+    signature; see the module docstring's fix-round-2 correction for the
+    full citation trail. In short: ``SSHServerConnection.validate_public_key``
+    (``connection.py:6199``) calls ``key.verify()`` directly
+    (``connection.py:6217``), and ``SSHKey.verify()`` (``public_key.py:580``)
+    checks only ``sig_algorithm in self.all_sig_algorithms`` -- the KEY's
+    own fixed, per-type set, never ``options.signature_algs``. For RSA,
+    ``all_sig_algorithms`` always includes legacy SHA-1 ``ssh-rsa``
+    (``rsa.py:98-107``), so a plain RSA key accepts and verifies a
+    ``ssh-rsa``-signed authentication blob no matter what SIGNATURE_ALGS
+    says -- confirmed empirically, see
+    ``test_unnarrowed_rsa_key_accepts_sha1_as_the_negative_control``.
+
+    The only way to actually refuse a SHA-1 RSA signature is to narrow the
+    KEY OBJECT itself, per connection, before it is used to verify
+    anything -- which is what this function does: it mutates
+    ``sig_algorithms``/``all_sig_algorithms`` on the given instance,
+    shadowing the class attribute so every other instance of the same key
+    type (and the class itself) is unaffected. Task 6's connecting-key
+    resolution (wherever this plan's gateway resolves a client's key before
+    ``validate_public_key`` verifies it) is the intended call site -- that
+    wiring is carried forward, not built here.
+
+    RISK, made loud rather than silent: this relies on
+    ``all_sig_algorithms``/``sig_algorithms`` being plain, writable instance
+    attributes, which is true in the installed 2.24.0 but is not a
+    documented contract. If a future asyncssh makes them read-only (or
+    otherwise silently drops the assignment), this raises ``AssertionError``
+    immediately rather than letting a caller believe SHA-1 was excluded
+    when it was not -- see
+    ``test_narrow_signature_algorithms_fails_loudly_if_narrowing_has_no_effect``.
+    """
+    narrowed_sig_algorithms = tuple(
+        alg for alg in key.sig_algorithms if alg in _SIGNATURE_ALGS_BYTES
+    )
+    narrowed_all_sig_algorithms = set(key.all_sig_algorithms) & _SIGNATURE_ALGS_BYTES
+
+    key.sig_algorithms = narrowed_sig_algorithms
+    key.all_sig_algorithms = narrowed_all_sig_algorithms
+
+    if key.all_sig_algorithms != narrowed_all_sig_algorithms:
+        raise AssertionError(
+            "narrow_signature_algorithms: assigning all_sig_algorithms had "
+            "no effect -- this asyncssh's SSHKey no longer exposes it as a "
+            "plain writable attribute, so this key was NOT narrowed and "
+            "still accepts every algorithm its type supports"
+        )
 
 
 @dataclass(frozen=True)
@@ -125,6 +209,11 @@ class GatewayConfig:
     # omits the field from __repr__ entirely (and therefore from __str__,
     # which falls back to __repr__ here), rather than substituting a
     # placeholder, so there is nothing partial to accidentally match against.
+    # It protects repr()/str() ONLY: dataclasses.asdict(config) walks
+    # dataclasses.fields() directly and ignores the repr metadata entirely,
+    # so it still returns internal_key verbatim (confirmed empirically) --
+    # do not asdict() a GatewayConfig anywhere that result might be logged
+    # or serialized.
     internal_key: str = field(repr=False)
     allowed_origins: tuple[str, ...]
     login_timeout: int = 20
@@ -135,11 +224,36 @@ class GatewayConfig:
     max_attachments_per_workspace: int = 4
     require_wss_token: bool = True
 
+    def __post_init__(self) -> None:
+        """Reject a non-positive cap rather than constructing it silently.
+
+        Before this, login_timeout=-5 or max_channels_per_connection=0
+        constructed a GatewayConfig without complaint, and login_timeout
+        flows straight into asyncssh's run_server -- a degenerate value
+        there is a footgun (0 or negative channel/connection caps would
+        mean "never admit anything" at best and something asyncssh itself
+        does not validate at worst) discovered at runtime instead of at
+        construction.
+        """
+        for field_name in (
+            "login_timeout",
+            "keepalive_interval",
+            "max_preauth_connections",
+            "preauth_rate_per_minute",
+            "max_channels_per_connection",
+            "max_attachments_per_workspace",
+        ):
+            value = getattr(self, field_name)
+            if value <= 0:
+                raise ValueError(
+                    f"GatewayConfig.{field_name} must be positive, got {value}"
+                )
+
 
 def _require_ed25519_host_key(path: str) -> None:
     """Reject any host key that is not Ed25519.
 
-    SERVER_HOST_KEY_ALGS says ``["ssh-ed25519"]``, but there is no asyncssh
+    SERVER_HOST_KEY_ALGS says ``("ssh-ed25519",)``, but there is no asyncssh
     server-side option that enforces it -- see that constant's own comment.
     A server's advertised host-key algorithms come straight from the *type*
     of key material loaded via `server_host_keys`, with no per-key filter
@@ -153,7 +267,12 @@ def _require_ed25519_host_key(path: str) -> None:
     own SSH stack does too, so this is not a compatibility compromise.
     """
     try:
-        with open(path, encoding="utf-8") as handle:
+        # Binary, not text: asyncssh.import_private_key accepts bytes or
+        # str (BytesOrStr), and a valid PKCS#1/PKCS#8 DER-encoded key is
+        # not valid UTF-8. Opening in text mode would reject such a key
+        # with a message blaming the key's content rather than the mode
+        # this file read it in.
+        with open(path, "rb") as handle:
             key = asyncssh.import_private_key(handle.read())
     except Exception as exc:
         raise ValueError(
@@ -198,6 +317,14 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> GatewayConfig:
             "without it no inner-hop certificate can ever be minted, so every "
             "connection would authenticate and then fail"
         )
+    # Parse it now, the same way _require_ed25519_host_key parses host keys:
+    # a missing file, a .pub, an encrypted key, or a non-Ed25519 CA must fail
+    # here, not at the first attempted mint. Task 1's SshUserCa.__init__
+    # already refuses anything but Ed25519 (and anything unparseable) --
+    # reuse it rather than re-deriving that check, and let it raise: a
+    # missing file surfaces as OSError, a wrong key type or unusable content
+    # as ValueError, whichever asyncssh/SshUserCa itself produces.
+    load_user_ca(user_ca_path)
 
     internal_key = (src.get("MCP_INTERNAL_KEY") or "").strip()
     if not internal_key:
@@ -250,6 +377,19 @@ def server_options(config: GatewayConfig) -> dict:
         "x11_forwarding": False,
         "line_editor": False,
         "gss_host": None,
+        # Only public-key auth is meant to reach this gateway. These three
+        # are False today only because the not-yet-written SSHServer
+        # subclass inherits validate_password/validate_kbdint_response/
+        # validate_host_based_user_key, which the base class returns
+        # False/None from by default -- an accident of what that subclass
+        # happens not to override, not a policy this file states. Pinning
+        # them here means a later subclass adding one of those methods for
+        # an unrelated reason cannot silently enable password/kbdint/
+        # host-based auth on an internet-facing listener that has no
+        # MaxAuthTries (asyncssh ships no auth-attempt limiter at all).
+        "password_auth": False,
+        "kbdint_auth": False,
+        "host_based_auth": False,
         # Default 120s; every pre-auth connection holds a socket for that long.
         "login_timeout": config.login_timeout,
         # Default 0 (disabled).
