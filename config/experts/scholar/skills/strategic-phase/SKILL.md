@@ -1,0 +1,77 @@
+---
+name: strategic-phase
+description: Scholar's strategic-phase instructions — assess exploration coverage, maintain the idea, experiment and dead-end indexes, plan the next research batch. Delivered automatically once per strategic phase through the phase_start binding; not a skill to invoke by hand.
+display_name: Strategic Phase (Scholar)
+tags:
+  - phase
+  - worker
+catalog: hidden
+---
+
+# Strategic phase — Scholar
+
+You are in STRATEGIC mode. Purpose: assess exploration coverage, identify underexplored areas, and plan the next research batch.
+These instructions apply to the whole strategic phase, until the next [PHASE_TRANSITION] notice.
+
+Do NOT execute research, run experiments, or write idea artifacts. This phase is for reviewing coverage and planning exploration direction.
+
+Coverage review:
+1. Read plan.md for current exploration strategy and phase history.
+2. Search the knowledge base (kb_search) for dead ends, failed approaches, and blockers from previous phases. Do not repeat strategies already marked as failed.
+3. List ideas produced so far in `output/ideas/` — check quantity and topic spread.
+4. Compare coverage against the task description. Which aspects have been explored? Which are untouched?
+5. Check for depth traps: have you spent multiple phases on the same topic? If so, write what you have and move on.
+6. Review dead ends (kb_search with tag="dead-end") — are there adjacent angles worth exploring from failed leads?
+
+Knowledge maintenance:
+- SEARCH FIRST: Before creating any note, use kb_search to check for existing entries on the same topic. If a match exists, UPDATE it (kb_update) rather than creating a duplicate.
+- Track ideas written with the kb_write tool (type=state, tag=idea-index); content lists NNN_title references. Search first, update if exists.
+- Track experiments run with the kb_write tool (type=state, tag=experiment-index); content lists NNN_title references and outcomes.
+- Track dead ends with the kb_write tool (type=learning, tag=dead-end); content gives topic + why abandoned. These prevent revisiting.
+- Track key sources with the kb_write tool (type=learning, tag=key-source) for cross-referencing in future phases.
+- Record failed approaches with root cause via the kb_write tool (type=learning, tag=failed-approach); include what was tried and why it failed.
+- Mark outdated knowledge as superseded with the kb_update tool (status=superseded). Link to the replacement note.
+- Prefer UPDATE over CREATE — the knowledge base should converge, not accumulate multiple versions of truth.
+
+Plan adaptation:
+- Evaluate breadth: have you used multiple exploration modes (web, codebase, logs, experiments) or stuck to one?
+- Evaluate volume: are you producing enough ideas per phase? Target 2-4 idea artifacts per tactical phase.
+- If a research direction dried up, pivot to a different exploration mode or angle.
+- If the task has multiple facets, ensure each gets at least one tactical phase of exploration.
+
+{% if has_tool("spawn_subagent") -%}
+Parallel research via subagents — the DEFAULT for separable work:
+When the remaining work has 2+ separable research threads, fanning them out to subagents is the default. Executing separable threads sequentially yourself is the exception and needs a reason (threads depend on each other's results, or the whole question is answerable in 1-2 tool calls). `spawn_subagent` is cheap and non-blocking: each subagent runs inline with its own fresh context, does the reading, and returns a distilled result string directly to you. Nothing suspends and nothing is merged — you delegate the reading so your own context stays small for synthesis.
+
+How to fan out:
+- Call `spawn_subagent` multiple times in a SINGLE turn — one call per thread. The calls run concurrently: N calls in one turn = N parallel readers.
+- Each task_description must be fully self-contained — the subagent cannot see your conversation. Include: the specific research question, which sources to use (URLs, paths, search angles) and which exploration mode (web, codebase, logs), and exactly what to return.
+- Use expected_return_format to shape the reply (e.g., "3-5 findings as bullets, each with the source URL and a one-line assessment").
+- Subagents share your citation library — tell them to cite sources (cite_web / cite_document) as they read; their citations are available to you afterwards.
+
+Delegate vs do it yourself:
+- Delegate (default): different topics, different source types, different facets of the same question, comparison research, reading a cluster of long sources.
+- Do it yourself (exception): threads that require each other's results, a single narrow question, and ALWAYS the synthesis.
+
+Scaling: 2-3 subagents for comparison research or multi-facet exploration, 4-5 for broad surveys across many independent topics. Never spawn 1 subagent for work you could do in a couple of tool calls.
+
+Your role — synthesizer, not reader:
+1. Review each returned result for quality and citation support
+2. Identify overlaps, contradictions, and gaps across the results — reconcile contradictions yourself if needed
+3. Write the idea artifacts and knowledge notes yourself from the returned findings (deduplicated, not accumulated)
+4. Update plan.md with what was covered and what gaps remain
+
+Do NOT redo delegated work — if a subagent researched topic X, do not also research topic X yourself. Spend your own tool calls on synthesis, gap analysis, and coverage assessment.
+{% endif -%}
+Planning research todos:
+Each todo should target a specific exploration question. Specify:
+- The question to answer (not "research X" but "what are the top 3 approaches to X and their tradeoffs?")
+- Which exploration mode to use (web, codebase, logs, experiment)
+- What output to produce (idea artifact, experiment, or note)
+
+Bad: "Research caching"
+Good: "Search for Redis vs in-memory caching patterns for Python LangGraph agents. Compare latency, complexity, and persistence tradeoffs. Write idea artifact to output/ideas/"
+
+Action bias: Strategic review should be shorter than tactical exploration. If you have spent more than 8 tool calls without transitioning, you are over-planning. Define exploration targets and move to execution.
+
+When strategic review is complete, transition to tactical phase with specific exploration actions.

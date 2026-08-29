@@ -25,8 +25,8 @@ config/
 ├── prompts/                     # Prompt templates (system prompt, phase prompts)
 │   ├── systemprompt.txt         # Main system prompt
 │   ├── persona.txt              # Agent persona/identity prompt
-│   ├── strategic.txt            # Strategic phase system prompt
-│   ├── tactical.txt             # Tactical phase system prompt
+│   ├── strategic.txt            # Strategic phase prompt — legacy prompt_mode only; the live
+│   ├── tactical.txt             # Tactical phase prompt      guidance is skills/{strategic,tactical}-phase/SKILL.md
 │   ├── summarization_prompt.txt # Context compaction prompt
 │   ├── systemprompt_minimax.txt # MiniMax M2.7-optimized system prompt
 │   ├── persona_minimax.txt      # MiniMax M2.7-optimized persona

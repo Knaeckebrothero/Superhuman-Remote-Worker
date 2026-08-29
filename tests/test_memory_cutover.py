@@ -540,6 +540,7 @@ def _mock_aux():
 _EXECUTE_PATCHES = (
     ("src.graph.get_archiver", None),
     ("src.graph.get_phase_system_prompt", "SYS"),
+    ("src.graph.get_system_prompt", "SYS"),
 )
 
 
@@ -570,6 +571,7 @@ class TestWorkerExecuteWiring:
         with (
             patch("src.graph.get_archiver", return_value=None),
             patch("src.graph.get_phase_system_prompt", return_value="SYS"),
+            patch("src.graph.get_system_prompt", return_value="SYS"),
         ):
             first = await node(state)
             _apply_turn(state, first)
@@ -638,6 +640,7 @@ class TestWorkerExecuteWiring:
         with (
             patch("src.graph.get_archiver", return_value=None),
             patch("src.graph.get_phase_system_prompt", return_value="SYS"),
+            patch("src.graph.get_system_prompt", return_value="SYS"),
         ):
             first = await node(state)
             _apply_turn(state, first)
@@ -678,6 +681,7 @@ class TestWorkerExecuteWiring:
         with (
             patch("src.graph.get_archiver", return_value=None),
             patch("src.graph.get_phase_system_prompt", return_value="SYS"),
+            patch("src.graph.get_system_prompt", return_value="SYS"),
         ):
             first = await node(state)
             _apply_turn(state, first)
@@ -729,6 +733,7 @@ class TestWorkerExecuteWiring:
         with (
             patch("src.graph.get_archiver", return_value=None),
             patch("src.graph.get_phase_system_prompt", return_value="SYS"),
+            patch("src.graph.get_system_prompt", return_value="SYS"),
         ):
             first = await node(_worker_state())
         block = first["messages"][0]
@@ -826,6 +831,7 @@ class TestWorkerExecuteWiring:
         with (
             patch("src.graph.get_archiver", return_value=None),
             patch("src.graph.get_phase_system_prompt", return_value="SYS"),
+            patch("src.graph.get_system_prompt", return_value="SYS"),
         ):
             result = await node(_worker_state())
 
@@ -856,6 +862,7 @@ class TestWorkerExecuteWiring:
             # blocks trip get_phase_system_prompt's .format with the
             # bare default model) — the wiring is.
             patch("src.graph.get_phase_system_prompt", return_value="SYS"),
+            patch("src.graph.get_system_prompt", return_value="SYS"),
         ):
             result = await node(_worker_state())
         await asyncio.sleep(0)  # let the fire-and-forget capture task run
@@ -934,6 +941,7 @@ class TestWorkerExecuteWiring:
         with (
             patch("src.graph.get_archiver", return_value=None),
             patch("src.graph.get_phase_system_prompt", return_value="SYS"),
+            patch("src.graph.get_system_prompt", return_value="SYS"),
         ):
             await node(_worker_state())
         await asyncio.sleep(0)
@@ -1442,3 +1450,168 @@ def _make_kb_retriever(runtime):
     from src.services.memory.plugins.legacy import KbNotesRetriever
 
     return KbNotesRetriever(runtime.knowledge_store, project_id=runtime.project_id)
+
+
+# ---------------------------------------------------------------------------
+# U2 WP2: the phase skills as phase_start blocks, the DB addendum, legacy mode
+# ---------------------------------------------------------------------------
+
+_TACTICAL_SKILL_MD = (
+    "---\n"
+    "name: tactical-phase\n"
+    "description: test body\n"
+    "catalog: hidden\n"
+    "---\n\n"
+    "# Tactical phase\n\n"
+    "You are in TACTICAL mode. UNIQUE TACTICAL SKILL BODY\n"
+)
+
+
+def _bind_tactical_phase_skill(env, *, also_research_guide: bool = False):
+    entries = [
+        InstructionFileEntry(
+            trigger="phase_start:tactical", skill="tactical-phase", enforce=False
+        )
+    ]
+    env["workspace"].write_file("skills/tactical-phase/SKILL.md", _TACTICAL_SKILL_MD)
+    if also_research_guide:
+        guide = InstructionFileEntry(
+            trigger="phase_start:tactical", skill="research-guide", enforce=False
+        )
+        env["workspace"].write_file(guide.path, "RESEARCH GUIDE BODY")
+        entries.append(guide)
+    env["config"].instruction_files = entries
+    env["ctx"]._instruction_files = entries
+    return entries
+
+
+class TestPhaseSkillBlocks:
+    @pytest.mark.asyncio
+    async def test_bound_skill_block_delivers_the_body_without_frontmatter(
+        self, execute_env
+    ):
+        """A bound skill delivers its instructions, not its catalog frontmatter;
+        the factory's [phase: ...] header is the only header."""
+        from src.core.message_markers import protected_path
+
+        env = execute_env
+        _bind_tactical_phase_skill(env)
+        node = _make_execute_node(
+            env["config"],
+            env["workspace"],
+            env["todo"],
+            env["ctx"],
+            env["service"],
+            {"llm": env["llm"], "context": env["context"]},
+        )
+        state = _worker_state()
+        with (
+            patch("src.graph.get_archiver", return_value=None),
+            patch("src.graph.get_phase_system_prompt", return_value="LEGACY-SYS"),
+            patch("src.graph.get_system_prompt", return_value="ONE-SYS"),
+        ):
+            first = await node(state)
+
+        block = first["messages"][0]
+        assert is_protected_message(block)
+        assert protected_path(block) == "skills/tactical-phase/SKILL.md"
+        assert block.content.startswith(
+            "[phase: tactical] Phase instructions (from skills/tactical-phase/SKILL.md)"
+        )
+        assert "UNIQUE TACTICAL SKILL BODY" in block.content
+        assert "catalog: hidden" not in block.content
+        assert "name: tactical-phase" not in block.content
+        assert block.content.count("[phase:") == 1
+        assert "<expert_workflow" not in block.content  # no DB addendum here
+        # Skills mode: the ONE phase-agnostic prompt heads the request.
+        request = env["llm"].ainvoke.call_args_list[0].args[0]
+        assert request[0].content == "ONE-SYS"
+
+    @pytest.mark.asyncio
+    async def test_db_phase_addendum_rides_inside_the_phase_block(self, execute_env):
+        """A DB expert's own tactical prompt is fenced (<expert_workflow>) and
+        appended INSIDE the tactical-phase block — one protected identity per
+        path, delivered once, brace-safe."""
+        env = execute_env
+        _bind_tactical_phase_skill(env)
+        env["config"].extra["_db_prompt_keys"] = ["tactical"]
+        env["config"].extra["_resolved_prompts"] = {
+            "tactical": 'FORK TACTICAL RULE {"json": true}',
+        }
+        node = _make_execute_node(
+            env["config"],
+            env["workspace"],
+            env["todo"],
+            env["ctx"],
+            env["service"],
+            {"llm": env["llm"], "context": env["context"]},
+        )
+        state = _worker_state()
+        with (
+            patch("src.graph.get_archiver", return_value=None),
+            patch("src.graph.get_phase_system_prompt", return_value="LEGACY-SYS"),
+            patch("src.graph.get_system_prompt", return_value="ONE-SYS"),
+        ):
+            first = await node(state)
+            _apply_turn(state, first)
+            second = await node(state)
+
+        blocks = [m for m in first["messages"] if is_protected_message(m)]
+        assert len(blocks) == 1
+        content = blocks[0].content
+        assert content.index("UNIQUE TACTICAL SKILL BODY") < content.index(
+            "<expert_workflow"
+        )
+        assert "FORK TACTICAL RULE" in content
+        assert (
+            '"json": true' in content
+            and "{" not in content.split("<expert_workflow")[1]
+        )
+        assert content.count("<expert_workflow") == 1
+        assert first["phase_instruction_injections"] == [
+            "2:tactical:skills/tactical-phase/SKILL.md"
+        ]
+        # Second turn: the addendum is in history, nothing is re-delivered.
+        assert not any(is_protected_message(m) for m in second["messages"])
+        requests = [c.args[0] for c in env["llm"].ainvoke.call_args_list]
+        for request in requests:
+            assert _count_text(request, "FORK TACTICAL RULE") == 1
+            assert _count_text(request, "<expert_workflow") == 1
+
+    @pytest.mark.asyncio
+    async def test_legacy_prompt_mode_skips_phase_skill_blocks_and_renders_the_swap(
+        self, execute_env
+    ):
+        """phase_settings.prompt_mode == "legacy" (the bench's "current" arm):
+        the per-phase system-prompt swap is rendered and the phase-skill
+        bindings are NOT delivered; other phase_start bindings still are."""
+        env = execute_env
+        _bind_tactical_phase_skill(env, also_research_guide=True)
+        env["config"].phase_settings.prompt_mode = "legacy"
+        node = _make_execute_node(
+            env["config"],
+            env["workspace"],
+            env["todo"],
+            env["ctx"],
+            env["service"],
+            {"llm": env["llm"], "context": env["context"]},
+        )
+        state = _worker_state()
+        with (
+            patch("src.graph.get_archiver", return_value=None),
+            patch("src.graph.get_phase_system_prompt", return_value="LEGACY-SYS"),
+            patch("src.graph.get_system_prompt", return_value="ONE-SYS"),
+        ):
+            first = await node(state)
+
+        request = env["llm"].ainvoke.call_args_list[0].args[0]
+        assert request[0].content == "LEGACY-SYS"
+        blocks = [m for m in first["messages"] if is_protected_message(m)]
+        assert [m.additional_kwargs["srw_instruction_path"] for m in blocks] == [
+            "skills/research-guide/SKILL.md"
+        ]
+        assert _count_text(request, "UNIQUE TACTICAL SKILL BODY") == 0
+        assert _count_text(request, "RESEARCH GUIDE BODY") == 1
+        assert first["phase_instruction_injections"] == [
+            "2:tactical:skills/research-guide/SKILL.md"
+        ]

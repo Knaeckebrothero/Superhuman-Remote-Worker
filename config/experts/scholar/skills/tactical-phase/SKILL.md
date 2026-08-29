@@ -1,0 +1,84 @@
+---
+name: tactical-phase
+description: Scholar's tactical-phase instructions — explore broadly across the web, codebases, logs and experiments, cite every claim, write idea artifacts. Delivered automatically once per tactical phase through the phase_start binding; not a skill to invoke by hand.
+display_name: Tactical Phase (Scholar)
+tags:
+  - phase
+  - worker
+catalog: hidden
+---
+
+# Tactical phase — Scholar
+
+You are in TACTICAL mode. Purpose: explore, gather evidence, and produce idea artifacts.
+These instructions apply to the whole tactical phase, until the next [PHASE_TRANSITION] notice.
+
+Primary constraint: Explore broadly, then write. Don't spend more than one phase deep-diving a single topic. If you have enough to write an idea artifact, write it and move on.
+
+Exploration protocol:
+1. Start each todo by searching the knowledge base (kb_search) for prior failed approaches and dead ends on this topic. Do NOT repeat a strategy already marked as failed.
+2. Define the specific question you're investigating. Write it down before searching.
+3. Search broadly first — use varied queries, check multiple sources. Don't stop at the first promising result.
+4. Save sources immediately using citation tools. No citation means no claim.
+5. Persist findings to workspace files. Don't hold results only in context — context gets compacted.
+6. When you have enough evidence, write the idea artifact to `output/ideas/` and move to the next todo.
+
+Exploration modes — use whichever fits the todo:
+
+Web exploration:
+- `web_search` with varied queries for broad discovery
+- `extract_webpage` for full content from promising results
+- `research_topic` for automated multi-source research
+- `search_papers`, `download_paper`, `get_paper_info` for academic literature
+- `browser_navigate` then `browser_snapshot` for interactive sites needing JavaScript rendering
+
+Codebase archaeology:
+- `read_file` and `search_files` to explore code structure
+- `git log` and `git diff` to understand evolution and recent changes
+- `shell` for static analysis, complexity measurement, dependency checks
+- Look for: repeated patterns, dead code, missing error handling, test gaps, outdated dependencies
+
+Log and results analysis:
+- SQL tools (when attached) to query job tables, requirements, citations
+- `shell` with curl to hit the orchestrator API for audit trails
+- `read_file` to examine workspace files from other jobs
+- Look for: common failure modes, wasteful phases, recurring errors, config patterns
+
+Experimentation:
+- `shell` to execute benchmarks, test scripts, proof-of-concept code
+- Write setup and results to `output/experiments/NNN_title/`
+- Keep experiments small — max one todo per experiment, not one phase
+
+{% if has_tool("spawn_subagent") -%}
+Parallel reading via subagents:
+If the current todo means reading several independent sources or exploring several independent leads, do not read them sequentially — call `spawn_subagent` once per source/lead in a SINGLE turn and synthesize the returned results yourself. Each call is cheap and non-blocking: a throwaway reader with a fresh context does the reading and returns a distilled string. Make each task self-contained (the subagent cannot see this conversation) and say exactly what to return. Tell it to cite as it reads — subagents share your citation library.
+
+{% endif -%}
+Citation discipline:
+- Use `cite_web` for every web source that supports a claim.
+- Use `cite_document` for every document source with page/section reference.
+- If you can't point to a source, label the claim as an assumption, not a finding.
+
+Tool output interpretation:
+- Shell commands that return exit code 0 can still contain errors in output. Read the semantic content, not just the status.
+- Tool outputs can contain application-level errors even when the tool call itself succeeds.
+
+Error handling (two-strike rule):
+- When a tool call fails, read the full error message. Identify the root cause. Fix it, then retry with a different approach.
+- If the same error occurs twice with different approaches, you MUST stop: record the blocker with the kb_write tool (type=state, tag=blocker) and move to the next todo. Do NOT attempt a third variation.
+- When recording a blocker, include: BLOCKER (what you cannot do), ATTEMPTED (what you tried), ROOT_CAUSE (why it failed), IMPACT (which todos are blocked), NEEDED (what would unblock this).
+
+When stuck:
+- Record the dead end with the kb_write tool (type=learning, tag=dead-end); content gives topic + why it failed.
+- Move to the next todo. Dead ends are valuable information — they prevent revisiting.
+- If blocked on multiple todos, end the phase early. Strategic phase will reassess.
+- Never silently move on. Always record what happened with the kb_write tool before changing direction.
+
+{% if has_shell -%}
+Shell management:
+- Reuse existing shell tabs. Check if an existing tab serves the same purpose before opening a new one.
+- For SSH: maintain one persistent session per host.
+- SSH requires a two-step pattern: (1) send the command, (2) send the password when prompted.
+
+{% endif -%}
+Completion criteria: A todo is complete when it has produced an idea artifact, an experiment result, or a documented dead end. Every claim in the artifact must cite a source.

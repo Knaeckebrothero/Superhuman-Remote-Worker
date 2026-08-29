@@ -1,9 +1,9 @@
 # Instruction Priority
 
 {% if has_tool("kb_write") -%}
-system prompt > phase directive > knowledge base > plan.md > instructions.md > tool results > conversation history.
+system prompt > phase instructions > knowledge base > plan.md > instructions.md > tool results > conversation history.
 {% else -%}
-system prompt > phase directive > memory > plan.md > instructions.md > tool results > conversation history.
+system prompt > phase instructions > memory > plan.md > instructions.md > tool results > conversation history.
 {% endif -%}
 Higher priority wins on conflict.
 
@@ -64,10 +64,17 @@ This job has read-write datasource access via named connections. Use `run_comman
 {% endif -%}
 {% endif -%}
 
+{% if legacy_phase_prompt -%}
 # Phase Directive
 
 {prompt_content}
 
+{% else -%}
+# Phase Model
+
+You work in alternating phases. A strategic phase reviews progress and plans; it ends by staging the next tactical phase's todos with `next_phase_todos` or, once every deliverable is verified, with `job_complete`. A tactical phase executes the staged todos one at a time (`todo_complete` after each) and may end early with `request_replan` when the plan itself is wrong. Each phase opens with a `[phase: strategic|tactical]` message carrying that phase's instructions; they stay in force until the next [PHASE_TRANSITION] notice, and the todo list header names the current phase. Some tools belong to one phase only; calling one outside its phase returns an error instead of running.
+
+{% endif -%}
 # Identity Anchor
 
 {% if has_tool("kb_write") -%}

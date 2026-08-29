@@ -432,7 +432,16 @@ CRITIC_PROMPT_DIR = project_root / "config" / "experts" / "critic"
 class TestCriticStrategicPromptVerdictTiming:
     """The critic strategic prompt must agree with the strategic-only verdict tools."""
 
-    @pytest.mark.parametrize("fname", ["strategic.txt", "strategic_minimax.txt"])
+    # The critic's strategic guidance is the expert-local phase skill since U2
+    # (the .txt files stay only until the family variants are deleted).
+    @pytest.mark.parametrize(
+        "fname",
+        [
+            "strategic.txt",
+            "strategic_minimax.txt",
+            "skills/strategic-phase/SKILL.md",
+        ],
+    )
     def test_prompt_does_not_forbid_strategic_verdict(self, fname):
         text = (CRITIC_PROMPT_DIR / fname).read_text(encoding="utf-8")
         # The exact sentence that caused the 8a3fc7d1 deadlock.
@@ -441,7 +450,14 @@ class TestCriticStrategicPromptVerdictTiming:
             "return_job_with_feedback are strategic-only — this deadlocks the critic."
         )
 
-    @pytest.mark.parametrize("fname", ["strategic.txt", "strategic_minimax.txt"])
+    @pytest.mark.parametrize(
+        "fname",
+        [
+            "strategic.txt",
+            "strategic_minimax.txt",
+            "skills/strategic-phase/SKILL.md",
+        ],
+    )
     def test_prompt_directs_verdict_into_strategic(self, fname):
         text = (CRITIC_PROMPT_DIR / fname).read_text(encoding="utf-8")
         assert "approve_job_verdict" in text

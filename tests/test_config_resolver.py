@@ -549,3 +549,106 @@ def test_unresolvable_ref_dropped_with_warning(caplog):
     cfg = load_config_from_resolved(blob)
     assert set(cfg.subagents.roster) == {"explorer"}
     assert cfg.extra["_roster_warnings"] == warnings
+
+
+# --- U2 WP2: the phase-skill floor for the worker role + prompt_mode ---------
+
+
+def _phase_bindings(entries):
+    return [
+        e for e in entries if e.get("skill") in ("strategic-phase", "tactical-phase")
+    ]
+
+
+def test_worker_resolution_restores_the_phase_skill_bindings_an_expert_replaced():
+    """``instruction_files`` replaces wholesale on merge; the assistant (a
+    session expert) authors its own list. Dispatched as a worker it must still
+    carry the two phase bindings — they replaced the unconditional system-prompt
+    swap — restored at the front, frozen in the blob, visible to the PDP."""
+    from src.core.loader import load_config_from_resolved
+
+    cap: dict = {}
+    blob = resolve_config(
+        base_config_name="assistant", expert_type="worker", capture=cap
+    )
+    entries = blob["agent"]["instruction_files"]
+    assert [e["skill"] for e in entries[:2]] == ["strategic-phase", "tactical-phase"]
+    assert [e["trigger"] for e in entries[:2]] == [
+        "phase_start:strategic",
+        "phase_start:tactical",
+    ]
+    assert all(e["enforce"] is False for e in entries[:2])
+    # The assistant's own bindings survive behind them.
+    assert any(e["skill"] == "cite-as-you-write" for e in entries[2:])
+    assert [e["skill"] for e in cap["merged_fragment"]["instruction_files"][:2]] == [
+        "strategic-phase",
+        "tactical-phase",
+    ]
+    assert blob["instructions"]["strategic-phase"].startswith(
+        "---\nname: strategic-phase"
+    )
+    cfg = load_config_from_resolved(blob)
+    assert {e.path for e in cfg.instruction_files} >= {
+        "skills/strategic-phase/SKILL.md",
+        "skills/tactical-phase/SKILL.md",
+    }
+    # An expert that already carries them is left alone (no duplicates).
+    dev = resolve_config(base_config_name="developer", expert_type="worker")
+    assert len(_phase_bindings(dev["agent"]["instruction_files"])) == 2
+    # Sessions have no phase loop: no floor there.
+    session = resolve_config(base_config_name="assistant", expert_type="session")
+    assert _phase_bindings(session["agent"]["instruction_files"]) == []
+
+
+def test_a_db_expert_forked_before_u2_gets_the_phase_bindings_back():
+    row = {
+        "expert_type": "worker",
+        "name": "old-fork",
+        "config": {
+            "instruction_files": [
+                {"skill": "todo-guide", "trigger": "before_tool:next_phase_todos"}
+            ]
+        },
+        "prompts": {"strategic": "FORK STRATEGIC ADDENDUM"},
+    }
+    blob = resolve_config(
+        base_config_name="worker_base", expert_type="worker", expert_row=row
+    )
+    entries = blob["agent"]["instruction_files"]
+    assert [e["skill"] for e in entries] == [
+        "strategic-phase",
+        "tactical-phase",
+        "todo-guide",
+    ]
+    # The DB prompt keeps its key and its DB-authored marker: at delivery it is
+    # the fenced <expert_workflow> addendum of the strategic block.
+    assert blob["prompts"]["strategic"] == "FORK STRATEGIC ADDENDUM"
+    assert blob["agent"]["_db_prompt_keys"] == ["strategic"]
+
+
+def test_legacy_prompt_mode_flows_through_config_override_and_skips_the_floor():
+    from src.core.loader import load_config_from_resolved
+
+    blob = resolve_config(
+        base_config_name="assistant",
+        expert_type="worker",
+        request_override={"phase_settings": {"prompt_mode": "legacy"}},
+    )
+    assert blob["agent"]["phase_settings"]["prompt_mode"] == "legacy"
+    assert blob["agent"]["phase_settings"]["min_todos"] == 2  # merged, not replaced
+    assert _phase_bindings(blob["agent"]["instruction_files"]) == []
+    assert load_config_from_resolved(blob).phase_settings.prompt_mode == "legacy"
+    # Default is skills, and it is frozen explicitly.
+    default = resolve_config(base_config_name="developer", expert_type="worker")
+    assert default["agent"]["phase_settings"]["prompt_mode"] == "skills"
+
+
+def test_invalid_prompt_mode_is_refused_at_resolution():
+    import pytest
+
+    with pytest.raises(ValueError, match="prompt_mode"):
+        resolve_config(
+            base_config_name="developer",
+            expert_type="worker",
+            request_override={"phase_settings": {"prompt_mode": "bogus"}},
+        )

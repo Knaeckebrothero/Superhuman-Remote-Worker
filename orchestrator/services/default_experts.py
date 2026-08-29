@@ -18,7 +18,7 @@ import yaml
 
 from .grants_service import resolve_grants_for
 from src.core.expert_resolution import with_role_tag
-from src.core.loader import canonical_config_name
+from src.core.loader import canonical_config_name, expert_phase_prompt_bodies
 
 logger = logging.getLogger(__name__)
 
@@ -90,13 +90,14 @@ def load_seed_bundle(
     for key, filename in (
         ("persona", "persona.txt"),
         ("instructions", "instructions.md"),
-        ("strategic", "strategic.txt"),
-        ("tactical", "tactical.txt"),
         ("summarization", "summarization_prompt.txt"),
     ):
         path = expert_dir / filename
         if path.exists():
             prompts[key] = path.read_text(encoding="utf-8")
+    # strategic/tactical: the expert-local phase skill bodies (U2), same DB
+    # keys — delivered as the fenced <expert_workflow> addendum of the phase block.
+    prompts.update(expert_phase_prompt_bodies(expert_dir))
 
     return {
         "name": directory,

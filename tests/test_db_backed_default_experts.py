@@ -277,3 +277,35 @@ def test_seed_bundles_carry_the_role_tag():
     # general-worker authors its role tag already: kept in place, not doubled.
     assert worker["tags"] == ["general", "worker", "safe-default"]
     assert session["tags"][-1] == "session" and session["tags"].count("session") == 1
+
+
+def test_seed_bundle_reads_expert_local_phase_skill_bodies(tmp_path):
+    """U2: the managed seed's prompts.strategic/tactical come from the
+    expert-local phase skills (body only), falling back to the legacy .txt."""
+    expert_dir = tmp_path / "experts" / "seeded"
+    (expert_dir / "skills" / "strategic-phase").mkdir(parents=True)
+    (expert_dir / "config.yaml").write_text(
+        "$extends: worker_base\nagent_id: seeded\ndisplay_name: Seeded\n"
+    )
+    (expert_dir / "persona.txt").write_text("I am seeded.\n")
+    (expert_dir / "skills" / "strategic-phase" / "SKILL.md").write_text(
+        "---\nname: strategic-phase\ndescription: d\ncatalog: hidden\n---\n\n"
+        "# Strategic phase\n\nSEEDED STRATEGIC BODY\n"
+    )
+    (expert_dir / "tactical.txt").write_text(
+        "<tactical_phase>\nLEGACY TXT\n</tactical_phase>\n"
+    )
+
+    bundle = load_seed_bundle(tmp_path, directory="seeded", expert_type="worker")
+
+    assert bundle["prompts"]["persona"] == "I am seeded.\n"
+    assert (
+        bundle["prompts"]["strategic"] == "# Strategic phase\n\nSEEDED STRATEGIC BODY\n"
+    )
+    assert "catalog: hidden" not in bundle["prompts"]["strategic"]
+    assert bundle["prompts"]["tactical"].startswith("<tactical_phase>")
+    # The bundled worker seed itself ships no phase prompt of its own.
+    seed = load_seed_bundle(
+        ROOT / "config", directory="general-worker", expert_type="worker"
+    )
+    assert "strategic" not in seed["prompts"] and "tactical" not in seed["prompts"]

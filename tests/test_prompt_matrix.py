@@ -17,6 +17,8 @@ from src.core.loader import (
     load_base_system_prompt,
     load_phase_component,
     render_placeholders,
+    load_agent_config_from_dict,
+    serialize_resolved_config,
 )
 from src.core.model_registry import family_of
 
@@ -911,3 +913,110 @@ class TestLLMReuseEquality:
             summarization=PhaseLLMOverride(model="gpt-4o-mini"),
         )
         assert config.get_phase_config("summarization") != self._main(config)
+
+
+# =============================================================================
+# U2: phase_settings.prompt_mode — one phase-agnostic prompt vs the legacy swap
+# =============================================================================
+
+
+class TestPromptMode:
+    """``get_system_prompt`` is the worker's one prompt; ``get_phase_system_prompt``
+    delegates to it unless ``prompt_mode == "legacy"`` or the template is a
+    pre-U2 one (bare ``{prompt_content}`` slot, no ``legacy_phase_prompt``)."""
+
+    _TEMPLATE = (
+        "{agent_display_name}\n"
+        "{% if legacy_phase_prompt -%}\n"
+        "<phase_directive>\n{prompt_content}\n</phase_directive>\n"
+        "{% else -%}\n"
+        "<phase_model>alternating phases</phase_model>\n"
+        "{% endif -%}\n"
+        "END"
+    )
+
+    def _write(self, tmp_path):
+        config_prompts = tmp_path / "config" / "prompts"
+        config_prompts.mkdir(parents=True)
+        (config_prompts / "systemprompt.txt").write_text(self._TEMPLATE)
+        (config_prompts / "strategic.txt").write_text("strategic phase {phase_number}")
+        (config_prompts / "tactical.txt").write_text("tactical phase {phase_number}")
+
+    def test_get_system_prompt_is_phase_agnostic(self, tmp_path):
+        from src.core.loader import get_system_prompt, uses_legacy_phase_prompt
+
+        config = AgentConfig(agent_id="test", display_name="Test Agent")
+        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+            self._write(tmp_path)
+            one = get_system_prompt(config, tool_names=[])
+            strategic = get_phase_system_prompt(
+                config, is_strategic=True, phase_number=1, tool_names=[]
+            )
+            tactical = get_phase_system_prompt(
+                config, is_strategic=False, phase_number=2, tool_names=[]
+            )
+        assert uses_legacy_phase_prompt(config) is False
+        assert "Test Agent" in one
+        assert "<phase_model>alternating phases</phase_model>" in one
+        assert "phase_directive" not in one and "{prompt_content}" not in one
+        assert "strategic phase" not in one and "tactical phase" not in one
+        assert "{%" not in one and "legacy_phase_prompt" not in one
+        assert one == strategic == tactical  # the swap is gone
+
+    def test_legacy_mode_renders_phase_component(self, tmp_path):
+        from src.core.loader import PROMPT_MODE_LEGACY, uses_legacy_phase_prompt
+
+        config = AgentConfig(agent_id="test", display_name="Test Agent")
+        config.phase_settings.prompt_mode = PROMPT_MODE_LEGACY
+        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+            self._write(tmp_path)
+            strategic = get_phase_system_prompt(
+                config, is_strategic=True, phase_number=1, tool_names=[]
+            )
+            tactical = get_phase_system_prompt(
+                config, is_strategic=False, phase_number=2, tool_names=[]
+            )
+        assert uses_legacy_phase_prompt(config) is True
+        assert "<phase_directive>\nstrategic phase 1\n</phase_directive>" in strategic
+        assert "<phase_directive>\ntactical phase 2\n</phase_directive>" in tactical
+        for out in (strategic, tactical):
+            assert "phase_model" not in out and "{%" not in out
+            assert "{prompt_content}" not in out and "END" in out
+
+    def test_prompt_mode_validates(self):
+        from src.core.loader import PhaseSettings
+
+        assert PhaseSettings().prompt_mode == "skills"
+        assert PhaseSettings(prompt_mode="legacy").prompt_mode == "legacy"
+        with pytest.raises(ValueError, match="prompt_mode"):
+            PhaseSettings(prompt_mode="bogus")
+        with pytest.raises(ValueError, match="prompt_mode"):
+            load_agent_config_from_dict(
+                {
+                    "agent_id": "t",
+                    "display_name": "T",
+                    "phase_settings": {"prompt_mode": "bogus"},
+                }
+            )
+
+    def test_prompt_mode_rides_config_override_and_the_frozen_blob(self, tmp_path):
+        from src.core.loader import (
+            deep_merge,
+            load_config_from_resolved,
+            load_role_base,
+        )
+
+        data = deep_merge(
+            load_role_base("worker"),
+            {"phase_settings": {"prompt_mode": "legacy"}},
+        )
+        cfg = load_agent_config_from_dict(data)
+        assert cfg.phase_settings.prompt_mode == "legacy"
+        assert cfg.phase_settings.min_todos == 2  # the override merged, not replaced
+        cfg._deployment_dir = str(tmp_path)
+        blob = serialize_resolved_config(cfg)
+        assert blob["agent"]["phase_settings"]["prompt_mode"] == "legacy"
+        assert load_config_from_resolved(blob).phase_settings.prompt_mode == "legacy"
+        # Default: skills, in the blob too.
+        default = load_agent_config_from_dict(load_role_base("worker"))
+        assert default.phase_settings.prompt_mode == "skills"

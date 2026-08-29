@@ -14,7 +14,7 @@ import re
 from dataclasses import dataclass, field, fields as dataclass_fields
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import yaml
 from langchain_core.language_models import BaseChatModel
@@ -1170,6 +1170,7 @@ def render_instruction_content(
     tool_names: List[str],
     cli_datasources: Optional[List[str]] = None,
     protected_cloud: bool = False,
+    extra_context: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Render Jinja2 template markers in instruction file content.
 
@@ -1179,6 +1180,8 @@ def render_instruction_content(
     ``{% if protected_cloud %}`` for the protected-cloud honesty block, and
     ``{{ tools }}`` variable access.  Non-templated content (no ``{%``
     or ``{{`` markers) passes through unchanged with zero overhead.
+    ``extra_context`` adds caller-owned variables (the worker system prompt
+    passes ``legacy_phase_prompt``); it can never shadow the built-ins.
 
     Args:
         content: Raw instruction file content (may contain Jinja2 markers).
@@ -1206,7 +1209,8 @@ def render_instruction_content(
     template = env.from_string(content)
     tool_set = set(tool_names)
     ds_set = set(cli_datasources or [])
-    return template.render(
+    context: Dict[str, Any] = dict(extra_context or {})
+    context.update(
         tools=tool_names,
         has_tool=lambda name: name in tool_set,
         has_shell=_has_shell_tools(tool_set),
@@ -1214,6 +1218,7 @@ def render_instruction_content(
         has_cli_datasource=lambda ds_type: ds_type in ds_set,
         protected_cloud=protected_cloud,
     )
+    return template.render(**context)
 
 
 class MatrixResolver:
@@ -1927,6 +1932,19 @@ class ContextManagementConfig:
     max_summary_length: int = 10000
 
 
+#: ``phase_settings.prompt_mode`` values (U2). ``skills``: one phase-agnostic
+#: system prompt, the phase guidance delivered once per concrete phase as the
+#: ``strategic-phase`` / ``tactical-phase`` skills (persistent, protected
+#: messages). ``legacy``: the pre-U2 swap — strategic/tactical prompt files
+#: rendered into the system prompt every turn, phase-filtered tool bindings,
+#: no phase-skill blocks. ``legacy`` exists only so the U2 bench can run both
+#: arms on one image (universal_experts_and_subagents.md §1.2); U2 WP6
+#: deletes it together with the family variants.
+PROMPT_MODE_SKILLS = "skills"
+PROMPT_MODE_LEGACY = "legacy"
+VALID_PROMPT_MODES = frozenset({PROMPT_MODE_SKILLS, PROMPT_MODE_LEGACY})
+
+
 @dataclass
 class PhaseSettings:
     """Phase alternation settings.
@@ -1934,11 +1952,21 @@ class PhaseSettings:
     Controls the strategic/tactical phase transitions. min/max_todos are
     the LIVE bounds: agent.py passes them into TodoManager at construction,
     where stage_tactical_todos enforces them. The worker overlay (worker_base) lowers the
-    floor to 2.
+    floor to 2. ``prompt_mode`` selects how the worker receives its phase
+    guidance (see ``PROMPT_MODE_SKILLS`` / ``PROMPT_MODE_LEGACY``); it rides
+    ``config_override`` like every other key here and is frozen with the job.
     """
 
     min_todos: int = 5  # Minimum todos required for strategic->tactical transition
     max_todos: int = 20  # Maximum todos allowed for strategic->tactical transition
+    prompt_mode: str = PROMPT_MODE_SKILLS  # skills | legacy (U2)
+
+    def __post_init__(self) -> None:
+        if self.prompt_mode not in VALID_PROMPT_MODES:
+            raise ValueError(
+                "phase_settings.prompt_mode must be one of "
+                f"{sorted(VALID_PROMPT_MODES)} (got {self.prompt_mode!r})"
+            )
 
 
 @dataclass
@@ -2908,6 +2936,7 @@ def load_agent_config(
     phase_config = PhaseSettings(
         min_todos=phase_data.get("min_todos", 5),
         max_todos=phase_data.get("max_todos", 20),
+        prompt_mode=phase_data.get("prompt_mode", PROMPT_MODE_SKILLS),
     )
 
     memory_data = data.get("memory", {})
@@ -3177,6 +3206,7 @@ def load_agent_config_from_dict(
     phase_config = PhaseSettings(
         min_todos=phase_data.get("min_todos", 5),
         max_todos=phase_data.get("max_todos", 20),
+        prompt_mode=phase_data.get("prompt_mode", PROMPT_MODE_SKILLS),
     )
 
     memory_data = data.get("memory", {})
@@ -4559,6 +4589,172 @@ def render_placeholders(text: str, **known: str) -> str:
     return _PROMPT_PLACEHOLDER_RE.sub(_sub, text)
 
 
+# =============================================================================
+# Phase skills (U2) — the worker's phase guidance as phase_start-bound skills
+# =============================================================================
+#
+# The strategic/tactical prompt swap of the system prompt is replaced by two
+# bundled skills bound in the worker overlay (``instruction_files``) with
+# ``trigger: phase_start:<phase>``: delivered once per concrete phase as a
+# persistent, protected message (src/core/workspace_injection.py), not
+# re-rendered into every request. An expert overrides a body by shipping
+# ``config/experts/<expert>/skills/<skill>/SKILL.md`` next to its config.yaml
+# (location-primary, like prompt files). A DB expert's ``prompts.strategic`` /
+# ``prompts.tactical`` stays an addendum: fenced and appended to the block.
+# Design: knowledge-base/knowledge/features/universal_experts_and_subagents.md §1.2.
+
+#: phase name -> the bundled skill that carries that phase's instructions.
+PHASE_SKILLS: Dict[str, str] = {
+    "strategic": "strategic-phase",
+    "tactical": "tactical-phase",
+}
+PHASE_SKILL_NAMES = frozenset(PHASE_SKILLS.values())
+
+#: Jinja variable the worker system-prompt templates branch on: True renders
+#: the pre-U2 ``<phase_directive>{prompt_content}</phase_directive>`` slot,
+#: False the phase-agnostic ``<phase_model>`` block. Present in every current
+#: template, absent from every pre-U2 one — which is what
+#: :func:`is_legacy_phase_template` keys on.
+LEGACY_PHASE_PROMPT_FLAG = "legacy_phase_prompt"
+
+
+def is_legacy_phase_template(template: str) -> bool:
+    """A pre-U2 worker system-prompt template: it still has the bare
+    ``{prompt_content}`` slot and knows nothing of the guarded legacy branch.
+
+    Such a template only exists frozen in a job dispatched before U2 (or as a
+    synthetic test template); rendering it phase-agnostic would drop the
+    phase guidance the job was dispatched with, so it keeps the swap.
+    """
+    return "{prompt_content}" in template and LEGACY_PHASE_PROMPT_FLAG not in template
+
+
+def prompt_mode_of(config: Any) -> str:
+    """``config.phase_settings.prompt_mode`` with the skills default for
+    anything that is not a real config (tests hand the execute node a
+    MagicMock; the comparison must stay ``== "legacy"``, never truthiness)."""
+    settings = getattr(config, "phase_settings", None)
+    mode = getattr(settings, "prompt_mode", PROMPT_MODE_SKILLS)
+    return mode if isinstance(mode, str) else PROMPT_MODE_SKILLS
+
+
+def uses_legacy_phase_prompt(config: Any) -> bool:
+    """Whether the worker renders the pre-U2 phase swap for this job.
+
+    True when ``phase_settings.prompt_mode == "legacy"`` (the bench's
+    "current" arm) OR the frozen system-prompt template is a pre-U2 one (a
+    job dispatched before U2, resumed under it). The frozen blob is what a
+    dispatched job has; a disk template is judged inside
+    :func:`get_phase_system_prompt` when it is loaded. One decision drives the
+    system prompt, whether the phase-skill blocks are delivered, and where a
+    DB expert's phase addendum goes.
+    """
+    if prompt_mode_of(config) == PROMPT_MODE_LEGACY:
+        return True
+    extra = getattr(config, "extra", None)
+    resolved = extra.get("_resolved_prompts") if isinstance(extra, dict) else None
+    template = resolved.get("systemprompt") if isinstance(resolved, dict) else None
+    return isinstance(template, str) and is_legacy_phase_template(template)
+
+
+def phase_skill_bindings() -> List[Dict[str, Any]]:
+    """The worker overlay's two phase bindings, in config (dict) shape."""
+    return [
+        {"skill": skill, "trigger": f"phase_start:{phase}", "enforce": False}
+        for phase, skill in PHASE_SKILLS.items()
+    ]
+
+
+def ensure_phase_skill_bindings(
+    entries: Optional[List[Dict[str, Any]]],
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """``entries`` with a binding to each phase skill, prepending the missing
+    ones. Returns ``(entries, restored skill names)``.
+
+    ``deep_merge`` replaces lists wholesale, so an expert that declares its
+    own ``instruction_files`` (bundled: scholar, product-qa, designer — they
+    restate the bindings; DB experts forked before U2 do not) silently loses
+    the phase guidance the swap used to deliver unconditionally. The worker
+    resolver (orchestrator/services/config_resolver.py) restores it.
+    """
+    entries = list(entries or [])
+    present = {e.get("skill") for e in entries if isinstance(e, dict)}
+    missing = [b for b in phase_skill_bindings() if b["skill"] not in present]
+    return (missing + entries, [b["skill"] for b in missing])
+
+
+def resolve_bound_skill_dir(skill: str, deployment_dir: Optional[str]) -> Path:
+    """Directory a bound skill's ``SKILL.md`` is read from — location-primary
+    like prompt files: ``<deployment_dir>/skills/<skill>`` when the expert
+    ships one, else the bundled ``config/skills/<skill>``.
+
+    The binding (``skill: strategic-phase``) and the workspace path
+    (``skills/strategic-phase/SKILL.md``) do not change; only the body the
+    freeze reads does. Used by ``serialize_resolved_config`` and the prompt
+    render gate.
+    """
+    if deployment_dir:
+        local = Path(deployment_dir) / "skills" / skill
+        if (local / "SKILL.md").is_file():
+            return local
+    return get_project_root() / "config" / "skills" / skill
+
+
+def expert_phase_prompt_bodies(expert_dir: Union[str, Path]) -> Dict[str, str]:
+    """``{"strategic": body, "tactical": body}`` of an expert directory —
+    the expert-local phase skill bodies (frontmatter stripped), falling back
+    to the legacy ``strategic.txt`` / ``tactical.txt`` while those exist.
+
+    Managed-expert seeding and the fork bundle write these into the DB row's
+    ``prompts.strategic`` / ``prompts.tactical`` (shape unchanged); at
+    delivery they become the fenced ``<expert_workflow>`` addendum of the
+    phase block.
+    """
+    from src.core.skill_format import skill_body
+
+    expert_dir = Path(expert_dir)
+    out: Dict[str, str] = {}
+    for phase, skill in PHASE_SKILLS.items():
+        skill_md = expert_dir / "skills" / skill / "SKILL.md"
+        if skill_md.is_file():
+            out[phase] = skill_body(skill_md.read_text(encoding="utf-8"))
+            continue
+        legacy = expert_dir / f"{phase}.txt"
+        if legacy.is_file():
+            out[phase] = legacy.read_text(encoding="utf-8")
+    return out
+
+
+def db_phase_addendum(config: Any, phase_name: str) -> Optional[str]:
+    """A DB expert's own ``strategic`` / ``tactical`` prompt for ``phase_name``
+    (present in ``_resolved_prompts`` AND marked DB-authored in
+    ``_db_prompt_keys``), fenced as ``<expert_workflow>``; None otherwise.
+
+    Untrusted text: fenced (braces stripped, subordinated to system rules)
+    exactly as the legacy swap fenced it into the system prompt — never
+    Jinja-rendered.
+    """
+    extra = getattr(config, "extra", None)
+    if not isinstance(extra, dict):
+        return None
+    if phase_name not in (extra.get("_db_prompt_keys") or ()):
+        return None
+    resolved = extra.get("_resolved_prompts")
+    text_value = resolved.get(phase_name) if isinstance(resolved, dict) else None
+    if not isinstance(text_value, str) or not text_value.strip():
+        return None
+    from src.core.expert_resolution import fence_phase_directive
+
+    return fence_phase_directive(text_value)
+
+
+def append_expert_workflow_addendum(body: str, addendum: str) -> str:
+    """The phase block body with the fenced DB addendum appended — ONE block
+    per (phase, path), so the addendum shares the skill's protected identity
+    (see src/core/workspace_injection.create_phase_instruction_message)."""
+    return f"{body.rstrip()}\n\n{addendum}\n"
+
+
 def scheduled_work_system_floor(
     tool_names: "set[str] | frozenset[str] | list[str] | tuple[str, ...] | None",
 ) -> str:
@@ -4662,14 +4858,19 @@ def get_phase_system_prompt(
 ) -> str:
     """Get the complete system prompt for the current phase.
 
-    This is the main entry point for phase-aware prompts. It uses a
-    component-based system:
+    Since U2 the worker path is phase-agnostic by default — this delegates to
+    :func:`get_system_prompt` — and only renders the legacy swap when
+    ``phase_settings.prompt_mode == "legacy"`` or the (frozen) base template
+    is a pre-U2 one (``is_legacy_phase_template``). The legacy swap:
     1. Load base template (systemprompt.txt)
     2. Load phase component (strategic.txt or tactical.txt)
     3. Render phase component's {phase_number} placeholder
     4. Inject rendered component into base template's {prompt_content}
     5. Render remaining placeholders ({agent_display_name}, etc.)
     6. Render Jinja2 conditionals ({% if has_tool("kb_write") %} etc.)
+
+    ``prompt_type="interactive"`` (sessions) is a single self-contained
+    prompt with no phase component either way.
 
     Note: todos, memory, and knowledge are injected as transient messages
     in graph.py, not included in the system prompt.
@@ -4783,26 +4984,25 @@ def get_phase_system_prompt(
 
         return rendered
 
-    # Worker mode: base template (systemprompt.txt) + phase component (strategic/tactical)
+    # Worker mode. The base template (frozen at dispatch, else disk) decides
+    # the render path: a pre-U2 template still carries the bare
+    # ``<phase_directive>{prompt_content}</phase_directive>`` slot, so an
+    # in-flight job keeps the swap it was dispatched with; the current
+    # templates guard that slot behind ``legacy_phase_prompt`` and render
+    # phase-agnostic unless ``phase_settings.prompt_mode == "legacy"``.
     base_template = resolved_prompts.get("systemprompt") or load_base_system_prompt(
         resolver
     )
+    expert_identity = _worker_expert_identity(config, resolver, resolved_prompts)
+    if not (
+        prompt_mode_of(config) == PROMPT_MODE_LEGACY
+        or is_legacy_phase_template(base_template)
+    ):
+        return _render_worker_prompt(
+            config, model, tool_names, base_template, expert_identity
+        )
 
-    # Load expert persona (empty string if no persona file exists)
-    expert_identity = resolved_prompts.get("persona") or ""
-    if not expert_identity:
-        try:
-            expert_identity = resolver.load("persona")
-        except FileNotFoundError:
-            expert_identity = ""
-    if expert_identity and config.extra.get("_persona_source") == "db":
-        # Untrusted user persona — fence + subordinate below operator policy
-        # (decision 7), never inject at system altitude.
-        from src.core.expert_resolution import fence_persona
-
-        expert_identity = fence_persona(expert_identity)
-
-    # Load phase component
+    # Legacy swap (deleted in U2 WP6): phase component into {prompt_content}.
     prompt_type_key = prompt_type or ("strategic" if is_strategic else "tactical")
     phase_component = resolved_prompts.get(prompt_type_key) or load_phase_component(
         is_strategic, resolver
@@ -4818,22 +5018,77 @@ def get_phase_system_prompt(
 
         phase_component = fence_phase_directive(phase_component)
 
+    return _render_worker_prompt(
+        config,
+        model,
+        tool_names,
+        base_template,
+        expert_identity,
+        phase_component=phase_component,
+        phase_number=phase_number,
+    )
+
+
+def _worker_expert_identity(
+    config: AgentConfig, resolver: PromptMatrixResolver, resolved_prompts: dict
+) -> str:
+    """The ``{expert_identity}`` text: frozen persona, else the resolver's;
+    fenced when it is DB-authored (decision 7)."""
+    expert_identity = resolved_prompts.get("persona") or ""
+    if not expert_identity:
+        try:
+            expert_identity = resolver.load("persona")
+        except FileNotFoundError:
+            expert_identity = ""
+    if expert_identity and config.extra.get("_persona_source") == "db":
+        # Untrusted user persona — fence + subordinate below operator policy
+        # (decision 7), never inject at system altitude.
+        from src.core.expert_resolution import fence_persona
+
+        expert_identity = fence_persona(expert_identity)
+    return expert_identity
+
+
+def _render_worker_prompt(
+    config: AgentConfig,
+    model: str,
+    tool_names: Optional[List[str]],
+    base_template: str,
+    expert_identity: str,
+    *,
+    phase_component: Optional[str] = None,
+    phase_number: int = 0,
+) -> str:
+    """Render the worker system prompt from its parts.
+
+    ``phase_component`` is None on the phase-agnostic path (the template's
+    ``legacy_phase_prompt`` branch renders False and a bare ``{prompt_content}``
+    of a pre-U2 template renders empty) and the loaded strategic/tactical
+    component on the legacy swap.
+    """
+    legacy = phase_component is not None
     # Render Jinja2 conditionals BEFORE placeholder substitution — Jinja2 owns
     # {%..%} blocks and leaves single-brace placeholders untouched.
     cli_ds = config.extra.get("_cli_datasources", [])
     if tool_names is not None:
-        phase_component = render_instruction_content(
-            phase_component, tool_names, cli_datasources=cli_ds
-        )
+        if legacy:
+            phase_component = render_instruction_content(
+                phase_component, tool_names, cli_datasources=cli_ds
+            )
         base_template = render_instruction_content(
-            base_template, tool_names, cli_datasources=cli_ds
+            base_template,
+            tool_names,
+            cli_datasources=cli_ds,
+            extra_context={LEGACY_PHASE_PROMPT_FLAG: legacy},
         )
 
     # Render the phase component's {phase_number} placeholder. Uses
     # render_placeholders (NOT str.format) so literal braces in the trusted prose
     # — repro-path hints, CSS in a mockup — pass through instead of raising.
-    rendered_component = render_placeholders(
-        phase_component, phase_number=str(phase_number)
+    rendered_component = (
+        render_placeholders(phase_component, phase_number=str(phase_number))
+        if legacy
+        else ""
     )
 
     # Inject all components and render remaining placeholders
@@ -4861,6 +5116,35 @@ def get_phase_system_prompt(
         rendered = f"Reasoning: {level}\n\n{rendered}"
 
     return with_current_date(rendered)
+
+
+def get_system_prompt(
+    config: AgentConfig,
+    model: str = "",
+    tool_names: Optional[List[str]] = None,
+) -> str:
+    """The worker's ONE system prompt (U2): phase-agnostic.
+
+    Same pipeline as the legacy :func:`get_phase_system_prompt` minus the
+    phase component — base template (frozen or matrix-resolved), fenced
+    persona, skills menu, Jinja conditionals, reasoning directive, date line.
+    The template's ``<phase_model>`` block replaces the old
+    ``<phase_directive>``; the phase instructions themselves reach the model
+    once per phase as the ``strategic-phase`` / ``tactical-phase`` skill
+    blocks. A pre-U2 template handed to this function renders its bare
+    ``{prompt_content}`` empty. Pass ``tool_names`` (the graph always does):
+    as before, Jinja is only rendered when they are given.
+    """
+    resolved_prompts = config.extra.get("_resolved_prompts", {})
+    model_family = family_of(model) if model else "default"
+    resolver = PromptMatrixResolver(config._deployment_dir, model_family)
+    base_template = resolved_prompts.get("systemprompt") or load_base_system_prompt(
+        resolver
+    )
+    expert_identity = _worker_expert_identity(config, resolver, resolved_prompts)
+    return _render_worker_prompt(
+        config, model, tool_names, base_template, expert_identity
+    )
 
 
 def load_instructions(config: AgentConfig, model: str = "") -> str:
@@ -5806,13 +6090,17 @@ def serialize_resolved_config(config: AgentConfig, model: str = "") -> dict:
             deployment_dir=config._deployment_dir,
             framework_dir=templates_dir,
         )
-        skills_root = get_project_root() / "config" / "skills"
         for entry in config.instruction_files:
             if entry.skill:
                 # Bound skill: freeze SKILL.md keyed by skill name (NOT its "SKILL"
                 # stem). Flag-independent — does not depend on the catalog gather.
+                # Location-primary: an expert-local skills/<name>/SKILL.md next
+                # to the expert's config.yaml outranks the bundled one (U2).
                 if entry.skill not in instructions:
-                    skill_md = skills_root / entry.skill / "SKILL.md"
+                    skill_md = (
+                        resolve_bound_skill_dir(entry.skill, config._deployment_dir)
+                        / "SKILL.md"
+                    )
                     try:
                         instructions[entry.skill] = skill_md.read_text(encoding="utf-8")
                     except OSError:

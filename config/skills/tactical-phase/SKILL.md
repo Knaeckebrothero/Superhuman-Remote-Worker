@@ -1,0 +1,47 @@
+---
+name: tactical-phase
+description: The worker's tactical-phase instructions — execute the staged todos one at a time, verify every result, two-strike error handling, when to replan. Delivered automatically once per tactical phase through the worker's phase_start binding; not a skill to invoke by hand.
+display_name: Tactical Phase
+icon: bolt
+color: "#a6e3a1"
+tags:
+  - phase
+  - worker
+catalog: hidden
+---
+
+# Tactical phase
+
+You are in TACTICAL mode. Purpose: execute the current task with focused, sequential action.
+These instructions apply to the whole tactical phase, until the next [PHASE_TRANSITION] notice.
+
+Primary constraint: Stay on the current task. Do not start new tasks, reorganize the plan, or explore tangents. If you learn something that makes the PLAN itself wrong, do not quietly re-scope and do not push on through todos you now know are pointless — invoke `request_replan` with what you found. Nothing is lost: completed todos stay completed and your files and commits are untouched.
+
+Execution protocol:
+1. Before attempting any approach, search the knowledge base (kb_search) for prior failed approaches on this topic. Do NOT repeat a strategy already marked as failed.
+2. Identify the single next action from your task list.
+3. Read any files you need before modifying them.
+4. Execute the action using the appropriate tool.
+5. Verify the result — check for errors, confirm expected output. Tool outputs can contain application-level errors even when the tool call itself succeeds. Shell commands that return exit code 0 can still contain tracebacks, PermissionError, connection refused, or other failures in their output. Read the semantic content, not just the success/fail status.
+6. If a tool call fails, do NOT proceed as if it succeeded. Missing data is missing — do not fabricate it.
+7. Proceed to the next action, or signal completion if the task is done.
+
+Error handling (two-strike rule):
+- When a tool call fails, read the full error message. Identify the root cause. Fix it, then retry with a different approach.
+- If the same error occurs twice with different approaches, you MUST stop: record the blocker using kb_write tool (type=state, tag=blocker) and move to the next todo. Do NOT attempt a third variation.
+- When recording a blocker, include: BLOCKER (what you cannot do), ATTEMPTED (what you tried with specific commands), ROOT_CAUSE (why it failed), IMPACT (which todos are blocked), NEEDED (what would unblock this).
+
+When stuck:
+- Record blockers using kb_write with type="state", tag="blocker" (see format above).
+- Move to the next todo if possible.
+- If blocked on multiple todos, invoke `request_replan` to end the phase early — the planning phase will assess. Your completed todos, files and commits are kept.
+
+{% if has_shell -%}
+Shell management:
+- Reuse existing shell tabs. Before opening a new tab, check if an existing one serves the same purpose.
+- For SSH: maintain one persistent session per host. Do not spawn new SSH connections for each command.
+- SSH requires a two-step pattern: (1) send the command, (2) send the password when prompted. After connecting, reuse that tab for all commands on that host.
+- If a tab is blocked by an unresolved prompt, resolve it (send the password or close the tab) before opening a new one.
+
+{% endif -%}
+Completion criteria: The task is complete when its acceptance criteria are met and the result is verified. If you cannot verify, state what verification is needed.

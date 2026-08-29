@@ -87,6 +87,18 @@ _POST_SPLIT_OVERLAY_ADDITIONS: dict[str, tuple[str, ...]] = {
     "worker": ("delegation.max_concurrent", "delegation.run_in_background_default"),
     "session": (),
 }
+#: Bindings later work added to an overlay's ``instruction_files`` (role ->
+#: skill names). The list replaces wholesale on merge, so a dotted path cannot
+#: name one entry: they are matched by ``skill``, asserted PRESENT first (in
+#: the merged dict AND in the frozen blob, where the freeze also keys the
+#: skill body under the same name), then removed before the comparison.
+_POST_SPLIT_OVERLAY_BINDINGS: dict[str, tuple[str, ...]] = {
+    # U2 WP2: the phase skills replace the per-phase system-prompt swap
+    # (config/skills/{strategic,tactical}-phase). scholar, product-qa and
+    # designer restate them because their own lists replace the overlay's.
+    "worker": ("strategic-phase", "tactical-phase"),
+    "session": (),
+}
 
 
 def _bundled_configs() -> list[tuple[str, Path, str | None]]:
@@ -133,6 +145,29 @@ def _without_post_split_additions(data: dict, role: str) -> dict:
         for part in parents:
             node = node[part]
         del node[leaf]
+    return _without_post_split_bindings(out, role, require=True)
+
+
+def _without_post_split_bindings(data: dict, role: str, *, require: bool) -> dict:
+    """``data`` minus the ``instruction_files`` bindings added after the
+    baseline was frozen (``_POST_SPLIT_OVERLAY_BINDINGS``). ``require`` asserts
+    each one is present first (the post-split side); the pre-split side of an
+    expert that RESTATES the bindings in its own leaf carries them too and is
+    stripped without the assertion."""
+    out = copy.deepcopy(data)
+    bindings = _POST_SPLIT_OVERLAY_BINDINGS.get(role, ())
+    if not bindings:
+        return out
+    entries = out.get("instruction_files")
+    if not isinstance(entries, list):
+        assert not require, "instruction_files is listed as extended but absent"
+        return out
+    if require:
+        for skill in bindings:
+            assert any(e.get("skill") == skill for e in entries), (
+                f"binding to {skill} is listed as added but absent"
+            )
+    out["instruction_files"] = [e for e in entries if e.get("skill") not in bindings]
     return out
 
 
@@ -141,6 +176,22 @@ def _effective(config_path: str, deployment_dir: str | None) -> dict:
     cfg = load_agent_config(config_path, deployment_dir)
     blob = serialize_resolved_config(cfg, model=cfg.llm.model)
     return {k: blob[k] for k in ("agent", "prompts", "instructions")}
+
+
+def _effective_without_post_split_bindings(
+    config_path: str, deployment_dir: str | None, role: str, *, require: bool = True
+) -> dict:
+    """``_effective`` minus the post-split bindings: in ``agent.instruction_files``
+    (asdict shape) and the skill bodies the freeze keys under the same names in
+    ``instructions``. The dotted additions need no exclusion here — their
+    dataclass defaults are identical on both sides."""
+    blob = _effective(config_path, deployment_dir)
+    blob["agent"] = _without_post_split_bindings(blob["agent"], role, require=require)
+    for skill in _POST_SPLIT_OVERLAY_BINDINGS.get(role, ()):
+        if require:
+            assert blob["instructions"].get(skill), f"{skill} body is not frozen"
+        blob["instructions"].pop(skill, None)
+    return blob
 
 
 @pytest.fixture(scope="module")
@@ -202,9 +253,9 @@ def test_role_base_effective_config_is_identical_to_the_pre_split_base(role):
     effective config as before: matrix applied with the same explicit keys,
     same prompts, same instructions."""
     root_path, deployment_dir = resolve_config_path(ROLE_ROOTS[role])
-    assert _effective(root_path, deployment_dir) == _effective(
-        str(_PRE_SPLIT[role]), None
-    )
+    assert _effective_without_post_split_bindings(
+        root_path, deployment_dir, role
+    ) == _effective(str(_PRE_SPLIT[role]), None)
 
 
 @pytest.mark.parametrize("role", sorted(_PRE_SPLIT))
@@ -221,7 +272,11 @@ def test_authored_llm_keys_of_a_root_match_the_pre_split_base(role):
 def test_bundled_expert_merged_dict_is_identical(name, pre_split_leaves):
     tmp_leaf, _, role = pre_split_leaves[name]
     leaf = next(p for n, p, _ in _BUNDLED if n == name)
-    pre = load_and_merge_config(str(tmp_leaf))
+    # The pre-split side is the CURRENT leaf on the frozen base: an expert that
+    # restates the post-split bindings in its own leaf carries them here too.
+    pre = _without_post_split_bindings(
+        load_and_merge_config(str(tmp_leaf)), role, require=False
+    )
     post = _without_post_split_additions(load_and_merge_config(str(leaf)), role)
     post_role = _without_post_split_additions(
         load_and_merge_config(str(leaf), role=role), role
@@ -233,10 +288,12 @@ def test_bundled_expert_merged_dict_is_identical(name, pre_split_leaves):
 
 @pytest.mark.parametrize("name", _IDS)
 def test_bundled_expert_effective_config_is_identical(name, pre_split_leaves):
-    tmp_leaf, deployment_dir, _ = pre_split_leaves[name]
+    tmp_leaf, deployment_dir, role = pre_split_leaves[name]
     leaf = next(p for n, p, _ in _BUNDLED if n == name)
-    assert _effective(str(leaf), deployment_dir) == _effective(
-        str(tmp_leaf), deployment_dir
+    assert _effective_without_post_split_bindings(
+        str(leaf), deployment_dir, role
+    ) == _effective_without_post_split_bindings(
+        str(tmp_leaf), deployment_dir, role, require=False
     ), name
 
 

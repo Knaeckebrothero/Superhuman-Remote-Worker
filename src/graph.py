@@ -109,13 +109,19 @@ from .core.llm_retry import (  # noqa: F401
     initial_error_freeze_fields,
 )
 from .core.loader import (
+    PHASE_SKILL_NAMES,
+    PHASE_SKILLS,
     AgentConfig,
-    resolve_model_settings,
-    load_summarization_prompt,
-    load_auxiliary_prompt,
+    append_expert_workflow_addendum,
+    db_phase_addendum,
     get_phase_system_prompt,
-    _resolve_max_output_tokens,
+    get_system_prompt,
+    load_auxiliary_prompt,
+    load_summarization_prompt,
+    resolve_model_settings,
+    uses_legacy_phase_prompt,
     _is_output_truncated,
+    _resolve_max_output_tokens,
 )
 from .core.model_registry import family_of
 from .core.phase import (
@@ -856,15 +862,32 @@ def create_execute_node(
         # Build messages for LLM
         prepared_messages = []
 
-        # Get phase-aware system prompt (todos, memory, and knowledge are injected as transient messages below)
+        # System prompt (U2): ONE phase-agnostic prompt — the phase guidance
+        # reaches the model as the strategic-phase / tactical-phase skill
+        # blocks below, not as a per-phase swap of the system message (the
+        # swap broke the cached prefix at every phase boundary). The legacy
+        # swap is still rendered for phase_settings.prompt_mode == "legacy"
+        # (the bench's "current" arm) and for a job dispatched before U2 whose
+        # frozen template still carries {prompt_content}; the same decision
+        # skips the phase-skill blocks and keeps a DB expert's phase addendum
+        # in the system prompt for those jobs. Todos, memory and knowledge
+        # are injected as transient messages below either way.
         phase_llm_config = config.llm  # one model for every phase (U1)
-        full_system = get_phase_system_prompt(
-            config=config,
-            is_strategic=is_strategic,
-            phase_number=phase_number,
-            model=phase_llm_config.model,
-            tool_names=tool_names,
-        )
+        legacy_phase_prompt = uses_legacy_phase_prompt(config)
+        if legacy_phase_prompt:
+            full_system = get_phase_system_prompt(
+                config=config,
+                is_strategic=is_strategic,
+                phase_number=phase_number,
+                model=phase_llm_config.model,
+                tool_names=tool_names,
+            )
+        else:
+            full_system = get_system_prompt(
+                config=config,
+                model=phase_llm_config.model,
+                tool_names=tool_names,
+            )
         phase_key = phase_key_for(phase_number, phase_name)
         context_mgr.set_current_phase(phase_name, phase_key=phase_key)
         logger.debug(
@@ -895,6 +918,7 @@ def create_execute_node(
         if tool_context and hasattr(tool_context, "get_phase_instruction_files"):
             phase_entries = tool_context.get_phase_instruction_files(phase_name)
             if phase_entries:
+                from src.core.skill_format import skill_body
                 from src.core.workspace_injection import (
                     create_phase_instruction_message,
                 )
@@ -904,6 +928,10 @@ def create_execute_node(
                 }
                 seen_paths: set[str] = set()
                 for entry in phase_entries:
+                    if legacy_phase_prompt and entry.skill in PHASE_SKILL_NAMES:
+                        # The legacy swap carries the phase text in the system
+                        # prompt; the phase skills would say it twice.
+                        continue
                     instr_path = entry.path.lstrip("/")
                     if instr_path in seen_paths:
                         continue  # duplicate bindings to one artifact
@@ -918,6 +946,20 @@ def create_execute_node(
                             f"[{job_id}] Phase instruction file not found: {entry.path}"
                         )
                         continue
+                    if entry.skill:
+                        # A bound skill delivers its instructions, not its
+                        # catalog frontmatter.
+                        instr_content = skill_body(instr_content)
+                        if entry.skill == PHASE_SKILLS.get(phase_name):
+                            # A DB expert's own strategic/tactical prompt rides
+                            # INSIDE the phase block (one protected identity per
+                            # path), fenced as <expert_workflow> exactly as the
+                            # legacy swap fenced it into the system prompt.
+                            addendum = db_phase_addendum(config, phase_name)
+                            if addendum:
+                                instr_content = append_expert_workflow_addendum(
+                                    instr_content, addendum
+                                )
                     delivered_phase_blocks.append(
                         create_phase_instruction_message(
                             instr_path, instr_content, phase_name, phase_key

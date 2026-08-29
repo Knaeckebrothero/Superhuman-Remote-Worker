@@ -431,3 +431,32 @@ async def test_list_type_filter_matches_tag(monkeypatch):
     assert {"developer", "assistant", "tagged-worker", "plain-session", "dual"} <= set(
         default
     )
+
+
+def test_bundled_expert_bundle_reads_the_phase_skill_bodies():
+    """U2: a fork's prompts.strategic/tactical are the expert-local phase skill
+    BODIES (frontmatter stripped) — the DB shape is unchanged and the text is
+    what the phase block's <expert_workflow> addendum will carry."""
+    from pathlib import Path
+
+    from src.core.skill_format import parse_skill_md
+
+    bundle = _bundled_expert_bundle("developer")
+    if bundle is None:
+        pytest.skip("developer bundled expert not found in this env")
+    prompts = bundle["prompts"]
+    dev = Path("config/experts/developer")
+    for phase in ("strategic", "tactical"):
+        _fm, body = parse_skill_md(
+            (dev / "skills" / f"{phase}-phase" / "SKILL.md").read_text(encoding="utf-8")
+        )
+        assert prompts[phase] == body.lstrip("\n")
+        assert not prompts[phase].startswith("---")
+        assert f"name: {phase}-phase" not in prompts[phase]
+        assert f"You are in {phase.upper()} mode." in prompts[phase]
+    assert "tdd_phase" in prompts["strategic"]
+    # An expert with neither a local phase skill nor the legacy .txt has no key.
+    writer = _bundled_expert_bundle("writer")
+    if writer is not None:
+        assert "strategic" not in writer["prompts"]
+        assert "tactical" not in writer["prompts"]

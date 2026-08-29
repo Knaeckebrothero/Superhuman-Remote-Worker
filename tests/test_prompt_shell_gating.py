@@ -20,10 +20,17 @@ from src.core.loader import _has_shell_tools, render_instruction_content
 
 # summarization_* are rendered with .format_map (see services/auxiliary.py),
 # not Jinja — they are not part of this contract.
+# The worker's tactical guidance is a phase_start-bound skill since U2 (the
+# bundled body plus every expert-local override); its shell block must track
+# the bound tools exactly like the templates.
 PROMPT_FILES = sorted(
-    f
-    for f in glob.glob("config/prompts/*.txt")
-    if not f.split("/")[-1].startswith("summarization_")
+    [
+        f
+        for f in glob.glob("config/prompts/*.txt")
+        if not f.split("/")[-1].startswith("summarization_")
+    ]
+    + glob.glob("config/skills/tactical-phase/SKILL.md")
+    + glob.glob("config/experts/*/skills/tactical-phase/SKILL.md")
 )
 
 # Tool sets a lite-tier (virtual/none) agent vs. a sandbox agent actually gets.
@@ -59,6 +66,8 @@ def _strip_raw(text):
 def test_prompt_files_discovered():
     """Guard against the glob silently matching nothing."""
     assert len(PROMPT_FILES) > 20
+    assert "config/skills/tactical-phase/SKILL.md" in PROMPT_FILES
+    assert sum(p.startswith("config/experts/") for p in PROMPT_FILES) >= 6
 
 
 @pytest.mark.parametrize("path", PROMPT_FILES)

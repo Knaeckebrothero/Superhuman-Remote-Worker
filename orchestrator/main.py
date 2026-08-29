@@ -632,6 +632,7 @@ from src.core.loader import (  # noqa: E402
     INHERIT_MODEL,
     ROLE_ROOTS,
     canonical_config_name,
+    expert_phase_prompt_bodies,
     chain_root,
     load_and_merge_config,
     load_role_base,
@@ -61617,8 +61618,21 @@ def _skill_row_to_meta(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def _scan_skills() -> list[SkillInfo]:
-    """Scan config/skills/<name>/SKILL.md for bundled skills."""
-    from src.core.skill_format import SkillFormatError, parse_skill_md, skill_identity
+    """Scan config/skills/<name>/SKILL.md for bundled skills.
+
+    A skill whose frontmatter says ``catalog: hidden`` (the worker's phase
+    skills, U2) is not a catalog entry: it never enters the model-invoked
+    menu, a session's skill list or the cockpit's bundled list. It still
+    reaches an agent through a deterministic ``instruction_files`` binding
+    (frozen by ``serialize_resolved_config`` straight from disk) and stays
+    readable with ``use_skill`` once materialised.
+    """
+    from src.core.skill_format import (
+        SkillFormatError,
+        is_catalog_hidden,
+        parse_skill_md,
+        skill_identity,
+    )
 
     skills_dir = _get_config_dir() / "skills"
     skills: list[SkillInfo] = []
@@ -61630,6 +61644,8 @@ def _scan_skills() -> list[SkillInfo]:
             continue
         try:
             fm, _ = parse_skill_md(skill_md.read_text(encoding="utf-8"))
+            if is_catalog_hidden(fm):
+                continue
             name, description = skill_identity(fm)
             skills.append(
                 SkillInfo(
@@ -61827,17 +61843,19 @@ def _bundled_expert_bundle(expert_id: str) -> dict[str, Any] | None:
     # (family-agnostic) files only. Disk family variants (strategic_gpt_5.txt …)
     # stay a bundled/framework concern; the fork keeps the base, which is strictly
     # better than the old persona+instructions-only bundle that dropped the rest.
+    # strategic/tactical come from the expert-local phase skills (U2: the
+    # bodies of skills/<phase>-phase/SKILL.md), keeping the DB shape — at
+    # delivery they are the fenced <expert_workflow> addendum of the phase block.
     prompts: dict[str, Any] = {}
     for key, fname in (
         ("persona", "persona.txt"),
         ("instructions", "instructions.md"),
-        ("strategic", "strategic.txt"),
-        ("tactical", "tactical.txt"),
         ("summarization", "summarization_prompt.txt"),
     ):
         fp = expert_dir / fname
         if fp.exists():
             prompts[key] = fp.read_text(encoding="utf-8")
+    prompts.update(expert_phase_prompt_bodies(expert_dir))
     return {
         "name": expert_id,
         "display_name": info.display_name,

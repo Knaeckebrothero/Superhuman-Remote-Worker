@@ -1,0 +1,104 @@
+---
+name: strategic-phase
+description: Developer's strategic-phase instructions — verify what actually changed, keep spec.yaml the contract, maintain the traceability matrix, and stamp the next tactical phase's tdd_phase and todos. Delivered automatically once per strategic phase through the phase_start binding; not a skill to invoke by hand.
+display_name: Strategic Phase (Developer)
+tags:
+  - phase
+  - worker
+catalog: hidden
+---
+
+# Strategic phase — Developer
+
+You are in STRATEGIC mode. Purpose: review what actually changed, verify the spec is still the contract, maintain the traceability matrix, and plan the next tactical phase by setting its `tdd_phase` and todos.
+These instructions apply to the whole strategic phase, until the next [PHASE_TRANSITION] notice.
+
+Do NOT implement code in this phase. No `write_file` to source or tests, no `run_command` that modifies state. This phase is for reviewing, planning, and updating the spec/traceability matrix.
+
+Spec discipline (first thing every strategic phase):
+1. Read `spec.yaml`. Confirm it exists and has acceptance criteria with IDs and `test_oracle` entries.
+2. If this is the first strategic phase and there is no spec yet — that is the next tactical phase's job (`tdd_phase: spec`). Do not start writing tests or code without a spec.
+3. If the spec exists, hash-check it against the version recorded in `spec_lock.md`'s protected `## Acceptance Criteria` section. If they diverge, someone (you or a prior agent) modified the spec mid-flight — this is the failure mode the discipline exists to prevent. Investigate, restore the locked version unless there is a written reason to revise, and record a `kb_write` (type=decision, tag=spec-revision) explaining why if you do revise.
+4. Never silently rewrite acceptance criteria to match what landed. Spec revision is a deliberate strategic action that must be recorded.
+
+Review protocol:
+1. Run git in the shell to verify what actually changed:
+   - `git log` for recent commits
+   - `git diff` against the previous boundary tag (`<job_short_id>-phase-<N>-<type>-complete`, from `git tag`) for all changes since phase start
+   - `git tag` to check phase milestones
+   - `read_file` to spot-check key files
+2. Phase-type compliance check — confirm the previous tactical phase respected its file scope:
+   - If the previous phase was `red`, the diff should be confined to `tests/`. Source-file edits in a red phase are a discipline violation — record and reset.
+   - If the previous phase was `green` or `refactor`, the diff should NOT touch `tests/`. Test edits during implementation are a discipline violation — investigate and decide whether to revert.
+3. Search the knowledge base (kb_search) for failed approaches and blockers — do not repeat strategies already marked as failed.
+4. Read any `BLOCKED:` / `ABORT:` markers from the prior tactical phase. These are honest signals, not failures — they require action: revise the spec, change the approach, or surface to a human.
+5. Write findings to `archive/phase_N_retrospective.md`. This is ground truth after context compaction.
+
+Traceability matrix (maintained in `spec_lock.md`):
+| AC ID | Test Oracle | Status (not_started / red / green / refactored / blocked) |
+
+After every tactical phase, update the matrix:
+- AC-N status moves `not_started → red → green → refactored` as work progresses.
+- An AC with no test after the red phase that was supposed to cover it is a gap — either add it in the next phase or shrink the spec.
+- An AC marked `blocked` must have a corresponding `kb_write` blocker note.
+
+Knowledge maintenance:
+- SEARCH FIRST: Before creating any note, use kb_search to check for existing entries. If a match exists, UPDATE it (kb_update) rather than duplicating.
+- Record repository structure discoveries and conventions: kb_write (type=learning).
+- Record pinned instructions from instructions.md: kb_write (type=state, tag=pinned).
+- Record blockers with structured content (BLOCKER / ATTEMPTED / ROOT_CAUSE / IMPACT / NEEDED): kb_write (type=state, tag=blocker).
+- Record decisions with DECISION / RATIONALE / ALTERNATIVES: kb_write (type=decision).
+- Record failed approaches with root cause: kb_write (type=learning, tag=failed-approach).
+- Mark outdated knowledge superseded: kb_update (status=superseded), link to replacement.
+
+Plan adaptation:
+- Mark previous phases with outcomes (which AC moved to green, what's blocked).
+- Evaluate todo scoping: were tests too broad? Did the green phase need to touch more files than expected (which suggests the spec was vague)?
+- Add context-gathering todos if you found yourself guessing at conventions.
+- Re-sequence the plan based on what was learned.
+
+Setting `tdd_phase` for the next tactical phase:
+The tdd_phase is the single most important decision in the strategic phase. It determines what the next phase is allowed to do.
+
+- `spec` — when there's no `spec.yaml` yet, or when current AC are revealed to be wrong/contradictory and need rewriting. Forbidden to edit `src/` or `tests/`.
+- `red` — when AC exist but have no tests yet, or when adding tests for the next batch of AC. Forbidden to edit `src/`.
+- `green` — when there are failing tests for AC and no implementation yet. Forbidden to edit `tests/`.
+- `refactor` — when all in-scope AC are green and the structure needs improvement. Forbidden to edit `tests/`.
+- `integration` — packaging, commit cleanup, PR prep at the very end.
+
+Pick exactly one tdd_phase per tactical phase. Mixing types in one phase is the failure mode that erases the TDD discipline.
+
+{% if has_tool("spawn_subagent") -%}
+Parallel exploration via subagents — for understanding, research, and experiments (never the production code):
+The hard, token-heavy part of implementation is understanding the system and deciding what's correct — not typing. Parallelize THAT. `spawn_subagent` spins up throwaway subagents that run inline with their own fresh context and return a result string; they have the full toolset (read, shell, websearch/browser, and — for spikes — writes). Good uses:
+- Explore several independent code areas at once: how module X works, where Y is called from, what the failing test actually touches, how a subsystem is wired.
+- Research external material: look up library/API docs, an error message, a language/framework detail, or prior art via web_search; when a page needs JavaScript to render, use `browser_navigate` then `browser_snapshot`.
+- Prototype or spike a throwaway approach to learn from before you commit to one in the real code.
+
+How to fan out: call `spawn_subagent` several times in a SINGLE turn — one focused, self-contained task each (the subagent can't see your conversation, so spell out the question, the paths/URLs, and exactly what to return). N calls in one turn run concurrently.
+
+The one rule — the production implementation is YOURS. Do NOT split the feature you're building across parallel subagents. Subagent-driven coding fragments the one thing that needs a single coherent head, and the bottleneck was never how fast code gets typed — it's writing the RIGHT code. Subagents inform and prototype; you write the code that lands, run it, test it, and own it.
+{% endif -%}
+Creating execution-ready todos:
+Each todo must:
+- Name the `tdd_phase` it belongs to (must match the phase's tdd_phase).
+- Reference the AC IDs it serves (every red/green/refactor todo must trace to >= 1 AC).
+- Name target files (and the directory restriction implied by tdd_phase).
+- Name the verification command.
+
+Phase-typed examples:
+
+`tdd_phase: red`
+Good: "Write failing test for AC-1 in repos/<name>/tests/test_persistent_ttl.py::test_magic_link_extends_deadline. Cover: thread in awaiting_user, magic_link_clicked arrives, awaiting_user_deadline = now + ttl_default. Follow style from repos/<name>/tests/test_persistent_chat.py. Run `pytest tests/test_persistent_ttl.py::test_magic_link_extends_deadline -x -v` — confirm it fails with AssertionError, not ImportError."
+
+`tdd_phase: green`
+Good: "Make AC-1 test pass: in repos/<name>/src/persistent/lifecycle.py, handle MagicLinkClicked event by setting thread.awaiting_user_deadline = now + ttl_default. Reference pattern: repos/<name>/src/persistent/lifecycle.py:handle_idle (line 88). Forbidden: editing tests/. Run `pytest tests/test_persistent_ttl.py -x` — must go from red to green; full suite `pytest tests/ -x` must stay green."
+
+`tdd_phase: refactor`
+Good: "Extract MagicLinkClicked handler from repos/<name>/src/persistent/lifecycle.py into repos/<name>/src/persistent/handlers/magic_link.py. Keep behavior identical. Run `pytest tests/ -x` — every previously-green test must remain green."
+
+Bad (vague, no AC trace, no phase awareness): "Fix the auth bug", "Add tests".
+
+Action bias: Strategic review should be shorter than tactical execution. If you have spent more than 10 tool calls without transitioning, you are over-planning. Define concrete todos with explicit AC IDs and move to execution.
+
+When strategic review is complete, transition to tactical phase with the chosen tdd_phase stamped on every todo.

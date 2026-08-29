@@ -14,18 +14,21 @@ secrets with ``redact_config_override`` before persisting.
 from __future__ import annotations
 
 import copy
+import logging
 from typing import Awaitable, Callable, Optional
 
 import yaml
 
 from src.core.loader import (
     INHERIT_MODEL,
+    PROMPT_MODE_LEGACY,
     ROLE_ROOTS,
     ROOT_NAMES,
     _apply_settings_matrix,
     authored_llm_keys,
     canonical_config_name,
     deep_merge,
+    ensure_phase_skill_bindings,
     load_agent_config_from_dict,
     load_and_merge_config,
     normalize_llm_tiers,
@@ -36,6 +39,8 @@ from src.core.loader import (
 )
 from src.core.subagent_roster import resolve_subagent_roster
 from src.core.tool_policy import normalize_tool_policy
+
+logger = logging.getLogger(__name__)
 
 # Prompt segments a DB/forked expert may override — one family-agnostic version
 # each (model adaptation stays in the systemprompt_<family> wrapper). persona +
@@ -238,6 +243,16 @@ def resolve_config(
     # what the role does not read (e.g. `workspace.backend` for a subagent).
     data = prune_ignored_keys(data)
 
+    # Phase-skill floor (U2, worker role, skills mode): the strategic-phase /
+    # tactical-phase bindings replaced an unconditional system-prompt swap, so
+    # a worker must always carry them. `deep_merge` replaces lists wholesale —
+    # an expert that authors its own `instruction_files` (a DB expert forked
+    # before U2, a session expert dispatched as a worker) would otherwise lose
+    # its phase guidance silently. Restored here, before the capture and the
+    # freeze, so the PDP view and the blob agree.
+    if role == "worker":
+        data = ensure_worker_phase_skill_bindings(data)
+
     # Roster materialisation: every `subagents.roster` entry becomes its fully
     # merged subagent-role config (pruning point 3 of 3 runs per entry inside).
     # The parent's llm is final here — an `inherit` entry copies the model the
@@ -292,6 +307,32 @@ def resolve_config(
         blob["skills"] = skills
 
     return blob
+
+
+def ensure_worker_phase_skill_bindings(data: dict) -> dict:
+    """Return ``data`` with the two phase-skill bindings present in
+    ``instruction_files`` (prepended when missing). A no-op in legacy prompt
+    mode — the swap carries the phase text there and the runtime skips the
+    phase-skill blocks anyway."""
+    phase_settings = data.get("phase_settings")
+    mode = (
+        phase_settings.get("prompt_mode") if isinstance(phase_settings, dict) else None
+    )
+    if mode == PROMPT_MODE_LEGACY:
+        return data
+    entries = data.get("instruction_files")
+    entries, restored = ensure_phase_skill_bindings(
+        entries if isinstance(entries, list) else []
+    )
+    if restored:
+        logger.info(
+            "Restored phase-skill bindings %s for worker expert %r (its "
+            "instruction_files replaced the worker overlay's list)",
+            restored,
+            data.get("agent_id"),
+        )
+        data["instruction_files"] = entries
+    return data
 
 
 def unrouted_model_slots(blob: dict) -> list[str]:

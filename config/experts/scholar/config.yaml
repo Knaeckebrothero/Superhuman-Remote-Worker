@@ -40,6 +40,13 @@ workspace:
 
 # Scholar-specific instruction files (the conservative base does not add these)
 instruction_files:
+  # Phase skills restated: this list replaces the worker overlay's wholesale.
+  - skill: strategic-phase
+    trigger: phase_start:strategic
+    enforce: false
+  - skill: tactical-phase
+    trigger: phase_start:tactical
+    enforce: false
   - skill: todo-guide
     trigger: before_tool:next_phase_todos
     enforce: true

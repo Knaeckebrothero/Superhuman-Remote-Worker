@@ -104,3 +104,44 @@ async def test_ordinary_resolved_catalog_excludes_managed_app_guide(monkeypatch)
     names = {item["name"] for item in payload["menu"]}
     assert "app-guide" not in names
     assert names, "ordinary bundled skills should still resolve"
+
+
+def test_scan_skills_hides_catalog_hidden_skills():
+    """``catalog: hidden`` (the worker's phase skills, U2) keeps a bundled skill
+    out of the scanned catalog — the model-invoked menu, the session list and
+    the cockpit's bundled list all read this cache — while the binding channel
+    still freezes it straight from disk."""
+    from src.core.loader import (
+        PHASE_SKILL_NAMES,
+        load_agent_config,
+        resolve_config_path,
+    )
+    from src.core.loader import serialize_resolved_config
+
+    names = {s.name for s in orchestrator_main._scan_skills()}
+    assert names, "bundled skills should still scan"
+    assert not (names & PHASE_SKILL_NAMES), names & PHASE_SKILL_NAMES
+    assert "todo-guide" in names  # an ordinary bound skill is still listed
+    path, dep = resolve_config_path("worker_base")
+    cfg = load_agent_config(path, dep)
+    frozen = serialize_resolved_config(cfg, model=cfg.llm.model)["instructions"]
+    assert PHASE_SKILL_NAMES <= set(frozen)
+
+
+@pytest.mark.asyncio
+async def test_resolved_catalog_never_offers_the_phase_skills(monkeypatch):
+    from src.core.loader import PHASE_SKILL_NAMES
+
+    monkeypatch.setattr(orchestrator_main, "_is_skills_db_enabled", lambda: True)
+    monkeypatch.setattr(
+        orchestrator_main, "_skills_cache", orchestrator_main._scan_skills()
+    )
+    monkeypatch.setattr(
+        orchestrator_main.postgres_db,
+        "list_skills_visible",
+        AsyncMock(return_value=[]),
+    )
+    payload = await orchestrator_main._gather_in_scope_skills("user-1")
+    names = {item["name"] for item in payload["menu"]}
+    assert not (names & PHASE_SKILL_NAMES)
+    assert not (set(payload["files"]) & PHASE_SKILL_NAMES)

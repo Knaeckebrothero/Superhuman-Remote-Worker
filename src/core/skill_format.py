@@ -47,6 +47,29 @@ def parse_skill_md(text: str) -> tuple[dict[str, Any], str]:
     return fm, m.group(2)
 
 
+#: Frontmatter ``catalog: hidden`` — the skill is never offered in the
+#: model-invoked menu or the skills list; it reaches an agent only through a
+#: deterministic binding (the worker's phase skills). Still readable with
+#: ``use_skill`` once bound and materialised.
+CATALOG_HIDDEN = "hidden"
+
+
+def is_catalog_hidden(frontmatter: dict[str, Any]) -> bool:
+    """Whether a skill's frontmatter opts it out of every catalog."""
+    return str(frontmatter.get("catalog", "") or "").strip().lower() == CATALOG_HIDDEN
+
+
+def skill_body(text: str) -> str:
+    """The body of a SKILL.md (frontmatter stripped); ``text`` unchanged when
+    it carries no frontmatter block. Used where a skill's *instructions* are
+    delivered rather than its file (the phase block, the fork bundle)."""
+    try:
+        _fm, body = parse_skill_md(text)
+    except SkillFormatError:
+        return text
+    return body.lstrip("\n")
+
+
 def skill_identity(frontmatter: dict[str, Any]) -> tuple[str, str]:
     """Extract and validate (name, description) from frontmatter."""
     name = str(frontmatter.get("name", "")).strip()

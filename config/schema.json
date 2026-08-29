@@ -2019,6 +2019,12 @@
           "minimum": 1,
           "default": 30,
           "description": "Maximum todos allowed for a strategic->tactical transition"
+        },
+        "prompt_mode": {
+          "type": "string",
+          "enum": ["skills", "legacy"],
+          "default": "skills",
+          "description": "How the worker receives its phase guidance (U2). `skills` (default): one phase-agnostic system prompt; the strategic-phase / tactical-phase skills are delivered once per concrete phase through their phase_start bindings as persistent, protected messages. `legacy`: the pre-U2 swap — strategic.txt / tactical.txt (and their model-family variants) rendered into the system prompt every turn, phase-filtered tool bindings, no phase-skill blocks. Kept only so the U2 bench can run both arms on one image; removed with the family variants (U2 WP6). Flows through config_override like every phase_settings key; the frozen config decides for an in-flight job."
         }
       },
       "additionalProperties": false
