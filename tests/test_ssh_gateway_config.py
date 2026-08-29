@@ -31,6 +31,10 @@ BASE_ENV = {
     # SESSION_JWT_SECRET, so load_config refuses to start without it unless
     # SSH_GATEWAY_REQUIRE_TOKEN is explicitly "false" (ruling G38).
     "SESSION_JWT_SECRET": "test-only-session-secret",
+    # Required since fix round 2: silence here is refused, because an unset
+    # value buckets every WSS client under the ingress IP and one attacker's
+    # refused-handshake flood then burns the whole fleet's admission budget.
+    "SSH_GATEWAY_TRUSTED_PROXIES": "10.42.0.0/16",
 }
 
 
@@ -450,14 +454,61 @@ def test_session_secret_never_appears_in_repr():
     assert secret not in str(config)
 
 
-def test_trusted_proxies_default_to_nothing():
-    """No trusted hop means X-Forwarded-For is never believed -- the
-    fail-closed default. Trusting it unconditionally (the plan's original
-    _client_ip) let any client spoof a fresh source IP per connection and
-    nullify per-source rate limiting entirely."""
+def test_an_unset_trusted_proxy_list_is_refused():
+    """Silence is refused. There is no safe default here, in either direction.
+
+    This started as concern 2 in the task report ("Task 11 must set this") and
+    was escalated to a boot condition, because the mitigation for a
+    documentation-only requirement is a docstring -- which is exactly how this
+    plan lost ``detach``, three audit writes with no caller, and a user
+    notification.
+
+    The consequence of omission is not merely degraded rate limiting: since
+    refused handshakes share the source's rate window, every WSS client
+    bucketed under one ingress IP means a single attacker's flood burns the
+    fleet's admission budget for a minute. Same shape as the empty-origin-list
+    refusal a few tests up, which fails closed on the reasoning that "an empty
+    list would accept cross-site WebSocket handshakes".
+    """
     env = dict(BASE_ENV)
     env.pop("SSH_GATEWAY_TRUSTED_PROXIES", None)
-    assert load_config(env).trusted_proxies == ()
+    with pytest.raises(ValueError, match="SSH_GATEWAY_TRUSTED_PROXIES"):
+        load_config(env)
+
+
+def test_the_refusal_names_the_consequence_and_the_way_out():
+    """A boot refusal an operator cannot act on just gets worked around."""
+    env = dict(BASE_ENV)
+    env.pop("SSH_GATEWAY_TRUSTED_PROXIES", None)
+    with pytest.raises(ValueError) as excinfo:
+        load_config(env)
+    message = str(excinfo.value)
+    assert "none" in message  # the explicit opt-out, by name
+    assert "X-Forwarded-For" in message  # what the setting actually governs
+
+
+@pytest.mark.parametrize("blank", ["", "   ", ",", " , "])
+def test_a_blank_trusted_proxy_list_is_refused_like_an_absent_one(blank):
+    """A key set to nothing is the same omission with extra steps -- it must
+    not be a quieter way to reach the vulnerable state."""
+    with pytest.raises(ValueError, match="SSH_GATEWAY_TRUSTED_PROXIES"):
+        load_config({**BASE_ENV, "SSH_GATEWAY_TRUSTED_PROXIES": blank})
+
+
+@pytest.mark.parametrize("marker", ["none", "NONE", "  None  "])
+def test_the_explicit_opt_out_is_accepted(marker):
+    """A TCP-only deployment genuinely has no proxy hop, and must be able to
+    say so. The point of the refusal is that the operator makes the choice,
+    not that the choice is unavailable -- ``none`` means "trust the socket
+    peer", which is exactly right when nothing sits in front."""
+    config = load_config({**BASE_ENV, "SSH_GATEWAY_TRUSTED_PROXIES": marker})
+    assert config.trusted_proxies == ()
+
+
+def test_the_opt_out_is_the_whole_value_not_an_entry():
+    """``10.0.0.0/8,none`` is a typo, not a hop plus an opt-out."""
+    with pytest.raises(ValueError, match="SSH_GATEWAY_TRUSTED_PROXIES"):
+        load_config({**BASE_ENV, "SSH_GATEWAY_TRUSTED_PROXIES": "10.0.0.0/8,none"})
 
 
 def test_trusted_proxies_parse_as_cidrs():

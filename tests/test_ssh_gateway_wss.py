@@ -708,6 +708,11 @@ def gateway_env(tmp_path_factory):
         "MCP_INTERNAL_KEY": "internal-key-value",
         "SSH_GATEWAY_ALLOWED_ORIGINS": "https://cockpit.srw.works",
         "SESSION_JWT_SECRET": SECRET,
+        # Required at boot since fix round 2, and "none" is the honest answer
+        # here: nothing proxies this test gateway, so the socket peer is the
+        # source. The trusted-hop path is exercised by ``client_ip``'s own
+        # tests above, which drive the header directly.
+        "SSH_GATEWAY_TRUSTED_PROXIES": "none",
         # Ephemeral: 2222 would collide with anything else on the host.
         "SSH_GATEWAY_SSH_PORT": "0",
         "SSH_GATEWAY_SSH_HOST": "127.0.0.1",

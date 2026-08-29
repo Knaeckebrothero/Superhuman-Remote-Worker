@@ -242,10 +242,16 @@ class GatewayConfig:
     # no shared state.
     session_jwt_secret: str = field(default="", repr=False)
     # Source addresses whose ``X-Forwarded-For`` header the gateway believes.
-    # Empty by default: without a known ingress hop the header is client-
-    # supplied fiction, and trusting it (as the plan's original ``_client_ip``
-    # did, taking its FIRST entry) lets any client mint a fresh source IP per
-    # connection and nullify per-source rate limiting entirely.
+    # Without a known ingress hop the header is client-supplied fiction, and
+    # trusting it (as the plan's original ``_client_ip`` did, taking its FIRST
+    # entry) lets any client mint a fresh source IP per connection and nullify
+    # per-source rate limiting entirely.
+    #
+    # The dataclass default is empty and means "trust the socket peer", but
+    # ``load_config`` will NOT reach it by omission -- an unset environment
+    # variable is a boot failure, and empty is reachable only through the
+    # explicit ``SSH_GATEWAY_TRUSTED_PROXIES=none``. See load_config for why
+    # neither default is safe to inherit silently.
     trusted_proxies: tuple[str, ...] = ()
     # The raw TCP SSH listener. Task 11 ships ``containerPort: 2222`` and an
     # optional LoadBalancer on it, and every step of Task 12's live gate is an
@@ -402,11 +408,35 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> GatewayConfig:
             "user credential at all"
         )
 
-    trusted_proxies = tuple(
-        p.strip()
-        for p in (src.get("SSH_GATEWAY_TRUSTED_PROXIES") or "").split(",")
-        if p.strip()
-    )
+    # No default, in EITHER direction: this is one of the values where both
+    # possible defaults are wrong, so the operator has to say which one they
+    # mean. Omitting it used to mean "trust nothing", which reads safe and is
+    # not: behind an ingress, every WSS client is then bucketed under the
+    # ingress pod's own IP, and because refused handshakes share a source's
+    # rate window (see GatewayLimiter.note_handshake_refusal), one attacker's
+    # flood burns the whole fleet's admission budget for a minute. Defaulting
+    # the other way -- trusting any hop -- is the spoofable header this
+    # setting exists to prevent. The empty origin allow-list above fails
+    # closed for the same shape of reason.
+    raw_trusted = src.get("SSH_GATEWAY_TRUSTED_PROXIES")
+    if raw_trusted is None or not raw_trusted.replace(",", "").strip():
+        raise ValueError(
+            "ssh-gateway requires SSH_GATEWAY_TRUSTED_PROXIES: the source "
+            "addresses whose X-Forwarded-For header it may believe (the "
+            "ingress hop, as an IP or CIDR list). Set it to "
+            "SSH_GATEWAY_TRUSTED_PROXIES=none if nothing proxies this "
+            "gateway, which trusts the socket peer instead -- but say so "
+            "explicitly: left unset behind an ingress, every client is rate "
+            "limited as one source and a single flood locks out the fleet"
+        )
+
+    if raw_trusted.strip().lower() == "none":
+        # The explicit opt-out, and it must be the WHOLE value: "10.0.0.0/8,
+        # none" is a typo, not a hop plus an opt-out, and falls through to the
+        # CIDR validation below, which rejects it by name.
+        trusted_proxies: tuple[str, ...] = ()
+    else:
+        trusted_proxies = tuple(p.strip() for p in raw_trusted.split(",") if p.strip())
     for entry in trusted_proxies:
         try:
             ipaddress.ip_network(entry, strict=False)

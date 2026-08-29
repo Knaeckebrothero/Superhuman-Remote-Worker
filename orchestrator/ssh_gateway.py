@@ -52,7 +52,10 @@ metered (``_refuse_handshake``): refusals share the source's 60-second rate
 window, so with every WSS client bucketed under one ingress IP, an
 unauthenticated flood from anywhere burns the budget everyone else is
 admitted from. Bucketed by real client address, it burns only the flooder's
-own.
+own. It is therefore a BOOT CONDITION, not a recommendation: ``load_config``
+refuses to start without it, and a deployment with nothing in front of the
+gateway must say ``SSH_GATEWAY_TRUSTED_PROXIES=none`` out loud rather than
+inherit the vulnerable state by omission.
 
 The credential the USER presents is NOT ``MCP_INTERNAL_KEY``. See
 ``services/ssh_gateway_token.py`` for the full account (ruling G38); in short,
