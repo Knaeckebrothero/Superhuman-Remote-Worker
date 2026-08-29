@@ -17,20 +17,25 @@ special-cases sftp and runs a *local* sftp server instead of forwarding.
 from __future__ import annotations
 
 import inspect
+import logging
 
 import asyncssh
 from asyncssh.constants import EXTENDED_DATA_STDERR
 from asyncssh.stream import SSHReader, SSHWriter
+
+logger = logging.getLogger(__name__)
 
 ALLOWED_SUBSYSTEMS = frozenset({"sftp"})
 
 # Ruling G16: this isn't a resolved-target refusal (ssh_gateway_client's
 # REFUSAL_MESSAGES table owns those, keyed by workspace state) -- it's a
 # generic proxy-layer failure, so there is no per-state message to look up.
-# 69 mirrors that table's own EX_UNAVAILABLE bucket ("broken or gone, not
-# fixed by retrying alone"), the honest characterization of an upstream that
-# refused to start a process at all.
-UPSTREAM_FAILURE_EXIT_CODE = 69
+# 75 EX_TEMPFAIL, not 69 EX_UNAVAILABLE (fix round 1, Minor #2): a
+# create_process failure on an already-established upstream connection --
+# the workspace sshd's MaxSessions exhausted, a transient hiccup -- is
+# generally retryable. Mirrors e16cdc13's own reasoning for reclassifying
+# stale_binding the same way in ssh_gateway_client.REFUSAL_MESSAGES.
+UPSTREAM_FAILURE_EXIT_CODE = 75
 
 
 class ProxyProcess(asyncssh.SSHServerProcess):
@@ -40,8 +45,20 @@ class ProxyProcess(asyncssh.SSHServerProcess):
         return subsystem in ALLOWED_SUBSYSTEMS
 
     def session_started(self) -> None:
-        # Binary, not UTF-8: session data is arbitrary bytes, and this also
-        # disables asyncssh's line editor as a side effect.
+        # Binary, not UTF-8: session data is arbitrary bytes. This is *not*
+        # what keeps asyncssh's line editor out of the way (fix round 1,
+        # Minor #1 -- the previous comment claiming that was false): the
+        # listener already passes line_editor=False
+        # (ssh_gateway_config.py's server_options), so asyncssh's
+        # SSHServerChannel._wrap_session (asyncssh/channel.py) never installs
+        # SSHLineEditorSession around this session at all. Even if it were
+        # installed, its session_started calls create_editor() *before*
+        # delegating to this one (asyncssh/editor.py), so a set_encoding()
+        # here would be too late to matter either way. The listener's own
+        # encoding=None also already makes the channel binary before this
+        # method ever runs -- restating it below matches asyncssh's own
+        # _init_sftp_server idiom (asyncssh/stream.py) as defense in depth,
+        # not the mechanism that makes this safe.
         self._chan.set_encoding(None)
         self._encoding = None
         handler = self._start_process(
@@ -83,6 +100,20 @@ async def proxy_session(process, upstream) -> None:
         # -- the exact bug item 2 above describes, reintroduced through the
         # error path instead of the happy path. The channel is binary
         # (encoding=None, forced above), so stderr takes bytes, not str.
+        #
+        # Fix round 1, Important #1: log before doing anything else. Before
+        # this override existed, an escaping exception here still reached
+        # asyncssh's own internal_error() logging path (connection.py's
+        # _reap_task); a bare `except Exception:` with no bind and no log
+        # would have thrown that trace away and left only a generic stderr
+        # line and an exit code -- an operability regression, not a wash.
+        # Not deferred to Task 8's module logger: wiring this now is the
+        # pattern this plan already had to un-defer elsewhere.
+        logger.exception(
+            "ssh gateway: failed to start upstream session (command=%r, subsystem=%r)",
+            process.command,
+            process.subsystem,
+        )
         try:
             process.stderr.write(b"srw: failed to start the session on the workspace\n")
         except Exception:

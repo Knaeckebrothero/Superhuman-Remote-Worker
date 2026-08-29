@@ -18,6 +18,7 @@ into, since nothing else here calls that override at all.
 """
 
 import inspect
+import logging
 
 import asyncssh
 import pytest
@@ -267,6 +268,30 @@ async def test_upstream_failure_is_reported_and_exits_nonzero():
     assert proc.stderr.written == [
         b"srw: failed to start the session on the workspace\n"
     ]
+
+
+@pytest.mark.asyncio
+async def test_upstream_failure_is_logged_with_traceback(caplog):
+    """Fix round 1, Important #1: the except clause used to discard the
+    exception outright -- no bind, no log -- so a failed attach left only a
+    generic stderr line and an exit code. Before this override existed at
+    all, the escaping exception still reached asyncssh's own
+    internal_error() logging path (connection.py's _reap_task); losing that
+    on the way to fixing the hang would have been a regression, not a wash.
+    Checked against caplog.text (the fully rendered output), not just the
+    bare message, because "with traceback" is the actual requirement --
+    logger.error(msg) with no exc_info would pass a check that only looked
+    at record.getMessage()."""
+    proc = FakeProcess()
+    upstream = FailingUpstream(ConnectionError("upstream refused the connection"))
+
+    await proxy_session(proc, upstream)
+
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1
+    assert errors[0].exc_info is not None
+    assert "ConnectionError" in caplog.text
+    assert "upstream refused the connection" in caplog.text
 
 
 @pytest.mark.asyncio
