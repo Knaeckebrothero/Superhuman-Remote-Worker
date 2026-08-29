@@ -63871,10 +63871,17 @@ def _ssh_target_response(
     joined in for exactly this reason). ``.get`` rather than a required key:
     every real caller passes the dict that resolver returns, but tests and
     any future caller that only has a plain ``{"id": ...}`` must not crash
-    this helper for it. Threading it through here is what lets ``POST
-    /api/internal/ssh-attachments`` ever be handed a key id by the gateway —
-    without it, the gateway would have resolved a key at auth time and then
-    have no way to carry it forward to the attachment-open call.
+    this helper for it.
+
+    NOT load-bearing for ``POST /api/internal/ssh-attachments``: that
+    endpoint re-resolves ``ssh_key_id`` server-side itself rather than
+    trusting a value the gateway echoes back (fix round 1, Important 1 —
+    accepting it from the caller would be exactly the "internal key plus an
+    asserted identity" this module's own docstring rules out). This field
+    stays because it is already built and tested, leaks nothing beyond the
+    ``user_id`` already on this response, and is useful for gateway-side
+    logging — but nothing should come to depend on it for anything other
+    than display/logging.
     """
     ssh_key_id = user.get("ssh_key_id")
     return {
@@ -63990,9 +63997,17 @@ async def get_ssh_target(
 
 
 class SshKeyUsedRequest(BaseModel):
-    """Body for the gateway's post-authentication ``last_used_at`` bump."""
+    """Body for the gateway's post-authentication ``last_used_at`` bump.
 
-    fingerprint: str
+    ``fingerprint`` is capped: it flows straight into a SQL predicate
+    (``resolve_user_by_ssh_fingerprint``, then ``mark_ssh_key_used``'s
+    second WHERE clause) with no length check downstream, so an unbounded
+    body would let any ``X-Internal-Key`` holder push an arbitrarily large
+    value into that query. A SHA256 fingerprint is ``"SHA256:"`` plus 43
+    base64 characters (50 total); 128 is headroom, not a tight fit.
+    """
+
+    fingerprint: str = Field(..., min_length=1, max_length=128)
 
 
 @app.post("/api/internal/ssh-keys/used")
@@ -64026,22 +64041,48 @@ async def internal_mark_ssh_key_used(
     user = await postgres_db.resolve_user_by_ssh_fingerprint(body.fingerprint)
     key_id = user.get("ssh_key_id") if user else None
     if key_id:
-        await postgres_db.mark_ssh_key_used(str(key_id), body.fingerprint)
+        try:
+            await postgres_db.mark_ssh_key_used(str(key_id), body.fingerprint)
+        except Exception:
+            # mark_ssh_key_used's own docstring: "a failed bump must not
+            # discard an authentication that already succeeded." The
+            # gateway calls this after key.verify has already passed, so a
+            # transient DB hiccup on the bump itself must not turn into a
+            # 500 for what is, from the caller's side, a fire-and-forget
+            # bookkeeping call.
+            logger.warning(
+                "mark_ssh_key_used failed for a resolved key; last_used_at not bumped",
+                exc_info=True,
+            )
     return {"status": "ok"}
 
 
 class SshAttachmentCreate(BaseModel):
     """Body for opening an SSH-attachment audit row.
 
-    ``ssh_key_id`` and ``client_ip`` are Optional, matching
-    ``PostgresDB.record_ssh_attachment``'s signature.
+    Deliberately does NOT carry ``thread_id``/``user_id``/``ssh_key_id``.
+    ``get_ssh_target``'s docstring states the invariant this body must not
+    violate: "this codebase does not accept an internal key plus an
+    asserted user identity." An earlier draft of this endpoint took those
+    three as asserted fields — any ``X-Internal-Key`` holder (every agent
+    pod) could then write an audit row attributing an SSH attach to any
+    user on any thread. That the value is only ever recorded, never used
+    for an authorization decision, is a mitigation, not a justification —
+    the audit table's whole purpose is a trustworthy record of who reached
+    a workspace over SSH, and a forgeable one is worth less than it looks.
+
+    ``thread_id``, ``user_id`` and ``ssh_key_id`` are resolved server-side
+    instead, by ``internal_create_ssh_attachment``, from ``fingerprint`` and
+    ``handle`` — the same two values ``get_ssh_target`` resolves identity
+    from.
+
+    ``fingerprint`` is capped for the same reason as
+    ``SshKeyUsedRequest.fingerprint``.
     """
 
-    thread_id: str
-    user_id: str
-    ssh_key_id: str | None = None
-    client_ip: str | None = None
+    fingerprint: str = Field(..., min_length=1, max_length=128)
     handle: str
+    client_ip: str | None = None
 
 
 @app.post("/api/internal/ssh-attachments")
@@ -64051,30 +64092,72 @@ async def internal_create_ssh_attachment(
     """Open an SSH-attachment audit row. **Internal** — requires
     ``X-Internal-Key``.
 
-    The gateway calls this once it has resolved a live target at first
-    channel open, so it has all five fields by then. See
-    ``PostgresDB.record_ssh_attachment`` for the column contract and for why
-    a malformed ``handle`` or id raises ``ValueError`` rather than being
-    silently accepted.
+    Resolves ``thread_id``, ``user_id`` and ``ssh_key_id`` server-side from
+    ``fingerprint`` and ``handle`` — see ``SshAttachmentCreate`` for why an
+    asserted identity is never accepted here. The resolution is the
+    identical lookup ``get_ssh_target`` performs (``get_thread_id_by_ssh_
+    handle`` + ``resolve_user_by_ssh_fingerprint``, gated by
+    ``user_can_access_ide_entity``), reusing that endpoint's opaque 404 for
+    every failure mode — unknown handle, unknown/unapproved key, and "not
+    your thread" all come back identical, so this endpoint cannot be used
+    to probe for handle or key existence either. In real operation this is
+    not expected to fail: the gateway only calls this after ``get_ssh_
+    target`` already resolved the same handle/fingerprint pair to open the
+    SSH session in the first place.
+
+    A foreign-key violation on the insert (thread, user or key deleted
+    between the resolution above and the write below — a real race, e.g. a
+    thread torn down mid-session, not just a probe) and a malformed
+    ``handle`` surfacing from ``record_ssh_attachment`` both map to 400
+    rather than an unhandled 500.
     """
     await require_internal(request)
+
+    opaque = HTTPException(status_code=404, detail="No such workspace")
+    if not is_valid_handle(body.handle):
+        raise opaque
+
+    thread_id = await postgres_db.get_thread_id_by_ssh_handle(body.handle)
+    user = await postgres_db.resolve_user_by_ssh_fingerprint(body.fingerprint)
+    if not thread_id or not user:
+        raise opaque
+    if not await user_can_access_ide_entity(user, postgres_db, thread_id):
+        raise opaque
+
+    ssh_key_id = user.get("ssh_key_id")
     try:
         attachment_id = await postgres_db.record_ssh_attachment(
-            body.thread_id,
-            body.user_id,
-            body.ssh_key_id,
+            thread_id,
+            str(user["id"]),
+            str(ssh_key_id) if ssh_key_id else None,
             body.client_ip,
             body.handle,
         )
-    except ValueError as exc:
+    except (ValueError, asyncpg.ForeignKeyViolationError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"attachment_id": attachment_id}
 
 
 class SshAttachmentClose(BaseModel):
-    """Body for closing an SSH-attachment audit row."""
+    """Body for closing an SSH-attachment audit row.
 
-    channels: list[str] = Field(default_factory=list)
+    ``channels`` is capped in both count and per-entry length: it is written
+    straight into a ``text[]`` column (migration 0204) with no size limit of
+    its own, so an unbounded body would let any ``X-Internal-Key`` holder
+    inflate an audit row arbitrarily. Two channel types exist today
+    ("session", "sftp"), so 8 entries of up to 32 characters each is
+    generous headroom, not a tight fit.
+    """
+
+    channels: list[str] = Field(default_factory=list, max_length=8)
+
+    @field_validator("channels")
+    @classmethod
+    def _cap_channel_name_length(cls, value: list[str]) -> list[str]:
+        for channel in value:
+            if len(channel) > 32:
+                raise ValueError(f"channel name too long: {channel[:40]!r}...")
+        return value
 
 
 @app.post("/api/internal/ssh-attachments/{attachment_id}/close")

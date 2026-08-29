@@ -1,34 +1,42 @@
-"""Tests for the SSH-gateway audit endpoints (Task 6A).
+"""Tests for the SSH-gateway audit endpoints (Task 6A, plus fix round 1).
 
-Plan 1 built three database methods for SSH auditing —
-``mark_ssh_key_used``, ``record_ssh_attachment``, ``close_ssh_attachment``
-in ``database/postgres.py`` — and left them for the gateway to call. But the
-gateway is a separate process with no database credentials at all
-(``GatewayConfig`` has no DB field, by design). It reaches the orchestrator
-only over HTTP with an ``X-Internal-Key`` header, so these three endpoints
-are the only way those methods can ever be called in production.
+Plan 1 built mark_ssh_key_used, record_ssh_attachment and
+close_ssh_attachment on PostgresDB but left them with no caller — the
+gateway holds no DB credentials and reaches the orchestrator only over
+HTTP with an X-Internal-Key header. This module covers the three endpoints
+that make them callable:
 
-* ``POST /api/internal/ssh-keys/used`` is keyed by FINGERPRINT, not
-  ``key_id``, on purpose: the gateway calls this from asyncssh's
-  ``auth_completed()``, immediately after ``key.verify`` succeeds, but the
-  gateway resolves its target — and therefore a key id — lazily, at first
-  channel open. At the only moment this call may legitimately fire, it holds
-  a fingerprint and nothing else. An unknown fingerprint is a silent no-op
-  success, not a 404 — a 404 would turn this into an existence oracle for
-  registered keys (same anti-enumeration property ``get_ssh_target``
-  protects).
+* ``POST /api/internal/ssh-keys/used`` is keyed by fingerprint (not
+  key_id), since the gateway calls this from auth_completed() before it
+  has resolved a target/key id. Unknown fingerprint is a silent success,
+  not a 404, to avoid an existence oracle. A failed bump (fix round 1,
+  Minor 2) must not surface as a 500 — the call is best-effort bookkeeping
+  after an authentication that already succeeded.
 * ``POST /api/internal/ssh-attachments`` opens an audit row and hands back
-  its id for the matching close.
+  its id. Fix round 1, Important 1: the original body took ``thread_id``/
+  ``user_id``/``ssh_key_id`` as asserted values, which any
+  ``X-Internal-Key`` holder (every agent pod) could forge — the audit
+  table's whole purpose is a trustworthy record of who reached a workspace
+  over SSH. The body now carries only ``fingerprint``/``handle``/
+  ``client_ip``; identity is resolved server-side on the same path
+  ``get_ssh_target`` uses, reusing its opaque-404 contract for every
+  resolution failure. A foreign-key violation on the insert (Minor 1) also
+  maps to 400, not 500.
 * ``POST /api/internal/ssh-attachments/{id}/close`` returns the row count
-  from ``close_ssh_attachment`` honestly — 0 for an unknown or
-  already-closed id — rather than turning that into an error, since the
-  gateway treats this as best-effort bookkeeping.
-* ``ssh_key_id`` is added to the ``get_ssh_target`` response so the gateway
-  can ever supply one to the create-attachment call above.
+  from close_ssh_attachment honestly — 0 for an unknown or already-closed
+  id — rather than turning that into an error.
+* ``ssh_key_id`` is added to the get_ssh_target response so the gateway can
+  log a key id — no longer load-bearing for attachment-create, which
+  resolves its own copy server-side, but kept for that purpose.
+* Fix round 1, Minor 4: ``fingerprint`` (both endpoints) and ``channels``
+  are capped, so an internal-key holder cannot inflate a query or an audit
+  row arbitrarily.
 """
 
+import asyncpg
 import pytest
 from fastapi import HTTPException
+from pydantic import ValidationError
 
 import main
 from tests._route_inventory import mounted_routes
@@ -60,6 +68,30 @@ def internal(monkeypatch):
     monkeypatch.setattr(main, "require_internal", _allow)
 
 
+_DEFAULT_USER = object()  # sentinel: "user" itself must be able to mean None
+
+
+def _resolved(monkeypatch, *, thread_id=THREAD, user=_DEFAULT_USER, access=True):
+    """Wire the three lookups internal_create_ssh_attachment performs, the
+    same three get_ssh_target performs. Shared by every create-attachment
+    test below so each one only overrides what it's testing."""
+    if user is _DEFAULT_USER:
+        user = {"id": USER, "ssh_key_id": KEY_ID}
+
+    async def _thread_id_fn(handle):
+        return thread_id
+
+    async def _user_fn(fp):
+        return user
+
+    async def _access_fn(u, db, entity_id):
+        return access
+
+    monkeypatch.setattr(main.postgres_db, "get_thread_id_by_ssh_handle", _thread_id_fn)
+    monkeypatch.setattr(main.postgres_db, "resolve_user_by_ssh_fingerprint", _user_fn)
+    monkeypatch.setattr(main, "user_can_access_ide_entity", _access_fn)
+
+
 # =============================================================================
 # X-Internal-Key enforcement
 # =============================================================================
@@ -88,9 +120,7 @@ async def test_create_attachment_requires_internal_key(monkeypatch):
         await main.internal_create_ssh_attachment(
             request=object(),
             body=main.SshAttachmentCreate(
-                thread_id=THREAD,
-                user_id=USER,
-                ssh_key_id=KEY_ID,
+                fingerprint=FINGERPRINT,
                 client_ip="10.0.0.1",
                 handle="s-7f3a91c2",
             ),
@@ -167,6 +197,34 @@ async def test_mark_used_unknown_fingerprint_is_silent_success_no_write(
     assert result == {"status": "ok"}
 
 
+@pytest.mark.asyncio
+async def test_mark_used_db_hiccup_does_not_500(internal, monkeypatch):
+    """Fix round 1, Minor 2: mark_ssh_key_used's own docstring says to wrap
+    the call site — a failed bump must not discard an authentication that
+    already succeeded. A transient DB error here must not propagate."""
+
+    async def _user(fp):
+        return {"id": USER, "ssh_key_id": KEY_ID}
+
+    async def _boom(key_id, fingerprint_sha256):
+        raise asyncpg.PostgresConnectionError("connection lost")
+
+    monkeypatch.setattr(main.postgres_db, "resolve_user_by_ssh_fingerprint", _user)
+    monkeypatch.setattr(main.postgres_db, "mark_ssh_key_used", _boom)
+
+    result = await main.internal_mark_ssh_key_used(
+        request=object(), body=main.SshKeyUsedRequest(fingerprint=FINGERPRINT)
+    )
+    assert result == {"status": "ok"}
+
+
+def test_mark_used_fingerprint_is_capped():
+    """Fix round 1, Minor 4: an unbounded fingerprint reaches a SQL
+    predicate verbatim. 500KB is comfortably past any real fingerprint."""
+    with pytest.raises(ValidationError):
+        main.SshKeyUsedRequest(fingerprint="A" * (500 * 1024))
+
+
 # =============================================================================
 # POST /api/internal/ssh-attachments
 # =============================================================================
@@ -174,6 +232,10 @@ async def test_mark_used_unknown_fingerprint_is_silent_success_no_write(
 
 @pytest.mark.asyncio
 async def test_create_attachment_happy_path(internal, monkeypatch):
+    """thread_id/user_id/ssh_key_id passed to the DB layer are the
+    SERVER-resolved ones, not anything from the body — the body no longer
+    even carries those fields (Important 1)."""
+    _resolved(monkeypatch, user={"id": USER, "ssh_key_id": KEY_ID})
     captured = {}
 
     async def _record(thread_id, user_id, ssh_key_id, client_ip, handle):
@@ -191,11 +253,7 @@ async def test_create_attachment_happy_path(internal, monkeypatch):
     result = await main.internal_create_ssh_attachment(
         request=object(),
         body=main.SshAttachmentCreate(
-            thread_id=THREAD,
-            user_id=USER,
-            ssh_key_id=KEY_ID,
-            client_ip="10.0.0.1",
-            handle="s-7f3a91c2",
+            fingerprint=FINGERPRINT, client_ip="10.0.0.1", handle="s-7f3a91c2"
         ),
     )
     assert result == {"attachment_id": ATTACHMENT_ID}
@@ -209,25 +267,205 @@ async def test_create_attachment_happy_path(internal, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_create_attachment_allows_optional_fields_to_be_absent(
-    internal, monkeypatch
-):
-    """``ssh_key_id`` and ``client_ip`` are Optional[str] on the DB method."""
+async def test_create_attachment_ssh_key_id_absent_is_none(internal, monkeypatch):
+    """A resolved user with no ``ssh_key_id`` (a plain ``{"id": ...}``, as a
+    defensive caller might return) must pass ``None`` through, not crash."""
+    _resolved(monkeypatch, user={"id": USER})
 
     async def _record(thread_id, user_id, ssh_key_id, client_ip, handle):
         assert ssh_key_id is None
-        assert client_ip is None
         return ATTACHMENT_ID
 
     monkeypatch.setattr(main.postgres_db, "record_ssh_attachment", _record)
 
     result = await main.internal_create_ssh_attachment(
         request=object(),
-        body=main.SshAttachmentCreate(
-            thread_id=THREAD, user_id=USER, handle="s-7f3a91c2"
-        ),
+        body=main.SshAttachmentCreate(fingerprint=FINGERPRINT, handle="s-7f3a91c2"),
     )
     assert result == {"attachment_id": ATTACHMENT_ID}
+
+
+@pytest.mark.asyncio
+async def test_create_attachment_ignores_any_caller_supplied_identity(
+    internal, monkeypatch
+):
+    """Important 1's negative control: even if a caller smuggles thread_id/
+    user_id into the raw JSON body, the record call must use the
+    server-resolved identity, never the attacker's. Pydantic silently drops
+    the unknown fields (matching the house pattern for internal POST
+    bodies), so this also proves that drop isn't just cosmetic — nothing
+    downstream ever sees the attacker's values, because the model has
+    nowhere to put them.
+    """
+    ATTACKER_THREAD = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+    ATTACKER_USER = "ffffffff-ffff-ffff-ffff-fffffffffffe"
+    ATTACKER_KEY = "ffffffff-ffff-ffff-ffff-fffffffffffd"
+
+    raw_body = {
+        "fingerprint": FINGERPRINT,
+        "handle": "s-7f3a91c2",
+        "client_ip": "10.0.0.1",
+        # attacker-supplied extras that must never reach the DB call:
+        "thread_id": ATTACKER_THREAD,
+        "user_id": ATTACKER_USER,
+        "ssh_key_id": ATTACKER_KEY,
+    }
+    body = main.SshAttachmentCreate.model_validate(raw_body)
+    assert not hasattr(body, "thread_id")
+    assert not hasattr(body, "user_id")
+    assert not hasattr(body, "ssh_key_id")
+
+    _resolved(monkeypatch, user={"id": USER, "ssh_key_id": KEY_ID})
+    captured = {}
+
+    async def _record(thread_id, user_id, ssh_key_id, client_ip, handle):
+        captured.update(thread_id=thread_id, user_id=user_id, ssh_key_id=ssh_key_id)
+        return ATTACHMENT_ID
+
+    monkeypatch.setattr(main.postgres_db, "record_ssh_attachment", _record)
+
+    await main.internal_create_ssh_attachment(request=object(), body=body)
+
+    assert captured == {"thread_id": THREAD, "user_id": USER, "ssh_key_id": KEY_ID}
+    assert ATTACKER_THREAD not in captured.values()
+    assert ATTACKER_USER not in captured.values()
+    assert ATTACKER_KEY not in captured.values()
+
+
+def test_attachment_create_body_has_no_identity_fields():
+    """Structural half of the negative control above: the schema itself
+    must not accept an asserted identity, under any field name this task's
+    original (rejected) design used."""
+    fields = main.SshAttachmentCreate.model_fields
+    assert "thread_id" not in fields
+    assert "user_id" not in fields
+    assert "ssh_key_id" not in fields
+
+
+@pytest.mark.asyncio
+async def test_create_attachment_unknown_handle_is_opaque_404(internal, monkeypatch):
+    _resolved(monkeypatch, thread_id=None)
+
+    with pytest.raises(HTTPException) as excinfo:
+        await main.internal_create_ssh_attachment(
+            request=object(),
+            body=main.SshAttachmentCreate(fingerprint=FINGERPRINT, handle="s-aaaaaaaa"),
+        )
+    assert excinfo.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_create_attachment_unknown_fingerprint_is_opaque_404(
+    internal, monkeypatch
+):
+    _resolved(monkeypatch, user=None)
+
+    with pytest.raises(HTTPException) as excinfo:
+        await main.internal_create_ssh_attachment(
+            request=object(),
+            body=main.SshAttachmentCreate(fingerprint=FINGERPRINT, handle="s-7f3a91c2"),
+        )
+    assert excinfo.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_create_attachment_not_authorized_is_opaque_404(internal, monkeypatch):
+    """Same status/detail as the two tests above — mirrors get_ssh_target's
+    anti-enumeration contract, which this endpoint deliberately reuses."""
+    _resolved(monkeypatch, access=False)
+
+    with pytest.raises(HTTPException) as not_yours:
+        await main.internal_create_ssh_attachment(
+            request=object(),
+            body=main.SshAttachmentCreate(fingerprint=FINGERPRINT, handle="s-7f3a91c2"),
+        )
+
+    _resolved(monkeypatch, thread_id=None)
+    with pytest.raises(HTTPException) as unknown:
+        await main.internal_create_ssh_attachment(
+            request=object(),
+            body=main.SshAttachmentCreate(fingerprint=FINGERPRINT, handle="s-aaaaaaaa"),
+        )
+
+    assert not_yours.value.status_code == unknown.value.status_code == 404
+    assert not_yours.value.detail == unknown.value.detail
+
+
+@pytest.mark.asyncio
+async def test_create_attachment_malformed_handle_is_opaque_404_before_touching_db(
+    internal, monkeypatch
+):
+    called = False
+
+    async def _tripwire(handle):
+        nonlocal called
+        called = True
+        return None
+
+    monkeypatch.setattr(main.postgres_db, "get_thread_id_by_ssh_handle", _tripwire)
+
+    with pytest.raises(HTTPException) as excinfo:
+        await main.internal_create_ssh_attachment(
+            request=object(),
+            body=main.SshAttachmentCreate(
+                fingerprint=FINGERPRINT, handle="s-abc\nProxyCommand x"
+            ),
+        )
+    assert excinfo.value.status_code == 404
+    assert called is False
+
+
+@pytest.mark.asyncio
+async def test_create_attachment_value_error_maps_to_400(internal, monkeypatch):
+    """Fix round 1, Minor 3 / process item 4: this must be a real, killing
+    test, not one that passes whether or not the except block exists.
+    Deleting ``except (ValueError, ...)`` around record_ssh_attachment in
+    internal_create_ssh_attachment lets this ValueError propagate
+    uncaught, which is not an HTTPException — pytest.raises below then
+    fails."""
+    _resolved(monkeypatch, user={"id": USER, "ssh_key_id": KEY_ID})
+
+    async def _record(*a, **kw):
+        raise ValueError("invalid ssh handle: boom")
+
+    monkeypatch.setattr(main.postgres_db, "record_ssh_attachment", _record)
+
+    with pytest.raises(HTTPException) as excinfo:
+        await main.internal_create_ssh_attachment(
+            request=object(),
+            body=main.SshAttachmentCreate(fingerprint=FINGERPRINT, handle="s-7f3a91c2"),
+        )
+    assert excinfo.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_create_attachment_fk_violation_maps_to_400(internal, monkeypatch):
+    """Fix round 1, Minor 1: a well-formed but nonexistent id (thread, user
+    or key deleted between resolution and insert — a real race, e.g. a
+    thread torn down mid-session) raises asyncpg.ForeignKeyViolationError,
+    which must not escape as a 500."""
+    _resolved(monkeypatch, user={"id": USER, "ssh_key_id": KEY_ID})
+
+    async def _record(*a, **kw):
+        raise asyncpg.ForeignKeyViolationError(
+            'insert or update on table "ssh_attachments" violates foreign '
+            "key constraint"
+        )
+
+    monkeypatch.setattr(main.postgres_db, "record_ssh_attachment", _record)
+
+    with pytest.raises(HTTPException) as excinfo:
+        await main.internal_create_ssh_attachment(
+            request=object(),
+            body=main.SshAttachmentCreate(fingerprint=FINGERPRINT, handle="s-7f3a91c2"),
+        )
+    assert excinfo.value.status_code < 500
+    assert excinfo.value.status_code == 400
+
+
+def test_create_attachment_fingerprint_is_capped():
+    with pytest.raises(ValidationError):
+        main.SshAttachmentCreate(fingerprint="A" * (500 * 1024), handle="s-7f3a91c2")
 
 
 # =============================================================================
@@ -278,6 +516,35 @@ async def test_close_attachment_unknown_id_returns_zero_not_an_error(
     assert result == {"closed": 0}
 
 
+@pytest.mark.asyncio
+async def test_close_attachment_malformed_id_maps_to_400_not_500(internal):
+    """Process item 4, close-endpoint half. Deliberately does NOT
+    monkeypatch close_ssh_attachment: UUID(attachment_id) raises ValueError
+    inside the REAL method before any connection is acquired
+    (database/postgres.py), so this exercises the actual production code
+    path end to end. Deleting the endpoint's ``except ValueError`` lets a
+    bare ValueError propagate — not an HTTPException — which fails this
+    test.
+    """
+    with pytest.raises(HTTPException) as excinfo:
+        await main.internal_close_ssh_attachment(
+            request=object(),
+            attachment_id="not-a-uuid",
+            body=main.SshAttachmentClose(channels=[]),
+        )
+    assert excinfo.value.status_code == 400
+
+
+def test_close_attachment_channels_count_is_capped():
+    with pytest.raises(ValidationError):
+        main.SshAttachmentClose(channels=["session"] * 9)
+
+
+def test_close_attachment_channel_name_length_is_capped():
+    with pytest.raises(ValidationError):
+        main.SshAttachmentClose(channels=["x" * 33])
+
+
 # =============================================================================
 # ssh_key_id added to the ssh-targets response
 # =============================================================================
@@ -286,9 +553,11 @@ async def test_close_attachment_unknown_id_returns_zero_not_an_error(
 @pytest.mark.asyncio
 async def test_ssh_key_id_appears_in_ssh_target_response(monkeypatch):
     """Without this, endpoint 2 (create-attachment) could never be handed a
-    key id by the gateway, because ``resolve_user_by_ssh_fingerprint``
-    already resolves one but ``_ssh_target_response`` dropped it on the
-    floor."""
+    key id by the gateway for logging, because
+    ``resolve_user_by_ssh_fingerprint`` already resolves one but
+    ``_ssh_target_response`` dropped it on the floor. No longer
+    load-bearing for the create-attachment call itself (that now resolves
+    its own copy server-side) — kept for gateway-side logging."""
 
     async def _allow(request):
         return None
