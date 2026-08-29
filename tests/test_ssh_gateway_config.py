@@ -486,9 +486,9 @@ def test_ssh_listener_defaults_to_2222():
 
 
 def test_ssh_listener_port_is_overridable_and_range_checked():
-    assert load_config({**BASE_ENV, "SSH_GATEWAY_SSH_PORT": "2200"}).ssh_listen_port == (
-        2200
-    )
+    assert load_config(
+        {**BASE_ENV, "SSH_GATEWAY_SSH_PORT": "2200"}
+    ).ssh_listen_port == (2200)
     for bad in ("70000", "-1", "not-a-port"):
         with pytest.raises(ValueError, match="SSH_GATEWAY_SSH_PORT"):
             load_config({**BASE_ENV, "SSH_GATEWAY_SSH_PORT": bad})

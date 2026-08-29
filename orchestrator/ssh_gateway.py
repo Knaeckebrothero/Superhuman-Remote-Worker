@@ -33,6 +33,20 @@ skipping a release, an upstream connection never closed), and a leak here is
 not subtle: the counter only climbs, so ``max_preauth_connections`` leaks
 turn into a gateway that refuses everyone until the pod restarts.
 
+WHAT THAT SLOT ACTUALLY BOUNDS, because the name understates it: the slot is
+held for the whole connection, not just until authentication completes, so
+``max_preauth_connections`` (default 64) and ``max_preauth_connections_per_
+source`` (default 16) are in practice caps on CONCURRENT CONNECTIONS. That is
+deliberate — it is the only global concurrency bound this process has, and
+releasing at auth would leave an authenticated client free to hold unbounded
+sockets — but it has two sizing consequences an operator must know. A NAT'd
+office reaching the TCP listener shares one source bucket, so the 17th
+simultaneous session from that office is refused; and on the WSS path, if
+``SSH_GATEWAY_TRUSTED_PROXIES`` is not set to the ingress hop, EVERY WSS
+client is bucketed under the ingress pod's own IP and the whole fleet shares
+16 slots. Task 11 must set that variable, and raise these caps if sessions,
+rather than handshakes, are what needs bounding.
+
 The credential the USER presents is NOT ``MCP_INTERNAL_KEY``. See
 ``services/ssh_gateway_token.py`` for the full account (ruling G38); in short,
 that value is the platform's service-to-service key for ~50
