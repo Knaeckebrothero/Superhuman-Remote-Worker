@@ -152,16 +152,84 @@ def test_everything_else_is_refused(dest):
 @pytest.mark.asyncio
 async def test_upstream_is_not_dialled_during_auth():
     """Callback order is begin_auth -> validate_public_key. Resolving a target
-    in begin_auth was measured at 100 upstream dials for 100 failed auths."""
+    in begin_auth was measured at 100 upstream dials for 100 failed auths.
+
+    Both callbacks are exercised, not just ``begin_auth``: that one is
+    synchronous and so could not await a resolver even if someone put one
+    there, which made the earlier single-callback version of this test close
+    to a tautology. ``validate_public_key`` is the callback where a
+    plausible edit really could reach the orchestrator -- see
+    ``test_the_query_phase_performs_no_write_and_no_outbound_call``.
+    """
     dials = []
 
     async def _resolver(handle, fingerprint):
         dials.append(handle)
         raise AssertionError("resolver must not run during authentication")
 
+    key = asyncssh.generate_private_key("ssh-ed25519").convert_to_public()
     server = GatewaySSHServer(_context(resolve=_resolver), CLIENT_IP)
+
     assert server.begin_auth(HANDLE) is True
+    assert server.validate_public_key(HANDLE, key) is True
+    await asyncio.sleep(0)
+
     assert dials == []
+
+
+@pytest.mark.asyncio
+async def test_the_query_phase_performs_no_write_and_no_outbound_call():
+    """``validate_public_key`` runs in asyncssh's publickey QUERY phase,
+    before any signature exists (``auth.py:795``; ``connection.py:6211-6217``
+    runs the callback ahead of ``key.verify``), so anything with a side
+    effect here fires for anyone who merely OFFERS a key.
+
+    That is not hypothetical: ``resolve_user_by_ssh_fingerprint`` used to
+    fold a ``last_used_at`` bump into its own SELECT as a ``WITH bumped AS
+    (UPDATE ...)`` CTE, and commit e17d209f ("make ssh fingerprint
+    resolution a pure read") split it out for exactly this reason --
+    ``last_used_at`` is the field a user checks to notice a stolen key, so a
+    value an unauthenticated peer can stamp destroys the only detection
+    signal on this surface. This test is what stops that being quietly
+    reintroduced one layer up.
+
+    Three assertions rather than one, because the defect has three shapes:
+    a direct await is impossible here (the callback is sync), so it would
+    arrive as a synchronous call, as a ``self._schedule(...)`` (the module
+    already has that helper, which is what makes the edit plausible), or as
+    a bare ``ensure_future``. The recorder catches the first, the task-set
+    comparisons catch the other two -- and the ``sleep(0)`` between them is
+    what gives a scheduled coroutine the chance to run and be caught.
+    """
+    calls = []
+
+    async def _recorder(*args, **kwargs):
+        calls.append(args)
+        return "att-1"
+
+    async def _resolver(handle, fingerprint):
+        calls.append(("resolve", handle))
+        raise AssertionError("nothing may resolve during the query phase")
+
+    context = _context(
+        resolve=_resolver,
+        mark_key_used=_recorder,
+        record_attach=_recorder,
+        close_attach=_recorder,
+    )
+    server = GatewaySSHServer(context, CLIENT_IP)
+    key = asyncssh.generate_private_key("ssh-ed25519").convert_to_public()
+
+    tasks_before = asyncio.all_tasks()
+    background_before = set(mod._BACKGROUND_TASKS)
+
+    assert server.validate_public_key(HANDLE, key) is True
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert calls == []
+    assert set(mod._BACKGROUND_TASKS) == background_before
+    assert asyncio.all_tasks() - tasks_before == set()
 
 
 def test_public_key_auth_records_the_fingerprint():
@@ -445,15 +513,32 @@ async def test_a_second_channel_reuses_the_first_resolution():
     """One attachment row and one workspace-cap charge per CONNECTION, not
     per channel -- otherwise a JetBrains client (which opens several
     channels at once) would exhaust max_attachments_per_workspace by
-    itself."""
+    itself.
+
+    THE ``await asyncio.sleep(0)`` IN EACH FAKE IS THE TEST. Without it
+    neither fake ever yields to the loop, so the first ``gather`` leg runs
+    start to finish before the second one begins, ``self._target`` is
+    already set by then, and the outer fast-path check alone satisfies every
+    assertion below -- ``_resolve_lock`` can be deleted outright with the
+    whole suite still green (measured: it was). Any real resolver awaits an
+    HTTP round trip and therefore yields, and with the yield restored the
+    lock-less form resolves twice and charges the workspace cap twice
+    (``{'t1': 2}``), which is the JetBrains case this exists for.
+
+    The ``_attachments`` assertion is not redundant with the resolve count:
+    the count alone would still pass if a future edit resolved once but
+    charged ``try_attach`` on every channel.
+    """
     resolved = []
     recorded = []
 
     async def _resolve(handle, fingerprint):
+        await asyncio.sleep(0)
         resolved.append(handle)
         return _target()
 
     async def _record(fingerprint, handle, client_ip):
+        await asyncio.sleep(0)
         recorded.append(handle)
         return "att-1"
 
@@ -467,8 +552,8 @@ async def test_a_second_channel_reuses_the_first_resolution():
 
     await asyncio.gather(server._attached_target(), server._attached_target())
 
-    assert len(resolved) == 1
-    assert len(recorded) == 1
+    assert resolved == [HANDLE]
+    assert recorded == [HANDLE]
     assert limiter._attachments == {"t1": 1}
 
 
@@ -698,3 +783,173 @@ def test_a_client_supplied_subsystem_never_reaches_the_audit_row():
     server._note_channel_type(FakeProcess())
 
     assert server.channel_types == [mod.SESSION_CHANNEL_TYPE, mod.SFTP_CHANNEL_TYPE]
+
+
+# --- fix round 1: shutdown drain, late audit rows, half-wired contexts ----
+
+
+@pytest.mark.asyncio
+async def test_an_audit_row_written_after_the_close_is_closed_anyway():
+    """The orphan window: connection_lost is synchronous and reads
+    _attachment_id directly, so a connection lost while the record POST is
+    in flight sees None and schedules no close. The row would then be
+    written after the close and stay open forever.
+
+    The fake record here blocks on an event, which is what puts
+    connection_lost strictly inside the in-flight window rather than hoping
+    the scheduler lands there. Moving the record inside _resolve_lock does
+    NOT fix this -- connection_lost never takes that lock -- which is why
+    the fix is a re-check after the await instead."""
+    release = asyncio.Event()
+    closed = []
+
+    async def _resolve(handle, fingerprint):
+        return _target()
+
+    async def _record(fingerprint, handle, client_ip):
+        await release.wait()
+        return "att-late"
+
+    async def _close(attachment_id, fingerprint, channels):
+        closed.append(attachment_id)
+        return 1
+
+    limiter = _limiter()
+    server = _authenticated(
+        GatewaySSHServer(
+            _context(
+                limiter=limiter,
+                resolve=_resolve,
+                record_attach=_record,
+                close_attach=_close,
+            ),
+            CLIENT_IP,
+        )
+    )
+
+    attaching = asyncio.ensure_future(server._attached_target())
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    # The peer vanishes while the audit POST is still in flight.
+    server.connection_lost(None)
+    assert closed == []
+    assert limiter._attachments == {}
+
+    release.set()
+    await attaching
+    await _drain_background_tasks()
+
+    assert closed == ["att-late"]
+
+
+@pytest.mark.asyncio
+async def test_drain_background_tasks_awaits_in_flight_closes():
+    """Task 8's shutdown calls this. Without it a rollout that stops the
+    loop mid-close leaves those rows open, silently."""
+    finished = []
+    release = asyncio.Event()
+
+    async def _resolve(handle, fingerprint):
+        return _target()
+
+    async def _record(fingerprint, handle, client_ip):
+        return "att-1"
+
+    async def _close(attachment_id, fingerprint, channels):
+        await release.wait()
+        finished.append(attachment_id)
+        return 1
+
+    server = _authenticated(
+        GatewaySSHServer(
+            _context(
+                limiter=_limiter(),
+                resolve=_resolve,
+                record_attach=_record,
+                close_attach=_close,
+            ),
+            CLIENT_IP,
+        )
+    )
+    await server._attached_target()
+    server.connection_lost(None)
+
+    release.set()
+    assert await mod.drain_background_tasks(timeout=5.0) == 0
+    assert finished == ["att-1"]
+
+
+@pytest.mark.asyncio
+async def test_drain_reports_and_cancels_what_it_could_not_finish():
+    """A shutdown that hangs on bookkeeping is worse than an unclosed audit
+    row, so the drain has a ceiling -- and returns a number the caller can
+    log rather than losing the row invisibly."""
+
+    async def _resolve(handle, fingerprint):
+        return _target()
+
+    async def _record(fingerprint, handle, client_ip):
+        return "att-1"
+
+    async def _close(attachment_id, fingerprint, channels):
+        await asyncio.Event().wait()  # never resolves
+
+    server = _authenticated(
+        GatewaySSHServer(
+            _context(
+                limiter=_limiter(),
+                resolve=_resolve,
+                record_attach=_record,
+                close_attach=_close,
+            ),
+            CLIENT_IP,
+        )
+    )
+    await server._attached_target()
+    server.connection_lost(None)
+
+    assert await mod.drain_background_tasks(timeout=0.01) == 1
+    assert await mod.drain_background_tasks(timeout=0.01) == 0
+
+
+@pytest.mark.asyncio
+async def test_drain_is_a_no_op_with_nothing_in_flight():
+    assert await mod.drain_background_tasks(timeout=0.01) == 0
+
+
+def test_missing_required_names_only_the_fields_a_connection_needs():
+    """The uniform Optional[Callable] typing hides that resolve/limiter are
+    required while the three audit callables genuinely are not."""
+    assert _context().missing_required() == ("resolve", "limiter")
+    assert _context(resolve=lambda *a: None).missing_required() == ("limiter",)
+    assert (
+        _context(resolve=lambda *a: None, limiter=_limiter()).missing_required() == ()
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_half_wired_context_refuses_readably_instead_of_raising():
+    """resolve=None used to reach `await None(...)` and throw a TypeError
+    into asyncssh, which becomes an opaque internal error with nothing for
+    the user or the operator to act on."""
+    server = _authenticated(GatewaySSHServer(_context(limiter=_limiter()), CLIENT_IP))
+    process = FakeProcess()
+    await server._session_factory(process)
+
+    assert process.stderr_text == f"srw: {mod.MISCONFIGURED_MESSAGE}\n"
+    assert process.exit_code == mod.MISCONFIGURED_EXIT_CODE
+
+
+def test_a_missing_limiter_refuses_the_channel_rather_than_uncapping_it():
+    """Fail closed: a listener with no limiter must not accept unbounded
+    channels just because there is no slot to charge."""
+    server = _authenticated(
+        GatewaySSHServer(_context(resolve=lambda *a: None), CLIENT_IP)
+    )
+
+    with pytest.raises(asyncssh.ChannelOpenError) as excinfo:
+        server.session_requested()
+
+    assert excinfo.value.code == OPEN_ADMINISTRATIVELY_PROHIBITED
+    assert mod.MISCONFIGURED_MESSAGE in excinfo.value.reason

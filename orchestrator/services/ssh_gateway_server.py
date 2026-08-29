@@ -102,6 +102,38 @@ ATTACHMENT_LIMIT_EXIT_CODE = 75
 # mid-flight and the audit row silently stays open.
 _BACKGROUND_TASKS: set[asyncio.Task] = set()
 
+# Default ceiling for drain_background_tasks. Comfortably above one audit
+# close's own budget so an in-flight close normally finishes, and well inside
+# a Kubernetes ``terminationGracePeriodSeconds`` so a rollout is not held up.
+DRAIN_TIMEOUT_SECONDS = 5.0
+
+
+async def drain_background_tasks(timeout: float | None = DRAIN_TIMEOUT_SECONDS) -> int:
+    """Await in-flight audit closes, returning how many did NOT settle.
+
+    Task 8's shutdown should call this. ``connection_lost`` schedules the
+    attachment close rather than awaiting it (the callback is synchronous),
+    so without a drain a rollout that tears the process down mid-flight
+    leaves those rows open in the audit table -- silently, because the loop
+    simply stops.
+
+    Anything still running past ``timeout`` is cancelled rather than waited
+    on forever: a shutdown that hangs on bookkeeping is worse than an
+    unclosed audit row, and the return value gives the caller a number to
+    log rather than making the loss invisible.
+    """
+    pending = [task for task in _BACKGROUND_TASKS if not task.done()]
+    if not pending:
+        return 0
+    _, still_pending = await asyncio.wait(pending, timeout=timeout)
+    for task in still_pending:
+        task.cancel()
+    if still_pending:
+        logger.warning(
+            "ssh gateway: %d audit close(s) cancelled at shutdown", len(still_pending)
+        )
+    return len(still_pending)
+
 
 def clamp_direct_tcpip(dest_host: str) -> bool:
     """True iff a direct-tcpip destination is permitted.
@@ -115,8 +147,19 @@ def clamp_direct_tcpip(dest_host: str) -> bool:
     return dest_host in _LOOPBACK_DESTINATIONS
 
 
+MISCONFIGURED_MESSAGE = (
+    "this gateway is not correctly configured - report this to an administrator"
+)
+# 69 EX_UNAVAILABLE, not 75: reconnecting cannot fix a half-wired listener.
+MISCONFIGURED_EXIT_CODE = 69
+
+
 class AttachmentLimitReached(Exception):
     """This workspace already has as many SSH attachments as it allows."""
+
+
+class GatewayMisconfigured(Exception):
+    """A required ``GatewayContext`` field was never bound."""
 
 
 @dataclass
@@ -139,6 +182,20 @@ class GatewayContext:
     # Defaulted, unlike its five siblings, only because it was added after
     # the field order above was already being constructed positionally.
     mark_key_used: Optional[Callable] = None
+
+    # Not every field is optional in the same sense, and the uniform
+    # ``Optional[Callable]`` typing hides that. ``resolve`` and ``limiter``
+    # are REQUIRED -- a connection cannot authorize or bound anything
+    # without them. The three audit callables are genuinely optional (audit
+    # is best effort by design, and every call site guards them), and
+    # ``ca``/``config`` are not touched by this module at all yet.
+    REQUIRED_FIELDS = ("resolve", "limiter")
+
+    def missing_required(self) -> tuple[str, ...]:
+        """Names of required fields this context never had bound."""
+        return tuple(
+            name for name in self.REQUIRED_FIELDS if getattr(self, name) is None
+        )
 
 
 class _GatewayProxyProcess(ProxyProcess):
@@ -192,6 +249,9 @@ class GatewaySSHServer(asyncssh.SSHServer):
         self._attachment_id: Optional[str] = None
         self._channel_types: list[str] = []
         self._open_channels = 0
+        # Set by connection_lost, read by _open_attachment_record. See the
+        # latter for the window this closes.
+        self._connection_closed = False
 
     # --- observable state (read by tests and by Task 8's logging) ---------
 
@@ -272,10 +332,24 @@ class GatewaySSHServer(asyncssh.SSHServer):
 
         Awaited rather than fired and forgotten (asyncssh awaits a coroutine
         returned from here, ``connection.py:2113``), so the bump is on record
-        before any channel opens; the cost is that a slow orchestrator delays
-        userauth-success by at most ``orchestrator_request_timeout``. Every
-        failure is swallowed: a bookkeeping write must never tear down a
-        session that already authenticated.
+        before any channel opens.
+
+        CORRECTION: an earlier version of this docstring said awaiting
+        "delays userauth-success". It does not. ``connection.py:2101`` sends
+        ``MSG_USERAUTH_SUCCESS`` and ``:2107`` flushes deferred packets,
+        both BEFORE the ``:2113`` await -- authentication latency is
+        untouched. What awaiting really costs is that the async branch of
+        ``_finish_recv_packet`` sets ``self._recv_handler = lambda: False``
+        (``connection.py:1719-1725``), buffering this connection's further
+        inbound packets until the bump resolves, so a degraded orchestrator
+        makes the first channel open hang. That is bounded by
+        ``ssh_gateway_client.KEY_USE_BUMP_TIMEOUT_SECONDS`` rather than the
+        full request timeout, which is the right fix; scheduling instead
+        would drop the backpressure exactly when the control plane is
+        degraded (see that constant's own comment).
+
+        Every failure is swallowed: a bookkeeping write must never tear down
+        a session that already authenticated.
         """
         bump = self._context.mark_key_used
         if bump is None or not self.presented_fingerprint:
@@ -318,7 +392,22 @@ class GatewaySSHServer(asyncssh.SSHServer):
         channel that is opened and then abandoned without ever being closed
         individually).
         """
-        if not self._context.limiter.try_open_channel(self._connection_id):
+        limiter = self._context.limiter
+        if limiter is None:
+            # Fail closed rather than skipping the cap: a listener with no
+            # limiter would otherwise accept unbounded channels. Refused
+            # here rather than deferred to the stderr path below because
+            # without a limiter there is no slot to charge in the first
+            # place. logger.error, not warning -- this is an operator bug,
+            # not a user one, and it makes every connection useless.
+            logger.error(
+                "ssh gateway: GatewayContext is missing %s; refusing every channel",
+                ", ".join(self._context.missing_required()),
+            )
+            raise asyncssh.ChannelOpenError(
+                OPEN_ADMINISTRATIVELY_PROHIBITED, MISCONFIGURED_MESSAGE
+            )
+        if not limiter.try_open_channel(self._connection_id):
             raise asyncssh.ChannelOpenError(
                 OPEN_ADMINISTRATIVELY_PROHIBITED,
                 "too many concurrent channels on this connection",
@@ -351,6 +440,7 @@ class GatewaySSHServer(asyncssh.SSHServer):
         finds nothing -- it exists for the channel that never reached a
         session at all.
         """
+        self._connection_closed = True
         while self._open_channels > 0:
             self._channel_closed()
         self._release_attachment()
@@ -416,6 +506,9 @@ class GatewaySSHServer(asyncssh.SSHServer):
         except AttachmentLimitReached:
             self._refuse(process, ATTACHMENT_LIMIT_MESSAGE, ATTACHMENT_LIMIT_EXIT_CODE)
             return
+        except GatewayMisconfigured:
+            self._refuse(process, MISCONFIGURED_MESSAGE, MISCONFIGURED_EXIT_CODE)
+            return
         await proxy_session(process, upstream)
 
     def _refuse(self, process, message: str, code: int) -> None:
@@ -468,6 +561,20 @@ class GatewaySSHServer(asyncssh.SSHServer):
         """
         if self._target is not None:
             return self._target
+
+        missing = self._context.missing_required()
+        if missing:
+            # A readable stderr refusal beats a TypeError/AttributeError
+            # escaping into asyncssh, where it becomes an opaque internal
+            # error with nothing for either the user or the operator to act
+            # on. The log line names the field; the user is told only that
+            # the gateway is misconfigured.
+            logger.error(
+                "ssh gateway: GatewayContext is missing %s; cannot resolve a target",
+                ", ".join(missing),
+            )
+            raise GatewayMisconfigured(missing)
+
         async with self._resolve_lock:
             if self._target is not None:
                 return self._target
@@ -484,6 +591,21 @@ class GatewaySSHServer(asyncssh.SSHServer):
         return self._target
 
     async def _open_attachment_record(self) -> None:
+        """Open the audit row, and close it again if we already lost the peer.
+
+        ``connection_lost`` is synchronous and reads ``_attachment_id``
+        directly, so a connection lost while this POST is in flight sees
+        ``None`` and schedules no close -- the row is then written after the
+        close and stays open forever. The ``_connection_closed`` re-check
+        below is what closes that window.
+
+        Note it is NOT closed by moving this call inside ``_resolve_lock``,
+        which was the first suggestion: ``connection_lost`` never takes that
+        lock, so the same in-flight POST loses the same race one line
+        earlier. The race is between an await and a synchronous callback,
+        not between two awaits, and only re-checking after the await can see
+        it.
+        """
         record = self._context.record_attach
         if record is None:
             return
@@ -498,6 +620,12 @@ class GatewaySSHServer(asyncssh.SSHServer):
                 "ssh gateway: no audit row opened for this attachment",
                 exc_info=True,
             )
+            return
+        if self._connection_closed:
+            # _release_attachment already swapped _attached_workspace to
+            # None, so this cannot double-detach; it only picks up the id
+            # that arrived too late for it.
+            self._release_attachment()
 
     async def _upstream(self):
         """Resolve, attach, and connect.

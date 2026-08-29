@@ -131,7 +131,32 @@ def _audit_headers(config) -> dict:
     return {"X-Internal-Key": config.internal_key}
 
 
-async def _post_audit(config, path: str, payload: dict) -> Any:
+# The ``last_used_at`` bump gets its own, much shorter budget than
+# ``orchestrator_request_timeout``. asyncssh awaits ``auth_completed``'s
+# coroutine from inside packet processing, and the async branch of
+# ``_finish_recv_packet`` sets ``self._recv_handler = lambda: False``
+# (``connection.py:1719-1725``) for the duration -- so every further inbound
+# packet on that connection is buffered until the bump resolves, and the
+# user's first channel open hangs rather than failing. (Note what this is
+# NOT: userauth-success is already on the wire by then --
+# ``connection.py:2101`` sends ``MSG_USERAUTH_SUCCESS`` and ``:2107`` flushes
+# deferred packets, both before the ``:2113`` await -- so authentication
+# latency is unaffected. An earlier version of this file's docstrings claimed
+# otherwise and was wrong.)
+#
+# Awaiting is still right, and this constant is why: it caps the stall at ~2s
+# instead of 10s while keeping the two properties fire-and-forget would give
+# up -- one in-flight bump per connection (``_http_post`` builds a fresh
+# unpooled ``httpx.AsyncClient`` per call, and the post-auth path has no
+# admission cap of its own, so unbounded scheduling would amplify exactly the
+# control-plane degradation it is meant to tolerate), and the bump being on
+# record before any channel opens.
+KEY_USE_BUMP_TIMEOUT_SECONDS = 2.0
+
+
+async def _post_audit(
+    config, path: str, payload: dict, timeout: float | None = None
+) -> Any:
     """POST one audit write and return its parsed body, or raise.
 
     Every failure mode collapses into ``AuditWriteFailed``: a transport
@@ -140,14 +165,22 @@ async def _post_audit(config, path: str, payload: dict) -> Any:
     with ``from exc`` keeps the original in the traceback the caller logs --
     "the audit write failed" with no cause attached is not an operable log
     line.
+
+    ``timeout`` defaults to ``config.orchestrator_request_timeout``. A caller
+    passing one gets the SHORTER of the two, never a longer one: an operator
+    who tightens the global budget is stating a ceiling, and a per-call
+    override must not quietly raise it.
     """
     url = f"{config.orchestrator_url}{path}"
+    budget = config.orchestrator_request_timeout
+    if timeout is not None:
+        budget = min(timeout, budget)
     try:
         response = await _http_post(
             url,
             headers=_audit_headers(config),
             json=payload,
-            timeout=config.orchestrator_request_timeout,
+            timeout=budget,
         )
     except Exception as exc:
         raise AuditWriteFailed(f"POST {path} failed: {exc!r}") from exc
@@ -178,9 +211,16 @@ async def mark_key_used(config, fingerprint: str) -> None:
 
     An unknown fingerprint is a 200 no-op server-side, not a 404, so this
     function cannot be used to probe which keys are registered.
+
+    Runs on a ``KEY_USE_BUMP_TIMEOUT_SECONDS`` budget rather than the full
+    ``orchestrator_request_timeout`` -- see that constant for why this one
+    call is the one that needs a tighter one.
     """
     await _post_audit(
-        config, "/api/internal/ssh-keys/used", {"fingerprint": fingerprint}
+        config,
+        "/api/internal/ssh-keys/used",
+        {"fingerprint": fingerprint},
+        timeout=KEY_USE_BUMP_TIMEOUT_SECONDS,
     )
 
 

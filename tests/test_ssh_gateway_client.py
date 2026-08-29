@@ -26,6 +26,7 @@ import pytest
 
 from services import ssh_gateway_targets
 from services.ssh_gateway_client import (
+    KEY_USE_BUMP_TIMEOUT_SECONDS,
     REFUSAL_MESSAGES,
     SshTarget,
     TargetDenied,
@@ -605,7 +606,38 @@ async def test_mark_key_used_posts_only_the_fingerprint(monkeypatch):
     assert call["url"] == "http://orchestrator:8085/api/internal/ssh-keys/used"
     assert call["json"] == {"fingerprint": "SHA256:abc"}
     assert call["headers"] == {"X-Internal-Key": "internal"}
-    assert call["timeout"] == 10.0
+    assert call["timeout"] == KEY_USE_BUMP_TIMEOUT_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_the_bump_gets_a_shorter_budget_than_the_other_audit_calls(monkeypatch):
+    """asyncssh awaits auth_completed from inside packet processing and
+    buffers the connection's further inbound packets while it runs
+    (connection.py:1719-1725), so a slow bump hangs the user's first channel
+    open. The other two audit calls run off the packet path and keep the
+    full budget."""
+    from services.ssh_gateway_client import record_attachment
+
+    post = _patch_post(
+        monkeypatch, _PostRecorder(FakeResponse(200, {"attachment_id": "att-1"}))
+    )
+    await record_attachment(_config(), "SHA256:abc", "s-7f3a91c2")
+
+    assert post.calls[0]["timeout"] == 10.0
+    assert KEY_USE_BUMP_TIMEOUT_SECONDS < 10.0
+
+
+@pytest.mark.asyncio
+async def test_a_tightened_global_budget_is_never_widened_by_the_override(monkeypatch):
+    """An operator who lowers orchestrator_request_timeout is stating a
+    ceiling. A per-call override takes the SHORTER of the two, so the bump's
+    own constant can only ever tighten, never relax, that ceiling."""
+    from services.ssh_gateway_client import mark_key_used
+
+    post = _patch_post(monkeypatch, _PostRecorder(FakeResponse(200, {"status": "ok"})))
+    await mark_key_used(_config(orchestrator_request_timeout=0.5), "SHA256:abc")
+
+    assert post.calls[0]["timeout"] == 0.5
 
 
 @pytest.mark.asyncio
