@@ -185,7 +185,21 @@ export const TOOL_DESCRIPTORS: Record<string, ToolDescriptor> = {
 
     // Communication & delegation
     send_message: {title: 'Send message', icon: 'send', category: 'communication', params: [{key: ['message', 'content'], label: 'Message', kind: 'text'}], subtitle: (a) => pickArg(a, ['message', 'content'])},
-    delegate_work: {title: 'Delegate work', icon: 'group_work', category: 'delegation', params: [{key: ['task', 'description'], label: 'Task', kind: 'text'}], subtitle: (a) => pickArg(a, ['task', 'description'])},
+    delegate_agent: {
+        title: 'Delegate to subagent',
+        icon: 'group_work',
+        category: 'delegation',
+        params: [
+            {key: 'subagent_type', label: 'Subagent', kind: 'text'},
+            {key: 'description', label: 'Brief', kind: 'text'},
+        ],
+        result: {kind: 'text'},
+        subtitle: (a) => {
+            const type = pickArg(a, 'subagent_type');
+            const description = pickArg(a, 'description');
+            return type && description ? `${type}: ${description}` : type || description;
+        },
+    },
     // notify_user renders as a first-class officer→user bubble (see `notify`
     // on ToolCardView); this descriptor is the fallback surface only.
     notify_user: {title: 'Message the user', icon: 'campaign', category: 'communication', params: [{key: 'subject', label: 'Subject', kind: 'text'}, {key: 'message', label: 'Message', kind: 'text'}, {key: 'urgency', label: 'Urgency', kind: 'text'}], result: {kind: 'text'}, subtitle: (a) => pickArg(a, ['subject', 'message'])},

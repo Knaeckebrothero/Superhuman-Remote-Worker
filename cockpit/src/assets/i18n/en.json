@@ -62,7 +62,7 @@
       "todo_complete": "Complete todo",
       "cite_document": "Cite document",
       "send_message": "Send message",
-      "delegate_work": "Delegate work",
+      "delegate_agent": "Delegate to subagent",
       "job_complete": "Complete job",
       "mark_complete": "Mark complete",
       "set_canvas": "Present in Canvas",
@@ -844,6 +844,18 @@
       "showSubjobRows": "Show {{count}} hidden as rows",
       "showSubjobRowsHint": "Adds sub-jobs to the origin filter, so they appear in the list.",
       "subjobs": "Sub-jobs ({{count}})",
+      "subagents": "Subagents ({{count}})",
+      "subagentsMetrics": "{{turns}} turns · {{tokens}} tokens",
+      "subagentsTranscript": "Transcript",
+      "subagentsStatuses": {
+        "running": "Running",
+        "completed": "Completed",
+        "parked": "Parked",
+        "interrupted": "Interrupted",
+        "capped": "Capped",
+        "error": "Error",
+        "cancelled": "Cancelled"
+      },
       "tokens": "Tokens",
       "unknown": "Unknown",
       "usage": "Usage",
@@ -1493,6 +1505,21 @@
   },
   "chat": {
     "defaultTitle": "Persistent Agent",
+    "subagent": {
+      "banner": "Subagent transcript · {{handle}} · {{type}} · {{status}}",
+      "parentJob": "Parent job {{id}}",
+      "loading": "Loading transcript…",
+      "loadFailed": "The transcript could not be loaded.",
+      "empty": "No transcript messages yet.",
+      "turn": "Turn {{count}}",
+      "thinking": "Reasoning",
+      "roles": {
+        "user": "Brief",
+        "assistant": "Subagent",
+        "tool": "Tool",
+        "system": "Event"
+      }
+    },
     "connection": {
       "connected": "Connected",
       "connecting": "Connecting...",
@@ -1936,7 +1963,7 @@
       "list_sources": "Listing sources",
       "search_library": "Searching library",
       "send_message": "Sending message",
-      "delegate_work": "Delegating work",
+      "delegate_agent": "Delegating to subagent",
       "mark_complete": "Marking complete",
       "job_complete": "Completing job"
     },
@@ -3030,14 +3057,13 @@
       "countBound": "{{n}} bound",
       "countPredicted": "{{n}} predicted",
       "group": "Tools",
-      "maxDepth": "Max depth",
+      "maxConcurrent": "Max concurrent",
       "provenance": {
         "measured": "Live from the running agent",
         "measured_partial": "Live from the running agent — partial answer",
         "predicted": "Predicted, not measured",
         "unknown": "The resolved toolset could not be read"
       },
-      "timeout": "Timeout (sec)",
       "unknownCategory": "This cockpit build has no description for this category."
     },
     "toolCategories": {

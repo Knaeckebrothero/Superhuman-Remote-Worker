@@ -200,6 +200,19 @@ describe('SessionsPageComponent', () => {
             expect(component.threads()[0].status).toBe('ending');
             expect(component.threads()[0].runtime_retirement_pending).toBe(true);
         });
+
+        it('fails closed if a server or cache includes a child thread', async () => {
+            mockHttp.get.mockReturnValue(of({
+                threads: [
+                    makeThread({kind: 'session'}),
+                    makeThread({id: 'child-1', kind: 'subagent'}),
+                ],
+            }));
+
+            await component.loadThreads();
+
+            expect(component.threads().map(thread => thread.id)).toEqual(['thread-1']);
+        });
     });
 
     // =========================================================================

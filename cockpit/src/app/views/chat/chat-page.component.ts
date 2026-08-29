@@ -30,6 +30,9 @@ import {CanvasPaneComponent} from '../canvas/canvas-pane.component';
 import {canvasSourceKey} from '../canvas/canvas-rendering';
 import {SettingsPaneComponent} from './settings-pane.component';
 import {ConfigDriftDialogComponent} from './config-drift-dialog.component';
+import {ApiService} from '../../core/services/api.service';
+import {PersistentThreadMessage, Thread} from '../../core/models/api.model';
+import {SubagentTranscriptComponent} from './subagent-transcript.component';
 
 export interface BrowserReplacementTarget {
     readonly threadId: string;
@@ -64,8 +67,18 @@ export function browserReplacementTargetMatches(
         AppButtonComponent,
         AppDialogComponent,
         ConfigDriftDialogComponent,
+        SubagentTranscriptComponent,
     ],
     template: `
+      @if (subagentThread(); as thread) {
+        <app-subagent-transcript
+          [thread]="thread"
+          [messages]="subagentMessages()"
+          [loading]="subagentLoading()"
+          [error]="subagentError()"
+          (refresh)="refreshSubagentTranscript()"
+        />
+      } @else {
       @if (canvasAvailable()) {
         <button type="button" class="canvas-skip-link" (click)="openCanvas(true)">
           {{ 'canvas.skipToCanvas' | transloco }}
@@ -163,6 +176,7 @@ export function browserReplacementTargetMatches(
           (dismissed)="chat.pendingDrift.set(null)"
         />
       }
+      }
     `,
     styles: `
       :host {
@@ -257,10 +271,15 @@ export class ChatPageComponent implements OnInit, OnDestroy {
     readonly chat = inject(PersistentChatService);
     private readonly toast = inject(AppToastService);
     private readonly errors = inject(ErrorMessageService);
+    private readonly api = inject(ApiService);
     private readonly canvas = inject(CanvasService);
     readonly viewport = inject(ViewportService);
     private readonly destroyRef = inject(DestroyRef);
     private routeGeneration = 0;
+    readonly subagentThread = signal<Thread | null>(null);
+    readonly subagentMessages = signal<PersistentThreadMessage[]>([]);
+    readonly subagentLoading = signal(false);
+    readonly subagentError = signal(false);
     readonly canvasOpen = signal(false);
     readonly canvasFocus = signal(false);
     readonly canvasDirty = signal(false);
@@ -623,6 +642,10 @@ export class ChatPageComponent implements OnInit, OnDestroy {
 
     private handleThreadRoute(threadId: string | null): void {
         const routeGeneration = ++this.routeGeneration;
+        this.subagentThread.set(null);
+        this.subagentMessages.set([]);
+        this.subagentLoading.set(false);
+        this.subagentError.set(false);
 
         if (threadId === '_creating') {
             this.canvas.selectThread(null);
@@ -650,22 +673,62 @@ export class ChatPageComponent implements OnInit, OnDestroy {
                 void this.router.navigate(['/sessions']);
             }
         } else if (threadId) {
-            // Canvas state reconciles independently from chat history and may
-            // remain available even when the live agent transport is offline.
-            this.canvas.selectThread(threadId);
-            // Already connected or mid-start on this thread? Don't reconnect.
-            // The mid-start case is the draft flow landing here right after
-            // createAndConnect — a second connect() would race the first.
-            if (
-                this.chat.threadId() === threadId &&
-                (this.chat.isConnected() || this.chat.isStartingSession())
-            ) return;
+            // Identify a child before touching any session transport. A child
+            // runs inside its parent job's pod; attaching it as a session would
+            // provision/connect a runtime that does not exist.
+            this.api.getPersistentThread(threadId)
+                .pipe(takeUntilDestroyed(this.destroyRef))
+                .subscribe(row => {
+                    if (routeGeneration !== this.routeGeneration) return;
+                    // A failed read (older orchestrator, transient error) is
+                    // not a verdict on the thread: take the ordinary session
+                    // path exactly as before the preflight existed.
+                    const thread = row ? (row as unknown as Thread) : null;
+                    if (thread?.kind === 'subagent') {
+                        this.canvas.selectThread(null);
+                        this.subagentThread.set(thread);
+                        this.loadSubagentTranscript(thread.id, routeGeneration);
+                        return;
+                    }
 
-            void this.chat.connect(threadId);
+                    // Canvas state reconciles independently from chat history
+                    // and may remain available while transport is offline.
+                    this.canvas.selectThread(threadId);
+                    // Already connected or mid-start on this thread? Don't
+                    // reconnect. The latter is the draft flow landing here
+                    // right after createAndConnect.
+                    if (
+                        this.chat.threadId() === threadId &&
+                        (this.chat.isConnected() || this.chat.isStartingSession())
+                    ) return;
+
+                    void this.chat.connect(threadId);
+                });
         } else {
             this.canvas.selectThread(null);
             void this.router.navigate(['/sessions']);
         }
+    }
+
+    refreshSubagentTranscript(): void {
+        const thread = this.subagentThread();
+        if (thread) this.loadSubagentTranscript(thread.id, this.routeGeneration);
+    }
+
+    private loadSubagentTranscript(threadId: string, routeGeneration: number): void {
+        this.subagentLoading.set(true);
+        this.subagentError.set(false);
+        this.api.getPersistentThreadHistory(threadId)
+            .pipe(takeUntilDestroyed(this.destroyRef))
+            .subscribe(history => {
+                if (
+                    routeGeneration !== this.routeGeneration ||
+                    this.subagentThread()?.id !== threadId
+                ) return;
+                this.subagentLoading.set(false);
+                this.subagentError.set(history === null);
+                this.subagentMessages.set(history?.messages ?? []);
+            });
     }
 
     ngOnDestroy(): void {

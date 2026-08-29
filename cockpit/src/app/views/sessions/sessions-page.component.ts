@@ -617,11 +617,15 @@ export class SessionsPageComponent implements OnInit {
                 this.http.get<{ threads: Thread[] }>(`${environment.apiUrl}/persistent/threads`)
             );
             this.threads.set(
-                (data.threads || []).map(thread =>
-                    thread.runtime_retirement_pending === true
-                        ? { ...thread, status: 'ending' as const }
-                        : thread,
-                ),
+                (data.threads || [])
+                    // The server filters children, but keep the mutation-heavy
+                    // session controls fail-closed against an older/cached list.
+                    .filter(thread => thread.kind !== 'subagent')
+                    .map(thread =>
+                        thread.runtime_retirement_pending === true
+                            ? { ...thread, status: 'ending' as const }
+                            : thread,
+                    ),
             );
         } catch (e) {
             // Silent — sessions not available

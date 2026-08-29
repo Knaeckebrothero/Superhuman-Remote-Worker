@@ -103,6 +103,34 @@ describe('buildToolCardView', () => {
         expect(v.details).toContainEqual({label: 'Exit code', value: '0', tone: 'ok'});
     });
 
+    it('delegate_agent shows its type, brief, and text envelope', () => {
+        const v = buildToolCardView(norm({
+            tool: 'delegate_agent',
+            args: {subagent_type: 'tester', description: 'Run the focused suite'},
+            result: '[subagent tester-7f3a · tester · completed]',
+        }));
+
+        expect(v.title).toBe('Delegate to subagent');
+        expect(v.icon).toBe('group_work');
+        expect(v.subtitle).toBe('tester: Run the focused suite');
+        expect(v.params).toEqual([
+            {label: 'Subagent', value: 'tester', kind: 'text'},
+            {label: 'Brief', value: 'Run the focused suite', kind: 'text'},
+        ]);
+        expect(v.result?.kind).toBe('text');
+    });
+
+    it('delegate_agent subtitle falls back to whichever field is present', () => {
+        expect(buildToolCardView(norm({
+            tool: 'delegate_agent',
+            args: {subagent_type: 'reviewer'},
+        })).subtitle).toBe('reviewer');
+        expect(buildToolCardView(norm({
+            tool: 'delegate_agent',
+            args: {description: 'Review the diff'},
+        })).subtitle).toBe('Review the diff');
+    });
+
     it('edit_file replace → a real old→new diff', () => {
         const v = buildToolCardView(
             norm({tool: 'edit_file', args: {path: 'a.ts', old_string: 'foo', new_string: 'bar'}}),

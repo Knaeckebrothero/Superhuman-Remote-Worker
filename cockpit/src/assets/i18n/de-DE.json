@@ -62,7 +62,7 @@
       "todo_complete": "Aufgabe abschließen",
       "cite_document": "Dokument zitieren",
       "send_message": "Nachricht senden",
-      "delegate_work": "Arbeit delegieren",
+      "delegate_agent": "An Subagent delegieren",
       "job_complete": "Job abschließen",
       "mark_complete": "Als erledigt markieren",
       "set_canvas": "In Canvas präsentieren",
@@ -844,6 +844,18 @@
       "showSubjobRows": "{{count}} ausgeblendete als Zeilen anzeigen",
       "showSubjobRowsHint": "Fügt Unteraufträge zum Herkunftsfilter hinzu, damit sie in der Liste erscheinen.",
       "subjobs": "Unteraufträge ({{count}})",
+      "subagents": "Subagenten ({{count}})",
+      "subagentsMetrics": "{{turns}} Züge · {{tokens}} Tokens",
+      "subagentsTranscript": "Transkript",
+      "subagentsStatuses": {
+        "running": "Läuft",
+        "completed": "Abgeschlossen",
+        "parked": "Geparkt",
+        "interrupted": "Unterbrochen",
+        "capped": "Begrenzt",
+        "error": "Fehler",
+        "cancelled": "Abgebrochen"
+      },
       "tokens": "Tokens",
       "unknown": "Unbekannt",
       "usage": "Verbrauch",
@@ -1493,6 +1505,21 @@
   },
   "chat": {
     "defaultTitle": "Persistenter Agent",
+    "subagent": {
+      "banner": "Subagent-Transkript · {{handle}} · {{type}} · {{status}}",
+      "parentJob": "Übergeordneter Job {{id}}",
+      "loading": "Transkript wird geladen…",
+      "loadFailed": "Das Transkript konnte nicht geladen werden.",
+      "empty": "Noch keine Transkript-Nachrichten.",
+      "turn": "Zug {{count}}",
+      "thinking": "Reasoning",
+      "roles": {
+        "user": "Auftrag",
+        "assistant": "Subagent",
+        "tool": "Werkzeug",
+        "system": "Ereignis"
+      }
+    },
     "connection": {
       "connected": "Verbunden",
       "connecting": "Verbinde...",
@@ -1936,7 +1963,7 @@
       "list_sources": "Listet Quellen",
       "search_library": "Sucht in Bibliothek",
       "send_message": "Sendet Nachricht",
-      "delegate_work": "Delegiert Arbeit",
+      "delegate_agent": "Delegiert an Subagent",
       "mark_complete": "Markiert als abgeschlossen",
       "job_complete": "Schließt Auftrag ab"
     },
@@ -3021,14 +3048,13 @@
       "countBound": "{{n}} gebunden",
       "countPredicted": "{{n}} vorhergesagt",
       "group": "Werkzeuge",
-      "maxDepth": "Max. Tiefe",
+      "maxConcurrent": "Max. gleichzeitig",
       "provenance": {
         "measured": "Live vom laufenden Agenten",
         "measured_partial": "Live vom laufenden Agenten — unvollständige Antwort",
         "predicted": "Vorhergesagt, nicht gemessen",
         "unknown": "Der aufgelöste Werkzeugsatz konnte nicht gelesen werden"
       },
-      "timeout": "Timeout (Sek.)",
       "unknownCategory": "Dieser Cockpit-Build hat keine Beschreibung für diese Kategorie."
     },
     "toolCategories": {

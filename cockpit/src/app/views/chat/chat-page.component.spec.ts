@@ -1,7 +1,7 @@
 import {signal} from '@angular/core';
 import {TestBed} from '@angular/core/testing';
 import {ActivatedRoute, convertToParamMap, Router} from '@angular/router';
-import {BehaviorSubject} from 'rxjs';
+import {BehaviorSubject, of} from 'rxjs';
 import {afterEach, describe, expect, it, vi} from 'vitest';
 import {CanvasService} from '../../core/services/canvas.service';
 import {BrowserCapability, CanvasState} from '../../core/models/canvas.model';
@@ -10,12 +10,17 @@ import {PersistentChatService} from '../../core/services/persistent-chat.service
 import type {ConfigDriftItem} from '../../core/services/resume-error';
 import {ViewportService} from '../../core/services/viewport.service';
 import {AppToastService} from '../../ui/toast';
+import {ApiService} from '../../core/services/api.service';
 import {
   browserReplacementTargetMatches,
   ChatPageComponent,
 } from './chat-page.component';
 
-function createFixture(options: {draft?: boolean; threadId?: string} = {}): {
+function createFixture(options: {
+  draft?: boolean;
+  threadId?: string;
+  thread?: Record<string, unknown>;
+} = {}): {
   component: ChatPageComponent;
   params: BehaviorSubject<ReturnType<typeof convertToParamMap>>;
   chat: {
@@ -42,6 +47,10 @@ function createFixture(options: {draft?: boolean; threadId?: string} = {}): {
   };
   viewport: {isMobile: ReturnType<typeof signal<boolean>>};
   router: {navigate: ReturnType<typeof vi.fn>};
+  api: {
+    getPersistentThread: ReturnType<typeof vi.fn>;
+    getPersistentThreadHistory: ReturnType<typeof vi.fn>;
+  };
 } {
   const params = new BehaviorSubject(
     convertToParamMap(options.threadId ? {threadId: options.threadId} : {}),
@@ -78,6 +87,19 @@ function createFixture(options: {draft?: boolean; threadId?: string} = {}): {
   });
   const viewport = {isMobile: signal(false)};
   const router = {navigate: vi.fn().mockResolvedValue(true)};
+  const api = {
+    getPersistentThread: vi.fn().mockReturnValue(of(options.thread ?? {
+      id: options.threadId ?? 'thread-1',
+      kind: 'session',
+      status: 'active',
+    })),
+    getPersistentThreadHistory: vi.fn().mockReturnValue(of({
+      thread_id: options.threadId ?? 'thread-1',
+      messages: [],
+      total: 0,
+      has_more: false,
+    })),
+  };
 
   TestBed.configureTestingModule({
     providers: [
@@ -91,6 +113,7 @@ function createFixture(options: {draft?: boolean; threadId?: string} = {}): {
       },
       {provide: Router, useValue: router},
       {provide: PersistentChatService, useValue: chat},
+      {provide: ApiService, useValue: api},
       {provide: CanvasService, useValue: canvas},
       {provide: ViewportService, useValue: viewport},
       {provide: AppToastService, useValue: {danger: vi.fn()}},
@@ -104,6 +127,7 @@ function createFixture(options: {draft?: boolean; threadId?: string} = {}): {
     canvas,
     viewport,
     router,
+    api,
   };
 }
 
@@ -159,6 +183,33 @@ describe('ChatPageComponent Canvas route selection', () => {
 
     params.next(convertToParamMap({threadId: 'ignored-on-draft-route'}));
     expect(canvas.selectThread).toHaveBeenCalledOnce();
+  });
+
+  it('loads a subagent transcript without connecting or selecting live Canvas state', () => {
+    const thread = {
+      id: 'child-1',
+      title: 'Subagent tester-7f3a',
+      kind: 'subagent',
+      status: 'active',
+      parent_job_id: 'job-1',
+      subagent_handle: 'tester-7f3a',
+      subagent_type: 'tester',
+      subagent_status: 'running',
+    };
+    const {component, chat, canvas, api} = createFixture({threadId: 'child-1', thread});
+
+    component.ngOnInit();
+    TestBed.tick();
+
+    expect(chat.connect).not.toHaveBeenCalled();
+    expect(chat.enterDraftSession).not.toHaveBeenCalled();
+    expect(canvas.selectThread).toHaveBeenCalledWith(null);
+    expect(canvas.selectThread).not.toHaveBeenCalledWith('child-1');
+    expect(api.getPersistentThreadHistory).toHaveBeenCalledWith('child-1');
+    expect(component.subagentThread()).toMatchObject(thread);
+
+    component.refreshSubagentTranscript();
+    expect(api.getPersistentThreadHistory).toHaveBeenCalledTimes(2);
   });
 
   it('opens a new source but does not reopen a locally closed same-source refresh', () => {

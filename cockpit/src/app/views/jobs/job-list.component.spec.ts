@@ -42,6 +42,7 @@ function mountLogic(overrides: {
     getJobUsage: vi.fn().mockReturnValue(of(null)),
     getJobProgress: vi.fn().mockReturnValue(of(null)),
     getJobSubjobs: vi.fn().mockReturnValue(of(null)),
+    getJobSubagents: vi.fn().mockReturnValue(of(null)),
     ...overrides.api,
   } as unknown as ApiService;
 
@@ -405,6 +406,27 @@ describe('JobListComponent — server-resolved tree', () => {
 
     expect(getJobSubjobs).toHaveBeenCalledTimes(1);
     expect(getJobSubjobs).toHaveBeenCalledWith('root-1');
+  });
+
+  it('fetches and unwraps subagents with the rest of the panel', () => {
+    const roster = {
+      job_id: 'root-1',
+      count: 1,
+      subagents: [{thread_id: 'thread-a', handle: 'tester-7f3a', status: 'running'}],
+    };
+    const getJobSubagents = vi.fn().mockReturnValue(of(roster));
+    const {fixture, component} = mountLogic({
+      api: {
+        getJobsPage: vi.fn().mockReturnValue(of(page([job('root-1')]))),
+        getJobSubagents,
+      } as Partial<ApiService>,
+    });
+    fixture.detectChanges();
+
+    component.toggleExpand('root-1');
+
+    expect(getJobSubagents).toHaveBeenCalledWith('root-1');
+    expect(component.jobDetails()['root-1'].subagents).toEqual(roster.subagents);
   });
 
   it('unwraps the roster envelope into the panel state', () => {

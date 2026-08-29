@@ -1828,6 +1828,7 @@ export class JobListComponent implements OnInit, OnDestroy {
         loadingSubtree: false,
         subtreeAttempted: false,
         subjobs: null,
+        subagents: null,
       },
     }));
     forkJoin({
@@ -1840,6 +1841,7 @@ export class JobListComponent implements OnInit, OnDestroy {
       // to ask for it, and for a `waiting` parent it is the single thing that
       // explains the status they opened the panel to understand.
       subjobs: this.api.getJobSubjobs(jobId),
+      subagents: this.api.getJobSubagents(jobId),
     })
       .pipe(takeUntilDestroyed(this.destroyRef))
       .subscribe((result) => {
@@ -1849,11 +1851,16 @@ export class JobListComponent implements OnInit, OnDestroy {
             ...cache[jobId],
             loading: false,
             error:
-              !result.detail && !result.usage && !result.progress && !result.subjobs,
+              !result.detail &&
+              !result.usage &&
+              !result.progress &&
+              !result.subjobs &&
+              !result.subagents,
             detail: result.detail,
             usage: result.usage,
             progress: result.progress,
             subjobs: result.subjobs?.subjobs ?? null,
+            subagents: result.subagents?.subagents ?? null,
           },
         }));
       });

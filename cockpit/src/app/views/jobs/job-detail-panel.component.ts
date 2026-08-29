@@ -6,10 +6,13 @@ import {
   output,
   signal,
 } from '@angular/core';
+import {RouterLink} from '@angular/router';
 import {TranslocoModule} from '@jsverse/transloco';
 import {
   Job,
   JobProgress,
+  JobSubagent,
+  JobSubagentStatus,
   JobSubjob,
   JobUsage,
   WorkspaceContractProjection,
@@ -51,6 +54,8 @@ export interface JobDetailState {
    * renders nothing in both cases, but only one of them is a fact.
    */
   subjobs: JobSubjob[] | null;
+  /** The job's in-process child threads. Null while loading or on failure. */
+  subagents: JobSubagent[] | null;
 }
 
 /**
@@ -173,6 +178,28 @@ export function subjobElapsedSeconds(sub: JobSubjob, now: number): number | null
   return Math.floor((ended - started) / 1000);
 }
 
+/** Elapsed time for an in-process child, using the same live/terminal shape as subjobs. */
+export function subagentElapsedSeconds(sub: JobSubagent, now: number): number | null {
+  const started = Date.parse(sub.started_at);
+  if (!Number.isFinite(started)) return null;
+  const endRaw = sub.ended_at ?? (sub.status === 'running' ? null : sub.last_activity);
+  const ended = endRaw ? Date.parse(endRaw) : now;
+  if (!Number.isFinite(ended) || ended < started) return null;
+  return Math.floor((ended - started) / 1000);
+}
+
+export function subagentStatusTone(status: JobSubagentStatus): BadgeTone {
+  switch (status) {
+    case 'completed': return 'success';
+    case 'running': return 'accent';
+    case 'error':
+    case 'cancelled': return 'danger';
+    case 'parked':
+    case 'interrupted':
+    case 'capped': return 'warning';
+  }
+}
+
 /** Subjobs still capable of moving on their own. */
 export function liveSubjobCount(subjobs: readonly JobSubjob[]): number {
   return subjobs.filter((sub) => !isTerminalJobStatus(sub.status)).length;
@@ -207,7 +234,7 @@ export function subjobBlockedKey(
   selector: 'app-job-detail-panel',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [TranslocoModule, AppBadgeComponent, AppSpinnerComponent],
+  imports: [RouterLink, TranslocoModule, AppBadgeComponent, AppSpinnerComponent],
   template: `
     <div class="detail-panel">
       @if (job().description) {
@@ -387,6 +414,48 @@ export function subjobBlockedKey(
                   </td>
                   <td class="sub-elapsed">{{ elapsedLabel(sub) || '—' }}</td>
                   <td class="sub-id"><code>{{ shortId(sub.id) }}</code></td>
+                </tr>
+              }
+            </tbody>
+          </table>
+        </div>
+      }
+
+      @if (subagents().length > 0) {
+        <div class="detail-subjobs detail-subagents">
+          <div class="subjobs-head">
+            <span class="subjobs-label">
+              {{ 'jobs.detail.subagents' | transloco: {count: subagents().length} }}
+            </span>
+          </div>
+          <table class="subjob-table subagent-table">
+            <tbody>
+              @for (child of subagents(); track child.thread_id) {
+                <tr class="subjob-row subagent-row" [class.subagent-live]="child.status === 'running'">
+                  <td class="sub-role subagent-handle">{{ child.handle }}</td>
+                  <td class="subagent-type">{{ child.subagent_type }}</td>
+                  <td class="sub-status">
+                    <app-badge [tone]="subagentTone(child.status)" size="xs">
+                      {{ 'jobs.detail.subagentsStatuses.' + child.status | transloco }}
+                    </app-badge>
+                  </td>
+                  <td class="sub-desc">
+                    <span class="sub-desc-text" [title]="child.description">
+                      {{ child.description }}
+                    </span>
+                  </td>
+                  <td class="subagent-metrics">
+                    {{
+                      'jobs.detail.subagentsMetrics'
+                        | transloco: {turns: formatCount(child.turns), tokens: formatCount(child.tokens)}
+                    }}
+                  </td>
+                  <td class="sub-elapsed">{{ subagentElapsedLabel(child) || '—' }}</td>
+                  <td class="subagent-link">
+                    <a [routerLink]="['/sessions', child.thread_id]">
+                      {{ 'jobs.detail.subagentsTranscript' | transloco }}
+                    </a>
+                  </td>
                 </tr>
               }
             </tbody>
@@ -602,6 +671,10 @@ export function subjobBlockedKey(
         color: var(--accent-color);
         font-weight: 600;
       }
+      .subagent-live .subagent-handle {
+        color: var(--accent-color);
+        font-weight: 600;
+      }
       .sub-role {
         color: var(--text-primary);
         white-space: nowrap;
@@ -610,6 +683,22 @@ export function subjobBlockedKey(
       .sub-status {
         width: 1%;
         white-space: nowrap;
+      }
+      .subagent-type,
+      .subagent-metrics,
+      .subagent-link {
+        width: 1%;
+        white-space: nowrap;
+      }
+      .subagent-type,
+      .subagent-metrics {
+        color: var(--text-secondary);
+      }
+      .subagent-metrics {
+        font-variant-numeric: tabular-nums;
+      }
+      .subagent-link a {
+        color: var(--accent-color);
       }
       .sub-desc {
         color: var(--text-secondary);
@@ -648,7 +737,8 @@ export function subjobBlockedKey(
         /* Narrow: the description and the id are the first things to go —
            the role, status and elapsed are what answer the question. */
         .sub-desc,
-        .sub-id {
+        .sub-id,
+        .subagent-metrics {
           display: none;
         }
       }
@@ -697,6 +787,10 @@ export class JobDetailPanelComponent {
     return jobStatusTone(status);
   }
 
+  subagentTone(status: JobSubagentStatus): BadgeTone {
+    return subagentStatusTone(status);
+  }
+
   /**
    * Elapsed time for one roster row.
    *
@@ -709,8 +803,13 @@ export class JobDetailPanelComponent {
     return formatDurationSeconds(subjobElapsedSeconds(sub, Date.now()));
   }
 
+  subagentElapsedLabel(sub: JobSubagent): string | null {
+    return formatDurationSeconds(subagentElapsedSeconds(sub, Date.now()));
+  }
+
   /** The tree as the server knows it. Empty while loading or after a failure. */
   readonly subjobs = computed<JobSubjob[]>(() => this.data()?.subjobs ?? []);
+  readonly subagents = computed<JobSubagent[]>(() => this.data()?.subagents ?? []);
 
   /** Subjobs still able to move on their own. */
   readonly liveCount = computed(() => liveSubjobCount(this.subjobs()));

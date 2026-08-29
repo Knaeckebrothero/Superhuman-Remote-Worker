@@ -781,7 +781,7 @@ export class AgentActivityComponent {
     // Communication tools
     send_message: 'communication',
     // Delegation tools
-    delegate_work: 'delegation',
+    delegate_agent: 'delegation',
   };
 
   // Step type badge labels

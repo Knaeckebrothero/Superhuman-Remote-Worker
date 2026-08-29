@@ -191,7 +191,7 @@ const TOOL_LABELS: Record<string, string> = {
 
     // Communication & delegation
     send_message: 'Sending message',
-    delegate_work: 'Delegating work',
+    delegate_agent: 'Delegating to subagent',
 
     // Job lifecycle
     mark_complete: 'Marking complete',

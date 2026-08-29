@@ -3,12 +3,26 @@
   "$id": "https://example.com/agent-config.schema.json",
   "title": "Universal Agent Configuration",
   "description": "Configuration schema for the Universal Agent in the workspace-centric architecture",
+  "$comment": "U1 (universal experts): an expert has ONE llm.model. The per-phase tiers llm.strategic / llm.tactical / llm.subagent were removed from this schema; the loader still accepts them in any authored layer (bundled YAML, DB expert, job/thread override, frozen resolved_config) and maps them with a deprecation warning — strategic/tactical lift into llm.model when the layer sets no llm.model (strategic wins; an explicit llm.model in the same layer wins over both), subagent moves to subagents.llm. See knowledge-base/knowledge/features/universal_experts_and_subagents.md §1.1.",
   "type": "object",
   "required": ["agent_id", "display_name", "llm", "workspace", "tools", "connections"],
   "properties": {
     "$schema": {
       "type": "string",
       "description": "JSON Schema reference"
+    },
+    "$extends": {
+      "type": "string",
+      "description": "Parent config this file deep-merges onto (objects merge, lists replace, null clears). Chain roots: worker_base / session_base / subagent_base — the role overlays under config/overlays/ by their public names (default(s), persistent_default(s) and overlays/<role> are aliases) — and expert_base, the shared root every overlay extends. Any other value names another expert (config/experts/<name>, config/subagents/<name> or config/<name>.yaml) whose own chain is followed. When a config is resolved FOR a role (a job asks for worker, a session for session, a roster entry for subagent), the link that ends the chain is re-rooted onto that role's overlay, so every expert is usable in every role. See knowledge-base/knowledge/features/universal_experts_and_subagents.md §1.1.",
+      "examples": ["worker_base", "session_base", "expert_base", "critic"]
+    },
+    "$ignore_keys": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Dotted key paths the config's ROLE ignores — declared by a role overlay (config/overlays/subagent.yaml ignores workspace.backend, autonomy, verification, ...). Pruned from the merged config after every merge, again after the job/thread override layers, and after a roster override: a key that does not apply to a role is dropped silently, never an error. Rides the merge like any list (a child that declares its own list replaces it wholesale; an empty list disables pruning). Never parsed into the agent config.",
+      "examples": [["workspace.backend", "autonomy", "verification", "phase_settings"]]
     },
     "agent_id": {
       "type": "string",
@@ -43,24 +57,49 @@
       "items": {
         "type": "string"
       },
-      "description": "Tags for categorization and filtering in expert discovery",
-      "examples": [["research", "academic"], ["documentation", "writing"]]
+      "description": "Metadata for categorization and filtering in expert discovery — a soft UI filter, never read for behaviour (U1 D4). Role tags (worker / session / subagent) mark the roles an expert is meant for: the orchestrator derives a bundled expert's role tag from its $extends chain root and a DB expert's from expert_type; `subagent` is authored (library entries under config/subagents/ carry it). Every expert stays usable in every role.",
+      "examples": [["research", "academic"], ["subagent"], ["documentation", "writing"]]
+    },
+    "subagents": {
+      "type": "object",
+      "description": "Built-in subagents (universal_experts_and_subagents.md §1.1). `roster` names the children this expert may delegate to: inline small experts (same schema as an expert, resolved on the subagent role overlay) or `$ref` entries — a bundled expert dir name (`critic`), a library entry (`subagents/explorer` / `explorer`) or a DB expert id — with sibling keys deep-merged over the referenced expert. `llm` is the roster-wide model default (below every entry's own `llm`, above the base and the `$ref` target). A job/thread override deep-merges into `subagents.roster.<name>`. Entries are materialised at resolve time (merged chain, settings matrix per entry, parent-only keys pruned); a referenced expert's own `subagents` block is dropped (depth 1). See config/subagents/README.md.",
+      "properties": {
+        "default": {
+          "type": ["string", "null"],
+          "description": "Roster entry a `delegate_agent` call falls back to when it names no `subagent_type`"
+        },
+        "llm": {
+          "$ref": "#/$defs/llmPhaseOverride",
+          "description": "Roster-wide LLM partial (model / provider / transport / params) applied to every entry that does not pin its own `llm` key. `model: inherit` = the parent's model. A legacy `llm.subagent` tier maps here."
+        },
+        "roster": {
+          "type": "object",
+          "description": "Subagent name -> inline entry or `$ref` entry. The name is the child's agent_id and the `subagent_type` the parent passes to `delegate_agent`.",
+          "propertyNames": {
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]*$"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/subagentRosterEntry"
+          }
+        }
+      },
+      "additionalProperties": false
     },
     "llm": {
       "type": "object",
-      "description": "LLM configuration with optional phase-specific overrides",
+      "description": "LLM configuration: one model per expert (runs every phase and session turn) plus an optional summarization override. Legacy llm.strategic/tactical/subagent keys are accepted by the loader and mapped (see the top-level $comment) but are no longer schema keys.",
       "required": ["model"],
       "properties": {
         "model": {
           "type": "string",
-          "description": "Default model identifier (used when no phase override)",
-          "examples": ["RedHatAI/gemma-4-31B-it-FP8-Dynamic", "gpt-4o", "claude-sonnet-4-20250514", "gemini-2.0-flash"]
+          "description": "Model identifier — the single model every phase runs on",
+          "examples": ["RedHatAI/gemma-4-31B-it-FP8-Dynamic", "gpt-4o", "claude-sonnet-4-20250514", "gemini-2.0-flash", "codex/gpt-5.4", "codex/gpt-5.3-codex", "codex/gpt-5.3-codex-spark"]
         },
         "provider": {
           "type": ["string", "null"],
-          "enum": ["openai", "anthropic", "google", "groq", "openrouter", null],
+          "enum": ["openai", "anthropic", "google", "groq", "openrouter", "codex", null],
           "default": null,
-          "description": "LLM provider. Auto-detected from model name if null (claude-* → anthropic, gemini-* → google, default → openai). Groq requires explicit setting."
+          "description": "LLM provider. Auto-detected from model name if null (claude-* → anthropic, gemini-* → google, codex/* → codex, default → openai). Groq requires explicit setting."
         },
         "temperature": {
           "type": "number",
@@ -127,14 +166,6 @@
           "default": null,
           "description": "Override max output tokens (auto-detected if null)"
         },
-        "strategic": {
-          "$ref": "#/$defs/llmPhaseOverride",
-          "description": "LLM overrides for strategic (planning) phases. Uses more capable models for high-level decisions."
-        },
-        "tactical": {
-          "$ref": "#/$defs/llmPhaseOverride",
-          "description": "LLM overrides for tactical (execution) phases. Can use faster/cheaper models for task execution."
-        },
         "summarization": {
           "$ref": "#/$defs/llmPhaseOverride",
           "description": "LLM overrides for context summarization. Can use different model for compacting conversation history."
@@ -189,9 +220,39 @@
         },
         "backend": {
           "type": "string",
-          "enum": ["local", "remote"],
-          "default": "local",
-          "description": "Workspace backend type. 'local' uses the local filesystem (default). 'remote' uses SSH/SFTP to a VM."
+          "enum": ["sandbox", "vm", "virtual", "none"],
+          "default": "sandbox",
+          "description": "Workspace backend type. 'sandbox' (SSH/SFTP to an isolated workspace container) and 'vm' (SSH/SFTP to a KubeVirt VM with sudo gate) get the full shell/git/browser toolset. The lite tiers run with no workspace pod (no_workspace_agent_mode.md): 'virtual' exposes object-store-backed file tools (no shell/git/browser); 'none' exposes no file tools at all. Shell/browser/git are gated off automatically for the lite tiers by backend capability, not by config. The agent never operates on its own filesystem."
+        },
+        "container": {
+          "type": "object",
+          "description": "Workspace container settings (only used when backend: container). The orchestrator provisions the container and injects SSH connection details automatically.",
+          "properties": {
+            "image": {
+              "type": "string",
+              "description": "Workspace container image override (defaults to WORKSPACE_IMAGE env var)"
+            },
+            "cpu": {
+              "type": "string",
+              "default": "500m",
+              "description": "CPU request for workspace container"
+            },
+            "memory": {
+              "type": "string",
+              "default": "1Gi",
+              "description": "Memory request for workspace container"
+            },
+            "cpu_limit": {
+              "type": "string",
+              "default": "2000m",
+              "description": "CPU limit for workspace container"
+            },
+            "memory_limit": {
+              "type": "string",
+              "default": "4Gi",
+              "description": "Memory limit for workspace container"
+            }
+          }
         },
         "remote": {
           "type": "object",
@@ -217,8 +278,8 @@
             },
             "workspace_path": {
               "type": "string",
-              "default": "/home/agent-host",
-              "description": "Workspace root path on remote (= agent home dir)"
+              "default": "/home/agent-host/workspace",
+              "description": "Workspace root path on remote (subdirectory of agent home)"
             }
           },
           "required": ["host"]
@@ -226,155 +287,1530 @@
       }
     },
     "tools": {
+      "description": "Tool configuration by category: one field per TOOL_REGISTRY category, plus mcp. Each value is POLICY, not membership: true / false / {only: [...]} / {except: [...]}, or the legacy spellings (a bare list = only; [] = false). See knowledge-base/knowledge/features/tool_config_policy_vs_membership.md.",
       "type": "object",
-      "description": "Tool configuration by category (matches src/tools/ packages)",
-      "required": ["workspace", "core"],
+      "required": [
+        "workspace",
+        "core"
+      ],
       "properties": {
-        "workspace": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Workspace file operation tools (src/tools/workspace/)",
-          "examples": [["read_file", "write_file", "list_files", "edit_file"]]
+        "agent_catalog": {
+          "description": "Agent catalog tools: manage experts and skills. Primarily for persistent agents (src/tools/orchestrator/catalog.py). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "examples": [
+            [
+              "list_experts",
+              "get_expert",
+              "list_skills",
+              "search_skills",
+              "get_skill"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
         },
-        "core": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Core tools: todo management + job completion (src/tools/core/)",
-          "examples": [["next_phase_todos", "todo_complete", "mark_complete", "job_complete"]]
+        "browser_direct": {
+          "description": "Direct browser-control tools (src/tools/research/browser_direct.py). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
         },
-        "research": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Research/web search tools (src/tools/research/)",
-          "examples": [["web_search"]]
+        "catalog_authoring": {
+          "description": "Catalogue-authoring tools: create or update experts, skills and automations from portable JSON bundles (src/tools/orchestrator/catalog.py, workflows.py). Split out of agent_catalog/workflows so those groups hold only reads and their `true` expansion is safe by construction. Gated by the catalog_authoring capability grant, deny-by-default, because these tools write rows the user's other agents then run. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "examples": [
+            [
+              "get_expert_bundle",
+              "set_expert_bundle",
+              "get_skill_bundle",
+              "set_skill_bundle",
+              "get_automation_bundle",
+              "set_automation_bundle"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "canvas": {
+          "description": "Dynamic Canvas presentation tools for persistent sessions (src/tools/canvas/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "examples": [
+            [
+              "get_canvas",
+              "set_canvas",
+              "clear_canvas"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
         },
         "citation": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Citation management tools (src/tools/citation/)",
-          "examples": [["cite_document", "cite_web", "list_sources"]]
-        },
-        "graph": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Neo4j graph tools (src/tools/graph/). Injected automatically when a Neo4j connector is attached to the job. Usually left empty in config.",
-          "examples": [["cypher_query", "cypher_execute", "get_database_schema"]]
-        },
-        "sql": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "PostgreSQL query tools (src/tools/sql/). Injected automatically when a PostgreSQL connector is attached to the job.",
-          "examples": [["sql_query", "sql_schema", "sql_execute"]]
-        },
-        "mongodb": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "MongoDB query tools (src/tools/mongodb/). Injected automatically when a MongoDB connector is attached to the job.",
-          "examples": [["mongo_query", "mongo_aggregate", "mongo_schema", "mongo_insert", "mongo_update"]]
-        },
-        "git": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Git version control tools for workspace history (src/tools/git/)",
-          "examples": [["git_log", "git_show", "git_diff", "git_status", "git_tags"]]
-        },
-        "shell": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Shell tools: command execution (src/tools/shell/)",
-          "examples": [["run_command", "shell_read"], ["shell_execute", "shell_read"]]
-        },
-        "evaluation": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Evaluation/verdict tools for critic agents: approve or return jobs with feedback (src/tools/evaluation/)",
-          "examples": [["approve_job_verdict", "return_job_with_feedback"]]
-        },
-        "knowledge": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Knowledge base tools: project knowledge CRUD + search (src/tools/knowledge/)",
-          "examples": [["kb_write", "kb_update", "kb_read", "kb_list", "kb_search", "kb_related"]]
+          "description": "Citation management tools (src/tools/citation/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "examples": [
+            [
+              "cite_document",
+              "cite_web",
+              "list_sources"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
         },
         "communication": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Communication tools: agent-initiated messaging to humans via email (src/tools/communication/)",
-          "examples": [["send_message"]]
+          "description": "Communication tools: agent-initiated messaging to humans via email (src/tools/communication/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "examples": [
+            [
+              "send_message"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "core": {
+          "description": "Core tools: todo management + job completion (src/tools/core/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "examples": [
+            [
+              "next_phase_todos",
+              "todo_complete",
+              "mark_complete",
+              "job_complete"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
         },
         "delegation": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Delegation tools: spawn child jobs that branch off the workspace (src/tools/delegation/)",
-          "examples": [["delegate_work"]]
+          "description": "Delegation tools: the built-in subagents' `delegate_agent` (src/tools/delegation/), bound only when named here AND `delegation.enabled` is true. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list — `true` never expands to the spawn tool (grant: explicit). The deleted names `spawn_subagent` / `delegate_work` / `resume_delegation_child` are mapped to `delegate_agent` by the loader with a deprecation warning.",
+          "examples": [
+            [
+              "delegate_agent"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
         },
-        "orchestrator": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Non-job orchestrator application tools for projects, repositories, catalog/workflows, and session context",
-          "examples": [["get_session_context", "get_current_project", "list_project_jobs"]]
+        "email": {
+          "description": "email tools. Machine-owned: every tool here is code-granted (an email datasource is attached (tier from its config.access)), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "evaluation": {
+          "description": "Evaluation/verdict tools for critic agents: approve or return jobs with feedback (src/tools/evaluation/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "examples": [
+            [
+              "approve_job_verdict",
+              "return_job_with_feedback"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "git": {
+          "description": "Git version control tools for workspace history (src/tools/git/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "examples": [
+            [
+              "git_log",
+              "git_show",
+              "git_diff",
+              "git_status",
+              "git_tags"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "graph": {
+          "description": "Neo4j graph tools (src/tools/graph/). Injected automatically when a Neo4j datasource is attached to the job. Usually left empty in config. Machine-owned: every tool here is code-granted (a neo4j datasource is attached), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "examples": [
+            [
+              "cypher_query",
+              "cypher_execute",
+              "get_database_schema"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "knowledge": {
+          "description": "Knowledge base tools: project knowledge CRUD + search (src/tools/knowledge/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "examples": [
+            [
+              "kb_write",
+              "kb_update",
+              "kb_read",
+              "kb_list",
+              "kb_search",
+              "kb_related"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "loop": {
+          "description": "Loop campaign tools (src/tools/loop/); injected per job via config_override for a planner loop's checkpoint critic, never listed in bundled configs. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "mcp": {
+          "description": "MCP datasource tools, discovered at runtime; no static registry membership, so `true` resolves to the '*' sentinel expanded after MCP discovery. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "mongodb": {
+          "description": "MongoDB query tools (src/tools/mongodb/). Injected automatically when a MongoDB datasource is attached to the job. Machine-owned: every tool here is code-granted (a mongodb datasource is attached), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "examples": [
+            [
+              "mongo_query",
+              "mongo_aggregate",
+              "mongo_schema",
+              "mongo_insert",
+              "mongo_update"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
         },
         "job_control": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Canonical job-control writes generated from the shared job descriptors",
-          "examples": [["create_job", "approve_job", "resume_job_with_feedback", "cancel_job", "pause_job"]]
+          "description": "Canonical job-control writes generated from src/shared/orch_surface/jobs descriptors. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "examples": [
+            [
+              "create_job",
+              "approve_job",
+              "resume_job_with_feedback",
+              "cancel_job",
+              "pause_job"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
         },
         "job_inspection": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Canonical job inspection reads generated from the shared job descriptors",
-          "examples": [["list_jobs", "get_job", "get_job_file", "list_job_files"]]
+          "description": "Canonical job inspection reads generated from src/shared/orch_surface/jobs descriptors. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "examples": [
+            [
+              "list_jobs",
+              "get_job",
+              "get_job_file",
+              "list_job_files"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
         },
-        "agent_catalog": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Agent catalog tools: manage experts and skills. Primarily for persistent agents (src/tools/orchestrator/catalog.py)",
-          "examples": [["list_experts", "get_expert", "list_skills", "search_skills", "get_skill"]]
+        "orchestrator": {
+          "description": "Non-job orchestrator application tools for projects, repositories, catalog/workflows, and session context. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "examples": [
+            [
+              "get_session_context",
+              "get_current_project",
+              "list_project_jobs"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "product_help": {
+          "description": "Product-guide reader tools (src/tools/product_help.py, src/tools/product_capabilities.py). Machine-owned: every tool here is code-granted (persistent-session floor; see each tool's own gate), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "repo": {
+          "description": "Repository-datasource write tools (src/tools/repo/); distinct from `git`, which is the workspace's own version control. Machine-owned: every tool here is code-granted (a repository datasource is attached), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "research": {
+          "description": "Research/web search tools (src/tools/research/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "examples": [
+            [
+              "web_search"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "session_task": {
+          "description": "Lightweight session todo tools (src/tools/core/session_task_tools.py). Machine-owned: every tool here is code-granted (persistent session, unconditional (src/api/persistent_session.py:1415)), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "shell": {
+          "description": "Shell tools: command execution (src/tools/shell/). shell must enumerate its tools: only `{only: [...]}` (or a bare list, the same thing) and `false` (or []) are accepted. `true` and `except` both auto-track the registry, so a tool added to the shell category later would land here with no diff to review; for a code-execution category that is the wrong default.",
+          "examples": [
+            [
+              "run_command",
+              "shell_read"
+            ],
+            [
+              "shell_execute",
+              "shell_read"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean",
+              "const": false,
+              "description": "Only `false` is accepted here. shell must enumerate its tools: only `{only: [...]}` (or a bare list, the same thing) and `false` (or []) are accepted. `true` and `except` both auto-track the registry, so a tool added to the shell category later would land here with no diff to review; for a code-execution category that is the wrong default."
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "required": [
+                "only"
+              ],
+              "description": "Only `{only: [...]}` is accepted here. shell must enumerate its tools: only `{only: [...]}` (or a bare list, the same thing) and `false` (or []) are accepted. `true` and `except` both auto-track the registry, so a tool added to the shell category later would land here with no diff to review; for a code-execution category that is the wrong default."
+            }
+          ]
+        },
+        "sql": {
+          "description": "PostgreSQL query tools (src/tools/sql/). Injected automatically when a PostgreSQL datasource is attached to the job. Machine-owned: every tool here is code-granted (a postgresql datasource is attached), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "examples": [
+            [
+              "sql_query",
+              "sql_schema",
+              "sql_execute"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "webdav": {
+          "description": "WebDAV / cloud-storage tools (src/tools/webdav/). Machine-owned: every tool here is code-granted (a webdav datasource is attached), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
         },
         "workflows": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Workflow tools: inspect automations and project loops, and draft disabled automations. Primarily for persistent agents (src/tools/orchestrator/workflows.py)",
-          "examples": [["list_automations", "get_automation", "list_automation_runs", "propose_automation", "get_project_loop", "list_project_loop_jobs", "explain_project_loop"]]
+          "description": "Workflow tools: inspect automations and project loops, and draft disabled automations. Primarily for persistent agents (src/tools/orchestrator/workflows.py). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "examples": [
+            [
+              "list_automations",
+              "get_automation",
+              "list_automation_runs",
+              "propose_automation",
+              "get_project_loop",
+              "list_project_loop_jobs",
+              "explain_project_loop"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "workspace": {
+          "description": "Workspace file operation tools (src/tools/workspace/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "examples": [
+            [
+              "read_file",
+              "write_file",
+              "list_files",
+              "edit_file"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "instruction_files": {
       "type": "array",
@@ -458,6 +1894,12 @@
           "default": 3,
           "description": "Number of retries for failed tool calls"
         },
+        "llm_inproc_retries": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 5,
+          "description": "Tier-1 in-process LLM-invoke retries before the worker freezes the job for pause+backoff re-dispatch (llm_outage_pause_and_backoff_redispatch.md)"
+        },
         "response_validation": {
           "type": "object",
           "description": "LLM response degeneration validation settings",
@@ -493,8 +1935,99 @@
             }
           },
           "additionalProperties": false
+        },
+        "progress_stall_threshold": {
+          "type": "integer",
+          "minimum": 5,
+          "default": 30,
+          "description": "Tool calls without progress before nudge reminder is injected"
+        },
+        "max_tool_calls_per_phase": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "Optional per-phase tool-call ceiling (0 = off). Superseded by max_tool_calls_per_job, which bounds the job rather than resetting each boundary"
+        },
+        "max_tool_calls_per_job": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 5000,
+          "description": "Job-wide tool-call ceiling — the only automatic stop for a runaway job. Exceeding it freezes with budget_exceeded for human review (0 disables)"
+        },
+        "tool_category_timeouts": {
+          "type": "object",
+          "description": "Per-tool-category audited batch timeout ceilings (seconds). Empty values use graph defaults.",
+          "properties": {
+            "default": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 120,
+              "description": "Fallback timeout for categories not explicitly listed"
+            }
+          },
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "act_ratio_nudge_threshold": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 6,
+          "description": "Consecutive tool actions touching only process artifacts before the act-ratio 'stop planning' nudge fires (0 disables)"
+        },
+        "progress_push_interval_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 60,
+          "description": "Minimum seconds between progress pushes to the workspace remote. Commits are unthrottled; only the network round-trip is rate-limited"
+        },
+        "progress_wip_commit_after_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 300,
+          "description": "Seconds without a commit before the turn loop commits work in progress, covering agents stuck on a single long todo (0 disables)"
+        },
+        "queued_reply_max_wait_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 300,
+          "description": "Maximum seconds a queued (non-urgent) reply waits for a natural break (a completed todo) before being delivered anyway (0 = break-driven only)"
+        },
+        "process_artifact_patterns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": ["todos.yaml", "plan.md", "archive/*", "*retrospective*"],
+          "description": "fnmatch patterns (workspace-relative) classifying file targets as process artifacts for the act-ratio tripwire"
         }
       }
+    },
+    "phase_settings": {
+      "type": "object",
+      "description": "Phase alternation bounds enforced by TodoManager.stage_tactical_todos (next_phase_todos)",
+      "properties": {
+        "min_todos": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 5,
+          "description": "Minimum todos required for a strategic->tactical transition (worker_base sets 2)"
+        },
+        "max_todos": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 30,
+          "description": "Maximum todos allowed for a strategic->tactical transition"
+        },
+        "prompt_mode": {
+          "type": "string",
+          "enum": ["skills", "legacy"],
+          "default": "skills",
+          "description": "How the worker receives its phase guidance (U2). `skills` (default): one phase-agnostic system prompt; the strategic-phase / tactical-phase skills are delivered once per concrete phase through their phase_start bindings as persistent, protected messages. `legacy`: the pre-U2 swap — strategic.txt / tactical.txt (and their model-family variants) rendered into the system prompt every turn, phase-filtered tool bindings, no phase-skill blocks. Kept only so the U2 bench can run both arms on one image; removed with the family variants (U2 WP6). Flows through config_override like every phase_settings key; the frozen config decides for an in-flight job."
+        }
+      },
+      "additionalProperties": false
     },
     "context_management": {
       "type": "object",
@@ -569,22 +2102,46 @@
     },
     "browser": {
       "type": "object",
-      "description": "Browser automation configuration (browser-use + Playwright)",
+      "description": "Browser tool configuration (workspace-side browser-exec daemon; the agent pod never runs a browser)",
       "properties": {
-        "headless": {
-          "type": "boolean",
-          "default": true,
-          "description": "Run browser without visible UI"
+        "snapshot": {
+          "type": "object",
+          "description": "Page-state results returned by the direct browser tools",
+          "properties": {
+            "include_screenshot": {
+              "description": "Include screenshots in results: \"auto\" (if model is multimodal), true, or false",
+              "default": "auto"
+            },
+            "max_dom_chars": {
+              "type": "integer",
+              "default": 40000,
+              "description": "Truncate DOM text beyond this many characters"
+            }
+          }
         },
-        "timeout": {
-          "type": "integer",
-          "default": 60000,
-          "description": "Browser operation timeout in milliseconds"
-        },
-        "use_vision": {
-          "type": "boolean",
-          "default": false,
-          "description": "Use screenshot-based navigation instead of DOM/accessibility tree"
+        "security": {
+          "type": "object",
+          "description": "URL validation applied agent-side before dispatching actions",
+          "properties": {
+            "allowed_domains": {
+              "type": "array",
+              "items": { "type": "string" },
+              "default": [],
+              "description": "Allowlist of domains (empty = allow all)"
+            },
+            "blocked_domains": {
+              "type": "array",
+              "items": { "type": "string" },
+              "default": [],
+              "description": "Blocklist of domains"
+            },
+            "blocked_schemes": {
+              "type": "array",
+              "items": { "type": "string" },
+              "default": ["file", "javascript", "data"],
+              "description": "URL schemes that are always rejected"
+            }
+          }
         }
       }
     },
@@ -628,13 +2185,48 @@
           "items": {
             "type": "string"
           },
-          "description": "Commands blocked from execution for safety",
-          "default": ["sudo", "reboot", "shutdown", "poweroff", "halt", "init", "systemctl"]
+          "description": "Commands blocked from execution for safety (sudo has its own intercept via sudo_action)",
+          "default": ["reboot", "shutdown", "poweroff", "halt", "init"]
+        },
+        "sudo_action": {
+          "type": "string",
+          "enum": ["freeze", "block", "allow"],
+          "default": "freeze",
+          "description": "How to handle sudo commands: 'freeze' (intercept and offer VM upgrade), 'block' (hard reject), 'allow' (pass through, for VM-backed agents)"
         },
         "sandbox": {
           "type": "boolean",
           "default": true,
           "description": "Restrict working directory to workspace root"
+        }
+      },
+      "additionalProperties": false
+    },
+    "interactive": {
+      "type": "object",
+      "description": "Settings for persistent interactive mode (--mode persistent). Controls permission defaults and idle behavior.",
+      "properties": {
+        "permission_mode": {
+          "type": "string",
+          "enum": [
+            "supervised",
+            "auto_accept",
+            "autonomous"
+          ],
+          "default": "supervised",
+          "description": "Default permission mode for tool execution in interactive sessions"
+        },
+        "idle_timeout_minutes": {
+          "type": "integer",
+          "default": 30,
+          "minimum": 0,
+          "description": "Auto-end session after idle period in minutes (0 = disabled)"
+        },
+        "narration_mode": {
+          "type": "string",
+          "enum": ["silent", "verbose", "auto"],
+          "default": "auto",
+          "description": "How much the agent narrates its work in an interactive session. Changed live through the session control endpoint ('narration.set'), which enforces the same vocabulary."
         }
       },
       "additionalProperties": false
@@ -652,6 +2244,12 @@
           "type": "string",
           "default": "critic",
           "description": "Expert config name to use for the reviewer job"
+        },
+        "max_rounds": {
+          "type": "integer",
+          "default": 3,
+          "minimum": 0,
+          "description": "Max critic/worker feedback round-trips before the job is auto-accepted (0 = unlimited). worker_base ships 5; 3 is the code default when the key is absent."
         }
       },
       "additionalProperties": false
@@ -673,18 +2271,102 @@
       },
       "additionalProperties": false
     },
+    "delegation": {
+      "type": "object",
+      "description": "The built-in subagents' settings (universal_experts_and_subagents.md §0 D7; runtime in src/subagents/). `enabled` is the binding gate of the `delegate_agent` tool — the tool exists only when this is true AND the expert names it in `tools.delegation`. Which children exist, their model, tools, write policy and budgets live in `subagents.roster`; a child never delegates (depth 1). The pre-U3 keys (`max_depth`, `default_timeout`, `max_timeout`, `allowed_configs`, `mode`, `light`) are no longer accepted by this schema; the loader still drops them from any authored layer with a deprecation warning.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Opt-in: the expert may bind `delegate_agent` (it must also name the tool in `tools.delegation`)"
+        },
+        "max_concurrent": {
+          "type": "integer",
+          "default": 4,
+          "minimum": 1,
+          "description": "Roster runtime (D7): how many `delegate_agent` children may run concurrently per parent; calls above the cap queue and run in waves. Values below 1 are raised to 1 by the loader."
+        },
+        "run_in_background_default": {
+          "type": "boolean",
+          "default": false,
+          "description": "Roster runtime: the `run_in_background` a `delegate_agent` call gets when it does not say. false = the result returns as the tool result; true = the child's completion re-enters the parent as a message (U4)."
+        }
+      },
+      "additionalProperties": false
+    },
     "autonomy": {
       "type": "string",
       "enum": ["full", "review", "partial", "guided", "dependent"],
       "default": "partial",
       "description": "Controls when the agent pauses for human review. full=never, review=after job_complete, partial=after first strategic + job_complete, guided=after every strategic + job_complete, dependent=after every phase + job_complete."
+    },
+    "image_quality": {
+      "type": "string",
+      "enum": ["economy", "standard", "high"],
+      "default": "standard",
+      "description": "Resolution tier of images delivered to the model. economy=~768px, standard=~1568px, high=model-family max edge. Higher = more visual detail and more image tokens. Applied (downscale/re-encode) at the image seam; overridable per session/job."
     }
   },
   "additionalProperties": true,
   "$defs": {
+    "subagentRosterEntry": {
+      "type": "object",
+      "description": "One `subagents.roster` entry. Inline: any expert-schema key (the entry resolves on the subagent overlay: expert_base <- overlays/subagent <- these keys). Reference: `$ref` plus optional sibling keys deep-merged over the referenced expert. Keys that do not apply to a child (workspace.backend, autonomy, verification, phase_settings, delegation, tools.delegation, communication, scholar, curator, officer, headless — the subagent overlay's `$ignore_keys`) are pruned, never errors. `isolation`, `write_policy`, `return` and the child budgets under `limits` are U3 runtime keys carried verbatim on the resolved entry in U1.",
+      "properties": {
+        "$ref": {
+          "type": "string",
+          "description": "A bundled expert dir name (`critic` / `experts/critic`), a library entry (`explorer` / `subagents/explorer`) or a DB expert id (UUID). Never a path. Sibling keys override the referenced expert."
+        },
+        "description": {
+          "type": "string",
+          "description": "What this child is for — the text the parent model sees next to the `subagent_type`. Required in spirit for inline entries."
+        },
+        "llm": {
+          "$ref": "#/$defs/llmPhaseOverride",
+          "description": "The child's model / transport / params. `model: inherit` (the subagent overlay's default) = the parent's model + transport, materialised at resolve time."
+        },
+        "tools": {
+          "$ref": "#/properties/tools",
+          "description": "The child's tool groups. Unqualified children get the subagent overlay's read-only floor; a `$ref` to a fuller expert keeps that expert's tools (minus `delegation`)."
+        },
+        "prompts": {
+          "type": "object",
+          "additionalProperties": { "type": ["string", "null"] },
+          "description": "Prompt files or text. Inline entries name files resolved against the parent expert's directory (`_deployment_dir` on the resolved entry); a DB-referenced expert's prompt text is inlined by the resolver. Read by the roster runtime (U3)."
+        },
+        "isolation": {
+          "type": "string",
+          "enum": ["shared", "worktree"],
+          "description": "U3: where the child works — the parent's tree (`shared`) or its own git worktree. A per-call `isolation` may override."
+        },
+        "write_policy": {
+          "type": "string",
+          "enum": ["none", "scratch_only", "owned_paths", "full"],
+          "description": "U3: what the child may write (owned paths come from the brief)."
+        },
+        "limits": {
+          "type": "object",
+          "description": "The ordinary `limits` keys plus the child budgets the roster runtime enforces (U3): max_turns, max_tokens, return_budget_tokens, stale_idle_s, stale_in_tool_s. Operator-owned, never model-facing parameters.",
+          "properties": {
+            "max_turns": { "type": "integer", "minimum": 1 },
+            "max_tokens": { "type": "integer", "minimum": 1000 },
+            "return_budget_tokens": { "type": "integer", "minimum": 100 },
+            "stale_idle_s": { "type": "number", "minimum": 0 },
+            "stale_in_tool_s": { "type": "number", "minimum": 0 }
+          },
+          "additionalProperties": true
+        },
+        "return": {
+          "type": "string",
+          "enum": ["summary", "structured", "evidence", "diff"],
+          "description": "U3: the shape of what the child hands back to the parent."
+        }
+      },
+      "additionalProperties": true
+    },
     "llmPhaseOverride": {
       "type": "object",
-      "description": "Phase-specific LLM overrides. Only specified fields override the base config.",
+      "description": "Partial LLM overrides (llm.summarization). Only specified fields override the base config.",
       "properties": {
         "model": {
           "type": "string",
@@ -692,7 +2374,7 @@
         },
         "provider": {
           "type": ["string", "null"],
-          "enum": ["openai", "anthropic", "google", "groq", "openrouter", null],
+          "enum": ["openai", "anthropic", "google", "groq", "openrouter", "codex", null],
           "description": "LLM provider override"
         },
         "temperature": {

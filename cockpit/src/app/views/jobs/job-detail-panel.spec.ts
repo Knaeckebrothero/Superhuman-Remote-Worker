@@ -1,4 +1,8 @@
-import {describe, expect, it} from 'vitest';
+import {signal, ɵresolveComponentResources} from '@angular/core';
+import {TestBed} from '@angular/core/testing';
+import {provideRouter} from '@angular/router';
+import {TranslocoService, TranslocoTestingModule} from '@jsverse/transloco';
+import {afterEach, beforeAll, describe, expect, it} from 'vitest';
 import {
   costDisplay,
   formatCount,
@@ -6,12 +10,17 @@ import {
   formatUsd,
   jobModelLabel,
   liveSubjobCount,
+  JobDetailPanelComponent,
   shortJobId,
+  subagentElapsedSeconds,
+  subagentStatusTone,
   subjobBlockedKey,
   subjobElapsedSeconds,
   workspaceBackendLabel,
 } from './job-detail-panel.component';
-import type {Job, JobSubjob, JobUsage} from '../../core/models/api.model';
+import type {Job, JobSubagent, JobSubjob, JobUsage} from '../../core/models/api.model';
+import type {JobSummary} from '../../core/models/audit.model';
+import en from '../../../assets/i18n/en.json';
 
 /**
  * The panel's job is to be honest about what it does not know, so that is what
@@ -315,5 +324,120 @@ describe('subjobBlockedKey', () => {
   it('stays silent when the status is missing', () => {
     expect(subjobBlockedKey(null, [sub()])).toBeNull();
     expect(subjobBlockedKey(undefined, [sub()])).toBeNull();
+  });
+});
+
+function child(over: Partial<JobSubagent> = {}): JobSubagent {
+  return {
+    thread_id: '209c55c3-9fac-4a17-8dfa-40628688dd72',
+    handle: 'tester-7f3a',
+    subagent_type: 'tester',
+    status: 'running',
+    thread_status: 'active',
+    outcome: null,
+    error: null,
+    turns: 4,
+    tokens: 12345,
+    report_path: null,
+    parent_tool_call_id: 'call-1',
+    parent_thread_id: null,
+    description: 'Run the focused Cockpit tests and report exact failures.',
+    isolation: 'shared',
+    write_policy: 'none',
+    parent_iteration: 3,
+    fork: false,
+    started_at: '2026-08-23T10:00:00Z',
+    ended_at: null,
+    last_activity: '2026-08-23T11:00:00Z',
+    ...over,
+  };
+}
+
+describe('subagent roster', () => {
+  beforeAll(async () => {
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+  afterEach(() => TestBed.resetTestingModule());
+
+  function render(subagents: JobSubagent[] | null) {
+    TestBed.configureTestingModule({
+      imports: [
+        JobDetailPanelComponent,
+        TranslocoTestingModule.forRoot({
+          langs: {en},
+          translocoConfig: {availableLangs: ['en'], defaultLang: 'en'},
+        }),
+      ],
+      providers: [provideRouter([])],
+    });
+    const transloco = TestBed.inject(TranslocoService);
+    transloco.setTranslation(en, 'en');
+    transloco.setActiveLang('en');
+    const fixture = TestBed.createComponent(JobDetailPanelComponent);
+    const component = fixture.componentInstance;
+    Object.defineProperty(component, 'job', {
+      value: signal({
+        id: 'job-1',
+        description: 'Parent job',
+        status: 'processing',
+        created_at: '2026-08-23T09:00:00Z',
+      } as JobSummary),
+    });
+    Object.defineProperty(component, 'data', {
+      value: signal({
+        loading: false,
+        error: false,
+        detail: null,
+        usage: null,
+        progress: null,
+        usageSubtree: null,
+        loadingSubtree: false,
+        subtreeAttempted: false,
+        subjobs: [],
+        subagents,
+      }),
+    });
+    fixture.detectChanges();
+    return fixture;
+  }
+
+  it('renders child rows, transcript links, and the running marker', () => {
+    const fixture = render([
+      child(),
+      child({
+        thread_id: '32ca2166-1719-48d8-905f-8d846835ac1e',
+        handle: 'reviewer-2a1c',
+        subagent_type: 'reviewer',
+        status: 'completed',
+        thread_status: 'ended',
+        ended_at: '2026-08-23T10:15:00Z',
+      }),
+    ]);
+    const root = fixture.nativeElement as HTMLElement;
+    const rows = root.querySelectorAll('.subagent-row');
+
+    expect(rows).toHaveLength(2);
+    expect(rows[0].textContent).toContain('tester-7f3a');
+    expect(rows[0].textContent).toContain('Run the focused Cockpit tests');
+    expect(rows[0].classList.contains('subagent-live')).toBe(true);
+    expect(rows[1].classList.contains('subagent-live')).toBe(false);
+    expect(rows[0].querySelector('a')?.getAttribute('href')).toBe(
+      '/sessions/209c55c3-9fac-4a17-8dfa-40628688dd72',
+    );
+  });
+
+  it.each([[], null])('hides the section for %s', (subagents) => {
+    const root = render(subagents as JobSubagent[] | null).nativeElement as HTMLElement;
+    expect(root.querySelector('.detail-subagents')).toBeNull();
+  });
+
+  it('uses child timestamps for elapsed time and lifecycle tones', () => {
+    expect(subagentElapsedSeconds(child(), NOW)).toBe(2 * 3600);
+    expect(
+      subagentElapsedSeconds(child({status: 'completed', ended_at: '2026-08-23T10:30:00Z'}), NOW),
+    ).toBe(30 * 60);
+    expect(subagentStatusTone('running')).toBe('accent');
+    expect(subagentStatusTone('completed')).toBe('success');
+    expect(subagentStatusTone('error')).toBe('danger');
   });
 });

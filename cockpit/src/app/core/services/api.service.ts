@@ -54,6 +54,7 @@ import {
     JobDiffSummary,
     JobProgress,
     JobUsage,
+    JobSubagentRoster,
     JobSubjobRoster,
     JobRejectResult,
     JobReviewSessionResult,
@@ -93,6 +94,7 @@ import {
     ThreadCloudRejectResult,
     ThreadCloudDiffFile,
     ThreadCloudDiffSummary,
+    PersistentThreadHistory,
     User,
     UserCapabilities,
     VoiceCapabilities,
@@ -1910,6 +1912,21 @@ export class ApiService {
             );
     }
 
+    /** Read a persistent thread's durable transcript without attaching its
+     * runtime transport. This is the only history path used for child agents. */
+    getPersistentThreadHistory(threadId: string): Observable<PersistentThreadHistory | null> {
+        return this.http
+            .get<PersistentThreadHistory>(
+                `${this.baseUrl}/persistent/threads/${threadId}/messages`,
+            )
+            .pipe(
+                catchError((error) => {
+                    console.error(`Failed to get transcript for thread ${threadId}:`, error);
+                    return of(null);
+                }),
+            );
+    }
+
     /**
      * The session's resolved toolset: what the running agent actually bound,
      * or a labelled prediction when there is no agent to ask.
@@ -2194,6 +2211,20 @@ export class ApiService {
     return this.http.get<JobSubjobRoster>(`${this.baseUrl}/jobs/${jobId}/subjobs`).pipe(
       catchError((error) => {
         console.error(`Failed to fetch subjobs for job ${jobId}:`, error);
+        return of(null);
+      }),
+    );
+  }
+
+  /**
+   * The in-process child agents a job ran, including their transcript ids.
+   * Degrades independently so a roster outage never blanks the rest of the
+   * job detail panel.
+   */
+  getJobSubagents(jobId: string): Observable<JobSubagentRoster | null> {
+    return this.http.get<JobSubagentRoster>(`${this.baseUrl}/jobs/${jobId}/subagents`).pipe(
+      catchError((error) => {
+        console.error(`Failed to fetch subagents for job ${jobId}:`, error);
         return of(null);
       }),
     );

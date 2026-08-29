@@ -1735,6 +1735,8 @@ export interface Thread {
   id: string;
   title: string;
   status: ThreadStatus;
+  /** Absent on orchestrators predating child threads. */
+  kind?: 'session' | 'subagent';
   config_name: string;
   permission_mode: string;
   user_id?: string | null;
@@ -1758,6 +1760,40 @@ export interface Thread {
   mounts?: ThreadMount[];
   /** Derived: `source_ref` of every `mount_kind === 'project'` row. */
   project_ids?: string[];
+  /** Child-thread identity. All fields are absent on ordinary sessions and on
+   *  orchestrators predating U3. */
+  parent_job_id?: string | null;
+  subagent_handle?: string | null;
+  subagent_type?: string | null;
+  subagent_status?: JobSubagentStatus | null;
+  subagent_outcome?: string | null;
+  subagent_error?: string | null;
+  report_path?: string | null;
+}
+
+/** One row from the persistent thread transcript endpoint. */
+export interface PersistentThreadMessage {
+  id: string;
+  role: string;
+  content: string | null;
+  tool_calls: Array<{
+    name: string;
+    args: Record<string, unknown>;
+    id: string;
+    decision?: string;
+    category?: string;
+  }> | null;
+  turn_number: number | null;
+  tool_call_id?: string | null;
+  thinking?: string | null;
+  created_at: string | null;
+}
+
+export interface PersistentThreadHistory {
+  thread_id: string;
+  messages: PersistentThreadMessage[];
+  total: number;
+  has_more: boolean;
 }
 
 // =============================================================================
@@ -2378,6 +2414,45 @@ export interface JobSubjobRoster {
   job_id: string;
   count: number;
   subjobs: JobSubjob[];
+}
+
+export type JobSubagentStatus =
+  | 'running'
+  | 'completed'
+  | 'parked'
+  | 'interrupted'
+  | 'capped'
+  | 'error'
+  | 'cancelled';
+
+/** One child thread published by `GET /api/jobs/{job_id}/subagents`. */
+export interface JobSubagent {
+  thread_id: string;
+  handle: string;
+  subagent_type: string;
+  status: JobSubagentStatus;
+  thread_status: ThreadStatus;
+  outcome: string | null;
+  error: string | null;
+  turns: number;
+  tokens: number;
+  report_path: string | null;
+  parent_tool_call_id: string | null;
+  parent_thread_id: string | null;
+  description: string;
+  isolation: string | null;
+  write_policy: string | null;
+  parent_iteration: number | null;
+  fork: boolean;
+  started_at: string;
+  ended_at: string | null;
+  last_activity: string | null;
+}
+
+export interface JobSubagentRoster {
+  job_id: string;
+  count: number;
+  subagents: JobSubagent[];
 }
 
 export type JobUsageState = 'measured' | 'no_usage' | 'predates_ledger' | 'unavailable';
