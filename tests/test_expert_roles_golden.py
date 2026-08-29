@@ -91,6 +91,18 @@ _POST_SPLIT_OVERLAY_ADDITIONS: dict[str, tuple[str, ...]] = {
     # ``_without_effective_additions``).
     "session": ("limits.llm_inproc_retries",),
 }
+#: Keys later work packages DELETED from an overlay after the baseline was
+#: frozen (role -> dotted paths, with the WP that removed them) — the mirror
+#: of the additions above: asserted ABSENT in the post-split dict and PRESENT
+#: in the frozen baseline first (a stale entry cannot hide a leak either way),
+#: then removed from the pre-split side before the comparison.
+_POST_SPLIT_OVERLAY_REMOVALS: dict[str, tuple[str, ...]] = {
+    # U3 WP4: a delegation batch runs without the tool-batch watchdog (B.6),
+    # so the per-category ceiling for `delegation` left the worker overlay
+    # with the light reader it was sized for.
+    "worker": ("limits.tool_category_timeouts.delegation",),
+    "session": (),
+}
 #: Bindings later work added to an overlay's ``instruction_files`` (role ->
 #: skill names). The list replaces wholesale on merge, so a dotted path cannot
 #: name one entry: they are matched by ``skill``, asserted PRESENT first (in
@@ -138,18 +150,48 @@ def _dotted_present(data: dict, dotted: str) -> bool:
     return True
 
 
-def _without_post_split_additions(data: dict, role: str) -> dict:
+def _delete_dotted(data: dict, dotted: str) -> None:
+    *parents, leaf = dotted.split(".")
+    node = data
+    for part in parents:
+        node = node[part]
+    del node[leaf]
+
+
+def _without_post_split_additions(
+    data: dict, role: str, *, require: bool = True
+) -> dict:
     """``data`` minus the overlay keys added after the baseline was frozen
-    (each one must actually be present — see ``_POST_SPLIT_OVERLAY_ADDITIONS``)."""
+    (each one must actually be present — see ``_POST_SPLIT_OVERLAY_ADDITIONS``),
+    and asserted free of the keys removed since (``_POST_SPLIT_OVERLAY_REMOVALS``).
+    ``require=False`` is the PRE-split side of an expert whose own leaf restates
+    an added key (stripped if present, never asserted)."""
     out = copy.deepcopy(data)
     for dotted in _POST_SPLIT_OVERLAY_ADDITIONS.get(role, ()):
-        assert _dotted_present(out, dotted), f"{dotted} is listed as added but absent"
-        *parents, leaf = dotted.split(".")
-        node = out
-        for part in parents:
-            node = node[part]
-        del node[leaf]
-    return _without_post_split_bindings(out, role, require=True)
+        present = _dotted_present(out, dotted)
+        assert present or not require, f"{dotted} is listed as added but absent"
+        if present:
+            _delete_dotted(out, dotted)
+    if require:
+        for dotted in _POST_SPLIT_OVERLAY_REMOVALS.get(role, ()):
+            assert not _dotted_present(out, dotted), (
+                f"{dotted} is listed as removed but present"
+            )
+    return _without_post_split_bindings(out, role, require=require)
+
+
+def _without_post_split_removals(data: dict, role: str, *, require: bool) -> dict:
+    """The PRE-split side minus the overlay keys deleted after the baseline was
+    frozen. ``require`` asserts each one is present in the frozen base (the
+    role-base compare); an expert leaf on the frozen base is stripped without
+    the assertion."""
+    out = copy.deepcopy(data)
+    for dotted in _POST_SPLIT_OVERLAY_REMOVALS.get(role, ()):
+        present = _dotted_present(out, dotted)
+        assert present or not require, f"{dotted} is listed as removed but absent"
+        if present:
+            _delete_dotted(out, dotted)
+    return out
 
 
 def _without_post_split_bindings(data: dict, role: str, *, require: bool) -> dict:
@@ -181,7 +223,10 @@ def _without_effective_additions(agent: dict, role: str) -> dict:
     of the effective compare (the dataclass fills the pre-split side), so they
     are stripped from both without a presence assertion."""
     out = copy.deepcopy(agent)
-    for dotted in _POST_SPLIT_OVERLAY_ADDITIONS.get(role, ()):
+    for dotted in (
+        *_POST_SPLIT_OVERLAY_ADDITIONS.get(role, ()),
+        *_POST_SPLIT_OVERLAY_REMOVALS.get(role, ()),
+    ):
         *parents, leaf = dotted.split(".")
         node = out
         for part in parents:
@@ -263,7 +308,9 @@ def test_pre_split_fixture_is_the_a8950251_base(role):
 
 @pytest.mark.parametrize("role", sorted(_PRE_SPLIT))
 def test_role_base_merged_dict_is_identical_to_the_pre_split_base(role):
-    pre = load_and_merge_config(str(_PRE_SPLIT[role]))
+    pre = _without_post_split_removals(
+        load_and_merge_config(str(_PRE_SPLIT[role])), role, require=True
+    )
     post = _without_post_split_additions(load_role_base(role), role)
     assert post == pre
     assert json.dumps(post, sort_keys=True) == json.dumps(pre, sort_keys=True)
@@ -303,8 +350,12 @@ def test_bundled_expert_merged_dict_is_identical(name, pre_split_leaves):
     leaf = next(p for n, p, _ in _BUNDLED if n == name)
     # The pre-split side is the CURRENT leaf on the frozen base: an expert that
     # restates the post-split bindings in its own leaf carries them here too.
-    pre = _without_post_split_bindings(
-        load_and_merge_config(str(tmp_leaf)), role, require=False
+    pre = _without_post_split_removals(
+        _without_post_split_additions(
+            load_and_merge_config(str(tmp_leaf)), role, require=False
+        ),
+        role,
+        require=False,
     )
     post = _without_post_split_additions(load_and_merge_config(str(leaf)), role)
     post_role = _without_post_split_additions(

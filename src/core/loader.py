@@ -358,6 +358,76 @@ def normalize_llm_tiers(fragment: Any, *, source: str, merged: bool = False) -> 
     return out
 
 
+# Legacy ``delegation`` settings (pre-U3). The heavy child-job path
+# (``delegate_work``: ``max_depth`` / ``default_timeout`` / ``max_timeout`` /
+# ``allowed_configs``) and the light reader (``mode`` / ``light``) were deleted
+# in U3 WP4; the keys are still ACCEPTED in every authored layer and dropped
+# by ``normalize_delegation_block`` with one deprecation warning per layer, so
+# stored DB expert fragments, job/thread overrides and frozen blobs never
+# need a data migration. See universal_experts_and_subagents.md §0 D2/D7.
+_LEGACY_DELEGATION_KEYS = (
+    "max_depth",
+    "default_timeout",
+    "max_timeout",
+    "allowed_configs",
+    "mode",
+    "light",
+)
+
+# Same de-dup discipline as the tier log: one warning per (source, digest).
+_DELEGATION_LOG_SEEN: Set[tuple] = set()
+_DELEGATION_LOG_SEEN_MAX = 1024
+
+
+def _log_legacy_delegation_once(source: str, dropped: Dict[str, Any]) -> None:
+    key = (source, _tier_layer_digest(dropped))
+    if key in _DELEGATION_LOG_SEEN:
+        return
+    if len(_DELEGATION_LOG_SEEN) >= _DELEGATION_LOG_SEEN_MAX:
+        _DELEGATION_LOG_SEEN.clear()
+    _DELEGATION_LOG_SEEN.add(key)
+    logger.warning(
+        "config: legacy delegation key(s) %s in %s dropped — the delegation "
+        "block is {enabled, max_concurrent, run_in_background_default} since "
+        "U3 (delegate_work / spawn_subagent were deleted; see "
+        "universal_experts_and_subagents.md §0 D2/D7)",
+        sorted(dropped),
+        source,
+    )
+
+
+def normalize_delegation_block(fragment: Any, *, source: str) -> Any:
+    """Drop the pre-U3 ``delegation`` keys of ONE config layer.
+
+    U3 left the delegation block with three keys — ``enabled`` (the binding
+    gate of ``delegate_agent``), ``max_concurrent`` and
+    ``run_in_background_default``. Layers authored before that — bundled
+    YAML, DB expert fragments, job ``config_override``s, thread overrides,
+    frozen ``resolved_config`` blobs — may still carry ``max_depth`` /
+    ``default_timeout`` / ``max_timeout`` / ``allowed_configs`` (the heavy
+    child-job path) or ``mode`` / ``light`` (the light reader); every seam a
+    layer enters through calls this first, so they keep resolving and the
+    rest of the block (``enabled`` in particular) is untouched. Layer-local
+    by construction (the keys are dropped, never merged), so the same call
+    serves authored layers and merged blobs. Never mutates the input; a layer
+    without legacy keys is returned by identity. Logs one deprecation
+    warning per (source, layer).
+    """
+    if not isinstance(fragment, dict):
+        return fragment
+    delegation = fragment.get("delegation")
+    if not isinstance(delegation, dict) or not any(
+        k in delegation for k in _LEGACY_DELEGATION_KEYS
+    ):
+        return fragment
+    out = dict(fragment)
+    delegation = dict(delegation)
+    dropped = {k: delegation.pop(k) for k in _LEGACY_DELEGATION_KEYS if k in delegation}
+    out["delegation"] = delegation
+    _log_legacy_delegation_once(source, dropped)
+    return out
+
+
 # =============================================================================
 # Subagent roster: the ``inherit`` model sentinel (U1 — universal experts)
 # =============================================================================
@@ -607,10 +677,12 @@ def load_and_merge_config(
     # $extends chain. Runs BEFORE the merge because expansion is layer-local —
     # each layer resolves to list[str] on its own, and deep_merge's "lists
     # replace, dicts merge" then carries the layer model unmodified.
-    config_data = normalize_tool_policy(config_data)
+    config_data = normalize_tool_policy(config_data, source=str(config_path))
     # Same seam for the legacy llm tiers: layer-local, before the merge, so a
     # child's explicit llm.model and a parent's phase pin resolve per layer.
     config_data = normalize_llm_tiers(config_data, source=str(config_path))
+    # And for the pre-U3 delegation keys (dropped, never merged).
+    config_data = normalize_delegation_block(config_data, source=str(config_path))
 
     # Handle $extends inheritance
     if "$extends" in config_data:
@@ -1727,7 +1799,7 @@ class ToolsConfig:
     set is pinned against the registry by
     ``tests/test_tool_policy.py::TestCategoryVocabularyAgreement`` — it cannot
     be *derived* at import time because ``src/tools/registry`` imports this
-    module (via ``spawn_subagent``), so the dependency only runs one way.
+    module (via the tool packages), so the dependency only runs one way.
 
     Values are canonical ``List[str]``. The authoring vocabulary
     (``true`` / ``false`` / ``{only}`` / ``{except}``) is resolved to that form
@@ -2301,40 +2373,26 @@ def _parse_officer_config(data: Dict[str, Any]) -> OfficerConfig:
 
 @dataclass
 class DelegationConfig:
-    """Subagent delegation configuration.
+    """The built-in subagents' settings (universal_experts_and_subagents.md
+    §0 D7; the runtime is ``src/subagents``).
 
-    Controls whether agents can spawn child jobs via the delegate_work tool.
-    Children branch off the parent workspace and work in parallel via git worktrees.
-    See knowledge-base/knowledge/features/subagent_delegation.md.
+    ``enabled`` is the binding gate: ``delegate_agent`` is created only when
+    it is true AND the config names the tool in ``tools.delegation``. One
+    subagent kind, depth fixed at 1 (D2) — a child never delegates.
 
-    Depth is computed by counting delegation links (creation_order IS NOT NULL)
-    in the ancestor chain.  Lifecycle links (scholar/critic with creation_order
-    IS NULL) do not increment depth.  A job can delegate when its delegation
-    depth is strictly less than max_depth.
+    The pre-U3 keys (``max_depth`` / ``default_timeout`` / ``max_timeout`` /
+    ``allowed_configs`` of the heavy child-job path, ``mode`` / ``light`` of
+    the light reader) are dropped by ``normalize_delegation_block`` at every
+    layer seam with a deprecation warning; they never reach this dataclass.
     """
 
     enabled: bool = False
-    max_depth: int = 1  # Max delegation nesting; only delegation links count (lifecycle links are depth-transparent)
-    default_timeout: int = 7200  # 2 hours
-    max_timeout: int = 14400  # 4 hours
-    allowed_configs: List[str] = field(default_factory=list)  # empty = any
-    # Backend for the shared `spawn_subagent` tool: "heavy" (full child jobs)
-    # or "light" (throwaway in-process readers). Operator-selected, not the
-    # model's choice.
-    mode: str = "heavy"
-    # Light-backend knobs (max_iterations, max_tokens, max_parallel,
-    # allow_writes). Kept as a plain dict — the light factory reads it with
-    # .get() defaults, so unknown/missing keys are fine.
-    light: Dict[str, Any] = field(default_factory=dict)
-    # --- roster runtime (universal_experts_and_subagents.md §0 D7) ----------
-    # Per-parent cap on concurrently running `delegate_agent` children (U3
-    # runtime; schema + config key since U1). Always >= 1.
+    # Per-parent cap on concurrently running `delegate_agent` children
+    # (calls above the cap queue and run in waves). Always >= 1.
     max_concurrent: int = 4
-    # Default for a `delegate_agent` call that does not say run_in_background.
+    # Default for a `delegate_agent` call that does not say run_in_background
+    # (background children arrive with the U4 control plane).
     run_in_background_default: bool = False
-    # NOTE: max_depth / default_timeout / max_timeout / allowed_configs / mode
-    # / light belong to the delegate_work + light-runner generation and go
-    # with them in U3 (D2: one subagent kind, depth fixed at 1).
 
 
 @dataclass
@@ -2516,13 +2574,7 @@ def _parse_delegation_config(delegation_data: Any) -> DelegationConfig:
         )
         max_concurrent = 1
     return DelegationConfig(
-        enabled=delegation_data.get("enabled", False),
-        max_depth=delegation_data.get("max_depth", 1),
-        default_timeout=delegation_data.get("default_timeout", 7200),
-        max_timeout=delegation_data.get("max_timeout", 14400),
-        allowed_configs=delegation_data.get("allowed_configs", []),
-        mode=delegation_data.get("mode", "heavy"),
-        light=delegation_data.get("light", {}) or {},
+        enabled=bool(delegation_data.get("enabled", False)),
         max_concurrent=max_concurrent,
         run_in_background_default=bool(
             delegation_data.get("run_in_background_default", False)
@@ -3085,6 +3137,10 @@ def load_agent_config_from_dict(
     data = normalize_llm_tiers(
         data, source=f"merged:{data.get('agent_id', '?')}", merged=True
     )
+    # Same for a frozen blob's pre-U3 delegation keys (dropped, logged once).
+    data = normalize_delegation_block(
+        data, source=f"merged:{data.get('agent_id', '?')}"
+    )
 
     # Parse nested configs (same as load_agent_config)
     llm_data = data.get("llm", {})
@@ -3383,8 +3439,13 @@ def load_uploaded_config(uploaded_config_path: Path) -> Dict[str, Any]:
 
     # Normalisation seam 2 of 6: a job's uploaded config is an authored layer
     # like any other, and this path never goes through load_and_merge_config.
-    uploaded_data = normalize_tool_policy(uploaded_data)
+    uploaded_data = normalize_tool_policy(
+        uploaded_data, source=f"upload:{Path(uploaded_config_path).name}"
+    )
     uploaded_data = normalize_llm_tiers(
+        uploaded_data, source=f"upload:{Path(uploaded_config_path).name}"
+    )
+    uploaded_data = normalize_delegation_block(
         uploaded_data, source=f"upload:{Path(uploaded_config_path).name}"
     )
 

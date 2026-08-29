@@ -118,7 +118,7 @@ async def test_enforce_dispatch_grants_allows_when_granted(monkeypatch):
     )
     # Granted shell + delegation -> the worker-base-shaped fragment passes.
     await m._enforce_dispatch_grants(
-        {"tools": {"shell": ["ls"], "delegation": ["delegate_work"]}},
+        {"tools": {"shell": ["ls"], "delegation": ["delegate_agent"]}},
         runner_user_id=_UID,
         project_ids=[],
     )
@@ -554,9 +554,10 @@ async def test_duplicate_expert_scholar_end_to_end_for_a_default_grants_user(
     assert "shell" not in stored.get("tools", {})
     assert "delegation" not in stored.get("tools", {})
     assert "enabled" not in stored.get("delegation", {})
-    # Scholar's delegation.mode is not the violation (only .enabled is) and
-    # must survive — proof the strip did not take the whole settings dict.
-    assert stored["delegation"]["mode"] == "light"
+    # Scholar's delegation.max_concurrent is not the violation (only .enabled
+    # is) and must survive — proof the strip did not take the whole settings
+    # dict.
+    assert stored["delegation"]["max_concurrent"] == 4
 
 
 # The brief's own measurement: default grants (shell_tools=False,
@@ -731,9 +732,9 @@ async def test_fork_my_expert_default_strips_a_bundled_source_and_reports_it(
     assert "shell" not in stored.get("tools", {})
     assert "delegation" not in stored.get("tools", {})
     assert "enabled" not in stored.get("delegation", {})
-    # delegation.mode is not the violation (only .enabled is) and must survive
-    # — proof the strip did not take the whole settings dict.
-    assert stored["delegation"]["mode"] == "light"
+    # delegation.max_concurrent is not the violation (only .enabled is) and
+    # must survive — proof the strip did not take the whole settings dict.
+    assert stored["delegation"]["max_concurrent"] == 4
 
 
 @pytest.mark.asyncio

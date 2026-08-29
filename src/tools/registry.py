@@ -139,7 +139,7 @@ TOOL_REGISTRY.update(get_delegation_metadata())
 #                construction* — no mark required.  Prefer that fix: a category
 #                whose name matches its blast radius needs no exception list.
 #                What remains marked is the residue where a category genuinely
-#                mixes tiers (``delegate_work``, ``steer_job``).
+#                mixes tiers (``delegate_agent``, ``steer_job``).
 #
 # ``gate``
 #   A short string, present on every classified entry: what actually decides

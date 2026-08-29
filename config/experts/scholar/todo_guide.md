@@ -117,7 +117,7 @@ Example todos:
 - "Document results with actual numbers — include commands.sh for reproducibility"
 - "Write idea artifact if experiment supports the hypothesis, or note dead end if not"
 
-{% if has_tool("spawn_subagent") -%}
+{% if has_tool("delegate_agent") -%}
 ### 5. Fan-Out Research Phase (subagents)
 
 Purpose: Fan independent research threads out to subagents; keep your own context for synthesis.
@@ -127,7 +127,7 @@ structure it as a fan-out phase. A sequential exploration phase for separable th
 exception and needs a reason (threads depend on each other, or there is only one narrow topic).
 
 Structure: 1-2 fan-out todos followed by 2-3 synthesis todos that process the returned results.
-A fan-out todo means calling `spawn_subagent` several times in a SINGLE turn — one call per
+A fan-out todo means calling `delegate_agent` several times in a SINGLE turn — one call per
 thread; the calls run in parallel. Subagents return result STRINGS directly to you — they do
 not write files. You author every artifact and knowledge note yourself.
 
@@ -152,7 +152,7 @@ When NOT to use a fan-out phase:
 - You need to experiment iteratively (fan-out is for parallel reading/research, not sequential experimentation)
 {% endif -%}
 
-### {% if has_tool("spawn_subagent") %}6{% else %}5{% endif %}. Synthesis Phase
+### {% if has_tool("delegate_agent") %}6{% else %}5{% endif %}. Synthesis Phase
 
 Purpose: Review accumulated findings and generate remaining idea artifacts.
 
@@ -190,7 +190,7 @@ Every factual claim in an idea artifact must cite a source:
 | Codebase Archaeology | 5-7 | Examining repository for patterns and gaps |
 | Log & Data Analysis | 4-6 | Mining execution data for operational insights |
 | Experiment | 3-5 | Validating a hypothesis with a benchmark or PoC |
-{% if has_tool("spawn_subagent") -%}
+{% if has_tool("delegate_agent") -%}
 | Fan-Out Research | 1-2 fan-out + 2-3 synthesis | 2+ independent topics/sources — the DEFAULT for separable research |
 {% endif -%}
 | Synthesis | 4-6 | Reviewing findings, writing remaining ideas |

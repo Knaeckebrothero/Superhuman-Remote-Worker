@@ -674,15 +674,24 @@ class TestDelegationBatch:
 
     @pytest.mark.asyncio
     async def test_the_rejection_names_the_delegation_tool_in_the_batch(
-        self, tool_node
+        self, tool_node, monkeypatch
     ):
-        """spawn_subagent (category delegation, until WP4) follows the same
-        rule and the text names it, not delegate_agent."""
+        """The rule keys on the registry CATEGORY, and the text names the tool
+        that was in the batch — not the literal ``delegate_agent``. Pinned
+        with a stand-in registry entry (delegate_agent is the only delegation
+        tool since U3 WP4)."""
+        from src.tools.registry import TOOL_REGISTRY
+
+        monkeypatch.setitem(
+            TOOL_REGISTRY,
+            "delegate_probe",
+            {"category": "delegation", "phases": ["strategic", "tactical"]},
+        )
         tool_node.ainvoke = AsyncMock(
-            return_value={"messages": [result_for("spawn_subagent", "c2", "reader")]}
+            return_value={"messages": [result_for("delegate_probe", "c2", "reader")]}
         )
         audited = create_audited_tool_node(
-            [tool("spawn_subagent"), tool("read_file")],
+            [tool("delegate_probe"), tool("read_file")],
             FakeConfig(),
             tool_context=tool_context(),
         )
@@ -690,7 +699,7 @@ class TestDelegationBatch:
             state(
                 [
                     tc("read_file", "c1", {"path": "a"}),
-                    tc("spawn_subagent", "c2", {"task_description": "x"}),
+                    tc("delegate_probe", "c2", {"prompt": "x"}),
                 ],
                 is_strategic=False,
                 phase_number=4,
@@ -699,6 +708,6 @@ class TestDelegationBatch:
         by_id = {m.tool_call_id: m.content for m in tool_messages(result)}
         assert by_id["c2"] == "reader"
         assert by_id["c1"] == (
-            "Not executed: `read_file` was batched with spawn_subagent; re-issue "
+            "Not executed: `read_file` was batched with delegate_probe; re-issue "
             "it in the next turn — delegation runs in a turn of its own"
         )

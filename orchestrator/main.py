@@ -19385,7 +19385,7 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
         )
         # Inheritance is for DELEGATION; project defaults are for DISPATCH.
         #
-        # A parented subjob (critic, curator, pre-job scholar, delegate_work)
+        # A parented subjob (critic, curator, pre-job scholar, a legacy delegation child)
         # must never exceed its parent's connectors, so ``parent_job_id`` keeps
         # inheriting unconditionally. But a thread that *commissions* fresh
         # project work — an officer, a session — is not delegating its own
@@ -61630,8 +61630,17 @@ def _validate_expert_fragment(config: dict[str, Any]) -> dict[str, Any]:
     top level and in every roster entry), so callers persist the canonical
     form and the save-time PDP (which reads ``_truthy(tools.get(...))``, and
     gets ``{}`` / ``{only: []}`` backwards) only ever sees a list.
+
+    4. **Legacy delegation** (U3 WP4) — a fragment re-submitted from a row
+       authored before U3 may still grant ``spawn_subagent`` /
+       ``delegate_work`` (mapped to ``delegate_agent`` by the shared tools
+       gate) and carry ``delegation.mode`` / ``.light`` / the heavy-path
+       timeouts (dropped by ``normalize_delegation_block``); the row is
+       persisted canonical, so the managed seed rows never 422 on their next
+       edit.
     """
     from src.core.expert_resolution import hard_deny_scan
+    from src.core.loader import normalize_delegation_block
     from src.core.subagent_roster import (
         RosterResolutionError,
         validate_roster_fragment,
@@ -61644,7 +61653,12 @@ def _validate_expert_fragment(config: dict[str, Any]) -> dict[str, Any]:
             detail="config may not set credential sections: "
             + ", ".join(sorted(offending)),
         )
-    validated = _with_validated_tool_overrides(config) or {}
+    validated = (
+        normalize_delegation_block(
+            _with_validated_tool_overrides(config), source="expert-save"
+        )
+        or {}
+    )
     subagents = validated.get("subagents")
     if subagents is None:
         return validated

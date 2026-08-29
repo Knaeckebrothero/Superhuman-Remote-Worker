@@ -542,8 +542,8 @@ _TOOL_RULES: Mapping[CapabilityResolverKey, _ToolRule] = {
         ),
     ),
     CapabilityResolverKey.SESSION_DELEGATE: _ToolRule(
-        readiness=frozenset({"create_job", "delegate_work", "spawn_subagent"}),
-        execute=frozenset({"create_job", "delegate_work", "spawn_subagent"}),
+        readiness=frozenset({"create_job", "delegate_agent"}),
+        execute=frozenset({"create_job", "delegate_agent"}),
     ),
     CapabilityResolverKey.WORKSPACE_SELECT: _ToolRule(
         readiness=frozenset({"request_workspace_upgrade"}),

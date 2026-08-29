@@ -352,15 +352,15 @@ class ToolContext:
     )  # job_id, project_id, priority, config_name, repo_name
     _resolved_tool_names: List[str] = field(
         default_factory=list
-    )  # Parent's actually-loaded tool names, stashed post-load so the light
-    # spawn_subagent backend can build a reader inheriting them (minus the
-    # delegation category). Empty until _setup_job_tools finishes loading.
+    )  # Parent's actually-loaded tool names, stashed post-load: the runtime
+    # ceiling a subagent child's allowlist is intersected with (U3 B.2).
+    # Empty until _setup_job_tools finishes loading.
     session_runtime_facts: Optional[SessionRuntimeFacts] = (
         None  # Atomically replaced redacted persistent-session observation.
         # Worker jobs and sessions still setting up/tearing down leave it None.
     )
-    _limits: Optional[Any] = None  # Parent LimitsConfig — used to build the
-    # light-subagent reader LLM (create_llm(subagent_cfg, limits=...)).
+    _limits: Optional[Any] = None  # Parent LimitsConfig — carried for the
+    # subagent child build (create_llm(child_cfg, limits=...)).
     # --- Built-in subagents (U3). The parent's tool node / agent.py stamp
     # these; ``delegate_agent`` and ``src.subagents`` read them lazily. ---
     subagent_runtime: Optional[Any] = (

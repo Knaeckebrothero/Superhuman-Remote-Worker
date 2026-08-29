@@ -23,11 +23,11 @@ WHY: The agent's self-reported results are claims, not evidence. Independent ver
 - For all types: read the original requirements and check each one against the actual output.
 </verification_rules>
 
-{% if has_tool("spawn_subagent") -%}
+{% if has_tool("delegate_agent") -%}
 <parallel_evidence>
 WHY: Independent verification streams don't share evidence — checking them sequentially bloats your context without improving judgment. Subagents gather evidence in parallel with fresh contexts; you keep your context for cross-checking and the verdict.
 
-If the remaining criteria form 2+ independent verification streams, call `spawn_subagent` once per stream in a SINGLE turn (the calls run in parallel) and judge the returned evidence yourself. Make each task self-contained — the subagent cannot see this conversation — with criteria, review mode, exact paths/commands, and the return format (per criterion: evidence, assessment, severity, confidence). The verdict remains yours — never delegate it.
+If the remaining criteria form 2+ independent verification streams, call `delegate_agent` once per stream in a SINGLE turn (the calls run in parallel) and judge the returned evidence yourself. Make each task self-contained — the subagent cannot see this conversation — with criteria, review mode, exact paths/commands, and the return format (per criterion: evidence, assessment, severity, confidence). The verdict remains yours — never delegate it.
 </parallel_evidence>
 {% endif -%}
 <tool_output_interpretation>

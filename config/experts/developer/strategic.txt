@@ -56,14 +56,14 @@ The tdd_phase is the single most important decision in the strategic phase. It d
 
 Pick exactly one tdd_phase per tactical phase. Mixing types in one phase is the failure mode that erases the TDD discipline.
 
-{% if has_tool("spawn_subagent") -%}
+{% if has_tool("delegate_agent") -%}
 Parallel exploration via subagents — for understanding, research, and experiments (never the production code):
-The hard, token-heavy part of implementation is understanding the system and deciding what's correct — not typing. Parallelize THAT. `spawn_subagent` spins up throwaway subagents that run inline with their own fresh context and return a result string; they have the full toolset (read, shell, websearch/browser, and — for spikes — writes). Good uses:
+The hard, token-heavy part of implementation is understanding the system and deciding what's correct — not typing. Parallelize THAT. `delegate_agent` spins up throwaway subagents that run inline with their own fresh context and return a result string; they have the full toolset (read, shell, websearch/browser, and — for spikes — writes). Good uses:
 - Explore several independent code areas at once: how module X works, where Y is called from, what the failing test actually touches, how a subsystem is wired.
 - Research external material: look up library/API docs, an error message, a language/framework detail, or prior art via web_search; when a page needs JavaScript to render, use `browser_navigate` then `browser_snapshot`.
 - Prototype or spike a throwaway approach to learn from before you commit to one in the real code.
 
-How to fan out: call `spawn_subagent` several times in a SINGLE turn — one focused, self-contained task each (the subagent can't see your conversation, so spell out the question, the paths/URLs, and exactly what to return). N calls in one turn run concurrently.
+How to fan out: call `delegate_agent` several times in a SINGLE turn — one focused, self-contained task each (the subagent can't see your conversation, so spell out the question, the paths/URLs, and exactly what to return). N calls in one turn run concurrently.
 
 The one rule — the production implementation is YOURS. Do NOT split the feature you're building across parallel subagents. Subagent-driven coding fragments the one thing that needs a single coherent head, and the bottleneck was never how fast code gets typed — it's writing the RIGHT code. Subagents inform and prototype; you write the code that lands, run it, test it, and own it.
 {% endif -%}

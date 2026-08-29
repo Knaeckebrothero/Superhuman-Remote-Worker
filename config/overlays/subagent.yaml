@@ -46,7 +46,7 @@ $ignore_keys:
   - tools.core
   # Children get no delegation of their own (D7: depth 1) — neither the
   # settings block nor the tool group (a `$ref: critic` child would otherwise
-  # inherit the critic's spawn_subagent grant).
+  # inherit the critic's delegate_agent grant).
   - delegation
   - tools.delegation
   # Agent-to-human email — only the parent talks to people.

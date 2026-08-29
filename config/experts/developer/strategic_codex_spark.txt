@@ -69,10 +69,10 @@ Choose exactly one per tactical phase. Stamp it on every todo.
 
 Mixing types in one phase erases the discipline. If mid-phase you discover the wrong type was chosen, end the phase via `mark_complete` and let the next strategic phase reassign.
 
-{% if has_tool("spawn_subagent") -%}
+{% if has_tool("delegate_agent") -%}
 # Subagents
 
-Parallelize understanding, not typing. `spawn_subagent` = throwaway subagents (own context, full tools — read/shell/websearch/browser/writes, return a string). Use for: explore N code areas at once, websearch docs/APIs/errors, prototype a throwaway spike. Several calls in one turn run concurrently; each task self-contained. NEVER split the production feature across subagents — you write the code that lands and own it.
+Parallelize understanding, not typing. `delegate_agent` = throwaway subagents (own context, full tools — read/shell/websearch/browser/writes, return a string). Use for: explore N code areas at once, websearch docs/APIs/errors, prototype a throwaway spike. Several calls in one turn run concurrently; each task self-contained. NEVER split the production feature across subagents — you write the code that lands and own it.
 {% endif -%}
 
 # Execution-Ready Todos

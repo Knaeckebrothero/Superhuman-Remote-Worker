@@ -164,7 +164,11 @@ def build_expert_config(base: dict, row: dict) -> tuple[dict, dict]:
     """Merge a DB expert fragment onto its expert_type base (RFC 7396 via
     deep_merge). Returns (merged_config_dict, prompts_dict). Tolerates JSONB
     delivered as str (asyncpg without a codec)."""
-    from src.core.loader import deep_merge, normalize_llm_tiers
+    from src.core.loader import (
+        deep_merge,
+        normalize_delegation_block,
+        normalize_llm_tiers,
+    )
     from src.core.tool_policy import normalize_tool_policy
 
     config = row.get("config") or {}
@@ -178,12 +182,15 @@ def build_expert_config(base: dict, row: dict) -> tuple[dict, dict]:
     # caller. Stored fragments are JSON lists today — lists stay canonical
     # forever, so no row needs migrating — but the expert editor will start
     # emitting true/false, and both must merge identically.
-    config = normalize_tool_policy(config)
+    config = normalize_tool_policy(config, source=expert_layer_source(row))
     # Same seam for the pre-U1 llm tiers (layer-local rule): a stored
     # ``llm.strategic`` pin resolves to the row's single model, carrying its
     # transport/params along; ``llm.subagent`` moves to ``subagents.llm``.
     # Stored rows never need a data migration.
     config = normalize_llm_tiers(config, source=expert_layer_source(row))
+    # And the pre-U3 delegation keys (``mode`` / ``light`` / the heavy-path
+    # timeouts) a stored row may still carry: dropped with one warning.
+    config = normalize_delegation_block(config, source=expert_layer_source(row))
     merged = deep_merge(base, config)
     merged.pop("connections", None)  # belt-and-braces; deny-scan already ran at save
     return merged, prompts

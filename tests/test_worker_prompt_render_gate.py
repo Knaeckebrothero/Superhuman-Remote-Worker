@@ -11,7 +11,7 @@ expert actually grants, and pin:
 - the ``<phase_model>`` block replaced ``<phase_directive>`` and the hierarchy
   line says "phase instructions";
 - the tactical body's shell block is present iff the expert grants a shell,
-  and every ``has_tool("spawn_subagent")`` block follows the grant;
+  and every ``has_tool("delegate_agent")`` block follows the grant;
 - a DB expert's phase prompt rides INSIDE the phase block as the fenced
   ``<expert_workflow>`` addendum (one protected identity per path);
 - the legacy switch: ``prompt_mode: legacy`` renders today's swap, a frozen
@@ -224,9 +224,9 @@ def test_phase_body_renders_for_the_experts_grants(name, leaf, phase):
     # Shell guidance follows the shell grant (tactical bodies that carry it).
     if "Shell management" in raw:
         assert ("Shell management" in rendered) == _has_shell_tools(set(tools)), label
-    # spawn_subagent blocks follow the grant.
-    if 'has_tool("spawn_subagent")' in raw:
-        assert ("spawn_subagent" in rendered) == ("spawn_subagent" in tools), label
+    # delegate_agent blocks follow the grant.
+    if 'has_tool("delegate_agent")' in raw:
+        assert ("delegate_agent" in rendered) == ("delegate_agent" in tools), label
     # Every has_tool(...) conditional in the body resolves against the grant.
     for tool in re.findall(r'has_tool\(\s*["\']([^"\']+)["\']\s*\)', raw):
         if tool not in tools:

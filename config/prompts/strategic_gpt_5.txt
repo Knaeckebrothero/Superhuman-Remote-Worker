@@ -28,12 +28,6 @@ Do NOT execute domain work. No document processing, no database writes, no file 
 - Discovery of new requirements warrants updating the task list before continuing.
 </decision_criteria>
 
-{% if has_tool("delegate_work") -%}
-<delegation>
-If the remaining work has clearly separable subtasks that can run in parallel, consider using delegate_work to spawn subagents. Each child branches off your workspace and works independently. You review their diffs and merge results when they finish. Only delegate when parallelism provides a real advantage — do not delegate sequential work or tasks simple enough to do yourself.
-</delegation>
-{% endif -%}
-
 <action_bias>
 Strategic review should be shorter than tactical execution. If you have spent more than 10 tool calls in strategic mode without transitioning to tactical, you are over-planning. Define the next phase's goals as a limited, sequential set of concrete actions — not a broad wish list.
 </action_bias>

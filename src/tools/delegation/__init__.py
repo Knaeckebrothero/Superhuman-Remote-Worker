@@ -1,16 +1,22 @@
-"""Delegation toolkit — subagent spawning tools.
+"""Delegation toolkit — the built-in subagents.
 
-Three primitives (two of them on their way out):
+One tool: ``delegate_agent`` (U3) — one bounded brief to a roster subagent
+running in-process on ``run_persistent_loop``; the child's report returns as
+the tool result. Created only when ``delegation.enabled`` is true AND the
+config names the tool in ``tools.delegation`` (``grant: explicit``). See
+knowledge-base/knowledge/features/universal_experts_and_subagents.md.
 
-- `delegate_agent` — the built-in subagents (U3): one bounded brief to a
-  roster subagent running in-process on `run_persistent_loop`; the report
-  returns as the tool result. Created only when `delegation.enabled`. See
-  knowledge-base/knowledge/features/universal_experts_and_subagents.md.
-- `delegate_work` / `resume_delegation_child` — the heavyweight path: spawn 1-5
-  child jobs as git worktree branches; the parent suspends (checkpoint + wake)
-  and resumes to review/merge results. Deleted in U3 WP4.
-- `spawn_subagent` — the light in-process reader (`delegation.mode: light`).
-  Deleted in U3 WP4 once `delegate_agent` replaces it in the experts.
+The heavyweight pair (``delegate_work`` / ``resume_delegation_child``: child
+JOBS on git worktree branches, the parent frozen until they finished) and the
+light in-process reader (``spawn_subagent``, ``delegation.mode: light``) were
+deleted in U3 WP4. A config layer that still names them in ``tools.delegation``
+is mapped to ``delegate_agent`` by ``src.core.tool_policy.normalize_tool_policy``;
+their settings keys are dropped by ``src.core.loader.normalize_delegation_block``.
+The orchestrator-side child-job machinery is kept one release, inert — see
+knowledge-base/knowledge/issues/delegation_child_machinery_retirement.md.
+
+``reader_env`` (the per-child git worktree + re-rooted backend) stays: it is
+the ``isolation: worktree`` path of ``src.subagents.child``.
 """
 
 from typing import Any, Dict, List
@@ -19,32 +25,19 @@ from ..context import ToolContext
 
 
 def create_delegation_tools(context: ToolContext) -> List[Any]:
-    """Create all delegation tools with injected context.
+    """Create the delegation tools with injected context.
 
-    Args:
-        context: ToolContext (must have workspace_manager, orchestrator_client, job_metadata)
-
-    Returns:
-        List of LangChain tool functions
+    Returns ``[]`` unless ``delegation.enabled`` is true on the context's
+    tool config — the binding follows the settings flag as well as the
+    ``tools.delegation`` grant (B.12).
     """
     from .delegate_agent import create_delegate_agent_tools
-    from .delegate_work import create_delegation_tools as _create_heavy
-    from .spawn_subagent import create_spawn_subagent_tools
 
-    tools = list(_create_heavy(context))
-    tools.extend(create_spawn_subagent_tools(context))
-    tools.extend(create_delegate_agent_tools(context))
-    return tools
+    return list(create_delegate_agent_tools(context))
 
 
 def get_delegation_metadata() -> Dict[str, Dict[str, Any]]:
-    """Get metadata for all delegation tools."""
+    """Registry metadata for the delegation category."""
     from .delegate_agent import DELEGATE_AGENT_METADATA
-    from .delegate_work import DELEGATION_TOOLS_METADATA
-    from .spawn_subagent import SPAWN_SUBAGENT_METADATA
 
-    return {
-        **DELEGATION_TOOLS_METADATA,
-        **SPAWN_SUBAGENT_METADATA,
-        **DELEGATE_AGENT_METADATA,
-    }
+    return dict(DELEGATE_AGENT_METADATA)

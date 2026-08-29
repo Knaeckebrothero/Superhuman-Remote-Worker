@@ -61,7 +61,8 @@ class _Stop:
 
 STOP = _Stop()
 
-#: The light runner's forced-synthesis prompt (light_runner.py:151-154).
+#: The forced-synthesis prompt (inherited from the light runner, deleted in
+#: U3 WP4).
 SYNTH_PROMPT = (
     "You have reached your {reason}. Do NOT call any more tools. Based only "
     "on what you have gathered so far, write your final answer now."

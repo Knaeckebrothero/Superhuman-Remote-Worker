@@ -60,7 +60,7 @@ from ..core.skill_resolution import (
     APP_GUIDE_LOADER_TOOL,
     app_guide_health_snapshot,
 )
-from ..core.loader import normalize_llm_tiers
+from ..core.loader import normalize_delegation_block, normalize_llm_tiers
 from ..core.tool_policy import (
     normalize_tool_policy,
     validate_tool_override_fragment,
@@ -4376,8 +4376,12 @@ async def _attach_session_inner(
         # normalisation — otherwise `canvas: false` never becomes the `[]` that
         # _apply_session_tool_group_markers matches on, and the group stays on.
         # Same seam for a legacy llm.strategic/tactical/subagent block.
-        config_override = normalize_llm_tiers(
-            normalize_tool_policy(config_override), source="thread-override"
+        config_override = normalize_delegation_block(
+            normalize_llm_tiers(
+                normalize_tool_policy(config_override, source="thread-override"),
+                source="thread-override",
+            ),
+            source="thread-override",
         )
         base_dict = dataclasses.asdict(effective_config)
         merged = deep_merge(base_dict, config_override)
@@ -14823,8 +14827,12 @@ async def _handle_config_update(
 
         # Live `config.update` is the same raw-override shape as the legacy
         # attach path above; normalise before both the merge and the markers.
-        effective_override = normalize_llm_tiers(
-            normalize_tool_policy(effective_override), source="thread-override"
+        effective_override = normalize_delegation_block(
+            normalize_llm_tiers(
+                normalize_tool_policy(effective_override, source="thread-override"),
+                source="thread-override",
+            ),
+            source="thread-override",
         )
         base_dict = dataclasses.asdict(_session.config)
         merged = deep_merge(base_dict, effective_override)

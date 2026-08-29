@@ -210,7 +210,8 @@ def test_phase_skills_are_catalog_hidden_and_bound():
         assert binding["trigger"] == f"phase_start:{phase}"
         assert binding["enforce"] is False
     assert "{% if has_shell" in (_SKILLS / "tactical-phase" / "SKILL.md").read_text()
-    assert (
-        'has_tool("delegate_work")'
-        in (_SKILLS / "strategic-phase" / "SKILL.md").read_text()
-    )
+    # The heavy-path delegation paragraph left with delegate_work (U3 WP4);
+    # the generic delegation rules are a tool-gated runtime floor, not skill
+    # prose, and the per-expert stance lives in the expert's own phase skills.
+    strategic = (_SKILLS / "strategic-phase" / "SKILL.md").read_text()
+    assert "delegate_work" not in strategic and "has_tool(" not in strategic

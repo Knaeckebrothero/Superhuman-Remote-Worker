@@ -308,14 +308,10 @@ class TestExplicitGrants:
             item.name for item in JOB_DESCRIPTORS if item.grant == "explicit"
         }
         assert _classified("explicit") == descriptor_explicit | {
-            # Heavy delegation: no config has granted these since 57430a2a and
-            # whether to restore them is an open decision. `delegation: true`
-            # must not be what takes it.
-            "delegate_work",
-            "resume_delegation_child",
             # Built-in subagents (U3): named outright in tools.delegation AND
             # gated on delegation.enabled; `delegation: true` never expands
-            # to a spawn tool.
+            # to a spawn tool. (The heavy pair delegate_work /
+            # resume_delegation_child was deleted in U3 WP4.)
             "delegate_agent",
         }
         assert {"steer_job", "get_stuck_jobs"} <= descriptor_explicit
@@ -401,12 +397,20 @@ class TestTrueExpansionIsSafe:
         membership at all, and ``product_help`` / ``session_task`` do not even
         have a ``ToolsConfig`` field to name.
         """
+        from src.core.tool_policy import ENUMERATE_ONLY_CATEGORIES
+
         empty = {
             category
             for category in {meta["category"] for meta in TOOL_REGISTRY.values()}
             if not expand_true(category)
         }
-        assert empty == set(CODE_GRANTED_CATEGORIES)
+        # `delegation` (U3 WP4) holds one `grant: explicit` tool, so its
+        # `true` expansion is empty by design — and the category refuses
+        # `true` outright (enumerate-only, like `shell`), so "on" is still
+        # expressible: `{only: [delegate_agent]}`, served by
+        # `enumerate_only_members`.
+        assert empty - ENUMERATE_ONLY_CATEGORIES == set(CODE_GRANTED_CATEGORIES)
+        assert empty & ENUMERATE_ONLY_CATEGORIES == {"delegation"}
 
 
 class TestMcp:

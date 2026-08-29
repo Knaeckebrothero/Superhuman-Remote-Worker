@@ -9,8 +9,8 @@ a session (guardrails + the ``parallel_tool_calls`` gate; never
 
 Tool names: ``entry allowlist ∩ parent._resolved_tool_names − CONTROL_PLANE``
 (by registry category) — the parent's loaded names are the runtime ceiling
-(backend capability filter, grants, datasources, MCP); the three delegation
-names are denied by name as well (depth 1, D7).
+(backend capability filter, grants, datasources, MCP); the delegation tool
+is denied by name as well (depth 1, D7).
 
 Isolation: ``shared`` = the parent's tree through a copied
 ``WorkspaceManager`` whose git manager is read-only (the loop's turn-end
@@ -69,9 +69,7 @@ CONTROL_PLANE_CATEGORIES = frozenset(
     }
 )
 #: Denied by name too — a renamed category must never let one through.
-DELEGATION_TOOL_NAMES = frozenset(
-    {"delegate_agent", "spawn_subagent", "delegate_work", "resume_delegation_child"}
-)
+DELEGATION_TOOL_NAMES = frozenset({"delegate_agent"})
 #: The tools ``write_policy`` governs (B.8; the workspace mutators plus the
 #: knowledge-base writers). ``kb_delete`` is listed for the day it exists.
 WRITE_TOOLS = frozenset(
@@ -878,9 +876,7 @@ async def build_child(
             index = (
                 worktree_index if worktree_index is not None else next(_WORKTREE_INDEX)
             )
-            env = await acquire_reader_env(
-                parent_context, [], index=index, allow_writes=True, name=handle
-            )
+            env = await acquire_reader_env(parent_context, [], index=index, name=handle)
             ctx = env.context
             workspace_manager = ctx.workspace_manager
             if getattr(workspace_manager, "_git_manager", None) is not None:

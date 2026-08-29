@@ -684,10 +684,10 @@
           ]
         },
         "delegation": {
-          "description": "Delegation tools: spawn child jobs that branch off the workspace (src/tools/delegation/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "Delegation tools: the built-in subagents' `delegate_agent` (src/tools/delegation/), bound only when named here AND `delegation.enabled` is true. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list — `true` never expands to the spawn tool (grant: explicit). The deleted names `spawn_subagent` / `delegate_work` / `resume_delegation_child` are mapped to `delegate_agent` by the loader with a deprecation warning.",
           "examples": [
             [
-              "delegate_work"
+              "delegate_agent"
             ]
           ],
           "oneOf": [
@@ -2273,95 +2273,23 @@
     },
     "delegation": {
       "type": "object",
-      "description": "Subagent delegation: let agents spawn child jobs that branch off the workspace. Children inherit the parent's workspace as a git branch and work in parallel via git worktrees. See knowledge-base/knowledge/features/subagent_delegation.md.",
+      "description": "The built-in subagents' settings (universal_experts_and_subagents.md §0 D7; runtime in src/subagents/). `enabled` is the binding gate of the `delegate_agent` tool — the tool exists only when this is true AND the expert names it in `tools.delegation`. Which children exist, their model, tools, write policy and budgets live in `subagents.roster`; a child never delegates (depth 1). The pre-U3 keys (`max_depth`, `default_timeout`, `max_timeout`, `allowed_configs`, `mode`, `light`) are no longer accepted by this schema; the loader still drops them from any authored layer with a deprecation warning.",
       "properties": {
         "enabled": {
           "type": "boolean",
           "default": false,
-          "description": "Opt-in: agent gets the delegate_work tool to spawn child jobs"
-        },
-        "max_depth": {
-          "type": "integer",
-          "default": 1,
-          "minimum": 1,
-          "maximum": 3,
-          "description": "Maximum nesting depth (1 = no grandchildren)"
-        },
-        "default_timeout": {
-          "type": "integer",
-          "default": 7200,
-          "description": "Default timeout per delegation in seconds (2 hours)"
-        },
-        "max_timeout": {
-          "type": "integer",
-          "default": 14400,
-          "description": "Maximum allowed timeout in seconds (4 hours)"
-        },
-        "allowed_configs": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "default": [],
-          "description": "Which expert configs children can use (empty array = any config allowed)"
-        },
-        "mode": {
-          "type": "string",
-          "enum": ["heavy", "light"],
-          "default": "heavy",
-          "description": "Backend for the shared spawn_subagent tool. 'heavy' = full child jobs (delegate_work path: worktree + dispatch + parent freeze + merge); 'light' = throwaway in-process ReAct readers that return a string with no freeze/merge. The agent-facing name and schema are identical; the backend is operator-selected."
-        },
-        "light": {
-          "type": "object",
-          "description": "Light-backend knobs (used only when mode is 'light'). Throwaway readers that read sources and return a distilled string; per-reader git worktree, discarded never merged. The reader MODEL is set via subagents.llm (the roster-wide partial; a legacy llm.subagent maps there), not here.",
-          "properties": {
-            "enabled": {
-              "type": "boolean",
-              "default": true,
-              "description": "Whether the light backend is available when mode is 'light'"
-            },
-            "max_iterations": {
-              "type": "integer",
-              "default": 10,
-              "minimum": 1,
-              "description": "Per-reader ReAct loop iteration cap"
-            },
-            "max_tokens": {
-              "type": "integer",
-              "default": 40000,
-              "minimum": 1000,
-              "description": "Per-reader token budget"
-            },
-            "max_parallel": {
-              "type": "integer",
-              "default": 3,
-              "minimum": 1,
-              "description": "Maximum concurrent readers per turn"
-            },
-            "timeout_seconds": {
-              "type": "number",
-              "default": 240,
-              "minimum": 0,
-              "description": "Wall-clock budget for one reader, in seconds (0 = unbounded). This is a deadline, not a retryable timeout — light_runner never retries it."
-            },
-            "allow_writes": {
-              "type": "boolean",
-              "default": false,
-              "description": "Whether readers may write to their worktree (default read-and-distill only)"
-            }
-          },
-          "additionalProperties": false
+          "description": "Opt-in: the expert may bind `delegate_agent` (it must also name the tool in `tools.delegation`)"
         },
         "max_concurrent": {
           "type": "integer",
           "default": 4,
           "minimum": 1,
-          "description": "Roster runtime (D7): how many `delegate_agent` children may run concurrently per parent. Values below 1 are raised to 1 by the loader."
+          "description": "Roster runtime (D7): how many `delegate_agent` children may run concurrently per parent; calls above the cap queue and run in waves. Values below 1 are raised to 1 by the loader."
         },
         "run_in_background_default": {
           "type": "boolean",
           "default": false,
-          "description": "Roster runtime: the `run_in_background` a `delegate_agent` call gets when it does not say. false = the result returns as the tool result; true = the child's completion re-enters the parent as a message."
+          "description": "Roster runtime: the `run_in_background` a `delegate_agent` call gets when it does not say. false = the result returns as the tool result; true = the child's completion re-enters the parent as a message (U4)."
         }
       },
       "additionalProperties": false

@@ -380,10 +380,17 @@ class TestShellMustEnumerate:
                 == value
             ), rel
 
-    def test_the_rule_is_scoped_to_shell(self):
-        assert ENUMERATE_ONLY_CATEGORIES == {"shell"}
+    def test_the_rule_is_scoped_to_shell_and_delegation(self):
+        """``delegation`` joined in U3 WP4: its one tool is ``grant: explicit``,
+        so ``true`` would silently expand to ``[]`` — refusing it keeps the
+        settings toggle honest (the cockpit sends the served enumeration). A
+        STORED ``true`` is compat, not vocabulary: ``normalize_tool_policy``
+        maps it to ``[delegate_agent]`` (tests/test_delegation_config_compat)."""
+        assert ENUMERATE_ONLY_CATEGORIES == {"shell", "delegation"}
         assert expand_category_true("git")
         assert expand_tool_policy({"except": ["git_log"]}, "git")
+        with pytest.raises(ToolPolicyError, match="must enumerate"):
+            expand_category_true("delegation")
 
     def test_the_legacy_coding_alias_obeys_the_shell_rule(self):
         for value in (True, {"except": ["srw_cloud_status"]}):
@@ -465,7 +472,9 @@ class TestMachineOwnedCategories:
         empties = {
             c
             for c in get_categories()
-            if c not in ("mcp", "shell") and not expand_category_true(c)
+            if c != "mcp"
+            and c not in ENUMERATE_ONLY_CATEGORIES  # `true` is refused there
+            and not expand_category_true(c)
         }
         assert empties == set(self._MACHINE_OWNED)
 
@@ -499,8 +508,11 @@ class TestExpansionAgainstTheClosedVocabulary:
 
     @pytest.mark.parametrize("category", sorted(get_categories()))
     def test_production_expansion_matches_an_independent_derivation(self, category):
-        if category in ("mcp", "shell"):
-            pytest.skip("special-cased; covered by TestMcp / TestShell*")
+        if category == "mcp" or category in ENUMERATE_ONLY_CATEGORIES:
+            pytest.skip(
+                "special-cased; covered by TestMcp / TestShell* / "
+                "test_the_rule_is_scoped_to_shell_and_delegation"
+            )
         assert set(expand_category_true(category)) == _reference_expand_true(category)
 
 
@@ -611,7 +623,7 @@ class TestCategoryVocabularyAgreement:
     """``TOOL_REGISTRY`` is the authority; three other lists mirror it.
 
     ``ToolsConfig`` cannot derive its fields at runtime — ``src/tools/registry``
-    imports ``src/core/loader`` (via ``spawn_subagent``), so a module-level
+    imports ``src/core/loader`` (via the tool packages), so a module-level
     import the other way is a cycle.  ``get_all_tool_names`` *is* derived from
     ``ToolsConfig``, which removes one of the four lists outright; the
     remaining two are pinned here so adding a registry category fails loudly at
@@ -869,12 +881,15 @@ class TestEnumerateOnlyMembersAreServable:
                 validate_tool_override_fragment({"tools": {category: True}})
 
     def test_it_names_no_code_granted_tool(self):
-        """`only` carrying a code-granted name would assert config manages it."""
+        """`only` carrying a code-granted name would assert config manages it.
+        An `explicit` name is the opposite case — naming it is how config
+        grants it (`delegation`'s one member)."""
         from src.tools.registry import TOOL_REGISTRY
 
         for names in enumerate_only_members().values():
             for name in names:
-                assert "grant" not in TOOL_REGISTRY[name], name
+                assert TOOL_REGISTRY[name].get("grant") != "code", name
+        assert enumerate_only_members()["delegation"] == ["delegate_agent"]
 
     def test_shell_is_the_current_membership(self):
         assert enumerate_only_members()["shell"] == [

@@ -81,6 +81,106 @@ MCP_WILDCARD = "*"
 #: silent ``[]``.
 LEGACY_CATEGORY_ALIASES: dict[str, str] = {"coding": "shell"}
 
+#: Tool NAMES that no longer exist, keyed by the category they lived in, and
+#: the tool a layer naming them means today.  ``spawn_subagent`` (the light
+#: in-process reader) and ``delegate_work`` / ``resume_delegation_child`` (the
+#: heavy child-job pair) were deleted in U3 WP4 with ``delegate_agent`` as the
+#: one delegation tool — a hard rename, no alias tool.  Stored DB expert
+#: fragments, job/thread overrides and frozen blobs that still grant the old
+#: names are mapped here (deduplicated, logged once per layer), so no row needs
+#: a data migration and the request boundary keeps accepting a fragment the
+#: cockpit re-submits from an old row.  Only lists and mappings are affected;
+#: a name outside its home category still fails the foreign-name gate.
+LEGACY_TOOL_NAME_ALIASES: dict[str, dict[str, str]] = {
+    "delegation": {
+        "spawn_subagent": "delegate_agent",
+        "delegate_work": "delegate_agent",
+        "resume_delegation_child": "delegate_agent",
+    },
+}
+
+#: A ``true`` a STORED layer may still carry for a category that has since
+#: become enumerate-only, and the exact list it means.  ``tools.delegation:
+#: true`` was legal (it expanded to ``[spawn_subagent]``) until U3 WP4 made
+#: the category enumerate; jobs and threads created through the cockpit's
+#: delegation toggle in that window carry the raw ``true`` in their stored
+#: override, and a resume must keep resolving them.  Mapped by
+#: :func:`normalize_tool_policy` (the config-layer seam) to THIS list — never
+#: "all members", so U4's control-plane tools in the same category never land
+#: under an old ``true`` unreviewed — with one warning per (source, category).
+#: The request boundary (:func:`validate_tool_override_fragment`) keeps
+#: refusing ``true``: a new request has the served enumeration to send.
+LEGACY_TRUE_EXPANSIONS: dict[str, tuple[str, ...]] = {
+    "delegation": ("delegate_agent",),
+}
+
+# One deprecation warning per (source, category, renamed names) — sessions
+# re-normalise their layers on every attach, so an unbounded log would spam.
+_ALIAS_LOG_SEEN: set[tuple] = set()
+_ALIAS_LOG_SEEN_MAX = 1024
+
+
+def _log_legacy_tool_names_once(
+    source: str, category: str, renamed: dict[str, str]
+) -> None:
+    key = (source, category, tuple(sorted(renamed)))
+    if key in _ALIAS_LOG_SEEN:
+        return
+    if len(_ALIAS_LOG_SEEN) >= _ALIAS_LOG_SEEN_MAX:
+        _ALIAS_LOG_SEEN.clear()
+    _ALIAS_LOG_SEEN.add(key)
+    logger.warning(
+        "config: legacy tool name(s) %s in tools.%s of %s → %s (deleted in U3; "
+        "see universal_experts_and_subagents.md §0 D1/D2)",
+        sorted(renamed),
+        category,
+        source,
+        sorted(set(renamed.values())),
+    )
+
+
+def _expand_legacy_true(category: str, *, source: str) -> list[str]:
+    """``tools.<category>: true`` on a stored layer of a now enumerate-only
+    category → the fixed :data:`LEGACY_TRUE_EXPANSIONS` list, logged once per
+    (source, category)."""
+    names = list(LEGACY_TRUE_EXPANSIONS[category])
+    key = (source, category, True)
+    if key not in _ALIAS_LOG_SEEN:
+        if len(_ALIAS_LOG_SEEN) >= _ALIAS_LOG_SEEN_MAX:
+            _ALIAS_LOG_SEEN.clear()
+        _ALIAS_LOG_SEEN.add(key)
+        logger.warning(
+            "config: legacy `tools.%s: true` in %s → %s (%s enumerates since U3; "
+            "write {only: %s} — see universal_experts_and_subagents.md §0 D7)",
+            category,
+            source,
+            names,
+            category,
+            names,
+        )
+    return names
+
+
+def _rename_legacy_tool_names(
+    names: list[str], category: str, *, source: str
+) -> list[str]:
+    """Map deleted tool names onto their successor; identity when none occur."""
+    aliases = LEGACY_TOOL_NAME_ALIASES.get(category)
+    if not aliases or not any(name in aliases for name in names):
+        return names
+    out: list[str] = []
+    renamed: dict[str, str] = {}
+    for name in names:
+        target = aliases.get(name)
+        if target is not None:
+            renamed[name] = target
+            name = target
+        if name not in out:
+            out.append(name)
+    _log_legacy_tool_names_once(source, category, renamed)
+    return out
+
+
 #: Categories that must enumerate their tools and may never auto-track the
 #: registry.  ``only`` (and its legacy spelling, a bare list) is the sole form
 #: that does not auto-track: ``true`` means "this category and whatever is
@@ -96,7 +196,17 @@ LEGACY_CATEGORY_ALIASES: dict[str, str] = {"coding": "shell"}
 #: ``shell_execute`` being rewritten by ``get_all_tool_names`` from
 #: ``extra.shell.mode`` makes naming both halves redundant, not dangerous, and
 #: ``config/experts/bughunter`` already names both today.
-ENUMERATE_ONLY_CATEGORIES: frozenset[str] = frozenset({"shell"})
+#:
+#: ``delegation`` joined in U3 WP4: its one tool, ``delegate_agent``, is
+#: ``grant: "explicit"`` (``true`` must never hand out a spawn tool — the
+#: design's D7), so ``true`` would expand to ``[]`` and read as "off" while
+#: the settings toggle believed it turned delegation on.  Refusing ``true``
+#: makes the category enumerate like ``shell`` — the cockpit already handles
+#: that generically through ``enumerate_only_members`` — and the U4 control
+#: plane (``wait_agent`` / ``message_agent`` / ``stop_agent`` /
+#: ``list_agents``) will land in the same category without silently reaching
+#: every config that said ``true``.
+ENUMERATE_ONLY_CATEGORIES: frozenset[str] = frozenset({"shell", "delegation"})
 
 _POLICY_KEYS = ("only", "except")
 
@@ -107,7 +217,8 @@ def _enumerate_only_error(category: str, form: str) -> "ToolPolicyError":
         f"its tools — write {{only: [...]}} (or a bare list, the same thing) "
         f"or false. Both `true` and `except` auto-track the registry, so a tool "
         f"added to the {category} category later would land here with no diff "
-        f"to review; for a code-execution category that is the wrong default. "
+        f"to review; for a code-execution or delegation category that is the "
+        f"wrong default. "
         f"See knowledge-base/knowledge/features/tool_config_policy_vs_membership.md, "
         f"'`shell` accepts `only` and `false`'."
     )
@@ -120,8 +231,8 @@ class ToolPolicyError(ValueError):
 def _registry():
     """Import the registry lazily.
 
-    ``src/tools/registry`` imports ``src/core/loader`` (through
-    ``spawn_subagent``), and ``src/core/loader`` imports this module — so a
+    ``src/tools/registry`` imports ``src/core/loader`` (through the tool
+    packages), and ``src/core/loader`` imports this module — so a
     module-level import here would close a cycle.  The list forms, which are
     the overwhelming majority, never reach this.
     """
@@ -167,6 +278,18 @@ def _grantable(category: str) -> list[str]:
         name
         for name in reg.get_tools_by_category(category)
         if "grant" not in reg.TOOL_REGISTRY[name]
+    )
+
+
+def _enumerable(category: str) -> list[str]:
+    """The category's members an ``only`` list may name: everything config
+    grants, whether by policy (unmarked) or by naming (``grant: "explicit"``)
+    — i.e. all but the ``grant: "code"`` tier."""
+    reg = _registry()
+    return sorted(
+        name
+        for name in reg.get_tools_by_category(category)
+        if reg.TOOL_REGISTRY[name].get("grant") != "code"
     )
 
 
@@ -233,20 +356,26 @@ def enumerate_only_members() -> dict[str, list[str]]:
     hazard does not follow it: a tool added to ``shell`` tomorrow does not
     appear in a session created today.
 
-    Grantable members only — the same subset :func:`expand_category_true`
-    would produce elsewhere — because a ``grant: "code"`` name in an ``only``
-    list is a name config does not manage.
+    Every member config may name: the ``true`` expansion's grantable subset
+    plus the ``grant: "explicit"`` tier — an ``only`` list is exactly how an
+    explicit tool is granted (``delegation``'s one member is explicit; served
+    here, it is enablable at all).  Never a ``grant: "code"`` name, which in
+    an ``only`` list would assert config manages it.
     """
     return {
-        category: _grantable(category) for category in sorted(ENUMERATE_ONLY_CATEGORIES)
+        category: _enumerable(category)
+        for category in sorted(ENUMERATE_ONLY_CATEGORIES)
     }
 
 
-def expand_tool_policy(value: Any, category: str) -> list[str]:
+def expand_tool_policy(
+    value: Any, category: str, *, source: str = "config-layer"
+) -> list[str]:
     """Resolve one ``tools.<category>`` value to the canonical ``list[str]``.
 
     Layer-local: consults only ``value`` and the registry, never a parent
-    layer.  Always returns a fresh list.
+    layer.  Always returns a fresh list.  ``source`` labels the layer in the
+    deprecation warning a :data:`LEGACY_TOOL_NAME_ALIASES` hit logs.
 
     ``only`` and a bare list are returned **as written** — never intersected
     with the ``true`` expansion.  That asymmetry is the entire point of the
@@ -261,9 +390,9 @@ def expand_tool_policy(value: Any, category: str) -> list[str]:
     if value is False:
         return []
     if isinstance(value, (list, tuple)):
-        return _as_name_list(value, category, "tools.%s" % category)
+        return _as_name_list(value, category, "tools.%s" % category, source=source)
     if isinstance(value, dict):
-        return _expand_mapping(value, category)
+        return _expand_mapping(value, category, source=source)
 
     raise ToolPolicyError(
         f"tools.{category}: unsupported value {value!r} "
@@ -272,7 +401,7 @@ def expand_tool_policy(value: Any, category: str) -> list[str]:
     )
 
 
-def normalize_tool_policy(fragment: Any) -> Any:
+def normalize_tool_policy(fragment: Any, *, source: str = "config-layer") -> Any:
     """Return ``fragment`` with every ``tools.<category>`` in canonical form.
 
     Never mutates the input — config layers are caller-owned and several are
@@ -280,7 +409,11 @@ def normalize_tool_policy(fragment: Any) -> Any:
     returned unchanged, by identity.
 
     Idempotent, which is what makes the belt-and-braces placement at several
-    call sites safe.
+    call sites safe.  ``source`` names the layer (the same label
+    ``normalize_llm_tiers`` uses) in the one-per-layer deprecation warning a
+    deleted tool name (:data:`LEGACY_TOOL_NAME_ALIASES`) or a stored ``true``
+    on a now enumerate-only category (:data:`LEGACY_TRUE_EXPANSIONS`) triggers.
+    Both are config-layer compat only — the request boundary does not map them.
 
     Keys that address no known category pass through **verbatim**, preserving
     today's end-to-end silent-ignore for a typo like ``tools.workspaces``.
@@ -300,7 +433,10 @@ def normalize_tool_policy(fragment: Any) -> Any:
         if category not in known:
             normalized[key] = value
             continue
-        normalized[key] = expand_tool_policy(value, category)
+        if value is True and category in LEGACY_TRUE_EXPANSIONS:
+            normalized[key] = _expand_legacy_true(category, source=source)
+            continue
+        normalized[key] = expand_tool_policy(value, category, source=source)
 
     return {**fragment, "tools": normalized}
 
@@ -331,7 +467,9 @@ def assert_tool_policy_canonical(tools_data: Any, *, where: str) -> None:
             )
 
 
-def validate_tool_override_fragment(config_override: Any) -> dict[str, list[str]]:
+def validate_tool_override_fragment(
+    config_override: Any, *, source: str = "request"
+) -> dict[str, list[str]]:
     """Validate a **request-layer** ``tools`` mapping against the registry.
 
     The one tool vocabulary for every write boundary: session create, session
@@ -402,7 +540,7 @@ def validate_tool_override_fragment(config_override: Any) -> dict[str, list[str]
                 f"{category} category. Write one of them."
             )
         claimed_by[category] = key
-        names = expand_tool_policy(value, category)
+        names = expand_tool_policy(value, category, source=source)
         if not names and _is_affirmative(value):
             # The caller asked for ON and the expansion is empty, because every
             # tool here is ``grant: "code"``.  ``expand_category_true`` logs a
@@ -486,17 +624,21 @@ def _require_known_category(category: str) -> None:
         )
 
 
-def _as_name_list(value: Iterable[Any], category: str, label: str) -> list[str]:
+def _as_name_list(
+    value: Iterable[Any], category: str, label: str, *, source: str = "config-layer"
+) -> list[str]:
     names = list(value)
     bad = [n for n in names if not isinstance(n, str)]
     if bad:
         raise ToolPolicyError(
             f"{label}: expected a list of tool-name strings; got {bad!r}."
         )
-    return names
+    return _rename_legacy_tool_names(names, category, source=source)
 
 
-def _expand_mapping(value: dict, category: str) -> list[str]:
+def _expand_mapping(
+    value: dict, category: str, *, source: str = "config-layer"
+) -> list[str]:
     keys = set(value)
     present = [k for k in _POLICY_KEYS if k in keys]
 
@@ -522,7 +664,10 @@ def _expand_mapping(value: dict, category: str) -> list[str]:
 
     key = present[0]
     names = _as_name_list(
-        _require_list(value[key], category, key), category, f"tools.{category}.{key}"
+        _require_list(value[key], category, key),
+        category,
+        f"tools.{category}.{key}",
+        source=source,
     )
 
     if key == "only":
@@ -582,6 +727,8 @@ def _require_list(value: Any, category: str, key: str) -> list:
 __all__ = [
     "ENUMERATE_ONLY_CATEGORIES",
     "LEGACY_CATEGORY_ALIASES",
+    "LEGACY_TOOL_NAME_ALIASES",
+    "LEGACY_TRUE_EXPANSIONS",
     "MCP_WILDCARD",
     "ToolPolicyError",
     "assert_tool_policy_canonical",

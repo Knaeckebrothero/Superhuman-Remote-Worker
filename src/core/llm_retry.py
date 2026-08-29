@@ -14,9 +14,9 @@ it bypassed.
 Everything here is pure exception inspection — ``status_code`` attributes,
 class-name matching, and regex over stringified provider bodies. No graph
 state, no config, no I/O, and no imports beyond the standard library. That
-purity is load-bearing: ``src/tools/delegation/light_runner.py`` is documented
-as "deliberately pure and infra-free" so it can be unit-tested with a fake LLM
-and no SSH, and it cannot reach triage that lives inside the graph. This code
+purity is load-bearing: the subagent child driver (``src/subagents``) and the
+persistent loop are unit-tested with a fake LLM and no SSH, and neither can
+reach triage that lives inside the graph. This code
 previously lived in ``src/graph.py``, which forced ``src/persistent_graph.py``
 to import it lazily inside a function to dodge the 5k-line module; that dodge
 is gone now.

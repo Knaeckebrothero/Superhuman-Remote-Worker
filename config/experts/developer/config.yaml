@@ -20,18 +20,15 @@ tags:
 llm:
   reasoning_level: high
 
-# Subagent delegation — light in-process subagents for parallel EXPLORATION,
-# research, and prototyping/experiments. They inherit the full toolset (including
-# writes) so they can run tests/spikes; the guardrail that the *production*
-# implementation stays single-threaded and yours is by PROMPT, not tool-stripping
-# (allow_writes stays true — we monitor rather than lock down). Reader MODEL comes
-# from subagents.llm (falls back to the parent's llm.model; per-job override via
+# Built-in subagents (delegate_agent) — parallel EXPLORATION, research and
+# bounded implementation work fanned out to the roster children; the parent
+# owns the code that lands. `enabled` gates the tool binding; which children
+# exist, their tools, write policy and budgets live in `subagents.roster`
+# (their model defaults to the parent's; per-job override via
 # config_override.subagents.llm).
 delegation:
   enabled: true
-  mode: light
-  light:
-    allow_writes: true
+  max_concurrent: 4
 
 workspace:
   structure:
@@ -71,10 +68,9 @@ tools:
     - crawl_website
     - map_website
     - research_topic
-  # Light subagent delegation via spawn_subagent (replaces the inherited heavy
-  # delegate_work / resume_delegation_child grant from the former broad base).
+  # The built-in subagents' spawn tool (bound only with delegation.enabled).
   delegation:
-    - spawn_subagent
+    - delegate_agent
   # Disable unused tool categories
   citation: []
   graph: []

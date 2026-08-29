@@ -151,10 +151,9 @@ limits:
     git: 120
     knowledge: 120
     communication: 120
-    # Delegation batches run whole in-process subagent loops (spawn_subagent),
-    # not SSH ops — must exceed delegation.light.timeout_seconds plus queueing
-    # slack (fan-out > max_parallel runs in waves), or deep fan-outs get killed.
-    delegation: 600
+    # No `delegation` entry: a batch carrying a delegate_agent call runs
+    # WITHOUT the watchdog (U3 B.6) — children are bounded by their own
+    # turn/token/staleness budgets, set per roster entry.
     orchestrator: 120
     canvas: 120
     workflows: 120
@@ -216,40 +215,18 @@ scholar:
   enabled: false           # Experts opt in when a dedicated research pass is required
   scholar_config: scholar   # Which expert config to use
 
-# Subagent delegation — let agents spawn child jobs that branch off the workspace
+# Built-in subagents (universal_experts_and_subagents.md §0 D7; runtime in
+# src/subagents/). `enabled` is the binding gate of the `delegate_agent` tool:
+# the tool is created only when this is true AND the expert names it in
+# tools.delegation. Which children exist, their model, tools and budgets live
+# in the expert's `subagents.roster` (see config/subagents/README.md). A child
+# never delegates (depth 1). The pre-U3 keys (max_depth, default_timeout,
+# max_timeout, allowed_configs, mode, light) are dropped by the loader with a
+# deprecation warning wherever an older layer still carries them.
 delegation:
   enabled: false             # Experts opt in; base workers never spawn children
-  max_depth: 1               # Nesting depth (1 = no grandchildren)
-  default_timeout: 7200      # Default timeout per delegation in seconds (2h)
-  max_timeout: 14400          # Maximum allowed timeout (4h)
-  allowed_configs: []        # Which configs children can use (empty = any)
-  # Roster runtime knobs (universal_experts_and_subagents.md §0 D7; the
-  # `delegate_agent` runtime lands in U3, the keys are config since U1):
   max_concurrent: 4          # Concurrently running children per parent (>= 1)
   run_in_background_default: false   # Default for a call that does not say run_in_background
-  # Backend for the shared `spawn_subagent` tool. The agent-facing name and
-  # schema are identical either way — the backend is operator-selected, not the
-  # model's choice:
-  #   heavy — full child jobs (the delegate_work path): worktree + dispatch +
-  #           parent freeze/checkpoint/wake + squash-merge.
-  #   light — throwaway in-process ReAct readers that read sources and return a
-  #           string; per-reader worktree, discarded never merged, no freeze.
-  mode: heavy
-  # Light-backend knobs (used only when mode: light). The reader MODEL is set
-  # via `subagents.llm` (see expert_base.yaml's llm: block), not here — so a
-  # top-tier parent can spawn a mid-tier reader (opus → sonnet, gpt → gpt-mini).
-  light:
-    enabled: true
-    max_iterations: 10       # Per-reader ReAct loop cap
-    max_tokens: 40000        # Per-reader token budget
-    max_parallel: 3          # Max concurrent readers per turn
-    # Per-reader wall-clock budget (0 = unbounded). Readers self-terminate with
-    # partial results at this deadline. Must stay well under
-    # tool_category_timeouts.delegation or the parent batch watchdog discards
-    # the whole fan-out (job 472ea457: 3-way fan-out vs 120s watchdog → job
-    # failed as "workspace may be wedged").
-    timeout_seconds: 240
-    allow_writes: false      # Readers read-and-distill by default (no merge)
 
 # Autonomy level — controls when the agent pauses for human review
 # full | review | partial | guided | dependent

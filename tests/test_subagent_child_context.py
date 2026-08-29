@@ -111,8 +111,7 @@ def _parent(tmp_path, *, git=False, names=None):
                 "edit_file",
                 "create_directory",
                 "delete_file",
-                "spawn_subagent",
-                "delegate_work",
+                "delegate_agent",
                 "job_complete",
             ]
         ),
@@ -150,8 +149,6 @@ class TestToolSelection:
         parent = [
             "read_file",
             "delegate_agent",
-            "spawn_subagent",
-            "delegate_work",
             "job_complete",
             "todo_complete",
             "send_message",
@@ -168,7 +165,8 @@ class TestToolSelection:
         ]
         names, dropped = select_child_tool_names(parent, parent)
         assert names == ["read_file", "get_job"]  # job_inspection reads survive
-        for name in DELEGATION_TOOL_NAMES - {"resume_delegation_child"}:
+        assert DELEGATION_TOOL_NAMES == {"delegate_agent"}
+        for name in DELEGATION_TOOL_NAMES:
             assert dropped[name] == "control plane (delegation)"
         assert dropped["job_complete"] == "control plane (core)"
         assert dropped["send_message"] == "control plane (communication)"

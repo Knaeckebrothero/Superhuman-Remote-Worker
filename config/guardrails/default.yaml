@@ -199,15 +199,13 @@ tool_examples:
             claim="Q3 revenue grew 12% year-over-year.",
         )
 
-  # ----- src/tools/delegation/delegate_work.py -----
-  delegate_work: |-
+  # ----- src/tools/delegation/delegate_agent.py -----
+  delegate_agent: |-
     Examples:
-        delegate_work(
-            tasks=[
-                {"description": "Research arxiv for transformer scaling laws", "expert": "scholar"},
-                {"description": "Implement the rate limiter prototype", "expert": "developer"},
-            ],
-            context="We need both literature review and a working prototype before phase 3.",
+        delegate_agent(
+            description="Map the rate limiter module",
+            prompt="Objective: explain how src/ratelimit/ enforces per-user quotas. Read src/ratelimit/*.py and tests/test_ratelimit.py. Report: the entry points, the data model, where the quota is checked (file:line), and any gap you find — 10 bullets max, no code changes.",
+            subagent_type="explorer",
         )
 
   # ----- src/tools/research/web.py -----

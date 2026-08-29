@@ -15,13 +15,13 @@ tags:
   - quality
   - gating
 
-# Light subagent delegation: throwaway in-process evidence gatherers via
-# spawn_subagent. Verification fan-out is the driving use case — subagents
-# gather evidence, the critic renders the verdict. Reader model = subagents.llm
-# (falls back to the parent's llm.model).
+# Built-in subagents (delegate_agent): evidence gatherers fanned out per
+# verification stream — subagents gather evidence, the critic renders the
+# verdict. `enabled` gates the tool binding; the children and their model live
+# in `subagents.roster` (model defaults to the parent's).
 delegation:
   enabled: true
-  mode: light
+  max_concurrent: 4
 
 workspace:
   structure:
@@ -57,7 +57,7 @@ tools:
   # the workspace, including repos/<name>/, which git_* cannot. Declaring them
   # here would advertise tools the pod never binds.
   delegation:
-    - spawn_subagent
+    - delegate_agent
   # SQL injected when system datasource attached (for querying job data)
   sql: []
   # Not needed

@@ -20,13 +20,14 @@ llm: {}
 scholar:
   enabled: false
 
-# Light subagent delegation: throwaway in-process readers via spawn_subagent.
-# Research fan-out is the driving use case — the parent delegates the reading
-# and authors the synthesis. The reader MODEL comes from subagents.llm (falls
-# back to the parent's llm.model; override per job via config_override.subagents.llm).
+# Built-in subagents (delegate_agent): readers fanned out per research thread
+# — the parent delegates the reading and authors the synthesis. `enabled` gates
+# the tool binding; the children and their model live in `subagents.roster`
+# (model defaults to the parent's; override per job via
+# config_override.subagents.llm).
 delegation:
   enabled: true
-  mode: light
+  max_concurrent: 4
 
 workspace:
   structure:
@@ -111,7 +112,7 @@ tools:
   # the workspace, including repos/<name>/, which git_* cannot. Declaring them
   # here would advertise tools the pod never binds.
   delegation:
-    - spawn_subagent
+    - delegate_agent
   # SQL injected when system datasource attached (for reading job data, test results)
   sql: []
   # Citations: a research agent must back every factual claim with a source.

@@ -317,8 +317,7 @@ CONTROL_AND_KNOWLEDGE_SAMPLE = [
     "task_add",
     "task_complete",
     "task_list",
-    "delegate_work",
-    "spawn_subagent",
+    "delegate_agent",
     "web_search",
 ]
 

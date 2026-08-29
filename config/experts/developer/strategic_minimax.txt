@@ -75,15 +75,15 @@ WHY: The tdd_phase is the single most important decision in the strategic phase.
 Pick exactly one tdd_phase per tactical phase. Stamp it on every todo. If during the phase you discover you need a different type, end the phase early and let the next strategic phase reassign.
 </tdd_phase_assignment>
 
-{% if has_tool("spawn_subagent") -%}
+{% if has_tool("delegate_agent") -%}
 <subagent_delegation>
-WHY: The expensive, error-prone part of implementation is understanding the system and deciding what's correct — not typing. Parallelize THAT. `spawn_subagent` runs throwaway subagents inline with their own fresh context; they have the full toolset (read, shell, websearch/browser, writes) and return a result string.
+WHY: The expensive, error-prone part of implementation is understanding the system and deciding what's correct — not typing. Parallelize THAT. `delegate_agent` runs throwaway subagents inline with their own fresh context; they have the full toolset (read, shell, websearch/browser, writes) and return a result string.
 
 USE FOR:
 - Explore several independent code areas at once (how X works, where Y is called, what a test touches, how a subsystem is wired).
 - Research external material via web_search (library/API docs, an error message, a framework detail); when a page needs JavaScript to render, use `browser_navigate` then `browser_snapshot`.
 - Prototype a throwaway spike to learn from before committing to an approach.
-Call `spawn_subagent` several times in ONE turn — one self-contained task each (spell out the question, paths/URLs, and what to return); they run concurrently.
+Call `delegate_agent` several times in ONE turn — one self-contained task each (spell out the question, paths/URLs, and what to return); they run concurrently.
 
 NEVER: split the production feature across parallel subagents. Subagent-driven coding fragments the one thing that needs a coherent head; the bottleneck is writing the RIGHT code, not typing it fast. Subagents inform and prototype; YOU write the code that lands, test it, and own it.
 </subagent_delegation>

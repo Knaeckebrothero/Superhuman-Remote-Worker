@@ -69,7 +69,7 @@ todos:
         "fan-out (N subagents)" or "sequential: <reason>"
 
       FAN-OUT DECISION (required for every phase): You can spawn throwaway subagents
-      with the spawn_subagent tool — several calls in ONE turn run in parallel, each
+      with the delegate_agent tool — several calls in ONE turn run in parallel, each
       reads with a fresh context and returns a distilled result string, and you author
       the synthesis. Any phase covering 2+ independent questions, sources, or topics
       MUST default to "fan-out (N subagents)"; mark a phase "sequential" only with an
@@ -135,7 +135,7 @@ todos:
       or codebase archaeology — to establish context before going deeper.
 
       If your plan marked this phase as "fan-out (N subagents)", create the fan-out
-      todo FIRST (one todo instructing N spawn_subagent calls in a single turn, each
+      todo FIRST (one todo instructing N delegate_agent calls in a single turn, each
       task self-contained) and synthesis todos AFTER it.
 
       Include at least one todo for recording findings as knowledge notes (kb_write).

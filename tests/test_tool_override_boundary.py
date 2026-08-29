@@ -167,7 +167,7 @@ class TestCrossCategorySmuggling:
             ("citation", "run_command"),
             ("knowledge", "browser_navigate"),
             ("git", "kb_write"),
-            ("research", "spawn_subagent"),
+            ("research", "delegate_agent"),
             # And the ones no surface ever checked.
             ("workspace", "run_command"),
             ("core", "web_search"),
@@ -1714,7 +1714,8 @@ class TestNoModelAuthoredPathReachesSessionCreate:
 
     The property that does is that **no model-authored path reaches session
     create's `config_override`**: the MCP `create_persistent_thread` tool
-    exposes no such parameter, and `spawn_subagent` uses a fixed environment.
+    exposes no such parameter, and `delegate_agent` builds its child from the
+    expert's roster, never from a model-authored config.
     That is load-bearing and otherwise invisible — adding the parameter would
     silently dissolve the mitigation. So it is pinned here.
     """

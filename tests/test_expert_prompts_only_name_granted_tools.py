@@ -39,7 +39,17 @@ _CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
 # Tools deleted from the registry. Prompts naming these are the exact bug this
 # test exists for, and the registry can no longer flag them. Add a name here
 # when you remove a tool, so stale prose fails loudly instead of rotting.
-_REMOVED_TOOL_NAMES = frozenset({"browse_website", "download_from_website"})
+_REMOVED_TOOL_NAMES = frozenset(
+    {
+        "browse_website",
+        "download_from_website",
+        # U3 WP4: the light reader and the heavy child-job pair — one tool,
+        # delegate_agent, replaced all three.
+        "spawn_subagent",
+        "delegate_work",
+        "resume_delegation_child",
+    }
+)
 
 # Tools the DISPATCHER stamps into a job's config fragment rather than any
 # checked-in config: ``approve_job_verdict`` / ``return_job_with_feedback`` via

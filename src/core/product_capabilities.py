@@ -1344,7 +1344,7 @@ CAPABILITY_DEFINITIONS = validate_capability_registry(
             "sessions.delegate",
             topics=("delegation", "jobs", "sessions"),
             title_key="productCapabilities.sessionsDelegate",
-            summary="Delegate bounded work from a live session to worker agents.",
+            summary="Delegate bounded work from a live session to worker jobs or built-in subagents.",
             help_topic_id="fleet-and-delegation",
             resolver_key=CapabilityResolverKey.SESSION_DELEGATE,
         ),

@@ -37,14 +37,14 @@ Decision criteria:
 - If deliverables have not been examined against criteria → plan a tactical verification phase.
 - If all criteria have been evaluated with evidence → render the verdict now, in this strategic phase, by calling approve_job_verdict or return_job_with_feedback directly (do not stage it as a tactical todo — these tools exist only in strategic phases).
 
-{% if has_tool("spawn_subagent") -%}
+{% if has_tool("delegate_agent") -%}
 Parallel verification via subagents — the DEFAULT for independent streams:
-When the review has 2+ independent verification streams, fanning them out to subagents is the default — checking streams one-by-one yourself is the exception and needs a reason (criteria depend on each other's findings, or the review is a handful of files). `spawn_subagent` is cheap and non-blocking: each subagent runs inline with its own fresh context, gathers the evidence, and returns its findings directly to you as a string. Nothing suspends and nothing is merged — your own context stays small for judging.
+When the review has 2+ independent verification streams, fanning them out to subagents is the default — checking streams one-by-one yourself is the exception and needs a reason (criteria depend on each other's findings, or the review is a handful of files). `delegate_agent` is cheap and non-blocking: each subagent runs inline with its own fresh context, gathers the evidence, and returns its findings directly to you as a string. Nothing suspends and nothing is merged — your own context stays small for judging.
 
 How to fan out:
-- Call `spawn_subagent` multiple times in a SINGLE turn — one call per verification stream. The calls run concurrently.
-- Each task_description must be fully self-contained — the subagent cannot see your conversation. Include: which criteria or deliverables to verify, which review mode (code review, test execution, infrastructure verification, document review), and the exact paths/commands involved.
-- Use expected_return_format, e.g.: "for each criterion — evidence (exact quotes or command output), assessment (met / partially met / not met), severity, confidence".
+- Call `delegate_agent` multiple times in a SINGLE turn — one call per verification stream. The calls run concurrently.
+- Each `prompt` must be fully self-contained — the subagent cannot see your conversation. Include: which criteria or deliverables to verify, which review mode (code review, test execution, infrastructure verification, document review), and the exact paths/commands involved.
+- Say in the prompt exactly what to return, e.g.: "for each criterion — evidence (exact quotes or command output), assessment (met / partially met / not met), severity, confidence".
 
 Delegate vs do it yourself:
 - Delegate (default): independent review modes (code review + test execution + deployment verification), separate criteria groups that don't share evidence, multi-file audits where each subsystem can be reviewed independently.

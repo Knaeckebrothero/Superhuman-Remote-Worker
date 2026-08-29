@@ -381,7 +381,9 @@ def _resolve_entry(ctx: _Context, name: str, raw: Any) -> Dict[str, Any]:
         )
     # The entry's sibling keys are an authored layer like any other: tool
     # policy + legacy llm tiers normalised at birth, before the merge.
-    layer = normalize_llm_tiers(normalize_tool_policy(raw), source=f"roster:{name}")
+    layer = normalize_llm_tiers(
+        normalize_tool_policy(raw, source=f"roster:{name}"), source=f"roster:{name}"
+    )
     ref = layer.get("$ref")
     overrides = {k: v for k, v in layer.items() if k != "$ref"}
 

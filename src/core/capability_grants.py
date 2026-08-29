@@ -375,7 +375,8 @@ def strip_to_grants(fragment: dict, grants: dict) -> tuple[dict, list[str]]:
     inside `delegation`, never the whole `delegation` settings dict —
     `evaluate` gates on `.enabled is True` or a non-empty `tools.delegation`,
     not on the settings dict merely existing, so deleting the dict would also
-    drop `max_depth`/`default_timeout`, which were never the violation. For
+    drop `max_concurrent`/`run_in_background_default`, which were never the
+    violation. For
     the same reason `unattended_operations` drops only `officer.enabled` and
     keeps the rest of the kit (slots, sleep bounds, pools).
 

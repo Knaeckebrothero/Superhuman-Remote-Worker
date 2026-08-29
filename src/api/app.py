@@ -1233,7 +1233,6 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         feedback = request.feedback
         config_name = request.config_name
         previous_status = request.previous_status
-        delegation_results = request.delegation_results
 
         # Build metadata with config info for resume
         resume_metadata = {}
@@ -1271,8 +1270,6 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             # Feeds the pod-handoff clone fallback in _setup_job_workspace
             # (resume_fresh_workspace_no_clone_fallback.md).
             resume_metadata["git_remote_url"] = request.git_remote_url
-        if delegation_results:
-            resume_metadata["delegation_results"] = delegation_results
 
         # Start processing in background
         async def _resume_job():

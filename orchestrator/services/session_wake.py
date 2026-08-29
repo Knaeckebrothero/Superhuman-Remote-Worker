@@ -632,9 +632,9 @@ async def _format_wake_message(db: Any, row: dict[str, Any], thread_id: str) -> 
 
     Pointers, not payloads. ``Outputs`` names the tools that read the result; it
     does not inline it. Inlining would make every wake expensive and defeat the
-    entire point of delegating the work. ``Task`` is the one field the
-    delegation formatter (``_format_delegation_results``) gets away without,
-    because its children arrive as one batch — a session may have fanned out
+    entire point of delegating the work. ``Task`` is the one field a batch
+    formatter could get away without (the old worker delegation formatter
+    did) — a session may have fanned out
     three jobs twenty minutes and one compaction ago and cannot otherwise tell
     them apart.
 

@@ -1,10 +1,12 @@
-"""Integration tests for the light-subagent reader environment (Phase 2).
+"""Integration tests for the subagent worktree environment (the
+``isolation: worktree`` path of ``src.subagents.child``).
 
 Uses a real git repo + FilesystemTestBackend to verify acquire_reader_env:
-worktree created/removed on the (test) workspace, reader tools exclude the
-delegation category (no nesting), reader writes land in the worktree (isolated
-from the parent root), and the reader context shares the parent's
-orchestrator_client + job metadata (so citations stay under the parent job).
+worktree created/removed on the (test) workspace, the tools loaded are exactly
+the names given (the caller selects them — U3 WP4 removed the environment's
+own filter), child writes land in the worktree (isolated from the parent
+root), and the child context shares the parent's orchestrator_client + job
+metadata (so citations stay under the parent job).
 """
 
 import subprocess
@@ -13,7 +15,6 @@ import pytest
 
 from src.tools.context import ToolContext
 from src.tools.delegation.reader_env import (
-    _reader_tool_names,
     acquire_reader_env,
     release_reader_env,
 )
@@ -55,28 +56,39 @@ def parent_context(tmp_path):
     ), ws
 
 
-class TestReaderToolNameFilter:
-    def test_excludes_delegation_category(self):
-        names = ["read_file", "delegate_work", "spawn_subagent", "cite_web"]
-        out = _reader_tool_names(names, allow_writes=True)
-        assert "delegate_work" not in out
-        assert "spawn_subagent" not in out
-        assert "read_file" in out
-        assert "cite_web" in out  # citation tools survive
+class TestReaderToolNames:
+    """The environment loads the names it is given, verbatim: the child build
+    (``select_child_tool_names``) owns the allowlist / control-plane / write
+    policy decisions, and nothing here second-guesses them."""
 
-    def test_write_tools_gated_by_allow_writes(self):
-        names = ["read_file", "write_file", "edit_file"]
-        assert "write_file" not in _reader_tool_names(names, allow_writes=False)
-        assert "write_file" in _reader_tool_names(names, allow_writes=True)
+    @pytest.mark.asyncio
+    async def test_loads_exactly_the_given_names(self, parent_context):
+        parent_ctx, _ = parent_context
+        env = await acquire_reader_env(
+            parent_ctx,
+            ["read_file", "write_file", "list_files", "cite_web"],
+            index=0,
+            total=1,
+        )
+        loaded = {t.name for t in env.tools}
+        assert loaded == {"read_file", "write_file", "list_files", "cite_web"}
+        await release_reader_env(env)
+
+    @pytest.mark.asyncio
+    async def test_an_empty_list_loads_nothing(self, parent_context):
+        """``src.subagents.child`` passes ``[]`` and loads its own selection on
+        the re-based context afterwards."""
+        parent_ctx, _ = parent_context
+        env = await acquire_reader_env(parent_ctx, [], index=0, total=1)
+        assert env.tools == []
+        await release_reader_env(env)
 
 
 class TestAcquireReaderEnv:
     @pytest.mark.asyncio
     async def test_worktree_created_and_removed(self, parent_context):
         parent_ctx, ws = parent_context
-        env = await acquire_reader_env(
-            parent_ctx, ["read_file"], index=0, total=2, allow_writes=True
-        )
+        env = await acquire_reader_env(parent_ctx, ["read_file"], index=0, total=2)
         assert env.worktree_path == ".worktrees/sub_0"
         assert (ws / ".worktrees" / "sub_0").is_dir()  # created on the workspace
         assert env.branch == "sub/0"
@@ -85,33 +97,9 @@ class TestAcquireReaderEnv:
         assert not (ws / ".worktrees" / "sub_0").exists()  # removed
 
     @pytest.mark.asyncio
-    async def test_reader_tools_exclude_delegation(self, parent_context):
-        parent_ctx, _ = parent_context
-        env = await acquire_reader_env(
-            parent_ctx,
-            [
-                "read_file",
-                "write_file",
-                "list_files",
-                "delegate_work",
-                "spawn_subagent",
-            ],
-            index=0,
-            total=1,
-            allow_writes=True,
-        )
-        loaded = {t.name for t in env.tools}
-        assert "delegate_work" not in loaded
-        assert "spawn_subagent" not in loaded
-        assert "read_file" in loaded
-        await release_reader_env(env)
-
-    @pytest.mark.asyncio
     async def test_reader_writes_land_in_worktree(self, parent_context):
         parent_ctx, ws = parent_context
-        env = await acquire_reader_env(
-            parent_ctx, ["read_file"], index=1, total=2, allow_writes=True
-        )
+        env = await acquire_reader_env(parent_ctx, ["read_file"], index=1, total=2)
         # Write through the reader's workspace manager.
         env.context.workspace_manager.write_file("notes.md", "reader output")
         assert (ws / ".worktrees" / "sub_1" / "notes.md").read_text() == "reader output"
@@ -142,9 +130,7 @@ class TestAcquireReaderEnv:
     @pytest.mark.asyncio
     async def test_port_block_mentions_range_and_worktree(self, parent_context):
         parent_ctx, _ = parent_context
-        env = await acquire_reader_env(
-            parent_ctx, ["read_file"], index=2, total=4, allow_writes=True
-        )
+        env = await acquire_reader_env(parent_ctx, ["read_file"], index=2, total=4)
         assert "8300-8399" in env.port_block  # (index+1)*100 base
         assert ".worktrees/sub_2" in env.port_block
         await release_reader_env(env)

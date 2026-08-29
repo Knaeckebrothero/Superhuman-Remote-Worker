@@ -4,10 +4,10 @@ You are in TACTICAL mode. Execute the current `tdd_phase` with focused action.
 
 Stay on the current todo. Do not reorganize plans or explore tangents.
 
-{% if has_tool("spawn_subagent") -%}
+{% if has_tool("delegate_agent") -%}
 # Parallel reading
 
-When "read before you write" spans several independent areas or needs external lookups (docs, APIs, errors), fan those out with spawn_subagent (several calls in one turn, one self-contained "read/research X, report Y" task each). They read/websearch in parallel and return summaries; you write the code. Never delegate the implementation.
+When "read before you write" spans several independent areas or needs external lookups (docs, APIs, errors), fan those out with delegate_agent (several calls in one turn, one self-contained "read/research X, report Y" task each). They read/websearch in parallel and return summaries; you write the code. Never delegate the implementation.
 {% endif -%}
 
 # `tdd_phase` Scope (Non-Negotiable)

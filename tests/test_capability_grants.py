@@ -300,7 +300,7 @@ def test_session_base_is_safe_for_a_new_principal():
 
 
 def test_specialists_explicitly_opt_in_to_delegation():
-    """Profiles that declare spawn_subagent must not inherit the safe-base off."""
+    """Profiles that declare delegate_agent must not inherit the safe-base off."""
     from orchestrator.services.config_resolver import resolve_config
 
     for name in ("developer", "critic", "scholar"):
@@ -308,7 +308,7 @@ def test_specialists_explicitly_opt_in_to_delegation():
         resolve_config(base_config_name=name, capture=cap, expert_type="worker")
         fragment = cap["merged_fragment"]
         assert fragment["delegation"]["enabled"] is True
-        assert fragment["tools"]["delegation"] == ["spawn_subagent"]
+        assert fragment["tools"]["delegation"] == ["delegate_agent"]
 
 
 # --- strip_to_grants (2026-08-04 plan, expert-write-gate-holes, task 3) ------
@@ -369,8 +369,12 @@ def _deny_only(key: str) -> dict:
 _RULE_FRAGMENTS: dict[str, dict] = {
     "shell_tools": {"tools": {"shell": ["run_command"], "git": ["git_status"]}},
     "delegation": {
-        "tools": {"delegation": ["spawn_subagent"], "git": ["git_status"]},
-        "delegation": {"enabled": True, "max_depth": 3, "default_timeout": 600},
+        "tools": {"delegation": ["delegate_agent"], "git": ["git_status"]},
+        "delegation": {
+            "enabled": True,
+            "max_concurrent": 3,
+            "run_in_background_default": True,
+        },
     },
     "datasource_tools": {
         "tools": {
@@ -426,7 +430,8 @@ def test_delegation_strip_keeps_settings_that_were_never_the_violation():
     `.enabled is True` or a non-empty `tools.delegation`, not on the settings
     dict merely existing — so the strip must take `tools.delegation` and only
     the `.enabled` flag, never the whole `delegation` dict (that would also
-    drop `max_depth`/`default_timeout`, which were never the problem)."""
+    drop `max_concurrent`/`run_in_background_default`, which were never the
+    problem)."""
     stripped, dropped = strip_to_grants(
         _RULE_FRAGMENTS["delegation"], _deny_only("delegation")
     )
@@ -434,8 +439,8 @@ def test_delegation_strip_keeps_settings_that_were_never_the_violation():
     assert "delegation" not in stripped["tools"]
     assert stripped["tools"]["git"] == ["git_status"]
     assert "enabled" not in stripped["delegation"]
-    assert stripped["delegation"]["max_depth"] == 3
-    assert stripped["delegation"]["default_timeout"] == 600
+    assert stripped["delegation"]["max_concurrent"] == 3
+    assert stripped["delegation"]["run_in_background_default"] is True
 
 
 def test_unattended_operations_gates_officer_enabled_only():
@@ -546,7 +551,7 @@ def test_a_user_with_every_grant_gets_an_unmodified_copy():
     fragment = {
         "tools": {
             "shell": ["run_command"],
-            "delegation": ["spawn_subagent"],
+            "delegation": ["delegate_agent"],
             "sql": ["run_query"],
             "browser_direct": ["browser_navigate"],
             "catalog_authoring": ["create_expert"],
@@ -574,7 +579,7 @@ def test_defaults_grant_browser_and_datasource_but_deny_shell_and_delegation():
     fragment = {
         "tools": {
             "shell": ["run_command"],
-            "delegation": ["spawn_subagent"],
+            "delegation": ["delegate_agent"],
             "browser_direct": ["browser_navigate"],
             "sql": ["run_query"],
         },
@@ -603,7 +608,7 @@ def test_kitchen_sink_fragment_strips_every_current_violation_at_once():
     kitchen_sink = {
         "tools": {
             "shell": ["run_command"],
-            "delegation": ["spawn_subagent"],
+            "delegation": ["delegate_agent"],
             "sql": ["run_query"],
             "mongodb": ["run_query"],
             "graph": ["run_query"],

@@ -15,8 +15,8 @@ These instructions apply to the whole tactical phase, until the next [PHASE_TRAN
 
 Primary constraint: one todo at a time, scoped to a single focused change. Read before you write. Verify before you mark complete. Stay within the file-scope the tdd_phase allows.
 
-{% if has_tool("spawn_subagent") -%}
-Parallel reading: when "read before you write" spans several independent areas — how N modules work, where a function is called, what a subsystem does — or needs external lookups (docs, APIs, an error message), fan those out with spawn_subagent (several calls in one turn, one self-contained "read/research X, report Y" task each). They read and websearch in parallel and hand back summaries; you write the code. Never delegate the implementation itself.
+{% if has_tool("delegate_agent") -%}
+Parallel reading: when "read before you write" spans several independent areas — how N modules work, where a function is called, what a subsystem does — or needs external lookups (docs, APIs, an error message), fan those out with delegate_agent (several calls in one turn, one self-contained "read/research X, report Y" task each). They read and websearch in parallel and hand back summaries; you write the code. Never delegate the implementation itself.
 {% endif -%}
 
 Phase-type compliance (the most important rule):

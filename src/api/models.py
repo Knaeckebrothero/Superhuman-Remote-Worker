@@ -548,11 +548,6 @@ class JobResumeRequest(BaseModel):
             "Gitea repo instead of starting blank (set by orchestrator)."
         ),
     )
-    delegation_results: Optional[Dict[str, Any]] = Field(
-        default=None,
-        description="Results from completed delegation children (set by orchestrator when "
-        "resuming a parent from 'waiting' status).",
-    )
     recipient: Optional[PinnedJobRecipient] = Field(
         default=None,
         repr=False,

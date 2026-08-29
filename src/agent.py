@@ -142,8 +142,8 @@ def _stateless_worker_remote_authority(
 #      LLM call failed, so the tools node never ran), but an agent that is not
 #      told so will burn a turn on git_status/read_file re-verifying a workspace
 #      that never changed.
-# Formatted like _format_delegation_results (## heading + prose) — the other
-# message this codebase injects into a running conversation.
+# Formatted as a "## heading + prose" notice, like every other message this
+# codebase injects into a running conversation.
 _SHAPE_NUDGE_TEXT = (
     "## Transport Notice\n"
     "\n"
@@ -238,43 +238,6 @@ class _AiosqliteConnectionWrapper:
 
 
 logger = logging.getLogger(__name__)
-
-
-def _format_delegation_results(delegation_results: list) -> str:
-    """Format delegation child results as a human-readable message.
-
-    Injected into the parent's graph state as a HumanMessage on delegation
-    resume. Each child's deliverables live at its grafted ``outputs/<n>-...``
-    folder on this branch — the parent READS them (and integrates anything
-    that must become real code itself); there are no branches to merge.
-    """
-    lines = [
-        "## Delegation Results",
-        "",
-        f"All {len(delegation_results)} subagent(s) have completed. "
-        "Each one's deliverables have been added to this branch under its "
-        "`outputs/` folder. Review them below, then integrate what you need.",
-        "",
-    ]
-    for child in delegation_results:
-        status = child.get("status", "unknown")
-        lines.append(f"### Child {child.get('creation_order', '?')}: {status}")
-        lines.append(f"- **Job ID**: {child.get('job_id', 'unknown')}")
-        lines.append(f"- **Config**: {child.get('config_name', 'unknown')}")
-        lines.append(f"- **Status**: {status}")
-        if child.get("confidence") is not None:
-            lines.append(f"- **Confidence**: {child['confidence']}")
-        if child.get("output_path"):
-            lines.append(f"- **Output**: `{child['output_path']}/`")
-        if child.get("summary"):
-            lines.append(f"- **Summary**: {child['summary']}")
-        lines.append("")
-
-    lines.append(
-        "Use `read_file`/`list_files` on each child's `outputs/<n>-...` folder to "
-        "review its deliverables, then integrate the parts you need into your own work."
-    )
-    return "\n".join(lines)
 
 
 # The branch a job's work belongs on when the job row carries no explicit
@@ -1235,7 +1198,7 @@ class UniversalAgent:
 
             # Stateless routing and batch arming must be one durable update.
             # A second LangGraph update can consume the pending task selected
-            # by feedback/delegation/auto-continue before any node runs.
+            # by feedback/auto-continue before any node runs.
             worker_resume_updates: Dict[str, Any] = {}
             worker_resume_as_node: Optional[str] = None
 
@@ -1260,34 +1223,9 @@ class UniversalAgent:
                 if selected_node is not None:
                     worker_resume_as_node = selected_node
 
-            # Inject delegation results into graph state when resuming from waiting
-            delegation_results = (updated_metadata or {}).get("delegation_results")
-            if (
-                resume
-                and delegation_results
-                and (graph_input is None or stateless_worker)
-            ):
-                selected_node = await self._inject_delegation_results(
-                    job_id=job_id,
-                    stateless_worker=stateless_worker,
-                    graph_input=graph_input,
-                    thread_config=thread_config,
-                    checkpoint_values=checkpoint_values,
-                    delegation_results=delegation_results,
-                    metadata=updated_metadata,
-                    deferred_updates=(
-                        worker_resume_updates
-                        if stateless_worker and graph_input is None
-                        else None
-                    ),
-                )
-                if selected_node is not None:
-                    # Retain today's ordering: delegation is applied after
-                    # feedback and therefore selects the final resume route.
-                    worker_resume_as_node = selected_node
             # Auto-continue resume (version_upgrade / llm_unavailable / memory /
-            # workspace-upgrade): a graceful re-dispatch with NO feedback and NO
-            # delegation. The prior in-graph freeze persisted should_stop=True +
+            # workspace-upgrade): a graceful re-dispatch with NO feedback. The
+            # prior in-graph freeze persisted should_stop=True +
             # freeze_data in the checkpoint and the run reached END. ainvoke(None)
             # on an ended thread with should_stop=True runs ZERO nodes and returns
             # the terminal frozen state — so restore_todo_state (which clears the
@@ -1297,12 +1235,7 @@ class UniversalAgent:
             # commit clear + nudge + arm in ONE START update. Scoped to
             # auto-continue freeze types so human-review stops are untouched. See
             # knowledge-base/knowledge/issues/version_upgrade_drain_livelock.md.
-            if (
-                resume
-                and graph_input is None
-                and not feedback
-                and not delegation_results
-            ):
+            if resume and graph_input is None and not feedback:
                 selected_node = await self._prepare_auto_continue_resume(
                     job_id=job_id,
                     thread_config=thread_config,
@@ -1318,8 +1251,8 @@ class UniversalAgent:
                     worker_resume_as_node = selected_node
 
             if stateless_worker:
-                # Arm last, after feedback/delegation/auto-continue has chosen
-                # the resume frontier.  A plain state update on a mid-loop
+                # Arm last, after feedback/auto-continue has chosen the resume
+                # frontier.  A plain state update on a mid-loop
                 # checkpoint must preserve its pending next node; START is
                 # reserved for a clean END re-entry below.
                 worker_terminal_state = await self._arm_worker_batch(
@@ -1637,82 +1570,6 @@ class UniversalAgent:
         checkpoint_values.update(feedback_update)
         return (
             "__start__"
-            if graph_input is None and deferred_updates is not None
-            else None
-        )
-
-    async def _inject_delegation_results(
-        self,
-        *,
-        job_id: str,
-        stateless_worker: bool,
-        graph_input: Optional[UniversalAgentState],
-        thread_config: Dict[str, Any],
-        checkpoint_values: Dict[str, Any],
-        delegation_results: list,
-        metadata: Optional[Dict[str, Any]],
-        deferred_updates: Optional[Dict[str, Any]] = None,
-    ) -> Optional[str]:
-        """Inject one exact delegation generation on checkpoint or fresh input."""
-        from langchain_core.messages import HumanMessage
-        from src.shared.job_steering import context_delivery_key
-
-        delegation_key = context_delivery_key(
-            "delegation",
-            delegation_results,
-            delivery_id=(metadata or {}).get("delegation_results_delivery_id"),
-        )
-        delivered_delegation_keys = {
-            str(value)
-            for value in checkpoint_values.get("delivered_delegation_keys") or []
-            if value is not None
-        }
-        if stateless_worker and delegation_key in delivered_delegation_keys:
-            logger.info(
-                "[%s] Suppressed checkpointed delegation generation %s",
-                job_id,
-                delegation_key,
-            )
-            return None
-
-        result_message = HumanMessage(
-            content=_format_delegation_results(delegation_results)
-        )
-        delegation_update: Dict[str, Any] = {
-            "messages": [result_message],
-            "should_stop": False,
-            "goal_achieved": False,
-            "client_report_id": None,
-            "completion_report_payload": None,
-        }
-        if stateless_worker:
-            delegation_update["delivered_delegation_keys"] = sorted(
-                delivered_delegation_keys | {delegation_key}
-            )
-        if graph_input is None:
-            if deferred_updates is not None:
-                _merge_worker_resume_updates(deferred_updates, delegation_update)
-                logger.info(
-                    "[%s] Staged delegation results for atomic stateless resume + arm",
-                    job_id,
-                )
-            else:
-                await self._graph.aupdate_state(
-                    thread_config,
-                    delegation_update,
-                    as_node="restore_todo_state",
-                )
-        else:
-            existing_messages = list(graph_input.get("messages") or [])
-            graph_input.update(delegation_update)
-            graph_input["messages"] = [*existing_messages, result_message]
-        checkpoint_values.update(delegation_update)
-        logger.info(
-            "Injected delegation results into graph state (%d children)",
-            len(delegation_results),
-        )
-        return (
-            "restore_todo_state"
             if graph_input is None and deferred_updates is not None
             else None
         )
@@ -3028,6 +2885,7 @@ class UniversalAgent:
                 _apply_settings_matrix,
                 deep_merge,
                 load_agent_config_from_dict,
+                normalize_delegation_block,
                 normalize_llm_tiers,
             )
             from .core.tool_policy import normalize_tool_policy
@@ -3039,8 +2897,13 @@ class UniversalAgent:
             # already carries canonical lists.) Same seam for a legacy
             # llm.strategic/tactical pin: the whole block — model plus the
             # transport the dispatcher injected into it — lifts to llm.model.
-            config_override = normalize_llm_tiers(
-                normalize_tool_policy(metadata["config_override"]),
+            config_override = normalize_delegation_block(
+                normalize_llm_tiers(
+                    normalize_tool_policy(
+                        metadata["config_override"], source="job-override"
+                    ),
+                    source="job-override",
+                ),
                 source="job-override",
             )
             logger.info(
@@ -3982,16 +3845,15 @@ class UniversalAgent:
             "model_max_context_tokens": self.config.limits.model_max_context_tokens,
             # Per-family page-render DPI (None -> renderer default 150).
             "pdf_render_dpi": getattr(self.config.limits, "pdf_render_dpi", None),
-            # Delegation tools read their settings from this plain dict
-            # (delegate_work's enabled/timeout checks, spawn_subagent's
-            # mode/light backend selection). "delegation" is a parsed/known
-            # config field, so it is NOT part of config.extra — inject the
-            # typed config back in explicitly or the tools see an empty dict.
+            # The delegate_agent factory reads its settings from this plain
+            # dict (enabled = the binding gate, max_concurrent = the per-parent
+            # cap). "delegation" is a parsed/known config field, so it is NOT
+            # part of config.extra — inject the typed config back in explicitly
+            # or the tool sees an empty dict.
             "delegation": asdict(self.config.delegation),
-            # Same for the built-in subagents (U1): the roster-wide llm the
-            # light runner reads today and the resolved roster the roster
-            # runtime (U3) will read. Plain dict — no dataclass instances in
-            # the tool-visible config.
+            # Same for the built-in subagents (U1): the roster-wide llm and the
+            # resolved roster the subagent runtime reads. Plain dict — no
+            # dataclass instances in the tool-visible config.
             "subagents": asdict(self.config.subagents),
             "tags": list(self.config.tags),
         }
@@ -4269,11 +4131,11 @@ class UniversalAgent:
 
         loaded_tool_names = [t.name for t in self._tools]
 
-        # Stash the resolved tool list + limits so the light spawn_subagent
-        # backend can build a reader that inherits the parent's tools (minus the
-        # delegation category) and the reader LLM. Read at spawn time — the
-        # spawn_subagent factory already ran during load_tools() above but its
-        # closure reads these lazily. (context is self._tool_context here.)
+        # Stash the resolved tool list + limits: a subagent child's allowlist is
+        # intersected with the parent's loaded names (the runtime ceiling) and
+        # its LLM is built with the parent's limits. Read at spawn time — the
+        # delegate_agent factory already ran during load_tools() above but the
+        # runtime reads these lazily. (context is self._tool_context here.)
         context._resolved_tool_names = loaded_tool_names
         context._limits = self.config.limits
 

@@ -102,14 +102,19 @@ one research job, one implementation job, and one review job.
 
 **Delegation** is useful when one parent agent can divide a single outcome into
 independent investigations or workstreams and then synthesize the results. It
-must be enabled in the selected expert or in **Agent Settings → Tools →
-Delegation**, and non-admin users need the delegation grant.
+must be enabled in the selected expert (`delegation.enabled` plus the
+`delegate_agent` tool) or in **Agent Settings → Tools → Delegation**, and
+non-admin users need the delegation grant.
 
-The exact behavior is configured by the expert and deployment. A delegated
-subagent may be a short-lived, fresh-context helper that returns a focused
-result, or a full child job working on its own branch while the parent waits
-and later reviews the result. Limits, write access, nesting, and timeouts are
-configuration-dependent.
+A delegated subagent is a short-lived, fresh-context helper of a type the
+expert's roster defines (for example an explorer that reads and reports). It
+runs inside the parent's job on the same workspace, sees only the brief it was
+given, and returns its report as the parent's tool result; the parent keeps
+working from that report. Which subagent types exist, their tools, write
+access and turn/token budgets are set by the expert's configuration, not by
+the parent at call time. Subagents cannot delegate further, and the full
+report of every child is kept under `.subagents/<handle>/report.md` in the
+job workspace.
 
 Delegation does not make one job fire-and-forget: the parent remains
 responsible for the shared outcome. For user-visible, independently managed

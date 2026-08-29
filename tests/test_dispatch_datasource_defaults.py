@@ -3,7 +3,7 @@
 ``create_job``'s connector branch used to read "does this job have a thread or a
 parent?" and, if so, inherit. That folded two different things together:
 
-* A **delegated** subjob (critic, curator, pre-job scholar, ``delegate_work``)
+* A **delegated** subjob (critic, curator, pre-job scholar, a legacy delegation child)
   must never exceed its parent's connectors. Inheritance is the containment
   rule, and it stays.
 * A thread that **commissions** fresh project work — an officer, a session — is
@@ -174,7 +174,7 @@ class TestDelegationStillInherits:
     ):
         """Containment beats convenience.
 
-        A critic, curator, pre-job scholar or ``delegate_work`` child must never
+        A critic, curator, pre-job scholar or legacy delegation child must never
         acquire a connector its parent did not have. If the defaults flag could
         reach a parented job it would become a quiet capability escalation:
         "attach whatever the project offers" applied to work that was scoped

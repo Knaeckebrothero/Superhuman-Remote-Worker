@@ -100,9 +100,10 @@ Everything the expert schema allows (`config/schema.json`), plus, per entry:
 | `limits`       | ordinary `limits` keys parse; the child budgets (`max_turns`, `max_tokens`, `return_budget_tokens`, `stale_idle_s`, `stale_in_tool_s`) are carried, not yet parsed | enforced |
 | `return`       | carried verbatim (`summary` \| `structured` \| `evidence` \| `diff`) | shapes the result |
 
-In U1 the resolved entry is data only: the roster runtime (`delegate_agent`,
-U3) is what turns an entry into a running child. Until then the light
-`spawn_subagent` runner reads only the roster-wide `subagents.llm`.
+The resolved entry is data until a `delegate_agent` call names it: the roster
+runtime (`src/subagents/`, U3) turns the entry into a running child. The tool
+itself is bound only when the parent sets `delegation.enabled` AND names
+`delegate_agent` in `tools.delegation`.
 
 ## Adding a library entry
 

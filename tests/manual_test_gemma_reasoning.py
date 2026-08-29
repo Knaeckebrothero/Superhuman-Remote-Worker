@@ -585,13 +585,14 @@ def _build_prod_tools() -> list[dict[str, Any]]:
         ["branch"],
     )
     t(
-        "delegate_work",
-        "Spawn subagents to handle parallel tasks.",
+        "delegate_agent",
+        "Delegate one bounded brief to a roster subagent; returns its report.",
         {
-            "tasks": {"type": "array", "items": {"type": "object"}},
-            "context": _arg_str(),
+            "description": _arg_str(),
+            "prompt": _arg_str(),
+            "subagent_type": _arg_str(),
         },
-        ["tasks"],
+        ["description", "prompt", "subagent_type"],
     )
     t(
         "todo_complete",

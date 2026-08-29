@@ -1,22 +1,25 @@
-"""Reader environment for light subagents (Phase 2).
+"""Worktree environment for a subagent child (``isolation: worktree``).
 
-`acquire_reader_env` gives one light reader an isolated, pod-correct place to
-work: its own git worktree on the WORKSPACE pod (created over the shared
-connection), a `SubdirBackend` view re-rooted at that worktree, a reader
+`acquire_reader_env` gives one child an isolated, pod-correct place to work:
+its own git worktree on the WORKSPACE pod (created over the shared
+connection), a `SubdirBackend` view re-rooted at that worktree, a child
 `WorkspaceManager`/`GitManager` pointed at it, its own namespaced shell, and a
 `ToolContext` that mirrors the parent's — same `orchestrator_client` +
-`_job_metadata` (so `cite_*` stays under the PARENT job_id → shared citation DB)
-— but with the reader workspace/shell and the tool set **minus the delegation
-category** (no `spawn_subagent`/`delegate_work` → enforces no-nesting).
+`_job_metadata` (so `cite_*` stays under the PARENT job_id → shared citation
+DB) — but with the child workspace/shell. The tools loaded are exactly
+``tool_names`` as given: the caller (``src.subagents.child``) chooses the
+child's names (entry allowlist ∩ parent's loaded names − control plane), and
+nothing here second-guesses that.
 
-`release_reader_env` tears the reader down: closes only its own shell tabs (never
-the shared session) and removes the worktree. Best-effort, logged.
+`release_reader_env` tears the child down: closes only its own shell tabs
+(never the shared session) and removes the worktree. Best-effort, logged.
 
 Pod separation: worktree creation and git run on the workspace pod via the
 parent backend; blocking paramiko/git is offloaded with `run_in_executor`, and
 concurrent worktree creation is serialized behind a module lock (one repo lock).
 
-See knowledge-base/knowledge/issues/delegation_light_mode_missing.md (Phase 2).
+Born as the light-subagent reader environment (the ``spawn_subagent`` path,
+deleted in U3 WP4); the worktree mechanics are unchanged.
 """
 
 import asyncio
@@ -35,12 +38,7 @@ logger = logging.getLogger(__name__)
 # Serializes `git worktree add` across concurrent readers (one repo lock).
 _WORKTREE_LOCK = asyncio.Lock()
 
-# Write tools withheld from read-leaning readers (they would author output the
-# scholar is meant to author). Included only when allow_writes is True — and even
-# then they land in the reader's worktree, never the parent root.
-_WRITE_TOOLS = frozenset({"write_file", "edit_file"})
-
-# Port range per reader (mirrors delegate_work's convention).
+# Port range per child (100 ports each, from 8100 up).
 _PORT_BASE = 8000
 _PORT_SIZE = 100
 
@@ -59,32 +57,14 @@ class ReaderEnv:
     _parent_git: Any  # parent GitManager (for worktree_remove); None if no git
 
 
-def _reader_tool_names(
-    parent_tool_names: List[str], *, allow_writes: bool
-) -> List[str]:
-    """Parent's tool names minus delegation (no nesting) and, unless writes are
-    allowed, minus the file-write tools."""
-    from ..registry import TOOL_REGISTRY
-
-    out = []
-    for name in parent_tool_names:
-        meta = TOOL_REGISTRY.get(name, {})
-        if meta.get("category") == "delegation":
-            continue  # no grandchildren
-        if not allow_writes and name in _WRITE_TOOLS:
-            continue
-        out.append(name)
-    return out
-
-
 def _build_reader_port_block(
     index: int, total: Optional[int], worktree_path: Optional[str]
 ) -> str:
     """Port-range + worktree awareness block for a reader (accurate wording).
 
-    ``total`` is optional: iterative fan-out (one spawn_subagent call = one
-    reader) does not know how many siblings run concurrently, so when total is
-    None the block simply notes that siblings may be running.
+    ``total`` is optional: iterative fan-out (one ``delegate_agent`` call =
+    one child) does not know how many siblings run concurrently, so when total
+    is None the block simply notes that siblings may be running.
     """
     base = _PORT_BASE + (index + 1) * _PORT_SIZE
     end = base + _PORT_SIZE - 1
@@ -105,18 +85,19 @@ def _build_reader_port_block(
 
 async def acquire_reader_env(
     parent_context: ToolContext,
-    parent_tool_names: List[str],
+    tool_names: List[str],
     *,
     index: int,
     total: Optional[int] = None,
-    allow_writes: bool = False,
     name: Optional[str] = None,
 ) -> ReaderEnv:
-    """Build one reader's isolated worktree + tools. See module docstring.
+    """Build one child's isolated worktree + tools. See module docstring.
 
-    ``name`` (U3 subagents: the child's handle) names the worktree, its branch
-    and the shell-tab namespace instead of the numeric ``index`` — so a
-    worktree child is recognisable on the workspace pod as
+    ``tool_names`` are loaded verbatim on the child context (an empty list
+    loads nothing — ``src.subagents.child`` loads its own selection after
+    re-basing the context). ``name`` (the child's handle) names the worktree,
+    its branch and the shell-tab namespace instead of the numeric ``index`` —
+    so a worktree child is recognisable on the workspace pod as
     ``.worktrees/<handle>`` / ``sub/<handle>`` / ``<handle>__<tab>``.
     """
     loop = asyncio.get_running_loop()
@@ -224,8 +205,7 @@ async def acquire_reader_env(
     reader_context._pinned_reads = set()
     reader_context._recent_read_versions = {}
 
-    reader_names = _reader_tool_names(parent_tool_names, allow_writes=allow_writes)
-    tools = load_tools(reader_names, reader_context)
+    tools = load_tools(list(tool_names), reader_context)
 
     # Readers get their own overlay (own WorkspaceManager); give it a provider
     # bound to the reader's own tool list — not the parent's.

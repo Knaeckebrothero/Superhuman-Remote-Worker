@@ -162,10 +162,10 @@ tool_examples:
     Examples:
         <|tool_call>call:cite_document{text:<|"|>Total revenue rose 12% YoY.<|"|>,document_path:<|"|>documents/q3_report.pdf<|"|>,page:12,claim:<|"|>Q3 revenue grew 12% year-over-year.<|"|>}<tool_call|>
 
-  # ----- src/tools/delegation/delegate_work.py -----
-  delegate_work: |-
+  # ----- src/tools/delegation/delegate_agent.py -----
+  delegate_agent: |-
     Examples:
-        <|tool_call>call:delegate_work{tasks:[{description:<|"|>Research arxiv for transformer scaling laws<|"|>,expert:<|"|>scholar<|"|>},{description:<|"|>Implement the rate limiter prototype<|"|>,expert:<|"|>developer<|"|>}],context:<|"|>We need both literature review and a working prototype before phase 3.<|"|>}<tool_call|>
+        <|tool_call>call:delegate_agent{description:<|"|>Map the rate limiter module<|"|>,prompt:<|"|>Objective: explain how src/ratelimit/ enforces per-user quotas. Read src/ratelimit/*.py and tests/test_ratelimit.py. Report: the entry points, the data model, where the quota is checked (file:line), and any gap you find — 10 bullets max, no code changes.<|"|>,subagent_type:<|"|>explorer<|"|>}<tool_call|>
 
   # ----- src/tools/research/web.py -----
   web_search: |-

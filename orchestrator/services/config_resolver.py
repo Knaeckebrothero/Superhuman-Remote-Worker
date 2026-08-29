@@ -31,6 +31,7 @@ from src.core.loader import (
     ensure_phase_skill_bindings,
     load_agent_config_from_dict,
     load_and_merge_config,
+    normalize_delegation_block,
     normalize_llm_tiers,
     prune_ignored_keys,
     reroot_extends,
@@ -154,8 +155,13 @@ def resolve_config(
             bundled_leaf.pop("$extends", None)
             # Read straight off disk, so it bypasses load_and_merge_config's
             # normalisation and needs its own (tool policy + legacy llm tiers).
-            bundled_leaf = normalize_tool_policy(bundled_leaf)
+            bundled_leaf = normalize_tool_policy(
+                bundled_leaf, source=f"bundled-leaf:{base_config_name}"
+            )
             bundled_leaf = normalize_llm_tiers(
+                bundled_leaf, source=f"bundled-leaf:{base_config_name}"
+            )
+            bundled_leaf = normalize_delegation_block(
                 bundled_leaf, source=f"bundled-leaf:{base_config_name}"
             )
     except Exception:
@@ -171,8 +177,12 @@ def resolve_config(
     # Default-model floor: replace the base placeholder model before the expert
     # merges (the expert/request still override it).
     if base_defaults:
-        base_defaults = normalize_llm_tiers(
-            normalize_tool_policy(base_defaults), source="base-defaults"
+        base_defaults = normalize_delegation_block(
+            normalize_llm_tiers(
+                normalize_tool_policy(base_defaults, source="base-defaults"),
+                source="base-defaults",
+            ),
+            source="base-defaults",
         )
         if base_defaults.get("llm"):
             explicit_llm_keys |= set(base_defaults["llm"].keys())
@@ -233,7 +243,12 @@ def resolve_config(
         ("request-override", request_override),
     ):
         if layer:
-            layer = normalize_llm_tiers(normalize_tool_policy(layer), source=_source)
+            layer = normalize_delegation_block(
+                normalize_llm_tiers(
+                    normalize_tool_policy(layer, source=_source), source=_source
+                ),
+                source=_source,
+            )
             if layer.get("llm"):
                 explicit_llm_keys |= set(layer["llm"].keys())
             data = deep_merge(data, layer)
