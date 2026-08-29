@@ -18,7 +18,18 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
-from src.core.context import ContextManager, ContextConfig, ConversationSummary
+from src.core.context import (
+    ContextManager,
+    ContextConfig,
+    ConversationSummary,
+    place_pinned_after_summary,
+)
+from src.core.message_markers import (
+    PROTECTED_KEY,
+    is_protected_message,
+    protected_phase_key,
+)
+from src.core.workspace_injection import create_phase_instruction_message
 from src.core.summarizer import (
     SummarizationEngine,
     SummarizationFailed,
@@ -1623,3 +1634,180 @@ class TestCompactionBoundaryId:
             messages=[HumanMessage(content="hi", id="x0")], auxiliary=mock_llm
         )
         assert context_manager._last_compaction_boundary_id is None
+
+
+# =============================================================================
+# Protected phase blocks across summarisation — U2 WP1
+# =============================================================================
+
+
+class TestPinnedAfterSummary:
+    """A protected phase block that fell into the summarised region is
+    re-seated right after the ``[Summary of prior work]`` message and before
+    the kept window — for the CURRENT phase only. The context_manager
+    fixture keeps 3 recent messages."""
+
+    BODY = "PROTECTED PHASE BODY " * 20
+
+    @classmethod
+    def _block(cls, phase_key, msg_id="blk", path="skills/tactical-phase/SKILL.md"):
+        block = create_phase_instruction_message(path, cls.BODY, "tactical", phase_key)
+        block.id = msg_id  # what the reducer assigned when it was delivered
+        return block
+
+    @staticmethod
+    def _base():
+        msgs = []
+        for i in range(8):
+            msgs.append(HumanMessage(content=f"question {i} " + "x" * 200, id=f"h{i}"))
+            msgs.append(AIMessage(content=f"answer {i} " + "y" * 200, id=f"a{i}"))
+        return msgs
+
+    @classmethod
+    def _history(cls, block, block_at):
+        msgs = cls._base()
+        msgs.insert(block_at, block)
+        return msgs
+
+    @staticmethod
+    def _split(result):
+        kept = [m for m in result if not isinstance(m, RemoveMessage)]
+        removed = {m.id for m in result if isinstance(m, RemoveMessage)}
+        summary_idx = next(
+            i
+            for i, m in enumerate(kept)
+            if isinstance(m, SystemMessage) and "[Summary of prior work]" in m.content
+        )
+        return kept, removed, summary_idx
+
+    @pytest.mark.asyncio
+    async def test_current_phase_block_reinjected_after_summary_before_keep_window(
+        self, context_manager, mock_llm
+    ):
+        block = self._block("2:tactical")
+        messages = self._history(block, block_at=2)
+        context_manager.set_current_phase("tactical", phase_key="2:tactical")
+
+        result = await context_manager.summarize_and_compact(
+            messages=messages, auxiliary=mock_llm
+        )
+
+        kept, removed, summary_idx = self._split(result)
+        protected = [m for m in kept if is_protected_message(m)]
+        assert len(protected) == 1
+        reseated = protected[0]
+        assert kept.index(reseated) == summary_idx + 1
+        assert reseated.content == block.content
+        assert reseated.additional_kwargs == block.additional_kwargs
+        # Appended fresh (no id); the original is evicted by its id.
+        assert reseated.id is None
+        assert "blk" in removed
+        # The kept window follows the block.
+        assert [m.content for m in kept[summary_idx + 2 :]] == [
+            m.content for m in messages[-3:]
+        ]
+
+    @pytest.mark.asyncio
+    async def test_other_phase_blocks_are_summarised_away(
+        self, context_manager, mock_llm
+    ):
+        stale = self._block("1:strategic", msg_id="stale")
+        messages = self._history(stale, block_at=2)
+        context_manager.set_current_phase("tactical", phase_key="2:tactical")
+
+        result = await context_manager.summarize_and_compact(
+            messages=messages, auxiliary=mock_llm
+        )
+
+        kept, removed, _ = self._split(result)
+        assert not any(is_protected_message(m) for m in kept)
+        assert "stale" in removed
+        assert not any(self.BODY in str(m.content) for m in kept)
+
+    @pytest.mark.asyncio
+    async def test_block_in_keep_window_keeps_marker_and_is_not_duplicated(
+        self, context_manager, mock_llm
+    ):
+        block = self._block("2:tactical")
+        base = self._base()
+        messages = base[:-1] + [block, base[-1]]  # window = [h7, block, a7]
+        context_manager.set_current_phase("tactical", phase_key="2:tactical")
+
+        result = await context_manager.summarize_and_compact(
+            messages=messages, auxiliary=mock_llm
+        )
+
+        kept, removed, summary_idx = self._split(result)
+        protected = [m for m in kept if is_protected_message(m)]
+        assert len(protected) == 1
+        assert protected[0].additional_kwargs == block.additional_kwargs
+        # It stayed at its window position (after h7) — not pinned a second time.
+        assert kept.index(protected[0]) == summary_idx + 2
+        assert kept[summary_idx + 1].content == messages[-3].content
+        assert "blk" in removed  # original evicted, fresh copy appended
+
+    @pytest.mark.asyncio
+    async def test_protected_text_absent_from_summary_input(
+        self, context_manager, mock_llm
+    ):
+        block = self._block("2:tactical")
+        messages = self._history(block, block_at=2)
+        context_manager.set_current_phase("tactical", phase_key="2:tactical")
+
+        parts = context_manager._format_messages_for_summary(messages)
+        assert parts
+        assert not any(self.BODY in p for p in parts)
+        assert any("question 0" in p for p in parts)
+
+        await context_manager.summarize_and_compact(
+            messages=messages, auxiliary=mock_llm
+        )
+        structured = mock_llm.llm.with_structured_output.return_value
+        assert structured.ainvoke.await_count >= 1
+        sent = str(structured.ainvoke.call_args_list)
+        assert self.BODY not in sent
+        assert "question 0" in sent
+
+    @pytest.mark.asyncio
+    async def test_generic_pin_survives_any_phase(self, context_manager, mock_llm):
+        pin = HumanMessage(
+            content="GENERIC PIN", id="pin", additional_kwargs={PROTECTED_KEY: True}
+        )
+        messages = self._history(pin, block_at=2)
+        context_manager.set_current_phase("tactical", phase_key="9:tactical")
+
+        result = await context_manager.summarize_and_compact(
+            messages=messages, auxiliary=mock_llm
+        )
+
+        kept, removed, summary_idx = self._split(result)
+        assert kept[summary_idx + 1].content == "GENERIC PIN"
+        assert is_protected_message(kept[summary_idx + 1])
+        assert "pin" in removed
+
+    def test_place_pinned_after_summary_dedupes_and_filters(self):
+        summary = SystemMessage(content="[Summary of prior work]\nS")
+        current = self._block("2:tactical", msg_id="c")
+        duplicate = self._block("2:tactical", msg_id="d")
+        stale = self._block("1:strategic", msg_id="s")
+        summarized = [stale, current, duplicate, HumanMessage(content="old")]
+
+        # The window already holds the identity: nothing is re-seated.
+        window_block = self._block("2:tactical", msg_id="k")
+        kept = [window_block, HumanMessage(content="w")]
+        assert place_pinned_after_summary(summary, summarized, kept, "2:tactical") == [
+            summary,
+            *kept,
+        ]
+
+        # Otherwise exactly one fresh copy of the current block: id-less,
+        # markers intact, the stale phase filtered out.
+        kept = [HumanMessage(content="w")]
+        out = place_pinned_after_summary(summary, summarized, kept, "2:tactical")
+        assert len(out) == 3
+        assert out[0] is summary
+        assert out[2] is kept[0]
+        assert is_protected_message(out[1])
+        assert out[1].id is None
+        assert protected_phase_key(out[1]) == "2:tactical"
+        assert out[1].content == current.content

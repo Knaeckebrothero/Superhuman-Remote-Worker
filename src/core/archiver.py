@@ -514,6 +514,7 @@ class LLMArchiver:
             phase: Current phase ("strategic" or "tactical")
             phase_number: Current phase number
         """
+        from src.core.message_markers import is_protected_message
         from src.core.workspace_injection import is_workspace_injection_message
 
         try:
@@ -535,8 +536,15 @@ class LLMArchiver:
                 if isinstance(msg, AIMessage):
                     last_ai_idx = i
 
+            # A protected phase instruction block is history (it persists in
+            # state), but it is not a user turn: on its delivery turn it is
+            # archived as a context descriptor, never as a human bubble.
+            delivered_context: List[BaseMessage] = []
             new_inputs = []
             for msg in real_messages[last_ai_idx + 1 :]:
+                if is_protected_message(msg):
+                    delivered_context.append(msg)
+                    continue
                 content = _normalize_content(msg.content)
 
                 input_entry: Dict[str, Any] = {
@@ -554,7 +562,9 @@ class LLMArchiver:
 
             # Injected context frame, as compact descriptors (payload order:
             # the block sits after the conversation, so append at the end).
-            new_inputs.extend(self._context_frame_entries(job_id, injected))
+            new_inputs.extend(
+                self._context_frame_entries(job_id, delivered_context + injected)
+            )
 
             # Extract response
             resp_content = _normalize_content(response.content)
@@ -635,6 +645,7 @@ class LLMArchiver:
         )
         from src.core.knowledge_injection import KNOWLEDGE_TOOL_CALL_ID_PREFIX
         from src.core.memory_injection import MEMORY_TOOL_CALL_ID_PREFIX
+        from src.core.message_markers import is_protected_message, protected_path
         from src.core.workspace_injection import (
             INSTRUCTION_TOOL_CALL_ID_PREFIX,
             content_hash_id,
@@ -665,7 +676,13 @@ class LLMArchiver:
         entries: List[Dict[str, Any]] = []
         for msg in injected:
             label: Optional[str] = None
-            if isinstance(msg, HumanMessage):
+            if is_protected_message(msg):
+                # Persistent phase instruction block (src/core/message_markers):
+                # labelled by the artifact path it delivers. Mirrored in
+                # src/shared/orch_surface/formatters.py::_context_label.
+                kind = "phase_instruction"
+                label = protected_path(msg)
+            elif isinstance(msg, HumanMessage):
                 # Only the todos block is injected as a transient HumanMessage.
                 kind = "todos"
             elif isinstance(msg, ToolMessage):
@@ -690,7 +707,11 @@ class LLMArchiver:
                 entry["label"] = label
             # Several instruction files can be injected per turn: track each
             # by label (or content hash) so they don't clobber one another.
-            key = kind if kind != "instruction" else f"instruction:{label or digest}"
+            key = (
+                f"{kind}:{label or digest}"
+                if kind in ("instruction", "phase_instruction")
+                else kind
+            )
             if prev.get(key) != digest:
                 entry["content"] = content
             prev[key] = digest

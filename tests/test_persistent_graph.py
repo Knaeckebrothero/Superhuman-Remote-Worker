@@ -5107,3 +5107,17 @@ class TestMaybeEstimateReasoningTokens:
         _maybe_estimate_reasoning_tokens(tm, "")
         assert "reasoning_tokens" not in tm
         assert "reasoning_estimated" not in tm
+
+
+# =============================================================================
+# PERSIST_ROLE_KEY import path (re-exported from src.core.message_markers)
+# =============================================================================
+
+
+class TestPersistRoleKeyReexport:
+    def test_persist_role_key_is_the_message_markers_constant(self):
+        from src.core.message_markers import PERSIST_ROLE_KEY as canonical
+        from src.persistent_graph import PERSIST_ROLE_KEY
+
+        assert PERSIST_ROLE_KEY is canonical
+        assert PERSIST_ROLE_KEY == "_srw_persist_role"

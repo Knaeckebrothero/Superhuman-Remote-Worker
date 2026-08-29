@@ -57,7 +57,11 @@ class UniversalAgentState(TypedDict):
         phase_number: Increments at each phase transition (for tracking/logging)
         is_final_phase: True when job_complete was called, job completes when todos done
         turn_count: LLM call counter, used by memory extraction to trigger every N turns
-        phase_instruction_injections: Checkpointed once-per-phase instruction keys
+        phase_instruction_injections: Checkpointed once-per-phase delivery ledger
+            ("<n>:<phase>:<path>") of the phase_start instruction blocks; the
+            block itself is a protected HumanMessage in ``messages`` (see
+            src/core/message_markers.py) — the ledger records delivery, the
+            execute node checks presence and self-heals a ledger-only entry
         last_observed_turn: Last turn when memory extraction ran (for interval tracking)
         delivered_reply_keys: Durable identities of queued replies already
             appended to message history (worker handoff dedup)
@@ -130,7 +134,7 @@ class UniversalAgentState(TypedDict):
     # completion; this stops the retry re-archiving the same boundary.
     last_archived_phase: Optional[str]
     turn_count: int  # LLM call counter (for memory extraction interval)
-    phase_instruction_injections: List[str]  # Once-per-phase instruction keys
+    phase_instruction_injections: List[str]  # Once-per-phase delivery ledger
     last_observed_turn: int  # Last turn when memory extraction ran
     last_assembled_turn: int  # Last turn when memory assembler ran
     delivered_reply_keys: List[str]  # Checkpoint-coupled queued-reply dedup

@@ -8,7 +8,11 @@ making it appear as if the agent already read certain files. This approach:
 
 Handles injection of:
 - Todo lists (as transient HumanMessage)
-- Instruction files delivered once at a concrete phase start
+- Phase instruction blocks delivered once at a concrete phase start — NOT
+  transient: ``create_phase_instruction_message`` builds a persistent,
+  protected HumanMessage (see src/core/message_markers.py) that the graph
+  appends to state and the context manager keeps out of every compaction
+  strategy
 - Memory and knowledge injection use their own modules (memory_injection.py, knowledge_injection.py)
 """
 
@@ -16,6 +20,14 @@ import hashlib
 from typing import List, Tuple
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
+
+from src.core.message_markers import (
+    INSTRUCTION_PATH_KEY,
+    PERSIST_ROLE_EVENT,
+    PERSIST_ROLE_KEY,
+    PHASE_KEY,
+    PROTECTED_KEY,
+)
 
 # Prefix for identifying synthetic instruction tool calls
 # Used to exclude these messages from summarization
@@ -86,15 +98,66 @@ def create_todos_human_message(todos_content: str) -> HumanMessage:
     )
 
 
+PHASE_INSTRUCTION_CONTENT_PREFIX = "[phase: "
+
+
+def create_phase_instruction_message(
+    file_path: str,
+    content: str,
+    phase_name: str,
+    phase_key: str,
+) -> HumanMessage:
+    """Build the persistent, protected phase instruction block.
+
+    Delivered ONCE per concrete phase instance by the execute node, appended
+    to the graph's ``messages`` before compaction so it lands in state and
+    the checkpoint. It is a ``HumanMessage`` for every model family (the
+    ``role=event`` convention: Anthropic rejects non-consecutive system
+    messages and Gemini relocates a mid-history SystemMessage into the
+    system slot, which breaks the cached prefix on every turn). The markers
+    in ``additional_kwargs`` make it *protected*: skipped by tool-result
+    clearing, trimming, elision and the summariser's input, and re-seated
+    right after the summary while its phase is current.
+
+    Content is deterministic for identical inputs (prompt-cache hygiene).
+
+    Args:
+        file_path: Workspace-relative path of the instruction artifact
+        content: Body of the artifact (already rendered)
+        phase_name: ``"strategic"`` or ``"tactical"``
+        phase_key: ``"<phase_number>:<phase_name>"`` of the concrete phase
+    """
+    body = (
+        f"{PHASE_INSTRUCTION_CONTENT_PREFIX}{phase_name}] Phase instructions "
+        f"(from {file_path}). They apply for the whole phase.\n\n{content}"
+    )
+    return HumanMessage(
+        content=body,
+        additional_kwargs={
+            PERSIST_ROLE_KEY: PERSIST_ROLE_EVENT,
+            PROTECTED_KEY: True,
+            PHASE_KEY: phase_key,
+            INSTRUCTION_PATH_KEY: file_path,
+        },
+    )
+
+
 def create_instruction_tool_messages(
     file_path: str,
     content: str,
 ) -> Tuple[AIMessage, ToolMessage]:
     """Create synthetic AIMessage + ToolMessage pair for instruction file injection.
 
+    .. deprecated::
+        The worker's phase-start delivery uses
+        :func:`create_phase_instruction_message` (a persistent, protected
+        HumanMessage in state) since U2 WP1. This pair is a *transient*
+        shape — it is dropped before summarisation and never written to
+        state — and is kept only for callers and tests that still build the
+        legacy layout (archiver context-frame descriptors, rewind fixtures).
+
     Creates a fake tool call that makes it appear as if the agent already
     called read_file on the instruction file and received the content.
-    Used for checkpointed, once-per-phase-start instruction delivery.
 
     Args:
         file_path: Workspace-relative path of the instruction file

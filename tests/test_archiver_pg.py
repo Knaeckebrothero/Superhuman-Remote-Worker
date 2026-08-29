@@ -375,3 +375,46 @@ def test_chat_tool_call_args_stored_when_long(archiver, fw):
     assert long_cmd[:300] in tcs["c1"]["args"]
     # Short args fit in the preview — no duplicate full copy.
     assert "args" not in tcs["c2"]
+
+
+def test_chat_delta_labels_phase_instruction_block_as_context(archiver, fw):
+    """A delivered phase block is history, not a user turn: on its delivery
+    turn it is archived as a context descriptor (kind=phase_instruction,
+    labelled by the artifact path), never as a human bubble."""
+    from src.core.workspace_injection import create_phase_instruction_message
+
+    block = create_phase_instruction_message(
+        "skills/research-guide/SKILL.md", "GUIDE BODY", "tactical", "2:tactical"
+    )
+    messages = [
+        SystemMessage("sys"),
+        HumanMessage("do the task"),
+        AIMessage(
+            "",
+            tool_calls=[{"name": "read_file", "args": {"path": "a.md"}, "id": "c1"}],
+        ),
+        ToolMessage("file body", tool_call_id="c1", name="read_file"),
+        block,
+        create_todos_human_message("Current Tasks"),
+    ]
+    job = str(uuid4())
+    archiver.archive(job, "universal", messages, AIMessage("next"), "gpt-x")
+
+    inputs = fw.chat_rows[-1]["inputs"]
+    real = [i for i in inputs if i["type"] != "context"]
+    assert [i["type"] for i in real] == ["tool"]
+    assert not any("[phase: " in (i.get("content") or "") for i in real)
+    ctx = {c["kind"]: c for c in inputs if c["type"] == "context"}
+    assert set(ctx) == {"phase_instruction", "todos"}
+    entry = ctx["phase_instruction"]
+    assert entry["label"] == "skills/research-guide/SKILL.md"
+    assert entry["content"].startswith("[phase: tactical]")
+    assert "GUIDE BODY" in entry["content"]
+
+    # Next turn the block sits before the model's reply: it is history now,
+    # not part of the delta.
+    later = messages[:-1] + [AIMessage("next"), HumanMessage("continue"), messages[-1]]
+    archiver.archive(job, "universal", later, AIMessage("ok"), "gpt-x")
+    inputs2 = fw.chat_rows[-1]["inputs"]
+    assert [c["kind"] for c in inputs2 if c["type"] == "context"] == ["todos"]
+    assert [i["type"] for i in inputs2 if i["type"] != "context"] == ["human"]

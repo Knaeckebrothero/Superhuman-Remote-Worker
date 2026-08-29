@@ -32,6 +32,7 @@ from langchain_core.messages import (
 )
 
 from src.core.loader import InstructionFileEntry, QueryConfig, load_agent_config
+from src.core.message_markers import is_protected_message, protected_phase_key
 from src.core.workspace import WorkspaceManager
 from src.core.workspace_injection import (
     TODOS_INJECTION_CONTENT_PREFIX,
@@ -137,9 +138,10 @@ class FakeContextMgr:
         self._state = SimpleNamespace(summaries=[])
         self._ensure_hook = ensure_hook
         self._should_summarize = should_summarize
+        self.phase_key: Optional[str] = None
 
-    def set_current_phase(self, phase: str) -> None:
-        pass
+    def set_current_phase(self, phase: str, phase_key: Optional[str] = None) -> None:
+        self.phase_key = phase_key
 
     def should_summarize(self, messages) -> bool:
         # The pre_compaction emit gates on this; off by default so these
@@ -472,22 +474,89 @@ def execute_env(worker_config, workspace_manager):
     }
 
 
+def _bind_phase_start(env, body: str, *, duplicate: bool = False):
+    """Bind research-guide at phase_start:tactical and write ``body`` to it."""
+    entry = InstructionFileEntry(
+        trigger="phase_start:tactical",
+        skill="research-guide",
+        enforce=False,
+    )
+    entries = [entry, entry] if duplicate else [entry]
+    env["config"].instruction_files = entries
+    env["ctx"]._instruction_files = entries
+    env["workspace"].write_file(entry.path, body)
+    return entry
+
+
+def _apply_turn(state: dict, result: dict) -> None:
+    """What the graph does between turns: the add_messages reducer (append
+    everything that is not a RemoveMessage) plus the scalar updates."""
+    state["messages"] = state["messages"] + [
+        m for m in result["messages"] if not isinstance(m, RemoveMessage)
+    ]
+    state["iteration"] = result["iteration"]
+    state["turn_count"] = result["turn_count"]
+    if "phase_instruction_injections" in result:
+        state["phase_instruction_injections"] = result["phase_instruction_injections"]
+
+
+def _phase_blocks(request, phase_key: str):
+    return [
+        m
+        for m in request
+        if is_protected_message(m) and protected_phase_key(m) == phase_key
+    ]
+
+
+def _count_text(request, text: str) -> int:
+    return sum(text in str(getattr(m, "content", "")) for m in request)
+
+
+def _mock_aux():
+    """AuxiliaryLLM whose structured summariser returns a fixed short summary."""
+    from src.core.context import ConversationSummary
+    from src.services.auxiliary import AuxiliaryLLM
+
+    parsed = ConversationSummary(
+        summary="Summary of the work so far.",
+        tasks_completed="- read files",
+        key_decisions="",
+        current_state="mid-phase",
+        blockers="",
+    )
+    structured = AsyncMock()
+    structured.ainvoke = AsyncMock(
+        return_value={
+            "raw": AIMessage(content="s"),
+            "parsed": parsed,
+            "parsing_error": None,
+        }
+    )
+    llm = MagicMock()
+    llm.with_structured_output = MagicMock(return_value=structured)
+    return AuxiliaryLLM(llm=llm, max_context_tokens=15_000)
+
+
+_EXECUTE_PATCHES = (
+    ("src.graph.get_archiver", None),
+    ("src.graph.get_phase_system_prompt", "SYS"),
+)
+
+
 class TestWorkerExecuteWiring:
     @pytest.mark.asyncio
     async def test_phase_start_instruction_is_injected_once_per_phase_instance(
         self, execute_env
     ):
+        """U2 WP1 durability: the body is delivered ONCE per concrete phase
+        as a persistent, protected HumanMessage — present exactly once in
+        EVERY request of the phase (from history, not the transient tail),
+        returned in state on the delivery turn, and a new phase instance
+        gets its own block while the old one stays in uncompacted history."""
         env = execute_env
-        entry = InstructionFileEntry(
-            trigger="phase_start:tactical",
-            skill="research-guide",
-            enforce=False,
-        )
-        # Duplicate bindings to the same artifact must still inject one body.
-        env["config"].instruction_files = [entry, entry]
-        env["ctx"]._instruction_files = [entry, entry]
         marker = "UNIQUE PHASE-START RESEARCH PROCEDURE"
-        env["workspace"].write_file(entry.path, marker)
+        # Duplicate bindings to the same artifact must still deliver one body.
+        _bind_phase_start(env, marker, duplicate=True)
         node = _make_execute_node(
             env["config"],
             env["workspace"],
@@ -503,48 +572,227 @@ class TestWorkerExecuteWiring:
             patch("src.graph.get_phase_system_prompt", return_value="SYS"),
         ):
             first = await node(state)
-            state.update(
-                {
-                    "iteration": first["iteration"],
-                    "turn_count": first["turn_count"],
-                    "phase_instruction_injections": first[
-                        "phase_instruction_injections"
-                    ],
-                }
-            )
+            _apply_turn(state, first)
             second = await node(state)
-            state.update(
-                {
-                    "iteration": second["iteration"],
-                    "turn_count": second["turn_count"],
-                    "phase_instruction_injections": second.get(
-                        "phase_instruction_injections",
-                        state["phase_instruction_injections"],
-                    ),
-                    "phase_number": 4,
-                }
-            )
+            _apply_turn(state, second)
+            state["phase_number"] = 4
             third = await node(state)
 
         requests = [call.args[0] for call in env["llm"].ainvoke.call_args_list]
 
-        def carries_marker(request):
-            return any(
-                marker in str(getattr(message, "content", "")) for message in request
-            )
+        # Delivery turn: the block is returned in state ahead of the response
+        # and the ledger records the concrete phase instance.
+        assert is_protected_message(first["messages"][0])
+        assert marker in first["messages"][0].content
+        assert isinstance(first["messages"][1], AIMessage)
+        assert first["phase_instruction_injections"] == [
+            "2:tactical:skills/research-guide/SKILL.md"
+        ]
+        assert env["context"].phase_key == "4:tactical"
 
-        assert carries_marker(requests[0]) is True
-        assert (
-            sum(
-                marker in str(getattr(message, "content", ""))
-                for message in requests[0]
-            )
-            == 1
+        # Every request of the phase carries it exactly once.
+        for request in requests[:2]:
+            assert len(_phase_blocks(request, "2:tactical")) == 1
+            assert _count_text(request, marker) == 1
+        # Second turn: nothing re-delivered, ledger untouched.
+        assert "phase_instruction_injections" not in second
+        assert not any(is_protected_message(m) for m in second["messages"])
+        # It is history: it sits before the transient tail (todos last).
+        todo_idx = next(
+            i
+            for i, m in enumerate(requests[1])
+            if isinstance(m, HumanMessage)
+            and str(m.content).startswith(TODOS_INJECTION_CONTENT_PREFIX)
         )
-        assert carries_marker(requests[1]) is False
-        assert carries_marker(requests[2]) is True
-        assert len(first["phase_instruction_injections"]) == 1
+        block_idx = next(
+            i for i, m in enumerate(requests[1]) if is_protected_message(m)
+        )
+        assert block_idx < todo_idx
+        assert requests[1][block_idx] is state["messages"][1]
+
+        # Phase 4 gets its own block; phase 2's stays in uncompacted history.
+        assert len(_phase_blocks(requests[2], "4:tactical")) == 1
+        assert len(_phase_blocks(requests[2], "2:tactical")) == 1
         assert len(third["phase_instruction_injections"]) == 2
+
+    @pytest.mark.asyncio
+    async def test_ledger_present_but_block_missing_self_heals_once(self, execute_env):
+        """A job resumed mid-phase from a pre-change checkpoint has the ledger
+        entry but no block in history: deliver once more (logged), then the
+        presence check takes over — no second delivery, ledger unchanged."""
+        env = execute_env
+        marker = "SELF-HEAL PHASE BODY"
+        _bind_phase_start(env, marker)
+        node = _make_execute_node(
+            env["config"],
+            env["workspace"],
+            env["todo"],
+            env["ctx"],
+            env["service"],
+            {"llm": env["llm"], "context": env["context"]},
+        )
+        key = "2:tactical:skills/research-guide/SKILL.md"
+        state = _worker_state()
+        state["phase_instruction_injections"] = [key]
+
+        with (
+            patch("src.graph.get_archiver", return_value=None),
+            patch("src.graph.get_phase_system_prompt", return_value="SYS"),
+        ):
+            first = await node(state)
+            _apply_turn(state, first)
+            second = await node(state)
+
+        requests = [call.args[0] for call in env["llm"].ainvoke.call_args_list]
+        assert len(_phase_blocks(requests[0], "2:tactical")) == 1
+        assert _count_text(requests[0], marker) == 1
+        assert is_protected_message(first["messages"][0])
+        assert first["phase_instruction_injections"] == [key]
+        # Healed: the next turn sees the block and delivers nothing.
+        assert len(_phase_blocks(requests[1], "2:tactical")) == 1
+        assert _count_text(requests[1], marker) == 1
+        assert "phase_instruction_injections" not in second
+        assert not any(is_protected_message(m) for m in second["messages"])
+
+    @pytest.mark.asyncio
+    async def test_prompt_tokens_grow_only_by_new_messages_across_two_tactical_turns(
+        self, execute_env
+    ):
+        """Acceptance (b): the block is never re-billed. Across two consecutive
+        tactical turns the request grows only by the new messages; the prefix
+        up to and including the block is byte-identical, and the tail is the
+        same block of transients."""
+        env = execute_env
+        body = "PHASE BODY " * 50
+        _bind_phase_start(env, body)
+        node = _make_execute_node(
+            env["config"],
+            env["workspace"],
+            env["todo"],
+            env["ctx"],
+            env["service"],
+            {"llm": env["llm"], "context": env["context"]},
+        )
+        state = _worker_state()
+
+        with (
+            patch("src.graph.get_archiver", return_value=None),
+            patch("src.graph.get_phase_system_prompt", return_value="SYS"),
+        ):
+            first = await node(state)
+            _apply_turn(state, first)
+            await node(state)
+
+        req1, req2 = [call.args[0] for call in env["llm"].ainvoke.call_args_list]
+
+        def chars(messages) -> int:
+            return sum(len(str(getattr(m, "content", ""))) for m in messages)
+
+        new_messages = first["messages"][1:]  # response (+ any reminder)
+        assert chars(req2) - chars(req1) == chars(new_messages)
+        assert _count_text(req1, body) == 1
+        assert _count_text(req2, body) == 1
+
+        # [system, task, block] is the stable prefix; then the new messages;
+        # then the unchanged transient tail.
+        prefix = 3
+        assert [m.content for m in req2[:prefix]] == [m.content for m in req1[:prefix]]
+        assert is_protected_message(req1[prefix - 1])
+        assert [m.content for m in req2[prefix : prefix + len(new_messages)]] == [
+            m.content for m in new_messages
+        ]
+        assert [m.content for m in req2[prefix + len(new_messages) :]] == [
+            m.content for m in req1[prefix:]
+        ]
+
+    @pytest.mark.asyncio
+    async def test_phase_block_is_present_exactly_once_after_each_strategy(
+        self, execute_env
+    ):
+        """Acceptance (a): over the same history, tool-result clearing,
+        trimming and summarisation each leave exactly one phase block —
+        and summarisation seats it right after the summary, before the
+        kept window."""
+        from src.core.context import ContextConfig, ContextManager
+
+        env = execute_env
+        body = "RESEARCH PROCEDURE " * 40
+        _bind_phase_start(env, body)
+        node = _make_execute_node(
+            env["config"],
+            env["workspace"],
+            env["todo"],
+            env["ctx"],
+            env["service"],
+            {"llm": env["llm"], "context": env["context"]},
+        )
+        with (
+            patch("src.graph.get_archiver", return_value=None),
+            patch("src.graph.get_phase_system_prompt", return_value="SYS"),
+        ):
+            first = await node(_worker_state())
+        block = first["messages"][0]
+        assert is_protected_message(block)
+        block.id = "blk"  # what the reducer assigns on append
+
+        # Grow the history the way the tools node would, after the block.
+        history = [HumanMessage(content="start", id="h0"), block]
+        for i in range(6):
+            history.append(
+                AIMessage(
+                    content=f"step {i}",
+                    id=f"a{i}",
+                    tool_calls=[
+                        {"name": "read_file", "args": {"path": f"f{i}"}, "id": f"c{i}"}
+                    ],
+                )
+            )
+            history.append(
+                ToolMessage(
+                    content=f"result {i} " + "z" * 300, tool_call_id=f"c{i}", id=f"t{i}"
+                )
+            )
+        history.append(HumanMessage(content="continue", id="h1"))
+
+        mgr = ContextManager(
+            config=ContextConfig(
+                compaction_threshold_tokens=500,
+                summarization_threshold_tokens=500,
+                keep_recent_messages=3,
+                keep_recent_tool_results=2,
+                model_max_context_tokens=4000,
+            )
+        )
+        mgr.set_current_phase("tactical", phase_key="2:tactical")
+
+        def protected(messages):
+            return [m for m in messages if is_protected_message(m)]
+
+        cleared = mgr.clear_old_tool_results(history)
+        assert protected(cleared) == [block]
+        assert cleared[1] is block
+
+        trimmed = mgr.trim_messages(history, keep_recent=3)
+        assert protected(trimmed) == [block]
+        assert trimmed[1] is block  # after the task, before the window
+
+        summarised = await mgr.summarize_and_compact(history, _mock_aux())
+        kept = [m for m in summarised if not isinstance(m, RemoveMessage)]
+        summary_idx = next(
+            i
+            for i, m in enumerate(kept)
+            if isinstance(m, SystemMessage) and "[Summary of prior work]" in m.content
+        )
+        blocks = protected(kept)
+        assert len(blocks) == 1
+        assert kept.index(blocks[0]) == summary_idx + 1
+        assert blocks[0].content == block.content
+        assert blocks[0].additional_kwargs == block.additional_kwargs
+        assert blocks[0].id is None
+        assert "blk" in {m.id for m in summarised if isinstance(m, RemoveMessage)}
+        assert [m.content for m in kept[summary_idx + 2 :]] == [
+            m.content for m in history[-3:]
+        ]
 
     @pytest.mark.asyncio
     async def test_phase_start_instruction_survives_emergency_compaction_retry(

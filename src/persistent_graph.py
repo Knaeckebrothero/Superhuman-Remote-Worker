@@ -39,6 +39,7 @@ from .core.context import (
 )
 from .core.llm_retry import _classify_llm_error, _extract_rate_limit_delay
 from .core.loader import with_current_date
+from .core.message_markers import PERSIST_ROLE_KEY as _PERSIST_ROLE_KEY
 from .core.summarizer import count_text_tokens
 from .core.workspace_backend import WorkspaceUnavailableError
 from .shared.tool_arg_coercion import coerce_tool_args
@@ -319,9 +320,10 @@ DENY_SENTINEL = "__DENY__"
 # should be PERSISTED under, when its LangChain type is only a carrier. An
 # injected system notice travels as HumanMessage — so this loop, the turn
 # reconciler's backwards walk, and the model's context all stay unchanged — but
-# must persist as role='event' rather than as a user bubble. Defined here (the
-# lower layer) so the transport and the loop cannot drift apart on the spelling.
-PERSIST_ROLE_KEY = "_srw_persist_role"
+# must persist as role='event' rather than as a user bubble. The spelling lives
+# in src/core/message_markers.py (shared with the worker's protected phase
+# blocks); re-exported here so the transport keeps importing it from the loop.
+PERSIST_ROLE_KEY = _PERSIST_ROLE_KEY
 
 
 def _user_facing_turn_error(e: BaseException) -> str:

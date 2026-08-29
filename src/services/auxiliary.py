@@ -2143,12 +2143,15 @@ def _format_messages_for_extraction(messages: List[BaseMessage]) -> str:
     Filters out injection messages (workspace, memory, instruction)
     to focus on actual conversation content.
     """
+    from src.core.message_markers import is_protected_message
     from src.core.workspace_injection import is_workspace_injection_message
 
     lines = []
     for msg in messages:
         if is_workspace_injection_message(msg):
             continue
+        if is_protected_message(msg):
+            continue  # phase instruction block — guidance, not conversation
 
         role = _get_message_role(msg)
         content = msg.content if hasattr(msg, "content") else ""

@@ -75,6 +75,11 @@ from .core.context import (
     sanitize_message_history,
     scrub_history_tool_call_arguments,
 )
+from .core.message_markers import (
+    is_protected_message,
+    phase_key_for,
+    protected_identity,
+)
 
 # LLM provider-error triage lives in src/core/llm_retry.py (pure, stdlib-only)
 # so that call sites which cannot import this module — notably the light
@@ -860,11 +865,87 @@ def create_execute_node(
             model=phase_llm_config.model,
             tool_names=tool_names,
         )
-        context_mgr.set_current_phase(phase_name)
+        phase_key = phase_key_for(phase_number, phase_name)
+        context_mgr.set_current_phase(phase_name, phase_key=phase_key)
         logger.debug(
             f"[{job_id}] Using {phase_name} LLM and prompt for phase {phase_number}"
         )
         prepared_messages.append(SystemMessage(content=full_system))
+
+        # Phase-start instruction delivery: each `phase_start`-bound artifact
+        # reaches a concrete phase instance ONCE, as a persistent, protected
+        # HumanMessage appended to the working history BEFORE compaction. It
+        # rides through ensure_within_limits (kept out of clearing, trimming
+        # and elision; re-seated right after a summary while its phase is
+        # current), is returned in state on the successful turn and lands in
+        # the checkpoint — paid once, then a stable, cacheable prefix, unlike
+        # the transient tail below which is re-billed every request.
+        #
+        # The ledger (state.phase_instruction_injections, "<n>:<phase>:<path>")
+        # keeps its "delivered" meaning. Presence of a protected block with
+        # the same (phase key, path) in `messages` is the per-turn check; a
+        # ledger entry without a block (a job resumed mid-phase from a
+        # pre-change checkpoint, or a rewound history) self-heals by
+        # delivering once more.
+        completed_phase_injections = set(
+            state.get("phase_instruction_injections") or []
+        )
+        pending_phase_injections: set[str] = set()
+        delivered_phase_blocks: list = []
+        if tool_context and hasattr(tool_context, "get_phase_instruction_files"):
+            phase_entries = tool_context.get_phase_instruction_files(phase_name)
+            if phase_entries:
+                from src.core.workspace_injection import (
+                    create_phase_instruction_message,
+                )
+
+                present_blocks = {
+                    protected_identity(m) for m in messages if is_protected_message(m)
+                }
+                seen_paths: set[str] = set()
+                for entry in phase_entries:
+                    instr_path = entry.path.lstrip("/")
+                    if instr_path in seen_paths:
+                        continue  # duplicate bindings to one artifact
+                    seen_paths.add(instr_path)
+                    injection_key = f"{phase_key}:{instr_path}"
+                    if (phase_key, instr_path) in present_blocks:
+                        continue  # delivered and still in history
+                    try:
+                        instr_content = workspace_manager.read_file(entry.path)
+                    except FileNotFoundError:
+                        logger.warning(
+                            f"[{job_id}] Phase instruction file not found: {entry.path}"
+                        )
+                        continue
+                    delivered_phase_blocks.append(
+                        create_phase_instruction_message(
+                            instr_path, instr_content, phase_name, phase_key
+                        )
+                    )
+                    pending_phase_injections.add(injection_key)
+                    if injection_key in completed_phase_injections:
+                        logger.warning(
+                            f"[{job_id}] Phase instruction {instr_path} is in the "
+                            f"delivery ledger for {phase_key} but absent from "
+                            "history — delivering once more (self-heal)"
+                        )
+                    else:
+                        logger.debug(
+                            f"[{job_id}] Delivered phase-start instruction once: "
+                            f"{instr_path} ({phase_key})"
+                        )
+        if delivered_phase_blocks:
+            messages = list(messages) + delivered_phase_blocks
+        phase_ledger_update: Dict[str, Any] = (
+            {
+                "phase_instruction_injections": sorted(
+                    completed_phase_injections | pending_phase_injections
+                )
+            }
+            if pending_phase_injections
+            else {}
+        )
 
         # Estimate transient injection overhead (system prompt + todos + memory + knowledge)
         # so compaction thresholds account for messages that will be added AFTER compaction
@@ -1010,7 +1091,9 @@ def create_execute_node(
         # 1. Summary SystemMessages first (context from before compaction)
         # 2. Rest of conversation (excluding regular SystemMessages)
         # 3. Transient injections at the tail (memories, knowledge, citation
-        #    feedback, instruction files, then the todo list last)
+        #    feedback, supervisor guidance, then the todo list last). The
+        #    phase instruction block is NOT part of the tail: it is history
+        #    (delivered above, persisted in state).
 
         # Step 1: Add summaries first
         for msg in messages:
@@ -1018,11 +1101,10 @@ def create_execute_node(
                 if "[Summary of prior work]" in msg.content:
                     prepared_messages.append(msg)
 
-        # Helper: inject all transient messages (todos, memories, knowledge, instruction files)
+        # Helper: inject all transient messages (todos, memories, knowledge, guidance)
         # Used both in normal path and safety rebuild to avoid code duplication
         from src.core.workspace_injection import (
             create_todos_human_message,
-            create_instruction_tool_messages,
             find_tail_injection_anchor,
         )
 
@@ -1322,13 +1404,8 @@ def create_execute_node(
                     f"{len(_guidance_entries)} pending entrie(s)"
                 )
 
-        completed_phase_injections = set(
-            state.get("phase_instruction_injections") or []
-        )
-        pending_phase_injections: set[str] = set()
-
         def _inject_transient_messages(target_messages: list) -> None:
-            """Splice transient injections (memories, knowledge, instruction files, todos) at the tail.
+            """Splice transient injections (memories, knowledge, guidance, todos) at the tail.
 
             The block goes AFTER the conversation (see find_tail_injection_anchor):
             it changes every turn, and provider prompt caches match on a strict
@@ -1338,9 +1415,12 @@ def create_execute_node(
 
             Within the block the todo list goes LAST: it is the agent's current
             "query", and models weight the end of the prompt highest.
+
+            Phase-start instruction blocks are NOT transient: they are
+            delivered once into the working history (see the delivery step
+            before compaction) and persist in state.
             """
             block: list = []
-            target_phase_injections: set[str] = set()
 
             # MemoryManager seam: the assembled payload replaces the legacy
             # _memory_block/_knowledge_block branches below (both stay ""
@@ -1381,40 +1461,6 @@ def create_execute_node(
                 block.append(cit_ai)
                 block.append(cit_tool)
 
-            # Phase-start instruction files: each concrete phase instance sees
-            # each bound artifact once. The successful LLM turn checkpoints the
-            # keys below; unlike dynamic todos/memory, static skills are never
-            # re-presented as a fresh tail instruction on every request.
-            if tool_context and hasattr(tool_context, "get_phase_instruction_files"):
-                phase_entries = tool_context.get_phase_instruction_files(phase_name)
-                if phase_entries:
-                    for entry in phase_entries:
-                        injection_key = (
-                            f"{phase_number}:{phase_name}:{entry.path.lstrip('/')}"
-                        )
-                        if (
-                            injection_key in completed_phase_injections
-                            or injection_key in target_phase_injections
-                        ):
-                            continue
-                        try:
-                            instr_content = workspace_manager.read_file(entry.path)
-                            instr_ai, instr_tool = create_instruction_tool_messages(
-                                entry.path, instr_content
-                            )
-                            block.append(instr_ai)
-                            block.append(instr_tool)
-                            target_phase_injections.add(injection_key)
-                            pending_phase_injections.add(injection_key)
-                            logger.debug(
-                                f"[{job_id}] Injected phase-start instruction "
-                                f"once: {entry.path}"
-                            )
-                        except FileNotFoundError:
-                            logger.warning(
-                                f"[{job_id}] Phase instruction file not found: {entry.path}"
-                            )
-
             # Supervisor guidance: the last synthetic pair before the todo
             # list, so mid-run steering is the freshest context short of the
             # current tasks themselves.
@@ -1445,7 +1491,7 @@ def create_execute_node(
             if not isinstance(msg, SystemMessage):
                 prepared_messages.append(msg)
 
-        # Inject transient messages (memory, knowledge, instruction files, todos)
+        # Inject transient messages (memory, knowledge, guidance, todos)
         # AFTER the conversation: the stable history prefix stays byte-identical
         # across turns, so provider prompt caches reuse it instead of
         # re-processing the whole conversation every request.
@@ -1501,8 +1547,8 @@ def create_execute_node(
                 if not isinstance(msg, SystemMessage):
                     prepared_messages.append(msg)
 
-            # Re-inject ALL transient messages (memory + knowledge + instruction
-            # files + todos) at the tail
+            # Re-inject ALL transient messages (memory + knowledge + guidance
+            # + todos) at the tail; the phase block is inside `messages`.
             _inject_transient_messages(prepared_messages)
             logger.debug(
                 f"[{job_id}] Re-injected transient messages after safety compaction"
@@ -1948,12 +1994,16 @@ def create_execute_node(
                                     + [ai_summary, human_feedback]
                                 )
                             else:
-                                result_messages = [ai_summary, human_feedback]
+                                result_messages = delivered_phase_blocks + [
+                                    ai_summary,
+                                    human_feedback,
+                                ]
 
                             return {
                                 "messages": result_messages,
                                 "iteration": iteration + 1,
                                 "error": None,
+                                **phase_ledger_update,
                             }
 
                         # Streak > 3: fall through to error
@@ -2192,10 +2242,7 @@ def create_execute_node(
                     "turn_count": new_turn_count,
                     "error": None,
                 }
-                if pending_phase_injections:
-                    result_update["phase_instruction_injections"] = sorted(
-                        completed_phase_injections | pending_phase_injections
-                    )
+                result_update.update(phase_ledger_update)
                 if extraction_triggered:
                     result_update["last_observed_turn"] = new_turn_count
                 if assembly_triggered:
@@ -2205,15 +2252,17 @@ def create_execute_node(
                         _delivered_guidance_ids | _absorbed_guidance_ids
                     )
 
-                # Return compacted messages + response if compaction occurred,
-                # otherwise just append the response (add_messages reducer handles this)
+                # Return compacted messages + response if compaction occurred
+                # (the phase block is inside `messages`: kept in the window or
+                # re-seated after the summary), otherwise append the block(s)
+                # delivered this turn + the response (add_messages reducer).
                 if context_was_compacted:
                     # Include RemoveMessage markers so state reducer removes old messages
                     result_messages = remove_markers + messages + [response]
                     if injected_reminder:
                         result_messages.append(injected_reminder)
                     return {"messages": result_messages, **result_update}
-                result_messages = [response]
+                result_messages = delivered_phase_blocks + [response]
                 if injected_reminder:
                     result_messages.append(injected_reminder)
                 return {"messages": result_messages, **result_update}
@@ -2266,9 +2315,10 @@ def create_execute_node(
 
                     # The provider rejected the previous request before it
                     # could consume any tail guidance. Rebuild the same
-                    # transient block after emergency compaction; otherwise a
-                    # phase-start key could be checkpointed even though the
-                    # successful retry never saw its instruction body.
+                    # transient block after emergency compaction. The phase
+                    # instruction block needs no rebuild: it is inside
+                    # `messages` and rode through the compaction (kept or
+                    # re-seated after the summary).
                     _inject_transient_messages(prepared_messages)
 
                     # Merge remove markers
@@ -2386,12 +2436,16 @@ def create_execute_node(
                                 remove_markers + messages + [ai_summary, human_feedback]
                             )
                         else:
-                            result_messages = [ai_summary, human_feedback]
+                            result_messages = delivered_phase_blocks + [
+                                ai_summary,
+                                human_feedback,
+                            ]
 
                         return {
                             "messages": result_messages,
                             "iteration": iteration + 1,
                             "error": None,
+                            **phase_ledger_update,
                         }
 
                     # Streak > 3: fall through to standard retry exhaustion
@@ -3224,6 +3278,16 @@ def create_archive_phase_node(
             # (arXiv 2607.08032); no major harness compacts on a structural
             # boundary. See knowledge-base/knowledge/issues/phase_model_overhead_amnesia_loop.md.
             force_summarize = False
+
+            # The phase is over: clear the protected-block phase key so a
+            # boundary compaction summarises the ending phase's instruction
+            # block away with its region instead of re-seating it after the
+            # summary (generic pins — no phase key — still survive). The
+            # execute node is the only place that sets a non-None key; the
+            # next phase's first turn sets its own.
+            context_mgr.set_current_phase(
+                "strategic" if is_strategic else "tactical", phase_key=None
+            )
 
             compacted_messages = await context_mgr.ensure_within_limits(
                 messages,

@@ -6,10 +6,22 @@ and is_workspace_injection_message.
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
+from src.core.message_markers import (
+    INSTRUCTION_PATH_KEY,
+    PERSIST_ROLE_KEY,
+    PHASE_KEY,
+    PROTECTED_KEY,
+    is_protected_message,
+    protected_identity,
+    protected_path,
+    protected_phase_key,
+)
 from src.core.workspace_injection import (
     INSTRUCTION_TOOL_CALL_ID_PREFIX,
+    PHASE_INSTRUCTION_CONTENT_PREFIX,
     TODOS_INJECTION_CONTENT_PREFIX,
     content_hash_id,
+    create_phase_instruction_message,
     create_todos_human_message,
     create_instruction_tool_messages,
     find_tail_injection_anchor,
@@ -208,3 +220,64 @@ class TestFindTailInjectionAnchor:
     def test_no_human_or_tool_returns_len(self):
         assert find_tail_injection_anchor([]) == 0
         assert find_tail_injection_anchor([SystemMessage(content="s")]) == 1
+
+
+# =============================================================================
+# create_phase_instruction_message — persistent, protected phase block
+# =============================================================================
+
+
+class TestCreatePhaseInstructionMessage:
+    """The phase_start delivery shape (U2 WP1): a HumanMessage carrying the
+    protected markers, persisted in state — not a transient injection."""
+
+    PATH = "skills/research-guide/SKILL.md"
+
+    def _block(self, content="You are entering a tactical phase."):
+        return create_phase_instruction_message(
+            self.PATH, content, "tactical", "2:tactical"
+        )
+
+    def test_is_human_message_with_role_event(self):
+        msg = self._block()
+        assert isinstance(msg, HumanMessage)
+        assert msg.additional_kwargs[PERSIST_ROLE_KEY] == "event"
+
+    def test_marker_contract(self):
+        msg = self._block()
+        assert msg.additional_kwargs == {
+            PERSIST_ROLE_KEY: "event",
+            PROTECTED_KEY: True,
+            PHASE_KEY: "2:tactical",
+            INSTRUCTION_PATH_KEY: self.PATH,
+        }
+        assert is_protected_message(msg) is True
+        assert protected_phase_key(msg) == "2:tactical"
+        assert protected_path(msg) == self.PATH
+        assert protected_identity(msg) == ("2:tactical", self.PATH)
+
+    def test_content_names_phase_path_and_body(self):
+        msg = self._block("BODY TEXT")
+        assert msg.content.startswith(f"{PHASE_INSTRUCTION_CONTENT_PREFIX}tactical]")
+        assert self.PATH in msg.content
+        assert msg.content.endswith("BODY TEXT")
+        assert "whole phase" in msg.content
+
+    def test_deterministic(self):
+        a, b = self._block(), self._block()
+        assert a.content == b.content
+        assert a.additional_kwargs == b.additional_kwargs
+        # No id: the add_messages reducer assigns one on append, and a
+        # RemoveMessage for an id that never reached state would raise.
+        assert a.id is None
+
+    def test_not_a_transient_injection(self):
+        # It is history, not tail: summarisation must not drop it as transient
+        # (that path filters without RemoveMessage markers and would orphan it).
+        assert is_workspace_injection_message(self._block()) is False
+
+    def test_plain_messages_are_not_protected(self):
+        assert is_protected_message(HumanMessage(content="hi")) is False
+        assert is_protected_message(AIMessage(content="x")) is False
+        assert protected_phase_key(HumanMessage(content="hi")) is None
+        assert protected_path(HumanMessage(content="hi")) is None

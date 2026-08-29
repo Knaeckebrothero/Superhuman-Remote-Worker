@@ -41,6 +41,11 @@ from src.core.image_tokens import (
     split_text_and_image_blocks,
     split_text_and_images,
 )
+from src.core.message_markers import (
+    is_pinned_for_phase,
+    is_protected_message,
+    protected_identity,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +69,70 @@ def extract_summary_text(messages: List[BaseMessage]) -> Optional[str]:
         ):
             return content.split(prefix, 1)[1].strip()
     return None
+
+
+def fresh_protected_copy(message: BaseMessage) -> BaseMessage:
+    """Copy of a protected message without an id, markers intact.
+
+    A copy without an id is *appended* by LangGraph's ``add_messages``
+    reducer (the original is evicted by its ``RemoveMessage`` marker), which
+    is how a re-seated block moves from the summarised region to its new
+    position right after the summary.
+    """
+    if isinstance(message, HumanMessage):
+        return HumanMessage(
+            content=message.content,
+            additional_kwargs=dict(message.additional_kwargs or {}),
+        )
+    return message.model_copy(update={"id": None})
+
+
+def select_pinned_for_reseat(
+    summarized: List[BaseMessage],
+    kept: List[BaseMessage],
+    current_phase_key: Optional[str],
+) -> List[BaseMessage]:
+    """Fresh copies of the protected messages in ``summarized`` that must survive.
+
+    A protected message survives a summary when it is a generic pin (no
+    phase key) or bound to ``current_phase_key``; earlier phases' blocks are
+    summarised away with their region. Copies are de-duplicated by
+    ``protected_identity`` against ``kept`` (the window that follows the
+    summary) and against each other, in original order.
+    """
+    present = {protected_identity(m) for m in kept if is_protected_message(m)}
+    pinned: List[BaseMessage] = []
+    for msg in summarized:
+        if not is_pinned_for_phase(msg, current_phase_key):
+            continue
+        identity = protected_identity(msg)
+        if identity in present:
+            continue
+        present.add(identity)
+        pinned.append(fresh_protected_copy(msg))
+    return pinned
+
+
+def place_pinned_after_summary(
+    summary_msg: BaseMessage,
+    summarized: List[BaseMessage],
+    kept: List[BaseMessage],
+    current_phase_key: Optional[str],
+) -> List[BaseMessage]:
+    """``[summary, *re-seated protected blocks, *kept]`` — the compacted tail.
+
+    The current phase's instruction block goes immediately after the
+    ``[Summary of prior work]`` message and before the kept window, so the
+    model reads "what happened" and then "how this phase works" ahead of
+    the live turns. See :func:`select_pinned_for_reseat` for the rule.
+    """
+    pinned = select_pinned_for_reseat(summarized, kept, current_phase_key)
+    if pinned:
+        logger.info(
+            f"Re-seated {len(pinned)} protected message(s) after the summary "
+            f"(phase key {current_phase_key!r})"
+        )
+    return [summary_msg, *pinned, *kept]
 
 
 class IdentityAnchor(BaseModel):
@@ -1028,6 +1097,10 @@ class ContextManager:
         # Stats of the most recent successful summarization, read by the
         # transport into the context.compacted completion event.
         self._last_summarization_stats: Optional[Dict[str, Any]] = None
+        # "<n>:<phase>" of the running phase (set_current_phase): the key a
+        # protected phase block must carry to be re-seated after a summary.
+        # None (sessions, resume nodes) re-seats generic pins only.
+        self._current_phase_key: Optional[str] = None
         # Set by summarize_and_compact to the id of the last message the newest
         # summary covers (the summarized/kept boundary). The persistent-session
         # transport reads it to record a message-granular `boundary_seq` on the
@@ -1074,15 +1147,25 @@ class ContextManager:
         if self.token_counter not in self._phase_counters.values():
             self.token_counter = self._default_counter
 
-    def set_current_phase(self, phase: str) -> None:
-        """Switch token counter to the appropriate phase-specific model.
+    def set_current_phase(self, phase: str, phase_key: Optional[str] = None) -> None:
+        """Record the running phase: token counter + the protected-block key.
 
         Falls back to the default counter if no phase-specific one exists.
 
         Args:
             phase: Phase name ("strategic" or "tactical")
+            phase_key: ``"<phase_number>:<phase>"`` of the concrete phase
+                instance. Protected messages bound to this key are re-seated
+                after a summary; other phases' blocks are summarised away.
+                ``None`` clears the key (sessions never set one).
         """
         self.token_counter = self._phase_counters.get(phase, self._default_counter)
+        self._current_phase_key = phase_key
+
+    @property
+    def current_phase_key(self) -> Optional[str]:
+        """The phase key protected blocks must carry to survive a summary."""
+        return self._current_phase_key
 
     def set_progress_callback(
         self, callback: Optional[Callable[[str, Dict[str, Any]], Any]]
@@ -1236,8 +1319,13 @@ class ContextManager:
         """
         keep_recent = keep_recent or self.config.keep_recent_tool_results
 
-        # Count tool messages from the end
-        tool_indices = [i for i, m in enumerate(messages) if isinstance(m, ToolMessage)]
+        # Count tool messages from the end (protected messages are neither
+        # cleared nor counted against the window)
+        tool_indices = [
+            i
+            for i, m in enumerate(messages)
+            if isinstance(m, ToolMessage) and not is_protected_message(m)
+        ]
 
         if not tool_indices:
             return messages
@@ -1297,8 +1385,13 @@ class ContextManager:
         max_length = max_length or self.config.max_tool_result_length
         keep_recent = keep_recent or self.config.keep_recent_tool_results
 
-        # Count tool messages from the end
-        tool_indices = [i for i, m in enumerate(messages) if isinstance(m, ToolMessage)]
+        # Count tool messages from the end (protected messages are neither
+        # truncated nor counted against the window)
+        tool_indices = [
+            i
+            for i, m in enumerate(messages)
+            if isinstance(m, ToolMessage) and not is_protected_message(m)
+        ]
 
         if not tool_indices:
             return messages
@@ -1308,7 +1401,11 @@ class ContextManager:
 
         result = []
         for i, msg in enumerate(messages):
-            if isinstance(msg, ToolMessage) and i not in recent_indices:
+            if (
+                isinstance(msg, ToolMessage)
+                and i not in recent_indices
+                and not is_protected_message(msg)
+            ):
                 if len(msg.content) > max_length and not self._is_evidence_tool_message(
                     msg
                 ):
@@ -1385,6 +1482,7 @@ class ContextManager:
         Preserves (never trimmed - implements Layers 1-3 protection):
         - All system messages (Layer 1: system prompt, Layer 2: todo list)
         - The first human message (original task)
+        - Protected messages (phase instruction blocks), wherever they sit
         - Recent conversation messages
 
         Note: Layer 2 (todo list with visual separators) is injected fresh
@@ -1413,16 +1511,20 @@ class ContextManager:
             (i for i, m in enumerate(conversation) if isinstance(m, HumanMessage)), None
         )
 
-        trimmed_conversation = []
-        if (
-            first_human_idx is not None
-            and first_human_idx < len(conversation) - keep_recent
-        ):
-            trimmed_conversation = [conversation[first_human_idx]]
-
-        # Add recent messages, ensuring we don't orphan ToolMessages
+        # Recent messages start at a boundary that doesn't orphan ToolMessages
         target_start = len(conversation) - keep_recent
         safe_start = find_safe_slice_start(conversation, target_start)
+
+        trimmed_conversation = []
+        if first_human_idx is not None and first_human_idx < safe_start:
+            trimmed_conversation = [conversation[first_human_idx]]
+        # Protected messages outside the window are kept in their original
+        # relative order, after the original task and before the window.
+        trimmed_conversation.extend(
+            m
+            for i, m in enumerate(conversation[:safe_start])
+            if i != first_human_idx and is_protected_message(m)
+        )
         trimmed_conversation.extend(conversation[safe_start:])
 
         trimmed_count = len(conversation) - len(trimmed_conversation)
@@ -1578,6 +1680,8 @@ class ContextManager:
         result = list(messages)
         shed = 0
         for i, msg in enumerate(result):
+            if is_protected_message(msg):
+                continue
             if isinstance(msg, HumanMessage) and has_image_content(msg.content):
                 tokens = self.token_counter([msg])
                 _text, n_images = split_text_and_images(msg.content)
@@ -1632,6 +1736,8 @@ class ContextManager:
 
         sized = []
         for i, msg in enumerate(result):
+            if is_protected_message(msg):
+                continue  # phase instruction blocks are never shed
             if isinstance(msg, ToolMessage) and isinstance(msg.content, str):
                 if msg.content.startswith("[tool result elided"):
                     continue  # already elided
@@ -1697,7 +1803,11 @@ class ContextManager:
             # Build list of (index, content_length) for ToolMessages, sorted largest first
             tool_sizes = []
             for i, msg in enumerate(messages):
-                if isinstance(msg, ToolMessage) and len(msg.content) > limit:
+                if (
+                    isinstance(msg, ToolMessage)
+                    and len(msg.content) > limit
+                    and not is_protected_message(msg)
+                ):
                     tool_sizes.append((i, len(msg.content)))
             tool_sizes.sort(key=lambda x: x[1], reverse=True)
 
@@ -1794,6 +1904,11 @@ class ContextManager:
         for i, msg in enumerate(messages):
             # Skip workspace injection messages - they're re-injected fresh after summarization
             if is_workspace_injection_message(msg):
+                continue
+            # Skip protected messages (phase instruction blocks): they are
+            # re-seated verbatim after the summary, and their text would
+            # otherwise dominate the summary of the work.
+            if is_protected_message(msg):
                 continue
 
             # Insert recency marker before the first message in the recent window
@@ -2085,6 +2200,7 @@ class ContextManager:
                 msg_tokens > oversized_threshold
                 and isinstance(msg, AIMessage)
                 and not getattr(msg, "tool_calls", None)
+                and not is_protected_message(msg)
             )
             if replaceable:
                 oversized_count += 1
@@ -2139,7 +2255,7 @@ class ContextManager:
             )
             capped_messages: List[BaseMessage] = []
             for msg in tool_messages:
-                if not isinstance(msg, ToolMessage):
+                if not isinstance(msg, ToolMessage) or is_protected_message(msg):
                     capped_messages.append(msg)
                     continue
 
@@ -2344,16 +2460,34 @@ class ContextManager:
                     )
                 )
             elif isinstance(msg, HumanMessage):
-                fresh_recent.append(HumanMessage(content=msg.content))
+                # additional_kwargs ride along: a protected phase block in
+                # the keep window must keep its markers (and a session event
+                # notice its persist role) through the fresh copy.
+                fresh_recent.append(
+                    HumanMessage(
+                        content=msg.content,
+                        additional_kwargs=dict(msg.additional_kwargs or {}),
+                    )
+                )
             else:
                 # For any other message type, try to preserve it
                 fresh_recent.append(msg)
+
+        # Summary, then the current phase's protected blocks that fell into
+        # the summarised region (fresh copies, deduped against the window),
+        # then the kept window. Other phases' blocks go with their region.
+        compacted_tail = place_pinned_after_summary(
+            summary_msg,
+            messages_to_summarize,
+            fresh_recent,
+            self._current_phase_key,
+        )
 
         merged_summaries_info = (
             f", merged {len(old_summaries)} prior summaries" if old_summaries else ""
         )
         logger.info(
-            f"Compacted {len(messages)} messages to {len(system_msgs) + 1 + len(fresh_recent)} "
+            f"Compacted {len(messages)} messages to {len(system_msgs) + len(compacted_tail)} "
             f"(summarized {len(messages_to_summarize)} messages{merged_summaries_info}, "
             f"removing {len(removal_markers)}, {messages_without_ids} without IDs)"
         )
@@ -2378,12 +2512,13 @@ class ContextManager:
         # persistent transport's _record_compaction).
         if self._last_summarization_stats is not None:
             self._last_summarization_stats["after_tokens"] = self.get_token_count(
-                system_msgs + [summary_msg] + fresh_recent
+                system_msgs + compacted_tail
             )
 
-        # Return: removal markers + system messages + summary + fresh recent
-        # Order matters: summary comes BEFORE recent messages
-        return removal_markers + system_msgs + [summary_msg] + fresh_recent
+        # Return: removal markers + system messages + summary + re-seated
+        # protected blocks + fresh recent. Order matters: the summary comes
+        # BEFORE the phase block, which comes BEFORE the recent messages.
+        return removal_markers + system_msgs + compacted_tail
 
     def create_pre_model_hook(self) -> Callable[[Dict[str, Any]], Dict[str, Any]]:
         """Create a pre-model hook for LangGraph integration.

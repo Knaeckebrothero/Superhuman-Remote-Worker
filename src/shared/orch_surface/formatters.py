@@ -412,6 +412,11 @@ def _context_label(msg: dict[str, Any]) -> str | None:
         content = msg.get("content_preview") or msg.get("content") or ""
         if isinstance(content, str) and content.startswith("<active_tasks>"):
             return "todos"
+        # Persistent phase instruction block (src/core/message_markers.py):
+        # newer archivers store it as type="context" kind="phase_instruction";
+        # this prefix catches a row stored verbatim by an older writer.
+        if isinstance(content, str) and content.startswith("[phase: "):
+            return "phase_instruction"
     if msg.get("type") == "tool":
         tcid = msg.get("tool_call_id") or ""
         for prefix, k in _INJECT_KIND_BY_PREFIX:

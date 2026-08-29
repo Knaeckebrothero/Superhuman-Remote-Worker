@@ -20,6 +20,8 @@ from src.core.context import (
     sanitize_message_history,
     scrub_history_tool_call_arguments,
 )
+from src.core.message_markers import PROTECTED_KEY, is_protected_message
+from src.core.workspace_injection import create_phase_instruction_message
 
 
 # =============================================================================
@@ -928,3 +930,135 @@ class TestRepairToolCallArguments:
         ]
         out = scrub_history_tool_call_arguments(history)
         assert out[0].content == "q" and out[1].content == "r"
+
+
+# =============================================================================
+# Protected messages (phase instruction blocks) — U2 WP1
+# =============================================================================
+
+
+class TestProtectedMessages:
+    """Protected messages survive every compaction strategy short of
+    summarisation, which re-seats them (see
+    tests/test_context_safety.py::TestPinnedAfterSummary)."""
+
+    @staticmethod
+    def _block(phase_key="2:tactical"):
+        return create_phase_instruction_message(
+            "skills/tactical-phase/SKILL.md", "PHASE BODY", "tactical", phase_key
+        )
+
+    def test_set_current_phase_records_phase_key(self, mgr):
+        assert mgr.current_phase_key is None
+        mgr.set_current_phase("tactical", phase_key="2:tactical")
+        assert mgr.current_phase_key == "2:tactical"
+        # Sessions call it without a key: the key is cleared, never stale.
+        mgr.set_current_phase("strategic")
+        assert mgr.current_phase_key is None
+
+    def test_trim_keeps_protected_outside_window(self, mgr):
+        block = self._block()
+        messages = [HumanMessage(content="original task"), block]
+        for i in range(6):
+            messages.append(HumanMessage(content=f"msg {i}"))
+            messages.append(AIMessage(content=f"resp {i}"))
+        result = mgr.trim_messages(messages, keep_recent=3)
+        # Original task, then the protected block, then the window.
+        assert result[0].content == "original task"
+        assert result[1] is block
+        assert result[2:] == messages[-3:]
+        assert sum(is_protected_message(m) for m in result) == 1
+
+    def test_trim_keeps_protected_inside_window_once(self, mgr):
+        block = self._block()
+        messages = [HumanMessage(content=f"m{i}") for i in range(6)]
+        messages += [block, HumanMessage(content="last")]
+        result = mgr.trim_messages(messages, keep_recent=3)
+        assert sum(is_protected_message(m) for m in result) == 1
+        assert result[-2] is block
+
+    def test_clear_old_tool_results_ignores_protected(self, mgr):
+        block = self._block()
+        protected_tool = ToolMessage(
+            content="protected result",
+            tool_call_id="tc_p",
+            additional_kwargs={PROTECTED_KEY: True},
+        )
+        messages = [
+            AIMessage(
+                content="",
+                tool_calls=[{"name": "r", "id": f"tc{i}", "args": {}} for i in range(3)]
+                + [{"name": "r", "id": "tc_p", "args": {}}],
+            ),
+            protected_tool,
+            block,
+            ToolMessage(content="old", tool_call_id="tc0"),
+            ToolMessage(content="mid", tool_call_id="tc1"),
+            ToolMessage(content="recent", tool_call_id="tc2"),
+        ]
+        result = mgr.clear_old_tool_results(messages, keep_recent=1)
+        # Neither cleared nor counted against the keep window.
+        assert result[1] is protected_tool
+        assert result[2] is block
+        tool_contents = [m.content for m in result if isinstance(m, ToolMessage)]
+        assert tool_contents == ["protected result", "[cleared]", "[cleared]", "recent"]
+
+    def test_truncate_long_tool_results_ignores_protected(self, mgr):
+        long_text = "x" * 500
+        protected_tool = ToolMessage(
+            content=long_text,
+            tool_call_id="tc_p",
+            additional_kwargs={PROTECTED_KEY: True},
+        )
+        messages = [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"name": "r", "id": "tc_p", "args": {}},
+                    {"name": "r", "id": "tc0", "args": {}},
+                    {"name": "r", "id": "tc1", "args": {}},
+                ],
+            ),
+            protected_tool,
+            ToolMessage(content=long_text, tool_call_id="tc0"),
+            ToolMessage(content="short", tool_call_id="tc1"),
+        ]
+        result = mgr.truncate_long_tool_results(messages, max_length=100, keep_recent=1)
+        assert result[1].content == long_text
+        assert "[TRUNCATED" in result[2].content
+
+    def test_elide_skips_protected(self, mgr):
+        block = self._block()
+        ai = AIMessage(
+            content="",
+            id="a1",
+            tool_calls=[
+                {"id": "t1", "name": "read", "args": {}},
+                {"id": "tp", "name": "read", "args": {}},
+            ],
+        )
+        big = ToolMessage(content="regulation " * 2000, tool_call_id="t1", id="t1")
+        protected_big = ToolMessage(
+            content="protected " * 3000,
+            tool_call_id="tp",
+            id="tp",
+            additional_kwargs={PROTECTED_KEY: True},
+        )
+        messages = [HumanMessage(content="go", id="h1"), block, ai, protected_big, big]
+        result = mgr._elide_largest_tool_results(messages, 500)
+        tools = {m.tool_call_id: m for m in result if isinstance(m, ToolMessage)}
+        # The larger protected result is never shed; the unprotected one is.
+        assert tools["tp"].content.startswith("protected ")
+        assert tools["t1"].content.startswith("[tool result elided")
+        assert result[1] is block
+
+    def test_emergency_truncate_skips_protected(self, mgr):
+        protected_big = ToolMessage(
+            content="p" * 5000,
+            tool_call_id="tp",
+            additional_kwargs={PROTECTED_KEY: True},
+        )
+        big = ToolMessage(content="q" * 5000, tool_call_id="t1")
+        result = mgr._emergency_truncate_tool_results([protected_big, big])
+        assert result[0].content == "p" * 5000
+        assert "[EMERGENCY TRUNCATED" in result[1].content

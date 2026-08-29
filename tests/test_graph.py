@@ -894,6 +894,137 @@ class TestArchivePhaseNode:
             "Expected force=False for tactical→strategic transition"
         )
 
+    @pytest.mark.asyncio
+    async def test_boundary_compaction_drops_ending_phase_block_keeps_generic_pin(
+        self, managers, mock_config
+    ):
+        """U2 WP1: the archive node clears the protected-block phase key before
+        its boundary compaction, so the ending phase's instruction block is
+        summarised away with its region (not re-seated after the summary),
+        while a generic pin (no phase key) survives. The execute node stays
+        the only place that sets a non-None key."""
+        from langchain_core.messages import (
+            AIMessage,
+            HumanMessage,
+            RemoveMessage,
+            SystemMessage,
+        )
+
+        from src.core.context import (
+            ContextConfig,
+            ContextManager,
+            ConversationSummary,
+        )
+        from src.core.message_markers import (
+            PROTECTED_KEY,
+            is_protected_message,
+            protected_phase_key,
+        )
+        from src.core.workspace_injection import create_phase_instruction_message
+        from src.services.auxiliary import AuxiliaryLLM
+
+        managers["todo"].add("Task 1")
+        managers["todo"].complete("todo_1")
+        managers["plan"].write("## Phase 2: Test\n\n- [x] Task 1")
+
+        # A real context manager, thresholds low enough that the boundary
+        # compaction summarises, left as the execute node leaves it (key set).
+        context_mgr = ContextManager(
+            config=ContextConfig(
+                compaction_threshold_tokens=200,
+                summarization_threshold_tokens=200,
+                message_count_threshold=1000,
+                message_count_min_tokens=100,
+                keep_recent_messages=2,
+                keep_recent_tool_results=2,
+                model_max_context_tokens=4000,
+            )
+        )
+        context_mgr.set_current_phase("tactical", phase_key="2:tactical")
+
+        parsed = ConversationSummary(
+            summary="Phase 2 work.",
+            tasks_completed="- Task 1",
+            key_decisions="",
+            current_state="phase ended",
+            blockers="",
+        )
+        structured = AsyncMock()
+        structured.ainvoke = AsyncMock(
+            return_value={
+                "raw": AIMessage(content="s"),
+                "parsed": parsed,
+                "parsing_error": None,
+            }
+        )
+        aux_llm = MagicMock()
+        aux_llm.with_structured_output = MagicMock(return_value=structured)
+        auxiliary = AuxiliaryLLM(llm=aux_llm, max_context_tokens=15_000)
+
+        block = create_phase_instruction_message(
+            "skills/research-guide/SKILL.md",
+            "TACTICAL GUIDANCE " * 30,
+            "tactical",
+            "2:tactical",
+        )
+        block.id = "blk"
+        pin = HumanMessage(
+            content="GENERIC PIN", id="pin", additional_kwargs={PROTECTED_KEY: True}
+        )
+        history = [HumanMessage(content="start", id="h0"), block, pin]
+        for i in range(6):
+            history.append(
+                HumanMessage(content=f"question {i} " + "x" * 200, id=f"h{i + 1}")
+            )
+            history.append(
+                AIMessage(content=f"answer {i} " + "y" * 200, id=f"a{i + 1}")
+            )
+
+        mock_config.context_management = MagicMock()
+        mock_config.context_management.compact_on_archive = True
+        mock_config.context_management.reasoning_level = None
+        mock_config.context_management.max_summary_length = 10000
+        mock_config.llm = MagicMock()
+        mock_config.llm.reasoning_level = "high"
+
+        node = create_archive_phase_node(
+            managers["todo"],
+            managers["plan"],
+            mock_config,
+            context_mgr,
+            auxiliary,
+            "Summarize this conversation.",
+        )
+        state = {
+            "job_id": "test-123",
+            "messages": history,
+            "is_strategic_phase": False,
+            "phase_number": 2,
+        }
+        result = await node(state)
+
+        assert context_mgr.current_phase_key is None
+        kept = [m for m in result["messages"] if not isinstance(m, RemoveMessage)]
+        removed = {m.id for m in result["messages"] if isinstance(m, RemoveMessage)}
+        assert "blk" in removed
+        assert "pin" in removed
+        # The ending phase's block is gone from the compacted history...
+        assert not any(
+            is_protected_message(m) and protected_phase_key(m) == "2:tactical"
+            for m in kept
+        )
+        assert not any("TACTICAL GUIDANCE" in str(m.content) for m in kept)
+        # ...while the generic pin is re-seated right after the summary.
+        summary_idx = next(
+            i
+            for i, m in enumerate(kept)
+            if isinstance(m, SystemMessage) and "[Summary of prior work]" in m.content
+        )
+        assert kept[summary_idx + 1].content == "GENERIC PIN"
+        assert is_protected_message(kept[summary_idx + 1])
+        assert kept[summary_idx + 1].id is None
+        assert "Phase complete" in kept[-1].content
+
 
 class TestCheckGoalNode:
     """Tests for check_goal node."""

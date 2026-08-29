@@ -161,6 +161,7 @@ class MemoryExtractionEngine:
         hard-split handles a giant tool result instead; truncating here would
         drop exactly the durable detail this feature exists to capture.
         """
+        from src.core.message_markers import is_protected_message
         from src.core.workspace_injection import is_workspace_injection_message
         from src.services.auxiliary import _get_message_role
 
@@ -168,6 +169,8 @@ class MemoryExtractionEngine:
         for msg in messages:
             if is_workspace_injection_message(msg):
                 continue
+            if is_protected_message(msg):
+                continue  # phase instruction block — guidance, not a fact
             content = getattr(msg, "content", "")
             if not isinstance(content, str):
                 content = str(content)
