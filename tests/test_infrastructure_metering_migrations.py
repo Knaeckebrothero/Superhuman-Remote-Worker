@@ -307,7 +307,12 @@ APP_THREADS_SSH_HANDLE_IDX = (
 APP_SSH_ATTACHMENTS = (
     ROOT / "orchestrator/database/migrations/app/0204_ssh_attachments.sql"
 )
-APP_CURRENT_MIGRATION_HEAD = APP_SSH_ATTACHMENTS
+# U1 config unification: the experts.tags role backfill (data only) — the head
+# after the 0201-0204 SSH lane; bump when the next lands.
+APP_EXPERTS_ROLE_TAGS_BACKFILL = (
+    ROOT / "orchestrator/database/migrations/app/0205_experts_role_tags_backfill.sql"
+)
+APP_CURRENT_MIGRATION_HEAD = APP_EXPERTS_ROLE_TAGS_BACKFILL
 AUDIT_EXPANSION = (
     ROOT
     / "orchestrator/database/migrations/audit/0003_infrastructure_usage_events_v2.sql"
