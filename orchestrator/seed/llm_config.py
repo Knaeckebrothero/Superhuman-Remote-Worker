@@ -130,6 +130,11 @@ TAVILY_ENDPOINT_LABEL = "Tavily"
 TAVILY_MODEL_ID = "tavily"
 _TAVILY_BASE_URL = "https://api.tavily.com"
 
+# Bundled, keyless search service. The Helm seed Job supplies the Service URL;
+# the orchestrator/agent runtime never guesses whether the component exists.
+SEARXNG_ENDPOINT_LABEL = "SearXNG"
+SEARXNG_MODEL_ID = "searxng"
+
 # Fallback used when CODEX_PROXY_URL is unset. Mirrors the runtime fallback
 # in ``orchestrator.main._get_codex_subscription_models`` so login flows that
 # work without the env var also wire up a transport row.
@@ -685,6 +690,68 @@ async def ensure_tavily_search_endpoint(db: PostgresDB) -> bool:
         return False
 
 
+async def ensure_searxng_search_endpoint(
+    db: PostgresDB, *, base_url: str | None = None
+) -> bool:
+    """Register the bundled SearXNG service and fill an empty search slot.
+
+    This runs after :func:`ensure_tavily_search_endpoint`. A fresh install gets
+    SearXNG as its primary search provider; an install whose primary is already
+    Tavily (or an admin-selected provider) gets SearXNG as the fallback. The
+    default writes happen only alongside the first catalog-row insert, so an
+    admin can subsequently clear or replace either slot without a later boot
+    undoing that choice.
+
+    An existing well-known endpoint without its model is an admin-deletion
+    tombstone and is not repaired. Returns True only when a new catalog row was
+    inserted. Failures are best-effort and never abort startup.
+    """
+
+    url = (base_url or os.environ.get("SEARXNG_BASE_URL") or "").strip().rstrip("/")
+    if not url:
+        return False
+    try:
+        for endpoint in await db.list_system_llm_endpoints():
+            if endpoint.get("label") == SEARXNG_ENDPOINT_LABEL:
+                return False
+
+        endpoint = await db.create_system_llm_endpoint(
+            label=SEARXNG_ENDPOINT_LABEL,
+            base_url=url,
+            api_key=None,
+            key_prefix=None,
+        )
+        inserted = await db.create_model(
+            provider_kind="endpoint",
+            provider_ref=str(endpoint["id"]),
+            model_id=SEARXNG_MODEL_ID,
+            display_label="SearXNG (self-hosted)",
+            capabilities=["search"],
+            family="searxng",
+            params_json={"provider": "searxng", "ops": ["search"]},
+            enabled=True,
+            seeded_from="helm:searxng",
+            on_conflict_do_nothing=True,
+        )
+        if inserted is None:
+            return False
+
+        primary = await db.get_default_llm_model("search")
+        if not primary:
+            await db.set_default_llm_model("search", SEARXNG_MODEL_ID)
+        elif primary != SEARXNG_MODEL_ID and not await db.get_default_llm_model(
+            "search_fallback"
+        ):
+            await db.set_default_llm_model("search_fallback", SEARXNG_MODEL_ID)
+        logger.info(
+            "ensure_searxng_search_endpoint: registered bundled SearXNG provider"
+        )
+        return True
+    except Exception:
+        logger.exception("ensure_searxng_search_endpoint: wiring failed")
+        return False
+
+
 async def run(payload_path: Path) -> SeedReport:
     """Open a DB connection, apply the seed, and report."""
     payload = load_payload(payload_path)
@@ -697,13 +764,24 @@ async def run(payload_path: Path) -> SeedReport:
     await db.connect()
     try:
         report = await seed(db, payload)
-        # Legacy Tavily upgrades ride the same boot Job as catalog seeding. The
-        # orchestrator Deployment intentionally does not mount this secret.
-        await ensure_tavily_search_endpoint(db)
     finally:
         await db.close()
     report.log()
     return report
+
+
+async def run_research_provider_seed() -> None:
+    """Run deployment-provided research seeders in their required order."""
+
+    db = PostgresDB()
+    await db.connect()
+    try:
+        # The legacy key must claim an empty primary before bundled SearXNG is
+        # allowed to fill either slot.
+        await ensure_tavily_search_endpoint(db)
+        await ensure_searxng_search_endpoint(db)
+    finally:
+        await db.close()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -719,6 +797,11 @@ def main(argv: list[str] | None = None) -> int:
         default="INFO",
         help="Python log level name (default: INFO).",
     )
+    parser.add_argument(
+        "--research-providers-only",
+        action="store_true",
+        help="Run only the Tavily/SearXNG boot seeders (no payload required).",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -727,7 +810,10 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     try:
-        asyncio.run(run(args.payload))
+        if args.research_providers_only:
+            asyncio.run(run_research_provider_seed())
+        else:
+            asyncio.run(run(args.payload))
     except Exception:
         logger.exception("seed run failed")
         return 1

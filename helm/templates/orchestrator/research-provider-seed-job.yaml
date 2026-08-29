@@ -1,0 +1,105 @@
+{{- /*
+Boot-only promotion for deployment-provided research providers. This is
+separate from llm.seed.enabled: a fresh chart must register bundled SearXNG,
+and a legacy TAVILY_API_KEY must be promoted even when the operator intentionally
+disabled custom LLM catalog seeding.
+
+The Job is the only runtime consumer of TAVILY_API_KEY. It runs Tavily before
+SearXNG, then exits; neither the orchestrator Deployment nor agent pods receive
+the deployment-wide key. Like the LLM seed hook, it must not render while the
+orchestrator is quiesced because its health wait would deadlock the release.
+*/ -}}
+{{- if gt (int .Values.orchestrator.replicas) 0 }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "srw.fullname" . }}-research-provider-seed
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "research-provider-seed") | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 600
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "research-provider-seed") | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        - name: wait-for-orchestrator
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              i=0
+              until wget -q -O- http://{{ include "srw.fullname" . }}-orchestrator:8085/api/health >/dev/null; do
+                i=$((i+1))
+                [ "$i" -ge 100 ] && { echo "orchestrator not ready after 300s; failing the research seed hook"; exit 1; }
+                echo "waiting for orchestrator ($i/100)"; sleep 3
+              done
+      containers:
+        - name: seed
+          image: {{ include "srw.imageRef" (dict "image" .Values.image.orchestrator) | quote }}
+          imagePullPolicy: {{ .Values.image.orchestrator.pullPolicy }}
+          command: ["python", "-m", "seed.llm_config"]
+          args: ["--research-providers-only"]
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: POSTGRES_HOST
+            - name: POSTGRES_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: POSTGRES_PORT
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: POSTGRES_DB
+            - name: POSTGRES_SSLMODE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: POSTGRES_SSLMODE
+            - name: APP_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: APP_ENCRYPTION_KEY
+            - name: TAVILY_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: TAVILY_API_KEY
+                  optional: true
+            {{- if .Values.searxng.enabled }}
+            - name: SEARXNG_BASE_URL
+              value: "http://{{ include "srw.serviceName" (dict "context" . "component" "searxng") }}:{{ .Values.searxng.service.port }}"
+            {{- end }}
+          resources:
+            {{- toYaml .Values.llm.seed.resources | nindent 12 }}
+{{- end }}

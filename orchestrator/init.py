@@ -206,6 +206,12 @@ async def init_postgres(force_reset: bool = False) -> bool:
         if await ensure_tavily_search_endpoint(db):
             logger.info("  Registered Tavily search provider from TAVILY_API_KEY")
 
+        # The bundled keyless provider fills only an empty primary/fallback.
+        # Keep this immediately after Tavily: upgrades with a legacy Tavily key
+        # must retain Tavily as primary and place SearXNG in fallback.
+        if await ensure_searxng_search_endpoint(db):
+            logger.info("  Registered bundled SearXNG search provider")
+
         # Auto-wire the ElevenLabs TTS provider when ELEVENLABS_API_KEY is set
         # (idempotent; env is the source of truth for the key)
         if await ensure_elevenlabs_tts_endpoint(db):
@@ -840,6 +846,7 @@ from orchestrator.seed.llm_config import (  # noqa: E402, F401
     CODEX_PROXY_ENDPOINT_LABEL,  # re-exported: tests reference init_mod.CODEX_PROXY_ENDPOINT_LABEL
     ensure_codex_proxy_endpoint,
     ensure_elevenlabs_tts_endpoint,
+    ensure_searxng_search_endpoint,
     ensure_tavily_search_endpoint,
 )
 

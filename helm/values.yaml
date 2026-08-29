@@ -2530,6 +2530,47 @@ workspace:
     pauseImage: "registry.k8s.io/pause:3.10"
 
 # =============================================================================
+# Self-hosted Web Research Providers
+# =============================================================================
+searxng:
+  # -- Keyless metasearch for a working fresh-install search default. This
+  # references the unmodified upstream AGPL image as a separate service.
+  enabled: true
+  image: ghcr.io/searxng/searxng:2026.8.20-8d3dd0cd4
+  service:
+    port: 8080
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "100m"
+    limits:
+      memory: "2Gi"
+      cpu: "1000m"
+
+crawl4ai:
+  # -- Default-off because the browser service needs about 4 GiB at its
+  # supported ceiling. Enabling this deploys the fixed-destination service;
+  # catalog/provider registration remains an explicit admin action.
+  enabled: false
+  image: docker.io/unclecode/crawl4ai:0.9.2
+  service:
+    port: 11235
+  # -- High-entropy bearer/JWT signing token required by the Crawl4AI API. The
+  # Secret defaults to the chart's application Secret; set name to use a
+  # dedicated Secret. The key must exist and contain at least 32 characters
+  # before enabling the component.
+  apiTokenSecret:
+    name: ""
+    key: CRAWL4AI_API_TOKEN
+  resources:
+    requests:
+      memory: "1Gi"
+      cpu: "500m"
+    limits:
+      memory: "4Gi"
+      cpu: "2000m"
+
+# =============================================================================
 # Optional Admin UIs
 # =============================================================================
 pgadmin:

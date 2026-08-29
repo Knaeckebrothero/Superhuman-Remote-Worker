@@ -361,6 +361,26 @@ container in the Pod shares one data PVC. Upgrades therefore include a brief,
 deliberate Nextcloud restart instead of risking a cross-node ReadWriteOnce
 multi-attach deadlock.
 
+### Self-hosted web research
+
+The chart deploys SearXNG by default (`searxng.enabled=true`) and seeds its
+keyless in-cluster Service as the primary search provider on a fresh install.
+If a Tavily key or an admin-selected search default already exists, SearXNG is
+seeded into the empty fallback slot instead. Both catalog and default writes
+are insert-only; later admin changes are not repaired or overwritten at boot.
+
+Crawl4AI is available with `crawl4ai.enabled=true`, but remains off by default
+because its browser service has a 4 GiB memory limit. Before enabling it, add a
+strong `CRAWL4AI_API_TOKEN` to the Secret selected by
+`crawl4ai.apiTokenSecret`. Registering a Crawl4AI catalog endpoint is an
+explicit admin action; its `api_key` carries this bearer credential. The chart
+also uses the same high-entropy value as Crawl4AI's stable JWT signing key.
+
+Both workloads always render an egress NetworkPolicy. They may resolve DNS and
+reach public HTTP(S), but RFC1918, cluster/service, link-local/metadata, and
+loopback ranges are excluded. There is no value that deploys either workload
+without this policy.
+
 **LLM provider keys** (any combination, depending on which providers you use):
 - `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GROQ_API_KEY`, `GOOGLE_API_KEY`, `OPENROUTER_API_KEY`, `TAVILY_API_KEY`, `SEMANTIC_SCHOLAR_API_KEY`, `UNPAYWALL_EMAIL`
 
@@ -371,6 +391,8 @@ multi-attach deadlock.
 - `DISCORD_WEBHOOK_URL`, `SLACK_WEBHOOK_URL` (chat notifications)
 - `TAILSCALE_AUTH_KEY` (when `agent.tailscale.enabled`)
 - `CODEX_MANAGEMENT_KEY` (when `codexProxy.enabled`)
+- `CRAWL4AI_API_TOKEN` (required when `crawl4ai.enabled`; use a long random
+  bearer token)
 - `MCP_INTERNAL_KEY` (when `mcp.enabled` or delegated Dynamic Canvas tools are
   enabled). External-Secret and pre-existing-Secret deployments must provide
   this independently generated shared secret. If it is absent, the

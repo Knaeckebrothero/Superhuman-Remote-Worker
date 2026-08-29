@@ -140,14 +140,6 @@ spec:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: APP_ENCRYPTION_KEY
-            # Legacy Tavily upgrades are converted to endpoint + catalog rows
-            # by this Job. The orchestrator runtime does not consume the key.
-            - name: TAVILY_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "srw.secretName" . }}
-                  key: TAVILY_API_KEY
-                  optional: true
             {{- range $provider, $ref := .Values.llm.seed.systemApiKeys }}
             - name: {{ printf "SEED_%s_API_KEY" ($provider | upper | replace "-" "_") | quote }}
               valueFrom:

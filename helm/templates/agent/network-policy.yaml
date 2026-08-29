@@ -151,6 +151,27 @@ spec:
         - protocol: TCP
           port: 9200
     {{- end }}
+    {{- if .Values.searxng.enabled }}
+    # Fixed-destination search API. SearXNG performs internet fetches in its
+    # separately policy-confined pod; agents never fetch result URLs directly.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "searxng") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.searxng.service.port }}
+    {{- end }}
+    {{- if .Values.crawl4ai.enabled }}
+    # Fixed-destination off-pod fetch API.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "crawl4ai") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.crawl4ai.service.port }}
+    {{- end }}
     # Public internet (TCP 80/443 for external LLM providers, Tavily web
     # research, external Keycloak token-exchange; 22 for completeness). The
     # `except` list subtracts cluster CIDRs, the home LAN, and link-local /
