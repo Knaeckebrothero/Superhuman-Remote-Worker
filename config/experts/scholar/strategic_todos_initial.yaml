@@ -66,15 +66,17 @@ todos:
       - "## Exploration Questions" — the specific questions from todo 2
       - Phase table with: phase name, exploration mode, target questions, expected output
         (idea artifacts, experiment results, or notes), and a fan-out decision —
-        "fan-out (N subagents)" or "sequential: <reason>"
+        "fan-out (N)" or "sequential: <reason>"
 
-      FAN-OUT DECISION (required for every phase): You can spawn throwaway subagents
-      with the delegate_agent tool — several calls in ONE turn run in parallel, each
-      reads with a fresh context and returns a distilled result string, and you author
+      {% if has_tool("delegate_agent") -%}
+      FAN-OUT DECISION (required for every phase): You can delegate reading to `reader`
+      children — several delegate_agent calls in ONE turn run in parallel, each answers
+      one question with a bounded evidence-backed return, and you author
       the synthesis. Any phase covering 2+ independent questions, sources, or topics
       MUST default to "fan-out (N subagents)"; mark a phase "sequential" only with an
       explicit reason (threads depend on each other's results, or a single narrow
       topic). Record the decision in the phase table — later phases follow the plan.
+      {% endif -%}
 
       PHASE SIZING: Cover the investigation in ONE exploration phase (10-20 todos)
       where you can. A second phase must earn its planning cycle — plan one only when
@@ -134,9 +136,11 @@ todos:
       The first phase should typically be a broad exploration sweep — web search
       or codebase archaeology — to establish context before going deeper.
 
-      If your plan marked this phase as "fan-out (N subagents)", create the fan-out
-      todo FIRST (one todo instructing N delegate_agent calls in a single turn, each
-      task self-contained) and synthesis todos AFTER it.
+      {% if has_tool("delegate_agent") -%}
+      If your plan marked this phase as "fan-out (N)", create the fan-out todo FIRST
+      (one todo instructing N delegate_agent calls to `reader` children in a single
+      turn, each brief self-contained) and synthesis todos AFTER it.
+      {% endif -%}
 
       Include at least one todo for recording findings as knowledge notes (kb_write).
 

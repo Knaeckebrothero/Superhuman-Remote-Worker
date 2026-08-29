@@ -18,9 +18,7 @@ Verification rules:
 - For all types: read the original requirements and check each one against the actual output.
 
 {% if has_tool("delegate_agent") -%}
-Parallel evidence gathering via subagents:
-If the remaining criteria form 2+ independent verification streams, do not check them sequentially — call `delegate_agent` once per stream in a SINGLE turn and judge the returned evidence yourself. Each call is cheap and non-blocking: a throwaway subagent with a fresh context gathers the evidence and returns its findings as a string. Make each task self-contained (criteria + review mode + exact paths/commands + return format). The verdict remains yours — never delegate it.
-
+Delegate evidence gathering to `verifier` children — one per independent stream, in one turn. They return per-criterion evidence with file:line and exact output; they never approve or reject. The verdict is yours.
 {% endif -%}
 Tool output interpretation:
 - Shell commands that return exit code 0 can still contain tracebacks, PermissionError, or connection refused in their output. Read the semantic content, not just the success/fail status.

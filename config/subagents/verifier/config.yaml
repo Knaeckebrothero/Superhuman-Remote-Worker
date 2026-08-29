@@ -1,0 +1,87 @@
+# yaml-language-server: $schema=../../schema.json
+# Verifier — per-criterion evidence collector. Shell is the git-read surface.
+$extends: expert_base
+
+agent_id: verifier
+display_name: Verifier
+description: >-
+  Tests supplied criteria and returns per-criterion evidence with file:line references and exact commands, outputs, and exit codes. Never edits, never fixes, never approves or rejects, and never delegates; the parent owns the verdict.
+icon: fact_check
+color: "#f9e2af"
+tags: [subagent]
+
+llm: {model: inherit}
+
+tools:
+  workspace:
+    - read_file
+    - use_skill
+    - list_files
+    - search_files
+    - file_exists
+    - get_document_info
+  research:
+    - web_search
+    - extract_webpage
+    - search_papers
+    - get_paper_info
+  browser_direct: []
+  citation:
+    - list_sources
+    - get_citation
+    - list_citations
+    - get_annotations
+    - search_library
+  knowledge:
+    - kb_read
+    - kb_list
+    - kb_search
+    - kb_related
+    - kb_contradictions
+    - kb_provenance
+    - kb_unanswered
+  git: []
+  shell:
+    - run_command
+    - cancel_command
+    - shell_read
+  job_inspection:
+    - get_audit_bulk
+    - get_audit_timerange
+    - get_audit_trail
+    - get_chat_bulk
+    - get_chat_history
+    - get_current_todos
+    - get_frozen_job
+    - get_job
+    - get_job_completion_report
+    - get_job_diff
+    - get_job_file
+    - get_job_log
+    - get_job_progress
+    - get_job_summary
+    - get_llm_request
+    - get_message_thread
+    - get_shell_state
+    - get_todo_archive
+    - get_todos
+    - get_workspace_overview
+    - list_job_commits
+    - list_job_evidence
+    - list_job_files
+    - list_jobs
+    - list_llm_requests
+    - list_message_threads
+    - list_todo_archives
+    - read_job_evidence
+    - search_audit
+
+isolation: shared
+write_policy: none
+limits:
+  max_turns: 60
+  max_tokens: 300000
+  return_budget_tokens: 3000
+  stale_idle_s: 300
+  stale_in_tool_s: 1200
+return: evidence

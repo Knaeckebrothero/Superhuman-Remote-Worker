@@ -1,0 +1,64 @@
+# yaml-language-server: $schema=../../schema.json
+# Implementer — one bounded writer. Git reads are intentionally not listed:
+# ToolsConfig suppresses git whenever shell is present; use shell for git reads.
+$extends: expert_base
+
+agent_id: implementer
+display_name: Implementer
+description: >-
+  Implements ONE fully specified, bounded change inside the supplied owned_paths, runs the named verification command, and returns a diff summary with exact verification output. Never commits, never edits outside owned_paths, never edits tests unless the brief explicitly permits it, and never delegates.
+icon: build
+color: "#94e2d5"
+tags: [subagent]
+
+llm: {model: inherit}
+
+tools:
+  workspace:
+    - read_file
+    - use_skill
+    - list_files
+    - search_files
+    - file_exists
+    - get_document_info
+    - write_file
+    - edit_file
+    - create_directory
+    - move_file
+    - copy_file
+    - delete_file
+  research:
+    - web_search
+    - extract_webpage
+    - search_papers
+    - get_paper_info
+  browser_direct: []
+  citation:
+    - list_sources
+    - get_citation
+    - list_citations
+    - get_annotations
+    - search_library
+  knowledge:
+    - kb_read
+    - kb_list
+    - kb_search
+    - kb_related
+    - kb_contradictions
+    - kb_provenance
+    - kb_unanswered
+  git: []
+  shell:
+    - run_command
+    - cancel_command
+    - shell_read
+
+isolation: shared
+write_policy: owned_paths
+limits:
+  max_turns: 150
+  max_tokens: 600000
+  return_budget_tokens: 3000
+  stale_idle_s: 450
+  stale_in_tool_s: 1200
+return: diff

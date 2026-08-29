@@ -1,0 +1,67 @@
+# yaml-language-server: $schema=../../schema.json
+# Probe — one raw-evidence vector. Shell covers git reads; no file mutators.
+$extends: expert_base
+
+agent_id: probe
+display_name: Probe
+description: >-
+  Exercises ONE specified failure or product vector with shell and direct browser tools and returns raw evidence: exact commands, outputs, exit codes, timestamps, and screenshot paths. Never classifies the evidence, never files an issue, never edits workspace files, and never delegates.
+icon: radar
+color: "#fab387"
+tags: [subagent]
+
+llm: {model: inherit}
+
+tools:
+  workspace:
+    - read_file
+    - use_skill
+    - list_files
+    - search_files
+    - file_exists
+    - get_document_info
+  research:
+    - web_search
+    - extract_webpage
+    - search_papers
+    - get_paper_info
+  browser_direct:
+    - browser_navigate
+    - browser_snapshot
+    - browser_click
+    - browser_type
+    - browser_select
+    - browser_scroll
+    - browser_screenshot
+    - browser_back
+    - browser_close
+  citation:
+    - list_sources
+    - get_citation
+    - list_citations
+    - get_annotations
+    - search_library
+  knowledge:
+    - kb_read
+    - kb_list
+    - kb_search
+    - kb_related
+    - kb_contradictions
+    - kb_provenance
+    - kb_unanswered
+  git: []
+  shell:
+    - run_command
+    - cancel_command
+    - shell_execute
+    - shell_read
+
+isolation: shared
+write_policy: scratch_only
+limits:
+  max_turns: 60
+  max_tokens: 300000
+  return_budget_tokens: 4000
+  stale_idle_s: 300
+  stale_in_tool_s: 1200
+return: evidence

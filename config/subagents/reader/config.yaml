@@ -1,0 +1,62 @@
+# yaml-language-server: $schema=../../schema.json
+# Reader — the Scholar's one-question research unit.
+$extends: expert_base
+
+agent_id: reader
+display_name: Reader
+description: >-
+  Answers ONE bounded research question from workspace documents, attached sources, papers, or the web and returns a compact evidence-backed answer with tool-issued citations. Never edits workspace files, never widens the question, never authors the parent's artifact, and never delegates.
+icon: menu_book
+color: "#cba6f7"
+tags: [subagent]
+
+llm: {model: inherit}
+
+tools:
+  workspace:
+    - read_file
+    - use_skill
+    - list_files
+    - search_files
+    - file_exists
+    - get_document_info
+  research:
+    - web_search
+    - extract_webpage
+    - search_papers
+    - get_paper_info
+    - download_paper
+  browser_direct: []
+  citation:
+    - cite_web
+    - cite_document
+    - list_sources
+    - get_citation
+    - list_citations
+    - get_annotations
+    - search_library
+  knowledge:
+    - kb_read
+    - kb_list
+    - kb_search
+    - kb_related
+    - kb_contradictions
+    - kb_provenance
+    - kb_unanswered
+  git:
+    - git_log
+    - git_show
+    - git_diff
+    - git_status
+    - git_tags
+  shell: []
+
+isolation: shared
+write_policy: none
+limits:
+  max_turns: 30
+  max_tokens: 150000
+  return_budget_tokens: 1500
+  stale_idle_s: 300
+  stale_in_tool_s: 600
+return: summary

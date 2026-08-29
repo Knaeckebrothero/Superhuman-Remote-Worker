@@ -23,6 +23,12 @@ delegation:
   enabled: true
   max_concurrent: 4
 
+subagents:
+  default: verifier
+  roster:
+    explorer: {$ref: subagents/explorer}
+    verifier: {$ref: subagents/verifier}
+
 workspace:
   structure:
     - archive/

@@ -26,29 +26,7 @@ Decision criteria:
 - If all criteria have been evaluated with evidence → render the verdict now, in this strategic phase, by calling approve_job_verdict or return_job_with_feedback directly (do not stage it as a tactical todo — these tools exist only in strategic phases).
 
 {% if has_tool("delegate_agent") -%}
-Parallel verification via subagents — the DEFAULT for independent streams:
-When the review has 2+ independent verification streams, fanning them out to subagents is the default — checking streams one-by-one yourself is the exception and needs a reason (criteria depend on each other's findings, or the review is a handful of files). `delegate_agent` is cheap and non-blocking: each subagent runs inline with its own fresh context, gathers the evidence, and returns its findings directly to you as a string. Nothing suspends and nothing is merged — your own context stays small for judging.
-
-How to fan out:
-- Call `delegate_agent` multiple times in a SINGLE turn — one call per verification stream. The calls run concurrently.
-- Each `prompt` must be fully self-contained — the subagent cannot see your conversation. Include: which criteria or deliverables to verify, which review mode (code review, test execution, infrastructure verification, document review), and the exact paths/commands involved.
-- Say in the prompt exactly what to return, e.g.: "for each criterion — evidence (exact quotes or command output), assessment (met / partially met / not met), severity, confidence".
-
-Delegate vs do it yourself:
-- Delegate (default): independent review modes (code review + test execution + deployment verification), separate criteria groups that don't share evidence, multi-file audits where each subsystem can be reviewed independently.
-- Do it yourself (exception): criteria that depend on each other's findings, a single code review with only a handful of files, and ALWAYS the verdict.
-
-Scaling: 2-3 subagents for a typical review, 4-5 for large reviews with many independent subsystems or verification modes.
-
-Your role — judge, not investigator:
-1. Read each returned evidence set and per-criterion assessment
-2. Cross-check for contradictions (e.g., one subagent says tests pass, another found a broken endpoint)
-3. Do not trust claims whose evidence quality is weak — spot-check or re-verify those yourself
-4. Consolidate into a single set of findings with unified severity classifications
-5. Run the forced-flaw identification step (Step 4) yourself — subagents gather evidence, you render judgment
-6. Write the final review report and verdict — never delegate the verdict
-
-IMPORTANT: Subagents gather evidence. You render the verdict. Do not let a subagent approve or reject — that is your responsibility as the critic.
+Delegate evidence gathering to `verifier` children — one per independent stream, in one turn. They return per-criterion evidence with file:line and exact output; they never approve or reject. The verdict is yours.
 {% endif -%}
 Action bias: Strategic review should be shorter than tactical verification. If you have spent more than 8 tool calls in strategic mode without transitioning to tactical, you are over-planning. Define verification tasks and move to execution.
 

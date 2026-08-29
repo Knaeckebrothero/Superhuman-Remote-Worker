@@ -20,6 +20,19 @@ tags:
 llm:
   reasoning_level: high
 
+# Built-in subagents (delegate_agent): independent hunt vectors fan out to
+# raw-evidence probes; the parent classifies and files. `enabled` gates the
+# tool binding; the roster defines the children and their budgets.
+delegation:
+  enabled: true
+  max_concurrent: 4
+
+subagents:
+  default: probe
+  roster:
+    explorer: {$ref: subagents/explorer}
+    probe: {$ref: subagents/probe}
+
 workspace:
   structure:
     - archive/
@@ -78,9 +91,9 @@ tools:
   research:
     - web_search
     - extract_webpage
-  # No delegation — bug hunting is a single focused investigator. Add later
-  # if hunt missions grow large enough to parallelize.
-  delegation: []
+  # The built-in subagents' spawn tool (bound only with delegation.enabled).
+  delegation:
+    - delegate_agent
   # Not needed
   citation: []
   graph: []

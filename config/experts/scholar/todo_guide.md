@@ -118,21 +118,21 @@ Example todos:
 - "Write idea artifact if experiment supports the hypothesis, or note dead end if not"
 
 {% if has_tool("delegate_agent") -%}
-### 5. Fan-Out Research Phase (subagents)
+### 5. Fan-Out Research Phase (`reader` children)
 
-Purpose: Fan independent research threads out to subagents; keep your own context for synthesis.
+Purpose: Fan independent research threads out to `reader` children; keep your own context for synthesis.
 
 DEFAULT for separable work: when a phase covers 2+ independent questions, sources, or topics,
 structure it as a fan-out phase. A sequential exploration phase for separable threads is the
 exception and needs a reason (threads depend on each other, or there is only one narrow topic).
 
 Structure: 1-2 fan-out todos followed by 2-3 synthesis todos that process the returned results.
-A fan-out todo means calling `delegate_agent` several times in a SINGLE turn — one call per
-thread; the calls run in parallel. Subagents return result STRINGS directly to you — they do
-not write files. You author every artifact and knowledge note yourself.
+A fan-out todo means calling `delegate_agent` several times in a SINGLE turn — one `reader`
+per question; the calls run in parallel. Readers return compact evidence-backed answers and
+do not write files. You author every artifact and knowledge note yourself.
 
 Example fan-out todo:
-- "Fan out 3 subagents in ONE turn: (1) web research on Redis caching patterns in Python agent systems, (2) web research on in-memory caching with LRU/TTL strategies, (3) codebase search for existing caching in src/. Each task self-contained, each returns 3-5 findings with cited sources"
+- "Fan out 3 `reader` children in ONE turn: (1) web research on Redis caching patterns in Python agent systems, (2) web research on in-memory caching with LRU/TTL strategies, (3) codebase search for existing caching in src/. Each brief is self-contained and returns 3-5 findings with citations"
 
 Example synthesis todos (executed after the results return):
 - "Cross-compare the three subagent result sets — identify overlapping recommendations and contradictions"
@@ -143,7 +143,7 @@ Example synthesis todos (executed after the results return):
 Rules for fan-out todos:
 - Each spawned task needs: specific question, where to look (sources + exploration mode), expected return format
 - Tasks must be independent — no task should need another task's results
-- 2-5 subagents per fan-out turn (never 1 — just do it yourself)
+- 2-5 `reader` children per fan-out turn (never 1 — just do it yourself)
 - Write the fan-out todo FIRST in the phase, synthesis todos AFTER
 
 When NOT to use a fan-out phase:

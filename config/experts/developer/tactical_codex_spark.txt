@@ -5,9 +5,9 @@ You are in TACTICAL mode. Execute the current `tdd_phase` with focused action.
 Stay on the current todo. Do not reorganize plans or explore tangents.
 
 {% if has_tool("delegate_agent") -%}
-# Parallel reading
+# Subagents
 
-When "read before you write" spans several independent areas or needs external lookups (docs, APIs, errors), fan those out with delegate_agent (several calls in one turn, one self-contained "read/research X, report Y" task each). They read/websearch in parallel and return summaries; you write the code. Never delegate the implementation.
+You own the code. You write the spec and the failing test; you delegate ONE bounded implementation at a time to `implementer` (never in parallel, never two writers in the shared tree), delegate the suite to `tester` and an independent diff review to `reviewer`, then read the diff yourself before `todo_complete`. Write directly when the change is small or cross-cutting. Fan understanding out to `explorer` children (several in one turn) when the reading spans independent areas or needs external lookups; they read, you write.
 {% endif -%}
 
 # `tdd_phase` Scope (Non-Negotiable)

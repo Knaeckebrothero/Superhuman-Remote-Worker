@@ -556,14 +556,115 @@ def bind_child_tools(llm: Any, tools: List[Any], cfg: Any) -> Any:
     return llm.bind_tools(bound, **bind_kwargs)
 
 
-def child_system_prompt(cfg: Any, tools: List[Any]) -> str:
-    """The child's system prompt — ``get_system_prompt`` on the child config
-    for now (WP5 adds the subagent framework template)."""
-    from src.core.loader import get_system_prompt
+_RETURN_EXPECTATIONS = {
+    "summary": "a compact answer with the evidence needed to use it",
+    "structured": "findings grouped as requested, with exact outcomes",
+    "evidence": "raw, attributable evidence with commands or locations and outputs",
+    "diff": "changed files and behavior, followed by verification results",
+}
 
-    return get_system_prompt(
-        cfg, model=cfg.llm.model or "", tool_names=[t.name for t in tools]
+
+def render_subagent_environment(
+    entry: Mapping[str, Any],
+    budgets: Any,
+    *,
+    handle: str,
+    subagent_type: str,
+    isolation: str,
+    write_policy: str,
+    owned_paths: Sequence[str] = (),
+    worktree_path: Optional[str] = None,
+    worktree_branch: Optional[str] = None,
+) -> str:
+    """The trusted, spawn-specific environment block injected into the prompt."""
+    if isolation == "worktree":
+        isolation_line = (
+            f"Isolation: worktree — path `{worktree_path or '(pending)'}` on branch "
+            f"`{worktree_branch or f'sub/{handle}'}`; the parent integrates it."
+        )
+    else:
+        isolation_line = (
+            "Isolation: shared — the parent's tree; no commits — the parent commits."
+        )
+
+    if write_policy == "owned_paths":
+        paths = ", ".join(f"`{path}`" for path in owned_paths) or "(none)"
+        write_line = f"Write policy: owned_paths — write only these globs: {paths}."
+    elif write_policy == "scratch_only":
+        write_line = (
+            f"Write policy: scratch_only — write only under `.subagents/{handle}/`."
+        )
+    elif write_policy == "none":
+        write_line = "Write policy: none — do not write to the workspace."
+    else:
+        write_line = "Write policy: full — write only what the brief requires."
+
+    return_kind = str(entry.get("return") or "summary")
+    expectation = _RETURN_EXPECTATIONS.get(return_kind, _RETURN_EXPECTATIONS["summary"])
+    return "\n".join(
+        [
+            "<subagent_environment>",
+            f"Handle: {handle}",
+            f"Subagent type: {subagent_type}",
+            isolation_line,
+            write_line,
+            f"Expected report ({return_kind}): {expectation}.",
+            (
+                f"Budget: at most {budgets.max_turns} turns and "
+                f"{budgets.max_tokens} tokens; your report is trimmed past "
+                f"{budgets.return_budget_tokens} tokens — the full text is spilled "
+                f"to `.subagents/{handle}/report.md`."
+            ),
+            "</subagent_environment>",
+        ]
     )
+
+
+def child_system_prompt(cfg: Any, tools: List[Any], *, environment: str) -> str:
+    """Render the framework-owned child prompt with this spawn's environment."""
+    from src.core.loader import get_subagent_system_prompt
+
+    return get_subagent_system_prompt(
+        cfg,
+        model=cfg.llm.model or "",
+        tool_names=[t.name for t in tools],
+        environment=environment,
+    )
+
+
+def drop_missing_before_tool_bindings(
+    cfg: Any, workspace_manager: Any, *, handle: str
+) -> List[str]:
+    """Drop enforced tool bindings whose artifact is absent from this tree.
+
+    A referenced expert may carry bindings for skills only its own parent
+    deploys. Keeping such a gate would permanently wedge the child: it can be
+    told to read a path that does not exist. Phase bindings are left alone
+    (children have no phases); only ``before_tool`` enforcement is filtered.
+    """
+    kept = []
+    dropped: List[str] = []
+    for entry in list(getattr(cfg, "instruction_files", None) or []):
+        if entry.trigger_type != "before_tool":
+            kept.append(entry)
+            continue
+        try:
+            exists = bool(workspace_manager.exists(entry.path))
+        except Exception:
+            exists = False
+        if exists:
+            kept.append(entry)
+        else:
+            dropped.append(entry.path)
+    cfg.instruction_files = kept
+    if dropped:
+        logger.warning(
+            "subagent %s: dropped before_tool binding(s) with no artifact in "
+            "the child tree: %s",
+            handle,
+            ", ".join(dropped),
+        )
+    return dropped
 
 
 def build_context_manager(cfg: Any) -> Any:
@@ -702,6 +803,7 @@ class ChildBuild:
     tools: List[Any]
     tool_context: Any
     system_prompt: str
+    subagent_environment: str
     context_manager: Any
     workspace_manager: Any
     owned_paths: List[str] = field(default_factory=list)
@@ -809,6 +911,7 @@ async def build_child(
     parent_tool_names: Optional[Sequence[str]] = None,
     llm_factory: Optional[Callable[[Any, Any], Any]] = None,
     worktree_index: Optional[int] = None,
+    budgets: Any = None,
 ) -> ChildBuild:
     """Build the child of ``entry`` for ``parent_context`` (see module doc).
 
@@ -839,6 +942,10 @@ async def build_child(
     cfg = build_child_config(
         entry, live_llm_config=getattr(host, "live_llm_config", None)
     )
+    if budgets is None:
+        from .budgets import ChildBudgets
+
+        budgets = ChildBudgets.from_entry(entry, subagent_type)
     parent_names = list(
         parent_tool_names
         if parent_tool_names is not None
@@ -907,6 +1014,11 @@ async def build_child(
             workspace_manager=workspace_manager,
             shell_manager=shell_manager,
         )
+        # The parent deploys instruction artifacts before any child exists. A
+        # `$ref` may carry gates for artifacts that are not in this parent's
+        # tree; remove only those impossible gates before wrapping tools.
+        drop_missing_before_tool_bindings(cfg, workspace_manager, handle=handle)
+        ctx._instruction_files = list(cfg.instruction_files)
 
         from src.tools.description_manager import apply_description_overrides
         from src.tools.registry import apply_instruction_enforcement, load_tools
@@ -923,7 +1035,20 @@ async def build_child(
 
         llm = (llm_factory or _default_llm_factory)(cfg.llm, cfg.limits)
         llm_with_tools = bind_child_tools(llm, tools, cfg)
-        system_prompt = child_system_prompt(cfg, tools)
+        subagent_environment = render_subagent_environment(
+            entry,
+            budgets,
+            handle=handle,
+            subagent_type=subagent_type,
+            isolation=isolation,
+            write_policy=write_policy,
+            owned_paths=owned,
+            worktree_path=worktree_path,
+            worktree_branch=getattr(env, "branch", None),
+        )
+        system_prompt = child_system_prompt(
+            cfg, tools, environment=subagent_environment
+        )
         context_manager = build_context_manager(cfg)
     except BaseException:
         if writer_guard is not None:
@@ -950,6 +1075,7 @@ async def build_child(
         tools=tools,
         tool_context=ctx,
         system_prompt=system_prompt,
+        subagent_environment=subagent_environment,
         context_manager=context_manager,
         workspace_manager=workspace_manager,
         owned_paths=owned,
@@ -983,11 +1109,13 @@ __all__ = [
     "build_context_manager",
     "child_system_prompt",
     "child_tool_config",
+    "drop_missing_before_tool_bindings",
     "entry_tool_names",
     "normalise_rel_path",
     "overlay_live_llm",
     "path_allowed",
     "rebase_context",
+    "render_subagent_environment",
     "select_child_tool_names",
     "write_policy_violation",
 ]

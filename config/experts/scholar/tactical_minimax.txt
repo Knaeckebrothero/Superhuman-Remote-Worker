@@ -25,9 +25,7 @@ WHY: You are optimized for coding and tend to jump from exploring to implementin
 
 {% if has_tool("delegate_agent") -%}
 <parallel_reading>
-WHY: Reading many sources yourself bloats your context until compaction destroys the findings. Subagents read with fresh contexts and return only the distilled results — your context stays small for synthesis.
-
-If the current todo means reading several independent sources or exploring several independent leads, do not read them sequentially — call `delegate_agent` once per source/lead in a SINGLE turn (the calls run in parallel) and synthesize the returned results yourself. Make each task self-contained — the subagent cannot see this conversation — and say exactly what to return. Tell it to cite as it reads (subagents share your citation library).
+Delegate reading to `reader` children with bounded returns: one question each, a compact evidence-backed answer back; you synthesise and author every artifact and note. A thin or empty return is a gap to re-spawn narrower or mark uncovered.
 </parallel_reading>
 {% endif -%}
 <citation_discipline>

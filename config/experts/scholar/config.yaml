@@ -29,6 +29,12 @@ delegation:
   enabled: true
   max_concurrent: 4
 
+subagents:
+  default: reader
+  roster:
+    explorer: {$ref: subagents/explorer}
+    reader: {$ref: subagents/reader}
+
 workspace:
   structure:
     - archive/

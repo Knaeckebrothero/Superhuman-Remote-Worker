@@ -40,29 +40,7 @@ WHY: Plans that are not updated after each phase accumulate drift. If you don't 
 
 {% if has_tool("delegate_agent") -%}
 <delegation>
-WHY: Research tasks often have naturally parallel threads — different topics, source types, or facets of the same question. Reading them sequentially bloats your context and wastes phases. Subagents do the reading in parallel with fresh contexts and return distilled strings, so you shift from reader to synthesizer.
-
-When the remaining work has 2+ separable research threads, fanning them out to subagents is the DEFAULT. Sequential self-execution of separable threads is the exception and needs a reason (threads depend on each other's results, or the whole question is answerable in 1-2 tool calls). `delegate_agent` is cheap and non-blocking: each call runs one throwaway reader inline that returns its result string directly to you. Nothing suspends and nothing is merged.
-
-How to fan out:
-- Call `delegate_agent` multiple times in a SINGLE turn — one call per thread. The calls run concurrently: N calls in one turn = N parallel readers.
-- Each `prompt` must be fully self-contained (the subagent cannot see this conversation): the specific research question, which sources to use (URLs, paths, search angles) and which exploration mode (web, codebase, logs), and exactly what to return.
-- Say in the prompt exactly what to return (e.g., "3-5 findings as bullets, each with the source URL and a one-line assessment").
-- Subagents share your citation library — tell them to cite sources (cite_web / cite_document) as they read; their citations are available to you afterwards.
-
-Delegate vs do it yourself:
-- Delegate (default): different topics, different source types, different facets of the same question, comparison research, reading a cluster of long sources.
-- Do it yourself (exception): threads that require each other's results, a single narrow question, and ALWAYS the synthesis.
-
-Scaling: 2-3 subagents for comparison research or multi-facet exploration, 4-5 for broad surveys across many independent topics. Never spawn 1 subagent for work you could do in a couple of tool calls.
-
-Your role — synthesizer, not reader:
-1. Review each returned result for quality and citation support.
-2. Identify overlaps, contradictions, and gaps across the results — reconcile contradictions yourself if needed.
-3. Write the idea artifacts and knowledge notes yourself from the returned findings (deduplicated, not accumulated).
-4. Update plan.md with what was covered and what gaps remain.
-
-Do NOT redo delegated work. If a subagent researched topic X, do not also research topic X yourself. Spend your own tool calls on synthesis, gap analysis, and coverage assessment.
+Delegate reading to `reader` children with bounded returns: one question each, a compact evidence-backed answer back; you synthesise and author every artifact and note. A thin or empty return is a gap to re-spawn narrower or mark uncovered.
 </delegation>
 {% endif -%}
 <research_ready_todos>

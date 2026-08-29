@@ -127,7 +127,12 @@ def _all_config_names() -> list[str]:
         for p in _CONFIG_DIR.glob("experts/*/config.yaml")
         if p.parent.name != "__pycache__"
     )
-    return _STANDALONE_CONFIGS + experts
+    library = sorted(
+        f"subagents/{p.parent.name}"
+        for p in _CONFIG_DIR.glob("subagents/*/config.yaml")
+        if p.parent.name != "__pycache__"
+    )
+    return _STANDALONE_CONFIGS + experts + library
 
 
 def _minimal(**extra) -> dict:
@@ -141,12 +146,18 @@ class TestPopulation:
     def test_the_declaration_scan_actually_found_the_configs(self):
         """A scan that silently found nothing would make every test below pass."""
         files = {rel for rel, _, _ in _DECLARATIONS}
-        assert len(files) == 15, f"expected 15 configs declaring tools:, got {files}"
+        assert len(files) == 21, f"expected 21 configs declaring tools:, got {files}"
         assert "config/expert_base.yaml" in files
         assert "config/overlays/worker.yaml" in files
         assert "config/overlays/session.yaml" in files
         assert "config/overlays/subagent.yaml" in files
         assert "config/subagents/explorer/config.yaml" in files
+        assert "config/subagents/implementer/config.yaml" in files
+        assert "config/subagents/probe/config.yaml" in files
+        assert "config/subagents/reader/config.yaml" in files
+        assert "config/subagents/reviewer/config.yaml" in files
+        assert "config/subagents/tester/config.yaml" in files
+        assert "config/subagents/verifier/config.yaml" in files
         assert any("experts/centurion" in f for f in files)
         # 148 after job_control/job_inspection became descriptor-owned groups;
         # 149 with the Centurion's explicit knowledge grant
@@ -158,9 +169,10 @@ class TestPopulation:
         # expert_base (17 shared groups) + the worker / session / subagent
         # overlays (4 + 6 + 13 role-owned groups); 143 with the subagent
         # library's explorer entry (6 read-only groups restated so it is
-        # read-only standalone too — config/subagents/README.md).
-        assert len(_DECLARATIONS) == 143, (
-            f"expected 143 raw declarations, got {len(_DECLARATIONS)}"
+        # read-only standalone too); 187 with U3 WP5's six entries (44 explicit
+        # group declarations, including the reviewer/verifier inspection group).
+        assert len(_DECLARATIONS) == 187, (
+            f"expected 187 raw declarations, got {len(_DECLARATIONS)}"
         )
 
     def test_every_shipped_declaration_is_already_a_list(self):
@@ -368,12 +380,12 @@ class TestShellMustEnumerate:
         ]
 
     def test_every_shipped_shell_declaration_is_still_accepted(self):
-        """Ten configs declare ``tools.shell`` (the shared root plus nine
-        experts/profiles — the role overlays inherit the root's ``[]``); all
-        are bare lists or ``[]``, the legacy spellings of ``only`` and
+        """Sixteen configs declare ``tools.shell`` (the prior ten plus all six
+        U3 WP5 library entries, including reader's explicit empty override);
+        all are bare lists or ``[]``, the legacy spellings of ``only`` and
         ``false``. None is affected."""
         decls = [(rel, v) for rel, cat, v in _DECLARATIONS if cat == "shell"]
-        assert len(decls) == 10, decls
+        assert len(decls) == 16, decls
         for rel, value in decls:
             assert (
                 normalize_tool_policy({"tools": {"shell": value}})["tools"]["shell"]

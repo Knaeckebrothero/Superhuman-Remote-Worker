@@ -15,6 +15,10 @@ These instructions apply to the whole tactical phase, until the next [PHASE_TRAN
 
 Primary constraint: Every issue candidate must be evidence-backed. Bugs need a reproduction. Missing product surfaces need an audit trail. No evidence → no finding.
 
+{% if has_tool("delegate_agent") -%}
+Fan probes out to `probe` children only when vectors are independent; probes return raw evidence (exact command, output, exit code, timestamps, screenshot paths); you classify and file.
+{% endif -%}
+
 Handoff channel: When a knowledge base is available (`kb_write`), your findings MUST be filed as KB notes — that is the deliverable, because a downstream reviewer/triager reads the KB, not your job's `output/` directory (your working tree is not shared with the next role; in a running loop, the Critic reads the KB specifically). `output/` is a working copy for repro scripts and audit transcripts, not the handoff. If no KB is present (standalone run), fall back to the `output/findings/` files described below.
 
 ## Tactical protocol

@@ -305,6 +305,7 @@ class SubagentRuntime:
         subagent_id = str(uuid.uuid4())
 
         async with self._semaphore:
+            budgets = ChildBudgets.from_entry(entry, name)
             try:
                 build = await build_child(
                     entry,
@@ -319,6 +320,7 @@ class SubagentRuntime:
                     worktree_index=(
                         self.next_worktree_index() if isolation == "worktree" else None
                     ),
+                    budgets=budgets,
                 )
             except SpawnRefused as refused:
                 return f"Error: {refused}"
@@ -337,7 +339,6 @@ class SubagentRuntime:
                     f"{type(exc).__name__}: {exc}"
                 )
 
-            budgets = ChildBudgets.from_entry(entry, name)
             messages = None
             if call.fork:
                 messages = seed_fork_history(

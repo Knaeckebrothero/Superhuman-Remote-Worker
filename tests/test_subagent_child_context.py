@@ -3,6 +3,7 @@ LLM inheritance, write policy, the single-writer guard, officer never on."""
 
 from __future__ import annotations
 
+import logging
 import subprocess
 from collections import deque
 
@@ -320,6 +321,62 @@ class TestBuildShared:
         entry["officer"] = {"enabled": True, "sleep_min_minutes": 1}
         build = await _build(ctx, entry)
         assert build.config.officer.enabled is False
+        await build.release()
+
+    @pytest.mark.asyncio
+    async def test_ref_child_drops_only_missing_before_tool_artifacts(
+        self, tmp_path, caplog
+    ):
+        """A foreign expert's enforced gate cannot wedge a child when this
+        parent's workspace never deployed the bound skill artifact."""
+        ctx, root = _parent(tmp_path)
+        present = root / "skills" / "present-guide"
+        present.mkdir(parents=True)
+        (present / "SKILL.md").write_text("# present\n")
+        entry = _entry(
+            name="reviewer",
+            ref="critic",
+            instruction_files=[
+                {
+                    "skill": "missing-critic-guide",
+                    "trigger": "before_tool:read_file",
+                    "enforce": True,
+                },
+                {
+                    "skill": "present-guide",
+                    "trigger": "before_tool:read_file",
+                    "enforce": True,
+                },
+                {
+                    "skill": "missing-phase-guide",
+                    "trigger": "phase_start:tactical",
+                    "enforce": False,
+                },
+            ],
+        )
+        with caplog.at_level(logging.WARNING):
+            build = await _build(
+                ctx,
+                entry,
+                handle="reviewer-0001",
+                subagent_type="reviewer",
+            )
+        assert [item.path for item in build.config.instruction_files] == [
+            "skills/present-guide/SKILL.md",
+            "skills/missing-phase-guide/SKILL.md",
+        ]
+        assert [item.path for item in build.tool_context._instruction_files] == [
+            "skills/present-guide/SKILL.md",
+            "skills/missing-phase-guide/SKILL.md",
+        ]
+        records = [
+            record
+            for record in caplog.records
+            if "dropped before_tool binding(s)" in record.getMessage()
+        ]
+        assert len(records) == 1
+        assert "missing-critic-guide" in records[0].getMessage()
+        assert "present-guide" not in records[0].getMessage()
         await build.release()
 
     @pytest.mark.asyncio

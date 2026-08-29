@@ -562,18 +562,18 @@ async def test_duplicate_expert_scholar_end_to_end_for_a_default_grants_user(
 
 # The brief's own measurement: default grants (shell_tools=False,
 # delegation=False) refuse 7 of the 11 shipped experts before task 3 —
-# scholar, developer, critic (shell + delegation) and bughunter, designer,
-# designer-interactive, product-qa (shell). This is the after: every one
+# scholar, developer, critic, bughunter and product-qa (shell + delegation),
+# plus designer and designer-interactive (shell). This is the after: every one
 # forks (200) for the same default-grants non-admin, and drops exactly the
 # grants the brief measured, no more and no less.
 _PREVIOUSLY_REFUSED_SHIPPED_EXPERTS = {
     "scholar": {"shell_tools", "delegation"},
     "developer": {"shell_tools", "delegation"},
     "critic": {"shell_tools", "delegation"},
-    "bughunter": {"shell_tools"},
+    "bughunter": {"shell_tools", "delegation"},
     "designer": {"shell_tools"},
     "designer-interactive": {"shell_tools"},
-    "product-qa": {"shell_tools"},
+    "product-qa": {"shell_tools", "delegation"},
 }
 
 

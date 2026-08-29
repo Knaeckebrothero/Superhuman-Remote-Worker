@@ -116,6 +116,14 @@ the parent at call time. Subagents cannot delegate further, and the full
 report of every child is kept under `.subagents/<handle>/report.md` in the
 job workspace.
 
+The bundled rosters use `implementer` for one bounded owned-path change,
+`tester` for commands, `reviewer` for diff findings, `verifier` for criterion
+evidence, `reader` for one research question, and `probe` for one raw-evidence
+vector. Run only one shared-tree writer at a time; partition its `owned_paths`
+and let the parent review and commit. Foreground delegation returns when the
+child finishes, so there is nothing to poll. Interactive sessions still use
+`create_job` when the work should run as an independently managed Fleet job.
+
 Delegation does not make one job fire-and-forget: the parent remains
 responsible for the shared outcome. For user-visible, independently managed
 background tasks, create separate Fleet jobs instead.

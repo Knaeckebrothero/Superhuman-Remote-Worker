@@ -44,6 +44,7 @@ from src.core.loader import (
     canonical_config_name,
     chain_root,
     deep_merge,
+    get_all_tool_names,
     load_agent_config,
     load_agent_config_from_dict,
     load_and_merge_config,
@@ -663,14 +664,22 @@ _LIBRARY_IDS = [p.parent.name for p in _LIBRARY]
 
 
 def test_the_library_is_discovered():
-    """Guard the guard: the shipped explorer entry must be in the sweep."""
-    assert "explorer" in _LIBRARY_IDS
+    """Guard the guard: all seven shipped child types are in the sweep."""
+    assert set(_LIBRARY_IDS) == {
+        "explorer",
+        "implementer",
+        "probe",
+        "reader",
+        "reviewer",
+        "tester",
+        "verifier",
+    }
 
 
 @pytest.mark.parametrize("name", _LIBRARY_IDS)
 def test_library_entry_resolves_in_the_subagent_role(name, subagent_ignored):
     """A library entry is a roster target: on the subagent overlay it keeps
-    its own read-only tools, carries the `subagent` tag, inherits the
+    exactly its declared tools, carries the `subagent` tag, inherits the
     parent's model by default, and parses like any config."""
     leaf = next(p for p in _LIBRARY if p.parent.name == name)
     own = yaml.safe_load(leaf.read_text(encoding="utf-8"))
@@ -686,30 +695,59 @@ def test_library_entry_resolves_in_the_subagent_role(name, subagent_ignored):
     assert data["llm"]["model"] == "inherit"
     assert data["interactive"]["permission_mode"] == "autonomous"
     assert data["memory"]["enabled"] is False
-    # Never wider than the overlay's floor, group by group.
-    floor = load_role_base("subagent")["tools"]
-    for group, names in data["tools"].items():
-        assert set(names) <= set(floor.get(group, [])), f"{name}: tools.{group}"
     cfg = load_agent_config(str(leaf), str(leaf.parent), role="subagent")
     assert cfg.agent_id == own["agent_id"]
     assert "subagent" in cfg.tags
     assert IGNORE_KEYS_DIRECTIVE not in cfg.extra and "tags" not in cfg.extra
+    declared = {group: list(names) for group, names in own["tools"].items()}
+    actual = {group: list(names) for group, names in vars(cfg.tools).items() if names}
+    assert actual == {group: names for group, names in declared.items() if names}
 
 
 @pytest.mark.parametrize("name", _LIBRARY_IDS)
 def test_library_entry_is_read_only_when_loaded_standalone(name):
-    """Standalone (no role) the entry sits on expert_base, which grants writes
-    and a browser — the entry must restate its read-only groups so a
-    `--config <name>` boot or the grants snapshot never sees more than the
-    subagent overlay's floor."""
-    from src.core.loader import get_all_tool_names
+    """Standalone loading cannot leak expert_base capabilities.
+
+    Read-only entries may add shell, git reads and job-inspection reads to the
+    subagent floor. Implementer is the sole workspace writer; probe and reader
+    never acquire a workspace file mutator.
+    """
+    from src.subagents.child import WRITE_TOOLS
+    from src.tools.registry import TOOL_REGISTRY
 
     leaf = next(p for p in _LIBRARY if p.parent.name == name)
+    own = yaml.safe_load(leaf.read_text(encoding="utf-8"))
     floor_path, floor_dir = resolve_config_path(ROLE_ROOTS["subagent"])
     floor = set(get_all_tool_names(load_agent_config(floor_path, floor_dir)))
-    standalone = set(get_all_tool_names(load_agent_config(str(leaf), str(leaf.parent))))
-    assert standalone <= floor, sorted(standalone - floor)
+    cfg = load_agent_config(str(leaf), str(leaf.parent))
+    standalone = set(get_all_tool_names(cfg))
     assert standalone, "an empty toolset would make this vacuous"
+
+    # Every non-empty group is authored on the leaf: nothing from expert_base
+    # may leak through a group the entry forgot to restate.
+    declared = {group: list(names) for group, names in own["tools"].items() if names}
+    actual = {group: list(names) for group, names in vars(cfg.tools).items() if names}
+    assert actual == declared
+
+    if own.get("write_policy", "none") == "none":
+        allowed_categories = {"shell", "git", "job_inspection"}
+        allowed = floor | {
+            tool
+            for tool, metadata in TOOL_REGISTRY.items()
+            if metadata.get("category") in allowed_categories
+        }
+        if name == "reader":
+            # The scholar's fan-out unit deliberately extends the floor with
+            # paper download and the shared citation-library write surface.
+            allowed |= {"download_paper", "cite_web", "cite_document"}
+        assert standalone <= allowed, sorted(standalone - allowed)
+        assert not (standalone & WRITE_TOOLS)
+
+    workspace_mutators = standalone & WRITE_TOOLS
+    assert bool(workspace_mutators) is (name == "implementer")
+    if name in {"probe", "reader"}:
+        assert "write_file" not in standalone
+
     # And by the two `$ref` spellings, the same file.
     assert resolve_config_path(f"subagents/{name}")[0] == str(leaf)
     assert resolve_config_path(name)[0] == str(leaf)

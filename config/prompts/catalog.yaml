@@ -61,6 +61,18 @@
     every turn. Resolves to a model-family variant
     (systemprompt_interactive_<family>.txt) where one exists, else the base file.
 
+# --- Prompts · headless child agents only ------------------------------------
+# Framework-owned like systemprompt_interactive: editable as a global prompt,
+# never accepted in an expert's prompts payload. Per-type identity is persona.txt.
+- kind: prompts
+  name: systemprompt_subagent
+  group: "Prompts · subagents"
+  title: "Subagent system prompt"
+  description: >-
+    The single framework prompt used by every headless child session. The
+    roster entry's persona and spawn-specific environment are injected into
+    it; there are no model-family variants.
+
 # --- Instructions · worker (job) agents only ----------------------------------
 # Workspace scaffolding + the strategic todo/phase system. Persistent sessions
 # use none of these (no phases, no todos); src/persistent_graph.py never loads

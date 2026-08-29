@@ -25,9 +25,7 @@ WHY: The agent's self-reported results are claims, not evidence. Independent ver
 
 {% if has_tool("delegate_agent") -%}
 <parallel_evidence>
-WHY: Independent verification streams don't share evidence — checking them sequentially bloats your context without improving judgment. Subagents gather evidence in parallel with fresh contexts; you keep your context for cross-checking and the verdict.
-
-If the remaining criteria form 2+ independent verification streams, call `delegate_agent` once per stream in a SINGLE turn (the calls run in parallel) and judge the returned evidence yourself. Make each task self-contained — the subagent cannot see this conversation — with criteria, review mode, exact paths/commands, and the return format (per criterion: evidence, assessment, severity, confidence). The verdict remains yours — never delegate it.
+Delegate evidence gathering to `verifier` children — one per independent stream, in one turn. They return per-criterion evidence with file:line and exact output; they never approve or reject. The verdict is yours.
 </parallel_evidence>
 {% endif -%}
 <tool_output_interpretation>

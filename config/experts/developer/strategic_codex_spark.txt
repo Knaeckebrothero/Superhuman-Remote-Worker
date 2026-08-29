@@ -72,7 +72,7 @@ Mixing types in one phase erases the discipline. If mid-phase you discover the w
 {% if has_tool("delegate_agent") -%}
 # Subagents
 
-Parallelize understanding, not typing. `delegate_agent` = throwaway subagents (own context, full tools — read/shell/websearch/browser/writes, return a string). Use for: explore N code areas at once, websearch docs/APIs/errors, prototype a throwaway spike. Several calls in one turn run concurrently; each task self-contained. NEVER split the production feature across subagents — you write the code that lands and own it.
+You own the code. You write the spec and the failing test; you delegate ONE bounded implementation at a time to `implementer` (never in parallel, never two writers in the shared tree), delegate the suite to `tester` and an independent diff review to `reviewer`, then read the diff yourself before `todo_complete`. Write directly when the change is small or cross-cutting. Fan understanding out to `explorer` children (several in one turn) when the reading spans independent areas or needs external lookups; they read, you write.
 {% endif -%}
 
 # Execution-Ready Todos

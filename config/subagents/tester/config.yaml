@@ -1,0 +1,57 @@
+# yaml-language-server: $schema=../../schema.json
+# Tester — command runner only. Git reads are omitted because shell is present.
+$extends: expert_base
+
+agent_id: tester
+display_name: Tester
+description: >-
+  Runs exactly the requested test suite or verification command and returns pass/fail per case with exact output and exit codes. Writes nothing, fixes nothing, changes no configuration, and never delegates.
+icon: science
+color: "#a6e3a1"
+tags: [subagent]
+
+llm: {model: inherit}
+
+tools:
+  workspace:
+    - read_file
+    - use_skill
+    - list_files
+    - search_files
+    - file_exists
+    - get_document_info
+  research:
+    - web_search
+    - extract_webpage
+    - search_papers
+    - get_paper_info
+  browser_direct: []
+  citation:
+    - list_sources
+    - get_citation
+    - list_citations
+    - get_annotations
+    - search_library
+  knowledge:
+    - kb_read
+    - kb_list
+    - kb_search
+    - kb_related
+    - kb_contradictions
+    - kb_provenance
+    - kb_unanswered
+  git: []
+  shell:
+    - run_command
+    - cancel_command
+    - shell_read
+
+isolation: shared
+write_policy: none
+limits:
+  max_turns: 60
+  max_tokens: 300000
+  return_budget_tokens: 2500
+  stale_idle_s: 300
+  stale_in_tool_s: 1800
+return: structured

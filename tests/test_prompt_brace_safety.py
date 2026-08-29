@@ -29,6 +29,7 @@ _KNOWN = {
     "agent_display_name": "SENTINEL_NAME",
     "expert_identity": "SENTINEL_IDENTITY",
     "available_skills": "SENTINEL_SKILLS",
+    "subagent_environment": "SENTINEL_SUBAGENT_ENVIRONMENT",
     "prompt_content": "SENTINEL_CONTENT",
 }
 

@@ -62,15 +62,20 @@ todos:
       (8) Check for CI config (repos/<name>/.github/workflows/, repos/<name>/.gitlab-ci.yml,
           etc.) to see how tests are run on the pipeline.
 
+      {% if has_tool("delegate_agent") -%}
       FAN-OUT (the default when the repo has several independent areas): steps (2)-(8)
-      are mostly parallel reads — instead of doing them all yourself, spawn throwaway
-      subagents with the delegate_agent tool. Several calls in ONE turn run in parallel,
+      are mostly parallel reads — instead of doing them all yourself, delegate them to
+      `explorer` children. Several delegate_agent calls in ONE turn run in parallel,
       each maps one area with a fresh context and returns a distilled summary, and you
-      assemble the repo map and write the notes. Give each a self-contained task ("map
+      assemble the repo map and write the notes. Give each a self-contained brief ("map
       repos/<name>/src/<area>: modules, key classes, conventions — report back"; "find the test
       framework + exact test command — report back"; or a websearch like "how does
-      <framework> configure its test runner?"). Keep the spec authoring to yourself, and
-      do NOT delegate the implementation — subagents explore and research; you write code.
+      <framework> configure its test runner?"). You own the spec and failing test. After
+      that, delegate at most ONE bounded implementation at a time to `implementer` with
+      explicit owned_paths (a green-phase brief forbids tests/), then use `tester` for the
+      suite and `reviewer` for the diff; read the diff yourself before todo_complete.
+      Write directly when the change is small or cross-cutting.
+      {% endif -%}
 
       Record findings as knowledge notes via kb_write (type=learning, tag=repository):
       - Repository clone name (repos/<name>/) and base branch, from README.md

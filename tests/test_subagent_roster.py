@@ -31,6 +31,7 @@ from src.core.loader import (
     INHERIT_MODEL,
     ROSTER_INHERIT_MARKER,
     SubagentsConfig,
+    get_all_tool_names,
     load_agent_config,
     load_agent_config_from_dict,
     load_config_from_resolved,
@@ -44,6 +45,14 @@ from src.core.subagent_roster import (
     RosterResolutionError,
     resolve_subagent_roster,
 )
+from src.subagents.budgets import BUILTIN_DEFAULTS, ChildBudgets
+from src.subagents.child import (
+    CONTROL_PLANE_CATEGORIES,
+    DELEGATION_TOOL_NAMES,
+    entry_tool_names,
+    select_child_tool_names,
+)
+from src.tools.registry import TOOL_REGISTRY
 
 _REPO = Path(__file__).resolve().parents[1]
 _CONFIG = _REPO / "config"
@@ -727,16 +736,64 @@ def test_load_agent_config_resolves_a_bundled_roster_from_disk(tmp_path):
         load_agent_config(str(bad))
 
 
-def test_bundled_experts_carry_no_roster_and_the_public_bases_parse():
-    """Nothing shipped declares a roster yet; every public base still parses
-    with the empty typed shape (and the new delegation keys) in place."""
-    for name in ("worker_base", "session_base", "subagent_base", "critic", "assistant"):
+def test_public_bases_carry_no_roster_and_five_experts_resolve_the_library():
+    """Public bases stay neutral; the five U3 parents resolve usable rosters."""
+    for name in ("worker_base", "session_base", "subagent_base"):
         path, deployment_dir = resolve_config_path(name)
         cfg = load_agent_config(path, deployment_dir)
         assert cfg.subagents == SubagentsConfig(), name
         assert "subagents" not in cfg.extra, name
         assert cfg.delegation.max_concurrent == 4, name
         assert cfg.delegation.run_in_background_default is False, name
-    critic = load_agent_config(*resolve_config_path("critic"))
-    assert critic.tags == ["review", "quality", "gating"]
-    assert "tags" not in critic.extra
+
+    expected = {
+        "developer": (
+            "explorer",
+            {"explorer", "implementer", "tester", "reviewer"},
+        ),
+        "critic": ("verifier", {"explorer", "verifier"}),
+        "scholar": ("reader", {"explorer", "reader"}),
+        "bughunter": ("probe", {"explorer", "probe"}),
+        "product-qa": ("probe", {"explorer", "probe"}),
+    }
+    for expert, (default, names) in expected.items():
+        cfg = load_agent_config(*resolve_config_path(expert))
+        assert cfg.subagents.default == default
+        assert set(cfg.subagents.roster) == names
+        parent_names = get_all_tool_names(cfg)
+        for name, entry in cfg.subagents.roster.items():
+            library_leaf = _CONFIG / "subagents" / name / "config.yaml"
+            assert entry["_ref_kind"] == "library"
+            assert entry["_ref"] == f"subagents/{name}"
+            assert entry["_deployment_dir"] == f"config/subagents/{name}"
+            assert resolve_config_path(entry["_ref"])[0] == str(library_leaf)
+
+            raw = yaml.safe_load(library_leaf.read_text(encoding="utf-8"))
+            budgets = ChildBudgets.from_entry(entry, name)
+            declared = raw.get("limits") or dict(
+                zip(
+                    (
+                        "max_turns",
+                        "max_tokens",
+                        "return_budget_tokens",
+                        "stale_idle_s",
+                        "stale_in_tool_s",
+                    ),
+                    BUILTIN_DEFAULTS[name],
+                    strict=True,
+                )
+            )
+            for key, value in declared.items():
+                assert getattr(budgets, key) == value
+
+            selected, _dropped = select_child_tool_names(
+                entry_tool_names(entry),
+                parent_names,
+                write_policy=str(entry.get("write_policy") or "none"),
+            )
+            assert selected, f"{expert}/{name} resolved no child tools"
+            assert not (set(selected) & DELEGATION_TOOL_NAMES)
+            for tool_name in selected:
+                assert TOOL_REGISTRY[tool_name]["category"] not in (
+                    CONTROL_PLANE_CATEGORIES
+                )

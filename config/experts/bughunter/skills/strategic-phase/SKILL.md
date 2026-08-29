@@ -44,4 +44,8 @@ Decision criteria:
 
 Action bias: Strategic hunting should be shorter than tactical probing. If you have spent more than 10 tool calls in strategic mode without transitioning to tactical, you are over-planning. Pick the top vectors and start probing — you can re-plan after the first wave of results.
 
+{% if has_tool("delegate_agent") -%}
+Fan probes out to `probe` children only when vectors are independent; probes return raw evidence (exact command, output, exit code, timestamps, screenshot paths); you classify and file.
+{% endif -%}
+
 When the hunt plan is ready, transition to tactical with specific probes to run.
