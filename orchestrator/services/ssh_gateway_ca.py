@@ -9,9 +9,23 @@ connection. Consequences worth keeping in mind while editing this file:
 - Revocation is publishing a new CA public key to workspaces, not
   re-provisioning the fleet.
 
-The single principal is load-bearing. A certificate whose principal list is
-empty or wildcarded would be accepted for any user on any host — that class of
-mistake is what CVE-2025-49825 was.
+The single principal is load-bearing, but only within one scope: it restricts
+the certificate to one Unix *user* on the inner hop. A certificate whose
+principal list is empty or wildcarded would be accepted for any user on any
+host -- that class of mistake is what CVE-2025-49825 was -- but a correctly
+scoped single principal does not by itself restrict *which workspace* accepts
+it. Every workspace image bakes in the same Unix user
+(``docker/Dockerfile.workspace``'s ``useradd -m -s /bin/bash -u 1000
+agent-host``), and OpenSSH's ``AuthorizedPrincipalsFile`` defaults to
+``none``, so today a certificate minted for one workspace is honored by every
+workspace for the whole of its validity window. Closing that is Task 9's to
+do: per-workspace principals plus an ``AuthorizedPrincipalsFile`` that only
+the intended workspace populates. It is NOT ``source_address`` -- that option
+restricts the address the certificate's *presenter* connects from
+(``ssh-keygen(1)``: "the source addresses from which the certificate is
+considered valid"), and our presenter is the gateway, not the workspace, so
+pinning a target workspace's pod IP there would make every legitimate
+connection invalid rather than scope anything.
 
 The certificate carries exactly two OpenSSH extensions -- ``permit-pty`` and
 ``permit-port-forwarding`` -- and denies the other three (``permit-X11-
@@ -22,9 +36,13 @@ certificate no matter what the workspace's own ``sshd_config`` allows, so
 Denying ``permit-pty`` would mean no interactive shell at all -- the feature's
 primary use case -- and denying ``permit-port-forwarding`` would kill the
 ``direct-tcpip`` path JetBrains Gateway/``ProxyJump`` needs and that the
-gateway's own ``clamp_direct_tcpip`` exists to police; the workspace's
-``PermitOpen 127.0.0.1:*`` does the real narrowing of *where* that forwarding
-can go, but only once the certificate permits forwarding at all. Both
+gateway's own ``clamp_direct_tcpip`` exists to police. Two settings in the
+workspace's ``sshd_config`` (``docker/Dockerfile.workspace``) do the real
+narrowing once the certificate permits forwarding at all: ``PermitOpen
+127.0.0.1:*`` constrains *where* a ``direct-tcpip`` channel may target, and
+``AllowTcpForwarding local`` denies remote (``-R``) forwarding outright.
+Relaxing either widens what this certificate's ``permit-port-forwarding``
+actually grants, so a future editor touching one should see the other. Both
 asyncssh's ``generate_user_certificate`` and real OpenSSH's ``ssh-keygen -s``
 grant every ``permit-*`` extension by default when unspecified (the latter's
 ``-O clear`` option exists precisely because the default is all-on -- see
@@ -39,18 +57,42 @@ from __future__ import annotations
 import time
 
 import asyncssh
+from asyncssh.public_key import SSHOpenSSHCertificate
 
 DEFAULT_CERT_LIFETIME_SECONDS = 300
+# Neither asyncssh nor OpenSSH impose a ceiling of their own -- an unspecified
+# valid_before means "forever" to both -- so this module owns one. A multiple
+# of the default (rather than an unrelated round number) keeps the
+# relationship between "normal" and "as long as we ever allow" visible at the
+# call site.
+MAX_CERT_LIFETIME_SECONDS = DEFAULT_CERT_LIFETIME_SECONDS * 4
+# How far before "now" `valid_after` is backdated, so a workspace whose clock
+# trails the gateway's does not reject a certificate issued moments ago.
+# Named so tests can pin the certificate's span exactly instead of allowing
+# slop for an unlabeled number.
+CERT_BACKDATE_SECONDS = 60
 
 
 class SshUserCa:
     """Mints short-lived user certificates for the inner hop."""
 
     def __init__(self, ca_private_key_pem: str):
+        """Load and validate the CA's signing key.
+
+        Restricted to Ed25519. This constructor is the one place that ever
+        touches the CA key, making it the natural chokepoint to reject a
+        weak or wrong-type key -- e.g. asyncssh will happily load and sign
+        with a 1024-bit RSA key otherwise -- before it can mint anything.
+        """
         try:
             self._ca_key = asyncssh.import_private_key(ca_private_key_pem)
         except Exception as exc:
             raise ValueError("ssh-gateway user CA is not a usable private key") from exc
+        algorithm = self._ca_key.get_algorithm()
+        if algorithm != "ssh-ed25519":
+            raise ValueError(
+                f"ssh-gateway user CA must be Ed25519 (ssh-ed25519), got {algorithm!r}"
+            )
 
     @property
     def public_key_line(self) -> str:
@@ -61,31 +103,42 @@ class SshUserCa:
         self,
         principal: str,
         lifetime_seconds: int = DEFAULT_CERT_LIFETIME_SECONDS,
-    ) -> tuple[asyncssh.SSHKey, asyncssh.SSHCertificate]:
+    ) -> tuple[asyncssh.SSHKey, SSHOpenSSHCertificate]:
         """A fresh keypair and a certificate over it, valid for one attachment.
 
-        ``valid_after`` is backdated 60s so a workspace whose clock trails the
-        gateway does not reject a certificate issued moments ago.
+        ``valid_after`` is backdated by ``CERT_BACKDATE_SECONDS`` (see that
+        constant's docstring). ``lifetime_seconds`` is capped at
+        ``MAX_CERT_LIFETIME_SECONDS``: small/degenerate values already fail
+        closed (asyncssh rejects ``valid_before <= valid_after``), but
+        nothing bounds the top end, so a future caller wiring this to config
+        or an env var could otherwise mint a certificate lasting years from
+        a single typo.
 
         ``permit_pty`` and ``permit_port_forwarding`` are granted -- an
         interactive shell needs the former, ``direct-tcpip`` needs the
-        latter, and the workspace's own ``PermitOpen 127.0.0.1:*`` narrows
-        what that forwarding can reach. The other three ``permit_*`` flags
-        are passed as ``False`` explicitly: asyncssh's own default for each
-        is ``True`` (confirmed against the installed 2.24.0 source, and
+        latter, and the workspace's own ``PermitOpen 127.0.0.1:*`` /
+        ``AllowTcpForwarding local`` narrow what that forwarding can reach
+        and whether it can run in reverse. The other three ``permit_*``
+        flags are passed as ``False`` explicitly: asyncssh's own default for
+        each is ``True`` (confirmed against the installed 2.24.0 source, and
         matching real ``ssh-keygen -s``'s documented default), so omitting
         them would silently grant X11 forwarding, agent forwarding, and the
         user rc file -- none of which this certificate should carry.
         """
         if not principal:
             raise ValueError("a certificate principal is required")
+        if lifetime_seconds > MAX_CERT_LIFETIME_SECONDS:
+            raise ValueError(
+                f"lifetime_seconds={lifetime_seconds} exceeds "
+                f"MAX_CERT_LIFETIME_SECONDS={MAX_CERT_LIFETIME_SECONDS}"
+            )
         key = asyncssh.generate_private_key("ssh-ed25519")
         now = int(time.time())
         cert = self._ca_key.generate_user_certificate(
             key,
             "srw-ssh-gateway",
             principals=[principal],
-            valid_after=now - 60,
+            valid_after=now - CERT_BACKDATE_SECONDS,
             valid_before=now + lifetime_seconds,
             permit_pty=True,
             permit_port_forwarding=True,

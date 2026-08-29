@@ -6,7 +6,12 @@ import asyncssh
 import pytest
 from asyncssh.public_key import CERT_TYPE_USER
 
-from services.ssh_gateway_ca import DEFAULT_CERT_LIFETIME_SECONDS, SshUserCa
+from services.ssh_gateway_ca import (
+    CERT_BACKDATE_SECONDS,
+    DEFAULT_CERT_LIFETIME_SECONDS,
+    MAX_CERT_LIFETIME_SECONDS,
+    SshUserCa,
+)
 
 
 @pytest.fixture
@@ -29,24 +34,24 @@ def test_mint_produces_a_certificate_for_one_principal(ca_pem):
 # as `_valid_after`/`_valid_before` (public_key.py:1572-1573) -- there is no
 # public `valid_after`/`valid_before` property in this version. Confirmed by
 # reading the installed source and grepping the whole package for any public
-# accessor (none exists); this is a deliberate choice against a missing
-# public API, not an oversight. See task-1-report.md for the full discrepancy
-# note. `test_certificate_outside_its_window_is_rejected` below covers the
-# same ground through the real public `cert.validate(...)` method instead.
+# accessor (none exists). The span test below is the one place that still
+# reads them: a duration has no public accessor at all. "Is it valid right
+# now" DOES have one (`cert.validate`), so that test uses it instead.
 
 
 def test_certificate_is_short_lived(ca_pem):
     _, cert = SshUserCa(ca_pem).mint("agent-host")
     span = cert._valid_before - cert._valid_after  # private field; see note above
-    assert span <= DEFAULT_CERT_LIFETIME_SECONDS + 120  # clock-skew allowance
+    # `now` is captured once in mint() and reused for both valid_after and
+    # valid_before, so the span is exactly lifetime + backdate -- no
+    # clock-skew slop needed, and none should be allowed: a silent multiple
+    # of CERT_BACKDATE_SECONDS must fail this.
+    assert span == DEFAULT_CERT_LIFETIME_SECONDS + CERT_BACKDATE_SECONDS
 
 
 def test_certificate_is_valid_now(ca_pem):
     _, cert = SshUserCa(ca_pem).mint("agent-host")
-    now = time.time()
-    assert (
-        cert._valid_after <= now < cert._valid_before
-    )  # private field; see note above
+    cert.validate(CERT_TYPE_USER, "agent-host")  # must not raise
 
 
 def test_certificate_outside_its_window_is_rejected(ca_pem):
@@ -63,33 +68,62 @@ def test_certificate_outside_its_window_is_rejected(ca_pem):
         cert.validate(CERT_TYPE_USER, "agent-host")
 
 
+def test_mint_accepts_lifetime_at_the_ceiling(ca_pem):
+    _, cert = SshUserCa(ca_pem).mint(
+        "agent-host", lifetime_seconds=MAX_CERT_LIFETIME_SECONDS
+    )
+    span = cert._valid_before - cert._valid_after
+    assert span == MAX_CERT_LIFETIME_SECONDS + CERT_BACKDATE_SECONDS
+
+
+def test_mint_rejects_lifetime_beyond_the_ceiling(ca_pem):
+    """Neither asyncssh nor OpenSSH bound valid_before; a typo feeding a huge
+    lifetime_seconds through config would otherwise mint a years-long
+    certificate from a module whose entire premise is short-livedness."""
+    with pytest.raises(ValueError):
+        SshUserCa(ca_pem).mint(
+            "agent-host", lifetime_seconds=MAX_CERT_LIFETIME_SECONDS + 1
+        )
+
+
 def test_each_mint_uses_a_fresh_keypair(ca_pem):
     """A per-connection keypair means a leaked one is worthless in minutes and
-    cannot be correlated across sessions."""
+    cannot be correlated across sessions.
+
+    Compares ``.public_data``, not ``export_private_key()``: the OpenSSH
+    private-key encoding embeds a random check-int, so two exports of the
+    *same* key object are already unequal (empirically confirmed) -- that
+    assertion would pass even if ``mint()`` returned one fixed key every
+    time. ``.public_data`` is stable for a given key and differs only when
+    the key itself differs. Also compares what each certificate actually
+    signed (``cert.key``), not just what ``mint()`` handed back, so the
+    check covers what got signed too.
+    """
     ca = SshUserCa(ca_pem)
-    first, _ = ca.mint("agent-host")
-    second, _ = ca.mint("agent-host")
-    assert first.export_private_key() != second.export_private_key()
+    first_key, first_cert = ca.mint("agent-host")
+    second_key, second_cert = ca.mint("agent-host")
+    assert first_key.public_data != second_key.public_data
+    assert first_cert.key.public_data != second_cert.key.public_data
 
 
 def test_mint_grants_only_pty_and_port_forwarding(ca_pem):
     """permit-pty is required for an interactive shell (the feature's primary
     use case) and permit-port-forwarding for direct-tcpip (JetBrains Gateway /
-    ProxyJump), which the workspace's own `PermitOpen 127.0.0.1:*` narrows --
-    but only once the certificate allows forwarding at all; extensions are
-    permissive-by-listing, so sshd_config cannot grant back what the
-    certificate omits. asyncssh (like real `ssh-keygen -s`, confirmed via its
-    `-O clear` option and its man page's "permitted by default" wording)
-    defaults every permit-* to granted, so the three unneeded ones
-    (X11-forwarding, agent-forwarding, user-rc) must be denied explicitly or
-    they are inherited on. This asserts both directions in one equality: a
-    missing permit-pty/permit-port-forwarding fails it, and so does any of
-    the other three leaking back in."""
+    ProxyJump), which the workspace's own `PermitOpen 127.0.0.1:*` /
+    `AllowTcpForwarding local` narrow -- but only once the certificate allows
+    forwarding at all; extensions are permissive-by-listing, so sshd_config
+    cannot grant back what the certificate omits. asyncssh (like real
+    `ssh-keygen -s`, confirmed via its `-O clear` option and its man page's
+    "permitted by default" wording) defaults every permit-* to granted, so
+    the three unneeded ones (X11-forwarding, agent-forwarding, user-rc) must
+    be denied explicitly or they are inherited on. This asserts both
+    directions in one equality: a missing permit-pty/permit-port-forwarding
+    fails it, and so does any of the other three leaking back in."""
     _, cert = SshUserCa(ca_pem).mint("agent-host")
     assert cert.options == {"permit-pty": True, "permit-port-forwarding": True}
 
 
-def test_signed_by_the_expected_ca(ca_pem, tmp_path):
+def test_signed_by_the_expected_ca(ca_pem):
     ca = SshUserCa(ca_pem)
     _, cert = ca.mint("agent-host")
     ca_key = asyncssh.import_private_key(ca_pem)
@@ -103,5 +137,24 @@ def test_rejects_a_public_key_as_the_ca(tmp_path):
         check=True,
         capture_output=True,
     )
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="not a usable private key"):
         SshUserCa((path.with_suffix(".pub")).read_text())
+
+
+def test_rejects_a_non_ed25519_ca(tmp_path):
+    """The constructor is the one chokepoint that ever sees the CA key -- a
+    1024-bit RSA key loads and would sign happily otherwise (empirically
+    checked against asyncssh directly), so it is where a wrong key type must
+    be refused, with a message naming both what was required and supplied.
+    """
+    path = tmp_path / "ca"
+    subprocess.run(
+        ["ssh-keygen", "-t", "rsa", "-b", "1024", "-N", "", "-f", str(path)],
+        check=True,
+        capture_output=True,
+    )
+    with pytest.raises(ValueError) as exc_info:
+        SshUserCa(path.read_text())
+    message = str(exc_info.value)
+    assert "ed25519" in message.lower()
+    assert "ssh-rsa" in message
