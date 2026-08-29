@@ -18,15 +18,17 @@ creates its entry on a mere *read* -- so a refused admission, or a
 release()/close_channel()/detach() call for an id that was never admitted,
 would silently allocate a permanent zero-valued entry. On an internet-facing
 gateway that receives constant background scan traffic from source IPs that
-never come back, that grows forever. Every store here is a plain ``dict``,
-and every mutating method deletes a key the instant its count or window
-empties, and never creates one for an admission it refused.
+never come back, that grows forever. Every store here is a plain ``dict``
+(``_recent`` is an ``OrderedDict``, for the recency-ordered eviction
+``_reap_expired_front`` relies on -- see its docstring), and every
+mutating method deletes a key the instant its count or window empties,
+and never creates one for an admission it refused.
 """
 
 from __future__ import annotations
 
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Callable
 
 
@@ -59,7 +61,13 @@ class GatewayLimiter:
 
         time_fn defaults to time.monotonic and exists so tests can inject
         a fake, advanceable clock -- the 60-second rate window is
-        otherwise untestable without a real 60-second sleep.
+        otherwise untestable without a real 60-second sleep. It is
+        expected to be monotonically non-decreasing, like time.monotonic
+        itself. Verified (not just assumed): a clock that jumps backwards
+        does not corrupt state -- the `> 60.0` comparison simply stops
+        finding anything old enough to expire, so affected sources stay
+        rate-limited (fail closed) rather than being let through, and
+        normal expiry resumes on its own once the clock catches back up.
         """
         self._max_preauth = max_preauth_connections
         self._max_preauth_per_source = max_preauth_connections_per_source
@@ -70,7 +78,7 @@ class GatewayLimiter:
 
         self._preauth_total: int = 0
         self._preauth_by_source: dict[str, int] = {}
-        self._recent: dict[str, deque[float]] = {}
+        self._recent: OrderedDict[str, deque[float]] = OrderedDict()
         self._channels: dict[str, int] = {}
         self._attachments: dict[str, int] = {}
 
@@ -83,21 +91,44 @@ class GatewayLimiter:
         admission rate, this source's concurrent pre-auth count, and the
         gateway-wide concurrent pre-auth count. A refusal at any gate
         leaves no bookkeeping behind for an unrecognized client_ip.
+
+        A refused attempt is never appended to its source's rate window.
+        This is deliberate -- a refusal must not burn a legitimate
+        client's own future admission budget -- but it also means a
+        connect-and-drop source that never holds a pre-auth slot is never
+        slowed by any gate here: the rate gate never records it, and the
+        concurrency gates only bind on connections that stay open. That
+        traffic shape is exactly what made the reap cost in
+        `_reap_expired_front` worth keeping cheap; see its docstring.
         """
         now = self._time_fn()
-        self._reap_expired_windows(now)
 
-        if len(self._recent.get(client_ip, ())) >= self._rate:
+        # Trim only THIS source's own expired timestamps first. Bounded by
+        # preauth_rate_per_minute (a small constant, e.g. 60), not by how
+        # many other sources are tracked -- cheap no matter what
+        # _reap_expired_front below costs.
+        window = self._recent.get(client_ip)
+        if window is not None:
+            while window and now - window[0] > 60.0:
+                window.popleft()
+            if not window:
+                del self._recent[client_ip]
+                window = None
+
+        self._reap_expired_front(now)
+
+        rate_count = len(window) if window is not None else 0
+        if rate_count >= self._rate:
             return False
         if self._preauth_by_source.get(client_ip, 0) >= self._max_preauth_per_source:
             return False
         if self._preauth_total >= self._max_preauth:
             return False
 
-        window = self._recent.get(client_ip)
         if window is None:
             window = self._recent[client_ip] = deque()
         window.append(now)
+        self._recent.move_to_end(client_ip)
         self._preauth_by_source[client_ip] = (
             self._preauth_by_source.get(client_ip, 0) + 1
         )
@@ -110,7 +141,14 @@ class GatewayLimiter:
         A release for a source with no tracked slot (a double release, or
         a release with no matching try_admit) is a no-op: it must not
         create a new entry, and must not free a gateway-wide slot that
-        this client_ip was never charged for.
+        this client_ip was never charged for. This guard is load-bearing,
+        not defensive filler: Task 8 has a real hazard where
+        websocket.accept() can raise between try_admit and the
+        surrounding try/finally, producing exactly this kind of unmatched
+        release, and removing the guard would let that hazard (or a
+        source simply calling release() speculatively) silently inflate
+        the effective global cap. Covered by
+        test_an_unmatched_release_cannot_forge_a_global_preauth_slot.
         """
         count = self._preauth_by_source.get(client_ip)
         if not count:
@@ -121,30 +159,48 @@ class GatewayLimiter:
             self._preauth_by_source[client_ip] = count - 1
         self._preauth_total = max(0, self._preauth_total - 1)
 
-    def _reap_expired_windows(self, now: float) -> None:
-        """Drop every source's rate-limit window once it empties.
+    def _reap_expired_front(self, now: float) -> None:
+        """Evict fully-expired sources from the front of `_recent`.
 
-        try_admit is the only method invoked for connections that never
-        complete auth, so it is the only place background scan traffic --
-        many distinct source IPs, most never seen again -- actually
-        touches this module. Purging only the *current caller's* own
-        window would leave one permanent entry behind per one-shot
-        scanning source; sweeping every tracked window here instead
-        bounds ``_recent`` to "sources seen within the trailing 60
-        seconds," which is the bound the rate limiter is already meant to
-        enforce. Cost is O(distinct recent sources) per admission
-        attempt -- bounded by real incoming connections, not by all-time
-        scanning history, which is acceptable for a resource guard that
-        is explicitly not a hot request-per-second path.
+        `_recent` is an OrderedDict kept in recency order: every
+        successful admission calls `move_to_end(client_ip)`, so the front
+        is always the least-recently-admitted source and the back is the
+        most recent. That ordering is what makes this cheap: as long as
+        the front entry's *newest* timestamp is still within the
+        60-second window, every entry behind it is at least as recent, so
+        it must be within the window too, and the loop can stop without
+        looking at it. It never inspects a live entry, let alone all of
+        them.
+
+        A prior version of this comment claimed the equivalent full-scan
+        sweep was "acceptable... for a resource guard that is explicitly
+        not a hot request-per-second path." That was false and is exactly
+        what a review measured: try_admit runs on every inbound TCP
+        connection to an internet-facing SSH listener, which is precisely
+        an attacker-controlled request-per-second path, and the old
+        unconditional per-call scan over every tracked source was 970x
+        slower at 8,000 tracked sources than at zero -- a cheaper DoS than
+        the unbounded-memory leak it replaced, since a connect-and-drop
+        source holds no slot and so was never throttled by any cap (see
+        try_admit's docstring). This version's cost is bounded by how many
+        entries this call actually evicts, not by how many are tracked:
+        each entry is created once and evicted at most once over its
+        lifetime, so total eviction work across the module's lifetime is
+        bounded by total entries ever created -- amortized O(1) per
+        try_admit call, though any single call landing right after a
+        large cohort ages out will do work proportional to that cohort,
+        not to unrelated still-live entries.
+        `test_reaping_does_not_scale_with_the_number_of_tracked_sources`
+        verifies the stop-at-the-first-live-entry behavior directly, by
+        counting dict entries inspected rather than wall-clock time (a
+        timing assertion would flake under CI load).
         """
-        stale = []
-        for ip, window in self._recent.items():
-            while window and now - window[0] > 60.0:
-                window.popleft()
-            if not window:
-                stale.append(ip)
-        for ip in stale:
-            del self._recent[ip]
+        while self._recent:
+            oldest_ip, oldest_window = next(iter(self._recent.items()))
+            if now - oldest_window[-1] > 60.0:
+                del self._recent[oldest_ip]
+            else:
+                break
 
     # -- channels ---------------------------------------------------------
 

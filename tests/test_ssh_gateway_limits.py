@@ -14,6 +14,8 @@ attachments), plus three properties a review found broken in the first cut:
   clock has to be injectable rather than calling time.monotonic() directly.
 """
 
+from collections import OrderedDict
+
 from services.ssh_gateway_limits import GatewayLimiter
 
 
@@ -28,6 +30,35 @@ class FakeClock:
 
     def advance(self, seconds: float) -> None:
         self._now += seconds
+
+
+class _CountingItemsView:
+    """Wraps an OrderedDict's items() view to count how many (key, value)
+    pairs are actually consumed during iteration.
+
+    Exists to prove a reap loop's cost in operations rather than
+    wall-clock time -- a wall-clock assertion would flake under CI load,
+    per fix-round review finding (Critical)."""
+
+    def __init__(self, view, counter_holder):
+        self._view = view
+        self._counter_holder = counter_holder
+
+    def __iter__(self):
+        for item in self._view:
+            self._counter_holder.entries_inspected += 1
+            yield item
+
+
+class _CountingOrderedDict(OrderedDict):
+    """An OrderedDict that counts every entry inspected via items()."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.entries_inspected = 0
+
+    def items(self):
+        return _CountingItemsView(super().items(), self)
 
 
 def _limiter(**kw):
@@ -243,3 +274,68 @@ def test_rate_limit_window_boundary_is_exclusive_at_exactly_60_seconds():
 
     clock.advance(1e-6)
     assert limiter.try_admit("1.1.1.1") is True  # now strictly older than 60s
+
+
+# -- Fix round 1: review found the G18 sweep itself was an O(N)-per-call
+#    DoS (attacker-controlled N, paid even by refused attempts), and a
+#    second uncovered path where an unmatched release() could forge a
+#    global pre-auth slot (mutation M6 in the review's mutation testing
+#    caught nothing). ------------------------------------------------
+
+
+def test_reaping_does_not_scale_with_the_number_of_tracked_sources():
+    """The first cut swept every tracked source on every try_admit call
+    (O(N) per call, N attacker-controlled, paid even by refused attempts --
+    measured by review at 8,000 tracked sources: 577us per call vs 0.6us
+    baseline, a cheaper DoS than the unbounded-memory leak it replaced,
+    since a connect-and-drop attacker holds no pre-auth slot and so is
+    never throttled by any cap).
+
+    The fix keeps `_recent` ordered by recency (move_to_end on each
+    admission) so the front-eviction reap can stop at the first still-live
+    entry instead of inspecting every tracked source. Proven here by
+    counting dict entries actually inspected, not wall-clock time, since a
+    timing assertion would flake under CI load.
+    """
+    clock = FakeClock(start=0.0)
+    limiter = _limiter(
+        max_preauth_connections=10_000, preauth_rate_per_minute=10_000, time_fn=clock
+    )
+
+    # 3 sources admitted now -- stale once the clock moves past 60s.
+    for i in range(3):
+        assert limiter.try_admit(f"10.0.0.{i}") is True
+
+    clock.advance(55.0)
+
+    # A large cohort admitted later: still fresh at measurement time, and
+    # must never be inspected by the front-eviction reap.
+    for i in range(5000):
+        assert limiter.try_admit(f"10.1.0.{i}") is True
+
+    limiter._recent = _CountingOrderedDict(limiter._recent)
+    clock.advance(6.0)  # now: the first 3 are 61s old; the 5000 are 6s old
+
+    assert limiter.try_admit("192.0.2.1") is True
+
+    # Only the 3 now-stale entries, plus the one live entry the loop stops
+    # at, may have been inspected -- nowhere near the ~5,003 tracked.
+    assert limiter._recent.entries_inspected <= 10
+
+
+def test_an_unmatched_release_cannot_forge_a_global_preauth_slot():
+    """A release() for a source that was never admitted must not free a
+    slot on the gateway-wide counter. Task 8's own brief flags a real
+    double-release hazard (websocket.accept() can raise between try_admit
+    and the surrounding try/finally); without this guard, that hazard --
+    or a source spoofing repeated releases -- silently inflates the
+    effective global cap."""
+    limiter = _limiter(max_preauth_connections=2, preauth_rate_per_minute=10)
+    assert limiter.try_admit("1.1.1.1") is True
+    assert limiter.try_admit("2.2.2.2") is True
+    assert limiter.try_admit("3.3.3.3") is False  # global cap (2) reached
+
+    for _ in range(20):
+        limiter.release("9.9.9.9")  # never admitted; must be a no-op
+
+    assert limiter.try_admit("4.4.4.4") is False  # still full
