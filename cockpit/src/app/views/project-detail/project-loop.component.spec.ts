@@ -86,6 +86,16 @@ describe('workerExpertsOnly', () => {
     ]);
   });
 
+  it('keeps a session expert tagged worker (U1: tags are additive role metadata)', () => {
+    expect(
+      workerExpertsOnly([
+        {id: 'a', expert_type: 'session', tags: ['session', 'worker']},
+        {id: 'b', expert_type: 'session', tags: ['session']},
+        {id: 'c', expert_type: 'worker', tags: ['worker']},
+      ]).map((e) => e.id),
+    ).toEqual(['a', 'c']);
+  });
+
   it('is empty for empty input', () => {
     expect(workerExpertsOnly([])).toEqual([]);
   });

@@ -44,26 +44,82 @@ export interface PaginationState {
 // =============================================================================
 
 /**
+ * The roles an expert can run in (universal_experts_and_subagents.md §0 D4).
+ * One schema, one role overlay each; every expert stays usable in every role.
+ */
+export type ExpertRole = 'worker' | 'session' | 'subagent';
+
+export const EXPERT_ROLES: readonly ExpertRole[] = ['worker', 'session', 'subagent'];
+
+/**
  * Expert configuration for discovery and selection.
  */
 export interface Expert {
   id: string;
   /** Slug used to reference the expert by name (e.g. a loop's role_sequence).
-   *  For bundled experts this equals `id`; for DB experts it's the name column. */
+   *  For bundled experts this equals `id`; for DB experts it's the name column.
+   *  Subagent-library entries (`config/subagents/*`) carry `subagents/<id>`
+   *  here — the unambiguous `$ref` spelling for a roster entry. */
   name?: string;
   display_name: string;
   description: string;
   icon: string;
   color: string;
+  /** Additive metadata — a soft UI filter, never read for behaviour. Every
+   *  listed expert carries its role tag(s) (`worker` / `session` /
+   *  `subagent`) next to whatever free-text tags the author added; the list
+   *  filters and the pickers match on `expert_type || tags`. */
   tags: string[];
-  /** 'bundled' (disk config) | 'user' | 'global' | 'managed' (DB-backed). DB experts are
-   *  selected via expert_id; bundled experts via config_name. */
+  /** 'bundled' (disk config) | 'library' (config/subagents/*) | 'user' |
+   *  'global' | 'managed' (DB-backed). DB experts are selected via expert_id;
+   *  bundled experts via config_name. */
   source?: string;
-  storage_kind?: 'bundled' | 'db';
+  storage_kind?: 'bundled' | 'library' | 'db';
   owner_id?: string | null;
   managed_key?: string | null;
-  /** 'worker' | 'session'. */
+  /** 'worker' | 'session' — the expert's identity role (a library entry
+   *  reports its `$extends` chain root, `worker` by default). */
   expert_type?: string;
+}
+
+// ---- Subagent roster (`config.subagents`, universal_experts_and_subagents.md §1.1) ----
+
+export type SubagentIsolation = 'shared' | 'worktree';
+export type SubagentWritePolicy = 'none' | 'scratch_only' | 'owned_paths' | 'full';
+export type SubagentReturnKind = 'summary' | 'structured' | 'evidence' | 'diff';
+
+/** The `llm.model` value that means "run on the parent's model". */
+export const SUBAGENT_INHERIT_MODEL = 'inherit';
+
+/**
+ * One `subagents.roster` entry. Inline: any expert-schema key (resolved on the
+ * subagent overlay). Reference: `$ref` — a bundled expert dir name (`critic`),
+ * a library entry (`subagents/explorer`) or a DB expert id — plus optional
+ * sibling keys deep-merged over the referenced expert. `isolation`,
+ * `write_policy`, `limits.*` budgets and `return` are U3 runtime keys carried
+ * verbatim in U1.
+ */
+export interface SubagentRosterEntry {
+  $ref?: string;
+  description?: string;
+  /** `{model: 'inherit' | <catalog model>, ...provider/transport/params}`. */
+  llm?: Record<string, unknown>;
+  tools?: Record<string, unknown>;
+  prompts?: Record<string, string | null>;
+  isolation?: SubagentIsolation;
+  write_policy?: SubagentWritePolicy;
+  limits?: Record<string, unknown>;
+  return?: SubagentReturnKind;
+  [key: string]: unknown;
+}
+
+/** The expert's `subagents` block. `llm` is the roster-wide model default
+ *  (the "Subagent model" picker); `default` names the entry `delegate_agent`
+ *  falls back to when a call passes no `subagent_type`. */
+export interface SubagentsConfig {
+  default?: string | null;
+  llm?: Record<string, unknown>;
+  roster?: Record<string, SubagentRosterEntry>;
 }
 
 export interface ExpertDefaultSlot {
@@ -102,13 +158,20 @@ export interface EffectiveModelSlot {
  * precedence dispatch uses. Lets the picker show the model that will actually
  * run if the user makes no change. See Layer 3 in the issue doc
  * loop_ran_codex_spark_not_selected_model_then_hung_on_cooldown.md.
+ *
+ * Since U1 an expert has ONE model (`llm.model`): `model` is what the picker's
+ * unset "Default" option names in both the job and the session form
+ * (`session` is kept equal to it); `subagent` is the roster-wide
+ * `subagents.llm.model` when pinned to a real model, else `model` (`inherit`
+ * IS the parent's model). The per-phase `strategic` / `tactical` slots are
+ * gone on both sides.
  */
 export interface EffectiveModels {
-  strategic: EffectiveModelSlot;
-  tactical: EffectiveModelSlot;
-  /** Reader model for spawn_subagent delegation. Resolves subagent → tactical →
-   *  base server-side, mirroring the agent's reader-model fallback. */
+  model: EffectiveModelSlot;
+  /** Roster-wide subagent model (`subagents.llm.model`), falling back to
+   *  `model` — mirrors the resolver's `inherit` handling. */
   subagent: EffectiveModelSlot;
+  /** Always equal to `model`; kept for readers of the session detail. */
   session: EffectiveModelSlot;
 }
 
@@ -126,6 +189,9 @@ export interface ExpertDetail extends Expert {
   settings_matrix?: Record<string, Record<string, unknown>>;
   /** Effective model + provenance per slot (server-resolved). */
   effective_models?: EffectiveModels | null;
+  /** The role the detail was resolved in (`GET /api/experts/{id}?role=`);
+   *  `expert_type` stays the expert's identity. */
+  resolved_role?: ExpertRole;
   /** DB-backed experts only — present on create/update responses + detail. */
   name?: string;
   owner_id?: string;
@@ -183,7 +249,10 @@ export interface ExpertCreateRequest {
   description?: string | null;
   icon?: string;
   color?: string;
+  /** Role tags (`worker` / `session` / `subagent`) + free-text tags. The
+   *  server always adds the `expert_type` role tag on write. */
   tags?: string[];
+  /** May carry a `subagents` roster — validated server-side (422/400). */
   config?: Record<string, unknown>;
   prompts?: Record<string, unknown>;
 }

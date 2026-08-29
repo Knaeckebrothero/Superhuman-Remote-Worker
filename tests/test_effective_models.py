@@ -6,8 +6,9 @@ has ONE model (``llm.model``) plus the roster-wide subagent model
 (``subagents.llm.model``): the per-phase tiers are gone, a legacy fragment is
 read through the loader's compat mapping (a stored ``llm.strategic`` pin
 surfaces as ``model``, a stored ``llm.subagent`` as the ``subagent`` slot), and
-``strategic`` / ``tactical`` are kept equal to ``model`` as deprecated aliases
-until the cockpit reads ``model`` (U1 WP6). See
+the payload carries exactly the ``model`` / ``subagent`` / ``session`` slots —
+the ``strategic`` / ``tactical`` aliases the cockpit read in between went with
+U1 WP6 on both sides. See
 knowledge-base/knowledge/issues/loop_ran_codex_spark_not_selected_model_then_hung_on_cooldown.md (Layer 3)
 and knowledge-base/knowledge/features/universal_experts_and_subagents.md §1.1.
 """
@@ -30,7 +31,7 @@ import main  # noqa: E402
 
 eff = main._effective_models_from_layers
 
-SLOTS = {"model", "subagent", "session", "strategic", "tactical"}
+SLOTS = {"model", "subagent", "session"}
 
 
 def _all_equal(result: dict, expected: dict) -> bool:
@@ -40,9 +41,17 @@ def _all_equal(result: dict, expected: dict) -> bool:
 class TestEffectiveModelsFromLayers:
     def test_model_agnostic_expert_uses_account_default(self):
         """A bundled, model-agnostic expert ({}) resolves to the user's account
-        default_model in every slot; the aliases equal ``model``."""
+        default_model in every slot."""
         r = eff({}, "acct-model", "sys-model")
         assert _all_equal(r, {"model": "acct-model", "source": "account_default"})
+
+    def test_no_per_phase_aliases_remain(self):
+        """The deprecated ``strategic`` / ``tactical`` aliases are gone: the
+        payload is exactly the three U1 slots, whatever the layers hold."""
+        for llm in ({}, {"model": "m"}, {"strategic": {"model": "s"}}):
+            r = eff(llm, "acct", "sys", {"llm": {"model": "reader"}})
+            assert set(r) == SLOTS
+            assert "strategic" not in r and "tactical" not in r
 
     def test_no_account_default_falls_to_system(self):
         r = eff({}, None, "sys-model")
@@ -78,7 +87,7 @@ class TestEffectiveModelsFromLayers:
         r = eff({"model": "top"}, "acct", "sys", {"llm": {"model": "haiku"}})
         assert r["subagent"] == {"model": "haiku", "source": "expert"}
         assert r["model"] == {"model": "top", "source": "expert"}
-        assert r["session"] == r["strategic"] == r["tactical"] == r["model"]
+        assert r["session"] == r["model"]
 
     def test_subagent_inherit_is_the_parent_model(self):
         """``inherit`` is not a selection: the children run on the expert's

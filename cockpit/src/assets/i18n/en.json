@@ -2018,6 +2018,8 @@
     "filterAll": "All",
     "filterWorker": "Worker",
     "filterSession": "Session",
+    "filterSubagent": "Subagent",
+    "showAll": "Show all experts",
     "colName": "Name",
     "colType": "Type",
     "colSource": "Source",
@@ -2039,7 +2041,63 @@
     "imported": "Expert imported",
     "inUse": "Expert is in use by {{count}} job(s)",
     "saveFailed": "Save failed",
-    "invalidJson": "Invalid JSON file"
+    "invalidJson": "Invalid JSON file",
+    "model": {
+      "title": "Model",
+      "model": "Model",
+      "baseDefault": "Base default",
+      "subagent": "Subagent model",
+      "subagentHint": "Roster-wide default for subagents — every entry without a model of its own runs on it; unset means they inherit this expert's model."
+    },
+    "tags": {
+      "title": "Tags",
+      "hint": "Role tags decide which pickers list this expert — every expert stays usable in every role. Other tags are free text for your own filtering.",
+      "roles": "Roles",
+      "roleLocked": "{{role}} — this expert's type, always on",
+      "free": "Other tags (comma separated)",
+      "freePlaceholder": "research, academic"
+    },
+    "subagents": {
+      "title": "Subagents",
+      "hint": "The roster this expert may delegate to: small inline experts, or references to any other expert (a referenced expert's workspace, autonomy and verification settings are ignored when it runs as a subagent). The name is the subagent_type the parent passes to delegate_agent.",
+      "empty": "No roster entries yet.",
+      "add": "Add subagent",
+      "remove": "Remove subagent",
+      "name": "Name",
+      "nameHint": "Letters, digits, _ and - (must start with a letter or digit)",
+      "nameInvalid": "The name must start with a letter or digit and contain only letters, digits, _ and -",
+      "nameDuplicate": "Another entry already uses this name",
+      "kind": "Kind",
+      "kindInline": "Inline (small expert)",
+      "kindReference": "Reference (another expert)",
+      "reference": "Referenced expert",
+      "referenceNone": "— pick an expert —",
+      "referenceLoading": "Loading experts…",
+      "referenceRequired": "Pick the expert this entry references",
+      "referenceHint": "The settings below override the referenced expert.",
+      "description": "Description",
+      "descriptionHint": "What the parent model sees next to the subagent_type.",
+      "model": "Model",
+      "modelInherit": "Inherit the parent's model",
+      "isolation": "Isolation",
+      "isolationDefault": "Default",
+      "isolationShared": "Shared — the parent's tree",
+      "isolationWorktree": "Worktree — its own git worktree",
+      "writePolicy": "Write policy",
+      "writePolicyDefault": "Default",
+      "writePolicyNone": "None (read-only)",
+      "writePolicyScratchOnly": "Scratch only",
+      "writePolicyOwnedPaths": "Owned paths (from the brief)",
+      "writePolicyFull": "Full",
+      "extra": "Tools, limits, return — JSON",
+      "extraHint": "Any other entry key (tools, limits, return, prompts, further llm settings), kept verbatim.",
+      "extraInvalid": "Invalid JSON",
+      "extraNotObject": "Must be a JSON object",
+      "default": "Default subagent",
+      "defaultHint": "What a delegate_agent call falls back to when it names no subagent_type.",
+      "defaultNone": "None",
+      "invalid": "The subagent roster has errors — fix them before saving."
+    }
   },
   "skills": {
     "title": "Skills",
@@ -2507,10 +2565,6 @@
       "research": "Research & Browser",
       "auxiliary": "Auxiliary LLM",
       "session": "Session"
-    },
-    "phases": {
-      "strategic": "Strategic",
-      "tactical": "Tactical"
     },
     "labels": {
       "reasoning": "Reasoning",
@@ -3107,9 +3161,8 @@
     "model": {
       "group": "Model",
       "preset": "Preset",
-      "strategic": "Strategic",
-      "tactical": "Tactical",
-      "subagent": "Subagent",
+      "subagent": "Subagent model",
+      "subagentRoster": "Roster-wide default for subagents — unset means they inherit the model above.",
       "single": "Model",
       "temperature": "Temperature",
       "reasoning": "Reasoning",
@@ -3125,9 +3178,7 @@
         "project": "project default"
       },
       "presetUnconfigured": "One or both models lack an API key",
-      "providerNoKey": "{{provider}} (no API key)",
-      "mismatchWindow": "These models have different context windows — they share one history, so it's capped to the smaller (~{{min}}).",
-      "mismatchMultimodal": "One of these models can't read images — image input will be disabled for both phases."
+      "providerNoKey": "{{provider}} (no API key)"
     }
   },
   "agentList": {

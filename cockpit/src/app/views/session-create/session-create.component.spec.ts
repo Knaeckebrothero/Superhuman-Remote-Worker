@@ -409,7 +409,7 @@ describe('SessionCreateComponent — reasoning pick lost to an involuntary prefi
     // Unbounded time later, the user fills in the Settings tab: a model, then
     // Reasoning: Max. No pending requests, nothing racing — a plain, settled
     // page. No expert card is ever clicked.
-    modelGroup.onSessionModelChange('gpt-5.6-sol');
+    modelGroup.onModelChange('gpt-5.6-sol');
     modelGroup.onSessionReasoningChange('max');
     expect(modelGroup.sessionReasoning()).toBe('max');
 
@@ -446,10 +446,10 @@ describe('SessionCreateComponent — reasoning pick lost to an involuntary prefi
     expect(modelGroup.reasoningResetNotice()).toBe(true);
     // The model pick "survives" only by coincidence: prefillFromConfig's
     // no-base-model branch restores from the very localStorage key
-    // onSessionModelChange had just written, so it silently re-lands on the
+    // onModelChange had just written, so it silently re-lands on the
     // identical value — indistinguishable from "my pick stuck." This is why
     // the user only noticed the Reasoning field, not the Model field.
-    expect(modelGroup.sessionModel()).toBe('gpt-5.6-sol');
+    expect(modelGroup.model()).toBe('gpt-5.6-sol');
 
     http.verify();
   });
@@ -471,7 +471,7 @@ describe('SessionCreateComponent — reasoning pick lost to an involuntary prefi
     // The user acts before the plain expert-list/effective-default round
     // (already in flight since ngOnInit) has settled. No expert card is ever
     // clicked — expertSelectionTouched stays false for the rest of the test.
-    modelGroup.onSessionModelChange('gpt-5.6-sol');
+    modelGroup.onModelChange('gpt-5.6-sol');
     modelGroup.onSessionReasoningChange('max');
     expect(modelGroup.sessionReasoning()).toBe('max');
 
@@ -497,7 +497,7 @@ describe('SessionCreateComponent — reasoning pick lost to an involuntary prefi
 
     expect(modelGroup.sessionReasoning()).toBeNull();
     expect(modelGroup.reasoningResetNotice()).toBe(true);
-    expect(modelGroup.sessionModel()).toBe('gpt-5.6-sol');
+    expect(modelGroup.model()).toBe('gpt-5.6-sol');
 
     http.verify();
   });

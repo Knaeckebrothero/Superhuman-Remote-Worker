@@ -2018,6 +2018,8 @@
     "filterAll": "Alle",
     "filterWorker": "Worker",
     "filterSession": "Sitzung",
+    "filterSubagent": "Subagent",
+    "showAll": "Alle Experten anzeigen",
     "colName": "Name",
     "colType": "Typ",
     "colSource": "Quelle",
@@ -2039,7 +2041,63 @@
     "imported": "Experte importiert",
     "inUse": "Experte wird von {{count}} Aufträgen verwendet",
     "saveFailed": "Speichern fehlgeschlagen",
-    "invalidJson": "Ungültige JSON-Datei"
+    "invalidJson": "Ungültige JSON-Datei",
+    "model": {
+      "title": "Modell",
+      "model": "Modell",
+      "baseDefault": "Basis-Standard",
+      "subagent": "Subagent-Modell",
+      "subagentHint": "Standard für alle Subagenten — jeder Eintrag ohne eigenes Modell läuft darauf; ohne Auswahl übernehmen sie das Modell dieses Experten."
+    },
+    "tags": {
+      "title": "Tags",
+      "hint": "Rollen-Tags bestimmen, in welchen Auswahllisten dieser Experte erscheint — jeder Experte bleibt in jeder Rolle nutzbar. Weitere Tags sind Freitext zum eigenen Filtern.",
+      "roles": "Rollen",
+      "roleLocked": "{{role}} — Typ dieses Experten, immer aktiv",
+      "free": "Weitere Tags (durch Komma getrennt)",
+      "freePlaceholder": "research, academic"
+    },
+    "subagents": {
+      "title": "Subagenten",
+      "hint": "Die Riege, an die dieser Experte delegieren darf: kleine Inline-Experten oder Verweise auf beliebige andere Experten (Workspace-, Autonomie- und Prüfeinstellungen eines verwiesenen Experten werden als Subagent ignoriert). Der Name ist der subagent_type, den der Eltern-Agent an delegate_agent übergibt.",
+      "empty": "Noch keine Einträge.",
+      "add": "Subagent hinzufügen",
+      "remove": "Subagent entfernen",
+      "name": "Name",
+      "nameHint": "Buchstaben, Ziffern, _ und - (muss mit Buchstabe oder Ziffer beginnen)",
+      "nameInvalid": "Der Name muss mit einem Buchstaben oder einer Ziffer beginnen und darf nur Buchstaben, Ziffern, _ und - enthalten",
+      "nameDuplicate": "Ein anderer Eintrag verwendet diesen Namen bereits",
+      "kind": "Art",
+      "kindInline": "Inline (kleiner Experte)",
+      "kindReference": "Verweis (anderer Experte)",
+      "reference": "Verwiesener Experte",
+      "referenceNone": "— Experten wählen —",
+      "referenceLoading": "Experten werden geladen…",
+      "referenceRequired": "Wähle den Experten, auf den dieser Eintrag verweist",
+      "referenceHint": "Die Einstellungen darunter überschreiben den verwiesenen Experten.",
+      "description": "Beschreibung",
+      "descriptionHint": "Was das Eltern-Modell neben dem subagent_type sieht.",
+      "model": "Modell",
+      "modelInherit": "Modell des Eltern-Agenten übernehmen",
+      "isolation": "Isolation",
+      "isolationDefault": "Standard",
+      "isolationShared": "Geteilt — der Baum des Eltern-Agenten",
+      "isolationWorktree": "Worktree — eigener Git-Worktree",
+      "writePolicy": "Schreibrichtlinie",
+      "writePolicyDefault": "Standard",
+      "writePolicyNone": "Keine (nur lesen)",
+      "writePolicyScratchOnly": "Nur Scratch",
+      "writePolicyOwnedPaths": "Zugewiesene Pfade (aus dem Auftrag)",
+      "writePolicyFull": "Voll",
+      "extra": "Tools, Limits, Rückgabe — JSON",
+      "extraHint": "Jeder weitere Schlüssel des Eintrags (tools, limits, return, prompts, weitere llm-Einstellungen), unverändert übernommen.",
+      "extraInvalid": "Ungültiges JSON",
+      "extraNotObject": "Muss ein JSON-Objekt sein",
+      "default": "Standard-Subagent",
+      "defaultHint": "Worauf ein delegate_agent-Aufruf ohne subagent_type zurückfällt.",
+      "defaultNone": "Keiner",
+      "invalid": "Die Subagenten-Riege enthält Fehler — bitte vor dem Speichern beheben."
+    }
   },
   "skills": {
     "title": "Skills",
@@ -2507,10 +2565,6 @@
       "research": "Recherche & Browser",
       "auxiliary": "Hilfs-LLM",
       "session": "Sitzung"
-    },
-    "phases": {
-      "strategic": "Strategisch",
-      "tactical": "Taktisch"
     },
     "labels": {
       "reasoning": "Reasoning",
@@ -3098,9 +3152,8 @@
     "model": {
       "group": "Modell",
       "preset": "Voreinstellung",
-      "strategic": "Strategisch",
-      "tactical": "Taktisch",
-      "subagent": "Subagent",
+      "subagent": "Subagent-Modell",
+      "subagentRoster": "Standard für alle Subagenten — ohne Auswahl übernehmen sie das Modell oben.",
       "single": "Modell",
       "reasoning": "Reasoning",
       "reasoningDefaultOption": "{{label}} (Standard)",
@@ -3116,8 +3169,6 @@
       },
       "presetUnconfigured": "Mindestens einem Modell fehlt ein API-Schlüssel",
       "providerNoKey": "{{provider}} (kein API-Schlüssel)",
-      "mismatchWindow": "Diese Modelle haben unterschiedliche Kontextfenster — sie teilen sich einen Verlauf und werden auf das kleinere begrenzt (~{{min}}).",
-      "mismatchMultimodal": "Eines dieser Modelle kann keine Bilder lesen — die Bildeingabe wird für beide Phasen deaktiviert.",
       "temperature": "Temperatur"
     },
     "narrationModes": {

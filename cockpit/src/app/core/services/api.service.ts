@@ -35,6 +35,7 @@ import {
     ExpertCreateRequest,
     ExpertDetail,
     ExpertDuplicateResult,
+    ExpertRole,
     ExpertUpdateRequest,
     Skill,
     SkillCreateRequest,
@@ -653,9 +654,17 @@ export class ApiService {
 
   /**
    * Get list of available expert configurations.
+   *
+   * `expertType` filters server-side on `expert_type || tags` (a session row
+   * tagged `worker` lists under `worker`); `subagent` lists the
+   * `config/subagents/*` library (rows with `name = subagents/<id>`, the
+   * roster `$ref` spelling) plus every expert tagged `subagent`. `showAll`
+   * drops the role filter — the "Show all experts" toggle of the pickers and
+   * the roster reference picker; the server accepts a cross-role pick.
    */
-  getExperts(expertType?: 'worker' | 'session'): Observable<Expert[]> {
-    const params = expertType ? new HttpParams().set('type', expertType) : undefined;
+  getExperts(expertType?: ExpertRole, opts?: {showAll?: boolean}): Observable<Expert[]> {
+    const type = opts?.showAll ? undefined : expertType;
+    const params = type ? new HttpParams().set('type', type) : undefined;
     return this.http.get<Expert[]>(`${this.baseUrl}/experts`, {params}).pipe(
       catchError(() => of([])),
     );
@@ -716,12 +725,19 @@ export class ApiService {
    * actually boots `virtual`, which used to leave repository connectors
    * selectable and 400 every create). The expert editor must NOT pass it: its
    * diff baseline has to stay the pure framework base.
+   *
+   * `role` resolves the expert in that role (`?role=worker|session|subagent`,
+   * cross-role allowed — a session expert previewed as a subagent); the
+   * payload keeps `expert_type` and adds `resolved_role`.
    */
   getExpertDetail(
     expertId: string,
-    opts?: {accountDefaults?: boolean},
+    opts?: {accountDefaults?: boolean; role?: ExpertRole},
   ): Observable<ExpertDetail | null> {
-    const qs = opts?.accountDefaults ? '?account_defaults=true' : '';
+    const parts: string[] = [];
+    if (opts?.accountDefaults) parts.push('account_defaults=true');
+    if (opts?.role) parts.push(`role=${opts.role}`);
+    const qs = parts.length ? `?${parts.join('&')}` : '';
     return this.http.get<ExpertDetail>(`${this.baseUrl}/experts/${expertId}${qs}`).pipe(
       catchError(() => of(null)),
     );

@@ -530,4 +530,6 @@ class TestRoleParameter:
         effective = detail["effective_models"]
         assert effective["model"] == {"model": "lead-model", "source": "expert"}
         assert effective["subagent"] == {"model": "reader-model", "source": "expert"}
-        assert effective["strategic"] == effective["tactical"] == effective["model"]
+        assert effective["session"] == effective["model"]
+        # The per-phase aliases went with U1 WP6 (the cockpit reads `model`).
+        assert set(effective) == {"model", "subagent", "session"}

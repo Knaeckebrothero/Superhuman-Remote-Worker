@@ -1,13 +1,19 @@
 import {describe, expect, it} from 'vitest';
 import {
+  buildModelFragment,
   buildPromptsPayload,
+  buildSubagentsFragment,
+  buildTagsPayload,
   expertBaseConfigName,
   expertEditorMode,
   expertToolPreviewRequest,
   forkNoticeTranslationArgs,
   parseConfigText,
   slugify,
+  splitTags,
+  stripEmptySubagents,
 } from './expert-editor.component';
+import {assembleExpertConfig, liftLegacyTiers} from './expert-config';
 
 const FIELDS = {
   persona: 'P',
@@ -101,6 +107,126 @@ describe('buildPromptsPayload', () => {
       'job',
     );
     expect(out).toEqual({persona: 'P', tactical: 'T'});
+  });
+});
+
+// U1: ONE model per expert (llm.model) for worker and session alike; the
+// roster-wide subagent model lives at subagents.llm.model.
+describe('buildModelFragment', () => {
+  it('writes llm.model, and nothing for an empty pick (inherit)', () => {
+    expect(buildModelFragment('gpt-5.4')).toEqual({llm: {model: 'gpt-5.4'}});
+    expect(buildModelFragment('')).toEqual({});
+  });
+});
+
+describe('buildSubagentsFragment', () => {
+  it('merges the subagent model into the roster editor value', () => {
+    expect(
+      buildSubagentsFragment({default: 'explorer', roster: {explorer: {$ref: 'subagents/explorer'}}}, 'gpt-4o'),
+    ).toEqual({
+      default: 'explorer',
+      roster: {explorer: {$ref: 'subagents/explorer'}},
+      llm: {model: 'gpt-4o'},
+    });
+  });
+
+  it('is {} (never absent) when there is nothing — the host replaces the stored block wholesale', () => {
+    expect(buildSubagentsFragment(null, '')).toEqual({});
+  });
+
+  it('a subagent model alone yields the roster-wide llm', () => {
+    expect(buildSubagentsFragment(null, 'gpt-4o')).toEqual({llm: {model: 'gpt-4o'}});
+  });
+
+  it('an empty pick clears llm.model but keeps the rest of llm', () => {
+    expect(buildSubagentsFragment({llm: {model: 'old', provider: 'openai'}} as never, '')).toEqual({
+      llm: {provider: 'openai'},
+    });
+    expect(buildSubagentsFragment({llm: {model: 'old'}} as never, '')).toEqual({});
+  });
+
+  it('end to end: a removed roster entry stays removed, an empty block is stripped', () => {
+    const stored = {
+      llm: {model: 'lead'},
+      subagents: {default: 'b', llm: {model: 'reader'}, roster: {a: {$ref: 'critic'}, b: {$ref: 'scholar'}}},
+    };
+    const overrides = {
+      subagents: buildSubagentsFragment({roster: {a: {$ref: 'critic'}}}, 'reader'),
+    };
+    expect(stripEmptySubagents(assembleExpertConfig(stored, overrides, {}))).toEqual({
+      llm: {model: 'lead'},
+      subagents: {roster: {a: {$ref: 'critic'}}, llm: {model: 'reader'}},
+    });
+    // Everything cleared → no subagents key at all.
+    expect(
+      stripEmptySubagents(assembleExpertConfig(stored, {subagents: buildSubagentsFragment(null, '')}, {})),
+    ).toEqual({llm: {model: 'lead'}});
+  });
+
+  it('a legacy fragment is prefilled through the lift and saved back in the new shape', () => {
+    // What ngOnInit does with the export bundle's config before anything reads it.
+    const lifted = liftLegacyTiers({
+      llm: {strategic: {model: 'strat', reasoning_level: 'high'}, subagent: {model: 'reader'}},
+    });
+    expect(lifted).toEqual({
+      llm: {model: 'strat', reasoning_level: 'high'},
+      subagents: {llm: {model: 'reader'}},
+    });
+    // …and the save writes exactly that shape, not the tiers.
+    const saved = stripEmptySubagents(
+      assembleExpertConfig(
+        lifted,
+        {...buildModelFragment('strat'), subagents: buildSubagentsFragment(null, 'reader')},
+        {},
+      ),
+    );
+    expect(saved).toEqual({
+      llm: {model: 'strat', reasoning_level: 'high'},
+      subagents: {llm: {model: 'reader'}},
+    });
+    expect((saved['llm'] as Record<string, unknown>)['strategic']).toBeUndefined();
+  });
+});
+
+describe('stripEmptySubagents', () => {
+  it('drops only an empty subagents block', () => {
+    expect(stripEmptySubagents({llm: {}, subagents: {}})).toEqual({llm: {}});
+    expect(stripEmptySubagents({subagents: {roster: {}}})).toEqual({subagents: {roster: {}}});
+    expect(stripEmptySubagents({llm: {}})).toEqual({llm: {}});
+  });
+});
+
+// Tags: role chips (the expert's own type locked on) + free text, one array.
+describe('buildTagsPayload / splitTags', () => {
+  it('puts the role tags first, in canonical order, with the type always on', () => {
+    expect(buildTagsPayload('session', ['subagent'], 'research, academic')).toEqual([
+      'session',
+      'subagent',
+      'research',
+      'academic',
+    ]);
+    expect(buildTagsPayload('worker', [], '')).toEqual(['worker']);
+  });
+
+  it('de-duplicates and trims', () => {
+    expect(buildTagsPayload('worker', ['worker', 'session'], ' worker , x,, x ')).toEqual([
+      'worker',
+      'session',
+      'x',
+    ]);
+  });
+
+  it('splits stored tags back into chips and free text', () => {
+    expect(splitTags(['session', 'research', 'worker', 'academic'])).toEqual({
+      roles: ['worker', 'session'],
+      free: 'research, academic',
+    });
+    expect(splitTags([])).toEqual({roles: [], free: ''});
+  });
+
+  it('round-trips', () => {
+    const {roles, free} = splitTags(['worker', 'subagent', 'a', 'b']);
+    expect(buildTagsPayload('worker', roles, free)).toEqual(['worker', 'subagent', 'a', 'b']);
   });
 });
 

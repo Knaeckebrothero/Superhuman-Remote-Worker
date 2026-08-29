@@ -60937,10 +60937,10 @@ def _effective_models_from_layers(
     ``{slot: {"model": str|None, "source": str}}`` for slots ``model`` (the
     expert's model), ``subagent`` (``subagents.llm.model`` when pinned to a
     real model, else ``model`` — ``inherit`` IS the parent's model) and
-    ``session`` (= ``model``); ``strategic`` / ``tactical`` are kept equal to
-    ``model`` as DEPRECATED aliases until the cockpit reads ``model`` (U1
-    WP6, which removes them on both sides). ``source`` is one of ``expert`` /
-    ``account_default`` / ``system_default``.
+    ``session`` (= ``model``). The ``strategic`` / ``tactical`` aliases the
+    cockpit read in between are gone (U1 WP6 switched every reader to
+    ``model``). ``source`` is one of ``expert`` / ``account_default`` /
+    ``system_default``.
     """
     fragment: dict[str, Any] = {"llm": dict(expert_llm or {})}
     if isinstance(expert_subagents, dict):
@@ -60968,9 +60968,6 @@ def _effective_models_from_layers(
         "model": dict(top),
         "subagent": subagent,
         "session": dict(top),
-        # Deprecated aliases (removed with the cockpit cutover, U1 WP6).
-        "strategic": dict(top),
-        "tactical": dict(top),
     }
 
 

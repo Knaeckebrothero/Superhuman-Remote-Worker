@@ -34,6 +34,33 @@ describe('ApiService expert write methods', () => {
     expect(params.get('type')).toBe('session');
   });
 
+  it('lists the subagent library through the same type filter', () => {
+    const {svc, http} = makeService();
+    svc.getExperts('subagent').subscribe();
+    const params = http.get.mock.calls[0][1].params;
+    expect(params.get('type')).toBe('subagent');
+  });
+
+  // The "Show all experts" toggle: the server accepts a cross-role pick, so
+  // the picker simply stops asking for a role.
+  it('showAll drops the type filter', () => {
+    const {svc, http} = makeService();
+    svc.getExperts('worker', {showAll: true}).subscribe();
+    expect(http.get).toHaveBeenCalledWith('/api/experts', {params: undefined});
+  });
+
+  it('getExpertDetail resolves an expert in another role via ?role=', () => {
+    const {svc, http} = makeService();
+    svc.getExpertDetail('critic', {role: 'subagent'}).subscribe();
+    expect(http.get).toHaveBeenCalledWith('/api/experts/critic?role=subagent');
+  });
+
+  it('getExpertDetail combines the account layer and the role', () => {
+    const {svc, http} = makeService();
+    svc.getExpertDetail('abc', {accountDefaults: true, role: 'session'}).subscribe();
+    expect(http.get).toHaveBeenCalledWith('/api/experts/abc?account_defaults=true&role=session');
+  });
+
   it('loads project-aware effective defaults', () => {
     const {svc, http} = makeService();
     svc.getExpertDefaults('project-1').subscribe();
