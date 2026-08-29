@@ -1058,14 +1058,33 @@ def create_execute_node(
             else {}
         )
 
-        # Estimate transient injection overhead (system prompt + todos + memory + knowledge)
-        # so compaction thresholds account for messages that will be added AFTER compaction
+        # Estimate the request overhead that `messages` does not carry, so the
+        # compaction thresholds account for it. The prepared request is
+        # system -> summaries -> history (incl. the protected phase block) ->
+        # transient tail (memory, knowledge, citation feedback, supervisor
+        # guidance, todos last); tests/test_execute_prepared_layout.py pins
+        # that layout. The estimate is position-agnostic. It covers:
+        #   - the system prompt and the transient tail (todos + the memory and
+        #     knowledge budgets) — outside `messages`, added after compaction;
+        #     the citation-feedback and guidance pairs are small and unbudgeted;
+        #   - once per phase, on its delivery turn only, the phase block just
+        #     appended above. The block IS in `messages`, but the trigger is
+        #     floored by the provider's last input_tokens
+        #     (ContextManager._trigger_token_count), an anchor that predates
+        #     the block — without this term a block of a few thousand tokens
+        #     is invisible to the trigger for one turn. When the local estimate
+        #     dominates instead, the block counts twice on that one turn,
+        #     bounded by the 50% floor below.
         injection_overhead_tokens = context_mgr.get_token_count(
             [prepared_messages[0]]
         )  # system prompt
         injection_overhead_tokens += (
             len(todo_manager.format_for_injection()) // 4
         )  # approximate
+        if delivered_phase_blocks:
+            injection_overhead_tokens += context_mgr.get_token_count(
+                delivered_phase_blocks
+            )
 
         # Add memory injection budget overhead
         recall_store = tool_context.recall_store if tool_context else None
