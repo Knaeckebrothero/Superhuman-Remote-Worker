@@ -63865,10 +63865,22 @@ def _ssh_target_response(
     Service). The name stays because the gateway plan already reads this
     field by it; do not "fix" it into something that suggests the gateway
     should resolve or trust an IP.
+
+    ``ssh_key_id`` comes from ``user`` because ``resolve_user_by_ssh_
+    fingerprint`` already resolves it (it's the matched ``user_ssh_keys.id``,
+    joined in for exactly this reason). ``.get`` rather than a required key:
+    every real caller passes the dict that resolver returns, but tests and
+    any future caller that only has a plain ``{"id": ...}`` must not crash
+    this helper for it. Threading it through here is what lets ``POST
+    /api/internal/ssh-attachments`` ever be handed a key id by the gateway —
+    without it, the gateway would have resolved a key at auth time and then
+    have no way to carry it forward to the attachment-open call.
     """
+    ssh_key_id = user.get("ssh_key_id")
     return {
         "thread_id": thread_id,
         "user_id": str(user["id"]),
+        "ssh_key_id": str(ssh_key_id) if ssh_key_id else None,
         "pod_ip": target.host if target else None,
         "pod_port": target.port if target else None,
         "host_key_fingerprint": target.fingerprint if target else None,
@@ -63975,6 +63987,115 @@ async def get_ssh_target(
         return _ssh_target_response(thread_id, user, STATE_VM_UNSUPPORTED)
 
     return _ssh_target_response(thread_id, user, STATE_LIVE, target)
+
+
+class SshKeyUsedRequest(BaseModel):
+    """Body for the gateway's post-authentication ``last_used_at`` bump."""
+
+    fingerprint: str
+
+
+@app.post("/api/internal/ssh-keys/used")
+async def internal_mark_ssh_key_used(
+    request: Request, body: SshKeyUsedRequest
+) -> dict[str, str]:
+    """Stamp ``last_used_at`` on the key behind a presented fingerprint.
+    **Internal** — requires ``X-Internal-Key``.
+
+    Keyed by FINGERPRINT, not ``key_id``, and that is not arbitrary: the
+    gateway calls this from asyncssh's ``auth_completed()``, which fires
+    immediately after ``key.verify`` succeeds — but the gateway resolves its
+    target (and therefore a key id) lazily, at first channel open. At the
+    only moment this call may legitimately fire, it holds a fingerprint and
+    nothing else. An endpoint taking ``key_id`` would be uncallable then.
+
+    Resolution happens server-side via ``resolve_user_by_ssh_fingerprint``
+    (the same pure-read resolver ``get_ssh_target`` uses) so the actual
+    write goes through ``mark_ssh_key_used``, which additionally requires
+    the fingerprint to match the row being stamped — see that method's
+    docstring for why this endpoint is safe to call with only a fingerprint
+    even though ``get_ssh_target`` itself must never call it.
+
+    An unknown fingerprint is a quiet no-op success, not a 404: the caller
+    has already authenticated against *some* key by the time this fires, and
+    a 404 here would turn this endpoint into an existence oracle for
+    registered keys (identical reasoning to ``get_ssh_target``'s opaque
+    404s).
+    """
+    await require_internal(request)
+    user = await postgres_db.resolve_user_by_ssh_fingerprint(body.fingerprint)
+    key_id = user.get("ssh_key_id") if user else None
+    if key_id:
+        await postgres_db.mark_ssh_key_used(str(key_id), body.fingerprint)
+    return {"status": "ok"}
+
+
+class SshAttachmentCreate(BaseModel):
+    """Body for opening an SSH-attachment audit row.
+
+    ``ssh_key_id`` and ``client_ip`` are Optional, matching
+    ``PostgresDB.record_ssh_attachment``'s signature.
+    """
+
+    thread_id: str
+    user_id: str
+    ssh_key_id: str | None = None
+    client_ip: str | None = None
+    handle: str
+
+
+@app.post("/api/internal/ssh-attachments")
+async def internal_create_ssh_attachment(
+    request: Request, body: SshAttachmentCreate
+) -> dict[str, str]:
+    """Open an SSH-attachment audit row. **Internal** — requires
+    ``X-Internal-Key``.
+
+    The gateway calls this once it has resolved a live target at first
+    channel open, so it has all five fields by then. See
+    ``PostgresDB.record_ssh_attachment`` for the column contract and for why
+    a malformed ``handle`` or id raises ``ValueError`` rather than being
+    silently accepted.
+    """
+    await require_internal(request)
+    try:
+        attachment_id = await postgres_db.record_ssh_attachment(
+            body.thread_id,
+            body.user_id,
+            body.ssh_key_id,
+            body.client_ip,
+            body.handle,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"attachment_id": attachment_id}
+
+
+class SshAttachmentClose(BaseModel):
+    """Body for closing an SSH-attachment audit row."""
+
+    channels: list[str] = Field(default_factory=list)
+
+
+@app.post("/api/internal/ssh-attachments/{attachment_id}/close")
+async def internal_close_ssh_attachment(
+    request: Request, attachment_id: str, body: SshAttachmentClose
+) -> dict[str, int]:
+    """Stamp detach time on an SSH-attachment row. **Internal** — requires
+    ``X-Internal-Key``.
+
+    Returns the row count from ``close_ssh_attachment`` honestly: 0 for an
+    unknown or already-closed id, 1 for a normal close. The gateway treats
+    this as best-effort bookkeeping, so a 0 is not turned into an error here
+    either — the caller decides whether a double-detach or a lost row needs
+    logging.
+    """
+    await require_internal(request)
+    try:
+        closed = await postgres_db.close_ssh_attachment(attachment_id, body.channels)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"closed": closed}
 
 
 # =============================================================================
