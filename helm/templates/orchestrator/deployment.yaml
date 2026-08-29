@@ -890,7 +890,7 @@ spec:
                   name: {{ include "srw.secretName" . }}
                   key: NEXTCLOUD_AGENT_PASSWORD
                   optional: true
-            {{- if and .Values.nextcloud.enabled .Values.nextcloud.protectedEffect.enabled }}
+            {{- if and .Values.nextcloud.enabled (eq (include "srw.nextcloudProtectedEffectEnabled" .) "true") }}
             - name: NEXTCLOUD_PROTECTED_EFFECT_URL
               valueFrom:
                 configMapKeyRef:

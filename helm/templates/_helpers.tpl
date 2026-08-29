@@ -279,16 +279,46 @@ authority even when every timing knob remains unchanged.
 {{- end -}}
 {{- end }}
 
+{{/*
+Whether the bundled protected-effect lane is deployed.
+
+`nextcloud.protectedEffect.enabled` is deliberately tri-state:
+
+  unset (default) — derive it. Protected cloud mode has exactly one valid
+                    server topology, so a bundled+internal Nextcloud follows
+                    agent.protectedCloudModeEnabled rather than making the
+                    operator assert the same decision twice.
+  true            — deploy the lane regardless of the feature flag. This is the
+                    staged rollout: stand the lane (and its adoption-once HMAC
+                    root) up first, verify it, then flip the flag.
+  false           — refuse to deploy it. Combined with protected cloud mode
+                    this is a contradiction and still fails the render, because
+                    the mode is inert without the lane (nextcloud.py raises
+                    NOT_SUPPORTED on every capability request).
+*/}}
+{{- define "srw.nextcloudProtectedEffectEnabled" -}}
+{{- $effect := .Values.nextcloud.protectedEffect -}}
+{{- if kindIs "invalid" $effect.enabled -}}
+{{- $protectedCloud := eq (lower (toString .Values.agent.protectedCloudModeEnabled)) "true" -}}
+{{- if and $protectedCloud .Values.nextcloud.enabled .Values.nextcloud.internal -}}true{{- end -}}
+{{- else if $effect.enabled -}}true{{- end -}}
+{{- end }}
+
 {{- define "srw.nextcloudProtectedEffectValidate" -}}
 {{- $effect := .Values.nextcloud.protectedEffect -}}
+{{- $effectEnabled := eq (include "srw.nextcloudProtectedEffectEnabled" .) "true" -}}
 {{- $protectedCloud := eq (lower (toString .Values.agent.protectedCloudModeEnabled)) "true" -}}
-{{- if and $protectedCloud .Values.nextcloud.enabled (not $effect.enabled) -}}
-  {{- fail "agent.protectedCloudModeEnabled=true with bundled Nextcloud requires nextcloud.protectedEffect.enabled=true" -}}
+{{- if and $protectedCloud .Values.nextcloud.enabled (not $effectEnabled) -}}
+  {{- if kindIs "invalid" $effect.enabled -}}
+    {{- fail "agent.protectedCloudModeEnabled=true requires a bundled nextcloud.internal=true deployment; the protected-effect lane cannot be derived for an external Nextcloud" -}}
+  {{- else -}}
+    {{- fail "agent.protectedCloudModeEnabled=true with bundled Nextcloud contradicts nextcloud.protectedEffect.enabled=false; unset it to derive the lane from the feature flag, or turn the flag off" -}}
+  {{- end -}}
 {{- end -}}
 {{- if and $protectedCloud (eq (default "" .Values.cloud.externalBackend) "nextcloud") -}}
   {{- fail "agent.protectedCloudModeEnabled=true is not supported for external Nextcloud without an attested server-enforced protected-effect lane" -}}
 {{- end -}}
-{{- if $effect.enabled -}}
+{{- if $effectEnabled -}}
   {{- if not (and .Values.nextcloud.enabled .Values.nextcloud.internal) -}}
     {{- fail "nextcloud.protectedEffect.enabled requires bundled nextcloud.enabled=true and nextcloud.internal=true; external Nextcloud is ineligible without an equivalent server-enforced effect lane" -}}
   {{- end -}}

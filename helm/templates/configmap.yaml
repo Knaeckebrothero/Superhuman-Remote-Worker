@@ -687,7 +687,7 @@ data:
   NEXTCLOUD_PUBLIC_URL: {{ include "srw.cloudUrl" . | quote }}
   NEXTCLOUD_ADMIN_USER: {{ "admin" | quote }}
   NEXTCLOUD_AGENT_USER: {{ "agent-service" | quote }}
-  {{- if .Values.nextcloud.protectedEffect.enabled }}
+  {{- if (eq (include "srw.nextcloudProtectedEffectEnabled" .) "true") }}
   # Server-enforced bounded lane for the five attempt-scoped authority POSTs.
   NEXTCLOUD_PROTECTED_EFFECT_URL: {{ printf "http://%s" (include "srw.nextcloudProtectedEffectName" .) | quote }}
   NEXTCLOUD_PROTECTED_EFFECT_CONFIG_SHA256: {{ include "srw.nextcloudProtectedEffectConfigSha256" . | quote }}

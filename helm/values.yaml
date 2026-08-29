@@ -2196,7 +2196,13 @@ nextcloud:
   # External Nextcloud installations are deliberately ineligible unless they
   # deploy and attest an equivalent server-side lane.
   protectedEffect:
-    enabled: false
+    # Tri-state. Unset (the default) derives the lane from
+    # agent.protectedCloudModeEnabled on a bundled, internal Nextcloud —
+    # protected cloud mode is inert without it, so there is nothing to decide
+    # separately. Set `true` to stage the lane (and its adoption-once HMAC
+    # root) ahead of the feature flag; `false` refuses it outright and makes
+    # protectedCloudModeEnabled=true a render-time contradiction.
+    enabled: null
     # The HMAC root must never live in the shared application Secret: dynamic
     # agent Pods consume that bundle via envFrom. ESO therefore reads a
     # dedicated Vault path, while pre-created-secret users name a dedicated

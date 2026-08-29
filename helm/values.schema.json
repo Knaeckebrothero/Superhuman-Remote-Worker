@@ -647,7 +647,7 @@
         "protectedEffect": {
           "type": "object",
           "properties": {
-            "enabled": { "type": "boolean" },
+            "enabled": { "type": ["boolean", "null"] },
             "hmacSecretName": { "type": "string" },
             "hmacVaultPath": { "type": "string" },
             "fpmImage": { "type": "string", "minLength": 1 },

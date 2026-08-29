@@ -7,7 +7,7 @@ metadata:
   labels:
     {{- include "srw.componentLabels" (dict "context" . "component" "nextcloud") | nindent 4 }}
 data:
-  {{- if .Values.nextcloud.protectedEffect.enabled }}
+  {{- if (eq (include "srw.nextcloudProtectedEffectEnabled" .) "true") }}
   common.php: |
 {{ .Files.Get "files/nextcloud-protected-effect/common.php" | indent 4 }}
   prepend.php: |
@@ -192,7 +192,7 @@ spec:
     metadata:
       labels:
         {{- include "srw.componentSelectorLabels" (dict "context" . "component" "nextcloud") | nindent 8 }}
-      {{- if .Values.nextcloud.protectedEffect.enabled }}
+      {{- if (eq (include "srw.nextcloudProtectedEffectEnabled" .) "true") }}
       annotations:
         checksum/protected-effect-config: {{ include "srw.nextcloudProtectedEffectConfigSha256" . | quote }}
       {{- end }}
@@ -304,7 +304,7 @@ spec:
             periodSeconds: 10
           resources:
             {{- toYaml .Values.nextcloud.resources | nindent 12 }}
-        {{- if .Values.nextcloud.protectedEffect.enabled }}
+        {{- if (eq (include "srw.nextcloudProtectedEffectEnabled" .) "true") }}
         - name: nextcloud-protected-effect-fpm
           image: {{ .Values.nextcloud.protectedEffect.fpmImage | quote }}
           imagePullPolicy: IfNotPresent
@@ -408,7 +408,7 @@ spec:
           configMap:
             name: {{ include "srw.fullname" . }}-nextcloud-hooks
             defaultMode: 0755
-        {{- if .Values.nextcloud.protectedEffect.enabled }}
+        {{- if (eq (include "srw.nextcloudProtectedEffectEnabled" .) "true") }}
         - name: protected-effect-run
           emptyDir:
             medium: Memory
@@ -428,7 +428,7 @@ spec:
       targetPort: 80
   selector:
     {{- include "srw.componentSelectorLabels" (dict "context" . "component" "nextcloud") | nindent 4 }}
-{{- if .Values.nextcloud.protectedEffect.enabled }}
+{{- if (eq (include "srw.nextcloudProtectedEffectEnabled" .) "true") }}
 ---
 apiVersion: v1
 kind: Service

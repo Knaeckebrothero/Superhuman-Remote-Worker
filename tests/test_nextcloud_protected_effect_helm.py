@@ -339,6 +339,8 @@ def test_chart_managed_effect_key_is_stable_length_and_not_plain_config() -> Non
             "nextcloud.replicas=1",
             "--set",
             "agent.protectedCloudModeEnabled=true",
+            "--set",
+            "nextcloud.protectedEffect.enabled=false",
         ),
         (
             "--set",
@@ -367,6 +369,40 @@ def test_lane_refuses_external_or_unbounded_server_configuration(
 
     assert result.returncode != 0
     assert "protectedEffect" in result.stderr or "protected-effect" in result.stderr
+
+
+def test_lane_is_derived_from_the_protected_cloud_feature_flag() -> None:
+    """The lane is not a second decision: protected cloud mode implies it.
+
+    `agent.protectedCloudModeEnabled` is inert without the server lane —
+    NextcloudBackend raises NOT_SUPPORTED on every capability request when the
+    effect client is unconfigured — so a bundled, internal Nextcloud derives
+    `nextcloud.protectedEffect.enabled` from the feature flag rather than making
+    an operator assert the same decision in two places.
+    """
+
+    bundled = (
+        "--set",
+        "opencloud.enabled=false",
+        "--set",
+        "nextcloud.enabled=true",
+        "--set",
+        "nextcloud.replicas=1",
+        "--set",
+        "nextcloud.protectedEffect.hmacVaultPath=test/protected-effect",
+    )
+
+    derived = _render(*bundled, "--set", "agent.protectedCloudModeEnabled=true")
+    assert "nextcloud-protected-effect-fpm" in derived.stdout
+
+    # Explicit true still stands the lane up ahead of the flag, so the
+    # adoption-once HMAC root can be created and verified as its own step.
+    staged = _render(*bundled, "--set", "nextcloud.protectedEffect.enabled=true")
+    assert "nextcloud-protected-effect-fpm" in staged.stdout
+
+    # And an unset lane stays off while the feature flag is off.
+    off = _render(*bundled)
+    assert "nextcloud-protected-effect-fpm" not in off.stdout
 
 
 def test_server_bundle_verifies_before_nextcloud_and_exposes_only_five_posts() -> None:
