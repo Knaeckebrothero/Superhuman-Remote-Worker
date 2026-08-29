@@ -110,7 +110,7 @@ canonical file wasn't updated → file a finding, don't shrug).
 ## 3. `near-duplicate` ground truth (pgvector, read-only)
 
 ```bash
-kubectl --context main exec -n superhuman-remote-worker srw-pgvector-0 -- sh -c \
+kubectl --context=k3d-srw exec -n srw srw-pgvector-0 -- sh -c \
   'psql -U "$POSTGRES_USER" -d srw_vector -c "
    SELECT a.note_id, b.note_id, round((1 - (a.embedding <=> b.embedding))::numeric, 3) AS sim
    FROM knowledge_index a JOIN knowledge_index b
@@ -125,7 +125,7 @@ kubectl --context main exec -n superhuman-remote-worker srw-pgvector-0 -- sh -c 
 Oversized ground truth while you're there:
 
 ```bash
-kubectl --context main exec -n superhuman-remote-worker srw-pgvector-0 -- sh -c \
+kubectl --context=k3d-srw exec -n srw srw-pgvector-0 -- sh -c \
   'psql -U "$POSTGRES_USER" -d srw_vector -c "
    SELECT note_id, length(content)/1024 AS kb FROM knowledge_index
    WHERE project_id::text LIKE '\''68137e29%'\'' AND length(content) > 15360

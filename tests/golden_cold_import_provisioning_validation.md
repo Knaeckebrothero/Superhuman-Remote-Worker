@@ -88,9 +88,9 @@ Cost: one ~15–30 min import window on the dev VM cluster.
 
 | Thing | Value |
 |---|---|
-| Orchestrator | context `main`, ns `superhuman-remote-worker`, `deploy/srw-orchestrator` |
-| VM controller | context `vm`, ns `agent-vms`, `deploy/srw-vm-vm-controller` |
-| **Do NOT touch** | ns `srw-prod-private*` on either cluster (real prod) |
+| Orchestrator | your app context/namespace, `deploy/srw-orchestrator` |
+| VM controller | your VM-cluster context, ns `agent-vms`, `deploy/srw-vm-vm-controller` |
+| **Do NOT touch** | any production namespace on either cluster |
 | Golden naming | `agent-vm-golden-<sha256(image)[:12]>`, annotation `srw.io/vm-image-ref` holds the image |
 | Budgets | boot `VM_PROVISION_TIMEOUT_S=600` × 3 attempts; golden `VM_GOLDEN_WAIT_TIMEOUT_S=2700` (code default, no helm override) |
 
@@ -124,7 +124,7 @@ Cost: one ~15–30 min import window on the dev VM cluster.
 4. Watch both sides:
    ```bash
    kubectl --context=vm -n agent-vms logs deploy/srw-vm-vm-controller -f | grep -Ei 'golden|deferring|created|idempotent'
-   kubectl --context=main -n superhuman-remote-worker logs deploy/srw-orchestrator -f \
+   kubectl --context=<app-cluster> -n <app-namespace> logs deploy/srw-orchestrator -f \
      | grep -Ei 'waiting on golden|golden wait exhausted|waiting_golden|auto-provisioned|VM stuck|recycling'
    kubectl --context=vm -n agent-vms get dv -w | grep golden
    ```

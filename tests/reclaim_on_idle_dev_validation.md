@@ -37,7 +37,7 @@ Prereqs: the durability commits deployed (image built from `develop`), `WORKSPAC
 `WORKSPACE_STORAGE_CLASS=longhorn-ephemeral` (single-replica — reclaim deletes a real Longhorn volume).
 
 ```sh
-export KCTX="--context main"; export NS="-n superhuman-remote-worker"
+export KCTX="--context=k3d-srw"; export NS="-n srw"   # substitute your own context/namespace
 ORCH=$(kubectl $KCTX $NS get pods -l app=srw-orchestrator -o jsonpath='{.items[0].metadata.name}')
 ```
 

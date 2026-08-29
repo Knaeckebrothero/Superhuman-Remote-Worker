@@ -70,8 +70,8 @@ still-indexing KB to a new job/session.
    so indexing takes long enough to observe. The loop's own jobs repo is a
    ready-made large vault (project `68137e29`, hundreds of interlinked OKF notes) —
    or create a throwaway Gitea repo with a `knowledge/` tree of markdown.
-3. k3d context/namespace: `--context=k3d-srw -n srw` (local). On homelab prod
-   substitute `--context main -n superhuman-remote-worker` and `srw-pgvector-0`.
+3. k3d context/namespace: `--context=k3d-srw -n srw` (local). On another cluster
+   substitute your own `--context`/`-n` and the pgvector pod name.
 
 ## 0. Migration + payload shape (fast pre-check, no large KB needed)
 

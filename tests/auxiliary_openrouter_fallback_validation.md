@@ -36,8 +36,8 @@ Two coupled fixes:
 | §4 Surfacing | `aux_degraded` reaches the DB / admin badge while on fallback | dev or k3d | pending |
 
 **Why k3d can't run §2 as-is:** the k3d model registry has no OpenRouter model,
-and the default aux (`gemma-4-moe`) resolves to the *same* endpoint
-(`ai.h4ll.app`) as embedding, so the exact misroute can't form. §3 forces the
+and the default aux (`gemma-4-moe`) resolves to the *same* endpoint as
+embedding, so the exact misroute can't form. §3 forces the
 fallback path artificially instead. The real routing fix is proven by §0 (unit)
 + §2 (dev, the exact repro).
 
