@@ -13,15 +13,25 @@ The single principal is load-bearing. A certificate whose principal list is
 empty or wildcarded would be accepted for any user on any host — that class of
 mistake is what CVE-2025-49825 was.
 
-The certificate also carries no OpenSSH extensions (permit-pty,
-permit-X11-forwarding, permit-agent-forwarding, permit-port-forwarding,
-permit-user-rc). Unlike the ``ssh-keygen -s`` CLI -- which grants none of
-these unless asked -- asyncssh's ``generate_user_certificate`` defaults every
-one of them to ``True``, so ``mint()`` below denies each explicitly rather
-than omitting them; omitting them would silently grant all five. This
-certificate only has to satisfy the workspace's ``TrustedUserCAKeys``; the
-workspace's own ``sshd_config`` already governs what a session may do, and
-this certificate should not duplicate or widen that.
+The certificate carries exactly two OpenSSH extensions -- ``permit-pty`` and
+``permit-port-forwarding`` -- and denies the other three (``permit-X11-
+forwarding``, ``permit-agent-forwarding``, ``permit-user-rc``). Extensions are
+permissive-by-listing: an omitted one is refused for the life of the
+certificate no matter what the workspace's own ``sshd_config`` allows, so
+``sshd_config`` cannot grant back a permission this certificate withholds.
+Denying ``permit-pty`` would mean no interactive shell at all -- the feature's
+primary use case -- and denying ``permit-port-forwarding`` would kill the
+``direct-tcpip`` path JetBrains Gateway/``ProxyJump`` needs and that the
+gateway's own ``clamp_direct_tcpip`` exists to police; the workspace's
+``PermitOpen 127.0.0.1:*`` does the real narrowing of *where* that forwarding
+can go, but only once the certificate permits forwarding at all. Both
+asyncssh's ``generate_user_certificate`` and real OpenSSH's ``ssh-keygen -s``
+grant every ``permit-*`` extension by default when unspecified (the latter's
+``-O clear`` option exists precisely because the default is all-on -- see
+``ssh-keygen(1)``), so ``mint()`` below must deny X11/agent-forwarding/
+user-rc explicitly; it cannot rely on omission. Agent forwarding into an
+agent's own workspace is a real risk on top of being merely unneeded, X11 is
+unused here, and ``permit-user-rc`` is extra execution surface for nothing.
 """
 
 from __future__ import annotations
@@ -57,11 +67,15 @@ class SshUserCa:
         ``valid_after`` is backdated 60s so a workspace whose clock trails the
         gateway does not reject a certificate issued moments ago.
 
-        Every ``permit_*`` extension is passed as ``False``: asyncssh's own
-        default for each is ``True`` (confirmed against the installed 2.24.0
-        source), so leaving them out would grant pty/X11-forwarding/
-        agent-forwarding/port-forwarding and the user rc file -- the opposite
-        of the "no extensions" this certificate is meant to carry.
+        ``permit_pty`` and ``permit_port_forwarding`` are granted -- an
+        interactive shell needs the former, ``direct-tcpip`` needs the
+        latter, and the workspace's own ``PermitOpen 127.0.0.1:*`` narrows
+        what that forwarding can reach. The other three ``permit_*`` flags
+        are passed as ``False`` explicitly: asyncssh's own default for each
+        is ``True`` (confirmed against the installed 2.24.0 source, and
+        matching real ``ssh-keygen -s``'s documented default), so omitting
+        them would silently grant X11 forwarding, agent forwarding, and the
+        user rc file -- none of which this certificate should carry.
         """
         if not principal:
             raise ValueError("a certificate principal is required")
@@ -73,10 +87,10 @@ class SshUserCa:
             principals=[principal],
             valid_after=now - 60,
             valid_before=now + lifetime_seconds,
+            permit_pty=True,
+            permit_port_forwarding=True,
             permit_x11_forwarding=False,
             permit_agent_forwarding=False,
-            permit_port_forwarding=False,
-            permit_pty=False,
             permit_user_rc=False,
         )
         return key, cert

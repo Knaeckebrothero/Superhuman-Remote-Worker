@@ -25,21 +25,28 @@ def test_mint_produces_a_certificate_for_one_principal(ca_pem):
     assert cert.principals == ["agent-host"]
 
 
+# asyncssh 2.24.0's SSHOpenSSHCertificate(V01) stores the validity window only
+# as `_valid_after`/`_valid_before` (public_key.py:1572-1573) -- there is no
+# public `valid_after`/`valid_before` property in this version. Confirmed by
+# reading the installed source and grepping the whole package for any public
+# accessor (none exists); this is a deliberate choice against a missing
+# public API, not an oversight. See task-1-report.md for the full discrepancy
+# note. `test_certificate_outside_its_window_is_rejected` below covers the
+# same ground through the real public `cert.validate(...)` method instead.
+
+
 def test_certificate_is_short_lived(ca_pem):
     _, cert = SshUserCa(ca_pem).mint("agent-host")
-    # asyncssh 2.24.0's SSHOpenSSHCertificate(V01) stores the validity window
-    # only as `_valid_after`/`_valid_before` (see public_key.py:1572-1573).
-    # There is no public `valid_after`/`valid_before` property in this
-    # version -- confirmed by reading the installed source. See
-    # task-1-report.md for the full discrepancy note.
-    span = cert._valid_before - cert._valid_after
+    span = cert._valid_before - cert._valid_after  # private field; see note above
     assert span <= DEFAULT_CERT_LIFETIME_SECONDS + 120  # clock-skew allowance
 
 
 def test_certificate_is_valid_now(ca_pem):
     _, cert = SshUserCa(ca_pem).mint("agent-host")
     now = time.time()
-    assert cert._valid_after <= now < cert._valid_before
+    assert (
+        cert._valid_after <= now < cert._valid_before
+    )  # private field; see note above
 
 
 def test_certificate_outside_its_window_is_rejected(ca_pem):
@@ -65,12 +72,21 @@ def test_each_mint_uses_a_fresh_keypair(ca_pem):
     assert first.export_private_key() != second.export_private_key()
 
 
-def test_mint_grants_no_extensions(ca_pem):
-    """asyncssh defaults permit-pty/X11/agent/port-forwarding/user-rc to
-    granted (True) unless told otherwise (public_key.py:657-661) -- the
-    opposite of "no extensions". mint() must deny every one explicitly."""
+def test_mint_grants_only_pty_and_port_forwarding(ca_pem):
+    """permit-pty is required for an interactive shell (the feature's primary
+    use case) and permit-port-forwarding for direct-tcpip (JetBrains Gateway /
+    ProxyJump), which the workspace's own `PermitOpen 127.0.0.1:*` narrows --
+    but only once the certificate allows forwarding at all; extensions are
+    permissive-by-listing, so sshd_config cannot grant back what the
+    certificate omits. asyncssh (like real `ssh-keygen -s`, confirmed via its
+    `-O clear` option and its man page's "permitted by default" wording)
+    defaults every permit-* to granted, so the three unneeded ones
+    (X11-forwarding, agent-forwarding, user-rc) must be denied explicitly or
+    they are inherited on. This asserts both directions in one equality: a
+    missing permit-pty/permit-port-forwarding fails it, and so does any of
+    the other three leaking back in."""
     _, cert = SshUserCa(ca_pem).mint("agent-host")
-    assert cert.options == {}
+    assert cert.options == {"permit-pty": True, "permit-port-forwarding": True}
 
 
 def test_signed_by_the_expected_ca(ca_pem, tmp_path):
