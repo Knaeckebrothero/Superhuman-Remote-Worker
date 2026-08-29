@@ -11,6 +11,7 @@ from services.ssh_gateway_ca import (
     DEFAULT_CERT_LIFETIME_SECONDS,
     MAX_CERT_LIFETIME_SECONDS,
     SshUserCa,
+    load_user_ca,
 )
 
 
@@ -170,3 +171,23 @@ def test_mint_refuses_a_non_positive_lifetime(ca_pem, bad):
     ca = SshUserCa(ca_pem)
     with pytest.raises(ValueError, match="must be positive"):
         ca.mint("agent-host", lifetime_seconds=bad)
+
+
+def test_load_user_ca_names_the_offending_path(tmp_path):
+    """An operator reading a startup failure needs to know WHICH file was
+    wrong. SshUserCa.__init__ cannot say -- it takes a key, not a path -- so
+    load_user_ca attaches it, matching what the host-key check already does."""
+    bad = tmp_path / "wrong-type.pem"
+    rsa = asyncssh.generate_private_key("ssh-rsa", key_size=3072)
+    bad.write_bytes(rsa.export_private_key())
+    with pytest.raises(ValueError, match="wrong-type.pem"):
+        load_user_ca(str(bad))
+
+
+def test_load_user_ca_accepts_a_der_key(tmp_path):
+    """asyncssh accepts DER as well as PEM; a text-mode read would reject this
+    valid key with a UnicodeDecodeError blaming the key, not the encoding."""
+    der = tmp_path / "ca.der"
+    key = asyncssh.generate_private_key("ssh-ed25519")
+    der.write_bytes(key.export_private_key("pkcs8-der"))
+    assert load_user_ca(str(der)).public_key_line.startswith("ssh-ed25519 ")

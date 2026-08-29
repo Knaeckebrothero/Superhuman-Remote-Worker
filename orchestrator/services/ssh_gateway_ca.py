@@ -83,7 +83,7 @@ CERT_BACKDATE_SECONDS = 60
 class SshUserCa:
     """Mints short-lived user certificates for the inner hop."""
 
-    def __init__(self, ca_private_key_pem: str):
+    def __init__(self, ca_private_key_pem: str | bytes):
         """Load and validate the CA's signing key.
 
         Restricted to Ed25519. This constructor is the one place that ever
@@ -167,6 +167,22 @@ class SshUserCa:
 
 
 def load_user_ca(path: str) -> SshUserCa:
-    """Load the CA from its mounted secret."""
-    with open(path, encoding="utf-8") as handle:
-        return SshUserCa(handle.read())
+    """Load the CA from its mounted secret.
+
+    Read as BYTES, not utf-8 text: asyncssh accepts DER as well as PEM, and a
+    text-mode read turns a perfectly good binary key into a UnicodeDecodeError
+    that blames the key rather than the encoding. ssh_gateway_config's
+    host-key check carried the identical bug and was fixed the same way.
+
+    Re-raises the constructor's ValueError with the path attached.
+    ``SshUserCa.__init__`` deliberately does not know its own path -- it takes
+    a key so it stays usable with an in-memory one -- but an operator reading a
+    startup failure needs to know WHICH file was wrong, which is what
+    ``_require_ed25519_host_key`` already does in every one of its branches.
+    """
+    with open(path, "rb") as handle:
+        data = handle.read()
+    try:
+        return SshUserCa(data)
+    except ValueError as exc:
+        raise ValueError(f"{path!r}: {exc}") from (exc.__cause__ or exc)
