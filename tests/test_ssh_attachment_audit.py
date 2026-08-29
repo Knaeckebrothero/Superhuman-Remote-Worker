@@ -1,4 +1,6 @@
 # tests/test_ssh_attachment_audit.py
+import asyncio
+import logging
 import pathlib
 import re
 from uuid import UUID
@@ -50,6 +52,35 @@ def test_survives_key_deletion():
         r"ON DELETE SET NULL",
         SQL.read_text(),
     )
+
+
+def test_survives_session_deletion():
+    """Ending a session must not erase the record that it was SSH'd into.
+
+    An audit trail the audited party can delete on demand (by ending its own
+    session) is not an audit trail -- thread_id carries ON DELETE SET NULL,
+    not CASCADE, and the owner decision this migration now encodes says that
+    row must outlive the thread it describes.
+
+    Pinned as one clause, not two independent substring checks, for the same
+    reason as test_survives_key_deletion: "thread_id" and "ON DELETE SET
+    NULL" checked separately would still pass if thread_id alone carried
+    CASCADE while some other column happened to carry SET NULL. The pattern
+    also doubles as proof thread_id is no longer NOT NULL -- "uuid NOT NULL
+    REFERENCES" would not match "uuid\\s+REFERENCES".
+    """
+    assert re.search(
+        r"thread_id\s+uuid\s+REFERENCES public\.threads\(id\)\s+"
+        r"ON DELETE SET NULL",
+        SQL.read_text(),
+    )
+
+
+def test_no_cascade_deletes():
+    """All three FKs -- user_id, ssh_key_id and now thread_id -- are SET
+    NULL. Growth is bounded by the retention sweeper instead of cascade,
+    matching how 0025_security_events.sql treats security audit."""
+    assert "ON DELETE CASCADE" not in SQL.read_text()
 
 
 class FakeConn:
@@ -247,3 +278,76 @@ async def test_record_keeps_a_valid_client_ip():
         handle="s-7f3a91c2",
     )
     assert conn.calls[0][1][4] == "203.0.113.7"
+
+
+# =============================================================================
+# prune_ssh_attachments -- retention sweep, mirroring prune_security_events
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_prune_deletes_rows_older_than_retention():
+    conn = FakeConn(fetchval=7)
+    got = await _db(conn).prune_ssh_attachments(retention_days=45)
+    assert got == 7
+    sql, args = conn.calls[0]
+    assert "DELETE FROM ssh_attachments" in sql
+    assert "attached_at" in sql
+    # Bound as a parameter, not interpolated into the SQL text.
+    assert args == (45,)
+
+
+@pytest.mark.asyncio
+async def test_prune_defaults_to_ninety_days():
+    conn = FakeConn(fetchval=0)
+    await _db(conn).prune_ssh_attachments()
+    assert conn.calls[0][1] == (90,)
+
+
+@pytest.mark.asyncio
+async def test_prune_returns_zero_when_fetchval_is_none():
+    """Mirrors prune_security_events's ``int(count or 0)`` guard."""
+    conn = FakeConn(fetchval=None)
+    assert await _db(conn).prune_ssh_attachments() == 0
+
+
+# =============================================================================
+# ssh_attachments_prune_sweeper -- env-var defaults
+# =============================================================================
+#
+# The loop body (the actual prune call) is exercised above through
+# PostgresDB.prune_ssh_attachments directly; running the sweeper's own loop
+# would mean standing up postgres_db for real. What's cheap to prove without
+# that is the sweeper's env-var default resolution: pre-setting shutdown_event
+# before the call makes ``while not shutdown_event.is_set()`` false on its
+# first check, so the loop body -- and the only DB access in this function --
+# never executes. Only the two log lines bracketing it fire, and the first one
+# names the defaults it resolved.
+
+
+@pytest.mark.asyncio
+async def test_sweeper_logs_default_interval_and_retention(caplog, monkeypatch):
+    monkeypatch.delenv("SSH_ATTACHMENTS_PRUNE_INTERVAL_S", raising=False)
+    monkeypatch.delenv("SSH_ATTACHMENTS_RETENTION_DAYS", raising=False)
+    from main import ssh_attachments_prune_sweeper
+
+    shutdown_event = asyncio.Event()
+    shutdown_event.set()
+    with caplog.at_level(logging.INFO):
+        await ssh_attachments_prune_sweeper(shutdown_event)
+    assert "interval=3600" in caplog.text
+    assert "retention=90" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_sweeper_honors_env_var_overrides(caplog, monkeypatch):
+    monkeypatch.setenv("SSH_ATTACHMENTS_PRUNE_INTERVAL_S", "120")
+    monkeypatch.setenv("SSH_ATTACHMENTS_RETENTION_DAYS", "14")
+    from main import ssh_attachments_prune_sweeper
+
+    shutdown_event = asyncio.Event()
+    shutdown_event.set()
+    with caplog.at_level(logging.INFO):
+        await ssh_attachments_prune_sweeper(shutdown_event)
+    assert "interval=120" in caplog.text
+    assert "retention=14" in caplog.text

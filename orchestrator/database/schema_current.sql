@@ -17554,7 +17554,7 @@ COMMENT ON COLUMN public.srw_sessions.last_seen_at IS 'Idle timeout anchor: vali
 
 CREATE TABLE public.ssh_attachments (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
-    thread_id uuid NOT NULL,
+    thread_id uuid,
     user_id uuid,
     ssh_key_id uuid,
     handle text NOT NULL,
@@ -26095,7 +26095,7 @@ ALTER TABLE ONLY public.ssh_attachments
 --
 
 ALTER TABLE ONLY public.ssh_attachments
-    ADD CONSTRAINT ssh_attachments_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.threads(id) ON DELETE CASCADE;
+    ADD CONSTRAINT ssh_attachments_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.threads(id) ON DELETE SET NULL;
 
 
 --

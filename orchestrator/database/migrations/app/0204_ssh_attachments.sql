@@ -1,5 +1,22 @@
 -- migration:     0204_ssh_attachments.sql
 -- description:   Audit record of user SSH attachments to session workspaces.
+--
+--                Design notes:
+--                  - thread_id is REFERENCES ... ON DELETE SET NULL, not
+--                    CASCADE, and no longer NOT NULL: the row must outlive the
+--                    session it describes, because an audit trail the audited
+--                    party can delete on demand is not an audit trail.
+--                  - handle stays a NOT NULL text copy, so the row is still
+--                    meaningful and correlatable once thread_id goes NULL.
+--                  - Growth is bounded by the retention sweeper in main.py
+--                    (SSH_ATTACHMENTS_RETENTION_DAYS, default 90) rather than
+--                    by cascade, exactly as 0025_security_events.sql bounds
+--                    security_events.
+--                  - This makes all three FKs consistent: user_id, ssh_key_id
+--                    and now thread_id all ON DELETE SET NULL, so the
+--                    ssh_key_id comment below ("Revoking a key must not erase
+--                    the history of what it did") is no longer contradicted by
+--                    its neighbour.
 -- depends-on:    0203_threads_ssh_handle_idx.notx.sql
 -- expected:     One new table plus two lookup indexes. No writes to existing rows.
 -- locks:        ACCESS EXCLUSIVE on the new table, plus a brief
@@ -49,18 +66,18 @@ DECLARE
 BEGIN
     LOOP
         BEGIN
-CREATE TABLE IF NOT EXISTS public.ssh_attachments (
-    id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    thread_id    uuid NOT NULL REFERENCES public.threads(id) ON DELETE CASCADE,
-    user_id      uuid REFERENCES public.users(id) ON DELETE SET NULL,
-    -- Revoking a key must not erase the history of what it did.
-    ssh_key_id   uuid REFERENCES public.user_ssh_keys(id) ON DELETE SET NULL,
-    handle       text NOT NULL,
-    client_ip    inet,
-    channels     text[] NOT NULL DEFAULT '{}',
-    attached_at  timestamptz NOT NULL DEFAULT now(),
-    detached_at  timestamptz
-);
+            CREATE TABLE IF NOT EXISTS public.ssh_attachments (
+                id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                thread_id    uuid REFERENCES public.threads(id) ON DELETE SET NULL,
+                user_id      uuid REFERENCES public.users(id) ON DELETE SET NULL,
+                -- Revoking a key must not erase the history of what it did.
+                ssh_key_id   uuid REFERENCES public.user_ssh_keys(id) ON DELETE SET NULL,
+                handle       text NOT NULL,
+                client_ip    inet,
+                channels     text[] NOT NULL DEFAULT '{}',
+                attached_at  timestamptz NOT NULL DEFAULT now(),
+                detached_at  timestamptz
+            );
             EXIT;
         EXCEPTION WHEN lock_not_available THEN
             attempt := attempt + 1;

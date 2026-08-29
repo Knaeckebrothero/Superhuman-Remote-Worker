@@ -41307,6 +41307,26 @@ class PostgresDB:
             return int(result.split()[1])
         return 0
 
+    async def prune_ssh_attachments(self, retention_days: int = 90) -> int:
+        """Delete attach records older than ``retention_days``. Returns rows deleted.
+
+        Prunes on attached_at (an attachment that never got a close record
+        has no detached_at to bound on), mirroring prune_security_events's
+        created_at bound.
+        """
+        async with self.acquire() as conn:
+            count = await conn.fetchval(
+                """
+                WITH deleted AS (
+                    DELETE FROM ssh_attachments
+                    WHERE attached_at < NOW() - make_interval(days => $1)
+                    RETURNING 1
+                ) SELECT COUNT(*) FROM deleted
+                """,
+                int(retention_days),
+            )
+        return int(count or 0)
+
     # =========================================================================
     # PROJECT API KEY OPERATIONS
     # =========================================================================

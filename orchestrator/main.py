@@ -17058,6 +17058,12 @@ async def lifespan(app: FastAPI):
     security_events_prune_task = asyncio.create_task(
         security_events_prune_sweeper(_shutdown_event)
     )
+    # Not leader-gated, matching security_events_prune_task above: a
+    # delete-by-age is idempotent, so two replicas racing it is harmless —
+    # the second finds nothing.
+    ssh_attachments_prune_task = asyncio.create_task(
+        ssh_attachments_prune_sweeper(_shutdown_event)
+    )
     # In-flight checkpoint retention: bound every live thread's LangGraph
     # checkpoints to the newest N while it runs (leader-gated), so a long job
     # can't fill the checkpointer PVC before it terminates.
@@ -17394,6 +17400,7 @@ async def lifespan(app: FastAPI):
         await completion_sweep_router_task
     await completion_monitor_task
     await security_events_prune_task
+    await ssh_attachments_prune_task
     await checkpoint_retention_task
     await headless_notify_task
     await attention_sleep_task
@@ -57665,6 +57672,42 @@ async def security_events_prune_sweeper(shutdown_event: asyncio.Event) -> None:
         except asyncio.TimeoutError:
             pass
     logger.info("Security-events prune sweeper stopped")
+
+
+async def ssh_attachments_prune_sweeper(shutdown_event: asyncio.Event) -> None:
+    """Background task that prunes the ssh_attachments audit log on retention.
+
+    Runs hourly (SSH_ATTACHMENTS_PRUNE_INTERVAL_S, default 3600). Deletes
+    rows older than SSH_ATTACHMENTS_RETENTION_DAYS (default 90). thread_id
+    on this table is ON DELETE SET NULL rather than CASCADE (see 0204's
+    header), so ending a session no longer prunes its attach history —
+    this sweeper is what bounds the table's growth instead.
+
+    Not leader-gated, matching security_events_prune_task: a delete-by-age
+    is idempotent, so two replicas racing it is harmless — the second finds
+    nothing. Best-effort: survives transient DB errors by logging and
+    continuing.
+    """
+    interval_s = int(os.environ.get("SSH_ATTACHMENTS_PRUNE_INTERVAL_S", "3600"))
+    retention_days = int(os.environ.get("SSH_ATTACHMENTS_RETENTION_DAYS", "90"))
+    logger.info(
+        "SSH-attachments prune sweeper started (interval=%ds, retention=%dd)",
+        interval_s,
+        retention_days,
+    )
+    while not shutdown_event.is_set():
+        try:
+            deleted = await postgres_db.prune_ssh_attachments(retention_days)
+            if deleted:
+                logger.info("ssh_attachments prune: deleted=%d", deleted)
+        except Exception as e:
+            logger.warning("ssh_attachments prune error (non-fatal): %s", e)
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=float(interval_s))
+            break
+        except asyncio.TimeoutError:
+            pass
+    logger.info("SSH-attachments prune sweeper stopped")
 
 
 # =============================================================================
