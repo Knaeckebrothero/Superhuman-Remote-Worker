@@ -1,8 +1,4 @@
-"""Web search tools for the Universal Agent.
-
-Provides web search and content extraction capabilities using Tavily API.
-Supports search, extract, crawl, and map operations.
-"""
+"""Provider-neutral web search and content retrieval tools."""
 
 import asyncio
 import logging
@@ -11,6 +7,7 @@ from typing import Any, Dict, List, Literal, Optional
 from langchain_core.tools import tool
 
 from ..context import ToolContext
+from .search import ProviderError, SearchAdapter, create_search_adapter
 
 logger = logging.getLogger(__name__)
 
@@ -27,14 +24,14 @@ RESEARCH_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "module": "research.web",
         "function": "web_search",
         "description": (
-            "Search the web using Tavily API. Results are returned as bounded "
+            "Search the web. Results are returned as bounded "
             "snippets; raw page content can be fetched and archived to the "
             "workspace for later reading/citation."
         ),
         "category": "research",
         "defer_to_workspace": True,
         "short_description": (
-            "Search the web via Tavily; archive full text and return compact snippets."
+            "Search the web; archive full text and return compact snippets."
         ),
         "phases": ["tactical"],
     },
@@ -42,9 +39,8 @@ RESEARCH_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "module": "research.web",
         "function": "extract_webpage",
         "description": (
-            "Extract full content from one or more web pages using Tavily "
-            "Extract. Content is archived when possible and inline output is "
-            "bounded per call."
+            "Extract full content from web pages. Content is archived when "
+            "possible and inline output is bounded per call."
         ),
         "category": "research",
         "short_description": (
@@ -56,9 +52,8 @@ RESEARCH_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "module": "research.web",
         "function": "crawl_website",
         "description": (
-            "Crawl a website starting from a URL using Tavily Crawl. Crawled "
-            "page content is archived when possible and returned as snippets "
-            "with saved-file pointers."
+            "Crawl a website from a URL. Page content is archived when possible "
+            "and returned as snippets with saved-file pointers."
         ),
         "category": "research",
         "short_description": "Crawl and archive website pages with compact snippets.",
@@ -67,19 +62,12 @@ RESEARCH_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
     "map_website": {
         "module": "research.web",
         "function": "map_website",
-        "description": "Map website structure to discover URLs using Tavily Map",
+        "description": "Map website structure to discover URLs",
         "category": "research",
-        "short_description": "Discover URLs in a website's structure via Tavily Map.",
+        "short_description": "Discover URLs in a website's structure.",
         "phases": ["tactical"],
     },
 }
-
-
-def _get_tavily_api_key() -> Optional[str]:
-    """Get Tavily API key from environment."""
-    import os
-
-    return os.getenv("TAVILY_API_KEY")
 
 
 def _parse_comma_list(value: Optional[str]) -> Optional[List[str]]:
@@ -157,6 +145,19 @@ def _run_async(coro: Any, loop: Optional[asyncio.AbstractEventLoop] = None) -> A
     return asyncio.run(coro)
 
 
+def _research_adapter(
+    context: Optional[ToolContext], capability: str
+) -> SearchAdapter | None:
+    """Resolve one configured adapter for direct helper calls and tool creation."""
+
+    if context is None or not isinstance(context.config, dict):
+        return None
+    research = context.config.get("research")
+    if not isinstance(research, dict):
+        return None
+    return create_search_adapter(research.get(capability))
+
+
 def create_web_tools(context: ToolContext) -> List[Any]:
     """Create web search tools with injected context.
 
@@ -175,6 +176,9 @@ def create_web_tools(context: ToolContext) -> List[Any]:
     except RuntimeError:
         _creator_loop = None
 
+    search_adapter = _research_adapter(context, "search")
+    fetch_adapter = _research_adapter(context, "fetch")
+
     @tool
     def web_search(
         query: str,
@@ -186,7 +190,7 @@ def create_web_tools(context: ToolContext) -> List[Any]:
         exclude_domains: Optional[str] = None,
         include_raw_content: bool = False,
     ) -> str:
-        """Search the web for information using Tavily.
+        """Search the web for information.
 
         Each result is automatically registered as a citation source.
         Use cite_web() with the URL to create citations from these sources.
@@ -217,6 +221,7 @@ def create_web_tools(context: ToolContext) -> List[Any]:
             exclude_domains=exclude_domains,
             include_raw_content=include_raw_content,
             creator_loop=_creator_loop,
+            adapter=search_adapter,
         )
 
     @tool
@@ -225,7 +230,7 @@ def create_web_tools(context: ToolContext) -> List[Any]:
         query: Optional[str] = None,
         extract_depth: Literal["basic", "advanced"] = "basic",
     ) -> str:
-        """Extract full content from one or more web pages using Tavily Extract.
+        """Extract full content from one or more web pages.
 
         Retrieves the complete text content of web pages as clean markdown.
         Useful for reading articles, documentation, or any web content in full.
@@ -248,6 +253,7 @@ def create_web_tools(context: ToolContext) -> List[Any]:
             query=query,
             extract_depth=extract_depth,
             creator_loop=_creator_loop,
+            adapter=fetch_adapter,
         )
 
     @tool
@@ -260,7 +266,7 @@ def create_web_tools(context: ToolContext) -> List[Any]:
         select_paths: Optional[str] = None,
         exclude_paths: Optional[str] = None,
     ) -> str:
-        """Crawl a website starting from a URL using Tavily Crawl.
+        """Crawl a website starting from a URL.
 
         Performs a breadth-first traversal from the starting URL, extracting
         and archiving content from discovered pages. Each crawled page is
@@ -290,6 +296,7 @@ def create_web_tools(context: ToolContext) -> List[Any]:
             select_paths=select_paths,
             exclude_paths=exclude_paths,
             creator_loop=_creator_loop,
+            adapter=fetch_adapter,
         )
 
     @tool
@@ -301,7 +308,7 @@ def create_web_tools(context: ToolContext) -> List[Any]:
         select_paths: Optional[str] = None,
         exclude_paths: Optional[str] = None,
     ) -> str:
-        """Map a website's structure to discover URLs using Tavily Map.
+        """Map a website's structure to discover URLs.
 
         Creates a sitemap-like listing of all discoverable URLs on a website.
         Does NOT extract content - use extract_webpage or crawl_website for that.
@@ -325,9 +332,21 @@ def create_web_tools(context: ToolContext) -> List[Any]:
             limit=limit,
             select_paths=select_paths,
             exclude_paths=exclude_paths,
+            context=context,
+            adapter=fetch_adapter,
         )
 
-    return [web_search, extract_webpage, crawl_website, map_website]
+    tools = []
+    if search_adapter is not None and "search" in search_adapter.ops:
+        tools.append(web_search)
+    if fetch_adapter is not None:
+        if "extract" in fetch_adapter.ops:
+            tools.append(extract_webpage)
+        if "crawl" in fetch_adapter.ops:
+            tools.append(crawl_website)
+        if "map" in fetch_adapter.ops:
+            tools.append(map_website)
+    return tools
 
 
 def _direct_web_search(
@@ -341,8 +360,9 @@ def _direct_web_search(
     exclude_domains: Optional[str] = None,
     include_raw_content: bool = False,
     creator_loop: Optional[asyncio.AbstractEventLoop] = None,
+    adapter: SearchAdapter | None = None,
 ) -> str:
-    """Direct Tavily web search.
+    """Search the web through the configured provider.
 
     Args:
         query: Search query
@@ -359,38 +379,32 @@ def _direct_web_search(
         Search results with snippets, saved-file pointers, URLs, and source IDs
         (if context provided)
     """
-    api_key = _get_tavily_api_key()
-    if not api_key:
-        return "Error: TAVILY_API_KEY not configured"
+    adapter = adapter or _research_adapter(context, "search")
+    if adapter is None:
+        return "Error: web search provider not configured"
 
     try:
-        from langchain_tavily import TavilySearch
-
-        # include_raw_content must be set at construction time
-        constructor_kwargs = {"api_key": api_key, "max_results": max_results}
-        if include_raw_content:
-            constructor_kwargs["include_raw_content"] = True
-        search = TavilySearch(**constructor_kwargs)
-
-        # Runtime parameters passed at invoke time
-        invoke_kwargs: Dict[str, Any] = {"query": query}
-        if search_depth != "basic":
-            invoke_kwargs["search_depth"] = search_depth
-        if topic != "general":
-            invoke_kwargs["topic"] = topic
-        if time_range:
-            invoke_kwargs["time_range"] = time_range
-
         parsed_include = _parse_comma_list(include_domains)
         parsed_exclude = _parse_comma_list(exclude_domains)
-        if parsed_include:
-            invoke_kwargs["include_domains"] = parsed_include
-        if parsed_exclude:
-            invoke_kwargs["exclude_domains"] = parsed_exclude
-
-        response = search.invoke(invoke_kwargs)
-
-        results = response.get("results", [])
+        provider_results = adapter.search(
+            query,
+            max_results,
+            search_depth=search_depth,
+            topic=topic,
+            time_range=time_range,
+            include_domains=parsed_include,
+            exclude_domains=parsed_exclude,
+            include_raw_content=include_raw_content,
+        )
+        results = [
+            {
+                "title": item.title,
+                "url": item.url,
+                "content": item.snippet,
+                "raw_content": item.raw_content,
+            }
+            for item in provider_results
+        ]
         if not results:
             return f"No web results found for: {query}"
 
@@ -490,8 +504,9 @@ def _direct_web_search(
 
         return result
 
-    except ImportError:
-        return "Error: langchain-tavily package not installed"
+    except ProviderError as e:
+        logger.warning("Web search provider failed for query %s: %s", query, e)
+        return f"Error searching web: {str(e)}"
     except Exception as e:
         logger.exception("Web search failed for query: %s", query)
         return f"Error searching web: {str(e)}"
@@ -503,8 +518,9 @@ def _extract_webpage(
     query: Optional[str] = None,
     extract_depth: str = "basic",
     creator_loop: Optional[asyncio.AbstractEventLoop] = None,
+    adapter: SearchAdapter | None = None,
 ) -> str:
-    """Extract full content from web pages using Tavily Extract.
+    """Extract full content from web pages through the configured provider.
 
     Args:
         urls: Comma-separated URLs to extract
@@ -515,28 +531,28 @@ def _extract_webpage(
     Returns:
         Extracted content from each URL
     """
-    api_key = _get_tavily_api_key()
-    if not api_key:
-        return "Error: TAVILY_API_KEY not configured"
-
     url_list = [u.strip() for u in urls.split(",") if u.strip()]
     if not url_list:
         return "Error: No URLs provided"
     if len(url_list) > 20:
         return "Error: Maximum 20 URLs allowed per request"
 
+    adapter = adapter or _research_adapter(context, "fetch")
+    if adapter is None:
+        return "Error: web fetch provider not configured"
+
     try:
-        from langchain_tavily import TavilyExtract
-
-        extract = TavilyExtract(api_key=api_key, extract_depth=extract_depth)
-
-        invoke_kwargs: Dict[str, Any] = {"urls": url_list}
-        if query:
-            invoke_kwargs["query"] = query
-
-        response = extract.invoke(invoke_kwargs)
-        results = response.get("results", [])
-        failed = response.get("failed_results", [])
+        pages = adapter.extract(
+            url_list,
+            query=query,
+            extract_depth=extract_depth,
+        )
+        results = [
+            {"url": page.url, "raw_content": page.content}
+            for page in pages
+            if page.failed is None
+        ]
+        failed = [page.url for page in pages if page.failed is not None]
 
         if not results and not failed:
             return "No content could be extracted from the provided URL(s)."
@@ -619,8 +635,9 @@ def _extract_webpage(
 
         return output
 
-    except ImportError:
-        return "Error: langchain-tavily package not installed"
+    except ProviderError as e:
+        logger.warning("Web extract provider failed for URLs %s: %s", urls, e)
+        return f"Error extracting content: {str(e)}"
     except Exception as e:
         logger.exception("Web extract failed for URLs: %s", urls)
         return f"Error extracting content: {str(e)}"
@@ -636,8 +653,9 @@ def _crawl_website(
     select_paths: Optional[str] = None,
     exclude_paths: Optional[str] = None,
     creator_loop: Optional[asyncio.AbstractEventLoop] = None,
+    adapter: SearchAdapter | None = None,
 ) -> str:
-    """Crawl a website using Tavily Crawl.
+    """Crawl a website through the configured provider.
 
     Args:
         url: Starting URL
@@ -652,37 +670,32 @@ def _crawl_website(
     Returns:
         Crawled content from each page
     """
-    api_key = _get_tavily_api_key()
-    if not api_key:
-        return "Error: TAVILY_API_KEY not configured"
-
     # Clamp parameters
     max_depth = max(1, min(5, max_depth))
     max_breadth = max(1, min(500, max_breadth))
     limit = max(1, limit)
 
+    adapter = adapter or _research_adapter(context, "fetch")
+    if adapter is None:
+        return "Error: web fetch provider not configured"
+
     try:
-        from langchain_tavily import TavilyCrawl
-
-        crawl = TavilyCrawl(api_key=api_key)
-
-        invoke_kwargs: Dict[str, Any] = {
-            "url": url,
-            "max_depth": max_depth,
-            "max_breadth": max_breadth,
-            "limit": limit,
-        }
-        if instructions:
-            invoke_kwargs["instructions"] = instructions
         parsed_select = _parse_comma_list(select_paths)
         parsed_exclude = _parse_comma_list(exclude_paths)
-        if parsed_select:
-            invoke_kwargs["select_paths"] = parsed_select
-        if parsed_exclude:
-            invoke_kwargs["exclude_paths"] = parsed_exclude
-
-        response = crawl.invoke(invoke_kwargs)
-        results = response.get("results", [])
+        pages = adapter.crawl(
+            url,
+            instructions=instructions,
+            max_depth=max_depth,
+            max_breadth=max_breadth,
+            limit=limit,
+            select_paths=parsed_select,
+            exclude_paths=parsed_exclude,
+        )
+        results = [
+            {"url": page.url, "raw_content": page.content}
+            for page in pages
+            if page.failed is None
+        ]
 
         if not results:
             return f"No pages could be crawled from: {url}"
@@ -752,8 +765,9 @@ def _crawl_website(
 
         return output
 
-    except ImportError:
-        return "Error: langchain-tavily package not installed"
+    except ProviderError as e:
+        logger.warning("Web crawl provider failed for URL %s: %s", url, e)
+        return f"Error crawling website: {str(e)}"
     except Exception as e:
         logger.exception("Web crawl failed for URL: %s", url)
         return f"Error crawling website: {str(e)}"
@@ -766,8 +780,10 @@ def _map_website(
     limit: int = 50,
     select_paths: Optional[str] = None,
     exclude_paths: Optional[str] = None,
+    context: Optional[ToolContext] = None,
+    adapter: SearchAdapter | None = None,
 ) -> str:
-    """Map website structure using Tavily Map.
+    """Map website structure through the configured provider.
 
     Args:
         url: Starting URL
@@ -780,34 +796,24 @@ def _map_website(
     Returns:
         List of discovered URLs
     """
-    api_key = _get_tavily_api_key()
-    if not api_key:
-        return "Error: TAVILY_API_KEY not configured"
-
     max_depth = max(1, min(5, max_depth))
     limit = max(1, limit)
 
+    adapter = adapter or _research_adapter(context, "fetch")
+    if adapter is None:
+        return "Error: web fetch provider not configured"
+
     try:
-        from langchain_tavily import TavilyMap
-
-        mapper = TavilyMap(api_key=api_key)
-
-        invoke_kwargs: Dict[str, Any] = {
-            "url": url,
-            "max_depth": max_depth,
-            "limit": limit,
-        }
-        if instructions:
-            invoke_kwargs["instructions"] = instructions
         parsed_select = _parse_comma_list(select_paths)
         parsed_exclude = _parse_comma_list(exclude_paths)
-        if parsed_select:
-            invoke_kwargs["select_paths"] = parsed_select
-        if parsed_exclude:
-            invoke_kwargs["exclude_paths"] = parsed_exclude
-
-        response = mapper.invoke(invoke_kwargs)
-        results = response.get("results", [])
+        results = adapter.map(
+            url,
+            instructions=instructions,
+            max_depth=max_depth,
+            limit=limit,
+            select_paths=parsed_select,
+            exclude_paths=parsed_exclude,
+        )
 
         if not results:
             return f"No URLs discovered for: {url}"
@@ -825,7 +831,8 @@ def _map_website(
 
         return output
 
-    except ImportError:
-        return "Error: langchain-tavily package not installed"
+    except ProviderError as e:
+        logger.warning("Web map provider failed for URL %s: %s", url, e)
+        return f"Error mapping website: {str(e)}"
     except Exception as e:
         return f"Error mapping website: {str(e)}"
