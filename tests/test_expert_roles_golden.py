@@ -85,7 +85,11 @@ _POST_SPLIT_OVERLAY_ADDITIONS: dict[str, tuple[str, ...]] = {
     # values; the dataclass defaults are identical, so the effective-config
     # identity below holds without an exclusion).
     "worker": ("delegation.max_concurrent", "delegation.run_in_background_default"),
-    "session": (),
+    # U3 WP1: the persistent loop reads limits.llm_inproc_retries (it was a
+    # hard-coded 3); the overlay pins the historical 3 against the dataclass
+    # default of 5, so the effective compare strips it too (see
+    # ``_without_effective_additions``).
+    "session": ("limits.llm_inproc_retries",),
 }
 #: Bindings later work added to an overlay's ``instruction_files`` (role ->
 #: skill names). The list replaces wholesale on merge, so a dotted path cannot
@@ -171,11 +175,35 @@ def _without_post_split_bindings(data: dict, role: str, *, require: bool) -> dic
     return out
 
 
-def _effective(config_path: str, deployment_dir: str | None) -> dict:
-    """The deterministic part of the frozen blob for a config loaded from disk."""
+def _without_effective_additions(agent: dict, role: str) -> dict:
+    """``agent`` (the asdict blob) minus the dotted post-split additions whose
+    overlay value differs from the dataclass default — present on both sides
+    of the effective compare (the dataclass fills the pre-split side), so they
+    are stripped from both without a presence assertion."""
+    out = copy.deepcopy(agent)
+    for dotted in _POST_SPLIT_OVERLAY_ADDITIONS.get(role, ()):
+        *parents, leaf = dotted.split(".")
+        node = out
+        for part in parents:
+            node = node.get(part) if isinstance(node, dict) else None
+            if node is None:
+                break
+        if isinstance(node, dict):
+            node.pop(leaf, None)
+    return out
+
+
+def _effective(
+    config_path: str, deployment_dir: str | None, role: str | None = None
+) -> dict:
+    """The deterministic part of the frozen blob for a config loaded from disk
+    (minus the effective-side post-split additions of ``role`` when given)."""
     cfg = load_agent_config(config_path, deployment_dir)
     blob = serialize_resolved_config(cfg, model=cfg.llm.model)
-    return {k: blob[k] for k in ("agent", "prompts", "instructions")}
+    out = {k: blob[k] for k in ("agent", "prompts", "instructions")}
+    if role is not None:
+        out["agent"] = _without_effective_additions(out["agent"], role)
+    return out
 
 
 def _effective_without_post_split_bindings(
@@ -183,9 +211,10 @@ def _effective_without_post_split_bindings(
 ) -> dict:
     """``_effective`` minus the post-split bindings: in ``agent.instruction_files``
     (asdict shape) and the skill bodies the freeze keys under the same names in
-    ``instructions``. The dotted additions need no exclusion here — their
-    dataclass defaults are identical on both sides."""
-    blob = _effective(config_path, deployment_dir)
+    ``instructions``. Dotted additions whose dataclass default equals the
+    overlay value need no exclusion; the others are stripped on both sides by
+    ``_without_effective_additions``."""
+    blob = _effective(config_path, deployment_dir, role)
     blob["agent"] = _without_post_split_bindings(blob["agent"], role, require=require)
     for skill in _POST_SPLIT_OVERLAY_BINDINGS.get(role, ()):
         if require:
@@ -255,7 +284,7 @@ def test_role_base_effective_config_is_identical_to_the_pre_split_base(role):
     root_path, deployment_dir = resolve_config_path(ROLE_ROOTS[role])
     assert _effective_without_post_split_bindings(
         root_path, deployment_dir, role
-    ) == _effective(str(_PRE_SPLIT[role]), None)
+    ) == _effective(str(_PRE_SPLIT[role]), None, role)
 
 
 @pytest.mark.parametrize("role", sorted(_PRE_SPLIT))

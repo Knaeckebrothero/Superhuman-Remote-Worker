@@ -132,6 +132,10 @@ limits:
   # closed set of keys today, so they are not declared here yet — an
   # undeclared key under `limits` would be dropped silently, not carried.
   tool_retry_count: 2
+  # In-process LLM attempts per child turn (src/persistent_graph.py reads it):
+  # a parent is waiting on the child, so fail fast like a session, never the
+  # worker's 5-attempt pause+backoff ladder.
+  llm_inproc_retries: 3
 
 memory:
   # A child returns a bounded result to its parent; it does not write to (or

@@ -193,6 +193,9 @@ class GitManager:
         "__pycache__/",
         ".DS_Store",
         "*.pyc",
+        # Subagent spill reports (src/subagents/envelope.py) live in the parent
+        # tree but are never part of the job's deliverable.
+        ".subagents/",
     ]
 
     def init_repository(self) -> bool:

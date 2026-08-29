@@ -290,6 +290,17 @@ class SummarizationEngine:
         """
         if not plan.chunks:
             raise SummarizationFailed("empty_plan", "Nothing to summarize")
+        if self.auxiliary is None:
+            # Fast-fail: no auxiliary model means no fold call can ever
+            # succeed, so the retry burn (5 s + 15 s per pass, observed as a
+            # 20 s stall per turn in the U0 subagent spike, scenario E) would
+            # only delay the same "keep the raw history" outcome.
+            raise SummarizationFailed(
+                "aux_unavailable",
+                "no auxiliary LLM configured for summarization",
+                pass_index=1,
+                n_passes=plan.n_passes,
+            )
 
         summary = seed_summary
         for chunk in plan.chunks:

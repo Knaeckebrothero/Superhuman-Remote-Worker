@@ -692,6 +692,22 @@ _SESSION_LLM_MAX_ATTEMPTS = 3
 _SESSION_LLM_RETRY_BASE_DELAY = 2.0
 
 
+def _resolve_session_llm_max_attempts(config: Any) -> int:
+    """The in-process LLM attempt ceiling for one turn of this loop.
+
+    ``config.limits.llm_inproc_retries`` when the config carries a real
+    integer (the session and subagent overlays pin 3; a roster entry may
+    lower it further), else the module fallback ``_SESSION_LLM_MAX_ATTEMPTS``
+    — read at call time so tests that patch the constant keep working, and
+    so MagicMock configs (whose attributes are never ints) never leak a mock
+    into the attempt arithmetic. Never below 1: zero attempts is no turn.
+    """
+    value = getattr(getattr(config, "limits", None), "llm_inproc_retries", None)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return _SESSION_LLM_MAX_ATTEMPTS
+    return max(1, value)
+
+
 # Classifications worth another attempt. Deliberately the complement of the
 # fail-fast verdicts (`permanent`, `quota_exhausted`, `cooldown`): those are
 # states no retry inside a turn can fix, and the worker path already fails fast
@@ -2449,8 +2465,9 @@ async def _execute_turn(
                         _nothing_shown = not (
                             response_content or reasoning_streamed or reasoning_emitted
                         )
+                        _max_attempts = _resolve_session_llm_max_attempts(config)
                         if (
-                            _llm_attempt + 1 < _SESSION_LLM_MAX_ATTEMPTS
+                            _llm_attempt + 1 < _max_attempts
                             and _nothing_shown
                             and _is_retryable_llm_error(chunk_err)
                         ):
@@ -2459,7 +2476,7 @@ async def _execute_turn(
                                 "Transient LLM stream error (attempt %d/%d), "
                                 "retrying in %.1fs: %s: %s",
                                 _llm_attempt + 1,
-                                _SESSION_LLM_MAX_ATTEMPTS,
+                                _max_attempts,
                                 _delay,
                                 type(chunk_err).__name__,
                                 chunk_err,

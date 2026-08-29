@@ -1,0 +1,55 @@
+"""Built-in subagents (U3): a child session driven inside its parent's process.
+
+Package layout:
+
+- ``host``     — ``ParentHost`` (what a child needs from its parent, B.13)
+- ``ledger``   — ``SubagentLedger`` (durable child state; null impl here, DB in WP3)
+- ``budgets``  — ``ChildBudgets`` + the staleness watcher (B.4)
+- ``child``    — build the child from a resolved roster entry (B.2, B.8, B.9)
+- ``driver``   — ``SubagentDriver`` on ``run_persistent_loop`` (B.3)
+- ``envelope`` — the return contract (B.5)
+- ``fork``     — ``fork=true`` history seeding (B.7)
+
+Import rule: nothing in this package imports ``src.tools.registry`` at module
+level (registry → delegation → subagents → persistent_graph would cycle);
+the tool factory (WP2) imports this package lazily.
+"""
+
+from .budgets import ChildBudgets, StalenessWatcher
+from .child import (
+    ChildBuild,
+    SharedWriterGuard,
+    SpawnRefused,
+    build_child,
+    build_child_config,
+    select_child_tool_names,
+)
+from .driver import STOP, SubagentDriver, SubagentResult
+from .envelope import build_envelope, neutralise_control_markers, return_budget
+from .fork import seed_fork_history
+from .host import ContextProbe, ParentHost, SimpleParentHost
+from .ledger import NullLedger, RecordingLedger, SubagentLedger
+
+__all__ = [
+    "STOP",
+    "ChildBudgets",
+    "ChildBuild",
+    "ContextProbe",
+    "NullLedger",
+    "ParentHost",
+    "RecordingLedger",
+    "SharedWriterGuard",
+    "SimpleParentHost",
+    "SpawnRefused",
+    "StalenessWatcher",
+    "SubagentDriver",
+    "SubagentLedger",
+    "SubagentResult",
+    "build_child",
+    "build_child_config",
+    "build_envelope",
+    "neutralise_control_markers",
+    "return_budget",
+    "seed_fork_history",
+    "select_child_tool_names",
+]

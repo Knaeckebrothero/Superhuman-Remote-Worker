@@ -110,8 +110,15 @@ async def acquire_reader_env(
     index: int,
     total: Optional[int] = None,
     allow_writes: bool = False,
+    name: Optional[str] = None,
 ) -> ReaderEnv:
-    """Build one reader's isolated worktree + tools. See module docstring."""
+    """Build one reader's isolated worktree + tools. See module docstring.
+
+    ``name`` (U3 subagents: the child's handle) names the worktree, its branch
+    and the shell-tab namespace instead of the numeric ``index`` — so a
+    worktree child is recognisable on the workspace pod as
+    ``.worktrees/<handle>`` / ``sub/<handle>`` / ``<handle>__<tab>``.
+    """
     loop = asyncio.get_running_loop()
     parent_ws = parent_context.workspace_manager
     if parent_ws is None:
@@ -119,8 +126,9 @@ async def acquire_reader_env(
     parent_backend = parent_ws.backend
     parent_git = getattr(parent_ws, "git_manager", None)
 
-    worktree_rel = f".worktrees/sub_{index}"
-    branch = f"sub/{index}"
+    label = name if name else str(index)
+    worktree_rel = f".worktrees/sub_{index}" if not name else f".worktrees/{name}"
+    branch = f"sub/{label}"
     worktree_ready = False
 
     if parent_git is not None and getattr(parent_git, "is_active", False):
@@ -137,7 +145,9 @@ async def acquire_reader_env(
     if not worktree_ready:
         # No git (or add failed): a plain scratch subdir still isolates the
         # reader's files via SubdirBackend — just without a git branch.
-        worktree_rel = f".subagents/reader_{index}"
+        worktree_rel = (
+            f".subagents/reader_{index}" if not name else f".subagents/{name}.tree"
+        )
         branch = None
         try:
             await loop.run_in_executor(None, parent_backend.mkdir, worktree_rel)
@@ -146,7 +156,9 @@ async def acquire_reader_env(
 
     # Re-rooted view over the shared connection + namespaced shell tabs.
     subdir_backend = SubdirBackend(
-        parent_backend, worktree_rel, shell_tab_prefix=f"sub{index}__"
+        parent_backend,
+        worktree_rel,
+        shell_tab_prefix=f"sub{index}__" if not name else f"{name}__",
     )
 
     # Reader workspace manager rooted at the worktree (no re-init / no rm -rf).
@@ -185,7 +197,7 @@ async def acquire_reader_env(
 
             shell_cfg = (parent_context.config or {}).get("shell", {})
             reader_shell = ShellManager(
-                job_id=f"{parent_ws.job_id}-s{index}",
+                job_id=f"{parent_ws.job_id}-s{label}",
                 max_tabs=shell_cfg.get("max_tabs", 15),
                 scrollback_limit=shell_cfg.get("scrollback_limit", 5000),
                 default_timeout=shell_cfg.get("default_timeout", 120),
