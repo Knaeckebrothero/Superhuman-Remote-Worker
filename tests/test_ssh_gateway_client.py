@@ -550,3 +550,238 @@ def test_exit_codes_are_pinned_per_state_not_just_in_the_legal_set():
     for state, expected_code in _EXPECTED_EXIT_CODES.items():
         _, code = REFUSAL_MESSAGES[state]
         assert code == expected_code, f"{state}: expected {expected_code}, got {code}"
+
+
+# =====================================================================
+# Task 6A's audit endpoints
+#
+# These three are WRITES, and they fail differently from resolve_target
+# above: an audit failure raises AuditWriteFailed and every caller
+# swallows it, because a bookkeeping write must never tear down a session
+# that already authenticated. The tests below therefore care about two
+# things a refusal test would not: that a bad response can never be
+# mistaken for a good one, and that nothing here can manufacture a
+# TargetDenied/TargetUnavailable the gateway would turn into a refusal.
+# =====================================================================
+
+
+class _PostRecorder:
+    """Stands in for ``_http_post``, recording exactly what went on the wire."""
+
+    def __init__(self, response=None, raises=None):
+        self.calls = []
+        self._response = response
+        self._raises = raises
+
+    async def __call__(self, url, headers=None, json=None, timeout=None):
+        self.calls.append(
+            {"url": url, "headers": headers, "json": json, "timeout": timeout}
+        )
+        if self._raises is not None:
+            raise self._raises
+        return self._response
+
+
+def _patch_post(monkeypatch, recorder):
+    import services.ssh_gateway_client as mod
+
+    monkeypatch.setattr(mod, "_http_post", recorder)
+    return recorder
+
+
+@pytest.mark.asyncio
+async def test_mark_key_used_posts_only_the_fingerprint(monkeypatch):
+    """The gateway holds no key id at auth_completed time -- target
+    resolution is lazy -- so this endpoint is keyed by fingerprint. Sending
+    anything more would also be asserting an identity, which this module's
+    docstring rules out."""
+    from services.ssh_gateway_client import mark_key_used
+
+    post = _patch_post(monkeypatch, _PostRecorder(FakeResponse(200, {"status": "ok"})))
+    await mark_key_used(_config(), "SHA256:abc")
+
+    assert len(post.calls) == 1
+    call = post.calls[0]
+    assert call["url"] == "http://orchestrator:8085/api/internal/ssh-keys/used"
+    assert call["json"] == {"fingerprint": "SHA256:abc"}
+    assert call["headers"] == {"X-Internal-Key": "internal"}
+    assert call["timeout"] == 10.0
+
+
+@pytest.mark.asyncio
+async def test_an_audit_write_never_raises_a_refusal(monkeypatch):
+    """AuditWriteFailed must not be a TargetDenied/TargetUnavailable: those
+    two are authorization outcomes the gateway turns into a readable
+    refusal, and a control-plane hiccup on a bookkeeping write must never be
+    able to manufacture one."""
+    from services.ssh_gateway_client import AuditWriteFailed, mark_key_used
+
+    _patch_post(monkeypatch, _PostRecorder(raises=RuntimeError("connection reset")))
+
+    with pytest.raises(AuditWriteFailed) as excinfo:
+        await mark_key_used(_config(), "SHA256:abc")
+
+    assert not isinstance(excinfo.value, (TargetDenied, TargetUnavailable))
+    assert isinstance(excinfo.value.__cause__, RuntimeError)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [400, 404, 422, 500, 503])
+async def test_a_non_200_audit_response_is_a_failure(monkeypatch, status):
+    from services.ssh_gateway_client import AuditWriteFailed, mark_key_used
+
+    _patch_post(monkeypatch, _PostRecorder(FakeResponse(status, {"status": "ok"})))
+
+    with pytest.raises(AuditWriteFailed):
+        await mark_key_used(_config(), "SHA256:abc")
+
+
+@pytest.mark.asyncio
+async def test_record_attachment_asserts_no_identity(monkeypatch):
+    """thread_id/user_id/ssh_key_id are resolved server-side. An earlier
+    draft of the endpoint took them as asserted fields, which let any
+    internal-key holder attribute an SSH attach to any user."""
+    from services.ssh_gateway_client import record_attachment
+
+    post = _patch_post(
+        monkeypatch, _PostRecorder(FakeResponse(200, {"attachment_id": "att-1"}))
+    )
+    attachment_id = await record_attachment(
+        _config(), "SHA256:abc", "s-7f3a91c2", "203.0.113.9"
+    )
+
+    assert attachment_id == "att-1"
+    assert (
+        post.calls[0]["url"] == "http://orchestrator:8085/api/internal/ssh-attachments"
+    )
+    assert post.calls[0]["json"] == {
+        "fingerprint": "SHA256:abc",
+        "handle": "s-7f3a91c2",
+        "client_ip": "203.0.113.9",
+    }
+
+
+@pytest.mark.asyncio
+async def test_record_attachment_refuses_an_invalid_handle_before_the_request(
+    monkeypatch,
+):
+    """The handle is the SSH username and is fully attacker-controlled. A
+    handle this module would refuse to resolve has no business riding along
+    with config.internal_key to open an audit row either."""
+    from services.ssh_gateway_client import AuditWriteFailed, record_attachment
+
+    post = _patch_post(
+        monkeypatch, _PostRecorder(FakeResponse(200, {"attachment_id": "att-1"}))
+    )
+
+    with pytest.raises(AuditWriteFailed):
+        await record_attachment(_config(), "SHA256:abc", "../../admin")
+
+    assert post.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [{}, {"attachment_id": None}, {"attachment_id": ""}, {"attachment_id": 7}, []],
+)
+async def test_record_attachment_rejects_an_unusable_id(monkeypatch, payload):
+    """Without this the gateway would hold a None/int "id" and later POST it
+    into a URL path, turning one bad response into a second bad request."""
+    from services.ssh_gateway_client import AuditWriteFailed, record_attachment
+
+    _patch_post(monkeypatch, _PostRecorder(FakeResponse(200, payload)))
+
+    with pytest.raises(AuditWriteFailed):
+        await record_attachment(_config(), "SHA256:abc", "s-7f3a91c2")
+
+
+@pytest.mark.asyncio
+async def test_close_attachment_sends_the_fingerprint_and_channels(monkeypatch):
+    """The endpoint authorizes the close against the named attachment's own
+    thread, so the fingerprint is not optional decoration -- without it any
+    internal-key holder could close (and fabricate channels on) an audit row
+    belonging to someone else."""
+    from services.ssh_gateway_client import close_attachment
+
+    post = _patch_post(monkeypatch, _PostRecorder(FakeResponse(200, {"closed": 1})))
+    closed = await close_attachment(
+        _config(), "att-1", "SHA256:abc", ("session", "sftp")
+    )
+
+    assert closed == 1
+    assert post.calls[0]["url"] == (
+        "http://orchestrator:8085/api/internal/ssh-attachments/att-1/close"
+    )
+    assert post.calls[0]["json"] == {
+        "fingerprint": "SHA256:abc",
+        "channels": ["session", "sftp"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_close_attachment_percent_encodes_the_id(monkeypatch):
+    """The one value here that lands in a URL path. resolve_target encodes
+    its handle at the point the path is built rather than trusting where it
+    came from; this follows that precedent."""
+    from services.ssh_gateway_client import close_attachment
+
+    post = _patch_post(monkeypatch, _PostRecorder(FakeResponse(200, {"closed": 0})))
+    await close_attachment(_config(), "../../admin", "SHA256:abc")
+
+    assert post.calls[0]["url"] == (
+        "http://orchestrator:8085/api/internal/ssh-attachments/..%2F..%2Fadmin/close"
+    )
+
+
+@pytest.mark.asyncio
+async def test_close_attachment_treats_zero_as_a_normal_outcome(monkeypatch):
+    """{"closed": 0} is the endpoint's opaque answer for unknown, already
+    closed, and not-yours alike. The gateway's close is best effort and must
+    not log a failure for the ordinary already-closed case."""
+    from services.ssh_gateway_client import close_attachment
+
+    _patch_post(monkeypatch, _PostRecorder(FakeResponse(200, {"closed": 0})))
+    assert await close_attachment(_config(), "att-1", "SHA256:abc") == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload", [{}, {"closed": None}, {"closed": True}, {"closed": "1"}]
+)
+async def test_close_attachment_rejects_an_unusable_count(monkeypatch, payload):
+    """`isinstance(True, int)` is True, so a JSON boolean would otherwise
+    read back as "1 row closed" -- the same bool-is-an-int trap _is_valid_port
+    guards against one field over."""
+    from services.ssh_gateway_client import AuditWriteFailed, close_attachment
+
+    _patch_post(monkeypatch, _PostRecorder(FakeResponse(200, payload)))
+
+    with pytest.raises(AuditWriteFailed):
+        await close_attachment(_config(), "att-1", "SHA256:abc")
+
+
+@pytest.mark.asyncio
+async def test_a_non_json_audit_body_is_a_failure(monkeypatch):
+    from services.ssh_gateway_client import AuditWriteFailed, mark_key_used
+
+    _patch_post(monkeypatch, _PostRecorder(NonJsonResponse()))
+
+    with pytest.raises(AuditWriteFailed):
+        await mark_key_used(_config(), "SHA256:abc")
+
+
+@pytest.mark.asyncio
+async def test_client_ip_is_omitted_rather_than_sent_as_null(monkeypatch):
+    """The gateway does not always know a peer address (Task 8's websocket
+    bridge behind a proxy that strips it). Omitting the optional field is
+    the documented shape; sending an explicit null is the same to Pydantic
+    but reads in a request log as "we knew it was nothing"."""
+    from services.ssh_gateway_client import record_attachment
+
+    post = _patch_post(
+        monkeypatch, _PostRecorder(FakeResponse(200, {"attachment_id": "att-1"}))
+    )
+    await record_attachment(_config(), "SHA256:abc", "s-7f3a91c2")
+
+    assert "client_ip" not in post.calls[0]["json"]

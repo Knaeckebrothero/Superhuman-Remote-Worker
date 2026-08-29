@@ -5,10 +5,25 @@ key the client just authenticated with, and the orchestrator maps that to a
 user and decides authorization. Sending a user id instead would be rejected:
 this codebase does not treat an internal key plus an asserted identity as
 equivalent to an authenticated user.
+
+Two kinds of call live here and they fail differently:
+
+``resolve_target`` is an AUTHORIZATION read. It fails closed, turning every
+control-plane problem into a readable refusal, because the alternative is
+either an open door or a hang.
+
+``mark_key_used`` / ``record_attachment`` / ``close_attachment`` are AUDIT
+writes against Task 6A's internal endpoints. They raise ``AuditWriteFailed``
+rather than inventing a refusal, and every caller is expected to swallow it:
+a bookkeeping failure must never tear down a session that already
+authenticated. They are here rather than in the server module because this
+module is the gateway's only view of platform state -- there is exactly one
+place that knows how to reach the orchestrator, and it is this file.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
@@ -92,9 +107,149 @@ class TargetUnavailable(Exception):
         self.state = state
 
 
+class AuditWriteFailed(Exception):
+    """An audit bookkeeping write did not land.
+
+    Deliberately NOT a ``TargetDenied``/``TargetUnavailable``: those two are
+    authorization outcomes the gateway turns into a refusal the user reads,
+    and an audit write must never be able to manufacture one. Every caller
+    catches this and carries on.
+    """
+
+
 async def _http_get(url: str, headers: dict, params: dict, timeout: float) -> Any:
     async with httpx.AsyncClient(timeout=timeout) as client:
         return await client.get(url, headers=headers, params=params)
+
+
+async def _http_post(url: str, headers: dict, json: dict, timeout: float) -> Any:
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        return await client.post(url, headers=headers, json=json)
+
+
+def _audit_headers(config) -> dict:
+    return {"X-Internal-Key": config.internal_key}
+
+
+async def _post_audit(config, path: str, payload: dict) -> Any:
+    """POST one audit write and return its parsed body, or raise.
+
+    Every failure mode collapses into ``AuditWriteFailed``: a transport
+    error, a non-200, and a body that is not a JSON object are all the same
+    thing to a caller whose only reaction is to log and carry on. Chaining
+    with ``from exc`` keeps the original in the traceback the caller logs --
+    "the audit write failed" with no cause attached is not an operable log
+    line.
+    """
+    url = f"{config.orchestrator_url}{path}"
+    try:
+        response = await _http_post(
+            url,
+            headers=_audit_headers(config),
+            json=payload,
+            timeout=config.orchestrator_request_timeout,
+        )
+    except Exception as exc:
+        raise AuditWriteFailed(f"POST {path} failed: {exc!r}") from exc
+
+    if response.status_code != 200:
+        raise AuditWriteFailed(f"POST {path} returned {response.status_code}")
+
+    try:
+        body = response.json()
+    except Exception as exc:
+        raise AuditWriteFailed(f"POST {path} returned a non-JSON body") from exc
+
+    if not isinstance(body, dict):
+        raise AuditWriteFailed(
+            f"POST {path} returned {type(body).__name__}, not an object"
+        )
+    return body
+
+
+async def mark_key_used(config, fingerprint: str) -> None:
+    """Stamp ``last_used_at`` on the key behind ``fingerprint``.
+
+    Keyed by fingerprint rather than key id because the gateway's only
+    legitimate call site is asyncssh's ``auth_completed()``, which fires
+    immediately after ``key.verify`` succeeds -- while target resolution
+    (and therefore any key id) is lazy, at first channel open. At that
+    instant the gateway holds a fingerprint and nothing else.
+
+    An unknown fingerprint is a 200 no-op server-side, not a 404, so this
+    function cannot be used to probe which keys are registered.
+    """
+    await _post_audit(
+        config, "/api/internal/ssh-keys/used", {"fingerprint": fingerprint}
+    )
+
+
+async def record_attachment(
+    config, fingerprint: str, handle: str, client_ip: str | None = None
+) -> str:
+    """Open the audit row for one SSH attachment, returning its id.
+
+    Sends only ``fingerprint``/``handle``/``client_ip``: ``thread_id``,
+    ``user_id`` and ``ssh_key_id`` are resolved server-side, because this
+    codebase does not accept an internal key plus an asserted identity (see
+    the module docstring, and ``SshAttachmentCreate``'s). The endpoint
+    re-runs the identical authorization ``resolve_target`` already passed,
+    and returns the same opaque 404 for every failure -- unknown handle,
+    unknown key, and "not your thread" are indistinguishable here too.
+
+    ``handle`` is validated before the request rather than after: it is the
+    SSH username, fully attacker-controlled, and ``resolve_target``'s own
+    comment explains why an unvalidated one must never reach a request
+    carrying ``config.internal_key``. It travels in the JSON body here
+    rather than the URL path, so this is defence in depth rather than the
+    traversal fix it is there -- but a handle this module would refuse to
+    resolve has no business opening an audit row either.
+    """
+    if not is_valid_handle(handle):
+        raise AuditWriteFailed("refusing to record an attachment for an invalid handle")
+
+    payload: dict[str, Any] = {"fingerprint": fingerprint, "handle": handle}
+    if client_ip:
+        payload["client_ip"] = client_ip
+
+    body = await _post_audit(config, "/api/internal/ssh-attachments", payload)
+    attachment_id = body.get("attachment_id")
+    if not isinstance(attachment_id, str) or not attachment_id:
+        # Without this the gateway would hold a None/int "id" and later POST
+        # it into a URL path, turning one bad response into a second bad
+        # request instead of one logged failure.
+        raise AuditWriteFailed("ssh-attachments returned no usable attachment_id")
+    return attachment_id
+
+
+async def close_attachment(
+    config, attachment_id: str, fingerprint: str, channels: Sequence[str] = ()
+) -> int:
+    """Stamp detach time on an attachment row, returning how many rows closed.
+
+    ``fingerprint`` is in the body because the endpoint authorizes the close
+    against the named attachment's own thread -- an internal-key holder must
+    not be able to silently close (or fabricate ``channels`` on) an audit row
+    belonging to someone else. ``{"closed": 0}`` is the endpoint's opaque
+    answer for every unauthorized or unknown id and is a normal, non-raising
+    outcome here: the row may already have been closed by a previous
+    best-effort attempt.
+
+    ``attachment_id`` is percent-encoded even though it comes from this
+    module's own ``record_attachment``: it is the one value here that lands
+    in a URL path, and ``resolve_target``'s handle encoding sets the
+    precedent that a path segment is encoded at the point it is built, not
+    trusted because of where it came from.
+    """
+    body = await _post_audit(
+        config,
+        f"/api/internal/ssh-attachments/{quote(attachment_id, safe='')}/close",
+        {"fingerprint": fingerprint, "channels": list(channels)},
+    )
+    closed = body.get("closed")
+    if not isinstance(closed, int) or isinstance(closed, bool):
+        raise AuditWriteFailed("ssh-attachments close returned no usable count")
+    return closed
 
 
 def _is_valid_port(value: Any) -> bool:
