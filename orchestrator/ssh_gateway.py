@@ -1,0 +1,514 @@
+"""Dedicated front door for workspace SSH.
+
+This process contains no platform API, no cockpit routes and no database
+credentials. It terminates SSH and proxies into workspaces, and it is deployed
+separately from the orchestrator so that control-plane rollouts — which happen
+on nearly every commit — do not drop live interactive sessions.
+
+TWO TRANSPORTS, AND THEY ARE NOT EQUALLY PROTECTED. Read this before assuming
+a control applies to both:
+
+* **WSS** — ``/api/ssh/attach``. The WebSocket is pumped byte-for-byte into
+  one half of a ``socket.socketpair()``; the other half is handed to
+  ``asyncssh.run_server``, so there is no loopback TCP listener on this path
+  and therefore no port-to-IP map and no reuse race. Guarded by an
+  exact-match **Origin** check and a short-lived, user-bound **bearer token**,
+  both applied before the upgrade.
+* **TCP** — ``:2222`` (``GatewayConfig.ssh_listen_port``). A plain listening
+  socket; each accepted socket goes to the same ``GatewaySSHServer`` factory
+  and the same ``GatewayLimiter``. **Neither the Origin check nor the bearer
+  token applies here, and neither can**: a raw SSH client sends no Origin
+  header and has nowhere to put a bearer token before the SSH banner. This
+  transport's controls are the LoadBalancer's ``allowedClientCIDRs``
+  (Task 11 refuses to render an unscoped SSH Service) plus SSH public-key
+  authentication, which is the same posture as any internet-facing sshd.
+  Do not "harden" the WSS path and record the result as a property of the
+  gateway; state which transport you mean.
+
+Both transports charge the same pre-auth limiter, and on both the slot is
+released exactly once, on every exit path — including an ``accept()`` that
+raises, and asyncssh's own ``login_timeout`` disconnect. This seam has leaked
+three times in this plan already (``detach`` never called, an early return
+skipping a release, an upstream connection never closed), and a leak here is
+not subtle: the counter only climbs, so ``max_preauth_connections`` leaks
+turn into a gateway that refuses everyone until the pod restarts.
+
+The credential the USER presents is NOT ``MCP_INTERNAL_KEY``. See
+``services/ssh_gateway_token.py`` for the full account (ruling G38); in short,
+that value is the platform's service-to-service key for ~50
+``require_internal`` endpoints, and handing it to every SSH user's laptop
+would have been the seam design §6.3 warns about twice.
+
+Three asyncssh gotchas, all hit in testing and all still true on 2.24.0:
+``run_server`` returns an ``_ACMWrapper``, not a coroutine, so it cannot be
+handed straight to ``create_task``; it does not return until authentication
+completes (``wait='auth'``), so awaiting it before the client connects
+deadlocks; and ``get_extra_info('peername')`` on a socketpair is ``''``, so
+the real client IP has to travel in the ``server_factory`` closure.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import functools
+import ipaddress
+import logging
+import socket
+from typing import Optional, Sequence
+
+import asyncssh
+from starlette.applications import Starlette
+from starlette.responses import JSONResponse
+from starlette.routing import Route, WebSocketRoute
+
+from services.ssh_gateway_ca import load_user_ca
+from services.ssh_gateway_client import (
+    close_attachment,
+    mark_key_used,
+    record_attachment,
+    resolve_target,
+)
+from services.ssh_gateway_config import load_config, server_options
+from services.ssh_gateway_limits import GatewayLimiter
+from services.ssh_gateway_server import (
+    GatewayContext,
+    GatewaySSHServer,
+    drain_background_tasks,
+)
+from services.ssh_gateway_token import verify_attach_token
+
+logger = logging.getLogger(__name__)
+
+# Application-defined close codes (4000-4999 is the private range). Distinct
+# per refusal so the client helper can tell "your token expired, fetch another"
+# from "this build is talking to the wrong host" without parsing a reason
+# string.
+WS_TOKEN_REFUSED = 4401
+WS_ORIGIN_REFUSED = 4403
+WS_RATE_REFUSED = 4429
+
+# How much of one WebSocket frame / socket read is moved at a time.
+PUMP_CHUNK_BYTES = 65536
+
+# Backlog for the TCP listener. Above the default pre-auth cap (64) so the
+# kernel queue is never the thing that refuses a burst -- GatewayLimiter is,
+# and it can say so.
+TCP_LISTEN_BACKLOG = 128
+
+
+def origin_allowed(origin: Optional[str], allowed: Sequence[str]) -> bool:
+    """Exact-match Origin check. **WSS transport only.**
+
+    Starlette does no same-origin validation of its own, and this endpoint
+    shares a hostname with cockpit's cookie-authenticated API — the adjacency
+    that made Gitpod's CVE-2023-0957 end in permanent SSH persistence.
+    Prefix matching would accept ``cockpit.srw.works.evil.example``.
+    """
+    if not origin or not allowed:
+        return False
+    return origin in tuple(allowed)
+
+
+def client_ip(websocket, trusted_proxies: Sequence[str] = ()) -> str:
+    """The source address this connection is rate-limited and audited as.
+
+    ``X-Forwarded-For`` is believed only when the socket peer is one of
+    ``trusted_proxies``, and then only its RIGHTMOST entry. Both halves
+    matter:
+
+    * Trusting it unconditionally (the plan's original ``_client_ip``) lets
+      any client send a fresh header per connection and mint a fresh
+      rate-limit bucket each time, which nullifies every per-source control
+      in ``GatewayLimiter`` — the module that exists precisely because
+      asyncssh ships no MaxStartups or PerSourceMaxStartups.
+    * Taking the FIRST entry (also the original) reads the attacker's half of
+      the header. ingress-nginx sets ``$proxy_add_x_forwarded_for``, which
+      APPENDS the real peer to whatever the client already sent, so with one
+      trusted hop the rightmost entry is the one the trusted hop wrote and
+      everything left of it is client-supplied fiction.
+
+    The TCP transport does not come through here at all: it has a real socket
+    peer and no headers.
+    """
+    peer = getattr(getattr(websocket, "client", None), "host", "") or ""
+    if trusted_proxies and _address_matches(peer, trusted_proxies):
+        forwarded = websocket.headers.get("x-forwarded-for", "")
+        if forwarded:
+            rightmost = forwarded.split(",")[-1].strip()
+            if rightmost:
+                return rightmost
+    return peer or "unknown"
+
+
+def _address_matches(address: str, networks: Sequence[str]) -> bool:
+    try:
+        parsed = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    for entry in networks:
+        try:
+            network = ipaddress.ip_network(entry, strict=False)
+        except ValueError:
+            # load_config already refuses these at boot; skipping rather than
+            # raising keeps one bad entry from failing open OR taking the
+            # whole listener down mid-connection.
+            continue
+        if parsed in network:
+            return True
+    return False
+
+
+def attach_principal(websocket, config) -> Optional[str]:
+    """The user id behind this WebSocket's bearer token, or ``None``.
+
+    **WSS transport only** — HTTP-layer authentication, before the upgrade.
+    Nobody in this product category ships an unauthenticated SSH-speaking
+    WebSocket: Gitpod authenticates before the upgrade, Codespaces sends a
+    tunnel JWT, SSM uses SigV4, Coder requires a session token.
+
+    The token is a short-lived HMAC minted by the orchestrator for a specific
+    user (``POST /api/ssh/attach-token``), verified here with
+    ``SESSION_JWT_SECRET``. It is deliberately NOT ``config.internal_key``:
+    that is the gateway's own service credential for the orchestrator's
+    internal API, and comparing a user-presented string against it would put
+    the platform's master key in every user's home directory.
+
+    Header-only, deliberately: a query parameter lands in every access log and
+    in browser history, and the only intended client is plan 3's helper, which
+    can set a header. Returns the id rather than a bool so the caller has to
+    hold the answer to "who?".
+    """
+    presented = websocket.headers.get("authorization") or ""
+    if presented[:7].lower() != "bearer ":
+        return None
+    return verify_attach_token(presented[7:].strip(), config.session_jwt_secret)
+
+
+async def attach_endpoint(websocket) -> None:
+    """Pump one authenticated WebSocket into an SSH server on a socketpair."""
+    state = websocket.app.state
+    config = state.config
+
+    if not origin_allowed(websocket.headers.get("origin"), config.allowed_origins):
+        await websocket.close(code=WS_ORIGIN_REFUSED)
+        return
+
+    principal = None
+    if config.require_wss_token:
+        principal = attach_principal(websocket, config)
+        if principal is None:
+            await websocket.close(code=WS_TOKEN_REFUSED)
+            return
+
+    source = client_ip(websocket, config.trusted_proxies)
+    if not state.limiter.try_admit(source):
+        await websocket.close(code=WS_RATE_REFUSED)
+        return
+
+    # THE TRY OPENS ON THE LINE AFTER A SUCCESSFUL ADMIT, WITH NOTHING
+    # BETWEEN. The plan's original put ``await websocket.accept()`` here,
+    # outside the try, so an accept that raised -- a client that vanishes
+    # mid-handshake, which is routine on an internet-facing listener -- leaked
+    # its pre-auth slot permanently.
+    try:
+        logger.info("ssh gateway: wss attach from %s for user %s", source, principal)
+        await _attach_over_socketpair(websocket, state, source)
+    finally:
+        state.limiter.release(source)
+
+
+async def _attach_over_socketpair(websocket, state, source: str) -> None:
+    await websocket.accept()
+
+    srv_sock, ws_sock = socket.socketpair()
+    ws_sock.setblocking(False)
+    connection = None
+    try:
+        # run_server is an async context manager wrapper, not a coroutine, so
+        # it is wrapped before create_task; and it does not return until
+        # authentication completes, so it cannot be awaited before the pumps
+        # start moving bytes.
+        server_task = asyncio.create_task(_run_ssh_on_socket(srv_sock, state, source))
+        try:
+            await _pump(websocket, ws_sock)
+        finally:
+            server_task.cancel()
+            # Awaited, not just cancelled: an unretrieved exception from
+            # _serve() surfaces as an "exception was never retrieved" warning
+            # at garbage-collection time instead of an error anyone reads.
+            results = await asyncio.gather(server_task, return_exceptions=True)
+            connection = _completed_connection(results[0], source)
+    finally:
+        if connection is not None:
+            connection.abort()
+        for sock in (srv_sock, ws_sock):
+            with contextlib.suppress(OSError):
+                sock.close()
+
+
+def _completed_connection(result, source: str):
+    """The SSHServerConnection ``_run_ssh_on_socket`` produced, if any."""
+    if isinstance(result, asyncio.CancelledError):
+        # Cancelled before authentication finished: normal, and the common
+        # case (a user closes the terminal before typing anything).
+        return None
+    if isinstance(result, BaseException):
+        logger.info(
+            "ssh gateway: attach from %s ended without authenticating: %s",
+            source,
+            result,
+        )
+        return None
+    return result
+
+
+async def _run_ssh_on_socket(sock, state, source: str):
+    """Speak SSH on ``sock``. The one place both transports meet.
+
+    The real client IP travels in this closure because
+    ``get_extra_info('peername')`` is ``''`` on a socketpair -- and on the TCP
+    path it is passed in from ``accept()`` for the same reason the WSS path
+    cannot read it off the socket: one code path, one source of truth.
+    """
+
+    def _server_factory():
+        return GatewaySSHServer(state.context, source)
+
+    return await asyncssh.run_server(
+        sock, server_factory=_server_factory, **server_options(state.config)
+    )
+
+
+async def _pump(websocket, sock) -> None:
+    """Move bytes both ways until either direction ends.
+
+    ``asyncio.wait`` rather than ``gather``: gather leaves the sibling
+    running when one side raises, and a pump left reading a closed socket
+    is a task that never finishes and a connection that never releases its
+    slot. Every task's exception is retrieved here, not left for the loop's
+    handler to complain about at collection time.
+    """
+    loop = asyncio.get_running_loop()
+    tasks = {
+        asyncio.create_task(_ws_to_sock(websocket, sock, loop)),
+        asyncio.create_task(_sock_to_ws(websocket, sock, loop)),
+    }
+    try:
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            if task.cancelled():
+                continue
+            if task.exception() is not None:
+                logger.debug("ssh attach closed", exc_info=task.exception())
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _ws_to_sock(websocket, sock, loop) -> None:
+    while True:
+        data = await websocket.receive_bytes()
+        if not data:
+            return
+        await loop.sock_sendall(sock, data)
+
+
+async def _sock_to_ws(websocket, sock, loop) -> None:
+    while True:
+        data = await loop.sock_recv(sock, PUMP_CHUNK_BYTES)
+        if not data:
+            return
+        await websocket.send_bytes(data)
+
+
+class SshTcpListener:
+    """The raw SSH listener on 2222.
+
+    Task 11 ships ``containerPort: 2222`` and an optional LoadBalancer on it,
+    and every step of Task 12's live gate is an ``ssh -p 2222`` command, so
+    without this the chart fronts a dead port and the plan cannot gate itself.
+    A raw ``accept()`` loop rather than ``asyncio.start_server`` because
+    ``asyncssh.run_server`` wants the socket itself, and because the peer
+    address is needed at factory-construction time.
+
+    NO ORIGIN CHECK AND NO BEARER TOKEN HERE -- see the module docstring. The
+    controls on this path are the LoadBalancer's ``allowedClientCIDRs`` and
+    SSH public-key auth.
+    """
+
+    def __init__(self, sock: socket.socket, state):
+        self._sock = sock
+        self._state = state
+        self._accept_task: Optional[asyncio.Task] = None
+        self._connections: set[asyncio.Task] = set()
+
+    @property
+    def port(self) -> int:
+        return self._sock.getsockname()[1]
+
+    def start(self) -> None:
+        self._accept_task = asyncio.create_task(self._accept_forever())
+
+    async def _accept_forever(self) -> None:
+        loop = asyncio.get_running_loop()
+        while True:
+            try:
+                sock, address = await loop.sock_accept(self._sock)
+            except asyncio.CancelledError:
+                raise
+            except OSError:
+                # The listening socket was closed under us: shutdown, not an
+                # error worth a stack trace.
+                logger.info("ssh gateway: tcp listener stopped accepting")
+                return
+            source = address[0] if address else "unknown"
+            if not self._state.limiter.try_admit(source):
+                # Closed before a single SSH byte is written. asyncssh ships
+                # no MaxStartups at all (measured: 1000 silent pre-auth
+                # connections accepted in 0.3s), which is why this gate is
+                # ahead of run_server rather than inside it.
+                logger.info("ssh gateway: refused tcp connection from %s", source)
+                with contextlib.suppress(OSError):
+                    sock.close()
+                continue
+            task = asyncio.create_task(self._serve(sock, source))
+            self._connections.add(task)
+            task.add_done_callback(self._connections.discard)
+
+    async def _serve(self, sock: socket.socket, source: str) -> None:
+        try:
+            try:
+                connection = await _run_ssh_on_socket(sock, self._state, source)
+            except asyncio.CancelledError:
+                with contextlib.suppress(OSError):
+                    sock.close()
+                raise
+            except Exception as exc:
+                # Never authenticated: a scan, a login_timeout, a client that
+                # hung up. asyncssh's own teardown aborts the connection when
+                # it got that far, but a failure BEFORE the transport exists
+                # leaves this socket to us.
+                logger.info(
+                    "ssh gateway: tcp connection from %s ended without "
+                    "authenticating: %s",
+                    source,
+                    exc,
+                )
+                with contextlib.suppress(OSError):
+                    sock.close()
+                return
+            try:
+                await connection.wait_closed()
+            finally:
+                connection.abort()
+        finally:
+            # The single release for this connection, covering every path out
+            # of the block above: refused auth, login_timeout, a normal
+            # logout, and cancellation at shutdown.
+            self._state.limiter.release(source)
+
+    async def close(self) -> None:
+        if self._accept_task is not None:
+            self._accept_task.cancel()
+            await asyncio.gather(self._accept_task, return_exceptions=True)
+            self._accept_task = None
+        with contextlib.suppress(OSError):
+            self._sock.close()
+        connections = list(self._connections)
+        for task in connections:
+            task.cancel()
+        if connections:
+            await asyncio.gather(*connections, return_exceptions=True)
+
+
+def _listen_socket(host: str, port: int) -> socket.socket:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind((host, port))
+        sock.listen(TCP_LISTEN_BACKLOG)
+    except OSError:
+        sock.close()
+        raise
+    sock.setblocking(False)
+    return sock
+
+
+@contextlib.asynccontextmanager
+async def lifespan(app):
+    """Start the TCP listener, and drain the audit writes on the way out."""
+    config = app.state.config
+    listener = SshTcpListener(
+        _listen_socket(config.ssh_listen_host, config.ssh_listen_port), app.state
+    )
+    listener.start()
+    app.state.ssh_listener = listener
+    logger.info(
+        "ssh gateway: listening for ssh on %s:%d", config.ssh_listen_host, listener.port
+    )
+    try:
+        yield
+    finally:
+        app.state.ssh_listener = None
+        await listener.close()
+        # Carried from Task 6: connection_lost SCHEDULES the attachment close
+        # rather than awaiting it (the asyncssh callback is synchronous), so
+        # without this a rollout mid-flight leaves those rows open forever --
+        # silently, because the loop simply stops.
+        undrained = await drain_background_tasks()
+        if undrained:
+            logger.warning(
+                "ssh gateway: %d audit close(s) abandoned at shutdown", undrained
+            )
+
+
+async def healthz(request):
+    return JSONResponse({"status": "ok"})
+
+
+def _build_app() -> Starlette:
+    config = load_config()
+    application = Starlette(
+        routes=[
+            WebSocketRoute("/api/ssh/attach", attach_endpoint),
+            Route("/healthz", healthz),
+        ],
+        lifespan=lifespan,
+    )
+    application.state.config = config
+    application.state.ssh_listener = None
+    application.state.limiter = GatewayLimiter(
+        max_preauth_connections=config.max_preauth_connections,
+        preauth_rate_per_minute=config.preauth_rate_per_minute,
+        max_channels_per_connection=config.max_channels_per_connection,
+        max_attachments_per_workspace=config.max_attachments_per_workspace,
+    )
+    # Every callable pre-bound to the config with functools.partial, which is
+    # the arrangement GatewayContext documents: a server that could re-derive
+    # its own orchestrator client could also reach past the seam the tests
+    # inject at. mark_key_used is bound HERE and not left defaulted to None --
+    # left unbound, last_used_at never moves in production and the
+    # stolen-key signal the whole column exists for is dead (ruling G1).
+    application.state.context = GatewayContext(
+        config=config,
+        ca=load_user_ca(config.user_ca_path),
+        limiter=application.state.limiter,
+        resolve=functools.partial(resolve_target, config),
+        record_attach=functools.partial(record_attachment, config),
+        close_attach=functools.partial(close_attachment, config),
+        mark_key_used=functools.partial(mark_key_used, config),
+    )
+    return application
+
+
+def create_app() -> Starlette:
+    """Factory, so importing this module needs no environment.
+
+    The Deployment runs ``uvicorn ssh_gateway:create_app --factory`` (Task
+    11). There is deliberately no module-level ``app = _build_app()``: it
+    would demand host keys, a CA and a secret at import time, which makes the
+    module untestable and turns any config error into an import traceback.
+    """
+    return _build_app()
