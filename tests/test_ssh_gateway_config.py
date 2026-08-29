@@ -1,4 +1,6 @@
 import subprocess
+import tempfile
+from pathlib import Path
 
 import asyncssh
 import pytest
@@ -12,8 +14,22 @@ from services.ssh_gateway_config import (
     server_options,
 )
 
+# A real Ed25519 host key, generated once for the whole module (same
+# module-level tempfile.mkdtemp() pattern tests/conftest.py already uses for
+# WORKSPACE_PATH). load_config now opens and parses every configured host
+# key to enforce SERVER_HOST_KEY_ALGS == ["ssh-ed25519"] (fix round 1 below),
+# so BASE_ENV's host key must be a real, valid key on disk rather than the
+# placeholder path this file used before that check existed.
+_KEY_DIR = Path(tempfile.mkdtemp(prefix="ssh_gateway_config_test_"))
+_ED25519_HOST_KEY = _KEY_DIR / "ed25519"
+subprocess.run(
+    ["ssh-keygen", "-t", "ed25519", "-N", "", "-f", str(_ED25519_HOST_KEY)],
+    check=True,
+    capture_output=True,
+)
+
 BASE_ENV = {
-    "SSH_GATEWAY_HOST_KEYS": "/run/secrets/gw/ed25519,/run/secrets/gw/rsa",
+    "SSH_GATEWAY_HOST_KEYS": str(_ED25519_HOST_KEY),
     "SSH_GATEWAY_USER_CA": "/run/secrets/gw/user-ca",
     "ORCHESTRATOR_URL": "http://orchestrator:8085",
     "MCP_INTERNAL_KEY": "internal",
@@ -78,7 +94,12 @@ def test_server_options_pin_every_algorithm_list():
 def test_server_host_key_algs_have_no_sha1_or_plain_rsa():
     """SERVER_HOST_KEY_ALGS is the fifth pinned list; test_no_sha1_anywhere
     above does not cover it (it was never imported in the brief's own test).
-    Same weak-algorithm policy applies to it as to the other four."""
+    Fix round 1 makes this exact rather than just "no known-weak names":
+    RSA is not offered as a fallback at all (see
+    test_load_config_rejects_a_non_ed25519_host_key for why), so the only
+    algorithm this gateway's own inbound identity ever advertises is
+    ssh-ed25519."""
+    assert SERVER_HOST_KEY_ALGS == ["ssh-ed25519"]
     for name in SERVER_HOST_KEY_ALGS:
         assert "sha1" not in name.lower()
     assert "ssh-rsa" not in SERVER_HOST_KEY_ALGS
@@ -130,38 +151,57 @@ def test_server_options_does_not_pass_server_host_key_algs():
     assert "server_host_key_algs" not in opts
 
 
-@pytest.fixture
-def host_key_paths(tmp_path):
-    ed_path = tmp_path / "ed25519"
-    rsa_path = tmp_path / "rsa"
-    subprocess.run(
-        ["ssh-keygen", "-t", "ed25519", "-N", "", "-f", str(ed_path)],
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["ssh-keygen", "-t", "rsa", "-b", "3072", "-N", "", "-f", str(rsa_path)],
-        check=True,
-        capture_output=True,
-    )
-    return str(ed_path), str(rsa_path)
-
-
 @pytest.mark.asyncio
-async def test_server_options_are_accepted_by_asyncssh(host_key_paths):
+async def test_server_options_are_accepted_by_asyncssh():
     """The real proof, not a dict-shape proxy for it: feed server_options()'s
     dict through the exact option-parsing coroutine asyncssh.run_server calls
     internally (`SSHServerConnectionOptions.construct`, confirmed by reading
-    run_server's source at connection.py:9128), unmocked, against real host
-    key files. A key-name typo or an argument run_server does not accept
+    run_server's source at connection.py:9128), unmocked, against a real host
+    key file. A key-name typo or an argument run_server does not accept
     raises here; asserting the dict merely has certain keys would not catch
-    either."""
-    ed_path, rsa_path = host_key_paths
-    env = {**BASE_ENV, "SSH_GATEWAY_HOST_KEYS": f"{ed_path},{rsa_path}"}
-    opts = server_options(load_config(env))
+    either.
+
+    The second assertion is the property SERVER_HOST_KEY_ALGS exists to
+    describe, and the one that actually matters: not that the constant is
+    the right list of strings, but that the config this module accepts
+    causes the real, installed asyncssh to advertise exactly {ssh-ed25519}
+    as its host-key algorithm during KEX. See
+    test_load_config_rejects_a_non_ed25519_host_key for the negative control
+    that shows this assertion (and the config it depends on) actually
+    discriminates.
+    """
+    opts = server_options(load_config(BASE_ENV))
 
     constructed = await asyncssh.SSHServerConnectionOptions.construct(
         None, config=(), **opts
     )
 
     assert constructed.kex_algs
+    assert set(constructed.server_host_keys.keys()) == {b"ssh-ed25519"}
+
+
+def test_load_config_rejects_a_non_ed25519_host_key(tmp_path):
+    """SERVER_HOST_KEY_ALGS says ["ssh-ed25519"], but asyncssh has no
+    server-side option that can enforce it (see that constant's comment in
+    ssh_gateway_config.py): a server's advertised host-key algorithms come
+    straight from the *type* of key material loaded via `server_host_keys`,
+    with no per-key filter available anywhere in the options layer. An RSA
+    key's sig_algorithms includes legacy SHA-1 ssh-rsa plus four more
+    @ssh.com variants regardless of what SIGNATURE_ALGS/KEX_ALGS/MAC_ALGS
+    say -- reproduced directly below against a real generated RSA key. The
+    only place left that can enforce Ed25519-only is here, at config load,
+    before the key ever reaches server_options()/run_server.
+    """
+    rsa_path = tmp_path / "rsa"
+    subprocess.run(
+        ["ssh-keygen", "-t", "rsa", "-b", "3072", "-N", "", "-f", str(rsa_path)],
+        check=True,
+        capture_output=True,
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        load_config({**BASE_ENV, "SSH_GATEWAY_HOST_KEYS": str(rsa_path)})
+
+    message = str(exc_info.value)
+    assert "ed25519" in message.lower()
+    assert str(rsa_path) in message

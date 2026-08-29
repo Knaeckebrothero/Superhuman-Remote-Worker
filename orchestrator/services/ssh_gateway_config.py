@@ -26,6 +26,8 @@ import os
 from dataclasses import dataclass, field
 from typing import Mapping, Optional
 
+import asyncssh
+
 SIGNATURE_ALGS = [
     "ssh-ed25519",
     "sk-ssh-ed25519@openssh.com",
@@ -56,9 +58,8 @@ MAC_ALGS = [
     "hmac-sha2-512-etm@openssh.com",
 ]
 
-# Ed25519 first, RSA as a fallback: an ed25519-only server fails at KEX against
-# older Java SSH stacks, before any error message can reach a human, and
-# JetBrains ships its own SSH implementation rather than using OpenSSH.
+# Ed25519 only. RSA is deliberately not offered as a fallback -- see why
+# below -- so there is exactly one entry.
 #
 # UNLIKE the four lists above, this one is never passed to asyncssh. Verified
 # by reading connection.py's SSHServerConnectionOptions.prepare() signature
@@ -83,32 +84,32 @@ MAC_ALGS = [
 # seen by connecting users. The likely origin of this task's brief passing it
 # into `server_options()` is conflating those two uses of the same name.
 #
-# A server's host-key algorithm set is instead derived entirely from the
-# *type* of key material handed to `server_host_keys`: an Ed25519 key
-# contributes exactly `ssh-ed25519`, but an RSA key contributes its FULL
-# `RSAKey.sig_algorithms` tuple — `rsa-sha2-256`, `rsa-sha2-512`, four
-# `ssh-rsa-shaNNN@ssh.com` variants, AND legacy SHA-1 `ssh-rsa` — verified
-# empirically against a real generated RSA host key. `signature_algs` does
-# NOT filter this; it governs client authentication signatures only
-# (confirmed by reading `SSHServerConnection.__init__`, where
+# WHY THIS LIST HAS ONE ENTRY, NOT AN ED25519+RSA-FALLBACK PAIR: a server's
+# host-key algorithm set is derived entirely from the *type* of key material
+# handed to `server_host_keys`, with no per-key filter available anywhere in
+# asyncssh's options layer — an Ed25519 key contributes exactly
+# `ssh-ed25519`, but an RSA key contributes its FULL `RSAKey.sig_algorithms`
+# tuple: `rsa-sha2-256`, `rsa-sha2-512`, four `ssh-rsa-shaNNN@ssh.com`
+# variants, AND legacy SHA-1 `ssh-rsa` — verified empirically against a real
+# generated RSA host key
+# (tests/test_ssh_gateway_config.py::test_load_config_rejects_a_non_ed25519_host_key).
+# `signature_algs` does NOT filter this; it governs client authentication
+# signatures only (confirmed by reading `SSHServerConnection.__init__`, where
 # `self._server_host_key_algs = list(options.server_host_keys.keys())` is
 # built straight from loaded key material with no reference to
-# `options.signature_algs`).
-#
-# CONSEQUENCE, carried forward rather than silently patched here: this
-# module's config field is `host_key_paths: tuple[str, ...]` — raw file
-# paths, not pre-loaded/filtered key objects — matching the interface every
-# other task in this plan was written against. Handing an RSA host key path
-# through unfiltered therefore re-admits legacy SHA-1 `ssh-rsa`, exactly the
-# exposure `SIGNATURE_ALGS` above exists to close, via a completely different
-# door. Closing it requires either (a) never provisioning an RSA host key —
-# which contradicts this list's own JetBrains/legacy-Java rationale — or (b)
-# whichever task actually loads key material for the running server
-# pre-filtering each loaded keypair's `.host_key_algorithms` against this
-# list before it reaches `server_host_keys`. This list exists so that task
-# has the intended allow-list ready; it is exported but intentionally unused
-# within this module.
-SERVER_HOST_KEY_ALGS = ["ssh-ed25519", "rsa-sha2-512", "rsa-sha2-256"]
+# `options.signature_algs`). Since nothing below this layer can keep an RSA
+# host key from re-admitting SHA-1 `ssh-rsa` once loaded, this policy is
+# enforced one layer up instead: `load_config`'s `_require_ed25519_host_key`
+# opens and parses every configured host key and refuses anything whose
+# algorithm is not `ssh-ed25519`, before any key ever reaches
+# `server_options()`/`run_server`. That is why RSA is not offered as a
+# fallback host key at all, unlike SIGNATURE_ALGS/SERVER host-key
+# *client-auth* algorithms further up this module, where RSA survives as
+# `rsa-sha2-256`/`rsa-sha2-512` because `signature_algs` genuinely is
+# enforceable by asyncssh. OpenSSH has supported Ed25519 host keys since 6.5
+# (2014) and JetBrains's own SSH stack does too, so this excludes no client
+# this gateway must serve in 2026.
+SERVER_HOST_KEY_ALGS = ["ssh-ed25519"]
 
 
 @dataclass(frozen=True)
@@ -135,6 +136,38 @@ class GatewayConfig:
     require_wss_token: bool = True
 
 
+def _require_ed25519_host_key(path: str) -> None:
+    """Reject any host key that is not Ed25519.
+
+    SERVER_HOST_KEY_ALGS says ``["ssh-ed25519"]``, but there is no asyncssh
+    server-side option that enforces it -- see that constant's own comment.
+    A server's advertised host-key algorithms come straight from the *type*
+    of key material loaded via `server_host_keys`, with no per-key filter
+    available anywhere in the options layer, so this function is the ONLY
+    place this policy can actually be enforced. It must run before any key
+    reaches `server_options()`/`run_server`, matching the shape of Task 1's
+    `SshUserCa.__init__`, the CA key's own one chokepoint: load the key,
+    reject anything unusable, then reject the wrong algorithm by name.
+
+    OpenSSH has supported Ed25519 host keys since 6.5 (2014) and JetBrains's
+    own SSH stack does too, so this is not a compatibility compromise.
+    """
+    try:
+        with open(path, encoding="utf-8") as handle:
+            key = asyncssh.import_private_key(handle.read())
+    except Exception as exc:
+        raise ValueError(
+            f"ssh-gateway host key {path!r} is not a usable private key"
+        ) from exc
+
+    algorithm = key.get_algorithm()
+    if algorithm != "ssh-ed25519":
+        raise ValueError(
+            f"ssh-gateway host key {path!r} must be Ed25519 (ssh-ed25519), "
+            f"got {algorithm!r}"
+        )
+
+
 def load_config(env: Optional[Mapping[str, str]] = None) -> GatewayConfig:
     """Build config from the environment, failing closed on anything missing.
 
@@ -155,6 +188,8 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> GatewayConfig:
         raise ValueError(
             "ssh-gateway requires at least one host key (SSH_GATEWAY_HOST_KEYS)"
         )
+    for path in host_keys:
+        _require_ed25519_host_key(path)
 
     user_ca_path = (src.get("SSH_GATEWAY_USER_CA") or "").strip()
     if not user_ca_path:
