@@ -313,6 +313,10 @@ class TestExplicitGrants:
             # must not be what takes it.
             "delegate_work",
             "resume_delegation_child",
+            # Built-in subagents (U3): named outright in tools.delegation AND
+            # gated on delegation.enabled; `delegation: true` never expands
+            # to a spawn tool.
+            "delegate_agent",
         }
         assert {"steer_job", "get_stuck_jobs"} <= descriptor_explicit
         # The six `*_bundle` tools left this tier on 2026-08-03. They did not

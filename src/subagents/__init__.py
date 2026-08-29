@@ -2,17 +2,21 @@
 
 Package layout:
 
-- ``host``     — ``ParentHost`` (what a child needs from its parent, B.13)
+- ``host``     — ``ParentHost`` (what a child needs from its parent, B.13),
+                 ``WorkerHost`` (the worker job's implementation)
 - ``ledger``   — ``SubagentLedger`` (durable child state; null impl here, DB in WP3)
 - ``budgets``  — ``ChildBudgets`` + the staleness watcher (B.4)
 - ``child``    — build the child from a resolved roster entry (B.2, B.8, B.9)
 - ``driver``   — ``SubagentDriver`` on ``run_persistent_loop`` (B.3)
+- ``runtime``  — ``SubagentRuntime`` per parent: roster, handles, semaphore,
+                 batch sharing, idempotent re-execution (B.3, B.6)
 - ``envelope`` — the return contract (B.5)
 - ``fork``     — ``fork=true`` history seeding (B.7)
 
 Import rule: nothing in this package imports ``src.tools.registry`` at module
 level (registry → delegation → subagents → persistent_graph would cycle);
-the tool factory (WP2) imports this package lazily.
+the ``delegate_agent`` tool factory and ``agent.py`` import this package
+lazily.
 """
 
 from .budgets import ChildBudgets, StalenessWatcher
@@ -27,11 +31,19 @@ from .child import (
 from .driver import STOP, SubagentDriver, SubagentResult
 from .envelope import build_envelope, neutralise_control_markers, return_budget
 from .fork import seed_fork_history
-from .host import ContextProbe, ParentHost, SimpleParentHost
-from .ledger import NullLedger, RecordingLedger, SubagentLedger
+from .host import ContextProbe, ParentHost, SimpleParentHost, WorkerHost
+from .ledger import SUBAGENT_STATUSES, NullLedger, RecordingLedger, SubagentLedger
+from .runtime import (
+    BACKGROUND_UNAVAILABLE,
+    SubagentCall,
+    SubagentRecord,
+    SubagentRuntime,
+)
 
 __all__ = [
+    "BACKGROUND_UNAVAILABLE",
     "STOP",
+    "SUBAGENT_STATUSES",
     "ChildBudgets",
     "ChildBuild",
     "ContextProbe",
@@ -42,9 +54,13 @@ __all__ = [
     "SimpleParentHost",
     "SpawnRefused",
     "StalenessWatcher",
+    "SubagentCall",
     "SubagentDriver",
     "SubagentLedger",
+    "SubagentRecord",
     "SubagentResult",
+    "SubagentRuntime",
+    "WorkerHost",
     "build_child",
     "build_child_config",
     "build_envelope",

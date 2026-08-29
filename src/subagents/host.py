@@ -8,6 +8,7 @@ simple parents use :class:`SimpleParentHost`.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import (
     Any,
@@ -19,6 +20,8 @@ from typing import (
     Protocol,
     runtime_checkable,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class ContextProbe(NamedTuple):
@@ -125,4 +128,108 @@ class SimpleParentHost:
         self.events.append(text)
 
 
-__all__ = ["ContextProbe", "ParentHost", "SimpleParentHost"]
+def _default_drain_check() -> bool:
+    """The worker's drain intent (dual-mode heartbeat), read lazily so this
+    module never imports the API layer; ``False`` when the seam is absent."""
+    try:
+        from src.api.dual_app import is_drain_requested
+
+        return bool(is_drain_requested())
+    except Exception:
+        return False
+
+
+@dataclass
+class WorkerHost:
+    """The :class:`ParentHost` of a worker JOB (U3 WP2, plan B.13).
+
+    Built by ``UniversalAgent._setup_job_tools`` from the job's identity and
+    live objects; the per-batch facts (the durable message list, the audit
+    metadata, the context probe, the admission fence) are read off the
+    parent's ``ToolContext``, where the graph stamps them — so the host is
+    always current without the graph knowing about hosts.
+    """
+
+    job_id: str
+    agent_type: str
+    tool_context: Any
+    thread_id: Optional[str] = None
+    user_id: Optional[str] = None
+    auxiliary_llm: Optional[Any] = None
+    live_llm_config: Optional[Any] = None
+    postgres: Optional[Any] = None
+    #: Overrides the context's ``provider_admission`` callable when set
+    #: (tests); ``None`` = the context's fence, else the dual-app drain seam.
+    admission_fn: Optional[Callable[[], bool]] = None
+    events: List[str] = field(default_factory=list)
+
+    @property
+    def audit_metadata(self) -> Dict[str, Any]:
+        """The parent graph's ``state["metadata"]`` as stamped for the current
+        batch; the job metadata the tools carry until the first batch."""
+        stamped = getattr(self.tool_context, "_parent_audit_metadata", None)
+        if isinstance(stamped, dict):
+            return stamped
+        fallback = getattr(self.tool_context, "_job_metadata", None)
+        return dict(fallback) if isinstance(fallback, dict) else {}
+
+    def provider_admission(self) -> bool:
+        fence = self.admission_fn
+        if fence is None:
+            fence = getattr(self.tool_context, "provider_admission", None)
+        if not callable(fence):
+            return not _default_drain_check()
+        try:
+            return bool(fence())
+        except Exception:
+            logger.warning(
+                "subagent host: admission fence raised — closing", exc_info=True
+            )
+            return False
+
+    def context_probe(self) -> Optional[ContextProbe]:
+        probe = getattr(self.tool_context, "parent_context_probe", None)
+        if not callable(probe):
+            return None
+        try:
+            return probe()
+        except Exception:
+            logger.debug("subagent host: context probe failed", exc_info=True)
+            return None
+
+    def fork_source(self) -> List[Any]:
+        source = getattr(self.tool_context, "_fork_source", None)
+        return list(source or [])
+
+    def enqueue_event(self, text: str) -> None:
+        # U4 wires Lane B delivery; a foreground parent only records it.
+        self.events.append(text)
+
+    @classmethod
+    def from_context(cls, tool_context: Any, **overrides: Any) -> "WorkerHost":
+        """A host from what a parent ``ToolContext`` already carries (the
+        fallback the tool uses when agent.py has not installed one)."""
+        config = getattr(tool_context, "config", None) or {}
+        job_meta = getattr(tool_context, "_job_metadata", None) or {}
+        values: Dict[str, Any] = {
+            "job_id": str(
+                overrides.pop("job_id", None)
+                or getattr(tool_context, "job_id", None)
+                or job_meta.get("job_id")
+                or ""
+            ),
+            "agent_type": str(
+                overrides.pop("agent_type", None) or config.get("agent_id") or "worker"
+            ),
+            "tool_context": tool_context,
+            "thread_id": getattr(tool_context, "thread_id", None),
+            "user_id": getattr(tool_context, "user_id", None),
+            "auxiliary_llm": getattr(tool_context, "auxiliary_llm", None),
+            "live_llm_config": getattr(tool_context, "_llm_config", None),
+            "postgres": getattr(tool_context, "postgres_db", None),
+        }
+        values.update(overrides)
+        return cls(**values)
+
+
+__all__ = ["ContextProbe", "ParentHost", "SimpleParentHost", "WorkerHost"]

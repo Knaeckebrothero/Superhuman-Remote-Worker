@@ -4277,6 +4277,11 @@ class UniversalAgent:
         context._resolved_tool_names = loaded_tool_names
         context._limits = self.config.limits
 
+        # Built-in subagents (U3): the parent host + per-job runtime behind
+        # delegate_agent. Installed after load_tools so the runtime sees the
+        # resolved tool names; the tool reads it lazily at call time.
+        self._install_subagent_runtime(context)
+
         # Capability-scoped bundled skills are resolved only after the final
         # backend gate. In particular, worker jobs must never advertise or
         # materialize present-with-canvas because Canvas is session-only.
@@ -4313,6 +4318,53 @@ class UniversalAgent:
         self._doc_registration_task = asyncio.create_task(
             self._register_initial_documents_background(context)
         )
+
+    def _install_subagent_runtime(self, context: ToolContext) -> None:
+        """Wire the built-in subagents onto the parent's ToolContext (U3 B.13).
+
+        Always stashes what a child needs from the parent regardless of the
+        grant — the auxiliary LLM (children compact with it) and the
+        provider-admission fence (a drain ends every child at its next
+        provider call without spend). The ``WorkerHost`` + ``SubagentRuntime``
+        pair is built only when ``delegation.enabled`` (nothing else binds
+        ``delegate_agent``). Lazy import: ``src.subagents`` pulls
+        ``persistent_graph``. Non-fatal — the tool builds its own runtime on
+        first use if this failed.
+        """
+        from .graph import _is_drain_requested
+
+        context.auxiliary_llm = self._auxiliary_llm
+        context.provider_admission = lambda: not _is_drain_requested()
+        delegation = (context.config or {}).get("delegation") or {}
+        if not isinstance(delegation, dict) or delegation.get("enabled") is not True:
+            context.subagent_runtime = None
+            context._parent_host = None
+            return
+        try:
+            from src.subagents.host import WorkerHost
+            from src.subagents.runtime import SubagentRuntime
+
+            host = WorkerHost(
+                job_id=str(self._current_job_id or ""),
+                agent_type=self.config.agent_id,
+                tool_context=context,
+                thread_id=None,
+                user_id=getattr(context, "user_id", None),
+                auxiliary_llm=self._auxiliary_llm,
+                live_llm_config=self.config.llm,
+                postgres=self.postgres_conn,
+            )
+            context._parent_host = host
+            context.subagent_runtime = SubagentRuntime.from_context(context, host)
+            logger.info(
+                "Subagent runtime installed for job %s: roster=%s max_concurrent=%s",
+                self._current_job_id,
+                context.subagent_runtime.roster_names,
+                context.subagent_runtime.max_concurrent,
+            )
+        except Exception as e:
+            logger.warning(f"Subagent runtime unavailable (non-fatal): {e}")
+            context.subagent_runtime = None
 
     def _bind_job_tools(self) -> None:
         """Bind the loaded tools to the job's LLM.

@@ -730,3 +730,48 @@ class TestWritePolicy:
             "use_skill",
         }
         assert registered - readers <= WRITE_TOOLS
+
+
+# ---------------------------------------------------------------------------
+# The parent-side stashes never reach a child (U3 WP2)
+# ---------------------------------------------------------------------------
+
+
+def test_rebase_context_resets_the_parent_side_subagent_stashes():
+    """A child is never a parent: the runtime, host, fork seed, probe,
+    admission fence and audit stamp are cleared on the copy (depth 1)."""
+    import copy
+
+    from src.core.loader import load_agent_config_from_dict
+
+    parent = ToolContext(
+        config={"agent_id": "developer"},
+        _job_metadata={"job_id": "parent-job"},
+    )
+    parent.subagent_runtime = object()
+    parent._parent_host = object()
+    parent.parent_context_probe = lambda: None
+    parent.provider_admission = lambda: True
+    parent._fork_source = [object()]
+    parent._parent_audit_metadata = {"job_id": "parent-job"}
+    child = copy.copy(parent)
+    cfg = load_agent_config_from_dict(
+        {"agent_id": "explorer", "display_name": "Explorer", "llm": dict(_PARENT_LLM)}
+    )
+    rebase_context(
+        child,
+        cfg=cfg,
+        tool_config={"agent_id": "explorer"},
+        workspace_manager=None,
+        shell_manager=None,
+    )
+    for name in (
+        "subagent_runtime",
+        "_parent_host",
+        "parent_context_probe",
+        "provider_admission",
+        "_fork_source",
+        "_parent_audit_metadata",
+    ):
+        assert getattr(child, name) is None, name
+        assert getattr(parent, name) is not None, name

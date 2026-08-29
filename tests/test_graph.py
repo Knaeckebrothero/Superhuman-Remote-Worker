@@ -2553,3 +2553,79 @@ class TestExecuteNodeBindings:
             )
         with pytest.raises(TypeError, match="llm_with_tools"):
             create_execute_node(**self._kwargs())
+
+
+# =============================================================================
+# Built-in subagents (U3 WP2): the context probe the graph stashes
+# =============================================================================
+
+
+class TestSubagentContextProbe:
+    """``build_phase_alternation_graph`` stashes ``parent_context_probe`` on
+    the ToolContext (plan B.5): a live read of the graph's ContextManager
+    that the return envelope shares the parent's headroom against."""
+
+    def _config(self):
+        from pathlib import Path
+        from src.core.loader import load_agent_config
+
+        root = Path(__file__).resolve().parents[1]
+        config = load_agent_config(str(root / "config" / "worker_base.yaml"))
+        config.memory.manager_enabled = False
+        return config
+
+    def test_graph_build_stashes_a_live_probe_on_the_tool_context(
+        self, workspace_manager
+    ):
+        from unittest.mock import patch
+
+        from src.core.context import ContextManager
+        from src.subagents import ContextProbe
+        from src.tools.context import ToolContext
+
+        config = self._config()
+        ctx = ToolContext(workspace_manager=workspace_manager)
+        assert ctx.parent_context_probe is None
+        managers_seen = []
+
+        def capture(**kwargs):
+            managers_seen.append(ContextManager(**kwargs))
+            return managers_seen[-1]
+
+        with patch("src.graph.ContextManager", side_effect=capture):
+            build_phase_alternation_graph(
+                llm_with_tools=MagicMock(),
+                tools=[],
+                config=config,
+                workspace=workspace_manager,
+                todo_manager=TodoManager(workspace_manager),
+                tool_context=ctx,
+            )
+        assert callable(ctx.parent_context_probe)
+        probe = ctx.parent_context_probe()
+        assert isinstance(probe, ContextProbe)
+        assert (
+            probe.compaction_threshold_tokens == config.limits.context_threshold_tokens
+        )
+        assert probe.model_max_context_tokens == config.limits.model_max_context_tokens
+        assert probe.last_provider_input_tokens is None
+        assert probe.current_token_count == 0
+
+        # Live, not a snapshot: the graph's own manager is what it reads.
+        (context_mgr,) = managers_seen
+        context_mgr.state.current_token_count = 4321
+        context_mgr.state.last_provider_input_tokens = 5000
+        again = ctx.parent_context_probe()
+        assert (again.current_token_count, again.last_provider_input_tokens) == (
+            4321,
+            5000,
+        )
+
+    def test_a_graph_without_a_tool_context_builds_as_before(self, workspace_manager):
+        build_phase_alternation_graph(
+            llm_with_tools=MagicMock(),
+            tools=[],
+            config=self._config(),
+            workspace=workspace_manager,
+            todo_manager=TodoManager(workspace_manager),
+        )

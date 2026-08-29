@@ -361,6 +361,39 @@ class ToolContext:
     )
     _limits: Optional[Any] = None  # Parent LimitsConfig — used to build the
     # light-subagent reader LLM (create_llm(subagent_cfg, limits=...)).
+    # --- Built-in subagents (U3). The parent's tool node / agent.py stamp
+    # these; ``delegate_agent`` and ``src.subagents`` read them lazily. ---
+    subagent_runtime: Optional[Any] = (
+        None  # SubagentRuntime — one per parent job (roster, semaphore,
+        # handles, idempotent re-execution). Installed by agent.py after the
+        # tools are loaded; the delegate_agent tool builds one on first use if
+        # it is still None (sessions in U5 take that path).
+    )
+    _parent_host: Optional[Any] = (
+        None  # ParentHost (WorkerHost for jobs) the runtime hands to children.
+    )
+    parent_context_probe: Optional[Callable[[], Any]] = (
+        None  # () -> ContextProbe of the parent's live ContextManager, stashed
+        # by build_phase_alternation_graph; the return envelope's headroom
+        # share reads it (B.5). None = no parent accounting (entry budget).
+    )
+    auxiliary_llm: Optional[Any] = (
+        None  # The parent's AuxiliaryLLM — children compact with it (a child
+        # with none fast-fails its summarizer and keeps its raw history).
+    )
+    provider_admission: Optional[Callable[[], bool]] = (
+        None  # () -> bool: False once the parent is draining. Every child
+        # checks it before each provider call (before_provider_admission) and
+        # ends its turn without spend when it is closed.
+    )
+    _fork_source: Optional[List[Any]] = (
+        None  # The parent's DURABLE state["messages"], stamped by the tool
+        # node before a delegation batch; ``fork=true`` children seed from it.
+    )
+    _parent_audit_metadata: Optional[Dict[str, Any]] = (
+        None  # state["metadata"] stamped per delegation batch — merged under
+        # the child's subagent_* keys on every child tool audit row.
+    )
 
     def __post_init__(self):
         """Validate context after initialization."""

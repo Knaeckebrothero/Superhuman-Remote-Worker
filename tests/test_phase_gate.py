@@ -482,3 +482,223 @@ class TestLegacyPromptMode:
         )
         assert tool_messages(result)[0].content == "done"
         tool_node.ainvoke.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Delegation batches (U3 B.6): delegation-only, no watchdog, per-call rejection
+# ---------------------------------------------------------------------------
+
+DELEGATION_COBATCH = (
+    "Not executed: `read_file` was batched with delegate_agent; re-issue it in "
+    "the next turn — delegation runs in a turn of its own"
+)
+
+
+class TestDelegationBatch:
+    @pytest.mark.asyncio
+    async def test_a_slow_child_outlives_the_old_delegation_timeout(self, tool_node):
+        """The old 600 s ``tool_category_timeouts.delegation`` case is gone: a
+        delegation batch runs without ``wait_for`` — the child's own budgets
+        bound it — and never trips the SSH-wedge reconnect."""
+        cfg = FakeConfig(
+            limits=LimitsConfig(tool_category_timeouts={"default": 1, "delegation": 1})
+        )
+
+        async def slow(_):
+            await asyncio.sleep(1.3)
+            return {"messages": [result_for("delegate_agent", "c1", "child report")]}
+
+        tool_node.ainvoke = slow
+        backend = MagicMock()
+        ctx = tool_context()
+        ctx.workspace_manager = MagicMock(backend=backend)
+        audited = create_audited_tool_node(
+            [tool("delegate_agent"), tool("read_file")], cfg, tool_context=ctx
+        )
+        result = await audited(
+            state(
+                [tc("delegate_agent", "c1", {"prompt": "x", "subagent_type": "e"})],
+                is_strategic=False,
+                phase_number=4,
+            )
+        )
+        (msg,) = tool_messages(result)
+        assert msg.content == "child report"
+        assert backend.method_calls == []
+
+    @pytest.mark.asyncio
+    async def test_a_mixed_batch_rejects_the_co_batched_call_and_runs_the_child(
+        self, tool_node
+    ):
+        tool_node.ainvoke = AsyncMock(
+            return_value={
+                "messages": [result_for("delegate_agent", "c1", "child report")]
+            }
+        )
+        ctx = tool_context()
+        audited = create_audited_tool_node(
+            [tool("delegate_agent"), tool("read_file")], FakeConfig(), tool_context=ctx
+        )
+        result = await audited(
+            state(
+                [
+                    tc("delegate_agent", "c1", {"prompt": "x", "subagent_type": "e"}),
+                    tc("read_file", "c2", {"path": "a"}),
+                ],
+                is_strategic=False,
+                phase_number=4,
+            )
+        )
+        msgs = tool_messages(result)
+        assert [m.tool_call_id for m in msgs] == ["c1", "c2"]
+        assert msgs[0].content == "child report"
+        assert msgs[1].content == DELEGATION_COBATCH
+        # The ToolNode saw only the delegation call.
+        executed = tool_node.ainvoke.await_args.args[0]["messages"][-1]
+        assert [c["id"] for c in executed.tool_calls] == ["c1"]
+
+    @pytest.mark.asyncio
+    async def test_a_shell_only_batch_still_times_out_and_reconnects(self, tool_node):
+        cfg = FakeConfig(limits=LimitsConfig(tool_category_timeouts={"default": 1}))
+
+        async def slow(_):
+            await asyncio.sleep(1.25)
+            return {"messages": [result_for("run_command", "c1")]}
+
+        tool_node.ainvoke = slow
+        backend = MagicMock()
+        ctx = tool_context()
+        ctx.workspace_manager = MagicMock(backend=backend)
+        audited = create_audited_tool_node(
+            [tool("run_command"), tool("delegate_agent")], cfg, tool_context=ctx
+        )
+        result = await audited(
+            state(
+                [tc("run_command", "c1", {"command": "sleep 5"})],
+                is_strategic=False,
+                phase_number=4,
+            )
+        )
+        (msg,) = tool_messages(result)
+        assert "timed out" in msg.content.lower()
+        assert backend.method_calls == [
+            call.shell_reset_after_timeout(),
+            call.disconnect(),
+            call.connect(),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_phase_illegal_call_keeps_the_phase_text(self, tool_node):
+        """Phase gate first, delegation rule second: the strategic tool in a
+        tactical delegation batch gets the phase rejection, not the co-batch
+        text, and the child still runs."""
+        tool_node.ainvoke = AsyncMock(
+            return_value={
+                "messages": [result_for("delegate_agent", "c1", "child report")]
+            }
+        )
+        audited = create_audited_tool_node(
+            [tool("delegate_agent"), tool("job_complete"), tool("read_file")],
+            FakeConfig(),
+            tool_context=tool_context(),
+        )
+        result = await audited(
+            state(
+                [
+                    tc("delegate_agent", "c1", {"prompt": "x", "subagent_type": "e"}),
+                    tc("job_complete", "c2"),
+                    tc("read_file", "c3", {"path": "a"}),
+                ],
+                is_strategic=False,
+                phase_number=4,
+            )
+        )
+        by_id = {m.tool_call_id: m.content for m in tool_messages(result)}
+        assert by_id["c1"] == "child report"
+        assert by_id["c2"].startswith(STRATEGIC_IN_TACTICAL)
+        assert BATCH_NOTE in by_id["c2"]
+        assert by_id["c3"] == DELEGATION_COBATCH
+        executed = tool_node.ainvoke.await_args.args[0]["messages"][-1]
+        assert [c["id"] for c in executed.tool_calls] == ["c1"]
+
+    @pytest.mark.asyncio
+    async def test_the_node_stamps_fork_source_metadata_and_batch_size(self, tool_node):
+        tool_node.ainvoke = AsyncMock(
+            return_value={
+                "messages": [
+                    result_for("delegate_agent", "c1", "one"),
+                    result_for("delegate_agent", "c2", "two"),
+                ]
+            }
+        )
+        ctx = tool_context()
+        audited = create_audited_tool_node(
+            [tool("delegate_agent")], FakeConfig(), tool_context=ctx
+        )
+        st = state(
+            [
+                tc("delegate_agent", "c1", {"prompt": "x", "subagent_type": "e"}),
+                tc("delegate_agent", "c2", {"prompt": "y", "subagent_type": "e"}),
+            ],
+            is_strategic=True,
+            phase_number=3,
+        )
+        st["metadata"] = {"job_id": "job-gate", "config_name": "developer"}
+        result = await audited(st)
+        assert [m.content for m in tool_messages(result)] == ["one", "two"]
+        assert ctx._fork_source is st["messages"]
+        assert ctx._parent_audit_metadata == {
+            "job_id": "job-gate",
+            "config_name": "developer",
+        }
+        ctx.subagent_runtime.begin_batch.assert_called_once_with(2)
+
+    @pytest.mark.asyncio
+    async def test_a_batch_without_delegation_is_not_stamped(self, tool_node):
+        tool_node.ainvoke = AsyncMock(
+            return_value={"messages": [result_for("read_file", "c1", "body")]}
+        )
+        ctx = tool_context()
+        audited = create_audited_tool_node(
+            [tool("read_file"), tool("delegate_agent")], FakeConfig(), tool_context=ctx
+        )
+        result = await audited(
+            state(
+                [tc("read_file", "c1", {"path": "a"})],
+                is_strategic=False,
+                phase_number=4,
+            )
+        )
+        assert tool_messages(result)[0].content == "body"
+        ctx.subagent_runtime.begin_batch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_rejection_names_the_delegation_tool_in_the_batch(
+        self, tool_node
+    ):
+        """spawn_subagent (category delegation, until WP4) follows the same
+        rule and the text names it, not delegate_agent."""
+        tool_node.ainvoke = AsyncMock(
+            return_value={"messages": [result_for("spawn_subagent", "c2", "reader")]}
+        )
+        audited = create_audited_tool_node(
+            [tool("spawn_subagent"), tool("read_file")],
+            FakeConfig(),
+            tool_context=tool_context(),
+        )
+        result = await audited(
+            state(
+                [
+                    tc("read_file", "c1", {"path": "a"}),
+                    tc("spawn_subagent", "c2", {"task_description": "x"}),
+                ],
+                is_strategic=False,
+                phase_number=4,
+            )
+        )
+        by_id = {m.tool_call_id: m.content for m in tool_messages(result)}
+        assert by_id["c2"] == "reader"
+        assert by_id["c1"] == (
+            "Not executed: `read_file` was batched with spawn_subagent; re-issue "
+            "it in the next turn — delegation runs in a turn of its own"
+        )

@@ -824,3 +824,55 @@ class TestCitationEngine:
         assert ctx.citation_engine is None
         assert ctx._source_registry == {}
         engine.close.assert_not_called()
+
+
+# =============================================================================
+# Built-in subagents (U3 WP2): the fields the runtime and the host read
+# =============================================================================
+
+
+class TestSubagentFields:
+    """The parent-side stashes ``delegate_agent`` / ``src.subagents`` read
+    lazily: all optional, all None until agent.py / the graph set them."""
+
+    FIELDS = (
+        "subagent_runtime",
+        "_parent_host",
+        "parent_context_probe",
+        "auxiliary_llm",
+        "provider_admission",
+        "_fork_source",
+        "_parent_audit_metadata",
+    )
+
+    def test_defaults_are_none(self):
+        ctx = ToolContext()
+        for name in self.FIELDS:
+            assert getattr(ctx, name) is None, name
+
+    def test_fields_are_plain_assignable_stashes(self):
+        ctx = ToolContext()
+        runtime = object()
+        messages = [object()]
+        ctx.subagent_runtime = runtime
+        ctx.parent_context_probe = lambda: "probe"
+        ctx.provider_admission = lambda: False
+        ctx._fork_source = messages
+        ctx._parent_audit_metadata = {"job_id": "j"}
+        assert ctx.subagent_runtime is runtime
+        assert ctx.parent_context_probe() == "probe"
+        assert ctx.provider_admission() is False
+        assert ctx._fork_source is messages
+        assert ctx._parent_audit_metadata == {"job_id": "j"}
+
+    def test_a_shallow_copy_shares_the_stashes_until_the_child_build_resets_them(
+        self,
+    ):
+        import copy
+
+        ctx = ToolContext()
+        ctx.subagent_runtime = object()
+        ctx._fork_source = [1]
+        child = copy.copy(ctx)
+        assert child.subagent_runtime is ctx.subagent_runtime
+        assert child._fork_source is ctx._fork_source

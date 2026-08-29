@@ -267,3 +267,137 @@ class TestBindJobTools:
             agent = _bind(config, tools)
             assert agent._tools[0].func is gate  # what the ToolNode executes
             assert all("next_phase_todos" in b.tool_names for b in agent._llm.calls[:1])
+
+
+# ---------------------------------------------------------------------------
+# ``_install_subagent_runtime`` (U3 WP2): the WorkerHost + runtime per job
+# ---------------------------------------------------------------------------
+
+
+def _delegating_context(**config_overrides) -> ToolContext:
+    config = {
+        "agent_id": "developer",
+        "delegation": {"enabled": True, "max_concurrent": 3},
+        "subagents": {
+            "default": "explorer",
+            "roster": {
+                "explorer": {"agent_id": "explorer", "display_name": "Explorer"}
+            },
+        },
+    }
+    config.update(config_overrides)
+    return ToolContext(
+        config=config,
+        _job_metadata={"job_id": "job-42", "config_name": "developer"},
+    )
+
+
+class _HostAgent:
+    """Only what _install_subagent_runtime touches."""
+
+    def __init__(self, config):
+        self.config = config
+        self._auxiliary_llm = object()
+        self.postgres_conn = object()
+        self._current_job_id = "job-42"
+
+
+def _install(ctx, agent=None):
+    from src.agent import UniversalAgent
+
+    agent = agent or _HostAgent(_make_config({}))
+    UniversalAgent._install_subagent_runtime(agent, ctx)
+    return agent
+
+
+class TestSubagentHostWiring:
+    def test_enabled_delegation_installs_the_host_and_the_runtime(self):
+        from src.subagents import SubagentRuntime, WorkerHost
+
+        ctx = _delegating_context()
+        agent = _install(ctx)
+        runtime = ctx.subagent_runtime
+        host = ctx._parent_host
+        assert isinstance(runtime, SubagentRuntime)
+        assert isinstance(host, WorkerHost)
+        assert runtime.host is host and runtime.parent_context is ctx
+        assert host.job_id == "job-42"
+        assert host.agent_type == agent.config.agent_id
+        assert host.thread_id is None
+        assert host.auxiliary_llm is agent._auxiliary_llm
+        assert host.live_llm_config is agent.config.llm
+        assert host.postgres is agent.postgres_conn
+        assert host.tool_context is ctx
+        assert ctx.auxiliary_llm is agent._auxiliary_llm
+        assert runtime.max_concurrent == 3
+        assert runtime.roster_names == ["explorer"]
+        assert runtime.default == "explorer"
+
+    def test_the_admission_fence_follows_the_graphs_drain_seam(self):
+        ctx = _delegating_context()
+        with patch("src.graph._is_drain_requested", return_value=False) as drain:
+            _install(ctx)
+            host = ctx._parent_host
+            assert callable(ctx.provider_admission)
+            assert ctx.provider_admission() is True
+            assert host.provider_admission() is True
+            drain.return_value = True
+            assert ctx.provider_admission() is False
+            assert host.provider_admission() is False
+
+    def test_audit_metadata_prefers_the_batch_stamp(self):
+        ctx = _delegating_context()
+        _install(ctx)
+        host = ctx._parent_host
+        assert host.audit_metadata == {"job_id": "job-42", "config_name": "developer"}
+        stamped = {"job_id": "job-42", "document_path": "/data/doc.pdf"}
+        ctx._parent_audit_metadata = stamped
+        assert host.audit_metadata is stamped
+
+    def test_probe_and_fork_source_are_empty_until_the_graph_stamps_them(self):
+        from src.subagents import ContextProbe
+
+        ctx = _delegating_context()
+        _install(ctx)
+        host = ctx._parent_host
+        assert host.context_probe() is None
+        assert host.fork_source() == []
+        probe = ContextProbe(None, 10, 100, 1000)
+        ctx.parent_context_probe = lambda: probe
+        messages = [object(), object()]
+        ctx._fork_source = messages
+        assert host.context_probe() is probe
+        assert host.fork_source() == messages
+        assert host.fork_source() is not messages  # a copy, never the live list
+
+    def test_disabled_delegation_installs_no_runtime_but_still_the_stashes(self):
+        ctx = _delegating_context(delegation={"enabled": False})
+        agent = _install(ctx)
+        assert ctx.subagent_runtime is None
+        assert ctx._parent_host is None
+        assert ctx.auxiliary_llm is agent._auxiliary_llm
+        assert callable(ctx.provider_admission)
+
+    def test_an_install_failure_is_non_fatal(self):
+        ctx = _delegating_context()
+        with patch(
+            "src.subagents.runtime.SubagentRuntime.from_context",
+            side_effect=RuntimeError("boom"),
+        ):
+            _install(ctx)
+        assert ctx.subagent_runtime is None
+
+    def test_the_tool_builds_a_runtime_lazily_when_none_was_installed(self):
+        from src.subagents import SubagentRuntime, WorkerHost
+        from src.tools.delegation.delegate_agent import ensure_runtime
+
+        ctx = _delegating_context()
+        ctx._llm_config = _make_config({}).llm
+        runtime = ensure_runtime(ctx)
+        assert isinstance(runtime, SubagentRuntime)
+        assert ctx.subagent_runtime is runtime
+        assert isinstance(ctx._parent_host, WorkerHost)
+        assert ctx._parent_host.job_id == "job-42"
+        assert ctx._parent_host.agent_type == "developer"
+        assert ctx._parent_host.live_llm_config is ctx._llm_config
+        assert ensure_runtime(ctx) is runtime

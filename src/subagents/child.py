@@ -669,6 +669,14 @@ def rebase_context(
     ctx._current_phase_number = None
     ctx._current_turn_count = 0
     ctx._graph_progress = 0
+    # Never a parent: no runtime, no host, no fork seed, no probe and no
+    # admission fence of its own (the driver consults the HOST's).
+    ctx.subagent_runtime = None
+    ctx._parent_host = None
+    ctx.parent_context_probe = None
+    ctx.provider_admission = None
+    ctx._fork_source = None
+    ctx._parent_audit_metadata = None
     ctx.config = tool_config
     ctx._llm_config = cfg.llm
     ctx._limits = cfg.limits

@@ -4940,6 +4940,33 @@ def create_audited_tool_node(
     _phase_gated_names = set(n for n in _all_tool_names if n in _TOOL_REG)
     _legacy_batch_gate = uses_legacy_phase_prompt(config)
 
+    def _delegation_cobatch_text(tool_name: str, delegation_tool: str) -> str:
+        """The per-call rejection of a non-delegation call that shared a batch
+        with a delegation call (U3 B.6): what to do, never the tool surface."""
+        return (
+            f"Not executed: `{tool_name}` was batched with "
+            f"{delegation_tool or 'delegate_agent'}; re-issue it in the next "
+            "turn — delegation runs in a turn of its own"
+        )
+
+    def _stamp_delegation_batch(
+        state: UniversalAgentState, messages: List[Any], n_delegation_calls: int
+    ) -> None:
+        """What the subagent runtime reads per batch: the parent's DURABLE
+        message list (a ``fork=true`` seed), the audit metadata the child's
+        tool rows inherit, and how many children share the return headroom."""
+        if tool_context is None:
+            return
+        try:
+            tool_context._fork_source = messages
+            tool_context._parent_audit_metadata = state.get("metadata")
+            runtime = getattr(tool_context, "subagent_runtime", None)
+            begin_batch = getattr(runtime, "begin_batch", None)
+            if callable(begin_batch):
+                begin_batch(n_delegation_calls)
+        except Exception:
+            logger.debug("Failed to stamp the delegation batch", exc_info=True)
+
     def _phase_rejection_text(
         tool_name: str, phase_str: str, phase_number: int, others_executed: bool
     ) -> str:
@@ -5023,6 +5050,36 @@ def create_audited_tool_node(
             tc for i, tc in enumerate(tool_calls_info) if i not in rejected_idx
         ]
         rejected_call_ids = {tc["call_id"] for tc in phase_violations}
+
+        # Delegation-only batch (U3 B.6). A batch carrying any
+        # delegation-category call runs ONLY its delegation calls: children
+        # are in-process LLM loops bounded by their own turn/token/staleness
+        # budgets, so the batch runs without the SSH-wedge watchdog — and a
+        # co-batched workspace call must not ride along unbounded. Those
+        # calls are rejected per call (same merge as the phase gate) and
+        # re-issued by the model in the next turn.
+        delegation_idx = {
+            i
+            for i, tc in enumerate(tool_calls_info)
+            if i not in rejected_idx and _get_tool_category(tc["name"]) == "delegation"
+        }
+        cobatched_idx: set = set()
+        delegation_batch = bool(delegation_idx)
+        if delegation_batch:
+            cobatched_idx = {
+                i
+                for i in range(len(tool_calls_info))
+                if i not in rejected_idx and i not in delegation_idx
+            }
+            legal_calls = [
+                tc for i, tc in enumerate(tool_calls_info) if i in delegation_idx
+            ]
+        rejected_idx_all = rejected_idx | cobatched_idx
+        cobatched_calls = {id(tool_calls_info[i]) for i in cobatched_idx}
+        delegation_tool_name = (
+            tool_calls_info[min(delegation_idx)]["name"] if delegation_batch else ""
+        )
+
         if phase_violations and _legacy_batch_gate:
             # Legacy prompt mode: the phase-filtered bindings are the primary
             # gate and this only catches hallucinated calls. ToolNode can't
@@ -5071,6 +5128,13 @@ def create_audited_tool_node(
                 f"[{job_id}] Phase gate: {[tc['name'] for tc in phase_violations]} "
                 f"not available in the {phase_str} phase — rejected per call, "
                 f"{len(legal_calls)} legal call(s) executed"
+            )
+        if cobatched_idx:
+            logger.warning(
+                f"[{job_id}] Delegation batch: "
+                f"{[tool_calls_info[i]['name'] for i in sorted(cobatched_idx)]} "
+                f"batched with {delegation_tool_name} — not executed; "
+                f"{len(legal_calls)} delegation call(s) run"
             )
 
         # Phase change: reset all detection state
@@ -5193,51 +5257,40 @@ def create_audited_tool_node(
         # blocks execution). Rejected calls never reach the ToolNode: it runs
         # on a copy of the AIMessage carrying only the legal calls, and the
         # rejected ones are answered after execution, in their original
-        # positions. Same batch timeout / watchdog semantics as before.
+        # positions. Same batch timeout / watchdog semantics as before for
+        # every batch that is not a delegation batch.
         start_time = time.time()
         batch_timeout = _get_batch_tool_timeout(legal_calls)
         executed_tool_batch = len(legal_calls) > 0
         result: Dict[str, Any] = {"messages": []}
         timed_out = False
-        try:
-            if legal_calls:
-                result = await asyncio.wait_for(
-                    tool_node.ainvoke(
-                        _state_with_legal_calls(state, messages, rejected_idx)
-                        if phase_violations
-                        else state
-                    ),
-                    timeout=batch_timeout,
+        node_input = (
+            _state_with_legal_calls(state, messages, rejected_idx_all)
+            if rejected_idx_all
+            else state
+        )
+        if legal_calls and delegation_batch:
+            # Children are bounded by their own budgets (turns, tokens,
+            # staleness — B.4), never by a wall clock here: no wait_for, no
+            # reconnect, and a slow fan-out is not a wedged workspace. The
+            # stamps give the runtime what the envelope and a fork need.
+            _stamp_delegation_batch(state, messages, len(legal_calls))
+            result = await tool_node.ainvoke(node_input)
+            _TOOL_TIMEOUT_RETRIES[0] = 0
+        else:
+            try:
+                if legal_calls:
+                    result = await asyncio.wait_for(
+                        tool_node.ainvoke(node_input),
+                        timeout=batch_timeout,
+                    )
+                    _TOOL_TIMEOUT_RETRIES[0] = 0
+            except asyncio.TimeoutError:
+                timed_out = True
+                logger.warning(
+                    f"[{job_id}] Tool batch timed out after {batch_timeout}s "
+                    f"across {len(legal_calls)} calls"
                 )
-                _TOOL_TIMEOUT_RETRIES[0] = 0
-        except asyncio.TimeoutError:
-            timed_out = True
-            logger.warning(
-                f"[{job_id}] Tool batch timed out after {batch_timeout}s "
-                f"across {len(legal_calls)} calls"
-            )
-            # A delegation-only batch (spawn_subagent fan-out) runs in-process
-            # LLM loops, not workspace SSH ops — its latency says nothing about
-            # workspace health. Reconnecting would cancel nothing useful and
-            # escalating to WorkspaceUnavailableError fails the whole job over
-            # a slow fan-out (job 472ea457). Return timeout ToolMessages and
-            # let the LLM adapt; the SSH wedge watchdog stays armed for every
-            # other category.
-            delegation_only = bool(legal_calls) and all(
-                _get_tool_category(tc["name"]) == "delegation" for tc in legal_calls
-            )
-            if delegation_only:
-                result = _build_timeout_error_result(
-                    legal_calls,
-                    batch_timeout,
-                    hint=(
-                        "The subagent batch was cancelled for exceeding its "
-                        "time budget; the workspace itself is healthy. Spawn "
-                        "fewer subagents per turn or give each a narrower "
-                        "task, or continue without them."
-                    ),
-                )
-            else:
                 if _TOOL_TIMEOUT_RETRIES[0] >= 1:
                     _TOOL_TIMEOUT_RETRIES[0] = 0
                     raise WorkspaceUnavailableError(
@@ -5258,21 +5311,27 @@ def create_audited_tool_node(
                 result = _build_timeout_error_result(legal_calls, batch_timeout)
         execution_time_ms = int((time.time() - start_time) * 1000)
 
-        if phase_violations:
-            result["messages"] = _merge_phase_rejections(
-                result.get("messages", []),
-                tool_calls_info,
-                rejected_idx,
-                lambda tc: ToolMessage(
-                    content=_phase_rejection_text(
+        if rejected_idx_all:
+
+            def _rejection(tc: dict) -> ToolMessage:
+                if id(tc) in cobatched_calls:
+                    content = _delegation_cobatch_text(tc["name"], delegation_tool_name)
+                else:
+                    content = _phase_rejection_text(
                         tc["name"],
                         phase_str,
                         phase_number,
                         bool(legal_calls) and not timed_out,
-                    ),
-                    tool_call_id=tc["call_id"],
-                    name=tc["name"],
-                ),
+                    )
+                return ToolMessage(
+                    content=content, tool_call_id=tc["call_id"], name=tc["name"]
+                )
+
+            result["messages"] = _merge_phase_rejections(
+                result.get("messages", []),
+                tool_calls_info,
+                rejected_idx_all,
+                _rejection,
             )
 
         # Heartbeat visibility marker:
@@ -5701,6 +5760,26 @@ def build_phase_alternation_graph(
         model=config.llm.model,
         summarization_call_timeout=config.auxiliary.summarization_call_timeout,
     )
+
+    # Built-in subagents (U3 B.5): the return envelope shares the PARENT's
+    # remaining headroom, read through this probe of the live ContextManager
+    # at envelope time. Lazy import — src.subagents pulls persistent_graph.
+    if tool_context is not None:
+
+        def _parent_context_probe():
+            from src.subagents.host import ContextProbe
+
+            live = context_mgr.state
+            return ContextProbe(
+                last_provider_input_tokens=live.last_provider_input_tokens,
+                current_token_count=int(live.current_token_count or 0),
+                compaction_threshold_tokens=int(
+                    context_config.compaction_threshold_tokens
+                ),
+                model_max_context_tokens=int(context_config.model_max_context_tokens),
+            )
+
+        tool_context.parent_context_probe = _parent_context_probe
 
     # Compaction progress for worker agents goes to the log (persistent
     # sessions broadcast SSE frames instead — persistent_app wires its own).
