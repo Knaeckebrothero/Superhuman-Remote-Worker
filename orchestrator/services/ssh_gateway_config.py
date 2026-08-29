@@ -218,6 +218,13 @@ class GatewayConfig:
     allowed_origins: tuple[str, ...]
     login_timeout: int = 20
     keepalive_interval: int = 30
+    # The gateway's own outbound call to the orchestrator's internal
+    # ssh-targets API (services.ssh_gateway_client.resolve_target), not to
+    # be confused with login_timeout above (asyncssh's inbound pre-auth
+    # budget). Was a bare `timeout=10.0` literal in resolve_target until a
+    # review flagged it as the one gateway budget with no config lever --
+    # every sibling budget here is a validated GatewayConfig field.
+    orchestrator_request_timeout: float = 10.0
     max_preauth_connections: int = 64
     preauth_rate_per_minute: int = 60
     max_channels_per_connection: int = 12
@@ -238,6 +245,7 @@ class GatewayConfig:
         for field_name in (
             "login_timeout",
             "keepalive_interval",
+            "orchestrator_request_timeout",
             "max_preauth_connections",
             "preauth_rate_per_minute",
             "max_channels_per_connection",

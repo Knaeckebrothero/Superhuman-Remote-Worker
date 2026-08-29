@@ -318,6 +318,8 @@ def test_gateway_config_rejects_non_positive_caps():
         ("login_timeout", -5),
         ("login_timeout", 0),
         ("keepalive_interval", -1),
+        ("orchestrator_request_timeout", -1),
+        ("orchestrator_request_timeout", 0),
         ("max_preauth_connections", 0),
         ("preauth_rate_per_minute", -1),
         ("max_channels_per_connection", 0),
@@ -333,6 +335,7 @@ def test_gateway_config_accepts_the_positive_defaults():
     config = GatewayConfig(**_gateway_config_kwargs())
     assert config.login_timeout == 20
     assert config.max_channels_per_connection == 12
+    assert config.orchestrator_request_timeout == 10.0
 
 
 def _sign_and_verify(key, pub, algorithm: bytes, data: bytes) -> bool:

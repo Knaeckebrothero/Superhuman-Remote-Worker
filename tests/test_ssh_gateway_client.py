@@ -5,10 +5,11 @@ Builds ``GatewayConfig`` directly rather than going through ``load_config``:
 configured host key (rejecting anything that isn't Ed25519) and loads the
 user CA key from disk (Task 1's ``load_user_ca``). ``resolve_target`` never
 reads ``host_key_paths``, ``user_ca_path``, or ``allowed_origins`` -- only
-``config.orchestrator_url`` and ``config.internal_key`` -- so routing every
-test in this file through real key generation and parsing would make them
-about ``ssh_gateway_config``'s file I/O, not about this module's HTTP
-behavior. Mirrors the ``_gateway_config_kwargs`` pattern at
+``config.orchestrator_url``, ``config.internal_key`` and
+``config.orchestrator_request_timeout`` -- so routing every test in this
+file through real key generation and parsing would make them about
+``ssh_gateway_config``'s file I/O, not about this module's HTTP behavior.
+Mirrors the ``_gateway_config_kwargs`` pattern at
 ``tests/test_ssh_gateway_config.py:300``, which exists for the exact same
 reason one field over (``GatewayConfig`` construction tests that don't want
 ``load_config``'s validation).
@@ -18,6 +19,8 @@ that fixture's real key material comes from a ``scope="session", autouse``
 fixture defined in that module, which pytest only runs for tests collected
 from that module.
 """
+
+import json
 
 import pytest
 
@@ -30,6 +33,8 @@ from services.ssh_gateway_client import (
     resolve_target,
 )
 from services.ssh_gateway_config import GatewayConfig
+
+_UNSET = object()
 
 
 def _gateway_config_kwargs(**overrides):
@@ -48,38 +53,95 @@ def _config(**overrides) -> GatewayConfig:
     return GatewayConfig(**_gateway_config_kwargs(**overrides))
 
 
+def _live_payload(**overrides):
+    payload = {
+        "thread_id": "t1",
+        "user_id": "u1",
+        "pod_ip": "10.1.2.3",
+        "pod_port": 30022,
+        "host_key_fingerprint": "SHA256:xyz",
+        "state": "live",
+    }
+    payload.update(overrides)
+    return payload
+
+
 class FakeResponse:
-    def __init__(self, status, payload=None):
+    def __init__(self, status, payload=_UNSET):
         self.status_code = status
-        self._payload = payload or {}
+        # `payload if payload is not _UNSET else {}` rather than the more
+        # obvious `payload or {}`: a JSON list/string/null test payload
+        # (`[]`, `""`, `None`) is falsy, so `or {}` would silently replace an
+        # intentional non-dict payload with an empty dict and the review
+        # 3.1 tests below would never actually exercise a non-dict body.
+        self._payload = {} if payload is _UNSET else payload
 
     def json(self):
         return self._payload
 
 
+class NonJsonResponse:
+    """A 200 whose body isn't JSON at all -- e.g. an ingress or error page.
+
+    ``httpx.Response.json()`` is ``json.loads(self.content)``, which raises
+    ``json.JSONDecodeError`` (a ``ValueError`` subclass) on a non-JSON body.
+    """
+
+    status_code = 200
+
+    def json(self):
+        raise json.JSONDecodeError("Expecting value", "", 0)
+
+
 @pytest.mark.asyncio
 async def test_live_target_is_returned(monkeypatch):
+    calls = []
+
     async def _get(url, headers=None, params=None, timeout=None):
-        assert headers["X-Internal-Key"] == "internal"
-        assert params["fingerprint"].startswith("SHA256:")
-        return FakeResponse(
-            200,
-            {
-                "thread_id": "t1",
-                "user_id": "u1",
-                "pod_ip": "10.1.2.3",
-                "pod_port": 30022,
-                "host_key_fingerprint": "SHA256:xyz",
-                "state": "live",
-            },
+        calls.append(
+            {"url": url, "headers": headers, "params": params, "timeout": timeout}
         )
+        return FakeResponse(200, _live_payload())
 
     import services.ssh_gateway_client as mod
 
     monkeypatch.setattr(mod, "_http_get", _get)
     target = await resolve_target(_config(), "s-7f3a91c2", "SHA256:abc")
+
     assert isinstance(target, SshTarget)
     assert target.pod_port == 30022
+
+    # Review 4.3: these used to be assertions *inside* the fake, which
+    # resolve_target calls inside its own `except Exception` -- a failure
+    # there was swallowed and resurfaced as a misleading
+    # `TargetUnavailable: unreachable` instead of the real AssertionError.
+    # Recording the call and asserting after resolve_target returns points a
+    # future failure at the real cause.
+    assert len(calls) == 1
+    assert calls[0]["headers"]["X-Internal-Key"] == "internal"
+    assert calls[0]["params"]["fingerprint"].startswith("SHA256:")
+    # Review 4.5: this was a hardcoded `timeout=10.0` literal with no config
+    # lever; it must come from GatewayConfig, matching every sibling budget.
+    assert calls[0]["timeout"] == 10.0
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_request_timeout_is_configurable(monkeypatch):
+    """The literal is gone: a non-default config value actually reaches
+    _http_get, not just a field that exists but is never read."""
+    calls = []
+
+    async def _get(url, headers=None, params=None, timeout=None):
+        calls.append(timeout)
+        return FakeResponse(200, _live_payload())
+
+    import services.ssh_gateway_client as mod
+
+    monkeypatch.setattr(mod, "_http_get", _get)
+    await resolve_target(
+        _config(orchestrator_request_timeout=2.5), "s-7f3a91c2", "SHA256:abc"
+    )
+    assert calls == [2.5]
 
 
 @pytest.mark.asyncio
@@ -101,14 +163,12 @@ async def test_non_live_state_raises_with_the_state(monkeypatch):
     async def _get(url, headers=None, params=None, timeout=None):
         return FakeResponse(
             200,
-            {
-                "thread_id": "t1",
-                "user_id": "u1",
-                "pod_ip": None,
-                "pod_port": None,
-                "host_key_fingerprint": None,
-                "state": "suspended",
-            },
+            _live_payload(
+                pod_ip=None,
+                pod_port=None,
+                host_key_fingerprint=None,
+                state="suspended",
+            ),
         )
 
     import services.ssh_gateway_client as mod
@@ -132,6 +192,121 @@ async def test_orchestrator_failure_fails_closed(monkeypatch):
     assert excinfo.value.state == "unreachable"
 
 
+# ---------------------------------------------------------------------------
+# Review Critical 3.0: handle is the SSH username and is fully
+# attacker-controlled. Unvalidated, it is interpolated straight into the URL
+# path, and httpx normalises ".." path segments -- an authenticated
+# GET-request-forgery primitive into arbitrary orchestrator internal routes,
+# carrying config.internal_key with it.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_handle_path_traversal_is_denied_without_an_http_call(monkeypatch):
+    """One '../' is the working payload -- verified independently by the
+    coordinator; the review's own two-segment example
+    ('../../api/internal/agent-token') is off by one segment and actually
+    misses:
+
+        '../../api/internal/agent-token'
+            -> /api/internal/ssh-targets/../../api/internal/agent-token
+            -> normalises to /api/api/internal/agent-token        (misses)
+        '../agent-token'
+            -> /api/internal/ssh-targets/../agent-token
+            -> normalises to /api/internal/agent-token             (HITS)
+
+    Asserts _http_get is never even called for an invalid handle -- a
+    reverted fix would let this fake "hit" (return a live-shaped 200), which
+    is exactly what an attacker's forged request would look like from the
+    gateway's side.
+    """
+    calls = []
+
+    async def _get(url, headers=None, params=None, timeout=None):
+        calls.append(url)
+        return FakeResponse(200, _live_payload())
+
+    import services.ssh_gateway_client as mod
+
+    monkeypatch.setattr(mod, "_http_get", _get)
+    with pytest.raises(TargetDenied):
+        await resolve_target(_config(), "../agent-token", "SHA256:abc")
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_ordinary_handle_still_reaches_the_http_call(monkeypatch):
+    """Negative control for the handle-validation gate itself: a
+    well-formed handle must still work, proving the gate discriminates
+    rather than just refusing everything."""
+    calls = []
+
+    async def _get(url, headers=None, params=None, timeout=None):
+        calls.append(url)
+        return FakeResponse(200, _live_payload())
+
+    import services.ssh_gateway_client as mod
+
+    monkeypatch.setattr(mod, "_http_get", _get)
+    target = await resolve_target(_config(), "s-7f3a91c2", "SHA256:abc")
+    assert isinstance(target, SshTarget)
+    assert len(calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Review Important 3.1: the malformed-payload guard (Ruling G13) started one
+# line too late. response.json() and the state read were outside the try,
+# so a non-JSON body, a non-dict payload, or an unhashable state all still
+# escaped as unhandled exceptions.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_non_json_response_body_refuses_instead_of_crashing(monkeypatch):
+    async def _get(url, headers=None, params=None, timeout=None):
+        return NonJsonResponse()
+
+    import services.ssh_gateway_client as mod
+
+    monkeypatch.setattr(mod, "_http_get", _get)
+    with pytest.raises(TargetUnavailable) as excinfo:
+        await resolve_target(_config(), "s-7f3a91c2", "SHA256:abc")
+    assert excinfo.value.state == "unreachable"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [[], "oops", None], ids=["list", "string", "null"])
+async def test_non_dict_payload_refuses_instead_of_crashing(monkeypatch, payload):
+    async def _get(url, headers=None, params=None, timeout=None):
+        return FakeResponse(200, payload)
+
+    import services.ssh_gateway_client as mod
+
+    monkeypatch.setattr(mod, "_http_get", _get)
+    with pytest.raises(TargetUnavailable) as excinfo:
+        await resolve_target(_config(), "s-7f3a91c2", "SHA256:abc")
+    assert excinfo.value.state == "unreachable"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", [["a", "list"], {"a": "dict"}], ids=["list", "dict"])
+async def test_unhashable_state_refuses_instead_of_crashing(monkeypatch, state):
+    """`state in REFUSAL_MESSAGES` raises `TypeError: unhashable type` for a
+    list/dict state -- the report's own claim that this branch "handles
+    absent/unexpected values without crashing" was false for this case
+    (review §1/§4.6)."""
+
+    async def _get(url, headers=None, params=None, timeout=None):
+        return FakeResponse(200, {"state": state})
+
+    import services.ssh_gateway_client as mod
+
+    monkeypatch.setattr(mod, "_http_get", _get)
+    with pytest.raises(TargetUnavailable) as excinfo:
+        await resolve_target(_config(), "s-7f3a91c2", "SHA256:abc")
+    assert excinfo.value.state == "unreachable"
+
+
 @pytest.mark.asyncio
 async def test_live_payload_with_null_port_refuses_instead_of_crashing(monkeypatch):
     """Ruling G13: ``state: "live"`` is not proof the rest of the payload is
@@ -140,17 +315,7 @@ async def test_live_payload_with_null_port_refuses_instead_of_crashing(monkeypat
     in the SSH server."""
 
     async def _get(url, headers=None, params=None, timeout=None):
-        return FakeResponse(
-            200,
-            {
-                "thread_id": "t1",
-                "user_id": "u1",
-                "pod_ip": "svc.ns.svc.cluster.local",
-                "pod_port": None,
-                "host_key_fingerprint": "SHA256:xyz",
-                "state": "live",
-            },
-        )
+        return FakeResponse(200, _live_payload(pod_port=None))
 
     import services.ssh_gateway_client as mod
 
@@ -166,17 +331,9 @@ async def test_live_payload_missing_a_field_refuses_instead_of_crashing(monkeypa
     required field must not surface as an unhandled ``KeyError`` either."""
 
     async def _get(url, headers=None, params=None, timeout=None):
-        return FakeResponse(
-            200,
-            {
-                "thread_id": "t1",
-                "user_id": "u1",
-                "pod_ip": "svc.ns.svc.cluster.local",
-                "pod_port": 30022,
-                "state": "live",
-                # host_key_fingerprint is missing entirely.
-            },
-        )
+        payload = _live_payload()
+        del payload["host_key_fingerprint"]
+        return FakeResponse(200, payload)
 
     import services.ssh_gateway_client as mod
 
@@ -184,6 +341,74 @@ async def test_live_payload_missing_a_field_refuses_instead_of_crashing(monkeypa
     with pytest.raises(TargetUnavailable) as excinfo:
         await resolve_target(_config(), "s-7f3a91c2", "SHA256:abc")
     assert excinfo.value.state == "unreachable"
+
+
+# ---------------------------------------------------------------------------
+# Review Important 3.2: the live guard is type-blind. A frozen dataclass
+# performs no runtime validation, so a "live" state with a null pod_ip, or a
+# bool/float/out-of-range pod_port, still produced a usable-looking
+# SshTarget.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"pod_ip": None},
+        {"pod_ip": ""},
+        {"pod_port": True},
+        {"pod_port": 3.9},
+        {"pod_port": 0},
+        {"pod_port": 70000},
+        {"pod_port": "30022"},
+        {"host_key_fingerprint": None},
+        {"host_key_fingerprint": ""},
+    ],
+    ids=[
+        "pod_ip-null",
+        "pod_ip-empty",
+        "pod_port-bool-true",
+        "pod_port-float",
+        "pod_port-zero",
+        "pod_port-too-large",
+        "pod_port-numeric-string",
+        "fingerprint-null",
+        "fingerprint-empty",
+    ],
+)
+async def test_live_payload_with_an_invalid_field_refuses_instead_of_returning_a_target(
+    monkeypatch, overrides
+):
+    """isinstance(True, int) is True and int(3.9) == 3 -- both must be
+    excluded explicitly, not discovered by a bare isinstance/int() pair."""
+
+    async def _get(url, headers=None, params=None, timeout=None):
+        return FakeResponse(200, _live_payload(**overrides))
+
+    import services.ssh_gateway_client as mod
+
+    monkeypatch.setattr(mod, "_http_get", _get)
+    with pytest.raises(TargetUnavailable) as excinfo:
+        await resolve_target(_config(), "s-7f3a91c2", "SHA256:abc")
+    assert excinfo.value.state == "unreachable"
+
+
+@pytest.mark.asyncio
+async def test_live_payload_with_valid_fields_is_still_accepted(monkeypatch):
+    """Negative control for the validation above: an ordinary well-formed
+    live payload must still come back as a usable SshTarget."""
+
+    async def _get(url, headers=None, params=None, timeout=None):
+        return FakeResponse(200, _live_payload())
+
+    import services.ssh_gateway_client as mod
+
+    monkeypatch.setattr(mod, "_http_get", _get)
+    target = await resolve_target(_config(), "s-7f3a91c2", "SHA256:abc")
+    assert target.pod_ip == "10.1.2.3"
+    assert target.pod_port == 30022
+    assert target.host_key_fingerprint == "SHA256:xyz"
 
 
 @pytest.mark.asyncio
@@ -202,14 +427,9 @@ async def test_the_three_added_states_are_not_collapsed_to_unreachable(
     async def _get(url, headers=None, params=None, timeout=None):
         return FakeResponse(
             200,
-            {
-                "thread_id": "t1",
-                "user_id": "u1",
-                "pod_ip": None,
-                "pod_port": None,
-                "host_key_fingerprint": None,
-                "state": state,
-            },
+            _live_payload(
+                pod_ip=None, pod_port=None, host_key_fingerprint=None, state=state
+            ),
         )
 
     import services.ssh_gateway_client as mod
@@ -228,6 +448,15 @@ def _non_live_states() -> list[str]:
     to ``ssh_gateway_targets.py`` is picked up here automatically, so if
     ``REFUSAL_MESSAGES`` is not updated to match, this test fails instead of
     ``resolve_target`` silently degrading the new state to "unreachable".
+
+    Review 4.4: this depends on one convention holding upstream -- every
+    state is a module-level ``STATE_*`` string constant. A new state added
+    under a different shape (an enum member, a differently-prefixed
+    constant, a bare string literal inside ``resolve_workspace_state``) is
+    not something this introspection can see; the
+    ``{"failed", "deleted", "stale_binding"} <= set(states)`` floor below
+    only catches *total* breakage of that convention, not the loss of one
+    member under it.
     """
     return [
         value
@@ -250,20 +479,68 @@ def test_every_state_has_a_message_and_exit_code():
         assert code in (69, 75, 77)
 
 
-def test_suspended_and_reclaimed_say_different_things():
-    """A reclaimed volume is not the same promise as a suspended one."""
-    assert REFUSAL_MESSAGES["suspended"][0] != REFUSAL_MESSAGES["reclaimed"][0]
+def test_client_side_states_are_covered_too():
+    """Review 4.1: "unreachable" and "denied" are synthesized by
+    resolve_target itself (five call sites: the outer except, the non-200
+    branch, the non-live fallback, and the payload-validation/malformed-
+    payload except), not STATE_* constants from ssh_gateway_targets --
+    _non_live_states() cannot see them by construction, so deleting either
+    entry from REFUSAL_MESSAGES went completely unnoticed before this test
+    existed. A downstream REFUSAL_MESSAGES[exc.state] lookup would KeyError
+    at the exact moment you least want an exception: while printing a
+    refusal."""
+    assert {"unreachable", "denied"} <= REFUSAL_MESSAGES.keys()
 
 
-def test_failed_deleted_and_stale_binding_say_different_things():
-    """Ruling G10: these three (plus never_provisioned, the state they used
-    to be misreported as inside ssh_gateway_targets.py itself) must each be
-    distinct -- collapsing any pair back together reintroduces the exact
-    "operator sent after the wrong problem" defect this ruling fixes."""
-    messages = {
-        REFUSAL_MESSAGES["failed"][0],
-        REFUSAL_MESSAGES["deleted"][0],
-        REFUSAL_MESSAGES["stale_binding"][0],
-        REFUSAL_MESSAGES["never_provisioned"][0],
-    }
-    assert len(messages) == 4
+def test_every_message_is_distinct():
+    """Review 4.2: two hardcoded pairs (suspended/reclaimed,
+    failed/deleted/stale_binding/never_provisioned) only spot-checked
+    distinctness -- making `restoring` silently reuse
+    `never_provisioned`'s text still passed 12/12. This is the structural
+    form of the property: every message in the table must be unique, since
+    a repeated message hides which of two different problems the user
+    actually has (e.g. a reclaimed volume is not the same promise as a
+    merely suspended one, and none of "failed"/"deleted"/"stale_binding"
+    should read the same as the "never_provisioned" state they used to be
+    misreported as, inside ssh_gateway_targets.py itself, before that
+    module's own fix)."""
+    messages = [message for message, _ in REFUSAL_MESSAGES.values()]
+    assert len(set(messages)) == len(messages)
+
+
+_EXPECTED_EXIT_CODES = {
+    # 75 EX_TEMPFAIL -- genuinely retryable without anything else changing.
+    "suspended": 75,
+    "reclaimed": 75,
+    "ending": 75,
+    "restoring": 75,
+    # 69 EX_UNAVAILABLE -- broken or gone, not fixed by retrying alone.
+    "failed": 69,
+    "deleted": 69,
+    "ended": 69,
+    "stale_binding": 69,
+    "never_provisioned": 69,
+    "unreachable": 69,
+    # 77 EX_NOPERM -- policy refusals.
+    "denied": 77,
+    "vm_unsupported": 77,
+}
+
+
+def test_exit_codes_are_pinned_per_state_not_just_in_the_legal_set():
+    """Review 3.3: `assert code in (69, 75, 77)` alone still passes with
+    every state set to the same code -- verified: setting every entry's
+    code to 69 left the old suite at 12/12 green. An automated SSH retry
+    wrapper keying on the exit code would then loop forever against a
+    target that can never become live (vm_unsupported, failed, deleted,
+    ended) or, conversely, give up immediately on one genuinely worth
+    retrying (suspended, restoring). Pin each state's code individually.
+
+    The set-equality assertion (not just iterating _EXPECTED_EXIT_CODES)
+    also catches a state present in one table but not the other in either
+    direction.
+    """
+    assert set(_EXPECTED_EXIT_CODES) == set(REFUSAL_MESSAGES)
+    for state, expected_code in _EXPECTED_EXIT_CODES.items():
+        _, code = REFUSAL_MESSAGES[state]
+        assert code == expected_code, f"{state}: expected {expected_code}, got {code}"
