@@ -9,6 +9,7 @@ Or from orchestrator directory:
 
 import asyncio
 import copy
+import functools
 import hashlib
 import hmac
 import json
@@ -64037,6 +64038,81 @@ async def create_ssh_attach_token(request: Request) -> dict[str, Any]:
     return {
         "token": token,
         "expires_at": datetime.fromtimestamp(expires_at, tz=timezone.utc).isoformat(),
+    }
+
+
+@functools.lru_cache(maxsize=8)
+def _load_ssh_gateway_host_keys(paths_value: str) -> tuple[dict[str, str], ...]:
+    """Parse and fingerprint the gateway's public host keys.
+
+    Cached on ``paths_value`` itself — the raw ``SSH_GATEWAY_PUBLIC_HOST_KEYS``
+    string — not on nothing. ``get_ssh_host_keys`` below is unauthenticated by
+    design, so without this cache every anonymous request would drive a fresh
+    blocking ``open()`` plus asyncssh parse per configured key, on the event
+    loop, with no rate limit in front of it. Host key files don't change while
+    a pod is running, and keying the cache on the env value itself (rather
+    than calling this with no arguments) means a changed value — a real
+    config update, or a different value monkeypatched in per-test — gets a
+    fresh parse instead of a stale hit.
+    """
+    import asyncssh
+
+    entries: list[dict[str, str]] = []
+    for path in (p.strip() for p in paths_value.split(",")):
+        if not path:
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                raw = handle.read()
+            key = asyncssh.import_public_key(raw)
+        except Exception:
+            logger.warning("ssh gateway host key unreadable at %s", path)
+            continue
+        entries.append(
+            {
+                "type": key.get_algorithm(),
+                "public_key": key.export_public_key().decode().strip(),
+                "fingerprint": key.get_fingerprint("sha256"),
+            }
+        )
+    return tuple(entries)
+
+
+# nosec: public ssh-host-key-pinning (host keys are public material; client needs them before it can authenticate anything)
+@app.get("/api/ssh/host-keys")
+async def get_ssh_host_keys(request: Request) -> dict[str, Any]:
+    """Publish the SSH gateway's host keys so client tooling can pin them
+    without a human comparing fingerprints by eye (Gitpod's
+    ``/_ssh/host_keys``, Tailscale's control-plane distribution).
+
+    Deliberately unauthenticated: host keys are public, and the client needs
+    this response before it has anything to authenticate against yet. This
+    runs in the orchestrator, not the gateway process — it reads
+    ``SSH_GATEWAY_PUBLIC_HOST_KEYS`` (comma-separated public-key file paths)
+    and ``SSH_GATEWAY_HOSTNAME`` from its own environment, which the gateway
+    Deployment's operator is responsible for keeping in sync with the
+    gateway's actual ``SSH_GATEWAY_HOST_KEYS`` (private-key) configuration.
+
+    A path that doesn't parse as a key (missing, unreadable, garbage) is
+    logged and skipped rather than raising — one bad entry in the list
+    should not take down discovery for the rest. Pointing an entry at a
+    private key instead of its ``.pub`` file does not raise either: asyncssh
+    parses OpenSSH private-key material leniently and returns only its
+    public component (verified by reading ``asyncssh.public_key._decode_public``,
+    not assumed) — so this is not a rejection path, it is quietly correct.
+    Either way, only ``export_public_key()`` output ever reaches the
+    response; nothing here ever calls an export-private path.
+
+    Returns ``{"host_keys": [], "hostname": ...}`` when unconfigured, never
+    an error — an SSH client probing this before any gateway exists is a
+    normal, not exceptional, state.
+    """
+    entries = _load_ssh_gateway_host_keys(
+        os.environ.get("SSH_GATEWAY_PUBLIC_HOST_KEYS") or ""
+    )
+    return {
+        "host_keys": [dict(entry) for entry in entries],
+        "hostname": os.environ.get("SSH_GATEWAY_HOSTNAME", ""),
     }
 
 

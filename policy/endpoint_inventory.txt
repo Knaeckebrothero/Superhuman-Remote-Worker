@@ -421,6 +421,7 @@ POST   /api/ssh-keys                                                            
 POST   /api/ssh-keys/challenge                                                          gated:require_approved_user
 DELETE /api/ssh-keys/{key_id}                                                           gated:require_approved_user
 POST   /api/ssh/attach-token                                                            gated:require_approved_user
+GET    /api/ssh/host-keys                                                               public:ssh-host-key-pinning (host keys are public material; client needs them before it can authenticate anything)
 GET    /api/stats/agents                                                                admin:_require_admin
 GET    /api/stats/daily                                                                 gated:require_approved_user
 GET    /api/stats/jobs                                                                  gated:require_approved_user
