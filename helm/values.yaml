@@ -2641,6 +2641,12 @@ test:
 # =============================================================================
 reloader:
   enabled: true
+  # -- Watch every namespace in the cluster (ClusterRole) instead of only the
+  # release namespace (Role). Reloader only ever acts on workloads in this
+  # release, so the default is the narrow one: on a shared cluster a
+  # ClusterRole would hand this pod read access to every other tenant's
+  # Secrets. Verified on k3d that a namespaced Role still triggers reloads.
+  watchGlobally: false
   image: stakater/reloader:v1.3.0
   resources:
     requests:
