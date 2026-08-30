@@ -64041,32 +64041,48 @@ async def create_ssh_attach_token(request: Request) -> dict[str, Any]:
     }
 
 
-@functools.lru_cache(maxsize=8)
-def _load_ssh_gateway_host_keys(paths_value: str) -> tuple[dict[str, str], ...]:
-    """Parse and fingerprint the gateway's public host keys.
+class _PartialHostKeyRead(Exception):
+    """Carries a partial host-key read past ``functools.lru_cache``.
 
-    Cached on ``paths_value`` itself — the raw ``SSH_GATEWAY_PUBLIC_HOST_KEYS``
-    string — not on nothing. ``get_ssh_host_keys`` below is unauthenticated by
-    design, so without this cache every anonymous request would drive a fresh
-    blocking ``open()`` plus asyncssh parse per configured key, on the event
-    loop, with no rate limit in front of it. Host key files don't change while
-    a pod is running, and keying the cache on the env value itself (rather
-    than calling this with no arguments) means a changed value — a real
-    config update, or a different value monkeypatched in per-test — gets a
-    fresh parse instead of a stale hit.
+    ``lru_cache`` does not memoize calls that raise, which is exactly the
+    behavior wanted here: see ``_load_ssh_gateway_host_keys``.
+    """
+
+    def __init__(self, entries: tuple[dict[str, str], ...]) -> None:
+        super().__init__("one or more ssh gateway host key paths were unreadable")
+        self.entries = entries
+
+
+# Cap on how much of an operator-supplied path is read. A public key file is
+# a few hundred bytes; anything larger is a mis-pointed path, and there is no
+# reason to slurp it into memory to fail parsing it.
+_SSH_HOST_KEY_READ_LIMIT = 65536
+
+
+def _parse_ssh_gateway_host_keys(
+    paths_value: str,
+) -> tuple[tuple[dict[str, str], ...], bool]:
+    """Read and fingerprint every path in ``paths_value`` (uncached).
+
+    Returns ``(entries, complete)``. ``complete`` is False when any configured
+    path failed to read or parse. A bad entry is skipped rather than raising —
+    one typo in the list must not take down discovery for the rest — but the
+    caller needs to know it happened so it does not memoize a partial answer.
     """
     import asyncssh
 
     entries: list[dict[str, str]] = []
+    complete = True
     for path in (p.strip() for p in paths_value.split(",")):
         if not path:
             continue
         try:
             with open(path, "r", encoding="utf-8") as handle:
-                raw = handle.read()
+                raw = handle.read(_SSH_HOST_KEY_READ_LIMIT)
             key = asyncssh.import_public_key(raw)
         except Exception:
             logger.warning("ssh gateway host key unreadable at %s", path)
+            complete = False
             continue
         entries.append(
             {
@@ -64075,7 +64091,49 @@ def _load_ssh_gateway_host_keys(paths_value: str) -> tuple[dict[str, str], ...]:
                 "fingerprint": key.get_fingerprint("sha256"),
             }
         )
-    return tuple(entries)
+    return tuple(entries), complete
+
+
+@functools.lru_cache(maxsize=8)
+def _memoized_ssh_gateway_host_keys(paths_value: str) -> tuple[dict[str, str], ...]:
+    """Memoize a *complete* parse only; raise on a partial one.
+
+    ``functools.lru_cache`` never caches a call that raises, so signalling a
+    partial read with ``_PartialHostKeyRead`` is what makes the next request
+    retry instead of inheriting the failure.
+    """
+    entries, complete = _parse_ssh_gateway_host_keys(paths_value)
+    if not complete:
+        raise _PartialHostKeyRead(entries)
+    return entries
+
+
+def _load_ssh_gateway_host_keys(paths_value: str) -> tuple[dict[str, str], ...]:
+    """Parse and fingerprint the gateway's public host keys.
+
+    A fully-successful parse is cached on ``paths_value`` itself — the raw
+    ``SSH_GATEWAY_PUBLIC_HOST_KEYS`` string, not on nothing.
+    ``get_ssh_host_keys`` below is unauthenticated by design, so without that
+    cache every anonymous request would drive a fresh blocking ``open()`` plus
+    asyncssh parse per configured key, on the event loop, with no rate limit
+    in front of it. Keying on the env value (rather than calling with no
+    arguments) means a changed value — a real config update, or a different
+    value monkeypatched in per-test — gets a fresh parse instead of a stale
+    hit.
+
+    A partial or failed read is deliberately *not* cached. These files arrive
+    on a projected Secret volume, so contrary to what one might assume they
+    very much can be absent or in flux while the pod runs: the volume may not
+    be projected yet when the first request lands, and a read can fall in the
+    window where kubelet swaps the ``..data`` symlink during a Secret update.
+    Memoizing that outcome would publish ``host_keys: []`` — a hard stop for a
+    pinning client — until the pod restarted. Retrying costs one re-read per
+    request, and only for as long as the underlying problem lasts.
+    """
+    try:
+        return _memoized_ssh_gateway_host_keys(paths_value)
+    except _PartialHostKeyRead as partial:
+        return partial.entries
 
 
 # nosec: public ssh-host-key-pinning (host keys are public material; client needs them before it can authenticate anything)
