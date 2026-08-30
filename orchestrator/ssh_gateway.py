@@ -79,6 +79,7 @@ import errno
 import functools
 import ipaddress
 import logging
+import os
 import socket
 from typing import Optional, Sequence
 
@@ -647,6 +648,22 @@ async def healthz(request):
 
 
 def _build_app() -> Starlette:
+    # Without this the gateway's INFO records are dropped on the floor. Nothing
+    # in this process configures the root logger: uvicorn's dictConfig sets up
+    # only its own `uvicorn.*` loggers, leaving root with no handler, so Python
+    # falls back to `logging.lastResort` -- which is WARNING-level. Warnings,
+    # errors and tracebacks still surface, which is why this is easy to miss;
+    # what disappears is every refusal reason ("refused wss handshake from %s
+    # (%s)", "refused tcp connection from %s"), i.e. exactly what an operator
+    # needs when a user reports that SSH will not connect. Deliberately NOT the
+    # orchestrator's configure_logging(): reaching it from this flattened image
+    # means a try/except ModuleNotFoundError import dance, and getting that
+    # wrong crash-loops the gateway to gain a log format. basicConfig is a
+    # no-op when a handler already exists, so it cannot fight a real config.
+    logging.basicConfig(
+        level=os.environ.get("SSH_GATEWAY_LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
     config = load_config()
     application = Starlette(
         routes=[

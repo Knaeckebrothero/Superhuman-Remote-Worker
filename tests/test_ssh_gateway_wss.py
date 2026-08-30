@@ -21,6 +21,7 @@ including the one where ``accept()`` raises.
 
 import asyncio
 import errno
+import logging
 import socket
 import subprocess
 from types import SimpleNamespace
@@ -739,3 +740,39 @@ def app(gateway_environment):
     application.state.limiter = RecordingLimiter()
     application.state.context.limiter = application.state.limiter
     return application
+
+
+def test_info_records_survive_app_construction(gateway_environment):
+    """The gateway's refusal reasons must not be filtered out in production.
+
+    Nothing in this process configures the root logger — uvicorn's dictConfig
+    sets up only its own ``uvicorn.*`` loggers — so root is left with no
+    handler and Python falls back to ``logging.lastResort``, which is
+    WARNING-level. Warnings and tracebacks still surface, which is exactly why
+    this is easy to miss; what silently disappears is every INFO record, and on
+    this gateway that is the refusal path: "refused wss handshake from %s
+    (%s)", "refused tcp connection from %s", "refusing a subsystem channel".
+    Those are the first thing anyone asks for when a user reports that SSH will
+    not connect.
+
+    Asserts on the logger's effective level rather than on captured output,
+    because pytest's own capture plumbing attaches handlers and would mask the
+    very condition under test.
+    """
+    root = logging.getLogger()
+    saved_handlers, saved_level = root.handlers[:], root.level
+    try:
+        root.handlers.clear()
+        root.setLevel(logging.WARNING)  # a fresh interpreter's default
+
+        ssh_gateway.create_app()
+
+        gateway_logger = logging.getLogger(ssh_gateway.__name__)
+        assert gateway_logger.isEnabledFor(logging.INFO), (
+            "INFO is filtered, so every refusal reason is dropped: an operator "
+            "sees a failed connection with no logged cause"
+        )
+        assert root.handlers, "no root handler: records reach lastResort at WARNING"
+    finally:
+        root.handlers[:] = saved_handlers
+        root.setLevel(saved_level)
