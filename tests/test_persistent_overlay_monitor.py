@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import uuid
+from collections.abc import Callable
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -63,18 +64,38 @@ async def _run_loop_briefly(
     monkeypatch: pytest.MonkeyPatch,
     ticks: float = 2.5,
     interval: float = 0.01,
+    until: Callable[[], bool] | None = None,
 ) -> None:
-    """Start the monitor loop with a tiny probe interval, let it tick a few
-    times, then cancel it cleanly (mirrors this repo's other create_task +
-    sleep + cancel loop tests, e.g. tests/test_leader_election.py)."""
+    """Run the monitor until its expected effect, then cancel it cleanly.
+
+    Positive assertions wait on behavior rather than a fixed number of tiny
+    sleeps.  The monitor dispatches probe and heal calls separately to the
+    shared executor, so elapsed wall time is not a reliable indication that a
+    queued heal has started when the full suite is under load.
+    """
     monkeypatch.setattr(ps_module, "_CLOUD_OVERLAY_MONITOR_INTERVAL_SECONDS", interval)
     task = asyncio.create_task(session._cloud_overlay_monitor_loop())
-    await asyncio.sleep(interval * ticks)
-    task.cancel()
     try:
-        await task
-    except asyncio.CancelledError:
-        pass
+        if until is None:
+            await asyncio.sleep(interval * ticks)
+        else:
+
+            async def _wait_for_expected_effect() -> None:
+                while not until():
+                    if task.done():
+                        await task
+                        raise AssertionError(
+                            "overlay monitor exited before expected effect"
+                        )
+                    await asyncio.sleep(0)
+
+            await asyncio.wait_for(_wait_for_expected_effect(), timeout=5)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 @pytest.mark.asyncio
@@ -87,7 +108,11 @@ async def test_monitor_heals_on_dead_probe(monkeypatch):
         _protected_mount_id="protected-t",
     )
 
-    await _run_loop_briefly(session, monkeypatch=monkeypatch)
+    await _run_loop_briefly(
+        session,
+        monkeypatch=monkeypatch,
+        until=lambda: overlay.heal_calls >= 1 and bool(rclone.restart_calls),
+    )
 
     assert overlay.health_check_calls >= 1
     assert overlay.heal_calls >= 1
@@ -105,7 +130,11 @@ async def test_monitor_noop_when_healthy(monkeypatch):
         _protected_mount_id="protected-t",
     )
 
-    await _run_loop_briefly(session, monkeypatch=monkeypatch)
+    await _run_loop_briefly(
+        session,
+        monkeypatch=monkeypatch,
+        until=lambda: overlay.health_check_calls >= 1,
+    )
 
     assert overlay.health_check_calls >= 1
     assert overlay.heal_calls == 0
@@ -122,9 +151,11 @@ async def test_monitor_survives_heal_exception(monkeypatch):
         _protected_mount_id="protected-t",
     )
 
-    # Enough ticks that the loop would have died on the first heal exception
-    # if the try/except were missing or misplaced.
-    await _run_loop_briefly(session, monkeypatch=monkeypatch, ticks=4.5)
+    await _run_loop_briefly(
+        session,
+        monkeypatch=monkeypatch,
+        until=lambda: overlay.heal_calls >= 2,
+    )
 
     assert overlay.heal_calls >= 2, "loop must keep probing after a heal exception"
 
@@ -158,9 +189,11 @@ async def test_monitor_survives_overlay_active_property_exception(monkeypatch):
         _protected_mount_id="protected-t",
     )
 
-    # Enough ticks that the loop would have died on the first .active read
-    # if the guard didn't cover that access too.
-    await _run_loop_briefly(session, monkeypatch=monkeypatch, ticks=4.5)
+    await _run_loop_briefly(
+        session,
+        monkeypatch=monkeypatch,
+        until=lambda: overlay.probe_attempts >= 2,
+    )
 
     assert overlay.probe_attempts >= 2, (
         "loop must keep ticking past a non-heal exception"
