@@ -34,10 +34,12 @@ import copy
 import dataclasses
 import fnmatch
 import functools
+import hashlib
 import inspect
 import itertools
 import logging
 import posixpath
+import re
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -420,10 +422,35 @@ class NoPushGitManager:
         return getattr(self._inner, name)
 
 
+_TAB_UNSAFE = re.compile(r"[^a-z0-9]")
+
+
+def child_tab_prefix(handle: str) -> str:
+    """A shell-tab prefix that survives the real transport's validator.
+
+    ``RemoteBackend.TAB_NAME_PATTERN`` is ``^[a-z0-9-]{1,20}$`` and the tab a
+    child opens is ``<prefix><name>``, so the prefix must be short and contain
+    no underscore. The handle's 4-hex suffix is already unique per parent,
+    which is all the namespacing a child needs, and it leaves 15 characters
+    for the child's own tab name.
+
+    The original ``f"{handle}__"`` failed that pattern twice over -- underscores
+    and 25 characters for ``implementer-1cb8__default`` -- which broke
+    ``run_command`` for every shell-capable child. It went unnoticed because the
+    unit test drove a permissive filesystem backend; found on the U3 WP7 k3d
+    acceptance run (job dde11ae6).
+    """
+    tail = _TAB_UNSAFE.sub("", handle.rsplit("-", 1)[-1].lower())[:4]
+    if not tail:
+        tail = hashlib.sha256(handle.encode()).hexdigest()[:4]
+    return f"{tail}-"
+
+
 class SharedTreeShellBackend(SubdirBackend):
-    """The parent backend with ``<handle>__``-prefixed shell tabs and NO path
-    re-rooting — a ``shared`` child's shell runs in the parent tree on the
-    parent's tmux session, on tabs of its own."""
+    """The parent backend with short handle-derived prefixed shell tabs and NO
+    path re-rooting — a ``shared`` child's shell runs in the parent tree on the
+    parent's tmux session, on tabs of its own. See :func:`child_tab_prefix` for
+    why the prefix is the handle's hex tail rather than the whole handle."""
 
     def __init__(self, parent: Any, *, shell_tab_prefix: str) -> None:
         super().__init__(parent, "", shell_tab_prefix=shell_tab_prefix)
@@ -866,7 +893,9 @@ def _shared_shell_manager(
         or not getattr(backend, "supports_shell", False)
     ):
         return None, None
-    prefixed = SharedTreeShellBackend(backend, shell_tab_prefix=f"{handle}__")
+    prefixed = SharedTreeShellBackend(
+        backend, shell_tab_prefix=child_tab_prefix(handle)
+    )
     try:
         from src.tools.shell.shell_manager import ShellManager
 
@@ -1108,6 +1137,7 @@ __all__ = [
     "build_child_config",
     "build_context_manager",
     "child_system_prompt",
+    "child_tab_prefix",
     "child_tool_config",
     "drop_missing_before_tool_bindings",
     "entry_tool_names",

@@ -432,10 +432,57 @@ class TestBuildShared:
         assert build.shell_backend.root == backend.root  # no re-rooting
         out = build.shell_backend.shell_run("ls", tab_name="default", working_dir="src")
         assert out == "ran ls in 'src'"
-        assert backend.tabs == ["probe-1a2b__default"]
+        assert backend.tabs == ["1a2b-default"]
         assert build.shell_backend.shell_list_tabs() == [{"name": "default"}]
         await build.release()
         assert backend.tabs == []  # only the child's tabs were closed
+
+
+class TestChildTabNames:
+    """The child tab prefix must satisfy the REAL transport validator.
+
+    The prefixed-tab test above drives a permissive filesystem backend, so it
+    passed while every shell-capable child was broken on the cluster with
+    ``Invalid tab name 'implementer-1cb8__default'`` (U3 WP7, job dde11ae6).
+    This pins the produced name against RemoteBackend's own pattern.
+    """
+
+    @pytest.mark.parametrize(
+        "handle",
+        [
+            "implementer-1cb8",
+            "tester-afa0",
+            "explorer-bbf4",
+            "reviewer-0001",
+            "verifier-dead",
+            "reader-9f9f",
+            "probe-1a2b",
+            "weird handle!!",
+            "x",
+        ],
+    )
+    @pytest.mark.parametrize("tab", ["default", "build", "a" * 15])
+    def test_prefixed_tab_matches_the_transport_pattern(self, handle, tab):
+        from src.core.backends.remote import TAB_NAME_PATTERN
+        from src.subagents.child import child_tab_prefix
+
+        name = f"{child_tab_prefix(handle)}{tab}"
+        assert TAB_NAME_PATTERN.fullmatch(name), name
+
+    def test_prefix_is_short_enough_to_leave_the_child_a_usable_budget(self):
+        from src.core.backends.remote import TAB_NAME_PATTERN
+        from src.subagents.child import child_tab_prefix
+
+        prefix = child_tab_prefix("implementer-1cb8")
+        assert len(prefix) == 5
+        # 20 - 5 leaves 15 for the child's own name; one more must fail.
+        assert TAB_NAME_PATTERN.fullmatch(prefix + "a" * 15)
+        assert not TAB_NAME_PATTERN.fullmatch(prefix + "a" * 16)
+
+    def test_distinct_children_get_distinct_prefixes(self):
+        from src.subagents.child import child_tab_prefix
+
+        assert child_tab_prefix("implementer-1cb8") != child_tab_prefix("tester-afa0")
 
 
 class TestBuildWorktree:
