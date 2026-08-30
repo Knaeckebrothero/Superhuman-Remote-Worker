@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import yaml
 from langchain_core.language_models import BaseChatModel
 
+from src.core.expert_resolution import ASSEMBLER_OWNED_PROMPT_TOKENS
 from src.core.model_registry import family_of
 from src.core.tool_policy import (
     assert_tool_policy_canonical,
@@ -4632,8 +4633,12 @@ def load_phase_component(
 # EVERY ``{...}`` as a field and raises KeyError on the first literal brace,
 # which hard-fails the job at phase render (vault issues/, product-qa 'py,sh,md').
 _PROMPT_PLACEHOLDER_RE = re.compile(
-    r"\{(phase_number|agent_display_name|expert_identity|available_skills|"
-    r"subagent_environment|prompt_content)\}"
+    r"\{("
+    + "|".join(
+        re.escape(token.removeprefix("{").removesuffix("}"))
+        for token in ASSEMBLER_OWNED_PROMPT_TOKENS
+    )
+    + r")\}"
 )
 
 

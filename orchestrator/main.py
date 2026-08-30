@@ -61509,12 +61509,24 @@ _ALLOWED_EXPERT_PROMPT_KEYS = {
 
 
 def _validate_expert_prompts(v: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Reject unknown keys in an expert ``prompts`` payload (defense-in-depth)."""
+    """Validate the DB-expert prompt boundary (defense-in-depth)."""
     if v:
         unknown = set(v) - _ALLOWED_EXPERT_PROMPT_KEYS
         if unknown:
             raise ValueError(f"Unknown prompt keys: {sorted(unknown)}")
-    return v
+    from src.core.expert_resolution import validate_expert_persona_placeholders
+
+    return validate_expert_persona_placeholders(v)
+
+
+def _validate_expert_prompt_source_or_422(
+    prompts: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Reject an invalid stored/bundled copy source as an authoring error."""
+    try:
+        return _validate_expert_prompts(prompts)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 class ExpertCreate(BaseModel):
@@ -62064,6 +62076,7 @@ async def _create_forked_expert(
 
     base_name = src["name"]
     name = f"{base_name}-{suffix}"[:100]
+    prompts = _validate_expert_prompt_source_or_422(src.get("prompts") or {}) or {}
     for attempt in range(6):
         try:
             return await postgres_db.create_expert(
@@ -62076,7 +62089,7 @@ async def _create_forked_expert(
                 color=src.get("color", "#6B7280"),
                 tags=with_role_tag(src["expert_type"], src.get("tags")),
                 config=src.get("config") or {},
-                prompts=src.get("prompts") or {},
+                prompts=prompts,
             )
         except HTTPException:
             raise
@@ -62477,6 +62490,9 @@ async def fork_my_expert_default(
         source = _db_expert_to_bundle_src(selection.expert)
 
     source["config"] = _validate_expert_fragment(source.get("config") or {})
+    source["prompts"] = (
+        _validate_expert_prompt_source_or_422(source.get("prompts") or {}) or {}
+    )
     # Same 2026-08-04 decision as duplicate_expert (task 3 of the plan above):
     # this is `duplicate` plus "select the copy as my default", and its source
     # config carries the identical 7-of-11 exposure — a bundled expert or

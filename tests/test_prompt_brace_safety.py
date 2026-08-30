@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pytest
 
+from src.core.expert_resolution import ASSEMBLER_OWNED_PROMPT_TOKENS
 from src.core.loader import render_instruction_content, render_placeholders
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -32,6 +33,19 @@ _KNOWN = {
     "subagent_environment": "SENTINEL_SUBAGENT_ENVIRONMENT",
     "prompt_content": "SENTINEL_CONTENT",
 }
+
+_ASSEMBLER_PLACEHOLDERS = tuple(
+    token.removeprefix("{").removesuffix("}") for token in ASSEMBLER_OWNED_PROMPT_TOKENS
+)
+_ASSEMBLER_PLACEHOLDER_RE = re.compile(
+    r"\{(?:" + "|".join(map(re.escape, _ASSEMBLER_PLACEHOLDERS)) + r")\}"
+)
+
+_PERSONA_GLOBS = [
+    "config/experts/*/persona*.txt",
+    "config/subagents/*/persona*.txt",
+    "config/prompts/persona*.txt",
+]
 
 # Files that flow through the get_phase_system_prompt render sites: expert phase
 # prompts + persona, and the bundled base/phase/persona templates. Summarization,
@@ -56,9 +70,21 @@ def _shipped_prompts() -> list[Path]:
     return found
 
 
+def _shipped_personas() -> list[Path]:
+    found: list[Path] = []
+    for pattern in _PERSONA_GLOBS:
+        found.extend(sorted(_REPO_ROOT.glob(pattern)))
+    assert found, "persona source-policy sweep matched no files"
+    return found
+
+
 def _has_tool_names(content: str) -> list[str]:
     """Tool names referenced by ``has_tool("x")`` so the true Jinja branch renders."""
     return re.findall(r'has_tool\(\s*["\']([^"\']+)["\']\s*\)', content)
+
+
+def test_prompt_sweep_values_cover_the_assembler_contract():
+    assert tuple(_KNOWN) == _ASSEMBLER_PLACEHOLDERS
 
 
 @pytest.mark.parametrize(
@@ -79,6 +105,18 @@ def test_shipped_prompt_survives_render_pipeline(prompt_path: Path):
         # Must not raise regardless of which tokens are literal prose vs. ours.
         rendered = render_placeholders(jinja_rendered, **_KNOWN)
         assert rendered.strip(), f"{prompt_path} rendered empty (tools={tool_names!r})"
+
+
+@pytest.mark.parametrize(
+    "persona_path",
+    _shipped_personas(),
+    ids=lambda p: str(p.relative_to(_REPO_ROOT)),
+)
+def test_shipped_persona_contains_no_assembler_placeholder(persona_path: Path):
+    """Personas are content, never a nested source for the prompt assembler."""
+    content = persona_path.read_text(encoding="utf-8")
+    found = sorted(set(_ASSEMBLER_PLACEHOLDER_RE.findall(content)))
+    assert not found, f"{persona_path}: reserved assembler placeholders: {found}"
 
 
 def test_sweep_covers_the_known_offenders():

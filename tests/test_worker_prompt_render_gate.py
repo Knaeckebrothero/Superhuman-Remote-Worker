@@ -174,6 +174,10 @@ def test_system_prompt_renders_phase_agnostic(name, leaf, family):
     label = f"{name}/{family} system prompt"
     _assert_clean(prompt, label)
     assert cfg.display_name in prompt, label
+    persona = PromptMatrixResolver(str(leaf.parent), family).load("persona").strip()
+    assert persona and persona in prompt, label
+    assert "agent_display_name" not in prompt, label
+    assert "<user_persona" not in prompt, label
     assert any(m in prompt for m in _PHASE_MODEL_MARKERS), label
     assert not any(m in prompt for m in _PHASE_DIRECTIVE_MARKERS), label
     assert "phase instructions" in prompt, label

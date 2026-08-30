@@ -17,7 +17,10 @@ from typing import Any, Literal
 import yaml
 
 from .grants_service import resolve_grants_for
-from src.core.expert_resolution import with_role_tag
+from src.core.expert_resolution import (
+    validate_expert_persona_placeholders,
+    with_role_tag,
+)
 from src.core.loader import canonical_config_name, expert_phase_prompt_bodies
 
 logger = logging.getLogger(__name__)
@@ -98,6 +101,7 @@ def load_seed_bundle(
     # strategic/tactical: the expert-local phase skill bodies (U2), same DB
     # keys — delivered as the fenced <expert_workflow> addendum of the phase block.
     prompts.update(expert_phase_prompt_bodies(expert_dir))
+    validate_expert_persona_placeholders(prompts)
 
     return {
         "name": directory,

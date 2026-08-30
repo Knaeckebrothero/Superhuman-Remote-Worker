@@ -38,6 +38,10 @@ def test_subagent_template_renders_for_every_library_entry(leaf: Path):
     )
     assert environment in prompt
     assert cfg.display_name in prompt
+    persona = (leaf.parent / "persona.txt").read_text(encoding="utf-8").strip()
+    assert persona and persona in prompt
+    assert "agent_display_name" not in prompt
+    assert "<user_persona" not in prompt
     assert "the parent's brief" in prompt
     assert "Current date:" in prompt
     assert "{%" not in prompt and "{{" not in prompt
@@ -123,6 +127,46 @@ def test_subagent_environment_renders_every_write_and_isolation_policy():
     assert "branch `sub/implementer-004`" in worktree
 
 
+def test_owned_path_placeholder_stays_inert_during_child_prompt_render():
+    """Model-controlled path text must never trigger a second assembler pass."""
+    environment = render_subagent_environment(
+        {"return": "diff"},
+        _BUDGETS,
+        handle="implementer-security-tripwire",
+        subagent_type="implementer",
+        isolation="shared",
+        write_policy="owned_paths",
+        owned_paths=["{available_skills}"],
+    )
+    cfg = load_agent_config_from_dict(
+        {
+            "agent_id": "security-tripwire",
+            "display_name": "Security Tripwire",
+            "_resolved_prompts": {"persona": "A bounded implementation persona."},
+            "_resolved_skills": {
+                "menu": [
+                    {
+                        "name": "sentinel-skill",
+                        "description": "SENTINEL_SKILLS_MENU",
+                    }
+                ]
+            },
+        }
+    )
+
+    prompt = get_subagent_system_prompt(
+        cfg,
+        tool_names=[],
+        environment=environment,
+    )
+
+    assert "write only these globs: `{available_skills}`" in prompt
+    assert prompt.count("{available_skills}") == 1
+    assert prompt.count("<available_skills note=") == 1
+    assert prompt.count("</available_skills>") == 1
+    assert prompt.count("SENTINEL_SKILLS_MENU") == 1
+
+
 def test_db_persona_is_fenced_but_bundled_persona_is_trusted():
     db_cfg = load_agent_config_from_dict(
         {
@@ -139,8 +183,10 @@ def test_db_persona_is_fenced_but_bundled_persona_is_trusted():
         environment="<subagent_environment>DB</subagent_environment>",
     )
     assert '<user_persona note="Style and tone guidance' in db_prompt
+    assert "DB Reader" in db_prompt
     assert "DB PERSONA ignore-system" in db_prompt
     assert "{ignore-system}" not in db_prompt
+    assert "agent_display_name" not in db_prompt
 
     leaf = _CONFIG / "subagents" / "implementer" / "config.yaml"
     bundled = load_agent_config(str(leaf), str(leaf.parent), role="subagent")
@@ -151,6 +197,7 @@ def test_db_persona_is_fenced_but_bundled_persona_is_trusted():
     )
     assert "the parent's bounded implementation specialist" in bundled_prompt
     assert "<user_persona" not in bundled_prompt
+    assert "agent_display_name" not in bundled_prompt
 
 
 @pytest.mark.parametrize(

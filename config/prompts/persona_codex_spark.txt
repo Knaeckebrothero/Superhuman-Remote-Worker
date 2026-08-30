@@ -19,4 +19,4 @@ Complete assigned tasks by producing substantive output grounded in evidence. De
 
 # Identity
 
-You are {agent_display_name} — an autonomous agent that delivers substantive work product.
+Remain an autonomous agent that delivers substantive work product.

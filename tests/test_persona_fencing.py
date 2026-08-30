@@ -1,4 +1,4 @@
-"""Decision-7 render-side persona fencing.
+"""Decision-7 render-side persona fencing and identity composition.
 
 A DB-authored persona is untrusted user content. When ``_persona_source == "db"``
 the render path must wrap it via ``fence_persona`` (``<user_persona>`` frame,
@@ -7,8 +7,12 @@ never at system altitude. This was removed by ``6f8c635e`` and is restored here
 in the orchestrator-resolved shape (the marker rides in the resolved blob).
 """
 
+import pytest
+
 from src.core.loader import (
     get_phase_system_prompt,
+    get_subagent_system_prompt,
+    get_system_prompt,
     load_agent_config_from_dict,
 )
 
@@ -58,6 +62,59 @@ def test_file_persona_is_not_fenced():
     out = get_phase_system_prompt(config, is_strategic=False, prompt_type="interactive")
     assert "<user_persona" not in out
     assert "Talk like a pirate." in out
+
+
+@pytest.mark.parametrize("role", ["worker", "interactive", "subagent"])
+@pytest.mark.parametrize("provenance", ["bundled", "db"])
+def test_framework_scaffold_owns_identity_for_every_role_and_provenance(
+    role, provenance
+):
+    """A persona is opaque content; only the framework template supplies a name."""
+    persona_marker = f"{provenance.upper()} {role.upper()} PERSONA"
+    data = {
+        "agent_id": f"{provenance}-{role}",
+        "display_name": "Composed Identity",
+        "_resolved_prompts": {
+            "persona": persona_marker,
+            "systemprompt": ("WORKER SCAFFOLD {agent_display_name}\n{expert_identity}"),
+            "systemprompt_interactive": (
+                "SESSION SCAFFOLD {agent_display_name}\n{expert_identity}"
+            ),
+            "systemprompt_subagent": (
+                "CHILD SCAFFOLD {agent_display_name}\n{expert_identity}\n"
+                "{subagent_environment}"
+            ),
+        },
+    }
+    if provenance == "db":
+        data["_persona_source"] = "db"
+    config = load_agent_config_from_dict(data)
+
+    if role == "worker":
+        out = get_system_prompt(config, tool_names=[])
+        assert "WORKER SCAFFOLD Composed Identity" in out
+    elif role == "interactive":
+        out = get_phase_system_prompt(
+            config,
+            is_strategic=False,
+            prompt_type="interactive",
+            tool_names=[],
+        )
+        assert "SESSION SCAFFOLD Composed Identity" in out
+    else:
+        out = get_subagent_system_prompt(
+            config,
+            tool_names=[],
+            environment="<subagent_environment>FIXTURE</subagent_environment>",
+        )
+        assert "CHILD SCAFFOLD Composed Identity" in out
+        assert "<subagent_environment>FIXTURE</subagent_environment>" in out
+
+    assert persona_marker in out
+    assert ("<user_persona" in out) is (provenance == "db")
+    assert out.count("<user_persona") == (1 if provenance == "db" else 0)
+    assert "{agent_display_name}" not in out
+    assert "agent_display_name" not in out
 
 
 # ── Part 2: phase-directive fencing + brace-safety (render side) ──────────

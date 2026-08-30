@@ -324,7 +324,11 @@ APP_THREADS_PARENT_JOB_IDX = (
 APP_THREADS_SUBAGENT_VALIDATE = (
     ROOT / "orchestrator/database/migrations/app/0208_threads_subagent_validate.sql"
 )
-APP_CURRENT_MIGRATION_HEAD = APP_THREADS_SUBAGENT_VALIDATE
+APP_EXPERT_PERSONA_IDENTITY_BACKFILL = (
+    ROOT
+    / "orchestrator/database/migrations/app/0209_expert_persona_identity_backfill.sql"
+)
+APP_CURRENT_MIGRATION_HEAD = APP_EXPERT_PERSONA_IDENTITY_BACKFILL
 AUDIT_EXPANSION = (
     ROOT
     / "orchestrator/database/migrations/audit/0003_infrastructure_usage_events_v2.sql"

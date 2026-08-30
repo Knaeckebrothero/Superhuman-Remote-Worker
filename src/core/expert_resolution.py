@@ -12,6 +12,45 @@ import unicodedata
 from typing import Any
 
 
+# These tokens belong to the framework prompt assembler. Expert personas are
+# content inserted into that framework template, never templates themselves.
+# Keep the spellings explicit: the write boundary rejects the exact syntax the
+# assembler understands while leaving arbitrary brace-bearing prose alone.
+ASSEMBLER_OWNED_PROMPT_TOKENS = (
+    "{phase_number}",
+    "{agent_display_name}",
+    "{expert_identity}",
+    "{available_skills}",
+    "{subagent_environment}",
+    "{prompt_content}",
+)
+
+
+def validate_expert_persona_placeholders(
+    prompts: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Reject framework-owned placeholders in an expert persona.
+
+    A persona is a substitution value in the outer prompt assembler. Treating
+    it as another template would make stored/user-authored content executable
+    prompt structure and would require recursively scanning replacement values.
+    Reject only the assembler's six exact tokens; other braces remain ordinary
+    persona prose and are handled by the existing DB-persona fence at render.
+    """
+    if not prompts:
+        return prompts
+    persona = prompts.get("persona")
+    if not isinstance(persona, str):
+        return prompts
+    found = [token for token in ASSEMBLER_OWNED_PROMPT_TOKENS if token in persona]
+    if found:
+        raise ValueError(
+            "Expert persona must be plain text; reserved prompt placeholders "
+            f"are not allowed: {', '.join(found)}"
+        )
+    return prompts
+
+
 def canonical_key(key: str) -> str:
     """Canonicalize a config key for deny-matching: NFKC, casefold, strip the
     common visual separators. Blocks case/Unicode/separator-aliased bypasses
