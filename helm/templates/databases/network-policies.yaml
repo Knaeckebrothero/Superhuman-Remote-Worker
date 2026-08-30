@@ -11,8 +11,8 @@ NetworkPolicy entirely — no allowance needed.
 
 Optional admin UIs (pgadmin) are conditionally added to the
 allow-list when their respective .enabled toggles are set. The short-lived
-llm-seed Job is allowed against the main Postgres so the install can seed
-the model catalog.
+llm-seed and research-provider-seed Jobs are allowed against the main Postgres
+so the install can seed the model catalog and the research provider catalog.
 */ -}}
 
 {{- if and .Values.databases.postgres.enabled .Values.databases.postgres.internal }}
@@ -54,6 +54,14 @@ spec:
         - podSelector:
             matchLabels:
               {{- include "srw.componentSelectorLabels" (dict "context" . "component" "llm-seed") | nindent 14 }}
+        # Same shape as llm-seed above: a short-lived post-install Job that must
+        # reach the main Postgres to seed its catalog. Without this entry the Job
+        # cannot open a connection at all and dies with ConnectionRefusedError on
+        # the Service IP, which reads like a database outage rather than a policy
+        # denial -- the Service and its endpoint are both healthy.
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "research-provider-seed") | nindent 14 }}
         {{- if .Values.pgadmin.enabled }}
         - podSelector:
             matchLabels:
