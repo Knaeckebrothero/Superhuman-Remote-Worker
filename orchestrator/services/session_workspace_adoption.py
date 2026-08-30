@@ -217,6 +217,17 @@ async def ensure_legacy_k8s_thread_runtime_authority(
     )
     if reservation is None:
         moved_on = await db.get_thread(thread_id)
+        # Another adopter may have completed the exact same generation while
+        # this caller was attesting Kubernetes.  The reservation ledger then
+        # correctly refuses a second adoption over the now-UID-bearing row;
+        # classify that exact stamp as convergence rather than asking the
+        # caller to retry an adoption that is already complete.
+        if moved_on is not None and _attestation_matches_workspace(
+            _workspace(moved_on), confirmed
+        ):
+            return LegacyK8sAdoptionResult(
+                LegacyK8sAdoptionOutcome.CONVERGED, owner, moved_on
+            )
         if moved_on is None or not legacy_k8s_thread_runtime_adoption_candidate(
             moved_on
         ):
@@ -244,6 +255,17 @@ async def ensure_legacy_k8s_thread_runtime_authority(
         **reservation_fence,
         runtime_incarnation=confirmed.runtime_incarnation,
     ):
+        # Both adopters can acquire the same claimant/token before either one
+        # stamps the owner.  If the winner settles the reservation before this
+        # authorization runs, the update is deliberately refused; re-read the
+        # owner so that the loser's result still converges on the winner.
+        moved_on = await db.get_thread(thread_id)
+        if moved_on is not None and _attestation_matches_workspace(
+            _workspace(moved_on), confirmed
+        ):
+            return LegacyK8sAdoptionResult(
+                LegacyK8sAdoptionOutcome.CONVERGED, owner, moved_on
+            )
         return LegacyK8sAdoptionResult(
             LegacyK8sAdoptionOutcome.RETRY,
             owner,

@@ -205,6 +205,22 @@ async def test_actor_refusal_uses_only_monotonic_pre_setup_proof():
 
 
 @pytest.mark.asyncio
+async def test_setup_forwards_canonical_workspace_identity_to_shared_attach():
+    client = _client()
+    dual_app._orchestrator_client = client
+
+    with patch.object(persistent_app, "_attach_session", AsyncMock()) as setup:
+        response = await _attach_endpoint()(_request(workspace=True))
+        assert response.status_code == 200
+        await dual_app._session_attach_task
+
+    setup.assert_awaited_once()
+    kwargs = setup.await_args.kwargs
+    assert kwargs["workspace_generation"] == WORKSPACE_GENERATION
+    assert kwargs["workspace_runtime_incarnation"] == WORKSPACE_RUNTIME
+
+
+@pytest.mark.asyncio
 async def test_pre_setup_release_replays_same_proof_until_already_detached():
     outcomes = iter((False, False, True))
     client = _client(bound=False, release=lambda *_a, **_kw: next(outcomes))

@@ -221,6 +221,87 @@ def _canonical_runtime_generation(value: Any) -> str | None:
         return None
 
 
+_ATTACH_WORKSPACE_IDENTITY_UNSET = object()
+
+
+def _canonical_attach_workspace_identity(
+    workspace_generation: Any,
+    workspace_runtime_incarnation: Any,
+) -> Optional[Tuple[Optional[str], Optional[str]]]:
+    """Canonicalize an explicitly delivered workspace-authority pair.
+
+    ``None`` as the return value means the caller omitted the contract (the
+    dedicated startup path). ``(None, None)`` means the claim bundle captured
+    no physical identity yet; shared attach may still poll a workspace whose
+    session-runtime generation is authoritative. Keeping those states distinct
+    prevents a compatibility default from weakening a delivered exact pair.
+    """
+
+    generation_omitted = workspace_generation is _ATTACH_WORKSPACE_IDENTITY_UNSET
+    incarnation_omitted = (
+        workspace_runtime_incarnation is _ATTACH_WORKSPACE_IDENTITY_UNSET
+    )
+    if generation_omitted or incarnation_omitted:
+        if generation_omitted and incarnation_omitted:
+            return None
+        raise WorkspaceNotReady(
+            "Attach workspace identity must be delivered as an exact pair"
+        )
+    if workspace_generation is None and workspace_runtime_incarnation is None:
+        return (None, None)
+
+    canonical_generation = _canonical_runtime_generation(workspace_generation)
+    canonical_incarnation = _canonical_runtime_generation(workspace_runtime_incarnation)
+    if canonical_generation is None or canonical_incarnation is None:
+        raise WorkspaceNotReady("Attach workspace identity is malformed or incomplete")
+    return canonical_generation, canonical_incarnation
+
+
+def _assert_attach_workspace_tier(
+    expected: Optional[Tuple[Optional[str], Optional[str]]],
+    *,
+    is_lite_session: bool,
+) -> None:
+    """Reject an exact physical claim for a resolved no-workspace tier."""
+
+    if expected is None or expected == (None, None):
+        return
+    if is_lite_session:
+        raise WorkspaceNotReady(
+            "Attach workspace identity does not match the resolved workspace tier"
+        )
+
+
+def _assert_attach_workspace_payload(
+    expected: Optional[Tuple[Optional[str], Optional[str]]],
+    payload: Any,
+) -> None:
+    """Fence an observed workspace response to the delivered claim identity."""
+
+    if expected is None or expected == (None, None):
+        return
+    raw_generation = (
+        payload.get("workspace_generation") if isinstance(payload, dict) else None
+    )
+    raw_incarnation = (
+        payload.get("workspace_runtime_incarnation")
+        if isinstance(payload, dict)
+        else None
+    )
+    if raw_generation is None and raw_incarnation is None:
+        observed: Tuple[Optional[str], Optional[str]] = (None, None)
+    else:
+        canonical_generation = _canonical_runtime_generation(raw_generation)
+        canonical_incarnation = _canonical_runtime_generation(raw_incarnation)
+        if canonical_generation is None or canonical_incarnation is None:
+            raise WorkspaceNotReady(
+                "Observed workspace identity is malformed or incomplete"
+            )
+        observed = canonical_generation, canonical_incarnation
+    if observed != expected:
+        raise WorkspaceNotReady("Workspace identity changed during attach")
+
+
 def _adopt_attached_runtime_identity(
     generation: Any,
     attach_token: Any = None,
@@ -3922,6 +4003,8 @@ async def _attach_session_inner(
     pinned_runtime_generation_contract: Any = None,
     session_runtime_generation: Any = None,
     session_runtime_attach_token: Any = None,
+    workspace_generation: Any = _ATTACH_WORKSPACE_IDENTITY_UNSET,
+    workspace_runtime_incarnation: Any = _ATTACH_WORKSPACE_IDENTITY_UNSET,
 ) -> None:
     """Create and attach a PersistentSession for the given thread.
 
@@ -3941,6 +4024,10 @@ async def _attach_session_inner(
     global _pinned_runtime_generation_enabled
     global _failed_attach_workspace_cleanup_context
 
+    expected_workspace_identity = _canonical_attach_workspace_identity(
+        workspace_generation,
+        workspace_runtime_incarnation,
+    )
     prior_thread_id = _thread_id
 
     _cloud_sync_retry_pending = False
@@ -4041,7 +4128,7 @@ async def _attach_session_inner(
     # The orchestrator attaches the lite object-store mounts to this response
     # for lite threads, so the session can build its backend without a pod.
     _rc, _co = resolved_config, config_override
-    workspace_generation = ""
+    attached_workspace_generation = ""
     if _rc is None and _co is None and _orchestrator_client and _thread_id:
         try:
             _peek = await _orchestrator_client.get_thread_workspace(_thread_id)
@@ -4053,6 +4140,10 @@ async def _attach_session_inner(
                 # identity here would make the dedicated path fail before
                 # `_poll_workspace_ready` can observe engage -> ready.
                 if peek_delivery != "engaging":
+                    _assert_attach_workspace_payload(
+                        expected_workspace_identity,
+                        _peek,
+                    )
                     _bind_attached_runtime_payload(
                         _peek,
                         protected_required=(_protected_workspace_marker(_peek) == "on"),
@@ -4060,10 +4151,12 @@ async def _attach_session_inner(
                     _pinned_status_identity_enabled = (
                         _pinned_status_identity_advertised(_peek)
                     )
-                    workspace_generation = str(_peek.get("workspace_generation") or "")
+                    attached_workspace_generation = str(
+                        _peek.get("workspace_generation") or ""
+                    )
                 _rc = _peek.get("resolved_config")
                 _co = _peek.get("config_override")
-        except (ProtectedCloudUnavailable, SessionEnded):
+        except (ProtectedCloudUnavailable, SessionEnded, WorkspaceNotReady):
             raise
         except Exception:
             pass
@@ -4073,6 +4166,10 @@ async def _attach_session_inner(
     # Same dual-blob read for the VM tier: a vm-tier session must attach to its
     # VM and never to a container that happens to be ready (Defect 2).
     is_vm_session = _session_backend_is_vm(_rc) or _session_backend_is_vm(_co)
+    _assert_attach_workspace_tier(
+        expected_workspace_identity,
+        is_lite_session=is_lite_session,
+    )
     if _failed_attach_workspace_cleanup_context is not None:
         _failed_attach_workspace_cleanup_context["workspace_tier"] = (
             "vm" if is_vm_session else "virtual" if is_lite_session else "sandbox"
@@ -4091,6 +4188,10 @@ async def _attach_session_inner(
             require_vm=is_vm_session,
         )
         if workspace_override:
+            _assert_attach_workspace_payload(
+                expected_workspace_identity,
+                workspace_override,
+            )
             _bind_attached_runtime_payload(
                 workspace_override,
                 protected_required=(
@@ -4141,9 +4242,9 @@ async def _attach_session_inner(
             _thread_id,
         )
 
-    workspace_generation = str(
+    attached_workspace_generation = str(
         (workspace_override or {}).get("workspace_generation")
-        or workspace_generation
+        or attached_workspace_generation
         or ""
     )
 
@@ -4177,6 +4278,10 @@ async def _attach_session_inner(
         try:
             ws_info = await _orchestrator_client.get_thread_workspace(_thread_id)
             if ws_info:
+                _assert_attach_workspace_payload(
+                    expected_workspace_identity,
+                    ws_info,
+                )
                 _bind_attached_runtime_payload(
                     ws_info,
                     protected_required=(
@@ -4196,7 +4301,7 @@ async def _attach_session_inner(
                         "protected-cloud authority disappeared while attaching"
                     )
                 protected_cloud = fresh_delivery == "ready"
-                workspace_generation = workspace_generation or str(
+                attached_workspace_generation = attached_workspace_generation or str(
                     ws_info.get("workspace_generation") or ""
                 )
                 if not config_override:
@@ -4223,7 +4328,7 @@ async def _attach_session_inner(
                 raise ProtectedCloudUnavailable(
                     "protected-cloud workspace authority is unavailable"
                 )
-        except (ProtectedCloudUnavailable, SessionEnded):
+        except (ProtectedCloudUnavailable, SessionEnded, WorkspaceNotReady):
             raise
         except Exception:
             if protected_cloud:
@@ -4585,6 +4690,10 @@ async def _attach_session_inner(
                 raise ProtectedCloudUnavailable(
                     "protected-cloud workspace authority is unavailable"
                 )
+            _assert_attach_workspace_payload(
+                expected_workspace_identity,
+                final_workspace,
+            )
             _bind_attached_runtime_payload(
                 final_workspace,
                 protected_required=True,
@@ -4745,6 +4854,10 @@ async def _attach_session_inner(
         try:
             ws_info = await _orchestrator_client.get_thread_workspace(_thread_id)
             if ws_info:
+                _assert_attach_workspace_payload(
+                    expected_workspace_identity,
+                    ws_info,
+                )
                 _bind_attached_runtime_payload(
                     ws_info,
                     protected_required=(
@@ -4771,14 +4884,14 @@ async def _attach_session_inner(
                     raise ProtectedCloudUnavailable(
                         "protected-cloud mode was enabled during attach"
                     )
-                workspace_generation = workspace_generation or str(
+                attached_workspace_generation = attached_workspace_generation or str(
                     ws_info.get("workspace_generation") or ""
                 )
                 if not protected_cloud:
                     cloud_cfg = cloud_cfg or ws_info.get("cloud_sync")
                     nc_folder = nc_folder or ws_info.get("nc_session_folder")
                 cloud_degraded_hint = bool(ws_info.get("cloud_sync_degraded"))
-        except (ProtectedCloudUnavailable, SessionEnded):
+        except (ProtectedCloudUnavailable, SessionEnded, WorkspaceNotReady):
             raise
         except Exception:
             # A stateless turn cannot distinguish "no cloud configured" from
@@ -4805,7 +4918,7 @@ async def _attach_session_inner(
     # attach receives its binding generation. Retain the final value even when
     # no coordinator is built, so an omitted/degraded payload cannot hide a
     # pending generation row from the turn-start fail-closed check.
-    _session.cloud_sync_workspace_generation = workspace_generation
+    _session.cloud_sync_workspace_generation = attached_workspace_generation
     # Back-compat: translate a bare nc_session_folder into the new schema.
     # F-C1: gated on `not protected_cloud` too (defense-in-depth — nc_folder
     # is already forced None above for a protected thread, but this keeps
@@ -4819,7 +4932,7 @@ async def _attach_session_inner(
                 workspace_backend=_session.workspace_manager.backend,
                 cloud_cfg=cloud_cfg,
                 thread_id=str(_thread_id or ""),
-                workspace_generation=workspace_generation,
+                workspace_generation=attached_workspace_generation,
             )
             if _session.workspace_sync is None:
                 raise RuntimeError("cloud sync payload resolved no usable mounts")
@@ -5006,6 +5119,8 @@ async def _attach_session(
     pinned_runtime_generation_contract: Any = None,
     session_runtime_generation: Any = None,
     session_runtime_attach_token: Any = None,
+    workspace_generation: Any = _ATTACH_WORKSPACE_IDENTITY_UNSET,
+    workspace_runtime_incarnation: Any = _ATTACH_WORKSPACE_IDENTITY_UNSET,
 ) -> None:
     """Exception-safe attach transaction around the full construction tail."""
 
@@ -5023,6 +5138,8 @@ async def _attach_session(
             pinned_runtime_generation_contract=pinned_runtime_generation_contract,
             session_runtime_generation=session_runtime_generation,
             session_runtime_attach_token=session_runtime_attach_token,
+            workspace_generation=workspace_generation,
+            workspace_runtime_incarnation=workspace_runtime_incarnation,
         )
     except BaseException:
         # Covers every post-construction await, including event-journal setup,
@@ -15999,6 +16116,10 @@ async def _poll_workspace_ready(
         if vm_status == "ready" and ws.get("vm_ssh_host"):
             return {
                 "backend": "vm",
+                # Server-derived provisioner authority must survive this
+                # normalization boundary. PersistentSession deliberately does
+                # not trust the provisioner from agent config.
+                "workspace_provisioner": ws.get("workspace_provisioner"),
                 "workspace_generation": ws.get("workspace_generation"),
                 "workspace_runtime_incarnation": ws.get(
                     "workspace_runtime_incarnation"
@@ -16089,6 +16210,10 @@ async def _poll_workspace_ready(
                 workspace_ssh_host_key_fingerprint = None
             return {
                 "backend": "sandbox",
+                # This is orchestrator authority, not an inference from the
+                # normalized backend label. Dropping it makes every sandbox
+                # attach fail closed before its first model call.
+                "workspace_provisioner": ws.get("workspace_provisioner"),
                 # Preserve the authoritative protected-ready tuple through
                 # normalization.  `_attach_session_inner` revalidates the
                 # normalized response immediately before constructing

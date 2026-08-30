@@ -1919,6 +1919,63 @@ class TestRemoteBackendTmuxFences:
             )
         execute.assert_called_once_with("touch /tmp/example", timeout=17)
 
+    def test_eager_claim_loads_generation_for_attach_time_resource_mutation(self):
+        backend = self._incarnation_backend(token=21)
+        generation = "a" * 32
+
+        with (
+            patch.object(backend, "_ensure_connected") as ensure_connected,
+            patch.object(
+                backend,
+                "_create_or_observe_tmux_session",
+                return_value="existing",
+            ) as promote,
+            patch.object(
+                backend,
+                "_read_tmux_session_option",
+                return_value=generation,
+            ) as read_option,
+            patch.object(
+                backend,
+                "execute_with_secret_stdin",
+                return_value=True,
+            ) as execute,
+        ):
+            backend.claim_shell_owner()
+            assert backend.execute_claim_resource_with_secret_stdin(
+                "printf managed-repository", b"private", timeout=23
+            )
+
+        ensure_connected.assert_called_once_with()
+        promote.assert_called_once_with()
+        read_option.assert_called_once_with("@srw_generation")
+        assert backend._shell_generation == generation
+        assert "SRW_SHELL_PROCESS_TAG" in execute.call_args.args[0]
+
+    def test_eager_claim_rejects_malformed_process_generation(self):
+        backend = self._incarnation_backend(token=21)
+
+        with (
+            patch.object(backend, "_ensure_connected"),
+            patch.object(
+                backend,
+                "_create_or_observe_tmux_session",
+                return_value="existing",
+            ),
+            patch.object(
+                backend,
+                "_read_tmux_session_option",
+                return_value="not-a-generation",
+            ),
+            pytest.raises(
+                WorkspaceUnavailableError,
+                match="process generation is malformed",
+            ),
+        ):
+            backend.claim_shell_owner()
+
+        assert backend._shell_generation is None
+
     def test_stateless_resource_fence_is_separate_from_shell_retirement(
         self, remote_backend
     ):

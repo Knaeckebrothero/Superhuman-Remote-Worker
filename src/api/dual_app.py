@@ -1841,6 +1841,8 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                     ),
                     session_runtime_generation=runtime_generation,
                     session_runtime_attach_token=runtime_attach_token,
+                    workspace_generation=workspace_generation,
+                    workspace_runtime_incarnation=workspace_runtime_incarnation,
                 )
                 logger.info(f"Session setup complete for thread {thread_id}")
             except BaseException as attach_error:

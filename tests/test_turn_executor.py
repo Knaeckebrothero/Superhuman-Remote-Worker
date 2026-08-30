@@ -383,6 +383,10 @@ class Harness:
                 "project_ids": [],
                 "datasources": None,
                 "config_name": "session_base",
+                # Production claim bundles always carry this explicit pair.
+                # Keep the executor fake honest even for no-workspace tests.
+                "workspace_generation": None,
+                "workspace_runtime_incarnation": None,
             },
         )
 

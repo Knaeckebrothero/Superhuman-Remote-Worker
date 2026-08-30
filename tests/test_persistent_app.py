@@ -2137,6 +2137,7 @@ class TestPollWorkspaceReady:
             "vm_status": "ready",
             "vm_ssh_host": "10.0.0.5",
             "vm_ssh_port": 2222,
+            "workspace_provisioner": "k8s",
             "git_remote_url": "http://gitea/repo",
             "canvas_presentation_available": True,
             "canvas_live_apps_available": True,
@@ -2147,6 +2148,7 @@ class TestPollWorkspaceReady:
 
         assert result is not None
         assert result["backend"] == "vm"
+        assert result["workspace_provisioner"] == "k8s"
         assert result["remote"]["host"] == "10.0.0.5"
         assert result["remote"]["port"] == 2222
         assert result["canvas_presentation_available"] is False
@@ -2161,6 +2163,7 @@ class TestPollWorkspaceReady:
         client.get_thread_workspace.return_value = {
             "status": "ready",
             "pod_ip": "172.16.0.10",
+            "workspace_provisioner": "k8s",
             "workspace_generation": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
             "workspace_runtime_incarnation": ("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
             "workspace_ssh_host_key_fingerprint": "SHA256:trusted",
@@ -2174,6 +2177,7 @@ class TestPollWorkspaceReady:
 
         assert result is not None
         assert result["backend"] == "sandbox"
+        assert result["workspace_provisioner"] == "k8s"
         assert result["remote"]["host"] == "172.16.0.10"
         assert result["remote"]["port"] == 30022
         assert result["workspace_generation"] == "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"

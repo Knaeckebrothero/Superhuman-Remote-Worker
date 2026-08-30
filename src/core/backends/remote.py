@@ -739,6 +739,17 @@ class RemoteBackend(WorkspaceBackend):
         self._ensure_connected()
         started = time.perf_counter()
         disposition = self._create_or_observe_tmux_session()
+        if self.workspace_incarnation_fenced:
+            # Attach-time repository/cloud setup uses the claim-resource fence
+            # before ShellManager lazily calls _init_shell(). Load the exact
+            # generation established by the promotion now so those mutations
+            # inherit the same process identity as later tmux tool work.
+            generation = self._read_tmux_session_option(_TMUX_GENERATION_OPTION)
+            if not re.fullmatch(r"[0-9a-f]{32}", generation):
+                raise WorkspaceUnavailableError(
+                    "Remote tmux process generation is malformed"
+                )
+            self._shell_generation = generation
         logger.info(
             "remote shell ownership timing: session=%s disposition=%s total=%.3fs",
             self._session_name,

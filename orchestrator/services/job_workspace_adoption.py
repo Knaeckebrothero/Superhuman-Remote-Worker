@@ -408,6 +408,20 @@ async def ensure_legacy_k8s_job_runtime_authority(
         # the external attestation ran.  Re-read before reporting: a tier or
         # lifecycle transition that won is authority, not a transient error.
         moved_on = await db.get_job(owner.id)
+        # A concurrent adopter can have completed the exact same generation
+        # after our Kubernetes proof but before this reservation attempt.  A
+        # second generation is correctly refused once the row has a UID; the
+        # matching durable stamp means this caller converged, not that it must
+        # retry an already-complete adoption.
+        moved_workspace = _object(
+            _object((moved_on or {}).get("context")).get("workspace_container")
+        )
+        if moved_on is not None and _attestation_matches_workspace(
+            moved_workspace, confirmed
+        ):
+            return LegacyK8sAdoptionResult(
+                LegacyK8sAdoptionOutcome.CONVERGED, owner, moved_on
+            )
         try:
             still_a_candidate = moved_on is not None and (
                 legacy_k8s_job_runtime_adoption_candidate(moved_on)
@@ -444,6 +458,19 @@ async def ensure_legacy_k8s_job_runtime_authority(
         **reservation_fence,
         runtime_incarnation=confirmed.runtime_incarnation,
     ):
+        # Equal adopters share one claimant/token.  The laggard's runtime bind
+        # is refused if the winner has already settled it, so consult the owner
+        # projection before reporting a transient failure.
+        moved_on = await db.get_job(owner.id)
+        moved_workspace = _object(
+            _object((moved_on or {}).get("context")).get("workspace_container")
+        )
+        if moved_on is not None and _attestation_matches_workspace(
+            moved_workspace, confirmed
+        ):
+            return LegacyK8sAdoptionResult(
+                LegacyK8sAdoptionOutcome.CONVERGED, owner, moved_on
+            )
         return LegacyK8sAdoptionResult(
             LegacyK8sAdoptionOutcome.RETRY,
             owner,

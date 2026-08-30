@@ -16,6 +16,7 @@ GENERATION = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 ATTACH_TOKEN = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 WORKSPACE_GENERATION = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 WORKSPACE_INCARNATION = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+OTHER_WORKSPACE_GENERATION = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
 
 
 def _release_receipt(thread_id="thread-a", generation=GENERATION, token=ATTACH_TOKEN):
@@ -127,6 +128,52 @@ def test_pool_claim_is_non_ready_before_session_construction():
     app._failed_attach_release_receipt = _release_receipt()
     assert app._session is None
     assert app._pool_heartbeat_status() == "session"
+
+
+@pytest.mark.asyncio
+async def test_real_attach_boundary_forwards_workspace_identity_pair():
+    inner = AsyncMock()
+    with patch.object(app, "_attach_session_inner", inner):
+        await app._attach_session(
+            thread_id="thread-a",
+            workspace_generation=WORKSPACE_GENERATION,
+            workspace_runtime_incarnation=WORKSPACE_INCARNATION,
+        )
+
+    kwargs = inner.await_args.kwargs
+    assert kwargs["workspace_generation"] == WORKSPACE_GENERATION
+    assert kwargs["workspace_runtime_incarnation"] == WORKSPACE_INCARNATION
+
+
+@pytest.mark.parametrize(
+    ("workspace_generation", "workspace_runtime_incarnation"),
+    (
+        (WORKSPACE_GENERATION, None),
+        (None, WORKSPACE_INCARNATION),
+        ("not-a-uuid", WORKSPACE_INCARNATION),
+    ),
+)
+def test_attach_workspace_identity_requires_canonical_pair(
+    workspace_generation, workspace_runtime_incarnation
+):
+    with pytest.raises(app.WorkspaceNotReady, match="malformed or incomplete"):
+        app._canonical_attach_workspace_identity(
+            workspace_generation,
+            workspace_runtime_incarnation,
+        )
+
+
+def test_null_workspace_pair_allows_attach_to_poll_later_physical_identity():
+    expected = app._canonical_attach_workspace_identity(None, None)
+
+    app._assert_attach_workspace_tier(expected, is_lite_session=False)
+    app._assert_attach_workspace_payload(
+        expected,
+        {
+            "workspace_generation": WORKSPACE_GENERATION,
+            "workspace_runtime_incarnation": WORKSPACE_INCARNATION,
+        },
+    )
 
 
 @pytest.mark.asyncio
@@ -278,6 +325,8 @@ async def test_real_attach_crosses_one_way_setup_boundary_before_constructor():
                 pinned_runtime_generation_contract=1,
                 session_runtime_generation=GENERATION,
                 session_runtime_attach_token=ATTACH_TOKEN,
+                workspace_generation=WORKSPACE_GENERATION,
+                workspace_runtime_incarnation=WORKSPACE_INCARNATION,
             )
 
         context = app._failed_attach_workspace_cleanup_context
@@ -286,6 +335,71 @@ async def test_real_attach_crosses_one_way_setup_boundary_before_constructor():
         assert context["workspace_tier"] == "sandbox"
         assert context["workspace_generation"] == WORKSPACE_GENERATION
         assert context["workspace_runtime_incarnation"] == WORKSPACE_INCARNATION
+
+
+@pytest.mark.asyncio
+async def test_real_attach_rejects_workspace_identity_drift_before_constructor():
+    """Expected claim identity is authority, but never cleanup proof by itself."""
+
+    workspace = {
+        "status": "ready",
+        "backend": "sandbox",
+        "protected_cloud": False,
+        "remote": {
+            "host": "workspace.internal",
+            "port": 22,
+            "username": "agent-host",
+            "key_path": "/run/secrets/workspace-key",
+        },
+        "workspace_generation": OTHER_WORKSPACE_GENERATION,
+        "workspace_runtime_incarnation": WORKSPACE_INCARNATION,
+        "workspace_ssh_host_key_fingerprint": "SHA256:exact-host",
+        "pinned_runtime_generation_contract": 1,
+        "session_runtime_generation": GENERATION,
+        "session_runtime_attach_token": ATTACH_TOKEN,
+    }
+    client = SimpleNamespace(
+        get_thread_workspace=AsyncMock(return_value=workspace),
+        session_runtime_generation=GENERATION,
+        session_runtime_attach_token=ATTACH_TOKEN,
+        pinned_runtime_generation_contract=True,
+        runtime_actor=None,
+        adopt_session_runtime_identity=MagicMock(return_value=True),
+        clear_session_runtime_identity=MagicMock(return_value=True),
+    )
+    constructor = MagicMock()
+
+    with (
+        patch.object(app, "_orchestrator_client", client),
+        patch.object(app, "_session", None),
+        patch.object(app, "_thread_id", None),
+        patch.object(app, "_event_writer", None),
+        patch.object(app, "_failed_attach_workspace_cleanup_context", None),
+        patch.object(app, "_session_runtime_generation", None),
+        patch.object(app, "_session_runtime_attach_token", None),
+        patch.object(app, "_pinned_runtime_generation_enabled", False),
+        patch.object(app, "_retirement_admission_identity", None),
+        patch.object(app, "_retirement_admission_disposition", None),
+        patch.object(app, "_retirement_admission_token", None),
+        patch.object(app, "_retirement_admission_permanent", None),
+        patch.object(app, "PersistentSession", constructor),
+    ):
+        with pytest.raises(app.WorkspaceNotReady, match="identity changed"):
+            await app._attach_session_inner(
+                thread_id="thread-a",
+                pinned_runtime_generation_contract=1,
+                session_runtime_generation=GENERATION,
+                session_runtime_attach_token=ATTACH_TOKEN,
+                workspace_generation=WORKSPACE_GENERATION,
+                workspace_runtime_incarnation=WORKSPACE_INCARNATION,
+            )
+
+        constructor.assert_not_called()
+        context = app._failed_attach_workspace_cleanup_context
+        assert isinstance(context, dict)
+        assert context["setup_started"] is False
+        assert context["workspace_generation"] is None
+        assert context["workspace_runtime_incarnation"] is None
 
 
 @pytest.mark.asyncio

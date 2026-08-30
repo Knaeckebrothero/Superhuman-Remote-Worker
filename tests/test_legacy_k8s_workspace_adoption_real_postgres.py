@@ -158,6 +158,38 @@ def _workspace_of(thread):
     return metadata["workspace_container"]
 
 
+class _PausingAdoptionDB:
+    """Pause one lagging adopter at a selected ledger boundary."""
+
+    def __init__(self, delegate, pause_at):
+        self._delegate = delegate
+        self._pause_at = pause_at
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    def __getattr__(self, name):
+        return getattr(self._delegate, name)
+
+    async def _pause(self, boundary):
+        if self._pause_at == boundary:
+            self.entered.set()
+            await self.release.wait()
+
+    async def reserve_managed_repository_workspace_creation(self, *args, **kwargs):
+        await self._pause("reservation")
+        return await self._delegate.reserve_managed_repository_workspace_creation(
+            *args, **kwargs
+        )
+
+    async def authorize_managed_repository_workspace_creation_runtime(
+        self, *args, **kwargs
+    ):
+        await self._pause("runtime-authorization")
+        return await self._delegate.authorize_managed_repository_workspace_creation_runtime(
+            *args, **kwargs
+        )
+
+
 @pytest.mark.asyncio
 async def test_previous_release_session_adopts_once_from_live_attestation(db):
     thread = await _seed_previous_release_session(db)
@@ -252,6 +284,35 @@ async def test_concurrent_adopters_mint_one_generation_and_one_stamp(db):
             )
             == 1
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "pause_at",
+    ["reservation", "runtime-authorization"],
+)
+async def test_lagging_concurrent_adopter_converges_after_winner_settles(db, pause_at):
+    """A ledger refusal after an equal winner settles is not a fresh retry."""
+
+    thread = await _seed_previous_release_session(db)
+    attestation = _attestation()
+    provisioner = SimpleNamespace(
+        attest_workspace_runtime=AsyncMock(return_value=attestation)
+    )
+    lagging_db = _PausingAdoptionDB(db, pause_at)
+    lagging = asyncio.create_task(
+        ensure_legacy_k8s_thread_runtime_authority(lagging_db, provisioner, thread)
+    )
+    await asyncio.wait_for(lagging_db.entered.wait(), timeout=2)
+
+    winner = await ensure_legacy_k8s_thread_runtime_authority(db, provisioner, thread)
+    lagging_db.release.set()
+    lagged = await asyncio.wait_for(lagging, timeout=2)
+
+    assert winner.outcome is LegacyK8sAdoptionOutcome.ADOPTED
+    assert lagged.outcome is LegacyK8sAdoptionOutcome.CONVERGED
+    reservation = await _sole_reservation(db, "thread", thread["id"])
+    assert reservation["result_kind"] == "settled"
 
 
 @pytest.mark.asyncio

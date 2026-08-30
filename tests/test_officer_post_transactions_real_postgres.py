@@ -1011,7 +1011,6 @@ async def test_pre_0175_k8s_adoption_is_one_cas_and_claim_marker_is_preserved(db
         {
             LegacyK8sAdoptionOutcome.ADOPTED,
             LegacyK8sAdoptionOutcome.CONVERGED,
-            LegacyK8sAdoptionOutcome.RETRY,
         }
     )
     converged = await ensure_legacy_k8s_job_runtime_authority(db, provisioner, job)
