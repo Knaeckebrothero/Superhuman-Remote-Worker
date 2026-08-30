@@ -24,7 +24,14 @@
 # This only narrows the window — Tilt still kills the apply on a superseding
 # build or a Ctrl-C, which strands the release the same way. Closing it is
 # scripts/tilt-helm-apply.sh's preflight; see the `srw` resource below.
-update_settings(k8s_upsert_timeout_secs=180)
+# Raised 180 -> 900 on 2026-08-30. 180s covers a normal incremental upgrade but
+# NOT a from-scratch install: after a `helm uninstall` or a database reset the
+# next apply must create every object and wait on them, which overran 180s and
+# stranded the release in `pending-install` at revision 1. This value is a
+# maximum wait, not a delay -- a fast upgrade still returns in seconds -- so
+# raising it costs the inner loop nothing and only widens the window before
+# Tilt gives up.
+update_settings(k8s_upsert_timeout_secs=900)
 
 # -----------------------------------------------------------------------------
 # Global watch exclusions — paths Tilt must never treat as a code change.
@@ -405,9 +412,19 @@ k8s_custom_deploy(
     ],
     apply_env=_srw_helm_env,
     delete_cmd=['helm', 'uninstall', '--namespace', 'srw', 'srw'],
-    # Chart/values edits do not trigger a redeploy on their own — same as the
-    # `helm_resource` default this replaced. Image rebuilds drive the loop.
-    deps=[],
+    # Values edits DO trigger a redeploy (changed 2026-08-30). This was `deps=[]`,
+    # inherited from the `helm_resource` default this replaced, which meant an
+    # edit to either values file was silently a no-op: Tilt reported the resource
+    # green while the cluster kept the old rendering, and the only way to notice
+    # was to read the deployed object's env. That cost a full debug cycle on the
+    # 0185 maintenance-gate cutover, where values-local.yaml was edited, Tilt did
+    # nothing, and the orchestrator kept crash-looping on the value it had.
+    # The chart directory is deliberately NOT here: it holds hundreds of files and
+    # rendering is driven by the values above.
+    deps=[
+        'deployment/values-local.yaml',
+        'deployment/values-tilt.yaml',
+    ],
     image_deps=[img[0] for img in _srw_images],
 )
 
