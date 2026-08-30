@@ -2047,6 +2047,35 @@ keycloak:
   # without a DB wipe. Defaults to 2h idle / 24h max with a 3-day "remember me"
   # checkbox enabled — matches the homelab profile and avoids the 30-min
   # re-login that Keycloak's built-in defaults impose.
+  # -- Seed a fixed set of test accounts into the realm. LOCAL DEVELOPMENT ONLY.
+  # Passwords here are FIXED and PUBLISHED in README.md so every k3d developer
+  # shares one known set instead of hand-rolling accounts. Enabling this on any
+  # reachable deployment hands anyone who has read the repo full admin access.
+  # The bootstrap `test` admin is separate and always created; its password
+  # comes from the required KC_REALM_ADMIN_PASSWORD secret, never from here.
+  devUsers:
+    enabled: false
+    # All passwords are 16 characters to satisfy the realm password policy
+    # (length(16) and notUsername). Keep README.md's table in sync with this list.
+    users:
+      - username: dev-admin-1
+        password: srw-k3d-dev-adm1
+        admin: true
+      - username: dev-admin-2
+        password: srw-k3d-dev-adm2
+        admin: true
+      - username: dev-user-1
+        password: srw-k3d-dev-usr1
+        admin: false
+      - username: dev-user-2
+        password: srw-k3d-dev-usr2
+        admin: false
+      - username: dev-user-3
+        password: srw-k3d-dev-usr3
+        admin: false
+      - username: dev-user-4
+        password: srw-k3d-dev-usr4
+        admin: false
   session:
     rememberMe: true
     ssoSessionIdleTimeout: 7200              # 2 hours

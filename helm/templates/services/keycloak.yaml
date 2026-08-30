@@ -358,6 +358,30 @@ data:
             }
           ]
         }
+        {{- if .Values.keycloak.devUsers.enabled }}
+        {{- range .Values.keycloak.devUsers.users }},
+        {
+          "username": {{ .username | quote }},
+          "email": {{ printf "%s@%s" .username $.Values.global.domain | quote }},
+          "emailVerified": true,
+          "enabled": true,
+          "realmRoles": [
+            {{- if .admin }}
+            "admin",
+            {{- end }}
+            "user",
+            "default-roles-{{ $.Values.keycloak.realm }}"
+          ],
+          "credentials": [
+            {
+              "type": "password",
+              "value": {{ .password | quote }},
+              "temporary": false
+            }
+          ]
+        }
+        {{- end }}
+        {{- end }}
       ],
       "scopeMappings": [
         {

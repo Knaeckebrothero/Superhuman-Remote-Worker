@@ -247,11 +247,33 @@ kubectl --context=k3d-srw -n srw get pods -w
 
 Open `https://localhost/` in your browser and log in:
 
-| Username | Password |
-|----------|----------|
-| `test`   | `test`   |
+| Username | Password            | Roles         |
+|----------|---------------------|---------------|
+| `test`   | `srw-k3d-dev-test`  | admin + user  |
 
-The `test` user is pre-seeded in the Keycloak realm with `admin` + `user` roles, email already verified, mapped to `srw-admin` on Gitea — no approval flow, no email verification step.
+`test` is the bootstrap admin. It is seeded on every install and its password is whatever you set
+`KC_REALM_ADMIN_PASSWORD` to — the value above is the one in `values-local.yaml.example`. Email is
+pre-verified and it maps to `srw-admin` on Gitea, so there is no approval flow and no email step.
+
+**Shared development accounts.** For anything needing more than one user — sharing a project,
+testing permissions, reviewing another user's job — the chart can seed a fixed set. They are
+**off by default** and enabled by `values-local.yaml.example`, which is local-dev only:
+
+| Username      | Password           | Roles        |
+|---------------|--------------------|--------------|
+| `dev-admin-1` | `srw-k3d-dev-adm1` | admin + user |
+| `dev-admin-2` | `srw-k3d-dev-adm2` | admin + user |
+| `dev-user-1`  | `srw-k3d-dev-usr1` | user         |
+| `dev-user-2`  | `srw-k3d-dev-usr2` | user         |
+| `dev-user-3`  | `srw-k3d-dev-usr3` | user         |
+| `dev-user-4`  | `srw-k3d-dev-usr4` | user         |
+
+> **Never set `keycloak.devUsers.enabled: true` on a deployment anyone else can reach.** These
+> passwords are published here on purpose, so that anyone who has read this file has admin on any
+> install where the flag is on. The chart default is `false` and a test enforces it.
+
+All passwords are 16 characters because the realm enforces `length(16) and notUsername`. Adding a
+user means adding it to `keycloak.devUsers.users` in `helm/values.yaml` and to the table above.
 
 | URL | What it is |
 |-----|-----------|

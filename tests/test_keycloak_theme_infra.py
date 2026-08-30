@@ -343,6 +343,87 @@ def _render_realm() -> dict:
     raise AssertionError("no keycloak-realm ConfigMap in the render")
 
 
+@functools.lru_cache(maxsize=2)
+def _render_realm_with(*overrides: str) -> dict:
+    """`_render_realm` with extra `--set` overrides, for flag-gated blocks."""
+    cmd = [
+        "helm",
+        "template",
+        "srw",
+        str(ROOT / "helm"),
+        "-f",
+        str(ROOT / "helm/ci/test-values.yaml"),
+        "--set",
+        "keycloak.enabled=true",
+        "--set",
+        "keycloak.internal=true",
+    ]
+    for o in overrides:
+        cmd += ["--set", o]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, f"helm template failed:\n{result.stderr}"
+    for doc in yaml.safe_load_all(result.stdout):
+        if not doc or doc.get("kind") != "ConfigMap":
+            continue
+        if not doc.get("metadata", {}).get("name", "").endswith("-keycloak-realm"):
+            continue
+        return json.loads((doc.get("data") or {})["srw-realm.json"])
+    raise AssertionError("no keycloak-realm ConfigMap in the render")
+
+
+def test_dev_users_are_off_by_default_in_values() -> None:
+    """The published passwords in README only stay harmless while this is false.
+
+    Asserted against values.yaml rather than a render so it fails even if the
+    template stops consuming the flag.
+    """
+    values = yaml.safe_load((ROOT / "helm/values.yaml").read_text())
+    assert values["keycloak"]["devUsers"]["enabled"] is False
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm binary not installed")
+def test_shipped_realm_seeds_only_the_bootstrap_admin() -> None:
+    """A default install must not carry the documented dev credentials."""
+    users = _render_realm().get("users", [])
+    assert [u["username"] for u in users] == ["test"]
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm binary not installed")
+def test_dev_users_render_and_satisfy_the_password_policy() -> None:
+    """Enabled, they must clear the realm's own length(16)/notUsername policy —
+    otherwise Keycloak rejects them and the seeding silently half-works."""
+    realm = _render_realm_with("keycloak.devUsers.enabled=true")
+    users = {u["username"]: u for u in realm.get("users", [])}
+    assert "test" in users
+    for name in ("dev-admin-1", "dev-admin-2", "dev-user-1", "dev-user-4"):
+        assert name in users, f"{name} missing from the enabled render"
+        pw = users[name]["credentials"][0]["value"]
+        assert len(pw) >= 16, f"{name} password is {len(pw)} chars, policy needs 16"
+        assert pw != name, f"{name} password equals its username (notUsername)"
+    assert "admin" in users["dev-admin-1"]["realmRoles"]
+    assert "admin" not in users["dev-user-1"]["realmRoles"]
+
+
+def test_readme_dev_credentials_match_the_chart() -> None:
+    """README publishes these passwords; a drifted table sends developers to a
+    login that fails, or worse, understates which accounts actually exist."""
+    values = yaml.safe_load((ROOT / "helm/values.yaml").read_text())
+    chart = {
+        u["username"]: u["password"] for u in values["keycloak"]["devUsers"]["users"]
+    }
+    readme = dict(
+        re.findall(
+            r"^\|\s*`(dev-[a-z0-9-]+)`\s*\|\s*`([^`]+)`",
+            (ROOT / "README.md").read_text(),
+            re.M,
+        )
+    )
+    assert readme == chart, (
+        "README dev-credentials table is out of sync with keycloak.devUsers in "
+        f"helm/values.yaml.\n  README: {readme}\n  chart:  {chart}"
+    )
+
+
 @pytest.mark.skipif(shutil.which("helm") is None, reason="helm binary not installed")
 def test_configmap_keys_have_no_slashes() -> None:
     """A real API server rejects a ConfigMap key containing '/'. Assert on the
