@@ -102,6 +102,9 @@ test('first message creates a durable session and renders the reply', async ({ a
   );
 
   const threadId = await createdThreadPromise;
+  const admittedTopology = await app.threadTopology(threadId);
+  expect(admittedTopology.executionLane).toBe(app.expectedExecutionLane);
+  expect(admittedTopology.workspaceBackend).toBe(app.workspaceBackend);
   const uiEvidenceError = await immediateUiEvidence;
   if (uiEvidenceError) throw uiEvidenceError;
 
@@ -127,6 +130,19 @@ test('first message creates a durable session and renders the reply', async ({ a
   await expect(composer).toBeVisible();
   await expect(composer).toBeEnabled();
   await expect(composer).toHaveValue('');
+
+  await expect
+    .poll(() => app.threadTopology(threadId), {
+      timeout: 30_000,
+      intervals: [250, 500, 1_000],
+      message: 'The selected E2E topology must be observable after turn completion.',
+    })
+    .toEqual({
+      executionLane: app.expectedExecutionLane,
+      workspaceBackend: app.workspaceBackend,
+      workspaceStatus: app.workspaceBackend === 'sandbox' ? 'ready' : null,
+      workspaceProvisioner: app.workspaceBackend === 'sandbox' ? 'k8s' : null,
+    });
 
   // Assistant text can reach the DOM one event before turn.completed. A
   // harmless fill/clear makes the dynamic action render and proves it has

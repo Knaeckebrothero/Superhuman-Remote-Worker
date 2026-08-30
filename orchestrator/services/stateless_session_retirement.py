@@ -97,8 +97,10 @@ def resolve_shell_retirement_authority(
 
     A prior claim (positive queue token) proves that a durable shell record may
     exist.  Historical host/IP bytes alone are not authority: the endpoint must
-    still be Ready and paired with the exact backing generation, Pod UID, and
-    host-key fingerprint accepted by the normal stateless attach boundary.
+    either still be Ready or carry the exact End-owned
+    ``retiring_process_zero`` authority, paired with the backing generation,
+    Pod UID, and host-key fingerprint accepted by the normal stateless attach
+    boundary.  The retirement-only state never becomes Canvas/work admission.
     """
 
     token = int(terminal_token)
@@ -111,11 +113,32 @@ def resolve_shell_retirement_authority(
     metadata = _json_object(thread.get("metadata"))
     workspace = _json_object(metadata.get("workspace_container"))
     binding = _json_object(metadata.get("_workspace_binding"))
+    endpoint_available = remote_canvas_presentation_available(metadata, workspace)
+    if workspace.get("status") == "retiring_process_zero":
+        from src.shared.session_retirement import stateless_retirement_authority
+
+        try:
+            retirement = stateless_retirement_authority(metadata)
+        except RuntimeError:
+            retirement = None
+        endpoint_available = bool(
+            thread.get("status") == "ended"
+            and retirement is not None
+            and retirement.get("terminal_token") == token
+            and retirement.get("workspace_generation") == binding.get("generation")
+            and retirement.get("endpoint_generation")
+            == workspace.get(CANVAS_WORKSPACE_GENERATION_KEY)
+            and retirement.get("runtime_incarnation")
+            == workspace.get(WORKSPACE_RUNTIME_INCARNATION_KEY)
+            and retirement.get("host_key_fingerprint")
+            == binding.get("ssh_host_key_fingerprint")
+            and isinstance(binding.get("backing_id"), str)
+            and bool(binding.get("backing_id"))
+        )
     if (
-        workspace.get("status") != "ready"
-        or workspace.get("provisioner") != "k8s"
+        workspace.get("provisioner") != "k8s"
         or binding.get("kind") != "remote"
-        or not remote_canvas_presentation_available(metadata, workspace)
+        or not endpoint_available
     ):
         raise ShellRetirementUnavailable(
             "authoritative workspace retirement endpoint is unavailable"

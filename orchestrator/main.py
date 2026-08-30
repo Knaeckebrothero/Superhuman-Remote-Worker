@@ -8401,6 +8401,44 @@ def _require_stateless_workspace(thread: dict[str, Any]) -> str:
     return backend
 
 
+def _require_stateless_end_workspace(thread: dict[str, Any]) -> str:
+    """Require work admission or an exact in-progress End authority.
+
+    ``retiring_process_zero`` is deliberately excluded from the ordinary
+    stateless workspace gate: no new turn, control, upload, or Resume may use a
+    runtime after terminal cleanup has begun.  End itself must nevertheless be
+    able to retry that durable transition.  Admit only the exact intermediate
+    status on an ended thread with a structurally valid pending retirement
+    authority; every other refusal still uses the ordinary fail-closed gate.
+    """
+
+    backend, refusal_reason = stateless_session_workspace_check(thread)
+    if refusal_reason is None:
+        return backend
+
+    metadata = thread_metadata_object(thread)
+    workspace = metadata.get("workspace_container")
+    if (
+        refusal_reason == "workspace_status_unavailable"
+        and thread.get("status") == "ended"
+        and isinstance(workspace, dict)
+        and workspace.get("status") == "retiring_process_zero"
+    ):
+        from src.shared.session_retirement import stateless_retirement_authority
+
+        try:
+            retirement = stateless_retirement_authority(metadata)
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Stateless retirement authority is malformed",
+            ) from exc
+        if retirement is not None:
+            return backend
+
+    return _require_stateless_workspace(thread)
+
+
 def _session_ready_timeout_s(backend: Optional[str]) -> int:
     """Readiness-probe budget for the session-start paths (``provision_or_assign``
     and ``_do_prepare``'s ``wait_for_ready``).
@@ -50837,6 +50875,14 @@ async def create_thread(
             # seam (active today). The thread row is stamped with this
             # backend's id below, so resume/delete later dispatch via
             # for_thread. Issue 16, knowledge-base/knowledge/issues/main_cloud.md.
+            # Main-cloud storage is optional.  ``for_owner`` deliberately
+            # fails closed when no durable active-instance authority exists,
+            # because callers that intend a cloud effect must never fall back
+            # to an unattested adapter.  Thread creation itself is not such an
+            # effect: in a no-cloud deployment it must continue without the
+            # legacy session folder.
+            if main_cloud_router.active_instance_id is None:
+                return
             backend = main_cloud_router.for_owner(user)
             if not backend.is_initialized and backend.is_configured:
                 await backend.ensure_initialized()
@@ -53780,7 +53826,10 @@ async def _reconcile_stateless_thread_retirement(
                     status_code=503,
                     detail="Absent resident retirement proof was not durable",
                 )
-        elif runtime_authority == "exact_live" and workspace.get("status") == "ready":
+        elif runtime_authority == "exact_live" and workspace.get("status") in {
+            "ready",
+            "retiring_process_zero",
+        }:
             terminal_cloud_mount_cfg = await _build_agent_cloud_mount(
                 current,
                 mount_rows=await postgres_db.list_thread_mounts(thread_id),
@@ -53839,7 +53888,10 @@ async def _reconcile_stateless_thread_retirement(
             WorkspaceOwner.session(thread_id),
             expected_runtime_incarnation=str(runtime_incarnation),
         )
-        if runtime_authority == "exact_live" and workspace.get("status") == "ready":
+        if runtime_authority == "exact_live" and workspace.get("status") in {
+            "ready",
+            "retiring_process_zero",
+        }:
             if (
                 closure.get("resident_cleanup_required")
                 and terminal_cloud_mount_cfg is None
@@ -54966,7 +55018,7 @@ async def _end_thread_flow(
     # Every stateless tier uses the queue lifecycle, including lite sessions.
     # The validator keeps VM/unknown tiers refused while admitting only the
     # narrowed sandbox and lite authority shapes.
-    _require_stateless_workspace(thread)
+    _require_stateless_end_workspace(thread)
     initial_stateless_authority = (
         await postgres_db.get_stateless_thread_lifecycle_authority(thread_id)
     )
@@ -54984,7 +55036,7 @@ async def _end_thread_flow(
             fresh_thread = await postgres_db.get_thread(thread_id)
             if fresh_thread is None:
                 return {"status": "deleted"}
-            _require_stateless_workspace(fresh_thread)
+            _require_stateless_end_workspace(fresh_thread)
             fresh_authority = (
                 await postgres_db.get_stateless_thread_lifecycle_authority(thread_id)
             )

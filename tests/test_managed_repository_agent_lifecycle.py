@@ -16,6 +16,8 @@ import pytest
 
 from orchestrator.services.managed_repository_authority import _deploy_keypair
 from orchestrator.services.stateless_session_retirement import (
+    ShellRetirementUnavailable,
+    resolve_shell_retirement_authority,
     retire_stateless_workspace_residents,
     verify_stateless_workspace_residents_retired,
 )
@@ -853,6 +855,72 @@ def _terminal_thread() -> dict:
             },
         },
     }
+
+
+def _retiring_terminal_thread() -> dict:
+    thread = _terminal_thread()
+    metadata = thread["metadata"]
+    workspace = metadata["workspace_container"]
+    binding = metadata["_workspace_binding"]
+    workspace["status"] = "retiring_process_zero"
+    metadata["_stateless_workspace_retirement_pending"] = True
+    metadata["_stateless_claim_retirement"] = {
+        "terminal_token": 9,
+        "claimant_quiesced": True,
+        "shell_retirement_required": True,
+        "resident_cleanup_required": True,
+        "residents_retired": False,
+        "remote_retired": False,
+        "permanent": True,
+        "workspace_absence_proven": False,
+        "workspace_generation": binding["generation"],
+        "endpoint_generation": workspace["_canvas_workspace_generation"],
+        "runtime_incarnation": workspace["_runtime_incarnation"],
+        "host_key_fingerprint": binding["ssh_host_key_fingerprint"],
+    }
+    return thread
+
+
+def test_terminal_endpoint_accepts_exact_process_zero_retirement_fence() -> None:
+    thread = _retiring_terminal_thread()
+
+    authority = resolve_shell_retirement_authority(thread, terminal_token=9)
+
+    assert authority.thread_id == thread["id"]
+    assert (
+        authority.runtime_incarnation
+        == thread["metadata"]["workspace_container"]["_runtime_incarnation"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("terminal_token", 10),
+        ("workspace_generation", "11111111-1111-4111-8111-111111111111"),
+        ("endpoint_generation", "22222222-2222-4222-8222-222222222222"),
+        ("runtime_incarnation", "33333333-3333-4333-8333-333333333333"),
+        ("host_key_fingerprint", "SHA256:" + "B" * 43),
+    ],
+)
+def test_terminal_endpoint_rejects_drifted_process_zero_authority(
+    field: str,
+    value: object,
+) -> None:
+    thread = _retiring_terminal_thread()
+    thread["metadata"]["_stateless_claim_retirement"][field] = value
+
+    with pytest.raises(ShellRetirementUnavailable):
+        resolve_shell_retirement_authority(thread, terminal_token=9)
+
+
+def test_terminal_endpoint_rejects_unowned_process_zero_state() -> None:
+    thread = _retiring_terminal_thread()
+    thread["metadata"].pop("_stateless_workspace_retirement_pending")
+    thread["metadata"].pop("_stateless_claim_retirement")
+
+    with pytest.raises(ShellRetirementUnavailable):
+        resolve_shell_retirement_authority(thread, terminal_token=9)
 
 
 @pytest.mark.asyncio

@@ -749,6 +749,30 @@ def _persisted_thread_override(conn) -> dict:
 
 class TestSessionCreateBoundary:
     @pytest.mark.asyncio
+    async def test_create_skips_optional_cloud_without_active_instance_authority(
+        self, session_create_env, monkeypatch
+    ):
+        main, _, _, _ = session_create_env
+        for_owner = MagicMock(
+            side_effect=AssertionError(
+                "an unavailable optional cloud must not be resolved"
+            )
+        )
+        monkeypatch.setattr(
+            main,
+            "main_cloud_router",
+            SimpleNamespace(active_instance_id=None, for_owner=for_owner),
+        )
+
+        result = await main.create_thread(
+            main.ThreadCreateRequest(title="session without main cloud"),
+            MagicMock(),
+        )
+
+        assert result == {"thread_id": SESSION_THREAD_ID, "status": "created"}
+        for_owner.assert_not_called()
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "officer",
         [

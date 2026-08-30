@@ -25,12 +25,26 @@ function emitConsole(
   handlers: Map<PageEvent, PageHandler>,
   message: string,
   locationUrl = '',
+  type: 'error' | 'warning' = 'error',
 ): void {
   handlers.get('console')?.({
-    type: () => 'error',
+    type: () => type,
     text: () => message,
     location: () => ({ url: locationUrl }),
   } as ConsoleMessage);
+}
+
+function emitRequestFailed(
+  handlers: Map<PageEvent, PageHandler>,
+  method: string,
+  url: string,
+  failure = 'net::ERR_ABORTED',
+): void {
+  handlers.get('requestfailed')?.({
+    method: () => method,
+    url: () => url,
+    failure: () => ({ errorText: failure }),
+  } as Request);
 }
 
 function emitResponse(
@@ -139,5 +153,55 @@ describe('network ledger safety and warm-up classification', () => {
       "WebSocket connection to 'wss://foreign.test/p/owned-thread/ws?t=secret' failed",
     );
     expect(ledger.problems()).toHaveLength(2);
+  });
+
+  it('allows only the exact owned-stream abort armed by the warm-up watchdog', () => {
+    const { ledger, handlers } = ledgerHarness();
+    ledger.registerThread('owned-thread');
+    ledger.setPhase('turn');
+    emitConsole(
+      handlers,
+      '[persistent-chat] no SSE data within 5000ms of send — forcing reconnect',
+      'http://srw-e2e.test/main.js',
+      'warning',
+    );
+    emitRequestFailed(
+      handlers,
+      'GET',
+      'http://srw-e2e.test/api/persistent/threads/owned-thread/stream',
+    );
+
+    expect(ledger.problems()).toEqual([]);
+
+    emitRequestFailed(
+      handlers,
+      'GET',
+      'http://srw-e2e.test/api/persistent/threads/owned-thread/stream',
+    );
+    expect(ledger.problems()).toHaveLength(1);
+  });
+
+  it('does not spend an armed reconnect on a foreign thread stream', () => {
+    const { ledger, handlers } = ledgerHarness();
+    ledger.registerThread('owned-thread');
+    ledger.setPhase('turn');
+    emitConsole(
+      handlers,
+      '[persistent-chat] no SSE data within 5000ms of send — forcing reconnect',
+      'http://srw-e2e.test/main.js',
+      'warning',
+    );
+    emitRequestFailed(
+      handlers,
+      'GET',
+      'http://srw-e2e.test/api/persistent/threads/foreign-thread/stream',
+    );
+    emitRequestFailed(
+      handlers,
+      'GET',
+      'http://srw-e2e.test/api/persistent/threads/owned-thread/stream',
+    );
+
+    expect(ledger.problems()).toHaveLength(1);
   });
 });

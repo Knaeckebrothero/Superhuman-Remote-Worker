@@ -106,11 +106,12 @@ Each agent is a general-purpose LangGraph worker that can:
 - **Crash recovery** — checkpoints at every step, resume any job from where it left off
 - **Config-driven roles** — same codebase, different YAML configs for different specializations
 - **Multi-database support** — attach PostgreSQL, Neo4j, or MongoDB datasources to any job
-- **Multi-backend workspaces** — local filesystem, SSH/SFTP to remote containers, or dedicated VMs via QEMU/KubeVirt
+- **Isolated workspaces** — SSH/SFTP to per-job containers, or dedicated VMs via QEMU/KubeVirt for a stronger boundary
 - **Notifications** — email (SMTP), Slack, Discord, and ntfy webhooks for job status updates
 
 ## Table of Contents
 
+- [Security Model: Separate Harness and Workspace](#security-model-separate-harness-and-workspace)
 - [Quick Start](#quick-start)
 - [Local Kubernetes Setup (k3d)](#local-kubernetes-setup-k3d)
 - [Development Setup](#development-setup)
@@ -132,6 +133,45 @@ target. [k3d](https://k3d.io) turns any one machine into that cluster.
 | Run the system, on one machine or a hundred | [Local Kubernetes Setup (k3d)](#local-kubernetes-setup-k3d), then the same chart on a real cluster |
 | Iterate on Python code with the fastest possible edit-to-effect | [Fast inner loop with Tilt](#fast-inner-loop-with-tilt-recommended) — live-syncs source into the running pods |
 | Run tests, lint and one-off scripts on your host | [Development Setup](#development-setup) |
+
+## Security Model: Separate Harness and Workspace
+
+SRW treats repositories, model-generated files, and every command an agent runs
+as potentially hostile. A sufficiently capable model can use ordinary debugging
+facilities, malicious dependencies, or chained exploits to attack the process
+that is supposed to constrain it. A working directory or container path is not a
+security boundary when the harness and generated code share the same filesystem
+and security identity.
+
+For that reason, SRW deliberately separates its trusted control plane from its
+untrusted execution plane:
+
+```text
+TRUSTED CONTROL PLANE                     UNTRUSTED EXECUTION PLANE
+
+┌──────────────────────────────┐          ┌──────────────────────────────┐
+│ Orchestrator                 │          │ Per-job workspace            │
+│ Agent harness and policy     │ SSH/SFTP │ Repository and generated code│
+│ LLM and control credentials  ├─────────►│ File operations and commands │
+│ Final job-state authority    │          │ Container or dedicated VM    │
+└──────────────────────────────┘          └──────────────────────────────┘
+```
+
+The agent process never uses its own filesystem as the job workspace. There is
+no local-backend fallback: if the orchestrator cannot provision a remote
+workspace and provide SSH credentials, the job fails closed. This keeps normal
+workspace activity from directly modifying the harness, its policy checks, or
+its control-plane credentials. Only narrowly scoped, job-specific capabilities
+should cross into the workspace.
+
+This separation limits blast radius; it does not make arbitrary code safe.
+Workspace containers share a node kernel and therefore provide a weaker boundary
+than dedicated workspace VMs, which add a separate guest kernel and hypervisor
+boundary. Network policy, least-privilege credentials, audit logging, disposable
+workspaces, and human gates for privileged or irreversible actions remain part of
+the security model. Agent runtimes that require their harness and credentials to
+run inside the writable workspace cross this boundary and require an explicit,
+separate threat analysis rather than being treated as drop-in model providers.
 
 ## Quick Start
 

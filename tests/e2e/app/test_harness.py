@@ -135,7 +135,7 @@ def test_authoritative_run_is_red_when_teardown_fails(monkeypatch) -> None:
         store = Store()
 
         @staticmethod
-        def up():
+        def up(_profile_name):
             return ledger
 
         @staticmethod
@@ -167,7 +167,7 @@ def test_dirty_run_success_is_not_reported_as_authoritative(capsys) -> None:
         store = Store()
 
         @staticmethod
-        def up():
+        def up(_profile_name):
             return ledger
 
         @staticmethod
@@ -184,8 +184,8 @@ def test_dirty_run_success_is_not_reported_as_authoritative(capsys) -> None:
 
     assert harness._run_authoritative(Application()) == 0
     output = capsys.readouterr().out
-    assert "non-authoritative dirty-tree golden journey passed" in output
-    assert "[e2e-app] authoritative golden journey passed" not in output
+    assert "non-authoritative dirty-tree pinned-virtual golden journey passed" in output
+    assert "[e2e-app] authoritative pinned-virtual golden journey passed" not in output
 
 
 def test_teardown_does_not_treat_a_corrupt_active_ledger_as_absent(
@@ -210,6 +210,24 @@ def test_state_ledger_rejects_run_directory_escape(tmp_path: Path) -> None:
     ledger["run_dir"] = str(tmp_path / "outside")
 
     with pytest.raises(harness.SafetyError, match="outside"):
+        store.validate(ledger)
+
+
+def test_state_ledger_binds_the_selected_profile_and_rejects_unknown_values(
+    tmp_path: Path,
+) -> None:
+    store = harness.StateStore(tmp_path / "state")
+    ledger = store.initialize(
+        "20260824-123456-ab12cd34", profile_name="stateless-sandbox"
+    )
+
+    assert (
+        harness.profile_from_ledger(ledger)
+        == harness.APPLICATION_E2E_PROFILES["stateless-sandbox"]
+    )
+
+    ledger["profile"] = "not-a-profile"
+    with pytest.raises(harness.SafetyError, match="unknown application E2E profile"):
         store.validate(ledger)
 
 
@@ -485,6 +503,46 @@ def test_command_composition_is_current_sha_owned_and_non_atomic(
     assert helm_command[0:3] == ["helm", "upgrade", "--install"]
 
 
+def test_stateless_profile_adds_current_source_workspace_image_and_values(
+    tmp_path: Path,
+) -> None:
+    sha = "a" * 40
+    run_id = "20260824-123456-ab12cd34"
+    profile = harness.resolve_profile("stateless-sandbox")
+    images, commands = harness.build_image_commands(
+        sha, run_id, include_workspace=profile.include_workspace_image
+    )
+
+    assert set(images) == {
+        "orchestrator",
+        "agent",
+        "cockpit",
+        "provider",
+        "playwright",
+        "workspace",
+    }
+    workspace_command = commands[-1]
+    assert "docker/Dockerfile.workspace" in workspace_command
+    assert images["workspace"] in workspace_command
+
+    generated = yaml.safe_load(harness._image_values(images, sha, run_id))
+    assert generated["image"]["workspace"] == {
+        "repository": "srw-e2e-workspace",
+        "tag": images["workspace"].split(":", 1)[1],
+        "digest": "",
+        "pullPolicy": "IfNotPresent",
+    }
+    assert generated["provenance"]["components"]["workspace"]["sourceRevision"] == sha
+
+    command = harness.helm_install_command(
+        tmp_path / "kubeconfig", tmp_path / "images.yaml", profile.values_files
+    )
+    base_index = command.index(str(harness.VALUES_FILE))
+    overlay_index = command.index(str(harness.STATELESS_SANDBOX_VALUES_FILE))
+    image_index = command.index(str(tmp_path / "images.yaml"))
+    assert base_index < overlay_index < image_index
+
+
 def test_dependency_images_use_host_platform_archives_before_k3d_import(
     tmp_path: Path,
 ) -> None:
@@ -507,6 +565,13 @@ def test_dependency_images_use_host_platform_archives_before_k3d_import(
         (dependency,) for dependency in harness.DEPENDENCY_IMAGES
     ]
     assert groups[-1] == ("application", tuple(images.values()))
+
+    images["workspace"] = "srw-e2e-workspace:test"
+    stateless_groups = harness.image_import_groups(images)
+    assert stateless_groups[-1] == (
+        "application",
+        tuple(images.values()),
+    )
 
     for label, image_refs in groups:
         archive = tmp_path / f"{label}.tar"
@@ -576,11 +641,19 @@ def test_docker_archive_runtime_id_uses_config_digest_not_manifest_digest(
 
 
 def _runtime_image_test_ledger(
-    tmp_path: Path,
+    tmp_path: Path, profile_name: str = harness.DEFAULT_PROFILE_NAME
 ) -> tuple[harness.StateStore, dict, dict[str, str]]:
     store = harness.StateStore(tmp_path / "state")
-    ledger = store.initialize("20260824-123456-ab12cd34")
-    images, _commands = harness.build_image_commands("a" * 40, str(ledger["run_id"]))
+    ledger = store.initialize("20260824-123456-ab12cd34", profile_name)
+    profile = harness.resolve_profile(profile_name)
+    images, _commands = harness.build_image_commands(
+        "a" * 40,
+        str(ledger["run_id"]),
+        include_workspace=profile.include_workspace_image,
+    )
+    components = ["orchestrator", "agent", "cockpit", "provider"]
+    if profile.include_workspace_image:
+        components.append("workspace")
     tags = [
         *(
             harness.canonical_containerd_tag(image)
@@ -588,7 +661,7 @@ def _runtime_image_test_ledger(
         ),
         *(
             harness.canonical_containerd_tag(images[component])
-            for component in ("orchestrator", "agent", "cockpit", "provider")
+            for component in components
         ),
     ]
     runtime_ids = {
@@ -638,6 +711,38 @@ def test_runtime_image_verifier_matches_cri_config_ids_on_both_nodes(
         command[-4:] == ["crictl", "images", "-o", "json"]
         for command in runner.commands[1:]
     )
+
+
+def test_stateless_runtime_image_verifier_includes_workspace_on_both_nodes(
+    tmp_path: Path,
+) -> None:
+    store, ledger, runtime_ids = _runtime_image_test_ledger(
+        tmp_path, "stateless-sandbox"
+    )
+    inventory = json.dumps(
+        {
+            "images": [
+                {"repoTags": [tag], "id": config_id}
+                for tag, config_id in runtime_ids.items()
+            ]
+        }
+    )
+    runner = FakeRunner(
+        [
+            harness.CommandResult(
+                0,
+                f"{ledger['server_container_id']}|{ledger['cluster_name']}|server\n",
+            ),
+            harness.CommandResult(0, inventory),
+            harness.CommandResult(0, inventory),
+        ]
+    )
+
+    harness.ApplicationE2EHarness(store.root, runner)._verify_imported_node_images(
+        ledger
+    )
+
+    assert ledger["verified_node_images"] == {"server-0": 10, "agent-0": 10}
 
 
 def test_runtime_image_verifier_rejects_a_wrong_cri_config_id(
@@ -783,6 +888,63 @@ def test_resource_ledger_is_replaceable_only_after_matching_exact_cleanup() -> N
     assert document["resources"][0]["cleaned_at"] == document["cleanup_completed_at"]
 
 
+def test_exact_cleanup_retries_retryable_force_until_it_converges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FakePortForward:
+        def __init__(self, **_kwargs):
+            self.local_port = 43123
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    responses = iter(
+        [
+            (409, b""),  # graceful retirement remains busy
+            (409, b""),  # force closed admission; cleanup is still converging
+            (200, b""),  # same exact forced authority settles on retry
+            (404, b""),  # absence proof
+        ]
+    )
+    calls: list[str] = []
+
+    def fake_request(url: str, **_kwargs):
+        calls.append(url)
+        return next(responses)
+
+    monotonic_values = iter([0.0, 0.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0])
+    monkeypatch.setenv("APP_E2E_CLEANUP_TIMEOUT_SECONDS", "1")
+    monkeypatch.setenv("APP_E2E_FORCE_CLEANUP_TIMEOUT_SECONDS", "1")
+    monkeypatch.setattr(harness, "PortForward", FakePortForward)
+    monkeypatch.setattr(harness, "_http_request", fake_request)
+    monkeypatch.setattr(harness.time, "monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(harness.time, "sleep", lambda _seconds: None)
+
+    application = harness.ApplicationE2EHarness(tmp_path / "state")
+    thread_id = "123e4567-e89b-42d3-a456-426614174000"
+    results = application._cleanup_threads(
+        {"kubeconfig": str(tmp_path / "kubeconfig.yaml")},
+        [thread_id],
+        "session=owned",
+    )
+
+    assert results == [
+        {
+            "kind": "thread",
+            "id": thread_id,
+            "status": "200",
+            "forced": "true",
+        }
+    ]
+    assert calls[0].endswith(f"/{thread_id}?permanent=true")
+    assert calls[1].endswith(f"/{thread_id}?permanent=true&force=true")
+    assert calls[2] == calls[1]
+    assert calls[3].endswith(f"/{thread_id}")
+
+
 def test_cookie_header_selects_only_owned_origin() -> None:
     state = {
         "cookies": [
@@ -874,6 +1036,82 @@ def test_e2e_values_keep_only_required_stack_and_exact_provider_egress() -> None
     assert models[0]["capabilities"] == ["chat", "auxiliary"]
     assert models[0]["contextWindow"] == 128000
     assert models[1]["capabilities"] == ["embedding"]
+
+
+def test_stateless_sandbox_values_enable_only_the_session_executor_profile() -> None:
+    values = yaml.safe_load(
+        harness.STATELESS_SANDBOX_VALUES_FILE.read_text(encoding="utf-8")
+    )
+
+    assert values == {
+        "agent": {
+            "stateless": {
+                "enabled": True,
+                "replicas": 2,
+                "worker": {"enabled": False, "defaultEnabled": False},
+            }
+        },
+        "workspace": {
+            "pvcEnabled": True,
+            "pvcSize": "1Gi",
+            "ephemeralStorageClass": "local-path",
+        },
+    }
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+def test_stateless_sandbox_profile_renders_current_executor_and_workspace_images(
+    tmp_path: Path,
+) -> None:
+    sha = "a" * 40
+    run_id = "20260824-123456-ab12cd34"
+    profile = harness.resolve_profile("stateless-sandbox")
+    images, _commands = harness.build_image_commands(
+        sha, run_id, include_workspace=True
+    )
+    image_values = tmp_path / "images.yaml"
+    image_values.write_text(
+        harness._image_values(images, sha, run_id), encoding="utf-8"
+    )
+    command = [
+        "helm",
+        "template",
+        "srw-e2e",
+        str(harness.REPO_ROOT / "helm"),
+        "-n",
+        harness.NAMESPACE,
+    ]
+    for values_file in profile.values_files:
+        command.extend(("-f", str(values_file)))
+    command.extend(("-f", str(image_values)))
+    rendered = subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    ).stdout
+    documents = [document for document in yaml.safe_load_all(rendered) if document]
+    stateless = next(
+        document
+        for document in documents
+        if document.get("kind") == "Deployment"
+        and document.get("metadata", {}).get("name") == "srw-e2e-agent-stateless"
+    )
+    assert stateless["spec"]["replicas"] == 2
+    assert (
+        stateless["spec"]["template"]["spec"]["containers"][0]["image"]
+        == images["agent"]
+    )
+    config = next(
+        document
+        for document in documents
+        if document.get("kind") == "ConfigMap"
+        and document.get("metadata", {}).get("name") == "srw-e2e-config"
+    )
+    assert config["data"]["STATELESS_SESSION_ENABLED"] == "true"
+    assert config["data"]["STATELESS_WORKER_ENABLED"] == "false"
+    assert config["data"]["WORKSPACE_IMAGE"] == images["workspace"]
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")

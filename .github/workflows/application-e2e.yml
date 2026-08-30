@@ -1,16 +1,18 @@
 name: application-e2e-observation
 
-# Phase-B observation lane for the first full-stack Cockpit journey. This is a
-# standalone scheduled/manual workflow: it deliberately does not extend the
-# fast test-cockpit job or gate pushes/releases until the documented bake window
-# is complete.
+# Phase-B observation lane for the full-stack Cockpit journey across the cheap
+# pinned baseline and the incident-driven stateless sandbox topology. It stays
+# separate from the fast test-cockpit job and is not a release gate during its
+# documented bake window.
 
 on:
   schedule:
     # Daily, away from the top-of-hour scheduler spike and the Monday 06:00 UTC
     # stage1 rebuild. GitHub schedules always use the default branch's workflow.
-    - cron: '17 3 * * *'
+    - cron: "17 3 * * *"
   workflow_dispatch:
+  push:
+    branches: [develop]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -20,15 +22,27 @@ permissions:
   contents: read
 
 env:
-  APP_E2E_STATE_DIR: ${{ github.workspace }}/cockpit/test-results/application-e2e-ci-${{ github.run_id }}-${{ github.run_attempt }}
   K3D_VERSION: v5.8.3
   K3D_LINUX_AMD64_SHA256: dbaa79a76ace7f4ca230a1ff41dc7d8a5036a8ad0309e9c54f9bf3836dbe853e
 
 jobs:
   application-e2e:
-    name: application E2E observation
+    name: application E2E observation (${{ matrix.profile }})
     runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || vars.CI_RUNNER_LABEL || 'ubuntu-latest' }}
-    timeout-minutes: 45
+    timeout-minutes: ${{ matrix.job_timeout_minutes }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - profile: pinned-virtual
+            job_timeout_minutes: 45
+            lifecycle_timeout: 38m
+          - profile: stateless-sandbox
+            # This leg also builds/imports the large physical-workspace image.
+            job_timeout_minutes: 75
+            lifecycle_timeout: 68m
+    env:
+      APP_E2E_STATE_DIR: ${{ github.workspace }}/cockpit/test-results/application-e2e-ci-${{ matrix.profile }}-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -92,10 +106,10 @@ jobs:
           PYTHONUNBUFFERED: "1"
         run: |
           set +e
-          # Leave time inside the 45-minute job bound for SIGINT-driven exact
+          # Leave seven minutes inside the job bound for SIGINT-driven exact
           # cleanup, independent teardown proof, summaries, and artifact upload.
-          timeout --foreground --signal=INT --kill-after=4m 38m \
-            ./scripts/e2e-app.sh run
+          timeout --foreground --signal=INT --kill-after=4m "${{ matrix.lifecycle_timeout }}" \
+            ./scripts/e2e-app.sh run --profile "${{ matrix.profile }}"
           exit_code=$?
           set -e
           echo "exit_code=${exit_code}" >> "${GITHUB_OUTPUT}"
@@ -120,7 +134,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: application-e2e-metadata-${{ github.run_id }}-${{ github.run_attempt }}
+          name: application-e2e-metadata-${{ matrix.profile }}-${{ github.run_id }}-${{ github.run_attempt }}
           retention-days: 7
           if-no-files-found: ignore
           path: |
@@ -135,7 +149,7 @@ jobs:
         if: ${{ always() && steps.finalize.outputs.teardown_proven == 'true' }}
         uses: actions/upload-artifact@v4
         with:
-          name: application-e2e-browser-${{ github.run_id }}-${{ github.run_attempt }}
+          name: application-e2e-browser-${{ matrix.profile }}-${{ github.run_id }}-${{ github.run_attempt }}
           retention-days: 7
           if-no-files-found: ignore
           path: |

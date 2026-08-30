@@ -6,7 +6,11 @@ import { privateOutputPath, writePrivateJsonFile } from './environment';
 const THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // Normal graceful retirement gets the full documented cleanup budget. Force
 // is an exact-id fallback only after that window, never an early fast path.
-const CLEANUP_WINDOW_MS = 180_000;
+// A forced stateless retirement may itself return a retryable 409/503 after it
+// has closed admission but while final-memory/runtime cleanup converges, so it
+// receives a separate bounded continuation window.
+const GRACEFUL_CLEANUP_WINDOW_MS = 180_000;
+const FORCED_CLEANUP_WINDOW_MS = 60_000;
 const MUTATION_HEADERS = { 'X-CSRF': '1' };
 
 interface ThreadResource {
@@ -160,11 +164,11 @@ export class ResourceLedger {
     }
 
     const pathname = `/api/persistent/threads/${encodeURIComponent(threadId)}`;
-    const deadline = Date.now() + CLEANUP_WINDOW_MS;
+    const gracefulDeadline = Date.now() + GRACEFUL_CLEANUP_WINDOW_MS;
     let backoff = 250;
     let deleted = false;
 
-    while (Date.now() < deadline) {
+    while (Date.now() < gracefulDeadline) {
       const response = await request.delete(`${pathname}?permanent=true`, {
         headers: MUTATION_HEADERS,
         timeout: 20_000,
@@ -178,18 +182,36 @@ export class ResourceLedger {
           `Permanent delete for exact thread ${threadId} returned HTTP ${response.status()}.`,
         );
       }
-      await delay(Math.min(backoff, Math.max(0, deadline - Date.now())));
+      await delay(Math.min(backoff, Math.max(0, gracefulDeadline - Date.now())));
       backoff = Math.min(backoff * 2, 2_000);
     }
 
     if (!deleted) {
-      const forced = await request.delete(`${pathname}?permanent=true&force=true`, {
-        headers: MUTATION_HEADERS,
-        timeout: 30_000,
-      });
-      if (!forced.ok() && forced.status() !== 404) {
+      const forcedDeadline = Date.now() + FORCED_CLEANUP_WINDOW_MS;
+      backoff = 250;
+      let lastStatus = 0;
+      while (Date.now() < forcedDeadline) {
+        const forced = await request.delete(`${pathname}?permanent=true&force=true`, {
+          headers: MUTATION_HEADERS,
+          timeout: 30_000,
+        });
+        lastStatus = forced.status();
+        if (forced.ok() || lastStatus === 404) {
+          deleted = true;
+          break;
+        }
+        if (lastStatus !== 409 && lastStatus !== 503) {
+          throw new Error(
+            `Bounded force delete for exact thread ${threadId} returned HTTP ${lastStatus}.`,
+          );
+        }
+        await delay(Math.min(backoff, Math.max(0, forcedDeadline - Date.now())));
+        backoff = Math.min(backoff * 2, 2_000);
+      }
+      if (!deleted) {
         throw new Error(
-          `Bounded force delete for exact thread ${threadId} returned HTTP ${forced.status()}.`,
+          `Bounded force delete for exact thread ${threadId} did not settle ` +
+            `(last HTTP ${lastStatus}).`,
         );
       }
     }

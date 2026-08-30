@@ -174,11 +174,29 @@ async function bootstrapCatalogAndReadiness(
   expect(experts.defaults.worker).toMatchObject({ expert_type: 'worker' });
   expect(experts.defaults.session).toMatchObject({ expert_type: 'session' });
 
+  if (!ATTACH_MODE && environment.workspaceBackend === 'sandbox') {
+    const updated = await journey.request.patch(appUrl('/api/settings/preferences'), {
+      headers: CSRF_HEADERS,
+      data: { persistent_agent: { workspace_backend: environment.workspaceBackend } },
+    });
+    await requireJson<{ status: string }>(updated, 'journey workspace-profile selection');
+  }
+
   const preferences = await requireJson<Record<string, unknown>>(
     await journey.request.get(appUrl('/api/settings/preferences')),
     'journey preference verification',
   );
-  expect(Object.keys(preferences).filter((key) => key !== '_resolved')).toEqual([]);
+  const explicitPreferenceKeys = Object.keys(preferences)
+    .filter((key) => key !== '_resolved')
+    .sort();
+  if (environment.workspaceBackend === 'virtual') {
+    expect(explicitPreferenceKeys).toEqual([]);
+  } else {
+    expect(explicitPreferenceKeys).toEqual(['persistent_agent']);
+    expect(preferences['persistent_agent']).toEqual({
+      workspace_backend: environment.workspaceBackend,
+    });
+  }
   expect(preferences['_resolved']).toMatchObject({
     default_model: environment.chatModel,
     default_auxiliary_model: environment.chatModel,

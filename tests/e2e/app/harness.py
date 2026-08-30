@@ -37,6 +37,7 @@ REPO_ROOT: Final = Path(__file__).resolve().parents[3]
 ASSET_ROOT: Final = REPO_ROOT / "tests/e2e/app"
 K3D_TEMPLATE: Final = ASSET_ROOT / "k3d.yaml"
 VALUES_FILE: Final = ASSET_ROOT / "values-e2e.yaml"
+STATELESS_SANDBOX_VALUES_FILE: Final = ASSET_ROOT / "values-stateless-sandbox.yaml"
 PROVIDER_MANIFEST: Final = ASSET_ROOT / "deterministic_provider/kubernetes.yaml"
 PROVIDER_DOCKERFILE: Final = ASSET_ROOT / "deterministic_provider/Dockerfile"
 PLAYWRIGHT_RUNNER_DOCKERFILE: Final = ASSET_ROOT / "Dockerfile.playwright"
@@ -69,6 +70,7 @@ DEFAULT_STATE_ROOT: Final = REPO_ROOT / "cockpit/test-results/app-harness"
 STATE_ROOT_MARKER: Final = ".srw-application-e2e-root.json"
 RUN_DIRECTORY_MARKER: Final = ".srw-application-e2e-run.json"
 STATE_LOCK_FILE: Final = ".srw-application-e2e.lock"
+DEFAULT_PROFILE_NAME: Final = "pinned-virtual"
 
 SENSITIVE_LINE_MARKERS: Final = (
     '"authorization"',
@@ -101,6 +103,49 @@ class HarnessError(RuntimeError):
 
 class SafetyError(HarnessError):
     """A fail-closed ownership/origin violation."""
+
+
+@dataclasses.dataclass(frozen=True)
+class ApplicationE2EProfile:
+    name: str
+    values_files: tuple[Path, ...]
+    workspace_backend: str
+    execution_lane: str
+    include_workspace_image: bool = False
+    additional_deployments: tuple[str, ...] = ()
+
+
+APPLICATION_E2E_PROFILES: Final = {
+    DEFAULT_PROFILE_NAME: ApplicationE2EProfile(
+        name=DEFAULT_PROFILE_NAME,
+        values_files=(VALUES_FILE,),
+        workspace_backend="virtual",
+        execution_lane="pinned",
+    ),
+    "stateless-sandbox": ApplicationE2EProfile(
+        name="stateless-sandbox",
+        values_files=(VALUES_FILE, STATELESS_SANDBOX_VALUES_FILE),
+        workspace_backend="sandbox",
+        execution_lane="stateless",
+        include_workspace_image=True,
+        additional_deployments=("srw-e2e-agent-stateless",),
+    ),
+}
+
+
+def resolve_profile(name: str) -> ApplicationE2EProfile:
+    profile = APPLICATION_E2E_PROFILES.get(name)
+    if profile is None:
+        raise SafetyError("unknown application E2E profile")
+    return profile
+
+
+def profile_from_ledger(ledger: Mapping[str, Any]) -> ApplicationE2EProfile:
+    # Schema-1 ledgers written before profiles existed are pinned-virtual.
+    raw = ledger.get("profile", DEFAULT_PROFILE_NAME)
+    if not isinstance(raw, str):
+        raise SafetyError("ownership ledger profile is invalid")
+    return resolve_profile(raw)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -589,8 +634,11 @@ class StateStore:
         )
         return run_dir
 
-    def initialize(self, run_id: str) -> dict[str, Any]:
+    def initialize(
+        self, run_id: str, profile_name: str = DEFAULT_PROFILE_NAME
+    ) -> dict[str, Any]:
         validate_run_id(run_id)
+        profile = resolve_profile(profile_name)
         self._ensure_owned_root()
         with self._active_lock():
             if os.path.lexists(self.active_path):
@@ -607,6 +655,7 @@ class StateStore:
                 "cluster_name": cluster_name,
                 "namespace": NAMESPACE,
                 "release": RELEASE,
+                "profile": profile.name,
                 "base_url": BASE_URL,
                 "run_dir": str(run_dir),
                 "kubeconfig": str(run_dir / "kubeconfig.yaml"),
@@ -692,6 +741,7 @@ class StateStore:
         kubeconfig = Path(str(ledger.get("kubeconfig", ""))).resolve()
         if kubeconfig != run_dir / "kubeconfig.yaml":
             raise SafetyError("ledger kubeconfig path is not run-owned")
+        profile_from_ledger(ledger)
 
     def clear_active(self, ledger: dict[str, Any]) -> None:
         self.validate(ledger)
@@ -735,7 +785,9 @@ def validate_container_platform(platform: str) -> str:
 def image_import_groups(images: Mapping[str, str]) -> list[tuple[str, tuple[str, ...]]]:
     """Split imports so dependency failures identify one exact upstream image."""
 
-    components = ("orchestrator", "agent", "cockpit", "provider")
+    components = ["orchestrator", "agent", "cockpit", "provider"]
+    if "workspace" in images:
+        components.append("workspace")
     if any(not images.get(component) for component in components):
         raise SafetyError("image import requires every deployable E2E image")
     return [
@@ -836,6 +888,7 @@ def build_image_commands(
     *,
     dirty: bool = False,
     platform: str | None = None,
+    include_workspace: bool = False,
 ) -> tuple[dict[str, str], list[list[str]]]:
     if not re.fullmatch(r"[0-9a-f]{40,64}", sha):
         raise SafetyError("git revision is not a full hexadecimal commit id")
@@ -931,10 +984,32 @@ def build_image_commands(
             ".",
         ],
     ]
+    if include_workspace:
+        images["workspace"] = f"srw-e2e-workspace:{suffix}"
+        commands.append(
+            [
+                "docker",
+                "build",
+                *platform_args,
+                "--pull=false",
+                *ownership,
+                *common,
+                "-f",
+                "docker/Dockerfile.workspace",
+                "-t",
+                images["workspace"],
+                ".",
+            ]
+        )
     return images, commands
 
 
-def helm_install_command(kubeconfig: Path, image_values: Path) -> list[str]:
+def helm_install_command(
+    kubeconfig: Path,
+    image_values: Path,
+    values_files: Sequence[Path] = (VALUES_FILE,),
+) -> list[str]:
+    values_args = [argument for path in values_files for argument in ("-f", str(path))]
     return [
         "helm",
         "upgrade",
@@ -946,8 +1021,7 @@ def helm_install_command(kubeconfig: Path, image_values: Path) -> list[str]:
         "--namespace",
         NAMESPACE,
         "--create-namespace",
-        "-f",
-        str(VALUES_FILE),
+        *values_args,
         "-f",
         str(image_values),
         "--wait",
@@ -964,8 +1038,11 @@ def _image_values(
         repository, tag = ref.rsplit(":", 1)
         return repository, tag
 
+    configured_components = ["orchestrator", "agent", "cockpit"]
+    if "workspace" in images:
+        configured_components.append("workspace")
     lines = ["image:"]
-    for component in ("orchestrator", "agent", "cockpit"):
+    for component in configured_components:
         repository, tag = split(images[component])
         lines.extend(
             [
@@ -983,7 +1060,7 @@ def _image_values(
             "  components:",
         ]
     )
-    for component in ("orchestrator", "agent", "cockpit"):
+    for component in configured_components:
         lines.extend(
             [
                 f"    {component}:",
@@ -1257,6 +1334,7 @@ class ApplicationE2EHarness:
         self.store.persist(ledger)
         evidence = {
             "run_id": ledger["run_id"],
+            "profile": profile_from_ledger(ledger).name,
             "last_completed_layer": layer,
             "updated_at": ledger["updated_at"],
             "layer_timings": timings,
@@ -1513,6 +1591,7 @@ class ApplicationE2EHarness:
     def build_and_import_images(self, ledger: dict[str, Any]) -> None:
         sha = str(ledger.get("source_revision", ""))
         dirty = ledger.get("source_dirty") is True
+        profile = profile_from_ledger(ledger)
         platform_result = self.runner.run(
             [
                 "docker",
@@ -1528,6 +1607,7 @@ class ApplicationE2EHarness:
             str(ledger["run_id"]),
             dirty=dirty,
             platform=platform,
+            include_workspace=profile.include_workspace_image,
         )
         ledger["images"] = images
         ledger["image_ids"] = {}
@@ -1701,7 +1781,10 @@ class ApplicationE2EHarness:
             raise SafetyError("image verification ledger is incomplete")
 
         expected_tags: set[str] = set()
-        for component in ("orchestrator", "agent", "cockpit", "provider"):
+        components = ["orchestrator", "agent", "cockpit", "provider"]
+        if profile_from_ledger(ledger).include_workspace_image:
+            components.append("workspace")
+        for component in components:
             image = images.get(component)
             if not isinstance(image, str):
                 raise SafetyError("deployable image verification ledger is invalid")
@@ -1855,25 +1938,24 @@ class ApplicationE2EHarness:
 
     def deploy_chart(self, ledger: dict[str, Any]) -> None:
         image_values = self._run_dir(ledger) / "values-images.yaml"
+        profile = profile_from_ledger(ledger)
         self.runner.run(
             ["helm", "dependency", "build", str(REPO_ROOT / "helm")],
             timeout=300,
             label="Helm dependency build",
         )
+        lint_command = ["helm", "lint", str(REPO_ROOT / "helm")]
+        for values_file in profile.values_files:
+            lint_command.extend(("-f", str(values_file)))
+        lint_command.extend(("-f", str(image_values)))
         self.runner.run(
-            [
-                "helm",
-                "lint",
-                str(REPO_ROOT / "helm"),
-                "-f",
-                str(VALUES_FILE),
-                "-f",
-                str(image_values),
-            ],
+            lint_command,
             timeout=120,
             label="E2E Helm lint",
         )
-        command = helm_install_command(self._kubeconfig(ledger), image_values)
+        command = helm_install_command(
+            self._kubeconfig(ledger), image_values, profile.values_files
+        )
         if "--atomic" in command:
             raise SafetyError(
                 "E2E Helm install must preserve failed state for diagnostics"
@@ -1883,6 +1965,7 @@ class ApplicationE2EHarness:
             "srw-e2e-orchestrator",
             "srw-e2e-cockpit",
             "srw-e2e-keycloak",
+            *profile.additional_deployments,
         ):
             self.runner.run(
                 self._kubectl(
@@ -1901,11 +1984,16 @@ class ApplicationE2EHarness:
         self._mark_layer(ledger, "helm-workloads")
 
     def _verify_deployed_images(self, ledger: Mapping[str, Any]) -> None:
+        profile = profile_from_ledger(ledger)
         checks = {
             "deployment/srw-e2e-orchestrator": str(ledger["images"]["orchestrator"]),
             "deployment/srw-e2e-cockpit": str(ledger["images"]["cockpit"]),
             "deployment/srw-e2e-model-fixture": str(ledger["images"]["provider"]),
         }
+        if profile.name == "stateless-sandbox":
+            checks["deployment/srw-e2e-agent-stateless"] = str(
+                ledger["images"]["agent"]
+            )
         for resource, expected in checks.items():
             actual = self.runner.run(
                 self._kubectl(
@@ -1935,6 +2023,23 @@ class ApplicationE2EHarness:
         ).stdout
         if agent_image != str(ledger["images"]["agent"]):
             raise SafetyError("dynamic agent configuration is not current-SHA pinned")
+        if profile.include_workspace_image:
+            workspace_image = self.runner.run(
+                self._kubectl(
+                    ledger,
+                    "-n",
+                    NAMESPACE,
+                    "get",
+                    "configmap/srw-e2e-config",
+                    "-o",
+                    "jsonpath={.data.WORKSPACE_IMAGE}",
+                ),
+                label="dynamic workspace image verification",
+            ).stdout
+            if workspace_image != str(ledger["images"]["workspace"]):
+                raise SafetyError(
+                    "dynamic workspace configuration is not current-SHA pinned"
+                )
 
     def create_keycloak_users(self, ledger: dict[str, Any]) -> None:
         bundle = self._load_secrets(ledger)
@@ -2174,11 +2279,11 @@ class ApplicationE2EHarness:
                 )
         self._mark_layer(ledger, "provider-contract")
 
-    def up(self) -> dict[str, Any]:
+    def up(self, profile_name: str = DEFAULT_PROFILE_NAME) -> dict[str, Any]:
         self.check_prerequisites()
         sha, dirty = self.inspect_source()
         run_id = new_run_id()
-        ledger = self.store.initialize(run_id)
+        ledger = self.store.initialize(run_id, profile_name)
         ledger["source_revision"] = sha
         ledger["source_dirty"] = dirty
         ledger["authoritative"] = not dirty
@@ -2196,7 +2301,9 @@ class ApplicationE2EHarness:
         self.provider_preflight(ledger)
         self._mark_layer(ledger, "ready-for-playwright")
         print(
-            f"[e2e-app] owned environment ready ({ledger['cluster_name']})", flush=True
+            f"[e2e-app] owned {ledger['profile']} environment ready "
+            f"({ledger['cluster_name']})",
+            flush=True,
         )
         return ledger
 
@@ -2306,6 +2413,7 @@ class ApplicationE2EHarness:
 
     def test_owned(self, ledger: dict[str, Any]) -> None:
         self._assert_owned_cluster(ledger)
+        profile = profile_from_ledger(ledger)
         bundle = self._load_secrets(ledger)
         network, ingress_ip, gateway = self._network_facts(ledger)
         run_dir = self._run_dir(ledger)
@@ -2356,6 +2464,8 @@ class ApplicationE2EHarness:
                     ),
                     "APP_E2E_REPORT_DIR": f"{container_run_dir}/playwright-report",
                     "APP_E2E_DEFER_FAILED_CLEANUP": "1",
+                    "APP_E2E_WORKSPACE_BACKEND": profile.workspace_backend,
+                    "APP_E2E_EXPECT_EXECUTION_LANE": profile.execution_lane,
                 }
             )
             env_file = run_dir / "browser.env"
@@ -2370,7 +2480,8 @@ class ApplicationE2EHarness:
                 run_id=str(ledger["run_id"]),
             )
             print(
-                "[e2e-app] running Chromium journey in pinned Playwright image",
+                f"[e2e-app] running {profile.name} Chromium journey in pinned "
+                "Playwright image",
                 flush=True,
             )
             try:
@@ -2425,6 +2536,8 @@ class ApplicationE2EHarness:
             "APP_E2E_ALLOW_REMOTE",
             "APP_E2E_CHAT_MODEL",
             "APP_E2E_EMBEDDING_MODEL",
+            "APP_E2E_WORKSPACE_BACKEND",
+            "APP_E2E_EXPECT_EXECUTION_LANE",
         )
         environment = {
             name: os.environ[name]
@@ -2580,6 +2693,7 @@ class ApplicationE2EHarness:
                     "cockpit",
                     "provider",
                     "playwright",
+                    "workspace",
                 )
             ),
             *(
@@ -2804,6 +2918,13 @@ class ApplicationE2EHarness:
         timeout_seconds = int(os.environ.get("APP_E2E_CLEANUP_TIMEOUT_SECONDS", "180"))
         if not 1 <= timeout_seconds <= 300:
             raise SafetyError("cleanup timeout must be between 1 and 300 seconds")
+        force_timeout_seconds = int(
+            os.environ.get("APP_E2E_FORCE_CLEANUP_TIMEOUT_SECONDS", "60")
+        )
+        if not 1 <= force_timeout_seconds <= 120:
+            raise SafetyError(
+                "forced cleanup timeout must be between 1 and 120 seconds"
+            )
         results: list[dict[str, str]] = []
         with PortForward(
             kubeconfig=self._kubeconfig(ledger),
@@ -2837,15 +2958,27 @@ class ApplicationE2EHarness:
                 forced = False
                 if status in {409, 503}:
                     # Force escalation is legal only because thread_id came
-                    # from the validated, exact resource ledger above.
+                    # from the validated, exact resource ledger above. A
+                    # stateless force may durably close admission and still
+                    # return 409/503 while its final-memory/runtime obligations
+                    # converge, so retry that same exact authority separately.
                     forced = True
-                    status, _body = _http_request(
-                        f"{root}{path}?permanent=true&force=true",
-                        method="DELETE",
-                        headers=headers,
-                        expected=(200, 202, 204, 404),
-                        timeout=30,
-                    )
+                    force_deadline = time.monotonic() + force_timeout_seconds
+                    while time.monotonic() < force_deadline:
+                        status, _body = _http_request(
+                            f"{root}{path}?permanent=true&force=true",
+                            method="DELETE",
+                            headers=headers,
+                            expected=(200, 202, 204, 404, 409, 503),
+                            timeout=30,
+                        )
+                        if status not in {409, 503}:
+                            break
+                        time.sleep(min(2, max(0.1, force_deadline - time.monotonic())))
+                    if status in {409, 503}:
+                        raise HarnessError(
+                            "bounded exact-id force cleanup did not settle"
+                        )
                 verify_status, _body = _http_request(
                     f"{root}{path}",
                     headers=headers,
@@ -2957,7 +3090,13 @@ class ApplicationE2EHarness:
         sha = str(ledger.get("source_revision", ""))
         run_id = validate_run_id(str(ledger["run_id"]))
         dirty = ledger.get("source_dirty") is True
-        expected_images, _commands = build_image_commands(sha, run_id, dirty=dirty)
+        profile = profile_from_ledger(ledger)
+        expected_images, _commands = build_image_commands(
+            sha,
+            run_id,
+            dirty=dirty,
+            include_workspace=profile.include_workspace_image,
+        )
         if recorded_images != expected_images:
             raise SafetyError("ownership ledger image tags are not run-derived")
         recorded_ids = ledger.get("image_ids", {})
@@ -3161,13 +3300,15 @@ def _best_effort_down(harness: ApplicationE2EHarness) -> BaseException | None:
         return exc
 
 
-def _run_authoritative(harness: ApplicationE2EHarness) -> int:
+def _run_authoritative(
+    harness: ApplicationE2EHarness, profile_name: str = DEFAULT_PROFILE_NAME
+) -> int:
     ledger: dict[str, Any] | None = None
     primary_error: BaseException | None = None
     cleanup_error: BaseException | None = None
     down_error: BaseException | None = None
     try:
-        ledger = harness.up()
+        ledger = harness.up(profile_name)
         harness.test_owned(ledger)
     except BaseException as exc:  # cleanup/teardown must also run on Ctrl-C
         primary_error = exc
@@ -3216,7 +3357,9 @@ def _run_authoritative(harness: ApplicationE2EHarness) -> int:
         else "non-authoritative dirty-tree"
     )
     print(
-        f"[e2e-app] {evidence} golden journey passed and teardown completed", flush=True
+        f"[e2e-app] {evidence} {profile_name} golden journey passed and teardown "
+        "completed",
+        flush=True,
     )
     return 0
 
@@ -3224,8 +3367,19 @@ def _run_authoritative(harness: ApplicationE2EHarness) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser("run", help="own the complete up/test/cleanup/down lifecycle")
-    subparsers.add_parser("up", help="create and preflight a fresh owned environment")
+    profile_choices = tuple(APPLICATION_E2E_PROFILES)
+    run_parser = subparsers.add_parser(
+        "run", help="own the complete up/test/cleanup/down lifecycle"
+    )
+    run_parser.add_argument(
+        "--profile", choices=profile_choices, default=DEFAULT_PROFILE_NAME
+    )
+    up_parser = subparsers.add_parser(
+        "up", help="create and preflight a fresh owned environment"
+    )
+    up_parser.add_argument(
+        "--profile", choices=profile_choices, default=DEFAULT_PROFILE_NAME
+    )
     test_parser = subparsers.add_parser("test", help="run the browser journey")
     test_parser.add_argument(
         "--attach",
@@ -3243,10 +3397,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     harness = ApplicationE2EHarness(_state_root_from_environment())
     try:
         if arguments.command == "run":
-            return _run_authoritative(harness)
+            return _run_authoritative(harness, arguments.profile)
         if arguments.command == "up":
             try:
-                harness.up()
+                harness.up(arguments.profile)
             except BaseException:
                 _best_effort_diagnostics(harness)
                 down_error = _best_effort_down(harness)

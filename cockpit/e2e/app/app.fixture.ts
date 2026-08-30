@@ -22,16 +22,31 @@ interface ThreadList {
   threads: Array<{ id: string }>;
 }
 
+interface ThreadDetail {
+  execution_lane?: unknown;
+  metadata?: unknown;
+}
+
+export interface ThreadTopology {
+  executionLane: string | null;
+  workspaceBackend: string | null;
+  workspaceStatus: string | null;
+  workspaceProvisioner: string | null;
+}
+
 export interface ApplicationJourney {
   page: Page;
   runId: string;
   runToken: string;
   expectedReply: string;
   chatModel: string;
+  expectedExecutionLane: 'pinned' | 'stateless';
+  workspaceBackend: 'virtual' | 'sandbox';
   network: NetworkLedger;
   provider: ProviderControlClient;
   setPhase(phase: JourneyPhase): void;
   listThreadIds(): Promise<Set<string>>;
+  threadTopology(threadId: string): Promise<ThreadTopology>;
   registerThread(threadId: string): void;
 }
 
@@ -45,6 +60,16 @@ function safeTestFileName(testInfo: TestInfo): string {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function record(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function stringField(value: Record<string, unknown>, key: string): string | null {
+  return typeof value[key] === 'string' ? value[key] : null;
 }
 
 async function attachJson(testInfo: TestInfo, name: string, value: unknown): Promise<void> {
@@ -122,6 +147,8 @@ export const test = base.extend<ApplicationFixtures>({
         runToken,
         expectedReply,
         chatModel: environment.chatModel,
+        expectedExecutionLane: environment.expectedExecutionLane,
+        workspaceBackend: environment.workspaceBackend,
         network,
         provider,
         setPhase: (phase) => network.setPhase(phase),
@@ -131,6 +158,22 @@ export const test = base.extend<ApplicationFixtures>({
             'journey thread inventory',
           );
           return new Set(body.threads.map(({ id }) => id));
+        },
+        threadTopology: async (threadId) => {
+          const body = await requireJson<ThreadDetail>(
+            await request.get(`/api/persistent/threads/${encodeURIComponent(threadId)}`),
+            'journey thread topology',
+          );
+          const metadata = record(body.metadata);
+          const configOverride = record(metadata['config_override']);
+          const workspace = record(configOverride['workspace']);
+          const workspaceContainer = record(metadata['workspace_container']);
+          return {
+            executionLane: typeof body.execution_lane === 'string' ? body.execution_lane : null,
+            workspaceBackend: stringField(workspace, 'backend'),
+            workspaceStatus: stringField(workspaceContainer, 'status'),
+            workspaceProvisioner: stringField(workspaceContainer, 'provisioner'),
+          };
         },
         registerThread,
       };

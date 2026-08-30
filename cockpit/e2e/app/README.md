@@ -6,7 +6,14 @@ and it never intercepts application requests. The lifecycle owner is:
 
 ```bash
 ./scripts/e2e-app.sh run
+./scripts/e2e-app.sh run --profile stateless-sandbox
 ```
+
+The default `pinned-virtual` profile is the low-cost memory-backed baseline.
+`stateless-sandbox` reuses the same browser journey but enables the shared
+executor pool, selects a physical Kubernetes workspace, and includes the
+current-source workspace image in the build/import/deployment proof. The
+journey fails if orchestration silently falls back to the pinned lane.
 
 The initial blocking journey proves that opening `/` creates nothing, the first
 visible Send creates exactly one session and submits exactly one input, the
@@ -34,12 +41,19 @@ APP_E2E_ADMIN_PASSWORD
 APP_E2E_PROVIDER_BASE_URL
 APP_E2E_CONTROL_URL
 APP_E2E_CONTROL_TOKEN
+APP_E2E_WORKSPACE_BACKEND
+APP_E2E_EXPECT_EXECUTION_LANE
 ```
 
 The base URL accepts loopback and `.localhost` origins by default. A disposable
 container/cluster hostname additionally requires `APP_E2E_ALLOW_REMOTE=1`.
 `APP_E2E_PROVIDER_BASE_URL` is the exact in-cluster inference URL ending in
 `/v1`; setup rejects any catalog transport that points elsewhere.
+The topology variables form one of two accepted pairs: `virtual` + `pinned`,
+or `sandbox` + `stateless`. They default to the pinned pair for direct local
+Playwright use. Attach mode never changes an existing user's workspace
+preference, so a stateless attach run requires that user to be preconfigured
+for the sandbox tier.
 
 The owned-cluster runner may set `APP_E2E_AUTH_STATE` and
 `APP_E2E_RESOURCE_LEDGER` to its private run directory. Auth state is written

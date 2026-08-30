@@ -1,0 +1,17 @@
+# Profile overlay for SES-11. The shared values-e2e.yaml remains the cheap
+# pinned/virtual baseline; this overlay changes only the execution topology.
+agent:
+  stateless:
+    enabled: true
+    replicas: 2
+    worker:
+      enabled: false
+      defaultEnabled: false
+
+# Use a small local-path PVC so permanent teardown can prove and reclaim the
+# exact workspace without depending on an optional snapshot store. The
+# generated image-values layer supplies the current-source workspace image.
+workspace:
+  pvcEnabled: true
+  pvcSize: 1Gi
+  ephemeralStorageClass: local-path

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -169,6 +170,12 @@ def _release_authorized_live_thread() -> dict:
     }
 
 
+def _retiring_process_zero_thread() -> dict:
+    thread = _release_authorized_live_thread()
+    thread["metadata"]["workspace_container"]["status"] = "retiring_process_zero"
+    return thread
+
+
 @asynccontextmanager
 async def _owned_lock(*_args, **_kwargs):
     yield True
@@ -309,6 +316,156 @@ async def test_duplicate_soft_end_reuses_settled_proof_without_effects() -> None
     provisioner.release_absent_workspace.assert_not_awaited()
     snapshots.delete_snapshot.assert_not_awaited()
     db.delete_thread.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_permanent_end_retry_accepts_exact_process_zero_authority() -> None:
+    thread = _retiring_process_zero_thread()
+    authority = {
+        **_lifecycle_authority(),
+        "retirement_pending": True,
+        "retirement_token": "8",
+    }
+    db = SimpleNamespace(
+        get_thread=AsyncMock(return_value=thread),
+        get_stateless_thread_lifecycle_authority=AsyncMock(return_value=authority),
+        stateless_session_workspace_ensure_lock=_owned_lock,
+    )
+    reconcile = AsyncMock(return_value={"state": "missing"})
+
+    with (
+        patch.object(
+            main,
+            "require_thread_owner",
+            AsyncMock(return_value=({"sub": "user-1"}, thread)),
+        ),
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "_reconcile_stateless_thread_retirement", reconcile),
+    ):
+        result = await main.end_thread(
+            THREAD_ID, SimpleNamespace(), permanent=True, force=True
+        )
+
+    assert result == {"status": "deleted"}
+    reconcile.assert_awaited_once_with(
+        THREAD_ID,
+        force=True,
+        permanent=True,
+    )
+
+
+def test_process_zero_without_pending_retirement_stays_fail_closed() -> None:
+    thread = _retiring_process_zero_thread()
+    thread["metadata"].pop("_stateless_workspace_retirement_pending")
+    thread["metadata"].pop("_stateless_claim_retirement")
+
+    with pytest.raises(HTTPException) as exc:
+        main._require_stateless_end_workspace(thread)
+
+    assert exc.value.status_code == 409
+    assert "workspace_status_unavailable" in str(exc.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_process_zero_retry_retires_exact_live_residents_and_shell() -> None:
+    from services import stateless_session_retirement as retirement_service
+
+    settled = _retiring_process_zero_thread()
+    settled_marker = settled["metadata"]["_stateless_claim_retirement"]
+    settled_marker["permanent"] = True
+
+    resident_settled = deepcopy(settled)
+    resident_marker = resident_settled["metadata"]["_stateless_claim_retirement"]
+    resident_marker["remote_retired"] = False
+    resident_marker.pop("remote_retired_by")
+    resident_settled["metadata"].pop("_stateless_shell_retirement_ack")
+
+    unacknowledged = deepcopy(resident_settled)
+    unacknowledged_marker = unacknowledged["metadata"]["_stateless_claim_retirement"]
+    unacknowledged_marker["residents_retired"] = False
+    unacknowledged_marker.pop("residents_retired_by")
+    unacknowledged["metadata"].pop("_stateless_resident_retirement_ack")
+
+    def closure(*, residents: bool, shell: bool) -> dict:
+        return {
+            "state": "closed",
+            "terminal_token": 8,
+            "claimant_quiesced": True,
+            "claim_losses": [],
+            "resident_cleanup_required": True,
+            "resident_acknowledged": residents,
+            "shell_retirement_required": True,
+            "remote_acknowledged": shell,
+            "permanent": True,
+            "workspace_absence_proven": False,
+            "retry": True,
+        }
+
+    db = SimpleNamespace(
+        get_thread=AsyncMock(
+            side_effect=[
+                unacknowledged,
+                unacknowledged,
+                resident_settled,
+                settled,
+            ]
+        ),
+        begin_stateless_thread_workspace_retirement=AsyncMock(
+            side_effect=[
+                closure(residents=False, shell=False),
+                closure(residents=True, shell=False),
+                closure(residents=True, shell=True),
+            ]
+        ),
+        list_thread_mounts=AsyncMock(return_value=[]),
+        acknowledge_stateless_thread_resident_retirement=AsyncMock(return_value=True),
+        acknowledge_stateless_thread_shell_retirement=AsyncMock(return_value=True),
+    )
+    provisioner = SimpleNamespace(
+        workspace_pod_authority=AsyncMock(return_value="exact_live"),
+        release_workspace=AsyncMock(return_value=True),
+    )
+    authority = SimpleNamespace(
+        workspace_generation=GENERATION,
+        runtime_incarnation=RUNTIME,
+        host_key_fingerprint=FINGERPRINT,
+    )
+    proof = SimpleNamespace(authority=authority, as_dict=lambda: {})
+    retire_residents = AsyncMock(return_value=proof)
+    retire_shell = AsyncMock(return_value=authority)
+    verify_residents = AsyncMock(return_value=authority)
+
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "container_provisioner", provisioner),
+        patch.object(main, "_build_agent_cloud_mount", AsyncMock(return_value=None)),
+        patch.object(
+            retirement_service,
+            "retire_stateless_workspace_residents",
+            retire_residents,
+        ),
+        patch.object(
+            retirement_service,
+            "retire_stateless_session_shell",
+            retire_shell,
+        ),
+        patch.object(
+            retirement_service,
+            "verify_stateless_workspace_residents_retired",
+            verify_residents,
+        ),
+    ):
+        result = await main._reconcile_stateless_thread_retirement(
+            THREAD_ID,
+            force=True,
+            permanent=True,
+        )
+
+    assert result["state"] == "settled"
+    retire_residents.assert_awaited_once()
+    retire_shell.assert_awaited_once()
+    verify_residents.assert_awaited_once()
+    provisioner.release_workspace.assert_awaited_once()
 
 
 @pytest.mark.asyncio
