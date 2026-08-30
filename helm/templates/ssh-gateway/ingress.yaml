@@ -1,0 +1,53 @@
+{{- if and .Values.sshGateway.enabled .Values.ingress.enabled }}
+{{- $fullName := include "srw.fullname" . -}}
+{{- $apiHost := include "srw.urlHost" (include "srw.apiUrl" .) -}}
+# The WSS attach door, on the existing API host.
+#
+# ONLY `/api/ssh/attach` comes here. `/api/ssh/host-keys` is served by the
+# ORCHESTRATOR (it reads the projected .pub files from its own filesystem), so
+# a `/api/ssh` prefix on this ingress would swallow it and 404 every client
+# trying to pin a host key.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullName }}-ssh-gateway-ingress
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "ssh-gateway") | nindent 4 }}
+  annotations:
+    {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
+    {{- end }}
+    {{- if .Values.ingress.tls.enabled }}
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- else }}
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    {{- end }}
+    # Explicit, because without one Traefik may evaluate the api ingress's
+    # shorter `/` prefix first and send the WebSocket upgrade to the
+    # orchestrator, which has no route for it. 100/110/120/140 are taken by
+    # the routes in templates/ingress.yaml.
+    traefik.ingress.kubernetes.io/router.priority: "130"
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ $apiHost }}
+      secretName: {{ $fullName }}-api-tls
+  {{- end }}
+  rules:
+    - host: {{ $apiHost }}
+      http:
+        paths:
+          - path: /api/ssh/attach
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "srw.sshGatewayName" . }}
+                port:
+                  number: 8087
+{{- end }}

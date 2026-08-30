@@ -1,0 +1,36 @@
+{{- if .Values.sshGateway.enabled }}
+{{- $gw := .Values.sshGateway -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "srw.sshGatewayName" . }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "ssh-gateway") | nindent 4 }}
+data:
+  # Deliberately allowlisted for an internet-facing process, like
+  # canvas-gateway's. Do not replace this with the shared application
+  # ConfigMap, and do not add a key `services/ssh_gateway_config.load_config`
+  # does not read: a setting nothing reads is a knob an operator can turn
+  # forever with no effect. (tests/test_ssh_gateway_chart.py asserts exactly
+  # that, by parsing load_config for its reads.)
+  #
+  # That rule is why there is no limits block here. load_config reads none of
+  # max_preauth_connections / preauth_rate_per_minute /
+  # max_channels_per_connection / max_attachments_per_workspace /
+  # login_timeout — they are GatewayConfig dataclass defaults with no
+  # environment lever, so the effective caps are 64 concurrent SSH
+  # connections fleet-wide, 16 per source, 12 channels per connection and 4
+  # attachments per workspace, and a chart value for them would be a lie.
+  SSH_GATEWAY_HOST_KEYS: {{ include "srw.sshGatewayHostKeyPaths" . | quote }}
+  SSH_GATEWAY_USER_CA: {{ printf "%s/user-ca" (include "srw.sshGatewayCaDir" .) | quote }}
+  SSH_GATEWAY_ALLOWED_ORIGINS: {{ join "," $gw.allowedOrigins | quote }}
+  SSH_GATEWAY_TRUSTED_PROXIES: {{ $gw.trustedProxies | quote }}
+  SSH_GATEWAY_SSH_HOST: "0.0.0.0"
+  SSH_GATEWAY_SSH_PORT: {{ $gw.tcp.port | int | quote }}
+  # SSH_GATEWAY_REQUIRE_TOKEN is intentionally absent. It defaults to true and
+  # the only reason to set it is to disable the user credential on the WSS
+  # transport entirely; a chart value for that would be a footgun with a
+  # values-file-sized safety catch.
+  ORCHESTRATOR_URL: {{ include "srw.orchestratorClusterUrl" . | quote }}
+  LOG_LEVEL: {{ .Values.logLevel | quote }}
+{{- end }}

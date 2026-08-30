@@ -1,0 +1,81 @@
+{{- if and .Values.sshGateway.enabled .Values.sshGateway.networkPolicy.enabled }}
+{{- $gw := .Values.sshGateway -}}
+{{- $network := $gw.networkPolicy -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "srw.sshGatewayName" . }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "ssh-gateway") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "ssh-gateway") | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Whatever fronts the WSS door (ingress-controller pods, cloudflared, a
+    # dedicated edge). Only that source, only 8087.
+    - from:
+        - namespaceSelector:
+            {{- toYaml $network.edgeNamespaceSelector | nindent 12 }}
+          podSelector:
+            {{- toYaml $network.edgePodSelector | nindent 12 }}
+      ports:
+        - protocol: TCP
+          port: 8087
+    {{- if $gw.tcp.enabled }}
+    # The raw SSH door. Traffic arrives from outside the cluster, so the
+    # source is an ipBlock rather than a pod selector — and it is the real
+    # client address only when tcp.externalTrafficPolicy is Local; with the
+    # default Cluster policy kube-proxy SNATs it to a node IP, which these
+    # CIDRs will not match. The LoadBalancer's own loadBalancerSourceRanges is
+    # the fence that always applies.
+    {{- range $gw.tcp.allowedClientCIDRs }}
+    - from:
+        - ipBlock:
+            cidr: {{ . | quote }}
+      ports:
+        - protocol: TCP
+          port: {{ $gw.tcp.port }}
+    {{- end }}
+    {{- end }}
+    {{- with $network.extraIngress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  egress:
+    # Cluster DNS. Restricting this to kube-system labels is not portable
+    # across the chart's supported CNIs, so match the established workspace
+    # policy.
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Orchestrator: target resolution (/api/internal/ssh/targets), the
+    # attachment audit rows, and last-used stamping on the presented key.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "orchestrator") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 8085
+    # Workspace sshd, the inner hop. 30022 only: VM-tier workspaces are
+    # refused upstream by services/ssh_gateway_targets (vm_unsupported), so
+    # opening port 22 would be an unused hole in an internet-facing pod's
+    # egress.
+    - to:
+        - podSelector:
+            matchLabels:
+              srw.io/component: agent-workspace
+      ports:
+        - protocol: TCP
+          port: 30022
+    {{- with $network.extraEgress }}
+    # Deployment-specific targets. Name the narrowest possible
+    # namespace/CIDR and destination port.
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

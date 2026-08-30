@@ -915,6 +915,111 @@ auth:
     accessTokenRefreshSkewSeconds: 60
 
 # =============================================================================
+# SSH Gateway — user-facing SSH into session workspaces
+# =============================================================================
+# Runs on the orchestrator image with a different command (the canvas-gateway
+# pattern) and reads its configuration from its own ConfigMap through
+# `envFrom`. Off by default. `services/ssh_gateway_config.load_config` fails
+# closed on every value below that has no safe default, so the chart refuses
+# to render rather than letting the operator find out as a crash-loop.
+sshGateway:
+  enabled: false
+  replicas: 1
+  # -- Public hostname users put in `HostName`. Published verbatim by the
+  # orchestrator's unauthenticated `GET /api/ssh/host-keys` document and used
+  # by the config snippet Cockpit generates. The gateway process itself never
+  # reads it.
+  hostname: ""
+  # -- Origins permitted to open the WSS attach socket
+  # (`SSH_GATEWAY_ALLOWED_ORIGINS`). Empty fails closed: an empty allow-list
+  # would accept cross-site WebSocket handshakes, so `load_config` refuses to
+  # boot and this chart refuses to render.
+  allowedOrigins: []
+  # -- Source addresses whose `X-Forwarded-For` header the gateway may believe
+  # — the ingress hop, as a comma-separated IP/CIDR list. Set it to the string
+  # `none` when nothing proxies the gateway; it then trusts the socket peer.
+  #
+  # There is deliberately no default in EITHER direction. Left unset behind an
+  # ingress, every WSS client presents the *ingress's* address, so all of them
+  # share one source's 16-slot concurrency bucket and the seventeenth
+  # concurrent user is refused; defaulting the other way is the spoofable
+  # header the setting exists to prevent.
+  trustedProxies: ""
+  # -- Operator-provided, exactly like `vm-ssh-key`. The chart NEVER generates
+  # key material: template-time `genPrivateKey` guarded by `lookup` silently
+  # returns empty under `helm template` and `--dry-run`, which would rotate the
+  # host key on every Argo sync and break every user's known_hosts.
+  #
+  # This Secret must carry, for every name in `hostKeyNames` below, BOTH the
+  # private half (`<name>`, mounted into the gateway) and its public half
+  # (`<name>.pub`, mounted into the ORCHESTRATOR, which is where
+  # `GET /api/ssh/host-keys` runs). Without the `.pub` halves that endpoint
+  # answers 200 with an empty list forever and pinning clients silently
+  # degrade to trust-on-first-use.
+  hostKeySecret: ""
+  # -- Host-key names inside `hostKeySecret`. ONE list drives all four
+  # derived things — the gateway's `SSH_GATEWAY_HOST_KEYS`, the orchestrator's
+  # `SSH_GATEWAY_PUBLIC_HOST_KEYS`, and both pods' projected `items` — because
+  # when the served and the published key sets drift, clients see a host-key
+  # mismatch indistinguishable from an active MITM.
+  #
+  # Ed25519 ONLY. `_require_ed25519_host_key` (ssh_gateway_config.py) raises on
+  # any algorithm that is not `ssh-ed25519` at `load_config`, so an RSA host
+  # key means the gateway refuses to start; a server's advertised host-key
+  # algorithms come straight from the loaded key material, and an RSA key drags
+  # in legacy SHA-1 `ssh-rsa`.
+  hostKeyNames:
+    - ssh_host_ed25519_key
+  # -- Operator-provided Secret holding the user CA the gateway mints
+  # inner-hop certificates with. Key `user-ca` (the private half) is what the
+  # gateway mounts.
+  #
+  # The matching PUBLIC half must ALSO reach every workspace, and it does NOT
+  # travel through this Secret: `container_provisioner` projects `user-ca.pub`
+  # out of the `vm-ssh-key` Secret (`WORKSPACE_SSH_SECRET`). See
+  # `externalSecrets` below and helm/README.md — without that copy, sshd never
+  # gets `TrustedUserCAKeys` and every attach ends in PermissionDenied.
+  userCaSecret: ""
+  # -- Raw TCP listener. The gateway ALWAYS listens on 2222 inside the pod
+  # (`/healthz` reports 503 while that accept loop is down), and the ClusterIP
+  # Service always carries it. This block only opens the external door.
+  tcp:
+    enabled: false
+    port: 2222
+    # -- Required when `tcp.enabled` — mirrors `databases.neo4j.loadBalancer`'s
+    # `allowedClientCIDRs`. An unrestricted SSH LoadBalancer is not a default.
+    allowedClientCIDRs: []
+    # -- MetalLB pool / pinned address, and the k3s servicelb suppression the
+    # neo4j Bolt LoadBalancer uses.
+    ipAddressPool: ""
+    loadBalancerIP: ""
+    # -- `Local` preserves the real client source IP so the NetworkPolicy's
+    # ipBlock rules can match it (`Cluster` SNATs it to a node IP).
+    externalTrafficPolicy: ""
+  networkPolicy:
+    enabled: true
+    # -- Whatever fronts the WSS door: the ingress controller pods. Defaults to
+    # the chart's supported Traefik, matching the selectors
+    # workspace-network-policy.yaml already uses for code-server.
+    edgeNamespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: traefik
+    edgePodSelector:
+      matchLabels:
+        app.kubernetes.io/name: traefik
+    # -- Additive rules for deployment-specific edges (a cloudflared namespace,
+    # a dedicated LB subnet). Name the narrowest possible selector.
+    extraIngress: []
+    extraEgress: []
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+# =============================================================================
 # MCP Server (Claude Code / AI platform integration)
 # =============================================================================
 mcp:

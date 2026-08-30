@@ -1322,3 +1322,96 @@ Takes: dict "params" $params "limitMi" $limitMi "name" <cluster name>
 {{- fail (printf "database %s: shared_buffers (%dMi) + maintenance_work_mem (%dMi) + autovacuum_work_mem (%dMi x %d workers) = %dMi, which is at or above the memory limit of %dMi. That is an OOM kill during the first index build or autovacuum, not a slow one. Raise cnpgResources.limits.memory, lower databases.tuning.sharedBuffersPercent, or set autovacuum_work_mem explicitly -- it defaults to maintenance_work_mem, once per worker." .name $sb $mwm $avwm $workers $floor $limitMi) -}}
 {{- end -}}
 {{- end }}
+
+{{/*
+=============================================================================
+SSH gateway (templates/ssh-gateway/*, plus the orchestrator's host-key
+publication mount).
+=============================================================================
+*/}}
+
+{{- define "srw.sshGatewayName" -}}
+{{- printf "%s-ssh-gateway" (include "srw.fullname" .) -}}
+{{- end }}
+
+{{/*
+Where the gateway's host-key Secret is projected. The SAME path in both pods:
+the gateway mounts the private halves here, the orchestrator mounts only the
+`.pub` halves here, and both environment variables below are built from this
+one string so a moved mount cannot leave a stale path behind.
+*/}}
+{{- define "srw.sshGatewayHostKeyDir" -}}/run/secrets/ssh-gateway/host{{- end }}
+{{- define "srw.sshGatewayCaDir" -}}/run/secrets/ssh-gateway/ca{{- end }}
+
+{{/*
+`SSH_GATEWAY_HOST_KEYS` — the PRIVATE key paths the gateway process loads.
+*/}}
+{{- define "srw.sshGatewayHostKeyPaths" -}}
+{{- $dir := include "srw.sshGatewayHostKeyDir" . -}}
+{{- $paths := list -}}
+{{- range .Values.sshGateway.hostKeyNames -}}
+{{- $paths = append $paths (printf "%s/%s" $dir .) -}}
+{{- end -}}
+{{- join "," $paths -}}
+{{- end }}
+
+{{/*
+`SSH_GATEWAY_PUBLIC_HOST_KEYS` — the PUBLIC key paths the orchestrator's
+`GET /api/ssh/host-keys` reads and publishes.
+
+Rendered from the same `hostKeyNames` list as the private paths above, on
+purpose. These are two variables in two different Deployments read by two
+different processes, with no runtime cross-check anywhere: when they drift,
+an SSH client sees a host-key mismatch that is indistinguishable from an
+active MITM. One list is the only thing that makes drift unrepresentable.
+
+Pointing this at the PRIVATE files would also "work" (asyncssh's
+import_public_key emits only public material) and is deliberately not done:
+it would put the gateway's host private keys in a second pod for no benefit.
+*/}}
+{{- define "srw.sshGatewayPublicHostKeyPaths" -}}
+{{- $dir := include "srw.sshGatewayHostKeyDir" . -}}
+{{- $paths := list -}}
+{{- range .Values.sshGateway.hostKeyNames -}}
+{{- $paths = append $paths (printf "%s/%s.pub" $dir .) -}}
+{{- end -}}
+{{- join "," $paths -}}
+{{- end }}
+
+{{/*
+Every precondition `services/ssh_gateway_config.load_config` fails closed on,
+checked at render time instead. Included from the gateway Deployment (which
+renders whenever the component is enabled), so one `fail` aborts the whole
+release rather than shipping a pod that cannot boot.
+
+Emits nothing.
+*/}}
+{{- define "srw.sshGatewayValidate" -}}
+{{- $gw := .Values.sshGateway -}}
+{{- if empty $gw.allowedOrigins -}}
+{{- fail "sshGateway.enabled requires a non-empty sshGateway.allowedOrigins; an empty list would accept cross-site WebSocket handshakes, and load_config refuses to boot without it" -}}
+{{- end -}}
+{{- if eq (trim $gw.hostKeySecret) "" -}}
+{{- fail "sshGateway.enabled requires sshGateway.hostKeySecret. The chart never generates host keys: a generated key would rotate on upgrade and break every user's known_hosts." -}}
+{{- end -}}
+{{- if empty $gw.hostKeyNames -}}
+{{- fail "sshGateway.enabled requires a non-empty sshGateway.hostKeyNames; with no names neither the gateway's SSH_GATEWAY_HOST_KEYS nor the orchestrator's SSH_GATEWAY_PUBLIC_HOST_KEYS has anything to point at" -}}
+{{- end -}}
+{{- range $gw.hostKeyNames -}}
+{{- if regexMatch "(?i)(rsa|ecdsa|dss|dsa)" . -}}
+{{- fail (printf "sshGateway.hostKeyNames entry %q is not an Ed25519 host key. _require_ed25519_host_key (services/ssh_gateway_config.py) raises on any algorithm that is not ssh-ed25519, so the gateway would refuse to start -- a crash-loop three files away from this value. Use ssh_host_ed25519_key. (Naming-convention tripwire only; the load-time check is the real enforcement.)" .) -}}
+{{- end -}}
+{{- end -}}
+{{- if eq (trim $gw.userCaSecret) "" -}}
+{{- fail "sshGateway.enabled requires sshGateway.userCaSecret (the user CA the gateway signs inner-hop certificates with)" -}}
+{{- end -}}
+{{- if eq (trim $gw.trustedProxies) "" -}}
+{{- fail "sshGateway.enabled requires sshGateway.trustedProxies: the source addresses whose X-Forwarded-For header the gateway may believe (the ingress hop, as an IP/CIDR list), or the literal string \"none\" when nothing proxies it. Left unset behind an ingress every WSS client is rate limited as one source and the seventeenth concurrent user is refused." -}}
+{{- end -}}
+{{- if and $gw.tcp.enabled (empty $gw.tcp.allowedClientCIDRs) -}}
+{{- fail "sshGateway.tcp.enabled requires sshGateway.tcp.allowedClientCIDRs; an unscoped SSH LoadBalancer is not a supported default" -}}
+{{- end -}}
+{{- if and $gw.networkPolicy.enabled (or (empty $gw.networkPolicy.edgeNamespaceSelector) (empty $gw.networkPolicy.edgePodSelector)) -}}
+{{- fail "sshGateway.networkPolicy.enabled requires non-empty edgeNamespaceSelector and edgePodSelector; an empty selector matches everything, which is not a policy" -}}
+{{- end -}}
+{{- end }}

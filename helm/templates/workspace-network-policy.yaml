@@ -92,6 +92,20 @@ spec:
         - protocol: TCP
           port: 22
     {{- end }}
+    {{- if $.Values.sshGateway.enabled }}
+    # The ssh-gateway's inner hop: one certificate-authenticated SSH
+    # connection per user attach, multiplexed into channels. Container
+    # workspaces only (30022) — VM-tier targets are refused upstream by
+    # services/ssh_gateway_targets (vm_unsupported), so unlike the
+    # canvas-gateway block above this one deliberately does not open 22.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" $ "component" "ssh-gateway") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 30022
+    {{- end }}
     # code-server from orchestrator (IDE session proxying)
     - from:
         - podSelector:

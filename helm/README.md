@@ -554,7 +554,8 @@ Two Secrets must exist in the release namespace:
   platform uses to reach every workspace. The chart mounts the private half into the
   orchestrator and agents and injects the public half into each VM. `scripts/local-dev-up.sh`
   mints it locally; in production provide it via `secrets.existingVmSshKeySecret` or
-  `externalSecrets.vmSshKeyVaultPath`.
+  `externalSecrets.vmSshKeyVaultPath`. When `sshGateway.enabled`, this Secret must carry a
+  third key, `user-ca.pub` — see [SSH gateway](#ssh-gateway) below.
 - **`vm.lifecycleAuthSecretName`** with key `VM_LIFECYCLE_HMAC_SECRET` (≥ 32 random bytes,
   e.g. `python3 -c 'import secrets; print(secrets.token_hex(32))'`). The orchestrator and the
   controller share it to sign lifecycle requests, and the controller derives each VM's guest
@@ -569,6 +570,102 @@ matches the chart's `appVersion`, which exists only for released charts.
 kubectl get nodes -l kubevirt.io/schedulable=true
 kubectl get pods -l app.kubernetes.io/component=vm-controller
 ```
+
+## SSH gateway
+
+`sshGateway.enabled` adds a component that lets a user `ssh s-<handle>@<sshGateway.hostname>`
+straight into their session workspace. It runs the orchestrator image with a different command
+(`uvicorn ssh_gateway:create_app --factory`), authenticates the user's own public key, and mints
+a short-lived certificate for the inner hop to the workspace. It is off by default.
+
+### Three Secrets, three places
+
+The chart never generates key material. A template-time `genPrivateKey` guarded by `lookup`
+silently returns empty under `helm template` and `--dry-run`, which would rotate the host key on
+every Argo sync and break every user's `known_hosts`.
+
+```bash
+# Ed25519 ONLY. services/ssh_gateway_config._require_ed25519_host_key raises on any
+# other algorithm at load_config, so an RSA host key means the gateway will not start:
+# a server's advertised host-key algorithms come straight from the loaded key material,
+# and an RSA key drags in legacy SHA-1 ssh-rsa.
+ssh-keygen -t ed25519 -N "" -C srw-ssh-gateway -f ./ssh_host_ed25519_key
+ssh-keygen -t ed25519 -N "" -C srw-user-ca      -f ./user-ca
+
+kubectl -n <ns> create secret generic srw-ssh-gateway-hostkey \
+  --from-file=ssh_host_ed25519_key --from-file=ssh_host_ed25519_key.pub
+kubectl -n <ns> create secret generic srw-ssh-gateway-ca \
+  --from-file=user-ca --from-file=user-ca.pub
+```
+
+1. **`sshGateway.hostKeySecret`** — one entry per name in `sshGateway.hostKeyNames`, and **both
+   halves of each**. The private half is mounted into the gateway
+   (`SSH_GATEWAY_HOST_KEYS`); the `.pub` half is mounted into the **orchestrator**, which is
+   where `GET /api/ssh/host-keys` runs (`SSH_GATEWAY_PUBLIC_HOST_KEYS`). Both variables are
+   rendered from that one `hostKeyNames` list, because when the served and published key sets
+   drift a client sees a host-key mismatch indistinguishable from an active MITM. Omit the
+   `.pub` halves and the orchestrator pod will not start — deliberately, because the
+   alternative is publishing an empty key list forever while every client silently degrades to
+   trust-on-first-use.
+2. **`sshGateway.userCaSecret`** — key `user-ca`, the private CA half the gateway signs
+   inner-hop certificates with.
+3. **`user-ca.pub` inside the `vm-ssh-key` Secret.** This one is easy to miss and nothing else
+   catches it. `container_provisioner` projects `user-ca.pub` out of the Secret named by
+   `WORKSPACE_SSH_SECRET` (i.e. `vm-ssh-key`) into every workspace pod, where the entrypoint
+   installs it as sshd's `TrustedUserCAKeys`. It does **not** travel through
+   `sshGateway.userCaSecret`. Without it the pod starts fine (the projection is `optional`),
+   the entrypoint skips the write, and every attach ends in `PermissionDenied` — fail-closed,
+   but the whole feature inert.
+
+   There are four ways that Secret gets filled, and the fix differs for each:
+
+   | Supply path | What to do |
+   |---|---|
+   | `externalSecrets.vmSshKeyVaultPath` (layout A, `dataFrom: extract`) | the chart adds a `data:` entry alongside the bundle pull; put `SSH_GATEWAY_USER_CA_PUBLIC_KEY` in the bundle at `externalSecrets.vaultPath`. (ESO permits `data` next to `dataFrom`, and `data` wins on conflict.) Alternatively drop that entry and name a property literally `user-ca.pub` in your own bundle. |
+   | `externalSecrets.vaultPath` (layout B, the default) | the chart adds `secretKey: user-ca.pub`; put `SSH_GATEWAY_USER_CA_PUBLIC_KEY` in the same bundle. |
+   | `secrets.existingVmSshKeySecret` | the chart renders no template here at all. Add the key yourself: `kubectl -n <ns> patch secret <name> -p "{\"data\":{\"user-ca.pub\":\"$(base64 -w0 user-ca.pub)\"}}"` |
+   | `scripts/local-dev-up.sh` (k3d) | the script creates `srw-vm-ssh-key` with two keys only. Patch the third in with the same command before enabling the gateway. |
+
+   Both ESO entries render **only** when `sshGateway.enabled`: ESO fails the whole
+   ExternalSecret sync when a `data` entry names a property the bundle lacks, and an ungated
+   entry would break `vm-ssh-key` — the key the platform reaches every workspace with — for
+   every install that never asked for an ssh-gateway.
+
+   Verify it by reading the projected file inside a running workspace pod, not by inspecting
+   the template:
+
+   ```bash
+   kubectl -n <ns> exec deploy/<workspace-pod> -- cat /etc/ssh/srw_user_ca.pub
+   ```
+
+### Required values
+
+| Value | Why it has no default |
+|---|---|
+| `allowedOrigins` | an empty list accepts cross-site WebSocket handshakes; `load_config` refuses to boot |
+| `trustedProxies` | unset behind an ingress, every WSS client presents the *ingress's* address, so all of them share one source's 16-slot concurrency bucket and the seventeenth concurrent user is refused. Set it to the ingress hop's IP/CIDR, or the literal `none` when nothing proxies the gateway. Both possible defaults are wrong |
+| `hostKeySecret`, `userCaSecret` | operator-provided; see above |
+| `tcp.allowedClientCIDRs` | required when `tcp.enabled`: an unscoped SSH LoadBalancer is not a supported default |
+
+The chart `fail`s at render time on each of these rather than shipping a pod that crash-loops.
+
+### Doors
+
+`/api/ssh/attach` (the WSS transport) rides the existing API ingress at Traefik
+`router.priority: 130`. `/api/ssh/host-keys` stays on the orchestrator. The raw TCP listener
+always runs inside the pod on `tcp.port` (`/healthz` reports 503 while its accept loop is down)
+and the ClusterIP Service always carries it, so a port-forward works with `tcp.enabled: false`;
+`tcp.enabled` only adds the MetalLB LoadBalancer. Set `tcp.externalTrafficPolicy: Local` if you
+want the NetworkPolicy's ipBlock rules and the per-source connection bucket to see real client
+addresses — `Cluster` SNATs every client to a node IP and collapses them into one source.
+
+### Concurrency
+
+The gateway's caps are `GatewayConfig` dataclass defaults with no environment lever, so there is
+deliberately no chart value for them: 64 concurrent SSH connections fleet-wide, 16 per source,
+12 channels per connection, 4 attachments per workspace. The pre-auth slot is held for a
+connection's whole life, so despite the name these are session limits, not startup limits.
+`SshTcpListener` is AF_INET only — it does not bind IPv6.
 
 Then create a job with the VM backend (Cockpit → Create → workspace: VM, or
 `"workspace": {"backend": "vm"}` in the API call) and watch:

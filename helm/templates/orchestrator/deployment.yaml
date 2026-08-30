@@ -1724,6 +1724,27 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: LOG_FORMAT
+            {{- if .Values.sshGateway.enabled }}
+            # SSH gateway host-key publication. `GET /api/ssh/host-keys` runs
+            # HERE, not in the gateway: it reads these two variables and the
+            # .pub files the volume below projects. Without them the endpoint
+            # answers 200 with `{"host_keys": [], "hostname": ""}` forever and
+            # a pinning client silently degrades to trust-on-first-use.
+            #
+            # Explicit `env:` entries because this Deployment does not use
+            # `envFrom` at all — a key added to the shared ConfigMap would
+            # never arrive here.
+            #
+            # APPENDED AT THE END OF THIS LIST ON PURPOSE. Inserting into the
+            # middle of an existing env list can trip the Kubernetes
+            # strategic-merge bug that reports `env[N].valueFrom` patch errors
+            # and needs a delete+recreate of the Deployment; appending leaves
+            # every pre-existing index where it was.
+            - name: SSH_GATEWAY_PUBLIC_HOST_KEYS
+              value: {{ include "srw.sshGatewayPublicHostKeyPaths" . | quote }}
+            - name: SSH_GATEWAY_HOSTNAME
+              value: {{ .Values.sshGateway.hostname | quote }}
+            {{- end }}
           volumeMounts:
             - name: workspace
               mountPath: /workspace
@@ -1731,6 +1752,11 @@ spec:
               mountPath: /run/secrets/vm-ssh-key
               subPath: ssh-privatekey
               readOnly: true
+            {{- if .Values.sshGateway.enabled }}
+            - name: ssh-gateway-host-keys
+              mountPath: {{ include "srw.sshGatewayHostKeyDir" . }}
+              readOnly: true
+            {{- end }}
           lifecycle:
             preStop:
               exec:
@@ -1783,3 +1809,26 @@ spec:
             # non-root production image without relying on OpenSSH's
             # owner-dependent permission exception.
             defaultMode: 0444
+        {{- if .Values.sshGateway.enabled }}
+        # The ssh-gateway's host keys, PUBLIC HALVES ONLY. This pod serves
+        # `GET /api/ssh/host-keys` and needs the .pub files on disk to
+        # fingerprint them; `items:` is what keeps the gateway's host private
+        # keys out of a second pod. Pointing the endpoint at the private files
+        # instead would also work (asyncssh emits only public material) and is
+        # deliberately rejected.
+        #
+        # NOT `optional`. A hostKeySecret missing its .pub halves fails this
+        # pod loudly, at the moment the operator enables the component, rather
+        # than publishing an empty key list forever — which reads as "no
+        # gateway configured" to a client and is indistinguishable from one.
+        # 0444 for the same reason as vm-ssh-key above.
+        - name: ssh-gateway-host-keys
+          secret:
+            secretName: {{ .Values.sshGateway.hostKeySecret }}
+            defaultMode: 0444
+            items:
+              {{- range .Values.sshGateway.hostKeyNames }}
+              - key: {{ printf "%s.pub" . | quote }}
+                path: {{ printf "%s.pub" . | quote }}
+              {{- end }}
+        {{- end }}

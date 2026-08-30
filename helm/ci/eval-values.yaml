@@ -53,3 +53,24 @@ ingress:
 
 garage:
   enabled: true
+
+# SSH gateway. Enabled here on purpose: canvas.livePreview.viewer.enabled is
+# never true in any of the nine helm/ci scenarios, so canvas-gateway's
+# rendered output has never been validated. The TCP door is on too, so the
+# LoadBalancer branch and its CIDR scoping render in CI as well. The Secrets
+# named below are operator-provided at install time; nothing in CI reads them.
+sshGateway:
+  enabled: true
+  hostname: "ssh.eval.example.com"
+  allowedOrigins:
+    - "https://eval.example.com"
+  # The k3s/k3d pod CIDR — the ingress hop whose X-Forwarded-For the gateway
+  # may believe.
+  trustedProxies: "10.42.0.0/16"
+  hostKeySecret: "srw-ssh-gateway-hostkey"
+  userCaSecret: "srw-ssh-gateway-ca"
+  tcp:
+    enabled: true
+    allowedClientCIDRs:
+      - "10.0.0.0/8"
+    externalTrafficPolicy: Local

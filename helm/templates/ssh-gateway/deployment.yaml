@@ -1,0 +1,177 @@
+{{- if .Values.sshGateway.enabled }}
+{{- $gw := .Values.sshGateway -}}
+{{- include "srw.sshGatewayValidate" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "srw.sshGatewayName" . }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "ssh-gateway") | nindent 4 }}
+  {{- if .Values.reloader.enabled }}
+  annotations:
+    reloader.stakater.com/auto: "true"
+  {{- end }}
+spec:
+  replicas: {{ $gw.replicas }}
+  strategy:
+    rollingUpdate:
+      # Live SSH sessions die on rollout regardless; at least do not stack two
+      # generations of the gateway on one host key.
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "ssh-gateway") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "ssh-gateway") | nindent 8 }}
+    spec:
+      # The gateway talks to the orchestrator over HTTP with MCP_INTERNAL_KEY.
+      # It has no reason to hold a Kubernetes API credential.
+      automountServiceAccountToken: false
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # Hardened per infrastructure-metering/collector.yaml, NOT per
+      # canvas-gateway (which sets only allowPrivilegeEscalation and
+      # capabilities.drop). uid/gid 999 is the image's `srw` user
+      # (docker/Dockerfile.orchestrator).
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      # Long-lived interactive SSH sessions. The lifespan handler also drains
+      # in-flight attachment-close audit writes on the way out.
+      terminationGracePeriodSeconds: 120
+      containers:
+        - name: ssh-gateway
+          image: {{ include "srw.imageRef" (dict "image" .Values.image.orchestrator) | quote }}
+          imagePullPolicy: {{ .Values.image.orchestrator.pullPolicy }}
+          # Same image as the orchestrator, different entrypoint — the
+          # canvas-gateway pattern. `--factory` because ssh_gateway.py has no
+          # module-level `app`: building one at import time would demand host
+          # keys, a CA and a secret before uvicorn is even listening.
+          command:
+            - uvicorn
+            - ssh_gateway:create_app
+            - --factory
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8087"
+            - --http
+            - h11
+            # The gateway owns its own redacted control-path logging; uvicorn
+            # access logs would duplicate handshake metadata.
+            - --no-access-log
+          envFrom:
+            # Its OWN ConfigMap, like canvas-gateway. The orchestrator's
+            # explicit-`env` pattern means a new key added to the shared
+            # ConfigMap would silently never arrive.
+            - configMapRef:
+                name: {{ include "srw.sshGatewayName" . }}
+          env:
+            # `optional: true` on both of these on purpose: a missing key then
+            # surfaces as load_config's own explicit message in the pod log
+            # ("ssh-gateway requires SESSION_JWT_SECRET to verify the WSS
+            # attach token...") instead of an opaque
+            # CreateContainerConfigError. The gateway refuses to boot either
+            # way — this only decides how legible the refusal is.
+            - name: MCP_INTERNAL_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: MCP_INTERNAL_KEY
+                  optional: true
+            # The HMAC key for the token a USER presents to the WSS front
+            # door. Must resolve the SAME Secret and key the orchestrator
+            # mints with (orchestrator/deployment.yaml) or every token is
+            # refused with nothing in either log to say why.
+            - name: SESSION_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.sessionRouter.jwtSecretName | default (printf "%s-session-jwt" (include "srw.fullname" .)) }}
+                  key: {{ .Values.sessionRouter.jwtSecretKey | default "jwt-secret" }}
+                  optional: true
+          ports:
+            - name: http
+              containerPort: 8087
+              protocol: TCP
+            # Declared unconditionally: the raw TCP listener starts with the
+            # process regardless of `tcp.enabled` (see the lifespan handler),
+            # and /healthz reports 503 whenever that accept loop is down.
+            # `tcp.enabled` opens the external door, it does not start the
+            # listener.
+            - name: ssh
+              containerPort: {{ $gw.tcp.port }}
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            {{- toYaml $gw.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: ssh-gateway-host-keys
+              mountPath: {{ include "srw.sshGatewayHostKeyDir" . }}
+              readOnly: true
+            - name: ssh-gateway-user-ca
+              mountPath: {{ include "srw.sshGatewayCaDir" . }}
+              readOnly: true
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: ssh-gateway-host-keys
+          secret:
+            secretName: {{ $gw.hostKeySecret }}
+            # 0444, never 0400. A projected Secret file is owned root:root
+            # absent an fsGroup, and 0400 is owner-read-only — uid 999 cannot
+            # read its own host key and the pod crash-loops. The repo answers
+            # this the same way in three other places (agent/stateless-
+            # deployment.yaml, canvas-gateway/deployment.yaml,
+            # orchestrator/deployment.yaml). World-readable inside a
+            # single-purpose pod is what this project already accepts for the
+            # strictly more sensitive fleet-wide VM key.
+            defaultMode: 0444
+            # Only the private halves. The `.pub` files go to the
+            # orchestrator, which is where the publication endpoint runs; the
+            # gateway has no use for them.
+            items:
+              {{- range $gw.hostKeyNames }}
+              - key: {{ . | quote }}
+                path: {{ . | quote }}
+              {{- end }}
+        - name: ssh-gateway-user-ca
+          secret:
+            secretName: {{ $gw.userCaSecret }}
+            defaultMode: 0444
+            # The private CA half only. The PUBLIC half workspaces need does
+            # not travel through this Secret at all — container_provisioner
+            # projects `user-ca.pub` out of `vm-ssh-key`
+            # (WORKSPACE_SSH_SECRET). See helm/README.md.
+            items:
+              - key: user-ca
+                path: user-ca
+{{- end }}

@@ -239,6 +239,41 @@ canvas:
         extraEgress: []
 
 # -----------------------------------------------------------------------------
+# SSH gateway — user-facing `ssh s-<handle>@<hostname>` into session workspaces
+#
+# Off by default. Enabling it requires TWO operator-provided Secrets (the chart
+# never generates key material; a template-time key would rotate on every sync
+# and break every user's known_hosts) plus an origin allow-list and the trusted
+# proxy hop — the gateway's load_config fails closed on all of them.
+#
+#   ssh-keygen -t ed25519 -N "" -f ./ssh_host_ed25519_key      # Ed25519 ONLY
+#   ssh-keygen -t ed25519 -N "" -f ./user-ca
+#   kubectl -n <ns> create secret generic srw-ssh-gateway-hostkey \
+#     --from-file=ssh_host_ed25519_key --from-file=ssh_host_ed25519_key.pub
+#   kubectl -n <ns> create secret generic srw-ssh-gateway-ca \
+#     --from-file=user-ca --from-file=user-ca.pub
+#
+# The `.pub` host-key halves are NOT optional: the orchestrator mounts them to
+# serve GET /api/ssh/host-keys, and without them every pinning client silently
+# falls back to trust-on-first-use.
+#
+# A THIRD step is easy to miss: `user-ca.pub` must also land in the vm-ssh-key
+# Secret, which is where the workspace provisioner projects it from. See the
+# "SSH gateway" section of helm/README.md.
+# -----------------------------------------------------------------------------
+# sshGateway:
+#   enabled: true
+#   hostname: "ssh.example.com"
+#   allowedOrigins: ["https://app.example.com"]
+#   trustedProxies: "10.42.0.0/16"     # your ingress hop, or the literal "none"
+#   hostKeySecret: "srw-ssh-gateway-hostkey"
+#   userCaSecret: "srw-ssh-gateway-ca"
+#   tcp:
+#     enabled: true                    # raw :2222 door via MetalLB
+#     allowedClientCIDRs: ["10.0.0.0/8"]
+#     externalTrafficPolicy: Local     # required for the CIDR rules to match
+
+# -----------------------------------------------------------------------------
 # Session router — Direct Session WebSockets
 # (knowledge-base/knowledge/features/direct_session_websockets.md)
 #
