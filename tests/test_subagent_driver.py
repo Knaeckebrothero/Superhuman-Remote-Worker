@@ -861,7 +861,9 @@ class TestSharedTree:
         parent_git = parent_ctx.workspace_manager.git_manager
         assert parent_git is not None and parent_git.is_active
         before = _git(["rev-list", "--count", "HEAD"], root).stdout.strip()
-        entry = explorer_entry(tools={"workspace": ["read_file", "write_file"]})
+        entry = explorer_entry(
+            tools={"workspace": ["read_file", "write_file"]}, write_policy="full"
+        )
         driver, fake, build = await make_driver(
             parent_ctx,
             [

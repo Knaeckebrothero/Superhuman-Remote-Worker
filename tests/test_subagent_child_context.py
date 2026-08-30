@@ -233,7 +233,9 @@ class TestBuildShared:
         build = await _build(ctx, _entry())
         child = build.tool_context
         assert child is not ctx
-        assert build.isolation == "shared" and build.write_policy == "full"
+        # explorer is read-only: it declares write_policy: none (the entry
+        # grants no workspace mutator, so the stated policy matches the grant).
+        assert build.isolation == "shared" and build.write_policy == "none"
         assert build.tool_names == ["read_file", "list_files", "search_files"]
         assert {t.name for t in build.tools} == set(child._resolved_tool_names)
         # Fresh objects: the parent's names stay the parent's.
@@ -294,7 +296,9 @@ class TestBuildShared:
         self, tmp_path
     ):
         ctx, root = _parent(tmp_path, git=True)
-        entry = _entry(tools={"workspace": ["read_file", "write_file"]})
+        entry = _entry(
+            tools={"workspace": ["read_file", "write_file"]}, write_policy="full"
+        )
         build = await _build(ctx, entry)
         ws = build.workspace_manager
         assert isinstance(ws.git_manager, ReadOnlyGitManager)
@@ -439,7 +443,9 @@ class TestBuildWorktree:
     async def test_worktree_child_is_rooted_in_its_own_worktree(self, tmp_path):
         ctx, root = _parent(tmp_path, git=True)
         entry = _entry(
-            tools={"workspace": ["read_file", "write_file"]}, isolation="worktree"
+            tools={"workspace": ["read_file", "write_file"]},
+            isolation="worktree",
+            write_policy="full",
         )
         build = await _build(ctx, entry, handle="implementer-7f3a")
         assert build.isolation == "worktree"
@@ -747,7 +753,9 @@ class TestWritePolicy:
     async def test_single_shared_writer_guard(self, tmp_path):
         ctx, _ = _parent(tmp_path)
         guard = SharedWriterGuard()
-        writer = _entry(tools={"workspace": ["read_file", "write_file"]})
+        writer = _entry(
+            tools={"workspace": ["read_file", "write_file"]}, write_policy="full"
+        )
         first = await _build(ctx, writer, handle="implementer-0001", writer_guard=guard)
         assert guard.active_writer == "implementer-0001"
         # A second shared writer is refused ...
@@ -759,7 +767,9 @@ class TestWritePolicy:
         await reader.release()
         # ... and a worktree writer too.
         wt = _entry(
-            tools={"workspace": ["read_file", "write_file"]}, isolation="worktree"
+            tools={"workspace": ["read_file", "write_file"]},
+            isolation="worktree",
+            write_policy="full",
         )
         second = await _build(ctx, wt, handle="implementer-0003", writer_guard=guard)
         await second.release()

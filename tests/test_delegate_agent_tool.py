@@ -625,6 +625,7 @@ class TestRun:
             {
                 "writer": {
                     "$ref": "subagents/explorer",
+                    "write_policy": "full",
                     "tools": {"workspace": ["read_file", "write_file"]},
                 }
             },
