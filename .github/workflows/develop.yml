@@ -1911,11 +1911,29 @@ jobs:
           export REV_MCP="$SHA_MCP"
           export REV_WORKSPACE="$SHA_WORKSPACE"
           export CHART_VERSION="${{ steps.tag.outputs.chart_version }}"
+
+          # mcp.requireImageDigest is true on the dev overlay, and the chart
+          # FAILS TO RENDER without image.mcp.digest (templates/mcp/deployment.yaml).
+          # So the digest has to travel inside the chart now that the values
+          # overlay no longer carries image data. Resolve it from the registry
+          # rather than from this run's build outputs: it must be correct on runs
+          # where mcp did NOT rebuild, and the registry answers for whatever the
+          # tag points at today. Fails closed — an unresolvable digest must stop
+          # the publish, not ship a chart that cannot render.
+          MCP_REF="ghcr.io/knaeckebrothero/superhuman-remote-worker-mcp:${TAG_MCP}"
+          MCP_DIGEST=$(docker buildx imagetools inspect "$MCP_REF" --format '{{.Manifest.Digest}}' || true)
+          case "$MCP_DIGEST" in
+            sha256:*) ;;
+            *) echo "::error::could not resolve a digest for ${MCP_REF} (got '${MCP_DIGEST}'); refusing to publish a chart that cannot render with mcp.requireImageDigest=true"; exit 1 ;;
+          esac
+          export MCP_DIGEST
+
           yq -i '
             .image.orchestrator.tag = strenv(TAG_ORCHESTRATOR) |
             .image.agent.tag        = strenv(TAG_AGENT) |
             .image.cockpit.tag      = strenv(TAG_COCKPIT) |
             .image.mcp.tag          = strenv(TAG_MCP) |
+            .image.mcp.digest       = strenv(MCP_DIGEST) |
             .image.workspace.tag    = strenv(TAG_WORKSPACE) |
             .provenance.releaseVersion = strenv(CHART_VERSION) |
             .provenance.components.orchestrator.sourceRevision = strenv(REV_ORCHESTRATOR) |
