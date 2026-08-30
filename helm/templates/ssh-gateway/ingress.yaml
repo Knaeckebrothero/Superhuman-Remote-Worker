@@ -3,10 +3,22 @@
 {{- $apiHost := include "srw.urlHost" (include "srw.apiUrl" .) -}}
 # The WSS attach door, on the existing API host.
 #
-# ONLY `/api/ssh/attach` comes here. `/api/ssh/host-keys` is served by the
-# ORCHESTRATOR (it reads the projected .pub files from its own filesystem), so
-# a `/api/ssh` prefix on this ingress would swallow it and 404 every client
-# trying to pin a host key.
+# ONLY `/api/ssh/attach` comes here, and only as an EXACT match. Every other
+# `/api/ssh*` route is served by the ORCHESTRATOR:
+#
+#   * `/api/ssh/attach-token` MINTS the WSS token this door then verifies.
+#   * `/api/ssh/host-keys` publishes the .pub halves a client pins.
+#
+# Traefik maps `pathType: Prefix` to `PathPrefix()`, which is a RAW STRING
+# prefix rather than a path-element match, and the explicit priority below
+# beats the api ingress's length-derived default. Under `Prefix` this rule
+# therefore swallows `/api/ssh/attach-token` and answers it with the gateway's
+# Starlette 404 -- no token can ever be minted, and the whole feature is dead
+# with nothing in any log naming the cause. `Exact` maps to `Path()` and
+# claims exactly the one route the gateway serves.
+# (tests/test_ssh_gateway_chart.py asserts this against the committed
+# orchestrator endpoint inventory, so a future `/api/ssh/attach-*` endpoint
+# fails the suite instead of the feature.)
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -44,7 +56,9 @@ spec:
       http:
         paths:
           - path: /api/ssh/attach
-            pathType: Prefix
+            # Exact, NOT Prefix -- see the header comment. `Prefix` routes
+            # `/api/ssh/attach-token` here too and 404s every token request.
+            pathType: Exact
             backend:
               service:
                 name: {{ include "srw.sshGatewayName" . }}

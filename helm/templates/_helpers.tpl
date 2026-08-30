@@ -1405,8 +1405,14 @@ Emits nothing.
 {{- if eq (trim $gw.userCaSecret) "" -}}
 {{- fail "sshGateway.enabled requires sshGateway.userCaSecret (the user CA the gateway signs inner-hop certificates with)" -}}
 {{- end -}}
+{{- if and (empty .Values.sessionRouter.jwtSecret) (empty .Values.sessionRouter.jwtSecretName) -}}
+{{- fail "sshGateway.enabled requires a configured sessionRouter JWT secret (sessionRouter.jwtSecret for the chart-rendered Secret, or sessionRouter.jwtSecretName for one you own). SESSION_JWT_SECRET is the HMAC key the gateway verifies the attach token the orchestrator mints with; load_config refuses to boot without it. With neither value set no Secret is rendered at all, the secretKeyRef is `optional: true`, and the gateway crash-loops with the reason three files away from the values file." -}}
+{{- end -}}
 {{- if eq (trim $gw.trustedProxies) "" -}}
 {{- fail "sshGateway.enabled requires sshGateway.trustedProxies: the source addresses whose X-Forwarded-For header the gateway may believe (the ingress hop, as an IP/CIDR list), or the literal string \"none\" when nothing proxies it. Left unset behind an ingress every WSS client is rate limited as one source and the seventeenth concurrent user is refused." -}}
+{{- end -}}
+{{- if or (lt (int $gw.tcp.port) 1024) (gt (int $gw.tcp.port) 65535) -}}
+{{- fail (printf "sshGateway.tcp.port must be between 1024 and 65535 (got %v). The gateway runs as uid 999 with every capability dropped, so it cannot bind a privileged port: the accept loop would never come up, /healthz would answer 503 forever, and the pod would never go Ready." $gw.tcp.port) -}}
 {{- end -}}
 {{- if and $gw.tcp.enabled (empty $gw.tcp.allowedClientCIDRs) -}}
 {{- fail "sshGateway.tcp.enabled requires sshGateway.tcp.allowedClientCIDRs; an unscoped SSH LoadBalancer is not a supported default" -}}

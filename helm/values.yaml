@@ -924,6 +924,19 @@ auth:
 # to render rather than letting the operator find out as a crash-loop.
 sshGateway:
   enabled: false
+  # -- Gateway pods. EVERY abuse cap the gateway enforces is PER POD, so this
+  # value multiplies all of them.
+  #
+  # `GatewayLimiter` is constructed once per process (ssh_gateway.py) with no
+  # shared store, and the WSS ingress has no session affinity, so at
+  # `replicas: 2` the effective caps are 128 concurrent SSH connections, 32
+  # per source, and — this is the one that matters — 8 attachments per
+  # workspace instead of 4. That last one is a SECURITY cap on how many people
+  # can be attached to a single workspace at once, not a capacity cap, and
+  # none of the five has an environment lever to compensate with (they are
+  # `GatewayConfig` dataclass defaults; `load_config` reads none of them).
+  #
+  # Raise this only with that understood.
   replicas: 1
   # -- Public hostname users put in `HostName`. Published verbatim by the
   # orchestrator's unauthenticated `GET /api/ssh/host-keys` document and used

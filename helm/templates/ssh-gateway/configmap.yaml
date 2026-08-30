@@ -12,15 +12,19 @@ data:
   # ConfigMap, and do not add a key `services/ssh_gateway_config.load_config`
   # does not read: a setting nothing reads is a knob an operator can turn
   # forever with no effect. (tests/test_ssh_gateway_chart.py asserts exactly
-  # that, by parsing load_config for its reads.)
+  # that in BOTH directions, by parsing load_config for its reads: nothing
+  # here it never reads, and nothing it requires missing from here.)
   #
   # That rule is why there is no limits block here. load_config reads none of
   # max_preauth_connections / preauth_rate_per_minute /
   # max_channels_per_connection / max_attachments_per_workspace /
   # login_timeout — they are GatewayConfig dataclass defaults with no
-  # environment lever, so the effective caps are 64 concurrent SSH
-  # connections fleet-wide, 16 per source, 12 channels per connection and 4
-  # attachments per workspace, and a chart value for them would be a lie.
+  # environment lever, so a chart value for them would be a lie. The effective
+  # caps are PER GATEWAY POD — GatewayLimiter is constructed per process with
+  # no shared store and this ingress has no session affinity — namely 64
+  # concurrent SSH connections, 16 per source, 12 channels per connection and
+  # 4 attachments per workspace. sshGateway.replicas multiplies every one of
+  # them, including max_attachments_per_workspace, which is a SECURITY cap.
   SSH_GATEWAY_HOST_KEYS: {{ include "srw.sshGatewayHostKeyPaths" . | quote }}
   SSH_GATEWAY_USER_CA: {{ printf "%s/user-ca" (include "srw.sshGatewayCaDir" .) | quote }}
   SSH_GATEWAY_ALLOWED_ORIGINS: {{ join "," $gw.allowedOrigins | quote }}
@@ -31,6 +35,17 @@ data:
   # the only reason to set it is to disable the user credential on the WSS
   # transport entirely; a chart value for that would be a footgun with a
   # values-file-sized safety catch.
+  #
+  # Required, not merely nice: load_config's own fallback is
+  # "http://orchestrator:8085", a Service name THIS CHART NEVER CREATES (it
+  # renders srw-<release>-orchestrator). Dropped, the gateway boots happily
+  # and every attach dies at DNS resolution instead — silent, not fail-closed.
   ORCHESTRATOR_URL: {{ include "srw.orchestratorClusterUrl" . | quote }}
-  LOG_LEVEL: {{ .Values.logLevel | quote }}
+  # LOG_LEVEL is deliberately absent. ssh_gateway.py never calls
+  # configure_logging (logging_config.py is what reads LOG_LEVEL, and only
+  # main.py imports it), and uvicorn's default log config installs no root
+  # handler — so the gateway's own logger.info/debug go to logging.lastResort
+  # at WARNING and are dropped. Rendering the key would be exactly the dead
+  # config the comment above forbids. Wire configure_logging() into
+  # create_app() first, then add it back.
 {{- end }}

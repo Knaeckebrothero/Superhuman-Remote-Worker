@@ -260,6 +260,14 @@ canvas:
 # A THIRD step is easy to miss: `user-ca.pub` must also land in the vm-ssh-key
 # Secret, which is where the workspace provisioner projects it from. See the
 # "SSH gateway" section of helm/README.md.
+#
+# The gateway also REQUIRES a sessionRouter JWT secret (see below): it is the
+# HMAC key it verifies the attach token with. The chart refuses to render
+# without one rather than shipping a pod that crash-loops.
+#
+# Every abuse cap the gateway enforces is per POD, so `replicas` multiplies
+# all of them — including `max_attachments_per_workspace`, a security cap.
+# Leave it at 1 unless you have read helm/values.yaml's note on it.
 # -----------------------------------------------------------------------------
 # sshGateway:
 #   enabled: true

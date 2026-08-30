@@ -54,6 +54,14 @@ ingress:
 garage:
   enabled: true
 
+# The HMAC key the orchestrator mints session/attach tokens with and the
+# ssh-gateway verifies them with. A CI-only sentinel, never a real key: this
+# scenario exists to prove the render describes a BOOTABLE install, and
+# without it the gateway's SESSION_JWT_SECRET names a Secret nothing renders,
+# so the pod crash-loops in exactly the scenario added to validate it.
+sessionRouter:
+  jwtSecret: "ci-only-not-a-secret-0000000000000000000000000000000000000000"
+
 # SSH gateway. Enabled here on purpose: canvas.livePreview.viewer.enabled is
 # never true in any of the nine helm/ci scenarios, so canvas-gateway's
 # rendered output has never been validated. The TCP door is on too, so the

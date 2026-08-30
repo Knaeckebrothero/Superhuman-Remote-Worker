@@ -15,8 +15,15 @@ spec:
   replicas: {{ $gw.replicas }}
   strategy:
     rollingUpdate:
-      # Live SSH sessions die on rollout regardless; at least do not stack two
-      # generations of the gateway on one host key.
+      # Live SSH sessions die on rollout regardless, so trade a surge for a
+      # gap: never drop the WSS door while the new pod comes up.
+      #
+      # This does NOT avoid two generations overlapping — it guarantees it.
+      # maxSurge defaults to 25%, which rounds UP to 1 at replicas: 1, so the
+      # new pod starts before the old one goes. That is harmless: both
+      # generations mount the same host-key Secret, so no client sees a key
+      # change. Actually serializing them would need maxSurge: 0 +
+      # maxUnavailable: 1, which buys a gap for nothing.
       maxUnavailable: 0
   selector:
     matchLabels:

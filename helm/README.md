@@ -621,7 +621,7 @@ kubectl -n <ns> create secret generic srw-ssh-gateway-ca \
 
    | Supply path | What to do |
    |---|---|
-   | `externalSecrets.vmSshKeyVaultPath` (layout A, `dataFrom: extract`) | the chart adds a `data:` entry alongside the bundle pull; put `SSH_GATEWAY_USER_CA_PUBLIC_KEY` in the bundle at `externalSecrets.vaultPath`. (ESO permits `data` next to `dataFrom`, and `data` wins on conflict.) Alternatively drop that entry and name a property literally `user-ca.pub` in your own bundle. |
+   | `externalSecrets.vmSshKeyVaultPath` (layout A, `dataFrom: extract`) | the chart adds a `data:` entry alongside the bundle pull; put `SSH_GATEWAY_USER_CA_PUBLIC_KEY` in the bundle at `externalSecrets.vaultPath`. (ESO permits `data` next to `dataFrom`, and `data` wins on conflict.) There is no value that drops that entry: it renders whenever `sshGateway.enabled`, so a layout A bundle that already carries its own `user-ca.pub` must **still** have `SSH_GATEWAY_USER_CA_PUBLIC_KEY` at `externalSecrets.vaultPath` or ESO fails the whole `vm-ssh-key` sync. |
    | `externalSecrets.vaultPath` (layout B, the default) | the chart adds `secretKey: user-ca.pub`; put `SSH_GATEWAY_USER_CA_PUBLIC_KEY` in the same bundle. |
    | `secrets.existingVmSshKeySecret` | the chart renders no template here at all. Add the key yourself: `kubectl -n <ns> patch secret <name> -p "{\"data\":{\"user-ca.pub\":\"$(base64 -w0 user-ca.pub)\"}}"` |
    | `scripts/local-dev-up.sh` (k3d) | the script creates `srw-vm-ssh-key` with two keys only. Patch the third in with the same command before enabling the gateway. |
@@ -645,14 +645,20 @@ kubectl -n <ns> create secret generic srw-ssh-gateway-ca \
 | `allowedOrigins` | an empty list accepts cross-site WebSocket handshakes; `load_config` refuses to boot |
 | `trustedProxies` | unset behind an ingress, every WSS client presents the *ingress's* address, so all of them share one source's 16-slot concurrency bucket and the seventeenth concurrent user is refused. Set it to the ingress hop's IP/CIDR, or the literal `none` when nothing proxies the gateway. Both possible defaults are wrong |
 | `hostKeySecret`, `userCaSecret` | operator-provided; see above |
+| `sessionRouter.jwtSecret` **or** `sessionRouter.jwtSecretName` | `SESSION_JWT_SECRET` is the HMAC key the gateway verifies the attach token the orchestrator minted. With neither set, no Secret is rendered, the gateway's `secretKeyRef` (`optional: true`) resolves to nothing, and `load_config` refuses to boot — a crash-loop, not a render error. Set `jwtSecret` for the chart-rendered Secret (layout A) or `jwtSecretName` for one you own (layout B) |
 | `tcp.allowedClientCIDRs` | required when `tcp.enabled`: an unscoped SSH LoadBalancer is not a supported default |
+| `tcp.port` | has a default (2222) but is range-checked: the gateway runs as uid 999 with all capabilities dropped, so anything below 1024 never binds and `/healthz` answers 503 forever |
 
 The chart `fail`s at render time on each of these rather than shipping a pod that crash-loops.
 
 ### Doors
 
 `/api/ssh/attach` (the WSS transport) rides the existing API ingress at Traefik
-`router.priority: 130`. `/api/ssh/host-keys` stays on the orchestrator. The raw TCP listener
+`router.priority: 130`, as `pathType: Exact`. Exact is load-bearing, not tidiness: Traefik renders
+`Prefix` as `PathPrefix()`, a raw string prefix, and the explicit priority beats the `/api` rule —
+so `Prefix` here would route `POST /api/ssh/attach-token` to the gateway too and 404 every attempt
+to mint a token. Both `/api/ssh/attach-token` and `/api/ssh/host-keys` stay on the orchestrator.
+The raw TCP listener
 always runs inside the pod on `tcp.port` (`/healthz` reports 503 while its accept loop is down)
 and the ClusterIP Service always carries it, so a port-forward works with `tcp.enabled: false`;
 `tcp.enabled` only adds the MetalLB LoadBalancer. Set `tcp.externalTrafficPolicy: Local` if you
@@ -662,10 +668,17 @@ addresses — `Cluster` SNATs every client to a node IP and collapses them into 
 ### Concurrency
 
 The gateway's caps are `GatewayConfig` dataclass defaults with no environment lever, so there is
-deliberately no chart value for them: 64 concurrent SSH connections fleet-wide, 16 per source,
-12 channels per connection, 4 attachments per workspace. The pre-auth slot is held for a
+deliberately no chart value for them. **Per gateway pod:** 64 concurrent SSH connections, 16 per
+source, 12 channels per connection, 4 attachments per workspace. The pre-auth slot is held for a
 connection's whole life, so despite the name these are session limits, not startup limits.
 `SshTcpListener` is AF_INET only — it does not bind IPv6.
+
+None of those numbers is fleet-wide. `GatewayLimiter` is constructed once per process with no
+shared store, and the WSS ingress has no session affinity, so **`sshGateway.replicas` multiplies
+every one of them** — including `max_attachments_per_workspace`, which bounds how many people can
+be attached to a single workspace at once. That is a security cap, not a capacity cap, and
+`replicas: 2` doubles it to 8 with nothing in the chart or the logs saying so. `replicas: 1` is
+load-bearing; raise it only with that understood.
 
 Then create a job with the VM backend (Cockpit → Create → workspace: VM, or
 `"workspace": {"backend": "vm"}` in the API call) and watch:

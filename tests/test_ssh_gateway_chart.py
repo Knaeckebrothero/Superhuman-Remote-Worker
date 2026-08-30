@@ -51,7 +51,19 @@ ENABLE = [
     "sshGateway.hostKeySecret=srw-ssh-gateway-hostkey",
     "--set",
     "sshGateway.userCaSecret=srw-ssh-gateway-ca",
+    # SESSION_JWT_SECRET is the HMAC key the gateway verifies the attach
+    # token with. Without a sessionRouter secret configured the chart renders
+    # no Secret for the gateway's `optional: true` secretKeyRef to resolve,
+    # and load_config refuses to boot -- so this belongs in the minimum,
+    # exactly like allowedOrigins.
+    "--set",
+    "sessionRouter.jwtSecret=chart-test-not-a-real-key",
 ]
+
+# The committed, test-enforced list of every route the ORCHESTRATOR serves
+# (tests/test_endpoint_inventory.py keeps it honest against main.py). Used to
+# prove the gateway Ingress does not steal one of them.
+ENDPOINT_INVENTORY = ROOT / "policy" / "endpoint_inventory.txt"
 
 pytestmark = pytest.mark.skipif(
     shutil.which("helm") is None, reason="Helm is not installed"
@@ -113,6 +125,18 @@ def _volume(deployment: dict, name: str) -> dict:
     matches = [v for v in volumes if v["name"] == name]
     assert len(matches) == 1, f"no volume named {name}"
     return matches[0]
+
+
+def _orchestrator_routes() -> set[str]:
+    """Every path the orchestrator serves, from the committed inventory."""
+    routes = set()
+    for line in ENDPOINT_INVENTORY.read_text().splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        parts = line.split()
+        if len(parts) >= 2 and parts[0].isupper() and parts[1].startswith("/"):
+            routes.add(parts[1])
+    return routes
 
 
 @pytest.fixture(scope="module")
@@ -281,25 +305,51 @@ def test_trusted_proxies_reaches_the_gateway(docs: list[dict]) -> None:
 def test_configmap_carries_no_setting_the_gateway_never_reads(
     docs: list[dict],
 ) -> None:
-    """The signature defect of this plan, generalized: a chart value rendered
-    into an environment variable no code path reads is dead config an
-    operator can tune forever with no effect. `load_config` is the gateway's
-    only environment reader, so every SSH_GATEWAY_* key here must appear in
-    it.
+    """The signature defect of this plan, generalized, in BOTH directions.
+    `load_config` is the gateway's only environment reader, so:
 
-    (This is why there is no `sshGateway.limits` block: `load_config` reads
-    none of the five caps -- see the task report.)
+    * nothing may be rendered that it never reads -- dead config an operator
+      can tune forever with no effect; and
+    * nothing it requires may be missing -- which is the defect class this
+      plan actually keeps producing.
+
+    The second half is not symmetric bookkeeping. `ORCHESTRATOR_URL` has a
+    default, `"http://orchestrator:8085"`, and that default is WRONG for this
+    chart, which renders `srw-<release>-orchestrator`. Delete the ConfigMap
+    line and the gateway boots perfectly happily; every attach then dies at
+    DNS resolution. Silent, not fail-closed -- the worst shape available.
+
+    Only the three settings whose defaults are genuinely correct here are
+    exempt: SSH_GATEWAY_REQUIRE_TOKEN (defaults true, and a chart value to
+    turn the user credential off would be a footgun), SSH_GATEWAY_SSH_HOST and
+    SSH_GATEWAY_SSH_PORT.
+
+    (This is also why there is no `sshGateway.limits` block: `load_config`
+    reads none of the five caps -- see the task report.)
     """
     source = (ROOT / "orchestrator/services/ssh_gateway_config.py").read_text()
     read_by_load_config = set(re.findall(r'src\.get\(\s*"([A-Z_0-9]+)"', source))
     assert "SSH_GATEWAY_HOST_KEYS" in read_by_load_config  # regex sanity
+    assert "ORCHESTRATOR_URL" in read_by_load_config
+    assert "SESSION_JWT_SECRET" in read_by_load_config
 
-    rendered = {
-        key
-        for key in _one(docs, "ConfigMap", "ssh-gateway")["data"]
-        if key.startswith("SSH_GATEWAY_")
+    # Every key, not just the SSH_GATEWAY_* ones: LOG_LEVEL used to ride here
+    # reading nothing, because ssh_gateway.py never calls configure_logging.
+    config_keys = set(_one(docs, "ConfigMap", "ssh-gateway")["data"])
+    assert config_keys <= read_by_load_config, sorted(config_keys - read_by_load_config)
+
+    # The inverse. A required variable may arrive either through the
+    # ConfigMap (`envFrom`) or as an explicit `env:` entry on the container --
+    # the two Secret-backed ones take the second route.
+    supplied = config_keys | set(
+        _env(_container(_one(docs, "Deployment", "ssh-gateway"), "ssh-gateway"))
+    )
+    required = read_by_load_config - {
+        "SSH_GATEWAY_REQUIRE_TOKEN",
+        "SSH_GATEWAY_SSH_HOST",
+        "SSH_GATEWAY_SSH_PORT",
     }
-    assert rendered <= read_by_load_config, sorted(rendered - read_by_load_config)
+    assert required <= supplied, sorted(required - supplied)
 
 
 # ---------------------------------------------------------------------------
@@ -541,6 +591,45 @@ def test_ingress_routes_only_the_attach_socket_to_the_gateway(
     assert paths[0]["backend"]["service"]["port"]["number"] == 8087
 
 
+def test_ingress_steals_no_orchestrator_route(docs: list[dict]) -> None:
+    """C1: `pathType: Prefix` on `/api/ssh/attach` swallowed
+    `POST /api/ssh/attach-token` -- the endpoint that MINTS the token this
+    door verifies. Traefik renders Prefix as `PathPrefix()`, a RAW STRING
+    prefix rather than a path-element match, and the explicit
+    `router.priority: 130` beats the api ingress's length-derived default. So
+    every token request reached a gateway that serves two routes and got a
+    Starlette 404: no token, no attach, feature dead, and invisible to any
+    test that only reads this one manifest.
+
+    Modelled on Traefik's actual matchers -- Exact -> `Path()`,
+    Prefix/ImplementationSpecific -> `PathPrefix()` -- against the committed
+    orchestrator inventory. Catches both the regression (someone restores
+    `Prefix`) and the next `/api/ssh/attach-*` endpoint anyone adds.
+    """
+    orchestrator_routes = _orchestrator_routes()
+    # Regression detector, not a shape echo: if the inventory ever stops
+    # carrying the route that caused this bug, the test must say so rather
+    # than pass on an empty set.
+    assert "/api/ssh/attach-token" in orchestrator_routes
+    assert "/api/ssh/host-keys" in orchestrator_routes
+
+    paths = _one(docs, "Ingress", "ssh-gateway")["spec"]["rules"][0]["http"]["paths"]
+    stolen: dict[str, list[str]] = {}
+    for entry in paths:
+        claimed, kind = entry["path"], entry["pathType"]
+        if kind == "Exact":
+            captured = [r for r in orchestrator_routes if r == claimed]
+        else:  # Prefix and ImplementationSpecific both become PathPrefix()
+            captured = [r for r in orchestrator_routes if r.startswith(claimed)]
+        if captured:
+            stolen[f"{claimed} ({kind})"] = sorted(captured)
+
+    assert not stolen, (
+        "the ssh-gateway Ingress captures orchestrator routes, which reach a "
+        f"gateway that serves only /api/ssh/attach and /healthz: {stolen}"
+    )
+
+
 def test_tcp_listener_is_off_by_default(docs: list[dict]) -> None:
     services = _find(docs, "Service", "ssh-gateway")
     assert services
@@ -563,6 +652,18 @@ def test_tcp_listener_requires_cidr_scoping() -> None:
     # Assert on the reason, not just the failure: an unrelated render error
     # would otherwise let this pass while proving nothing.
     assert "allowedClientCIDRs" in result.stderr
+
+
+def test_privileged_tcp_port_is_refused() -> None:
+    """The pod runs as uid 999 with every capability dropped, so a port below
+    1024 never binds. The listener is not optional -- /healthz answers 503
+    while its accept loop is down -- so the pod would simply never go Ready,
+    with the cause a `bind: permission denied` deep in the log.
+    """
+    for port in ("22", "70000"):
+        result = _run(*ENABLE, "--set", f"sshGateway.tcp.port={port}")
+        assert result.returncode != 0, port
+        assert "tcp.port" in result.stderr, port
 
 
 def test_tcp_loadbalancer_is_scoped_when_enabled() -> None:
@@ -596,10 +697,35 @@ def test_enabling_without_config_fails_closed() -> None:
         ("sshGateway.hostKeySecret=", "hostKeySecret"),
         ("sshGateway.userCaSecret=", "userCaSecret"),
         ("sshGateway.trustedProxies=", "trustedProxies"),
+        # C2: with neither sessionRouter value set the chart renders no Secret
+        # at all, the gateway's `optional: true` secretKeyRef resolves to
+        # nothing, and load_config raises on SESSION_JWT_SECRET -- a
+        # CrashLoopBackOff three files away from the values file. Mirrors
+        # collabora/network-policy.yaml's identical precondition.
+        ("sessionRouter.jwtSecret=", "sessionRouter"),
     ):
         result = _run(*ENABLE, "--set", setting)
         assert result.returncode != 0, setting
         assert expected in result.stderr, setting
+
+
+def test_the_session_jwt_secret_the_gateway_names_actually_exists(
+    docs: list[dict],
+) -> None:
+    """C2, the supply side: the render-time `fail` proves the operator SAID
+    something, not that a Secret arrives. Layout A (`sessionRouter.jwtSecret`)
+    must actually render the Secret the gateway's secretKeyRef names -- the
+    reference is `optional: true`, so a name that resolves to nothing is a
+    silent unset variable, not a scheduling error.
+
+    Asserted against the reference the Deployment renders rather than a
+    literal, so a change to jwtSecretName's default cannot drift them apart.
+    """
+    ref = _env(_container(_one(docs, "Deployment", "ssh-gateway"), "ssh-gateway"))[
+        "SESSION_JWT_SECRET"
+    ]["valueFrom"]["secretKeyRef"]
+    secret = _one(docs, "Secret", ref["name"])
+    assert ref["key"] in (secret.get("stringData") or secret.get("data") or {})
 
 
 def test_gateway_network_policy_scopes_both_directions(docs: list[dict]) -> None:
@@ -658,4 +784,18 @@ def test_chart_ci_actually_renders_the_component() -> None:
     orchestrator = _one(docs, "Deployment", "-orchestrator")
     assert "SSH_GATEWAY_PUBLIC_HOST_KEYS" in _env(
         _container(orchestrator, "orchestrator")
+    )
+
+    # C2: the scenario exists to VALIDATE the component, so it has to describe
+    # an install that could boot, not merely one that renders. As written it
+    # set no sessionRouter JWT secret, so SESSION_JWT_SECRET named a Secret
+    # this render never produced and the gateway crash-looped -- in the very
+    # CI case added to catch that.
+    ref = _env(_container(_one(docs, "Deployment", "ssh-gateway"), "ssh-gateway"))[
+        "SESSION_JWT_SECRET"
+    ]["valueFrom"]["secretKeyRef"]
+    assert _find(docs, "Secret", ref["name"]), (
+        f"eval-values renders no Secret named {ref['name']}; the gateway's "
+        "SESSION_JWT_SECRET is optional:true, so this is an unset variable "
+        "and load_config refuses to boot"
     )
