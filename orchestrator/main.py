@@ -39073,11 +39073,15 @@ async def get_datasource_index_status(
     try:
         from src.services.knowledge_store import KnowledgeStore
 
-        from services.kb_datasources import index_status_payload
+        from services.kb_datasources import (
+            index_status_payload,
+            native_kb_project_id,
+        )
 
+        watermark_id = native_kb_project_id(datasource) or datasource_id
         watermark = await KnowledgeStore(
             db=vector_db, embedding_service=None
-        ).get_watermark(UUID(datasource_id))
+        ).get_watermark(UUID(watermark_id))
         return index_status_payload(datasource_id, watermark)
     except HTTPException:
         raise

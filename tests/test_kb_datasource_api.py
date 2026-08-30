@@ -217,6 +217,44 @@ async def test_status_endpoint_uses_normal_visibility_gate():
 
 
 @pytest.mark.asyncio
+async def test_status_endpoint_resolves_native_connector_to_project_watermark():
+    datasource_id = "11111111-2222-3333-4444-555555555555"
+    project_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    request = object()
+    gate = AsyncMock(
+        return_value=(
+            {},
+            {
+                "id": datasource_id,
+                "type": "kb",
+                "config": {"native_project_id": project_id},
+            },
+        )
+    )
+    watermark = KbWatermark(
+        kb_id=UUID(project_id),
+        indexed_commit="a" * 40,
+        status="ready",
+    )
+    get_watermark = AsyncMock(return_value=watermark)
+
+    with (
+        patch("main.require_datasource_access", gate),
+        patch(
+            "src.services.knowledge_store.KnowledgeStore.get_watermark",
+            get_watermark,
+        ),
+    ):
+        result = await get_datasource_index_status(request, datasource_id)
+
+    assert result["datasource_id"] == datasource_id
+    assert result["status"] == "ready"
+    assert result["indexed_commit"] == "a" * 40
+    gate.assert_awaited_once()
+    get_watermark.assert_awaited_once_with(UUID(project_id))
+
+
+@pytest.mark.asyncio
 async def test_manual_reindex_is_owner_gated_and_uses_stored_datasource():
     datasource_id = "11111111-2222-3333-4444-555555555555"
     datasource = {"id": datasource_id, "type": "kb"}
