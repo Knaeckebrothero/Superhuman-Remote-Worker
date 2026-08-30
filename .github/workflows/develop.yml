@@ -1869,12 +1869,73 @@ jobs:
           needs.build-orchestrator.result == 'success' ||
           needs.build-cockpit.result == 'success' ||
           needs.build-mcp.result == 'success'
+        env:
+          SHA_ORCHESTRATOR: ${{ needs.changes.outputs.orchestrator-sha }}
+          SHA_AGENT: ${{ needs.changes.outputs.agent-sha }}
+          SHA_COCKPIT: ${{ needs.changes.outputs.cockpit-sha }}
+          SHA_MCP: ${{ needs.changes.outputs.mcp-sha }}
+          SHA_WORKSPACE: ${{ needs.changes.outputs.workspace-sha }}
         run: |
           helm repo add collabora https://collaboraonline.github.io/online --force-update
           helm repo add cloudnative-pg https://cloudnative-pg.github.io/charts --force-update
           helm dependency build helm/
           # Override chart name for dev channel
           yq -i '.name = "srw-dev"' helm/Chart.yaml
+
+          # -- Bake component image tags into the chart itself --
+          # The chart version has to fully determine which images run: a Fleet
+          # HelmOp resolves a chart from the registry and has no git-read values
+          # overlay to carry tags alongside it. Baking them here is a build step,
+          # not a commit — helm/values.yaml is restored below and never staged.
+          #
+          # These are the SAME per-component identities the deployment overlay
+          # uses: the newest commit that touched each component's build inputs,
+          # never the push HEAD. So a component whose inputs did not change keeps
+          # its existing tag across runs and does not provoke a needless rollout
+          # (which for the agent means a fleet drain). The changes job emits all
+          # five unconditionally, so this is correct whether or not that
+          # component rebuilt in this run.
+          : "${SHA_ORCHESTRATOR:=$GITHUB_SHA}"
+          : "${SHA_AGENT:=$GITHUB_SHA}"
+          : "${SHA_COCKPIT:=$GITHUB_SHA}"
+          : "${SHA_MCP:=$GITHUB_SHA}"
+          : "${SHA_WORKSPACE:=$GITHUB_SHA}"
+          export TAG_ORCHESTRATOR="sha-${SHA_ORCHESTRATOR::7}"
+          export TAG_AGENT="sha-${SHA_AGENT::7}"
+          export TAG_COCKPIT="sha-${SHA_COCKPIT::7}"
+          export TAG_MCP="sha-${SHA_MCP::7}"
+          export TAG_WORKSPACE="sha-${SHA_WORKSPACE::7}"
+          export REV_ORCHESTRATOR="$SHA_ORCHESTRATOR"
+          export REV_AGENT="$SHA_AGENT"
+          export REV_COCKPIT="$SHA_COCKPIT"
+          export REV_MCP="$SHA_MCP"
+          export REV_WORKSPACE="$SHA_WORKSPACE"
+          export CHART_VERSION="${{ steps.tag.outputs.chart_version }}"
+          yq -i '
+            .image.orchestrator.tag = strenv(TAG_ORCHESTRATOR) |
+            .image.agent.tag        = strenv(TAG_AGENT) |
+            .image.cockpit.tag      = strenv(TAG_COCKPIT) |
+            .image.mcp.tag          = strenv(TAG_MCP) |
+            .image.workspace.tag    = strenv(TAG_WORKSPACE) |
+            .provenance.releaseVersion = strenv(CHART_VERSION) |
+            .provenance.components.orchestrator.sourceRevision = strenv(REV_ORCHESTRATOR) |
+            .provenance.components.agent.sourceRevision        = strenv(REV_AGENT) |
+            .provenance.components.cockpit.sourceRevision      = strenv(REV_COCKPIT) |
+            .provenance.components.mcp.sourceRevision          = strenv(REV_MCP) |
+            .provenance.components.workspace.sourceRevision    = strenv(REV_WORKSPACE)
+          ' helm/values.yaml
+
+          # Fail closed: a silently-unstamped chart would deploy ":latest" to
+          # every component — the exact failure this step exists to prevent, and
+          # invisible until pods started rolling. Checked structurally and scoped
+          # to .image.*: vmController.image.tag is legitimately "latest" in this
+          # chart, so a text grep for "tag: latest" blocks every publish.
+          UNSTAMPED=$(yq '[.image[] | select(.tag == "latest")] | length' helm/values.yaml)
+          if [ "$UNSTAMPED" != "0" ]; then
+            echo "::error::${UNSTAMPED} image tag(s) under .image are still 'latest' in helm/values.yaml; refusing to publish a chart that would deploy :latest"
+            exit 1
+          fi
+
           mkdir -p dist
           helm package helm/ \
             --version "${{ steps.tag.outputs.chart_version }}" \
@@ -1882,8 +1943,8 @@ jobs:
             --destination ./dist
           helm push ./dist/srw-dev-${{ steps.tag.outputs.chart_version }}.tgz \
             oci://ghcr.io/knaeckebrothero/charts
-          # Restore Chart.yaml (don't commit the name override)
-          git checkout helm/Chart.yaml
+          # Restore working copy (never commit the name override or baked tags)
+          git checkout helm/Chart.yaml helm/values.yaml
 
       # -- Publish dev VM-cluster chart (parallel to srw-dev). Re-publish for
       # chart sources or any image consumed by this chart, including the
