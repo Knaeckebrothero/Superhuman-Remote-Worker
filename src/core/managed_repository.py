@@ -101,7 +101,7 @@ def runtime_scope():
     return f"{boot}:{pid_namespace}"
 
 
-def identity(pid):
+def _identity_once(pid):
     proc = Path(f"/proc/{pid}")
     try:
         raw = (proc / "cmdline").read_bytes()
@@ -135,6 +135,23 @@ def identity(pid):
             fail()
         return None
     return command_name, argv, start_time(pid)
+
+
+def identity(pid):
+    # /proc exposes each exec/exit as several independently read files. Under
+    # process churn, a same-UID process can disappear or finish exec between
+    # cmdline, comm, status and stat, producing one conservative rc86 even when
+    # it has no relationship to a managed socket. Retry only that ambiguous
+    # observation for a short bound. A stable unreadable/foreign shape still
+    # exhausts the bound and fails closed exactly as before.
+    for attempt in range(5):
+        try:
+            return _identity_once(pid)
+        except SystemExit as exc:
+            if exc.code != 86 or attempt == 4:
+                raise
+            time.sleep(0.01)
+    fail()  # pragma: no cover - the loop either returns or raises
 
 
 mode = sys.argv[1]

@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { persistedResourceLedgerCanBeReplaced } from './resource-ledger';
+import {
+  persistedResourceLedgerCanBeReplaced,
+  remainingCleanupRequestTimeout,
+} from './resource-ledger';
 
 const THREAD_ID = '123e4567-e89b-42d3-a456-426614174000';
 
@@ -26,5 +29,13 @@ describe('persistedResourceLedgerCanBeReplaced', () => {
     ['a resource id is not exact', { resources: [{ kind: 'thread', id: 'all' }] }],
   ])('rejects replacement when %s', (_label, override) => {
     expect(persistedResourceLedgerCanBeReplaced(ledger(override))).toBe(false);
+  });
+});
+
+describe('remainingCleanupRequestTimeout', () => {
+  it('uses the lifecycle phase remainder instead of a short fixed request cap', () => {
+    expect(remainingCleanupRequestTimeout(180_000, 0)).toBe(180_000);
+    expect(remainingCleanupRequestTimeout(180_000, 75_250)).toBe(104_750);
+    expect(remainingCleanupRequestTimeout(180_000, 180_000)).toBe(1);
   });
 });

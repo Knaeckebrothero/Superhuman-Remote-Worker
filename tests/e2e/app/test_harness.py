@@ -910,9 +910,11 @@ def test_exact_cleanup_retries_retryable_force_until_it_converges(
         ]
     )
     calls: list[str] = []
+    request_timeouts: list[float] = []
 
-    def fake_request(url: str, **_kwargs):
+    def fake_request(url: str, **kwargs):
         calls.append(url)
+        request_timeouts.append(kwargs.get("timeout", 20))
         return next(responses)
 
     monotonic_values = iter([0.0, 0.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0])
@@ -943,6 +945,41 @@ def test_exact_cleanup_retries_retryable_force_until_it_converges(
     assert calls[1].endswith(f"/{thread_id}?permanent=true&force=true")
     assert calls[2] == calls[1]
     assert calls[3].endswith(f"/{thread_id}")
+    assert request_timeouts[:3] == [1, 1, 1]
+
+
+def test_exact_cleanup_request_receives_the_full_remaining_lifecycle_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FakePortForward:
+        def __init__(self, **_kwargs):
+            self.local_port = 43123
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    responses = iter([(204, b""), (404, b"")])
+    request_timeouts: list[float] = []
+
+    def fake_request(_url: str, **kwargs):
+        request_timeouts.append(kwargs.get("timeout", 20))
+        return next(responses)
+
+    monkeypatch.setattr(harness, "PortForward", FakePortForward)
+    monkeypatch.setattr(harness, "_http_request", fake_request)
+    monkeypatch.setattr(harness.time, "monotonic", lambda: 100.0)
+
+    application = harness.ApplicationE2EHarness(tmp_path / "state")
+    application._cleanup_threads(
+        {"kubeconfig": str(tmp_path / "kubeconfig.yaml")},
+        ["123e4567-e89b-42d3-a456-426614174000"],
+        "session=owned",
+    )
+
+    assert request_timeouts == [180, 20]
 
 
 def test_cookie_header_selects_only_owned_origin() -> None:

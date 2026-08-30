@@ -42,6 +42,10 @@ function delay(milliseconds: number): Promise<void> {
   return new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds));
 }
 
+export function remainingCleanupRequestTimeout(deadline: number, now: number): number {
+  return Math.max(1, deadline - now);
+}
+
 export class ResourceLedger {
   private readonly resources: ThreadResource[] = [];
   private finalized = false;
@@ -168,10 +172,17 @@ export class ResourceLedger {
     let backoff = 250;
     let deleted = false;
 
-    while (Date.now() < gracefulDeadline) {
+    while (true) {
+      const now = Date.now();
+      if (now >= gracefulDeadline) break;
       const response = await request.delete(`${pathname}?permanent=true`, {
         headers: MUTATION_HEADERS,
-        timeout: 20_000,
+        // Stateless End is one synchronous, acknowledged lifecycle protocol:
+        // resident drain, shell retirement, then exact Kubernetes cleanup.
+        // A short transport timeout abandons that operation while it still
+        // holds the retirement authority. Bound the request by this phase's
+        // existing deadline instead of imposing an unrelated UI-sized cap.
+        timeout: remainingCleanupRequestTimeout(gracefulDeadline, now),
       });
       if (response.ok() || response.status() === 404) {
         deleted = true;
@@ -190,10 +201,12 @@ export class ResourceLedger {
       const forcedDeadline = Date.now() + FORCED_CLEANUP_WINDOW_MS;
       backoff = 250;
       let lastStatus = 0;
-      while (Date.now() < forcedDeadline) {
+      while (true) {
+        const now = Date.now();
+        if (now >= forcedDeadline) break;
         const forced = await request.delete(`${pathname}?permanent=true&force=true`, {
           headers: MUTATION_HEADERS,
-          timeout: 30_000,
+          timeout: remainingCleanupRequestTimeout(forcedDeadline, now),
         });
         lastStatus = forced.status();
         if (forced.ok() || lastStatus === 404) {

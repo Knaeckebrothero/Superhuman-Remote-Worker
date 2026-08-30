@@ -2944,13 +2944,20 @@ class ApplicationE2EHarness:
                 path = f"/api/persistent/threads/{urllib.parse.quote(thread_id)}"
                 deadline = time.monotonic() + timeout_seconds
                 status = 0
-                while time.monotonic() < deadline:
+                while True:
+                    now = time.monotonic()
+                    if now >= deadline:
+                        break
                     status, _body = _http_request(
                         f"{root}{path}?permanent=true",
                         method="DELETE",
                         headers=headers,
                         expected=(200, 202, 204, 404, 409, 503),
-                        timeout=20,
+                        # Stateless End synchronously drains residents, retires
+                        # the shell, and proves exact Kubernetes cleanup. Give
+                        # that request the phase's remaining bounded budget;
+                        # 20 seconds can abandon a healthy lifecycle operation.
+                        timeout=max(0.1, deadline - now),
                     )
                     if status not in {409, 503}:
                         break
@@ -2964,13 +2971,16 @@ class ApplicationE2EHarness:
                     # converge, so retry that same exact authority separately.
                     forced = True
                     force_deadline = time.monotonic() + force_timeout_seconds
-                    while time.monotonic() < force_deadline:
+                    while True:
+                        now = time.monotonic()
+                        if now >= force_deadline:
+                            break
                         status, _body = _http_request(
                             f"{root}{path}?permanent=true&force=true",
                             method="DELETE",
                             headers=headers,
                             expected=(200, 202, 204, 404, 409, 503),
-                            timeout=30,
+                            timeout=max(0.1, force_deadline - now),
                         )
                         if status not in {409, 503}:
                             break

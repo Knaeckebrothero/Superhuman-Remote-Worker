@@ -113,10 +113,10 @@ WORKFLOWS: dict[str, Policy] = {
         triggers=frozenset({"schedule", "workflow_dispatch"}),
     ),
     "application-e2e.yml": Policy(
-        triggers=frozenset({"schedule", "workflow_dispatch"}),
+        triggers=frozenset({"push", "schedule", "workflow_dispatch"}),
         why=(
             "the full-stack observation builds an isolated k3d cluster and is "
-            "restricted to trusted scheduled/manual events"
+            "restricted to trusted develop pushes and scheduled/manual events"
         ),
     ),
     "postgres-operand-check.yml": Policy(

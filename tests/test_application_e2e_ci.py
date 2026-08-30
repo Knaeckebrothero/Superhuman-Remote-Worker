@@ -65,6 +65,7 @@ def test_workflow_pins_the_harness_toolchain_and_keeps_a_teardown_reserve() -> N
         'timeout --foreground --signal=INT --kill-after=4m "${{ matrix.lifecycle_timeout }}"'
         in raw
     )
+    assert 'install -d -m 0700 "${APP_E2E_STATE_DIR%/*}"' in raw
     assert "python -m tests.e2e.app.ci_finalize" in raw
     assert "if: always()" in raw
 

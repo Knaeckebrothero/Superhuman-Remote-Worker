@@ -22,6 +22,7 @@ from orchestrator.services.stateless_session_retirement import (
     verify_stateless_workspace_residents_retired,
 )
 from src.core.managed_repository import (
+    _SSH_AGENT_RETIRE_PROGRAM,
     managed_repository_agent_launch_command,
     managed_repository_agent_retirement_command,
     managed_repository_agent_zero_command,
@@ -101,6 +102,66 @@ def _stop(pid: int) -> None:
         time.sleep(0.02)
     if Path(f"/proc/{pid}").exists():
         os.kill(pid, signal.SIGKILL)
+
+
+def test_proc_identity_race_retries_then_fails_closed() -> None:
+    definitions, separator, _program = _SSH_AGENT_RETIRE_PROGRAM.partition(
+        "\nmode = sys.argv[1]"
+    )
+    assert separator
+    probe = r"""
+class FakeTime:
+    def __init__(self):
+        self.sleeps = []
+
+    def sleep(self, value):
+        self.sleeps.append(value)
+
+
+time = FakeTime()
+calls = 0
+
+
+def transient(_pid):
+    global calls
+    calls += 1
+    if calls == 1:
+        raise SystemExit(86)
+    return ("ssh-agent", ["ssh-agent", "-a", "/tmp/agent.sock", "-s"], "123")
+
+
+_identity_once = transient
+assert identity(42)[2] == "123"
+assert calls == 2
+assert time.sleeps == [0.01]
+
+
+def persistent(_pid):
+    global calls
+    calls += 1
+    raise SystemExit(86)
+
+
+calls = 0
+time.sleeps = []
+_identity_once = persistent
+try:
+    identity(42)
+except SystemExit as exc:
+    assert exc.code == 86
+else:
+    raise AssertionError("persistent ambiguity did not fail closed")
+assert calls == 5
+assert time.sleeps == [0.01, 0.01, 0.01, 0.01]
+"""
+    result = subprocess.run(
+        ["python3", "-c", definitions + probe],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr.decode(errors="replace")
 
 
 class _LocalShellBackend:

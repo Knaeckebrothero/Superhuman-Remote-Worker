@@ -97,6 +97,10 @@ jobs:
             echo "::error::Application E2E requires a clean checkout"
             exit 1
           }
+          # The harness deliberately creates and owns only the unique state
+          # root itself. Give that root a trusted, private output parent on a
+          # fresh checkout without pre-creating the ownership-marked child.
+          install -d -m 0700 "${APP_E2E_STATE_DIR%/*}"
 
       - name: Run fresh-cluster golden journey
         id: journey
