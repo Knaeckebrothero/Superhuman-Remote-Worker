@@ -23,7 +23,12 @@
   title: "Expert persona / identity"
   description: >-
     Injected as {expert_identity} on every call. Defines who the agent is and
-    how it thinks.
+    how it thinks. Plain role prose only: the framework's own placeholders
+    ({agent_display_name}, {expert_identity}, {available_skills},
+    {subagent_environment}, {prompt_content}, {phase_number}) are reserved for
+    the prompt assembler and are rejected on save. A persona is a value the
+    assembler substitutes IN, never a template it renders, so a placeholder
+    written here would never expand. Write the agent's name literally.
 - kind: prompts
   name: summarization
   group: "Prompts · all agents"

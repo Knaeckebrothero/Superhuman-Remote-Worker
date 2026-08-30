@@ -96,7 +96,7 @@ Everything the expert schema allows (`config/schema.json`), plus, per entry:
 | `tools`        | the child's tool groups (read-only floor by default) | bound as-is  |
 | `prompts`      | carried verbatim (inline: file names against `_deployment_dir`; DB: inlined text) | rendered |
 | `isolation`    | carried verbatim (`shared` \| `worktree`)      | enforced            |
-| `write_policy` | carried verbatim (`none` \| `scratch_only` \| `owned_paths` \| `full`) | enforced |
+| `write_policy` | carried verbatim (`none` \| `scratch_only` \| `owned_paths` \| `full`); **omitting it means `full`** — declare it explicitly | enforced |
 | `limits`       | ordinary `limits` keys parse; the child budgets (`max_turns`, `max_tokens`, `return_budget_tokens`, `stale_idle_s`, `stale_in_tool_s`) are carried, not yet parsed | enforced |
 | `return`       | carried verbatim (`summary` \| `structured` \| `evidence` \| `diff`) | shapes the result |
 
@@ -113,8 +113,21 @@ itself is bound only when the parent sets `delegation.enabled` AND names
    groups you rely on: a standalone load (`--config <name>`, the tool-grants
    snapshot) resolves on `expert_base`, not on the subagent overlay, and
    `expert_base` grants writes and a browser.
+   **Declare `write_policy` even when it is `none`.** An entry that omits it
+   resolves to `full`, which is what the child is told in its
+   `<subagent_environment>` block, what the spawn metadata records and what the
+   cockpit's Subagents row displays — misleading for an entry whose tools carry
+   no workspace mutator. The shipped `explorer` had exactly this gap
+   (found on the U3 WP7 k3d run, fixed in `460f905c`).
 2. Put prompt files (`persona.txt`, …) next to it — resolved via the entry's
-   `_deployment_dir` like a bundled expert's.
+   `_deployment_dir` like a bundled expert's. **A persona is plain role prose,
+   never a template**: the six framework placeholders (`{agent_display_name}`,
+   `{expert_identity}`, `{available_skills}`, `{subagent_environment}`,
+   `{prompt_content}`, `{phase_number}`) belong to the prompt assembler and are
+   rejected on the DB write path — a persona is a substitution *value*, so a
+   token inside it would never be expanded anyway. Write the display name
+   literally. See `ASSEMBLER_OWNED_PROMPT_TOKENS` in
+   `src/core/expert_resolution.py`.
 3. Run `UPDATE_TOOL_GRANTS_SNAPSHOT=1 pytest tests/test_config_tool_grants_snapshot.py`
    and review the added `subagents/<name>` entry, then
    `pytest tests/test_expert_roles_golden.py tests/test_subagent_roster.py tests/test_tool_policy.py`.
