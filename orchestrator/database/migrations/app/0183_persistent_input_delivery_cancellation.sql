@@ -32,7 +32,7 @@ ALTER TABLE public.thread_input_deliveries
     ADD CONSTRAINT thread_input_deliveries_state_check CHECK (state IN (
         'persisted', 'owned', 'queued', 'admitted', 'settled', 'deferred',
         'cancelled'
-    )) NOT VALID,
+    )),
     ADD CONSTRAINT thread_input_deliveries_cancellation_shape CHECK (
         (
             state <> 'cancelled'
@@ -51,7 +51,7 @@ ALTER TABLE public.thread_input_deliveries
             AND btrim(cancelled_reason) <> ''
             AND length(cancelled_reason) <= 120
         )
-    ) NOT VALID;
+    );
 
 COMMENT ON COLUMN public.thread_input_deliveries.cancelled_at IS
     'Terminal timestamp for an explicit direct-human Stop before provider admission.';

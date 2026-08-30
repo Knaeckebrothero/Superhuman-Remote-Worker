@@ -344,7 +344,16 @@ APP_IMAGE_DELIVERY_ROWS_EVENT_ROLE = (
 APP_SEARCH_FETCH_CAPABILITIES = (
     ROOT / "orchestrator/database/migrations/app/0212_search_fetch_capabilities.sql"
 )
-APP_CURRENT_MIGRATION_HEAD = APP_SEARCH_FETCH_CAPABILITIES
+# Supersedes 0183's constraint shape without editing 0183. Renumbered 0206 -> 0211
+# during the 2026-08-30 rebase onto develop: 0206 was already taken by
+# 0206_threads_subagent_kind.sql, which landed first.
+# Renumbered 0211 -> 0213 during the 2026-09-01 rebase onto the rewritten develop:
+# 0211 was taken upstream by 0211_image_delivery_rows_event_role.sql.
+APP_INPUT_DELIVERY_CONSTRAINTS_NOT_VALID = (
+    ROOT
+    / "orchestrator/database/migrations/app/0213_input_delivery_constraints_not_valid.sql"
+)
+APP_CURRENT_MIGRATION_HEAD = APP_INPUT_DELIVERY_CONSTRAINTS_NOT_VALID
 AUDIT_EXPANSION = (
     ROOT
     / "orchestrator/database/migrations/audit/0003_infrastructure_usage_events_v2.sql"
