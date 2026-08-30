@@ -30,6 +30,14 @@ llm:
   # subagents.llm) pins a cheaper model instead when the parent's is overkill.
   model: inherit
 
+# Read-only, stated explicitly. Without this key the entry resolves to the
+# schema default `full`, which is what the child is TOLD in its
+# <subagent_environment> block and what the cockpit displays -- misleading for
+# an entry whose tool grant carries no workspace mutator. Found on the k3d
+# WP7 acceptance run (job 329dc223), where explorer-bbf4 recorded
+# write_policy=full.
+write_policy: none
+
 tools:
   # The subagent overlay's read-only floor, restated here so this entry is
   # read-only when loaded standalone too (the tool-grants snapshot, a
