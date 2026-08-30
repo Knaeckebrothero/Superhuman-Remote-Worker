@@ -191,6 +191,47 @@ async def test_a_partial_read_is_retried_not_cached(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_a_complete_read_is_cached(monkeypatch, tmp_path):
+    """The cache is all that stands between an anonymous request and blocking
+    file I/O plus an asyncssh parse, per configured key, on the event loop.
+
+    Every other assertion in this file is about the *content* returned, which
+    is byte-identical whether or not the memoization exists — so deleting the
+    cache is a silent DoS regression on an unauthenticated, unrate-limited
+    endpoint that nothing here would catch. Pin the number of parses, not the
+    payload.
+    """
+    _, pub = _keygen(tmp_path / "gw")
+    monkeypatch.setenv("SSH_GATEWAY_PUBLIC_HOST_KEYS", str(pub))
+    monkeypatch.setenv("SSH_GATEWAY_HOSTNAME", "ssh.srw.works")
+
+    # Defensive: if the memoization is removed outright, this test must still
+    # reach its parse-count assertion and fail *there*, saying what broke —
+    # not error out on a missing cache_clear before asserting anything.
+    getattr(main._memoized_ssh_gateway_host_keys, "cache_clear", lambda: None)()
+
+    parses: list[str] = []
+    real_parse = main._parse_ssh_gateway_host_keys
+
+    def counting_parse(paths_value):
+        parses.append(paths_value)
+        return real_parse(paths_value)
+
+    monkeypatch.setattr(main, "_parse_ssh_gateway_host_keys", counting_parse)
+
+    first = await main.get_ssh_host_keys(request=object())
+    second = await main.get_ssh_host_keys(request=object())
+
+    assert first["host_keys"], "guard: the read must have succeeded to be cacheable"
+    assert first["host_keys"] == second["host_keys"]
+    assert len(parses) == 1, (
+        f"a complete read was re-parsed on every request ({len(parses)} parses "
+        "for 2 requests) — the memoization is gone, and this endpoint takes "
+        "anonymous traffic"
+    )
+
+
+@pytest.mark.asyncio
 async def test_unconfigured_returns_an_empty_list(monkeypatch):
     monkeypatch.delenv("SSH_GATEWAY_PUBLIC_HOST_KEYS", raising=False)
     monkeypatch.delenv("SSH_GATEWAY_HOSTNAME", raising=False)
