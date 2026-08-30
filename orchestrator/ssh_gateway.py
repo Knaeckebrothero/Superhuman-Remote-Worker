@@ -664,6 +664,30 @@ def _build_app() -> Starlette:
         level=os.environ.get("SSH_GATEWAY_LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    # Every outbound hop dies without this, and the cause is nowhere near the
+    # symptom. asyncssh's SSHClientConnectionOptions.prepare() calls
+    # getpass.getuser() UNCONDITIONALLY (connection.py:8186) -- before it looks
+    # at `username=` -- purely to locate ~/.ssh/config. getuser() consults
+    # LOGNAME/USER/LNAME/USERNAME and only then falls back to a passwd lookup
+    # for the current uid. This pod runs as uid 999 (chart securityContext) on
+    # an image whose /etc/passwd has no such user, so the fallback raises and
+    # asyncssh re-raises "Unknown local username". Every attach then fails with
+    # "workspace is unreachable right now" and a single WARNING line.
+    #
+    # Passing `username=` does NOT help: that is the REMOTE login name, chosen
+    # after this call. No asyncssh option reaches it -- the fix has to be
+    # environmental, which is why it lives here rather than in connect_upstream.
+    #
+    # setdefault, not assignment: a real deployment that sets LOGNAME keeps it.
+    # The value is only used to expand ~/.ssh/config, which this image does not
+    # ship, so it never affects authentication.
+    #
+    # Found by the Task 12 live gate. It is invisible in production only by
+    # accident: Dockerfile.orchestrator:60 creates uid 999, while the dev image
+    # Tilt builds does not -- and any runAsUser override (OpenShift arbitrary
+    # UIDs, a PSA/Kyverno mutation) reintroduces it on any image.
+    os.environ.setdefault("LOGNAME", "srw-ssh-gateway")
+
     config = load_config()
     application = Starlette(
         routes=[

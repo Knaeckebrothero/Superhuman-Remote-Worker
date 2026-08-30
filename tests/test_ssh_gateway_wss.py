@@ -26,6 +26,7 @@ import socket
 import subprocess
 from types import SimpleNamespace
 
+import asyncssh
 import pytest
 from starlette.datastructures import Address, Headers
 
@@ -776,3 +777,44 @@ def test_info_records_survive_app_construction(gateway_environment):
     finally:
         root.handlers[:] = saved_handlers
         root.setLevel(saved_level)
+
+
+def test_outbound_ssh_survives_a_uid_with_no_passwd_entry(
+    gateway_environment, monkeypatch
+):
+    """The gateway runs as uid 999 on an image that may not have that user.
+
+    asyncssh's SSHClientConnectionOptions.prepare() calls getpass.getuser()
+    unconditionally (connection.py:8186), BEFORE it considers ``username=``,
+    just to locate ~/.ssh/config. getuser() reads LOGNAME/USER/LNAME/USERNAME
+    and only then falls back to a passwd lookup for the current uid. The chart
+    pins runAsUser: 999 and the dev image has no such passwd entry, so that
+    fallback raises and asyncssh re-raises "Unknown local username" -- every
+    attach fails with "workspace is unreachable right now" and one WARNING.
+
+    Reproduces the real condition rather than asserting the env var directly:
+    clears all four names getuser() consults and makes the passwd fallback
+    raise KeyError exactly as it does for an unknown uid, then builds the app
+    and drives the same asyncssh call the outbound hop makes.
+    """
+    import getpass
+
+    for name in ("LOGNAME", "USER", "LNAME", "USERNAME"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(
+        "pwd.getpwuid", lambda _uid: (_ for _ in ()).throw(KeyError("uid 999"))
+    )
+
+    # Precondition: without the fix this environment genuinely breaks getuser().
+    # The exception type is version-dependent -- CPython 3.11 (the container)
+    # raises KeyError, which is the only type asyncssh catches; 3.13+ raises
+    # OSError, so there the failure escapes asyncssh's handler entirely and
+    # surfaces even less recognisably. Assert the breakage, not its spelling.
+    with pytest.raises((KeyError, OSError)):
+        getpass.getuser()
+
+    ssh_gateway.create_app()
+
+    # The app must have supplied a name, so the exact call asyncssh makes works.
+    assert getpass.getuser(), "getpass.getuser() still fails: outbound SSH cannot open"
+    asyncssh.SSHClientConnectionOptions(username="agent-host", known_hosts=None)
