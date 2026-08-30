@@ -279,6 +279,10 @@ def _reset_agent_globals():
 
     mod._session = None
     mod._thread_id = None
+    mod._pinned_status_identity_enabled = False
+    mod._pinned_runtime_generation_enabled = False
+    mod._session_runtime_generation = None
+    mod._session_runtime_attach_token = None
     mod._orchestrator_client = None
     mod._subscribers.clear()
     mod._loop_user_queue = None

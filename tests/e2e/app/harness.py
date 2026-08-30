@@ -782,6 +782,33 @@ def validate_container_platform(platform: str) -> str:
     return platform
 
 
+def docker_image_identity_command(image: str) -> list[str]:
+    """Inspect one selected local image without requiring Engine API 1.49."""
+
+    return [
+        "docker",
+        "image",
+        "inspect",
+        "--format",
+        "{{.Os}}/{{.Architecture}}|{{.Id}}",
+        image,
+    ]
+
+
+def validate_docker_image_identity(value: str, platform: str) -> str:
+    """Return an immutable image id only for the selected host platform."""
+
+    expected_platform = validate_container_platform(platform)
+    parts = value.strip().split("|")
+    if (
+        len(parts) != 2
+        or parts[0] != expected_platform
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", parts[1])
+    ):
+        raise SafetyError("dependency image has no exact local platform identity")
+    return parts[1]
+
+
 def image_import_groups(images: Mapping[str, str]) -> list[tuple[str, tuple[str, ...]]]:
     """Split imports so dependency failures identify one exact upstream image."""
 
@@ -1617,22 +1644,28 @@ class ApplicationE2EHarness:
         build_env = {"DOCKER_BUILDKIT": "1"}
         dependency_image_ids: dict[str, str] = {}
         for image in DEPENDENCY_IMAGES:
-            inspect_command = [
-                "docker",
-                "image",
-                "inspect",
-                "--platform",
-                platform,
-                "--format",
-                "{{.Id}}",
-                image,
-            ]
+            # ``docker image inspect --platform`` needs Engine API 1.49, but
+            # GitHub's current Engine 28.0 fallback exposes 1.48. The ordinary
+            # inspect response already carries the selected local image's OS,
+            # architecture and immutable id, so prove those explicitly instead.
+            inspect_command = docker_image_identity_command(image)
             inspection = self.runner.run(
                 inspect_command,
                 check=False,
                 label=f"cached dependency image inspection ({image})",
             )
-            if inspection.returncode:
+            image_id: str | None = None
+            if not inspection.returncode:
+                try:
+                    image_id = validate_docker_image_identity(
+                        inspection.stdout, platform
+                    )
+                except SafetyError:
+                    # A tag cached for another architecture is not usable by
+                    # this cluster. Pull the selected platform before proving
+                    # and recording its immutable local identity.
+                    pass
+            if image_id is None:
                 print(f"[e2e-app] pulling pinned dependency image {image}", flush=True)
                 self.runner.run(
                     ["docker", "pull", "--platform", platform, image],
@@ -1643,13 +1676,16 @@ class ApplicationE2EHarness:
                     inspect_command,
                     label=f"dependency image inspection ({image})",
                 )
+                try:
+                    image_id = validate_docker_image_identity(
+                        inspection.stdout, platform
+                    )
+                except SafetyError as exc:
+                    raise SafetyError(
+                        f"dependency image {image} has no exact local platform identity"
+                    ) from exc
             else:
                 print(f"[e2e-app] using cached dependency image {image}", flush=True)
-            image_id = inspection.stdout.strip()
-            if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
-                raise SafetyError(
-                    f"dependency image {image} has no immutable local image id"
-                )
             dependency_image_ids[image] = image_id
             ledger["dependency_image_ids"] = dependency_image_ids.copy()
             self.store.persist(ledger)

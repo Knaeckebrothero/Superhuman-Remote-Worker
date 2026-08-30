@@ -103,6 +103,10 @@ def _reset_agent_globals():
 
     mod._session = None
     mod._thread_id = None
+    mod._pinned_status_identity_enabled = False
+    mod._pinned_runtime_generation_enabled = False
+    mod._session_runtime_generation = None
+    mod._session_runtime_attach_token = None
     mod._orchestrator_client = None
     mod._subscribers.clear()
     mod._loop_user_queue = None
@@ -127,6 +131,22 @@ def _install_session(*, turn_count: int, headless_mode: str = "eager"):
     mod._orchestrator_client = client
     mod._loop_user_queue = asyncio.Queue()
     return session, client
+
+
+def test_reset_agent_globals_clears_pinned_identity_protocol() -> None:
+    import src.api.persistent_app as mod
+
+    mod._pinned_status_identity_enabled = True
+    mod._pinned_runtime_generation_enabled = True
+    mod._session_runtime_generation = "leaked-generation"
+    mod._session_runtime_attach_token = "leaked-attach"
+
+    _reset_agent_globals()
+
+    assert mod._pinned_status_identity_enabled is False
+    assert mod._pinned_runtime_generation_enabled is False
+    assert mod._session_runtime_generation is None
+    assert mod._session_runtime_attach_token is None
 
 
 class TestPoliteModeFlip:

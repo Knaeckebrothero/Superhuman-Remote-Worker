@@ -418,6 +418,7 @@ async def test_process_zero_retry_retires_exact_live_residents_and_shell() -> No
             ]
         ),
         list_thread_mounts=AsyncMock(return_value=[]),
+        record_managed_repository_workspace_process_zero=AsyncMock(return_value=True),
         acknowledge_stateless_thread_resident_retirement=AsyncMock(return_value=True),
         acknowledge_stateless_thread_shell_retirement=AsyncMock(return_value=True),
     )
@@ -463,6 +464,13 @@ async def test_process_zero_retry_retires_exact_live_residents_and_shell() -> No
 
     assert result["state"] == "settled"
     retire_residents.assert_awaited_once()
+    db.record_managed_repository_workspace_process_zero.assert_awaited_once_with(
+        THREAD_ID,
+        owner_kind="thread",
+        scope="workspace_container",
+        provisioner="k8s",
+        runtime_incarnation=RUNTIME,
+    )
     retire_shell.assert_awaited_once()
     verify_residents.assert_awaited_once()
     provisioner.release_workspace.assert_awaited_once()

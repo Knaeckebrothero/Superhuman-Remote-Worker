@@ -612,6 +612,32 @@ def test_container_platform_validation_fails_closed(platform: str) -> None:
         harness.validate_container_platform(platform)
 
 
+def test_dependency_image_inspection_proves_platform_without_api_1_49() -> None:
+    image_id = "a" * 64
+
+    command = harness.docker_image_identity_command("busybox:1.36")
+
+    assert command == [
+        "docker",
+        "image",
+        "inspect",
+        "--format",
+        "{{.Os}}/{{.Architecture}}|{{.Id}}",
+        "busybox:1.36",
+    ]
+    assert "--platform" not in command
+    assert (
+        harness.validate_docker_image_identity(
+            f"linux/amd64|sha256:{image_id}\n", "linux/amd64"
+        )
+        == f"sha256:{image_id}"
+    )
+    with pytest.raises(harness.SafetyError, match="platform identity"):
+        harness.validate_docker_image_identity(
+            f"linux/arm64|sha256:{image_id}", "linux/amd64"
+        )
+
+
 def test_docker_archive_runtime_id_uses_config_digest_not_manifest_digest(
     tmp_path: Path,
 ) -> None:

@@ -53846,6 +53846,27 @@ async def _reconcile_stateless_thread_retirement(
                     status_code=503,
                     detail="Workspace resident retirement is not yet acknowledged",
                 ) from exc
+            # The resident protocol's final command independently proves the
+            # exact workspace has no managed-repository credential agents.
+            # Persist that existing generic process-zero authority before the
+            # resident ACK. Otherwise release_workspace() must repeat the SSH
+            # retirement after the terminal shell record has been written and
+            # can remain fail-closed forever even though this exact proof was
+            # already obtained.
+            process_zero_recorded = (
+                await postgres_db.record_managed_repository_workspace_process_zero(
+                    thread_id,
+                    owner_kind="thread",
+                    scope="workspace_container",
+                    provisioner="k8s",
+                    runtime_incarnation=proof.authority.runtime_incarnation,
+                )
+            )
+            if not process_zero_recorded:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Managed repository process-zero proof was not durable",
+                )
             acknowledged = (
                 await postgres_db.acknowledge_stateless_thread_resident_retirement(
                     thread_id,
