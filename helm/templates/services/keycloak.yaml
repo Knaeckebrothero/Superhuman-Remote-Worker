@@ -35,7 +35,11 @@ data:
       "duplicateEmailsAllowed": false,
       "resetPasswordAllowed": true,
       "editUsernameAllowed": false,
-      "sslRequired": "none",
+      {{- /* TLS terminates at the ingress, so "all" would reject in-cluster
+           plaintext traffic. "external" is Keycloak's own default: HTTPS
+           required for external addresses, plaintext from private IPs. */}}
+      "sslRequired": "external",
+      "passwordPolicy": "length(16) and notUsername(undefined)",
       "bruteForceProtected": true,
       "permanentLockout": false,
       "maxFailureWaitSeconds": 900,
@@ -958,7 +962,9 @@ spec:
                       -s "ssoSessionIdleTimeoutRememberMe={{ .Values.keycloak.session.ssoSessionIdleTimeoutRememberMe }}" \
                       -s "ssoSessionMaxLifespanRememberMe={{ .Values.keycloak.session.ssoSessionMaxLifespanRememberMe }}" \
                       -s "accessTokenLifespan={{ .Values.keycloak.session.accessTokenLifespan }}" \
-                      -s "offlineSessionIdleTimeout={{ .Values.keycloak.session.offlineSessionIdleTimeout }}" 2>/dev/null
+                      -s "offlineSessionIdleTimeout={{ .Values.keycloak.session.offlineSessionIdleTimeout }}" \
+                      -s "sslRequired=external" \
+                      -s "passwordPolicy=length(16) and notUsername(undefined)" 2>/dev/null
                     {{- if .Values.opencloud.enabled }}
                     # --- Ensure OpenCloud clients + group ---
                     # Idempotent: creates only if missing.

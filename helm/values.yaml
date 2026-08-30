@@ -2054,7 +2054,7 @@ keycloak:
     ssoSessionIdleTimeoutRememberMe: 259200  # 3 days
     ssoSessionMaxLifespanRememberMe: 259200  # 3 days
     accessTokenLifespan: 900                 # 15 minutes
-    offlineSessionIdleTimeout: 2592000       # 30 days
+    offlineSessionIdleTimeout: 259200        # 3 days
   resources:
     requests:
       memory: "512Mi"
