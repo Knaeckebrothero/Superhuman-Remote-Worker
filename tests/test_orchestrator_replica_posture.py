@@ -98,20 +98,14 @@ def test_minavailable_is_not_configurable():
     assert _min_available(_ci("orchestrator.pdb.minAvailable=1", show_only=PDB)) == 0
 
 
-# --- the shipped overlays --------------------------------------------------
+# --- the shipped overlay ---------------------------------------------------
 #
 # deployment/values-local.yaml is gitignored; its committed template is the
-# thing to pin. Both files need `global.domain` and the licence, which the
-# overlays deliberately leave to the operator.
+# thing to pin. It needs `global.domain` and the licence, which the template
+# deliberately leaves to the operator. (The dev instance's replicas:2 posture
+# moved to the HomeLab values ConfigMap with the HelmOp cutover and is
+# guarded there, not here.)
 OVERLAY_SETTINGS = ("global.domain=posture.example.com", "license.acceptTerms=true")
-
-
-def test_dev_overlay_keeps_two_replicas():
-    """Dev is a four-node cluster and is where the HA posture is exercised.
-    It must not silently follow the single-node default."""
-    documents = _render(ROOT / "deployment/values-experimental.yaml", *OVERLAY_SETTINGS)
-    assert _replicas(documents) == 2
-    assert _min_available(documents) == 1
 
 
 def test_local_overlay_template_stays_at_one():

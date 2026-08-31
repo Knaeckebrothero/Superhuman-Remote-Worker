@@ -114,7 +114,9 @@ today.
 ### 2.1 Arm the flag
 Set it in the dev overlay and redeploy (GitOps), or patch for a quick soak:
 ```sh
-# GitOps (durable): set workspace.reclaimOnIdle: true in deployment/values-experimental.yaml, push, sync.
+# GitOps (durable): set workspace.reclaimOnIdle: true in the dev values ConfigMap
+# (HomeLab deployments_managed/srw-config/srw_values_configmap.yaml), push, then bump
+# the HelmOp's spec.forceSyncGeneration (a valuesFrom change alone does not re-render).
 # OR quick/manual (revertible): patch the configmap + restart, then remember to revert.
 ```
 Confirm live: `kubectl $KCTX $NS exec $ORCH -c orchestrator -- sh -c 'echo $WORKSPACE_RECLAIM_ON_IDLE'` → `true`.

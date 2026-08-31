@@ -9,8 +9,8 @@ ability to register their own key.
 Possession challenges are STATELESS — an HMAC-signed token over a nonce, the
 authenticated user's id and an expiry, verified with ``SESSION_JWT_SECRET`` —
 not an in-process dict. The orchestrator runs multiple replicas behind one
-Service with no session affinity (deployment/values-experimental.yaml
-``orchestrator.replicas: 2`` on dev, deliberately), so the pod that issues a
+Service with no session affinity (the dev values pin
+``orchestrator.replicas: 2`` deliberately), so the pod that issues a
 challenge is frequently not the pod that redeems it; an in-process store
 would reject roughly half of all registrations with "unknown challenge".
 See ruling F24 in

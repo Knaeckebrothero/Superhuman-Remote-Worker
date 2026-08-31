@@ -136,39 +136,6 @@ def test_public_examples_keep_live_preview_disabled() -> None:
     )
 
 
-def test_experimental_overlay_enables_dev_viewer_without_production_claims() -> None:
-    # Dev-cluster acceptance posture (2026-07-16): viewer enabled under the
-    # documented single-user development/cookie-free profile. The PSL flag
-    # stays false and the profile returns to production/psl-isolated only
-    # after the PSL boundary is verified.
-    values = yaml.safe_load((ROOT / "deployment/values-experimental.yaml").read_text())
-    live_preview = values["canvas"]["livePreview"]
-    viewer = live_preview["viewer"]
-
-    assert live_preview["enabled"] is True
-    assert viewer["enabled"] is True
-    assert viewer["deploymentProfile"] == "development"
-    assert viewer["cookieMode"] == "development-cookie-free"
-    assert viewer["domain"] == "srwcanvas.works"
-    assert viewer["hostSuffix"] == ".srwcanvas.works"
-    assert viewer["cockpitOrigins"] == ["https://cockpit.srw.works"]
-    assert viewer["pslBoundaryVerified"] is False
-    assert viewer["database"]["credentials"] == {
-        "create": False,
-        "existingSecret": "",
-        "vaultPath": "homelab/superhuman-remote-worker/canvas-gateway-db",
-        "passwordKey": "CANVAS_VIEWER_POSTGRES_PASSWORD",
-    }
-    # The edge is the existing Cloudflare Tunnel connector (see
-    # knowledge-base/knowledge/issues/canvas_hosted_edge_use_cloudflare_tunnel.md).
-    assert viewer["networkPolicy"]["edgeNamespaceSelector"] == {
-        "matchLabels": {"kubernetes.io/metadata.name": "cloudflare-tunnel"}
-    }
-    assert viewer["networkPolicy"]["edgePodSelector"] == {
-        "matchLabels": {"app": "cloudflared"}
-    }
-
-
 def test_canvas_viewer_chart_values_are_default_off_and_fail_closed() -> None:
     values = yaml.safe_load((ROOT / "helm/values.yaml").read_text())
     viewer = values["canvas"]["livePreview"]["viewer"]
@@ -554,39 +521,8 @@ def test_canvas_gateway_helm_render_contract_and_selector_gate() -> None:
 def test_canvas_gateway_vault_credentials_follow_viewer_lifecycle() -> None:
     chart = ROOT / "helm"
     test_values = chart / "ci/test-values.yaml"
-    experimental_values = ROOT / "deployment/values-experimental.yaml"
     base = ["helm", "template", "canvas-test", str(chart), "-f", str(test_values)]
     vault_path = "test/canvas-gateway-db"
-
-    # The dev overlay enables the viewer (2026-07-16, development profile), so
-    # its reserved Vault coordinates now render the gateway and its dedicated
-    # ExternalSecret — proving the credential mapping follows the gate.
-    experimental_render = subprocess.run(
-        [
-            "helm",
-            "template",
-            "srw",
-            str(chart),
-            "-f",
-            str(experimental_values),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
-    experimental_objects = [
-        item for item in yaml.safe_load_all(experimental_render) if item
-    ]
-    assert any(
-        item.get("kind") == "ExternalSecret"
-        and item.get("metadata", {}).get("name") == "srw-canvas-gateway-db"
-        for item in experimental_objects
-    )
-    assert any(
-        item.get("kind") == "Deployment"
-        and item.get("metadata", {}).get("name") == "srw-canvas-gateway"
-        for item in experimental_objects
-    )
 
     # Even disabling ESO entirely remains valid while the viewer is off.
     disabled_render = subprocess.run(
@@ -699,6 +635,16 @@ def test_canvas_gateway_vault_credentials_follow_viewer_lifecycle() -> None:
         == "canvas-gateway-credentials"
     ]
     assert len(external_secrets) == 1
+    # Viewer on + Vault coordinates renders the gateway itself too — the
+    # credential mapping follows the gate rather than existing on its own.
+    assert any(
+        item.get("kind") == "Deployment"
+        and item.get("metadata", {})
+        .get("labels", {})
+        .get("app.kubernetes.io/component")
+        == "canvas-gateway"
+        for item in objects
+    )
     external_secret = external_secrets[0]
     assert "dataFrom" not in external_secret["spec"]
     # One property: the password. The role name is chart configuration, and

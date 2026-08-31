@@ -745,9 +745,9 @@ jobs:
           # component's image identity (tag + provenance), instead of the
           # push HEAD. A rebuild from unchanged inputs (catch-up after a
           # blocked run, or a batched push whose HEAD is unrelated — e.g.
-          # docs) reproduces the SAME identity, so values-experimental.yaml
-          # only moves — and the lifecycle reconciler only drains agent pods
-          # — when the component's content actually changed.
+          # docs) reproduces the SAME identity, so the tags baked into the
+          # chart only move — and the lifecycle reconciler only drains agent
+          # pods — when the component's content actually changed.
           last_input_sha() {
             local sha
             sha=$(git log -1 --format=%H HEAD -- "$@")

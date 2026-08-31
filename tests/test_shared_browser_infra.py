@@ -27,13 +27,6 @@ def test_shared_browser_env_reaches_orchestrator():
     assert "CANVAS_SHARED_BROWSER_ENABLED" in deployment
 
 
-def test_dev_profile_enables_shared_browser():
-    experimental = yaml.safe_load(
-        (REPO / "deployment/values-experimental.yaml").read_text()
-    )
-    assert experimental["canvas"]["sharedBrowser"]["enabled"] is True
-
-
 def test_container_and_vm_install_the_same_stream_conformance_program():
     check = REPO / "docker/check-browser-stream.py"
     assert check.read_text().startswith("#!/usr/bin/env python3\n")

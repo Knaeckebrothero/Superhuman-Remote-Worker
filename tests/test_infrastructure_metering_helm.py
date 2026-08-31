@@ -191,37 +191,21 @@ def test_metering_credentials_select_short_properties_from_srw_secret_bundle():
         ]
 
 
-def test_development_metering_vault_sources_project_collector_credentials_only():
-    expected_path = "homelab/superhuman-remote-worker/srw-secrets"
+def test_metering_external_secrets_defaults_stay_dark_with_stable_properties():
+    """Chart contract only. The dev instance's posture (vault path, secret
+    names, all inventory/shadow flags pinned dark) moved to the HomeLab
+    values ConfigMap with the HelmOp cutover and is guarded there, not here.
+    The property names below are the ESO bundle convention shared with the
+    hand-minted ingestion Secrets — renaming them breaks live clusters."""
     expected_properties = {
         "vmiIngestionProperty": "METERING_VMI_INGESTION_KEY",
         "vmStorageIngestionProperty": "METERING_VM_STORAGE_INGESTION_KEY",
         "volumeIdentityProperty": "METERING_VOLUME_IDENTITY_KEY",
         "vmLifecycleAuthProperty": "METERING_VM_LIFECYCLE_HMAC_SECRET",
     }
-
-    main_values = yaml.safe_load(
-        (ROOT / "deployment/values-experimental.yaml").read_text(encoding="utf-8")
-    )
     chart_defaults = yaml.safe_load(
         (ROOT / "helm/values.yaml").read_text(encoding="utf-8")
     )
-
-    main_sync = main_values["infrastructureMetering"]["externalSecrets"]
-    assert main_sync == {"enabled": True, "vaultPath": expected_path}
-    assert main_values["externalSecrets"]["vaultPath"] == expected_path
-
-    expected_main_targets = {
-        "vmIngestionSecretName": "srw-infra-metering-vmi-ingestion",
-        "vmStorageIngestionSecretName": "srw-infra-metering-vm-storage-ingestion",
-        "volumeIdentitySecretName": "srw-infra-metering-volume-identity",
-        "volumeIdentityKeyVersion": "storage-v1",
-    }
-    assert {
-        key: main_values["infrastructureMetering"][key] for key in expected_main_targets
-    } == expected_main_targets
-    assert "vmLifecycleAuthSecretName" not in main_values["infrastructureMetering"]
-
     sync_defaults = chart_defaults["infrastructureMetering"]["externalSecrets"]
     assert sync_defaults["enabled"] is False
     assert {
@@ -630,67 +614,6 @@ def test_missing_remote_ingress_parent_from_reused_values_defaults_off():
         item.get("metadata", {}).get("name", "").endswith("remote-infra-metering")
         for item in objects
     )
-
-
-@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
-def test_experimental_cluster_keeps_storage_inventory_and_publication_dark():
-    chart = ROOT / "helm"
-    values = ROOT / "deployment/values-experimental.yaml"
-    rendered = subprocess.run(
-        ["helm", "template", "metering-test", str(chart), "-f", str(values)],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
-    objects = [item for item in yaml.safe_load_all(rendered) if item]
-    configmap = next(
-        item
-        for item in objects
-        if item["kind"] == "ConfigMap"
-        and "INFRASTRUCTURE_METERING_PVC_INVENTORY_ENABLED" in item.get("data", {})
-    )
-    for key in (
-        "INFRASTRUCTURE_METERING_PVC_INVENTORY_ENABLED",
-        "INFRASTRUCTURE_METERING_PV_INVENTORY_ENABLED",
-        "INFRASTRUCTURE_METERING_PVC_SHADOW_ENABLED",
-        "INFRASTRUCTURE_METERING_PV_SHADOW_ENABLED",
-        "INFRASTRUCTURE_METERING_PVC_PUBLICATION_ENABLED",
-        "INFRASTRUCTURE_METERING_PV_PUBLICATION_ENABLED",
-        "INFRASTRUCTURE_METERING_IDE_POD_SHADOW_ENABLED",
-        "INFRASTRUCTURE_METERING_AGENT_POD_SHADOW_ENABLED",
-        "INFRASTRUCTURE_METERING_IDE_POD_PUBLICATION_ENABLED",
-        "INFRASTRUCTURE_METERING_AGENT_POD_PUBLICATION_ENABLED",
-        "INFRASTRUCTURE_METERING_VM_INVENTORY_ENABLED",
-        "INFRASTRUCTURE_METERING_VM_SHADOW_ENABLED",
-        "INFRASTRUCTURE_METERING_VM_PUBLICATION_ENABLED",
-        "INFRASTRUCTURE_METERING_VM_PVC_INVENTORY_ENABLED",
-        "INFRASTRUCTURE_METERING_VM_PV_INVENTORY_ENABLED",
-        "INFRASTRUCTURE_METERING_VM_PVC_SHADOW_ENABLED",
-        "INFRASTRUCTURE_METERING_VM_PV_SHADOW_ENABLED",
-        "INFRASTRUCTURE_METERING_VM_PV_CLUSTER_WIDE_RBAC_ACKNOWLEDGED",
-    ):
-        assert configmap["data"][key] == "false"
-
-    collector_objects = [
-        item
-        for item in objects
-        if item.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/component")
-        == "infra-collector"
-    ]
-    roles = [item for item in collector_objects if item["kind"] == "Role"]
-    assert roles
-    assert all(
-        {resource for rule in role["rules"] for resource in rule["resources"]}
-        == {"pods"}
-        for role in roles
-    )
-    assert not any(item["kind"] == "ClusterRole" for item in collector_objects)
-    collector = next(item for item in collector_objects if item["kind"] == "Deployment")
-    env_names = {
-        item["name"]
-        for item in collector["spec"]["template"]["spec"]["containers"][0]["env"]
-    }
-    assert "INFRASTRUCTURE_METERING_VOLUME_IDENTITY_KEY" not in env_names
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
