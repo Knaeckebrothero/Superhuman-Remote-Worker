@@ -33,12 +33,23 @@ either and must not try (no sniffing the relayed byte stream for the text,
 no reinventing the exit-code mapping). It relays opaque frames and exits
 non-zero only for its own failures: TLS, a refused upgrade, or a failed
 token exchange. ``ssh`` itself surfaces the gateway's reason and exit code.
+
+RELAY DESIGN. Both directions are queued and written with non-blocking
+sends, checked against ``select``'s writable set — never a blocking
+``sendall`` inside the read branch. A blocking send there, once the peer's
+receive window fills during a bulk transfer, would stop the loop from
+draining the OTHER direction too, and the two ends would fill each other's
+windows and deadlock. Bytes that arrive in the same TCP segment as the
+handshake's trailing blank line are seeded into the relay rather than
+dropped — the gateway pumps the SSH banner immediately after accepting, so
+that coalescing is routine, not a corner case.
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import http.client
 import json
 import os
@@ -59,6 +70,26 @@ OPCODE_PING = 0x9
 OPCODE_PONG = 0xA
 
 PING_INTERVAL_SECONDS = 20  # Cloudflare closes idle sockets at roughly 100s.
+
+# Defensive cap against a malformed or hostile declared frame length forcing
+# unbounded buffering while more bytes are awaited. Far above anything the
+# gateway's own chunking would ever declare.
+MAX_FRAME_PAYLOAD = 16 * 1024 * 1024
+
+# Bound how much unwritten data queues per direction before that side's fd
+# stops being offered to select()'s read set -- backpressure, so a
+# destination that can't keep up (a slow local disk during a multi-GB scp, a
+# stalled TLS window) doesn't grow the queue without limit.
+MAX_QUEUE_BYTES = 4 * 1024 * 1024
+
+# A non-blocking send/recv that isn't ready yet: normal backpressure, not a
+# failure. ssl.SSLWant{Read,Write}Error are OSError subclasses distinct from
+# BlockingIOError (TLS can want a read to satisfy a write and vice versa).
+_WOULD_BLOCK = (BlockingIOError, ssl.SSLWantWriteError, ssl.SSLWantReadError)
+
+# RFC 6455 S4.1's fixed GUID, concatenated with the client's nonce and
+# SHA-1'd to produce Sec-WebSocket-Accept. Mandated by the spec; not a choice.
+_WS_ACCEPT_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 ATTACH_TOKEN_PATH = "/api/ssh/attach-token"
 
@@ -90,6 +121,23 @@ def build_handshake(url: str, token: str, origin: str) -> bytes:
     return ("\r\n".join(lines) + "\r\n\r\n").encode()
 
 
+def _mask(payload: bytes, key: bytes) -> bytes:
+    """XOR ``payload`` against ``key`` cycled to its length.
+
+    A generator-expression XOR (``bytes(b ^ key[i % 4] for i, b in
+    enumerate(payload))``) measured at ~4.27 ms per 64 KiB -- under 15 MB/s,
+    and every byte the user sends or receives pays it. Doing the XOR as one
+    big-integer operation instead is roughly an order of magnitude faster
+    (ruling I-7) and needs nothing beyond ``int.from_bytes``/``to_bytes``.
+    """
+    if not payload:
+        return b""
+    repeated = (key * (len(payload) // len(key) + 1))[: len(payload)]
+    return (int.from_bytes(payload, "big") ^ int.from_bytes(repeated, "big")).to_bytes(
+        len(payload), "big"
+    )
+
+
 def frame(payload: bytes, opcode: int, mask: bool = True) -> bytes:
     """Encode one WebSocket frame. Clients MUST mask (RFC 6455 SS5.3)."""
     header = bytearray([0x80 | opcode])
@@ -106,8 +154,7 @@ def frame(payload: bytes, opcode: int, mask: bool = True) -> bytes:
     if not mask:
         return bytes(header) + payload
     key = os.urandom(4)
-    masked = bytes(b ^ key[i % 4] for i, b in enumerate(payload))
-    return bytes(header) + key + masked
+    return bytes(header) + key + _mask(payload, key)
 
 
 def parse_frames(buffer: bytes) -> tuple[list[tuple[int, bytes]], bytes]:
@@ -115,6 +162,11 @@ def parse_frames(buffer: bytes) -> tuple[list[tuple[int, bytes]], bytes]:
 
     Returns (frames, remainder). A partial frame stays in the remainder — SSH
     is a byte stream and dropping one corrupts the session.
+
+    Raises ``ValueError`` on a length that RFC 6455 forbids (the 64-bit
+    form's most significant bit set) or that exceeds ``MAX_FRAME_PAYLOAD`` --
+    a malformed or hostile declared length must not force unbounded
+    buffering while the rest is awaited.
     """
     frames: list[tuple[int, bytes]] = []
     offset = 0
@@ -134,8 +186,19 @@ def parse_frames(buffer: bytes) -> tuple[list[tuple[int, bytes]], bytes]:
         elif length == 127:
             if len(buffer) - cursor < 8:
                 break
-            length = struct.unpack("!Q", buffer[cursor : cursor + 8])[0]
+            raw_length = buffer[cursor : cursor + 8]
+            if raw_length[0] & 0x80:
+                raise ValueError(
+                    "srw-ssh-proxy: frame length's most significant bit is "
+                    "set, which RFC 6455 forbids"
+                )
+            length = struct.unpack("!Q", raw_length)[0]
             cursor += 8
+        if length > MAX_FRAME_PAYLOAD:
+            raise ValueError(
+                f"srw-ssh-proxy: frame payload of {length} bytes exceeds "
+                f"the {MAX_FRAME_PAYLOAD}-byte cap"
+            )
         key = b""
         if masked:
             if len(buffer) - cursor < 4:
@@ -146,7 +209,7 @@ def parse_frames(buffer: bytes) -> tuple[list[tuple[int, bytes]], bytes]:
             break
         payload = buffer[cursor : cursor + length]
         if masked:
-            payload = bytes(b ^ key[i % 4] for i, b in enumerate(payload))
+            payload = _mask(payload, key)
         frames.append((opcode, payload))
         offset = cursor + length
     return frames, buffer[offset:]
@@ -158,6 +221,23 @@ def parse_frames(buffer: bytes) -> tuple[list[tuple[int, bytes]], bytes]:
 # ---------------------------------------------------------------------------
 
 
+def _warn_if_token_file_permissive(path: str) -> None:
+    """Warn (as ``ssh`` does for private keys) when the PAT file is
+    group/world readable. It holds a bearer credential in a location the
+    design's own docstring names as the thing to avoid leaving unprotected
+    (``ssh_gateway_token.py``'s "world-readable-by-default location")."""
+    try:
+        mode = os.stat(path).st_mode
+    except OSError:
+        return
+    if mode & 0o077:
+        sys.stderr.write(
+            f"srw-ssh-proxy: warning: {path} is readable by group or other "
+            f"(mode {oct(mode & 0o777)}); it holds a bearer credential -- "
+            "recommend chmod 600\n"
+        )
+
+
 def _load_pat() -> str:
     """The durable personal access token: $SRW_TOKEN, else ~/.config/srw/token."""
     token = os.environ.get("SRW_TOKEN", "").strip()
@@ -166,9 +246,11 @@ def _load_pat() -> str:
     path = os.path.expanduser("~/.config/srw/token")
     try:
         with open(path, "r", encoding="utf-8") as handle:
-            return handle.read().strip()
+            content = handle.read().strip()
     except OSError:
         return ""
+    _warn_if_token_file_permissive(path)
+    return content
 
 
 def fetch_attach_token(
@@ -183,8 +265,9 @@ def fetch_attach_token(
     Calls ``POST https://<host>/api/ssh/attach-token`` and returns
     ``(token, expires_at)``. Raises ``SystemExit`` with a message that
     distinguishes an authentication refusal (401/403 — a bad or unscoped
-    PAT) from a connection-level failure, so a user isn't left guessing
-    which one happened.
+    PAT), a malformed HTTP response, a TLS failure, and a plain connection
+    error — four different problems that want four different fixes, so a
+    single generic message would send someone down the wrong path.
     """
     conn = connection_cls(host, timeout=timeout)
     try:
@@ -196,8 +279,16 @@ def fetch_attach_token(
         )
         response = conn.getresponse()
         raw = response.read()
+    except ssl.SSLError as exc:
+        raise SystemExit(f"srw-ssh-proxy: TLS error talking to {host}: {exc}") from exc
+    except http.client.HTTPException as exc:
+        raise SystemExit(
+            f"srw-ssh-proxy: malformed HTTP response from {host}: {exc}"
+        ) from exc
     except OSError as exc:
-        raise SystemExit(f"srw-ssh-proxy: could not reach {host} for a token: {exc}") from exc
+        raise SystemExit(
+            f"srw-ssh-proxy: could not reach {host} for a token: {exc}"
+        ) from exc
     finally:
         conn.close()
 
@@ -248,8 +339,9 @@ def _default_origin(host: str) -> str:
     """Best-effort Origin guess: api.<domain> -> https://cockpit.<domain>.
 
     The gateway enforces an exact-match Origin allow-list and fails closed,
-    so a wrong guess here is a flat 403 with no hint from the server — that
-    hint is added in ``_handshake_error`` instead. Pass --origin to override.
+    so a wrong guess here is a flat, cause-blind 403 (see ``_handshake_error``
+    for what actually reaches the client on that status). Pass --origin to
+    override.
     """
     return f"https://{host.replace('api.', 'cockpit.', 1)}"
 
@@ -257,33 +349,97 @@ def _default_origin(host: str) -> str:
 def _handshake_error(status_line: str, origin: str) -> str:
     """Message for a non-101 handshake response.
 
-    A 403 gets an extra hint: the Origin allow-list check fails closed with
-    no detail in the response, so an opaque 403 is otherwise unfixable
-    without reading server logs.
+    A bare 403 here is ambiguous by construction, not just by omission: the
+    gateway's pre-accept refusals -- an expired or invalid attach token, a
+    rejected Origin, and the handshake rate limit -- are recorded as having
+    been measured live to all render as one identical, undifferentiated HTTP
+    403 (``orchestrator/ssh_gateway.py``'s WS_TOKEN_REFUSED / WS_ORIGIN_REFUSED
+    / WS_RATE_REFUSED). Naming only Origin here would send the most common
+    case (an expired token) down the wrong path.
     """
     message = f"srw-ssh-proxy: upgrade refused: {status_line}"
     if "403" in status_line:
-        message += f" (sent Origin: {origin!r}; try --origin if this is wrong)"
+        message += (
+            f" (sent Origin: {origin!r}; a bare 403 here means the attach "
+            "token was expired/invalid, the Origin was rejected, or the "
+            "handshake rate limit was hit -- retry for a fresh token, or "
+            "pass --origin if the Origin is wrong)"
+        )
     return message
 
 
-def _connect(host: str, origin: str) -> ssl.SSLSocket:
+def _extract_header(blob: bytes, name: str) -> str:
+    """Case-insensitively find one header's value in a raw HTTP header blob."""
+    target = name.lower().encode()
+    for line in blob.split(b"\r\n"):
+        key, sep, value = line.partition(b":")
+        if sep and key.strip().lower() == target:
+            return value.strip().decode(errors="replace")
+    return ""
+
+
+def _compute_accept(key: str) -> str:
+    """RFC 6455 SS4.1: base64(SHA-1(key + the WebSocket GUID))."""
+    digest = hashlib.sha1((key + _WS_ACCEPT_GUID).encode()).digest()
+    return base64.b64encode(digest).decode()
+
+
+def _split_handshake_response(response: bytes) -> tuple[str, bytes, bytes]:
+    """Split a raw handshake response into (status_line, header_blob, leftover).
+
+    ``leftover`` is whatever arrived after the blank line that ends the HTTP
+    headers in the SAME ``recv()`` calls used to read them -- already-arrived
+    WebSocket frame bytes, not more header. The gateway accepts and pumps the
+    SSH server's banner immediately, so the 101 response and the first data
+    frame routinely land in one TCP segment; treating ``leftover`` as
+    disposable silently drops the start of the session (ruling C-1).
+    """
+    header, _, leftover = response.partition(b"\r\n\r\n")
+    status = header.split(b"\r\n", 1)[0].decode(errors="replace")
+    return status, header, leftover
+
+
+def _connect(host: str, origin: str) -> tuple[ssl.SSLSocket, bytes]:
+    """Open the WSS connection. Returns ``(socket, leftover)`` -- see
+    ``_split_handshake_response`` for why ``leftover`` exists and must not be
+    discarded."""
     token = resolve_ws_token(host)
     url = f"wss://{host}/api/ssh/attach"
     raw = socket.create_connection((host, 443), timeout=30)
     context = ssl.create_default_context()
     sock = context.wrap_socket(raw, server_hostname=host)
-    sock.sendall(build_handshake(url, token, origin))
-    response = b""
-    while b"\r\n\r\n" not in response:
-        chunk = sock.recv(4096)
-        if not chunk:
-            raise SystemExit("srw-ssh-proxy: gateway closed during handshake")
-        response += chunk
-    status = response.split(b"\r\n", 1)[0].decode(errors="replace")
-    if "101" not in status:
-        raise SystemExit(_handshake_error(status, origin))
-    return sock
+    try:
+        request = build_handshake(url, token, origin)
+        sock.sendall(request)
+        response = b""
+        while b"\r\n\r\n" not in response:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise SystemExit("srw-ssh-proxy: gateway closed during handshake")
+            response += chunk
+        status, header, leftover = _split_handshake_response(response)
+        if "101" not in status:
+            raise SystemExit(_handshake_error(status, origin))
+        sent_key = _extract_header(request, "Sec-WebSocket-Key")
+        got_accept = _extract_header(header, "Sec-WebSocket-Accept")
+        if got_accept != _compute_accept(sent_key):
+            raise SystemExit(
+                "srw-ssh-proxy: handshake accepted (101) but Sec-WebSocket-Accept "
+                "did not match our key -- a proxy or middlebox may be interfering"
+            )
+        # This timeout was a *connect* timeout; it must not survive onto the
+        # live session, where a stalled send would otherwise raise
+        # socket.timeout and kill an otherwise-working connection.
+        sock.settimeout(None)
+        return sock, leftover
+    except BaseException:
+        sock.close()
+        raise
+
+
+# ---------------------------------------------------------------------------
+# The relay loop.
+# ---------------------------------------------------------------------------
 
 
 def _recv_available(sock) -> bytes:
@@ -306,44 +462,175 @@ def _recv_available(sock) -> bytes:
         return b""
     data = chunk
     while sock.pending() > 0:
-        more = sock.recv(65536)
+        try:
+            more = sock.recv(65536)
+        except _WOULD_BLOCK:
+            break
         if not more:
             break
         data += more
     return data
 
 
-def _pump(sock: ssl.SSLSocket, read_fd: int, write) -> None:
-    buffer = b""
+def _flush_queue(sender, queue: bytearray) -> None:
+    """Write as much of ``queue`` as ``sender`` accepts without blocking.
+
+    ``sender`` is a non-blocking ``send``/``os.write``-shaped callable:
+    bytes in, bytes-actually-written out. A would-block error means the OS
+    (or OpenSSL's own write buffer) isn't ready yet — normal backpressure,
+    not a failure — so the remainder just stays queued for the next
+    writable wakeup instead of raising (ruling I-5).
+    """
+    if not queue:
+        return
+    try:
+        sent = sender(bytes(queue))
+    except _WOULD_BLOCK:
+        return
+    if sent:
+        del queue[:sent]
+
+
+def _consume_frames(
+    data: bytes, to_local: bytearray, to_remote: bytearray
+) -> tuple[bytes, bool]:
+    """Parse whole frames out of ``data`` and route their payloads.
+
+    Binary and continuation payloads are queued onto ``to_local`` (bound for
+    the SSH client) in order — WS message boundaries don't matter to a raw
+    byte stream like SSH, so a fragmented message just needs its
+    continuation payloads relayed, not reassembled with any special marker
+    (ruling I-2: ``OPCODE_CONTINUATION`` was previously dropped outright). A
+    ping is answered with a queued pong; a close queues a close reply and
+    stops — any frames after it in ``data`` are not processed, matching a
+    peer that has no business sending more once it's closing.
+
+    Returns ``(remainder, should_stop)``: unparsed trailing bytes, and
+    whether a CLOSE was seen (the caller should flush ``to_remote`` and
+    return).
+    """
+    frames, remainder = parse_frames(data)
+    for opcode, payload in frames:
+        if opcode in (OPCODE_BINARY, OPCODE_CONTINUATION):
+            to_local += payload
+        elif opcode == OPCODE_PING:
+            to_remote += frame(payload, OPCODE_PONG)
+        elif opcode == OPCODE_CLOSE:
+            to_remote += frame(b"", OPCODE_CLOSE)
+            return remainder, True
+    return remainder, False
+
+
+def _drain_final(
+    write_fd: int, sock, to_local: bytearray, to_remote: bytearray
+) -> None:
+    """Best-effort final flush when the pump is shutting down.
+
+    Non-blocking sends can leave a small remainder queued, and there is no
+    more looping left to retry them on — this switches back to a blocking
+    write for the last few KB (a CLOSE echo, most often) rather than
+    silently dropping the tail of the session.
+    """
+    try:
+        if to_local:
+            os.set_blocking(write_fd, True)
+            os.write(write_fd, bytes(to_local))
+    except OSError:
+        pass
+    try:
+        if to_remote:
+            sock.setblocking(True)
+            sock.sendall(bytes(to_remote))
+    except OSError:
+        pass
+
+
+def _pump(sock, read_fd: int, write_fd: int, initial_buffer: bytes = b"") -> None:
+    """Relay bytes between the local SSH client (``read_fd``/``write_fd``) and
+    the WSS connection (``sock``) until either side closes.
+
+    Both directions are queued and written with non-blocking sends, checked
+    against ``select``'s writable set — never ``sendall`` inside the read
+    branch (ruling I-5). A blocking send there, once the peer's receive
+    window fills during a bulk transfer, would stop this loop from draining
+    the OTHER direction too, and the two ends would fill each other's
+    windows and deadlock — exactly what Task 7's ~1 GB ``scp`` gate and a
+    JetBrains multi-GB backend pull would hit.
+
+    ``initial_buffer`` seeds already-received bytes — see
+    ``_split_handshake_response`` (ruling C-1): the gateway pumps the SSH
+    banner immediately after accepting, so it and the 101 response routinely
+    arrive in the same TCP segment, after the header terminator ``_connect``
+    already consumed.
+    """
+    sock.setblocking(False)
+    os.set_blocking(read_fd, False)
+    os.set_blocking(write_fd, False)
+
+    def local_write(data: bytes) -> int:
+        return os.write(write_fd, data)
+
+    in_buffer = bytes(initial_buffer)
+    to_local = bytearray()
+    to_remote = bytearray()
     last_ping = 0.0
-    while True:
-        # If OpenSSL is already holding decrypted bytes, don't block in
-        # select() waiting for more to arrive over the wire — go drain them.
-        timeout = 0.0 if sock.pending() > 0 else 5.0
-        readable, _, _ = select.select([sock, read_fd], [], [], timeout)
-        now = time.monotonic()
-        if now - last_ping > PING_INTERVAL_SECONDS:
-            sock.sendall(frame(b"", OPCODE_PING))
-            last_ping = now
-        if read_fd in readable:
-            data = os.read(read_fd, 65536)
-            if not data:
-                sock.sendall(frame(b"", OPCODE_CLOSE))
-                return
-            sock.sendall(frame(data, OPCODE_BINARY))
-        if sock in readable or sock.pending() > 0:
-            chunk = _recv_available(sock)
-            if not chunk:
-                return
-            buffer += chunk
-            frames, buffer = parse_frames(buffer)
-            for opcode, payload in frames:
-                if opcode == OPCODE_BINARY:
-                    write(payload)
-                elif opcode == OPCODE_PING:
-                    sock.sendall(frame(payload, OPCODE_PONG))
-                elif opcode == OPCODE_CLOSE:
+    local_open = True
+    closing = False
+
+    try:
+        in_buffer, should_stop = _consume_frames(in_buffer, to_local, to_remote)
+        if should_stop:
+            return
+
+        while True:
+            rlist = []
+            if local_open and len(to_remote) < MAX_QUEUE_BYTES:
+                rlist.append(read_fd)
+            if len(to_local) < MAX_QUEUE_BYTES:
+                rlist.append(sock)
+            wlist = []
+            if to_remote:
+                wlist.append(sock)
+            if to_local:
+                wlist.append(write_fd)
+
+            # If OpenSSL is already holding decrypted bytes, don't block in
+            # select() waiting for more to arrive over the wire — drain them.
+            timeout = 0.0 if sock.pending() > 0 else 5.0
+            readable, writable, _ = select.select(rlist, wlist, [], timeout)
+
+            now = time.monotonic()
+            if now - last_ping > PING_INTERVAL_SECONDS:
+                to_remote += frame(b"", OPCODE_PING)
+                last_ping = now
+
+            if write_fd in writable:
+                _flush_queue(local_write, to_local)
+            if sock in writable:
+                _flush_queue(sock.send, to_remote)
+
+            if read_fd in readable:
+                data = os.read(read_fd, 65536)
+                if not data:
+                    to_remote += frame(b"", OPCODE_CLOSE)
+                    local_open = False
+                    closing = True
+                else:
+                    to_remote += frame(data, OPCODE_BINARY)
+
+            if sock in readable or sock.pending() > 0:
+                chunk = _recv_available(sock)
+                if not chunk:
                     return
+                in_buffer += chunk
+                in_buffer, should_stop = _consume_frames(in_buffer, to_local, to_remote)
+                if should_stop:
+                    return
+
+            if closing and not to_remote and not to_local:
+                return
+    finally:
+        _drain_final(write_fd, sock, to_local, to_remote)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -358,12 +645,8 @@ def main(argv: list[str] | None = None) -> int:
     origin = args.origin or _default_origin(args.host)
 
     if args.stdio:
-        sock = _connect(args.host, origin)
-        _pump(
-            sock,
-            sys.stdin.fileno(),
-            lambda data: (sys.stdout.buffer.write(data), sys.stdout.buffer.flush()),
-        )
+        sock, leftover = _connect(args.host, origin)
+        _pump(sock, sys.stdin.fileno(), sys.stdout.fileno(), leftover)
         return 0
 
     bind_host, _, bind_port = args.listen.rpartition(":")
@@ -373,20 +656,43 @@ def main(argv: list[str] | None = None) -> int:
     listener.listen(8)
     sys.stderr.write(f"srw-ssh-proxy: listening on {args.listen}\n")
     sys.stderr.flush()
-    while True:
-        client, _ = listener.accept()
-        threading.Thread(
-            target=_serve_client, args=(client, args.host, origin), daemon=True
-        ).start()
+    try:
+        while True:
+            client, _ = listener.accept()
+            threading.Thread(
+                target=_serve_client, args=(client, args.host, origin), daemon=True
+            ).start()
+    except KeyboardInterrupt:
+        sys.stderr.write("srw-ssh-proxy: interrupted, shutting down\n")
+        return 130
+    finally:
+        listener.close()
 
 
 def _serve_client(client: socket.socket, host: str, origin: str) -> None:
+    sock = None
     try:
-        sock = _connect(host, origin)
-        _pump(sock, client.fileno(), client.sendall)
+        sock, leftover = _connect(host, origin)
+        _pump(sock, client.fileno(), client.fileno(), leftover)
+    except SystemExit as exc:
+        # SystemExit derives from BaseException, not Exception: a bare
+        # `except Exception` (as this used to be) never catches it, and
+        # threading.excepthook silently drops an uncaught SystemExit in a
+        # non-main thread -- every credential/handshake failure raised as
+        # SystemExit would vanish with no stderr line at all (ruling I-1).
+        sys.stderr.write(f"srw-ssh-proxy: {exc}\n")
     except Exception as exc:  # one bad connection must not kill the listener
         sys.stderr.write(f"srw-ssh-proxy: {exc}\n")
     finally:
+        # The outbound WSS socket is this function's own resource -- _connect
+        # doesn't (and can't) know when the caller is done with it, so
+        # leaking it here leaks an fd and a TLS session per connection
+        # (ruling I-4).
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
         try:
             client.close()
         except OSError:
