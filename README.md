@@ -740,7 +740,7 @@ This means the agent can work on tasks that exceed any single context window, an
 
 ## Debugging
 
-- **Workspace files** (inside the workspace container, SSH in to look): `plan.md`, `todos.yaml`, `notes/`, `datasources.md`, `output/`
+- **Workspace files** (inside the workspace container, SSH in to look): `plan.md`, `todos.yaml`, `notes/`, `datasources.md`, `output/`. From your own terminal, editor, or IDE — not just Cockpit's file browser — see [docs/ssh-access.md](docs/ssh-access.md).
 - **Checkpoints**: `workspace/checkpoints/job_<id>.db` (SQLite, on the agent host)
 - **Logs**: `workspace/logs/job_<id>.log`
 - **Phase snapshots**: `workspace/phase_snapshots/job_<id>/phase_<n>/`
