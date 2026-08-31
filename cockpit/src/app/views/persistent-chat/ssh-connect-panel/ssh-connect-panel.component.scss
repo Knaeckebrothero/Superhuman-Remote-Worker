@@ -1,0 +1,87 @@
+// Own stylesheet, deliberately: persistent-chat.component.scss is already
+// close to its 48kB compiled-CSS budget (C5 — that figure is compiled
+// output, not the ~72kB on-disk file size). Nothing here is added there.
+
+:host {
+  display: block;
+}
+
+.ssh-connect-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 12px 4px 4px;
+}
+
+.ssh-connect-panel__unavailable {
+  color: var(--text-tertiary);
+  font-size: 0.85rem;
+  font-style: italic;
+  padding: 12px 4px;
+  margin: 0;
+}
+
+.ssh-connect-panel__intro {
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+  margin: 0;
+}
+
+.ssh-connect-panel__section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ssh-connect-panel__heading {
+  margin: 0;
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.ssh-connect-panel__hint {
+  margin: 0;
+  color: var(--text-tertiary);
+  font-size: 0.8rem;
+}
+
+.ssh-connect-panel__seams {
+  padding-top: 10px;
+  border-top: 1px solid var(--border-1);
+}
+
+.ssh-connect-panel__block-row {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.ssh-connect-panel__block {
+  flex: 1;
+  min-width: 0;
+  background: var(--surface-2);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  line-height: 1.5;
+  padding: 12px;
+  border-radius: var(--radius-control);
+  overflow-x: auto;
+  white-space: pre;
+  margin: 0;
+}
+
+.ssh-connect-panel__copy-btn {
+  flex-shrink: 0;
+  background: var(--surface-1);
+  color: var(--text-primary);
+  border: 1px solid var(--border-1);
+  border-radius: var(--radius-control);
+  padding: 6px 10px;
+  font-size: 0.8rem;
+  cursor: pointer;
+
+  &:hover {
+    background: var(--surface-2);
+  }
+}

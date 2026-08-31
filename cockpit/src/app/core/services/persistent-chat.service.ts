@@ -894,6 +894,12 @@ export class PersistentChatService {
   readonly turnCount = signal<number>(0);
   readonly ncSessionFolder = signal<string | null>(null);
   readonly cloudSessionUrl = signal<string | null>(null);
+  /** `Thread.ssh_handle` — minted once and static, so it rides the loaded
+   *  Thread (below) alongside `cloudSessionUrl`, not the 10-second
+   *  `IdeSessionStatus` poll. Feeds the session view's "Connect over SSH"
+   *  panel. Null on threads predating migration 0202 or before the thread
+   *  has loaded. */
+  readonly sshHandle = signal<string | null>(null);
 
   // --- Protected cloud mode (Slice C, Task 14): status-bar badge + review
   //     drawer for the thread's staged cloud-diff. `protectedCloud` comes
@@ -1816,6 +1822,7 @@ export class PersistentChatService {
       this.usage.set(null);
       this.ncSessionFolder.set(null);
       this.cloudSessionUrl.set(null);
+      this.sshHandle.set(null);
       this.tasks.set([]);
       this.undoAvailable.set(false);
       this.rewindInFlight.set(false);
@@ -2242,6 +2249,7 @@ export class PersistentChatService {
       this.turnCount.set(thread.total_turns || 0);
       this.ncSessionFolder.set(thread.nc_session_folder || null);
       this.cloudSessionUrl.set(thread.cloud_session_url || null);
+      this.sshHandle.set(thread.ssh_handle || null);
       this.threadStatus.set(effectiveStatus);
       this.endedAt.set(thread.ended_at || thread.last_activity || null);
       this.retirementDisposition.set(retirementDisposition);
@@ -3818,6 +3826,7 @@ export class PersistentChatService {
     this.turnCount.set(0);
     this.ncSessionFolder.set(null);
     this.cloudSessionUrl.set(null);
+    this.sshHandle.set(null);
     this.threadStatus.set(null);
     this.endedAt.set(null);
     this.retirementDisposition.set(null);

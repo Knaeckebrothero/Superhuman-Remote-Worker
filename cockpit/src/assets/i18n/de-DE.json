@@ -1584,7 +1584,24 @@
       "disconnect": "Trennen",
       "projectFilesButton": "Projektdateien",
       "projectFilesTooltip": "Projektordner {{name}} in Ihrer Cloud öffnen",
-      "sessionFilesButton": "Sitzungsdateien"
+      "sessionFilesButton": "Sitzungsdateien",
+      "sshButton": "SSH",
+      "sshTooltip": "Über SSH mit dem Arbeitsbereich dieser Sitzung verbinden"
+    },
+    "ssh": {
+      "intro": "Verbinden Sie sich mit dem Arbeitsbereich dieser Sitzung über Ihr eigenes Terminal, Ihren Editor oder Ihre IDE.",
+      "configTitle": "SSH-Konfiguration",
+      "configHint": "Fügen Sie dies zu ~/.ssh/config hinzu und verbinden Sie sich anschließend mit ssh srw-<handle>.",
+      "handleLabel": "Sitzungs-Handle",
+      "hostKeyLabel": "Fingerabdruck des Gateway-Hostschlüssels",
+      "hostKeyHint": "Überprüfen Sie diesen Fingerabdruck bei der ersten Verbindung.",
+      "jetBrainsTitle": "JetBrains Gateway",
+      "jetBrainsDesc": "Gateway kann den obigen Konfigurationsblock nicht verwenden. Führen Sie diesen Befehl lokal aus und richten Sie Gateway anschließend bei deaktiviertem \"Parse config file\" auf 127.0.0.1:2222 aus.",
+      "unavailable": "SSH-Zugriff ist für diese Sitzung noch nicht verfügbar.",
+      "seams": {
+        "rewindWarning": "Änderungen über SSH landen im nächsten Commit des Agenten und erscheinen in der Überprüfung als Änderungen des Agenten — ein Sitzungs-Rewind verwirft sie.",
+        "refused": "Remote-Portweiterleitung (ssh -R), Agent-Weiterleitung und Jump-Hosts (ssh -J) werden vom Gateway allesamt abgelehnt."
+      }
     },
     "citations": {
       "title": "Quellen",

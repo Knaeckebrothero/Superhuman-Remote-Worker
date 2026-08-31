@@ -74,6 +74,8 @@ import {AppBadgeComponent} from '../../ui/badge';
 import {CitationsPanelComponent} from './citations-panel/citations-panel.component';
 import {CloudReviewDialogComponent} from '../job-diff-review/cloud-review-dialog.component';
 import {CloudReviewBannerComponent} from './cloud-review-banner/cloud-review-banner.component';
+import {SshConnectPanelComponent} from './ssh-connect-panel/ssh-connect-panel.component';
+import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {AppSelectComponent} from '../../ui/select';
 import {AppIconComponent} from '../../ui/icon';
 import {AppDialogComponent} from '../../ui/dialog';
@@ -865,6 +867,7 @@ export function clearDraft(threadId: string | null): void {
         CitationsPanelComponent,
         CloudReviewDialogComponent,
         CloudReviewBannerComponent,
+        SshConnectPanelComponent,
     ],
     template: `
     <div class="chat-container"
@@ -946,6 +949,9 @@ export function clearDraft(threadId: string | null): void {
                     <app-menu-item [disabled]="true">{{ 'chat.header.ideLoadingTooltip' | transloco }}</app-menu-item>
                   }
                 }
+                @if (capabilities.sshGateway()) {
+                  <app-menu-item (activated)="showSshPanel.update(v => !v)">{{ 'chat.header.sshButton' | transloco }}</app-menu-item>
+                }
               </app-menu>
             } @else {
               <button class="settings-btn" (click)="settingsRequested.emit(undefined)"
@@ -1001,6 +1007,13 @@ export function clearDraft(threadId: string | null): void {
                     {{ 'chat.header.ideButton' | transloco }}
                   </button>
                 }
+              }
+              @if (capabilities.sshGateway()) {
+                <button class="ide-btn" (click)="showSshPanel.update(v => !v)"
+                        [title]="'chat.header.sshTooltip' | transloco">
+                  <app-icon size="sm" class="ide-icon">terminal</app-icon>
+                  {{ 'chat.header.sshButton' | transloco }}
+                </button>
               }
             }
             <app-button variant="ghost" size="sm" (clicked)="disconnectAndLeave()">
@@ -1168,6 +1181,27 @@ export function clearDraft(threadId: string | null): void {
         <div class="settings-panel citations-panel-wrap">
           <app-citations-panel (close)="showCitations.set(false)" />
         </div>
+      }
+
+      <!-- Connect over SSH (workspace_ssh_access.md §5.1). @defer'd on the
+           toggle: the session view sits in the INITIAL bundle
+           (app.routes.ts eagerly imports ChatPageComponent, which eagerly
+           imports this component), and a plain import of the panel plus its
+           stylesheet would land in that same chunk — which after Task 4
+           measures 2.73MB against a 2.75MB hard-fail budget, ~20kB of
+           headroom (ruling P-11). The panel only ever exists after a click,
+           so deferring on that click is its natural shape, not a workaround. -->
+      @defer (when showSshPanel()) {
+        @if (showSshPanel()) {
+          <div class="settings-panel">
+            <app-ssh-connect-panel
+              [handle]="chat.sshHandle()"
+              [apiHost]="sshApiHost"
+              [sshHost]="sshGatewayHostname()"
+              [hostKeyFingerprint]="sshHostKeyFingerprint()"
+            />
+          </div>
+        }
       }
 
       <!-- Cloud-diff review. Was an inline 70vh block wedged into the chat
@@ -2382,6 +2416,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     readonly chatWidthValue = computed(() => readingWidthToCss(this.chatPrefs.readingWidth()));
     readonly chatTextSizeValue = computed(() => textSizeToCss(this.chatPrefs.textSize()));
     private readonly deviceCapabilities = inject(DeviceCapabilitiesService);
+    readonly capabilities = inject(CapabilitiesService);
     readonly voiceCaps = inject(VoiceCapabilitiesService);
     private readonly voiceRecording = inject(VoiceRecordingService);
     private readonly router = inject(Router);
@@ -2481,6 +2516,38 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     // Settings panel
     readonly showViewMenu = signal(false);
     readonly showCitations = signal(false);
+    readonly showSshPanel = signal(false);
+
+    /** Bare hostname for `srw-ssh-proxy --stdio <apiHost>` (ssh-config.ts's
+     *  HOST_PATTERN admits no scheme, path or port). `environment.apiUrl`
+     *  carries the `/api` suffix and, in local/k3d dev, a scheme and port —
+     *  only the hostname survives here. Computed once: the orchestrator's
+     *  public host does not change without a page reload. */
+    readonly sshApiHost = (() => {
+        try {
+            return new URL(environment.apiUrl).hostname;
+        } catch {
+            return '';
+        }
+    })();
+
+    /** `SshGatewayInfo.hostname` (ssh.srw.works), or '' while loading / when
+     *  the deployment has no gateway. Pulled out of the template because
+     *  Angular's template type-checker mis-narrows the chained optional
+     *  member + `noUncheckedIndexedAccess` index access below when written
+     *  inline (TS2532 on a fully-guarded expression). */
+    readonly sshGatewayHostname = computed(() => this.capabilities.sshGateway()?.hostname ?? '');
+
+    /** First published host key's fingerprint, for first-connect
+     *  verification. Only ever one entry in practice — the gateway rejects
+     *  any host key that isn't Ed25519 (services/ssh_gateway_config.py) —
+     *  but this still degrades to '' rather than assume the array is
+     *  non-empty. */
+    readonly sshHostKeyFingerprint = computed(() => {
+        const gateway = this.capabilities.sshGateway();
+        if (!gateway || gateway.host_keys.length === 0) return '';
+        return gateway.host_keys[0]?.fingerprint ?? '';
+    });
 
     /**
      * Fold the header's secondary actions into the `⋮` overflow menu.
