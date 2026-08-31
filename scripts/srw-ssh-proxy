@@ -101,6 +101,22 @@ _DRAIN_FINAL_DEADLINE_SECONDS = 5.0
 # BlockingIOError (TLS can want a read to satisfy a write and vice versa).
 _WOULD_BLOCK = (BlockingIOError, ssl.SSLWantWriteError, ssl.SSLWantReadError)
 
+# Sentinel _recv_available returns when a read specifically needs a WRITE to
+# make progress (SSL_read wanting to flush e.g. a TLS 1.3 KeyUpdate response
+# or TLS 1.2 renegotiation data) and the send side isn't ready. This is NOT
+# just another _WOULD_BLOCK case (ruling R-1): a plain SSLWantReadError
+# self-limits, because OpenSSL only raises it after fully draining the
+# kernel receive buffer, so select() genuinely blocks on the next call.
+# SSLWantWriteError does not self-limit that way on the READ path -- the fd
+# can stay genuinely readable (more encrypted bytes keep arriving, or bytes
+# already sit in the kernel buffer) while the real blocking condition is a
+# full SEND buffer, which a read-only select() watch never notices. Folding
+# it into the plain would-block case, as an earlier round did, made _pump
+# call _recv_available again immediately, hit the identical error again,
+# forever: measured at ~330,000 calls/sec, ~100% CPU -- a livelock rather
+# than the crash it replaced.
+_WANTS_WRITE = object()
+
 # RFC 6455 S4.1's fixed GUID, concatenated with the client's nonce and
 # SHA-1'd to produce Sec-WebSocket-Accept. Mandated by the spec; not a choice.
 _WS_ACCEPT_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -490,9 +506,19 @@ def _recv_available(sock) -> bytes | None:
     ``socket.recv``) -- conflating the two, as an earlier version of this
     fix did, makes a spurious wakeup indistinguishable from EOF and tears
     down an otherwise-healthy session (ruling N-1).
+
+    Returns ``_WANTS_WRITE`` -- a third, distinct value -- when the would-
+    block is specifically ``SSLWantWriteError``. Folding it into the
+    ``None`` case (as the very first version of this fix did) is a second,
+    different bug: unlike ``SSLWantReadError``, it does not self-limit, so
+    ``_pump`` would call this again immediately, hit the identical error
+    again, forever (ruling R-1 -- see ``_WANTS_WRITE``'s own definition for
+    the measured cost).
     """
     try:
         chunk = sock.recv(65536)
+    except ssl.SSLWantWriteError:
+        return _WANTS_WRITE
     except _WOULD_BLOCK:
         return None
     if not chunk:
@@ -525,19 +551,22 @@ def _read_available(fd: int) -> bytes | None:
         return None
 
 
-def _classify_chunk(chunk: bytes | None) -> str:
+def _classify_chunk(chunk) -> str:
     """Classify one ``_recv_available``/``_read_available`` result for
     ``_pump``'s read branches.
 
-    Three-way, not the two-way ``if not chunk`` the previous version used:
-    ``None`` (would-block -- no data, the session stays open) has to be told
-    apart from ``b""`` (a real, clean close) has to be told apart from
-    non-empty bytes (data to process). Pulled out as its own pure function,
-    rather than left as the equivalent inline checks, specifically so this
-    exact would-block-vs-EOF distinction is pinned by a unit test instead of
-    only showing up in a live TLS session under real network conditions
-    (ruling N-1/N-2).
+    Four-way, not the two-way ``if not chunk`` the original version used:
+    ``_WANTS_WRITE`` (``_recv_available`` only -- SSL_read needs a write to
+    proceed, ruling R-1) has to be told apart from ``None`` (a plain
+    would-block -- no data, the session stays open) has to be told apart
+    from ``b""`` (a real, clean close) has to be told apart from non-empty
+    bytes (data to process). Pulled out as its own pure function, rather
+    than left as the equivalent inline checks, specifically so these exact
+    distinctions are pinned by a unit test instead of only showing up in a
+    live TLS session under real network conditions (ruling N-1/N-2/R-1).
     """
+    if chunk is _WANTS_WRITE:
+        return "wants_write"
     if chunk is None:
         return "continue"
     if not chunk:
@@ -567,13 +596,23 @@ def _flush_queue(sender, queue: bytearray) -> None:
     presented on retry are always the same buffer's same prefix. Any future
     change that mutates ``to_remote`` between a failed send and the next
     call would corrupt the TLS stream.
+
+    The ``memoryview`` is used as a context manager so it is explicitly
+    released before ``del queue[:sent]`` resizes the same ``bytearray``
+    (ruling R-3): a live, unreleased export on a ``bytearray`` makes
+    resizing it raise ``BufferError: Existing exports of data``. Real
+    ``os.write``/``socket.send`` don't retain the buffer they're passed
+    beyond the call, so this was latent rather than live -- but nothing
+    about ``sender``'s contract here forbids retaining it, and the explicit
+    release makes that safe regardless of what a given ``sender`` does.
     """
     if not queue:
         return
-    try:
-        sent = sender(memoryview(queue))
-    except _WOULD_BLOCK:
-        return
+    with memoryview(queue) as view:
+        try:
+            sent = sender(view)
+        except _WOULD_BLOCK:
+            return
     if sent:
         del queue[:sent]
 
@@ -631,6 +670,15 @@ def _drain_write_with_deadline(fileobj, write_fn, data, deadline: float) -> None
     Best-effort: whatever is unsent when the deadline passes is dropped
     silently. There is nothing better to do at the tail of a session that's
     already tearing down.
+
+    Waits on the readiness that actually matches the error (ruling R-4): a
+    write can raise ``SSLWantReadError`` too (SSL_write needing to process
+    something -- a session ticket, a renegotiation message -- before it can
+    finish sending), and writability is likely already true in that case,
+    so waiting on it makes ``select()`` return instantly and the retry hits
+    the identical error again -- the same confusion R-1 fixed on the read
+    side, in miniature here since this is bounded by ``deadline`` rather
+    than unbounded.
     """
     view = memoryview(data)
     while view:
@@ -639,6 +687,9 @@ def _drain_write_with_deadline(fileobj, write_fn, data, deadline: float) -> None
             return
         try:
             sent = write_fn(view)
+        except ssl.SSLWantReadError:
+            select.select([fileobj], [], [], min(remaining, 0.5))
+            continue
         except _WOULD_BLOCK:
             select.select([], [fileobj], [], min(remaining, 0.5))
             continue
@@ -650,35 +701,66 @@ def _drain_write_with_deadline(fileobj, write_fn, data, deadline: float) -> None
 
 
 def _drain_final(
-    write_fd: int, sock, to_local: bytearray, to_remote: bytearray
+    read_fd: int, write_fd: int, sock, to_local: bytearray, to_remote: bytearray
 ) -> None:
     """Best-effort final flush when the pump is shutting down, then restore
-    both the local fd and ``sock`` to blocking mode unconditionally.
+    ``read_fd``, ``write_fd``, and ``sock`` -- all three fds ``_pump`` set
+    non-blocking -- to blocking mode unconditionally.
 
     The flush itself stays non-blocking and bounded by a deadline -- see
     ``_drain_write_with_deadline``. Restoring blocking mode is unconditional,
     not only when there was something to flush: ``O_NONBLOCK`` lives on the
     shared open file description, and the common case at a clean shutdown is
-    an *empty* queue -- the previous version's ``os.set_blocking(write_fd,
+    an *empty* queue -- an earlier version's ``os.set_blocking(write_fd,
     True)`` sat inside ``if to_local:``, so that common case left
     stdin/stdout non-blocking on exit, which can affect whatever else holds
     that same fd (e.g. the parent shell, for a ``--stdio`` run from a
     terminal) after this process is gone (ruling N-6).
+
+    ``read_fd`` specifically -- restored here too, not just ``write_fd`` and
+    ``sock`` -- is the half of N-6 that actually causes harm (ruling R-2): a
+    version that restored only ``write_fd``/``sock`` passed every test,
+    because ``--listen`` mode's ``read_fd == write_fd`` aliasing means
+    restoring ``write_fd`` incidentally restores ``read_fd`` too. In
+    ``--stdio`` mode they're different fds, and ``read_fd`` is stdin -- the
+    exact fd N-6 was raised about, left non-blocking with nothing to alias
+    the fix onto it.
+
+    Each direction gets its OWN full ``_DRAIN_FINAL_DEADLINE_SECONDS``
+    budget, computed fresh right before that direction's call, not one
+    shared deadline computed up front (ruling R-6): a slow or wedged local
+    consumer eating the whole budget would otherwise leave the remote
+    CLOSE echo -- arguably the more important of the two, since it is what
+    tells the gateway the session is over -- with none left. Worst case
+    this doubles _drain_final's own total wall time (up to ~2x
+    ``_DRAIN_FINAL_DEADLINE_SECONDS`` instead of one shared budget); that
+    trade was made deliberately in favor of not starving the CLOSE echo.
     """
-    deadline = time.monotonic() + _DRAIN_FINAL_DEADLINE_SECONDS
     try:
         if to_local:
             _drain_write_with_deadline(
-                write_fd, lambda data: os.write(write_fd, data), to_local, deadline
+                write_fd,
+                lambda data: os.write(write_fd, data),
+                to_local,
+                time.monotonic() + _DRAIN_FINAL_DEADLINE_SECONDS,
             )
     finally:
         try:
             os.set_blocking(write_fd, True)
         except OSError:
             pass
+        try:
+            os.set_blocking(read_fd, True)
+        except OSError:
+            pass
     try:
         if to_remote:
-            _drain_write_with_deadline(sock, sock.send, to_remote, deadline)
+            _drain_write_with_deadline(
+                sock,
+                sock.send,
+                to_remote,
+                time.monotonic() + _DRAIN_FINAL_DEADLINE_SECONDS,
+            )
     finally:
         try:
             sock.setblocking(True)
@@ -703,10 +785,16 @@ def _pump(sock, read_fd: int, write_fd: int, initial_buffer: bytes = b"") -> Non
     banner immediately after accepting, so it and the 101 response routinely
     arrive in the same TCP segment, after the header terminator ``_connect``
     already consumed.
+
+    ``sock_wants_write`` tracks ``_recv_available`` reporting
+    ``_WANTS_WRITE`` (ruling R-1): while true, ``sock`` is dropped from the
+    read set entirely (not just skipped when "readable") and added to the
+    write set even with nothing queued in ``to_remote`` -- so ``select()``
+    genuinely blocks until the socket is actually writable, instead of
+    returning instantly because the fd is still readable at the raw level
+    (more encrypted bytes, or bytes already buffered) while the real
+    blocking condition -- a full send buffer -- never gets waited on at all.
     """
-    sock.setblocking(False)
-    os.set_blocking(read_fd, False)
-    os.set_blocking(write_fd, False)
 
     def local_write(data: bytes) -> int:
         return os.write(write_fd, data)
@@ -717,8 +805,13 @@ def _pump(sock, read_fd: int, write_fd: int, initial_buffer: bytes = b"") -> Non
     last_ping = time.monotonic()
     local_open = True
     closing = False
+    sock_wants_write = False
 
     try:
+        sock.setblocking(False)
+        os.set_blocking(read_fd, False)
+        os.set_blocking(write_fd, False)
+
         in_buffer, should_stop = _consume_frames(in_buffer, to_local, to_remote)
         if should_stop:
             return
@@ -727,10 +820,10 @@ def _pump(sock, read_fd: int, write_fd: int, initial_buffer: bytes = b"") -> Non
             rlist = []
             if local_open and len(to_remote) < MAX_QUEUE_BYTES:
                 rlist.append(read_fd)
-            if len(to_local) < MAX_QUEUE_BYTES:
+            if not sock_wants_write and len(to_local) < MAX_QUEUE_BYTES:
                 rlist.append(sock)
             wlist = []
-            if to_remote:
+            if to_remote or sock_wants_write:
                 wlist.append(sock)
             if to_local:
                 wlist.append(write_fd)
@@ -749,6 +842,7 @@ def _pump(sock, read_fd: int, write_fd: int, initial_buffer: bytes = b"") -> Non
                 _flush_queue(local_write, to_local)
             if sock in writable:
                 _flush_queue(sock.send, to_remote)
+                sock_wants_write = False
 
             if read_fd in readable:
                 data = _read_available(read_fd)
@@ -762,12 +856,14 @@ def _pump(sock, read_fd: int, write_fd: int, initial_buffer: bytes = b"") -> Non
                 # "continue": a spurious wakeup -- no data, try again next
                 # iteration. Must not be treated as EOF (ruling N-2).
 
-            if sock in readable or sock.pending() > 0:
+            if not sock_wants_write and (sock in readable or sock.pending() > 0):
                 chunk = _recv_available(sock)
                 outcome = _classify_chunk(chunk)
-                if outcome == "close":
+                if outcome == "wants_write":
+                    sock_wants_write = True
+                elif outcome == "close":
                     return
-                if outcome == "data":
+                elif outcome == "data":
                     in_buffer += chunk
                     in_buffer, should_stop = _consume_frames(
                         in_buffer, to_local, to_remote
@@ -780,7 +876,7 @@ def _pump(sock, read_fd: int, write_fd: int, initial_buffer: bytes = b"") -> Non
             if closing and not to_remote and not to_local:
                 return
     finally:
-        _drain_final(write_fd, sock, to_local, to_remote)
+        _drain_final(read_fd, write_fd, sock, to_local, to_remote)
 
 
 def _report_error(exc: BaseException) -> None:

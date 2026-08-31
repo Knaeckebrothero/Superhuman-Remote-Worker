@@ -638,6 +638,41 @@ class _PendinglessSocket:
         return 0
 
 
+def test_pump_still_drains_and_restores_if_going_nonblocking_fails(monkeypatch):
+    """R-5 (findings-r3.md, Minor): the three setblocking(False)/
+    set_blocking(..., False) calls used to sit before _pump's try, so an
+    OSError from any of them skipped `finally: _drain_final(...)` entirely
+    -- whichever of the three HAD already been made non-blocking (sock, in
+    this scenario, since it's set first) was left that way with no
+    cleanup and no restore."""
+    real_set_blocking = proxy.os.set_blocking
+    calls = {"n": 0}
+
+    def _flaky_set_blocking(fd, flag):
+        calls["n"] += 1
+        if calls["n"] == 1:  # the first of the two os.set_blocking calls
+            raise OSError("synthetic failure")
+        return real_set_blocking(fd, flag)
+
+    monkeypatch.setattr(proxy.os, "set_blocking", _flaky_set_blocking)
+
+    drained = []
+    monkeypatch.setattr(proxy, "_drain_final", lambda *a, **k: drained.append(a))
+
+    class _FakeSock:
+        def setblocking(self, flag):
+            pass
+
+    read_fd, write_fd = os.pipe()
+    try:
+        with pytest.raises(OSError):
+            proxy._pump(_FakeSock(), read_fd, write_fd)
+        assert len(drained) == 1, "finally: _drain_final(...) must still run"
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
 def test_pump_relays_the_seeded_leftover_and_both_live_directions():
     """End-to-end coverage of _pump itself (not just _consume_frames), over
     real local socketpairs -- no network, no TLS, so this is not the
@@ -825,6 +860,128 @@ def test_pump_survives_a_spurious_remote_wakeup(monkeypatch):
     assert "error" not in result
 
 
+class _PersistentlyWantsWriteSocket:
+    """Unlike ``_OnceWouldBlockSocket`` (a fixed one-shot failure, which
+    can't reproduce a genuinely unbounded loop -- the second call always
+    succeeds regardless of whether the caller waited correctly), this
+    raises ``exc`` on EVERY recv() until ``.free()`` is called, modelling
+    the real livelock condition: the error recurs for as long as the
+    underlying send buffer stays full, not just once. Correctly exercises
+    both halves of the fix -- ``_recv_available`` classifying the error,
+    and ``_pump`` actually gating on it -- since only a persistent failure
+    forces the gating logic to matter."""
+
+    def __init__(self, sock, exc):
+        self._sock = sock
+        self._exc = exc
+        self._freed = False
+        self.calls = 0
+
+    def free(self):
+        self._freed = True
+
+    def fileno(self):
+        return self._sock.fileno()
+
+    def recv(self, n):
+        self.calls += 1
+        if not self._freed:
+            raise self._exc
+        return self._sock.recv(n)
+
+    def send(self, data):
+        return self._sock.send(data)
+
+    def setblocking(self, flag):
+        self._sock.setblocking(flag)
+
+    def pending(self):
+        return 0
+
+
+def test_pump_waits_for_writability_instead_of_busy_spinning_on_sslwantwrite():
+    """R-1 (findings-r3.md, Important): the round-2 fix folded
+    SSLWantWriteError into the same would-block bucket as
+    SSLWantReadError/BlockingIOError. Unlike SSLWantReadError (which
+    self-limits -- OpenSSL only raises it after draining the kernel
+    buffer, so select() then genuinely blocks), SSLWantWriteError does not:
+    the peer can keep the fd readable indefinitely while the real blocking
+    condition is a full SEND buffer, which a read-only select() watch never
+    notices. The reviewer measured the result driving a real socket:
+    ~330,000 recv calls/sec, 1.07s CPU per 1.0s wall -- round 1's crash
+    turned into round 2's livelock.
+
+    Reproduces the same shape with a REAL socket: its send buffer is
+    genuinely filled (so writability is genuinely false), while the paired
+    end is genuinely readable (a real frame sitting unconsumed), and
+    SSLWantWriteError recurs on every attempt until freed -- not just
+    once -- so this only passes if _pump genuinely stops attempting reads
+    and waits on writability, not merely got lucky on a single retry.
+    Asserts recv() is called exactly once over a bounded window. Then
+    frees the send buffer for real and confirms the session actually
+    recovers and relays the data that had been blocked."""
+    remote_a, remote_b = socket.socketpair()
+    local_a, local_b = socket.socketpair()
+    remote_a.setblocking(False)
+    try:
+        while True:
+            remote_a.send(b"x" * 65536)
+    except BlockingIOError:
+        pass  # remote_a's send buffer is now genuinely full
+
+    # A real, genuinely-readable frame on remote_a's receive side --
+    # independent of the send-side buffer filled above.
+    remote_b.sendall(proxy.frame(b"trigger", proxy.OPCODE_BINARY, mask=False))
+
+    remote = _PersistentlyWantsWriteSocket(remote_a, ssl.SSLWantWriteError())
+    result = {}
+
+    def _run():
+        try:
+            proxy._pump(remote, local_a.fileno(), local_a.fileno())
+        except OSError as exc:  # pragma: no cover - surfaced via result below
+            result["error"] = exc
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    try:
+        time.sleep(0.3)
+        assert remote.calls == 1, (
+            f"busy-spun: recv() called {remote.calls} times in 0.3s "
+            "(a livelock measures ~330,000/sec)"
+        )
+
+        # Let the fake stop raising BEFORE the send buffer actually frees
+        # up, so there's no window where _pump's retry (once it sees
+        # writability) could hit the fake still raising and have to wait
+        # a second time -- deterministic, not racing on thread scheduling.
+        remote.free()
+
+        # Now free the send buffer for real: drain what remote_a sent into
+        # remote_b's receive side, and confirm the pump actually recovers
+        # rather than staying wedged.
+        remote_b.setblocking(False)
+        drained = 0
+        try:
+            while True:
+                drained += len(remote_b.recv(65536))
+        except BlockingIOError:
+            pass
+        assert drained > 0
+
+        local_b.settimeout(2.0)
+        assert local_b.recv(65536) == b"trigger"
+    finally:
+        local_b.close()
+        thread.join(timeout=2.0)
+        for sock in (remote_a, remote_b, local_a):
+            try:
+                sock.close()
+            except OSError:
+                pass
+    assert "error" not in result
+
+
 def test_pump_survives_a_spurious_local_read_wakeup(monkeypatch):
     """N-2's actual regression site, not just _read_available in isolation.
 
@@ -881,6 +1038,41 @@ def test_pump_survives_a_spurious_local_read_wakeup(monkeypatch):
             except OSError:
                 pass
     assert "error" not in result
+
+
+def test_pump_exits_when_the_remote_socket_closes():
+    """R-7 (findings-r3.md, Test to add): mutating _pump's remote-close
+    branch (`if outcome == "close": return` -> `pass`) kept all 66 tests
+    green at the time this was written -- the local direction's EOF
+    handling was pinned at pump level
+    (test_pump_survives_a_spurious_local_read_wakeup and its sibling
+    above), but the remote direction's close was only pinned at the
+    _recv_available/_classify_chunk helper level, never through a real
+    socket actually closing and _pump actually exiting. This is a real,
+    not a WS-level, close: remote_b.close() (a TCP/socket-level close),
+    not a CLOSE frame -- distinct from _consume_frames' CLOSE-frame path,
+    which is already covered elsewhere."""
+    remote_a, remote_b = socket.socketpair()
+    local_a, local_b = socket.socketpair()
+    remote = _PendinglessSocket(remote_a)
+
+    thread = threading.Thread(
+        target=proxy._pump,
+        args=(remote, local_a.fileno(), local_a.fileno()),
+        daemon=True,
+    )
+    thread.start()
+    try:
+        remote_b.close()  # a real socket-level close, not a WS CLOSE frame
+        thread.join(timeout=2.0)
+        assert not thread.is_alive(), "pump did not exit when the remote closed"
+    finally:
+        local_b.close()
+        for sock in (remote_a, local_a):
+            try:
+                sock.close()
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -1009,6 +1201,26 @@ def test_flush_queue_passes_a_memoryview_not_a_full_copy():
     assert received_types == [memoryview]
 
 
+def test_flush_queue_survives_a_sender_that_retains_the_memoryview():
+    """R-3 (findings-r3.md): a sender that keeps its argument beyond the
+    call -- real os.write/socket.send don't, but nothing in _flush_queue's
+    contract forbids it -- made `del queue[:sent]` raise `BufferError:
+    Existing exports of data` on the memoryview optimisation (ruling N-5),
+    because the view was still alive when the bytearray got resized. Using
+    the memoryview as a context manager releases the export explicitly
+    before the del, regardless of whether sender kept a reference."""
+    queue = bytearray(b"payload")
+    retained = []
+
+    def _sender(data):
+        retained.append(data)  # retains the memoryview itself, not just its type
+        return len(data)
+
+    proxy._flush_queue(_sender, queue)  # must not raise BufferError
+    assert queue == bytearray(b"")
+    assert len(retained) == 1
+
+
 # ---------------------------------------------------------------------------
 # N-3/N-6 — _drain_final's single re-blocked os.write/sendall could silently
 # truncate a short write and could hang forever on a wedged consumer, which
@@ -1082,13 +1294,58 @@ def test_drain_write_with_deadline_stops_cleanly_on_oserror():
     )
 
 
+def test_drain_write_with_deadline_waits_on_readability_for_sslwantreaderror(
+    monkeypatch,
+):
+    """R-4 (findings-r3.md, Minor): a WRITE that raises SSLWantReadError
+    needs a READ-readiness wait, not a write-readiness wait -- writability
+    is likely already true in that case, so waiting on it makes select()
+    return instantly and the retry hits the identical error again,
+    spinning for the remaining budget ('the same confusion as R-1 in
+    miniature', bounded here at 5s rather than unbounded). The spy doesn't
+    call the real select() -- fileobj is a plain object(), never a valid
+    fd -- it only needs to record which list fileobj landed in."""
+    calls = []
+
+    def _spy_select(rlist, wlist, xlist, timeout):
+        calls.append((list(rlist), list(wlist), timeout))
+        return ([], [], [])
+
+    monkeypatch.setattr(proxy.select, "select", _spy_select)
+
+    attempts = {"n": 0}
+
+    def _sender(data):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise ssl.SSLWantReadError()
+        return len(data)
+
+    fake_fileobj = object()
+    proxy._drain_write_with_deadline(
+        fake_fileobj, _sender, b"payload", time.monotonic() + 5.0
+    )
+    assert attempts["n"] == 2
+    assert len(calls) == 1
+    first_rlist, first_wlist, _ = calls[0]
+    assert fake_fileobj in first_rlist
+    assert fake_fileobj not in first_wlist
+
+
 def test_drain_final_restores_blocking_mode_even_with_empty_queues(monkeypatch):
-    """N-6: the previous version's os.set_blocking(write_fd, True) sat
-    inside `if to_local:`, so the common case -- a clean shutdown with
-    nothing left queued -- left the fd non-blocking on exit. That's the
-    scenario this test pins: both queues empty."""
+    """N-6/R-2: an earlier version's os.set_blocking(write_fd, True) sat
+    inside `if to_local:`, so a clean shutdown with nothing queued left the
+    fd non-blocking on exit -- and even after that was fixed, only
+    write_fd and sock were ever restored, never read_fd (ruling R-2, found
+    by reading the source directly: set_blocking appeared at exactly two
+    call sites, not three). --listen mode's read_fd == write_fd aliasing
+    hid that gap, since restoring write_fd incidentally restored read_fd
+    too there; --stdio's read_fd is stdin, the exact fd N-6 was raised
+    about. Uses a real pipe's two genuinely DISTINCT fds as read_fd/
+    write_fd so that aliasing can't mask a regression here again."""
     read_fd, write_fd = os.pipe()
     try:
+        os.set_blocking(read_fd, False)
         os.set_blocking(write_fd, False)
 
         class _FakeSock:
@@ -1096,9 +1353,10 @@ def test_drain_final_restores_blocking_mode_even_with_empty_queues(monkeypatch):
                 self.blocking = flag
 
         fake_sock = _FakeSock()
-        proxy._drain_final(write_fd, fake_sock, bytearray(), bytearray())
+        proxy._drain_final(read_fd, write_fd, fake_sock, bytearray(), bytearray())
 
-        # os.get_blocking is the direct way to observe the fd's own flag.
+        # os.get_blocking is the direct way to observe each fd's own flag.
+        assert os.get_blocking(read_fd) is True
         assert os.get_blocking(write_fd) is True
         assert fake_sock.blocking is True
     finally:
@@ -1121,7 +1379,7 @@ def test_drain_final_flushes_a_queued_close_echo_to_completion():
         os.set_blocking(write_fd, False)
         to_local = bytearray(b"x" * 1000)
         to_remote = bytearray(b"y" * 1000)
-        proxy._drain_final(write_fd, remote_a, to_local, to_remote)
+        proxy._drain_final(read_fd, write_fd, remote_a, to_local, to_remote)
 
         os.set_blocking(read_fd, False)
         assert os.read(read_fd, 4000) == b"x" * 1000
@@ -1133,6 +1391,51 @@ def test_drain_final_flushes_a_queued_close_echo_to_completion():
         os.close(write_fd)
         remote_a.close()
         remote_b.close()
+
+
+def test_drain_final_gives_each_direction_its_own_deadline_budget(monkeypatch):
+    """R-6 (findings-r3.md, Minor): a single shared deadline computed once
+    meant a slow/stuck local consumer eating time before the remote flush
+    even started would leave the remote CLOSE echo -- arguably the more
+    important of the two -- with less budget than it should get. Each
+    direction must be measured from its OWN start, not a deadline
+    inherited from the first call. The spy sleeps during the FIRST
+    (local) call to simulate that slow consumer, then records how much
+    budget the SECOND (remote) call was actually given: with one shared
+    deadline, the sleep eats directly into it, so the second call's
+    remaining budget would come out ~0.2s smaller than the first's; with
+    separate budgets, both stay close to the full
+    _DRAIN_FINAL_DEADLINE_SECONDS regardless of the sleep."""
+    deadlines_seen = []
+
+    def _spy_drain(fileobj, write_fn, data, deadline):
+        deadlines_seen.append((time.monotonic(), deadline))
+        if len(deadlines_seen) == 1:
+            time.sleep(0.2)
+
+    monkeypatch.setattr(proxy, "_drain_write_with_deadline", _spy_drain)
+
+    class _FakeSock:
+        def setblocking(self, flag):
+            pass
+
+        def send(self, data):  # never actually called: _drain_write_with_deadline
+            return len(data)  # is mocked above, but _drain_final references
+            # sock.send as an argument expression regardless of the mock.
+
+    read_fd, write_fd = os.pipe()
+    try:
+        proxy._drain_final(
+            read_fd, write_fd, _FakeSock(), bytearray(b"x"), bytearray(b"y")
+        )
+        assert len(deadlines_seen) == 2
+        (first_now, first_deadline), (second_now, second_deadline) = deadlines_seen
+        first_budget = first_deadline - first_now
+        second_budget = second_deadline - second_now
+        assert second_budget > first_budget - 0.05
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
 
 
 # ---------------------------------------------------------------------------
