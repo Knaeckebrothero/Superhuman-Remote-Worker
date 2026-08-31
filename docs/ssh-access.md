@@ -1,7 +1,7 @@
 # SSH access to a session workspace
 
 Every persistent session has a workspace container behind it, and you can open a real
-`ssh` connection into that container: run shell commands, `scp`/`rsync` files in and
+`ssh` connection into that container: run shell commands, `scp` files in and
 out, or point an editor at it. This page covers registering a key, connecting with
 plain `ssh`, VS Code Remote-SSH and JetBrains Gateway, what the gateway deliberately
 refuses, how this interacts with the agent working in the same workspace, and how to
@@ -133,9 +133,16 @@ A few things worth knowing about this block:
 - The panel also shows the **gateway host key fingerprint** — verify it on first
   connect, the same as you would for any new host.
 
-`scp`, `rsync`, and SFTP all work through this block unchanged (verified end-to-end:
-upload and download both round-tripped correctly), since the gateway implements a
-real `sftp` subsystem rather than refusing it.
+`scp` and SFTP both work through this block unchanged (verified end-to-end: upload
+and download both round-tripped correctly), since the gateway implements a real
+`sftp` subsystem rather than refusing it.
+
+**`rsync` does not work — the workspace image doesn't ship it.** `rsync` execs a
+remote `rsync --server` over the connection, and there is no `rsync` binary in the
+workspace container (confirmed live: `which rsync` inside a running workspace pod
+exits 1; the package list `docker/Dockerfile.workspace` installs doesn't include it
+either). It fails immediately with "command not found" rather than anything
+gateway-specific. Use `scp` instead.
 
 ## 3. JetBrains Gateway
 
@@ -172,14 +179,17 @@ for Gateway. State this plainly rather than let a Windows user discover it as a
 traceback.
 
 **The first attach downloads a large IDE backend.** Gateway itself only uploads a
-small (~2.4 MB) worker over SFTP — but that worker then has **the workspace**
-download a **~5 GB** JetBrains IDE backend from JetBrains' own CDN. Two consequences:
+small worker over SFTP (roughly 2.4 MB, from the design estimate — not re-measured
+here) — but that worker then has **the workspace** download the JetBrains IDE
+backend itself from JetBrains' own CDN. Expect roughly 5 GB (also from the design
+estimate, not measured in this deployment — no JetBrains client was available to
+trigger a real attach and watch it happen). Two consequences either way:
 
 - The workspace needs egress to JetBrains' CDN. If your deployment restricts
   workspace egress, this will hang or fail rather than error clearly.
-- The workspace needs **5 GB+ free disk**, on top of whatever your repo checkouts
-  and caches already use, against workspaces provisioned with a 10Gi volume. Check
-  free space before the first attach, or it can fill the volume.
+- The workspace needs several GB of free disk, on top of whatever your repo
+  checkouts and caches already use, against workspaces provisioned with a 10Gi
+  volume. Check free space before the first attach, or it can fill the volume.
 
 If the Origin `srw-ssh-proxy` guesses by default is wrong for your deployment (it
 guesses `https://cockpit.<domain>` from `api.<domain>`), append `--origin
@@ -204,11 +214,11 @@ test against):
 |---|---|---|
 | `ssh -R` (remote port forwarding) | Refused. The client prints `Warning: remote port forwarding failed for listen port N` and the rest of the session continues normally | Not implemented — asyncssh's `tcpip-forward` handler is never installed |
 | SSH agent forwarding (`-A`) | Refused. `$SSH_AUTH_SOCK` is simply never set in the remote shell | Means **no `git push` using your local key** from inside the workspace — the agent socket never reaches it |
-| `ssh -J` (jump host / `ProxyJump`) | Cannot work at all | `ProxyJump` needs a `direct-tcpip` channel to an arbitrary destination host, and the gateway clamps every `direct-tcpip` destination to the workspace's own loopback before dialing. (Confirmed live: a forward aimed at a real external address came back `connect failed: Connection refused` — the gateway substituted loopback, and nothing was listening there — not a generic protocol error, and not a proxy to the address you asked for.) |
-| `ssh -L` / `-D` to a service *inside* the workspace | Works | Same `direct-tcpip` path, but the destination you ask for already *is* loopback, so nothing gets clamped |
+| `ssh -J` (jump host / `ProxyJump`) | Cannot work at all | `ProxyJump` needs a `direct-tcpip` channel to an arbitrary destination host, and the gateway only permits a `direct-tcpip` destination of `127.0.0.1`/`localhost` — anything else is declined outright, with no dial attempted at all. (Confirmed live: a forward aimed at a real external address came back `connect failed: Connection refused`. That text is not evidence of an attempted-and-failed dial — it's asyncssh's fixed, generic literal for *any* declined channel-open request, emitted identically regardless of why. The gateway doesn't redirect the destination anywhere; it just says no.) |
+| `ssh -L` / `-D` to a service *inside* the workspace | Works | Same `direct-tcpip` path, but the destination you ask for already *is* loopback, so the permit check passes |
 | VM-tier workspaces | Refused with exit 77, `"this workspace is VM-tier - SSH access is not supported"` | Not implemented for that backend |
 
-The refusal for a clamped `-L`/`-J` destination surfaces at **first use of the
+The refusal for a non-loopback `-L`/`-J` destination surfaces at **first use of the
 forward**, not at `ssh` startup — `-L` itself will appear to succeed silently; the
 `Connection refused` only shows up once something tries to use the tunnel.
 
@@ -233,10 +243,17 @@ changes" in the diff.
 
 **403 at the WebSocket upgrade, before any SSH banner at all.** This is an Origin
 problem, not a credential problem. The gateway enforces an exact-match allow-list
-with no default in either direction — `sshGateway.allowedOrigins` ships **empty**,
-which fails closed, so *every* connection 403s until an operator adds the cockpit
-origin to it. `srw-ssh-proxy` prints the Origin it sent on this error, which is the
-fastest way to confirm this is what's happening:
+with no default in either direction, and it's stricter than "misconfigured at
+connect time" — a *completely empty* `sshGateway.allowedOrigins` can't ship at all:
+the Helm chart refuses to render (`helm template` with an empty list fails with
+"sshGateway.enabled requires a non-empty sshGateway.allowedOrigins", confirmed live),
+and even past that guard the gateway's own `load_config()` raises at boot, before the
+`/api/ssh/attach` route exists. So an *empty* list is never what you're looking at in
+production. What reaches this 403 in practice is a **non-empty but wrong** entry —
+the allow-listed origin has the wrong scheme (`http` vs `https`), the wrong port, or
+doesn't match the exact subdomain cockpit is actually served from. `srw-ssh-proxy`
+prints the Origin it sent on this error, which is the fastest way to compare it
+against what the operator configured:
 
 ```
 srw-ssh-proxy: upgrade refused: HTTP/1.1 403 Forbidden (sent Origin: 'https://cockpit.srw.works'; a
@@ -270,9 +287,14 @@ read them:
 
 | Exit | Meaning | Reasons |
 |---|---|---|
-| **75** | Retry later — nothing else needs to change | workspace suspended, reclaimed while idle, shutting down, still restoring, or a stale SSH binding |
-| **69** | Gone — retrying alone won't help | workspace failed, deleted, this session ended, never had a workspace, or is unreachable right now |
+| **75** | Retry later — nothing else needs to change | workspace suspended, reclaimed while idle, shutting down, still restoring, a stale SSH binding, or **too many SSH connections to this workspace already** — close one and reconnect |
+| **69** | Gone — retrying alone won't help | workspace failed, deleted, this session ended, never had a workspace, is unreachable right now, or **the gateway itself is misconfigured** — report this to an administrator, since reconnecting can't fix it |
 | **77** | Denied | unknown/unauthorized handle, unregistered key, or a VM-tier workspace |
+
+The attachment-cap and misconfiguration rows aren't tied to workspace state the way
+the others are — they come from the gateway's own resource limits and boot-time
+config, respectively — but they use the same exit-code channel and are worth
+recognizing if you hit them.
 
 The one you'll hit most often is a **suspended workspace**:
 
