@@ -209,7 +209,9 @@ describe('cloud review receipt store', () => {
     applied: 3,
     deleted: 1,
     overlayReset: false,
-    at: '2026-08-24T12:00:00.000Z',
+    // Relative, not pinned: the store drops receipts older than its 7-day
+    // retention window, so a wall-clock date here becomes a time bomb.
+    at: new Date(Date.now() - 60_000).toISOString(),
   };
 
   afterEach(() => localStorage.clear());
@@ -1072,7 +1074,7 @@ describe('JobDiffReviewComponent surface', () => {
         applied: 3,
         deleted: 1,
         overlayReset: true,
-        at: '2026-08-24T12:00:00.000Z',
+        at: new Date(Date.now() - 60_000).toISOString(),
       });
       await render({
         summary: threadSummary({ files: [], counts: { added: 0, modified: 0, deleted: 0 }, epoch: 6 }),
@@ -1087,7 +1089,7 @@ describe('JobDiffReviewComponent surface', () => {
         applied: 3,
         deleted: 1,
         overlayReset: true,
-        at: '2026-08-24T12:00:00.000Z',
+        at: new Date(Date.now() - 60_000).toISOString(),
       });
       await render();
       expect(text()).not.toContain('Applied to your cloud');

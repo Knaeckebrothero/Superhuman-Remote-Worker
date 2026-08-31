@@ -201,7 +201,7 @@ describe('CloudReviewBannerComponent', () => {
       applied: 3,
       deleted: 1,
       overlayReset: true,
-      at: '2026-08-24T12:00:00.000Z',
+      at: new Date(Date.now() - 60_000).toISOString(),
     });
     const root = await render({ protectedCloud: true, count: 0, probe: 'ready', threadId: 't1' });
     expect(text(root)).toContain('Last cloud review: applied');
@@ -220,7 +220,7 @@ describe('CloudReviewBannerComponent', () => {
       applied: 3,
       deleted: 1,
       overlayReset: true,
-      at: '2026-08-24T12:00:00.000Z',
+      at: new Date(Date.now() - 60_000).toISOString(),
     });
     const root = await render({ protectedCloud: true, count: 2, probe: 'ready', threadId: 't1' });
     expect(text(root)).toContain('waiting for your review');
