@@ -3859,6 +3859,7 @@ class ContainerProvisioner:
         owner: WorkspaceOwner,
         *,
         expected_runtime_incarnation: str,
+        _mutation_guard_held: bool = False,
     ) -> bool:
         """Release the workspace finalizer after exact terminal proof.
 
@@ -3872,6 +3873,7 @@ class ContainerProvisioner:
             pod_name=owner.pod_name,
             expected_runtime_incarnation=expected_runtime_incarnation,
             scope="workspace_container",
+            _mutation_guard_held=_mutation_guard_held,
         )
 
     async def _release_process_zero_finalizer(
@@ -5682,10 +5684,20 @@ class ContainerProvisioner:
         if not isinstance(claimed, dict):
             return _WORKSPACE_CLEANUP_RETRYABLE
         intent = claimed
+        captured_pod_uid = intent.get("pod_uid")
+        if captured_pod_uid is not None and str(captured_pod_uid) != str(
+            expected_runtime_incarnation
+        ):
+            return _WORKSPACE_CLEANUP_RETRYABLE
         deletion = await self.delete_workspace_with_outcome(
             owner,
             expected_runtime_incarnation=expected_runtime_incarnation,
             wait_for_exact_absence=True,
+            **(
+                {"captured_teardown_uid": str(captured_pod_uid)}
+                if captured_pod_uid is not None
+                else {}
+            ),
             cleanup_intent=intent,
             _mutation_guard_held=True,
         )
@@ -6993,6 +7005,7 @@ class ContainerProvisioner:
                 await self.release_stateless_workspace_process_zero_finalizer(
                     owner,
                     expected_runtime_incarnation=observed_runtime_uid,
+                    _mutation_guard_held=True,
                 )
             )
             if not released_finalizer:

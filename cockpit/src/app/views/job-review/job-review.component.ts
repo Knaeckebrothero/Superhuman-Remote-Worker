@@ -1087,7 +1087,9 @@ export class JobReviewComponent {
       }
 
       if (result.status === 'unavailable') {
-        this.resultMessage.set('IDE session is currently unavailable');
+        // The orchestrator says why when it knows (a contained browser
+        // transport, an unreachable VM); the generic line is the last resort.
+        this.resultMessage.set(result.error || 'IDE session is currently unavailable');
         this.resultIsError.set(true);
       }
       this.ideLoading.set(false);

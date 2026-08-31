@@ -657,7 +657,11 @@ from services.workspace_suspension import (  # noqa: E402
 )
 from services.snapshot_service import snapshot_service  # noqa: E402
 from services.ide_session import ide_session_service  # noqa: E402
-from services.ide_proxy import IdeProxyUnavailable, ide_proxy_service  # noqa: E402
+from services.ide_proxy import (  # noqa: E402
+    IdeProxyUnavailable,
+    contain_ide_status,
+    ide_proxy_service,
+)
 from services.email import email_service  # noqa: E402
 from services import headless_notifications  # noqa: E402
 from services.brand import TRAVERTINE as _BRAND  # noqa: E402
@@ -54147,6 +54151,51 @@ async def _reconcile_stateless_thread_retirement(
                 else None
             )
 
+            # Begin may have pre-admitted the terminal cleanup generation in
+            # the same transaction that closed the queue and projected
+            # retiring_process_zero. Claim that exact generation and capture
+            # its Pod/PVC/Service UIDs before release_workspace reads it.
+            # Passing an admitted-but-uncaptured intent directly to the lower
+            # deletion boundary correctly fails closed without issuing DELETE.
+            try:
+                teardown_identity = (
+                    await container_provisioner.capture_terminal_workspace_identity(
+                        WorkspaceOwner.session(thread_id)
+                    )
+                )
+            except WorkspaceRuntimeAuthorityError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Live workspace teardown identity is unavailable",
+                ) from exc
+            if (
+                teardown_identity.pod_uid != expected_runtime
+                or not teardown_identity.pod_ip
+                or teardown_identity.ssh_host_key_fingerprint != expected_fingerprint
+            ):
+                raise HTTPException(
+                    status_code=503,
+                    detail="Live workspace teardown identity changed",
+                )
+            cleanup_intent = (
+                await container_provisioner.prepare_workspace_cleanup_intent(
+                    WorkspaceOwner.session(thread_id),
+                    expected_runtime_incarnation=expected_runtime,
+                    target_disposition="deleted",
+                    reclaim_shared_resources=permanent,
+                    identity=teardown_identity,
+                )
+            )
+            if (
+                not isinstance(cleanup_intent, dict)
+                or cleanup_intent.get("resources_captured_at") is None
+                or bool(cleanup_intent.get("reclaim_shared_resources")) is not permanent
+            ):
+                raise HTTPException(
+                    status_code=503,
+                    detail="Live workspace cleanup authority is incomplete",
+                )
+
             async def _snapshot_ack() -> bool:
                 return (
                     await postgres_db.mark_stateless_thread_snapshot_restore_required(
@@ -54175,6 +54224,7 @@ async def _reconcile_stateless_thread_retirement(
                         ),
                         strict_terminal_snapshot=True,
                         strict=True,
+                        teardown_identity=teardown_identity,
                     ),
                     timeout=float(
                         os.environ.get("STATELESS_TERMINAL_RELEASE_TIMEOUT_S", "300")
@@ -59422,24 +59472,30 @@ async def get_thread_ide_status(thread_id: str, request: Request) -> dict[str, A
         ssh_host = vm_ctx.get("ssh_host") or vm_ctx.get("pod_ip")
         if ssh_host:
             proxy_base = os.environ.get("IDE_PROXY_BASE_URL", "http://localhost:8085")
-            return {
-                "status": "active",
-                "code_server_url": f"{proxy_base}/api/ide/{thread_id}/proxy/?folder=/home/agent-host/workspace",
-                "source": "live_vm",
-                "gitea_url": gitea_url,
-            }
+            return contain_ide_status(
+                {
+                    "status": "active",
+                    "code_server_url": f"{proxy_base}/api/ide/{thread_id}/proxy/?folder=/home/agent-host/workspace",
+                    "source": "live_vm",
+                    "gitea_url": gitea_url,
+                }
+            )
 
     # Check workspace container (K8s pod_ip or Docker Compose ide_host)
     if ws_ctx.get("status") == "ready" and (
         ws_ctx.get("pod_ip") or ws_ctx.get("ide_host")
     ):
         proxy_base = os.environ.get("IDE_PROXY_BASE_URL", "http://localhost:8085")
-        return {
-            "status": "active",
-            "code_server_url": f"{proxy_base}/api/ide/{thread_id}/proxy/?folder=/home/agent-host/workspace",
-            "source": "live_workspace",
-            "gitea_url": gitea_url,
-        }
+        # Withhold a URL the proxy would refuse; the Gitea link survives so the
+        # header keeps its one working way into the workspace.
+        return contain_ide_status(
+            {
+                "status": "active",
+                "code_server_url": f"{proxy_base}/api/ide/{thread_id}/proxy/?folder=/home/agent-host/workspace",
+                "source": "live_workspace",
+                "gitea_url": gitea_url,
+            }
+        )
 
     # Workspace is provisioning (includes "pending" from pre-provision signal)
     if ws_ctx.get("status") in ("provisioning", "pending") or vm_ctx.get("status") in (

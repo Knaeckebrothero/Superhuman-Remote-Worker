@@ -17206,7 +17206,17 @@ class PostgresDB:
                             next_runtime["_snapshot_restore_required"] = bool(
                                 intent.get("snapshot_restore_required")
                             )
-                        if owner_kind == "thread" and target == "deleted":
+                        # A resumable stateless End must clear the retired UID
+                        # before Resume can mint a successor. Permanent
+                        # terminal reclaim is different: the owner-delete
+                        # trigger still needs that immutable UID to select and
+                        # authenticate this exact settled cleanup intent.
+                        if (
+                            owner_kind == "thread"
+                            and target == "deleted"
+                            and str(intent.get("resource_policy") or "")
+                            != "terminal_reclaim"
+                        ):
                             next_runtime[_STATELESS_RUNTIME_INCARNATION_KEY] = None
                     else:
                         next_runtime["code_server_url"] = None

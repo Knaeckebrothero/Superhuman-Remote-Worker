@@ -44,6 +44,22 @@ class _ExactIdeRuntimeDB:
 
 
 @pytest.fixture
+def browser_ide_transport_available(monkeypatch):
+    """Lift the browser-transport containment for one test.
+
+    The restore machinery is dormant while the IDE proxy refuses every browser
+    transport, but it is not dead code — these tests keep covering it so that
+    lifting the proxy guards does not land on an untested path. Patching the
+    single ``services.ide_proxy`` entry point lifts it for every consumer at
+    once (status advertisement and ``start_session`` alike).
+    """
+
+    import services.ide_proxy as ide_proxy
+
+    monkeypatch.setattr(ide_proxy, "browser_ide_refusal", lambda: None)
+
+
+@pytest.fixture
 def service_factory():
     from orchestrator.services.ide_session import IdeSessionService
     from services.container_provisioner import WorkspaceRuntimeAttestation
@@ -520,7 +536,9 @@ async def test_repository_key_ssh_is_killed_and_reaped_on_lease_cancellation(
 
 
 @pytest.mark.asyncio
-async def test_restore_session_uses_long_vm_wait_estimate(service_factory):
+async def test_restore_session_uses_long_vm_wait_estimate(
+    service_factory, browser_ide_transport_available
+):
     """VM source snapshots report the longer, realistic restore estimate."""
     svc = service_factory
     svc._db.get_job = AsyncMock(
@@ -538,7 +556,9 @@ async def test_restore_session_uses_long_vm_wait_estimate(service_factory):
 
 
 @pytest.mark.asyncio
-async def test_start_expired_k8s_ide_never_reactivates_runtime_a(service_factory):
+async def test_start_expired_k8s_ide_never_reactivates_runtime_a(
+    service_factory, browser_ide_transport_available
+):
     """The exact expired UID is the stable restore operation, not a row update."""
 
     retired = "33333333-3333-4333-8333-333333333333"
@@ -568,7 +588,7 @@ async def test_start_expired_k8s_ide_never_reactivates_runtime_a(service_factory
 
 @pytest.mark.asyncio
 async def test_start_replays_receipt_backed_restoring_b_after_process_restart(
-    service_factory,
+    service_factory, browser_ide_transport_available
 ):
     """A new service process resumes B instead of treating restoring as live work."""
 
@@ -616,7 +636,7 @@ async def test_start_replays_receipt_backed_restoring_b_after_process_restart(
 
 @pytest.mark.asyncio
 async def test_concurrent_start_reuses_one_local_receipt_backed_restore_task(
-    service_factory,
+    service_factory, browser_ide_transport_available
 ):
     svc = service_factory
     svc._db.get_job = AsyncMock(
@@ -1437,7 +1457,9 @@ async def test_live_vm_status_is_unavailable_until_code_server_answers(
 
 
 @pytest.mark.asyncio
-async def test_live_vm_status_is_active_when_code_server_answers(service_factory):
+async def test_live_vm_status_is_active_when_code_server_answers(
+    service_factory, browser_ide_transport_available
+):
     svc = service_factory
     svc._get_job = AsyncMock(
         return_value={
@@ -1458,3 +1480,51 @@ async def test_live_vm_status_is_active_when_code_server_answers(service_factory
     assert result["status"] == "active"
     assert result["source"] == "live_vm"
     assert result["code_server_url"]
+
+
+# =============================================================================
+# Browser-transport containment — the advertisement must match the proxy
+# =============================================================================
+#
+# The IDE proxy refuses every browser transport (see services/ide_proxy.py
+# ``browser_ide_refusal``). While it does, a job must not be told it has an
+# openable IDE, and must not pay to restore one.
+
+
+@pytest.mark.asyncio
+async def test_live_workspace_status_withholds_url_while_contained(service_factory):
+    """A ready workspace resolves normally, then loses only its URL."""
+    svc = service_factory
+    svc._get_job = AsyncMock(
+        return_value={
+            "id": "job-0020",
+            "context": {
+                "workspace_container": {"status": "ready", "pod_ip": "10.42.0.9"}
+            },
+        }
+    )
+
+    result = await svc.get_session_status("job-0020")
+
+    assert result["status"] == "unavailable"
+    assert result["code_server_url"] is None
+    assert result["code"] == "ide_stream_operation_lease_unavailable"
+    assert result["error"]
+    # The underlying resolution is preserved, not discarded: only the
+    # advertisement is withheld.
+    assert result["source"] == "live_workspace"
+
+
+@pytest.mark.asyncio
+async def test_start_session_refuses_before_it_can_spend(service_factory):
+    """No job read, no snapshot pull, no VM — the refusal precedes all of it."""
+    svc = service_factory
+    svc._get_job = AsyncMock()
+
+    result = await svc.start_session("job-0021")
+
+    assert result["status"] == "unavailable"
+    assert result["code_server_url"] is None
+    assert result["code"] == "ide_stream_operation_lease_unavailable"
+    svc._get_job.assert_not_awaited()
+    svc._db.merge_ide_session_context.assert_not_awaited()

@@ -422,8 +422,22 @@ async def test_process_zero_retry_retires_exact_live_residents_and_shell() -> No
         acknowledge_stateless_thread_resident_retirement=AsyncMock(return_value=True),
         acknowledge_stateless_thread_shell_retirement=AsyncMock(return_value=True),
     )
+    teardown_identity = main.WorkspaceTeardownIdentity(
+        pod_uid=RUNTIME,
+        pvc_uid="44444444-4444-4444-8444-444444444444",
+        service_uid="55555555-5555-4555-8555-555555555555",
+        pod_ip="10.0.0.8",
+        ssh_host_key_fingerprint=FINGERPRINT,
+    )
     provisioner = SimpleNamespace(
         workspace_pod_authority=AsyncMock(return_value="exact_live"),
+        capture_terminal_workspace_identity=AsyncMock(return_value=teardown_identity),
+        prepare_workspace_cleanup_intent=AsyncMock(
+            return_value={
+                "resources_captured_at": "2026-08-30T00:00:00+00:00",
+                "reclaim_shared_resources": True,
+            }
+        ),
         release_workspace=AsyncMock(return_value=True),
     )
     authority = SimpleNamespace(
@@ -473,7 +487,17 @@ async def test_process_zero_retry_retires_exact_live_residents_and_shell() -> No
     )
     retire_shell.assert_awaited_once()
     verify_residents.assert_awaited_once()
-    provisioner.release_workspace.assert_awaited_once()
+    provisioner.prepare_workspace_cleanup_intent.assert_awaited_once()
+    assert provisioner.prepare_workspace_cleanup_intent.await_args.kwargs == {
+        "expected_runtime_incarnation": RUNTIME,
+        "target_disposition": "deleted",
+        "reclaim_shared_resources": True,
+        "identity": teardown_identity,
+    }
+    assert (
+        provisioner.release_workspace.await_args.kwargs["teardown_identity"]
+        == teardown_identity
+    )
 
 
 @pytest.mark.asyncio
@@ -656,8 +680,22 @@ async def test_delete_acceptance_cannot_finish_until_exact_old_uid_is_404() -> N
         begin_stateless_thread_workspace_retirement=AsyncMock(return_value=closure),
         finish_stateless_thread_workspace_retirement=AsyncMock(return_value=True),
     )
+    teardown_identity = main.WorkspaceTeardownIdentity(
+        pod_uid=RUNTIME,
+        pvc_uid="44444444-4444-4444-8444-444444444444",
+        service_uid="55555555-5555-4555-8555-555555555555",
+        pod_ip="10.0.0.8",
+        ssh_host_key_fingerprint=FINGERPRINT,
+    )
     provisioner = SimpleNamespace(
         workspace_pod_authority=AsyncMock(side_effect=["exact_live", "exact_absent"]),
+        capture_terminal_workspace_identity=AsyncMock(return_value=teardown_identity),
+        prepare_workspace_cleanup_intent=AsyncMock(
+            return_value={
+                "resources_captured_at": "2026-08-30T00:00:00+00:00",
+                "reclaim_shared_resources": False,
+            }
+        ),
         # First pass models UID-preconditioned DELETE acceptance while the old
         # object remains Terminating past the bounded exact-absence wait.
         release_workspace=AsyncMock(return_value=False),

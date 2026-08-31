@@ -30,6 +30,7 @@ NON_PINNED_LIFECYCLE_MIGRATIONS = tuple(
     for filename in (
         "0197_non_pinned_workspace_process_zero.sql",
         "0198_non_pinned_workspace_lifecycle_authority.sql",
+        "0210_thread_terminal_reclaim_projection.sql",
     )
 )
 
@@ -1557,6 +1558,165 @@ async def test_0195_soft_settled_thread_promotes_to_exact_terminal_reclaim(db):
         observed = json.loads(observed)
     assert observed["status"] == "deleted"
     assert observed["_runtime_incarnation"] is None
+
+
+@pytest.mark.asyncio
+async def test_0195_permanent_thread_cleanup_retains_uid_and_repairs_legacy_projection(
+    db,
+):
+    thread_id = uuid4()
+    runtime_uid = uuid4()
+    generation = uuid4()
+    fingerprint = "SHA256:" + ("A" * 43)
+    ack = {
+        "kind": "protocol",
+        "terminal_token": 8,
+        "workspace_generation": str(generation),
+        "endpoint_generation": str(generation),
+        "runtime_incarnation": str(runtime_uid),
+        "host_key_fingerprint": fingerprint,
+    }
+    metadata = {
+        "config_override": {"workspace": {"backend": "sandbox"}},
+        "_stateless_workspace_retirement_pending": True,
+        "_stateless_claim_retirement": {
+            "terminal_token": 8,
+            "claimant_quiesced": True,
+            "shell_retirement_required": True,
+            "resident_cleanup_required": True,
+            "residents_retired": True,
+            "residents_retired_by": "protocol",
+            "remote_retired": True,
+            "remote_retired_by": "protocol",
+            "permanent": True,
+            "workspace_absence_proven": False,
+            "workspace_generation": str(generation),
+            "endpoint_generation": str(generation),
+            "runtime_incarnation": str(runtime_uid),
+            "host_key_fingerprint": fingerprint,
+        },
+        "_stateless_resident_retirement_ack": dict(ack),
+        "_stateless_shell_retirement_ack": dict(ack),
+        "workspace_container": {
+            "status": "retiring_process_zero",
+            "provisioner": "k8s",
+            "pod_name": f"ws-thread-{str(thread_id)[:12]}",
+            "namespace": "agent-workspaces",
+            "pod_ip": "10.42.0.8",
+            "port": 30022,
+            "_canvas_workspace_generation": str(generation),
+            "_runtime_incarnation": str(runtime_uid),
+            "_snapshot_restore_required": False,
+        },
+        "_workspace_binding": {
+            "generation": str(generation),
+            "kind": "remote",
+            "backing_id": "k8s-pvc:agent-workspaces:pvc-uid",
+            "ssh_host_key_fingerprint": fingerprint,
+        },
+    }
+    async with db.acquire() as conn:
+        await _execute_pre_0195(
+            conn,
+            "INSERT INTO threads (id, status, execution_lane, metadata) "
+            "VALUES ($1, 'ended', 'stateless', $2::jsonb)",
+            thread_id,
+            json.dumps(metadata),
+        )
+        await conn.execute(
+            "INSERT INTO run_queue (unit_id, unit_kind, state, lease_token) "
+            "VALUES ($1, 'session_turn', 'done', 8)",
+            thread_id,
+        )
+
+    intent = await db.prepare_managed_repository_workspace_cleanup_intent(
+        str(thread_id),
+        owner_kind="thread",
+        scope="workspace_container",
+        runtime_incarnation=str(runtime_uid),
+        target_disposition="deleted",
+        reclaim_shared_resources=True,
+        pod_uid=str(runtime_uid),
+        pvc_uid=str(uuid4()),
+        service_uid=str(uuid4()),
+        resources_captured=True,
+    )
+    assert intent is not None
+    claimed = await db.claim_managed_repository_workspace_cleanup_intent(
+        str(intent["id"]), claimant="permanent-thread-cleanup"
+    )
+    assert claimed is not None
+    assert await db.record_managed_repository_workspace_process_zero(
+        str(thread_id),
+        owner_kind="thread",
+        scope="workspace_container",
+        provisioner="k8s",
+        runtime_incarnation=str(runtime_uid),
+    )
+    assert await db.settle_managed_repository_workspace_cleanup_intent(
+        str(thread_id),
+        owner_kind="thread",
+        scope="workspace_container",
+        runtime_incarnation=str(runtime_uid),
+        intent_generation=int(claimed["intent_generation"]),
+        claimant=str(claimed["claimed_by"]),
+        claim_token=int(claimed["claim_token"]),
+    )
+
+    thread = await db.get_thread(str(thread_id))
+    assert thread is not None
+    stored_metadata = thread["metadata"]
+    if isinstance(stored_metadata, str):
+        stored_metadata = json.loads(stored_metadata)
+    workspace = stored_metadata["workspace_container"]
+    assert workspace["status"] == "deleted"
+    assert workspace["_runtime_incarnation"] == str(runtime_uid)
+
+    # Recreate the short-lived 0198 shape, then prove the superseding
+    # migration restores only the UID backed by the exact settled authorities.
+    async with db.acquire() as conn:
+        await _execute_pre_0195(
+            conn,
+            "UPDATE threads SET metadata = jsonb_set(jsonb_set(metadata, "
+            "'{workspace_container,_runtime_incarnation}', 'null'::jsonb), "
+            "'{_stateless_claim_retirement,terminal_token}', '9'::jsonb) "
+            "WHERE id = $1",
+            thread_id,
+        )
+
+    # A deployment migration runs in its own advisory-locked session after
+    # pre-existing writers commit; keep the proof faithful to that boundary.
+    async with db.acquire() as conn:
+        await conn.execute(NON_PINNED_LIFECYCLE_MIGRATIONS[-1].read_text())
+
+    unmatched = await db.get_thread(str(thread_id))
+    assert unmatched is not None
+    unmatched_metadata = unmatched["metadata"]
+    if isinstance(unmatched_metadata, str):
+        unmatched_metadata = json.loads(unmatched_metadata)
+    assert unmatched_metadata["workspace_container"]["_runtime_incarnation"] is None
+
+    async with db.acquire() as conn:
+        await _execute_pre_0195(
+            conn,
+            "UPDATE threads SET metadata = jsonb_set(metadata, "
+            "'{_stateless_claim_retirement,terminal_token}', '8'::jsonb) "
+            "WHERE id = $1",
+            thread_id,
+        )
+    async with db.acquire() as conn:
+        await conn.execute(NON_PINNED_LIFECYCLE_MIGRATIONS[-1].read_text())
+
+    repaired = await db.get_thread(str(thread_id))
+    assert repaired is not None
+    repaired_metadata = repaired["metadata"]
+    if isinstance(repaired_metadata, str):
+        repaired_metadata = json.loads(repaired_metadata)
+    assert repaired_metadata["workspace_container"]["_runtime_incarnation"] == str(
+        runtime_uid
+    )
+    await db.delete_thread(str(thread_id))
+    assert await db.get_thread(str(thread_id)) is None
 
 
 @pytest.mark.asyncio

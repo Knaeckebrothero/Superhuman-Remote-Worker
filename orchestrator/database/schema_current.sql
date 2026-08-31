@@ -7507,7 +7507,8 @@ BEGIN
             END IF;
         END IF;
         IF requested_owner_kind = 'thread'
-           AND intent.target_disposition = 'deleted' THEN
+           AND intent.target_disposition = 'deleted'
+           AND intent.resource_policy = 'preserve' THEN
             expected_runtime_state := expected_runtime_state || jsonb_build_object(
                 '_runtime_incarnation', NULL::TEXT
             );
@@ -7897,7 +7898,16 @@ CREATE FUNCTION public.managed_repository_workspace_cleanup_projection_is_settle
                    requested_scope = 'workspace_container'
                    AND requested_owner_kind = 'thread'
                    AND projected_status = 'deleted'
-                   AND projected_runtime IS NULL
+                   AND (
+                       (
+                           intent.resource_policy = 'terminal_reclaim'
+                           AND projected_runtime = requested_runtime
+                       )
+                       OR (
+                           intent.resource_policy = 'preserve'
+                           AND projected_runtime IS NULL
+                       )
+                   )
                )
                OR (
                    NOT (

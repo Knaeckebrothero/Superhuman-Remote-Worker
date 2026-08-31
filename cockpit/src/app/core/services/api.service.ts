@@ -180,6 +180,8 @@ export interface IdeSessionStatus {
   source?: string;
   restore_type?: 'vm' | 'container' | 'k8s_container';
   error?: string;
+  /** Typed refusal code when the orchestrator withheld the IDE URL. */
+  code?: string;
 }
 
 /**

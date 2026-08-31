@@ -36,6 +36,7 @@ from services.container_provisioner import (
     WorkspaceRuntimeAttestation,
     WorkspaceRuntimeAuthorityError,
 )
+from services.ide_proxy import contain_ide_status, contained_ide_status
 from services.ssh_helpers import (
     EXTRACT_HOME_REMOTE_CMD,
     SSHHostKeyVerificationError,
@@ -199,11 +200,20 @@ class IdeSessionService:
         """Get the current IDE session status for a job.
 
         Combines live VM state, active session state, snapshot availability,
-        and Gitea repo existence into a single status response.
+        and Gitea repo existence into a single status response, then withholds
+        any ``code_server_url`` the contained browser transport would refuse.
+        The resolution below stays intact so the advertisement returns on its
+        own once the proxy guards are lifted.
 
         Returns:
             Dict with status, code_server_url, expires_at, etc.
         """
+
+        return contain_ide_status(await self._resolve_session_status(job_id))
+
+    async def _resolve_session_status(self, job_id: str) -> dict[str, Any]:
+        """Resolve the status a reachable code-server would be advertised at."""
+
         job = await self._get_job(job_id)
         if not job:
             return {"status": "unavailable", "code_server_url": None}
@@ -343,6 +353,13 @@ class IdeSessionService:
         Returns:
             Session status dict.
         """
+        # A restore nobody can open is pure spend — a VM or container is
+        # provisioned and a snapshot pulled for a URL the proxy refuses. Refuse
+        # before any of that, not after.
+        contained = contained_ide_status()
+        if contained is not None:
+            return contained
+
         # Check current state first (idempotent)
         current = await self.get_session_status(job_id)
         if current["status"] in ("active", "idle"):

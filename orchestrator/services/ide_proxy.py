@@ -39,6 +39,71 @@ class IdeProxyUnavailable(RuntimeError):
         self.detail = detail
 
 
+# Two transport guards in ``orchestrator/main.py`` currently contain the
+# browser IDE, and neither of them depends on target resolution:
+#
+#   * ``ide_proxy_ws`` refuses every IDE WebSocket with
+#     ``ide_stream_operation_lease_unavailable`` before resolving a target;
+#   * ``_request_exact_ide_http`` refuses every non-Docker target with
+#     ``ide_remote_transport_unavailable``.
+#
+# code-server cannot render a workbench without its WebSocket, so while the
+# stream guard stands no backend serves a usable IDE — the HTTP guard only
+# decides whether the refusal arrives as a blank page or as JSON. Status
+# endpoints therefore ask here before advertising a ``code_server_url``: an
+# "Open IDE" button that 503s is worse than an honest absence, and on the job
+# path ``start_session`` would otherwise pay for a snapshot restore nobody can
+# open.
+#
+# When the guards are lifted, make ``browser_ide_refusal`` return ``None``;
+# the advertisement returns with it.
+BROWSER_IDE_REFUSAL_CODE = "ide_stream_operation_lease_unavailable"
+BROWSER_IDE_REFUSAL_MESSAGE = (
+    "The browser IDE is unavailable: its transport is contained pending a "
+    "durable proxy-operation lease. Use the Git view to browse the workspace."
+)
+
+
+def browser_ide_refusal() -> tuple[str, str] | None:
+    """Return ``(code, message)`` while no backend can serve code-server."""
+
+    return BROWSER_IDE_REFUSAL_CODE, BROWSER_IDE_REFUSAL_MESSAGE
+
+
+def contained_ide_status() -> dict[str, Any] | None:
+    """Return the refusal payload while no backend can serve code-server.
+
+    Every consumer resolves the refusal through this module, so a test (or a
+    future gate) that lifts ``browser_ide_refusal`` lifts it everywhere at
+    once instead of leaving one caller advertising what another refuses.
+    """
+
+    refusal = browser_ide_refusal()
+    if refusal is None:
+        return None
+    code, message = refusal
+    return {
+        "status": "unavailable",
+        "code_server_url": None,
+        "code": code,
+        "error": message,
+    }
+
+
+def contain_ide_status(status: dict[str, Any]) -> dict[str, Any]:
+    """Downgrade a status payload that advertises an unreachable code-server.
+
+    Fields other than the URL are preserved — ``gitea_url`` above all: the Git
+    view reads the same workspace and is the honest fallback, so it must
+    survive the downgrade.
+    """
+
+    contained = contained_ide_status()
+    if contained is None or not status.get("code_server_url"):
+        return status
+    return {**status, **contained}
+
+
 @dataclass(frozen=True, slots=True)
 class IdeProxyTarget:
     """One exact, server-attested code-server network target.

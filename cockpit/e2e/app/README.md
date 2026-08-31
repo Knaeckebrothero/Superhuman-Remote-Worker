@@ -21,6 +21,35 @@ deterministic multi-chunk reply renders, reload hydrates one durable transcript,
 the session list finds the correlation marker, and exact-id teardown deletes
 only the resource recorded by that test.
 
+For `stateless-sandbox`, setup additionally proves the user's saved workspace
+preference is `sandbox`, the created thread is on the `stateless` lane, and a
+physical Kubernetes workspace is materialized. These are profile preconditions,
+not brittle browser assertions: the public chat journey remains identical across
+both profiles. The harness builds the workspace image from the current checkout
+and verifies every application tag plus its CRI config digest on both k3d nodes
+before deployment, so a cached pinned/virtual fallback cannot produce a green
+stateless result.
+
+Permanent cleanup is part of the gate. The browser transport closes first, then
+the exact ledger-owned thread is deleted under a 180-second graceful deadline.
+Retryable `409`/`503` responses keep retrying the same terminal authority; if the
+graceful phase does not settle, a separately bounded 60-second force phase may
+run. Each HTTP request receives only the time remaining in its phase. A green run
+requires a verified `404`, successful provider reset, and deletion of the exact
+owned cluster.
+
+Use a separate private state root for a dirty-tree development run and expect the
+harness to label its result non-authoritative:
+
+```bash
+APP_E2E_ALLOW_DIRTY=1 \
+APP_E2E_STATE_DIR="$PWD/cockpit/test-results/app-harness-stateless-local" \
+  ./scripts/e2e-app.sh run --profile stateless-sandbox
+```
+
+Do not reuse a state root with an active ownership ledger; finish its `cleanup`
+and `down` lifecycle first.
+
 ## Direct Playwright use
 
 Use this only after the committed E2E stack is ready. From `cockpit/`:

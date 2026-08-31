@@ -3888,6 +3888,8 @@ class TestStrictStatelessWorkspaceCreation:
             _NotFound(),
         ]
         p._set_context = AsyncMock()
+        release_finalizer = AsyncMock(wraps=p._release_process_zero_finalizer)
+        p._release_process_zero_finalizer = release_finalizer
 
         with patch(
             "orchestrator.services.container_provisioner.workspace_metering.close_interval",
@@ -3904,7 +3906,40 @@ class TestStrictStatelessWorkspaceCreation:
 
         p._core_api.delete_namespaced_pod.assert_called_once()
         p._core_api.patch_namespaced_pod.assert_called_once()
+        assert release_finalizer.await_args.kwargs["_mutation_guard_held"] is True
         p._set_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cleanup_reconciler_forwards_captured_uid_to_bounded_delete(self):
+        from orchestrator.services.container_provisioner import (
+            RuntimeDeletionOutcome,
+        )
+
+        db = _StrictCreationDB()
+        db.install_captured_cleanup_intent(self.RUNTIME)
+        p = self._provisioner(db)
+        p.delete_workspace_with_outcome = AsyncMock(
+            return_value=RuntimeDeletionOutcome("current_deleted")
+        )
+
+        with patch(
+            "orchestrator.services.container_provisioner.workspace_metering.close_interval",
+            new=AsyncMock(return_value=None),
+        ):
+            outcome = await p._reconcile_workspace_cleanup_intent_guarded(
+                self._owner(),
+                expected_runtime_incarnation=self.RUNTIME,
+                intent_generation=1,
+            )
+
+        assert outcome.settled
+        delete_call = p.delete_workspace_with_outcome.await_args
+        assert delete_call.args == (self._owner(),)
+        assert delete_call.kwargs["expected_runtime_incarnation"] == self.RUNTIME
+        assert delete_call.kwargs["captured_teardown_uid"] == self.RUNTIME
+        assert delete_call.kwargs["wait_for_exact_absence"] is True
+        assert delete_call.kwargs["cleanup_intent"]["pod_uid"] == self.RUNTIME
+        assert delete_call.kwargs["_mutation_guard_held"] is True
 
     @pytest.mark.asyncio
     async def test_create_conflict_adopts_only_matching_nonce_pod_once(self):

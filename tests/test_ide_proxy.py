@@ -1595,3 +1595,62 @@ class TestIdeProxyHttpAuthRedirect:
                 )
 
         assert exc_info.value.status_code == 403
+
+
+# =============================================================================
+# Browser IDE advertisement — one refusal, every consumer
+# =============================================================================
+
+
+class TestBrowserIdeAdvertisement:
+    """The status advertisement must agree with what the proxy will serve."""
+
+    def test_contained_status_withholds_url_and_keeps_the_git_link(self):
+        from services.ide_proxy import contain_ide_status
+
+        result = contain_ide_status(
+            {
+                "status": "active",
+                "code_server_url": "http://proxy/api/ide/thread-a/proxy/",
+                "source": "live_workspace",
+                "gitea_url": "https://git.example/srw/thread-a",
+            }
+        )
+
+        assert result["status"] == "unavailable"
+        assert result["code_server_url"] is None
+        assert result["code"] == "ide_stream_operation_lease_unavailable"
+        assert result["error"]
+        # The Git view reads the same workspace and still works; dropping it
+        # would take away the only remaining way in.
+        assert result["gitea_url"] == "https://git.example/srw/thread-a"
+        assert result["source"] == "live_workspace"
+
+    def test_payload_without_a_url_is_returned_untouched(self):
+        from services.ide_proxy import contain_ide_status
+
+        payload = {"status": "restoring", "code_server_url": None, "gitea_url": None}
+
+        assert contain_ide_status(payload) is payload
+
+    def test_lifting_the_refusal_restores_the_advertisement(self, monkeypatch):
+        """One function is the whole gate — flipping it re-advertises."""
+        import services.ide_proxy as ide_proxy
+
+        monkeypatch.setattr(ide_proxy, "browser_ide_refusal", lambda: None)
+        payload = {"status": "active", "code_server_url": "http://proxy/x/"}
+
+        assert ide_proxy.contain_ide_status(payload) is payload
+        assert ide_proxy.contained_ide_status() is None
+
+    def test_advertisement_stays_contained_while_the_stream_guard_stands(self):
+        """Anti-drift: re-enabling the transport must re-enable the advert.
+
+        ``ide_proxy_ws`` refuses every IDE WebSocket, and code-server cannot
+        render a workbench without one. If that guard is ever lifted without
+        lifting ``browser_ide_refusal``, the cockpit would keep hiding a
+        working IDE — so the two are asserted together here.
+        """
+        from services.ide_proxy import browser_ide_refusal
+
+        assert browser_ide_refusal() is not None
