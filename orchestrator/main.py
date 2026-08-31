@@ -52426,9 +52426,17 @@ async def get_thread(thread_id: str, request: Request) -> dict[str, Any]:
     attached mounts here so the Cockpit "Project files" panel can render
     them without a second round-trip. ``project_ids`` is the derived
     list-of-strings view kept stable for callers that only need scoping.
+
+    Threads created before migration 0202 have ``ssh_handle IS NULL``; mint
+    one lazily here on first view rather than showing an empty SSH panel
+    forever. Deliberately not done on the list endpoint — minting up to 50
+    handles as a side effect of rendering a list is unwanted write
+    amplification.
     """
     user, thread = await require_thread_owner(request, postgres_db, thread_id)
     result = _redact_thread_metadata(dict(thread))
+    if not result.get("ssh_handle"):
+        result["ssh_handle"] = await postgres_db.ensure_thread_ssh_handle(thread_id)
     mounts = await postgres_db.list_thread_mounts(thread_id)
     result["cloud_session_url"] = _resolve_cloud_session_url(thread, mounts)
     result["mounts"] = [

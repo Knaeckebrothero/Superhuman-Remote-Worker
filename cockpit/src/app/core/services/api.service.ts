@@ -95,6 +95,7 @@ import {
     ThreadCloudDiffFile,
     ThreadCloudDiffSummary,
     PersistentThreadHistory,
+    SshGatewayHostKeysResponse,
     User,
     UserCapabilities,
     VoiceCapabilities,
@@ -2388,6 +2389,16 @@ export class ApiService {
   getVoiceCapabilities(): Observable<VoiceCapabilities | null> {
     return this.http
       .get<VoiceCapabilities>(`${this.baseUrl}/voice/capabilities`)
+      .pipe(catchError(() => of(null)));
+  }
+
+  /** The SSH gateway's hostname and public host keys, unauthenticated by
+   * design (host keys are public material). Returns `{host_keys: [],
+   * hostname: ...}` — never an error — on a deployment with no gateway
+   * configured; `null` only on a transport failure. */
+  getSshHostKeys(): Observable<SshGatewayHostKeysResponse | null> {
+    return this.http
+      .get<SshGatewayHostKeysResponse>(`${this.baseUrl}/ssh/host-keys`)
       .pipe(catchError(() => of(null)));
   }
 

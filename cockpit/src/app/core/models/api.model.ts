@@ -1764,6 +1764,9 @@ export interface Thread {
   nc_session_folder?: string | null;
   nc_share_id?: number | null;
   cloud_session_url?: string | null;
+  /** Short handle used as the SSH username: `ssh s-7f3a91c2@ssh.<domain>`.
+   *  Minted once at creation; null on threads predating migration 0202. */
+  ssh_handle?: string | null;
   metadata?: Record<string, unknown>;
   /** Attached remote folders, ordered by `target_path`. Absent on the list
    *  endpoint's projection and on older orchestrators. */
@@ -2637,6 +2640,23 @@ export interface UserCapabilities {
   grants: Record<string, unknown> | null; // null ⇒ admin (unrestricted)
   catalog: GrantCatalog;
   features?: UserCapabilityFeatures;
+}
+
+/** One SSH gateway host key, as published by GET /api/ssh/host-keys — public
+ *  material only, safe for client-side pinning. */
+export interface SshHostKeyEntry {
+  type: string;
+  public_key: string;
+  fingerprint: string;
+}
+
+/** GET /api/ssh/host-keys — unauthenticated by design. Returns
+ * `{host_keys: [], hostname: ...}` on a deployment with no gateway
+ * configured, never an error; `CapabilitiesService.sshGateway` folds that
+ * shape down to `null` so the UI can hide the connect panel entirely. */
+export interface SshGatewayHostKeysResponse {
+  host_keys: SshHostKeyEntry[];
+  hostname: string;
 }
 
 /** GET /api/voice/capabilities — whether a usable TTS/STT model is configured

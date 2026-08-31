@@ -3,7 +3,7 @@ import {TestBed} from '@angular/core/testing';
 import {NEVER, of} from 'rxjs';
 import {CapabilitiesService} from './capabilities.service';
 import {ApiService} from './api.service';
-import type {GrantCatalog, UserCapabilities} from '../models/api.model';
+import type {GrantCatalog, SshGatewayHostKeysResponse, UserCapabilities} from '../models/api.model';
 
 const CATALOG: GrantCatalog = {
   permission_mode: {
@@ -14,11 +14,27 @@ const CATALOG: GrantCatalog = {
   },
 };
 
-function make(caps: UserCapabilities | null): CapabilitiesService {
+// The constructor unconditionally fetches both endpoints, so every test
+// double needs both — a mock exposing only `getMyCapabilities` throws
+// `getSshHostKeys is not a function` the moment the real service is
+// constructed. Deployments with no gateway configured answer this shape
+// (never an error), so it doubles as the default "no gateway" stub.
+const NO_GATEWAY: SshGatewayHostKeysResponse = {host_keys: [], hostname: ''};
+
+function make(
+  caps: UserCapabilities | null,
+  sshHostKeys: SshGatewayHostKeysResponse | null = NO_GATEWAY,
+): CapabilitiesService {
   TestBed.configureTestingModule({
     providers: [
       CapabilitiesService,
-      {provide: ApiService, useValue: {getMyCapabilities: () => of(caps)}},
+      {
+        provide: ApiService,
+        useValue: {
+          getMyCapabilities: () => of(caps),
+          getSshHostKeys: () => of(sshHostKeys),
+        },
+      },
     ],
   });
   return TestBed.inject(CapabilitiesService);
@@ -84,7 +100,10 @@ describe('CapabilitiesService.canPublishDatasources', () => {
     TestBed.configureTestingModule({
       providers: [
         CapabilitiesService,
-        {provide: ApiService, useValue: {getMyCapabilities: () => NEVER}},
+        {
+          provide: ApiService,
+          useValue: {getMyCapabilities: () => NEVER, getSshHostKeys: () => of(NO_GATEWAY)},
+        },
       ],
     });
     const svc = TestBed.inject(CapabilitiesService);
@@ -162,9 +181,49 @@ describe('CapabilitiesService.datasourceScopeAutoAttachAvailable', () => {
     TestBed.configureTestingModule({
       providers: [
         CapabilitiesService,
-        {provide: ApiService, useValue: {getMyCapabilities: () => NEVER}},
+        {
+          provide: ApiService,
+          useValue: {getMyCapabilities: () => NEVER, getSshHostKeys: () => of(NO_GATEWAY)},
+        },
       ],
     });
     expect(TestBed.inject(CapabilitiesService).datasourceScopeAutoAttachAvailable()).toBe(false);
+  });
+});
+
+describe('CapabilitiesService.sshGateway', () => {
+  it('is null when the deployment has no gateway configured (empty host_keys)', () => {
+    // GET /api/ssh/host-keys answers {host_keys: [], hostname: ...} rather
+    // than erroring in this case — the empty list must fold to null so the
+    // UI can hide the connect panel with one check.
+    const svc = make({is_admin: false, grants: {}, catalog: CATALOG}, NO_GATEWAY);
+    expect(svc.sshGateway()).toBeNull();
+  });
+
+  it('is null even when hostname is set but host_keys is empty', () => {
+    const svc = make(
+      {is_admin: false, grants: {}, catalog: CATALOG},
+      {host_keys: [], hostname: 'ssh.example.test'},
+    );
+    expect(svc.sshGateway()).toBeNull();
+  });
+
+  it('carries hostname and host_keys when the gateway is configured', () => {
+    const response: SshGatewayHostKeysResponse = {
+      hostname: 'ssh.example.test',
+      host_keys: [
+        {type: 'ssh-ed25519', public_key: 'ssh-ed25519 AAAA...', fingerprint: 'SHA256:abc'},
+      ],
+    };
+    const svc = make({is_admin: false, grants: {}, catalog: CATALOG}, response);
+    expect(svc.sshGateway()).toEqual(response);
+  });
+
+  it('is null on a transport failure', () => {
+    // ApiService.getSshHostKeys() catches transport errors to null itself
+    // (mirroring getMyCapabilities/getVoiceCapabilities); the mock here
+    // stands in for that already-caught outcome.
+    const svc = make({is_admin: false, grants: {}, catalog: CATALOG}, null);
+    expect(svc.sshGateway()).toBeNull();
   });
 });

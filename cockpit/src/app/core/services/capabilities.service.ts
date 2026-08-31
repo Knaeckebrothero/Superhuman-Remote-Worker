@@ -1,8 +1,21 @@
 import {computed, inject, Injectable, signal} from '@angular/core';
 import {ReplaySubject} from 'rxjs';
 import {ApiService} from './api.service';
-import type {GrantCatalog, UserCapabilityFeatures} from '../models/api.model';
+import type {
+  GrantCatalog,
+  SshGatewayHostKeysResponse,
+  SshHostKeyEntry,
+  UserCapabilityFeatures,
+} from '../models/api.model';
 import {allowedEnumOptions} from '../../views/agent-settings/capability-gates';
+
+/** `CapabilitiesService.sshGateway()`'s shape when the deployment has a
+ * gateway configured — `hostname` plus its public host keys for client-side
+ * pinning. */
+export interface SshGatewayInfo {
+  hostname: string;
+  host_keys: SshHostKeyEntry[];
+}
 
 /** Permission modes, lowest→highest autonomy (mirrors the backend
  * `_PERMISSION_ORDER` in src/core/capability_grants.py). */
@@ -27,6 +40,13 @@ export class CapabilitiesService {
   readonly catalog = signal<GrantCatalog>({});
   readonly features = signal<UserCapabilityFeatures>({});
 
+  /** The deployment's SSH gateway hostname + public host keys, or `null`
+   * while loading, on fetch error, or when the deployment has no gateway
+   * configured (`GET /api/ssh/host-keys` answers `{host_keys: [], ...}`
+   * rather than erroring in that case — an empty key list is folded to
+   * `null` here so the UI can hide the connect panel with one check). */
+  readonly sshGateway = signal<SshGatewayInfo | null>(null);
+
   // True when the capabilities fetch errored (ApiService catches to a null
   // emission, which would otherwise be indistinguishable from an admin's
   // null grants). Fail-closed consumers (publish gating) branch on this;
@@ -43,6 +63,7 @@ export class CapabilitiesService {
 
   constructor() {
     this.load();
+    this.loadSshGateway();
   }
 
   load(): void {
@@ -54,6 +75,16 @@ export class CapabilitiesService {
       this.datasourceScopeAutoAttachAvailabilitySubject.next(
         c?.features?.datasource_scope_auto_attach_v1 === true,
       );
+    });
+  }
+
+  private loadSshGateway(): void {
+    this.api.getSshHostKeys().subscribe((r: SshGatewayHostKeysResponse | null) => {
+      if (r && r.host_keys.length > 0) {
+        this.sshGateway.set({hostname: r.hostname, host_keys: r.host_keys});
+      } else {
+        this.sshGateway.set(null);
+      }
     });
   }
 
