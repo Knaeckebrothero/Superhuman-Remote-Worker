@@ -89,7 +89,6 @@ DATA_PREFIXES = (
     "config",
     "policy",
     "helm",
-    "helm-vm-cluster",
     "cockpit",
     "deployment",
     "website",

@@ -203,22 +203,12 @@ def test_development_metering_vault_sources_project_collector_credentials_only()
     main_values = yaml.safe_load(
         (ROOT / "deployment/values-experimental.yaml").read_text(encoding="utf-8")
     )
-    vm_fleet = yaml.safe_load(
-        (ROOT / "deployment-vms/srw-vm-controller/fleet.yaml").read_text(
-            encoding="utf-8"
-        )
-    )
     chart_defaults = yaml.safe_load(
         (ROOT / "helm/values.yaml").read_text(encoding="utf-8")
     )
-    vm_chart_defaults = yaml.safe_load(
-        (ROOT / "helm-vm-cluster/values.yaml").read_text(encoding="utf-8")
-    )
 
     main_sync = main_values["infrastructureMetering"]["externalSecrets"]
-    vm_sync = vm_fleet["helm"]["values"]["infrastructureMetering"]["externalSecrets"]
     assert main_sync == {"enabled": True, "vaultPath": expected_path}
-    assert vm_sync == {"enabled": True, "vaultPath": expected_path}
     assert main_values["externalSecrets"]["vaultPath"] == expected_path
 
     expected_main_targets = {
@@ -227,30 +217,16 @@ def test_development_metering_vault_sources_project_collector_credentials_only()
         "volumeIdentitySecretName": "srw-infra-metering-volume-identity",
         "volumeIdentityKeyVersion": "storage-v1",
     }
-    expected_vm_targets = {
-        "ingestionSecretName": "srw-infra-metering-vmi-ingestion",
-        "storageIngestionSecretName": "srw-infra-metering-vm-storage-ingestion",
-        "volumeIdentitySecretName": "srw-infra-metering-volume-identity",
-        "volumeIdentityKeyVersion": "storage-v1",
-    }
     assert {
         key: main_values["infrastructureMetering"][key] for key in expected_main_targets
     } == expected_main_targets
-    vm_metering = vm_fleet["helm"]["values"]["infrastructureMetering"]
-    assert {key: vm_metering[key] for key in expected_vm_targets} == expected_vm_targets
     assert "vmLifecycleAuthSecretName" not in main_values["infrastructureMetering"]
-    assert (
-        not vm_fleet["helm"]["values"]
-        .get("vmController", {})
-        .get("lifecycleAuthSecretName")
-    )
 
-    for defaults in (chart_defaults, vm_chart_defaults):
-        sync_defaults = defaults["infrastructureMetering"]["externalSecrets"]
-        assert sync_defaults["enabled"] is False
-        assert {
-            key: sync_defaults[key] for key in expected_properties
-        } == expected_properties
+    sync_defaults = chart_defaults["infrastructureMetering"]["externalSecrets"]
+    assert sync_defaults["enabled"] is False
+    assert {
+        key: sync_defaults[key] for key in expected_properties
+    } == expected_properties
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")

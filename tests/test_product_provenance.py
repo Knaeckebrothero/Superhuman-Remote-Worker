@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from contextlib import asynccontextmanager
@@ -542,13 +543,16 @@ def test_image_workflows_pass_full_source_revision_separately_from_short_sha():
 
     # ...and it must stay *derived* from the full sha, so the two cannot drift
     # apart into an image tagged with one commit and labeled with another.
-    assert develop.count("short=${FULL::7}") == 5
-    assert develop.count('COMPONENT_TAG="sha-${COMPONENT_SHA::7}"') == 5
+    # Six ident steps: the five service components plus vm-controller.
+    assert develop.count("short=${FULL::7}") == 6
+    # The chart-stamping step derives every baked tag from the same identity
+    # sha whose full form ships as that component's provenance revision.
+    assert len(re.findall(r'="sha-\$\{SHA_[A-Z]+::7\}"', develop)) == 5
 
     assert (
         ".provenance.components[strenv(component)].sourceRevision = strenv(GITHUB_SHA)"
     ) in main
-    assert develop.count("sourceRevision = strenv(COMPONENT_SHA)") >= 5
+    assert len(re.findall(r"sourceRevision\s*= strenv\(REV_[A-Z]+\)", develop)) == 5
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="helm is unavailable")

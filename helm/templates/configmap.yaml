@@ -768,7 +768,7 @@ data:
 
   # -- Persistent VM rootdisks (knowledge-base/knowledge/features/vm_persistent_rootdisk.md).
   # MUST mirror the VM controller's own vmController.persistentRootdisk.enabled
-  # (which may live in the separate helm-vm-cluster chart). The orchestrator
+  # (in same-cluster mode, this release's own vm-controller). The orchestrator
   # reads this to decide whether a VM's files survive a teardown — notably
   # whether VM session suspend may proceed without a snapshot. Enable the
   # CONTROLLER first: turning it on here against a controller that still

@@ -44,12 +44,13 @@ PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-# KubeVirt's hard cap on an inline cloudInitNoCloud userData block. Documented
-# in helm-vm-cluster/templates/vm-controller/configmap.yaml; exceeding it makes
-# KubeVirt reject the VM.
-USER_DATA_LIMIT = 2048
+# The same-cluster template mounts cloud-init from a Secret (no KubeVirt
+# 2048-byte inline cap), but the controller still truncates the description and
+# the whole payload must stay within the chart's own sanity budget — the same
+# bound test_vm_chart_manifest_contract.py holds the rendered chart to.
+USER_DATA_LIMIT = 16 * 1024
 
-VM_CLUSTER_CHART = "helm-vm-cluster/templates/vm-controller/configmap.yaml"
+MAIN_CHART_CONFIGMAP = "helm/templates/vm-controller/configmap.yaml"
 
 JOB_CONFIG_PATH = "/run/agent/job-config.json"
 
@@ -59,11 +60,11 @@ JOB_CONFIG_PATH = "/run/agent/job-config.json"
 # =============================================================================
 
 
-def _load_chart_vm_template(rel_path: str) -> str:
-    """Return the plain vm-template.yaml text embedded in a Helm ConfigMap.
+def _load_chart_vm_template(rel_path: str, block_key: str = "vm-template.yaml") -> str:
+    """Return one plain block-scalar text embedded in a Helm ConfigMap.
 
     Drops Helm comment blocks, substitutes a dummy for remaining Helm value
-    expressions, then extracts and dedents the `vm-template.yaml: |` block
+    expressions, then extracts and dedents the `<block_key>: |` block
     scalar — leaving exactly the text the provisioner loads at runtime, with
     its ${...} placeholders intact.
     """
@@ -72,7 +73,7 @@ def _load_chart_vm_template(rel_path: str) -> str:
     text = re.sub(r"\{\{-?\s*/\*.*?\*/\s*-?\}\}", "", text, flags=re.DOTALL)
 
     lines = text.splitlines()
-    start = next(i for i, ln in enumerate(lines) if "vm-template.yaml: |" in ln) + 1
+    start = next(i for i, ln in enumerate(lines) if f"{block_key}: |" in ln) + 1
 
     # The block scalar runs until the first non-blank line that is not indented
     # past the block's own indentation (e.g. the chart's trailing {{- end }}).
@@ -98,10 +99,12 @@ def _load_chart_vm_template(rel_path: str) -> str:
 
 
 def _user_data(manifest: dict) -> str:
-    """Extract the cloud-init userData text from a rendered VM manifest."""
-    volumes = manifest["spec"]["template"]["spec"]["volumes"]
-    cloud_init = next(v for v in volumes if "cloudInitNoCloud" in v)
-    return cloud_init["cloudInitNoCloud"]["userData"]
+    """Extract the rendered cloud-init userData for the VM.
+
+    The same-cluster template mounts cloud-init from a Secret; the controller
+    hands the rendered payload back on the manifest for the Secret write.
+    """
+    return manifest["_srwCloudInitUserData"]
 
 
 def _job_config(manifest: dict) -> dict:
@@ -179,17 +182,26 @@ def _install_controller_import_stubs() -> None:
 
 
 def _controller_render(description: str) -> dict:
-    """Render via the vm-controller running in the VM cluster."""
+    """Render via the vm-controller as deployed by the main chart.
+
+    Same-cluster splits the template in two: vm-template.yaml is the VM
+    manifest (cloud-init mounted via secretRef) and cloud-init.yaml is the
+    Secret payload; render_template() substitutes into both and hands the
+    rendered cloud-init back on the manifest as _srwCloudInitUserData.
+    """
     _install_controller_import_stubs()
     from vm.controller.controller import VMController
 
     ctrl = VMController()
-    ctrl.template_text = _load_chart_vm_template(VM_CLUSTER_CHART)
+    ctrl.template_text = _load_chart_vm_template(MAIN_CHART_CONFIGMAP)
+    ctrl.cloud_init_text = _load_chart_vm_template(
+        MAIN_CHART_CONFIGMAP, block_key="cloud-init.yaml"
+    )
     return ctrl.render_template({**BASE_JOB_CONFIG, "description": description})
 
 
 RENDER_SITES = [
-    pytest.param(_controller_render, id="external-vm-controller"),
+    pytest.param(_controller_render, id="same-cluster-vm-controller"),
 ]
 
 
@@ -228,11 +240,18 @@ def test_description_renders_a_parseable_manifest_and_job_config(render, descrip
 
 @pytest.mark.parametrize("render", RENDER_SITES)
 @pytest.mark.parametrize("description", HOSTILE_DESCRIPTIONS)
-def test_description_round_trips_into_job_config(render, description):
-    """Escaping is lossless: the VM sees the description it was given."""
+def test_description_never_reaches_the_vm(render, description):
+    """The same-cluster template ships NO description to the VM.
+
+    The parked external template inlined "description": "${DESCRIPTION}" into
+    job-config.json — the exact substitution that produced job 4435994d. The
+    same-cluster template designs the surface out instead: the VM never reads
+    the field (management-daemon.py ignores it), so it must not appear at all.
+    A description key reappearing here is someone re-opening that hole.
+    """
     manifest = render(description)
 
-    assert _job_config(manifest)["description"] == description
+    assert "description" not in _job_config(manifest)
 
 
 @pytest.mark.parametrize("render", RENDER_SITES)
@@ -265,26 +284,25 @@ def test_description_cannot_restructure_cloud_init(render):
     # userData must still be parseable cloud-init, structurally untouched.
     assert _write_file_paths(manifest) == _write_file_paths(baseline)
     assert _runcmd(manifest) == _runcmd(baseline)
-    # The payload survives only as inert data inside the description value.
-    # Escaping neutralizes structure; it does not delete content.
-    assert _job_config(manifest)["description"] == attack
+    # The payload's structure must not leak into the rendered cloud-init at
+    # all — same-cluster never substitutes the description anywhere.
+    assert "AAAAattacker" not in _user_data(manifest)
 
 
 @pytest.mark.parametrize("render", RENDER_SITES)
-def test_long_description_stays_within_kubevirt_user_data_limit(render):
-    """A long description cannot push userData past KubeVirt's inline cap.
+def test_long_description_stays_within_the_user_data_budget(render):
+    """A long description cannot push userData past the cloud-init budget.
 
-    Headroom is only ~350-450 bytes, and job descriptions routinely exceed
-    that, so the description has to be bounded. The VM never reads this field —
-    management-daemon.py is job-config.json's only consumer and ignores
-    `description` — so truncating it costs nothing.
+    The controller bounds the description (MAX_DESCRIPTION_LEN) because the VM
+    never reads it — management-daemon.py is job-config.json's only consumer
+    and ignores `description` — so truncating it costs nothing.
     """
     manifest = render("Build an ERP system. " * 500)
 
     user_data = _user_data(manifest)
     assert len(user_data.encode()) <= USER_DATA_LIMIT, (
-        f"userData is {len(user_data.encode())} bytes, over KubeVirt's "
-        f"{USER_DATA_LIMIT}-byte inline limit"
+        f"userData is {len(user_data.encode())} bytes, over the "
+        f"{USER_DATA_LIMIT}-byte cloud-init budget"
     )
     _job_config(manifest)  # still valid JSON after truncation
 

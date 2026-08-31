@@ -1,4 +1,4 @@
-"""Rendered contracts for same-cluster and parked external VM charts."""
+"""Rendered contracts for the VM topologies of the main chart."""
 
 from __future__ import annotations
 
@@ -18,7 +18,6 @@ CONTROLLER_SRC = ROOT / "vm/controller/controller.py"
 DAEMON_SRC = ROOT / "docker/agent-vm-base/files/management-daemon.py"
 RELEASE_NAMESPACE = "lane-c-contract"
 GUEST_ENV_PATH = "/etc/default/srw-guest"
-EXTERNAL_DAEMON_ENV_PATH = "/etc/default/management-daemon"
 AUTHORIZED_KEYS_PATH = "/etc/ssh/authorized_keys/agent-host"
 
 pytestmark = pytest.mark.skipif(
@@ -41,9 +40,6 @@ MAIN_EXTERNAL = Chart("main-external", "helm", "helm/ci/vm-external-values.yaml"
 MAIN_TEST = Chart("main-test", "helm", "helm/ci/test-values.yaml")
 INSTALLER_ALIAS = Chart(
     "installer-alias", "helm", "helm/ci/installer-production-vms-values.yaml"
-)
-EXTERNAL = Chart(
-    "external", "helm-vm-cluster", "helm-vm-cluster/ci/default-values.yaml"
 )
 
 
@@ -684,27 +680,6 @@ def test_every_same_cluster_placeholder_is_substituted() -> None:
     assert not emitted - controller_replacements()
 
 
-def test_external_template_contract_remains_self_contained() -> None:
-    rendered = render_chart(EXTERNAL)
-    vm = vm_template(rendered)
-    files = write_files(cloud_init(rendered))
-    assert daemon_required_env("nats") <= env_keys(files[EXTERNAL_DAEMON_ENV_PATH])
-    assert not placeholders(yaml.safe_dump(vm)) - controller_replacements()
-
-
-def test_external_vault_key_placeholder_is_controller_owned() -> None:
-    rendered = render_chart(
-        EXTERNAL,
-        "ssh.publicKey=",
-        "ssh.publicKeyVaultPath=secret/data/srw/vm-ssh",
-        "externalSecrets.enabled=true",
-    )
-    assert (
-        not placeholders(yaml.safe_dump(vm_template(rendered)))
-        - controller_replacements()
-    )
-
-
 SUBSTITUTION_WIDTHS = {
     "DESCRIPTION": 200,
     "JOB_ID": 36,
@@ -727,9 +702,7 @@ SUBSTITUTION_WIDTHS = {
 }
 
 
-@pytest.mark.parametrize(
-    ("chart", "limit"), [(MAIN, 16 * 1024), (EXTERNAL, 2048)], ids=str
-)
+@pytest.mark.parametrize(("chart", "limit"), [(MAIN, 16 * 1024)], ids=str)
 def test_cloud_init_sanity_budget(chart: Chart, limit: int) -> None:
     text = cloud_init(render_chart(chart))
     for name, width in SUBSTITUTION_WIDTHS.items():

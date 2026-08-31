@@ -515,17 +515,19 @@ jobs:
       vm-base: ${{ steps.check.outputs.vm-base }}
       vm-base-stage1: ${{ steps.check.outputs.vm-base-stage1 }}
       vm-controller: ${{ steps.check.outputs.vm-controller }}
-      sudo-gate: ${{ steps.check.outputs.sudo-gate }}
       workspace: ${{ steps.check.outputs.workspace }}
       # Per-component image identity: full sha of the newest commit that
       # touched the component's build inputs. Consumed by the build jobs
       # (image tag + baked BUILD_SHA/provenance) and deploy-experimental
-      # (values-experimental.yaml tag + provenance identity).
+      # (baked chart tags + provenance identity).
       agent-sha: ${{ steps.check.outputs.agent-sha }}
       orchestrator-sha: ${{ steps.check.outputs.orchestrator-sha }}
       cockpit-sha: ${{ steps.check.outputs.cockpit-sha }}
       mcp-sha: ${{ steps.check.outputs.mcp-sha }}
       workspace-sha: ${{ steps.check.outputs.workspace-sha }}
+      vm-controller-sha: ${{ steps.check.outputs.vm-controller-sha }}
+      vm-base-sha: ${{ steps.check.outputs.vm-base-sha }}
+      vm-base-stage1-sha: ${{ steps.check.outputs.vm-base-stage1-sha }}
       chart: ${{ steps.check.outputs.chart }}
       python-changed: ${{ steps.test-paths.outputs.python }}
       cockpit-changed: ${{ steps.test-paths.outputs.cockpit }}
@@ -738,26 +740,6 @@ jobs:
             fi
           }
 
-          has_changes() {
-            local sha="$1"
-            shift
-            local paths=("$@")
-            if [ -z "$sha" ]; then
-              echo "true"
-              return
-            fi
-            if ! git cat-file -t "$sha" &>/dev/null; then
-              echo "true"
-              return
-            fi
-            for path in "${paths[@]}"; do
-              if [ -n "$(git diff --name-only "$sha" HEAD -- "$path")" ]; then
-                echo "true"
-                return
-              fi
-            done
-            echo "false"
-          }
 
           # Newest commit that touched a component's build inputs — the
           # component's image identity (tag + provenance), instead of the
@@ -772,37 +754,8 @@ jobs:
             echo "${sha:-$GITHUB_SHA}"
           }
 
-          # VM image SHAs still come from fleet.yaml — the VM bundle is still a
-          # git-read Fleet GitRepo, so its ledger is still live. Brief C step 6.
-          # VM image SHAs live in fleet.yaml — vmController as a bare tag
-          # (image.vmController.tag), agent-vm-base embedded in the
-          # defaultVmImage URL (vmController.defaultVmImage).
-          #
-          # An EMPTY result is fail-open on purpose: it means nothing is deployed
-          # yet, and has_changes correctly treats that as "rebuild". A MISSING
-          # TOOL is not the same thing, but `yq ... 2>/dev/null` makes the two
-          # indistinguishable — so on a runner without yq, every VM job would
-          # rebuild on every run, silently and expensively. yq is preinstalled on
-          # ubuntu-latest and baked into the self-hosted runner image
-          # (docker/Dockerfile.ci-runner); if it is absent, something is broken
-          # and we want to hear about it rather than pay for it.
-          command -v yq >/dev/null 2>&1 || {
-            echo "::error::yq not found on this runner. It is preinstalled on ubuntu-latest and baked into docker/Dockerfile.ci-runner — if you see this, the runner image is broken."
-            exit 1
-          }
-          VM_FLEET=deployment-vms/srw-vm-controller/fleet.yaml
-          test -f "$VM_FLEET" || {
-            echo "::error::$VM_FLEET is missing — cannot resolve deployed VM SHAs."
-            exit 1
-          }
-          SHA_VM_CONTROLLER=$(yq '.helm.values.image.vmController.tag' "$VM_FLEET" | grep -oP 'sha-\K[0-9a-f]{7}' | head -1)
-          SHA_VM_BASE=$(yq '.helm.values.vmController.defaultVmImage' "$VM_FLEET" | grep -oP 'sha-\K[0-9a-f]{7}' | head -1)
-
-          echo "Deployed VM SHAs (from fleet.yaml):"
-          echo "  vm-controller=$SHA_VM_CONTROLLER  vm-base=$SHA_VM_BASE"
-
           # Build-input path lists — single source for BOTH the rebuild
-          # predicate (has_changes) and the image identity (last_input_sha),
+          # predicate (image_missing) and the image identity (last_input_sha),
           # so a component's tag can only ever move to a commit that touched
           # its inputs. Lists mirror the Dockerfiles' COPY statements:
           # Dockerfile.orchestrator copies src/, Dockerfile.cockpit copies
@@ -843,8 +796,8 @@ jobs:
           WORKSPACE_SHA=$(last_input_sha "${WORKSPACE_PATHS[@]}")
           WORKSPACE=$(image_missing workspace "$WORKSPACE_SHA")
 
-          VM_CONTROLLER=$(has_changes "$SHA_VM_CONTROLLER" \
-            vm/controller/)
+          VM_CONTROLLER_SHA=$(last_input_sha vm/controller/)
+          VM_CONTROLLER=$(image_missing vm-controller "$VM_CONTROLLER_SHA")
 
           # Stage1 rebuilds on changes to the heavy provisioning script, the
           # Packer template that drives it, .playwright-version, the cloud-init
@@ -860,22 +813,26 @@ jobs:
           # and fails every build. That is exactly what happened when 9fe74797
           # added the browser_use requirement: stage1 was never rebuilt (VM jobs
           # were skipped on the red-test-python runs), so stage2's gate rejected
-          # the pre-browser_use stage1. Since stage2 also rebuilds whenever stage1
-          # does (VM_BASE_STAGE1 is an OR-trigger for build-agent-vm-base), gate
+          # the pre-browser_use stage1. Since stage1's paths are part of stage2's
+          # identity below, stage2 also rebuilds whenever stage1 does — gate
           # requirements that are actually stage2-side stay covered too.
-          VM_BASE_STAGE1=$(has_changes "$SHA_VM_BASE" \
-            docker/agent-vm-base/scripts/provision-stage1.sh \
-            docker/agent-vm-base/scripts/cleanup-stage1.sh \
-            docker/agent-vm-base/stage1.pkr.hcl \
-            docker/agent-vm-base/Dockerfile.containerDisk-stage1 \
-            docker/agent-vm-base/cloud-init/ \
-            docker/assert-browser-stack.sh \
+          VM_BASE_STAGE1_PATHS=(docker/agent-vm-base/scripts/provision-stage1.sh
+            docker/agent-vm-base/scripts/cleanup-stage1.sh
+            docker/agent-vm-base/stage1.pkr.hcl
+            docker/agent-vm-base/Dockerfile.containerDisk-stage1
+            docker/agent-vm-base/cloud-init/
+            docker/assert-browser-stack.sh
             .playwright-version)
+          VM_BASE_STAGE1_SHA=$(last_input_sha "${VM_BASE_STAGE1_PATHS[@]}")
+          VM_BASE_STAGE1=$(image_missing agent-vm-base-stage1 "$VM_BASE_STAGE1_SHA")
 
           # Stage2 (the per-commit image) rebuilds on changes to its provisioning
           # script, Packer template, cleanup script, daemon/sudo-gate config
-          # files, or the containerDisk wrapper. Sudo-gate binary changes also
-          # trigger this via SUDO_GATE below.
+          # files, or the containerDisk wrapper. Its identity spans its own
+          # inputs PLUS stage1's PLUS the sudo-gate sources (vm/sudo-daemon/,
+          # vm/sudo-plugin/ — build-sudo-gate's binaries are baked into the
+          # image via files/), so a change to any of them mints a new stage2
+          # image and `vm-base` alone answers "must stage2 be (re)built".
           #
           # docker/browser-exec is uploaded (stage2.pkr.hcl, `../browser-exec`)
           # and installed into the stage2 layer by provision-stage2.sh, so a
@@ -884,29 +841,27 @@ jobs:
           # it here would let a browser-exec fix sit unbuilt in the VM image while
           # the container image shipped it, the same silent-drift bug the
           # WORKSPACE comment records for a0ce92d2.
-          VM_BASE=$(has_changes "$SHA_VM_BASE" \
-            docker/agent-vm-base/scripts/provision-stage2.sh \
-            docker/agent-vm-base/scripts/cleanup.sh \
-            docker/agent-vm-base/stage2.pkr.hcl \
-            docker/agent-vm-base/Dockerfile.containerDisk \
-            docker/agent-vm-base/files/ \
-            docker/browser-exec docker/check-browser-stream.py)
+          VM_BASE_PATHS=(docker/agent-vm-base/scripts/provision-stage2.sh
+            docker/agent-vm-base/scripts/cleanup.sh
+            docker/agent-vm-base/stage2.pkr.hcl
+            docker/agent-vm-base/Dockerfile.containerDisk
+            docker/agent-vm-base/files/
+            docker/browser-exec docker/check-browser-stream.py
+            vm/sudo-daemon/ vm/sudo-plugin/
+            "${VM_BASE_STAGE1_PATHS[@]}")
+          VM_BASE_SHA=$(last_input_sha "${VM_BASE_PATHS[@]}")
+          VM_BASE=$(image_missing agent-vm-base "$VM_BASE_SHA")
 
-          SUDO_GATE=$(has_changes "$SHA_VM_BASE" \
-            vm/sudo-daemon/ vm/sudo-plugin/)
-
-          # Chart changes (helm/ = main chart, helm-vm-cluster/ = vm-cluster
-          # chart). Watch the chart-created Secret verifier too so changes to
-          # that CI contract cannot skip the job that executes it. Both charts
-          # must remain watched: a helm-vm-cluster/-only change otherwise skips
-          # the vm-cluster chart publish + fleet bump.
+          # Chart changes (helm/ — the separate vm-cluster chart left with the
+          # dedicated vm cluster). Watch the chart-created Secret verifier too
+          # so changes to that CI contract cannot skip the job that executes it.
           # Same push-range base the test-path step resolved (RANGE_BASE), so a
           # chart edit five commits below the tip is not missed. This one is
           # sharper than the test case: a false negative here skips the chart
           # PUBLISH and the fleet bump, so dev keeps running the old chart with
           # a green tick. Empty means "no usable range" and falls open below.
           CHART_BASE="${RANGE_BASE:-}"
-          if [ -z "$CHART_BASE" ] || [ -n "$(git diff --name-only "$CHART_BASE" HEAD -- 'helm/' 'helm-vm-cluster/' 'scripts/check-chart-created-secret.sh')" ]; then
+          if [ -z "$CHART_BASE" ] || [ -n "$(git diff --name-only "$CHART_BASE" HEAD -- 'helm/' 'scripts/check-chart-created-secret.sh')" ]; then
             CHART="true"
           else
             CHART="false"
@@ -916,7 +871,8 @@ jobs:
           echo "Change detection results:"
           echo "  agent=$AGENT  orchestrator=$ORCHESTRATOR  cockpit=$COCKPIT"
           echo "  mcp=$MCP  workspace=$WORKSPACE"
-          echo "  vm-controller=$VM_CONTROLLER  vm-base=$VM_BASE  vm-base-stage1=$VM_BASE_STAGE1  sudo-gate=$SUDO_GATE"
+          echo "  vm-controller=$VM_CONTROLLER  vm-base=$VM_BASE  vm-base-stage1=$VM_BASE_STAGE1"
+          echo "  vm input shas: vm-controller=${VM_CONTROLLER_SHA::7} vm-base=${VM_BASE_SHA::7} vm-base-stage1=${VM_BASE_STAGE1_SHA::7}"
           echo "  chart=$CHART"
           echo "  input shas: agent=${AGENT_SHA::7} orchestrator=${ORCHESTRATOR_SHA::7} cockpit=${COCKPIT_SHA::7} mcp=${MCP_SHA::7} workspace=${WORKSPACE_SHA::7}"
 
@@ -932,9 +888,11 @@ jobs:
             echo "mcp-sha=$MCP_SHA"
             echo "workspace-sha=$WORKSPACE_SHA"
             echo "vm-controller=$VM_CONTROLLER"
+            echo "vm-controller-sha=$VM_CONTROLLER_SHA"
             echo "vm-base=$VM_BASE"
+            echo "vm-base-sha=$VM_BASE_SHA"
             echo "vm-base-stage1=$VM_BASE_STAGE1"
-            echo "sudo-gate=$SUDO_GATE"
+            echo "vm-base-stage1-sha=$VM_BASE_STAGE1_SHA"
             echo "chart=$CHART"
           } >> "$GITHUB_OUTPUT"
 
@@ -1431,7 +1389,7 @@ jobs:
     needs: [changes, dependency-audit, test-python, test-cockpit]
     if: >-
       always() && !cancelled() &&
-      (needs.changes.outputs.sudo-gate == 'true' || needs.changes.outputs.vm-base == 'true' || needs.changes.outputs.vm-base-stage1 == 'true' || github.event_name == 'workflow_dispatch') &&
+      (needs.changes.outputs.vm-base == 'true' || github.event_name == 'workflow_dispatch') &&
       needs.dependency-audit.result == 'success' &&
       needs.test-python.result != 'failure' && needs.test-python.result != 'cancelled' &&
       needs.test-cockpit.result != 'failure' && needs.test-cockpit.result != 'cancelled'
@@ -1578,6 +1536,10 @@ jobs:
         working-directory: docker/agent-vm-base
         run: |
           IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-agent-vm-base-stage1" | tr '[:upper:]' '[:lower:]')
+          # Image identity = newest input commit, not push HEAD (see build-agent).
+          # The registry predicate in the changes job checks exactly this tag.
+          IDENT="${{ needs.changes.outputs.vm-base-stage1-sha }}"
+          : "${IDENT:=$GITHUB_SHA}"
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             TAGS=("${IMAGE}:pr-validate-${GITHUB_SHA::7}")
           else
@@ -1586,7 +1548,7 @@ jobs:
             # would clobber main's prod base image, and — worse — a main-built
             # :latest that lacks develop-only base changes (e.g. browser_use)
             # would then fail develop's own stage2 gate.
-            TAGS=("${IMAGE}:sha-${GITHUB_SHA::7}" "${IMAGE}:experimental")
+            TAGS=("${IMAGE}:sha-${IDENT::7}" "${IMAGE}:experimental")
           fi
           BUILD_ARGS=(
             --build-arg "SRW_SOURCE_REVISION=${GITHUB_SHA}"
@@ -1612,7 +1574,7 @@ jobs:
     needs: [changes, dependency-audit, test-python, test-cockpit, build-sudo-gate, build-agent-vm-base-stage1]
     if: >-
       always() && !cancelled() &&
-      (needs.changes.outputs.vm-base == 'true' || needs.changes.outputs.vm-base-stage1 == 'true' || needs.changes.outputs.sudo-gate == 'true' || github.event_name == 'workflow_dispatch') &&
+      (needs.changes.outputs.vm-base == 'true' || github.event_name == 'workflow_dispatch') &&
       needs.dependency-audit.result == 'success' &&
       needs.test-python.result != 'failure' && needs.test-python.result != 'cancelled' &&
       needs.test-cockpit.result != 'failure' && needs.test-cockpit.result != 'cancelled' &&
@@ -1737,11 +1699,15 @@ jobs:
         working-directory: docker/agent-vm-base
         run: |
           IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-agent-vm-base" | tr '[:upper:]' '[:lower:]')
+          # Image identity = newest input commit, not push HEAD (see build-agent).
+          # The registry predicate in the changes job checks exactly this tag.
+          IDENT="${{ needs.changes.outputs.vm-base-sha }}"
+          : "${IDENT:=$GITHUB_SHA}"
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             # PR validation: build with a single throwaway tag, no push.
             TAGS=("${IMAGE}:pr-validate-${GITHUB_SHA::7}")
           else
-            TAGS=("${IMAGE}:sha-${GITHUB_SHA::7}" "${IMAGE}:experimental")
+            TAGS=("${IMAGE}:sha-${IDENT::7}" "${IMAGE}:experimental")
           fi
           BUILD_ARGS=(
             --build-arg "SRW_SOURCE_REVISION=${GITHUB_SHA}"
@@ -1784,13 +1750,24 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # Image identity = newest input commit, not push HEAD (see build-agent).
+      - name: Resolve component identity
+        id: ident
+        run: |
+          FULL="${{ needs.changes.outputs.vm-controller-sha }}"
+          : "${FULL:=$GITHUB_SHA}"
+          {
+            echo "full=$FULL"
+            echo "short=${FULL::7}"
+            echo "version=0.0.0-dev.sha-${FULL}"
+          } >> "$GITHUB_OUTPUT"
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-vm-controller
           tags: |
-            type=sha,format=short,prefix=sha-
+            type=raw,value=sha-${{ steps.ident.outputs.short }}
             type=raw,value=experimental,enable=${{ github.event_name != 'pull_request' }}
       - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
         uses: docker/build-push-action@v5
@@ -1802,28 +1779,24 @@ jobs:
           labels: |
             ${{ steps.meta.outputs.labels }}
             org.opencontainers.image.source=${{ env.SRW_SOURCE_URL }}
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ env.SRW_RELEASE_VERSION }}
+            org.opencontainers.image.revision=${{ steps.ident.outputs.full }}
+            org.opencontainers.image.version=${{ steps.ident.outputs.version }}
             org.opencontainers.image.documentation=${{ env.SRW_DOCUMENTATION_URL }}
             io.srw.component=vm-controller
           provenance: false
           build-args: |
-            SRW_SOURCE_REVISION=${{ github.sha }}
+            SRW_SOURCE_REVISION=${{ steps.ident.outputs.full }}
             SRW_SOURCE_URL=${{ env.SRW_SOURCE_URL }}
-            SRW_RELEASE_VERSION=${{ env.SRW_RELEASE_VERSION }}
+            SRW_RELEASE_VERSION=${{ steps.ident.outputs.version }}
             SRW_DOCUMENTATION_URL=${{ env.SRW_DOCUMENTATION_URL }}
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-vm-controller:buildcache-develop
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-vm-controller:buildcache-develop,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
   # ---------------------------------------------------------------------------
-  # Publish dev Helm chart + prepare a deployment config update for Fleet.
-  #
-  # Publishes the chart as "srw-dev" with a semver pre-release version
-  # (0.0.<run_number>), then updates fleet.yaml with the chart version
-  # and values-experimental.yaml with the new image tags. Branch protection
-  # requires the generated update to be reviewed/applied by an authorized
-  # administrator, so CI uploads the exact patch instead of attempting a bot
-  # push that the repository ruleset must reject.
+  # Publish the dev Helm chart. The chart version (monotonic 0.0.<run_number>)
+  # plus the baked image tags fully determine what the dev cluster runs — the
+  # Fleet HelmOp on the rancher cluster resolves ">=0.0.911" from GHCR on its
+  # own, so a publish IS the deploy. Nothing writes back to git.
   # ---------------------------------------------------------------------------
   deploy-experimental:
     needs:
@@ -1836,8 +1809,6 @@ jobs:
       - build-cockpit
       - build-mcp
       - build-workspace
-      - build-vm-controller
-      - build-agent-vm-base
       - chart-test
     if: >-
       always() && !cancelled() &&
@@ -2001,104 +1972,3 @@ jobs:
             oci://ghcr.io/knaeckebrothero/charts
           # Restore working copy (never commit the name override or baked tags)
           git checkout helm/Chart.yaml helm/values.yaml
-
-      # -- Publish dev VM-cluster chart (parallel to srw-dev). Re-publish for
-      # chart sources or any image consumed by this chart, including the
-      # independently versioned orchestrator image used by remote collectors. --
-      - name: Package and push dev vm-cluster chart
-        if: >-
-          needs.changes.outputs.chart == 'true' ||
-          needs.build-orchestrator.result == 'success' ||
-          needs.build-vm-controller.result == 'success' ||
-          needs.build-agent-vm-base.result == 'success'
-        run: |
-          # Override chart name for dev channel
-          yq -i '.name = "srw-dev-vm-cluster"' helm-vm-cluster/Chart.yaml
-          mkdir -p dist
-          helm package helm-vm-cluster/ \
-            --version "${{ steps.tag.outputs.chart_version }}" \
-            --app-version "${{ steps.tag.outputs.sha }}" \
-            --destination ./dist
-          helm push ./dist/srw-dev-vm-cluster-${{ steps.tag.outputs.chart_version }}.tgz \
-            oci://ghcr.io/knaeckebrothero/charts
-          git checkout helm-vm-cluster/Chart.yaml
-      - name: Update vm-cluster fleet.yaml chart version
-        if: >-
-          needs.changes.outputs.chart == 'true' ||
-          needs.build-orchestrator.result == 'success' ||
-          needs.build-vm-controller.result == 'success' ||
-          needs.build-agent-vm-base.result == 'success'
-        run: >-
-          yq -i '.helm.version = "${{ steps.tag.outputs.chart_version }}"'
-          deployment-vms/srw-vm-controller/fleet.yaml
-
-      # -- Update image tags in values-experimental.yaml --
-      # Each component is stamped with ITS OWN identity (newest commit that
-      # touched its build inputs, from the changes job) — never the push
-      # HEAD. Rebuilds from unchanged inputs rewrite identical values, the
-      # final git-diff gate sees no delta, and no deploy commit — so no
-      # stale-image drain of the agent fleet — happens without a real
-      # content change. Fallback to GITHUB_SHA mirrors the build jobs.
-      - name: Update orchestrator tag
-        if: needs.build-orchestrator.result == 'success'
-        env:
-          COMPONENT_SHA: ${{ needs.changes.outputs.orchestrator-sha }}
-        run: |
-          : "${COMPONENT_SHA:=$GITHUB_SHA}"
-          # Staleness guard — knowledge-base/knowledge/issues/ci_deploy_race_reverts_image_tags.md.
-          # Overlapping runs each derive this identity from their own checkout, so
-          # the run that finishes LAST can otherwise write an older sha over a
-          # newer one and silently revert a verified deploy. Skip only when the
-          # recorded revision is known AND is not an ancestor of ours; an unknown
-          # revision (this branch is rebased often) falls through and writes.
-          # Sourced from the VM bundle itself. The main overlay is no longer
-          # written by anything, so reading the guard's state from it would pin
-          # this comparison to a frozen 2026-08-28 sha forever. The VM bundle is
-          # still git-read, so the race this guards against is still real there.
-          # Its tag is the short form; git resolves short shas fine.
-          CURRENT_SHA=$(yq -r '.helm.values.image.orchestrator.tag // ""' \
-            deployment-vms/srw-vm-controller/fleet.yaml | sed 's/^sha-//')
-          if [ -n "$CURRENT_SHA" ] \
-             && git cat-file -e "${CURRENT_SHA}^{commit}" 2>/dev/null \
-             && ! git merge-base --is-ancestor "$CURRENT_SHA" "$COMPONENT_SHA"; then
-            echo "::notice::skipping stale orchestrator tag: deployed $CURRENT_SHA is not an ancestor of $COMPONENT_SHA"
-            exit 0
-          fi
-          export COMPONENT_TAG="sha-${COMPONENT_SHA::7}"
-          yq -i '
-            .helm.values.image.orchestrator.tag = strenv(COMPONENT_TAG) |
-            .helm.values.image.orchestrator.digest = ""
-          ' deployment-vms/srw-vm-controller/fleet.yaml
-      - name: Update VM controller image tag
-        if: needs.build-vm-controller.result == 'success'
-        run: >-
-          yq -i '.helm.values.image.vmController.tag = "${{ steps.tag.outputs.sha }}"'
-          deployment-vms/srw-vm-controller/fleet.yaml
-
-      - name: Update agent VM base image tag
-        if: needs.build-agent-vm-base.result == 'success'
-        run: >-
-          yq -i '.helm.values.vmController.defaultVmImage = "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:${{ steps.tag.outputs.sha }}"'
-          deployment-vms/srw-vm-controller/fleet.yaml
-
-      - name: Prepare protected deployment update
-        id: deployment-update
-        run: |
-          if git diff --quiet -- deployment-vms/; then
-            echo "No deployment changes to review"
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "changed=true" >> "$GITHUB_OUTPUT"
-          git diff --binary -- deployment-vms/ > experimental-deployment.patch
-          echo "::warning::develop is protected; review and apply the experimental deployment artifact as an authorized change"
-
-      - name: Upload protected deployment update
-        if: steps.deployment-update.outputs.changed == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: experimental-deployment-${{ github.run_id }}-${{ github.run_attempt }}
-          retention-days: 7
-          path: |
-            experimental-deployment.patch
-            deployment-vms/

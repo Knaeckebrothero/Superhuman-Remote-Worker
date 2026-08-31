@@ -5,8 +5,9 @@ Manages KubeVirt VirtualMachine resources on behalf of the orchestrator.
 Two transports, selected by TRANSPORT env (nats|http|both):
 
   nats  — cross-cluster: subscribe to vm.lifecycle.{create,delete,get},
-          publish results on vm.lifecycle.status. Default for the
-          deployment-vms/ Fleet bundle.
+          publish results on vm.lifecycle.status. Default when TRANSPORT is
+          unset (the parked external topology); the main chart's same-cluster
+          deployment sets http explicitly.
   http  — same-cluster: serve POST /vms, DELETE /vms/{id}, GET /vms/{id}
           on LISTEN_PORT (default 8080). Returns the result synchronously
           so the orchestrator's HTTP client can update job context itself
@@ -172,8 +173,8 @@ VM_ROOTDISK_PVC_UID_RETRY_SECONDS = float(
 )
 LIFECYCLE_LOCK_STRIPES = 256
 
-# Transport selection: nats | http | both. Defaults to nats so existing
-# deployment-vms/ Fleet bundles keep working without overrides.
+# Transport selection: nats | http | both. Defaults to nats (the parked
+# external topology); the main chart sets http for same-cluster.
 TRANSPORT = os.environ.get("TRANSPORT", "nats").lower()
 LISTEN_HOST = os.environ.get("LISTEN_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8080"))
