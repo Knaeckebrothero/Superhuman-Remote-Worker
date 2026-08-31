@@ -2022,20 +2022,6 @@ jobs:
           helm push ./dist/srw-dev-vm-cluster-${{ steps.tag.outputs.chart_version }}.tgz \
             oci://ghcr.io/knaeckebrothero/charts
           git checkout helm-vm-cluster/Chart.yaml
-
-      # -- Update fleet.yaml chart version (orchestrator chart) --
-      - name: Update fleet.yaml chart version
-        if: >-
-          needs.changes.outputs.chart == 'true' ||
-          needs.build-agent.result == 'success' ||
-          needs.build-orchestrator.result == 'success' ||
-          needs.build-cockpit.result == 'success' ||
-          needs.build-mcp.result == 'success'
-        run: >-
-          yq -i '.helm.version = "${{ steps.tag.outputs.chart_version }}"'
-          deployment/fleet.yaml
-
-      # -- Update vm-cluster bundle's chart version --
       - name: Update vm-cluster fleet.yaml chart version
         if: >-
           needs.changes.outputs.chart == 'true' ||
@@ -2065,8 +2051,13 @@ jobs:
           # newer one and silently revert a verified deploy. Skip only when the
           # recorded revision is known AND is not an ancestor of ours; an unknown
           # revision (this branch is rebased often) falls through and writes.
-          CURRENT_SHA=$(yq -r '.provenance.components.orchestrator.sourceRevision // ""' \
-            deployment/values-experimental.yaml)
+          # Sourced from the VM bundle itself. The main overlay is no longer
+          # written by anything, so reading the guard's state from it would pin
+          # this comparison to a frozen 2026-08-28 sha forever. The VM bundle is
+          # still git-read, so the race this guards against is still real there.
+          # Its tag is the short form; git resolves short shas fine.
+          CURRENT_SHA=$(yq -r '.helm.values.image.orchestrator.tag // ""' \
+            deployment-vms/srw-vm-controller/fleet.yaml | sed 's/^sha-//')
           if [ -n "$CURRENT_SHA" ] \
              && git cat-file -e "${CURRENT_SHA}^{commit}" 2>/dev/null \
              && ! git merge-base --is-ancestor "$CURRENT_SHA" "$COMPONENT_SHA"; then
@@ -2074,134 +2065,10 @@ jobs:
             exit 0
           fi
           export COMPONENT_TAG="sha-${COMPONENT_SHA::7}"
-          export COMPONENT_VERSION="0.0.0-dev.sha-${COMPONENT_SHA}"
-          yq -i '
-            .image.orchestrator.tag = strenv(COMPONENT_TAG) |
-            .provenance.releaseVersion = strenv(COMPONENT_VERSION) |
-            .provenance.components.orchestrator.sourceRevision = strenv(COMPONENT_SHA) |
-            .provenance.components.orchestrator.releaseVersion = strenv(COMPONENT_VERSION)
-          ' deployment/values-experimental.yaml
           yq -i '
             .helm.values.image.orchestrator.tag = strenv(COMPONENT_TAG) |
             .helm.values.image.orchestrator.digest = ""
           ' deployment-vms/srw-vm-controller/fleet.yaml
-
-      - name: Update agent tag
-        if: needs.build-agent.result == 'success'
-        env:
-          COMPONENT_SHA: ${{ needs.changes.outputs.agent-sha }}
-        run: |
-          : "${COMPONENT_SHA:=$GITHUB_SHA}"
-          # Staleness guard — knowledge-base/knowledge/issues/ci_deploy_race_reverts_image_tags.md.
-          # Overlapping runs each derive this identity from their own checkout, so
-          # the run that finishes LAST can otherwise write an older sha over a
-          # newer one and silently revert a verified deploy. Skip only when the
-          # recorded revision is known AND is not an ancestor of ours; an unknown
-          # revision (this branch is rebased often) falls through and writes.
-          CURRENT_SHA=$(yq -r '.provenance.components.agent.sourceRevision // ""' \
-            deployment/values-experimental.yaml)
-          if [ -n "$CURRENT_SHA" ] \
-             && git cat-file -e "${CURRENT_SHA}^{commit}" 2>/dev/null \
-             && ! git merge-base --is-ancestor "$CURRENT_SHA" "$COMPONENT_SHA"; then
-            echo "::notice::skipping stale agent tag: deployed $CURRENT_SHA is not an ancestor of $COMPONENT_SHA"
-            exit 0
-          fi
-          export COMPONENT_TAG="sha-${COMPONENT_SHA::7}"
-          export COMPONENT_VERSION="0.0.0-dev.sha-${COMPONENT_SHA}"
-          yq -i '
-            .image.agent.tag = strenv(COMPONENT_TAG) |
-            .provenance.components.agent.sourceRevision = strenv(COMPONENT_SHA) |
-            .provenance.components.agent.releaseVersion = strenv(COMPONENT_VERSION)
-          ' deployment/values-experimental.yaml
-
-      - name: Update cockpit tag
-        if: needs.build-cockpit.result == 'success'
-        env:
-          COMPONENT_SHA: ${{ needs.changes.outputs.cockpit-sha }}
-        run: |
-          : "${COMPONENT_SHA:=$GITHUB_SHA}"
-          # Staleness guard — knowledge-base/knowledge/issues/ci_deploy_race_reverts_image_tags.md.
-          # Overlapping runs each derive this identity from their own checkout, so
-          # the run that finishes LAST can otherwise write an older sha over a
-          # newer one and silently revert a verified deploy. Skip only when the
-          # recorded revision is known AND is not an ancestor of ours; an unknown
-          # revision (this branch is rebased often) falls through and writes.
-          CURRENT_SHA=$(yq -r '.provenance.components.cockpit.sourceRevision // ""' \
-            deployment/values-experimental.yaml)
-          if [ -n "$CURRENT_SHA" ] \
-             && git cat-file -e "${CURRENT_SHA}^{commit}" 2>/dev/null \
-             && ! git merge-base --is-ancestor "$CURRENT_SHA" "$COMPONENT_SHA"; then
-            echo "::notice::skipping stale cockpit tag: deployed $CURRENT_SHA is not an ancestor of $COMPONENT_SHA"
-            exit 0
-          fi
-          export COMPONENT_TAG="sha-${COMPONENT_SHA::7}"
-          export COMPONENT_VERSION="0.0.0-dev.sha-${COMPONENT_SHA}"
-          yq -i '
-            .image.cockpit.tag = strenv(COMPONENT_TAG) |
-            .provenance.components.cockpit.sourceRevision = strenv(COMPONENT_SHA) |
-            .provenance.components.cockpit.releaseVersion = strenv(COMPONENT_VERSION)
-          ' deployment/values-experimental.yaml
-
-      - name: Update MCP tag
-        if: needs.build-mcp.result == 'success'
-        env:
-          COMPONENT_SHA: ${{ needs.changes.outputs.mcp-sha }}
-          COMPONENT_DIGEST: ${{ needs.build-mcp.outputs.digest }}
-        run: |
-          : "${COMPONENT_SHA:=$GITHUB_SHA}"
-          # Staleness guard — knowledge-base/knowledge/issues/ci_deploy_race_reverts_image_tags.md.
-          # Overlapping runs each derive this identity from their own checkout, so
-          # the run that finishes LAST can otherwise write an older sha over a
-          # newer one and silently revert a verified deploy. Skip only when the
-          # recorded revision is known AND is not an ancestor of ours; an unknown
-          # revision (this branch is rebased often) falls through and writes.
-          CURRENT_SHA=$(yq -r '.provenance.components.mcp.sourceRevision // ""' \
-            deployment/values-experimental.yaml)
-          if [ -n "$CURRENT_SHA" ] \
-             && git cat-file -e "${CURRENT_SHA}^{commit}" 2>/dev/null \
-             && ! git merge-base --is-ancestor "$CURRENT_SHA" "$COMPONENT_SHA"; then
-            echo "::notice::skipping stale mcp tag: deployed $CURRENT_SHA is not an ancestor of $COMPONENT_SHA"
-            exit 0
-          fi
-          test -n "$COMPONENT_DIGEST"
-          case "$COMPONENT_DIGEST" in sha256:*) ;; *) exit 1 ;; esac
-          export COMPONENT_TAG="sha-${COMPONENT_SHA::7}"
-          export COMPONENT_VERSION="0.0.0-dev.sha-${COMPONENT_SHA}"
-          yq -i '
-            .image.mcp.tag = strenv(COMPONENT_TAG) |
-            .image.mcp.digest = strenv(COMPONENT_DIGEST) |
-            .provenance.components.mcp.sourceRevision = strenv(COMPONENT_SHA) |
-            .provenance.components.mcp.releaseVersion = strenv(COMPONENT_VERSION)
-          ' deployment/values-experimental.yaml
-
-      - name: Update workspace tag
-        if: needs.build-workspace.result == 'success'
-        env:
-          COMPONENT_SHA: ${{ needs.changes.outputs.workspace-sha }}
-        run: |
-          : "${COMPONENT_SHA:=$GITHUB_SHA}"
-          # Staleness guard — knowledge-base/knowledge/issues/ci_deploy_race_reverts_image_tags.md.
-          # Overlapping runs each derive this identity from their own checkout, so
-          # the run that finishes LAST can otherwise write an older sha over a
-          # newer one and silently revert a verified deploy. Skip only when the
-          # recorded revision is known AND is not an ancestor of ours; an unknown
-          # revision (this branch is rebased often) falls through and writes.
-          CURRENT_SHA=$(yq -r '.provenance.components.workspace.sourceRevision // ""' \
-            deployment/values-experimental.yaml)
-          if [ -n "$CURRENT_SHA" ] \
-             && git cat-file -e "${CURRENT_SHA}^{commit}" 2>/dev/null \
-             && ! git merge-base --is-ancestor "$CURRENT_SHA" "$COMPONENT_SHA"; then
-            echo "::notice::skipping stale workspace tag: deployed $CURRENT_SHA is not an ancestor of $COMPONENT_SHA"
-            exit 0
-          fi
-          export COMPONENT_TAG="sha-${COMPONENT_SHA::7}"
-          export COMPONENT_VERSION="0.0.0-dev.sha-${COMPONENT_SHA}"
-          yq -i '
-            .image.workspace.tag = strenv(COMPONENT_TAG) |
-            .provenance.components.workspace.sourceRevision = strenv(COMPONENT_SHA) |
-            .provenance.components.workspace.releaseVersion = strenv(COMPONENT_VERSION)
-          ' deployment/values-experimental.yaml
-
       - name: Update VM controller image tag
         if: needs.build-vm-controller.result == 'success'
         run: >-
@@ -2217,16 +2084,13 @@ jobs:
       - name: Prepare protected deployment update
         id: deployment-update
         run: |
-          if git diff --quiet -- deployment/fleet.yaml deployment/values-experimental.yaml deployment-vms/; then
+          if git diff --quiet -- deployment-vms/; then
             echo "No deployment changes to review"
             echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           echo "changed=true" >> "$GITHUB_OUTPUT"
-          git diff --binary -- \
-            deployment/fleet.yaml \
-            deployment/values-experimental.yaml \
-            deployment-vms/ > experimental-deployment.patch
+          git diff --binary -- deployment-vms/ > experimental-deployment.patch
           echo "::warning::develop is protected; review and apply the experimental deployment artifact as an authorized change"
 
       - name: Upload protected deployment update
@@ -2237,6 +2101,4 @@ jobs:
           retention-days: 7
           path: |
             experimental-deployment.patch
-            deployment/fleet.yaml
-            deployment/values-experimental.yaml
             deployment-vms/
