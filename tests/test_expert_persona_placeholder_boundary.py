@@ -226,7 +226,11 @@ def test_migration_is_the_unique_transactional_head_after_0208():
     assert PREDECESSOR in SQL.read_text()
     assert "-- transactional: yes" in SQL.read_text()
     names = [path.name for path in discover(MIGRATIONS)]
-    assert names[-1] == NAME
+    # This pinned `names[-1] == NAME`, i.e. "no migration ever lands after
+    # 0209" — not an invariant, just true on the day it was written. It went
+    # red the moment 0210 landed (f1bae1ec). What the test is actually for is
+    # this migration's position relative to its declared predecessor; the
+    # global head is pinned once, in test_infrastructure_metering_migrations.
     assert names.index(NAME) == names.index(PREDECESSOR) + 1
 
 

@@ -332,7 +332,11 @@ APP_THREAD_TERMINAL_RECLAIM_PROJECTION = (
     ROOT
     / "orchestrator/database/migrations/app/0210_thread_terminal_reclaim_projection.sql"
 )
-APP_CURRENT_MIGRATION_HEAD = APP_THREAD_TERMINAL_RECLAIM_PROJECTION
+APP_IMAGE_DELIVERY_ROWS_EVENT_ROLE = (
+    ROOT
+    / "orchestrator/database/migrations/app/0211_image_delivery_rows_event_role.sql"
+)
+APP_CURRENT_MIGRATION_HEAD = APP_IMAGE_DELIVERY_ROWS_EVENT_ROLE
 AUDIT_EXPANSION = (
     ROOT
     / "orchestrator/database/migrations/audit/0003_infrastructure_usage_events_v2.sql"

@@ -33,6 +33,7 @@ from typing import Optional, Sequence
 
 from langchain_core.messages import HumanMessage
 
+from src.core.message_markers import PERSIST_ROLE_EVENT, PERSIST_ROLE_KEY
 from src.services.image_downscale import (
     DEFAULT_BYTE_THRESHOLD,
     downscale_image_b64,
@@ -137,6 +138,27 @@ def make_multimodal_user_message(
     image content block per `ExtractedImage`, in input order. ``max_edge``
     (the resolved image-quality tier cap) is applied per image; ``None``
     leaves images untouched.
+
+    HumanMessage is a *carrier* here, not a claim that the user said this:
+    the message delivers a tool's image to a multimodal model mid-turn. So it
+    ships with the ``event`` persist role, exactly like the other synthetic
+    HumanMessages in the session loop (job-completion notices, tool-call
+    interruption notices, officer guard notes).
+
+    Stamping it here rather than at each call site is deliberate. Without the
+    marker the row persists as ``thread_messages.role = 'human'``, and the
+    stateless run-queue's oldest-unanswered predicate is exactly
+    ``role = 'human' AND seq > consumed_seq`` (``_PENDING_INPUT_SQL`` in
+    ``src/api/turn_executor.py``). A tool's image therefore became a *phantom
+    queued input*: it sat unconsumed until the user's next real message
+    triggered a fresh attach, at which point the executor claimed the phantom
+    as ``pending[0]``, rewound ``turn_count`` to its ``turn_number - 1``, and
+    re-opened an **already-used turn number** — the model re-answered the
+    previous message, the real one waited a full turn, and the duplicate
+    turn's rows sorted around the newer user row in the transcript. The role
+    is a transcript/queue distinction only: ``_db_rows_to_lc_messages``
+    restores ``event`` rows as HumanMessages, so the model's context is
+    byte-identical either way.
     """
     parts: list[dict] = [{"type": "text", "text": text}]
     for img in images:
@@ -148,7 +170,10 @@ def make_multimodal_user_message(
                 byte_threshold=byte_threshold,
             )
         )
-    return HumanMessage(content=parts)
+    return HumanMessage(
+        content=parts,
+        additional_kwargs={PERSIST_ROLE_KEY: PERSIST_ROLE_EVENT},
+    )
 
 
 def resolve_image_max_edge(config: object) -> int | None:

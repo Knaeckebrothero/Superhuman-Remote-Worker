@@ -9262,6 +9262,28 @@ describe('PersistentChatService — usage.updated telemetry', () => {
       ] as never);
       expect(turns.filter((t) => t.kind === 'user')).toHaveLength(1);
     });
+
+    it("hides the marker under the 'event' role too", () => {
+      // These rows used to persist as role='human', which made the stateless
+      // run-queue claim them as unanswered user input and re-run a finished
+      // turn; they now carry the 'event' persist role. 'event' renders as a
+      // muted system line, which is no better here than a user bubble — so
+      // the suppression is keyed on content, ahead of the role dispatch, and
+      // covers both the new rows and the pre-migration-0211 ones.
+      const turns = historyToTurns([
+        msg({ id: '1', content: 'Check this page' }),
+        msg({ id: '2', role: 'event', content: 'Image content from tool call call_ABC123:' }),
+      ] as never);
+      expect(turns.filter((t) => t.kind === 'system')).toHaveLength(0);
+      expect(turns.filter((t) => t.kind === 'user')).toHaveLength(1);
+    });
+
+    it("still renders a genuine 'event' notice", () => {
+      const turns = historyToTurns([
+        msg({ id: '1', role: 'event', content: '[JOB_FINISHED] worker job completed' }),
+      ] as never);
+      expect(turns.filter((t) => t.kind === 'system')).toHaveLength(1);
+    });
   });
 
   describe('citation drift + snapshot fetch (Half-B v2)', () => {

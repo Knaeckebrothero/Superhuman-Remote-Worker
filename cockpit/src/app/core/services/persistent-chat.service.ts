@@ -6565,6 +6565,14 @@ export function cloudCountFromSummary(s: ThreadCloudDiffSummary | null): number 
 // (src/services/image_content.py + src/persistent_graph.py). The base64 is
 // dropped at persist, leaving a bare marker that would otherwise render as a
 // user bubble — hide it from the transcript entirely.
+//
+// Matched on content, before the role dispatch, because the row's role
+// changed: these used to persist as 'human' (which made the stateless
+// run-queue claim them as unanswered user input and re-run a finished turn)
+// and now carry the 'event' persist role. Rows written before that fix keep
+// the old role until migration 0211 backfills them, and either role must
+// stay invisible — an 'event' row renders as a muted system line, which is
+// no better here than a user bubble.
 const SYNTHETIC_IMAGE_DELIVERY_RE = /^Image content from tool call \S+:\s*$/;
 
 export function historyToTurns(messages: HistoryMessage[]): Turn[] {
@@ -6579,6 +6587,11 @@ export function historyToTurns(messages: HistoryMessage[]): Turn[] {
     const isTool = m.role === 'tool' || m.role === 'ToolMessageChunk';
 
     const ts = m.created_at ? Date.parse(m.created_at) || Date.now() : Date.now();
+
+    // Role-independent (see SYNTHETIC_IMAGE_DELIVERY_RE): these carry no
+    // reader-facing content under any role, so drop them before the dispatch
+    // rather than inside the user branch alone.
+    if (SYNTHETIC_IMAGE_DELIVERY_RE.test(m.content || '')) continue;
 
     // Compaction boundary marker (role='summary'). Consecutive identical
     // summaries collapse to one marker (threads written before the
@@ -6646,7 +6659,6 @@ export function historyToTurns(messages: HistoryMessage[]): Turn[] {
     if (!isUser && !isAssistant && !isTool) continue;
 
     if (isUser) {
-      if (SYNTHETIC_IMAGE_DELIVERY_RE.test(m.content || '')) continue;
       const u: UserTurn = {
         kind: 'user',
         id: m.id,
