@@ -1,0 +1,397 @@
+#!/usr/bin/env python3
+"""srw-ssh-proxy — bridge an SSH client to a Superhuman Remote Worker workspace.
+
+Two modes:
+
+    ProxyCommand srw-ssh-proxy --stdio api.srw.works
+    srw-ssh-proxy --listen 127.0.0.1:2222 api.srw.works   # for JetBrains Gateway
+
+Standard library only, deliberately: a helper with dependencies reintroduces
+the install problem that ruled out websocat (see task-1-brief.md). Python has
+no stdlib WebSocket client, so the handshake and framing are implemented here.
+``wss://.../api/ssh/attach`` is the only production door — the raw TCP 2222
+path is off by default (``sshGateway.tcp.enabled: false``) — so both modes go
+over WSS.
+
+CREDENTIALS. The WebSocket upgrade wants a short-lived attach token, minted
+by ``POST /api/ssh/attach-token`` and valid for only
+``ATTACH_TOKEN_TTL_SECONDS == 300`` seconds server-side
+(``orchestrator/services/ssh_gateway_token.py``) — too short to store, so it
+is never written to disk. Instead:
+
+  * A durable personal access token (Settings -> API Keys) lives in
+    ``$SRW_TOKEN`` or ``~/.config/srw/token``. On *every* connection, before
+    the upgrade, this PAT is exchanged for a fresh attach token.
+  * ``$SRW_SSH_TOKEN`` is a one-off override: an already-minted attach token
+    (e.g. pasted straight from a Cockpit panel) that skips the exchange.
+
+EXIT CODES. The gateway writes its refusal reason (suspended, denied, gone,
+...) as a line inside the authenticated SSH channel and sets the SSH exit
+status there — both encrypted end-to-end between the user's ``ssh`` and the
+gateway's SSH server. This proxy sits *below* that transport: it cannot read
+either and must not try (no sniffing the relayed byte stream for the text,
+no reinventing the exit-code mapping). It relays opaque frames and exits
+non-zero only for its own failures: TLS, a refused upgrade, or a failed
+token exchange. ``ssh`` itself surfaces the gateway's reason and exit code.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import http.client
+import json
+import os
+import select
+import socket
+import ssl
+import struct
+import sys
+import threading
+import time
+from urllib.parse import urlparse
+
+OPCODE_CONTINUATION = 0x0
+OPCODE_TEXT = 0x1
+OPCODE_BINARY = 0x2
+OPCODE_CLOSE = 0x8
+OPCODE_PING = 0x9
+OPCODE_PONG = 0xA
+
+PING_INTERVAL_SECONDS = 20  # Cloudflare closes idle sockets at roughly 100s.
+
+ATTACH_TOKEN_PATH = "/api/ssh/attach-token"
+
+
+def build_handshake(url: str, token: str, origin: str) -> bytes:
+    """The HTTP/1.1 upgrade request.
+
+    Origin and Authorization are both required: the gateway authenticates at
+    the HTTP layer before upgrading and validates Origin explicitly (it fails
+    closed on an empty allow-list).
+    """
+    parsed = urlparse(url)
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    nonce = base64.b64encode(os.urandom(16)).decode()
+    lines = [
+        f"GET {path} HTTP/1.1",
+        f"Host: {parsed.hostname}",
+        "Upgrade: websocket",
+        "Connection: Upgrade",
+        f"Sec-WebSocket-Key: {nonce}",
+        "Sec-WebSocket-Version: 13",
+    ]
+    if origin:
+        lines.append(f"Origin: {origin}")
+    if token:
+        lines.append(f"Authorization: Bearer {token}")
+    return ("\r\n".join(lines) + "\r\n\r\n").encode()
+
+
+def frame(payload: bytes, opcode: int, mask: bool = True) -> bytes:
+    """Encode one WebSocket frame. Clients MUST mask (RFC 6455 SS5.3)."""
+    header = bytearray([0x80 | opcode])
+    length = len(payload)
+    mask_bit = 0x80 if mask else 0x00
+    if length < 126:
+        header.append(mask_bit | length)
+    elif length < 65536:
+        header.append(mask_bit | 126)
+        header += struct.pack("!H", length)
+    else:
+        header.append(mask_bit | 127)
+        header += struct.pack("!Q", length)
+    if not mask:
+        return bytes(header) + payload
+    key = os.urandom(4)
+    masked = bytes(b ^ key[i % 4] for i, b in enumerate(payload))
+    return bytes(header) + key + masked
+
+
+def parse_frames(buffer: bytes) -> tuple[list[tuple[int, bytes]], bytes]:
+    """Decode as many whole frames as `buffer` holds.
+
+    Returns (frames, remainder). A partial frame stays in the remainder — SSH
+    is a byte stream and dropping one corrupts the session.
+    """
+    frames: list[tuple[int, bytes]] = []
+    offset = 0
+    while True:
+        if len(buffer) - offset < 2:
+            break
+        first, second = buffer[offset], buffer[offset + 1]
+        opcode = first & 0x0F
+        masked = bool(second & 0x80)
+        length = second & 0x7F
+        cursor = offset + 2
+        if length == 126:
+            if len(buffer) - cursor < 2:
+                break
+            length = struct.unpack("!H", buffer[cursor : cursor + 2])[0]
+            cursor += 2
+        elif length == 127:
+            if len(buffer) - cursor < 8:
+                break
+            length = struct.unpack("!Q", buffer[cursor : cursor + 8])[0]
+            cursor += 8
+        key = b""
+        if masked:
+            if len(buffer) - cursor < 4:
+                break
+            key = buffer[cursor : cursor + 4]
+            cursor += 4
+        if len(buffer) - cursor < length:
+            break
+        payload = buffer[cursor : cursor + length]
+        if masked:
+            payload = bytes(b ^ key[i % 4] for i, b in enumerate(payload))
+        frames.append((opcode, payload))
+        offset = cursor + length
+    return frames, buffer[offset:]
+
+
+# ---------------------------------------------------------------------------
+# Credentials: durable PAT -> short-lived attach token, exchanged fresh on
+# every connection (the minted token is only valid for 300s server-side).
+# ---------------------------------------------------------------------------
+
+
+def _load_pat() -> str:
+    """The durable personal access token: $SRW_TOKEN, else ~/.config/srw/token."""
+    token = os.environ.get("SRW_TOKEN", "").strip()
+    if token:
+        return token
+    path = os.path.expanduser("~/.config/srw/token")
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.read().strip()
+    except OSError:
+        return ""
+
+
+def fetch_attach_token(
+    host: str,
+    pat: str,
+    *,
+    connection_cls=http.client.HTTPSConnection,
+    timeout: float = 15.0,
+) -> tuple[str, str]:
+    """Exchange a durable PAT for a short-lived attach token.
+
+    Calls ``POST https://<host>/api/ssh/attach-token`` and returns
+    ``(token, expires_at)``. Raises ``SystemExit`` with a message that
+    distinguishes an authentication refusal (401/403 — a bad or unscoped
+    PAT) from a connection-level failure, so a user isn't left guessing
+    which one happened.
+    """
+    conn = connection_cls(host, timeout=timeout)
+    try:
+        conn.request(
+            "POST",
+            ATTACH_TOKEN_PATH,
+            body=b"",
+            headers={"Authorization": f"Bearer {pat}"},
+        )
+        response = conn.getresponse()
+        raw = response.read()
+    except OSError as exc:
+        raise SystemExit(f"srw-ssh-proxy: could not reach {host} for a token: {exc}") from exc
+    finally:
+        conn.close()
+
+    if response.status != 200:
+        if response.status in (401, 403):
+            raise SystemExit(
+                f"srw-ssh-proxy: token exchange refused ({response.status}): "
+                "bad or unscoped PAT; check $SRW_TOKEN or ~/.config/srw/token"
+            )
+        raise SystemExit(
+            f"srw-ssh-proxy: token exchange failed ({response.status}): "
+            f"{raw.decode(errors='replace')[:200]}"
+        )
+    try:
+        payload = json.loads(raw)
+        return payload["token"], payload["expires_at"]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise SystemExit(f"srw-ssh-proxy: malformed token response: {exc}") from exc
+
+
+def resolve_ws_token(host: str) -> str:
+    """The Authorization bearer to present at the WebSocket upgrade.
+
+    ``SRW_SSH_TOKEN`` is a one-off, already-minted attach token and skips the
+    exchange entirely. Otherwise a durable PAT is exchanged for a fresh
+    attach token — deliberately not cached, so every connection (each accept
+    in ``--listen`` mode included) gets its own, well inside the 300s TTL.
+    """
+    override = os.environ.get("SRW_SSH_TOKEN", "").strip()
+    if override:
+        return override
+    pat = _load_pat()
+    if not pat:
+        raise SystemExit(
+            "srw-ssh-proxy: no credential found; set $SRW_TOKEN, write "
+            "~/.config/srw/token, or set $SRW_SSH_TOKEN to a one-off attach token"
+        )
+    token, _expires_at = fetch_attach_token(host, pat)
+    return token
+
+
+# ---------------------------------------------------------------------------
+# The WSS connection itself.
+# ---------------------------------------------------------------------------
+
+
+def _default_origin(host: str) -> str:
+    """Best-effort Origin guess: api.<domain> -> https://cockpit.<domain>.
+
+    The gateway enforces an exact-match Origin allow-list and fails closed,
+    so a wrong guess here is a flat 403 with no hint from the server — that
+    hint is added in ``_handshake_error`` instead. Pass --origin to override.
+    """
+    return f"https://{host.replace('api.', 'cockpit.', 1)}"
+
+
+def _handshake_error(status_line: str, origin: str) -> str:
+    """Message for a non-101 handshake response.
+
+    A 403 gets an extra hint: the Origin allow-list check fails closed with
+    no detail in the response, so an opaque 403 is otherwise unfixable
+    without reading server logs.
+    """
+    message = f"srw-ssh-proxy: upgrade refused: {status_line}"
+    if "403" in status_line:
+        message += f" (sent Origin: {origin!r}; try --origin if this is wrong)"
+    return message
+
+
+def _connect(host: str, origin: str) -> ssl.SSLSocket:
+    token = resolve_ws_token(host)
+    url = f"wss://{host}/api/ssh/attach"
+    raw = socket.create_connection((host, 443), timeout=30)
+    context = ssl.create_default_context()
+    sock = context.wrap_socket(raw, server_hostname=host)
+    sock.sendall(build_handshake(url, token, origin))
+    response = b""
+    while b"\r\n\r\n" not in response:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise SystemExit("srw-ssh-proxy: gateway closed during handshake")
+        response += chunk
+    status = response.split(b"\r\n", 1)[0].decode(errors="replace")
+    if "101" not in status:
+        raise SystemExit(_handshake_error(status, origin))
+    return sock
+
+
+def _recv_available(sock) -> bytes:
+    """One or more ``recv`` calls: at least one, plus draining anything
+    OpenSSL already decrypted into its own buffer.
+
+    ``select()`` reports the underlying file descriptor readable, not "there
+    is decrypted application data waiting" — OpenSSL can decrypt a whole TLS
+    record into its internal buffer on one ``recv()`` and leave more of it
+    unread. Those bytes will not make the socket readable to ``select()``
+    again until another TLS record arrives over the wire, so on a byte
+    stream like SSH a naive single ``recv()`` per wakeup can intermittently
+    stall. ``sock.pending()`` reports exactly that backlog.
+
+    Returns ``b""`` when the peer closed the connection, mirroring
+    ``socket.recv``.
+    """
+    chunk = sock.recv(65536)
+    if not chunk:
+        return b""
+    data = chunk
+    while sock.pending() > 0:
+        more = sock.recv(65536)
+        if not more:
+            break
+        data += more
+    return data
+
+
+def _pump(sock: ssl.SSLSocket, read_fd: int, write) -> None:
+    buffer = b""
+    last_ping = 0.0
+    while True:
+        # If OpenSSL is already holding decrypted bytes, don't block in
+        # select() waiting for more to arrive over the wire — go drain them.
+        timeout = 0.0 if sock.pending() > 0 else 5.0
+        readable, _, _ = select.select([sock, read_fd], [], [], timeout)
+        now = time.monotonic()
+        if now - last_ping > PING_INTERVAL_SECONDS:
+            sock.sendall(frame(b"", OPCODE_PING))
+            last_ping = now
+        if read_fd in readable:
+            data = os.read(read_fd, 65536)
+            if not data:
+                sock.sendall(frame(b"", OPCODE_CLOSE))
+                return
+            sock.sendall(frame(data, OPCODE_BINARY))
+        if sock in readable or sock.pending() > 0:
+            chunk = _recv_available(sock)
+            if not chunk:
+                return
+            buffer += chunk
+            frames, buffer = parse_frames(buffer)
+            for opcode, payload in frames:
+                if opcode == OPCODE_BINARY:
+                    write(payload)
+                elif opcode == OPCODE_PING:
+                    sock.sendall(frame(payload, OPCODE_PONG))
+                elif opcode == OPCODE_CLOSE:
+                    return
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="srw-ssh-proxy")
+    parser.add_argument("host", help="API hostname, e.g. api.srw.works")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--stdio", action="store_true", help="for ProxyCommand")
+    group.add_argument("--listen", metavar="ADDR:PORT", help="for JetBrains Gateway")
+    parser.add_argument("--origin", default="", help="Origin header to present")
+    args = parser.parse_args(argv)
+
+    origin = args.origin or _default_origin(args.host)
+
+    if args.stdio:
+        sock = _connect(args.host, origin)
+        _pump(
+            sock,
+            sys.stdin.fileno(),
+            lambda data: (sys.stdout.buffer.write(data), sys.stdout.buffer.flush()),
+        )
+        return 0
+
+    bind_host, _, bind_port = args.listen.rpartition(":")
+    listener = socket.socket()
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind((bind_host or "127.0.0.1", int(bind_port)))
+    listener.listen(8)
+    sys.stderr.write(f"srw-ssh-proxy: listening on {args.listen}\n")
+    sys.stderr.flush()
+    while True:
+        client, _ = listener.accept()
+        threading.Thread(
+            target=_serve_client, args=(client, args.host, origin), daemon=True
+        ).start()
+
+
+def _serve_client(client: socket.socket, host: str, origin: str) -> None:
+    try:
+        sock = _connect(host, origin)
+        _pump(sock, client.fileno(), client.sendall)
+    except Exception as exc:  # one bad connection must not kill the listener
+        sys.stderr.write(f"srw-ssh-proxy: {exc}\n")
+    finally:
+        try:
+            client.close()
+        except OSError:
+            pass
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
