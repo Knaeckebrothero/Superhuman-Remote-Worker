@@ -328,7 +328,11 @@ APP_EXPERT_PERSONA_IDENTITY_BACKFILL = (
     ROOT
     / "orchestrator/database/migrations/app/0209_expert_persona_identity_backfill.sql"
 )
-APP_CURRENT_MIGRATION_HEAD = APP_EXPERT_PERSONA_IDENTITY_BACKFILL
+APP_THREAD_TERMINAL_RECLAIM_PROJECTION = (
+    ROOT
+    / "orchestrator/database/migrations/app/0210_thread_terminal_reclaim_projection.sql"
+)
+APP_CURRENT_MIGRATION_HEAD = APP_THREAD_TERMINAL_RECLAIM_PROJECTION
 AUDIT_EXPANSION = (
     ROOT
     / "orchestrator/database/migrations/audit/0003_infrastructure_usage_events_v2.sql"
