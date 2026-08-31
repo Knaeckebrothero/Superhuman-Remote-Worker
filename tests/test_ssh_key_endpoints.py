@@ -858,3 +858,184 @@ def test_verify_returns_false_when_secret_is_empty(monkeypatch):
     token, _ = main._mint_ssh_key_challenge("user-a-id", "alice")
     monkeypatch.setattr(main, "_session_jwt_secret", "")
     assert main._verify_ssh_key_challenge(token, "user-a-id") is False
+
+
+# ---------------------------------------------------------------------------
+# §6.3 account-security notification (workspace_ssh_access.md): a key added
+# by someone else — a stolen session, a shared account — must stay visible
+# to its owner. Best-effort (main.py wraps the call in try/except), so these
+# pin the happy-path call, not failure handling — a broken notify path
+# already can't fail registration (see the wrapping try/except itself).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_adding_a_key_records_exactly_one_notification(
+    approved_user, monkeypatch
+):
+    from unittest.mock import AsyncMock
+
+    challenge = await main.create_ssh_key_challenge(request=object())
+    monkeypatch.setattr(
+        main,
+        "parse_public_key",
+        lambda text: _Body(
+            key_type="ssh-ed25519",
+            public_key=text,
+            fingerprint_sha256="SHA256:" + "C" * 43,
+            comment="",
+        ),
+    )
+    monkeypatch.setattr(main, "verify_possession", lambda *a, **k: True)
+
+    async def _create(**kwargs):
+        return {
+            "id": "k-notify-1",
+            "name": kwargs["name"],
+            "key_type": "ssh-ed25519",
+            "fingerprint_sha256": "SHA256:" + "C" * 43,
+            "created_at": None,
+            "last_used_at": None,
+            "disabled_at": None,
+        }
+
+    monkeypatch.setattr(main.postgres_db, "create_user_ssh_key", _create)
+
+    record = AsyncMock()
+    monkeypatch.setattr(main.notification_service, "record", record)
+
+    body = _Body(
+        name="laptop",
+        public_key="ssh-ed25519 AAAA",
+        challenge=challenge["challenge"],
+        signature="-----BEGIN SSH SIGNATURE-----",
+    )
+    await main.create_ssh_key(request=object(), body=body)
+
+    record.assert_awaited_once()
+    kwargs = record.await_args.kwargs
+    assert kwargs["category"] == "ssh_key_added"
+    assert kwargs["recipient_id"] == approved_user["id"]
+    assert kwargs["dedup_key"] == "ssh_key_added:k-notify-1"
+
+
+@pytest.mark.asyncio
+async def test_adding_the_same_key_twice_does_not_record_two_notifications(
+    approved_user, monkeypatch
+):
+    """The second attempt never reaches the notify call at all: the store's
+    fingerprint-uniqueness constraint rejects it first (409, same as
+    ``test_challenge_is_reusable_but_duplicate_key_is_rejected_by_fingerprint``),
+    so there is only ever one row to notify about."""
+    from unittest.mock import AsyncMock
+
+    from database.postgres import SshKeyAlreadyRegistered
+
+    challenge = await main.create_ssh_key_challenge(request=object())
+    monkeypatch.setattr(
+        main,
+        "parse_public_key",
+        lambda text: _Body(
+            key_type="ssh-ed25519",
+            public_key=text,
+            fingerprint_sha256="SHA256:" + "D" * 43,
+            comment="",
+        ),
+    )
+    monkeypatch.setattr(main, "verify_possession", lambda *a, **k: True)
+
+    calls = {"n": 0}
+
+    async def _create(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {
+                "id": "k-notify-2",
+                "name": kwargs["name"],
+                "key_type": "ssh-ed25519",
+                "fingerprint_sha256": "SHA256:" + "D" * 43,
+                "created_at": None,
+                "last_used_at": None,
+                "disabled_at": None,
+            }
+        raise SshKeyAlreadyRegistered("SHA256:" + "D" * 43)
+
+    monkeypatch.setattr(main.postgres_db, "create_user_ssh_key", _create)
+
+    record = AsyncMock()
+    monkeypatch.setattr(main.notification_service, "record", record)
+
+    body = _Body(
+        name="laptop",
+        public_key="ssh-ed25519 AAAA",
+        challenge=challenge["challenge"],
+        signature="-----BEGIN SSH SIGNATURE-----",
+    )
+    await main.create_ssh_key(request=object(), body=body)
+    with pytest.raises(HTTPException) as excinfo:
+        await main.create_ssh_key(request=object(), body=body)
+    assert excinfo.value.status_code == 409
+
+    record.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ssh_key_added_category_is_registered_high_severity():
+    """Registered in the catalog (not just called ad hoc), and `high` —
+    the account-security class, same reason a "new sign-in" mail is loud."""
+    from services import notification_catalog as cat
+
+    spec = cat.category_spec("ssh_key_added")
+    assert spec.severity == "high"
+    # Informational: nothing to approve/deny, so no action is declared
+    # (register_action refuses a handler for an action the category never
+    # declared — declaring one nothing implements would be silently dead).
+    assert spec.actions == ()
+
+
+@pytest.mark.asyncio
+async def test_ssh_key_notification_failure_does_not_fail_registration(
+    approved_user, monkeypatch
+):
+    """Best-effort: the key is already durably written by the time this
+    runs, so a notify-path exception must never surface as a failed
+    registration."""
+    challenge = await main.create_ssh_key_challenge(request=object())
+    monkeypatch.setattr(
+        main,
+        "parse_public_key",
+        lambda text: _Body(
+            key_type="ssh-ed25519",
+            public_key=text,
+            fingerprint_sha256="SHA256:" + "E" * 43,
+            comment="",
+        ),
+    )
+    monkeypatch.setattr(main, "verify_possession", lambda *a, **k: True)
+
+    async def _create(**kwargs):
+        return {
+            "id": "k-notify-3",
+            "name": kwargs["name"],
+            "key_type": "ssh-ed25519",
+            "fingerprint_sha256": "SHA256:" + "E" * 43,
+            "created_at": None,
+            "last_used_at": None,
+            "disabled_at": None,
+        }
+
+    monkeypatch.setattr(main.postgres_db, "create_user_ssh_key", _create)
+
+    async def _boom(**kwargs):
+        raise RuntimeError("notification service unavailable")
+
+    monkeypatch.setattr(main.notification_service, "record", _boom)
+
+    body = _Body(
+        name="laptop",
+        public_key="ssh-ed25519 AAAA",
+        challenge=challenge["challenge"],
+        signature="-----BEGIN SSH SIGNATURE-----",
+    )
+    result = await main.create_ssh_key(request=object(), body=body)
+    assert result["id"] == "k-notify-3"

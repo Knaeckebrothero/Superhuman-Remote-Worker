@@ -71,6 +71,18 @@ export const routes: Routes = [
   },
   { path: 'settings', component: SettingsComponent, canActivate: [authGuard] },
   { path: 'settings/api-keys', component: ApiKeysPageComponent, canActivate: [authGuard] },
+  // Lazy, unlike the PAT route above: the bundle has ~30 KB of headroom
+  // against the hard-fail initial-bundle budget, and this page (plus the
+  // ssh-keygen instructions it renders) is not something every session
+  // visits — see the `automations` route's rationale.
+  {
+    path: 'settings/ssh-keys',
+    loadComponent: () =>
+      import('./views/settings/ssh-keys/ssh-keys-page.component').then(
+        (m) => m.SshKeysPageComponent,
+      ),
+    canActivate: [authGuard],
+  },
   // Admin and the workbench load on demand. They are large (the config, usage
   // and grants screens alone are most of a megabyte of source, and the
   // workbench pulls the graph timeline), and no ordinary session ever opens

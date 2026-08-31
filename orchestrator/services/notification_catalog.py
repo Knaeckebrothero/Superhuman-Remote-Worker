@@ -325,6 +325,14 @@ CATEGORIES: dict[str, CategorySpec] = {
             (ACTION_APPROVE, ACTION_DENY, ACTION_OPEN_SOURCE),
             steps=_immediate("ntfy", "slack_webhook", "discord_webhook"),
         ),
+        # An SSH key was registered on the account (workspace_ssh_access.md
+        # §6.3): the standard account-security signal, so a key added by
+        # someone else (a stolen session, a shared account) is visible to
+        # its owner — the same reason a "new sign-in" mail is loud. Purely
+        # informational: there is nothing to approve or deny here, and no
+        # existing action constant is a fit, so this ships with none rather
+        # than declare one `register_action` would never see a handler for.
+        CategorySpec("ssh_key_added", "high"),
     )
 }
 

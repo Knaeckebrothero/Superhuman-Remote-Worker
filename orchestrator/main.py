@@ -63959,6 +63959,43 @@ async def create_ssh_key(request: Request, body: SshKeyCreate) -> dict[str, Any]
                 "keys. Delete one before adding another."
             ),
         ) from exc
+
+    # Account-security signal (workspace_ssh_access.md §6.3): a key added by
+    # someone else — a stolen session, a shared account — must stay visible
+    # to its owner, the same reason a "new sign-in" mail is loud. Best-effort
+    # and non-fatal, like every other notify-after-write call site in this
+    # file: the key is already durably registered, so a feed-write hiccup
+    # must never turn into a failed registration.
+    try:
+        await notification_service.record(
+            recipient_id=str(user["id"]),
+            category="ssh_key_added",
+            # Per-key, not per-user-per-day: a replayed request must collapse
+            # onto the same row, but a second, distinct key added minutes
+            # later is its own event.
+            dedup_key=f"ssh_key_added:{row['id']}",
+            subject=f"New SSH key added: {name}",
+            body=(
+                f"The SSH key **{name}** ({parsed.key_type}, "
+                f"`{parsed.fingerprint_sha256}`) was added to your account. "
+                "If this wasn't you, remove it from Settings → SSH Keys "
+                "immediately and rotate anything it may have reached."
+            ),
+            source_kind="ssh_key",
+            source_id=str(row["id"]),
+            payload={
+                "ssh_key_id": str(row["id"]),
+                "name": name,
+                "fingerprint": parsed.fingerprint_sha256,
+                "key_type": parsed.key_type,
+            },
+        )
+    except Exception:
+        logger.warning(
+            "ssh_key_added notification for key %s failed (non-fatal)",
+            str(row["id"])[:8],
+            exc_info=True,
+        )
     return _serialize_ssh_key_row(row)
 
 

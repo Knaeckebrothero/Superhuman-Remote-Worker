@@ -1307,6 +1307,15 @@ const EXPIRY_OPTIONS = [
           </app-button>
         </section>
 
+        <!-- SSH Keys link card — separate page, same pattern as the PAT card above -->
+        <section class="settings-section section-spacer">
+          <h2 class="section-title">{{ 'settings.sshKeys.linkTitle' | transloco }}</h2>
+          <p class="section-desc">{{ 'settings.sshKeys.linkDesc' | transloco }}</p>
+          <app-button variant="primary" size="md" (clicked)="goToSshKeys()">
+            {{ 'settings.sshKeys.linkManage' | transloco }}
+          </app-button>
+        </section>
+
         <!-- Codex Proxy Section (Admin Only) -->
         @if (userService.currentUser()?.is_admin) {
           <section class="settings-section section-spacer">
@@ -3120,6 +3129,10 @@ export class SettingsComponent implements OnInit {
 
   goToApiKeys(): void {
     this.router.navigateByUrl('/settings/api-keys');
+  }
+
+  goToSshKeys(): void {
+    this.router.navigateByUrl('/settings/ssh-keys');
   }
 
   mcpJsonSnippet = () => {
