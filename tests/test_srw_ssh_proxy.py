@@ -5,6 +5,7 @@ import pathlib
 import socket
 import ssl
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -117,6 +118,14 @@ def test_parse_frames_rejects_a_payload_over_the_cap():
     header = bytes([0x82, 127]) + too_big.to_bytes(8, "big")
     with pytest.raises(ValueError):
         proxy.parse_frames(header)
+
+
+def test_max_frame_payload_is_reconciled_with_the_queue_cap():
+    """N-4 (findings-r2.md): a 16 MiB frame cap against a 4 MiB queue cap
+    was a 256x gap -- one frame could add 4x the entire queue budget in a
+    single _consume_frames call. Pin them to the same order of magnitude
+    rather than any specific pair of numbers."""
+    assert proxy.MAX_FRAME_PAYLOAD <= proxy.MAX_QUEUE_BYTES
 
 
 # ---------------------------------------------------------------------------
@@ -307,14 +316,19 @@ def test_load_pat_is_quiet_when_the_token_file_is_private(
 
 class _FakeSSLSocket:
     def __init__(self, chunks, pending_after):
-        """``chunks`` is popped left-to-right by recv(); ``pending_after`` is
-        the pending() value to report right after each recv() call, indexed
-        the same way."""
+        """``chunks`` is popped left-to-right by recv(); an item that is an
+        exception *instance* is raised instead of returned, so the same fake
+        can simulate a would-block on any recv() call. ``pending_after`` is
+        the pending() value to report right after each successful recv()
+        call, indexed the same way."""
         self._chunks = list(chunks)
         self._pending_after = list(pending_after)
 
     def recv(self, _n):
-        return self._chunks.pop(0)
+        item = self._chunks.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
 
     def pending(self):
         return self._pending_after.pop(0)
@@ -327,9 +341,86 @@ def test_recv_available_drains_everything_openssl_already_decrypted():
     assert proxy._recv_available(sock) == b"hello world"
 
 
-def test_recv_available_returns_empty_on_a_closed_socket():
+def test_recv_available_returns_none_not_eof_on_a_would_block_first_recv():
+    """N-1 (findings-r2.md): reproduced live by the reviewer -- a 16 KiB TLS
+    record split across TCP segments (any real ~1500-byte-MTU path, i.e.
+    Task 7's scp) or a post-handshake NewSessionTicket/KeyUpdate both raise
+    SSLWantReadError on the very first recv(), on a socket this design made
+    non-blocking. That must return something _pump can tell apart from a
+    real close, not collapse into the same b"" (which is the trap: wrapping
+    just the first recv() in `except _WOULD_BLOCK: return b""` would pass
+    the test below on its own but kill a healthy session in _pump)."""
+    sock = _FakeSSLSocket(chunks=[ssl.SSLWantReadError()], pending_after=[])
+    assert proxy._recv_available(sock) is None
+
+
+def test_recv_available_still_returns_empty_bytes_not_none_on_real_eof():
+    """The companion to the test above. One test cannot cover both cases
+    (findings-r2.md's own warning): this pins that a real close still
+    reports as b"", distinct from the None a would-block reports above."""
     sock = _FakeSSLSocket(chunks=[b""], pending_after=[])
-    assert proxy._recv_available(sock) == b""
+    result = proxy._recv_available(sock)
+    assert result == b""
+    assert result is not None
+
+
+# ---------------------------------------------------------------------------
+# N-2 — os.read() has the identical would-block-vs-EOF trap as N-1, on the
+# local fd. Real os.pipe() fds, not mocks: a would-block on an actually-empty
+# non-blocking pipe is a genuine, deterministic OS behavior to test against.
+# ---------------------------------------------------------------------------
+
+
+def test_read_available_returns_none_when_nothing_is_ready():
+    read_fd, write_fd = os.pipe()
+    try:
+        os.set_blocking(read_fd, False)
+        assert proxy._read_available(read_fd) is None
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+def test_read_available_returns_bytes_when_data_is_ready():
+    read_fd, write_fd = os.pipe()
+    try:
+        os.write(write_fd, b"hello")
+        os.set_blocking(read_fd, False)
+        assert proxy._read_available(read_fd) == b"hello"
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+def test_read_available_returns_empty_bytes_on_real_eof():
+    read_fd, write_fd = os.pipe()
+    os.close(write_fd)  # writer gone -> the reader sees a real EOF
+    try:
+        os.set_blocking(read_fd, False)
+        result = proxy._read_available(read_fd)
+        assert result == b""
+        assert result is not None
+    finally:
+        os.close(read_fd)
+
+
+# ---------------------------------------------------------------------------
+# N-1/N-2 — _pump's read branches use one shared classifier for both
+# _recv_available and _read_available results; pinned directly since it's
+# the exact would-block-vs-EOF decision the regression was about.
+# ---------------------------------------------------------------------------
+
+
+def test_classify_chunk_would_block_means_continue():
+    assert proxy._classify_chunk(None) == "continue"
+
+
+def test_classify_chunk_real_eof_means_close():
+    assert proxy._classify_chunk(b"") == "close"
+
+
+def test_classify_chunk_nonempty_bytes_means_data():
+    assert proxy._classify_chunk(b"hello") == "data"
 
 
 # ---------------------------------------------------------------------------
@@ -417,6 +508,111 @@ def test_consume_frames_routes_a_seeded_leftover_buffer_to_the_relay():
     assert remainder == b""
 
 
+class _FakeRawConnectSocket:
+    """Stands in for the TCP socket _connect creates via
+    socket.create_connection, and -- paired with _FakeSSLContext below,
+    which skips the real TLS handshake -- for the SSLSocket it wraps.
+
+    Builds its canned handshake response lazily, on the first recv(), once
+    ``self.sent`` already holds the complete request _connect just sent:
+    that lets it compute a Sec-WebSocket-Accept that actually matches the
+    random Sec-WebSocket-Key _connect generated, so the round-1
+    Sec-WebSocket-Accept verification is genuinely exercised too, not
+    bypassed.
+    """
+
+    def __init__(self, banner: bytes):
+        self.sent = b""
+        self._banner = banner
+        self._response = None
+
+    def sendall(self, data):
+        self.sent += data
+
+    def recv(self, n):
+        if self._response is None:
+            sent_key = proxy._extract_header(self.sent, "Sec-WebSocket-Key")
+            accept = proxy._compute_accept(sent_key)
+            self._response = (
+                b"HTTP/1.1 101 Switching Protocols\r\n"
+                b"Upgrade: websocket\r\n"
+                b"Connection: Upgrade\r\n"
+                b"Sec-WebSocket-Accept: " + accept.encode() + b"\r\n"
+                b"\r\n" + self._banner
+            )
+        chunk, self._response = self._response[:n], self._response[n:]
+        return chunk
+
+    def settimeout(self, _value):
+        pass
+
+    def setblocking(self, _flag):
+        pass
+
+    def close(self):
+        pass
+
+
+class _FakeSSLContext:
+    def wrap_socket(self, raw, server_hostname=None):
+        return raw  # no real TLS: the fake raw socket already speaks plaintext
+
+
+def test_connect_relays_leftover_bytes_from_a_real_coalesced_response(monkeypatch):
+    """Residual C-1 gap (findings-r2.md): mutating _connect's own
+    `return sock, leftover` to `return sock, b""` still passed 42/42,
+    because _split_handshake_response is tested as a pure function and
+    _pump is tested with an explicitly-passed buffer -- nothing pinned the
+    wire between them, i.e. that _connect's own recv() loop actually
+    produces and returns the real leftover. This does, with a fake
+    create_connection/create_default_context -- no real network or TLS."""
+    fake_raw = _FakeRawConnectSocket(banner=b"SSH-2.0-coalesced-banner")
+    monkeypatch.setattr(proxy.socket, "create_connection", lambda *a, **k: fake_raw)
+    monkeypatch.setattr(proxy.ssl, "create_default_context", lambda: _FakeSSLContext())
+    monkeypatch.setattr(proxy, "resolve_ws_token", lambda host: "test-token")
+
+    sock, leftover = proxy._connect("api.srw.works", "https://cockpit.srw.works")
+    assert sock is fake_raw
+    assert leftover == b"SSH-2.0-coalesced-banner"
+
+
+class _FakeRawSocketThatClosesCleanly:
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class _CertFailingSSLContext:
+    def __init__(self, raw_to_track):
+        self._raw = raw_to_track
+
+    def wrap_socket(self, raw, server_hostname=None):
+        assert raw is self._raw
+        raise ssl.SSLCertVerificationError("certificate verify failed: self-signed")
+
+
+def test_connect_reports_a_bad_certificate_cleanly_and_closes_the_raw_socket(
+    monkeypatch,
+):
+    """Minor (findings-r2.md): wrap_socket used to sit outside _connect's
+    try block, so a bad certificate reached the user as a raw traceback --
+    same class of problem as fetch_attach_token's TLS handling, a different
+    site -- and the raw TCP socket it wraps was never closed either."""
+    fake_raw = _FakeRawSocketThatClosesCleanly()
+    monkeypatch.setattr(proxy.socket, "create_connection", lambda *a, **k: fake_raw)
+    monkeypatch.setattr(
+        proxy.ssl, "create_default_context", lambda: _CertFailingSSLContext(fake_raw)
+    )
+    monkeypatch.setattr(proxy, "resolve_ws_token", lambda host: "test-token")
+
+    with pytest.raises(SystemExit) as excinfo:
+        proxy._connect("api.srw.works", "https://cockpit.srw.works")
+    assert "TLS error" in str(excinfo.value)
+    assert fake_raw.closed is True
+
+
 class _PendinglessSocket:
     """Wraps a real (local, no network) socket to satisfy _pump's minimal
     SSLSocket-shaped interface -- recv/send/setblocking/fileno come from the
@@ -478,9 +674,14 @@ def test_pump_relays_the_seeded_leftover_and_both_live_directions():
         )
         assert local_b.recv(65536) == b"more-remote-data"
 
-        # Local -> remote. A PING may also be queued on the very first loop
-        # iteration (last_ping starts at 0.0, and time.monotonic() doesn't),
-        # so filter for the BINARY frame rather than assuming it's first.
+        # Local -> remote. Filtering for the BINARY frame (rather than
+        # asserting it's the only or first frame) is a leftover defensive
+        # habit from when last_ping started at 0.0 against
+        # time.monotonic()'s arbitrary epoch, queuing a spurious PING on the
+        # very first loop iteration of every connection -- fixed by seeding
+        # last_ping = time.monotonic() instead; see
+        # test_pump_does_not_ping_immediately_on_connect below, which pins
+        # that fix directly.
         local_b.sendall(b"local-input")
         buf = b""
         binary_frames = []
@@ -511,6 +712,174 @@ def test_pump_relays_the_seeded_leftover_and_both_live_directions():
             except OSError:
                 pass
     assert not still_running, "pump did not exit after local EOF"
+    assert "error" not in result
+
+
+def test_pump_does_not_ping_immediately_on_connect():
+    """Minor (findings-r2.md): last_ping used to start at 0.0 against
+    time.monotonic()'s arbitrary epoch (often system uptime, not 0), so
+    `now - last_ping > PING_INTERVAL_SECONDS` was true on the very first
+    loop iteration of every connection, queuing a PING nobody asked for
+    before any real traffic. Fixed by seeding last_ping = time.monotonic()
+    at pump start; this asserts the very first frame the remote sees is the
+    seeded banner itself, with no PING ahead of it."""
+    remote_a, remote_b = socket.socketpair()
+    local_a, local_b = socket.socketpair()
+    remote = _PendinglessSocket(remote_a)
+    seeded = proxy.frame(b"SSH-2.0-banner", proxy.OPCODE_BINARY, mask=False)
+
+    thread = threading.Thread(
+        target=proxy._pump,
+        args=(remote, local_a.fileno(), local_a.fileno()),
+        kwargs={"initial_buffer": seeded},
+        daemon=True,
+    )
+    thread.start()
+    try:
+        local_b.settimeout(2.0)
+        assert local_b.recv(65536) == b"SSH-2.0-banner"
+        # local-input should still be un-preceded by anything else queued.
+        local_b.sendall(b"probe")
+        remote_b.settimeout(2.0)
+        frames, _ = proxy.parse_frames(remote_b.recv(65536))
+        assert frames == [(proxy.OPCODE_BINARY, b"probe")]
+    finally:
+        local_b.close()
+        thread.join(timeout=2.0)
+        for sock in (remote_a, remote_b, local_a):
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+class _OnceWouldBlockSocket:
+    """Wraps a real socket; the ``raise_on_call_index``-th call to recv()
+    raises ``exc`` instead of delegating -- letting a test force one
+    genuine would-block through _pump's real select() loop (the fd is
+    actually readable; the *application* read is what would-blocks), then
+    resume normally. Models the reviewer's real-TLS repro (a record split
+    across TCP segments) without needing actual TLS handshake machinery."""
+
+    def __init__(self, sock, raise_on_call_index, exc):
+        self._sock = sock
+        self._raise_on = raise_on_call_index
+        self._exc = exc
+        self._calls = 0
+
+    def fileno(self):
+        return self._sock.fileno()
+
+    def recv(self, n):
+        call, self._calls = self._calls, self._calls + 1
+        if call == self._raise_on:
+            raise self._exc
+        return self._sock.recv(n)
+
+    def send(self, data):
+        return self._sock.send(data)
+
+    def setblocking(self, flag):
+        self._sock.setblocking(flag)
+
+    def pending(self):
+        return 0
+
+
+def test_pump_survives_a_spurious_remote_wakeup(monkeypatch):
+    """N-1's actual regression site, not just _recv_available in isolation:
+    mutation-tested (revert _pump's read branch to the old `if not chunk:
+    return`, ignoring _classify_chunk's continue/close distinction) --
+    every other test in this suite still passed. This forces one real
+    SSLWantReadError out of recv() on data that has genuinely arrived (a
+    real select() reports the fd readable), through the real _pump loop,
+    and confirms the session survives and the data still arrives once the
+    would-block clears -- rather than _pump treating it as a close."""
+    remote_a, remote_b = socket.socketpair()
+    local_a, local_b = socket.socketpair()
+    remote = _OnceWouldBlockSocket(
+        remote_a, raise_on_call_index=0, exc=ssl.SSLWantReadError()
+    )
+    result = {}
+
+    def _run():
+        try:
+            proxy._pump(remote, local_a.fileno(), local_a.fileno())
+        except OSError as exc:  # pragma: no cover - surfaced via result below
+            result["error"] = exc
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    try:
+        remote_b.sendall(proxy.frame(b"payload", proxy.OPCODE_BINARY, mask=False))
+        local_b.settimeout(2.0)
+        assert local_b.recv(65536) == b"payload"
+    finally:
+        local_b.close()
+        thread.join(timeout=2.0)
+        for sock in (remote_a, remote_b, local_a):
+            try:
+                sock.close()
+            except OSError:
+                pass
+    assert "error" not in result
+
+
+def test_pump_survives_a_spurious_local_read_wakeup(monkeypatch):
+    """N-2's actual regression site, not just _read_available in isolation.
+
+    Patches os.read itself (which _read_available wraps) rather than
+    _read_available directly: a first attempt at patching _read_available
+    instead did NOT catch the obvious revert-_pump's-branch-to-raw-os.read
+    mutation, because that reverted code bypasses _read_available entirely
+    -- the fake at that level simply never gets called under the mutation.
+    Patching the lower layer forces a real BlockingIOError out of whichever
+    of the two ends up calling os.read, so it catches both. This forces one
+    real BlockingIOError -- exactly what _read_available's own dedicated
+    tests above prove it turns into None -- through the real _pump loop,
+    and confirms the session survives rather than _pump fabricating a local
+    EOF."""
+    remote_a, remote_b = socket.socketpair()
+    local_a, local_b = socket.socketpair()
+    remote = _PendinglessSocket(remote_a)
+    real_os_read = proxy.os.read
+    calls = {"n": 0}
+
+    def _flaky_os_read(fd, n):
+        if fd == local_a.fileno() and calls["n"] == 0:
+            calls["n"] += 1
+            raise BlockingIOError()
+        return real_os_read(fd, n)
+
+    monkeypatch.setattr(proxy.os, "read", _flaky_os_read)
+    result = {}
+
+    def _run():
+        try:
+            proxy._pump(remote, local_a.fileno(), local_a.fileno())
+        except OSError as exc:  # pragma: no cover - surfaced via result below
+            result["error"] = exc
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    try:
+        local_b.sendall(b"local-payload")
+        remote_b.settimeout(2.0)
+        buf = b""
+        binary_frames = []
+        while not binary_frames:
+            buf += remote_b.recv(65536)
+            new_frames, buf = proxy.parse_frames(buf)
+            binary_frames = [f for f in new_frames if f[0] == proxy.OPCODE_BINARY]
+        assert binary_frames == [(proxy.OPCODE_BINARY, b"local-payload")]
+    finally:
+        local_b.close()
+        thread.join(timeout=2.0)
+        for sock in (remote_a, remote_b, local_a):
+            try:
+                sock.close()
+            except OSError:
+                pass
     assert "error" not in result
 
 
@@ -624,6 +993,148 @@ def test_flush_queue_treats_ssl_want_write_as_backpressure_too():
     assert queue == bytearray(b"payload")
 
 
+def test_flush_queue_passes_a_memoryview_not_a_full_copy():
+    """N-5 (findings-r2.md): sender(bytes(queue)) copied up to
+    MAX_QUEUE_BYTES on every writable wakeup per direction -- a real cost on
+    the critical path of the 1 GB transfer this design exists to survive.
+    memoryview(queue) is O(1)."""
+    queue = bytearray(b"payload")
+    received_types = []
+
+    def _sender(data):
+        received_types.append(type(data))
+        return len(data)
+
+    proxy._flush_queue(_sender, queue)
+    assert received_types == [memoryview]
+
+
+# ---------------------------------------------------------------------------
+# N-3/N-6 — _drain_final's single re-blocked os.write/sendall could silently
+# truncate a short write and could hang forever on a wedged consumer, which
+# would leak the pump's thread and both fds permanently in --listen mode.
+# It also only restored blocking mode inside `if to_local:`, leaving
+# stdin/stdout non-blocking on the common (empty-queue) clean-exit path.
+# ---------------------------------------------------------------------------
+
+
+def test_drain_write_with_deadline_loops_over_short_writes():
+    """os.write is not write_all -- POSIX permits a short count."""
+    sent_chunks = []
+
+    def _sender(data):
+        chunk = bytes(data)[:3]  # simulate a short write, 3 bytes at a time
+        sent_chunks.append(chunk)
+        return len(chunk)
+
+    proxy._drain_write_with_deadline(
+        object(), _sender, b"0123456789", time.monotonic() + 5.0
+    )
+    assert b"".join(sent_chunks) == b"0123456789"
+
+
+def test_drain_write_with_deadline_gives_up_on_an_already_expired_deadline():
+    attempts = []
+
+    def _sender(_data):
+        attempts.append(1)
+        return 1
+
+    started = time.monotonic()
+    proxy._drain_write_with_deadline(object(), _sender, b"payload", started - 1.0)
+    elapsed = time.monotonic() - started
+    assert elapsed < 1.0
+    assert attempts == []  # the deadline check comes before the first send
+
+
+def test_drain_write_with_deadline_bounds_a_genuinely_wedged_consumer():
+    """A consumer that never drains anything must not hang this forever --
+    that would leak _pump's thread and both fds permanently in --listen
+    mode (the same class of leak ruling I-4 was raised for). Uses a real
+    socketpair with its send buffer filled to genuinely force
+    BlockingIOError, so the would-block/retry-via-select path is actually
+    exercised, not just the already-expired-deadline fast path above."""
+    a, b = socket.socketpair()
+    try:
+        a.setblocking(False)
+        try:
+            while True:
+                a.send(b"x" * 65536)
+        except BlockingIOError:
+            pass  # a's send buffer is now full; b never reads it
+
+        started = time.monotonic()
+        proxy._drain_write_with_deadline(a, a.send, b"tail", started + 0.3)
+        elapsed = time.monotonic() - started
+        assert elapsed < 2.0  # bounded, not hung forever
+    finally:
+        a.close()
+        b.close()
+
+
+def test_drain_write_with_deadline_stops_cleanly_on_oserror():
+    def _sender(_data):
+        raise BrokenPipeError()
+
+    # Must not raise past the caller -- this runs from _pump's finally.
+    proxy._drain_write_with_deadline(
+        object(), _sender, b"payload", time.monotonic() + 5.0
+    )
+
+
+def test_drain_final_restores_blocking_mode_even_with_empty_queues(monkeypatch):
+    """N-6: the previous version's os.set_blocking(write_fd, True) sat
+    inside `if to_local:`, so the common case -- a clean shutdown with
+    nothing left queued -- left the fd non-blocking on exit. That's the
+    scenario this test pins: both queues empty."""
+    read_fd, write_fd = os.pipe()
+    try:
+        os.set_blocking(write_fd, False)
+
+        class _FakeSock:
+            def setblocking(self, flag):
+                self.blocking = flag
+
+        fake_sock = _FakeSock()
+        proxy._drain_final(write_fd, fake_sock, bytearray(), bytearray())
+
+        # os.get_blocking is the direct way to observe the fd's own flag.
+        assert os.get_blocking(write_fd) is True
+        assert fake_sock.blocking is True
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+def test_drain_final_flushes_a_queued_close_echo_to_completion():
+    """End-to-end sanity check with real pipes/sockets: a queued remainder
+    (the shape _drain_final exists to flush -- typically a CLOSE echo) is
+    fully delivered through _drain_final's actual wiring of write_fd/sock
+    into _drain_write_with_deadline, not just at that helper's own level.
+    Kept comfortably under a pipe's default ~64 KiB kernel buffer so this
+    doesn't need a concurrent reader draining it -- the retry-until-fully-
+    sent behavior itself is already pinned directly at the
+    _drain_write_with_deadline level above with a fake sender."""
+    read_fd, write_fd = os.pipe()
+    remote_a, remote_b = socket.socketpair()
+    try:
+        os.set_blocking(write_fd, False)
+        to_local = bytearray(b"x" * 1000)
+        to_remote = bytearray(b"y" * 1000)
+        proxy._drain_final(write_fd, remote_a, to_local, to_remote)
+
+        os.set_blocking(read_fd, False)
+        assert os.read(read_fd, 4000) == b"x" * 1000
+
+        remote_b.settimeout(2.0)
+        assert remote_b.recv(4000) == b"y" * 1000
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+        remote_a.close()
+        remote_b.close()
+
+
 # ---------------------------------------------------------------------------
 # I-1 — every failure in --listen mode was completely silent (SystemExit
 # derives from BaseException; threading.excepthook drops it silently).
@@ -655,8 +1166,83 @@ def test_serve_client_reports_systemexit_to_stderr_instead_of_swallowing_it(
     monkeypatch.setattr(proxy, "_connect", _raise)
     client = _FakeClient()
     proxy._serve_client(client, "api.srw.works", "https://cockpit.srw.works")
-    assert "token exchange refused" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "token exchange refused" in err
+    # Doubled-prefix minor (findings-r2.md): the SystemExit's own message
+    # already carries "srw-ssh-proxy:", so _serve_client must not prefix it
+    # again into "srw-ssh-proxy: srw-ssh-proxy: ...".
+    assert err.count("srw-ssh-proxy:") == 1
     assert client.closed is True
+
+
+# ---------------------------------------------------------------------------
+# Doubled prefix (findings-r2.md minor) — most SystemExits in this file
+# already carry "srw-ssh-proxy:" in their own message; re-prefixing at the
+# catch site doubled it.
+# ---------------------------------------------------------------------------
+
+
+def test_report_error_does_not_double_an_existing_prefix(capsys):
+    proxy._report_error(SystemExit("srw-ssh-proxy: already prefixed"))
+    assert capsys.readouterr().err == "srw-ssh-proxy: already prefixed\n"
+
+
+def test_report_error_adds_the_prefix_when_missing(capsys):
+    proxy._report_error(ValueError("no prefix here"))
+    assert capsys.readouterr().err == "srw-ssh-proxy: no prefix here\n"
+
+
+# ---------------------------------------------------------------------------
+# N-7 — main()'s --stdio branch had no equivalent of I-1's guard: a refused
+# handshake, a hostile/malformed frame (ValueError from parse_frames), or a
+# broken pipe surfaced as a raw traceback instead of a clean stderr line.
+# ---------------------------------------------------------------------------
+
+
+def test_main_stdio_mode_reports_errors_cleanly_instead_of_a_traceback(
+    monkeypatch, capsys
+):
+    def _raise(host, origin):
+        raise SystemExit("srw-ssh-proxy: gateway closed during handshake")
+
+    monkeypatch.setattr(proxy, "_connect", _raise)
+    rc = proxy.main(["--stdio", "api.srw.works"])
+    assert rc != 0
+    err = capsys.readouterr().err
+    assert "gateway closed during handshake" in err
+    assert err.count("srw-ssh-proxy:") == 1
+
+
+class _FakeStdioStream:
+    """A stand-in for sys.stdin/sys.stdout with just enough surface for
+    main()'s --stdio branch. pytest's own capture replaces sys.stdin with a
+    pseudofile that has no real fileno(), so a test running under capsys
+    needs this instead of the real sys.stdin/sys.stdout."""
+
+    def __init__(self, fd):
+        self._fd = fd
+
+    def fileno(self):
+        return self._fd
+
+
+def test_main_stdio_mode_reports_a_bare_valueerror_cleanly(monkeypatch, capsys):
+    """A hostile/malformed frame raises ValueError from parse_frames deep
+    inside _pump; this must not be a raw traceback either, and (unlike the
+    SystemExit case above) this exception has no existing prefix to begin
+    with, exercising _report_error's other branch."""
+
+    def _raise_pump(*_args, **_kwargs):
+        raise ValueError("frame payload exceeds the cap")
+
+    monkeypatch.setattr(proxy, "_connect", lambda host, origin: (object(), b""))
+    monkeypatch.setattr(proxy, "_pump", _raise_pump)
+    monkeypatch.setattr(proxy.sys, "stdin", _FakeStdioStream(0))
+    monkeypatch.setattr(proxy.sys, "stdout", _FakeStdioStream(1))
+    rc = proxy.main(["--stdio", "api.srw.works"])
+    assert rc != 0
+    err = capsys.readouterr().err
+    assert err == "srw-ssh-proxy: frame payload exceeds the cap\n"
 
 
 # ---------------------------------------------------------------------------

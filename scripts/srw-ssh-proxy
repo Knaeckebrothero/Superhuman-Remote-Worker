@@ -72,15 +72,29 @@ OPCODE_PONG = 0xA
 PING_INTERVAL_SECONDS = 20  # Cloudflare closes idle sockets at roughly 100s.
 
 # Defensive cap against a malformed or hostile declared frame length forcing
-# unbounded buffering while more bytes are awaited. Far above anything the
-# gateway's own chunking would ever declare.
-MAX_FRAME_PAYLOAD = 16 * 1024 * 1024
+# unbounded buffering while more bytes are awaited. The gateway itself never
+# emits more than PUMP_CHUNK_BYTES == 65536 bytes per frame
+# (orchestrator/ssh_gateway.py) -- this stays well above that real contract
+# for headroom, but reconciled to the same order of magnitude as
+# MAX_QUEUE_BYTES below rather than the 256x gap a 16 MiB cap left against a
+# 4 MiB queue cap (ruling N-4).
+MAX_FRAME_PAYLOAD = 1 * 1024 * 1024
 
 # Bound how much unwritten data queues per direction before that side's fd
-# stops being offered to select()'s read set -- backpressure, so a
+# stops being newly offered to select()'s read set -- backpressure, so a
 # destination that can't keep up (a slow local disk during a multi-GB scp, a
-# stalled TLS window) doesn't grow the queue without limit.
+# stalled TLS window) doesn't grow the queue without limit. This is a soft
+# cap, not a hard one: _pump's ``or sock.pending() > 0`` check still drains
+# one already-decrypted chunk into to_local even after sock was dropped from
+# the read set for being at cap -- bounded overshoot (at most one
+# MAX_FRAME_PAYLOAD-sized frame), not unlimited (ruling N-4).
 MAX_QUEUE_BYTES = 4 * 1024 * 1024
+
+# How long _drain_final will keep retrying a queued remainder (typically a
+# CLOSE echo) before giving up. Bounded so a wedged consumer at shutdown
+# can't hang _pump's `finally` forever -- that would leak the pump's thread
+# and both fds permanently in --listen mode (ruling N-3).
+_DRAIN_FINAL_DEADLINE_SECONDS = 5.0
 
 # A non-blocking send/recv that isn't ready yet: normal backpressure, not a
 # failure. ssl.SSLWant{Read,Write}Error are OSError subclasses distinct from
@@ -406,8 +420,20 @@ def _connect(host: str, origin: str) -> tuple[ssl.SSLSocket, bytes]:
     token = resolve_ws_token(host)
     url = f"wss://{host}/api/ssh/attach"
     raw = socket.create_connection((host, 443), timeout=30)
-    context = ssl.create_default_context()
-    sock = context.wrap_socket(raw, server_hostname=host)
+    try:
+        context = ssl.create_default_context()
+        sock = context.wrap_socket(raw, server_hostname=host)
+    except ssl.SSLError as exc:
+        # A bad certificate previously reached the user as a raw traceback --
+        # same class of problem as fetch_attach_token's TLS handling, just a
+        # different site (wrap_socket does the handshake synchronously here).
+        raw.close()
+        raise SystemExit(
+            f"srw-ssh-proxy: TLS error connecting to {host}: {exc}"
+        ) from exc
+    except BaseException:
+        raw.close()
+        raise
     try:
         request = build_handshake(url, token, origin)
         sock.sendall(request)
@@ -442,7 +468,7 @@ def _connect(host: str, origin: str) -> tuple[ssl.SSLSocket, bytes]:
 # ---------------------------------------------------------------------------
 
 
-def _recv_available(sock) -> bytes:
+def _recv_available(sock) -> bytes | None:
     """One or more ``recv`` calls: at least one, plus draining anything
     OpenSSL already decrypted into its own buffer.
 
@@ -454,10 +480,21 @@ def _recv_available(sock) -> bytes:
     stream like SSH a naive single ``recv()`` per wakeup can intermittently
     stall. ``sock.pending()`` reports exactly that backlog.
 
-    Returns ``b""`` when the peer closed the connection, mirroring
-    ``socket.recv``.
+    Returns ``None`` when ``sock`` (non-blocking since ruling I-5) was
+    reported readable but no application data was actually available yet --
+    a spurious wakeup, or a partial/control-only TLS record (a record split
+    across TCP segments on a real MTU, or a post-handshake NewSessionTicket/
+    KeyUpdate with nothing behind it) both raise ``SSLWantReadError`` here,
+    on any real network path. That must NOT collapse into the same value as
+    ``b""``, which means the peer closed the connection cleanly (mirroring
+    ``socket.recv``) -- conflating the two, as an earlier version of this
+    fix did, makes a spurious wakeup indistinguishable from EOF and tears
+    down an otherwise-healthy session (ruling N-1).
     """
-    chunk = sock.recv(65536)
+    try:
+        chunk = sock.recv(65536)
+    except _WOULD_BLOCK:
+        return None
     if not chunk:
         return b""
     data = chunk
@@ -472,19 +509,69 @@ def _recv_available(sock) -> bytes:
     return data
 
 
+def _read_available(fd: int) -> bytes | None:
+    """One ``os.read()`` from a non-blocking fd.
+
+    Symmetric with ``_recv_available`` and for the same reason (ruling N-2):
+    a spurious readability wakeup on ``fd`` must not be mistaken for the
+    local process closing its end (``b""``), which ``_pump`` would otherwise
+    relay as a fabricated CLOSE and tear down an otherwise-healthy session.
+    Lower probability than the TLS case (pipes rarely wake spuriously), but
+    the same shape of bug.
+    """
+    try:
+        return os.read(fd, 65536)
+    except BlockingIOError:
+        return None
+
+
+def _classify_chunk(chunk: bytes | None) -> str:
+    """Classify one ``_recv_available``/``_read_available`` result for
+    ``_pump``'s read branches.
+
+    Three-way, not the two-way ``if not chunk`` the previous version used:
+    ``None`` (would-block -- no data, the session stays open) has to be told
+    apart from ``b""`` (a real, clean close) has to be told apart from
+    non-empty bytes (data to process). Pulled out as its own pure function,
+    rather than left as the equivalent inline checks, specifically so this
+    exact would-block-vs-EOF distinction is pinned by a unit test instead of
+    only showing up in a live TLS session under real network conditions
+    (ruling N-1/N-2).
+    """
+    if chunk is None:
+        return "continue"
+    if not chunk:
+        return "close"
+    return "data"
+
+
 def _flush_queue(sender, queue: bytearray) -> None:
     """Write as much of ``queue`` as ``sender`` accepts without blocking.
 
     ``sender`` is a non-blocking ``send``/``os.write``-shaped callable:
-    bytes in, bytes-actually-written out. A would-block error means the OS
-    (or OpenSSL's own write buffer) isn't ready yet — normal backpressure,
-    not a failure — so the remainder just stays queued for the next
-    writable wakeup instead of raising (ruling I-5).
+    bytes-like in, bytes-actually-written out. Passed a ``memoryview`` of
+    ``queue`` rather than ``bytes(queue)`` -- ``os.write``/``socket.send``
+    both accept the buffer protocol directly, and copying up to
+    ``MAX_QUEUE_BYTES`` on every writable wakeup would be a real cost on the
+    critical path of the very multi-GB transfer this design exists to
+    survive (ruling N-5). A would-block error means the OS (or OpenSSL's own
+    write buffer) isn't ready yet — normal backpressure, not a failure — so
+    the remainder just stays queued for the next writable wakeup instead of
+    raising (ruling I-5).
+
+    OpenSSL's retry rule for a non-blocking ``SSL_write`` is to retry with
+    the SAME buffer, unchanged, until it stops asking for a retry. This
+    holds here only because a would-block leaves ``queue`` completely
+    untouched and nothing else ever trims or reorders ``to_remote`` except
+    this function consuming a confirmed-sent prefix -- so the bytes
+    presented on retry are always the same buffer's same prefix. Any future
+    change that mutates ``to_remote`` between a failed send and the next
+    call would corrupt the TLS stream.
     """
     if not queue:
         return
     try:
-        sent = sender(bytes(queue))
+        sent = sender(memoryview(queue))
     except _WOULD_BLOCK:
         return
     if sent:
@@ -521,28 +608,82 @@ def _consume_frames(
     return remainder, False
 
 
+def _drain_write_with_deadline(fileobj, write_fn, data, deadline: float) -> None:
+    """Write all of ``data`` via the non-blocking ``write_fn``, looping over
+    short writes and waiting on ``select`` for ``fileobj`` to become
+    writable between attempts, until either everything is sent or
+    ``deadline`` (a ``time.monotonic()`` endpoint) passes.
+
+    Two distinct bugs this replaces (ruling N-3): a single ``os.write`` is
+    not ``write_all`` -- POSIX permits a short count, most realistically
+    after a signal interrupts a partial transfer -- so one call could
+    silently drop the tail of ``data``; and re-blocking the fd and calling
+    a blocking write/``sendall`` has no bound at all, so a wedged consumer
+    could hang this forever. Since this only runs from ``_pump``'s
+    ``finally``, that hang previously meant the pump's thread (and both fds)
+    leaked permanently in ``--listen`` mode -- the same class of leak
+    ruling I-4 was raised for, reopened by a different route. Staying
+    non-blocking throughout (rather than re-blocking, as the previous
+    version did) is what makes the deadline actually enforceable: a
+    deadline check between retries cannot bound a single blocking syscall
+    that's already in progress.
+
+    Best-effort: whatever is unsent when the deadline passes is dropped
+    silently. There is nothing better to do at the tail of a session that's
+    already tearing down.
+    """
+    view = memoryview(data)
+    while view:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        try:
+            sent = write_fn(view)
+        except _WOULD_BLOCK:
+            select.select([], [fileobj], [], min(remaining, 0.5))
+            continue
+        except OSError:
+            return
+        if not sent:
+            return
+        view = view[sent:]
+
+
 def _drain_final(
     write_fd: int, sock, to_local: bytearray, to_remote: bytearray
 ) -> None:
-    """Best-effort final flush when the pump is shutting down.
+    """Best-effort final flush when the pump is shutting down, then restore
+    both the local fd and ``sock`` to blocking mode unconditionally.
 
-    Non-blocking sends can leave a small remainder queued, and there is no
-    more looping left to retry them on — this switches back to a blocking
-    write for the last few KB (a CLOSE echo, most often) rather than
-    silently dropping the tail of the session.
+    The flush itself stays non-blocking and bounded by a deadline -- see
+    ``_drain_write_with_deadline``. Restoring blocking mode is unconditional,
+    not only when there was something to flush: ``O_NONBLOCK`` lives on the
+    shared open file description, and the common case at a clean shutdown is
+    an *empty* queue -- the previous version's ``os.set_blocking(write_fd,
+    True)`` sat inside ``if to_local:``, so that common case left
+    stdin/stdout non-blocking on exit, which can affect whatever else holds
+    that same fd (e.g. the parent shell, for a ``--stdio`` run from a
+    terminal) after this process is gone (ruling N-6).
     """
+    deadline = time.monotonic() + _DRAIN_FINAL_DEADLINE_SECONDS
     try:
         if to_local:
+            _drain_write_with_deadline(
+                write_fd, lambda data: os.write(write_fd, data), to_local, deadline
+            )
+    finally:
+        try:
             os.set_blocking(write_fd, True)
-            os.write(write_fd, bytes(to_local))
-    except OSError:
-        pass
+        except OSError:
+            pass
     try:
         if to_remote:
+            _drain_write_with_deadline(sock, sock.send, to_remote, deadline)
+    finally:
+        try:
             sock.setblocking(True)
-            sock.sendall(bytes(to_remote))
-    except OSError:
-        pass
+        except OSError:
+            pass
 
 
 def _pump(sock, read_fd: int, write_fd: int, initial_buffer: bytes = b"") -> None:
@@ -573,7 +714,7 @@ def _pump(sock, read_fd: int, write_fd: int, initial_buffer: bytes = b"") -> Non
     in_buffer = bytes(initial_buffer)
     to_local = bytearray()
     to_remote = bytearray()
-    last_ping = 0.0
+    last_ping = time.monotonic()
     local_open = True
     closing = False
 
@@ -610,27 +751,52 @@ def _pump(sock, read_fd: int, write_fd: int, initial_buffer: bytes = b"") -> Non
                 _flush_queue(sock.send, to_remote)
 
             if read_fd in readable:
-                data = os.read(read_fd, 65536)
-                if not data:
+                data = _read_available(read_fd)
+                outcome = _classify_chunk(data)
+                if outcome == "close":
                     to_remote += frame(b"", OPCODE_CLOSE)
                     local_open = False
                     closing = True
-                else:
+                elif outcome == "data":
                     to_remote += frame(data, OPCODE_BINARY)
+                # "continue": a spurious wakeup -- no data, try again next
+                # iteration. Must not be treated as EOF (ruling N-2).
 
             if sock in readable or sock.pending() > 0:
                 chunk = _recv_available(sock)
-                if not chunk:
+                outcome = _classify_chunk(chunk)
+                if outcome == "close":
                     return
-                in_buffer += chunk
-                in_buffer, should_stop = _consume_frames(in_buffer, to_local, to_remote)
-                if should_stop:
-                    return
+                if outcome == "data":
+                    in_buffer += chunk
+                    in_buffer, should_stop = _consume_frames(
+                        in_buffer, to_local, to_remote
+                    )
+                    if should_stop:
+                        return
+                # "continue": a spurious wakeup or a partial/control-only TLS
+                # record -- no application data yet, not a close (ruling N-1).
 
             if closing and not to_remote and not to_local:
                 return
     finally:
         _drain_final(write_fd, sock, to_local, to_remote)
+
+
+def _report_error(exc: BaseException) -> None:
+    """Print one ``srw-ssh-proxy: <message>`` line to stderr.
+
+    Every ``SystemExit`` raised in this file already carries the prefix in
+    its own message (that's how every earlier fix's error text was written),
+    so prefixing again here doubled it into
+    ``srw-ssh-proxy: srw-ssh-proxy: ...``. This checks first, so it's also
+    correct for an exception type that DOESN'T carry the prefix (a raw
+    ``ValueError``/``OSError`` bubbling up from somewhere new).
+    """
+    message = str(exc)
+    if not message.startswith("srw-ssh-proxy:"):
+        message = f"srw-ssh-proxy: {message}"
+    sys.stderr.write(f"{message}\n")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -645,8 +811,16 @@ def main(argv: list[str] | None = None) -> int:
     origin = args.origin or _default_origin(args.host)
 
     if args.stdio:
-        sock, leftover = _connect(args.host, origin)
-        _pump(sock, sys.stdin.fileno(), sys.stdout.fileno(), leftover)
+        # Previously unguarded (ruling N-7): a refused handshake
+        # (SystemExit), a hostile/malformed frame (ValueError from
+        # parse_frames), or a broken pipe surfaced as a raw traceback
+        # instead of a clean srw-ssh-proxy: line.
+        try:
+            sock, leftover = _connect(args.host, origin)
+            _pump(sock, sys.stdin.fileno(), sys.stdout.fileno(), leftover)
+        except (SystemExit, OSError, ValueError) as exc:
+            _report_error(exc)
+            return 1
         return 0
 
     bind_host, _, bind_port = args.listen.rpartition(":")
@@ -680,9 +854,9 @@ def _serve_client(client: socket.socket, host: str, origin: str) -> None:
         # threading.excepthook silently drops an uncaught SystemExit in a
         # non-main thread -- every credential/handshake failure raised as
         # SystemExit would vanish with no stderr line at all (ruling I-1).
-        sys.stderr.write(f"srw-ssh-proxy: {exc}\n")
+        _report_error(exc)
     except Exception as exc:  # one bad connection must not kill the listener
-        sys.stderr.write(f"srw-ssh-proxy: {exc}\n")
+        _report_error(exc)
     finally:
         # The outbound WSS socket is this function's own resource -- _connect
         # doesn't (and can't) know when the caller is done with it, so
