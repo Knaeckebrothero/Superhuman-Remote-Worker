@@ -23989,14 +23989,21 @@ def _register_notification_actions() -> None:
 
     @register_action("ssh_key_added", "open")
     async def _open_ssh_keys(ctx: ActionContext) -> ActionResult:
-        # ssh_key_added carries no source_kind, so this action is the ONLY
-        # way one of these rows ever leaves `pending` (ruling P-12) — the
-        # shared `_navigate()` deliberately never sets `resolve`, since its
-        # other callers resolve through a registered source instead, so this
-        # builds its own ActionResult. `resolve=True` for a source-less
-        # category is the sanctioned mechanism per ActionResult.resolve's own
-        # comment above. The destination is also the right product answer:
-        # it's exactly where a user goes to revoke a key they did not add.
+        # ssh_key_added rows DO carry source_kind="ssh_key" and source_id
+        # (see the notification call this action's rows come from, further
+        # down in this file) — but no register_source_loader/
+        # register_source_probe is ever registered for "ssh_key", so nothing
+        # can compute source_resolved for it (M-2: this comment used to say
+        # "carries no source_kind", which is wrong — the row has one, it's
+        # just unprobed). This action is therefore the ONLY way one of these
+        # rows ever leaves `pending` (ruling P-12) — the shared `_navigate()`
+        # deliberately never sets `resolve`, since its other callers (e.g.
+        # automation_disabled, user_registered) resolve through a registered
+        # source probe instead, so this builds its own ActionResult.
+        # `resolve=True` here is the sanctioned mechanism per
+        # ActionResult.resolve's own comment above. The destination is also
+        # the right product answer: it's exactly where a user goes to revoke
+        # a key they did not add.
         return ActionResult(result={"navigate": "/settings/ssh-keys"}, resolve=True)
 
     async def _permission_decision(ctx: ActionContext, decision: str) -> ActionResult:
@@ -52444,11 +52451,26 @@ async def get_thread(thread_id: str, request: Request) -> dict[str, Any]:
     forever. Deliberately not done on the list endpoint — minting up to 50
     handles as a side effect of rendering a list is unwanted write
     amplification.
+
+    The mint is guarded (M-1): it's a write on an otherwise read-only view,
+    so a write failure here (a read-only replica, a full disk — this
+    deployment has actually had one) must not turn the whole thread view
+    into a 500 for the sake of one SSH-panel field. Caught broadly since
+    ``ensure_thread_ssh_handle`` can raise asyncpg errors or its own
+    exhausted-retries ``RuntimeError``; either way the response degrades to
+    a null handle (the panel already renders "unavailable" for that).
     """
     user, thread = await require_thread_owner(request, postgres_db, thread_id)
     result = _redact_thread_metadata(dict(thread))
     if not result.get("ssh_handle"):
-        result["ssh_handle"] = await postgres_db.ensure_thread_ssh_handle(thread_id)
+        try:
+            result["ssh_handle"] = await postgres_db.ensure_thread_ssh_handle(thread_id)
+        except Exception:
+            logger.warning(
+                "ensure_thread_ssh_handle failed for thread %s (non-fatal)",
+                str(thread_id)[:8],
+                exc_info=True,
+            )
     mounts = await postgres_db.list_thread_mounts(thread_id)
     result["cloud_session_url"] = _resolve_cloud_session_url(thread, mounts)
     result["mounts"] = [

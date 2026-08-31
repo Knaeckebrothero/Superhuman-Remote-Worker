@@ -1590,8 +1590,11 @@
     },
     "ssh": {
       "intro": "Connect to this session's workspace with your own terminal, editor or IDE.",
+      "prereqs": "Connecting also needs a Personal Access Token from Settings → API Keys, saved to ~/.config/srw/token, and the srw-ssh-proxy helper on your PATH.",
+      "prereqsLink": "Full setup guide",
       "configTitle": "SSH config",
       "configHint": "Add this to ~/.ssh/config, then connect with ssh srw-<handle>.",
+      "identityHint": "Assumes your private key is at ~/.ssh/id_ed25519. If yours lives elsewhere, edit IdentityFile above to match.",
       "handleLabel": "Session handle",
       "hostKeyLabel": "Gateway host key fingerprint",
       "hostKeyHint": "Verify this fingerprint the first time you connect.",

@@ -1590,8 +1590,11 @@
     },
     "ssh": {
       "intro": "Verbinden Sie sich mit dem Arbeitsbereich dieser Sitzung über Ihr eigenes Terminal, Ihren Editor oder Ihre IDE.",
+      "prereqs": "Zum Verbinden benötigen Sie außerdem ein Personal Access Token aus Einstellungen → API-Schlüssel, gespeichert unter ~/.config/srw/token, sowie den srw-ssh-proxy-Helfer in Ihrem PATH.",
+      "prereqsLink": "Vollständige Anleitung",
       "configTitle": "SSH-Konfiguration",
       "configHint": "Fügen Sie dies zu ~/.ssh/config hinzu und verbinden Sie sich anschließend mit ssh srw-<handle>.",
+      "identityHint": "Setzt voraus, dass sich Ihr privater Schlüssel unter ~/.ssh/id_ed25519 befindet. Liegt Ihrer woanders, passen Sie IdentityFile oben entsprechend an.",
       "handleLabel": "Sitzungs-Handle",
       "hostKeyLabel": "Fingerabdruck des Gateway-Hostschlüssels",
       "hostKeyHint": "Überprüfen Sie diesen Fingerabdruck bei der ersten Verbindung.",

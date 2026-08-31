@@ -576,6 +576,46 @@ def test_connect_relays_leftover_bytes_from_a_real_coalesced_response(monkeypatc
     assert leftover == b"SSH-2.0-coalesced-banner"
 
 
+# ---------------------------------------------------------------------------
+# M-3 — the handshake response buffer in _connect had no cap, unlike every
+# other buffer in this file (MAX_FRAME_PAYLOAD, MAX_QUEUE_BYTES).
+# ---------------------------------------------------------------------------
+
+
+class _FakeRawSocketThatNeverTerminatesHandshake:
+    """recv() always returns bytes that never contain b"\\r\\n\\r\\n" -- a
+    gateway, proxy or on-path attacker that never sends the header
+    terminator must not make _connect buffer without limit."""
+
+    def __init__(self):
+        self.sent = b""
+
+    def sendall(self, data):
+        self.sent += data
+
+    def recv(self, n):
+        return b"x" * n
+
+    def settimeout(self, _value):
+        pass
+
+    def setblocking(self, _flag):
+        pass
+
+    def close(self):
+        pass
+
+
+def test_connect_caps_handshake_response_buffering(monkeypatch):
+    fake_raw = _FakeRawSocketThatNeverTerminatesHandshake()
+    monkeypatch.setattr(proxy.socket, "create_connection", lambda *a, **k: fake_raw)
+    monkeypatch.setattr(proxy.ssl, "create_default_context", lambda: _FakeSSLContext())
+    monkeypatch.setattr(proxy, "resolve_ws_token", lambda host: "test-token")
+
+    with pytest.raises(SystemExit, match="exceeded"):
+        proxy._connect("api.srw.works", "https://cockpit.srw.works")
+
+
 class _FakeRawSocketThatClosesCleanly:
     def __init__(self):
         self.closed = False
@@ -1601,3 +1641,76 @@ def test_listen_mode_exits_cleanly_on_keyboardinterrupt(monkeypatch):
     rc = proxy.main(["--listen", "127.0.0.1:0", "api.srw.works"])
     assert rc == 130
     assert fake_listener.closed is True
+
+
+# ---------------------------------------------------------------------------
+# M-10 — --listen argument/bind/accept errors escaped as raw tracebacks,
+# unlike every other failure path in this file (which already goes through
+# _report_error).
+# ---------------------------------------------------------------------------
+
+
+def test_listen_mode_reports_a_non_numeric_port_cleanly(capsys):
+    rc = proxy.main(["--listen", "127.0.0.1:not-a-port", "api.srw.works"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert err.startswith("srw-ssh-proxy:")
+    assert "not-a-port" in err
+
+
+def test_listen_mode_reports_a_bind_failure_cleanly(monkeypatch, capsys):
+    class _FakeListenerBindFails:
+        def setsockopt(self, *_args, **_kwargs):
+            pass
+
+        def bind(self, *_args, **_kwargs):
+            raise OSError("Address already in use")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        proxy.socket, "socket", lambda *_args, **_kwargs: _FakeListenerBindFails()
+    )
+    rc = proxy.main(["--listen", "127.0.0.1:2222", "api.srw.works"])
+    assert rc == 1
+    assert capsys.readouterr().err == "srw-ssh-proxy: Address already in use\n"
+
+
+def test_listen_mode_reports_an_accept_failure_and_keeps_serving(monkeypatch, capsys):
+    """One bad accept() (e.g. EMFILE) must not kill the listener, mirroring
+    _serve_client's "one bad connection must not kill the listener" posture.
+    The fake raises OSError on the first accept() and KeyboardInterrupt on
+    the second, so a clean shutdown (rc == 130) proves the loop survived the
+    first failure instead of propagating it."""
+
+    class _FakeListenerAcceptFailsOnce:
+        def __init__(self):
+            self.calls = 0
+            self.closed = False
+
+        def setsockopt(self, *_args, **_kwargs):
+            pass
+
+        def bind(self, *_args, **_kwargs):
+            pass
+
+        def listen(self, *_args, **_kwargs):
+            pass
+
+        def accept(self):
+            self.calls += 1
+            if self.calls == 1:
+                raise OSError("Too many open files")
+            raise KeyboardInterrupt
+
+        def close(self):
+            self.closed = True
+
+    fake_listener = _FakeListenerAcceptFailsOnce()
+    monkeypatch.setattr(proxy.socket, "socket", lambda *_args, **_kwargs: fake_listener)
+    rc = proxy.main(["--listen", "127.0.0.1:0", "api.srw.works"])
+    assert rc == 130
+    assert fake_listener.calls == 2
+    assert fake_listener.closed is True
+    assert "srw-ssh-proxy: Too many open files" in capsys.readouterr().err

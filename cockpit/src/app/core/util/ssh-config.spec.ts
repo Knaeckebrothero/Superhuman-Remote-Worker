@@ -108,15 +108,46 @@ describe('buildSshConfig', () => {
 });
 
 describe('buildJetBrainsCommand', () => {
+    const valid = {apiHost: 'api.srw.works', origin: 'https://cockpit.srw.works'};
+
     it('uses listener mode, since Gateway cannot use ProxyCommand', () => {
-        expect(buildJetBrainsCommand({apiHost: 'api.srw.works'})).toBe(
-            'srw-ssh-proxy --listen 127.0.0.1:2222 api.srw.works',
+        expect(buildJetBrainsCommand(valid)).toBe(
+            'srw-ssh-proxy --listen 127.0.0.1:2222 api.srw.works --origin https://cockpit.srw.works',
         );
     });
 
     it('refuses a hostile apiHost too', () => {
         expect(() =>
-            buildJetBrainsCommand({apiHost: 'api.srw.works\nProxyCommand evil'}),
+            buildJetBrainsCommand({...valid, apiHost: 'api.srw.works\nProxyCommand evil'}),
         ).toThrow();
+    });
+
+    // Ruling I-2: this used to omit --origin entirely, so JetBrains users fell
+    // back to srw-ssh-proxy's own guess (api.<domain> -> https://cockpit.<domain>),
+    // which is wrong on the chart's own default topology (cockpit serves the
+    // apex domain, not a cockpit.<domain> subdomain — helm/values.yaml). Same
+    // injection sink as buildSshConfig's origin (interpolated into a
+    // ProxyCommand-adjacent shell context by srw-ssh-proxy itself), so it
+    // needs the same hostile-input coverage.
+    it('carries the calling origin, since the built-in guess is wrong on the chart defaults (ruling I-2)', () => {
+        expect(buildJetBrainsCommand(valid)).toContain(
+            '--origin https://cockpit.srw.works',
+        );
+    });
+
+    it('refuses a hostile origin too', () => {
+        expect(() =>
+            buildJetBrainsCommand({...valid, origin: 'https://cockpit.srw.works\nProxyCommand evil'}),
+        ).toThrow();
+    });
+
+    it('refuses an origin with no scheme too', () => {
+        expect(() => buildJetBrainsCommand({...valid, origin: 'cockpit.srw.works'})).toThrow();
+    });
+
+    it('accepts an origin with a port, same as buildSshConfig (ruling P-10)', () => {
+        expect(
+            buildJetBrainsCommand({...valid, origin: 'http://localhost:4200'}),
+        ).toBe('srw-ssh-proxy --listen 127.0.0.1:2222 api.srw.works --origin http://localhost:4200');
     });
 });

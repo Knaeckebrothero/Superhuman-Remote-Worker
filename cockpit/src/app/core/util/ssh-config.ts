@@ -98,11 +98,23 @@ export function buildSshConfig({handle, apiHost, sshHost, origin}: SshConfigOpti
     ].join('\n');
 }
 
-export function buildJetBrainsCommand({apiHost}: {apiHost: string}): string {
+export function buildJetBrainsCommand({apiHost, origin}: {apiHost: string; origin: string}): string {
     if (!HOST_PATTERN.test(apiHost)) {
         throw new Error('Refusing to generate a command for an invalid hostname.');
     }
+    if (!ORIGIN_PATTERN.test(origin)) {
+        throw new Error('Refusing to generate a command for an invalid origin.');
+    }
     // Gateway ignores IdentityFile, User, Port and ControlMaster, and has no
     // "use system OpenSSH" option — so it gets a local listener, not a config block.
-    return `srw-ssh-proxy --listen 127.0.0.1:2222 ${apiHost}`;
+    //
+    // `--origin` is required here for the same reason buildSshConfig always
+    // sends it (ruling P-8): srw-ssh-proxy's own fallback guess
+    // (api.<domain> -> https://cockpit.<domain>) is wrong on this chart's own
+    // default topology, where cockpit serves the apex domain rather than a
+    // cockpit.<domain> subdomain (helm/values.yaml `global.hostnames.cockpit`
+    // defaults to "" -> the bare domain). A wrong guess is a bare 403 at the
+    // WebSocket upgrade — the one client here that cannot fall back to the
+    // config block above (ruling I-2).
+    return `srw-ssh-proxy --listen 127.0.0.1:2222 ${apiHost} --origin ${origin}`;
 }

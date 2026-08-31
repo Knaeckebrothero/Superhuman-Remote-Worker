@@ -82,6 +82,37 @@ describe('SshKeysPageComponent', () => {
     expect(component.signCommand()).toContain('srw-ssh-key-registration');
   });
 
+  // M-5: a hardcoded /tmp/srw path in a command users are told to paste lets
+  // a pre-planted symlink on a shared machine clobber an arbitrary file.
+  it('uses mktemp instead of a fixed /tmp path (M-5)', async () => {
+    const fixture = TestBed.createComponent(SshKeysPageComponent);
+    const component = fixture.componentInstance;
+    await component.startRegistration();
+    expect(component.signCommand()).toContain('mktemp');
+    expect(component.signCommand()).not.toContain('/tmp/srw');
+  });
+
+  // M-6: the challenge token embeds a server-supplied identity label
+  // (the user's own preferred_username/email) sanitized for
+  // whitespace/printability but not for shell metacharacters. Unescaped
+  // interpolation into a single-quoted string breaks on an apostrophe.
+  it('escapes an apostrophe in the challenge so the command stays valid shell (M-6)', async () => {
+    // Mutate the existing object in place — requestChallenge's mock already
+    // captured a reference to it via mockResolvedValue(this.challenge) at
+    // construction time, so reassigning service.challenge to a new object
+    // here would not be seen by the already-configured mock.
+    service.challenge.challenge = "srw-ssh1:nonce:uid:123:o'brien:sig";
+    const fixture = TestBed.createComponent(SshKeysPageComponent);
+    const component = fixture.componentInstance;
+    await component.startRegistration();
+    // Naive `'${challenge}'` interpolation would close the quote at the
+    // apostrophe, splitting the token in two. The escaped form keeps the
+    // whole token inside one shell-safe single-quoted argument.
+    expect(component.signCommand()).toContain(
+      "'srw-ssh1:nonce:uid:123:o'\\''brien:sig'",
+    );
+  });
+
   it('sends the challenge back with the signature', async () => {
     const fixture = TestBed.createComponent(SshKeysPageComponent);
     const component = fixture.componentInstance;

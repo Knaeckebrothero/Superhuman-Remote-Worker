@@ -14,6 +14,24 @@ import {AppIconComponent} from '../../../ui/icon';
  *  server actually issued on the challenge response. */
 const FALLBACK_NAMESPACE = 'srw-ssh-key-registration';
 
+/**
+ * Escapes `value` for interpolation inside a single-quoted POSIX shell
+ * string: close the quote, emit a literal escaped quote, reopen the quote.
+ *
+ * `challenge.challenge` (`_mint_ssh_key_challenge` in `orchestrator/main.py`)
+ * embeds a human-readable identity label — the user's own
+ * `preferred_username` or `email` — sanitized server-side for
+ * whitespace/printability/ASCII/length but NOT for shell metacharacters. An
+ * apostrophe in that label (a user named `o'brien`) survives every one of
+ * those checks and would otherwise close the single-quoted string early,
+ * handing the user a broken command (self-targeting — the value is always
+ * the signer's own identity, never attacker-controlled). Standard technique;
+ * see e.g. the POSIX shell FAQ on quoting a single quote inside single quotes.
+ */
+function shellSingleQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
 interface SshKeyForm {
   name: string;
   publicKey: string;
@@ -345,12 +363,17 @@ export class SshKeysPageComponent implements OnInit {
     }
   }
 
+  /** `mktemp` rather than a fixed `/tmp/srw` path (M-5): a pre-planted
+   *  symlink at a predictable, world-guessable path in a command users are
+   *  told to paste turns into a file clobber on a shared machine. The
+   *  challenge token is escaped with `shellSingleQuote` (M-6) rather than
+   *  interpolated raw between hand-written quotes. */
   private buildSignCommand(challenge: SshKeyChallenge): string {
     const namespace = challenge.namespace || FALLBACK_NAMESPACE;
     return (
-      `echo -n '${challenge.challenge}' > /tmp/srw && ` +
-      `ssh-keygen -Y sign -f ~/.ssh/id_ed25519 -n ${namespace} /tmp/srw && ` +
-      `cat /tmp/srw.sig`
+      `f=$(mktemp) && echo -n ${shellSingleQuote(challenge.challenge)} > "$f" && ` +
+      `ssh-keygen -Y sign -f ~/.ssh/id_ed25519 -n ${namespace} "$f" && ` +
+      `cat "$f.sig"`
     );
   }
 

@@ -109,3 +109,24 @@ class TestGetThreadMintsSshHandleOnView:
 
         assert result["ssh_handle"] == "s-7f3a91c2"
         fake_db.ensure_thread_ssh_handle.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_mint_failure_degrades_to_a_null_handle_instead_of_500(
+        self, user_a, thread_a, fake_db
+    ):
+        """M-1 (final fix wave): the mint is a WRITE on an otherwise
+        read-only view. A read-only replica or a full disk -- this
+        deployment has actually had one -- must not turn the whole thread
+        view into a 500 for the sake of one SSH-panel field."""
+        from main import get_thread
+
+        thread_a["ssh_handle"] = None
+        fake_db.ensure_thread_ssh_handle = AsyncMock(
+            side_effect=RuntimeError("could not extend file: No space left on device")
+        )
+
+        with _patch_caller_and_db(user_a, fake_db):
+            result = await get_thread(str(thread_a["id"]), MagicMock())
+
+        assert result["ssh_handle"] is None
+        fake_db.ensure_thread_ssh_handle.assert_awaited_once_with(str(thread_a["id"]))

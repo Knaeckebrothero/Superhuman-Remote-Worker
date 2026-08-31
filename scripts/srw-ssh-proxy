@@ -90,6 +90,15 @@ MAX_FRAME_PAYLOAD = 1 * 1024 * 1024
 # MAX_FRAME_PAYLOAD-sized frame), not unlimited (ruling N-4).
 MAX_QUEUE_BYTES = 4 * 1024 * 1024
 
+# Bound how many bytes _connect will buffer while waiting for the handshake
+# response's terminating blank line (b"\r\n\r\n"). Every other buffer in this
+# file is capped (MAX_FRAME_PAYLOAD, MAX_QUEUE_BYTES above); this one wasn't
+# (M-3) -- a gateway, proxy or on-path attacker that never sends the
+# terminator would otherwise make this loop accumulate an unbounded amount of
+# memory. Real handshake headers are a few hundred bytes; this is headroom,
+# sized like MAX_FRAME_PAYLOAD, not an expected size.
+MAX_HANDSHAKE_RESPONSE_BYTES = 1 * 1024 * 1024
+
 # How long _drain_final will keep retrying a queued remainder (typically a
 # CLOSE echo) before giving up. Bounded so a wedged consumer at shutdown
 # can't hang _pump's `finally` forever -- that would leak the pump's thread
@@ -459,6 +468,12 @@ def _connect(host: str, origin: str) -> tuple[ssl.SSLSocket, bytes]:
             if not chunk:
                 raise SystemExit("srw-ssh-proxy: gateway closed during handshake")
             response += chunk
+            if len(response) > MAX_HANDSHAKE_RESPONSE_BYTES:
+                raise SystemExit(
+                    "srw-ssh-proxy: handshake response exceeded "
+                    f"{MAX_HANDSHAKE_RESPONSE_BYTES} bytes without a "
+                    "terminating blank line -- refusing to buffer further"
+                )
         status, header, leftover = _split_handshake_response(response)
         if "101" not in status:
             raise SystemExit(_handshake_error(status, origin))
@@ -919,16 +934,40 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         return 0
 
+    # M-10: argument/bind/accept errors here used to escape as raw
+    # tracebacks -- the only place in this file that still did, since
+    # --stdio's equivalent guard (ruling N-7) and every other failure path
+    # already goes through _report_error.
     bind_host, _, bind_port = args.listen.rpartition(":")
+    try:
+        bind_port_int = int(bind_port)
+    except ValueError:
+        _report_error(
+            ValueError(
+                f"invalid --listen address {args.listen!r}: port must be numeric"
+            )
+        )
+        return 1
     listener = socket.socket()
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    listener.bind((bind_host or "127.0.0.1", int(bind_port)))
-    listener.listen(8)
+    try:
+        listener.bind((bind_host or "127.0.0.1", bind_port_int))
+        listener.listen(8)
+    except OSError as exc:
+        _report_error(exc)
+        listener.close()
+        return 1
     sys.stderr.write(f"srw-ssh-proxy: listening on {args.listen}\n")
     sys.stderr.flush()
     try:
         while True:
-            client, _ = listener.accept()
+            try:
+                client, _ = listener.accept()
+            except OSError as exc:
+                # One bad accept() (e.g. EMFILE) must not kill the listener
+                # any more than one bad connection kills it in _serve_client.
+                _report_error(exc)
+                continue
             threading.Thread(
                 target=_serve_client, args=(client, args.host, origin), daemon=True
             ).start()

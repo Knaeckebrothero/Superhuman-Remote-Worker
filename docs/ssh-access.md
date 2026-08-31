@@ -29,10 +29,13 @@ key" form:
    command to run locally:
 
    ```bash
-   echo -n '<challenge>' > /tmp/srw && \
-     ssh-keygen -Y sign -f ~/.ssh/id_ed25519 -n srw-ssh-key-registration /tmp/srw && \
-     cat /tmp/srw.sig
+   f=$(mktemp) && echo -n '<challenge>' > "$f" && \
+     ssh-keygen -Y sign -f ~/.ssh/id_ed25519 -n srw-ssh-key-registration "$f" && \
+     cat "$f.sig"
    ```
+
+   (The command cockpit actually renders uses `mktemp` rather than a fixed path,
+   and escapes the challenge string for the shell — shown simplified here.)
 
 2. **Register the key.** Paste the public key and the signature that command
    produced back into the form, give the key a name, and submit.
@@ -76,6 +79,11 @@ Because that token expires in five minutes, **`$SRW_SSH_TOKEN` is useless in a c
 file or a script meant to be reused** — it works once, then mysteriously stops. Use
 `$SRW_TOKEN` (or the token file) for anything you intend to keep working.
 
+**`$SRW_TOKEN` is also used, for a different purpose, by this repository's `bench/`
+scripts** (an MCP token there, not a PAT — see `bench/README.md`). If you work in
+`bench/` too, don't assume one exported value is correct for both; check which tool
+you're about to run before trusting `$SRW_TOKEN` in your shell.
+
 ### Get the helper
 
 Cockpit's connect panel expects a single file, `srw-ssh-proxy`, on your `$PATH`. It's
@@ -87,6 +95,11 @@ it somewhere on your `PATH`, e.g.:
 ```bash
 install -m 755 scripts/srw-ssh-proxy ~/.local/bin/srw-ssh-proxy
 ```
+
+**The helper always dials TCP port 443** — it's hardcoded, not derived from the API
+hostname or any config. If your deployment serves the API (or the ssh-gateway
+Ingress behind it) on a different port, `srw-ssh-proxy` cannot reach it at all; there
+is currently no flag to override this.
 
 ### Paste the config, then connect
 
@@ -126,6 +139,14 @@ A few things worth knowing about this block:
 - **`IdentitiesOnly yes`** stops your client from offering every key in your agent —
   offering the wrong keys first risks `MaxAuthTries` lockout and would mis-attribute
   which key's `last_used_at` gets bumped.
+- **`IdentityFile` assumes `~/.ssh/id_ed25519`.** That's the only path the config
+  block generates, but the server accepts seven key types — Ed25519, ECDSA, RSA and
+  FIDO2 hardware-backed (`sk-*`) variants (`orchestrator/services/ssh_public_keys.py`).
+  If the key you registered lives somewhere else — a different filename, a different
+  algorithm — edit `IdentityFile` in the block above to point at it before
+  connecting. Combined with `IdentitiesOnly yes`, a wrong or missing path here means
+  `ssh` offers nothing and fails with `Permission denied (publickey)` — see
+  [Troubleshooting](#7-troubleshooting).
 - **`ControlMaster`/`ControlPath`/`ControlPersist`** let one authenticated attachment
   serve a follow-up `ssh`, `scp`, or `-L` for 10 minutes without re-authenticating —
   this is also what keeps you under the gateway's per-workspace attachment cap if you
@@ -152,10 +173,11 @@ supported-directive list — and there is no "use system OpenSSH executable" set
 to fall back on. Trying to point Gateway at the `Host srw-s-…` alias will fail in
 confusing ways.
 
-Instead, run the helper as a **local listener**:
+Instead, run the helper as a **local listener** — the connect panel's copy button
+renders the exact command for your deployment, `--origin` included (see below):
 
 ```bash
-srw-ssh-proxy --listen 127.0.0.1:2222 api.srw.works
+srw-ssh-proxy --listen 127.0.0.1:2222 api.srw.works --origin https://cockpit.srw.works
 ```
 
 Then in JetBrains Gateway: connect via SSH to `127.0.0.1:2222`, authentication type
@@ -191,10 +213,20 @@ trigger a real attach and watch it happen). Two consequences either way:
   checkouts and caches already use, against workspaces provisioned with a 10Gi
   volume. Check free space before the first attach, or it can fill the volume.
 
-If the Origin `srw-ssh-proxy` guesses by default is wrong for your deployment (it
-guesses `https://cockpit.<domain>` from `api.<domain>`), append `--origin
-<your-cockpit-origin>` to the command above — this flag works identically in
-`--listen` mode.
+**The command the panel's copy button gives you already includes `--origin`** — it
+carries the exact origin your browser used to load cockpit, the same value the
+config block in [Connect](#2-connect) carries. You only hit the guess described
+below if you type or script the command yourself instead of copying it.
+
+If you do, and omit `--origin`, `srw-ssh-proxy` falls back to guessing
+`https://cockpit.<domain>` from `api.<domain>`. **That guess is wrong on this
+chart's own default topology**: cockpit defaults to the apex domain
+(`global.hostnames.cockpit` is unset → `https://<domain>`, not
+`https://cockpit.<domain>` — `helm/values.yaml`), so the guess produces an origin
+that doesn't exist and the gateway's exact-match Origin check fails closed with a
+bare 403 — for the one client here that can't fall back to the config block. Always
+pass `--origin <your-cockpit-origin>` explicitly if you're not copying the panel's
+command verbatim; this flag works identically in `--listen` mode.
 
 ## 4. VS Code Remote-SSH
 
@@ -266,11 +298,20 @@ rejected Origin, and the handshake rate limit in this response — all three ren
 the same bare 403 — so if retrying (which gets a fresh attach token) doesn't help,
 suspect Origin next.
 
-**`Permission denied (publickey)` from your own `ssh` client.** This means the
-**handle in `User s-…` is not even a syntactically valid handle** — a typo, a stale
-copy-paste, or a hand-edited config — so the gateway declines to attempt key
-authentication at all for that username. It does **not** mean "your key isn't
-registered" — see the next entry for that case, which looks different.
+**`Permission denied (publickey)` from your own `ssh` client.** Two different causes
+produce this exact message, and `ssh` gives no way to tell them apart:
+
+- **No key at the `IdentityFile` path.** The config block assumes `~/.ssh/id_ed25519`
+  (see [the note above](#2-connect)); with `IdentitiesOnly yes` also set, a missing
+  or wrong path means your client offers no key at all. If you registered a key
+  stored somewhere else, edit `IdentityFile` to match. This is the most common
+  real-world cause — check it first.
+- **The handle in `User s-…` is not even a syntactically valid handle** — a typo, a
+  stale copy-paste, or a hand-edited config — so the gateway declines to attempt key
+  authentication at all for that username.
+
+Neither of these means "your key isn't registered" — see the next entry for that
+case, which looks different.
 
 **`srw: no such workspace, or you do not have access to it` (exit 77).** This is the
 gateway's *authorization* refusal, and it's deliberately worded identically for two

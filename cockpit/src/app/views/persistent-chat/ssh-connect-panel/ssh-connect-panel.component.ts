@@ -7,6 +7,13 @@ import {HANDLE_PATTERN, buildJetBrainsCommand, buildSshConfig} from '../../../co
  *  mirrors `AppCopyFieldComponent`'s own COPIED_RESET_MS. */
 const COPIED_RESET_MS = 2500;
 
+/** docs/ssh-access.md on the public repo, same host+path convention as
+ *  escape-hatch-panel.component.ts's link to automations_api.md. Linked from
+ *  the prerequisites line below (I-1): the PAT and the helper are both
+ *  documented there and nowhere else the product surfaces. */
+const SSH_DOCS_URL =
+    'https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/blob/main/docs/ssh-access.md';
+
 /**
  * Session view → "Connect over SSH". Renders the `~/.ssh/config` block for
  * this session's workspace, the gateway host key fingerprint for
@@ -35,6 +42,16 @@ const COPIED_RESET_MS = 2500;
       <div class="ssh-connect-panel">
         <p class="ssh-connect-panel__intro">{{ 'chat.ssh.intro' | transloco }}</p>
 
+        <p class="ssh-connect-panel__hint">
+          {{ 'chat.ssh.prereqs' | transloco }}
+          <a
+            class="ssh-connect-panel__docs-link"
+            [href]="sshDocsUrl"
+            target="_blank"
+            rel="noopener"
+          >{{ 'chat.ssh.prereqsLink' | transloco }}</a>
+        </p>
+
         <section class="ssh-connect-panel__section">
           <h3 class="ssh-connect-panel__heading">{{ 'chat.ssh.configTitle' | transloco }}</h3>
           <div class="ssh-connect-panel__block-row">
@@ -48,6 +65,7 @@ const COPIED_RESET_MS = 2500;
             </button>
           </div>
           <p class="ssh-connect-panel__hint">{{ 'chat.ssh.configHint' | transloco }}</p>
+          <p class="ssh-connect-panel__hint">{{ 'chat.ssh.identityHint' | transloco }}</p>
         </section>
 
         <section class="ssh-connect-panel__section">
@@ -98,6 +116,9 @@ export class SshConnectPanelComponent implements OnDestroy {
      *  without a full page reload. */
     private readonly origin = typeof window !== 'undefined' ? window.location.origin : '';
 
+    /** Bound into the template's docs link (I-1). */
+    readonly sshDocsUrl = SSH_DOCS_URL;
+
     /** False when there is nothing sane to render yet: no handle minted, a
      *  handle that fails validation (never trusted, even server-supplied),
      *  or a deployment with no configured gateway. */
@@ -122,10 +143,14 @@ export class SshConnectPanelComponent implements OnDestroy {
         }
     });
 
-    /** Same degrade-don't-throw posture as `configBlock`. */
+    /** Same degrade-don't-throw posture as `configBlock`. Carries `origin`
+     *  too (ruling I-2): the JetBrains listener command is the one client
+     *  surface that previously had no way to override srw-ssh-proxy's wrong
+     *  default guess on this chart's own topology, and this panel already
+     *  holds the correct value. */
     readonly jetBrainsCommand = computed(() => {
         try {
-            return buildJetBrainsCommand({apiHost: this.apiHost()});
+            return buildJetBrainsCommand({apiHost: this.apiHost(), origin: this.origin});
         } catch {
             return '';
         }

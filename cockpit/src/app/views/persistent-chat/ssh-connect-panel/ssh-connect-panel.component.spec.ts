@@ -80,6 +80,29 @@ describe('SshConnectPanelComponent', () => {
     expect(make(ready).componentInstance.jetBrainsCommand()).toContain('--listen');
   });
 
+  it('carries --origin in the JetBrains command too (ruling I-2)', () => {
+    // srw-ssh-proxy's own guess is wrong on the chart's default topology;
+    // this panel already holds the correct origin, so the JetBrains command
+    // must not rely on the guess either.
+    expect(make(ready).componentInstance.jetBrainsCommand()).toContain('--origin');
+  });
+
+  it('names the PAT and helper prerequisites, with a link to the docs (I-1)', () => {
+    const fixture = make(ready);
+    // Empty catalogue (ruling P-6, see above): the raw i18n key renders.
+    expect(fixture.nativeElement.textContent.toLowerCase()).toContain('prereqs');
+    const link: HTMLAnchorElement | null = fixture.nativeElement.querySelector(
+      'a.ssh-connect-panel__docs-link',
+    );
+    expect(link?.getAttribute('href')).toContain('ssh-access.md');
+  });
+
+  it('says the config assumes ~/.ssh/id_ed25519 (I-3)', () => {
+    // Raw key renders under the empty catalogue; "identityhint" is the
+    // lowercased key itself, same technique as the rewind-seam test below.
+    expect(make(ready).nativeElement.textContent.toLowerCase()).toContain('identityhint');
+  });
+
   it('hides itself when no handle exists yet', () => {
     const fixture = make({ ...ready, handle: null });
     expect(fixture.componentInstance.available()).toBe(false);

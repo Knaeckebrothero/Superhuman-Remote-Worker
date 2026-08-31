@@ -329,12 +329,16 @@ CATEGORIES: dict[str, CategorySpec] = {
         # §6.3): the standard account-security signal, so a key added by
         # someone else (a stolen session, a shared account) is visible to
         # its owner — the same reason a "new sign-in" mail is loud.
-        # Source-less (no source_kind), so ACTION_OPEN_SOURCE's handler is
-        # the ONLY way one of these ever leaves `pending` (ruling P-12,
-        # fix round 1: a zero-action version of this category could never
-        # resolve and would inflate the inbox forever) — it also happens to
-        # be the right destination: exactly where a user revokes a key they
-        # didn't add.
+        # The row DOES carry source_kind="ssh_key"/source_id (main.py's
+        # ssh_key_added notify call) — but no source_loader/source_probe is
+        # ever registered for that kind, so nothing can compute
+        # source_resolved for it (M-2: this comment used to say "no
+        # source_kind", which is wrong — the row has one, it's just
+        # unprobed). ACTION_OPEN_SOURCE's handler is therefore the ONLY way
+        # one of these ever leaves `pending` (ruling P-12, fix round 1: a
+        # zero-action version of this category could never resolve and would
+        # inflate the inbox forever) — it also happens to be the right
+        # destination: exactly where a user revokes a key they didn't add.
         CategorySpec("ssh_key_added", "high", (ACTION_OPEN_SOURCE,)),
     )
 }
