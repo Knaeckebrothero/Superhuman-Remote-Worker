@@ -500,6 +500,13 @@ jobs:
   changes:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # packages: read — the rebuild predicate asks the registry whether a
+    # component's image already exists. Four of the five component packages are
+    # private, so this is not optional. On a fork PR where the token cannot read
+    # them, the predicate fails open and everything builds (PRs never push).
+    permissions:
+      contents: read
+      packages: read
     outputs:
       agent: ${{ steps.check.outputs.agent }}
       orchestrator: ${{ steps.check.outputs.orchestrator }}
@@ -686,13 +693,49 @@ jobs:
           printf '  %s\n' "${picked[@]}"
           echo "pytest-target=${picked[*]}" >> "$GITHUB_OUTPUT"
 
-      - name: Detect changes against last deployed SHA per component
+      # Non-fatal on purpose: the rebuild predicate below fails open towards
+      # building, so a failed login costs redundant builds rather than a broken
+      # run. Fork PRs land here.
+      - name: Log in to GHCR (for the rebuild predicate)
+        continue-on-error: true
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Detect changes against what is already built
         id: check
         run: |
-          extract_sha() {
-            local component="$1"
-            grep -A1 "^  ${component}:" deployment/values-experimental.yaml 2>/dev/null \
-              | grep -oP 'tag:\s*sha-\K[0-9a-f]{7}' | head -1 || echo ""
+          # Rebuild predicate: does an image for this component's identity
+          # already exist in the registry?
+          #
+          # This replaces reading the last-deployed tag out of
+          # deployment/values-experimental.yaml. That file was the de-facto
+          # ledger of "what is built", but the DEPLOY job wrote it, so it only
+          # advanced when a deploy happened. Commit 8611183c removed the deploy
+          # push, the ledger froze at its 2026-08-28 values, and every component
+          # began diffing against a stale sha and rebuilding on every push —
+          # correct images, silently wasted CI. The registry is the honest
+          # ledger: it records what was actually BUILT, not what was last
+          # deployed, and nothing has to write to git to maintain it.
+          #
+          # It preserves the catch-up property the old predicate existed for. A
+          # build blocked by failing tests pushes no image, so a later run still
+          # finds nothing for that identity and rebuilds it — even when that push
+          # touched only unrelated paths.
+          #
+          # FAIL OPEN TOWARDS BUILDING: only a positive "it exists" skips. A
+          # registry hiccup, an auth failure or a missing tool costs one
+          # redundant build. The opposite would ship a commit with no image.
+          image_missing() {
+            local component="$1" sha="$2"
+            local ref="ghcr.io/knaeckebrothero/superhuman-remote-worker-${component}:sha-${sha:0:7}"
+            if docker buildx imagetools inspect "$ref" >/dev/null 2>&1; then
+              echo "false"
+            else
+              echo "true"
+            fi
           }
 
           has_changes() {
@@ -729,11 +772,8 @@ jobs:
             echo "${sha:-$GITHUB_SHA}"
           }
 
-          SHA_AGENT=$(extract_sha agent)
-          SHA_ORCHESTRATOR=$(extract_sha orchestrator)
-          SHA_COCKPIT=$(extract_sha cockpit)
-          SHA_MCP=$(extract_sha mcp)
-          SHA_WORKSPACE=$(extract_sha workspace)
+          # VM image SHAs still come from fleet.yaml — the VM bundle is still a
+          # git-read Fleet GitRepo, so its ledger is still live. Brief C step 6.
           # VM image SHAs live in fleet.yaml — vmController as a bare tag
           # (image.vmController.tag), agent-vm-base embedded in the
           # defaultVmImage URL (vmController.defaultVmImage).
@@ -758,9 +798,7 @@ jobs:
           SHA_VM_CONTROLLER=$(yq '.helm.values.image.vmController.tag' "$VM_FLEET" | grep -oP 'sha-\K[0-9a-f]{7}' | head -1)
           SHA_VM_BASE=$(yq '.helm.values.vmController.defaultVmImage' "$VM_FLEET" | grep -oP 'sha-\K[0-9a-f]{7}' | head -1)
 
-          echo "Deployed SHAs:"
-          echo "  agent=$SHA_AGENT  orchestrator=$SHA_ORCHESTRATOR  cockpit=$SHA_COCKPIT"
-          echo "  mcp=$SHA_MCP  workspace=$SHA_WORKSPACE"
+          echo "Deployed VM SHAs (from fleet.yaml):"
           echo "  vm-controller=$SHA_VM_CONTROLLER  vm-base=$SHA_VM_BASE"
 
           # Build-input path lists — single source for BOTH the rebuild
@@ -790,20 +828,20 @@ jobs:
             docker/assert-browser-stack.sh
             .playwright-version)
 
-          AGENT=$(has_changes "$SHA_AGENT" "${AGENT_PATHS[@]}")
           AGENT_SHA=$(last_input_sha "${AGENT_PATHS[@]}")
+          AGENT=$(image_missing agent "$AGENT_SHA")
 
-          ORCHESTRATOR=$(has_changes "$SHA_ORCHESTRATOR" "${ORCHESTRATOR_PATHS[@]}")
           ORCHESTRATOR_SHA=$(last_input_sha "${ORCHESTRATOR_PATHS[@]}")
+          ORCHESTRATOR=$(image_missing orchestrator "$ORCHESTRATOR_SHA")
 
-          COCKPIT=$(has_changes "$SHA_COCKPIT" "${COCKPIT_PATHS[@]}")
           COCKPIT_SHA=$(last_input_sha "${COCKPIT_PATHS[@]}")
+          COCKPIT=$(image_missing cockpit "$COCKPIT_SHA")
 
-          MCP=$(has_changes "$SHA_MCP" "${MCP_PATHS[@]}")
           MCP_SHA=$(last_input_sha "${MCP_PATHS[@]}")
+          MCP=$(image_missing mcp "$MCP_SHA")
 
-          WORKSPACE=$(has_changes "$SHA_WORKSPACE" "${WORKSPACE_PATHS[@]}")
           WORKSPACE_SHA=$(last_input_sha "${WORKSPACE_PATHS[@]}")
+          WORKSPACE=$(image_missing workspace "$WORKSPACE_SHA")
 
           VM_CONTROLLER=$(has_changes "$SHA_VM_CONTROLLER" \
             vm/controller/)
