@@ -57,21 +57,48 @@ describe('buildSshConfig', () => {
 
     // The origin is interpolated into ~/.ssh/config exactly like handle and
     // sshHost, so it is exactly as much of an injection sink as they are.
+    // Ruling P-10 widened the accepted grammar to http(s) + optional port
+    // (see below), so a scheme or a port alone is no longer hostile — only
+    // shapes that are actually dangerous in a shell/config-file context stay
+    // in this list: newline/CR, embedded whitespace, path, query, a bare
+    // host with no scheme, empty string, a tab, a NUL byte, and userinfo.
     const hostileOrigins = [
         'https://cockpit.srw.works\nProxyCommand rm -rf ~',
         'https://cockpit.srw.works ProxyCommand evil',
         'https://cockpit.srw.works\r\nUser root',
         'https://cockpit.srw.works/path',
         'https://cockpit.srw.works?query=1',
-        'https://cockpit.srw.works:4200',
-        'http://cockpit.srw.works',
         'cockpit.srw.works',
         '',
+        'https://cockpit.srw.works\tProxyCommand evil',
+        'https://cockpit.srw.works\u0000',
+        'https://user@cockpit.srw.works',
     ];
     hostileOrigins.forEach((origin) => {
         it(`refuses a hostile origin ${JSON.stringify(origin)}`, () => {
             expect(() => buildSshConfig({...valid, origin})).toThrow();
         });
+    });
+
+    // Regression tests for ruling P-10: a k3d port-forwarded cockpit serves
+    // http://localhost:PORT, and Task 5 feeds this function the real
+    // window.location.origin, so both of these must be accepted and carried
+    // through intact rather than rejected. (These two values previously sat
+    // in hostileOrigins above; the review caught that the pre-P-10 grammar
+    // rejected them only for the port and the scheme respectively, not for
+    // anything actually dangerous.)
+    it('accepts an origin with a port, since ruling P-10 allows it', () => {
+        const config = buildSshConfig({...valid, origin: 'https://cockpit.srw.works:4200'});
+        expect(config).toContain(
+            'ProxyCommand        srw-ssh-proxy --stdio api.srw.works --origin https://cockpit.srw.works:4200',
+        );
+    });
+
+    it('accepts an http origin, since ruling P-10 allows it (k3d port-forwarded cockpit)', () => {
+        const config = buildSshConfig({...valid, origin: 'http://cockpit.srw.works'});
+        expect(config).toContain(
+            'ProxyCommand        srw-ssh-proxy --stdio api.srw.works --origin http://cockpit.srw.works',
+        );
     });
 
     it('never interpolates a free-text title', () => {

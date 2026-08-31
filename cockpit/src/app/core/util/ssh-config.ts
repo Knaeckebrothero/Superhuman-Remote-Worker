@@ -10,6 +10,16 @@
  * the gateway's exact-match Origin allow-list — helm/values.yaml
  * `allowedOrigins`, no default in either direction, ruling P-8 — or the
  * connection is refused there regardless of what this function accepts).
+ *
+ * There's a second reason the charsets below are narrow: `ProxyCommand` is
+ * executed through `/bin/sh -c`, so every interpolated value lands in a
+ * *shell* context, not merely a config-file context. The grammars here admit
+ * only alphanumerics, dot, hyphen, colon and the scheme's `//` — none of
+ * which are shell metacharacters — which is why a validated value is safe to
+ * hand to `sh -c` as well as to the config parser. If this is ever loosened
+ * toward "general URL characters" (spaces, `?`, `#`, `@`, quotes, `$`, `` ` ``,
+ * `;`, `&`, `|`, ...), config injection becomes shell injection. Widen with
+ * that in mind, not just with the config-file sink in mind.
  */
 
 /** Crockford base32 minus the ambiguous i/l/o/u. Mirrors services/ssh_handles.py.
@@ -28,15 +38,24 @@ const HOST_BODY = '[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])
 const HOST_PATTERN = new RegExp(`^${HOST_BODY}$`, 'i');
 
 /**
- * `window.location.origin` and nothing else — scheme plus host, no port, no
- * path, no query, no whitespace, no newline. Deployed cockpit is always
- * https, so that's the only scheme accepted; anything this rejects that a
- * real deployment legitimately needs (e.g. a non-standard port) is a dead
- * end that surfaces as a thrown Error, not a security hole. The reverse —
- * this function accepting a shape the gateway's Origin allow-list would not
- * exact-match — is the actual sink being guarded against.
+ * `window.location.origin` and nothing else — scheme, host, and an optional
+ * port, no userinfo, no path, no query, no fragment, no whitespace, no
+ * control characters.
+ *
+ * Both `http` and `https` are accepted, and a port (1-5 digits) is allowed:
+ * ruling P-10. A k3d port-forwarded cockpit serves `http://localhost:PORT`,
+ * and Task 5 feeds this function the real `window.location.origin` — so a
+ * scheme- or port-only restriction would refuse to render the connect panel
+ * in exactly the environment Task 7's live gate runs in. Neither the scheme
+ * nor a numeric port is a shell metacharacter, so widening to admit them
+ * costs nothing on the injection side (see the module comment above); the
+ * only cost of accepting `http` is a 403 from a gateway whose Origin
+ * allow-list happens to list only `https` origins, which is a normal,
+ * already-named failure (Task 1's error message), not a security hole.
+ * The rule is: fail closed on the *dangerous* grammar, not the *unfamiliar*
+ * one. Do not re-tighten this back to `https`-only or portless.
  */
-const ORIGIN_PATTERN = new RegExp(`^https://${HOST_BODY}$`, 'i');
+const ORIGIN_PATTERN = new RegExp(`^https?://${HOST_BODY}(:\\d{1,5})?$`, 'i');
 
 export interface SshConfigOptions {
     handle: string;
