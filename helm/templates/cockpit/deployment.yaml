@@ -8,7 +8,7 @@ data:
   env.js: |
     (function(window) {
       window['env'] = window['env'] || {};
-      window['env']['apiUrl'] = '{{ ternary (include "srw.cockpitUrl" .) (include "srw.apiUrl" .) .Values.auth.bff.sameOriginApi }}/api';
+      window['env']['apiUrl'] = '{{ include "srw.cockpitFacingApiUrl" . }}/api';
       // Null keeps the live-app renderer dark. The suffix is exposed only
       // after the separate viewer gate is explicitly configured.
       window['env']['canvasViewerHostSuffix'] = {{ if and .Values.canvas.livePreview.enabled .Values.canvas.livePreview.viewer.enabled .Values.canvas.livePreview.viewer.hostSuffix }}{{ .Values.canvas.livePreview.viewer.hostSuffix | quote }}{{ else }}null{{ end }};

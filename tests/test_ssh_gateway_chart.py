@@ -630,6 +630,85 @@ def test_ingress_steals_no_orchestrator_route(docs: list[dict]) -> None:
     )
 
 
+def test_ingress_host_follows_cockpits_actual_apiurl(docs: list[dict]) -> None:
+    """task-7 live gate, controller correction C1: cockpit's own generated
+    `env.js` picks its `apiUrl` via a `sameOriginApi` ternary
+    (`srw.cockpitFacingApiUrl` -- cockpit/deployment.yaml), but this Ingress
+    used to be pinned to the bare `srw.apiUrl` host regardless of that flag.
+    With `sameOriginApi: true` the two disagreed: cockpit dialled the
+    cockpit host and this Ingress sat on the api host, so the generated
+    `ProxyCommand`'s WSS attach landed on the orchestrator's own ASGI app
+    (no route there) and came back a bare 403 with NOTHING in the
+    ssh-gateway pod's logs -- indistinguishable from a token/auth failure
+    without checking the gateway's logs and finding them empty. Both
+    settings must render on the SAME host cockpit's own apiUrl would use, or
+    this regresses silently (a rendering test can't see a 403 that never
+    reaches this file).
+    """
+    same_origin_off = _render(*ENABLE, "--set", "auth.bff.sameOriginApi=false")
+    same_origin_on = _render(*ENABLE, "--set", "auth.bff.sameOriginApi=true")
+
+    host_off = _one(same_origin_off, "Ingress", "ssh-gateway")["spec"]["rules"][0]["host"]
+    host_on = _one(same_origin_on, "Ingress", "ssh-gateway")["spec"]["rules"][0]["host"]
+
+    assert host_off == "api.example.com"
+    assert host_on == "example.com"
+    # And the TLS secret follows the same host, or cert-manager issues a
+    # redundant cert for it under the wrong Ingress's name.
+    assert _one(same_origin_off, "Ingress", "ssh-gateway")["spec"]["tls"][0][
+        "secretName"
+    ].endswith("-api-tls")
+    assert _one(same_origin_on, "Ingress", "ssh-gateway")["spec"]["tls"][0][
+        "secretName"
+    ].endswith("-cockpit-tls")
+
+
+def test_cockpit_env_js_apiurl_host_matches_the_gateway_ingress(docs: list[dict]) -> None:
+    """The other half of the C1 regression: prove the two templates that
+    independently compute "cockpit's API host" (cockpit/deployment.yaml's
+    `env.js` and ssh-gateway/ingress.yaml's Ingress host) can no longer
+    drift apart, across both settings of the flag that caused them to.
+    """
+    import re
+
+    for override in ("false", "true"):
+        rendered = _render(*ENABLE, "--set", f"auth.bff.sameOriginApi={override}")
+        ingress_host = _one(rendered, "Ingress", "ssh-gateway")["spec"]["rules"][0]["host"]
+        configmap = _one(rendered, "ConfigMap", "cockpit-env")
+        env_js = configmap["data"]["env.js"]
+        match = re.search(r"apiUrl'\] = '([^']+)'", env_js)
+        assert match, f"could not find apiUrl assignment in env.js:\n{env_js}"
+        api_url_host = match.group(1).split("://", 1)[1].split("/", 1)[0]
+        assert ingress_host == api_url_host, (
+            f"sameOriginApi={override}: ssh-gateway Ingress host "
+            f"({ingress_host!r}) != cockpit's own env.js apiUrl host "
+            f"({api_url_host!r}) -- a generated ProxyCommand would dial the "
+            "wrong host and get a bare 403 with nothing in the gateway's logs"
+        )
+
+
+def test_cors_middleware_allows_the_service_worker_bypass_header(
+    default_docs: list[dict],
+) -> None:
+    """Not ssh-gateway-specific, but found live while running this exact
+    plan's task-7 gate: `auth.interceptor.ts` sets `ngsw-bypass: 1` on every
+    non-safe (mutating) request to the orchestrator (bd31e072), and the
+    Traefik CORS middleware's `accessControlAllowHeaders` never grew a
+    matching entry. Any cross-origin cockpit/api deployment -- which is the
+    chart's own DEFAULT (`auth.bff.sameOriginApi: false`), not a corner case
+    -- therefore had every POST/PUT/PATCH/DELETE cockpit request (including
+    `POST /api/ssh-keys/challenge`, the first step of registering an SSH
+    key) silently rejected by the browser's CORS preflight before it ever
+    reached the orchestrator. Nothing server-side logs a CORS rejection, so
+    there is no signal of this anywhere but the browser console -- this
+    rendering test is the only thing that catches a future removal of the
+    header from either side without a live browser pass.
+    """
+    middleware = _one(default_docs, "Middleware", "cors")
+    allow_headers = middleware["spec"]["headers"]["accessControlAllowHeaders"]
+    assert "ngsw-bypass" in allow_headers
+
+
 def test_tcp_listener_is_off_by_default(docs: list[dict]) -> None:
     services = _find(docs, "Service", "ssh-gateway")
     assert services

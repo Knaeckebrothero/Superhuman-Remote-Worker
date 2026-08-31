@@ -395,6 +395,29 @@ Centralized so every URL helper picks up local-dev (no-TLS) deployments.
 {{- printf "%s://%s" (include "srw.urlScheme" .) (include "srw.host" (dict "context" . "key" "api" "default" "api")) }}
 {{- end }}
 
+{{/*
+The origin cockpit's own SPA actually dials for the API — NOT always
+"srw.apiUrl". When `auth.bff.sameOriginApi` is on, cockpit's served env.js
+points `apiUrl` at the cockpit's own origin (`srw.cockpitUrl`) instead, so
+same-origin path routing on the cockpit ingress can carry `/api`, `/auth`,
+`/ws` without a cross-site cookie (see cockpit/deployment.yaml's env.js
+ternary, which this mirrors exactly — keep the two in sync).
+
+Any ingress rule that must match wherever the BROWSER's own JS will dial —
+as opposed to the REST api ingress, which is deliberately host-pinned to
+`srw.apiUrl` regardless of this flag — needs to key off THIS helper, not
+`srw.apiUrl` directly. Ported to ssh-gateway/ingress.yaml after a live gate
+(task-7-brief.md, controller correction C1) found the two host names had
+drifted apart: cockpit dialled `apiHost` (`new URL(environment.apiUrl)
+.hostname`, persistent-chat.component.ts) on the cockpit origin, but the
+gateway's WSS ingress was still pinned to the bare `srw.apiUrl` host, so a
+generated ProxyCommand routed to the orchestrator's own ASGI app instead of
+the gateway pod and came back a bare 403 with nothing in the gateway's logs.
+*/}}
+{{- define "srw.cockpitFacingApiUrl" -}}
+{{- ternary (include "srw.cockpitUrl" .) (include "srw.apiUrl" .) .Values.auth.bff.sameOriginApi }}
+{{- end }}
+
 {{- define "srw.authUrl" -}}
 {{- if and .Values.keycloak.enabled (not .Values.keycloak.internal) .Values.keycloak.externalIssuerUrl }}
 {{- .Values.keycloak.externalIssuerUrl }}

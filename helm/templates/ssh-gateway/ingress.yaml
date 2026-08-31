@@ -1,7 +1,22 @@
 {{- if and .Values.sshGateway.enabled .Values.ingress.enabled }}
 {{- $fullName := include "srw.fullname" . -}}
-{{- $apiHost := include "srw.urlHost" (include "srw.apiUrl" .) -}}
-# The WSS attach door, on the existing API host.
+{{- /*
+  Host wherever cockpit's OWN generated ProxyCommand will actually dial --
+  not the bare API host. Those two are the same host except when
+  auth.bff.sameOriginApi is on, in which case cockpit's served env.js points
+  apiUrl at its own origin (srw.cockpitFacingApiUrl mirrors that ternary
+  exactly; keep both in sync with cockpit/deployment.yaml's env.js block).
+  A live gate (task-7-brief.md, controller correction C1) found these two
+  had drifted apart on a sameOriginApi:true deployment: cockpit dialled the
+  cockpit host, this ingress was still pinned to the bare api host, and the
+  generated config's WSS attach landed on the orchestrator's own ASGI app
+  (no route there) instead of the gateway pod -- a bare 403 with nothing in
+  the gateway's own logs, indistinguishable from a token/auth failure until
+  someone checks the gateway pod's log and finds it empty.
+*/}}
+{{- $apiHost := include "srw.urlHost" (include "srw.cockpitFacingApiUrl" .) -}}
+# The WSS attach door, on whatever host cockpit's own generated ProxyCommand
+# dials (see the note above) -- the api host, unless sameOriginApi moves it.
 #
 # ONLY `/api/ssh/attach` comes here, and only as an EXACT match. Every other
 # `/api/ssh*` route is served by the ORCHESTRATOR:
@@ -11,11 +26,12 @@
 #
 # Traefik maps `pathType: Prefix` to `PathPrefix()`, which is a RAW STRING
 # prefix rather than a path-element match, and the explicit priority below
-# beats the api ingress's length-derived default. Under `Prefix` this rule
-# therefore swallows `/api/ssh/attach-token` and answers it with the gateway's
-# Starlette 404 -- no token can ever be minted, and the whole feature is dead
-# with nothing in any log naming the cause. `Exact` maps to `Path()` and
-# claims exactly the one route the gateway serves.
+# beats the api/cockpit ingress's length-derived default. Under `Prefix` this
+# rule therefore swallows `/api/ssh/attach-token` (or, on the cockpit host,
+# every other `/api/*` route the same-origin block carries) and answers it
+# with the gateway's Starlette 404 -- no token can ever be minted, and the
+# whole feature is dead with nothing in any log naming the cause. `Exact`
+# maps to `Path()` and claims exactly the one route the gateway serves.
 # (tests/test_ssh_gateway_chart.py asserts this against the committed
 # orchestrator endpoint inventory, so a future `/api/ssh/attach-*` endpoint
 # fails the suite instead of the feature.)
@@ -49,7 +65,12 @@ spec:
   tls:
     - hosts:
         - {{ $apiHost }}
-      secretName: {{ $fullName }}-api-tls
+      # Reuse whichever TLS secret the host we just landed on already owns --
+      # the cockpit ingress's own secret when sameOriginApi moved us onto its
+      # host, the dedicated api-tls secret otherwise. Naming the wrong one
+      # doesn't break TLS (cert-manager happily issues a second cert into it
+      # for the same host), it just leaves a redundant certificate behind.
+      secretName: {{ $fullName }}-{{ ternary "cockpit" "api" .Values.auth.bff.sameOriginApi }}-tls
   {{- end }}
   rules:
     - host: {{ $apiHost }}
