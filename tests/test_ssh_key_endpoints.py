@@ -987,10 +987,29 @@ async def test_ssh_key_added_category_is_registered_high_severity():
 
     spec = cat.category_spec("ssh_key_added")
     assert spec.severity == "high"
-    # Informational: nothing to approve/deny, so no action is declared
-    # (register_action refuses a handler for an action the category never
-    # declared — declaring one nothing implements would be silently dead).
-    assert spec.actions == ()
+    # Ruling P-12 (fix round 1): source-less categories need a resolving
+    # action or the row can never leave `pending`, so this declares
+    # ACTION_OPEN_SOURCE rather than shipping with none.
+    assert [a.type for a in spec.actions] == ["open"]
+
+
+@pytest.mark.asyncio
+async def test_ssh_key_added_open_action_navigates_and_resolves():
+    """The declared `open` action is the ONLY way an `ssh_key_added` row
+    ever leaves `pending` — no source_kind is registered for it, so nothing
+    else can resolve it. Also pins the destination: Settings → SSH Keys is
+    where a user revokes a key they didn't add."""
+    from services.notification_catalog import ActionContext, action_handler
+
+    main._register_notification_actions()
+    handler = action_handler("ssh_key_added", "open")
+    assert handler is not None
+
+    result = await handler(
+        ActionContext(notification={}, user={"id": "u1"}, params={})
+    )
+    assert result.resolve is True
+    assert result.result == {"navigate": "/settings/ssh-keys"}
 
 
 @pytest.mark.asyncio

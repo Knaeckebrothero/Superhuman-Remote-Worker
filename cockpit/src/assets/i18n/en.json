@@ -3853,7 +3853,8 @@
       "automation_disabled": "Automation",
       "user_registered": "New user",
       "session_permission": "Permission",
-      "sudo_request": "Sudo"
+      "sudo_request": "Sudo",
+      "ssh_key_added": "SSH key added"
     },
     "severity": {
       "low": "Low",
@@ -3900,7 +3901,8 @@
       "loop": "Loop",
       "automation": "Automation",
       "user": "User",
-      "permission_request": "Permission request"
+      "permission_request": "Permission request",
+      "ssh_key": "SSH key"
     },
     "detail": {
       "noActions": "No actions available",

@@ -1,6 +1,6 @@
-import {Injectable, inject, signal} from '@angular/core';
+import {Injectable, inject} from '@angular/core';
 import {HttpClient} from '@angular/common/http';
-import {catchError, firstValueFrom, of} from 'rxjs';
+import {firstValueFrom} from 'rxjs';
 import {environment} from '../environment';
 
 /**
@@ -36,29 +36,25 @@ export interface CreateSshKeyRequest {
   signature: string;
 }
 
+/**
+ * Thin HTTP wrapper over `/api/ssh-keys*`. Deliberately holds no list state
+ * of its own (unlike `api-keys.service.ts`'s signal-backed `keys`): every
+ * method is Promise-returning (ruling P-4), and `SshKeysPageComponent` is
+ * the sole owner of the presentation-layer list — one `GET` per mutation,
+ * not two (fix round 1, minor "double fetch per mutation"). A second
+ * consumer that wants a push-updated signal should add one deliberately,
+ * not resurrect a copy that silently drifts from the component's.
+ */
 @Injectable({providedIn: 'root'})
 export class SshKeysService {
   private readonly http = inject(HttpClient);
   private readonly baseUrl = environment.apiUrl;
 
-  /** All known SSH keys for the current user. */
-  readonly keys = signal<SshKey[]>([]);
-  readonly isLoading = signal(false);
-
-  /** Load the current user's SSH keys into the signal. */
-  async loadKeys(): Promise<SshKey[]> {
-    this.isLoading.set(true);
-    try {
-      const keys = await firstValueFrom(
-        this.http
-          .get<SshKey[]>(`${this.baseUrl}/ssh-keys`)
-          .pipe(catchError(() => of([] as SshKey[]))),
-      );
-      this.keys.set(keys);
-      return keys;
-    } finally {
-      this.isLoading.set(false);
-    }
+  /** The current user's SSH keys. Errors propagate — a failed request must
+   *  never render as "no keys yet" (fix round 1, minor: a user who believes
+   *  a listed key vanished may re-register it). */
+  loadKeys(): Promise<SshKey[]> {
+    return firstValueFrom(this.http.get<SshKey[]>(`${this.baseUrl}/ssh-keys`));
   }
 
   /** Issue a possession challenge. The caller signs `challenge` with the
@@ -70,10 +66,9 @@ export class SshKeysService {
     );
   }
 
-  /** Register a public key once possession is proven. Refreshes the list
-   *  on success. */
-  async createKey(body: CreateSshKeyRequest): Promise<SshKey> {
-    const created = await firstValueFrom(
+  /** Register a public key once possession is proven. */
+  createKey(body: CreateSshKeyRequest): Promise<SshKey> {
+    return firstValueFrom(
       this.http.post<SshKey>(`${this.baseUrl}/ssh-keys`, {
         name: body.name,
         public_key: body.publicKey,
@@ -81,13 +76,10 @@ export class SshKeysService {
         signature: body.signature,
       }),
     );
-    await this.loadKeys();
-    return created;
   }
 
-  /** Remove a key. Refreshes the list on success. */
+  /** Remove a key. */
   async deleteKey(id: string): Promise<void> {
     await firstValueFrom(this.http.delete<{status: string}>(`${this.baseUrl}/ssh-keys/${id}`));
-    await this.loadKeys();
   }
 }

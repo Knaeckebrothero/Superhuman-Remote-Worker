@@ -227,11 +227,20 @@ export class SshKeysPageComponent implements OnInit {
     void this.refreshKeys();
   }
 
+  /** The sole owner of list refresh (fix round 1, minor "double fetch per
+   *  mutation" — the service no longer calls `loadKeys()` itself). Errors
+   *  surface via `error()` rather than rendering as an empty list: the
+   *  service's `loadKeys()` no longer swallows failures either (fix round
+   *  1, minor: a user who sees "no keys yet" on a failed request may
+   *  re-register a key they believe is gone). */
   private async refreshKeys(): Promise<void> {
     this.keysLoading.set(true);
     try {
       const keys = await this.service.loadKeys();
       this.keys.set(keys);
+      this.error.set(null);
+    } catch (err) {
+      this.error.set(this.extractError(err, 'Could not load your SSH keys.'));
     } finally {
       this.keysLoading.set(false);
     }

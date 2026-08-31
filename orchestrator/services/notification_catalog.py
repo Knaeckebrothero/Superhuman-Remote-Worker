@@ -328,11 +328,14 @@ CATEGORIES: dict[str, CategorySpec] = {
         # An SSH key was registered on the account (workspace_ssh_access.md
         # §6.3): the standard account-security signal, so a key added by
         # someone else (a stolen session, a shared account) is visible to
-        # its owner — the same reason a "new sign-in" mail is loud. Purely
-        # informational: there is nothing to approve or deny here, and no
-        # existing action constant is a fit, so this ships with none rather
-        # than declare one `register_action` would never see a handler for.
-        CategorySpec("ssh_key_added", "high"),
+        # its owner — the same reason a "new sign-in" mail is loud.
+        # Source-less (no source_kind), so ACTION_OPEN_SOURCE's handler is
+        # the ONLY way one of these ever leaves `pending` (ruling P-12,
+        # fix round 1: a zero-action version of this category could never
+        # resolve and would inflate the inbox forever) — it also happens to
+        # be the right destination: exactly where a user revokes a key they
+        # didn't add.
+        CategorySpec("ssh_key_added", "high", (ACTION_OPEN_SOURCE,)),
     )
 }
 

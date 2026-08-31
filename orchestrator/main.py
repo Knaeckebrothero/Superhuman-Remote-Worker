@@ -23987,6 +23987,18 @@ def _register_notification_actions() -> None:
     async def _open_admin_users(ctx: ActionContext) -> ActionResult:
         return _navigate("/admin/users")
 
+    @register_action("ssh_key_added", "open")
+    async def _open_ssh_keys(ctx: ActionContext) -> ActionResult:
+        # ssh_key_added carries no source_kind, so this action is the ONLY
+        # way one of these rows ever leaves `pending` (ruling P-12) — the
+        # shared `_navigate()` deliberately never sets `resolve`, since its
+        # other callers resolve through a registered source instead, so this
+        # builds its own ActionResult. `resolve=True` for a source-less
+        # category is the sanctioned mechanism per ActionResult.resolve's own
+        # comment above. The destination is also the right product answer:
+        # it's exactly where a user goes to revoke a key they did not add.
+        return ActionResult(result={"navigate": "/settings/ssh-keys"}, resolve=True)
+
     async def _permission_decision(ctx: ActionContext, decision: str) -> ActionResult:
         # act() proved the caller is the row's recipient, i.e. the thread
         # owner the sweeper addressed it to.

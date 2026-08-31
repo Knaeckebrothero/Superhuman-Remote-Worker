@@ -14,24 +14,10 @@ class TestCategories:
         for name, spec in cat.CATEGORIES.items():
             assert spec.name == name
             assert spec.severity in cat.SEVERITIES
+            assert spec.actions, f"{name} declares no actions"
             for action in spec.actions:
                 assert action.label_key.startswith("notifications.actions.")
                 assert action.style in cat.ACTION_STYLES
-
-    def test_every_category_declares_actions_except_purely_informational_ones(self):
-        # Every category needs at least one action UNLESS it is a purely
-        # informational signal with nothing to approve/deny/open beyond the
-        # feed row itself. `register_action` refuses to bind a handler to an
-        # undeclared action, and the catalog must never declare an action
-        # nothing implements — so a category with no fitting action ships
-        # with none rather than force one. `ssh_key_added` (account-security
-        # "this happened", workspace_ssh_access.md §6.3) is the first case.
-        NO_ACTION_CATEGORIES = {"ssh_key_added"}
-        for name, spec in cat.CATEGORIES.items():
-            if name in NO_ACTION_CATEGORIES:
-                assert spec.actions == (), f"{name} was expected to declare no actions"
-            else:
-                assert spec.actions, f"{name} declares no actions"
 
     def test_unknown_category_is_loud(self):
         with pytest.raises(ValueError, match="unknown notification category"):
