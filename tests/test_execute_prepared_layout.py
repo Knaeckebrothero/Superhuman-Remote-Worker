@@ -68,7 +68,12 @@ from src.core.memory_injection import (
     create_memory_injection_messages,
     is_memory_injection_message,
 )
-from src.core.message_markers import is_protected_message, protected_phase_key
+from src.core.message_markers import (
+    PERSIST_ROLE_EVENT,
+    PERSIST_ROLE_KEY,
+    is_protected_message,
+    protected_phase_key,
+)
 from src.core.workspace import WorkspaceManager
 from src.core.workspace_injection import (
     TODOS_INJECTION_CONTENT_PREFIX,
@@ -434,6 +439,38 @@ def _failed_citation(cid: int = 7) -> Citation:
 
 
 class TestPreparedLayout:
+    @pytest.mark.asyncio
+    async def test_live_child_status_is_transient_and_immediately_before_todos(
+        self, env
+    ):
+        _bind_tactical_phase_skill(env)
+        block = (
+            "<active_subagents>\n"
+            "- probe-ab12: running (background)\n"
+            "Reports push automatically; do not poll.\n"
+            "</active_subagents>"
+        )
+        env["ctx"].subagent_runtime = SimpleNamespace(
+            active_subagents_block=MagicMock(return_value=block)
+        )
+        llm = CapturingLLM()
+        node = _make_node(env, llm)
+
+        result = await _run(node, _state())
+
+        (request,) = llm.requests
+        active = next(
+            m for m in request if str(m.content).startswith("<active_subagents>")
+        )
+        assert request[-2] is active
+        assert _is_todos(request[-1])
+        assert active.additional_kwargs[PERSIST_ROLE_KEY] == PERSIST_ROLE_EVENT
+        assert "do not poll" in active.content
+        assert not any(
+            "<active_subagents>" in str(m.content) for m in result["messages"]
+        )
+        env["ctx"].subagent_runtime.active_subagents_block.assert_called_once_with()
+
     @pytest.mark.asyncio
     async def test_layout_is_system_summaries_history_block_then_tail_with_todos_last(
         self, env

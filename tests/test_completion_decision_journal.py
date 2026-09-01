@@ -48,6 +48,7 @@ def _context(client) -> MagicMock:
     context.workspace_manager = MagicMock()
     context.has_todo.return_value = False
     context.orchestrator_client = client
+    context.subagent_runtime = None
     return context
 
 
@@ -57,6 +58,46 @@ def _job_complete(client):
 
 
 class TestJobCompleteJournal:
+    @pytest.mark.asyncio
+    async def test_live_or_undelivered_child_blocks_before_journal(self):
+        client = MagicMock()
+        client.record_completion_decision = AsyncMock()
+        context = _context(client)
+        context.subagent_runtime = MagicMock()
+        context.subagent_runtime.has_completion_blockers.return_value = True
+        _, job_complete = create_job_tools(context)
+
+        result = await invoke_tool(
+            job_complete,
+            {"summary": "Done.", "deliverables": [], "confidence": 1.0},
+            call_id="call-too-early",
+        )
+
+        assert "blocked while a background subagent" in result
+        assert "Reports push automatically" in result
+        client.record_completion_decision.assert_not_awaited()
+        assert get_final_phase_data(JOB_ID) is None
+
+    @pytest.mark.asyncio
+    async def test_child_blocker_probe_failure_fails_closed(self):
+        client = MagicMock()
+        client.record_completion_decision = AsyncMock()
+        context = _context(client)
+        context.subagent_runtime = MagicMock()
+        context.subagent_runtime.has_completion_blockers.side_effect = RuntimeError(
+            "runtime unavailable"
+        )
+        _, job_complete = create_job_tools(context)
+
+        result = await invoke_tool(
+            job_complete,
+            {"summary": "Done.", "deliverables": [], "confidence": 1.0},
+        )
+
+        assert "could not be verified" in result
+        assert "NOT marked as final" in result
+        client.record_completion_decision.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_journal_write_happens_before_cache(self):
         """The decision must be durable before anything local observes it."""

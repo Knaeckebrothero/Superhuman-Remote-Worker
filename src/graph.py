@@ -1536,6 +1536,12 @@ def create_execute_node(
                     f"{len(_guidance_entries)} pending entrie(s)"
                 )
 
+        # Background children publish a process-local mirror only after their
+        # durable terminal+delivery transaction commits.  This status block is
+        # a latency/visibility aid, never durability: it is rebuilt at the
+        # prompt-cache tail and never enters graph state.
+        _active_subagents = _active_subagents_block(tool_context)
+
         def _inject_transient_messages(target_messages: list) -> None:
             """Splice transient injections (memories, knowledge, guidance, todos) at the tail.
 
@@ -1606,6 +1612,14 @@ def create_execute_node(
                 )
                 block.append(guid_ai)
                 block.append(guid_tool)
+
+            if _active_subagents:
+                block.append(
+                    HumanMessage(
+                        content=_active_subagents,
+                        additional_kwargs={PERSIST_ROLE_KEY: PERSIST_ROLE_EVENT},
+                    )
+                )
 
             # Todo list as transient HumanMessage — last, so the request ends
             # with the current tasks (query-at-end) and the synthetic tool-call
@@ -3746,6 +3760,51 @@ def _get_queued_replies(job_id: str) -> List[Dict[str, Any]]:
         return []
 
 
+def _active_subagents_block(tool_context: Optional["ToolContext"]) -> str:
+    """One transient parent-tail status block, or ``""`` when none are live."""
+    runtime = getattr(tool_context, "subagent_runtime", None)
+    render = getattr(runtime, "active_subagents_block", None)
+    if not callable(render):
+        return ""
+    try:
+        value = render()
+    except Exception:
+        logger.debug("Failed to render active subagent status", exc_info=True)
+        return ""
+    return str(value or "").strip()
+
+
+def _merge_local_subagent_deliveries(
+    inbox: List[Dict[str, Any]], tool_context: "ToolContext"
+) -> List[Dict[str, Any]]:
+    """Merge the post-commit local latency mirror with heartbeat deliveries.
+
+    The orchestrator/DB copy wins an identity collision.  Draining the local
+    mirror before the checkpoint is safe because it is never the authority:
+    a crash before absorption simply redelivers the same stable key from the
+    next heartbeat/database read.
+    """
+    runtime = getattr(tool_context, "subagent_runtime", None)
+    drain = getattr(runtime, "drain_local_deliveries", None)
+    if not callable(drain):
+        return list(inbox)
+    try:
+        local = drain()
+    except Exception:
+        logger.debug("Failed to drain local subagent deliveries", exc_info=True)
+        return list(inbox)
+    merged = list(inbox)
+    keys = {_reply_key(reply) for reply in merged if isinstance(reply, dict)}
+    for reply in local or []:
+        if not isinstance(reply, dict):
+            continue
+        key = _reply_key(reply)
+        if key not in keys:
+            merged.append(dict(reply))
+            keys.add(key)
+    return merged
+
+
 def _replies_overdue(replies: List[Dict[str, Any]], max_wait_seconds: float) -> bool:
     """True when the oldest queued reply has waited longer than the floor.
 
@@ -3815,7 +3874,7 @@ def _deliver_queued_replies(
     ``HumanMessage``. Child reports use the provider-portable HumanMessage
     carrier marked ``role=event`` and explicitly framed as evidence.
     """
-    inbox = _get_queued_replies(job_id)
+    inbox = _merge_local_subagent_deliveries(_get_queued_replies(job_id), tool_context)
 
     # Drop anything already appended to the conversation. The ack is
     # fire-and-forget, so the heartbeat keeps returning delivered entries for
@@ -4922,6 +4981,9 @@ def create_audited_tool_node(
 
     _TOOL_TIMEOUT_RETRIES = [0]  # tracks consecutive batch timeouts
     _TOOL_BATCH_TIMEOUT_SECONDS = 900  # absolute cap for any audited tool batch
+    _SUBAGENT_CONTROL_TOOLS = frozenset(
+        {"list_agents", "wait_agent", "message_agent", "stop_agent"}
+    )
 
     # Tools that indicate forward progress (reset stuck counter)
     PROGRESS_TOOLS = {
@@ -5185,6 +5247,9 @@ def create_audited_tool_node(
         }
         cobatched_idx: set = set()
         delegation_batch = bool(delegation_idx)
+        delegation_spawn_count = sum(
+            1 for i in delegation_idx if tool_calls_info[i]["name"] == "delegate_agent"
+        )
         if delegation_batch:
             cobatched_idx = {
                 i
@@ -5339,6 +5404,11 @@ def create_audited_tool_node(
         # Fingerprint-based loop detection -> track signatures for warnings
         _loop_warned_call_ids: set = set()  # call_ids to warn about after execution
         for tc_info in tool_calls_info:
+            # Controls remain audited and count against the global tool budget,
+            # but waiting/listing must not manufacture a loop warning. Reports
+            # push automatically; polling is neither required nor progress.
+            if tc_info["name"] in _SUBAGENT_CONTROL_TOOLS:
+                continue
             args_str = json.dumps(tc_info["args"], sort_keys=True, default=str)
             args_hash = hashlib.md5(args_str.encode()).hexdigest()[:12]
             call_sig = (tc_info["name"], args_hash)
@@ -5394,7 +5464,7 @@ def create_audited_tool_node(
             # staleness — B.4), never by a wall clock here: no wait_for, no
             # reconnect, and a slow fan-out is not a wedged workspace. The
             # stamps give the runtime what the envelope and a fork need.
-            _stamp_delegation_batch(state, messages, len(legal_calls))
+            _stamp_delegation_batch(state, messages, delegation_spawn_count)
             result = await tool_node.ainvoke(node_input)
             _TOOL_TIMEOUT_RETRIES[0] = 0
         else:
@@ -5568,11 +5638,14 @@ def create_audited_tool_node(
                 if progress_made:
                     break
 
+        progress_count = sum(
+            1 for tc in tool_calls_info if tc["name"] not in _SUBAGENT_CONTROL_TOOLS
+        )
         if progress_made:
             _calls_since_progress[0] = 0
             _reflection_injected[0] = False
         else:
-            _calls_since_progress[0] += len(tool_calls_info)
+            _calls_since_progress[0] += progress_count
 
         # request_replan is a deliberate re-plan: reset loop detection state
         if "request_replan" in {tc["name"] for tc in legal_calls}:
@@ -5629,9 +5702,12 @@ def create_audited_tool_node(
         # Act-ratio tripwire: count consecutive process-artifact-only actions;
         # any concrete action resets. At threshold, inject the one-line nudge
         # and re-arm the counter.
-        if _ACT_RATIO_THRESHOLD > 0 and executed_tool_batch:
-            if all(_is_process_action(tc["name"], tc["args"]) for tc in legal_calls):
-                _process_only_streak[0] += len(legal_calls)
+        act_calls = [
+            tc for tc in legal_calls if tc["name"] not in _SUBAGENT_CONTROL_TOOLS
+        ]
+        if _ACT_RATIO_THRESHOLD > 0 and act_calls:
+            if all(_is_process_action(tc["name"], tc["args"]) for tc in act_calls):
+                _process_only_streak[0] += len(act_calls)
             else:
                 _process_only_streak[0] = 0
             if _process_only_streak[0] >= _ACT_RATIO_THRESHOLD:

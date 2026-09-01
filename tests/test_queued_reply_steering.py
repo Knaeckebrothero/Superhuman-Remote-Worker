@@ -118,6 +118,60 @@ class TestRepliesOverdue:
 
 
 class TestDelivery:
+    def test_post_commit_local_child_event_pushes_without_heartbeat_delay(
+        self, monkeypatch, acks, written
+    ):
+        child = {
+            "id": "child-local-1",
+            "source": "subagent",
+            "thread_id": "child-thread",
+            "handle": "probe-ab12",
+            "run_generation": "generation-1",
+            "message": "The probe found the boundary.",
+            "timestamp": iso(0),
+        }
+        set_inbox(monkeypatch, [])
+        ctx = make_context()
+        ctx.subagent_runtime = SimpleNamespace(
+            drain_local_deliveries=MagicMock(return_value=[child])
+        )
+        result = {"messages": []}
+
+        _deliver_queued_replies("job-1", ctx, make_config(), result)
+
+        assert "probe found the boundary" in result["messages"][0].content
+        assert result["delivered_reply_keys"] == [_reply_key(child)]
+        assert acks[0]["reply_keys"] == [_reply_key(child)]
+        assert written == [[child]]
+        ctx.subagent_runtime.drain_local_deliveries.assert_called_once_with()
+
+    def test_heartbeat_copy_wins_a_stable_local_delivery_collision(
+        self, monkeypatch, acks, written
+    ):
+        durable = {
+            "id": "child-same",
+            "source": "subagent",
+            "thread_id": "child-thread",
+            "handle": "probe-ab12",
+            "run_generation": "generation-1",
+            "message": "durable report",
+            "timestamp": iso(1),
+        }
+        local = {**durable, "message": "unexpected local mismatch"}
+        set_inbox(monkeypatch, [durable])
+        ctx = make_context()
+        ctx.subagent_runtime = SimpleNamespace(
+            drain_local_deliveries=MagicMock(return_value=[local])
+        )
+        result = {"messages": []}
+
+        _deliver_queued_replies("job-1", ctx, make_config(), result)
+
+        assert "durable report" in result["messages"][0].content
+        assert "unexpected local mismatch" not in result["messages"][0].content
+        assert written == [[durable]]
+        assert result["delivered_reply_keys"] == [_reply_key(durable)]
+
     def test_completed_todo_delivers(self, monkeypatch, acks, written):
         reply = {"thread_id": "t1", "message": "check X", "timestamp": iso(5)}
         set_inbox(monkeypatch, [reply])

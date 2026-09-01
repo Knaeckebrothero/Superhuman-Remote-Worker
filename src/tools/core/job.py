@@ -187,6 +187,35 @@ def create_job_tools(context: ToolContext) -> List[Any]:
                     "call job_complete."
                 )
 
+            # Background children and their committed-but-not-yet-absorbed
+            # reports are part of this parent job.  Refuse the local decision
+            # before it clears staged work or journals success.  The
+            # orchestrator repeats this check transactionally; this process
+            # seam gives the model the useful explanation without relying on
+            # a race-prone local flag for correctness.
+            runtime = getattr(context, "subagent_runtime", None)
+            blockers = getattr(runtime, "has_completion_blockers", None)
+            if callable(blockers):
+                try:
+                    blocked = bool(blockers())
+                except Exception:
+                    logger.exception(
+                        "job_complete could not inspect background subagents"
+                    )
+                    return (
+                        "Error: background-subagent completion state could not "
+                        "be verified. The job is NOT marked as final. Retry "
+                        "after the runtime recovers; reports push automatically."
+                    )
+                if blocked:
+                    return (
+                        "ERROR: job_complete is blocked while a background "
+                        "subagent is queued/running or a completed child report "
+                        "has not yet been absorbed. Reports push automatically; "
+                        "continue useful work or wait once, then incorporate the "
+                        "evidence before completing the job."
+                    )
+
             # Check if already in final phase
             if context.job_id in _final_phase_data:
                 logger.info(
