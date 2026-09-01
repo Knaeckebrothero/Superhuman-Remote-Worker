@@ -126,6 +126,27 @@ excluded_rules = [
 #                image before this gate reported), so the bytes are pinned by
 #                the migration checksum guard and an in-place rewrite would
 #                wedge that cluster's boot.
+#        - app/0183: two constraint-missing-not-valid findings. This file is the
+#                cautionary case the rule exists for. ff178032 appended
+#                NOT VALID to both CHECKs *inside* 0183 after it had shipped;
+#                the checksum guard then refused to boot the orchestrator on
+#                every database that had already applied it, taking the whole
+#                stack down (every other pod's init container waits on the
+#                orchestrator). 0183 has since been restored to its original
+#                committed bytes and the NOT VALID form re-expressed as
+#                app/0213. Acting on this finding in place is precisely the
+#                outage; the file must stay byte-frozen forever.
+#        - app/0212: one constraint-missing-not-valid on models_capabilities_check.
+#                The app/0123 carve-out shape: the migration REPLACES the
+#                existing constraint with a strictly wider one (same predicate
+#                plus 'search' and 'fetch' in the allowed array), so every row
+#                that satisfied the old constraint satisfies the new one and
+#                the validation scan can only ever see rows it accepts. models
+#                is a small catalog table, so the scan is sub-second. The file
+#                is transactional-atomic by design — its own header records
+#                that replacing the inline CHECK must be one atomic change so
+#                no row can be written between the DROP and the ADD — and a
+#                NOT VALID split would reopen exactly that window.
 excluded_paths = [
     "orchestrator/database/migrations/app/0001_initial.sql",
     "orchestrator/database/migrations/vector/0001_initial.sql",
@@ -140,5 +161,7 @@ excluded_paths = [
     "orchestrator/database/migrations/app/0143_job_completion_accept_status.sql",
     "orchestrator/database/migrations/app/0147_thread_permission_lease_receipts.sql",
     "orchestrator/database/migrations/app/0171_officer_runtime_grant_liveness.sql",
+    "orchestrator/database/migrations/app/0183_persistent_input_delivery_cancellation.sql",
+    "orchestrator/database/migrations/app/0212_search_fetch_capabilities.sql",
     "orchestrator/database/migrations/vector/0008_kb_index_chunking.sql",
 ]
