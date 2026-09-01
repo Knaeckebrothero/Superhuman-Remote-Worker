@@ -11,10 +11,12 @@ Lifecycle, as the runtime drives it (``src/subagents/runtime.py``):
    parent_job_id=…, parent_thread_id=…, parent_tool_call_id=…, isolation=…,
    write_policy=…, brief_description=…, fork=…)`` once the child is built —
    the DB ledger creates the row here.
-2. ``persist_message`` per transcript message (the driver, WP1).
-3. ``update(subagent_id, status=<terminal>, outcome=…, turns=…, tokens=…,
+2. For ``fork=true``, ``persist_seed`` writes the exact reminted seed once,
+   atomically, before the child provider starts.
+3. ``persist_message`` per new transcript message (the driver, WP1).
+4. ``update(subagent_id, status=<terminal>, outcome=…, turns=…, tokens=…,
    report_path=…, error=…)`` after the envelope is rendered.
-4. ``lookup(parent_job_id, parent_tool_call_id)`` BEFORE a spawn: a terminal
+5. ``lookup(parent_job_id, parent_tool_call_id)`` BEFORE a spawn: a terminal
    row for the same key means the child already ran (a parent re-running
    its tools node after a hard kill) and the runtime replays the stored
    report instead of spending. Optional on the protocol — a ledger without
@@ -28,7 +30,16 @@ non-empty kind is terminal.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Protocol, Tuple, runtime_checkable
+from typing import (
+    Any,
+    Dict,
+    List,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+    runtime_checkable,
+)
 
 #: The status vocabulary the DB ledger stores in ``threads.subagent_status``.
 #: ``running`` at spawn; the driver's ``SubagentResult.kind`` for a finished
@@ -64,6 +75,16 @@ class SubagentLedger(Protocol):
         """Upsert one transcript message the instant the loop produced it."""
         ...
 
+    async def persist_seed(self, subagent_id: str, messages: Sequence[Any]) -> bool:
+        """Atomically persist a fork's exact reminted seed.
+
+        A durable implementation fences the whole batch by the parent
+        execution authority and child runtime generation. ``True`` is the
+        only success receipt; ``False`` or an exception prevents the child
+        provider from starting.
+        """
+        ...
+
     async def update(self, subagent_id: str, **fields: Any) -> None:
         """Record a status / outcome / counters change on the child row.
 
@@ -85,6 +106,9 @@ class NullLedger:
     ) -> None:
         return None
 
+    async def persist_seed(self, subagent_id: str, messages: Sequence[Any]) -> bool:
+        return True
+
     async def update(self, subagent_id: str, **fields: Any) -> None:
         return None
 
@@ -105,6 +129,7 @@ class RecordingLedger:
     def __init__(self) -> None:
         self.opened: List[tuple[str, dict]] = []
         self.messages: List[tuple[str, Any, int]] = []
+        self.seeds: List[tuple[str, List[Any]]] = []
         self.updates: List[tuple[str, dict]] = []
         self.rows: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self.lookups: List[Tuple[str, str]] = []
@@ -116,6 +141,10 @@ class RecordingLedger:
         self, subagent_id: str, msg: Any, turn_number: int
     ) -> None:
         self.messages.append((subagent_id, msg, turn_number))
+
+    async def persist_seed(self, subagent_id: str, messages: Sequence[Any]) -> bool:
+        self.seeds.append((subagent_id, list(messages)))
+        return True
 
     async def update(self, subagent_id: str, **fields: Any) -> None:
         self.updates.append((subagent_id, dict(fields)))

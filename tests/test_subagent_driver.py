@@ -153,6 +153,7 @@ async def make_driver(
     archiver=None,
     archive_fn=None,
     messages=None,
+    ledger=None,
     handle="explorer-0001",
 ):
     fake = FakeChatModel(script)
@@ -176,7 +177,7 @@ async def make_driver(
         parent_context=parent_ctx,
         subagent_id="child-0001",
         budgets=budgets or ChildBudgets(50, 250_000, 2000, 300, 900),
-        ledger=RecordingLedger(),
+        ledger=ledger or RecordingLedger(),
         clock=clock or time.monotonic,
         archiver=archiver,
         archive_fn=archive_fn or _record,
@@ -396,10 +397,12 @@ class TestScenarioABF:
 
 class TestScenarioC:
     @pytest.mark.asyncio
-    async def test_fork_seed_runs_with_the_child_prompt_and_no_open_call(self, parent):
+    async def test_fork_seed_is_persisted_then_runs_under_a_transient_child_prompt(
+        self, parent
+    ):
         parent_ctx, _ = parent
         parent_history = [
-            SystemMessage(content="PARENT SYSTEM PROMPT"),
+            SystemMessage(content="[Summary of prior work] parent summary"),
             HumanMessage(content="parent turn 1: please list files"),
             AIMessage(
                 content="",
@@ -423,6 +426,7 @@ class TestScenarioC:
             ),
         ]
         seed = seed_fork_history(parent_history)
+        initial_seed = tuple(seed)
         driver, fake, build = await make_driver(
             parent_ctx,
             [text_turn("Fork child reporting: history received.")],
@@ -438,10 +442,12 @@ class TestScenarioC:
         assert result.text == "Fork child reporting: history received."
         provider_input = fake.calls[0]
         assert isinstance(provider_input[0], SystemMessage)
-        assert "PARENT SYSTEM PROMPT" not in str(provider_input[0].content)
+        assert "parent summary" not in str(provider_input[0].content)
         assert str(provider_input[0].content).startswith(
             str(build.system_prompt).split("\n")[0][:20]
         )
+        assert isinstance(provider_input[1], SystemMessage)
+        assert provider_input[1].content == "[Summary of prior work] parent summary"
         assert not any(
             isinstance(m, AIMessage)
             and any(tc["id"] == "p2_open" for tc in m.tool_calls)
@@ -449,6 +455,82 @@ class TestScenarioC:
         )
         assert any("There is one file." in str(m.content) for m in provider_input)
         assert any("fork of the parent" in str(m.content) for m in provider_input)
+        # The child prompt is provider-only: the durable list still starts at
+        # the compacted summary and the bulk seed contains the exact reminted
+        # objects handed to the driver.
+        assert isinstance(driver.messages[0], SystemMessage)
+        assert driver.messages[0].content == "[Summary of prior work] parent summary"
+        assert not any(
+            getattr(message, "id", None) == driver._transient_prompt_id
+            for message in driver.messages
+        )
+        assert len(driver.ledger.seeds) == 1
+        seed_subagent_id, persisted_seed = driver.ledger.seeds[0]
+        assert seed_subagent_id == "child-0001"
+        assert len(persisted_seed) == len(initial_seed)
+        assert all(
+            saved is original for saved, original in zip(persisted_seed, initial_seed)
+        )
+        assert not any(
+            getattr(message, "id", None) == driver._transient_prompt_id
+            for message in persisted_seed
+        )
+
+    @pytest.mark.asyncio
+    async def test_seed_persistence_refusal_aborts_once_before_provider_start(
+        self, parent
+    ):
+        class RefusingLedger(RecordingLedger):
+            def __init__(self):
+                super().__init__()
+                self.seed_attempts = 0
+
+            async def persist_seed(self, subagent_id, messages):
+                self.seed_attempts += 1
+                return False
+
+        parent_ctx, _ = parent
+        ledger = RefusingLedger()
+        seed = seed_fork_history([SystemMessage(content="[Summary] durable")])
+        driver, fake, _ = await make_driver(
+            parent_ctx,
+            [text_turn("must never run")],
+            messages=seed,
+            ledger=ledger,
+        )
+        try:
+            with pytest.raises(RuntimeError, match="persistence was refused"):
+                await driver.run("brief")
+            with pytest.raises(RuntimeError, match="seed is not durable"):
+                await driver.run("brief again")
+        finally:
+            await driver.close()
+        assert ledger.seed_attempts == 1
+        assert fake.calls == []
+        assert not driver.started
+
+    @pytest.mark.asyncio
+    async def test_seed_persistence_exception_aborts_before_provider_start(
+        self, parent
+    ):
+        class FailingLedger(RecordingLedger):
+            async def persist_seed(self, subagent_id, messages):
+                raise RuntimeError("database unavailable")
+
+        parent_ctx, _ = parent
+        driver, fake, _ = await make_driver(
+            parent_ctx,
+            [text_turn("must never run")],
+            messages=seed_fork_history([]),
+            ledger=FailingLedger(),
+        )
+        try:
+            with pytest.raises(RuntimeError, match="failed before provider start"):
+                await driver.run("brief")
+        finally:
+            await driver.close()
+        assert fake.calls == []
+        assert not driver.started
 
 
 # ---------------------------------------------------------------------------

@@ -35,7 +35,13 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 
 from src.core.message_markers import PERSIST_ROLE_EVENT, PERSIST_ROLE_KEY
 from src.persistent_graph import (
@@ -74,6 +80,7 @@ _STALE_REASON = "activity limit"
 PLACEHOLDER_PREFIX = "⚠ "
 TRUNCATION_MARKER = "⚠ Output truncated at the model's limit"
 _UNSET = object()
+_SEED_PERSIST_TIMEOUT_S = 5.0
 
 
 def message_text(content: Any) -> str:
@@ -157,8 +164,17 @@ class SubagentDriver:
         self._archive_fn = archive_fn
         self._watcher_poll_interval = watcher_poll_interval
 
-        #: The child's durable history (a fork seeds it; the loop mutates it).
+        #: The child's durable history. A fork seed stays byte-for-byte free of
+        #: the child's transient system prompt; ``_loop_messages`` adds that
+        #: prompt only to the provider working view.
         self.messages: List[BaseMessage] = messages if messages is not None else []
+        self._seed_required = messages is not None
+        self._seed_persist_attempted = False
+        self._seed_persisted = not self._seed_required
+        self._seed_persist_error: Optional[BaseException] = None
+        self._loop_messages: Optional[List[BaseMessage]] = None
+        self._transient_prompt: Optional[SystemMessage] = None
+        self._transient_prompt_id = f"subagent_prompt_{uuid.uuid4().hex}"
         self.inbox: asyncio.Queue = asyncio.Queue()
         self.turn_done = asyncio.Event()
         self.hard_interrupt_event = asyncio.Event()
@@ -224,6 +240,11 @@ class SubagentDriver:
         keep the reasoning sink per child) and the staleness watcher."""
         if self._loop_task is not None:
             return
+        if self._seed_required and not self._seed_persisted:
+            raise RuntimeError(
+                f"subagent {self.handle}: fork seed must be durably persisted "
+                "before the provider loop starts"
+            )
         from src.core.logging_config import bind_log_context, reset_log_context
 
         token = bind_log_context(
@@ -244,32 +265,79 @@ class SubagentDriver:
 
     async def _run_loop(self) -> None:
         build = self.build
-        await run_persistent_loop(
-            llm_with_tools=build.llm_with_tools,
-            tools=build.tools,
-            context_manager=build.context_manager,
-            config=build.config,
-            system_prompt=build.system_prompt,
-            callbacks=self.callbacks(),
-            messages=self.messages,
-            auxiliary_llm=getattr(self.host, "auxiliary_llm", None),
-            recall_store=None,
-            knowledge_store=None,
-            project_id=None,
-            project_ids=None,
-            tool_context=build.tool_context,
-            initial_turn_count=0,
-            get_current_tools=self.current_tools,
-            get_current_context=None,
-            get_current_system_prompt=lambda: build.system_prompt,
-            memory_extraction_prompt="",
-            memory_service=None,
-            claim_memory_extraction_interval=None,
-            defer_memory_extraction_to_outbox=False,
-            memory_thread_id=self.subagent_id,
+        if self._seed_required:
+            self._transient_prompt = SystemMessage(
+                content=build.system_prompt,
+                id=self._transient_prompt_id,
+            )
+            # These are the exact seed objects accepted by ``persist_seed``.
+            # Only the list container and leading system prompt are transient.
+            self._loop_messages = [self._transient_prompt, *self.messages]
+        else:
+            # Preserve U3's lightweight non-fork behavior: the persistent loop
+            # installs its prompt in the otherwise empty in-memory history.
+            self._loop_messages = self.messages
+        try:
+            await run_persistent_loop(
+                llm_with_tools=build.llm_with_tools,
+                tools=build.tools,
+                context_manager=build.context_manager,
+                config=build.config,
+                system_prompt=build.system_prompt,
+                callbacks=self.callbacks(),
+                messages=self._loop_messages,
+                auxiliary_llm=getattr(self.host, "auxiliary_llm", None),
+                recall_store=None,
+                knowledge_store=None,
+                project_id=None,
+                project_ids=None,
+                tool_context=build.tool_context,
+                initial_turn_count=0,
+                get_current_tools=self.current_tools,
+                get_current_context=None,
+                get_current_system_prompt=lambda: build.system_prompt,
+                memory_extraction_prompt="",
+                memory_service=None,
+                claim_memory_extraction_interval=None,
+                defer_memory_extraction_to_outbox=False,
+                memory_thread_id=self.subagent_id,
+            )
+        finally:
+            self._sync_durable_messages_from_loop()
+
+    def _is_transient_prompt(self, message: Any) -> bool:
+        return getattr(message, "id", None) == self._transient_prompt_id
+
+    def _ensure_transient_prompt(self) -> None:
+        """Keep the child prompt ahead of a compacted durable summary."""
+        if not self._seed_required or self._loop_messages is None:
+            return
+        prompt = next(
+            (msg for msg in self._loop_messages if self._is_transient_prompt(msg)),
+            None,
         )
+        if prompt is None:
+            prompt = self._transient_prompt or SystemMessage(
+                content=self.build.system_prompt,
+                id=self._transient_prompt_id,
+            )
+            self._transient_prompt = prompt
+        self._loop_messages[:] = [
+            prompt,
+            *(msg for msg in self._loop_messages if not self._is_transient_prompt(msg)),
+        ]
+
+    def _sync_durable_messages_from_loop(self) -> None:
+        """Mirror the provider loop without its transient child prompt."""
+        if not self._seed_required or self._loop_messages is None:
+            return
+        self._ensure_transient_prompt()
+        self.messages[:] = [
+            msg for msg in self._loop_messages if not self._is_transient_prompt(msg)
+        ]
 
     def _on_loop_done(self, task: asyncio.Task) -> None:
+        self._sync_durable_messages_from_loop()
         if task.cancelled():
             self._loop_cancelled = True
         else:
@@ -324,6 +392,7 @@ class SubagentDriver:
 
     async def run(self, brief: str, *, role: str = "human") -> SubagentResult:
         """Deliver one brief, wait for the turn to settle, classify."""
+        await self._persist_seed_before_start()
         self.start()
         if not self.alive:
             raise RuntimeError(f"subagent {self.handle}: loop is not running")
@@ -334,6 +403,44 @@ class SubagentDriver:
         await self.turn_done.wait()
         self.running = False
         return self.classify()
+
+    async def _persist_seed_before_start(self) -> None:
+        """Persist a fork seed exactly once before any provider task exists."""
+        if not self._seed_required or self._seed_persisted:
+            return
+        if self._seed_persist_attempted:
+            error = self._seed_persist_error or RuntimeError(
+                "the prior fork-seed persistence attempt did not succeed"
+            )
+            raise RuntimeError(
+                f"subagent {self.handle}: fork seed is not durable"
+            ) from error
+
+        self._seed_persist_attempted = True
+        try:
+            persisted = await asyncio.wait_for(
+                self.ledger.persist_seed(self.subagent_id, self.messages),
+                timeout=_SEED_PERSIST_TIMEOUT_S,
+            )
+        except asyncio.CancelledError:
+            self._seed_persist_error = RuntimeError(
+                "fork-seed persistence was cancelled"
+            )
+            raise
+        except Exception as exc:
+            self._seed_persist_error = exc
+            raise RuntimeError(
+                f"subagent {self.handle}: fork seed persistence failed before "
+                "provider start"
+            ) from exc
+        if persisted is not True:
+            error = RuntimeError("fork-seed persistence returned no success receipt")
+            self._seed_persist_error = error
+            raise RuntimeError(
+                f"subagent {self.handle}: fork seed persistence was refused before "
+                "provider start"
+            ) from error
+        self._seed_persisted = True
 
     def steer(self, text: str) -> None:
         """Queue a ``role=event`` follow-up; mid-turn it ends the current turn
@@ -556,10 +663,13 @@ class SubagentDriver:
         self._activity()
 
     async def on_context_compacted(self, *args: Any, **kwargs: Any) -> None:
+        self._ensure_transient_prompt()
+        self._sync_durable_messages_from_loop()
         self._activity()
 
     async def on_turn_settled(self, turn_id: int, *args: Any, **kwargs: Any) -> None:
         """The authoritative end-of-turn edge (after memory/commit work)."""
+        self._sync_durable_messages_from_loop()
         self._activity()
         self.in_tool_since = None
         if self._synth_turn:
@@ -608,6 +718,7 @@ class SubagentDriver:
         return mode
 
     async def persist_message(self, msg: Any, *args: Any, **kwargs: Any) -> None:
+        self._sync_durable_messages_from_loop()
         try:
             await asyncio.wait_for(
                 self.ledger.persist_message(self.subagent_id, msg, self.turn_number),
