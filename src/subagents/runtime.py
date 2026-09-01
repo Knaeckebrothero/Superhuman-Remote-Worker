@@ -53,14 +53,6 @@ from .ledger import (
 
 logger = logging.getLogger(__name__)
 
-#: What ``run_in_background=true`` returns until U4 ships the control plane.
-BACKGROUND_UNAVAILABLE = (
-    "Error: run_in_background=true is not available yet — background "
-    "subagents arrive with the control plane (wait_agent / message_agent / "
-    "stop_agent / list_agents). Call again with run_in_background=false: the "
-    "child runs now and its report returns as this tool's result."
-)
-
 #: How long a ledger write may block the parent (non-fatal past it).
 _LEDGER_TIMEOUT_S = 5.0
 
@@ -1606,7 +1598,6 @@ class SubagentRuntime:
 
 
 __all__ = [
-    "BACKGROUND_UNAVAILABLE",
     "SubagentCall",
     "SubagentRecord",
     "SubagentRuntime",

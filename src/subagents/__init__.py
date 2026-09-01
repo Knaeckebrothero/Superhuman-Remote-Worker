@@ -42,15 +42,9 @@ from .ledger import (
     is_terminal_status,
 )
 from .persistence import DbSubagentLedger
-from .runtime import (
-    BACKGROUND_UNAVAILABLE,
-    SubagentCall,
-    SubagentRecord,
-    SubagentRuntime,
-)
+from .runtime import SubagentCall, SubagentRecord, SubagentRuntime
 
 __all__ = [
-    "BACKGROUND_UNAVAILABLE",
     "STOP",
     "SUBAGENT_STATUSES",
     "ChildBudgets",
