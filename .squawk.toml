@@ -127,15 +127,22 @@ excluded_rules = [
 #                the migration checksum guard and an in-place rewrite would
 #                wedge that cluster's boot.
 #        - app/0183: two constraint-missing-not-valid findings. This file is the
-#                cautionary case the rule exists for. ff178032 appended
+#                cautionary case the rule exists for, and it has now caused an
+#                outage twice in opposite directions. 2a950908 appended
 #                NOT VALID to both CHECKs *inside* 0183 after it had shipped;
 #                the checksum guard then refused to boot the orchestrator on
-#                every database that had already applied it, taking the whole
-#                stack down (every other pod's init container waits on the
-#                orchestrator). 0183 has since been restored to its original
-#                committed bytes and the NOT VALID form re-expressed as
-#                app/0213. Acting on this finding in place is precisely the
-#                outage; the file must stay byte-frozen forever.
+#                every database that had already applied the original bytes,
+#                taking the whole stack down (every other pod's init container
+#                waits on the orchestrator). The repair attempt restored the
+#                original bytes -- but the fleet had overwhelmingly applied the
+#                *edited* bytes, not the original: the dev cluster recorded
+#                46002314... on 2026-08-27 and origin/main ships the same
+#                content. Restoring the original therefore inverted the outage
+#                rather than ending it. 0183 now carries the bytes the fleet
+#                actually applied, and app/0213 re-expresses the same NOT VALID
+#                shape idempotently so either lineage converges. Acting on this
+#                finding in place is precisely the outage; the file must stay
+#                byte-frozen forever, at these bytes.
 #        - app/0212: one constraint-missing-not-valid on models_capabilities_check.
 #                The app/0123 carve-out shape: the migration REPLACES the
 #                existing constraint with a strictly wider one (same predicate
