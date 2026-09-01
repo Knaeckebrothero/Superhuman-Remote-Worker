@@ -591,6 +591,46 @@ class TestConsumeJobGuidance:
         assert [r["thread_id"] for r in ctx["consumed_replies"]] == ["officer"]
 
     @pytest.mark.asyncio
+    async def test_pinned_exact_subagent_key_preserves_a_newer_run_same_thread(
+        self, db
+    ):
+        from src.shared.job_steering import queued_reply_key
+
+        jid = str(uuid4())
+        child_id = str(uuid4())
+        first = {
+            "id": str(uuid4()),
+            "source": "subagent",
+            "thread_id": child_id,
+            "handle": "reviewer-7f3a",
+            "run_generation": str(uuid4()),
+            "message": "first run",
+            "timestamp": "2026-09-01T01:00:00+00:00",
+        }
+        successor = {
+            "id": str(uuid4()),
+            "source": "subagent",
+            "thread_id": child_id,
+            "handle": "reviewer-7f3a",
+            "run_generation": str(uuid4()),
+            "message": "successor run",
+            "timestamp": "2026-09-01T01:01:00+00:00",
+        }
+        await _insert_job(db, jid, {"queued_replies": [first, successor]})
+
+        moved = await db.consume_job_guidance(
+            jid,
+            reply_keys=[queued_reply_key(first)],
+        )
+
+        assert moved == 1
+        ctx = await _read_ctx(db, jid)
+        assert ctx["queued_replies"] == [successor]
+        assert ctx["consumed_replies"][0]["id"] == first["id"]
+        assert ctx["consumed_replies"][0]["source"] == "subagent"
+        assert ctx["consumed_replies"][0]["run_generation"] == first["run_generation"]
+
+    @pytest.mark.asyncio
     async def test_stateless_exact_reply_key_preserves_newer_same_thread(self, db):
         from src.shared.job_steering import queued_reply_key
 

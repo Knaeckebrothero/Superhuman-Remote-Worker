@@ -801,24 +801,21 @@ class TestQueuedReplyDrain:
         }
 
     @pytest.mark.asyncio
-    async def test_drain_injects_visible_message_and_acks_threads(
+    async def test_drain_injects_visible_message_and_acks_exact_reply(
         self, workspace_manager, todo_manager, mock_config
     ):
+        from src.shared.job_steering import queued_reply_key
+
         todo_manager.add("Task 1")
         todo_manager.complete("todo_1")
 
-        db = AsyncMock()
-        db.fetchrow.return_value = {
-            "context": {
-                "queued_replies": [
-                    {
-                        "thread_id": "officer",
-                        "message": "prioritize the report",
-                        "timestamp": "2026-07-30T10:00:00Z",
-                    }
-                ]
-            }
+        reply = {
+            "thread_id": "officer",
+            "message": "prioritize the report",
+            "timestamp": "2026-07-30T10:00:00Z",
         }
+        db = AsyncMock()
+        db.fetchrow.return_value = {"context": {"queued_replies": [reply]}}
         node = self._node(workspace_manager, todo_manager, mock_config, db)
 
         ack = MagicMock()
@@ -833,7 +830,7 @@ class TestQueuedReplyDrain:
         # audit file still written
         assert workspace_manager.exists("messages/officer/001_received.md")
 
-        ack.assert_called_once_with("test-123", reply_threads=["officer"])
+        ack.assert_called_once_with("test-123", reply_keys=[queued_reply_key(reply)])
 
     @pytest.mark.asyncio
     async def test_cleared_context_does_not_rematerialize(

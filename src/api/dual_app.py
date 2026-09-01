@@ -427,8 +427,9 @@ _guidance_inbox: Dict[str, List[Dict[str, Any]]] = {}
 # which stops being a usable cadence once tactical phases grow: at three phases
 # per job there is exactly one such boundary, and a reply sent during the
 # review phase would never be delivered at all. The graph now drains this inbox
-# at the agent's own natural breaks — a completed todo — with a wall-clock
-# floor so a stuck agent still sees its mail.
+# at source-aware cadence: completed child events on every tool-node pass;
+# human/operator mail at the agent's own natural breaks — a completed todo —
+# with a wall-clock floor so a stuck agent still sees it.
 _reply_inbox: Dict[str, List[Dict[str, Any]]] = {}
 
 
@@ -446,6 +447,7 @@ def ack_guidance(
     job_id: str,
     guidance_ids: Optional[List[str]] = None,
     reply_threads: Optional[List[str]] = None,
+    reply_keys: Optional[List[str]] = None,
 ) -> None:
     """Fire-and-forget ack: mark guidance/queued replies consumed on the orchestrator.
 
@@ -454,16 +456,19 @@ def ack_guidance(
     redelivered (at-least-once). Never blocks the graph.
     """
     client = _orchestrator_client
-    if client is None or not (guidance_ids or reply_threads):
+    if client is None or not (guidance_ids or reply_threads or reply_keys):
         return
 
     async def _send() -> None:
         try:
-            await client.ack_job_guidance(
-                job_id,
-                guidance_ids=list(guidance_ids or []),
-                reply_threads=list(reply_threads or []),
-            )
+            kwargs: Dict[str, List[str]] = {}
+            if guidance_ids is not None:
+                kwargs["guidance_ids"] = list(guidance_ids)
+            if reply_threads is not None:
+                kwargs["reply_threads"] = list(reply_threads)
+            if reply_keys is not None:
+                kwargs["reply_keys"] = list(reply_keys)
+            await client.ack_job_guidance(job_id, **kwargs)
         except Exception as e:
             logger.debug(f"Guidance ack for job {job_id} failed (will redeliver): {e}")
 
@@ -504,9 +509,9 @@ def _replace_inbox(
 def _update_guidance_inbox(response: Dict[str, Any]) -> None:
     """Refresh both steering inboxes for the current job from the heartbeat.
 
-    Both lanes share the transport and the prune contract; they differ only in
-    when the graph renders them — guidance every turn, replies at the agent's
-    next natural break.
+    Both lanes share the transport and prune contract. Guidance renders every
+    provider turn. In Lane B, child completion events render on every tool pass
+    while human/operator replies wait for the next natural break or expiry.
     """
     job_id = _current_job_id
     if _pod_state != PodState.WORKING or not job_id:
