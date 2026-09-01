@@ -3122,6 +3122,50 @@ async def _execute_turn(
                     interrupted=True,
                 )
 
+        # Session delegation is an all-or-nothing batch shape.  A child is an
+        # in-process provider/tool loop rather than an ordinary quick tool
+        # call, so allowing a workspace or control call to ride beside it
+        # makes the other call's ordering and authority boundary ambiguous.
+        # Reject the WHOLE mixed batch before permission announcement or any
+        # tool callback/invocation.  Every requested call still gets a
+        # ToolMessage so the provider sees a valid, paired history and can
+        # re-issue the two kinds of work in separate turns.
+        _batch_tool_names = [
+            str(tool_call.get("name") or "unknown") for tool_call in response.tool_calls
+        ]
+        _has_delegate_agent = "delegate_agent" in _batch_tool_names
+        _delegation_only_batch = _has_delegate_agent and all(
+            name == "delegate_agent" for name in _batch_tool_names
+        )
+        if _has_delegate_agent and not _delegation_only_batch:
+            _other_names = sorted(
+                {name for name in _batch_tool_names if name != "delegate_agent"}
+            )
+            _other_text = ", ".join(f"`{name}`" for name in _other_names)
+            _mixed_error = (
+                "Error: no tool in this batch was executed. `delegate_agent` "
+                f"cannot be batched with other tools ({_other_text}). Re-issue "
+                "the delegation calls alone, then call the other tools in a "
+                "later turn."
+            )
+            logger.warning(
+                "Rejected persistent-session tool batch mixing delegate_agent "
+                "with %s before execution",
+                ", ".join(_other_names),
+            )
+            for tool_call in response.tool_calls:
+                rejected = _ensure_msg_id(
+                    ToolMessage(
+                        content=_mixed_error,
+                        tool_call_id=str(tool_call.get("id") or ""),
+                        name=str(tool_call.get("name") or "unknown"),
+                    )
+                )
+                messages.append(rejected)
+                messages_added += 1
+                await _persist(rejected)
+            continue
+
         # Announce the whole batch up front so the client can show every
         # pending call at once. Names that resolve to no tool are filtered out:
         # they are rejected below without ever reaching the gate, so announcing
@@ -3138,8 +3182,239 @@ async def _execute_turn(
             except Exception as e:
                 logger.warning("Permission batch announce failed: %s", e)
 
+        _execute_delegation_batch = (
+            _delegation_only_batch and "delegate_agent" in tool_map
+        )
+        if _execute_delegation_batch:
+            # Permission decisions stay serial (the transport owns their
+            # durable/card lifecycle), but no child starts until the whole
+            # batch has been admitted.  Once admitted, invoke every child in
+            # its own task; the runtime semaphore applies the configured cap
+            # and turns a wider fan-out into waves.  asyncio.gather preserves
+            # input order, so ToolMessages remain paired in provider order
+            # even when a later child finishes first.
+            _delegation_decisions: list[
+                tuple[Any, dict[str, Any], str, PermissionOutcome]
+            ] = []
+            for i, tool_call in enumerate(response.tool_calls):
+                if callbacks.check_interrupt():
+                    logger.info("Interrupt received before delegation batch")
+                    await _record_unexecuted_tool_batch(
+                        # Permission collection is deliberately effect-free: no
+                        # child starts until every decision is known.  Earlier
+                        # approvals/declines are therefore just as unexecuted
+                        # as the current/tail calls when an interrupt wins.
+                        list(response.tool_calls),
+                        reason="interrupted before delegation execution",
+                    )
+                    return TurnResult(
+                        turn_id=0,
+                        messages_added=messages_added + 1,
+                        tool_calls_made=tool_calls_made,
+                        interrupted=True,
+                    )
+
+                tool = tool_map["delegate_agent"]
+                tool_args = tool_call.get("args", {})
+                tool_args, _repaired = coerce_tool_args(
+                    getattr(tool, "args_schema", None), tool_args
+                )
+                if _repaired:
+                    logger.info(
+                        "Repaired list argument(s) %s on delegate_agent",
+                        ", ".join(_repaired),
+                    )
+                tool_call_id = str(tool_call.get("id") or "")
+                outcome = PermissionOutcome.coerce(
+                    await callbacks.permission_check(
+                        "delegate_agent", tool_args, tool_call_id
+                    )
+                )
+                if outcome is PermissionOutcome.NO_ANSWER:
+                    logger.info(
+                        "Permission gate unanswered for delegate_agent (%s) — "
+                        "parking the delegation batch before any child starts",
+                        tool_call_id,
+                    )
+                    return TurnResult(
+                        turn_id=0,
+                        messages_added=messages_added,
+                        tool_calls_made=tool_calls_made,
+                    )
+                _delegation_decisions.append((tool, tool_args, tool_call_id, outcome))
+
+            # The last supervised decision may take minutes.  Close the final
+            # approval→effect race before constructing the runtime or any task:
+            # an interrupt that arrived while that await was resolving cancels
+            # the whole still-effect-free batch.
+            if callbacks.check_interrupt():
+                logger.info("Interrupt received after delegation permissions")
+                await _record_unexecuted_tool_batch(
+                    list(response.tool_calls),
+                    reason="interrupted before delegation execution",
+                )
+                return TurnResult(
+                    turn_id=0,
+                    messages_added=messages_added + 1,
+                    tool_calls_made=tool_calls_made,
+                    interrupted=True,
+                )
+
+            _approved_delegations = [
+                (tool, tool_args, tool_call_id)
+                for tool, tool_args, tool_call_id, outcome in _delegation_decisions
+                if outcome is PermissionOutcome.APPROVED
+            ]
+
+            if _approved_delegations:
+                # The fork source must be the durable parent list, including
+                # this assistant tool-call turn.  Install/resolve the runtime
+                # once before concurrent StructuredTool invocations so two
+                # first calls cannot race through lazy runtime construction.
+                if tool_context is not None:
+                    tool_context._fork_source = messages
+                    runtime = getattr(tool_context, "subagent_runtime", None)
+                    if runtime is None:
+                        from .tools.delegation.delegate_agent import (
+                            ensure_runtime as _ensure_subagent_runtime,
+                        )
+
+                        runtime = _ensure_subagent_runtime(tool_context)
+                    begin_batch = getattr(runtime, "begin_batch", None)
+                    if callable(begin_batch):
+                        begin_batch(len(_approved_delegations))
+
+                async def _invoke_delegation(
+                    tool: Any, tool_args: dict[str, Any], tool_call_id: str
+                ) -> tuple[str, bool]:
+                    await callbacks.on_tool_start(
+                        "delegate_agent", tool_args, tool_call_id
+                    )
+                    if callbacks.on_tool_execution_start is not None:
+                        await callbacks.on_tool_execution_start(
+                            "delegate_agent", tool_call_id
+                        )
+                    try:
+                        # InjectedToolCallId is populated only when a
+                        # StructuredTool receives the full model ToolCall.
+                        # Ordinary session tools intentionally retain the old
+                        # args-only invocation path below.
+                        result = await tool.ainvoke(
+                            {
+                                "type": "tool_call",
+                                "name": "delegate_agent",
+                                "args": tool_args,
+                                "id": tool_call_id,
+                            }
+                        )
+                        if isinstance(result, ToolMessage):
+                            result = result.content
+                        return (str(result) if result is not None else "", False)
+                    except WorkspaceUnavailableError:
+                        raise
+                    except Exception as exc:
+                        logger.warning("Tool delegate_agent failed: %s", exc)
+                        return (f"Tool execution error: {exc}", True)
+
+                _delegation_tasks = [
+                    asyncio.create_task(
+                        _invoke_delegation(tool, tool_args, tool_call_id),
+                        name=f"session-delegate-{index}",
+                    )
+                    for index, (tool, tool_args, tool_call_id) in enumerate(
+                        _approved_delegations
+                    )
+                ]
+                try:
+                    _delegation_results = await asyncio.gather(*_delegation_tasks)
+                except BaseException:
+                    # gather propagates the first WorkspaceUnavailableError or
+                    # CancelledError without joining siblings.  No failed turn
+                    # may return while another child can still spend or mutate.
+                    for task in _delegation_tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(
+                        *_delegation_tasks,
+                        return_exceptions=True,
+                    )
+                    raise
+            else:
+                _delegation_results = []
+
+            # Emit results in the provider's exact tool-call order, not task
+            # completion order (and not "declines first" when a supervised
+            # batch contains both approved and declined calls).
+            _approved_results = iter(_delegation_results)
+            for _tool, tool_args, tool_call_id, outcome in _delegation_decisions:
+                if outcome is PermissionOutcome.DECLINED:
+                    declined = _ensure_msg_id(
+                        ToolMessage(
+                            content="User declined this tool call.",
+                            tool_call_id=tool_call_id,
+                        )
+                    )
+                    messages.append(declined)
+                    messages_added += 1
+                    await _persist(declined)
+                    continue
+
+                result_str, is_error = next(_approved_results)
+                cleaned_str, extracted_images = extract_image_tags(result_str)
+                tool_message = _ensure_msg_id(
+                    ToolMessage(
+                        content=cleaned_str,
+                        tool_call_id=tool_call_id,
+                    )
+                )
+                messages.append(tool_message)
+                messages_added += 1
+                tool_calls_made += 1
+                if officer_max_actions:
+                    try:
+                        fingerprint = ("delegate_agent", repr(tool_args))
+                    except Exception:
+                        fingerprint = ("delegate_agent", "<unrepresentable>")
+                    guard_fingerprints[fingerprint] = (
+                        guard_fingerprints.get(fingerprint, 0) + 1
+                    )
+                await _persist(tool_message)
+
+                if extracted_images:
+                    image_message = _ensure_msg_id(
+                        make_multimodal_user_message(
+                            text=f"Image content from tool call {tool_call_id}:",
+                            images=extracted_images,
+                            max_edge=resolve_image_max_edge(config),
+                        )
+                    )
+                    messages.append(image_message)
+                    messages_added += 1
+                    await _persist(image_message)
+
+                await callbacks.on_tool_result(
+                    "delegate_agent",
+                    cleaned_str,
+                    tool_call_id,
+                    is_error=is_error,
+                )
+
+                if tool_context and callbacks.on_workspace_upgrade_needed:
+                    freeze_req = tool_context.consume_freeze_request()
+                    if freeze_req and freeze_req.get("freeze_type") in (
+                        "vm_upgrade_required",
+                        "workspace_upgrade_required",
+                    ):
+                        await callbacks.on_workspace_upgrade_needed(freeze_req)
+
+            # All calls were either executed or paired with explicit declines.
+            # Skip the ordinary sequential executor below and proceed to the
+            # shared post-batch sleep/guard checks.
+
         # --- Execute tool calls ---
-        for i, tool_call in enumerate(response.tool_calls):
+        for i, tool_call in enumerate(
+            [] if _execute_delegation_batch else response.tool_calls
+        ):
             # Check for interrupt before each tool
             if callbacks.check_interrupt():
                 logger.info(f"Interrupt received before tool {tool_call['name']}")
