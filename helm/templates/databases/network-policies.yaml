@@ -11,8 +11,9 @@ NetworkPolicy entirely — no allowance needed.
 
 Optional admin UIs (pgadmin) are conditionally added to the
 allow-list when their respective .enabled toggles are set. The short-lived
-llm-seed and research-provider-seed Jobs are allowed against the main Postgres
-so the install can seed the model catalog and the research provider catalog.
+llm-seed, research-provider-seed and canvas-gateway-role Jobs are allowed
+against the main Postgres so the install can seed the model catalog and the
+research provider catalog, and provision the canvas viewer role.
 */ -}}
 
 {{- if and .Values.databases.postgres.enabled .Values.databases.postgres.internal }}
@@ -62,6 +63,18 @@ spec:
         - podSelector:
             matchLabels:
               {{- include "srw.componentSelectorLabels" (dict "context" . "component" "research-provider-seed") | nindent 14 }}
+        {{- if and .Values.canvas.livePreview.viewer.enabled .Values.canvas.livePreview.viewer.database.provisionRole }}
+        # Third instance of the same shape, and it was missed until 2026-09-01:
+        # the canvas role-provisioning Job is component=canvas-gateway-role, NOT
+        # the canvas-gateway entry above, so that allowance never covered it. It
+        # failed exactly as the research-provider-seed comment predicts -- refused
+        # on a healthy Service -- and because the Job carried
+        # ttlSecondsAfterFinished it deleted itself five minutes later, so every
+        # trace of the failure disappeared before anyone looked.
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "canvas-gateway-role") | nindent 14 }}
+        {{- end }}
         {{- if .Values.pgadmin.enabled }}
         - podSelector:
             matchLabels:
