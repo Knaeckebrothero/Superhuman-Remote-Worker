@@ -38,6 +38,11 @@ Normal messages carry `E2E-{run-id}` and receive `E2E_REPLY:{run-id}`. Lifecycle
 requests without a token are associated only when exactly one run is armed. Unknown,
 ambiguous, exhausted, unsupported-schema, and wrong-model requests fail closed.
 
+The `search-job` scenario is a narrow live-gate driver. It advances the real agent
+through its strategic setup, stages a two-todo tactical phase, calls `web_search`,
+then returns through `job_complete` and the remaining strategic todos. Tool results
+still pass through SRW normally and are never retained by the fixture.
+
 ## Local contract tests
 
 From the repository root (using the repository Python environment):

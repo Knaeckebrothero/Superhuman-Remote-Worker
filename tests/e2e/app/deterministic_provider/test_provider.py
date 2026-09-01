@@ -456,6 +456,131 @@ async def test_tool_call_scenario_requires_tool_result_before_final_response(
     assert final_state["remaining_required_responses"] == 0
 
 
+async def test_search_job_scenario_drives_search_completion_and_todos(
+    control: httpx.AsyncClient,
+    inference: httpx.AsyncClient,
+) -> None:
+    run_id = "search-job-001"
+    await arm(control, run_id, scenario="search-job", required_responses=2)
+
+    incidental = await inference.post("/v1/chat/completions", json=chat_request(run_id))
+    assert incidental.status_code == 200
+    assert incidental.json()["choices"][0]["message"]["content"] == (
+        f"E2E_REPLY:{run_id}"
+    )
+
+    def tools(*names: str) -> list[dict]:
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": "test",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+            for name in names
+        ]
+
+    async def next_function(*names: str, stream: bool = False) -> dict:
+        response = await inference.post(
+            "/v1/chat/completions",
+            json=chat_request(
+                run_id,
+                stream=stream,
+                extra={"tools": tools(*names)},
+            ),
+        )
+        assert response.status_code == 200
+        if not stream:
+            return response.json()["choices"][0]["message"]["tool_calls"][0]["function"]
+        chunks = [event for event in sse_payloads(response) if isinstance(event, dict)]
+        return next(
+            chunk["choices"][0]["delta"]["tool_calls"][0]["function"]
+            for chunk in chunks
+            if chunk["choices"] and chunk["choices"][0]["delta"].get("tool_calls")
+        )
+
+    strategic_tools = ("todo_complete", "next_phase_todos", "job_complete")
+    for _ in range(4):
+        strategic = await next_function(*strategic_tools)
+        assert strategic["name"] == "todo_complete"
+
+    staged = await next_function(*strategic_tools)
+    assert staged["name"] == "next_phase_todos"
+    assert json.loads(staged["arguments"]) == {
+        "todos": [
+            "Run one live SearXNG web search for the official documentation.",
+            "Verify the search answer and close the research phase.",
+        ],
+        "phase_name": "SearXNG live search gate",
+    }
+    transition = await next_function(*strategic_tools)
+    assert transition["name"] == "todo_complete"
+
+    tactical_tools = ("todo_complete", "web_search")
+    search_function = await next_function(*tactical_tools)
+    assert search_function["name"] == "web_search"
+    assert json.loads(search_function["arguments"]) == {
+        "query": "SearXNG official documentation",
+        "max_results": 3,
+    }
+    for _ in range(2):
+        tactical = await next_function(*tactical_tools)
+        assert tactical["name"] == "todo_complete"
+
+    complete_function = await next_function(*strategic_tools)
+    assert complete_function["name"] == "job_complete"
+    assert json.loads(complete_function["arguments"]) == {
+        "summary": f"Completed the SearXNG live search gate for E2E-{run_id}.",
+        "deliverables": [],
+        "confidence": 1.0,
+    }
+
+    todo_function = await next_function(*strategic_tools, stream=True)
+    assert todo_function == {
+        "name": "todo_complete",
+        "arguments": '{"completion_note":"PASS: SearXNG live search gate completed."}',
+    }
+
+    state = (await control.get(f"/control/scenarios/{run_id}")).json()
+    assert state["unexpected_count"] == 0
+    assert state["pending_calls"] == 0
+    assert state["remaining_required_responses"] == 1
+    assert state["search_job_tool_steps"] == 11
+    assert len(state["calls"]) == 12
+
+
+async def test_search_job_scenario_refuses_an_expected_phase_tool_gap(
+    control: httpx.AsyncClient,
+    inference: httpx.AsyncClient,
+) -> None:
+    run_id = "search-job-gap-001"
+    await arm(control, run_id, scenario="search-job")
+    request = chat_request(
+        run_id,
+        extra={
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "job_complete",
+                        "description": "test",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ]
+        },
+    )
+
+    rejected = await inference.post("/v1/chat/completions", json=request)
+    assert rejected.status_code == 422
+    assert rejected.json()["error"]["type"] == "required_tool_missing"
+    state = (await control.get(f"/control/scenarios/{run_id}")).json()
+    assert state["unexpected_count"] == 1
+    assert state["search_job_tool_steps"] == 0
+
+
 async def test_numbered_stream_is_ordered_and_exactly_once(
     control: httpx.AsyncClient,
     inference: httpx.AsyncClient,

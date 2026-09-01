@@ -33,7 +33,14 @@ RERANK_MODEL_ID = "qwen3-reranker-8b"
 EMBEDDING_DIMENSIONS = 4096
 
 SUPPORTED_SCENARIOS = frozenset(
-    {"reply", "slow-stream", "error-once", "tool-call", "numbered-stream"}
+    {
+        "reply",
+        "slow-stream",
+        "error-once",
+        "tool-call",
+        "numbered-stream",
+        "search-job",
+    }
 )
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,127}$")
 _CORRELATION_RE = re.compile(
@@ -48,7 +55,12 @@ class ArmScenarioRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     scenario: Literal[
-        "reply", "slow-stream", "error-once", "tool-call", "numbered-stream"
+        "reply",
+        "slow-stream",
+        "error-once",
+        "tool-call",
+        "numbered-stream",
+        "search-job",
     ] = "reply"
     required_responses: int = Field(default=1, ge=1, le=100)
     chunk_delay_ms: int = Field(default=100, ge=0, le=2_000)
@@ -67,6 +79,14 @@ class CallDecision:
     tool_phase: bool = False
 
 
+@dataclass(frozen=True)
+class ToolCallSpec:
+    """One deterministic tool call returned without retaining its arguments."""
+
+    name: str
+    arguments: str
+
+
 @dataclass
 class PendingCall:
     decision: CallDecision
@@ -82,6 +102,7 @@ class RunState:
     consumed_required_responses: int = 0
     unexpected_calls: int = 0
     error_once_emitted: bool = False
+    search_job_tool_steps: int = 0
     next_sequence: int = 1
     counters: Counter[tuple[str, str, bool, str]] = field(default_factory=Counter)
     calls: list[dict[str, Any]] = field(default_factory=list)
@@ -373,6 +394,12 @@ class ScenarioStore:
                 return
             if outcome == "success" and decision.consume_required:
                 state.consumed_required_responses += 1
+            if (
+                outcome == "success"
+                and decision.scenario == "search-job"
+                and decision.tool_phase
+            ):
+                state.search_job_tool_steps += 1
             if outcome != "success":
                 state.unexpected_calls += 1
             duration_ms = max(0, int((time.monotonic() - pending.started_at) * 1000))
@@ -442,6 +469,7 @@ class ScenarioStore:
             "consumed_required_responses": state.consumed_required_responses,
             "reserved_required_responses": state.reserved_required_responses,
             "remaining_required_responses": state.remaining_required_responses,
+            "search_job_tool_steps": state.search_job_tool_steps,
             "unexpected_count": state.unexpected_calls,
             "pending_calls": len(state.pending),
             "counters": counters,
@@ -561,16 +589,45 @@ def create_inference_app(
                     "The requested structured-output schema is not supported by this fixture.",
                 )
 
-            has_tool_result = any(
-                isinstance(message, dict) and message.get("role") == "tool"
-                for message in messages
-            )
             state = await store.state(run_id)
-            tool_phase = (
-                state["scenario"] == "tool-call"
-                and not has_tool_result
-                and structured_name is None
-            )
+            tool_call: ToolCallSpec | None = None
+            if structured_name is None and state["scenario"] == "tool-call":
+                has_tool_result = any(
+                    isinstance(message, dict) and message.get("role") == "tool"
+                    for message in messages
+                )
+                if not has_tool_result:
+                    tool_call = ToolCallSpec(
+                        name=_first_tool_name(payload) or "e2e_tool",
+                        arguments="{}",
+                    )
+            elif structured_name is None and state["scenario"] == "search-job":
+                tool_names = _tool_names(payload)
+                if tool_names & {
+                    "todo_complete",
+                    "next_phase_todos",
+                    "web_search",
+                    "job_complete",
+                }:
+                    tool_call = _search_job_tool_call(
+                        state["search_job_tool_steps"], run_id
+                    )
+                if tool_call is not None and tool_call.name not in tool_names:
+                    await _account_rejection(
+                        store,
+                        run_id=run_id,
+                        endpoint="chat.completions",
+                        model=model,
+                        stream=stream,
+                        outcome="unexpected_required_tool_missing",
+                    )
+                    raise ScenarioError(
+                        422,
+                        "required_tool_missing",
+                        "The search-job scenario requires a tool that was not bound.",
+                    )
+
+            tool_phase = tool_call is not None
             consume_required = structured_name is None and not tool_phase
             decision = await store.begin_call(
                 run_id=run_id,
@@ -598,7 +655,7 @@ def create_inference_app(
                         decision=decision,
                         content=content,
                         finish_reason=finish_reason,
-                        tool_name=_first_tool_name(payload) if tool_phase else None,
+                        tool_call=tool_call,
                     ),
                     media_type="text/event-stream",
                     headers={
@@ -612,7 +669,7 @@ def create_inference_app(
                 decision=decision,
                 content=content,
                 finish_reason=finish_reason,
-                tool_name=_first_tool_name(payload) if tool_phase else None,
+                tool_call=tool_call,
             )
             await store.finish_call(decision, "success")
             return response
@@ -957,7 +1014,7 @@ async def _stream_completion(
     decision: CallDecision,
     content: str,
     finish_reason: str,
-    tool_name: str | None,
+    tool_call: ToolCallSpec | None,
 ) -> AsyncIterator[str]:
     completion_id = _response_id("chatcmpl")
     created = int(time.time())
@@ -1004,8 +1061,16 @@ async def _stream_completion(
                                         "id": f"call_{decision.sequence}",
                                         "type": "function",
                                         "function": {
-                                            "name": tool_name or "e2e_tool",
-                                            "arguments": "{}",
+                                            "name": (
+                                                tool_call.name
+                                                if tool_call is not None
+                                                else "e2e_tool"
+                                            ),
+                                            "arguments": (
+                                                tool_call.arguments
+                                                if tool_call is not None
+                                                else "{}"
+                                            ),
                                         },
                                     }
                                 ]
@@ -1061,7 +1126,7 @@ def _non_stream_completion(
     decision: CallDecision,
     content: str,
     finish_reason: str,
-    tool_name: str | None,
+    tool_call: ToolCallSpec | None,
 ) -> dict[str, Any]:
     message: dict[str, Any] = {"role": "assistant", "content": content}
     if decision.tool_phase:
@@ -1070,7 +1135,12 @@ def _non_stream_completion(
             {
                 "id": f"call_{decision.sequence}",
                 "type": "function",
-                "function": {"name": tool_name or "e2e_tool", "arguments": "{}"},
+                "function": {
+                    "name": tool_call.name if tool_call is not None else "e2e_tool",
+                    "arguments": (
+                        tool_call.arguments if tool_call is not None else "{}"
+                    ),
+                },
             }
         ]
     return {
@@ -1100,6 +1170,94 @@ def _first_tool_name(payload: dict[str, Any]) -> str | None:
         if isinstance(function, dict) and isinstance(function.get("name"), str):
             return function["name"]
     return None
+
+
+def _tool_names(payload: dict[str, Any]) -> set[str]:
+    tools = payload.get("tools")
+    if not isinstance(tools, list):
+        return set()
+    return {
+        name
+        for tool in tools
+        if isinstance(tool, dict)
+        and isinstance((function := tool.get("function")), dict)
+        and isinstance((name := function.get("name")), str)
+    }
+
+
+def _search_job_tool_call(step: int, run_id: str) -> ToolCallSpec:
+    """Drive the real phased agent through one off-pod search and completion."""
+
+    if step < 4:
+        return ToolCallSpec(
+            name="todo_complete",
+            arguments=json.dumps(
+                {"completion_note": "PASS: live-gate strategic setup step."},
+                separators=(",", ":"),
+            ),
+        )
+    if step == 4:
+        return ToolCallSpec(
+            name="next_phase_todos",
+            arguments=json.dumps(
+                {
+                    "todos": [
+                        "Run one live SearXNG web search for the official documentation.",
+                        "Verify the search answer and close the research phase.",
+                    ],
+                    "phase_name": "SearXNG live search gate",
+                },
+                separators=(",", ":"),
+            ),
+        )
+    if step == 5:
+        return ToolCallSpec(
+            name="todo_complete",
+            arguments=json.dumps(
+                {"completion_note": "PASS: tactical search phase staged."},
+                separators=(",", ":"),
+            ),
+        )
+    if step == 6:
+        return ToolCallSpec(
+            name="web_search",
+            arguments=json.dumps(
+                {
+                    "query": "SearXNG official documentation",
+                    "max_results": 3,
+                },
+                separators=(",", ":"),
+            ),
+        )
+    if step in {7, 8}:
+        return ToolCallSpec(
+            name="todo_complete",
+            arguments=json.dumps(
+                {"completion_note": "PASS: SearXNG tactical research step."},
+                separators=(",", ":"),
+            ),
+        )
+    if step == 9:
+        return ToolCallSpec(
+            name="job_complete",
+            arguments=json.dumps(
+                {
+                    "summary": (
+                        f"Completed the SearXNG live search gate for E2E-{run_id}."
+                    ),
+                    "deliverables": [],
+                    "confidence": 1.0,
+                },
+                separators=(",", ":"),
+            ),
+        )
+    return ToolCallSpec(
+        name="todo_complete",
+        arguments=json.dumps(
+            {"completion_note": "PASS: SearXNG live search gate completed."},
+            separators=(",", ":"),
+        ),
+    )
 
 
 def _embedding_inputs(value: Any) -> list[Any]:
