@@ -30,22 +30,102 @@ LLM-turn counter at spawn, read off the parent ``ToolContext``
 (``_current_turn_count``, stamped by the graph's execute / tools nodes) —
 the runtime itself does not know the graph's iteration (WP2 §8.1).
 
-Every write is best-effort: the runtime bounds each call and logs a
-failure; a child never fails because its ledger did. A child whose row could
-not be created keeps no durable state at all (no transcript, no update) —
-the runtime's in-memory record still serves the parent for this process
-life.
+Foreground U3 calls retain their bounded/best-effort runtime wrapper.  The
+background and fork-start paths are deliberately strict: a refused authority,
+generation, create receipt, or seed batch raises before a child can spend or
+later masquerade as recoverable.  A foreground child whose row could not be
+created keeps no durable state at all; its in-memory record still serves that
+parent process.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Mapping, Optional
+import json
+from typing import Any, Dict, Mapping, Optional, Sequence
+from uuid import UUID
+
+from langchain_core.messages import BaseMessage, message_to_dict, messages_from_dict
 
 from ..core.thread_messages import _serialize_message_row
+from ..shared.subagent_parent_authority import (
+    ParentExecutionAuthority,
+    coerce_parent_execution_authority,
+)
 from .ledger import is_terminal_status
 
 logger = logging.getLogger(__name__)
+
+SUBAGENT_FORK_SEED_PROVIDER_KEY = "_srw_subagent_fork_seed_v1"
+
+
+class SubagentPersistenceRefused(RuntimeError):
+    """A strict child write could not prove its row/generation."""
+
+
+class SubagentForkSeedDecodeError(ValueError):
+    """A stored lossless fork-seed envelope is malformed or unsupported."""
+
+
+def _serialize_seed_message(message: Any) -> Dict[str, Any]:
+    """Serialize an already-reminted fork message without changing identity.
+
+    The ordinary transcript serializer owns role/content normalization and
+    canonical tool calls.  Fork reminting also rewrites provider-native tool
+    call copies in ``additional_kwargs`` and ``response_metadata``; retain
+    those exact rewritten objects so a durable restart cannot resurrect the
+    parent's identities.  The database may map the stable message id onto its
+    UUID primary-key representation, but this layer never mints another id.
+    """
+
+    row = _serialize_message_row(message, 0)
+    additional_kwargs = getattr(message, "additional_kwargs", None)
+    response_metadata = getattr(message, "response_metadata", None)
+    if additional_kwargs:
+        row["additional_kwargs"] = additional_kwargs
+    if response_metadata:
+        row["response_metadata"] = response_metadata
+    # ``thread_messages.content`` is text and the ordinary transcript
+    # serializer deliberately flattens provider-native list content.  Keep a
+    # complete LangChain envelope in JSONB as the lossless recovery source;
+    # a background-child restore must read this key instead of reconstructing
+    # the seed from the diet resume columns used by ordinary sessions.
+    row["provider_raw"] = {SUBAGENT_FORK_SEED_PROVIDER_KEY: message_to_dict(message)}
+    return row
+
+
+def restore_subagent_fork_seed_message(provider_raw: Any) -> BaseMessage | None:
+    """Restore one exact fork seed from its lossless JSONB envelope.
+
+    ``None`` means this transcript row is not a fork-seed row.  A present but
+    malformed envelope raises a typed error so recovery fails closed instead
+    of silently rebuilding a flattened/provider-incompatible prefix.
+    """
+
+    value = provider_raw
+    if isinstance(value, (str, bytes)):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError) as exc:
+            raise SubagentForkSeedDecodeError(
+                "fork seed provider_raw is invalid JSON"
+            ) from exc
+    if not isinstance(value, Mapping):
+        return None
+    envelope = value.get(SUBAGENT_FORK_SEED_PROVIDER_KEY)
+    if envelope is None:
+        return None
+    if not isinstance(envelope, Mapping):
+        raise SubagentForkSeedDecodeError("fork seed envelope is not an object")
+    try:
+        restored = messages_from_dict([dict(envelope)])
+    except Exception as exc:
+        raise SubagentForkSeedDecodeError(
+            "fork seed envelope cannot be restored"
+        ) from exc
+    if len(restored) != 1 or not isinstance(restored[0], BaseMessage):
+        raise SubagentForkSeedDecodeError("fork seed envelope restored no message")
+    return restored[0]
 
 
 class DbSubagentLedger:
@@ -57,6 +137,7 @@ class DbSubagentLedger:
         postgres: Any,
         *,
         parent_context: Any = None,
+        parent_authority: ParentExecutionAuthority | Mapping[str, Any] | None = None,
     ) -> None:
         if client is None or postgres is None:
             raise ValueError(
@@ -66,6 +147,14 @@ class DbSubagentLedger:
         self.client = client
         self.postgres = postgres
         self.parent_context = parent_context
+        authority_value = (
+            parent_authority
+            or getattr(parent_context, "_parent_execution_authority", None)
+            or getattr(client, "parent_execution_authority", None)
+        )
+        if authority_value is None:
+            raise ValueError("DbSubagentLedger needs exact parent execution authority")
+        self.parent_authority = coerce_parent_execution_authority(authority_value)
         #: subagent_id → thread row id (the same value once the row exists).
         self._rows: Dict[str, str] = {}
         #: The exact run token every lifecycle mutation must match.
@@ -83,9 +172,17 @@ class DbSubagentLedger:
         a bare-metal agent without a DB: the runtime then uses ``NullLedger``)."""
         client = getattr(context, "orchestrator_client", None)
         postgres = getattr(context, "postgres_db", None)
-        if client is None or postgres is None:
+        authority = getattr(context, "_parent_execution_authority", None) or getattr(
+            client, "parent_execution_authority", None
+        )
+        if client is None or postgres is None or authority is None:
             return None
-        return cls(client, postgres, parent_context=context)
+        return cls(
+            client,
+            postgres,
+            parent_context=context,
+            parent_authority=authority,
+        )
 
     # ------------------------------------------------------------------
     # Introspection (tests, debugging)
@@ -109,6 +206,83 @@ class DbSubagentLedger:
     def runtime_generation_for(self, subagent_id: str) -> Optional[str]:
         return self._generations.get(str(subagent_id))
 
+    def _validated_live_identity(
+        self, row: Mapping[str, Any]
+    ) -> tuple[str, str, str, str, str] | None:
+        """Parse the immutable coordinates of one recovery-roster row.
+
+        The internal list endpoint returns the public roster shape rather than
+        a raw ``threads`` row.  Recovery must not let a malformed response
+        populate the mutation maps: in particular, a child generation without
+        its exact parent and handle is not an actionable lease.
+        """
+
+        raw_thread_id = row.get("thread_id")
+        raw_id = row.get("id")
+        try:
+            thread_id = str(UUID(str(raw_thread_id)))
+            if raw_id is not None and UUID(str(raw_id)) != UUID(thread_id):
+                return None
+            generation = str(UUID(str(row.get("runtime_generation"))))
+            parent_job_id = str(UUID(str(row.get("parent_job_id"))))
+        except (TypeError, ValueError, AttributeError):
+            return None
+        if not self.parent_authority.for_job(parent_job_id):
+            return None
+
+        handle_value = row.get("handle")
+        if not isinstance(handle_value, str) or not handle_value.strip():
+            return None
+        handle = handle_value.strip()
+        if handle != handle_value or len(handle) > 120:
+            return None
+
+        # ``list_live`` is an execution/recovery surface, not a general
+        # roster.  Requiring both lifecycle projections keeps an accidentally
+        # broad or stale server response from becoming writable state.
+        if row.get("status") not in {"queued", "running"}:
+            return None
+        if row.get("thread_status") not in {"created", "active"}:
+            return None
+        if not isinstance(row.get("run_in_background"), bool):
+            return None
+        subagent_type = row.get("subagent_type")
+        if not isinstance(subagent_type, str) or not subagent_type.strip():
+            return None
+        return thread_id, thread_id, generation, parent_job_id, handle
+
+    def _can_adopt_live_identity(
+        self, identity: tuple[str, str, str, str, str]
+    ) -> bool:
+        child_id, thread_id, generation, parent_job_id, handle = identity
+        expected = (
+            (self._rows, thread_id),
+            (self._generations, generation),
+            (self._parent_jobs, parent_job_id),
+            (self._handles, handle),
+        )
+        return all(mapping.get(child_id, value) == value for mapping, value in expected)
+
+    def adopt_live(self, row: Mapping[str, Any]) -> bool:
+        """Adopt one already-authorized live row into the local lease maps.
+
+        This performs no database mutation.  Invalid rows and rows that
+        conflict with an already-adopted identity leave every map untouched.
+        """
+
+        if not isinstance(row, Mapping):
+            return False
+        identity = self._validated_live_identity(row)
+        if identity is None or not self._can_adopt_live_identity(identity):
+            return False
+        child_id, thread_id, generation, parent_job_id, handle = identity
+        self._rows[child_id] = thread_id
+        self._generations[child_id] = generation
+        self._parent_jobs[child_id] = parent_job_id
+        self._handles[child_id] = handle
+        self._failed.discard(child_id)
+        return True
+
     def _parent_iteration(self, fields: Dict[str, Any]) -> Optional[int]:
         explicit = fields.get("parent_iteration")
         if explicit is not None:
@@ -128,6 +302,7 @@ class DbSubagentLedger:
 
     async def open(self, subagent_id: str, **fields: Any) -> Optional[Dict[str, str]]:
         subagent_id = str(subagent_id)
+        background = bool(fields.get("run_in_background", False))
         job_id = str(fields.get("parent_job_id") or "").strip()
         if not job_id:
             logger.warning(
@@ -136,12 +311,25 @@ class DbSubagentLedger:
                 fields.get("handle") or subagent_id,
             )
             self._failed.add(subagent_id)
+            if background:
+                raise SubagentPersistenceRefused(
+                    f"background subagent has no parent job for {subagent_id}"
+                )
+            return None
+        if not self.parent_authority.for_job(job_id):
+            logger.warning("subagent ledger: authority parent mismatch for %s", job_id)
+            self._failed.add(subagent_id)
+            if background:
+                raise SubagentPersistenceRefused(
+                    f"background subagent authority mismatch for {subagent_id}"
+                )
             return None
         initial_status = str(fields.get("status") or "running").strip()
         if initial_status not in {"queued", "running"}:
             raise ValueError("a subagent must open queued or running")
         created = await self.client.create_subagent_thread(
             job_id,
+            parent_authority=self.parent_authority,
             subagent_id=subagent_id,
             handle=str(fields.get("handle") or ""),
             subagent_type=str(fields.get("subagent_type") or ""),
@@ -152,10 +340,15 @@ class DbSubagentLedger:
             brief_description=str(fields.get("brief_description") or ""),
             parent_iteration=self._parent_iteration(fields),
             fork=bool(fields.get("fork", False)),
+            run_in_background=background,
             initial_status=initial_status,
         )
         if not isinstance(created, Mapping):
             self._failed.add(subagent_id)
+            if background:
+                raise SubagentPersistenceRefused(
+                    f"background subagent create refused for {subagent_id}"
+                )
             logger.warning(
                 "subagent ledger: the orchestrator did not create a fenced "
                 "thread row for %s (job %s) — no transcript will be kept",
@@ -167,6 +360,10 @@ class DbSubagentLedger:
         generation = str(created.get("runtime_generation") or "").strip()
         if not thread_id or not generation:
             self._failed.add(subagent_id)
+            if background:
+                raise SubagentPersistenceRefused(
+                    f"background subagent create returned no generation for {subagent_id}"
+                )
             logger.warning(
                 "subagent ledger: create for %s returned no generation token",
                 fields.get("handle") or subagent_id,
@@ -185,16 +382,52 @@ class DbSubagentLedger:
         self, subagent_id: str, msg: Any, turn_number: int
     ) -> None:
         thread_id = self._rows.get(str(subagent_id))
-        if thread_id is None:
+        generation = self._generations.get(str(subagent_id))
+        parent_job_id = self._parent_jobs.get(str(subagent_id))
+        if thread_id is None or generation is None or parent_job_id is None:
             return
         row = _serialize_message_row(msg, int(turn_number or 0))
-        await self.postgres.save_thread_message(thread_id=thread_id, **row)
+        saved = await self.postgres.save_subagent_thread_message(
+            thread_id=thread_id,
+            parent_job_id=parent_job_id,
+            parent_authority=self.parent_authority,
+            runtime_generation=generation,
+            **row,
+        )
+        if not saved:
+            raise SubagentPersistenceRefused(
+                f"subagent transcript generation refused for {subagent_id}"
+            )
+
+    async def persist_seed(self, subagent_id: str, messages: Sequence[Any]) -> bool:
+        """Persist an entire reminted fork seed atomically before provider I/O."""
+
+        child_key = str(subagent_id)
+        thread_id = self._rows.get(child_key)
+        generation = self._generations.get(child_key)
+        parent_job_id = self._parent_jobs.get(child_key)
+        if thread_id is None or generation is None or parent_job_id is None:
+            return False
+        rows = [_serialize_seed_message(message) for message in messages]
+        saved = await self.postgres.save_subagent_thread_messages(
+            thread_id=thread_id,
+            parent_job_id=parent_job_id,
+            parent_authority=self.parent_authority,
+            runtime_generation=generation,
+            messages=rows,
+        )
+        if not saved:
+            raise SubagentPersistenceRefused(
+                f"subagent seed generation refused for {subagent_id}"
+            )
+        return True
 
     async def update(self, subagent_id: str, **fields: Any) -> None:
         child_key = str(subagent_id)
         thread_id = self._rows.get(child_key)
         generation = self._generations.get(child_key)
-        if thread_id is None or generation is None:
+        parent_job_id = self._parent_jobs.get(child_key)
+        if thread_id is None or generation is None or parent_job_id is None:
             return
         kwargs: Dict[str, Any] = {}
         status = fields.get("status")
@@ -219,9 +452,17 @@ class DbSubagentLedger:
                     continue
         if not kwargs:
             return
-        await self.postgres.update_subagent_thread(
-            thread_id, runtime_generation=generation, **kwargs
+        updated = await self.postgres.update_subagent_thread(
+            thread_id,
+            parent_job_id=parent_job_id,
+            parent_authority=self.parent_authority,
+            runtime_generation=generation,
+            **kwargs,
         )
+        if not updated:
+            raise SubagentPersistenceRefused(
+                f"subagent lifecycle generation refused for {subagent_id}"
+            )
 
     async def terminalize_and_enqueue(
         self,
@@ -269,7 +510,10 @@ class DbSubagentLedger:
                 except (TypeError, ValueError):
                     continue
         return await self.client.terminalize_subagent_thread(
-            parent_job_id, thread_id, **kwargs
+            parent_job_id,
+            thread_id,
+            parent_authority=self.parent_authority,
+            **kwargs,
         )
 
     async def reopen(self, subagent_id: str) -> Optional[Dict[str, Any]]:
@@ -283,6 +527,7 @@ class DbSubagentLedger:
         result = await self.client.reopen_subagent_thread(
             parent_job_id,
             thread_id,
+            parent_authority=self.parent_authority,
             runtime_generation=generation,
         )
         if result and result.get("result") == "reopened":
@@ -293,19 +538,63 @@ class DbSubagentLedger:
         return dict(result) if result else None
 
     async def list_live(self, parent_job_id: str) -> list[Dict[str, Any]]:
-        """Read durable live children for recovery/control-plane bootstrap."""
-        rows = await self.client.list_live_subagent_threads(str(parent_job_id))
-        return [dict(row) for row in rows]
+        """Read and atomically adopt durable children for recovery bootstrap."""
+        if not self.parent_authority.for_job(parent_job_id):
+            raise SubagentPersistenceRefused(
+                "live child roster does not match parent execution authority"
+            )
+        rows = await self.client.list_live_subagent_threads(
+            str(parent_job_id), parent_authority=self.parent_authority
+        )
+        if not isinstance(rows, list):
+            raise SubagentPersistenceRefused("live child roster is not a list")
+
+        normalized: list[Dict[str, Any]] = []
+        identities: list[tuple[str, str, str, str, str]] = []
+        seen: set[str] = set()
+        for raw_row in rows:
+            if not isinstance(raw_row, Mapping):
+                raise SubagentPersistenceRefused("live child roster row is malformed")
+            row = dict(raw_row)
+            identity = self._validated_live_identity(row)
+            if (
+                identity is None
+                or identity[0] in seen
+                or not self._can_adopt_live_identity(identity)
+            ):
+                raise SubagentPersistenceRefused(
+                    "live child roster identity is malformed or conflicting"
+                )
+            seen.add(identity[0])
+            normalized.append(row)
+            identities.append(identity)
+
+        # Do not seed even the first row until every response row has passed
+        # validation and collision checks.
+        for row, identity in zip(normalized, identities, strict=True):
+            if not self.adopt_live(row):  # pragma: no cover - prevalidated above
+                raise SubagentPersistenceRefused(
+                    f"live child adoption changed unexpectedly for {identity[0]}"
+                )
+        return normalized
 
     async def lookup(
         self, parent_job_id: str, parent_tool_call_id: str
     ) -> Optional[Dict[str, Any]]:
         row = await self.postgres.get_subagent_thread_by_call(
-            str(parent_job_id), str(parent_tool_call_id)
+            str(parent_job_id),
+            str(parent_tool_call_id),
+            parent_authority=self.parent_authority,
         )
         if not row or not is_terminal_status(row.get("subagent_status")):
             return None
         return dict(row)
 
 
-__all__ = ["DbSubagentLedger"]
+__all__ = [
+    "DbSubagentLedger",
+    "SUBAGENT_FORK_SEED_PROVIDER_KEY",
+    "SubagentForkSeedDecodeError",
+    "SubagentPersistenceRefused",
+    "restore_subagent_fork_seed_message",
+]

@@ -9,10 +9,15 @@ from src.api.orchestrator_client import (
     OrchestratorClient,
     SessionGrantDenied,
     ThreadConfigUpdateDenied,
+    SubagentPersistenceError,
     VerdictRecordingError,
     create_orchestrator_client_from_env,
     get_agent_ip,
     get_hostname,
+)
+from src.shared.subagent_parent_authority import (
+    ParentExecutionAuthority,
+    ParentExecutionAuthorityRefused,
 )
 
 
@@ -1291,6 +1296,17 @@ class TestSubagentGenerationClient:
     CHILD = "11111111-1111-4111-8111-111111111111"
     JOB = "22222222-2222-4222-8222-222222222222"
     DELIVERY = "33333333-3333-4333-8333-333333333333"
+    AGENT = "44444444-4444-4444-8444-444444444444"
+
+    @property
+    def authority(self):
+        return ParentExecutionAuthority(
+            execution_lane="pinned",
+            parent_job_id=self.JOB,
+            agent_id=self.AGENT,
+            pod_uid="pod-test",
+            dispatch_process_generation="process-test",
+        )
 
     @pytest.fixture
     def client(self):
@@ -1314,6 +1330,7 @@ class TestSubagentGenerationClient:
 
         result = await client.create_subagent_thread(
             self.JOB,
+            parent_authority=self.authority,
             subagent_id=self.CHILD,
             handle="explorer-7f3a",
             subagent_type="explorer",
@@ -1330,11 +1347,46 @@ class TestSubagentGenerationClient:
         assert (
             await client.create_subagent_thread(
                 self.JOB,
+                parent_authority=self.authority,
                 handle="explorer-7f3a",
                 subagent_type="explorer",
             )
             is None
         )
+
+    @pytest.mark.asyncio
+    async def test_background_create_refusal_is_not_downgraded_to_no_row(self, client):
+        stale = MagicMock(status_code=409)
+        stale.json.return_value = {
+            "detail": {
+                "code": ParentExecutionAuthorityRefused.code,
+                "reason": "pinned_process_not_current",
+            }
+        }
+        client._client = MagicMock(post=AsyncMock(return_value=stale))
+
+        with pytest.raises(ParentExecutionAuthorityRefused):
+            await client.create_subagent_thread(
+                self.JOB,
+                parent_authority=self.authority,
+                handle="explorer-7f3a",
+                subagent_type="explorer",
+                run_in_background=True,
+                initial_status="queued",
+            )
+
+        malformed = MagicMock(status_code=200)
+        malformed.json.return_value = {"thread_id": self.CHILD}
+        client._client.post.return_value = malformed
+        with pytest.raises(SubagentPersistenceError):
+            await client.create_subagent_thread(
+                self.JOB,
+                parent_authority=self.authority,
+                handle="explorer-7f3a",
+                subagent_type="explorer",
+                run_in_background=True,
+                initial_status="queued",
+            )
 
     @pytest.mark.asyncio
     async def test_terminal_and_reopen_preserve_conflict_receipts(self, client):
@@ -1355,6 +1407,7 @@ class TestSubagentGenerationClient:
         result = await client.terminalize_subagent_thread(
             self.JOB,
             self.CHILD,
+            parent_authority=self.authority,
             runtime_generation=RUNTIME_GENERATION,
             delivery_id=self.DELIVERY,
             message="child report",
@@ -1369,6 +1422,7 @@ class TestSubagentGenerationClient:
         result = await client.reopen_subagent_thread(
             self.JOB,
             self.CHILD,
+            parent_authority=self.authority,
             runtime_generation=RUNTIME_GENERATION,
         )
         assert result == {
@@ -1389,20 +1443,49 @@ class TestSubagentGenerationClient:
             "thread_id": self.CHILD,
             "runtime_generation": RUNTIME_GENERATION,
         }
-        client._client = MagicMock(get=AsyncMock(side_effect=[live, exact]))
+        client._client = MagicMock(post=AsyncMock(side_effect=[live, exact]))
 
-        assert (await client.list_live_subagent_threads(self.JOB))[0][
-            "runtime_generation"
-        ] == RUNTIME_GENERATION
-        assert (await client.get_subagent_thread(self.JOB, self.CHILD))[
-            "thread_id"
-        ] == self.CHILD
-        assert client._client.get.await_args_list[0].args[0].endswith("/subagents/live")
         assert (
-            client._client.get.await_args_list[1]
+            await client.list_live_subagent_threads(
+                self.JOB, parent_authority=self.authority
+            )
+        )[0]["runtime_generation"] == RUNTIME_GENERATION
+        assert (
+            await client.get_subagent_thread(
+                self.JOB, self.CHILD, parent_authority=self.authority
+            )
+        )["thread_id"] == self.CHILD
+        assert (
+            client._client.post.await_args_list[0].args[0].endswith("/subagents/live")
+        )
+        assert (
+            client._client.post.await_args_list[1]
             .args[0]
             .endswith(f"/subagents/{self.CHILD}")
         )
+
+    @pytest.mark.asyncio
+    async def test_recovery_distinguishes_stale_authority_and_outage_from_empty(
+        self, client
+    ):
+        refused = MagicMock(status_code=409)
+        refused.json.return_value = {
+            "detail": {
+                "code": "parent_execution_authority_refused",
+                "reason": "pinned_process_not_current",
+            }
+        }
+        client._client = MagicMock(post=AsyncMock(return_value=refused))
+        with pytest.raises(ParentExecutionAuthorityRefused):
+            await client.list_live_subagent_threads(
+                self.JOB, parent_authority=self.authority
+            )
+
+        client._client.post.side_effect = RuntimeError("database unavailable")
+        with pytest.raises(SubagentPersistenceError):
+            await client.get_subagent_thread(
+                self.JOB, self.CHILD, parent_authority=self.authority
+            )
 
 
 class TestSaveThreadMessage:

@@ -23,6 +23,11 @@ from src.shared.runtime_actor import (
     RUNTIME_ACTOR_REFRESH_HEADER,
     RuntimeActorContext,
 )
+from src.shared.subagent_parent_authority import (
+    ParentExecutionAuthority,
+    ParentExecutionAuthorityRefused,
+    coerce_parent_execution_authority,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +119,33 @@ class CompletionNonTerminalReportError(Exception):
     def __init__(self, message: str = "") -> None:
         self.message = message
         super().__init__(message or self.code)
+
+
+class SubagentPersistenceError(RuntimeError):
+    """A strict child receipt/recovery request could not prove its result."""
+
+    def __init__(self, operation: str, status_code: int | None = None) -> None:
+        self.operation = operation
+        self.status_code = status_code
+        suffix = f" (HTTP {status_code})" if status_code is not None else ""
+        super().__init__(f"subagent {operation} failed{suffix}")
+
+
+def _raise_subagent_authority_refusal(response: Any) -> None:
+    """Raise the typed stale-parent signal for the internal authority 409."""
+
+    if getattr(response, "status_code", None) != 409:
+        return
+    try:
+        detail = response.json().get("detail")
+    except Exception:
+        detail = None
+    if isinstance(detail, dict) and detail.get("code") == (
+        ParentExecutionAuthorityRefused.code
+    ):
+        raise ParentExecutionAuthorityRefused(
+            str(detail.get("reason") or "remote_refusal")
+        )
 
 
 class VerdictRecordingError(Exception):
@@ -680,6 +712,7 @@ class OrchestratorClient:
         self,
         job_id: str,
         *,
+        parent_authority: ParentExecutionAuthority,
         handle: str,
         subagent_type: str,
         subagent_id: Optional[str] = None,
@@ -690,6 +723,7 @@ class OrchestratorClient:
         brief_description: str = "",
         parent_iteration: Optional[int] = None,
         fork: bool = False,
+        run_in_background: bool = False,
         initial_status: str = "running",
     ) -> Optional[dict[str, str]]:
         """Create the ``threads`` row of a subagent child of ``job_id`` (U3 B.1).
@@ -707,6 +741,9 @@ class OrchestratorClient:
 
         url = f"{self.orchestrator_url}/api/agents/jobs/{job_id}/subagents"
         payload: dict[str, Any] = {
+            "parent_authority": coerce_parent_execution_authority(
+                parent_authority
+            ).to_wire(),
             "handle": handle,
             "subagent_type": subagent_type,
             "subagent_id": subagent_id,
@@ -717,10 +754,12 @@ class OrchestratorClient:
             "brief_description": brief_description,
             "parent_iteration": parent_iteration,
             "fork": bool(fork),
+            "run_in_background": bool(run_in_background),
             "initial_status": initial_status,
         }
         try:
             response = await self._client.post(url, json=payload)
+            _raise_subagent_authority_refusal(response)
             if response.status_code == 200:
                 data = response.json()
                 thread_id = data.get("thread_id")
@@ -731,6 +770,10 @@ class OrchestratorClient:
                         "runtime_generation": str(UUID(str(runtime_generation))),
                     }
                 except (ValueError, TypeError, AttributeError):
+                    if run_in_background:
+                        raise SubagentPersistenceError(
+                            "background-create-payload", int(response.status_code)
+                        )
                     logger.error(
                         "Subagent create returned no valid generation for job %s",
                         job_id,
@@ -743,6 +786,10 @@ class OrchestratorClient:
                     handle,
                 )
                 return lease
+            if run_in_background:
+                raise SubagentPersistenceError(
+                    "background-create", int(response.status_code)
+                )
             logger.error(
                 "Failed to create subagent thread for job %s: %s - %s",
                 job_id,
@@ -750,50 +797,89 @@ class OrchestratorClient:
                 response.text,
             )
             return None
+        except (ParentExecutionAuthorityRefused, SubagentPersistenceError):
+            if run_in_background:
+                raise
+            logger.error(
+                "Failed to create subagent thread for foreground job %s",
+                job_id,
+                exc_info=True,
+            )
+            return None
         except Exception as e:
+            if run_in_background:
+                raise SubagentPersistenceError("background-create") from e
             logger.error(f"Failed to create subagent thread for job {job_id}: {e}")
             return None
 
-    async def list_live_subagent_threads(self, job_id: str) -> list[dict[str, Any]]:
+    async def list_live_subagent_threads(
+        self,
+        job_id: str,
+        *,
+        parent_authority: ParentExecutionAuthority,
+    ) -> list[dict[str, Any]]:
         """Return generation-bearing queued/running children of a worker job."""
         if not self._client:
             await self.connect()
         url = f"{self.orchestrator_url}/api/agents/jobs/{job_id}/subagents/live"
         try:
-            response = await self._client.get(url)
+            response = await self._client.post(
+                url,
+                json={
+                    "parent_authority": coerce_parent_execution_authority(
+                        parent_authority
+                    ).to_wire()
+                },
+            )
+            _raise_subagent_authority_refusal(response)
             if response.status_code != 200:
-                logger.error(
-                    "Failed to list live subagents for job %s: %s - %s",
-                    job_id,
-                    response.status_code,
-                    response.text,
-                )
-                return []
+                raise SubagentPersistenceError("live-list", int(response.status_code))
             rows = response.json().get("subagents")
-            return [dict(row) for row in rows] if isinstance(rows, list) else []
-        except Exception as e:
-            logger.error("Failed to list live subagents for job %s: %s", job_id, e)
-            return []
+            if not isinstance(rows, list):
+                raise SubagentPersistenceError("live-list-payload")
+            return [dict(row) for row in rows]
+        except (ParentExecutionAuthorityRefused, SubagentPersistenceError):
+            raise
+        except Exception as exc:
+            raise SubagentPersistenceError("live-list") from exc
 
     async def get_subagent_thread(
-        self, job_id: str, thread_id: str
+        self,
+        job_id: str,
+        thread_id: str,
+        *,
+        parent_authority: ParentExecutionAuthority,
     ) -> Optional[dict[str, Any]]:
         """Read one worker child under its parent job."""
         if not self._client:
             await self.connect()
         url = f"{self.orchestrator_url}/api/agents/jobs/{job_id}/subagents/{thread_id}"
         try:
-            response = await self._client.get(url)
-            return dict(response.json()) if response.status_code == 200 else None
-        except Exception as e:
-            logger.error("Failed to read subagent thread %s: %s", thread_id, e)
-            return None
+            response = await self._client.post(
+                url,
+                json={
+                    "parent_authority": coerce_parent_execution_authority(
+                        parent_authority
+                    ).to_wire()
+                },
+            )
+            _raise_subagent_authority_refusal(response)
+            if response.status_code == 200:
+                return dict(response.json())
+            if response.status_code == 404:
+                return None
+            raise SubagentPersistenceError("exact-read", int(response.status_code))
+        except (ParentExecutionAuthorityRefused, SubagentPersistenceError):
+            raise
+        except Exception as exc:
+            raise SubagentPersistenceError("exact-read") from exc
 
     async def reopen_subagent_thread(
         self,
         job_id: str,
         thread_id: str,
         *,
+        parent_authority: ParentExecutionAuthority,
         runtime_generation: str,
     ) -> Optional[dict[str, Any]]:
         """Rotate an ended child to a queued successor generation."""
@@ -805,29 +891,32 @@ class OrchestratorClient:
         )
         try:
             response = await self._client.post(
-                url, json={"runtime_generation": runtime_generation}
+                url,
+                json={
+                    "runtime_generation": runtime_generation,
+                    "parent_authority": coerce_parent_execution_authority(
+                        parent_authority
+                    ).to_wire(),
+                },
             )
             data = response.json()
+            _raise_subagent_authority_refusal(response)
             if response.status_code == 200:
                 return dict(data)
             if response.status_code == 409 and isinstance(data.get("detail"), dict):
                 return dict(data["detail"])
-            logger.error(
-                "Failed to reopen subagent %s: %s - %s",
-                thread_id,
-                response.status_code,
-                response.text,
-            )
-            return None
-        except Exception as e:
-            logger.error("Failed to reopen subagent %s: %s", thread_id, e)
-            return None
+            raise SubagentPersistenceError("reopen", int(response.status_code))
+        except (ParentExecutionAuthorityRefused, SubagentPersistenceError):
+            raise
+        except Exception as exc:
+            raise SubagentPersistenceError("reopen") from exc
 
     async def terminalize_subagent_thread(
         self,
         job_id: str,
         thread_id: str,
         *,
+        parent_authority: ParentExecutionAuthority,
         runtime_generation: str,
         delivery_id: str,
         message: str,
@@ -847,6 +936,9 @@ class OrchestratorClient:
             f"{thread_id}/terminal"
         )
         payload = {
+            "parent_authority": coerce_parent_execution_authority(
+                parent_authority
+            ).to_wire(),
             "runtime_generation": runtime_generation,
             "delivery_id": delivery_id,
             "message": message,
@@ -861,20 +953,16 @@ class OrchestratorClient:
         try:
             response = await self._client.post(url, json=payload)
             data = response.json()
+            _raise_subagent_authority_refusal(response)
             if response.status_code == 200:
                 return dict(data)
             if response.status_code == 409 and isinstance(data.get("detail"), dict):
                 return dict(data["detail"])
-            logger.error(
-                "Failed to terminalize subagent %s: %s - %s",
-                thread_id,
-                response.status_code,
-                response.text,
-            )
-            return None
-        except Exception as e:
-            logger.error("Failed to terminalize subagent %s: %s", thread_id, e)
-            return None
+            raise SubagentPersistenceError("terminalize", int(response.status_code))
+        except (ParentExecutionAuthorityRefused, SubagentPersistenceError):
+            raise
+        except Exception as exc:
+            raise SubagentPersistenceError("terminalize") from exc
 
     async def save_thread_message(
         self,

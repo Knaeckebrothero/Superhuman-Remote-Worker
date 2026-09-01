@@ -18,6 +18,11 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional, Any, List, Dict, Tuple
 
+from src.shared.subagent_parent_authority import (
+    ParentExecutionAuthority,
+    require_parent_execution_authority,
+)
+
 try:
     import asyncpg
 except ImportError:
@@ -458,10 +463,33 @@ class PostgresDB:
         "runtime_generation, metadata, created_at, last_activity, ended_at"
     )
 
+    async def parent_execution_authority_current(
+        self, parent_authority: ParentExecutionAuthority
+    ) -> bool:
+        """Await an exact DB authority probe immediately before external I/O.
+
+        ``True`` is the sole admitted result.  A stale execution raises
+        :class:`ParentExecutionAuthorityRefused`; connection/query failures
+        propagate separately, so an outage can never masquerade as a current
+        or empty parent.  The immutable captured authority is the only input.
+        """
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                await require_parent_execution_authority(
+                    conn,
+                    parent_authority,
+                    parent_job_id=parent_authority.parent_job_id,
+                    mutation=False,
+                )
+        return True
+
     async def update_subagent_thread(
         self,
         thread_id: str,
         *,
+        parent_job_id: str,
+        parent_authority: ParentExecutionAuthority,
         runtime_generation: str,
         status: Optional[str] = None,
         subagent_status: Optional[str] = None,
@@ -489,11 +517,19 @@ class PostgresDB:
         try:
             generation_uuid = uuid.UUID(str(runtime_generation))
             child_uuid = uuid.UUID(str(thread_id))
+            parent_uuid = uuid.UUID(str(parent_job_id))
         except (ValueError, TypeError, AttributeError):
             return False
         async with self.acquire() as conn:
-            result = await conn.execute(
-                """
+            async with conn.transaction():
+                await require_parent_execution_authority(
+                    conn,
+                    parent_authority,
+                    parent_job_id=parent_uuid,
+                    mutation=True,
+                )
+                result = await conn.execute(
+                    """
                 UPDATE threads
                    SET status           = COALESCE($2::text, status),
                        subagent_status  = COALESCE($3::text, subagent_status),
@@ -510,23 +546,214 @@ class PostgresDB:
                  WHERE id = $1::uuid
                    AND kind = 'subagent'
                    AND runtime_generation = $10::uuid
+                   AND parent_job_id = $11::uuid
                    AND status <> 'ended'
                 """,
-                str(child_uuid),
-                status,
-                subagent_status,
-                outcome,
-                turns,
-                tokens,
-                report_path,
-                error,
-                bool(ended),
-                str(generation_uuid),
-            )
+                    str(child_uuid),
+                    status,
+                    subagent_status,
+                    outcome,
+                    turns,
+                    tokens,
+                    report_path,
+                    error,
+                    bool(ended),
+                    str(generation_uuid),
+                    str(parent_uuid),
+                )
         return result == "UPDATE 1"
 
+    async def save_subagent_thread_message(
+        self,
+        thread_id: str,
+        *,
+        parent_job_id: str,
+        parent_authority: ParentExecutionAuthority,
+        runtime_generation: str,
+        role: str,
+        content: Optional[str] = None,
+        tool_calls: Optional[Any] = None,
+        turn_number: Optional[int] = None,
+        metrics: Optional[dict] = None,
+        tool_call_id: Optional[str] = None,
+        thinking: Optional[str] = None,
+        reasoning: Optional[Any] = None,
+        tool_results: Optional[Any] = None,
+        provider: Optional[str] = None,
+        provider_raw: Optional[Any] = None,
+        additional_kwargs: Optional[dict] = None,
+        response_metadata: Optional[dict] = None,
+        id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Persist one child transcript row under parent + generation fences.
+
+        This is intentionally separate from :meth:`save_thread_message`.
+        A stateless worker's queue unit is its parent *job*, not the child
+        thread; routing it through the session-thread fence is both the wrong
+        lock graph and a guaranteed lease/thread mismatch.
+        """
+
+        try:
+            parent_uuid = uuid.UUID(str(parent_job_id))
+            child_uuid = uuid.UUID(str(thread_id))
+            generation_uuid = uuid.UUID(str(runtime_generation))
+        except (ValueError, TypeError, AttributeError):
+            return None
+        msg_id = _coerce_row_id(id)
+        insert_args = (
+            msg_id,
+            str(child_uuid),
+            role,
+            content,
+            json.dumps(tool_calls) if tool_calls is not None else None,
+            turn_number,
+            json.dumps(metrics) if metrics is not None else None,
+            tool_call_id,
+            thinking,
+            json.dumps(reasoning) if reasoning is not None else None,
+            json.dumps(tool_results) if tool_results is not None else None,
+            provider,
+            json.dumps(provider_raw) if provider_raw is not None else None,
+            json.dumps(additional_kwargs) if additional_kwargs is not None else None,
+            json.dumps(response_metadata) if response_metadata is not None else None,
+        )
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                await require_parent_execution_authority(
+                    conn,
+                    parent_authority,
+                    parent_job_id=parent_uuid,
+                    mutation=True,
+                )
+                child = await conn.fetchrow(
+                    """
+                    SELECT runtime_generation, status
+                      FROM threads
+                     WHERE id = $1::uuid
+                       AND kind = 'subagent'
+                       AND parent_job_id = $2::uuid
+                     FOR UPDATE
+                    """,
+                    child_uuid,
+                    parent_uuid,
+                )
+                if (
+                    child is None
+                    or child["runtime_generation"] != generation_uuid
+                    or child["status"] == "ended"
+                ):
+                    return None
+                row = await conn.fetchrow(self._THREAD_MESSAGE_UPSERT_SQL, *insert_args)
+                await conn.execute(
+                    self._THREAD_ACTIVITY_BUMP_SQL,
+                    str(child_uuid),
+                    turn_number,
+                )
+        return {"id": str(row["id"]), "seq": row["seq"]}
+
+    async def save_subagent_thread_messages(
+        self,
+        thread_id: str,
+        *,
+        parent_job_id: str,
+        parent_authority: ParentExecutionAuthority,
+        runtime_generation: str,
+        messages: List[Dict[str, Any]],
+    ) -> bool:
+        """Atomically persist a reminted fork seed before child execution.
+
+        Every message is serialized by ``DbSubagentLedger`` before this call.
+        Parent authority and child generation are locked once, then all rows
+        upsert and the activity bump commit together.  ``False`` means the
+        child is missing/ended/stale; authority refusal and DB outage raise.
+        """
+
+        try:
+            parent_uuid = uuid.UUID(str(parent_job_id))
+            child_uuid = uuid.UUID(str(thread_id))
+            generation_uuid = uuid.UUID(str(runtime_generation))
+        except (ValueError, TypeError, AttributeError):
+            return False
+
+        args: List[Tuple[Any, ...]] = []
+        max_turn = 0
+        for message in messages:
+            turn_number = message.get("turn_number")
+            max_turn = max(max_turn, int(turn_number or 0))
+            args.append(
+                (
+                    _coerce_row_id(message.get("id")),
+                    str(child_uuid),
+                    message["role"],
+                    message.get("content"),
+                    json.dumps(message.get("tool_calls"))
+                    if message.get("tool_calls") is not None
+                    else None,
+                    turn_number,
+                    json.dumps(message.get("metrics"))
+                    if message.get("metrics") is not None
+                    else None,
+                    message.get("tool_call_id"),
+                    message.get("thinking"),
+                    json.dumps(message.get("reasoning"))
+                    if message.get("reasoning") is not None
+                    else None,
+                    json.dumps(message.get("tool_results"))
+                    if message.get("tool_results") is not None
+                    else None,
+                    message.get("provider"),
+                    json.dumps(message.get("provider_raw"))
+                    if message.get("provider_raw") is not None
+                    else None,
+                    json.dumps(message.get("additional_kwargs"))
+                    if message.get("additional_kwargs") is not None
+                    else None,
+                    json.dumps(message.get("response_metadata"))
+                    if message.get("response_metadata") is not None
+                    else None,
+                )
+            )
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                await require_parent_execution_authority(
+                    conn,
+                    parent_authority,
+                    parent_job_id=parent_uuid,
+                    mutation=True,
+                )
+                child = await conn.fetchrow(
+                    """
+                    SELECT runtime_generation, status
+                      FROM threads
+                     WHERE id = $1::uuid
+                       AND kind = 'subagent'
+                       AND parent_job_id = $2::uuid
+                     FOR UPDATE
+                    """,
+                    child_uuid,
+                    parent_uuid,
+                )
+                if (
+                    child is None
+                    or child["runtime_generation"] != generation_uuid
+                    or child["status"] == "ended"
+                ):
+                    return False
+                if args:
+                    await conn.executemany(self._THREAD_MESSAGE_UPSERT_BATCH_SQL, args)
+                    await conn.execute(
+                        self._THREAD_ACTIVITY_BUMP_SQL,
+                        str(child_uuid),
+                        max_turn,
+                    )
+        return True
+
     async def list_live_subagent_threads(
-        self, parent_job_id: str
+        self,
+        parent_job_id: str,
+        *,
+        parent_authority: ParentExecutionAuthority,
     ) -> List[Dict[str, Any]]:
         """Generation-bearing queued/running children recoverable by a parent."""
         try:
@@ -534,8 +761,15 @@ class PostgresDB:
         except (ValueError, TypeError, AttributeError):
             return []
         async with self.acquire() as conn:
-            rows = await conn.fetch(
-                f"""
+            async with conn.transaction():
+                await require_parent_execution_authority(
+                    conn,
+                    parent_authority,
+                    parent_job_id=parent_uuid,
+                    mutation=False,
+                )
+                rows = await conn.fetch(
+                    f"""
                 SELECT {self._SUBAGENT_THREAD_COLUMNS}
                   FROM threads
                  WHERE kind = 'subagent'
@@ -543,13 +777,18 @@ class PostgresDB:
                    AND status IN ('created', 'active')
                    AND subagent_status IN ('queued', 'running')
                  ORDER BY created_at, id
+                 FOR SHARE
                 """,
-                str(parent_uuid),
-            )
+                    str(parent_uuid),
+                )
         return [dict(row) for row in rows]
 
     async def get_subagent_thread(
-        self, parent_job_id: str, thread_id: str
+        self,
+        parent_job_id: str,
+        thread_id: str,
+        *,
+        parent_authority: ParentExecutionAuthority,
     ) -> Optional[Dict[str, Any]]:
         """Read one child under its parent, including its generation token."""
         try:
@@ -558,21 +797,33 @@ class PostgresDB:
         except (ValueError, TypeError, AttributeError):
             return None
         async with self.acquire() as conn:
-            row = await conn.fetchrow(
-                f"""
+            async with conn.transaction():
+                await require_parent_execution_authority(
+                    conn,
+                    parent_authority,
+                    parent_job_id=parent_uuid,
+                    mutation=False,
+                )
+                row = await conn.fetchrow(
+                    f"""
                 SELECT {self._SUBAGENT_THREAD_COLUMNS}
                   FROM threads
                  WHERE id = $1::uuid
                    AND kind = 'subagent'
                    AND parent_job_id = $2::uuid
+                 FOR SHARE
                 """,
-                str(child_uuid),
-                str(parent_uuid),
-            )
+                    str(child_uuid),
+                    str(parent_uuid),
+                )
         return dict(row) if row else None
 
     async def get_subagent_thread_by_call(
-        self, parent_job_id: str, parent_tool_call_id: str
+        self,
+        parent_job_id: str,
+        parent_tool_call_id: str,
+        *,
+        parent_authority: ParentExecutionAuthority,
     ) -> Optional[Dict[str, Any]]:
         """The child that answered one ``delegate_agent`` call of a job — the
         rotation-surviving idempotency lookup (newest row when the same call
@@ -583,12 +834,19 @@ class PostgresDB:
         try:
             # A non-uuid parent (a test host, a bare-metal job id) is "no
             # row", never an asyncpg DataError out of the uuid bind.
-            uuid.UUID(str(parent_job_id))
+            parent_uuid = uuid.UUID(str(parent_job_id))
         except (ValueError, TypeError, AttributeError):
             return None
         async with self.acquire() as conn:
-            row = await conn.fetchrow(
-                f"""
+            async with conn.transaction():
+                await require_parent_execution_authority(
+                    conn,
+                    parent_authority,
+                    parent_job_id=parent_uuid,
+                    mutation=False,
+                )
+                row = await conn.fetchrow(
+                    f"""
                 SELECT {self._SUBAGENT_THREAD_COLUMNS}
                   FROM threads
                  WHERE kind = 'subagent'
@@ -596,10 +854,11 @@ class PostgresDB:
                    AND parent_tool_call_id = $2
                  ORDER BY created_at DESC, id DESC
                  LIMIT 1
+                 FOR SHARE
                 """,
-                str(parent_job_id),
-                call_id,
-            )
+                    str(parent_uuid),
+                    call_id,
+                )
         return self._row_to_dict(row)
 
     async def get_thread_messages_history(

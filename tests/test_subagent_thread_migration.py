@@ -15,6 +15,7 @@ children first). The behavioural test skips without a container runtime.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import pathlib
 import re
@@ -28,6 +29,13 @@ import pytest
 from orchestrator.database.migrate import discover, run_migrations
 from orchestrator.database.postgres import PostgresDB as OrchestratorDB
 from src.database.postgres_db import PostgresDB as AgentDB
+from src.shared.subagent_parent_authority import (
+    ParentExecutionAuthority,
+    ParentExecutionAuthorityRefused,
+    require_parent_execution_authority,
+)
+from src.shared.run_queue import UNIT_KIND_WORKER_BATCH, reap_expired
+from src.shared.worker_queue import claim_worker_batch, enqueue_worker_batch
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 MIGRATIONS = ROOT / "orchestrator" / "database" / "migrations" / "app"
@@ -384,7 +392,10 @@ async def test_replay_onto_seeded_rows_and_the_child_lifecycle(
     owner = uuid4()
     stranger = uuid4()
     job_id = uuid4()
+    agent_id = uuid4()
     session_id = uuid4()
+    pod_uid = f"pod-{uuid4()}"
+    process_generation = str(uuid4())
     try:
         for path in discover(MIGRATIONS):
             if path.name >= COLUMNS:
@@ -399,9 +410,18 @@ async def test_replay_onto_seeded_rows_and_the_child_lifecycle(
                 )
             await conn.execute(
                 "INSERT INTO jobs (id, description, user_id, status) "
-                "VALUES ($1, 'parent job', $2, 'processing')",
+                "VALUES ($1, 'parent job', $2, 'created')",
                 job_id,
                 owner,
+            )
+            await conn.execute(
+                "INSERT INTO agents (id, config_name, status, current_job_id, "
+                "metadata, pod_uid) VALUES ($1, 'developer', 'working', $2, "
+                "$3::jsonb, $4)",
+                agent_id,
+                job_id,
+                json.dumps({"dispatch_process_generation": process_generation}),
+                pod_uid,
             )
             await conn.execute(
                 "INSERT INTO threads (id, user_id, title, status) "
@@ -409,6 +429,13 @@ async def test_replay_onto_seeded_rows_and_the_child_lifecycle(
                 session_id,
                 owner,
             )
+        # Use the production claim path: migration 0175 requires the
+        # server-minted workspace dispatch receipt when a job becomes pinned
+        # and processing.  The agent's reciprocal current_job row above makes
+        # the later process-identity fence exact.
+        assert await _orchestrator_db(pool).claim_job_for_agent(
+            str(job_id), str(agent_id)
+        )
 
         # --- the upgrade -------------------------------------------------
         await run_migrations(pool, MIGRATIONS)
@@ -441,11 +468,19 @@ async def test_replay_onto_seeded_rows_and_the_child_lifecycle(
 
         orchestrator = _orchestrator_db(pool)
         agent = _agent_db(pool)
+        authority = ParentExecutionAuthority(
+            execution_lane="pinned",
+            parent_job_id=job_id,
+            agent_id=agent_id,
+            pod_uid=pod_uid,
+            dispatch_process_generation=process_generation,
+        )
 
         # --- open: the row is derived from the job ------------------------
         child_id = str(uuid4())
         created = await orchestrator.create_subagent_thread(
             parent_job_id=str(job_id),
+            parent_authority=authority,
             thread_id=child_id,
             handle="explorer-0001",
             subagent_type="explorer",
@@ -462,6 +497,7 @@ async def test_replay_onto_seeded_rows_and_the_child_lifecycle(
         assert (
             await orchestrator.create_subagent_thread(
                 parent_job_id=str(job_id),
+                parent_authority=authority,
                 thread_id=child_id,
                 handle="explorer-0001",
                 subagent_type="explorer",
@@ -471,12 +507,24 @@ async def test_replay_onto_seeded_rows_and_the_child_lifecycle(
         )
         assert (
             await orchestrator.create_subagent_thread(
+                parent_job_id=str(job_id),
+                parent_authority=authority,
+                thread_id=child_id,
+                handle="explorer-0001",
+                subagent_type="explorer",
+                parent_tool_call_id="call-1",
+                run_in_background=True,
+                initial_status="queued",
+            )
+            is None
+        ), "a background retry cannot inherit a foreground recovery identity"
+        with pytest.raises(ParentExecutionAuthorityRefused):
+            await orchestrator.create_subagent_thread(
                 parent_job_id=str(uuid4()),
+                parent_authority=authority,
                 handle="explorer-0002",
                 subagent_type="explorer",
             )
-            is None
-        )
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT * FROM threads WHERE id = $1::uuid", child_id
@@ -504,11 +552,15 @@ async def test_replay_onto_seeded_rows_and_the_child_lifecycle(
             "brief_description": "find the secret",
             "parent_iteration": 7,
             "fork": False,
+            "run_in_background": False,
         }
 
         # --- the transcript through the agent-side pool -------------------
-        saved = await agent.save_thread_message(
+        saved = await agent.save_subagent_thread_message(
             thread_id=child_id,
+            parent_job_id=str(job_id),
+            parent_authority=authority,
+            runtime_generation=generation,
             id="chatcmpl-child-1",
             role="ai",
             content="the secret is MARMALADE",
@@ -527,6 +579,8 @@ async def test_replay_onto_seeded_rows_and_the_child_lifecycle(
         # --- the terminal update ------------------------------------------
         assert not await agent.update_subagent_thread(
             child_id,
+            parent_job_id=str(job_id),
+            parent_authority=authority,
             runtime_generation=str(uuid4()),
             status="ended",
             subagent_status="completed",
@@ -534,6 +588,8 @@ async def test_replay_onto_seeded_rows_and_the_child_lifecycle(
         ), "a stale generation cannot win the first terminal write"
         assert await agent.update_subagent_thread(
             child_id,
+            parent_job_id=str(job_id),
+            parent_authority=authority,
             runtime_generation=generation,
             status="ended",
             subagent_status="completed",
@@ -546,6 +602,8 @@ async def test_replay_onto_seeded_rows_and_the_child_lifecycle(
         # The guard: a session row is never touched by the subagent writer.
         assert not await agent.update_subagent_thread(
             str(session_id),
+            parent_job_id=str(job_id),
+            parent_authority=authority,
             runtime_generation=generation,
             status="ended",
             subagent_status="completed",
@@ -568,6 +626,7 @@ async def test_replay_onto_seeded_rows_and_the_child_lifecycle(
         # --- revival rotates the run claim; old owners stay fenced --------
         reopened = await orchestrator.reopen_subagent_thread(
             parent_job_id=str(job_id),
+            parent_authority=authority,
             thread_id=child_id,
             runtime_generation=generation,
         )
@@ -586,12 +645,84 @@ async def test_replay_onto_seeded_rows_and_the_child_lifecycle(
         assert revived["ended_at"] is None
         assert not await agent.update_subagent_thread(
             child_id,
+            parent_job_id=str(job_id),
+            parent_authority=authority,
             runtime_generation=generation,
             status="active",
             subagent_status="running",
         )
+
+        # --- a pinned replacement blocks behind the exact parent lock -----
+        replacement_generation = str(uuid4())
+
+        async def replace_pinned_process() -> None:
+            async with pool.acquire() as replacement_conn:
+                await replacement_conn.execute(
+                    "UPDATE agents SET metadata = jsonb_set("
+                    "COALESCE(metadata, '{}'::jsonb), "
+                    "'{dispatch_process_generation}', to_jsonb($2::text), true) "
+                    "WHERE id = $1",
+                    agent_id,
+                    replacement_generation,
+                )
+
+        async with pool.acquire() as authority_conn:
+            async with authority_conn.transaction():
+                await require_parent_execution_authority(
+                    authority_conn,
+                    authority,
+                    parent_job_id=job_id,
+                    mutation=True,
+                )
+                replacement = asyncio.create_task(replace_pinned_process())
+                with pytest.raises(TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(replacement), timeout=0.1)
+            await asyncio.wait_for(replacement, timeout=2)
+
+        # The replaced process cannot read (and therefore cannot leak) the
+        # successor child generation or mutate that successor.
+        with pytest.raises(ParentExecutionAuthorityRefused):
+            await orchestrator.get_subagent_thread(
+                str(job_id), child_id, parent_authority=authority
+            )
+        with pytest.raises(ParentExecutionAuthorityRefused):
+            await agent.update_subagent_thread(
+                child_id,
+                parent_job_id=str(job_id),
+                parent_authority=authority,
+                runtime_generation=next_generation,
+                status="active",
+                subagent_status="running",
+            )
+        async with pool.acquire() as conn:
+            still_current = await conn.fetchrow(
+                "SELECT status, runtime_generation FROM threads WHERE id=$1",
+                child_id,
+            )
+            assert still_current["status"] == "created"
+            assert str(still_current["runtime_generation"]) == next_generation
+            await conn.execute(
+                "UPDATE agents SET metadata = jsonb_set("
+                "COALESCE(metadata, '{}'::jsonb), "
+                "'{dispatch_process_generation}', to_jsonb($2::text), true) "
+                "WHERE id = $1",
+                agent_id,
+                process_generation,
+            )
+            await conn.execute(
+                "UPDATE agents SET pod_uid=$2 WHERE id=$1", agent_id, "replacement-pod"
+            )
+        with pytest.raises(ParentExecutionAuthorityRefused):
+            await agent.parent_execution_authority_current(authority)
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE agents SET pod_uid=$2 WHERE id=$1", agent_id, pod_uid
+            )
+        assert await agent.parent_execution_authority_current(authority)
         assert await agent.update_subagent_thread(
             child_id,
+            parent_job_id=str(job_id),
+            parent_authority=authority,
             runtime_generation=next_generation,
             status="active",
             subagent_status="running",
@@ -601,6 +732,7 @@ async def test_replay_onto_seeded_rows_and_the_child_lifecycle(
         delivery_id = str(uuid4())
         terminal = await orchestrator.terminalize_subagent_thread_and_enqueue(
             parent_job_id=str(job_id),
+            parent_authority=authority,
             thread_id=child_id,
             runtime_generation=next_generation,
             delivery_id=delivery_id,
@@ -615,6 +747,7 @@ async def test_replay_onto_seeded_rows_and_the_child_lifecycle(
         assert terminal["delivery"]["source"] == "subagent"
         retry = await orchestrator.terminalize_subagent_thread_and_enqueue(
             parent_job_id=str(job_id),
+            parent_authority=authority,
             thread_id=child_id,
             runtime_generation=next_generation,
             delivery_id=delivery_id,
@@ -632,6 +765,7 @@ async def test_replay_onto_seeded_rows_and_the_child_lifecycle(
         )
         consumed_retry = await orchestrator.terminalize_subagent_thread_and_enqueue(
             parent_job_id=str(job_id),
+            parent_authority=authority,
             thread_id=child_id,
             runtime_generation=next_generation,
             delivery_id=delivery_id,
@@ -648,17 +782,137 @@ async def test_replay_onto_seeded_rows_and_the_child_lifecycle(
         assert [str(r["id"]) for r in roster] == [child_id]
         assert roster[0]["subagent_status"] == "completed"
         for db in (orchestrator, agent):
-            found = await db.get_subagent_thread_by_call(str(job_id), "call-1")
+            found = await db.get_subagent_thread_by_call(
+                str(job_id), "call-1", parent_authority=authority
+            )
             assert found is not None and str(found["id"]) == child_id
-            assert await db.get_subagent_thread_by_call(str(job_id), "call-9") is None
+            assert (
+                await db.get_subagent_thread_by_call(
+                    str(job_id), "call-9", parent_authority=authority
+                )
+                is None
+            )
         sessions = await orchestrator.list_threads(user_id=str(owner))
         assert [str(t["id"]) for t in sessions] == [str(session_id)]
         assert await orchestrator.list_threads(status="ended") == []
+
+        # --- real stateless lease steal: queue -> job -> child ------------
+        stateless_job_id = uuid4()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "INSERT INTO jobs "
+                    "(id, description, user_id, status, execution_lane) "
+                    "VALUES ($1, 'stateless parent', $2, 'created', 'stateless')",
+                    stateless_job_id,
+                    owner,
+                )
+                await enqueue_worker_batch(
+                    conn, job_id=stateless_job_id, fair_key="authority-test"
+                )
+        stateless_claim = await claim_worker_batch(
+            pool, pod_name="authority-worker-a", affinity_grace_seconds=0
+        )
+        assert stateless_claim is not None
+        assert stateless_claim.unit_id == stateless_job_id
+        stateless_authority = ParentExecutionAuthority(
+            execution_lane="stateless",
+            parent_job_id=stateless_job_id,
+            worker_lease_token=stateless_claim.lease_token,
+        )
+        stateless_child_id = str(uuid4())
+        stateless_created = await orchestrator.create_subagent_thread(
+            parent_job_id=str(stateless_job_id),
+            parent_authority=stateless_authority,
+            thread_id=stateless_child_id,
+            handle="probe-0001",
+            subagent_type="probe",
+            parent_tool_call_id="stateless-call",
+            initial_status="queued",
+            run_in_background=True,
+        )
+        assert stateless_created is not None
+        stateless_generation = stateless_created["runtime_generation"]
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE run_queue SET leased_until=now()-interval '1 minute' "
+                "WHERE unit_id=$1",
+                stateless_job_id,
+            )
+
+        async def steal_expired_worker():
+            async with pool.acquire() as steal_conn:
+                return await reap_expired(
+                    steal_conn,
+                    unit_kind=UNIT_KIND_WORKER_BATCH,
+                    grace_seconds=0,
+                    backoff_base_seconds=0,
+                    jitter=0,
+                )
+
+        async with pool.acquire() as authority_conn:
+            async with authority_conn.transaction():
+                await require_parent_execution_authority(
+                    authority_conn,
+                    stateless_authority,
+                    parent_job_id=stateless_job_id,
+                    mutation=True,
+                )
+                steal = asyncio.create_task(steal_expired_worker())
+                with pytest.raises(TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(steal), timeout=0.1)
+            stolen = await asyncio.wait_for(steal, timeout=2)
+        assert len(stolen) == 1
+        assert stolen[0].previous_lease_token == stateless_claim.lease_token
+        with pytest.raises(ParentExecutionAuthorityRefused):
+            await orchestrator.get_subagent_thread(
+                str(stateless_job_id),
+                stateless_child_id,
+                parent_authority=stateless_authority,
+            )
+        with pytest.raises(ParentExecutionAuthorityRefused):
+            await agent.update_subagent_thread(
+                stateless_child_id,
+                parent_job_id=str(stateless_job_id),
+                parent_authority=stateless_authority,
+                runtime_generation=stateless_generation,
+                status="active",
+                subagent_status="running",
+            )
+        async with pool.acquire() as conn:
+            stateless_row = await conn.fetchrow(
+                "SELECT status, subagent_status, runtime_generation "
+                "FROM threads WHERE id=$1",
+                stateless_child_id,
+            )
+        assert stateless_row["status"] == "created"
+        assert stateless_row["subagent_status"] == "queued"
+        assert str(stateless_row["runtime_generation"]) == stateless_generation
+
+        successor_claim = await claim_worker_batch(
+            pool, pod_name="authority-worker-b", affinity_grace_seconds=0
+        )
+        assert successor_claim is not None
+        assert successor_claim.unit_id == stateless_job_id
+        successor_authority = ParentExecutionAuthority(
+            execution_lane="stateless",
+            parent_job_id=stateless_job_id,
+            worker_lease_token=successor_claim.lease_token,
+        )
+        assert await agent.update_subagent_thread(
+            stateless_child_id,
+            parent_job_id=str(stateless_job_id),
+            parent_authority=successor_authority,
+            runtime_generation=stateless_generation,
+            status="active",
+            subagent_status="running",
+        )
 
         # --- the cascade, and the live-child trap -------------------------
         live_id = str(uuid4())
         live_created = await orchestrator.create_subagent_thread(
             parent_job_id=str(job_id),
+            parent_authority=authority,
             thread_id=live_id,
             handle="explorer-0002",
             subagent_type="explorer",
@@ -680,7 +934,9 @@ async def test_replay_onto_seeded_rows_and_the_child_lifecycle(
         async with pool.acquire() as conn:
             assert (
                 await conn.fetchval(
-                    "SELECT count(*) FROM threads WHERE kind = 'subagent'"
+                    "SELECT count(*) FROM threads "
+                    "WHERE kind = 'subagent' AND parent_job_id=$1",
+                    job_id,
                 )
                 == 0
             )

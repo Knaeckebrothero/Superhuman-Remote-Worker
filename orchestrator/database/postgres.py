@@ -54,6 +54,10 @@ from src.shared.job_freeze_types import AUTO_REDISPATCH_FREEZE_TYPES
 from src.shared.job_steering import context_delivery_key, queued_reply_key
 from src.shared.pinned_session_identity import PinnedSessionBinding
 from src.shared.session_retirement import stateless_settled_retirement_authority
+from src.shared.subagent_parent_authority import (
+    ParentExecutionAuthority,
+    require_parent_execution_authority,
+)
 from src.shared.deliverable_contract import (
     parse_required_deliverables,
     pr_repositories,
@@ -29391,6 +29395,7 @@ class PostgresDB:
         self,
         *,
         parent_job_id: str,
+        parent_authority: ParentExecutionAuthority,
         handle: str,
         subagent_type: str,
         thread_id: str | None = None,
@@ -29401,6 +29406,7 @@ class PostgresDB:
         brief_description: str = "",
         parent_iteration: int | None = None,
         fork: bool = False,
+        run_in_background: bool = False,
         initial_status: str = "running",
     ) -> Dict[str, str] | None:
         """Create the ``threads`` row of a subagent child (U3 B.1) and return
@@ -29464,11 +29470,19 @@ class PostgresDB:
                 "brief_description": description,
                 "parent_iteration": parent_iteration,
                 "fork": bool(fork),
+                "run_in_background": bool(run_in_background),
             },
         }
         async with self.acquire() as conn:
-            row = await conn.fetchrow(
-                """
+            async with conn.transaction():
+                await require_parent_execution_authority(
+                    conn,
+                    parent_authority,
+                    parent_job_id=job_uuid,
+                    mutation=True,
+                )
+                row = await conn.fetchrow(
+                    """
                 INSERT INTO threads (
                     id, kind, user_id, project_id, title, status,
                     permission_mode, narration_mode, execution_lane, metadata,
@@ -29483,27 +29497,27 @@ class PostgresDB:
                 ON CONFLICT (id) DO NOTHING
                 RETURNING id, runtime_generation
                 """,
-                row_uuid,
-                job_uuid,
-                title[:200],
-                json.dumps(metadata),
-                parent_thread_uuid,
-                parent_tool_call_id,
-                handle,
-                subagent_type,
-                thread_status,
-                initial_status,
-            )
-            if row is not None:
-                return {
-                    "thread_id": str(row["id"]),
-                    "runtime_generation": str(row["runtime_generation"]),
-                }
-            # No row back: either the job is gone, or this exact id already
-            # exists (a retried create) — only an identity-exact retry is a
-            # success. Never hand a caller another parent's generation token.
-            existing = await conn.fetchrow(
-                """
+                    row_uuid,
+                    job_uuid,
+                    title[:200],
+                    json.dumps(metadata),
+                    parent_thread_uuid,
+                    parent_tool_call_id,
+                    handle,
+                    subagent_type,
+                    thread_status,
+                    initial_status,
+                )
+                if row is not None:
+                    return {
+                        "thread_id": str(row["id"]),
+                        "runtime_generation": str(row["runtime_generation"]),
+                    }
+                # No row back: this exact id may already exist (a retried
+                # create).  Parent existence/current ownership was proven
+                # above; only an identity-exact child retry may receive G.
+                existing = await conn.fetchrow(
+                    """
                 SELECT id, runtime_generation
                   FROM threads
                  WHERE id = $1
@@ -29512,13 +29526,17 @@ class PostgresDB:
                    AND subagent_handle = $3
                    AND subagent_type = $4
                    AND parent_tool_call_id IS NOT DISTINCT FROM $5
+                   AND COALESCE(
+                         metadata->'subagent'->>'run_in_background', 'false'
+                       ) = CASE WHEN $6::boolean THEN 'true' ELSE 'false' END
                 """,
-                row_uuid,
-                job_uuid,
-                handle,
-                subagent_type,
-                parent_tool_call_id,
-            )
+                    row_uuid,
+                    job_uuid,
+                    handle,
+                    subagent_type,
+                    parent_tool_call_id,
+                    bool(run_in_background),
+                )
         if not existing:
             return None
         return {
@@ -29551,7 +29569,10 @@ class PostgresDB:
         return [dict(row) for row in rows]
 
     async def list_live_subagent_threads(
-        self, parent_job_id: str
+        self,
+        parent_job_id: str,
+        *,
+        parent_authority: ParentExecutionAuthority,
     ) -> List[Dict[str, Any]]:
         """Return this job's generation-bearing children that can still act.
 
@@ -29565,8 +29586,15 @@ class PostgresDB:
         except (ValueError, TypeError, AttributeError):
             return []
         async with self.acquire() as conn:
-            rows = await conn.fetch(
-                f"""
+            async with conn.transaction():
+                await require_parent_execution_authority(
+                    conn,
+                    parent_authority,
+                    parent_job_id=job_uuid,
+                    mutation=False,
+                )
+                rows = await conn.fetch(
+                    f"""
                 SELECT {self._SUBAGENT_THREAD_COLUMNS}
                   FROM threads
                  WHERE kind = 'subagent'
@@ -29574,13 +29602,18 @@ class PostgresDB:
                    AND status IN ('created', 'active')
                    AND subagent_status IN ('queued', 'running')
                  ORDER BY created_at, id
+                 FOR SHARE
                 """,
-                job_uuid,
-            )
+                    job_uuid,
+                )
         return [dict(row) for row in rows]
 
     async def get_subagent_thread(
-        self, parent_job_id: str, thread_id: str
+        self,
+        parent_job_id: str,
+        thread_id: str,
+        *,
+        parent_authority: ParentExecutionAuthority,
     ) -> Dict[str, Any] | None:
         """Read one child under its parent, including its run generation."""
         try:
@@ -29589,21 +29622,33 @@ class PostgresDB:
         except (ValueError, TypeError, AttributeError):
             return None
         async with self.acquire() as conn:
-            row = await conn.fetchrow(
-                f"""
+            async with conn.transaction():
+                await require_parent_execution_authority(
+                    conn,
+                    parent_authority,
+                    parent_job_id=job_uuid,
+                    mutation=False,
+                )
+                row = await conn.fetchrow(
+                    f"""
                 SELECT {self._SUBAGENT_THREAD_COLUMNS}
                   FROM threads
                  WHERE id = $1
                    AND kind = 'subagent'
                    AND parent_job_id = $2
+                 FOR SHARE
                 """,
-                child_uuid,
-                job_uuid,
-            )
+                    child_uuid,
+                    job_uuid,
+                )
         return dict(row) if row else None
 
     async def get_subagent_thread_by_call(
-        self, parent_job_id: str, parent_tool_call_id: str
+        self,
+        parent_job_id: str,
+        parent_tool_call_id: str,
+        *,
+        parent_authority: ParentExecutionAuthority,
     ) -> Dict[str, Any] | None:
         """The child that answered one ``delegate_agent`` call of a job — the
         rotation-surviving idempotency lookup (newest row when the same call
@@ -29616,8 +29661,15 @@ class PostgresDB:
         if not call_id:
             return None
         async with self.acquire() as conn:
-            row = await conn.fetchrow(
-                f"""
+            async with conn.transaction():
+                await require_parent_execution_authority(
+                    conn,
+                    parent_authority,
+                    parent_job_id=job_uuid,
+                    mutation=False,
+                )
+                row = await conn.fetchrow(
+                    f"""
                 SELECT {self._SUBAGENT_THREAD_COLUMNS}
                   FROM threads
                  WHERE kind = 'subagent'
@@ -29625,10 +29677,11 @@ class PostgresDB:
                    AND parent_tool_call_id = $2
                  ORDER BY created_at DESC, id DESC
                  LIMIT 1
+                 FOR SHARE
                 """,
-                job_uuid,
-                call_id,
-            )
+                    job_uuid,
+                    call_id,
+                )
         return dict(row) if row else None
 
     async def reopen_subagent_thread(
@@ -29637,6 +29690,7 @@ class PostgresDB:
         parent_job_id: str,
         thread_id: str,
         runtime_generation: str,
+        parent_authority: ParentExecutionAuthority,
     ) -> Dict[str, Any] | None:
         """Rotate an ended child onto a queued successor generation.
 
@@ -29655,11 +29709,12 @@ class PostgresDB:
 
         async with self.acquire() as conn:
             async with conn.transaction():
-                parent = await conn.fetchval(
-                    "SELECT id FROM jobs WHERE id = $1 FOR UPDATE", job_uuid
+                await require_parent_execution_authority(
+                    conn,
+                    parent_authority,
+                    parent_job_id=job_uuid,
+                    mutation=True,
                 )
-                if parent is None:
-                    return None
                 child = await conn.fetchrow(
                     """
                     SELECT status, runtime_generation
@@ -29726,6 +29781,7 @@ class PostgresDB:
         parent_job_id: str,
         thread_id: str,
         runtime_generation: str,
+        parent_authority: ParentExecutionAuthority,
         delivery_id: str,
         message: str,
         timestamp: datetime | str,
@@ -29769,8 +29825,14 @@ class PostgresDB:
 
         async with self.acquire() as conn:
             async with conn.transaction():
-                # Lock order is part of the contract: every terminal delivery
-                # serializes on the parent before touching a child.
+                # Authority helper establishes queue->job for stateless and
+                # job->agent for pinned.  The child lock below is always last.
+                await require_parent_execution_authority(
+                    conn,
+                    parent_authority,
+                    parent_job_id=job_uuid,
+                    mutation=True,
+                )
                 parent = await conn.fetchrow(
                     "SELECT status, context FROM jobs WHERE id = $1 FOR UPDATE",
                     job_uuid,

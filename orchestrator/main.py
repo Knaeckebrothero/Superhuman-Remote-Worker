@@ -506,6 +506,10 @@ from src.core.product_capabilities import (  # noqa: E402
 from src.shared.pinned_session_identity import (  # noqa: E402
     PinnedJobRecipient,
 )
+from src.shared.subagent_parent_authority import (  # noqa: E402
+    ParentExecutionAuthority,
+    ParentExecutionAuthorityRefused,
+)
 
 # Lite (no-workspace-pod) backend names. Canonical set lives agent-side in the
 # backend factory; imported (not re-declared) so the dispatch/provisioning
@@ -36179,6 +36183,9 @@ def _subagent_thread_payload(row: dict[str, Any]) -> dict[str, Any]:
         spawn = {}
     return {
         "thread_id": str(row["id"]),
+        "parent_job_id": (
+            str(row["parent_job_id"]) if row.get("parent_job_id") else None
+        ),
         "runtime_generation": (
             str(row["runtime_generation"])
             if row.get("runtime_generation") is not None
@@ -36202,6 +36209,7 @@ def _subagent_thread_payload(row: dict[str, Any]) -> dict[str, Any]:
         "write_policy": spawn.get("write_policy"),
         "parent_iteration": spawn.get("parent_iteration"),
         "fork": bool(spawn.get("fork", False)),
+        "run_in_background": bool(spawn.get("run_in_background", False)),
         "started_at": row.get("created_at"),
         "ended_at": row.get("ended_at"),
         "last_activity": row.get("last_activity"),
@@ -43428,6 +43436,7 @@ class AgentSubagentThreadCreateRequest(BaseModel):
     """Body of ``POST /api/agents/jobs/{job_id}/subagents`` — what the agent-side
     subagent ledger knows at spawn (``SubagentLedger.open``)."""
 
+    parent_authority: ParentExecutionAuthority
     handle: str = Field(
         ..., min_length=1, max_length=120, description="<type>-<4 hex> handle"
     )
@@ -43444,6 +43453,7 @@ class AgentSubagentThreadCreateRequest(BaseModel):
     brief_description: str = Field(default="", max_length=2000)
     parent_iteration: int | None = None
     fork: bool = False
+    run_in_background: bool = False
     initial_status: Literal["queued", "running"] = "running"
 
 
@@ -43451,12 +43461,20 @@ class AgentSubagentThreadReopenRequest(BaseModel):
     """Exact ended generation to rotate before reviving a child."""
 
     runtime_generation: UUID
+    parent_authority: ParentExecutionAuthority
+
+
+class AgentSubagentThreadQueryRequest(BaseModel):
+    """Exact parent authority for an internal generation-bearing read."""
+
+    parent_authority: ParentExecutionAuthority
 
 
 class AgentSubagentThreadTerminalRequest(BaseModel):
     """One exact child generation plus its stable worker delivery intent."""
 
     runtime_generation: UUID
+    parent_authority: ParentExecutionAuthority
     delivery_id: UUID
     message: str = Field(..., min_length=1, max_length=200_000)
     timestamp: datetime
@@ -43490,6 +43508,7 @@ async def agent_create_subagent_thread(
     try:
         created = await postgres_db.create_subagent_thread(
             parent_job_id=job_id,
+            parent_authority=body.parent_authority,
             thread_id=str(body.subagent_id) if body.subagent_id else None,
             handle=body.handle,
             subagent_type=body.subagent_type,
@@ -43502,8 +43521,11 @@ async def agent_create_subagent_thread(
             brief_description=body.brief_description,
             parent_iteration=body.parent_iteration,
             fork=body.fork,
+            run_in_background=body.run_in_background,
             initial_status=body.initial_status,
         )
+    except ParentExecutionAuthorityRefused as e:
+        raise HTTPException(status_code=409, detail=e.detail()) from e
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
@@ -43513,14 +43535,18 @@ async def agent_create_subagent_thread(
     return {**created, "status": "created"}
 
 
-@app.get("/api/agents/jobs/{job_id}/subagents/live")
+@app.post("/api/agents/jobs/{job_id}/subagents/live")
 async def agent_list_live_subagent_threads(
-    request: Request, job_id: str
+    request: Request, job_id: str, body: AgentSubagentThreadQueryRequest
 ) -> dict[str, Any]:
     """List generation-bearing queued/running children. Internal only."""
     await require_internal(request)
     try:
-        rows = await postgres_db.list_live_subagent_threads(job_id)
+        rows = await postgres_db.list_live_subagent_threads(
+            job_id, parent_authority=body.parent_authority
+        )
+    except ParentExecutionAuthorityRefused as e:
+        raise HTTPException(status_code=409, detail=e.detail()) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
     return {
@@ -43530,14 +43556,23 @@ async def agent_list_live_subagent_threads(
     }
 
 
-@app.get("/api/agents/jobs/{job_id}/subagents/{thread_id}")
+@app.post("/api/agents/jobs/{job_id}/subagents/{thread_id}")
 async def agent_get_subagent_thread(
-    request: Request, job_id: str, thread_id: UUID
+    request: Request,
+    job_id: str,
+    thread_id: UUID,
+    body: AgentSubagentThreadQueryRequest,
 ) -> dict[str, Any]:
     """Read one exact worker child, including its generation. Internal only."""
     await require_internal(request)
     try:
-        row = await postgres_db.get_subagent_thread(job_id, str(thread_id))
+        row = await postgres_db.get_subagent_thread(
+            job_id,
+            str(thread_id),
+            parent_authority=body.parent_authority,
+        )
+    except ParentExecutionAuthorityRefused as e:
+        raise HTTPException(status_code=409, detail=e.detail()) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
     if row is None:
@@ -43559,7 +43594,10 @@ async def agent_reopen_subagent_thread(
             parent_job_id=job_id,
             thread_id=str(thread_id),
             runtime_generation=str(body.runtime_generation),
+            parent_authority=body.parent_authority,
         )
+    except ParentExecutionAuthorityRefused as e:
+        raise HTTPException(status_code=409, detail=e.detail()) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
     if result is None:
@@ -43583,6 +43621,7 @@ async def agent_terminalize_subagent_thread(
             parent_job_id=job_id,
             thread_id=str(thread_id),
             runtime_generation=str(body.runtime_generation),
+            parent_authority=body.parent_authority,
             delivery_id=str(body.delivery_id),
             message=body.message,
             timestamp=body.timestamp,
@@ -43593,6 +43632,8 @@ async def agent_terminalize_subagent_thread(
             report_path=body.report_path,
             error=body.error,
         )
+    except ParentExecutionAuthorityRefused as e:
+        raise HTTPException(status_code=409, detail=e.detail()) from e
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:

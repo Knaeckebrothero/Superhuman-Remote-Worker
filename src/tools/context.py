@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from ..database.postgres_db import PostgresDB
     from ..services.knowledge.bindings import KnowledgeBinding
+    from ..shared.subagent_parent_authority import ParentExecutionAuthority
 
 
 WorkspaceBackendId = Literal["sandbox", "vm", "virtual", "none"]
@@ -326,6 +327,11 @@ class ToolContext:
     # Stateless workers hydrate it from checkpointed delivered_reply_keys.
     _stateless_worker: bool = False
     _worker_lease_token: Optional[int] = None
+    _parent_execution_authority: Optional["ParentExecutionAuthority"] = (
+        None  # Immutable worker-job authority captured before subagent ledger
+        # construction.  Child persistence must never reconstruct this later
+        # from mutable client/environment state.
+    )
     _snapshot_callback: Optional[Any] = (
         None  # Callable[[str], None] — pre-write file snapshot for undo
     )

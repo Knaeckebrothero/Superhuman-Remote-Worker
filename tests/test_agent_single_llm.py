@@ -311,6 +311,41 @@ def _install(ctx, agent=None):
 
 
 class TestSubagentHostWiring:
+    def test_stateless_authority_is_captured_before_the_context_lease_stamp(self):
+        job_id = "aaaaaaaa-1111-4222-8333-444444444444"
+        ctx = _delegating_context()
+        agent = _HostAgent(_make_config({}))
+        agent._current_job_id = job_id
+        agent._worker_lease_token = 41
+
+        _install(ctx, agent)
+
+        authority = ctx._parent_execution_authority
+        assert authority.execution_lane == "stateless"
+        assert str(authority.parent_job_id) == job_id
+        assert authority.worker_lease_token == 41
+        assert ctx._worker_lease_token is None
+
+    def test_pinned_authority_captures_registered_process_and_pod(self):
+        job_id = "aaaaaaaa-1111-4222-8333-444444444444"
+        agent_id = "bbbbbbbb-1111-4222-8333-444444444444"
+        ctx = _delegating_context()
+        ctx.orchestrator_client = SimpleNamespace(
+            agent_id=agent_id,
+            dispatch_process_generation="process-7",
+        )
+        agent = _HostAgent(_make_config({}))
+        agent._current_job_id = job_id
+        with patch.dict("os.environ", {"POD_UID": "pod-7"}):
+            _install(ctx, agent)
+
+        authority = ctx._parent_execution_authority
+        assert authority.execution_lane == "pinned"
+        assert str(authority.parent_job_id) == job_id
+        assert str(authority.agent_id) == agent_id
+        assert authority.pod_uid == "pod-7"
+        assert authority.dispatch_process_generation == "process-7"
+
     def test_enabled_delegation_installs_the_host_and_the_runtime(self):
         from src.subagents import SubagentRuntime, WorkerHost
 
@@ -374,6 +409,7 @@ class TestSubagentHostWiring:
         """WP3: durable child rows need the orchestrator client (row creation)
         and the agent-side pool (transcript + lifecycle); with either missing
         the runtime keeps the null ledger and a child leaves no trace."""
+        from src.shared.subagent_parent_authority import ParentExecutionAuthority
         from src.subagents import DbSubagentLedger, NullLedger
 
         ctx = _delegating_context()
@@ -384,6 +420,11 @@ class TestSubagentHostWiring:
         wired = _delegating_context()
         wired.orchestrator_client = client
         wired.postgres_db = pool
+        wired._parent_execution_authority = ParentExecutionAuthority(
+            execution_lane="stateless",
+            parent_job_id="aaaaaaaa-1111-4222-8333-444444444444",
+            worker_lease_token=7,
+        )
         _install(wired)
         ledger = wired.subagent_runtime.ledger
         assert isinstance(ledger, DbSubagentLedger)

@@ -17,13 +17,17 @@ from __future__ import annotations
 
 import json
 from contextlib import asynccontextmanager
+from functools import partial
 from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID, uuid4
 
 import pytest
 
+import orchestrator.database.postgres as orchestrator_postgres
+import src.database.postgres_db as agent_postgres
 from orchestrator.database.postgres import PostgresDB as OrchestratorDB
 from src.database.postgres_db import PostgresDB as AgentDB
+from src.shared.subagent_parent_authority import ParentExecutionAuthority
 
 JOB = UUID("aaaaaaaa-1111-4222-8333-444444444444")
 CHILD = UUID("bbbbbbbb-1111-4222-8333-444444444444")
@@ -31,6 +35,34 @@ PARENT_THREAD = UUID("cccccccc-1111-4222-8333-444444444444")
 GENERATION = UUID("dddddddd-1111-4222-8333-444444444444")
 NEXT_GENERATION = UUID("eeeeeeee-1111-4222-8333-444444444444")
 DELIVERY = UUID("ffffffff-1111-4222-8333-444444444444")
+AGENT = UUID("99999999-1111-4222-8333-444444444444")
+AUTHORITY = ParentExecutionAuthority(
+    execution_lane="pinned",
+    parent_job_id=JOB,
+    agent_id=AGENT,
+    pod_uid="pod-test",
+    dispatch_process_generation="process-test",
+)
+
+
+@pytest.fixture(autouse=True)
+def _exact_parent_authority_gate(monkeypatch):
+    """These SQL-shape tests isolate child accessors; the shared gate has its
+    own lock-order tests in ``test_subagent_parent_authority.py``."""
+
+    gate = AsyncMock(
+        return_value={
+            "id": JOB,
+            "status": "processing",
+            "execution_lane": "pinned",
+            "assigned_agent_id": AGENT,
+        }
+    )
+    monkeypatch.setattr(
+        orchestrator_postgres, "require_parent_execution_authority", gate
+    )
+    monkeypatch.setattr(agent_postgres, "require_parent_execution_authority", gate)
+    return gate
 
 
 def _compact(sql: str) -> str:
@@ -57,6 +89,22 @@ def _orchestrator_db(conn) -> OrchestratorDB:
         yield conn
 
     db.acquire = acquire
+    db.create_subagent_thread = partial(
+        db.create_subagent_thread, parent_authority=AUTHORITY
+    )
+    db.list_live_subagent_threads = partial(
+        db.list_live_subagent_threads, parent_authority=AUTHORITY
+    )
+    db.get_subagent_thread = partial(db.get_subagent_thread, parent_authority=AUTHORITY)
+    db.get_subagent_thread_by_call = partial(
+        db.get_subagent_thread_by_call, parent_authority=AUTHORITY
+    )
+    db.reopen_subagent_thread = partial(
+        db.reopen_subagent_thread, parent_authority=AUTHORITY
+    )
+    db.terminalize_subagent_thread_and_enqueue = partial(
+        db.terminalize_subagent_thread_and_enqueue, parent_authority=AUTHORITY
+    )
     return db
 
 
@@ -70,6 +118,18 @@ def _agent_db(conn) -> AgentDB:
         yield conn
 
     db.acquire = acquire
+    db.update_subagent_thread = partial(
+        db.update_subagent_thread,
+        parent_job_id=str(JOB),
+        parent_authority=AUTHORITY,
+    )
+    db.list_live_subagent_threads = partial(
+        db.list_live_subagent_threads, parent_authority=AUTHORITY
+    )
+    db.get_subagent_thread = partial(db.get_subagent_thread, parent_authority=AUTHORITY)
+    db.get_subagent_thread_by_call = partial(
+        db.get_subagent_thread_by_call, parent_authority=AUTHORITY
+    )
     return db
 
 
@@ -134,6 +194,7 @@ class TestCreateSubagentThread:
             "brief_description": "implement the parser",
             "parent_iteration": 12,
             "fork": True,
+            "run_in_background": False,
         }
         assert args[4] == PARENT_THREAD
         assert args[5] == "call-1"
@@ -202,6 +263,7 @@ class TestCreateSubagentThread:
             "h-0001",
             "explorer",
             None,
+            False,
         )
 
     @pytest.mark.asyncio
@@ -223,6 +285,9 @@ class TestCreateSubagentThread:
             "thread_id": str(CHILD),
             "runtime_generation": str(GENERATION),
         }
+        probe = _compact(conn.fetchrow.call_args_list[1].args[0])
+        assert "run_in_background" in probe
+        assert conn.fetchrow.call_args_list[1].args[-1] is False
 
     @pytest.mark.asyncio
     async def test_malformed_ids_never_reach_sql(self):
@@ -389,7 +454,6 @@ class TestReopenSubagentThread:
             "thread_id": str(CHILD),
             "runtime_generation": str(NEXT_GENERATION),
         }
-        assert "FROM jobs" in _compact(conn.fetchval.call_args.args[0])
         lock_sql = _compact(conn.fetchrow.call_args_list[0].args[0])
         reopen_sql = _compact(conn.fetchrow.call_args_list[1].args[0])
         assert lock_sql.endswith("FOR UPDATE")
@@ -615,6 +679,105 @@ class TestDeleteJobEndsLiveChildren:
 # ---------------------------------------------------------------------------
 
 
+class TestAgentParentAuthorityProbe:
+    @pytest.mark.asyncio
+    async def test_it_checks_only_the_captured_parent_authority(
+        self, _exact_parent_authority_gate
+    ):
+        conn = _conn()
+        db = _agent_db(conn)
+
+        assert await db.parent_execution_authority_current(AUTHORITY) is True
+
+        _exact_parent_authority_gate.assert_awaited_once_with(
+            conn,
+            AUTHORITY,
+            parent_job_id=AUTHORITY.parent_job_id,
+            mutation=False,
+        )
+        conn.fetchrow.assert_not_awaited()
+        conn.execute.assert_not_awaited()
+
+
+class TestAgentSubagentTranscript:
+    @pytest.mark.asyncio
+    async def test_bulk_seed_locks_generation_then_inserts_in_order(self):
+        conn = _conn()
+        conn.fetchrow = AsyncMock(
+            return_value={"runtime_generation": GENERATION, "status": "active"}
+        )
+        db = _agent_db(conn)
+        messages = [
+            {
+                "id": "msg_child_ai",
+                "role": "ai",
+                "content": "calling",
+                "tool_calls": [{"name": "read_file", "args": {}, "id": "call_child"}],
+                "turn_number": 0,
+                "tool_call_id": None,
+                "additional_kwargs": {
+                    "tool_calls": [{"id": "call_child", "type": "function"}]
+                },
+                "provider_raw": {
+                    "_srw_subagent_fork_seed_v1": {
+                        "type": "ai",
+                        "data": {"id": "msg_child_ai"},
+                    }
+                },
+            },
+            {
+                "id": "msg_child_tool",
+                "role": "tool",
+                "content": "file",
+                "turn_number": 0,
+                "tool_call_id": "call_child",
+            },
+        ]
+
+        assert await db.save_subagent_thread_messages(
+            str(CHILD),
+            parent_job_id=str(JOB),
+            parent_authority=AUTHORITY,
+            runtime_generation=str(GENERATION),
+            messages=messages,
+        )
+
+        child_sql = _compact(conn.fetchrow.await_args.args[0])
+        assert child_sql.endswith("FOR UPDATE")
+        assert conn.fetchrow.await_args.args[1:] == (CHILD, JOB)
+        batch_sql, batch_args = conn.executemany.await_args.args
+        assert "RETURNING id, seq" not in batch_sql
+        assert [row[2] for row in batch_args] == ["ai", "tool"]
+        assert json.loads(batch_args[0][4])[0]["id"] == "call_child"
+        assert batch_args[1][7] == "call_child"
+        assert (
+            json.loads(batch_args[0][12])["_srw_subagent_fork_seed_v1"]["data"]["id"]
+            == "msg_child_ai"
+        )
+        assert json.loads(batch_args[0][13])["tool_calls"][0]["id"] == "call_child"
+        # Message ids are deterministically represented as UUID PKs; they are
+        # not randomly reminted by the persistence boundary.
+        assert batch_args[0][0] == agent_postgres._coerce_row_id("msg_child_ai")
+        assert batch_args[1][0] == agent_postgres._coerce_row_id("msg_child_tool")
+
+    @pytest.mark.asyncio
+    async def test_stale_generation_inserts_none_of_the_seed(self):
+        conn = _conn()
+        conn.fetchrow = AsyncMock(
+            return_value={"runtime_generation": NEXT_GENERATION, "status": "active"}
+        )
+        db = _agent_db(conn)
+
+        assert not await db.save_subagent_thread_messages(
+            str(CHILD),
+            parent_job_id=str(JOB),
+            parent_authority=AUTHORITY,
+            runtime_generation=str(GENERATION),
+            messages=[{"id": "m", "role": "human", "content": "seed"}],
+        )
+        conn.executemany.assert_not_awaited()
+
+
 class TestUpdateSubagentThread:
     @pytest.mark.asyncio
     async def test_every_field_lands_on_its_column_under_the_kind_guard(self):
@@ -650,6 +813,7 @@ class TestUpdateSubagentThread:
         )
         assert "last_activity = CURRENT_TIMESTAMP" in sql
         assert "runtime_generation = $10::uuid" in sql
+        assert "parent_job_id = $11::uuid" in sql
         assert sql.endswith("AND status <> 'ended'")
         assert args == (
             str(CHILD),
@@ -662,6 +826,7 @@ class TestUpdateSubagentThread:
             None,
             True,
             str(GENERATION),
+            str(JOB),
         )
 
     @pytest.mark.asyncio
@@ -684,6 +849,7 @@ class TestUpdateSubagentThread:
             None,
             False,
             str(GENERATION),
+            str(JOB),
         )
 
     @pytest.mark.asyncio

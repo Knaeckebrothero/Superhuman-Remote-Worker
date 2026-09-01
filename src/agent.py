@@ -4197,6 +4197,7 @@ class UniversalAgent:
         runtime on first use if this failed.
         """
         from .graph import _is_drain_requested
+        from .shared.subagent_parent_authority import ParentExecutionAuthority
 
         context.auxiliary_llm = self._auxiliary_llm
         context.provider_admission = lambda: not _is_drain_requested()
@@ -4205,6 +4206,45 @@ class UniversalAgent:
             context.subagent_runtime = None
             context._parent_host = None
             return
+        # Capture once, before the ledger is constructed.  In worker mode
+        # ``process_job`` has already stored the exact lease on ``self`` but
+        # stamps ``context._worker_lease_token`` only after this whole setup
+        # method returns; reading the context here would silently downgrade
+        # every stateless child to an unfenced writer.
+        try:
+            worker_lease_token = getattr(self, "_worker_lease_token", None)
+            if context._parent_execution_authority is not None:
+                # A caller may capture even earlier (for example a future
+                # host factory); never replace an already immutable value from
+                # mutable client/environment state.
+                pass
+            elif worker_lease_token is not None:
+                context._parent_execution_authority = ParentExecutionAuthority(
+                    execution_lane="stateless",
+                    parent_job_id=str(self._current_job_id or ""),
+                    worker_lease_token=int(worker_lease_token),
+                )
+            else:
+                client = context.orchestrator_client
+                context._parent_execution_authority = ParentExecutionAuthority(
+                    execution_lane="pinned",
+                    parent_job_id=str(self._current_job_id or ""),
+                    agent_id=getattr(client, "agent_id", None),
+                    pod_uid=os.environ.get("POD_UID"),
+                    dispatch_process_generation=getattr(
+                        client, "dispatch_process_generation", None
+                    ),
+                )
+        except (TypeError, ValueError) as exc:
+            # A local/bare test parent may have no registered process identity.
+            # It can still delegate with the in-memory NullLedger, but no child
+            # generation or transcript is exposed without exact authority.
+            logger.warning(
+                "Subagent durable authority unavailable for job %s: %s",
+                self._current_job_id,
+                exc,
+            )
+            context._parent_execution_authority = None
         try:
             from src.subagents.host import WorkerHost
             from src.subagents.ledger import NullLedger

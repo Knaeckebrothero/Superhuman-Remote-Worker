@@ -31,6 +31,17 @@ NOW = datetime(2026, 8, 29, 12, 0, 0, tzinfo=UTC)
 GENERATION = uuid.UUID("dddddddd-1111-4222-8333-444444444444")
 NEXT_GENERATION = uuid.UUID("eeeeeeee-1111-4222-8333-444444444444")
 DELIVERY = uuid.UUID("ffffffff-1111-4222-8333-444444444444")
+AGENT = uuid.UUID("99999999-1111-4222-8333-444444444444")
+
+
+def _authority(job_id: str):
+    return m.ParentExecutionAuthority(
+        execution_lane="pinned",
+        parent_job_id=job_id,
+        agent_id=AGENT,
+        pod_uid="pod-test",
+        dispatch_process_generation="process-test",
+    )
 
 
 _DEFAULT_METADATA = object()
@@ -74,6 +85,7 @@ def _row(
                     "brief_description": "find the secret",
                     "parent_iteration": 4,
                     "fork": False,
+                    "run_in_background": False,
                 },
             }
         ),
@@ -107,6 +119,7 @@ def create_env(monkeypatch):
     monkeypatch.setattr(m, "require_internal", gate)
 
     def body(**kw):
+        kw.setdefault("parent_authority", _authority(job_id))
         kw.setdefault("handle", "explorer-7f3a")
         kw.setdefault("subagent_type", "explorer")
         return m.AgentSubagentThreadCreateRequest(**kw)
@@ -152,7 +165,9 @@ class TestCreateEndpoint:
                 request,
                 str(uuid.uuid4()),
                 m.AgentSubagentThreadCreateRequest(
-                    handle="explorer-7f3a", subagent_type="explorer"
+                    parent_authority=_authority(str(uuid.uuid4())),
+                    handle="explorer-7f3a",
+                    subagent_type="explorer",
                 ),
             )
         assert excinfo.value.status_code == 401
@@ -173,6 +188,7 @@ class TestCreateEndpoint:
             brief_description="implement the parser",
             parent_iteration=12,
             fork=True,
+            run_in_background=True,
             initial_status="running",
         )
         assert payload == {
@@ -182,6 +198,7 @@ class TestCreateEndpoint:
         }
         create_env.db.create_subagent_thread.assert_awaited_once_with(
             parent_job_id=create_env.job_id,
+            parent_authority=_authority(create_env.job_id),
             thread_id=str(subagent_id),
             handle="explorer-7f3a",
             subagent_type="explorer",
@@ -192,6 +209,7 @@ class TestCreateEndpoint:
             brief_description="implement the parser",
             parent_iteration=12,
             fork=True,
+            run_in_background=True,
             initial_status="running",
         )
 
@@ -207,6 +225,7 @@ class TestCreateEndpoint:
         assert kwargs["brief_description"] == ""
         assert kwargs["parent_iteration"] is None
         assert kwargs["fork"] is False
+        assert kwargs["run_in_background"] is False
         assert kwargs["initial_status"] == "running"
 
     @pytest.mark.asyncio
@@ -243,13 +262,31 @@ class TestCreateEndpoint:
             await create_env.call()
         assert excinfo.value.status_code == 500
 
+    @pytest.mark.asyncio
+    async def test_stale_parent_execution_is_a_typed_409(self, create_env):
+        create_env.db.create_subagent_thread.side_effect = (
+            m.ParentExecutionAuthorityRefused("pinned_process_not_current")
+        )
+        with pytest.raises(m.HTTPException) as excinfo:
+            await create_env.call()
+        assert excinfo.value.status_code == 409
+        assert excinfo.value.detail == {
+            "code": "parent_execution_authority_refused",
+            "reason": "pinned_process_not_current",
+        }
+
 
 class TestGenerationEndpoints:
     @pytest.mark.asyncio
     async def test_live_list_and_exact_lookup_publish_the_generation(self, monkeypatch):
         job_id = str(uuid.uuid4())
         child_id = uuid.uuid4()
-        row = _row(thread_id=str(child_id), status="running", outcome=None)
+        row = _row(
+            thread_id=str(child_id),
+            parent_job_id=job_id,
+            status="running",
+            outcome=None,
+        )
         db = SimpleNamespace(
             list_live_subagent_threads=AsyncMock(return_value=[row]),
             get_subagent_thread=AsyncMock(return_value=row),
@@ -258,14 +295,24 @@ class TestGenerationEndpoints:
         monkeypatch.setattr(m, "postgres_db", db)
         monkeypatch.setattr(m, "require_internal", gate)
 
-        live = await m.agent_list_live_subagent_threads(SimpleNamespace(), job_id)
-        exact = await m.agent_get_subagent_thread(SimpleNamespace(), job_id, child_id)
+        query = m.AgentSubagentThreadQueryRequest(parent_authority=_authority(job_id))
+        live = await m.agent_list_live_subagent_threads(
+            SimpleNamespace(), job_id, query
+        )
+        exact = await m.agent_get_subagent_thread(
+            SimpleNamespace(), job_id, child_id, query
+        )
 
         assert live["subagents"][0]["runtime_generation"] == str(GENERATION)
+        assert live["subagents"][0]["parent_job_id"] == job_id
         assert exact["thread_id"] == str(child_id)
         assert exact["runtime_generation"] == str(GENERATION)
-        db.list_live_subagent_threads.assert_awaited_once_with(job_id)
-        db.get_subagent_thread.assert_awaited_once_with(job_id, str(child_id))
+        db.list_live_subagent_threads.assert_awaited_once_with(
+            job_id, parent_authority=query.parent_authority
+        )
+        db.get_subagent_thread.assert_awaited_once_with(
+            job_id, str(child_id), parent_authority=query.parent_authority
+        )
         assert gate.await_count == 2
 
     @pytest.mark.asyncio
@@ -285,7 +332,10 @@ class TestGenerationEndpoints:
         )
         monkeypatch.setattr(m, "postgres_db", db)
         monkeypatch.setattr(m, "require_internal", AsyncMock(return_value=None))
-        body = m.AgentSubagentThreadReopenRequest(runtime_generation=GENERATION)
+        body = m.AgentSubagentThreadReopenRequest(
+            runtime_generation=GENERATION,
+            parent_authority=_authority(job_id),
+        )
 
         result = await m.agent_reopen_subagent_thread(
             SimpleNamespace(), job_id, child_id, body
@@ -295,6 +345,7 @@ class TestGenerationEndpoints:
             parent_job_id=job_id,
             thread_id=str(child_id),
             runtime_generation=str(GENERATION),
+            parent_authority=body.parent_authority,
         )
 
         db.reopen_subagent_thread.return_value = {
@@ -328,6 +379,7 @@ class TestGenerationEndpoints:
         monkeypatch.setattr(m, "require_internal", AsyncMock(return_value=None))
         body = m.AgentSubagentThreadTerminalRequest(
             runtime_generation=GENERATION,
+            parent_authority=_authority(job_id),
             delivery_id=DELIVERY,
             message="child report",
             timestamp=NOW,
@@ -348,6 +400,7 @@ class TestGenerationEndpoints:
             parent_job_id=job_id,
             thread_id=str(child_id),
             runtime_generation=str(GENERATION),
+            parent_authority=body.parent_authority,
             delivery_id=str(DELIVERY),
             message="child report",
             timestamp=NOW,
@@ -372,6 +425,7 @@ class TestGenerationEndpoints:
         monkeypatch.setattr(m, "require_internal", AsyncMock(return_value=None))
         body = m.AgentSubagentThreadTerminalRequest(
             runtime_generation=GENERATION,
+            parent_authority=_authority(job_id),
             delivery_id=DELIVERY,
             message="child report",
             timestamp=NOW,
@@ -435,12 +489,15 @@ class TestRosterShape:
     @pytest.mark.asyncio
     async def test_the_row_contract(self, roster_env):
         child_id = str(uuid.uuid4())
-        roster_env.db.list_subagent_threads.return_value = [_row(thread_id=child_id)]
+        roster_env.db.list_subagent_threads.return_value = [
+            _row(thread_id=child_id, parent_job_id=roster_env.job_id)
+        ]
         payload = await roster_env.call()
         assert payload["count"] == 1
         row = payload["subagents"][0]
         assert row == {
             "thread_id": child_id,
+            "parent_job_id": roster_env.job_id,
             "runtime_generation": str(GENERATION),
             "handle": "explorer-7f3a",
             "subagent_type": "explorer",
@@ -458,6 +515,7 @@ class TestRosterShape:
             "write_policy": "none",
             "parent_iteration": 4,
             "fork": False,
+            "run_in_background": False,
             "started_at": NOW - timedelta(minutes=5),
             "ended_at": NOW,
             "last_activity": NOW,
