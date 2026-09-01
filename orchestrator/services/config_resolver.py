@@ -413,9 +413,12 @@ async def inject_blob_credentials(
     blob: dict,
     injector: Callable[[dict], Awaitable[dict] | Awaitable[None]],
 ) -> dict:
-    """Return a DELIVERY copy of ``blob`` with LLM / auxiliary / env credentials
-    injected. The input blob (the persistable copy) is never mutated and stays
-    secret-free — credentials live only on the returned copy.
+    """Return a DELIVERY copy of ``blob`` with transport credentials injected.
+
+    The input blob (the persistable copy) is never mutated and stays secret-free;
+    credentials live only on the returned copy. Besides the model and env-key
+    sections, ``research`` is carried through this seam because search/fetch
+    adapters are selected per dispatch rather than from pod environment.
 
     ``injector`` is an async callable taking a ``config_override``-shaped dict
     (``{"llm": {...}, "auxiliary": {...}, "env_keys": {...}}``) and enriching it
@@ -432,6 +435,8 @@ async def inject_blob_credentials(
         co["auxiliary"] = dict(agent["auxiliary"])
     if agent.get("env_keys"):
         co["env_keys"] = dict(agent["env_keys"])
+    if isinstance(agent.get("research"), dict):
+        co["research"] = copy.deepcopy(agent["research"])
     # The roster's model slots (U1): the roster-wide ``subagents.llm`` and
     # each entry's ``llm`` — ONLY the llm blocks, never the entries' full
     # configs, so the injector's input stays a config_override-shaped dict
@@ -497,6 +502,13 @@ async def inject_blob_credentials(
         agent["auxiliary"] = deep_merge(agent.get("auxiliary") or {}, co["auxiliary"])
     if co.get("env_keys"):
         agent.setdefault("env_keys", {}).update(co["env_keys"])
+    # Search/fetch resolution is authoritative for this dispatch. Replace the
+    # section rather than deep-merging it so an injector can remove a stale
+    # capability or same-row fallback by omitting it from the resolved block.
+    if isinstance(co.get("research"), dict) and co["research"]:
+        agent["research"] = copy.deepcopy(co["research"])
+    else:
+        agent.pop("research", None)
     co_sub = co.get("subagents")
     if isinstance(co_sub, dict) and isinstance(agent.get("subagents"), dict):
         sub = agent["subagents"]

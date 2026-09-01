@@ -9,6 +9,7 @@ without an expert changes nothing.
 """
 
 import asyncio
+import copy
 
 from orchestrator.security.access import redact_config_override
 from orchestrator.services.config_resolver import (
@@ -17,6 +18,7 @@ from orchestrator.services.config_resolver import (
 )
 from src.core.loader import (
     load_agent_config,
+    load_config_from_resolved,
     resolve_config_path,
     serialize_resolved_config,
 )
@@ -197,6 +199,42 @@ def test_credentials_injected_into_delivery_copy_only():
     assert delivered["agent"]["llm"]["base_url"] == "https://router.example"
     # The persistable blob stays clean.
     assert "api_key" not in blob["agent"].get("llm", {})
+
+
+def test_research_credentials_reach_resolved_config_delivery_only():
+    """Per-dispatch search config must survive the resolved-blob delivery seam.
+
+    The hydrated agent reads this unknown top-level section through
+    ``AgentConfig.extra``. The persistable source blob must remain untouched so
+    provider credentials never enter dispatch state.
+    """
+    blob = resolve_config(base_config_name="persistent_defaults")
+    original_research = copy.deepcopy(blob["agent"].get("research"))
+
+    async def fake_injector(co):
+        co["research"] = {
+            "search": {
+                "provider": "searxng",
+                "base_url": "http://searxng.svc:8080",
+                "api_key": None,
+                "ops": ["search"],
+            }
+        }
+        return co
+
+    delivered = asyncio.run(inject_blob_credentials(blob, fake_injector))
+
+    assert delivered["agent"]["research"] == {
+        "search": {
+            "provider": "searxng",
+            "base_url": "http://searxng.svc:8080",
+            "api_key": None,
+            "ops": ["search"],
+        }
+    }
+    hydrated = load_config_from_resolved(delivered)
+    assert hydrated.extra["research"] == delivered["agent"]["research"]
+    assert blob["agent"].get("research") == original_research
 
 
 def test_redact_strips_secrets_from_blob_for_persist():
