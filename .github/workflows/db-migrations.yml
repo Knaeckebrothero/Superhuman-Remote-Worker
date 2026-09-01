@@ -138,6 +138,28 @@ jobs:
             echo "No added/modified migrations in this change — nothing to lint."
             exit 0
           fi
+
+          # Drop the paths .squawk.toml already excludes. squawk applies its own
+          # excluded_paths and then exits 1 with "Failed to find files for
+          # provided patterns" when that leaves it nothing to lint. So a change
+          # whose only touched migration is an excluded, byte-frozen file --
+          # app/0183, app/0212 -- reds this lane with no actionable finding and
+          # no way to act on it, since the whole point of those entries is that
+          # the file must never be edited again. Observed on run 33489365630.
+          # Filtering here keeps "everything was excluded" a skip, not a failure.
+          # Assigned via a variable, not `mapfile < <(...)`: a process
+          # substitution's exit status is invisible to mapfile, so a broken or
+          # missing .squawk.toml would yield an empty list and silently SKIP the
+          # lint rather than fail it. Fail closed instead.
+          if ! filtered="$(printf '%s\n' "${files[@]}" | python3 -c 'import sys,tomllib,pathlib; ex=set(tomllib.loads(pathlib.Path(".squawk.toml").read_text()).get("excluded_paths",[])); sys.stdout.write("".join(p+"\n" for p in sys.stdin.read().splitlines() if p and p not in ex))')"; then
+            echo "::error::could not read excluded_paths from .squawk.toml"
+            exit 1
+          fi
+          if [ -n "$filtered" ]; then mapfile -t files <<<"$filtered"; else files=(); fi
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "Every changed migration is excluded by .squawk.toml — nothing to lint."
+            exit 0
+          fi
           echo "Linting ${#files[@]} changed migration(s):"
           printf '  %s\n' "${files[@]}"
 
