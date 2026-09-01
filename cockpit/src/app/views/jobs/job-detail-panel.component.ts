@@ -182,7 +182,8 @@ export function subjobElapsedSeconds(sub: JobSubjob, now: number): number | null
 export function subagentElapsedSeconds(sub: JobSubagent, now: number): number | null {
   const started = Date.parse(sub.started_at);
   if (!Number.isFinite(started)) return null;
-  const endRaw = sub.ended_at ?? (sub.status === 'running' ? null : sub.last_activity);
+  const live = sub.status === 'queued' || sub.status === 'running';
+  const endRaw = sub.ended_at ?? (live ? null : sub.last_activity);
   const ended = endRaw ? Date.parse(endRaw) : now;
   if (!Number.isFinite(ended) || ended < started) return null;
   return Math.floor((ended - started) / 1000);
@@ -192,6 +193,7 @@ export function subagentStatusTone(status: JobSubagentStatus): BadgeTone {
   switch (status) {
     case 'completed': return 'success';
     case 'running': return 'accent';
+    case 'queued': return 'info';
     case 'error':
     case 'cancelled': return 'danger';
     case 'parked':
@@ -431,7 +433,10 @@ export function subjobBlockedKey(
           <table class="subjob-table subagent-table">
             <tbody>
               @for (child of subagents(); track child.thread_id) {
-                <tr class="subjob-row subagent-row" [class.subagent-live]="child.status === 'running'">
+                <tr
+                  class="subjob-row subagent-row"
+                  [class.subagent-live]="child.status === 'queued' || child.status === 'running'"
+                >
                   <td class="sub-role subagent-handle">{{ child.handle }}</td>
                   <td class="subagent-type">{{ child.subagent_type }}</td>
                   <td class="sub-status">
@@ -443,6 +448,16 @@ export function subjobBlockedKey(
                     <span class="sub-desc-text" [title]="child.description">
                       {{ child.description }}
                     </span>
+                    @if (child.outcome) {
+                      <span class="sub-outcome" [title]="child.outcome">
+                        {{ 'jobs.detail.subagentsOutcome' | transloco: {outcome: child.outcome} }}
+                      </span>
+                    }
+                    @if (child.error) {
+                      <span class="sub-error" [title]="child.error">
+                        {{ 'jobs.detail.subagentsError' | transloco: {error: child.error} }}
+                      </span>
+                    }
                   </td>
                   <td class="subagent-metrics">
                     {{
@@ -714,6 +729,14 @@ export function subjobBlockedKey(
         display: block;
         margin-top: 2px;
         color: var(--danger);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .sub-outcome {
+        display: block;
+        margin-top: 2px;
+        color: var(--text-muted);
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;

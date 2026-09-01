@@ -12,10 +12,17 @@ import {AppIconComponent} from '../../ui/icon';
   template: `
     <main class="subagent-transcript">
       <header class="subagent-banner" data-testid="subagent-banner">
-        <a class="back-link" routerLink="/jobs">
-          <app-icon size="sm">arrow_back</app-icon>
-          {{ 'chat.subagent.parentJob' | transloco: {id: thread().parent_job_id} }}
-        </a>
+        @if (thread().parent_thread_id; as parentThreadId) {
+          <a class="back-link" [routerLink]="['/sessions', parentThreadId]">
+            <app-icon size="sm">arrow_back</app-icon>
+            {{ 'chat.subagent.parentSession' | transloco: {id: parentThreadId} }}
+          </a>
+        } @else {
+          <a class="back-link" routerLink="/jobs">
+            <app-icon size="sm">arrow_back</app-icon>
+            {{ 'chat.subagent.parentJob' | transloco: {id: thread().parent_job_id} }}
+          </a>
+        }
         <div class="banner-title">
           {{
             'chat.subagent.banner'
@@ -26,13 +33,26 @@ import {AppIconComponent} from '../../ui/icon';
                 }
           }}
         </div>
-        @if (thread().subagent_status === 'running') {
+        @if (isLive()) {
           <button type="button" class="refresh-action" (click)="refresh.emit()">
             <app-icon size="sm">refresh</app-icon>
             {{ 'common.refresh' | transloco }}
           </button>
         }
       </header>
+
+      @if (thread().subagent_outcome || thread().subagent_error) {
+        <div class="subagent-result" data-testid="subagent-result">
+          @if (thread().subagent_outcome; as outcome) {
+            <span>{{ 'jobs.detail.subagentsOutcome' | transloco: {outcome} }}</span>
+          }
+          @if (thread().subagent_error; as childError) {
+            <span class="subagent-result-error">
+              {{ 'jobs.detail.subagentsError' | transloco: {error: childError} }}
+            </span>
+          }
+        </div>
+      }
 
       <section class="transcript" aria-live="polite">
         @if (loading()) {
@@ -119,6 +139,19 @@ import {AppIconComponent} from '../../ui/icon';
       white-space: nowrap;
       font-weight: 600;
     }
+    .subagent-result {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 18px;
+      padding: 8px 18px;
+      color: var(--text-secondary);
+      background: var(--surface-1);
+      border-bottom: 1px solid var(--border-color);
+      font-size: 12px;
+    }
+    .subagent-result-error {
+      color: var(--danger);
+    }
     .refresh-action {
       border: 1px solid var(--border-color);
       border-radius: var(--radius-control);
@@ -203,6 +236,11 @@ export class SubagentTranscriptComponent {
   readonly loading = input(false);
   readonly error = input(false);
   readonly refresh = output<void>();
+
+  isLive(): boolean {
+    const status = this.thread().subagent_status;
+    return status === 'queued' || status === 'running';
+  }
 
   statusKey(): string {
     const status = this.thread().subagent_status;

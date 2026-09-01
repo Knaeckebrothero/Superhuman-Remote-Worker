@@ -101,11 +101,41 @@ describe('SubagentTranscriptComponent', () => {
     expect(render().nativeElement.querySelector('.refresh-action')).not.toBeNull();
   });
 
+  it('offers manual refresh while the child is queued', () => {
+    const root = render({subagent_status: 'queued'}).nativeElement as HTMLElement;
+
+    expect(root.querySelector('.refresh-action')).not.toBeNull();
+    expect(root.querySelector('[data-testid="subagent-banner"]')?.textContent).toContain('Queued');
+  });
+
   it('hides manual refresh after the child finishes', () => {
     expect(
       render({subagent_status: 'completed', status: 'ended'}).nativeElement.querySelector(
         '.refresh-action',
       ),
     ).toBeNull();
+  });
+
+  it('links a session-owned child back to its parent session', () => {
+    const root = render({
+      parent_job_id: null,
+      parent_thread_id: 'parent-session-1',
+    }).nativeElement as HTMLElement;
+    const link = root.querySelector('.back-link');
+
+    expect(link?.getAttribute('href')).toBe('/sessions/parent-session-1');
+    expect(link?.textContent).toContain('Parent session parent-session-1');
+  });
+
+  it('surfaces the durable child outcome and error', () => {
+    const root = render({
+      subagent_status: 'interrupted',
+      subagent_outcome: 'Partial report persisted.',
+      subagent_error: 'Stopped after the grace window.',
+    }).nativeElement as HTMLElement;
+    const result = root.querySelector('[data-testid="subagent-result"]');
+
+    expect(result?.textContent).toContain('Outcome: Partial report persisted.');
+    expect(result?.textContent).toContain('Error: Stopped after the grace window.');
   });
 });

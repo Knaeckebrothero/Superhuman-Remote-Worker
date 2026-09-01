@@ -845,9 +845,12 @@
       "showSubjobRowsHint": "Adds sub-jobs to the origin filter, so they appear in the list.",
       "subjobs": "Sub-jobs ({{count}})",
       "subagents": "Subagents ({{count}})",
+      "subagentsError": "Error: {{error}}",
       "subagentsMetrics": "{{turns}} turns · {{tokens}} tokens",
+      "subagentsOutcome": "Outcome: {{outcome}}",
       "subagentsTranscript": "Transcript",
       "subagentsStatuses": {
+        "queued": "Queued",
         "running": "Running",
         "completed": "Completed",
         "parked": "Parked",
@@ -1541,6 +1544,7 @@
     "subagent": {
       "banner": "Subagent transcript · {{handle}} · {{type}} · {{status}}",
       "parentJob": "Parent job {{id}}",
+      "parentSession": "Parent session {{id}}",
       "loading": "Loading transcript…",
       "loadFailed": "The transcript could not be loaded.",
       "empty": "No transcript messages yet.",

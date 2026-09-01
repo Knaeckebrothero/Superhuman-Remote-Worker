@@ -845,9 +845,12 @@
       "showSubjobRowsHint": "Fügt Unteraufträge zum Herkunftsfilter hinzu, damit sie in der Liste erscheinen.",
       "subjobs": "Unteraufträge ({{count}})",
       "subagents": "Subagenten ({{count}})",
+      "subagentsError": "Fehler: {{error}}",
       "subagentsMetrics": "{{turns}} Züge · {{tokens}} Tokens",
+      "subagentsOutcome": "Ergebnis: {{outcome}}",
       "subagentsTranscript": "Transkript",
       "subagentsStatuses": {
+        "queued": "In Warteschlange",
         "running": "Läuft",
         "completed": "Abgeschlossen",
         "parked": "Geparkt",
@@ -1541,6 +1544,7 @@
     "subagent": {
       "banner": "Subagent-Transkript · {{handle}} · {{type}} · {{status}}",
       "parentJob": "Übergeordneter Job {{id}}",
+      "parentSession": "Übergeordnete Sitzung {{id}}",
       "loading": "Transkript wird geladen…",
       "loadFailed": "Das Transkript konnte nicht geladen werden.",
       "empty": "Noch keine Transkript-Nachrichten.",

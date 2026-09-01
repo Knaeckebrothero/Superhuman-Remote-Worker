@@ -1,8 +1,8 @@
 import {signal} from '@angular/core';
 import {TestBed} from '@angular/core/testing';
 import {ActivatedRoute, convertToParamMap, Router} from '@angular/router';
-import {BehaviorSubject, of} from 'rxjs';
-import {afterEach, describe, expect, it, vi} from 'vitest';
+import {BehaviorSubject, of, Subject} from 'rxjs';
+import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
 import {CanvasService} from '../../core/services/canvas.service';
 import {BrowserCapability, CanvasState} from '../../core/models/canvas.model';
 import {ErrorMessageService} from '../../core/services/error-message.service';
@@ -11,6 +11,11 @@ import type {ConfigDriftItem} from '../../core/services/resume-error';
 import {ViewportService} from '../../core/services/viewport.service';
 import {AppToastService} from '../../ui/toast';
 import {ApiService} from '../../core/services/api.service';
+import type {
+  PersistentThreadHistory,
+  PersistentThreadMessage,
+  Thread,
+} from '../../core/models/api.model';
 import {
   browserReplacementTargetMatches,
   ChatPageComponent,
@@ -148,6 +153,49 @@ function presentedState(revision: number, path = 'output/report.md'): CanvasStat
   };
 }
 
+function childThread(over: Partial<Thread> = {}): Thread {
+  return {
+    id: 'child-1',
+    title: 'Subagent tester-7f3a',
+    kind: 'subagent',
+    status: 'active',
+    config_name: 'session_base',
+    permission_mode: 'autonomous',
+    created_at: '2026-09-01T10:00:00Z',
+    last_activity: '2026-09-01T10:00:00Z',
+    total_turns: 0,
+    total_tokens: 0,
+    parent_job_id: 'job-1',
+    subagent_handle: 'tester-7f3a',
+    subagent_type: 'tester',
+    subagent_status: 'queued',
+    ...over,
+  };
+}
+
+function childHistory(
+  threadId: string,
+  messages: PersistentThreadMessage[] = [],
+): PersistentThreadHistory {
+  return {
+    thread_id: threadId,
+    messages,
+    total: messages.length,
+    has_more: false,
+  };
+}
+
+function childMessage(id: string, content: string): PersistentThreadMessage {
+  return {
+    id,
+    role: 'ai',
+    content,
+    tool_calls: null,
+    turn_number: 1,
+    created_at: '2026-09-01T10:00:00Z',
+  };
+}
+
 describe('ChatPageComponent Canvas route selection', () => {
   afterEach(() => TestBed.resetTestingModule());
 
@@ -186,16 +234,7 @@ describe('ChatPageComponent Canvas route selection', () => {
   });
 
   it('loads a subagent transcript without connecting or selecting live Canvas state', () => {
-    const thread = {
-      id: 'child-1',
-      title: 'Subagent tester-7f3a',
-      kind: 'subagent',
-      status: 'active',
-      parent_job_id: 'job-1',
-      subagent_handle: 'tester-7f3a',
-      subagent_type: 'tester',
-      subagent_status: 'running',
-    };
+    const thread = childThread({subagent_status: 'running'});
     const {component, chat, canvas, api} = createFixture({threadId: 'child-1', thread});
 
     component.ngOnInit();
@@ -210,6 +249,7 @@ describe('ChatPageComponent Canvas route selection', () => {
 
     component.refreshSubagentTranscript();
     expect(api.getPersistentThreadHistory).toHaveBeenCalledTimes(2);
+    expect(api.getPersistentThread).toHaveBeenCalledTimes(2);
   });
 
   it('opens a new source but does not reopen a locally closed same-source refresh', () => {
@@ -516,6 +556,132 @@ describe('ChatPageComponent Canvas route selection', () => {
     expect(component.browserActionTooltipKey()).toBe(
       'canvas.browser.reason.workspace_required',
     );
+  });
+});
+
+describe('ChatPageComponent subagent transcript refresh', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+    TestBed.resetTestingModule();
+  });
+
+  it('polls queued/running detail and history, then stops on a terminal row', async () => {
+    const queued = childThread();
+    const running = childThread({
+      subagent_status: 'running',
+      total_turns: 1,
+      last_activity: '2026-09-01T10:00:05Z',
+    });
+    const completed = childThread({
+      subagent_status: 'completed',
+      status: 'ended',
+      ended_at: '2026-09-01T10:00:10Z',
+      total_turns: 2,
+    });
+    const {component, api, chat, canvas} = createFixture({threadId: queued.id, thread: queued});
+    api.getPersistentThread
+      .mockReset()
+      .mockReturnValueOnce(of(queued))
+      .mockReturnValueOnce(of(running))
+      .mockReturnValueOnce(of(completed));
+    api.getPersistentThreadHistory
+      .mockReset()
+      .mockReturnValueOnce(of(childHistory(queued.id)))
+      .mockReturnValueOnce(of(childHistory(queued.id, [childMessage('m1', 'Working.')])))
+      .mockReturnValueOnce(of(childHistory(queued.id, [childMessage('m2', 'Done.')])))
+
+    component.ngOnInit();
+    expect(component.subagentThread()?.subagent_status).toBe('queued');
+    expect(api.getPersistentThreadHistory).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(component.subagentThread()?.subagent_status).toBe('running');
+    expect(component.subagentMessages().map((message) => message.content)).toEqual(['Working.']);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(component.subagentThread()?.subagent_status).toBe('completed');
+    expect(component.subagentMessages().map((message) => message.content)).toEqual(['Done.']);
+
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(api.getPersistentThread).toHaveBeenCalledTimes(3);
+    expect(api.getPersistentThreadHistory).toHaveBeenCalledTimes(3);
+    expect(chat.connect).not.toHaveBeenCalled();
+    expect(canvas.selectThread).toHaveBeenCalledWith(null);
+  });
+
+  it('skips bounded refresh while the document is hidden', async () => {
+    const queued = childThread();
+    const visibility = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden');
+    const {component, api} = createFixture({threadId: queued.id, thread: queued});
+
+    component.ngOnInit();
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(api.getPersistentThread).toHaveBeenCalledTimes(1);
+    expect(api.getPersistentThreadHistory).toHaveBeenCalledTimes(1);
+
+    visibility.mockReturnValue('visible');
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(api.getPersistentThread).toHaveBeenCalledTimes(2);
+    expect(api.getPersistentThreadHistory).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not overlap a slow detail/history pair', async () => {
+    const queued = childThread();
+    const detail = new Subject<Record<string, unknown> | null>();
+    const history = new Subject<PersistentThreadHistory | null>();
+    const {component, api} = createFixture({threadId: queued.id, thread: queued});
+    api.getPersistentThread
+      .mockReset()
+      .mockReturnValueOnce(of(queued))
+      .mockReturnValueOnce(detail.asObservable());
+    api.getPersistentThreadHistory
+      .mockReset()
+      .mockReturnValueOnce(of(childHistory(queued.id)))
+      .mockReturnValueOnce(history.asObservable());
+
+    component.ngOnInit();
+    await vi.advanceTimersByTimeAsync(5_000);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(api.getPersistentThread).toHaveBeenCalledTimes(2);
+    expect(api.getPersistentThreadHistory).toHaveBeenCalledTimes(2);
+
+    detail.next(childThread({subagent_status: 'running'}));
+    detail.complete();
+    history.next(childHistory(queued.id, [childMessage('m1', 'Settled.')]));
+    history.complete();
+    expect(component.subagentMessages().map((message) => message.content)).toEqual(['Settled.']);
+  });
+
+  it('drops stale route responses and clears the timer on destroy', async () => {
+    const first = childThread({id: 'child-1'});
+    const second = childThread({id: 'child-2', subagent_handle: 'reviewer-2a1c'});
+    const staleHistory = new Subject<PersistentThreadHistory | null>();
+    const {component, params, api} = createFixture({threadId: first.id, thread: first});
+    api.getPersistentThread
+      .mockReset()
+      .mockReturnValueOnce(of(first))
+      .mockReturnValueOnce(of(second));
+    api.getPersistentThreadHistory
+      .mockReset()
+      .mockReturnValueOnce(staleHistory.asObservable())
+      .mockReturnValueOnce(of(childHistory(second.id, [childMessage('new', 'Second child.')])))
+
+    component.ngOnInit();
+    params.next(convertToParamMap({threadId: second.id}));
+    expect(component.subagentThread()?.id).toBe(second.id);
+    expect(component.subagentMessages().map((message) => message.content)).toEqual(['Second child.']);
+
+    staleHistory.next(childHistory(first.id, [childMessage('old', 'Stale child.')]));
+    staleHistory.complete();
+    expect(component.subagentThread()?.id).toBe(second.id);
+    expect(component.subagentMessages().map((message) => message.content)).toEqual(['Second child.']);
+
+    const readsBeforeDestroy = api.getPersistentThreadHistory.mock.calls.length;
+    component.ngOnDestroy();
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(api.getPersistentThreadHistory).toHaveBeenCalledTimes(readsBeforeDestroy);
   });
 });
 

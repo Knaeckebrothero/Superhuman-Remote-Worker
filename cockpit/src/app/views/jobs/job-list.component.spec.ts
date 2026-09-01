@@ -764,6 +764,30 @@ describe('JobListComponent — live refresh', () => {
     expect(getJobsPage.mock.calls.length).toBe(before);
   });
 
+  it('refreshes an expanded live job roster and stops after the parent is terminal', async () => {
+    let row = job('root-1', {status: 'processing'});
+    const getJobsPage = vi.fn().mockImplementation(() => of(page([row])));
+    const getJobSubagents = vi.fn().mockReturnValue(of({
+      job_id: 'root-1',
+      count: 0,
+      subagents: [],
+    }));
+    const {fixture, component} = mountLogic({
+      api: {getJobsPage, getJobSubagents} as Partial<ApiService>,
+    });
+    fixture.detectChanges();
+    component.toggleExpand('root-1');
+    expect(getJobSubagents).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(getJobSubagents).toHaveBeenCalledTimes(2);
+
+    row = job('root-1', {status: 'completed'});
+    component.jobs.set([row as JobSummary]);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(getJobSubagents).toHaveBeenCalledTimes(2);
+  });
+
   it('announces new jobs instead of splicing them above the cursor', async () => {
     const first = page([job('a')]);
     const grown = page([job('new'), job('a')]);

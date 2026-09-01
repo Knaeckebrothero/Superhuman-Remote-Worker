@@ -1776,6 +1776,8 @@ export interface Thread {
   /** Child-thread identity. All fields are absent on ordinary sessions and on
    *  orchestrators predating U3. */
   parent_job_id?: string | null;
+  /** Session parent for U5 children. Exactly one parent id is set on a child. */
+  parent_thread_id?: string | null;
   subagent_handle?: string | null;
   subagent_type?: string | null;
   subagent_status?: JobSubagentStatus | null;
@@ -2430,6 +2432,7 @@ export interface JobSubjobRoster {
 }
 
 export type JobSubagentStatus =
+  | 'queued'
   | 'running'
   | 'completed'
   | 'parked'
@@ -2441,6 +2444,8 @@ export type JobSubagentStatus =
 /** One child thread published by `GET /api/jobs/{job_id}/subagents`. */
 export interface JobSubagent {
   thread_id: string;
+  /** Durable run claim used to fence lifecycle writes; null on older rows. */
+  runtime_generation: string | null;
   handle: string;
   subagent_type: string;
   status: JobSubagentStatus;

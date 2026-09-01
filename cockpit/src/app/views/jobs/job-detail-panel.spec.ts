@@ -330,6 +330,7 @@ describe('subjobBlockedKey', () => {
 function child(over: Partial<JobSubagent> = {}): JobSubagent {
   return {
     thread_id: '209c55c3-9fac-4a17-8dfa-40628688dd72',
+    runtime_generation: null,
     handle: 'tester-7f3a',
     subagent_type: 'tester',
     status: 'running',
@@ -431,12 +432,34 @@ describe('subagent roster', () => {
     expect(root.querySelector('.detail-subagents')).toBeNull();
   });
 
+  it('renders queued children as live and surfaces terminal outcome and error evidence', () => {
+    const fixture = render([
+      child({status: 'queued', handle: 'probe-queued'}),
+      child({
+        status: 'interrupted',
+        handle: 'probe-stopped',
+        outcome: 'Partial report persisted.',
+        error: 'Stopped after the grace window.',
+      }),
+    ]);
+    const rows = fixture.nativeElement.querySelectorAll(
+      '.subagent-row',
+    ) as NodeListOf<HTMLElement>;
+
+    expect(rows[0].classList.contains('subagent-live')).toBe(true);
+    expect(rows[0].textContent).toContain('Queued');
+    expect(rows[1].textContent).toContain('Outcome: Partial report persisted.');
+    expect(rows[1].textContent).toContain('Error: Stopped after the grace window.');
+  });
+
   it('uses child timestamps for elapsed time and lifecycle tones', () => {
     expect(subagentElapsedSeconds(child(), NOW)).toBe(2 * 3600);
+    expect(subagentElapsedSeconds(child({status: 'queued'}), NOW)).toBe(2 * 3600);
     expect(
       subagentElapsedSeconds(child({status: 'completed', ended_at: '2026-08-23T10:30:00Z'}), NOW),
     ).toBe(30 * 60);
     expect(subagentStatusTone('running')).toBe('accent');
+    expect(subagentStatusTone('queued')).toBe('info');
     expect(subagentStatusTone('completed')).toBe('success');
     expect(subagentStatusTone('error')).toBe('danger');
   });
