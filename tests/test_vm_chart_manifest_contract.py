@@ -307,6 +307,28 @@ def test_same_cluster_vm_and_cloud_init_contract() -> None:
     assert "ssh-keygen -A" not in cloud_init(rendered)
 
 
+def test_rootdisk_names_its_volume_mode() -> None:
+    """The templated rootdisk must name volumeMode, never inherit it.
+
+    CDI fills an unset volumeMode from the target StorageClass's StorageProfile.
+    That profile is empty for ``rancher.io/local-path`` — which is why the
+    omission stayed invisible — but populated for a real CSI, where it resolves
+    to ``Block``. A Block rootdisk cannot be imported on a node running SELinux
+    with the importer's capabilities dropped: it dies with "blockdev: cannot
+    open /dev/cdi-block-volume: Permission denied". The controller hardcodes
+    Filesystem for the golden DataVolume and the clone target, so an unset mode
+    here left the DEFAULT path (goldenImage is off) as the only disagreeing one.
+    """
+    rendered = render_chart(MAIN)
+    storage = vm_template(rendered)["spec"]["dataVolumeTemplates"][0]["spec"]["storage"]
+    assert storage["volumeMode"] == "Filesystem"
+    assert storage["accessModes"] == ["ReadWriteOnce"]
+
+    # The template's mode must agree with the two paths the controller pins in
+    # Python, or a golden clone and a templated disk would disagree at runtime.
+    assert '"volumeMode": "Filesystem"' in CONTROLLER_SRC.read_text()
+
+
 def test_same_cluster_network_policy_ports() -> None:
     policies = [
         doc

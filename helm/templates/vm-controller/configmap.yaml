@@ -28,6 +28,15 @@ data:
           spec:
             storage:
               accessModes: [ReadWriteOnce]
+              # Name the mode; do NOT let CDI infer it. An unset volumeMode is
+              # filled from the target StorageClass's CDI StorageProfile, which
+              # is empty for rancher.io/local-path (so the omission was
+              # invisible) but populated for a real CSI, where it resolves to
+              # Block. A Block rootdisk cannot be imported on a node running
+              # SELinux with the importer's capabilities dropped. The controller
+              # already hardcodes Filesystem for the golden DataVolume and the
+              # clone target, so this keeps all three paths in agreement.
+              volumeMode: Filesystem
               storageClassName: ${VM_STORAGE_CLASS}
               resources:
                 requests:

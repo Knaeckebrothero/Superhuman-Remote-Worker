@@ -505,15 +505,33 @@ on another node and the VM never schedules.
 selection, KVM detection, the patches below, and a smoke test).
 
 **Storage.** The VM root disks are CDI DataVolumes on `vmController.vmStorageClass`
-(default `local-path`). With `local-path`:
+(default `local-path`).
 
-- the StorageProfile has no capabilities entry, so CDI cannot infer access modes — the chart's
-  template sets them explicitly; if you write your own DataVolumes, patch the profile once:
-  `kubectl patch storageprofile local-path --type merge -p '{"spec":{"claimPropertySets":[{"accessModes":["ReadWriteOnce"],"volumeMode":"Filesystem"}]}}'`
-- clones are host-assisted full copies (no snapshots), and volumes are pinned to the node
-  they were created on — set `vmController.nodeSelector` on any multi-node cluster;
-- set CDI's `scratchSpaceStorageClass` to the same class (done above). If your cluster has
-  several default StorageClasses, every VM-related object must name its class.
+Every DataVolume the chart and the controller create names **both** its access modes and
+`volumeMode: Filesystem` explicitly, and never lets CDI infer them from the target class's
+StorageProfile. Keep doing that if you write your own, because inference is storage-dependent
+and fails in opposite directions: `local-path` has no capabilities entry so there is nothing to
+infer, while a real CSI usually *does* have one and resolves to `Block` — and a Block root disk
+cannot be imported on a node running SELinux with the importer's capabilities dropped
+(`blockdev: cannot open /dev/cdi-block-volume: Permission denied`). Because the chart names them,
+no `kubectl patch storageprofile` is required on any class.
+
+With `local-path`:
+
+- clones are host-assisted full copies (no snapshots), and volumes carry a
+  `kubernetes.io/hostname` affinity, so a VM can only mount its disk on the node that created
+  it — **set `vmController.nodeSelector` on any multi-node cluster**, or a VM scheduled
+  elsewhere will never bind its root disk.
+
+With a CSI whose volumes attach on any node (Longhorn, Ceph, most cloud disks) that pinning is
+**not** needed — it is a property of node-local storage, not of the VM tier. Leave
+`vmController.nodeSelector` empty and let the scheduler place VMs, so VM and container workloads
+draw on one capacity pool. KubeVirt decides per node whether VMs can run there at all: check
+allocatable `devices.kubevirt.io/kvm`, **not** the `kubevirt.io/schedulable` label, which only
+tracks whether virt-handler is healthy and is true even on nodes with no usable virtualisation.
+
+Either way, set CDI's `scratchSpaceStorageClass` to the same class (done above). If your cluster
+has several default StorageClasses, every VM-related object must name its class.
 
 **Network.** The workspace NetworkPolicy must actually be enforced by your CNI. Calico,
 Cilium, OVN-Kubernetes and Antrea enforce natively; **k3s** enforces through its embedded
@@ -538,7 +556,8 @@ vmController:
   maxConcurrentVms: 4
   vmStorageClass: local-path
   vmDiskSize: 20Gi
-  nodeSelector: {}         # mandatory on multi-node clusters, e.g. {srw.io/vm-node: "true"}
+  nodeSelector: {}         # mandatory on multi-node clusters ONLY with node-local storage
+                           # (e.g. local-path): {srw.io/vm-node: "true"}. Leave empty on a CSI.
   tolerations: []          #   and the matching toleration for your taint
   goldenImage:
     enabled: true          # import the base image once, clone per VM
@@ -700,7 +719,8 @@ approval request in the cockpit; approve it and the command runs.
 | VMI stuck in `Scheduling` | no node with `kubevirt.io/schedulable=true` that matches `nodeSelector`/tolerations, or `devices.kubevirt.io/kvm` missing (no KVM) |
 | DataVolume `Pending` forever | WaitForFirstConsumer with no consumer — normal until the VM starts; for a standalone DataVolume add the `cdi.kubevirt.io/storage.bind.immediate.requested: "true"` annotation |
 | DataVolume stuck in `ImportScheduled` | CDI has no scratch space: set `scratchSpaceStorageClass` |
-| `UnrecognizedProvisioner` on the StorageProfile | normal for `local-path`; the chart sets access modes explicitly |
+| `UnrecognizedProvisioner` on the StorageProfile | normal for `local-path`; the chart names access modes and volume mode explicitly, so nothing needs to be inferred |
+| importer dies with `blockdev: cannot open /dev/cdi-block-volume: Permission denied` | the DataVolume left `volumeMode` unset and CDI inferred `Block` from the class's StorageProfile. The importer runs unprivileged with capabilities dropped and cannot open a raw device on an SELinux-enforcing node. Name `volumeMode: Filesystem` on the DataVolume |
 | VM `Stopped` after the guest powered off | KubeVirt does not restart a voluntary shutdown; the orchestrator recovers the job with the kept root disk |
 | `sudo` inside the VM is denied with "orchestrator unreachable" | the guest daemon cannot reach the orchestrator Service on 8085 — check the workspace NetworkPolicy and that `vm.mode` is `same-cluster` |
 | the agent logs `the final git push did NOT land` and the job's Gitea repo stays at "Initial commit" | the workspace was handed a remote it cannot authenticate. The orchestrator logs `Dispatch: repository transport for job …` at every dispatch: it must name an `ssh://srw-repo-…` alias with `1 managed credential(s)`; a plain `http://…` with `0 managed credential(s)` means the job row reached dispatch without `repo_name` or the managed repository authority could not be proven (a `No managed repository authority for job …` warning precedes it) |
