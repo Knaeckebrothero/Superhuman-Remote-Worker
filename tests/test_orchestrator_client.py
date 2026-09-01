@@ -1287,6 +1287,124 @@ class TestCreateThread:
             assert call_payload["title"] == "Local Session"
 
 
+class TestSubagentGenerationClient:
+    CHILD = "11111111-1111-4111-8111-111111111111"
+    JOB = "22222222-2222-4222-8222-222222222222"
+    DELIVERY = "33333333-3333-4333-8333-333333333333"
+
+    @pytest.fixture
+    def client(self):
+        return OrchestratorClient(
+            orchestrator_url="http://localhost:8085",
+            pod_ip="10.0.0.5",
+            pod_port=8001,
+            hostname="test-agent",
+            config_name="creator",
+            pid=12345,
+        )
+
+    @pytest.mark.asyncio
+    async def test_create_returns_only_a_complete_generation_lease(self, client):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "thread_id": self.CHILD,
+            "runtime_generation": RUNTIME_GENERATION,
+        }
+        client._client = MagicMock(post=AsyncMock(return_value=response))
+
+        result = await client.create_subagent_thread(
+            self.JOB,
+            subagent_id=self.CHILD,
+            handle="explorer-7f3a",
+            subagent_type="explorer",
+            initial_status="queued",
+        )
+        assert result == {
+            "thread_id": self.CHILD,
+            "runtime_generation": RUNTIME_GENERATION,
+        }
+        payload = client._client.post.await_args.kwargs["json"]
+        assert payload["initial_status"] == "queued"
+
+        response.json.return_value = {"thread_id": self.CHILD}
+        assert (
+            await client.create_subagent_thread(
+                self.JOB,
+                handle="explorer-7f3a",
+                subagent_type="explorer",
+            )
+            is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_terminal_and_reopen_preserve_conflict_receipts(self, client):
+        applied = MagicMock(status_code=200)
+        applied.json.return_value = {
+            "result": "applied",
+            "runtime_generation": RUNTIME_GENERATION,
+        }
+        stale = MagicMock(status_code=409)
+        stale.json.return_value = {
+            "detail": {
+                "result": "stale",
+                "runtime_generation": RUNTIME_GENERATION,
+            }
+        }
+        client._client = MagicMock(post=AsyncMock(side_effect=[applied, stale]))
+
+        result = await client.terminalize_subagent_thread(
+            self.JOB,
+            self.CHILD,
+            runtime_generation=RUNTIME_GENERATION,
+            delivery_id=self.DELIVERY,
+            message="child report",
+            timestamp="2026-09-01T01:02:03+00:00",
+            subagent_status="completed",
+        )
+        assert result["result"] == "applied"
+        terminal_call = client._client.post.await_args_list[0]
+        assert terminal_call.args[0].endswith(f"/{self.CHILD}/terminal")
+        assert terminal_call.kwargs["json"]["delivery_id"] == self.DELIVERY
+
+        result = await client.reopen_subagent_thread(
+            self.JOB,
+            self.CHILD,
+            runtime_generation=RUNTIME_GENERATION,
+        )
+        assert result == {
+            "result": "stale",
+            "runtime_generation": RUNTIME_GENERATION,
+        }
+
+    @pytest.mark.asyncio
+    async def test_live_list_and_exact_lookup_use_internal_child_paths(self, client):
+        live = MagicMock(status_code=200)
+        live.json.return_value = {
+            "subagents": [
+                {"thread_id": self.CHILD, "runtime_generation": RUNTIME_GENERATION}
+            ]
+        }
+        exact = MagicMock(status_code=200)
+        exact.json.return_value = {
+            "thread_id": self.CHILD,
+            "runtime_generation": RUNTIME_GENERATION,
+        }
+        client._client = MagicMock(get=AsyncMock(side_effect=[live, exact]))
+
+        assert (await client.list_live_subagent_threads(self.JOB))[0][
+            "runtime_generation"
+        ] == RUNTIME_GENERATION
+        assert (await client.get_subagent_thread(self.JOB, self.CHILD))[
+            "thread_id"
+        ] == self.CHILD
+        assert client._client.get.await_args_list[0].args[0].endswith("/subagents/live")
+        assert (
+            client._client.get.await_args_list[1]
+            .args[0]
+            .endswith(f"/subagents/{self.CHILD}")
+        )
+
+
 class TestSaveThreadMessage:
     """Tests for save_thread_message method."""
 

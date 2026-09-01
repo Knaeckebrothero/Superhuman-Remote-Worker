@@ -690,15 +690,17 @@ class OrchestratorClient:
         brief_description: str = "",
         parent_iteration: Optional[int] = None,
         fork: bool = False,
-    ) -> Optional[str]:
+        initial_status: str = "running",
+    ) -> Optional[dict[str, str]]:
         """Create the ``threads`` row of a subagent child of ``job_id`` (U3 B.1).
 
         ``POST /api/agents/jobs/{job_id}/subagents`` — internal (X-Internal-Key),
         never the session creation route: the orchestrator derives the row's
         owner and project from the job and provisions nothing. ``subagent_id``
         becomes the row id when given, so the child's audit rows and its
-        thread share one identity. Returns the thread id, or ``None`` on any
-        failure (the ledger then keeps no durable state for that child).
+        thread share one identity. Returns the thread id and the database-owned
+        runtime generation, or ``None`` on any failure (the ledger then keeps
+        no durable state for that child).
         """
         if not self._client:
             await self.connect()
@@ -715,18 +717,32 @@ class OrchestratorClient:
             "brief_description": brief_description,
             "parent_iteration": parent_iteration,
             "fork": bool(fork),
+            "initial_status": initial_status,
         }
         try:
             response = await self._client.post(url, json=payload)
             if response.status_code == 200:
-                thread_id = response.json().get("thread_id")
+                data = response.json()
+                thread_id = data.get("thread_id")
+                runtime_generation = data.get("runtime_generation")
+                try:
+                    lease = {
+                        "thread_id": str(UUID(str(thread_id))),
+                        "runtime_generation": str(UUID(str(runtime_generation))),
+                    }
+                except (ValueError, TypeError, AttributeError):
+                    logger.error(
+                        "Subagent create returned no valid generation for job %s",
+                        job_id,
+                    )
+                    return None
                 logger.info(
                     "Created subagent thread %s for job %s (%s)",
-                    thread_id,
+                    lease["thread_id"],
                     job_id,
                     handle,
                 )
-                return str(thread_id) if thread_id else None
+                return lease
             logger.error(
                 "Failed to create subagent thread for job %s: %s - %s",
                 job_id,
@@ -736,6 +752,128 @@ class OrchestratorClient:
             return None
         except Exception as e:
             logger.error(f"Failed to create subagent thread for job {job_id}: {e}")
+            return None
+
+    async def list_live_subagent_threads(self, job_id: str) -> list[dict[str, Any]]:
+        """Return generation-bearing queued/running children of a worker job."""
+        if not self._client:
+            await self.connect()
+        url = f"{self.orchestrator_url}/api/agents/jobs/{job_id}/subagents/live"
+        try:
+            response = await self._client.get(url)
+            if response.status_code != 200:
+                logger.error(
+                    "Failed to list live subagents for job %s: %s - %s",
+                    job_id,
+                    response.status_code,
+                    response.text,
+                )
+                return []
+            rows = response.json().get("subagents")
+            return [dict(row) for row in rows] if isinstance(rows, list) else []
+        except Exception as e:
+            logger.error("Failed to list live subagents for job %s: %s", job_id, e)
+            return []
+
+    async def get_subagent_thread(
+        self, job_id: str, thread_id: str
+    ) -> Optional[dict[str, Any]]:
+        """Read one worker child under its parent job."""
+        if not self._client:
+            await self.connect()
+        url = f"{self.orchestrator_url}/api/agents/jobs/{job_id}/subagents/{thread_id}"
+        try:
+            response = await self._client.get(url)
+            return dict(response.json()) if response.status_code == 200 else None
+        except Exception as e:
+            logger.error("Failed to read subagent thread %s: %s", thread_id, e)
+            return None
+
+    async def reopen_subagent_thread(
+        self,
+        job_id: str,
+        thread_id: str,
+        *,
+        runtime_generation: str,
+    ) -> Optional[dict[str, Any]]:
+        """Rotate an ended child to a queued successor generation."""
+        if not self._client:
+            await self.connect()
+        url = (
+            f"{self.orchestrator_url}/api/agents/jobs/{job_id}/subagents/"
+            f"{thread_id}/reopen"
+        )
+        try:
+            response = await self._client.post(
+                url, json={"runtime_generation": runtime_generation}
+            )
+            data = response.json()
+            if response.status_code == 200:
+                return dict(data)
+            if response.status_code == 409 and isinstance(data.get("detail"), dict):
+                return dict(data["detail"])
+            logger.error(
+                "Failed to reopen subagent %s: %s - %s",
+                thread_id,
+                response.status_code,
+                response.text,
+            )
+            return None
+        except Exception as e:
+            logger.error("Failed to reopen subagent %s: %s", thread_id, e)
+            return None
+
+    async def terminalize_subagent_thread(
+        self,
+        job_id: str,
+        thread_id: str,
+        *,
+        runtime_generation: str,
+        delivery_id: str,
+        message: str,
+        timestamp: str,
+        subagent_status: str,
+        outcome: Optional[str] = None,
+        turns: Optional[int] = None,
+        tokens: Optional[int] = None,
+        report_path: Optional[str] = None,
+        error: Optional[str] = None,
+    ) -> Optional[dict[str, Any]]:
+        """End one exact run and atomically enqueue its worker report."""
+        if not self._client:
+            await self.connect()
+        url = (
+            f"{self.orchestrator_url}/api/agents/jobs/{job_id}/subagents/"
+            f"{thread_id}/terminal"
+        )
+        payload = {
+            "runtime_generation": runtime_generation,
+            "delivery_id": delivery_id,
+            "message": message,
+            "timestamp": timestamp,
+            "subagent_status": subagent_status,
+            "outcome": outcome,
+            "turns": turns,
+            "tokens": tokens,
+            "report_path": report_path,
+            "error": error,
+        }
+        try:
+            response = await self._client.post(url, json=payload)
+            data = response.json()
+            if response.status_code == 200:
+                return dict(data)
+            if response.status_code == 409 and isinstance(data.get("detail"), dict):
+                return dict(data["detail"])
+            logger.error(
+                "Failed to terminalize subagent %s: %s - %s",
+                thread_id,
+                response.status_code,
+                response.text,
+            )
+            return None
+        except Exception as e:
+            logger.error("Failed to terminalize subagent %s: %s", thread_id, e)
             return None
 
     async def save_thread_message(

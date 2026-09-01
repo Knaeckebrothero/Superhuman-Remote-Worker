@@ -28,6 +28,9 @@ from src.database.postgres_db import PostgresDB as AgentDB
 JOB = UUID("aaaaaaaa-1111-4222-8333-444444444444")
 CHILD = UUID("bbbbbbbb-1111-4222-8333-444444444444")
 PARENT_THREAD = UUID("cccccccc-1111-4222-8333-444444444444")
+GENERATION = UUID("dddddddd-1111-4222-8333-444444444444")
+NEXT_GENERATION = UUID("eeeeeeee-1111-4222-8333-444444444444")
+DELIVERY = UUID("ffffffff-1111-4222-8333-444444444444")
 
 
 def _compact(sql: str) -> str:
@@ -79,7 +82,9 @@ class TestCreateSubagentThread:
     @pytest.mark.asyncio
     async def test_the_row_is_derived_from_the_job_in_one_insert(self):
         conn = _conn()
-        conn.fetchrow = AsyncMock(return_value={"id": CHILD})
+        conn.fetchrow = AsyncMock(
+            return_value={"id": CHILD, "runtime_generation": GENERATION}
+        )
         db = _orchestrator_db(conn)
 
         created = await db.create_subagent_thread(
@@ -96,7 +101,10 @@ class TestCreateSubagentThread:
             fork=True,
         )
 
-        assert created == str(CHILD)
+        assert created == {
+            "thread_id": str(CHILD),
+            "runtime_generation": str(GENERATION),
+        }
         sql = _compact(conn.fetchrow.call_args[0][0])
         args = conn.fetchrow.call_args[0][1:]
         assert sql.startswith("INSERT INTO threads (")
@@ -109,11 +117,11 @@ class TestCreateSubagentThread:
             "subagent_handle, subagent_type, subagent_status )" in sql
         )
         assert (
-            "SELECT $1, 'subagent', j.user_id, j.project_id, $3, 'active', "
+            "SELECT $1, 'subagent', j.user_id, j.project_id, $3, $9, "
             "'autonomous', 'silent', 'pinned', $4::jsonb, j.id, $5, $6, $7, $8, "
-            "'running' FROM jobs j WHERE j.id = $2" in sql
+            "$10 FROM jobs j WHERE j.id = $2" in sql
         )
-        assert "ON CONFLICT (id) DO NOTHING RETURNING id" in sql
+        assert "ON CONFLICT (id) DO NOTHING RETURNING id, runtime_generation" in sql
         assert args[0] == CHILD and args[1] == JOB
         assert args[2] == "implementer-7f3a: implement the parser"
         metadata = json.loads(args[3])
@@ -131,28 +139,50 @@ class TestCreateSubagentThread:
         assert args[5] == "call-1"
         assert args[6] == "implementer-7f3a"
         assert args[7] == "implementer"
-        conn.fetchval.assert_not_awaited()
+        assert args[8:] == ("active", "running")
+        assert conn.fetchrow.await_count == 1
 
     @pytest.mark.asyncio
     async def test_a_fresh_id_is_minted_when_none_is_given(self):
         conn = _conn()
-        conn.fetchrow = AsyncMock(side_effect=lambda sql, *a: {"id": a[0]})
+        conn.fetchrow = AsyncMock(
+            side_effect=lambda sql, *a: {
+                "id": a[0],
+                "runtime_generation": GENERATION,
+            }
+        )
         db = _orchestrator_db(conn)
         created = await db.create_subagent_thread(
             parent_job_id=str(JOB), handle="h-0001", subagent_type="explorer"
         )
-        assert UUID(created)  # a valid uuid the caller did not choose
+        assert UUID(created["thread_id"])  # a valid uuid the caller did not choose
+        assert created["runtime_generation"] == str(GENERATION)
         args = conn.fetchrow.call_args[0][1:]
         assert args[2] == "subagent h-0001"  # no brief → the handle titles it
         assert args[4] is None and args[5] is None
+
+    @pytest.mark.asyncio
+    async def test_queued_create_is_durable_before_it_can_run(self):
+        conn = _conn()
+        conn.fetchrow = AsyncMock(
+            return_value={"id": CHILD, "runtime_generation": GENERATION}
+        )
+        db = _orchestrator_db(conn)
+        await db.create_subagent_thread(
+            parent_job_id=str(JOB),
+            thread_id=str(CHILD),
+            handle="h-0001",
+            subagent_type="explorer",
+            initial_status="queued",
+        )
+        assert conn.fetchrow.call_args.args[-2:] == ("created", "queued")
 
     @pytest.mark.asyncio
     async def test_a_missing_job_yields_none_after_one_probe(self):
         """No row back means either no job or an already-created id — the
         follow-up SELECT tells them apart."""
         conn = _conn()
-        conn.fetchrow = AsyncMock(return_value=None)
-        conn.fetchval = AsyncMock(return_value=None)
+        conn.fetchrow = AsyncMock(side_effect=[None, None])
         db = _orchestrator_db(conn)
         assert (
             await db.create_subagent_thread(
@@ -163,22 +193,36 @@ class TestCreateSubagentThread:
             )
             is None
         )
-        probe = _compact(conn.fetchval.call_args[0][0])
-        assert probe == "SELECT id FROM threads WHERE id = $1 AND kind = 'subagent'"
-        assert conn.fetchval.call_args[0][1] == CHILD
+        probe = _compact(conn.fetchrow.call_args_list[1].args[0])
+        assert "SELECT id, runtime_generation FROM threads" in probe
+        assert "parent_job_id = $2" in probe
+        assert conn.fetchrow.call_args_list[1].args[1:] == (
+            CHILD,
+            JOB,
+            "h-0001",
+            "explorer",
+            None,
+        )
 
     @pytest.mark.asyncio
     async def test_a_retried_create_returns_the_existing_id(self):
         conn = _conn()
-        conn.fetchrow = AsyncMock(return_value=None)
-        conn.fetchval = AsyncMock(return_value=CHILD)
+        conn.fetchrow = AsyncMock(
+            side_effect=[
+                None,
+                {"id": CHILD, "runtime_generation": GENERATION},
+            ]
+        )
         db = _orchestrator_db(conn)
         assert await db.create_subagent_thread(
             parent_job_id=str(JOB),
             thread_id=str(CHILD),
             handle="h-0001",
             subagent_type="explorer",
-        ) == str(CHILD)
+        ) == {
+            "thread_id": str(CHILD),
+            "runtime_generation": str(GENERATION),
+        }
 
     @pytest.mark.asyncio
     async def test_malformed_ids_never_reach_sql(self):
@@ -221,6 +265,13 @@ class TestCreateSubagentThread:
             await db.create_subagent_thread(
                 parent_job_id=str(JOB), handle="h-0001", subagent_type="  "
             )
+        with pytest.raises(ValueError):
+            await db.create_subagent_thread(
+                parent_job_id=str(JOB),
+                handle="h-0001",
+                subagent_type="explorer",
+                initial_status="completed",
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +291,7 @@ class TestOrchestratorReads:
         assert "FROM threads WHERE kind = 'subagent' AND parent_job_id = $1" in sql
         assert "ORDER BY created_at, id" in sql
         for column in (
+            "runtime_generation",
             "subagent_handle",
             "subagent_type",
             "subagent_status",
@@ -285,6 +337,200 @@ class TestOrchestratorReads:
         assert await db.get_subagent_thread_by_call(str(JOB), "") is None
         assert await db.get_subagent_thread_by_call("nope", "call-1") is None
         conn.fetchrow.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_live_list_is_doubly_fenced_and_includes_generation(self):
+        conn = _conn()
+        conn.fetch = AsyncMock(
+            return_value=[{"id": CHILD, "runtime_generation": GENERATION}]
+        )
+        db = _orchestrator_db(conn)
+        assert await db.list_live_subagent_threads(str(JOB)) == [
+            {"id": CHILD, "runtime_generation": GENERATION}
+        ]
+        sql = _compact(conn.fetch.call_args.args[0])
+        assert "status IN ('created', 'active')" in sql
+        assert "subagent_status IN ('queued', 'running')" in sql
+        assert "runtime_generation" in sql
+
+    @pytest.mark.asyncio
+    async def test_exact_child_lookup_is_scoped_to_parent(self):
+        conn = _conn()
+        conn.fetchrow = AsyncMock(
+            return_value={"id": CHILD, "runtime_generation": GENERATION}
+        )
+        db = _orchestrator_db(conn)
+        row = await db.get_subagent_thread(str(JOB), str(CHILD))
+        assert row == {"id": CHILD, "runtime_generation": GENERATION}
+        sql = _compact(conn.fetchrow.call_args.args[0])
+        assert "id = $1" in sql and "parent_job_id = $2" in sql
+        assert conn.fetchrow.call_args.args[1:] == (CHILD, JOB)
+
+
+class TestReopenSubagentThread:
+    @pytest.mark.asyncio
+    async def test_ended_to_created_returns_the_trigger_rotated_generation(self):
+        conn = _conn()
+        conn.fetchval = AsyncMock(return_value=JOB)
+        conn.fetchrow = AsyncMock(
+            side_effect=[
+                {"status": "ended", "runtime_generation": GENERATION},
+                {"runtime_generation": NEXT_GENERATION},
+            ]
+        )
+        db = _orchestrator_db(conn)
+
+        assert await db.reopen_subagent_thread(
+            parent_job_id=str(JOB),
+            thread_id=str(CHILD),
+            runtime_generation=str(GENERATION),
+        ) == {
+            "result": "reopened",
+            "thread_id": str(CHILD),
+            "runtime_generation": str(NEXT_GENERATION),
+        }
+        assert "FROM jobs" in _compact(conn.fetchval.call_args.args[0])
+        lock_sql = _compact(conn.fetchrow.call_args_list[0].args[0])
+        reopen_sql = _compact(conn.fetchrow.call_args_list[1].args[0])
+        assert lock_sql.endswith("FOR UPDATE")
+        assert "SET status = 'created'" in reopen_sql
+        assert "subagent_status = 'queued'" in reopen_sql
+        assert "RETURNING runtime_generation" in reopen_sql
+
+    @pytest.mark.asyncio
+    async def test_stale_generation_never_takes_the_reopen_edge(self):
+        conn = _conn()
+        conn.fetchval = AsyncMock(return_value=JOB)
+        conn.fetchrow = AsyncMock(
+            return_value={"status": "ended", "runtime_generation": NEXT_GENERATION}
+        )
+        db = _orchestrator_db(conn)
+        result = await db.reopen_subagent_thread(
+            parent_job_id=str(JOB),
+            thread_id=str(CHILD),
+            runtime_generation=str(GENERATION),
+        )
+        assert result["result"] == "stale"
+        assert conn.fetchrow.await_count == 1
+
+
+class TestTerminalizeSubagentAndEnqueue:
+    timestamp = "2026-09-01T01:02:03+00:00"
+
+    @pytest.mark.asyncio
+    async def test_child_terminalization_and_reply_append_share_one_transaction(self):
+        conn = _conn()
+        conn.fetchrow = AsyncMock(
+            side_effect=[
+                {"status": "processing", "context": {"keep": "yes"}},
+                {
+                    "runtime_generation": GENERATION,
+                    "status": "active",
+                    "subagent_handle": "explorer-7f3a",
+                },
+            ]
+        )
+        conn.fetchval = AsyncMock(return_value=CHILD)
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+        db = _orchestrator_db(conn)
+
+        result = await db.terminalize_subagent_thread_and_enqueue(
+            parent_job_id=str(JOB),
+            thread_id=str(CHILD),
+            runtime_generation=str(GENERATION),
+            delivery_id=str(DELIVERY),
+            message="child report",
+            timestamp=self.timestamp,
+            subagent_status="completed",
+            outcome="completed",
+            turns=3,
+            tokens=1200,
+        )
+
+        assert result["result"] == "applied"
+        assert result["delivery"] == {
+            "id": str(DELIVERY),
+            "source": "subagent",
+            "thread_id": str(CHILD),
+            "handle": "explorer-7f3a",
+            "run_generation": str(GENERATION),
+            "message": "child report",
+            "timestamp": self.timestamp,
+        }
+        parent_lock = _compact(conn.fetchrow.call_args_list[0].args[0])
+        child_lock = _compact(conn.fetchrow.call_args_list[1].args[0])
+        terminal = _compact(conn.fetchval.call_args.args[0])
+        append = _compact(conn.execute.call_args.args[0])
+        assert (
+            parent_lock == "SELECT status, context FROM jobs WHERE id = $1 FOR UPDATE"
+        )
+        assert child_lock.endswith("FOR UPDATE")
+        assert "runtime_generation = $3" in terminal
+        assert "status <> 'ended'" in terminal
+        assert "'{queued_replies}'" in append
+        queued = json.loads(conn.execute.call_args.args[1])
+        assert queued == [result["delivery"]]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "lane,state", [("queued_replies", "queued"), ("consumed_replies", "consumed")]
+    )
+    async def test_retry_is_idempotent_before_or_after_consumption(self, lane, state):
+        reply = {
+            "id": str(DELIVERY),
+            "source": "subagent",
+            "thread_id": str(CHILD),
+            "handle": "explorer-7f3a",
+            "run_generation": str(GENERATION),
+            "message": "child report",
+            "timestamp": self.timestamp,
+        }
+        conn = _conn()
+        conn.fetchrow = AsyncMock(
+            return_value={"status": "processing", "context": {lane: [reply]}}
+        )
+        db = _orchestrator_db(conn)
+        result = await db.terminalize_subagent_thread_and_enqueue(
+            parent_job_id=str(JOB),
+            thread_id=str(CHILD),
+            runtime_generation=str(GENERATION),
+            delivery_id=str(DELIVERY),
+            message="child report",
+            timestamp=self.timestamp,
+            subagent_status="completed",
+        )
+        assert result["result"] == "idempotent"
+        assert result["delivery_state"] == state
+        assert conn.fetchrow.await_count == 1
+        conn.fetchval.assert_not_awaited()
+        conn.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stale_generation_cannot_terminalize_or_deliver(self):
+        conn = _conn()
+        conn.fetchrow = AsyncMock(
+            side_effect=[
+                {"status": "processing", "context": {}},
+                {
+                    "runtime_generation": NEXT_GENERATION,
+                    "status": "active",
+                    "subagent_handle": "explorer-7f3a",
+                },
+            ]
+        )
+        db = _orchestrator_db(conn)
+        result = await db.terminalize_subagent_thread_and_enqueue(
+            parent_job_id=str(JOB),
+            thread_id=str(CHILD),
+            runtime_generation=str(GENERATION),
+            delivery_id=str(DELIVERY),
+            message="stale report",
+            timestamp=self.timestamp,
+            subagent_status="completed",
+        )
+        assert result["result"] == "stale"
+        conn.fetchval.assert_not_awaited()
+        conn.execute.assert_not_awaited()
 
 
 class TestListThreadsSessionGate:
@@ -378,6 +624,7 @@ class TestUpdateSubagentThread:
 
         assert await db.update_subagent_thread(
             str(CHILD),
+            runtime_generation=str(GENERATION),
             status="ended",
             subagent_status="capped",
             outcome="capped:turns",
@@ -402,7 +649,8 @@ class TestUpdateSubagentThread:
             "CURRENT_TIMESTAMP) ELSE ended_at END" in sql
         )
         assert "last_activity = CURRENT_TIMESTAMP" in sql
-        assert sql.endswith("WHERE id = $1::uuid AND kind = 'subagent'")
+        assert "runtime_generation = $10::uuid" in sql
+        assert sql.endswith("AND status <> 'ended'")
         assert args == (
             str(CHILD),
             "ended",
@@ -413,6 +661,7 @@ class TestUpdateSubagentThread:
             ".subagents/explorer-0001/report.md",
             None,
             True,
+            str(GENERATION),
         )
 
     @pytest.mark.asyncio
@@ -420,16 +669,40 @@ class TestUpdateSubagentThread:
         conn = _conn()
         conn.execute = AsyncMock(return_value="UPDATE 1")
         db = _agent_db(conn)
-        await db.update_subagent_thread(str(CHILD), status="active")
+        await db.update_subagent_thread(
+            str(CHILD), runtime_generation=str(GENERATION), status="active"
+        )
         args = conn.execute.call_args[0][1:]
-        assert args == (str(CHILD), "active", None, None, None, None, None, None, False)
+        assert args == (
+            str(CHILD),
+            "active",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            False,
+            str(GENERATION),
+        )
 
     @pytest.mark.asyncio
     async def test_a_session_row_or_unknown_id_reports_false(self):
         conn = _conn()
         conn.execute = AsyncMock(return_value="UPDATE 0")
         db = _agent_db(conn)
-        assert not await db.update_subagent_thread(str(CHILD), status="ended")
+        assert not await db.update_subagent_thread(
+            str(CHILD), runtime_generation=str(GENERATION), status="ended"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_bad_generation_fails_before_sql(self):
+        conn = _conn()
+        db = _agent_db(conn)
+        assert not await db.update_subagent_thread(
+            str(CHILD), runtime_generation="not-a-generation", status="active"
+        )
+        conn.execute.assert_not_awaited()
 
 
 class TestAgentGetByCall:
@@ -448,6 +721,7 @@ class TestAgentGetByCall:
             "parent_tool_call_id = $2 ORDER BY created_at DESC, id DESC LIMIT 1" in sql
         )
         for column in (
+            "runtime_generation",
             "subagent_handle",
             "subagent_type",
             "subagent_status",

@@ -40,7 +40,7 @@ life.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 
 from ..core.thread_messages import _serialize_message_row
 from .ledger import is_terminal_status
@@ -68,6 +68,11 @@ class DbSubagentLedger:
         self.parent_context = parent_context
         #: subagent_id → thread row id (the same value once the row exists).
         self._rows: Dict[str, str] = {}
+        #: The exact run token every lifecycle mutation must match.
+        self._generations: Dict[str, str] = {}
+        #: Worker parent / handle retained for terminal delivery and revival.
+        self._parent_jobs: Dict[str, str] = {}
+        self._handles: Dict[str, str] = {}
         #: Children whose row creation definitively failed (no durable state).
         self._failed: set[str] = set()
 
@@ -94,8 +99,15 @@ class DbSubagentLedger:
     def failed(self) -> set[str]:
         return set(self._failed)
 
+    @property
+    def generations(self) -> Dict[str, str]:
+        return dict(self._generations)
+
     def thread_id_for(self, subagent_id: str) -> Optional[str]:
         return self._rows.get(str(subagent_id))
+
+    def runtime_generation_for(self, subagent_id: str) -> Optional[str]:
+        return self._generations.get(str(subagent_id))
 
     def _parent_iteration(self, fields: Dict[str, Any]) -> Optional[int]:
         explicit = fields.get("parent_iteration")
@@ -114,7 +126,7 @@ class DbSubagentLedger:
     # The protocol
     # ------------------------------------------------------------------
 
-    async def open(self, subagent_id: str, **fields: Any) -> None:
+    async def open(self, subagent_id: str, **fields: Any) -> Optional[Dict[str, str]]:
         subagent_id = str(subagent_id)
         job_id = str(fields.get("parent_job_id") or "").strip()
         if not job_id:
@@ -124,11 +136,11 @@ class DbSubagentLedger:
                 fields.get("handle") or subagent_id,
             )
             self._failed.add(subagent_id)
-            return
-        # Optimistic: a create that times out client-side may still land, and
-        # a later update against a row that never existed is a harmless no-op.
-        self._rows[subagent_id] = subagent_id
-        thread_id = await self.client.create_subagent_thread(
+            return None
+        initial_status = str(fields.get("status") or "running").strip()
+        if initial_status not in {"queued", "running"}:
+            raise ValueError("a subagent must open queued or running")
+        created = await self.client.create_subagent_thread(
             job_id,
             subagent_id=subagent_id,
             handle=str(fields.get("handle") or ""),
@@ -140,18 +152,34 @@ class DbSubagentLedger:
             brief_description=str(fields.get("brief_description") or ""),
             parent_iteration=self._parent_iteration(fields),
             fork=bool(fields.get("fork", False)),
+            initial_status=initial_status,
         )
-        if thread_id is None:
-            self._rows.pop(subagent_id, None)
+        if not isinstance(created, Mapping):
             self._failed.add(subagent_id)
             logger.warning(
-                "subagent ledger: the orchestrator did not create a thread row "
-                "for %s (job %s) — no transcript will be kept for this child",
+                "subagent ledger: the orchestrator did not create a fenced "
+                "thread row for %s (job %s) — no transcript will be kept",
                 fields.get("handle") or subagent_id,
                 job_id,
             )
-            return
-        self._rows[subagent_id] = str(thread_id)
+            return None
+        thread_id = str(created.get("thread_id") or "").strip()
+        generation = str(created.get("runtime_generation") or "").strip()
+        if not thread_id or not generation:
+            self._failed.add(subagent_id)
+            logger.warning(
+                "subagent ledger: create for %s returned no generation token",
+                fields.get("handle") or subagent_id,
+            )
+            return None
+        self._rows[subagent_id] = thread_id
+        self._generations[subagent_id] = generation
+        self._parent_jobs[subagent_id] = job_id
+        self._handles[subagent_id] = str(fields.get("handle") or "")
+        return {
+            "thread_id": thread_id,
+            "runtime_generation": generation,
+        }
 
     async def persist_message(
         self, subagent_id: str, msg: Any, turn_number: int
@@ -163,8 +191,10 @@ class DbSubagentLedger:
         await self.postgres.save_thread_message(thread_id=thread_id, **row)
 
     async def update(self, subagent_id: str, **fields: Any) -> None:
-        thread_id = self._rows.get(str(subagent_id))
-        if thread_id is None:
+        child_key = str(subagent_id)
+        thread_id = self._rows.get(child_key)
+        generation = self._generations.get(child_key)
+        if thread_id is None or generation is None:
             return
         kwargs: Dict[str, Any] = {}
         status = fields.get("status")
@@ -172,7 +202,9 @@ class DbSubagentLedger:
             kind = str(status)
             terminal = is_terminal_status(kind)
             kwargs["subagent_status"] = kind
-            kwargs["status"] = "ended" if terminal else "active"
+            kwargs["status"] = (
+                "ended" if terminal else "created" if kind == "queued" else "active"
+            )
             kwargs["ended"] = terminal
         for key in ("outcome", "report_path", "error"):
             value = fields.get(key)
@@ -187,7 +219,83 @@ class DbSubagentLedger:
                     continue
         if not kwargs:
             return
-        await self.postgres.update_subagent_thread(thread_id, **kwargs)
+        await self.postgres.update_subagent_thread(
+            thread_id, runtime_generation=generation, **kwargs
+        )
+
+    async def terminalize_and_enqueue(
+        self,
+        subagent_id: str,
+        *,
+        delivery_id: str,
+        message: str,
+        timestamp: Any,
+        status: str,
+        **fields: Any,
+    ) -> Optional[Dict[str, Any]]:
+        """Opt-in background terminal write plus worker-delivery transaction.
+
+        Foreground U3 calls continue to use :meth:`update`; they never enqueue
+        a second copy of the tool result into Lane B.
+        """
+        child_key = str(subagent_id)
+        thread_id = self._rows.get(child_key)
+        generation = self._generations.get(child_key)
+        parent_job_id = self._parent_jobs.get(child_key)
+        if thread_id is None or generation is None or parent_job_id is None:
+            return None
+        kind = str(status or "").strip()
+        if not is_terminal_status(kind):
+            raise ValueError("terminal delivery requires a terminal child status")
+        timestamp_text = (
+            timestamp.isoformat() if hasattr(timestamp, "isoformat") else str(timestamp)
+        )
+        kwargs: Dict[str, Any] = {
+            "runtime_generation": generation,
+            "delivery_id": str(delivery_id),
+            "message": str(message),
+            "timestamp": timestamp_text,
+            "subagent_status": kind,
+        }
+        for key in ("outcome", "report_path", "error"):
+            value = fields.get(key)
+            if value is not None:
+                kwargs[key] = str(value)
+        for key in ("turns", "tokens"):
+            value = fields.get(key)
+            if value is not None:
+                try:
+                    kwargs[key] = int(value)
+                except (TypeError, ValueError):
+                    continue
+        return await self.client.terminalize_subagent_thread(
+            parent_job_id, thread_id, **kwargs
+        )
+
+    async def reopen(self, subagent_id: str) -> Optional[Dict[str, Any]]:
+        """Rotate one terminal child and retain the successor generation."""
+        child_key = str(subagent_id)
+        thread_id = self._rows.get(child_key)
+        generation = self._generations.get(child_key)
+        parent_job_id = self._parent_jobs.get(child_key)
+        if thread_id is None or generation is None or parent_job_id is None:
+            return None
+        result = await self.client.reopen_subagent_thread(
+            parent_job_id,
+            thread_id,
+            runtime_generation=generation,
+        )
+        if result and result.get("result") == "reopened":
+            successor = str(result.get("runtime_generation") or "").strip()
+            if not successor:
+                return None
+            self._generations[child_key] = successor
+        return dict(result) if result else None
+
+    async def list_live(self, parent_job_id: str) -> list[Dict[str, Any]]:
+        """Read durable live children for recovery/control-plane bootstrap."""
+        rows = await self.client.list_live_subagent_threads(str(parent_job_id))
+        return [dict(row) for row in rows]
 
     async def lookup(
         self, parent_job_id: str, parent_tool_call_id: str

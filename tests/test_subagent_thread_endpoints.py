@@ -28,6 +28,9 @@ import orchestrator.main as m
 
 UTC = timezone.utc
 NOW = datetime(2026, 8, 29, 12, 0, 0, tzinfo=UTC)
+GENERATION = uuid.UUID("dddddddd-1111-4222-8333-444444444444")
+NEXT_GENERATION = uuid.UUID("eeeeeeee-1111-4222-8333-444444444444")
+DELIVERY = uuid.UUID("ffffffff-1111-4222-8333-444444444444")
 
 
 _DEFAULT_METADATA = object()
@@ -57,6 +60,7 @@ def _row(
         "title": "explorer-7f3a: find the secret",
         "total_turns": 3,
         "total_tokens": 1200,
+        "runtime_generation": GENERATION,
         "metadata": (
             metadata
             if metadata is not _DEFAULT_METADATA
@@ -90,7 +94,14 @@ def _row(
 def create_env(monkeypatch):
     job_id = str(uuid.uuid4())
     child_id = str(uuid.uuid4())
-    db = SimpleNamespace(create_subagent_thread=AsyncMock(return_value=child_id))
+    db = SimpleNamespace(
+        create_subagent_thread=AsyncMock(
+            return_value={
+                "thread_id": child_id,
+                "runtime_generation": str(GENERATION),
+            }
+        )
+    )
     gate = AsyncMock(return_value=None)
     monkeypatch.setattr(m, "postgres_db", db)
     monkeypatch.setattr(m, "require_internal", gate)
@@ -162,8 +173,13 @@ class TestCreateEndpoint:
             brief_description="implement the parser",
             parent_iteration=12,
             fork=True,
+            initial_status="running",
         )
-        assert payload == {"thread_id": create_env.child_id, "status": "created"}
+        assert payload == {
+            "thread_id": create_env.child_id,
+            "runtime_generation": str(GENERATION),
+            "status": "created",
+        }
         create_env.db.create_subagent_thread.assert_awaited_once_with(
             parent_job_id=create_env.job_id,
             thread_id=str(subagent_id),
@@ -176,6 +192,7 @@ class TestCreateEndpoint:
             brief_description="implement the parser",
             parent_iteration=12,
             fork=True,
+            initial_status="running",
         )
 
     @pytest.mark.asyncio
@@ -190,6 +207,15 @@ class TestCreateEndpoint:
         assert kwargs["brief_description"] == ""
         assert kwargs["parent_iteration"] is None
         assert kwargs["fork"] is False
+        assert kwargs["initial_status"] == "running"
+
+    @pytest.mark.asyncio
+    async def test_queued_is_an_explicit_create_state(self, create_env):
+        await create_env.call(initial_status="queued")
+        assert (
+            create_env.db.create_subagent_thread.await_args.kwargs["initial_status"]
+            == "queued"
+        )
 
     def test_the_body_refuses_an_empty_handle_or_type(self, create_env):
         with pytest.raises(ValueError):
@@ -216,6 +242,153 @@ class TestCreateEndpoint:
         with pytest.raises(m.HTTPException) as excinfo:
             await create_env.call()
         assert excinfo.value.status_code == 500
+
+
+class TestGenerationEndpoints:
+    @pytest.mark.asyncio
+    async def test_live_list_and_exact_lookup_publish_the_generation(self, monkeypatch):
+        job_id = str(uuid.uuid4())
+        child_id = uuid.uuid4()
+        row = _row(thread_id=str(child_id), status="running", outcome=None)
+        db = SimpleNamespace(
+            list_live_subagent_threads=AsyncMock(return_value=[row]),
+            get_subagent_thread=AsyncMock(return_value=row),
+        )
+        gate = AsyncMock(return_value=None)
+        monkeypatch.setattr(m, "postgres_db", db)
+        monkeypatch.setattr(m, "require_internal", gate)
+
+        live = await m.agent_list_live_subagent_threads(SimpleNamespace(), job_id)
+        exact = await m.agent_get_subagent_thread(SimpleNamespace(), job_id, child_id)
+
+        assert live["subagents"][0]["runtime_generation"] == str(GENERATION)
+        assert exact["thread_id"] == str(child_id)
+        assert exact["runtime_generation"] == str(GENERATION)
+        db.list_live_subagent_threads.assert_awaited_once_with(job_id)
+        db.get_subagent_thread.assert_awaited_once_with(job_id, str(child_id))
+        assert gate.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_reopen_returns_the_rotated_generation_and_maps_stale_to_409(
+        self, monkeypatch
+    ):
+        job_id = str(uuid.uuid4())
+        child_id = uuid.uuid4()
+        db = SimpleNamespace(
+            reopen_subagent_thread=AsyncMock(
+                return_value={
+                    "result": "reopened",
+                    "thread_id": str(child_id),
+                    "runtime_generation": str(NEXT_GENERATION),
+                }
+            )
+        )
+        monkeypatch.setattr(m, "postgres_db", db)
+        monkeypatch.setattr(m, "require_internal", AsyncMock(return_value=None))
+        body = m.AgentSubagentThreadReopenRequest(runtime_generation=GENERATION)
+
+        result = await m.agent_reopen_subagent_thread(
+            SimpleNamespace(), job_id, child_id, body
+        )
+        assert result["runtime_generation"] == str(NEXT_GENERATION)
+        db.reopen_subagent_thread.assert_awaited_once_with(
+            parent_job_id=job_id,
+            thread_id=str(child_id),
+            runtime_generation=str(GENERATION),
+        )
+
+        db.reopen_subagent_thread.return_value = {
+            "result": "stale",
+            "thread_id": str(child_id),
+            "runtime_generation": str(NEXT_GENERATION),
+        }
+        with pytest.raises(m.HTTPException) as excinfo:
+            await m.agent_reopen_subagent_thread(
+                SimpleNamespace(), job_id, child_id, body
+            )
+        assert excinfo.value.status_code == 409
+
+    @pytest.mark.asyncio
+    async def test_terminal_delivery_is_explicit_and_passes_every_field(
+        self, monkeypatch
+    ):
+        job_id = str(uuid.uuid4())
+        child_id = uuid.uuid4()
+        applied = {
+            "result": "applied",
+            "thread_id": str(child_id),
+            "runtime_generation": str(GENERATION),
+            "delivery_id": str(DELIVERY),
+            "delivery_state": "queued",
+        }
+        db = SimpleNamespace(
+            terminalize_subagent_thread_and_enqueue=AsyncMock(return_value=applied)
+        )
+        monkeypatch.setattr(m, "postgres_db", db)
+        monkeypatch.setattr(m, "require_internal", AsyncMock(return_value=None))
+        body = m.AgentSubagentThreadTerminalRequest(
+            runtime_generation=GENERATION,
+            delivery_id=DELIVERY,
+            message="child report",
+            timestamp=NOW,
+            subagent_status="completed",
+            outcome="completed",
+            turns=3,
+            tokens=1200,
+            report_path=".subagents/explorer-7f3a/report.md",
+        )
+
+        assert (
+            await m.agent_terminalize_subagent_thread(
+                SimpleNamespace(), job_id, child_id, body
+            )
+            == applied
+        )
+        db.terminalize_subagent_thread_and_enqueue.assert_awaited_once_with(
+            parent_job_id=job_id,
+            thread_id=str(child_id),
+            runtime_generation=str(GENERATION),
+            delivery_id=str(DELIVERY),
+            message="child report",
+            timestamp=NOW,
+            subagent_status="completed",
+            outcome="completed",
+            turns=3,
+            tokens=1200,
+            report_path=".subagents/explorer-7f3a/report.md",
+            error=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_terminal_stale_is_409_and_invalid_intent_is_400(self, monkeypatch):
+        job_id = str(uuid.uuid4())
+        child_id = uuid.uuid4()
+        db = SimpleNamespace(
+            terminalize_subagent_thread_and_enqueue=AsyncMock(
+                return_value={"result": "stale"}
+            )
+        )
+        monkeypatch.setattr(m, "postgres_db", db)
+        monkeypatch.setattr(m, "require_internal", AsyncMock(return_value=None))
+        body = m.AgentSubagentThreadTerminalRequest(
+            runtime_generation=GENERATION,
+            delivery_id=DELIVERY,
+            message="child report",
+            timestamp=NOW,
+            subagent_status="completed",
+        )
+        with pytest.raises(m.HTTPException) as excinfo:
+            await m.agent_terminalize_subagent_thread(
+                SimpleNamespace(), job_id, child_id, body
+            )
+        assert excinfo.value.status_code == 409
+
+        db.terminalize_subagent_thread_and_enqueue.side_effect = ValueError("bad")
+        with pytest.raises(m.HTTPException) as excinfo:
+            await m.agent_terminalize_subagent_thread(
+                SimpleNamespace(), job_id, child_id, body
+            )
+        assert excinfo.value.status_code == 400
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +441,7 @@ class TestRosterShape:
         row = payload["subagents"][0]
         assert row == {
             "thread_id": child_id,
+            "runtime_generation": str(GENERATION),
             "handle": "explorer-7f3a",
             "subagent_type": "explorer",
             "status": "completed",

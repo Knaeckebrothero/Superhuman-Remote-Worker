@@ -198,6 +198,7 @@ class TestConstruction:
 
     def test_the_status_vocabulary_is_pinned(self):
         assert SUBAGENT_STATUSES == (
+            "queued",
             "running",
             "completed",
             "parked",

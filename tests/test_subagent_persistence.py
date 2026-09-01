@@ -36,10 +36,37 @@ from tests._fs_backend import FilesystemTestBackend
 
 JOB = "aaaaaaaa-1111-4222-8333-444444444444"
 CHILD = "bbbbbbbb-1111-4222-8333-444444444444"
+GENERATION = "dddddddd-1111-4222-8333-444444444444"
+NEXT_GENERATION = "eeeeeeee-1111-4222-8333-444444444444"
+DELIVERY = "ffffffff-1111-4222-8333-444444444444"
 
 
 def _client(thread_id: str | None = CHILD) -> SimpleNamespace:
-    return SimpleNamespace(create_subagent_thread=AsyncMock(return_value=thread_id))
+    created = (
+        {"thread_id": thread_id, "runtime_generation": GENERATION}
+        if thread_id is not None
+        else None
+    )
+    return SimpleNamespace(
+        create_subagent_thread=AsyncMock(return_value=created),
+        terminalize_subagent_thread=AsyncMock(
+            return_value={
+                "result": "applied",
+                "thread_id": thread_id,
+                "runtime_generation": GENERATION,
+                "delivery_id": DELIVERY,
+                "delivery_state": "queued",
+            }
+        ),
+        reopen_subagent_thread=AsyncMock(
+            return_value={
+                "result": "reopened",
+                "thread_id": thread_id,
+                "runtime_generation": NEXT_GENERATION,
+            }
+        ),
+        list_live_subagent_threads=AsyncMock(return_value=[]),
+    )
 
 
 def _pool(row=None) -> SimpleNamespace:
@@ -109,7 +136,7 @@ class TestOpen:
     async def test_the_row_is_created_through_the_orchestrator_from_the_job(self):
         client, pool = _client(), _pool()
         ledger = DbSubagentLedger(client, pool)
-        await ledger.open(CHILD, **_open_fields())
+        receipt = await ledger.open(CHILD, **_open_fields())
         client.create_subagent_thread.assert_awaited_once_with(
             JOB,
             subagent_id=CHILD,
@@ -122,9 +149,16 @@ class TestOpen:
             brief_description="find the secret",
             parent_iteration=None,
             fork=False,
+            initial_status="running",
         )
+        assert receipt == {
+            "thread_id": CHILD,
+            "runtime_generation": GENERATION,
+        }
         assert ledger.thread_id_for(CHILD) == CHILD
+        assert ledger.runtime_generation_for(CHILD) == GENERATION
         assert ledger.rows == {CHILD: CHILD}
+        assert ledger.generations == {CHILD: GENERATION}
         assert ledger.failed == set()
 
     @pytest.mark.asyncio
@@ -151,12 +185,27 @@ class TestOpen:
         assert kwargs["parent_thread_id"] == "thread-9" and kwargs["fork"] is True
 
     @pytest.mark.asyncio
+    async def test_queued_open_returns_a_strict_receipt_before_running(self):
+        client = _client()
+        ledger = DbSubagentLedger(client, _pool())
+        receipt = await ledger.open(CHILD, **_open_fields(status="queued"))
+        assert receipt == {
+            "thread_id": CHILD,
+            "runtime_generation": GENERATION,
+        }
+        assert (
+            client.create_subagent_thread.await_args.kwargs["initial_status"]
+            == "queued"
+        )
+
+    @pytest.mark.asyncio
     async def test_a_refused_create_leaves_no_durable_state(self):
         client, pool = _client(None), _pool()
         ledger = DbSubagentLedger(client, pool)
         await ledger.open(CHILD, **_open_fields())
         assert ledger.thread_id_for(CHILD) is None
         assert ledger.failed == {CHILD}
+        assert ledger.generations == {}
         await ledger.persist_message(CHILD, AIMessage(content="x", id="m1"), 1)
         await ledger.update(CHILD, status="completed", outcome="completed")
         pool.save_thread_message.assert_not_awaited()
@@ -178,6 +227,10 @@ class TestOpen:
         assert ledger.thread_id_for(CHILD) == "other-id"
         await ledger.update(CHILD, status="completed")
         assert pool.update_subagent_thread.await_args.args == ("other-id",)
+        assert (
+            pool.update_subagent_thread.await_args.kwargs["runtime_generation"]
+            == GENERATION
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +304,7 @@ class TestUpdate:
         await ledger.update(CHILD, status="running", turns=2, tokens=300)
         pool.update_subagent_thread.assert_awaited_once_with(
             CHILD,
+            runtime_generation=GENERATION,
             subagent_status="running",
             status="active",
             ended=False,
@@ -259,8 +313,23 @@ class TestUpdate:
         )
 
     @pytest.mark.asyncio
+    async def test_queued_is_live_and_fenced_like_running(self):
+        pool = _pool()
+        ledger = DbSubagentLedger(_client(), pool)
+        await ledger.open(CHILD, **_open_fields(status="queued"))
+        await ledger.update(CHILD, status="queued")
+        pool.update_subagent_thread.assert_awaited_once_with(
+            CHILD,
+            runtime_generation=GENERATION,
+            subagent_status="queued",
+            status="created",
+            ended=False,
+        )
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "kind", [s for s in SUBAGENT_STATUSES if s != "running"] + ["exploded"]
+        "kind",
+        [s for s in SUBAGENT_STATUSES if s not in {"queued", "running"}] + ["exploded"],
     )
     async def test_every_terminal_kind_ends_the_thread(self, kind):
         """The closed thread vocabulary is never widened: any kind but
@@ -279,6 +348,7 @@ class TestUpdate:
         )
         kwargs = pool.update_subagent_thread.await_args.kwargs
         assert pool.update_subagent_thread.await_args.args == (CHILD,)
+        assert kwargs["runtime_generation"] == GENERATION
         assert kwargs["subagent_status"] == kind
         assert kwargs["status"] == "ended" and kwargs["ended"] is True
         assert kwargs["outcome"] == f"{kind}:detail"
@@ -296,7 +366,12 @@ class TestUpdate:
         await ledger.open(CHILD, **_open_fields())
         await ledger.update(CHILD, status="completed", report_path=None, error=None)
         kwargs = pool.update_subagent_thread.await_args.kwargs
-        assert set(kwargs) == {"subagent_status", "status", "ended"}
+        assert set(kwargs) == {
+            "runtime_generation",
+            "subagent_status",
+            "status",
+            "ended",
+        }
 
     @pytest.mark.asyncio
     async def test_counters_only_updates_do_not_touch_the_status(self):
@@ -304,9 +379,93 @@ class TestUpdate:
         ledger = DbSubagentLedger(_client(), pool)
         await ledger.open(CHILD, **_open_fields())
         await ledger.update(CHILD, turns="7", tokens=None)
-        pool.update_subagent_thread.assert_awaited_once_with(CHILD, turns=7)
+        pool.update_subagent_thread.assert_awaited_once_with(
+            CHILD, runtime_generation=GENERATION, turns=7
+        )
         await ledger.update(CHILD)  # nothing to write
         assert pool.update_subagent_thread.await_count == 1
+
+
+class TestBackgroundPersistenceSubstrate:
+    @pytest.mark.asyncio
+    async def test_terminal_delivery_is_opt_in_and_uses_the_stored_lease(self):
+        client = _client()
+        pool = _pool()
+        ledger = DbSubagentLedger(client, pool)
+        await ledger.open(CHILD, **_open_fields(status="queued"))
+
+        result = await ledger.terminalize_and_enqueue(
+            CHILD,
+            delivery_id=DELIVERY,
+            message="child report",
+            timestamp="2026-09-01T01:02:03+00:00",
+            status="completed",
+            outcome="completed",
+            turns="3",
+            tokens=1200,
+        )
+
+        assert result["result"] == "applied"
+        client.terminalize_subagent_thread.assert_awaited_once_with(
+            JOB,
+            CHILD,
+            runtime_generation=GENERATION,
+            delivery_id=DELIVERY,
+            message="child report",
+            timestamp="2026-09-01T01:02:03+00:00",
+            subagent_status="completed",
+            outcome="completed",
+            turns=3,
+            tokens=1200,
+        )
+        # The direct foreground lifecycle path was not invoked, so the tool
+        # result cannot be duplicated into Lane B by accident.
+        pool.update_subagent_thread.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_live_status_is_refused_as_a_terminal_delivery(self):
+        ledger = DbSubagentLedger(_client(), _pool())
+        await ledger.open(CHILD, **_open_fields())
+        with pytest.raises(ValueError):
+            await ledger.terminalize_and_enqueue(
+                CHILD,
+                delivery_id=DELIVERY,
+                message="not done",
+                timestamp="2026-09-01T01:02:03+00:00",
+                status="running",
+            )
+
+    @pytest.mark.asyncio
+    async def test_reopen_replaces_the_generation_before_the_next_transition(self):
+        client = _client()
+        pool = _pool()
+        ledger = DbSubagentLedger(client, pool)
+        await ledger.open(CHILD, **_open_fields())
+
+        result = await ledger.reopen(CHILD)
+        assert result["result"] == "reopened"
+        assert ledger.runtime_generation_for(CHILD) == NEXT_GENERATION
+        client.reopen_subagent_thread.assert_awaited_once_with(
+            JOB, CHILD, runtime_generation=GENERATION
+        )
+
+        await ledger.update(CHILD, status="running")
+        assert (
+            pool.update_subagent_thread.await_args.kwargs["runtime_generation"]
+            == NEXT_GENERATION
+        )
+
+    @pytest.mark.asyncio
+    async def test_live_list_is_the_clients_durable_recovery_view(self):
+        client = _client()
+        client.list_live_subagent_threads.return_value = [
+            {"thread_id": CHILD, "runtime_generation": GENERATION}
+        ]
+        ledger = DbSubagentLedger(client, _pool())
+        assert await ledger.list_live(JOB) == [
+            {"thread_id": CHILD, "runtime_generation": GENERATION}
+        ]
+        client.list_live_subagent_threads.assert_awaited_once_with(JOB)
 
 
 # ---------------------------------------------------------------------------
@@ -453,6 +612,7 @@ async def test_a_real_child_run_lands_its_row_transcript_and_terminal_update(tmp
     # The terminal update: ended, completed, the counters and the spill.
     final = pool.update_subagent_thread.await_args
     assert final.args == (CHILD,)
+    assert final.kwargs["runtime_generation"] == GENERATION
     assert final.kwargs["status"] == "ended" and final.kwargs["ended"] is True
     assert final.kwargs["subagent_status"] == "completed"
     assert final.kwargs["outcome"] == "completed"

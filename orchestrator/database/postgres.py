@@ -29384,7 +29384,7 @@ class PostgresDB:
         "id, kind, parent_job_id, parent_thread_id, parent_tool_call_id, "
         "subagent_handle, subagent_type, subagent_status, subagent_outcome, "
         "subagent_error, report_path, status, title, total_turns, total_tokens, "
-        "metadata, created_at, last_activity, ended_at"
+        "runtime_generation, metadata, created_at, last_activity, ended_at"
     )
 
     async def create_subagent_thread(
@@ -29401,9 +29401,11 @@ class PostgresDB:
         brief_description: str = "",
         parent_iteration: int | None = None,
         fork: bool = False,
-    ) -> str | None:
+        initial_status: str = "running",
+    ) -> Dict[str, str] | None:
         """Create the ``threads`` row of a subagent child (U3 B.1) and return
-        its id, or ``None`` when the parent job does not exist.
+        its id plus runtime generation, or ``None`` when the parent job does
+        not exist.
 
         The row is derived from the JOB in one statement — ``user_id`` and
         ``project_id`` come from ``jobs`` so ``require_thread_owner`` lets the
@@ -29443,6 +29445,10 @@ class PostgresDB:
         subagent_type = str(subagent_type or "").strip()
         if not handle or not subagent_type:
             raise ValueError("a subagent thread needs a handle and a type")
+        initial_status = str(initial_status or "").strip()
+        if initial_status not in {"queued", "running"}:
+            raise ValueError("initial subagent status must be queued or running")
+        thread_status = "created" if initial_status == "queued" else "active"
         description = " ".join(str(brief_description or "").split())
         title = f"{handle}: {description}" if description else f"subagent {handle}"
         metadata = {
@@ -29469,13 +29475,13 @@ class PostgresDB:
                     parent_job_id, parent_thread_id, parent_tool_call_id,
                     subagent_handle, subagent_type, subagent_status
                 )
-                SELECT $1, 'subagent', j.user_id, j.project_id, $3, 'active',
+                SELECT $1, 'subagent', j.user_id, j.project_id, $3, $9,
                        'autonomous', 'silent', 'pinned', $4::jsonb,
-                       j.id, $5, $6, $7, $8, 'running'
+                       j.id, $5, $6, $7, $8, $10
                   FROM jobs j
                  WHERE j.id = $2
                 ON CONFLICT (id) DO NOTHING
-                RETURNING id
+                RETURNING id, runtime_generation
                 """,
                 row_uuid,
                 job_uuid,
@@ -29485,16 +29491,40 @@ class PostgresDB:
                 parent_tool_call_id,
                 handle,
                 subagent_type,
+                thread_status,
+                initial_status,
             )
             if row is not None:
-                return str(row["id"])
+                return {
+                    "thread_id": str(row["id"]),
+                    "runtime_generation": str(row["runtime_generation"]),
+                }
             # No row back: either the job is gone, or this exact id already
-            # exists (a retried create) — only the latter is a success.
-            existing = await conn.fetchval(
-                "SELECT id FROM threads WHERE id = $1 AND kind = 'subagent'",
+            # exists (a retried create) — only an identity-exact retry is a
+            # success. Never hand a caller another parent's generation token.
+            existing = await conn.fetchrow(
+                """
+                SELECT id, runtime_generation
+                  FROM threads
+                 WHERE id = $1
+                   AND kind = 'subagent'
+                   AND parent_job_id = $2
+                   AND subagent_handle = $3
+                   AND subagent_type = $4
+                   AND parent_tool_call_id IS NOT DISTINCT FROM $5
+                """,
                 row_uuid,
+                job_uuid,
+                handle,
+                subagent_type,
+                parent_tool_call_id,
             )
-        return str(existing) if existing else None
+        if not existing:
+            return None
+        return {
+            "thread_id": str(existing["id"]),
+            "runtime_generation": str(existing["runtime_generation"]),
+        }
 
     async def list_subagent_threads(self, parent_job_id: str) -> List[Dict[str, Any]]:
         """Every subagent child of one job, in spawn order (U3 B.10).
@@ -29519,6 +29549,58 @@ class PostgresDB:
                 job_uuid,
             )
         return [dict(row) for row in rows]
+
+    async def list_live_subagent_threads(
+        self, parent_job_id: str
+    ) -> List[Dict[str, Any]]:
+        """Return this job's generation-bearing children that can still act.
+
+        ``queued`` is the durable pre-start state used by background/revival;
+        U3 children are created directly as ``running``.  The thread-status
+        predicate is intentionally redundant with the child status: a
+        partially written or legacy row must not be recovered as live.
+        """
+        try:
+            job_uuid = UUID(str(parent_job_id))
+        except (ValueError, TypeError, AttributeError):
+            return []
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                f"""
+                SELECT {self._SUBAGENT_THREAD_COLUMNS}
+                  FROM threads
+                 WHERE kind = 'subagent'
+                   AND parent_job_id = $1
+                   AND status IN ('created', 'active')
+                   AND subagent_status IN ('queued', 'running')
+                 ORDER BY created_at, id
+                """,
+                job_uuid,
+            )
+        return [dict(row) for row in rows]
+
+    async def get_subagent_thread(
+        self, parent_job_id: str, thread_id: str
+    ) -> Dict[str, Any] | None:
+        """Read one child under its parent, including its run generation."""
+        try:
+            job_uuid = UUID(str(parent_job_id))
+            child_uuid = UUID(str(thread_id))
+        except (ValueError, TypeError, AttributeError):
+            return None
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                f"""
+                SELECT {self._SUBAGENT_THREAD_COLUMNS}
+                  FROM threads
+                 WHERE id = $1
+                   AND kind = 'subagent'
+                   AND parent_job_id = $2
+                """,
+                child_uuid,
+                job_uuid,
+            )
+        return dict(row) if row else None
 
     async def get_subagent_thread_by_call(
         self, parent_job_id: str, parent_tool_call_id: str
@@ -29548,6 +29630,290 @@ class PostgresDB:
                 call_id,
             )
         return dict(row) if row else None
+
+    async def reopen_subagent_thread(
+        self,
+        *,
+        parent_job_id: str,
+        thread_id: str,
+        runtime_generation: str,
+    ) -> Dict[str, Any] | None:
+        """Rotate an ended child onto a queued successor generation.
+
+        The database owns the generation token: the sole legal
+        ``ended -> created`` edge fires the 0185 trigger and returns its new
+        UUID.  Starting work is a separate generation-fenced
+        ``created -> active`` transition, so a caller never acts before it
+        has received the successor token.
+        """
+        try:
+            job_uuid = UUID(str(parent_job_id))
+            child_uuid = UUID(str(thread_id))
+            expected_generation = UUID(str(runtime_generation))
+        except (ValueError, TypeError, AttributeError):
+            return None
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                parent = await conn.fetchval(
+                    "SELECT id FROM jobs WHERE id = $1 FOR UPDATE", job_uuid
+                )
+                if parent is None:
+                    return None
+                child = await conn.fetchrow(
+                    """
+                    SELECT status, runtime_generation
+                      FROM threads
+                     WHERE id = $1
+                       AND kind = 'subagent'
+                       AND parent_job_id = $2
+                     FOR UPDATE
+                    """,
+                    child_uuid,
+                    job_uuid,
+                )
+                if child is None:
+                    return None
+                if child["runtime_generation"] != expected_generation:
+                    return {
+                        "result": "stale",
+                        "thread_id": str(child_uuid),
+                    }
+                if child["status"] != "ended":
+                    return {
+                        "result": "not_terminal",
+                        "thread_id": str(child_uuid),
+                        "runtime_generation": str(expected_generation),
+                    }
+                reopened = await conn.fetchrow(
+                    """
+                    UPDATE threads
+                       SET status = 'created',
+                           subagent_status = 'queued',
+                           subagent_outcome = NULL,
+                           subagent_error = NULL,
+                           report_path = NULL,
+                           total_turns = 0,
+                           total_tokens = 0,
+                           ended_at = NULL,
+                           last_activity = CURRENT_TIMESTAMP
+                     WHERE id = $1
+                       AND kind = 'subagent'
+                       AND parent_job_id = $2
+                       AND runtime_generation = $3
+                       AND status = 'ended'
+                    RETURNING runtime_generation
+                    """,
+                    child_uuid,
+                    job_uuid,
+                    expected_generation,
+                )
+                if reopened is None:
+                    return {
+                        "result": "stale",
+                        "thread_id": str(child_uuid),
+                        "runtime_generation": str(expected_generation),
+                    }
+                return {
+                    "result": "reopened",
+                    "thread_id": str(child_uuid),
+                    "runtime_generation": str(reopened["runtime_generation"]),
+                }
+
+    async def terminalize_subagent_thread_and_enqueue(
+        self,
+        *,
+        parent_job_id: str,
+        thread_id: str,
+        runtime_generation: str,
+        delivery_id: str,
+        message: str,
+        timestamp: datetime | str,
+        subagent_status: str,
+        outcome: str | None = None,
+        turns: int | None = None,
+        tokens: int | None = None,
+        report_path: str | None = None,
+        error: str | None = None,
+    ) -> Dict[str, Any] | None:
+        """End one exact child run and queue its worker-parent report atomically.
+
+        The job row is locked before the child row.  ``delivery_id`` is the
+        stable queued-reply identity, and retries succeed after either the
+        queued or consumed copy is found.  A generation-mismatched writer can
+        neither end the successor nor publish evidence for it.
+        """
+        try:
+            job_uuid = UUID(str(parent_job_id))
+            child_uuid = UUID(str(thread_id))
+            expected_generation = UUID(str(runtime_generation))
+            reply_uuid = UUID(str(delivery_id))
+        except (ValueError, TypeError, AttributeError):
+            return None
+        terminal_kind = str(subagent_status or "").strip()
+        if not terminal_kind or terminal_kind in {"queued", "running"}:
+            raise ValueError("terminal subagent status must not be queued or running")
+        reply_message = str(message or "")
+        if not reply_message.strip():
+            raise ValueError("a subagent delivery needs a message")
+        if isinstance(timestamp, datetime):
+            stamp = timestamp
+        else:
+            try:
+                stamp = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("a subagent delivery needs an ISO timestamp") from exc
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        timestamp_text = stamp.astimezone(timezone.utc).isoformat()
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                # Lock order is part of the contract: every terminal delivery
+                # serializes on the parent before touching a child.
+                parent = await conn.fetchrow(
+                    "SELECT status, context FROM jobs WHERE id = $1 FOR UPDATE",
+                    job_uuid,
+                )
+                if parent is None:
+                    return None
+                context = _json_object_or_empty(parent.get("context"))
+                expected_identity = {
+                    "source": "subagent",
+                    "thread_id": str(child_uuid),
+                    "run_generation": str(expected_generation),
+                }
+                for lane in ("queued_replies", "consumed_replies"):
+                    entries = context.get(lane)
+                    if not isinstance(entries, list):
+                        continue
+                    for entry in entries:
+                        if not isinstance(entry, Mapping) or str(
+                            entry.get("id")
+                        ) != str(reply_uuid):
+                            continue
+                        if (
+                            any(
+                                str(entry.get(key) or "") != value
+                                for key, value in expected_identity.items()
+                            )
+                            or str(entry.get("message") or "") != reply_message
+                        ):
+                            raise ValueError(
+                                "subagent delivery id already names different evidence"
+                            )
+                        return {
+                            "result": "idempotent",
+                            "thread_id": str(child_uuid),
+                            "runtime_generation": str(expected_generation),
+                            "delivery_id": str(reply_uuid),
+                            "delivery_state": (
+                                "queued" if lane == "queued_replies" else "consumed"
+                            ),
+                        }
+                if parent.get("status") in {"completed", "failed", "cancelled"}:
+                    return {
+                        "result": "parent_terminal",
+                        "thread_id": str(child_uuid),
+                        "runtime_generation": str(expected_generation),
+                    }
+
+                child = await conn.fetchrow(
+                    """
+                    SELECT runtime_generation, status, subagent_handle
+                      FROM threads
+                     WHERE id = $1
+                       AND kind = 'subagent'
+                       AND parent_job_id = $2
+                     FOR UPDATE
+                    """,
+                    child_uuid,
+                    job_uuid,
+                )
+                if child is None:
+                    return None
+                if child["runtime_generation"] != expected_generation:
+                    return {
+                        "result": "stale",
+                        "thread_id": str(child_uuid),
+                    }
+                if child["status"] == "ended":
+                    return {
+                        "result": "already_terminal",
+                        "thread_id": str(child_uuid),
+                        "runtime_generation": str(expected_generation),
+                    }
+
+                ended = await conn.fetchval(
+                    """
+                    UPDATE threads
+                       SET status = 'ended',
+                           subagent_status = $4,
+                           subagent_outcome = COALESCE($5, subagent_outcome),
+                           total_turns = COALESCE($6, total_turns),
+                           total_tokens = COALESCE($7, total_tokens),
+                           report_path = COALESCE($8, report_path),
+                           subagent_error = COALESCE($9, subagent_error),
+                           ended_at = COALESCE(ended_at, CURRENT_TIMESTAMP),
+                           last_activity = CURRENT_TIMESTAMP
+                     WHERE id = $1
+                       AND kind = 'subagent'
+                       AND parent_job_id = $2
+                       AND runtime_generation = $3
+                       AND status <> 'ended'
+                    RETURNING id
+                    """,
+                    child_uuid,
+                    job_uuid,
+                    expected_generation,
+                    terminal_kind,
+                    outcome,
+                    turns,
+                    tokens,
+                    report_path,
+                    error,
+                )
+                if ended is None:
+                    return {
+                        "result": "stale",
+                        "thread_id": str(child_uuid),
+                        "runtime_generation": str(expected_generation),
+                    }
+
+                delivery = {
+                    "id": str(reply_uuid),
+                    "source": "subagent",
+                    "thread_id": str(child_uuid),
+                    "handle": child.get("subagent_handle"),
+                    "run_generation": str(expected_generation),
+                    "message": reply_message,
+                    "timestamp": timestamp_text,
+                }
+                queued = context.get("queued_replies")
+                queued_list = list(queued) if isinstance(queued, list) else []
+                queued_list.append(delivery)
+                await conn.execute(
+                    """
+                    UPDATE jobs
+                       SET context = jsonb_set(
+                               COALESCE(context, '{}'::jsonb),
+                               '{queued_replies}',
+                               $1::jsonb
+                           ),
+                           updated_at = CURRENT_TIMESTAMP
+                     WHERE id = $2
+                    """,
+                    json.dumps(queued_list),
+                    job_uuid,
+                )
+                return {
+                    "result": "applied",
+                    "thread_id": str(child_uuid),
+                    "runtime_generation": str(expected_generation),
+                    "delivery_id": str(reply_uuid),
+                    "delivery_state": "queued",
+                    "delivery": delivery,
+                }
 
     async def list_threads_needing_workspace(self) -> List[Dict[str, Any]]:
         """Active sessions whose workspace_container entry exists but is not ready or

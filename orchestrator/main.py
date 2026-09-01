@@ -36179,6 +36179,11 @@ def _subagent_thread_payload(row: dict[str, Any]) -> dict[str, Any]:
         spawn = {}
     return {
         "thread_id": str(row["id"]),
+        "runtime_generation": (
+            str(row["runtime_generation"])
+            if row.get("runtime_generation") is not None
+            else None
+        ),
         "handle": row.get("subagent_handle"),
         "subagent_type": row.get("subagent_type"),
         "status": row.get("subagent_status"),
@@ -43439,6 +43444,28 @@ class AgentSubagentThreadCreateRequest(BaseModel):
     brief_description: str = Field(default="", max_length=2000)
     parent_iteration: int | None = None
     fork: bool = False
+    initial_status: Literal["queued", "running"] = "running"
+
+
+class AgentSubagentThreadReopenRequest(BaseModel):
+    """Exact ended generation to rotate before reviving a child."""
+
+    runtime_generation: UUID
+
+
+class AgentSubagentThreadTerminalRequest(BaseModel):
+    """One exact child generation plus its stable worker delivery intent."""
+
+    runtime_generation: UUID
+    delivery_id: UUID
+    message: str = Field(..., min_length=1, max_length=200_000)
+    timestamp: datetime
+    subagent_status: str = Field(..., min_length=1, max_length=120)
+    outcome: str | None = Field(default=None, max_length=4000)
+    turns: int | None = Field(default=None, ge=0)
+    tokens: int | None = Field(default=None, ge=0)
+    report_path: str | None = Field(default=None, max_length=4000)
+    error: str | None = Field(default=None, max_length=20_000)
 
 
 @app.post("/api/agents/jobs/{job_id}/subagents")
@@ -43461,7 +43488,7 @@ async def agent_create_subagent_thread(
     """
     await require_internal(request)
     try:
-        thread_id = await postgres_db.create_subagent_thread(
+        created = await postgres_db.create_subagent_thread(
             parent_job_id=job_id,
             thread_id=str(body.subagent_id) if body.subagent_id else None,
             handle=body.handle,
@@ -43475,14 +43502,106 @@ async def agent_create_subagent_thread(
             brief_description=body.brief_description,
             parent_iteration=body.parent_iteration,
             fork=body.fork,
+            initial_status=body.initial_status,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
-    if thread_id is None:
+    if created is None:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
-    return {"thread_id": thread_id, "status": "created"}
+    return {**created, "status": "created"}
+
+
+@app.get("/api/agents/jobs/{job_id}/subagents/live")
+async def agent_list_live_subagent_threads(
+    request: Request, job_id: str
+) -> dict[str, Any]:
+    """List generation-bearing queued/running children. Internal only."""
+    await require_internal(request)
+    try:
+        rows = await postgres_db.list_live_subagent_threads(job_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return {
+        "job_id": job_id,
+        "count": len(rows),
+        "subagents": [_subagent_thread_payload(row) for row in rows],
+    }
+
+
+@app.get("/api/agents/jobs/{job_id}/subagents/{thread_id}")
+async def agent_get_subagent_thread(
+    request: Request, job_id: str, thread_id: UUID
+) -> dict[str, Any]:
+    """Read one exact worker child, including its generation. Internal only."""
+    await require_internal(request)
+    try:
+        row = await postgres_db.get_subagent_thread(job_id, str(thread_id))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    if row is None:
+        raise HTTPException(status_code=404, detail="Subagent thread not found")
+    return _subagent_thread_payload(row)
+
+
+@app.post("/api/agents/jobs/{job_id}/subagents/{thread_id}/reopen")
+async def agent_reopen_subagent_thread(
+    request: Request,
+    job_id: str,
+    thread_id: UUID,
+    body: AgentSubagentThreadReopenRequest,
+) -> dict[str, Any]:
+    """Rotate an ended child to a queued generation. Internal only."""
+    await require_internal(request)
+    try:
+        result = await postgres_db.reopen_subagent_thread(
+            parent_job_id=job_id,
+            thread_id=str(thread_id),
+            runtime_generation=str(body.runtime_generation),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    if result is None:
+        raise HTTPException(status_code=404, detail="Job or subagent thread not found")
+    if result.get("result") != "reopened":
+        raise HTTPException(status_code=409, detail=result)
+    return result
+
+
+@app.post("/api/agents/jobs/{job_id}/subagents/{thread_id}/terminal")
+async def agent_terminalize_subagent_thread(
+    request: Request,
+    job_id: str,
+    thread_id: UUID,
+    body: AgentSubagentThreadTerminalRequest,
+) -> dict[str, Any]:
+    """Atomically terminalize one run and enqueue its stable report."""
+    await require_internal(request)
+    try:
+        result = await postgres_db.terminalize_subagent_thread_and_enqueue(
+            parent_job_id=job_id,
+            thread_id=str(thread_id),
+            runtime_generation=str(body.runtime_generation),
+            delivery_id=str(body.delivery_id),
+            message=body.message,
+            timestamp=body.timestamp,
+            subagent_status=body.subagent_status,
+            outcome=body.outcome,
+            turns=body.turns,
+            tokens=body.tokens,
+            report_path=body.report_path,
+            error=body.error,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    if result is None:
+        raise HTTPException(status_code=404, detail="Job or subagent thread not found")
+    if result.get("result") not in {"applied", "idempotent"}:
+        raise HTTPException(status_code=409, detail=result)
+    return result
 
 
 def _slugify_mount_name(name: str) -> str:

@@ -455,13 +455,14 @@ class PostgresDB:
         "id, kind, parent_job_id, parent_thread_id, parent_tool_call_id, "
         "subagent_handle, subagent_type, subagent_status, subagent_outcome, "
         "subagent_error, report_path, status, title, total_turns, total_tokens, "
-        "metadata, created_at, last_activity, ended_at"
+        "runtime_generation, metadata, created_at, last_activity, ended_at"
     )
 
     async def update_subagent_thread(
         self,
         thread_id: str,
         *,
+        runtime_generation: str,
         status: Optional[str] = None,
         subagent_status: Optional[str] = None,
         outcome: Optional[str] = None,
@@ -473,8 +474,9 @@ class PostgresDB:
     ) -> bool:
         """Record a subagent child's lifecycle on its ``threads`` row (U3 B.1).
 
-        Guarded by ``kind = 'subagent'`` so this writer can never touch a
-        session row, and deliberately separate from :meth:`update_thread_status`,
+        Guarded by ``kind = 'subagent'`` and the exact runtime generation so
+        this writer can never touch a session row or a revived successor, and
+        deliberately separate from :meth:`update_thread_status`,
         which refuses ``ended`` on the pinned lane because a session's End is
         orchestrator-owned — a child has no pod, no workspace and no agents
         row, so its end is the ledger's to write. Every field is optional and
@@ -484,6 +486,11 @@ class PostgresDB:
         ``total_turns`` here is the child's provider-call count, not the
         session turn counter the message activity bump maintains.
         """
+        try:
+            generation_uuid = uuid.UUID(str(runtime_generation))
+            child_uuid = uuid.UUID(str(thread_id))
+        except (ValueError, TypeError, AttributeError):
+            return False
         async with self.acquire() as conn:
             result = await conn.execute(
                 """
@@ -502,8 +509,10 @@ class PostgresDB:
                        last_activity    = CURRENT_TIMESTAMP
                  WHERE id = $1::uuid
                    AND kind = 'subagent'
+                   AND runtime_generation = $10::uuid
+                   AND status <> 'ended'
                 """,
-                thread_id,
+                str(child_uuid),
                 status,
                 subagent_status,
                 outcome,
@@ -512,8 +521,55 @@ class PostgresDB:
                 report_path,
                 error,
                 bool(ended),
+                str(generation_uuid),
             )
         return result == "UPDATE 1"
+
+    async def list_live_subagent_threads(
+        self, parent_job_id: str
+    ) -> List[Dict[str, Any]]:
+        """Generation-bearing queued/running children recoverable by a parent."""
+        try:
+            parent_uuid = uuid.UUID(str(parent_job_id))
+        except (ValueError, TypeError, AttributeError):
+            return []
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                f"""
+                SELECT {self._SUBAGENT_THREAD_COLUMNS}
+                  FROM threads
+                 WHERE kind = 'subagent'
+                   AND parent_job_id = $1::uuid
+                   AND status IN ('created', 'active')
+                   AND subagent_status IN ('queued', 'running')
+                 ORDER BY created_at, id
+                """,
+                str(parent_uuid),
+            )
+        return [dict(row) for row in rows]
+
+    async def get_subagent_thread(
+        self, parent_job_id: str, thread_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Read one child under its parent, including its generation token."""
+        try:
+            parent_uuid = uuid.UUID(str(parent_job_id))
+            child_uuid = uuid.UUID(str(thread_id))
+        except (ValueError, TypeError, AttributeError):
+            return None
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                f"""
+                SELECT {self._SUBAGENT_THREAD_COLUMNS}
+                  FROM threads
+                 WHERE id = $1::uuid
+                   AND kind = 'subagent'
+                   AND parent_job_id = $2::uuid
+                """,
+                str(child_uuid),
+                str(parent_uuid),
+            )
+        return dict(row) if row else None
 
     async def get_subagent_thread_by_call(
         self, parent_job_id: str, parent_tool_call_id: str

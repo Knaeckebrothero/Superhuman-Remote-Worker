@@ -19,6 +19,7 @@ import json
 import pathlib
 import re
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from uuid import uuid4
 
 import asyncpg
@@ -454,7 +455,9 @@ async def test_replay_onto_seeded_rows_and_the_child_lifecycle(
             brief_description="  find the   secret ",
             parent_iteration=7,
         )
-        assert created == child_id
+        assert created is not None
+        assert created["thread_id"] == child_id
+        generation = created["runtime_generation"]
         # Idempotent per id; an unknown job is refused before any write.
         assert (
             await orchestrator.create_subagent_thread(
@@ -462,8 +465,9 @@ async def test_replay_onto_seeded_rows_and_the_child_lifecycle(
                 thread_id=child_id,
                 handle="explorer-0001",
                 subagent_type="explorer",
+                parent_tool_call_id="call-1",
             )
-            == child_id
+            == created
         )
         assert (
             await orchestrator.create_subagent_thread(
@@ -521,8 +525,16 @@ async def test_replay_onto_seeded_rows_and_the_child_lifecycle(
             )
 
         # --- the terminal update ------------------------------------------
+        assert not await agent.update_subagent_thread(
+            child_id,
+            runtime_generation=str(uuid4()),
+            status="ended",
+            subagent_status="completed",
+            ended=True,
+        ), "a stale generation cannot win the first terminal write"
         assert await agent.update_subagent_thread(
             child_id,
+            runtime_generation=generation,
             status="ended",
             subagent_status="completed",
             outcome="completed",
@@ -533,7 +545,11 @@ async def test_replay_onto_seeded_rows_and_the_child_lifecycle(
         )
         # The guard: a session row is never touched by the subagent writer.
         assert not await agent.update_subagent_thread(
-            str(session_id), status="ended", subagent_status="completed", ended=True
+            str(session_id),
+            runtime_generation=generation,
+            status="ended",
+            subagent_status="completed",
+            ended=True,
         )
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -549,6 +565,84 @@ async def test_replay_onto_seeded_rows_and_the_child_lifecycle(
         assert row["report_path"] == ".subagents/explorer-0001/report.md"
         assert session["status"] == "active" and session["ended_at"] is None
 
+        # --- revival rotates the run claim; old owners stay fenced --------
+        reopened = await orchestrator.reopen_subagent_thread(
+            parent_job_id=str(job_id),
+            thread_id=child_id,
+            runtime_generation=generation,
+        )
+        assert reopened is not None and reopened["result"] == "reopened"
+        next_generation = reopened["runtime_generation"]
+        assert next_generation != generation
+        async with pool.acquire() as conn:
+            revived = await conn.fetchrow(
+                "SELECT status, subagent_status, runtime_generation, ended_at "
+                "FROM threads WHERE id = $1::uuid",
+                child_id,
+            )
+        assert revived["status"] == "created"
+        assert revived["subagent_status"] == "queued"
+        assert str(revived["runtime_generation"]) == next_generation
+        assert revived["ended_at"] is None
+        assert not await agent.update_subagent_thread(
+            child_id,
+            runtime_generation=generation,
+            status="active",
+            subagent_status="running",
+        )
+        assert await agent.update_subagent_thread(
+            child_id,
+            runtime_generation=next_generation,
+            status="active",
+            subagent_status="running",
+        )
+
+        # --- terminal row + worker delivery are one idempotent operation --
+        delivery_id = str(uuid4())
+        terminal = await orchestrator.terminalize_subagent_thread_and_enqueue(
+            parent_job_id=str(job_id),
+            thread_id=child_id,
+            runtime_generation=next_generation,
+            delivery_id=delivery_id,
+            message="the secret is MARMALADE",
+            timestamp=datetime(2026, 9, 1, 1, 2, 3, tzinfo=timezone.utc),
+            subagent_status="completed",
+            outcome="completed",
+            turns=1,
+            tokens=25,
+        )
+        assert terminal is not None and terminal["result"] == "applied"
+        assert terminal["delivery"]["source"] == "subagent"
+        retry = await orchestrator.terminalize_subagent_thread_and_enqueue(
+            parent_job_id=str(job_id),
+            thread_id=child_id,
+            runtime_generation=next_generation,
+            delivery_id=delivery_id,
+            message="the secret is MARMALADE",
+            timestamp=datetime(2026, 9, 1, 1, 2, 3, tzinfo=timezone.utc),
+            subagent_status="completed",
+        )
+        assert retry is not None and retry["result"] == "idempotent"
+        assert retry["delivery_state"] == "queued"
+        assert (
+            await orchestrator.consume_job_guidance(
+                str(job_id), reply_threads=[child_id]
+            )
+            == 1
+        )
+        consumed_retry = await orchestrator.terminalize_subagent_thread_and_enqueue(
+            parent_job_id=str(job_id),
+            thread_id=child_id,
+            runtime_generation=next_generation,
+            delivery_id=delivery_id,
+            message="the secret is MARMALADE",
+            timestamp=datetime(2026, 9, 1, 1, 2, 3, tzinfo=timezone.utc),
+            subagent_status="completed",
+        )
+        assert consumed_retry is not None
+        assert consumed_retry["result"] == "idempotent"
+        assert consumed_retry["delivery_state"] == "consumed"
+
         # --- the reads: roster, replay lookup on both pools, sessions list --
         roster = await orchestrator.list_subagent_threads(str(job_id))
         assert [str(r["id"]) for r in roster] == [child_id]
@@ -563,16 +657,14 @@ async def test_replay_onto_seeded_rows_and_the_child_lifecycle(
 
         # --- the cascade, and the live-child trap -------------------------
         live_id = str(uuid4())
-        assert (
-            await orchestrator.create_subagent_thread(
-                parent_job_id=str(job_id),
-                thread_id=live_id,
-                handle="explorer-0002",
-                subagent_type="explorer",
-                parent_tool_call_id="call-2",
-            )
-            == live_id
+        live_created = await orchestrator.create_subagent_thread(
+            parent_job_id=str(job_id),
+            thread_id=live_id,
+            handle="explorer-0002",
+            subagent_type="explorer",
+            parent_tool_call_id="call-2",
         )
+        assert live_created is not None and live_created["thread_id"] == live_id
         async with pool.acquire() as conn:
             with pytest.raises(asyncpg.PostgresError) as blocked:
                 await conn.execute("DELETE FROM jobs WHERE id = $1", job_id)

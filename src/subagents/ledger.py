@@ -22,7 +22,8 @@ Lifecycle, as the runtime drives it (``src/subagents/runtime.py``):
 
 ``status`` is always one of :data:`SUBAGENT_STATUSES`; the finer
 classification (``capped:turns``, ``interrupted:drain``) rides in
-``outcome`` verbatim. Anything other than ``running`` is terminal.
+``outcome`` verbatim. ``queued`` and ``running`` are live; every other
+non-empty kind is terminal.
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ from typing import Any, Dict, List, Optional, Protocol, Tuple, runtime_checkable
 #: ``running`` at spawn; the driver's ``SubagentResult.kind`` for a finished
 #: child; ``cancelled`` when the parent's batch was cancelled mid-child.
 SUBAGENT_STATUSES: tuple[str, ...] = (
+    "queued",
     "running",
     "completed",
     "parked",
@@ -44,16 +46,16 @@ SUBAGENT_STATUSES: tuple[str, ...] = (
 
 
 def is_terminal_status(status: Any) -> bool:
-    """Every status but ``running`` ends the child (open set: an unknown
-    kind is terminal too — a row must never stay live on a typo)."""
+    """Every status but ``queued``/``running`` ends the child (open set: an
+    unknown kind is terminal too — a row must never stay live on a typo)."""
     text = str(status or "").strip()
-    return bool(text) and text != "running"
+    return bool(text) and text not in {"queued", "running"}
 
 
 @runtime_checkable
 class SubagentLedger(Protocol):
-    async def open(self, subagent_id: str, **fields: Any) -> None:
-        """Record a new child (``status="running"`` + its identity fields)."""
+    async def open(self, subagent_id: str, **fields: Any) -> Optional[Dict[str, str]]:
+        """Record a child and return its durable run lease when available."""
         ...
 
     async def persist_message(
