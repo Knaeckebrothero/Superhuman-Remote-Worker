@@ -7,12 +7,12 @@ import {HANDLE_PATTERN, buildJetBrainsCommand, buildSshConfig} from '../../../co
  *  mirrors `AppCopyFieldComponent`'s own COPIED_RESET_MS. */
 const COPIED_RESET_MS = 2500;
 
-/** docs/ssh-access.md on the public repo, same host+path convention as
+/** ssh-access.md on the public repo, same host+path convention as
  *  escape-hatch-panel.component.ts's link to automations_api.md. Linked from
  *  the prerequisites line below (I-1): the PAT and the helper are both
  *  documented there and nowhere else the product surfaces. */
 const SSH_DOCS_URL =
-    'https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/blob/main/docs/ssh-access.md';
+    'https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/blob/main/ssh-access.md';
 
 /**
  * Session view → "Connect over SSH". Renders the `~/.ssh/config` block for

@@ -955,7 +955,7 @@ sshGateway:
   # above defaults to "" (the bare domain), while `hostnames.api` defaults to
   # `api.<domain>`. A value that guesses the `cockpit.` subdomain is wrong out
   # of the box and every client gets a bare 403 at the WebSocket upgrade with
-  # nothing in the gateway pod's logs to explain why (docs/ssh-access.md
+  # nothing in the gateway pod's logs to explain why (ssh-access.md
   # §7 Troubleshooting; this is also the trap behind srw-ssh-proxy's own
   # `--origin` default guess).
   allowedOrigins: []
