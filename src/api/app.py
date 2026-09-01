@@ -37,6 +37,10 @@ from ..shared.workspace_contract import (
     WorkspaceContractError,
     validate_worker_workspace_projection,
 )
+from ..shared.subagent_lifecycle import (
+    SubagentLifecycleError,
+    SubagentQuiescenceError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +54,7 @@ _orchestrator_client: Optional[OrchestratorClient] = None
 _heartbeat_task: Optional[asyncio.Task] = None
 _current_job_id: Optional[str] = None
 _current_job_task: Optional[asyncio.Task] = None
+_pending_fatal_exit_task: Optional[asyncio.Task] = None
 
 # Cooperative stop mechanism (checked between graph iterations)
 # Used by both pause and cancel — _stop_reason discriminates the action.
@@ -61,6 +66,7 @@ _stop_completed: asyncio.Event = (
 
 _PINNED_RECIPIENT_MISMATCH = {"code": "pinned_recipient_mismatch"}
 _JOB_STREAM_CLOSE_TIMEOUT_SECONDS = 60.0
+_FATAL_EXIT_DEREGISTER_TIMEOUT_SECONDS = 5.0
 
 
 async def _close_job_stream(streaming_gen: Any, *, job_id: str) -> None:
@@ -83,7 +89,9 @@ async def _close_job_stream(streaming_gen: Any, *, job_id: str) -> None:
                 job_id,
                 _JOB_STREAM_CLOSE_TIMEOUT_SECONDS,
             )
-            raise RuntimeError(f"job {job_id} stream cleanup timed out") from exc
+            raise SubagentQuiescenceError(
+                f"job {job_id} stream cleanup timed out"
+            ) from exc
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -110,6 +118,81 @@ async def _close_job_stream(streaming_gen: Any, *, job_id: str) -> None:
             raise
     if cancellation is not None:
         raise cancellation
+
+
+def _schedule_fatal_exit(delay: float = 1.0) -> None:
+    """Retire this pinned owner after an unrecoverable local lifecycle fault."""
+
+    global _pending_fatal_exit_task
+    if _pending_fatal_exit_task and not _pending_fatal_exit_task.done():
+        return
+
+    async def _exit() -> None:
+        await asyncio.sleep(delay)
+        client = _orchestrator_client
+        if client is not None:
+            client.stop_heartbeat()
+            heartbeat = _heartbeat_task
+            if (
+                heartbeat is not None
+                and not heartbeat.done()
+                and heartbeat is not asyncio.current_task()
+            ):
+                heartbeat.cancel()
+            if client.agent_id:
+                try:
+                    await asyncio.wait_for(
+                        client.deregister(),
+                        timeout=_FATAL_EXIT_DEREGISTER_TIMEOUT_SECONDS,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Pinned owner deregistration failed before fatal exit"
+                    )
+        os._exit(1)
+
+    _pending_fatal_exit_task = asyncio.create_task(
+        _exit(), name="pinned-subagent-lifecycle-fatal-exit"
+    )
+
+
+async def _fail_closed_subagent_lifecycle(job_id: str) -> None:
+    """Make an unsettled pinned parent non-dispatchable, then retire it.
+
+    No completion report is emitted.  The current process first closes local
+    child work without writes, advertises draining, and then deregisters/exits
+    so the orchestrator can recover the still-processing parent on a successor.
+    """
+
+    global _shutdown_requested
+    _shutdown_requested = True
+    # Arm bounded owner retirement before any potentially wedged cleanup or
+    # transport await.  Cancellation/hung abandon must not preserve this owner.
+    _schedule_fatal_exit()
+    logger.critical(
+        "Pinned job child lifecycle could not settle; draining owner without "
+        "completion report: job=%s",
+        job_id,
+    )
+    agent = _agent
+    abandon = getattr(agent, "abandon_worker_subagents", None)
+    if callable(abandon):
+        try:
+            await abandon("pinned parent lifecycle failed")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Pinned child runtime abandon retry failed")
+    client = _orchestrator_client
+    if client is not None and client.agent_id:
+        try:
+            await client.heartbeat(
+                status="draining",
+                job_id=job_id,
+                metrics=_get_agent_metrics(),
+            )
+        except Exception:
+            logger.exception("Could not publish pinned lifecycle drain heartbeat")
 
 
 def _require_pinned_job_recipient(
@@ -752,6 +835,8 @@ async def _process_orchestrator_job(
     except asyncio.CancelledError:
         logger.info(f"Orchestrator job {job_id} was cancelled")
         raise
+    except SubagentLifecycleError:
+        await _fail_closed_subagent_lifecycle(job_id)
     except Exception as e:
         logger.error(f"Orchestrator job {job_id} failed: {e}", exc_info=True)
         # Report error to orchestrator
@@ -1407,6 +1492,8 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             except asyncio.CancelledError:
                 logger.info(f"Resumed job {request.job_id} was cancelled")
                 raise
+            except SubagentLifecycleError:
+                await _fail_closed_subagent_lifecycle(request.job_id)
             except Exception as e:
                 logger.error(f"Resumed job {request.job_id} failed: {e}", exc_info=True)
                 error_result = completion_error_payload(e)

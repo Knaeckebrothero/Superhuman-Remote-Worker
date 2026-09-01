@@ -50,6 +50,10 @@ from ..shared.workspace_contract import (
     WorkspaceContractError,
     validate_worker_workspace_projection,
 )
+from ..shared.subagent_lifecycle import (
+    SubagentLifecycleError,
+    SubagentQuiescenceError,
+)
 from ..shared.pinned_session_identity import (
     PINNED_SESSION_READY_IDENTITY_CONTRACT,
     pinned_session_ready_identity_fingerprint,
@@ -118,7 +122,9 @@ async def _close_job_stream(streaming_gen: Any, *, job_id: str) -> None:
                 job_id,
                 _JOB_STREAM_CLOSE_TIMEOUT_SECONDS,
             )
-            raise RuntimeError(f"job {job_id} stream cleanup timed out") from exc
+            raise SubagentQuiescenceError(
+                f"job {job_id} stream cleanup timed out"
+            ) from exc
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -836,6 +842,40 @@ def _schedule_exit(delay: float = 1.0) -> None:
     _pending_exit_task = asyncio.create_task(_exit())
 
 
+async def _fail_closed_subagent_lifecycle(job_id: str) -> None:
+    """Drain and retire a dual-mode owner whose children did not settle."""
+
+    global _shutdown_requested
+    _shutdown_requested = True
+    # Fatal even in loop mode. Arm retirement before cleanup/heartbeat awaits
+    # so a wedged runtime cannot keep this stale ToolContext dispatchable.
+    _schedule_exit(delay=1.0)
+    logger.critical(
+        "Pinned job child lifecycle could not settle; keeping pod non-idle and "
+        "retiring without completion report: job=%s",
+        job_id,
+    )
+    agent = _agent
+    abandon = getattr(agent, "abandon_worker_subagents", None)
+    if callable(abandon):
+        try:
+            await abandon("pinned parent lifecycle failed")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Pinned child runtime abandon retry failed")
+    client = _orchestrator_client
+    if client is not None and client.agent_id:
+        try:
+            await client.heartbeat(
+                status="draining",
+                job_id=job_id,
+                metrics=_get_agent_metrics(),
+            )
+        except Exception:
+            logger.exception("Could not publish pinned lifecycle drain heartbeat")
+
+
 def _should_loop() -> bool:
     """Check if agent should loop back to IDLE instead of exiting."""
     return os.environ.get("AGENT_LOOP", "").strip() == "1"
@@ -1159,6 +1199,8 @@ async def _process_orchestrator_job(
     except asyncio.CancelledError:
         logger.info(f"Job {job_id} was cancelled")
         raise
+    except SubagentLifecycleError:
+        await _fail_closed_subagent_lifecycle(job_id)
     except Exception as e:
         logger.error(f"Job {job_id} failed: {e}", exc_info=True)
         if _orchestrator_client:
@@ -1697,6 +1739,8 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
 
             except asyncio.CancelledError:
                 raise
+            except SubagentLifecycleError:
+                await _fail_closed_subagent_lifecycle(request.job_id)
             except Exception as e:
                 logger.error(f"Resume job {request.job_id} failed: {e}", exc_info=True)
                 if _orchestrator_client:

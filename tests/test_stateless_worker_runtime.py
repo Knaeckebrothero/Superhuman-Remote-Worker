@@ -25,6 +25,10 @@ from src.core.workspace_backend import WorkspaceUnavailableError
 from src.core.backends.remote import RemoteBackend
 from src.graph import route_entry
 from src.shared.run_queue import ClaimedUnit, EnqueueResult
+from src.shared.subagent_lifecycle import (
+    SubagentLifecycleError,
+    SubagentQuiescenceError,
+)
 from src.shared.job_steering import CheckpointSteeringAcker, context_delivery_key
 from src.shared.worker_queue import (
     WorkerClaim,
@@ -624,6 +628,99 @@ async def test_terminal_reports_once_then_closes_exact_watermark(
     rotate.assert_not_awaited()
     release.assert_not_awaited()
     assert agent.cleanup_calls == [False]
+
+
+@pytest.mark.asyncio
+async def test_terminal_report_waits_for_stream_generator_close(
+    worker_runtime, monkeypatch
+):
+    claim = _claim(input_seq=32, prior="processing")
+    final = {
+        "should_stop": True,
+        "goal_achieved": True,
+        "freeze_data": None,
+        "error": None,
+    }
+    executor, agent, client, _, _, _, _ = _install(monkeypatch, claim, final)
+    events = []
+
+    async def stream():
+        try:
+            yield final
+        finally:
+            events.append("stream_closed")
+
+    async def report(*args, **kwargs):
+        del args, kwargs
+        events.append("reported")
+        return True
+
+    agent.process_job = AsyncMock(return_value=stream())
+    client.report_completion.side_effect = report
+
+    await executor._serve_worker_claim(claim)
+
+    assert events[:2] == ["stream_closed", "reported"]
+
+
+@pytest.mark.asyncio
+async def test_child_quiescence_failure_retries_cleanup_then_releases_without_report(
+    worker_runtime, monkeypatch
+):
+    claim = _claim(input_seq=33, prior="processing", attempts=5, max_attempts=5)
+    final = {
+        "should_stop": True,
+        "goal_achieved": True,
+        "freeze_data": None,
+        "error": None,
+    }
+    executor, agent, client, _, _, _, release = _install(monkeypatch, claim, final)
+
+    async def stream():
+        yield final
+        raise SubagentQuiescenceError("terminal delivery unavailable")
+
+    agent.process_job = AsyncMock(return_value=stream())
+
+    await executor._serve_worker_claim(claim)
+
+    client.report_completion.assert_not_awaited()
+    assert agent.cleanup_calls == [True]
+    release.assert_awaited_once_with(
+        executor._db,
+        unit_id=claim.unit_id,
+        lease_token=claim.lease_token,
+        park_on_exhaustion=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_repeated_child_quiescence_failure_escapes_without_report_or_release(
+    worker_runtime, monkeypatch
+):
+    claim = _claim(input_seq=34, prior="processing", attempts=5, max_attempts=5)
+    final = {
+        "should_stop": True,
+        "goal_achieved": True,
+        "freeze_data": None,
+        "error": None,
+    }
+    executor, agent, client, _, _, _, release = _install(monkeypatch, claim, final)
+
+    async def stream():
+        yield final
+        raise SubagentQuiescenceError("first failure")
+
+    agent.process_job = AsyncMock(return_value=stream())
+    agent.cleanup_worker_claim = AsyncMock(
+        side_effect=SubagentQuiescenceError("retry failure")
+    )
+
+    with pytest.raises(SubagentLifecycleError, match="did not fully clean"):
+        await executor._serve_worker_claim(claim)
+
+    client.report_completion.assert_not_awaited()
+    release.assert_not_awaited()
 
 
 @pytest.mark.asyncio

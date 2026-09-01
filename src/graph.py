@@ -6344,8 +6344,18 @@ async def run_graph_with_streaming(
     Yields:
         State updates from each node
     """
-    async for state in graph.astream(graph_input, config=config, stream_mode="values"):
-        yield state
+    graph_stream = graph.astream(graph_input, config=config, stream_mode="values")
+    try:
+        async for state in graph_stream:
+            yield state
+    finally:
+        # ``async for`` does not synchronously close an inner async generator
+        # when this wrapper is closed.  Worker lease loss/rotation relies on the
+        # complete provider tail being joined before its parent runtime is
+        # quiesced and the claim is handed off.
+        close_graph_stream = getattr(graph_stream, "aclose", None)
+        if callable(close_graph_stream):
+            await close_graph_stream()
 
 
 # =============================================================================

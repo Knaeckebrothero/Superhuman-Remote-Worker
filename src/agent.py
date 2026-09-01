@@ -57,6 +57,12 @@ from .graph import (
 )
 from .managers import TodoManager
 from .shared.job_freeze_types import AUTO_CONTINUE_FREEZE_TYPES
+from .shared.subagent_lifecycle import (
+    SubagentAbandonError,
+    SubagentLifecycleError,
+    SubagentQuiescenceError,
+    SubagentRecoveryError,
+)
 from .tools import ToolContext, load_tools, apply_instruction_enforcement
 from .tools.description_manager import (
     apply_description_overrides,
@@ -358,6 +364,13 @@ class UniversalAgent:
         self._worker_finalization_backend: Any | None = None
         self._worker_terminal_shell_cleanup: Callable[[], None] | None = None
         self._worker_shell_admission_retired = False
+        # The runtime itself also fences these transitions, but retaining the
+        # exact object identity here makes the agent-side lifecycle idempotent:
+        # cleanup has several defensive call sites and must never terminalize a
+        # child generation twice.
+        self._subagent_recovered_runtime: Any | None = None
+        self._subagent_quiesced_runtime: Any | None = None
+        self._subagent_abandoned_runtime: Any | None = None
 
         # Phase-specific LLMs (created if phase overrides configured)
         self._strategic_llm: Optional[BaseChatModel] = None
@@ -981,6 +994,12 @@ class UniversalAgent:
                     f"kb_degraded={getattr(self, '_kb_degraded', False)}) — pausing "
                     f"for re-dispatch instead of running without memory/KB"
                 )
+                # Tool setup may already have installed a durable child
+                # runtime.  Reconcile and settle it before shell/datasource
+                # teardown or before returning a reportable freeze state.
+                await self._settle_subagent_runtime(
+                    "parent setup stopped: memory unavailable"
+                )
                 if not getattr(self, "_defer_job_cleanup", False):
                     self._cleanup_shell_manager()
                     self._close_datasource_connections()
@@ -1305,6 +1324,13 @@ class UniversalAgent:
                 return self._process_job_streaming(graph_input, thread_config)
             else:
                 try:
+                    # Reconcile predecessor child generations before the graph
+                    # can resume at any provider/tool frontier.  The runtime's
+                    # recovery lock and our object-identity guard make this an
+                    # exactly-once transition for the claim.  Already-terminal
+                    # checkpoint mirrors also need this before completion can
+                    # pass the orchestrator's live-child barrier.
+                    await self._recover_subagent_orphans()
                     if worker_terminal_state is not None:
                         return worker_terminal_state
                     final_state = await self._graph.ainvoke(
@@ -1314,13 +1340,22 @@ class UniversalAgent:
                     self._jobs_processed += 1
                     return dict(final_state)
                 finally:
+                    await self._quiesce_subagent_runtime("parent graph ended")
                     if not getattr(self, "_defer_job_cleanup", False):
                         self._current_job_id = None
                         self._cleanup_shell_manager()
                         self._close_datasource_connections()
                         await self._cleanup_checkpointer()
 
+        except SubagentLifecycleError:
+            # Never turn an unsettled child generation into a reportable parent
+            # error.  Worker/session drivers own the fail-closed disposition.
+            raise
         except Exception as e:
+            # Failures after tool setup can otherwise tear down the only
+            # reference to a durable runtime without recovering predecessor
+            # generations or joining current children.
+            await self._settle_subagent_runtime("parent setup or graph failed")
             from .core.workspace_backend import completion_error_payload
 
             error = completion_error_payload(e)["error"]
@@ -1972,8 +2007,111 @@ class UniversalAgent:
         else:
             self._worker_shell_admission_retired = True
 
+    def _current_subagent_runtime(self) -> Any | None:
+        """Return the claim-local child runtime without retaining its context."""
+
+        context = getattr(self, "_tool_context", None)
+        return getattr(context, "subagent_runtime", None)
+
+    async def _recover_subagent_orphans(self) -> None:
+        """Recover durable predecessor generations once before graph resume.
+
+        A null/in-memory ledger has no durable predecessor state to reconcile.
+        Checking for the strict live-list seam keeps bare/local parents working
+        while every DB-backed worker and pinned job takes the recovery gate.
+        """
+
+        runtime = self._current_subagent_runtime()
+        if (
+            runtime is None
+            or getattr(self, "_subagent_recovered_runtime", None) is runtime
+        ):
+            return
+        ledger = getattr(runtime, "ledger", None)
+        if not callable(getattr(ledger, "list_live", None)):
+            return
+        recover = getattr(runtime, "recover_orphans", None)
+        if not callable(recover):
+            raise SubagentRecoveryError(
+                "durable subagent runtime has no orphan recovery gate"
+            )
+        try:
+            await recover()
+        except asyncio.CancelledError:
+            raise
+        except SubagentLifecycleError:
+            raise
+        except Exception as exc:
+            raise SubagentRecoveryError(
+                "durable subagent orphan recovery failed"
+            ) from exc
+        self._subagent_recovered_runtime = runtime
+
+    async def _quiesce_subagent_runtime(self, reason: str) -> None:
+        """Settle a claim's children once while parent authority is current."""
+
+        runtime = self._current_subagent_runtime()
+        if runtime is None:
+            return
+        if getattr(self, "_subagent_abandoned_runtime", None) is runtime:
+            return
+        if getattr(self, "_subagent_quiesced_runtime", None) is runtime:
+            return
+        quiesce = getattr(runtime, "quiesce", None)
+        if not callable(quiesce):
+            raise SubagentQuiescenceError("subagent runtime has no quiescence gate")
+        try:
+            await quiesce(reason)
+        except asyncio.CancelledError:
+            raise
+        except SubagentLifecycleError:
+            raise
+        except Exception as exc:
+            raise SubagentQuiescenceError(
+                f"subagent runtime could not quiesce: {reason}"
+            ) from exc
+        self._subagent_quiesced_runtime = runtime
+
+    async def _settle_subagent_runtime(self, reason: str) -> None:
+        """Recover predecessors, then terminally join this runtime once."""
+
+        await self._recover_subagent_orphans()
+        await self._quiesce_subagent_runtime(reason)
+
+    async def abandon_worker_subagents(
+        self, reason: str = "worker lease authority lost"
+    ) -> None:
+        """Cancel claim-local children without writes after local lease loss."""
+
+        runtime = self._current_subagent_runtime()
+        if (
+            runtime is None
+            or getattr(self, "_subagent_abandoned_runtime", None) is runtime
+        ):
+            return
+        abandon = getattr(runtime, "abandon", None)
+        if not callable(abandon):
+            raise SubagentAbandonError("subagent runtime has no authority-loss gate")
+        try:
+            await abandon(reason)
+        except asyncio.CancelledError:
+            raise
+        except SubagentLifecycleError:
+            raise
+        except Exception as exc:
+            raise SubagentAbandonError(
+                f"subagent runtime could not abandon after authority loss: {reason}"
+            ) from exc
+        self._subagent_abandoned_runtime = runtime
+
     async def _scrub_worker_claim_locals(self) -> None:
         """Remove tenant-local state without deciding the remote shell fate."""
+
+        # This is the last invariant belt before ToolContext (and therefore the
+        # only reference to the child runtime) is dropped.  Normal streaming
+        # completion already quiesced in the generator; defensive cleanup paths
+        # safely collapse here through the identity guard.
+        await self._quiesce_subagent_runtime("worker claim cleanup")
 
         tool_context = getattr(self, "_tool_context", None)
         if tool_context is not None:
@@ -2035,6 +2173,9 @@ class UniversalAgent:
 
         if getattr(self, "_worker_finalization_held", False):
             return
+        # Child terminal evidence must be committed while parent authority and
+        # its transport are still live.  Never retire the shell/backend first.
+        await self._quiesce_subagent_runtime("worker finalization hold")
         backend = self._worker_workspace_backend()
         self._worker_finalization_backend = backend
         self._retire_worker_shell_admission(backend)
@@ -2069,6 +2210,9 @@ class UniversalAgent:
         passes ``False`` and keeps the historical destructive shell cleanup.
         """
 
+        # This is the disposition boundary: settle children before retiring
+        # shell admission, transport, or the ToolContext that owns the runtime.
+        await self._quiesce_subagent_runtime("worker claim cleanup")
         backend = self._worker_workspace_backend()
         backend_already_retired = bool(
             getattr(self, "_worker_finalization_held", False)
@@ -2126,12 +2270,22 @@ class UniversalAgent:
         self._worker_finalization_backend = None
         self._worker_terminal_shell_cleanup = None
         self._worker_shell_admission_retired = False
+        self._subagent_recovered_runtime = None
+        self._subagent_quiesced_runtime = None
+        self._subagent_abandoned_runtime = None
 
     async def _yield_error_state(
         self, error_state: Dict[str, Any]
     ) -> AsyncIterator[Dict[str, Any]]:
         """Yield a single error state for streaming mode."""
-        yield error_state
+        try:
+            # A checkpoint that is already terminal still has to reconcile
+            # predecessor children before the orchestrator's completion barrier
+            # can accept it; this path deliberately performs no provider work.
+            await self._recover_subagent_orphans()
+            yield error_state
+        finally:
+            await self._quiesce_subagent_runtime("parent stream ended")
 
     async def _process_job_streaming(
         self,
@@ -2153,17 +2307,31 @@ class UniversalAgent:
         pauses the job.
         """
         try:
+            # Recovery happens before the first graph step.  In particular, a
+            # resumed checkpoint may enter directly at a provider/tool node and
+            # cannot be allowed to race predecessor child generations.
+            await self._recover_subagent_orphans()
             # At most one in-process upgrade per run: virtual → sandbox flips the
             # backend to supports_shell=True, after which the request tool drops
             # out and the supports_shell guard below short-circuits anyway.
             upgraded = False
             while True:
                 final_state: Optional[Dict[str, Any]] = None
-                async for state in run_graph_with_streaming(
+                graph_stream = run_graph_with_streaming(
                     self._graph, graph_input, config
-                ):
-                    final_state = state
-                    yield state
+                )
+                try:
+                    async for state in graph_stream:
+                        final_state = state
+                        yield state
+                finally:
+                    # Closing an outer async generator does not implicitly wait
+                    # for the inner graph iterator's ``finally`` block.  Join it
+                    # explicitly before child quiescence and before the worker
+                    # driver can report or rotate this claim.
+                    close_graph_stream = getattr(graph_stream, "aclose", None)
+                    if callable(close_graph_stream):
+                        await close_graph_stream()
 
                 freeze = (final_state or {}).get("freeze_data") or {}
                 wants_upgrade = (
@@ -2210,6 +2378,10 @@ class UniversalAgent:
                 graph_input = None
 
             self._jobs_processed += 1
+        except SubagentLifecycleError:
+            # Recovery/quiescence is a parent-disposition fence, not a graph
+            # error that may be serialized and reported as terminal.
+            raise
         except Exception as e:
             # Mirror the non-streaming handler: classify the failure and yield
             # a TYPED error state instead of letting the exception escape the
@@ -2241,6 +2413,13 @@ class UniversalAgent:
                 "should_stop": True,
             }
         finally:
+            # The worker driver does not report/rotate until it observes this
+            # generator's StopAsyncIteration (and explicitly closes it on every
+            # other exit).  Settling children here therefore preserves the hard
+            # generator-close-before-disposition ordering while the parent lease
+            # is still live.
+            await self._quiesce_subagent_runtime("parent stream ended")
+
             # Drain in-flight memory captures (the fire-and-forget pre_compaction
             # extraction scheduled via capture_nowait) BEFORE tearing down
             # connections, so a compaction on the last LLM call before freeze

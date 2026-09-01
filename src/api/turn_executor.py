@@ -89,6 +89,7 @@ from ..shared.run_queue import (
     release_unit,
 )
 from ..shared.session_retirement import acknowledge_session_claim_quiesced
+from ..shared.subagent_lifecycle import SubagentLifecycleError
 from ..shared.worker_queue import (
     WorkerClaim,
     WorkerCompletionAcceptance,
@@ -823,6 +824,18 @@ class StatelessTurnExecutor:
                     await self._serve_worker_claim(worker_claim)
                 except asyncio.CancelledError:
                     raise
+                except SubagentLifecycleError:
+                    # Publishing this claim could overlap the old ToolContext
+                    # and child generation.  Leave the exact lease unresolved
+                    # for expiry/operator recovery and stop taking new work.
+                    logger.critical(
+                        "worker child lifecycle could not be settled; stopping "
+                        "executor without release (unit=%s token=%d)",
+                        worker_claim.unit_id,
+                        worker_claim.lease_token,
+                        exc_info=True,
+                    )
+                    self.request_stop()
                 except Exception:
                     logger.exception(
                         "unhandled error serving worker unit %s — releasing and "
@@ -968,6 +981,36 @@ class StatelessTurnExecutor:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._cleanup_worker_runtime(preserve_shell=True)
             raise
+        except SubagentLifecycleError as exc:
+            # Retry the lifecycle gate exactly once through the normal cleanup
+            # belt.  Only a fully successful cleanup permits retry publication;
+            # a second failure escapes to run(), which stops without release.
+            logger.error(
+                "worker child lifecycle failed before disposition: "
+                "unit=%s token=%d type=%s",
+                unit_id,
+                token,
+                type(exc).__name__,
+            )
+            try:
+                await self._cleanup_worker_runtime(preserve_shell=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception as retry_exc:
+                raise SubagentLifecycleError(
+                    "worker child lifecycle retry did not fully clean the claim"
+                ) from retry_exc
+            if self._lease.lost.is_set():
+                timing["outcome"] = "closed:child_lifecycle_after_lease_loss"
+                return
+            await self._release_worker_claim(
+                claim,
+                reason="child_lifecycle_failed",
+                park_on_exhaustion=False,
+                timing=timing,
+            )
+            timing["outcome"] = "released:child_lifecycle_failed"
+            return
         except Exception as exc:
             logger.exception(
                 "worker_batch failed before a disposition: unit=%s token=%d",
@@ -2129,6 +2172,15 @@ class StatelessTurnExecutor:
     async def _cleanup_worker_runtime(self, *, preserve_shell: bool) -> None:
         agent = _pa()._agent
         if agent is not None:
+            if self._lease.lost.is_set():
+                # Local lease loss is already sufficient to revoke effect
+                # authority.  Do not ask quiesce/its DB probe to rediscover the
+                # steal after a race; abandon first guarantees zero further
+                # child writes or provider/tool effects before ToolContext is
+                # scrubbed.
+                abandon = getattr(agent, "abandon_worker_subagents", None)
+                if callable(abandon):
+                    await abandon("worker lease authority lost")
             await agent.cleanup_worker_claim(preserve_shell=preserve_shell)
 
     async def _release_worker_claim(

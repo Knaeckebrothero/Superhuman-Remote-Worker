@@ -401,6 +401,22 @@ class TestGetCurrentJobEndpoint:
 
 class TestPinnedJobStreamClose:
     @pytest.mark.asyncio
+    async def test_close_timeout_is_a_typed_lifecycle_failure(self, monkeypatch):
+        import asyncio
+
+        import src.api.app as app_module
+        from src.shared.subagent_lifecycle import SubagentQuiescenceError
+
+        class _HungStream:
+            async def aclose(self):
+                await asyncio.Future()
+
+        monkeypatch.setattr(app_module, "_JOB_STREAM_CLOSE_TIMEOUT_SECONDS", 0.001)
+
+        with pytest.raises(SubagentQuiescenceError, match="cleanup timed out"):
+            await app_module._close_job_stream(_HungStream(), job_id="hung-close")
+
+    @pytest.mark.asyncio
     async def test_fresh_job_closes_before_completion_report_and_cleanup(
         self, monkeypatch
     ):
@@ -493,6 +509,106 @@ class TestPinnedJobStreamClose:
         await app_module._current_job_task
 
         assert events == ["close", "report", "cleanup"]
+
+    @pytest.mark.asyncio
+    async def test_fresh_job_lifecycle_failure_drains_without_completion_report(
+        self, monkeypatch
+    ):
+        import src.api.app as app_module
+        from src.shared.subagent_lifecycle import SubagentQuiescenceError
+
+        events: list[str] = []
+        client = MagicMock()
+        client.agent_id = AGENT_ID
+        client.report_completion = AsyncMock()
+        client.heartbeat = AsyncMock(return_value={})
+        agent = MagicMock()
+        agent._tool_context = None
+        agent.abandon_worker_subagents = AsyncMock()
+        agent.process_job = AsyncMock(
+            return_value=_TrackedStream(
+                [], events, error=SubagentQuiescenceError("delivery failed")
+            )
+        )
+        schedule_exit = MagicMock()
+
+        monkeypatch.setattr(app_module, "_agent", agent)
+        monkeypatch.setattr(app_module, "_orchestrator_client", client)
+        monkeypatch.setattr(app_module, "_current_job_id", "fresh-lifecycle")
+        monkeypatch.setattr(app_module, "_shutdown_requested", False)
+        monkeypatch.setattr(app_module, "_schedule_fatal_exit", schedule_exit)
+        monkeypatch.setattr(app_module, "_setup_job_file_logging", MagicMock())
+        monkeypatch.setattr(app_module, "_cleanup_job_file_handler", MagicMock())
+        app_module._clear_stop()
+
+        await app_module._process_orchestrator_job("fresh-lifecycle", "description")
+
+        assert events == ["close"]
+        client.report_completion.assert_not_awaited()
+        agent.abandon_worker_subagents.assert_awaited_once()
+        assert client.heartbeat.await_args.kwargs["status"] == "draining"
+        assert client.heartbeat.await_args.kwargs["job_id"] == "fresh-lifecycle"
+        assert app_module._shutdown_requested is True
+        schedule_exit.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_resumed_job_lifecycle_failure_drains_without_completion_report(
+        self, monkeypatch
+    ):
+        import src.api.app as app_module
+        from src.api.models import JobResumeRequest
+        from src.shared.subagent_lifecycle import SubagentRecoveryError
+
+        events: list[str] = []
+        client = MagicMock()
+        client.agent_id = AGENT_ID
+        client.dispatch_process_generation = PROCESS_GENERATION
+        client.report_completion = AsyncMock()
+        client.heartbeat = AsyncMock(return_value={})
+        agent = MagicMock()
+        agent.config.agent_id = "worker_base"
+        agent._tool_context = None
+        agent.abandon_worker_subagents = AsyncMock()
+        agent.process_job = AsyncMock(
+            return_value=_TrackedStream(
+                [], events, error=SubagentRecoveryError("recovery failed")
+            )
+        )
+        schedule_exit = MagicMock()
+
+        monkeypatch.delenv("POD_UID", raising=False)
+        monkeypatch.setattr(app_module, "_agent", agent)
+        monkeypatch.setattr(app_module, "_orchestrator_client", client)
+        monkeypatch.setattr(app_module, "_current_job_id", None)
+        monkeypatch.setattr(app_module, "_current_job_task", None)
+        monkeypatch.setattr(app_module, "_shutdown_requested", False)
+        monkeypatch.setattr(app_module, "_schedule_fatal_exit", schedule_exit)
+        monkeypatch.setattr(app_module, "_setup_job_file_logging", MagicMock())
+        monkeypatch.setattr(app_module, "_cleanup_job_file_handler", MagicMock())
+        app_module._clear_stop()
+
+        app = app_module.create_app()
+        resume_ep = next(
+            route.endpoint
+            for route in app.routes
+            if getattr(route, "path", "") == "/job/resume"
+        )
+        await resume_ep(
+            JobResumeRequest(
+                job_id="resume-lifecycle",
+                recipient=_recipient("resume-lifecycle"),
+                **_workspace_bundle(),
+            ),
+            MagicMock(),
+        )
+        await app_module._current_job_task
+
+        assert events == ["close"]
+        client.report_completion.assert_not_awaited()
+        agent.abandon_worker_subagents.assert_awaited_once()
+        assert client.heartbeat.await_args.kwargs["status"] == "draining"
+        assert client.heartbeat.await_args.kwargs["job_id"] == "resume-lifecycle"
+        schedule_exit.assert_called_once_with()
 
 
 def create_app_for_testing():

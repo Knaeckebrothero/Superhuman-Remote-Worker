@@ -65,6 +65,7 @@ def _restore_dual_app_globals():
         "_orchestrator_client",
         "_pending_exit_task",
         "_heartbeat_task",
+        "_shutdown_requested",
     )
     saved = {name: getattr(dual_app, name) for name in names}
     stop_req, stop_done = (
@@ -263,8 +264,64 @@ class TestProcessJobCompletionOrdering:
 
         assert events == ["close", "report", "reset"]
 
+    @pytest.mark.asyncio
+    async def test_lifecycle_failure_drains_without_report_or_idle_reset(
+        self, tmp_path, monkeypatch
+    ):
+        from src.api import dual_app
+        from src.shared.subagent_lifecycle import SubagentQuiescenceError
+
+        client = _reset_module(dual_app, pod_state=dual_app.PodState.WORKING)
+        dual_app._current_job_id = "job-lifecycle"
+        dual_app._shutdown_requested = False
+        monkeypatch.setenv("AGENT_LOOP", "1")
+        events: list[str] = []
+        agent = MagicMock()
+        agent._tool_context = None
+        agent.abandon_worker_subagents = AsyncMock()
+        agent.process_job = AsyncMock(
+            return_value=_TrackedStream(
+                [], events, error=SubagentQuiescenceError("delivery failed")
+            )
+        )
+        dual_app._agent = agent
+        reset = AsyncMock()
+        schedule_exit = MagicMock()
+        monkeypatch.setattr(dual_app, "_reset_to_idle", reset)
+        monkeypatch.setattr(dual_app, "_schedule_exit", schedule_exit)
+
+        from src.core import workspace as ws_mod
+
+        monkeypatch.setattr(ws_mod, "get_logs_path", lambda: tmp_path)
+
+        await dual_app._process_orchestrator_job("job-lifecycle", "desc")
+
+        assert events == ["close"]
+        client.report_completion.assert_not_awaited()
+        reset.assert_not_awaited()
+        agent.abandon_worker_subagents.assert_awaited_once()
+        assert client.heartbeat.await_args.kwargs["status"] == "draining"
+        assert client.heartbeat.await_args.kwargs["job_id"] == "job-lifecycle"
+        assert dual_app._shutdown_requested is True
+        assert dual_app._pod_state == dual_app.PodState.WORKING
+        schedule_exit.assert_called_once_with(delay=1.0)
+
 
 class TestJobStreamCloseCancellation:
+    @pytest.mark.asyncio
+    async def test_close_timeout_is_a_typed_lifecycle_failure(self, monkeypatch):
+        from src.api import dual_app
+        from src.shared.subagent_lifecycle import SubagentQuiescenceError
+
+        class _HungStream:
+            async def aclose(self):
+                await asyncio.Future()
+
+        monkeypatch.setattr(dual_app, "_JOB_STREAM_CLOSE_TIMEOUT_SECONDS", 0.001)
+
+        with pytest.raises(SubagentQuiescenceError, match="cleanup timed out"):
+            await dual_app._close_job_stream(_HungStream(), job_id="hung-close")
+
     @pytest.mark.asyncio
     async def test_caller_cancellation_waits_for_close_owner(self):
         from src.api import dual_app
@@ -360,6 +417,78 @@ class TestResumeJobStreamClose:
         await dual_app._current_job_task
 
         assert events == ["close", "report", "reset"]
+
+    @pytest.mark.asyncio
+    async def test_lifecycle_failure_resume_drains_without_report_or_reset(
+        self, tmp_path, monkeypatch
+    ):
+        from src.api import dual_app
+        from src.api.models import JobResumeRequest, PinnedJobRecipient
+        from src.shared.subagent_lifecycle import SubagentRecoveryError
+
+        client = _reset_module(dual_app)
+        client.dispatch_process_generation = "process-lifecycle-resume"
+        dual_app._shutdown_requested = False
+        monkeypatch.delenv("POD_UID", raising=False)
+        monkeypatch.setenv("AGENT_LOOP", "1")
+        events: list[str] = []
+        agent = MagicMock()
+        agent._tool_context = None
+        agent.abandon_worker_subagents = AsyncMock()
+        agent.process_job = AsyncMock(
+            return_value=_TrackedStream(
+                [], events, error=SubagentRecoveryError("recovery failed")
+            )
+        )
+        dual_app._agent = agent
+        reset = AsyncMock()
+        schedule_exit = MagicMock()
+        monkeypatch.setattr(dual_app, "_reset_to_idle", reset)
+        monkeypatch.setattr(dual_app, "_schedule_exit", schedule_exit)
+
+        from src.core import workspace as ws_mod
+
+        monkeypatch.setattr(ws_mod, "get_logs_path", lambda: tmp_path)
+        app = dual_app.create_dual_app()
+        resume_ep = next(
+            route.endpoint
+            for route in app.routes
+            if getattr(route, "path", "") == "/job/resume"
+        )
+
+        await resume_ep(
+            JobResumeRequest(
+                job_id="job-lifecycle-resume",
+                config_override={
+                    "workspace": {
+                        "backend": "sandbox",
+                        "remote": {"host": "workspace.test"},
+                    }
+                },
+                workspace_runtime={
+                    "requested_backend": None,
+                    "assigned_backend": "sandbox",
+                    "effective_backend": "sandbox",
+                    "state": "ready",
+                },
+                recipient=PinnedJobRecipient(
+                    expected_agent_id="agent-1",
+                    expected_pod_uid=None,
+                    expected_process_generation="process-lifecycle-resume",
+                    expected_job_id="job-lifecycle-resume",
+                ),
+            )
+        )
+        await dual_app._current_job_task
+
+        assert events == ["close"]
+        client.report_completion.assert_not_awaited()
+        reset.assert_not_awaited()
+        agent.abandon_worker_subagents.assert_awaited_once()
+        assert client.heartbeat.await_args.kwargs["status"] == "draining"
+        assert client.heartbeat.await_args.kwargs["job_id"] == ("job-lifecycle-resume")
+        assert dual_app._shutdown_requested is True
+        schedule_exit.assert_called_once_with(delay=1.0)
 
 
 class TestCancelHardKillResets:
