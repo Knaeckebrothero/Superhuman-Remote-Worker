@@ -1005,9 +1005,7 @@ async def test_ssh_key_added_open_action_navigates_and_resolves():
     handler = action_handler("ssh_key_added", "open")
     assert handler is not None
 
-    result = await handler(
-        ActionContext(notification={}, user={"id": "u1"}, params={})
-    )
+    result = await handler(ActionContext(notification={}, user={"id": "u1"}, params={}))
     assert result.resolve is True
     assert result.result == {"navigate": "/settings/ssh-keys"}
 

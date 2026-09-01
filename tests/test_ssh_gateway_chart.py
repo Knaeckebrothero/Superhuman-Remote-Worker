@@ -648,7 +648,9 @@ def test_ingress_host_follows_cockpits_actual_apiurl(docs: list[dict]) -> None:
     same_origin_off = _render(*ENABLE, "--set", "auth.bff.sameOriginApi=false")
     same_origin_on = _render(*ENABLE, "--set", "auth.bff.sameOriginApi=true")
 
-    host_off = _one(same_origin_off, "Ingress", "ssh-gateway")["spec"]["rules"][0]["host"]
+    host_off = _one(same_origin_off, "Ingress", "ssh-gateway")["spec"]["rules"][0][
+        "host"
+    ]
     host_on = _one(same_origin_on, "Ingress", "ssh-gateway")["spec"]["rules"][0]["host"]
 
     assert host_off == "api.example.com"
@@ -663,7 +665,9 @@ def test_ingress_host_follows_cockpits_actual_apiurl(docs: list[dict]) -> None:
     ].endswith("-cockpit-tls")
 
 
-def test_cockpit_env_js_apiurl_host_matches_the_gateway_ingress(docs: list[dict]) -> None:
+def test_cockpit_env_js_apiurl_host_matches_the_gateway_ingress(
+    docs: list[dict],
+) -> None:
     """The other half of the C1 regression: prove the two templates that
     independently compute "cockpit's API host" (cockpit/deployment.yaml's
     `env.js` and ssh-gateway/ingress.yaml's Ingress host) can no longer
@@ -673,7 +677,9 @@ def test_cockpit_env_js_apiurl_host_matches_the_gateway_ingress(docs: list[dict]
 
     for override in ("false", "true"):
         rendered = _render(*ENABLE, "--set", f"auth.bff.sameOriginApi={override}")
-        ingress_host = _one(rendered, "Ingress", "ssh-gateway")["spec"]["rules"][0]["host"]
+        ingress_host = _one(rendered, "Ingress", "ssh-gateway")["spec"]["rules"][0][
+            "host"
+        ]
         configmap = _one(rendered, "ConfigMap", "cockpit-env")
         env_js = configmap["data"]["env.js"]
         match = re.search(r"apiUrl'\] = '([^']+)'", env_js)

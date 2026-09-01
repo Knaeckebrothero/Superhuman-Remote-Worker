@@ -43,9 +43,7 @@ def _components(objects: list[dict], component: str) -> list[dict]:
     return [
         item
         for item in objects
-        if item.get("metadata", {})
-        .get("labels", {})
-        .get("app.kubernetes.io/component")
+        if item.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/component")
         == component
     ]
 
@@ -78,7 +76,9 @@ def _assert_confined_public_http_egress(policy: dict) -> None:
         if rule.get("to", [{}])[0].get("ipBlock", {}).get("cidr") == "0.0.0.0/0"
     ]
     assert len(internet_rules) == 1
-    assert {(port["protocol"], port["port"]) for port in internet_rules[0]["ports"]} == {
+    assert {
+        (port["protocol"], port["port"]) for port in internet_rules[0]["ports"]
+    } == {
         ("TCP", 80),
         ("TCP", 443),
     }
@@ -134,12 +134,16 @@ def test_flags_disable_searxng_and_enable_confined_crawl4ai() -> None:
     container = pod_spec["containers"][0]
     assert container["resources"]["limits"]["memory"] == "4Gi"
     assert container["securityContext"]["readOnlyRootFilesystem"] is True
-    token = next(item for item in container["env"] if item["name"] == "CRAWL4AI_API_TOKEN")
+    token = next(
+        item for item in container["env"] if item["name"] == "CRAWL4AI_API_TOKEN"
+    )
     assert token["valueFrom"]["secretKeyRef"]["key"] == "CRAWL4AI_API_TOKEN"
-    signing_key = next(item for item in container["env"] if item["name"] == "SECRET_KEY")
-    assert signing_key["valueFrom"]["secretKeyRef"] == token["valueFrom"][
-        "secretKeyRef"
-    ]
+    signing_key = next(
+        item for item in container["env"] if item["name"] == "SECRET_KEY"
+    )
+    assert (
+        signing_key["valueFrom"]["secretKeyRef"] == token["valueFrom"]["secretKeyRef"]
+    )
 
     config = _one(objects, "crawl4ai", "ConfigMap")["data"]["config.yml"]
     assert "jwt_enabled: true" in config

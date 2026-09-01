@@ -379,7 +379,9 @@ def test_firecrawl_declared_ops_return_normalized_shapes():
         api_key="fc-test",
     )
 
-    with patch("src.tools.research.search.firecrawl.httpx.Client", return_value=manager):
+    with patch(
+        "src.tools.research.search.firecrawl.httpx.Client", return_value=manager
+    ):
         assert adapter.search("query", 5, include_raw_content=True) == [
             Result(
                 title="Search result",
@@ -428,7 +430,9 @@ def test_firecrawl_zero_results_is_an_answer():
     client.post.return_value = response
     adapter = FirecrawlAdapter(base_url="https://firecrawl.internal/v2")
 
-    with patch("src.tools.research.search.firecrawl.httpx.Client", return_value=manager):
+    with patch(
+        "src.tools.research.search.firecrawl.httpx.Client", return_value=manager
+    ):
         assert adapter.search("nothing", 5) == []
 
 
@@ -498,7 +502,9 @@ def test_firecrawl_target_url_never_changes_http_request_origin(
     manager.__exit__.return_value = False
     adapter = FirecrawlAdapter(base_url="https://firecrawl.internal/v2")
 
-    with patch("src.tools.research.search.firecrawl.httpx.Client", return_value=manager):
+    with patch(
+        "src.tools.research.search.firecrawl.httpx.Client", return_value=manager
+    ):
         if method == "extract":
             adapter.extract([influenced_url])
         else:

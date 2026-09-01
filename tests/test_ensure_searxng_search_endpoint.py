@@ -62,9 +62,7 @@ async def test_existing_primary_places_searxng_in_empty_fallback(primary):
     db = _db(defaults={"search": primary})
 
     assert (
-        await ensure_searxng_search_endpoint(
-            db, base_url="http://srw-searxng:8080"
-        )
+        await ensure_searxng_search_endpoint(db, base_url="http://srw-searxng:8080")
         is True
     )
 
@@ -78,9 +76,7 @@ async def test_existing_fallback_is_not_clobbered():
     db = _db(defaults={"search": "brave", "search_fallback": "second-brave"})
 
     assert (
-        await ensure_searxng_search_endpoint(
-            db, base_url="http://srw-searxng:8080"
-        )
+        await ensure_searxng_search_endpoint(db, base_url="http://srw-searxng:8080")
         is True
     )
 
@@ -108,9 +104,7 @@ async def test_second_boot_and_admin_deleted_model_are_not_recreated():
     )
 
     assert (
-        await ensure_searxng_search_endpoint(
-            db, base_url="http://srw-searxng:8080"
-        )
+        await ensure_searxng_search_endpoint(db, base_url="http://srw-searxng:8080")
         is False
     )
     db.create_system_llm_endpoint.assert_not_awaited()
@@ -123,9 +117,7 @@ async def test_catalog_conflict_does_not_write_defaults():
     db = _db(inserted=False)
 
     assert (
-        await ensure_searxng_search_endpoint(
-            db, base_url="http://srw-searxng:8080"
-        )
+        await ensure_searxng_search_endpoint(db, base_url="http://srw-searxng:8080")
         is False
     )
     db.set_default_llm_model.assert_not_awaited()
