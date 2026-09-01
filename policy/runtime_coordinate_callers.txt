@@ -27,6 +27,7 @@ orchestrator/main.py  _detach_agent_session  http  client.post  5e8b40a94fa6  #1
 orchestrator/main.py  _dispatch_job_to_agent  http  client.post  d2ec1a50b42e  #1  exact-runtime-recipient
 orchestrator/main.py  _forward_to_agent  http  client.post  354d7ac9ee96  #1  exact-runtime-recipient
 orchestrator/main.py  _initiate_pause  http  client.post  c40208b4763b  #1  exact-runtime-recipient
+orchestrator/main.py  _parse_ssh_gateway_host_keys  ssh  asyncssh.import_public_key  4fe182bafd50  #1  local-only
 orchestrator/main.py  _prepare_pinned_job_mutation_target  http  client.get  8c74982a3556  #1  read-only-probe
 orchestrator/main.py  _prepare_pinned_session_mutation_target  http  client.get  8c74982a3556  #1  read-only-probe
 orchestrator/main.py  _recover_captured_sandbox_process_zero  remote-effect  RemoteBackend  0ff44667792a  #1  contained-k8s
@@ -89,6 +90,8 @@ orchestrator/services/snapshot_service.py  SnapshotService._collect_environment_
 orchestrator/services/snapshot_service.py  SnapshotService.capture_vm_snapshot  remote-effect  create_owned_subprocess_exec  48e3950913b3  #1  vm-authority
 orchestrator/services/snapshot_service.py  SnapshotService.capture_vm_snapshot  remote-effect  create_owned_subprocess_exec  a2b4f48f9bae  #1  vm-authority
 orchestrator/services/snapshot_service.py  SnapshotService.capture_vm_snapshot  remote-effect  self.upload_snapshot  8d7e90952645  #1  vm-authority
+orchestrator/services/ssh_gateway_client.py  resolve_target  ssh  SshTarget  2d5328ea1c45  #1  pinned-host-key
+orchestrator/services/ssh_gateway_server.py  connect_upstream  socket  asyncssh.connect  463ff14e685e  #1  pinned-host-key
 orchestrator/services/ssh_helpers.py  _scan_pinned_host_key  remote-effect  create_owned_subprocess_exec  5aba5e03ae48  #1  pinned-host-key
 orchestrator/services/ssh_helpers.py  pinned_agent_ssh_command  ssh  SSHHostKeyVerificationError  e9c8cd6548e1  #1  pinned-host-key
 orchestrator/services/ssh_helpers.py  pinned_agent_ssh_command  ssh  build_agent_ssh_cmd  1655b1e96d17  #1  pinned-host-key
