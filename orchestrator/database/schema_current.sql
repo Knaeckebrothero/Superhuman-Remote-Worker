@@ -15904,7 +15904,7 @@ CREATE TABLE public.models (
     notes text,
     created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
     updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT models_capabilities_check CHECK (((cardinality(capabilities) >= 1) AND (capabilities <@ ARRAY['chat'::text, 'auxiliary'::text, 'embedding'::text, 'vision'::text, 'whisper'::text, 'tts'::text]))),
+    CONSTRAINT models_capabilities_check CHECK (((cardinality(capabilities) >= 1) AND (capabilities <@ ARRAY['chat'::text, 'auxiliary'::text, 'embedding'::text, 'vision'::text, 'whisper'::text, 'tts'::text, 'search'::text, 'fetch'::text]))),
     CONSTRAINT models_provider_kind_check CHECK ((provider_kind = ANY (ARRAY['system'::text, 'endpoint'::text])))
 );
 
@@ -18309,13 +18309,11 @@ CREATE TABLE public.thread_input_deliveries (
     owner_executor text,
     owner_executor_pod_uid text,
     CONSTRAINT thread_input_deliveries_admission_shape CHECK ((((state <> ALL (ARRAY['admitted'::text, 'settled'::text])) AND (admitted_at IS NULL) AND (admitted_turn_number IS NULL)) OR ((state = ANY (ARRAY['admitted'::text, 'settled'::text])) AND (admitted_at IS NOT NULL) AND (admitted_turn_number IS NOT NULL)))),
-    CONSTRAINT thread_input_deliveries_cancellation_shape CHECK ((((state <> 'cancelled'::text) AND (cancelled_at IS NULL) AND (cancelled_turn_number IS NULL) AND (cancelled_reason IS NULL)) OR ((state = 'cancelled'::text) AND (source = 'direct_human'::text) AND (cancelled_at IS NOT NULL) AND (cancelled_turn_number IS NOT NULL) AND (cancelled_turn_number > 0) AND (cancelled_reason IS NOT NULL) AND (btrim(cancelled_reason) <> ''::text) AND (length(cancelled_reason) <= 120)))),
     CONSTRAINT thread_input_deliveries_claim_generation_check CHECK ((claim_generation >= 0)),
     CONSTRAINT thread_input_deliveries_claim_shape CHECK ((((execution_lane = 'pinned'::text) AND (((claim_generation = 0) AND (owner_agent_id IS NULL)) OR ((claim_generation > 0) AND (owner_agent_id IS NOT NULL)))) OR (execution_lane = 'stateless'::text))),
     CONSTRAINT thread_input_deliveries_lane_check CHECK ((execution_lane = ANY (ARRAY['pinned'::text, 'stateless'::text]))),
     CONSTRAINT thread_input_deliveries_owner_shape CHECK ((((execution_lane = 'pinned'::text) AND (owner_run_queue_lease_token IS NULL) AND (owner_executor IS NULL) AND (owner_executor_pod_uid IS NULL) AND (((owner_agent_id IS NULL) AND (owner_pod_uid IS NULL) AND (owner_runtime_generation IS NULL)) OR ((owner_agent_id IS NOT NULL) AND (owner_pod_uid IS NOT NULL) AND (owner_runtime_generation IS NOT NULL)))) OR ((execution_lane = 'stateless'::text) AND (owner_agent_id IS NULL) AND (owner_pod_uid IS NULL) AND (owner_runtime_generation IS NULL) AND (((claim_generation = 0) AND (owner_run_queue_lease_token IS NULL) AND (owner_executor IS NULL) AND (owner_executor_pod_uid IS NULL)) OR ((claim_generation > 0) AND (owner_run_queue_lease_token IS NOT NULL) AND (owner_run_queue_lease_token > 0) AND (owner_executor IS NOT NULL) AND (btrim(owner_executor) <> ''::text) AND (owner_executor_pod_uid IS NOT NULL) AND (btrim(owner_executor_pod_uid) <> ''::text)))))),
-    CONSTRAINT thread_input_deliveries_settlement_shape CHECK (((state = 'settled'::text) = (settled_at IS NOT NULL))),
-    CONSTRAINT thread_input_deliveries_state_check CHECK ((state = ANY (ARRAY['persisted'::text, 'owned'::text, 'queued'::text, 'admitted'::text, 'settled'::text, 'deferred'::text, 'cancelled'::text])))
+    CONSTRAINT thread_input_deliveries_settlement_shape CHECK (((state = 'settled'::text) = (settled_at IS NOT NULL)))
 );
 
 
@@ -21354,6 +21352,14 @@ ALTER TABLE ONLY public.thread_events
 
 
 --
+-- Name: thread_input_deliveries thread_input_deliveries_cancellation_shape; Type: CHECK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE public.thread_input_deliveries
+    ADD CONSTRAINT thread_input_deliveries_cancellation_shape CHECK ((((state <> 'cancelled'::text) AND (cancelled_at IS NULL) AND (cancelled_turn_number IS NULL) AND (cancelled_reason IS NULL)) OR ((state = 'cancelled'::text) AND (source = 'direct_human'::text) AND (cancelled_at IS NOT NULL) AND (cancelled_turn_number IS NOT NULL) AND (cancelled_turn_number > 0) AND (cancelled_reason IS NOT NULL) AND (btrim(cancelled_reason) <> ''::text) AND (length(cancelled_reason) <= 120)))) NOT VALID;
+
+
+--
 -- Name: thread_input_deliveries thread_input_deliveries_message_id_key; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -21367,6 +21373,14 @@ ALTER TABLE ONLY public.thread_input_deliveries
 
 ALTER TABLE ONLY public.thread_input_deliveries
     ADD CONSTRAINT thread_input_deliveries_pkey PRIMARY KEY (delivery_id);
+
+
+--
+-- Name: thread_input_deliveries thread_input_deliveries_state_check; Type: CHECK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE public.thread_input_deliveries
+    ADD CONSTRAINT thread_input_deliveries_state_check CHECK ((state = ANY (ARRAY['persisted'::text, 'owned'::text, 'queued'::text, 'admitted'::text, 'settled'::text, 'deferred'::text, 'cancelled'::text]))) NOT VALID;
 
 
 --
