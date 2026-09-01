@@ -11,13 +11,44 @@ metadata:
 data:
   provision.sql: |
 {{ .Files.Get "files/canvas-viewer-role.sql" | indent 4 }}
+{{- /*
+A Helm hook, not a plain resource. As a plain resource this Job was rendered
+into the release manifest, ran, and was then deleted by its own
+ttlSecondsAfterFinished — so Fleet, which builds its monitored set from
+release.Manifest, reported `job.batch <name> missing` and parked the bundle in
+Modified about five minutes after every single deploy. Hooks live in
+release.Hooks, which Fleet never reads, so the bundle stays green and a real
+failure surfaces as a failed release instead of the same generic Modified.
+
+The `-{{ .Release.Revision }}` name suffix went with it: it only existed to dodge
+Job-spec immutability across upgrades, which `before-hook-creation` now handles.
+
+The orchestrator.replicas guard is NOT optional — Helm blocks on a post-upgrade
+hook until it finishes, and this Job waits on a schema the orchestrator applies
+at startup. At replicas:0 it can never pass, wedging the release in
+pending-upgrade and blocking every later apply INCLUDING the one that scales the
+orchestrator back up. That deadlock cost two manual recoveries on 2026-08-23;
+see the same guard and the same reasoning in ../orchestrator/llm-seed-job.yaml.
+Use `gt (int ...) 0`, never `default` — Helm's `default` treats 0 as empty.
+
+The payload ConfigMap and the NetworkPolicy stay plain resources: post-* hooks
+run after the main manifest is applied, so both are already in place when this
+runs, and leaving them out of the hook set keeps them under Fleet's watch.
+*/ -}}
+{{- if gt (int .Values.orchestrator.replicas) 0 }}
 ---
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ include "srw.fullname" . }}-canvas-gateway-role-{{ .Release.Revision }}
+  name: {{ include "srw.fullname" . }}-canvas-gateway-role
   labels:
     {{- include "srw.componentLabels" (dict "context" . "component" "canvas-gateway-role") | nindent 4 }}
+  annotations:
+    # hook-weight 10 matches the seed Jobs: run after all weight<10 hooks and
+    # after the main manifest, so the orchestrator is up and migrating.
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
 spec:
   activeDeadlineSeconds: 600
   backoffLimit: 4
@@ -99,6 +130,7 @@ spec:
         - name: role-sql
           configMap:
             name: {{ include "srw.fullname" . }}-canvas-gateway-role
+{{- end }}
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
