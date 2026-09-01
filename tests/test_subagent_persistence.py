@@ -252,17 +252,25 @@ class TestOpen:
         assert ledger.failed == {CHILD}
 
     @pytest.mark.asyncio
-    async def test_the_row_id_the_orchestrator_returns_is_what_later_writes_use(self):
-        client, pool = _client("other-id"), _pool()
+    async def test_a_mismatched_row_id_is_refused_before_later_writes(self):
+        other = "99999999-9999-4999-8999-999999999999"
+        client, pool = _client(other), _pool()
         ledger = DbSubagentLedger(client, pool)
         await ledger.open(CHILD, **_open_fields())
-        assert ledger.thread_id_for(CHILD) == "other-id"
+        assert ledger.thread_id_for(CHILD) is None
+        assert ledger.failed == {CHILD}
         await ledger.update(CHILD, status="completed")
-        assert pool.update_subagent_thread.await_args.args == ("other-id",)
-        assert (
-            pool.update_subagent_thread.await_args.kwargs["runtime_generation"]
-            == GENERATION
-        )
+        pool.update_subagent_thread.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_background_mismatched_row_id_fails_closed(self):
+        other = "99999999-9999-4999-8999-999999999999"
+        ledger = DbSubagentLedger(_client(other), _pool())
+        with pytest.raises(SubagentPersistenceRefused):
+            await ledger.open(
+                CHILD,
+                **_open_fields(status="queued", run_in_background=True),
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -780,6 +788,14 @@ def _parent(tmp_path, *, client, pool) -> ToolContext:
 @pytest.mark.asyncio
 async def test_a_real_child_run_lands_its_row_transcript_and_terminal_update(tmp_path):
     client, pool = _client(), _pool()
+
+    async def _echo_child_receipt(_job_id, *, subagent_id, **_kwargs):
+        return {
+            "thread_id": subagent_id,
+            "runtime_generation": GENERATION,
+        }
+
+    client.create_subagent_thread.side_effect = _echo_child_receipt
     ctx = _parent(tmp_path, client=client, pool=pool)
     host = WorkerHost.from_context(ctx)
     ledger = DbSubagentLedger.from_context(ctx)
@@ -828,7 +844,7 @@ async def test_a_real_child_run_lands_its_row_transcript_and_terminal_update(tmp
     # The transcript: the brief, the tool-calling turn, the tool result, the
     # answer — every row on the child's thread id, serialised by role.
     rows = [c.kwargs for c in pool.save_subagent_thread_message.await_args_list]
-    assert rows and all(r["thread_id"] == CHILD for r in rows)
+    assert rows and all(r["thread_id"] == record.subagent_id for r in rows)
     roles = [r["role"] for r in rows]
     assert roles[0] == "human" and "secret word" in rows[0]["content"]
     assert "tool" in roles and "ai" in roles
@@ -837,7 +853,7 @@ async def test_a_real_child_run_lands_its_row_transcript_and_terminal_update(tmp
 
     # The terminal update: ended, completed, the counters and the spill.
     final = pool.update_subagent_thread.await_args
-    assert final.args == (CHILD,)
+    assert final.args == (record.subagent_id,)
     assert final.kwargs["runtime_generation"] == GENERATION
     assert final.kwargs["status"] == "ended" and final.kwargs["ended"] is True
     assert final.kwargs["subagent_status"] == "completed"

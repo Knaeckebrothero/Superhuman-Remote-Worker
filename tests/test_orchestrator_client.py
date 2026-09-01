@@ -1354,6 +1354,21 @@ class TestSubagentGenerationClient:
             is None
         )
 
+        response.json.return_value = {
+            "thread_id": "99999999-9999-4999-8999-999999999999",
+            "runtime_generation": RUNTIME_GENERATION,
+        }
+        assert (
+            await client.create_subagent_thread(
+                self.JOB,
+                parent_authority=self.authority,
+                subagent_id=self.CHILD,
+                handle="explorer-7f3a",
+                subagent_type="explorer",
+            )
+            is None
+        )
+
     @pytest.mark.asyncio
     async def test_background_create_refusal_is_not_downgraded_to_no_row(self, client):
         stale = MagicMock(status_code=409)
@@ -1382,6 +1397,23 @@ class TestSubagentGenerationClient:
             await client.create_subagent_thread(
                 self.JOB,
                 parent_authority=self.authority,
+                handle="explorer-7f3a",
+                subagent_type="explorer",
+                run_in_background=True,
+                initial_status="queued",
+            )
+
+        mismatched = MagicMock(status_code=200)
+        mismatched.json.return_value = {
+            "thread_id": "99999999-9999-4999-8999-999999999999",
+            "runtime_generation": RUNTIME_GENERATION,
+        }
+        client._client.post.return_value = mismatched
+        with pytest.raises(SubagentPersistenceError):
+            await client.create_subagent_thread(
+                self.JOB,
+                parent_authority=self.authority,
+                subagent_id=self.CHILD,
                 handle="explorer-7f3a",
                 subagent_type="explorer",
                 run_in_background=True,

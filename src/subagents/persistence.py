@@ -358,24 +358,36 @@ class DbSubagentLedger:
             return None
         thread_id = str(created.get("thread_id") or "").strip()
         generation = str(created.get("runtime_generation") or "").strip()
-        if not thread_id or not generation:
+        try:
+            exact_thread_id = str(UUID(thread_id))
+            exact_subagent_id = str(UUID(subagent_id))
+            exact_generation = str(UUID(generation))
+        except (TypeError, ValueError, AttributeError):
+            exact_thread_id = exact_subagent_id = exact_generation = ""
+        if (
+            not exact_thread_id
+            or exact_thread_id != exact_subagent_id
+            or not exact_generation
+        ):
             self._failed.add(subagent_id)
             if background:
                 raise SubagentPersistenceRefused(
-                    f"background subagent create returned no generation for {subagent_id}"
+                    "background subagent create returned a mismatched identity "
+                    f"or generation for {subagent_id}"
                 )
             logger.warning(
-                "subagent ledger: create for %s returned no generation token",
+                "subagent ledger: create for %s returned a mismatched identity "
+                "or generation token",
                 fields.get("handle") or subagent_id,
             )
             return None
-        self._rows[subagent_id] = thread_id
-        self._generations[subagent_id] = generation
+        self._rows[subagent_id] = exact_thread_id
+        self._generations[subagent_id] = exact_generation
         self._parent_jobs[subagent_id] = job_id
         self._handles[subagent_id] = str(fields.get("handle") or "")
         return {
-            "thread_id": thread_id,
-            "runtime_generation": generation,
+            "thread_id": exact_thread_id,
+            "runtime_generation": exact_generation,
         }
 
     async def persist_message(

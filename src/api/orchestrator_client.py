@@ -765,8 +765,19 @@ class OrchestratorClient:
                 thread_id = data.get("thread_id")
                 runtime_generation = data.get("runtime_generation")
                 try:
+                    returned_thread_id = UUID(str(thread_id))
+                    expected_thread_id = (
+                        UUID(str(subagent_id)) if subagent_id is not None else None
+                    )
+                    if (
+                        expected_thread_id is not None
+                        and returned_thread_id != expected_thread_id
+                    ):
+                        raise ValueError(
+                            "subagent create receipt returned a different thread id"
+                        )
                     lease = {
-                        "thread_id": str(UUID(str(thread_id))),
+                        "thread_id": str(returned_thread_id),
                         "runtime_generation": str(UUID(str(runtime_generation))),
                     }
                 except (ValueError, TypeError, AttributeError):
