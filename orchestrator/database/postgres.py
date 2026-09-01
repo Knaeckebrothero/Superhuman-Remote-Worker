@@ -56,6 +56,7 @@ from src.shared.pinned_session_identity import PinnedSessionBinding
 from src.shared.session_retirement import stateless_settled_retirement_authority
 from src.shared.subagent_parent_authority import (
     ParentExecutionAuthority,
+    ParentExecutionAuthorityRefused,
     require_parent_execution_authority,
 )
 from src.shared.deliverable_contract import (
@@ -300,6 +301,48 @@ class OrphanRecoveryBatch:
 
     def __bool__(self) -> bool:
         return bool(self.count)
+
+
+class CompletionDecisionBlocked(RuntimeError):
+    """A job cannot decide completion while child evidence is still live.
+
+    This is deliberately distinct from the historical ``False`` result of
+    :meth:`PostgresDB.set_completion_decision`: ``False`` continues to mean
+    that the job is absent or already terminal, while this exception carries
+    the precise, retryable reason a current worker was refused.
+    """
+
+    code = "completion_decision_blocked"
+
+    def __init__(
+        self,
+        *,
+        live_subagents: int = 0,
+        queued_subagent_replies: int = 0,
+    ) -> None:
+        self.live_subagents = max(0, int(live_subagents))
+        self.queued_subagent_replies = max(0, int(queued_subagent_replies))
+        if self.live_subagents and self.queued_subagent_replies:
+            self.reason = "live_subagents_and_queued_subagent_replies"
+        elif self.live_subagents:
+            self.reason = "live_subagents"
+        else:
+            self.reason = "queued_subagent_replies"
+        super().__init__(self.reason)
+
+    def detail(self) -> dict[str, Any]:
+        """Bounded HTTP-safe refusal detail for the internal endpoint."""
+
+        return {
+            "code": self.code,
+            "reason": self.reason,
+            "live_subagents": self.live_subagents,
+            "queued_subagent_replies": self.queued_subagent_replies,
+            "message": (
+                "Job completion is blocked until every live subagent has "
+                "settled and every queued subagent report has been consumed."
+            ),
+        }
 
 
 #: Every lifecycle status a job row may carry. Mirrors the cockpit's
@@ -8627,11 +8670,19 @@ class PostgresDB:
         Journal-before-observe (knowledge-base/knowledge/issues/
         job_finalization_decisions_held_only_in_process_memory.md): the agent's
         ``job_complete`` tool calls this THROUGH the orchestrator before it
-        returns to the model, so the decision survives any restart. One atomic
-        statement on the ``jobs`` row — the later status transition updates the
-        same row, so decision and status can never diverge across a partial
-        write. CAS-guarded on non-terminal status: a stale agent must not
-        rewrite the journal of a job that already reached a terminal state.
+        returns to the model, so the decision survives any restart. The parent
+        job is locked first, matching child create/terminal lock order. A
+        separate statement after that lock is acquired observes commits made
+        by a child transaction that won the lock race; checking children in
+        the locking statement itself would retain its pre-wait READ COMMITTED
+        snapshot and could miss that commit.
+
+        The decision is refused while any child is live or any durable
+        subagent report remains in ``context.queued_replies``. The later status
+        transition updates the same locked row, so decision and status cannot
+        diverge across a partial write. Terminal/missing jobs retain the
+        historical ``False`` result; retryable child blockers raise
+        :class:`CompletionDecisionBlocked` with a typed reason.
 
         Args:
             job_id: Job UUID as string
@@ -8641,6 +8692,10 @@ class PostgresDB:
         Returns:
             True if journaled; False if the job is missing, terminal, or the
             id is invalid.
+
+        Raises:
+            CompletionDecisionBlocked: a child is still live or its queued
+                report has not yet been consumed.
         """
         import json as json_module
 
@@ -8649,15 +8704,80 @@ class PostgresDB:
         except ValueError:
             return False
 
-        query = (
-            "UPDATE jobs "
-            "SET context = COALESCE(context, '{}'::jsonb) "
-            "    || jsonb_build_object('completion_decision', $1::jsonb), "
-            "    updated_at = CURRENT_TIMESTAMP "
-            "WHERE id = $2 AND status NOT IN ('completed', 'failed', 'cancelled')"
-        )
         async with self.acquire() as conn:
-            result = await conn.execute(query, json_module.dumps(decision), uuid_val)
+            async with conn.transaction():
+                # This lock is the serialization point shared with child
+                # creation and terminal delivery. Keep it as its own SQL
+                # statement: after a wait, the next READ COMMITTED statement
+                # receives a fresh snapshot that includes the winner's child
+                # row / queued report.
+                parent = await conn.fetchrow(
+                    """
+                    SELECT status
+                      FROM jobs
+                     WHERE id = $1::uuid
+                     FOR UPDATE
+                    """,
+                    uuid_val,
+                )
+                if parent is None or str(parent["status"]) in {
+                    "completed",
+                    "failed",
+                    "cancelled",
+                }:
+                    return False
+
+                blockers = await conn.fetchrow(
+                    """
+                    SELECT
+                        (
+                            SELECT count(*)
+                              FROM threads child
+                             WHERE child.kind = 'subagent'
+                               AND child.parent_job_id = parent.id
+                               AND child.status IN ('created', 'active')
+                               AND child.subagent_status IN ('queued', 'running')
+                        ) AS live_subagents,
+                        (
+                            SELECT count(*)
+                              FROM jsonb_array_elements(
+                                   CASE
+                                     WHEN jsonb_typeof(
+                                          COALESCE(parent.context, '{}'::jsonb)
+                                          ->'queued_replies'
+                                     ) = 'array'
+                                     THEN parent.context->'queued_replies'
+                                     ELSE '[]'::jsonb
+                                   END
+                              ) reply
+                             WHERE reply->>'source' = 'subagent'
+                        ) AS queued_subagent_replies
+                      FROM jobs parent
+                     WHERE parent.id = $1::uuid
+                    """,
+                    uuid_val,
+                )
+                live_subagents = int(blockers["live_subagents"] or 0)
+                queued_subagent_replies = int(blockers["queued_subagent_replies"] or 0)
+                if live_subagents or queued_subagent_replies:
+                    raise CompletionDecisionBlocked(
+                        live_subagents=live_subagents,
+                        queued_subagent_replies=queued_subagent_replies,
+                    )
+
+                result = await conn.execute(
+                    """
+                    UPDATE jobs
+                       SET context = COALESCE(context, '{}'::jsonb)
+                           || jsonb_build_object(
+                                'completion_decision', $1::jsonb
+                              ),
+                           updated_at = CURRENT_TIMESTAMP
+                     WHERE id = $2::uuid
+                    """,
+                    json_module.dumps(decision),
+                    uuid_val,
+                )
 
         return result == "UPDATE 1"
 
@@ -29411,7 +29531,9 @@ class PostgresDB:
     ) -> Dict[str, str] | None:
         """Create the ``threads`` row of a subagent child (U3 B.1) and return
         its id plus runtime generation, or ``None`` when the parent job does
-        not exist.
+        not exist. A parent that already journaled completion is refused: an
+        idempotent HTTP retry must not become authority to start or revive a
+        child after the completion barrier closed.
 
         The row is derived from the JOB in one statement — ``user_id`` and
         ``project_id`` come from ``jobs`` so ``require_thread_owner`` lets the
@@ -29481,6 +29603,19 @@ class PostgresDB:
                     parent_job_id=job_uuid,
                     mutation=True,
                 )
+                completion_decided = await conn.fetchval(
+                    """
+                    SELECT COALESCE(context, '{}'::jsonb)
+                           ? 'completion_decision'
+                      FROM jobs
+                     WHERE id = $1::uuid
+                    """,
+                    job_uuid,
+                )
+                if completion_decided is True:
+                    raise ParentExecutionAuthorityRefused(
+                        "completion_decision_recorded"
+                    )
                 row = await conn.fetchrow(
                     """
                 INSERT INTO threads (
@@ -29494,6 +29629,10 @@ class PostgresDB:
                        j.id, $5, $6, $7, $8, $10
                   FROM jobs j
                  WHERE j.id = $2
+                   AND NOT (
+                       COALESCE(j.context, '{}'::jsonb)
+                       ? 'completion_decision'
+                   )
                 ON CONFLICT (id) DO NOTHING
                 RETURNING id, runtime_generation
                 """,
@@ -29715,6 +29854,19 @@ class PostgresDB:
                     parent_job_id=job_uuid,
                     mutation=True,
                 )
+                completion_decided = await conn.fetchval(
+                    """
+                    SELECT COALESCE(context, '{}'::jsonb)
+                           ? 'completion_decision'
+                      FROM jobs
+                     WHERE id = $1::uuid
+                    """,
+                    job_uuid,
+                )
+                if completion_decided is True:
+                    raise ParentExecutionAuthorityRefused(
+                        "completion_decision_recorded"
+                    )
                 child = await conn.fetchrow(
                     """
                     SELECT status, runtime_generation
@@ -29757,6 +29909,15 @@ class PostgresDB:
                        AND parent_job_id = $2
                        AND runtime_generation = $3
                        AND status = 'ended'
+                       AND EXISTS (
+                           SELECT 1
+                             FROM jobs parent
+                            WHERE parent.id = $2
+                              AND NOT (
+                                  COALESCE(parent.context, '{}'::jsonb)
+                                  ? 'completion_decision'
+                              )
+                       )
                     RETURNING runtime_generation
                     """,
                     child_uuid,

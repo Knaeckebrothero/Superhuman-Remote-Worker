@@ -450,3 +450,31 @@ class TestRecordCompletionDecisionImpl:
         with pytest.raises(HTTPException) as exc:
             await self._call(db)
         assert exc.value.status_code == 409
+
+    @pytest.mark.asyncio
+    async def test_durable_subagent_barrier_is_a_typed_useful_409(self):
+        from fastapi import HTTPException
+        from orchestrator import main
+
+        db = self._db({"id": "j1", "status": "processing"})
+        db.set_completion_decision = AsyncMock(
+            side_effect=main.CompletionDecisionBlocked(
+                live_subagents=2,
+                queued_subagent_replies=1,
+            )
+        )
+
+        with pytest.raises(HTTPException) as exc:
+            await self._call(db)
+
+        assert exc.value.status_code == 409
+        assert exc.value.detail == {
+            "code": "completion_decision_blocked",
+            "reason": "live_subagents_and_queued_subagent_replies",
+            "live_subagents": 2,
+            "queued_subagent_replies": 1,
+            "message": (
+                "Job completion is blocked until every live subagent has "
+                "settled and every queued subagent report has been consumed."
+            ),
+        }

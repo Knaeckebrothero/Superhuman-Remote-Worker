@@ -126,6 +126,7 @@ from database import (  # noqa: E402
     MIGRATIONS_AUDIT_DIR,
 )
 from database.postgres import (  # noqa: E402
+    CompletionDecisionBlocked,
     KNOWN_JOB_ORIGINS,
     JOB_STATUS_FILTER_VALUES,
     DatasourceCatalogCursorError,
@@ -42201,7 +42202,11 @@ async def _record_completion_decision_impl(
     if notes:
         decision["notes"] = str(notes)
 
-    if not await postgres_db.set_completion_decision(job_id, decision):
+    try:
+        journaled = await postgres_db.set_completion_decision(job_id, decision)
+    except CompletionDecisionBlocked as exc:
+        raise HTTPException(status_code=409, detail=exc.detail()) from exc
+    if not journaled:
         # The CAS lost: the job vanished or flipped terminal under us.
         raise HTTPException(
             status_code=409,
@@ -43501,7 +43506,9 @@ async def agent_create_subagent_thread(
     workspace, no pod: a child runs inside its parent's. Compare
     ``POST /api/agents/threads``, which provisions a session.
 
-    Idempotent per ``subagent_id``: a retried create returns the same id.
+    Idempotent per ``subagent_id`` while the parent remains open: a retried
+    create returns the same id. Once a completion decision is journaled even
+    an exact retry is refused, so completion cannot race a child revival.
     404 when the job does not exist (the FK would refuse the row anyway).
     """
     await require_internal(request)

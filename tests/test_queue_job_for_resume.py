@@ -14,6 +14,7 @@ blocking message wedged its job. Mirrors tests/test_delegation_resume_claim.py.
 See knowledge-base/knowledge/issues/blocking_message_reply_keeps_freeze_data.md.
 """
 
+import asyncio
 import json
 from uuid import UUID
 
@@ -21,11 +22,17 @@ import pytest
 import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
-from orchestrator.database.postgres import PostgresDB
+from orchestrator.database.postgres import CompletionDecisionBlocked, PostgresDB
+from src.shared.subagent_parent_authority import (
+    ParentExecutionAuthority,
+    ParentExecutionAuthorityRefused,
+)
 
 JOB = "9b760af1-a693-4652-a50c-aca46542ab48"
 TARGET = "7c1275d8-2f9f-4a2b-9b58-6a1f6f6b2f10"
 AGENT = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+POD_UID = "pod-completion-barrier"
+PROCESS_GENERATION = "process-completion-barrier"
 
 JOB_COMPLETE_FREEZE = {
     "job_id": TARGET,
@@ -80,7 +87,51 @@ async def db(pg_dsn):
             )
             """
         )
-        await conn.execute("TRUNCATE jobs")
+        # ``set_completion_decision`` checks durable child state after locking
+        # the parent. These minimal sibling tables let this module exercise the
+        # real PostgreSQL lock/snapshot behavior without running migrations.
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agents (
+                id uuid PRIMARY KEY,
+                status text NOT NULL,
+                current_job_id uuid,
+                pod_uid text,
+                metadata jsonb NOT NULL DEFAULT '{}'::jsonb
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS threads (
+                id uuid PRIMARY KEY,
+                kind text NOT NULL,
+                user_id uuid,
+                project_id uuid,
+                title text,
+                status text NOT NULL,
+                permission_mode text,
+                narration_mode text,
+                execution_lane text,
+                metadata jsonb,
+                parent_job_id uuid,
+                parent_thread_id uuid,
+                parent_tool_call_id text,
+                subagent_handle text,
+                subagent_type text,
+                subagent_status text,
+                subagent_outcome text,
+                subagent_error text,
+                report_path text,
+                total_turns integer NOT NULL DEFAULT 0,
+                total_tokens bigint NOT NULL DEFAULT 0,
+                ended_at timestamptz,
+                last_activity timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                runtime_generation uuid NOT NULL DEFAULT gen_random_uuid()
+            )
+            """
+        )
+        await conn.execute("TRUNCATE threads, agents, jobs")
         await conn.execute(
             """
             INSERT INTO jobs (id, status, assigned_agent_id, context, freeze_data)
@@ -329,6 +380,258 @@ async def test_set_completion_decision_refuses_terminal_job(db):
     assert "completion_decision" not in ctx, (
         "a stale agent must not rewrite the journal of a terminal job"
     )
+
+
+@pytest.mark.asyncio
+async def test_completion_waits_for_child_create_winner_then_sees_live_row(db):
+    """A child transaction that owns the parent lock cannot be hidden by the
+    completion statement's pre-wait snapshot.
+
+    This is the race that requires a *second* statement after ``FOR UPDATE``:
+    the child row does not exist when completion starts, but must block the
+    decision once the winning create commits.
+    """
+
+    child_id = UUID("11111111-2222-4333-8444-555555555555")
+    locked = asyncio.Event()
+    release = asyncio.Event()
+
+    async def child_create_winner() -> None:
+        async with db.acquire() as conn:
+            async with conn.transaction():
+                await conn.fetchval(
+                    "SELECT id FROM jobs WHERE id=$1::uuid FOR UPDATE", UUID(JOB)
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO threads (
+                        id, kind, status, parent_job_id, subagent_status
+                    ) VALUES ($1, 'subagent', 'created', $2, 'queued')
+                    """,
+                    child_id,
+                    UUID(JOB),
+                )
+                locked.set()
+                await release.wait()
+
+    writer = asyncio.create_task(child_create_winner())
+    await locked.wait()
+    decision = asyncio.create_task(db.set_completion_decision(JOB, DECISION))
+    try:
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(decision), timeout=0.1)
+    finally:
+        release.set()
+    await writer
+
+    with pytest.raises(CompletionDecisionBlocked) as excinfo:
+        await decision
+    assert excinfo.value.reason == "live_subagents"
+    assert excinfo.value.live_subagents == 1
+    assert excinfo.value.queued_subagent_replies == 0
+    async with db.acquire() as conn:
+        assert "completion_decision" not in await db_context(conn, JOB)
+
+
+@pytest.mark.asyncio
+async def test_completion_waits_for_terminal_winner_then_sees_queued_report(db):
+    """Terminalizing a child does not open a completion gap: its atomically
+    queued report remains a blocker after the transaction releases the parent.
+    """
+
+    child_id = UUID("22222222-3333-4444-8555-666666666666")
+    reply = {
+        "id": "33333333-4444-4555-8666-777777777777",
+        "source": "subagent",
+        "thread_id": str(child_id),
+        "message": "independent verification finished",
+    }
+    async with db.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO threads (
+                id, kind, status, parent_job_id, subagent_status
+            ) VALUES ($1, 'subagent', 'active', $2, 'running')
+            """,
+            child_id,
+            UUID(JOB),
+        )
+
+    locked = asyncio.Event()
+    release = asyncio.Event()
+
+    async def child_terminal_winner() -> None:
+        async with db.acquire() as conn:
+            async with conn.transaction():
+                await conn.fetchval(
+                    "SELECT id FROM jobs WHERE id=$1::uuid FOR UPDATE", UUID(JOB)
+                )
+                await conn.execute(
+                    """
+                    UPDATE threads
+                       SET status='ended', subagent_status='completed'
+                     WHERE id=$1
+                    """,
+                    child_id,
+                )
+                await conn.execute(
+                    """
+                    UPDATE jobs
+                       SET context=jsonb_set(
+                           COALESCE(context, '{}'::jsonb),
+                           '{queued_replies}',
+                           $2::jsonb
+                       )
+                     WHERE id=$1
+                    """,
+                    UUID(JOB),
+                    json.dumps([reply]),
+                )
+                locked.set()
+                await release.wait()
+
+    writer = asyncio.create_task(child_terminal_winner())
+    await locked.wait()
+    decision = asyncio.create_task(db.set_completion_decision(JOB, DECISION))
+    try:
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(decision), timeout=0.1)
+    finally:
+        release.set()
+    await writer
+
+    with pytest.raises(CompletionDecisionBlocked) as excinfo:
+        await decision
+    assert excinfo.value.reason == "queued_subagent_replies"
+    assert excinfo.value.live_subagents == 0
+    assert excinfo.value.queued_subagent_replies == 1
+    async with db.acquire() as conn:
+        assert "completion_decision" not in await db_context(conn, JOB)
+
+
+@pytest.mark.asyncio
+async def test_committed_completion_decision_closes_child_create_admission(db):
+    """The opposite lock winner is safe too: after completion commits, the
+    production child-create funnel may not insert a new row under that parent.
+    """
+
+    authority = ParentExecutionAuthority(
+        execution_lane="pinned",
+        parent_job_id=UUID(JOB),
+        agent_id=UUID(AGENT),
+        pod_uid=POD_UID,
+        dispatch_process_generation=PROCESS_GENERATION,
+    )
+    async with db.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE jobs
+               SET status='processing', execution_lane='pinned',
+                   assigned_agent_id=$2
+             WHERE id=$1
+            """,
+            UUID(JOB),
+            UUID(AGENT),
+        )
+        await conn.execute(
+            """
+            INSERT INTO agents (
+                id, status, current_job_id, pod_uid, metadata
+            ) VALUES (
+                $1, 'working', $2, $3,
+                jsonb_build_object('dispatch_process_generation', $4::text)
+            )
+            """,
+            UUID(AGENT),
+            UUID(JOB),
+            POD_UID,
+            PROCESS_GENERATION,
+        )
+
+    assert await db.set_completion_decision(JOB, DECISION)
+    child_id = UUID("44444444-5555-4666-8777-888888888888")
+    with pytest.raises(ParentExecutionAuthorityRefused) as excinfo:
+        await db.create_subagent_thread(
+            parent_job_id=JOB,
+            parent_authority=authority,
+            thread_id=str(child_id),
+            handle="verifier-1234",
+            subagent_type="verifier",
+            run_in_background=True,
+            initial_status="queued",
+        )
+    assert excinfo.value.reason == "completion_decision_recorded"
+    async with db.acquire() as conn:
+        assert not await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM threads WHERE id=$1)", child_id
+        )
+
+
+@pytest.mark.asyncio
+async def test_committed_completion_decision_closes_child_reopen_admission(db):
+    """An ended child cannot be revived behind an already-closed barrier."""
+
+    authority = ParentExecutionAuthority(
+        execution_lane="pinned",
+        parent_job_id=UUID(JOB),
+        agent_id=UUID(AGENT),
+        pod_uid=POD_UID,
+        dispatch_process_generation=PROCESS_GENERATION,
+    )
+    child_id = UUID("55555555-6666-4777-8888-999999999999")
+    generation = UUID("66666666-7777-4888-8999-aaaaaaaaaaaa")
+    async with db.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE jobs
+               SET status='processing', execution_lane='pinned',
+                   assigned_agent_id=$2
+             WHERE id=$1
+            """,
+            UUID(JOB),
+            UUID(AGENT),
+        )
+        await conn.execute(
+            """
+            INSERT INTO agents (
+                id, status, current_job_id, pod_uid, metadata
+            ) VALUES (
+                $1, 'working', $2, $3,
+                jsonb_build_object('dispatch_process_generation', $4::text)
+            )
+            """,
+            UUID(AGENT),
+            UUID(JOB),
+            POD_UID,
+            PROCESS_GENERATION,
+        )
+        await conn.execute(
+            """
+            INSERT INTO threads (
+                id, kind, status, parent_job_id, subagent_status,
+                runtime_generation
+            ) VALUES ($1, 'subagent', 'ended', $2, 'completed', $3)
+            """,
+            child_id,
+            UUID(JOB),
+            generation,
+        )
+
+    assert await db.set_completion_decision(JOB, DECISION)
+    with pytest.raises(ParentExecutionAuthorityRefused) as excinfo:
+        await db.reopen_subagent_thread(
+            parent_job_id=JOB,
+            thread_id=str(child_id),
+            runtime_generation=str(generation),
+            parent_authority=authority,
+        )
+    assert excinfo.value.reason == "completion_decision_recorded"
+    async with db.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT status, runtime_generation FROM threads WHERE id=$1", child_id
+        )
+    assert row["status"] == "ended"
+    assert row["runtime_generation"] == generation
 
 
 async def db_context(conn, job_id: str) -> dict:
