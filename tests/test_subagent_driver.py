@@ -40,6 +40,7 @@ from src.subagents import (
     seed_fork_history,
 )
 from src.subagents.driver import PLACEHOLDER_PREFIX, SYNTH_PROMPT
+from src.subagents.driver import SubagentAuthorityLost
 from src.tools.context import ToolContext
 from tests._fake_chat_model import HANG, FakeChatModel, text_turn, tool_turn
 from tests._fs_backend import FilesystemTestBackend
@@ -383,10 +384,11 @@ class TestScenarioABF:
             "cancel_input_delivery",
             "settle_input_delivery",
             "before_turn_authorization",
-            "before_provider_execution",
         ):
             assert getattr(cbs, name) is None, name
         assert cbs.before_provider_admission is not None
+        assert cbs.before_provider_execution == driver.before_provider_execution
+        assert cbs.on_tool_execution_start == driver.on_tool_execution_start
         assert cbs.hard_interrupt_event is driver.hard_interrupt_event
 
 
@@ -1059,3 +1061,60 @@ class TestSharedTree:
         assert driver.tokens == 7 and driver.errors == ["boom"]
         assert driver.before_provider_admission("x", y=1) is True
         parent_ctx.consume_freeze_request()
+
+    @pytest.mark.asyncio
+    async def test_exact_authority_refusal_prevents_provider_spend(self, parent):
+        parent_ctx, _ = parent
+
+        async def stale():
+            return False
+
+        driver, fake, _ = await make_driver(
+            parent_ctx,
+            [text_turn("must never run")],
+            host=make_host(effect_authority_fn=stale),
+        )
+        try:
+            result = await driver.run("try")
+        finally:
+            await driver.close()
+        assert result.status == "interrupted:authority"
+        assert fake.calls == []
+
+    @pytest.mark.asyncio
+    async def test_exact_authority_is_rechecked_at_real_tool_effect(self, parent):
+        parent_ctx, _ = parent
+        probes = 0
+
+        async def current_once():
+            nonlocal probes
+            probes += 1
+            return probes == 1
+
+        driver, fake, _ = await make_driver(
+            parent_ctx,
+            [tool_turn("read_file", {"path": "notes/hello.md"}, "read-1")],
+            host=make_host(effect_authority_fn=current_once),
+        )
+        try:
+            result = await driver.run("read")
+        finally:
+            await driver.close()
+        assert result.status == "interrupted:authority"
+        assert len(fake.calls) == 1
+        assert probes == 2
+        assert not any(isinstance(msg, ToolMessage) for msg in _brief(driver))
+
+    @pytest.mark.asyncio
+    async def test_tool_effect_callback_raises_a_typed_authority_loss(self, parent):
+        parent_ctx, _ = parent
+
+        async def stale():
+            return False
+
+        driver, _, _ = await make_driver(
+            parent_ctx, [], host=make_host(effect_authority_fn=stale)
+        )
+        with pytest.raises(SubagentAuthorityLost):
+            await driver.on_tool_execution_start("read_file", "read-1")
+        assert driver.authority_lost is True

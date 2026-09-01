@@ -67,6 +67,11 @@ class _Stop:
 
 STOP = _Stop()
 
+
+class SubagentAuthorityLost(RuntimeError):
+    """The parent lost exact authority before an external child effect."""
+
+
 #: The forced-synthesis prompt (inherited from the light runner, deleted in
 #: U3 WP4).
 SYNTH_PROMPT = (
@@ -203,10 +208,11 @@ class SubagentDriver:
         self._stale_soft: Optional[str] = None
         self._stale_hard = False
         self._stopped = False
+        self._authority_lost = False
         self._synth_pending = False
         self._synth_reason = ""
         self._synth_turn = False
-        self._steer_pending = False
+        self._steer_pending = 0
         self._finish_length = False
         self._loop_exception: Optional[BaseException] = None
         self._loop_cancelled = False
@@ -234,6 +240,11 @@ class SubagentDriver:
     @property
     def alive(self) -> bool:
         return self._loop_task is not None and not self._loop_task.done()
+
+    @property
+    def authority_lost(self) -> bool:
+        """Whether an awaited provider/effect fence refused this driver."""
+        return self._authority_lost
 
     def start(self) -> None:
         """Create the loop task (one task per child: task-local contextvars
@@ -376,7 +387,7 @@ class SubagentDriver:
         self._synth_pending = False
         self._synth_reason = ""
         self._synth_turn = False
-        self._steer_pending = False
+        self._steer_pending = 0
         self._finish_length = False
         self.in_tool_since = None
         self._brief_start = len(self.messages)
@@ -392,7 +403,15 @@ class SubagentDriver:
 
     async def run(self, brief: str, *, role: str = "human") -> SubagentResult:
         """Deliver one brief, wait for the turn to settle, classify."""
+        if self._stopped:
+            self._reset_brief()
+            return self.classify()
         await self._persist_seed_before_start()
+        # ``graceful_stop`` can win while a fork seed is being persisted.  Do
+        # not create the provider loop after that stop has already settled.
+        if self._stopped:
+            self._reset_brief()
+            return self.classify()
         self.start()
         if not self.alive:
             raise RuntimeError(f"subagent {self.handle}: loop is not running")
@@ -447,7 +466,7 @@ class SubagentDriver:
         at the next checkpoint and the steered turn continues the brief."""
         self.inbox.put_nowait(self._item(text, PERSIST_ROLE_EVENT))
         if self.running:
-            self._steer_pending = True
+            self._steer_pending += 1
             self._interrupt = "graceful"
 
     async def stop(self, *, timeout: float = 10.0) -> None:
@@ -476,6 +495,43 @@ class SubagentDriver:
         except Exception:  # the loop's own exception is recorded by _on_loop_done
             pass
         await self._cancel_watcher()
+
+    async def graceful_stop(
+        self, reason: str = "parent requested stop", *, timeout: float = 10.0
+    ) -> SubagentResult:
+        """Ask a live brief for one tool-less partial, then hard-stop it.
+
+        The synthesis uses the driver's existing cap/staleness path: the
+        current turn is interrupted at a safe checkpoint, tools are removed,
+        and one evidence-only answer is attempted.  The grace window is
+        bounded; a stuck provider/tool is then stopped by :meth:`stop`.
+        """
+        self._stopped = True
+        self._discard_pending_inputs()
+        self._steer_pending = 0
+        if self.running and self.alive:
+            self._arm_synthesis(str(reason or "parent requested stop"))
+            try:
+                await asyncio.wait_for(self.turn_done.wait(), timeout=max(0.0, timeout))
+            except asyncio.TimeoutError:
+                pass
+        # Once the graceful window expires, the hard interrupt should settle
+        # promptly; do not accidentally wait a second full grace window.
+        await self.stop(timeout=min(1.0, max(0.1, timeout)))
+        return self.classify()
+
+    def _discard_pending_inputs(self) -> None:
+        """Drop queued steers before ordering the one stop synthesis turn."""
+        saw_stop = False
+        while True:
+            try:
+                item = self.inbox.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if item is STOP:
+                saw_stop = True
+        if saw_stop:
+            self.inbox.put_nowait(STOP)
 
     async def close(self) -> None:
         """``stop()`` and release the child's environment."""
@@ -612,6 +668,10 @@ class SubagentDriver:
         self._audits[call_id] = (audit_id, now)
 
     async def on_tool_execution_start(self, *args: Any, **kwargs: Any) -> None:
+        if not await self._effect_authority_open():
+            raise SubagentAuthorityLost(
+                f"subagent {self.handle}: parent authority was lost before tool effect"
+            )
         self._activity()
 
     async def on_tool_result(
@@ -681,7 +741,7 @@ class SubagentDriver:
         if self._synth_pending:
             self._synth_pending = False
             tail = self._tail_kind()
-            if tail == "ai" and not self._stale_hard:
+            if tail == "ai" and not self._stale_hard and not self._stopped:
                 # The cap landed exactly on a final answer — nothing to
                 # synthesise: the answer stands as completed. Disarm the
                 # interrupt the loop never consumed.
@@ -699,9 +759,9 @@ class SubagentDriver:
             )
             return
         if self._steer_pending:
-            # The interrupted turn made way for the steer; that turn continues
-            # the brief and settles it.
-            self._steer_pending = False
+            # Each queued steer owns one continuation turn.  A counter (not a
+            # bool) keeps multiple accepted events inside this tracked brief.
+            self._steer_pending -= 1
             return
         self._finish_brief()
 
@@ -829,6 +889,27 @@ class SubagentDriver:
     def before_provider_admission(self, *args: Any, **kwargs: Any) -> bool:
         return self._admission_open()
 
+    async def before_provider_execution(self, *args: Any, **kwargs: Any) -> bool:
+        """Exact awaited fence immediately before every provider attempt."""
+        return await self._effect_authority_open()
+
+    async def _effect_authority_open(self) -> bool:
+        if not self._admission_open():
+            return False
+        probe = getattr(self.host, "effect_authority", None)
+        if not callable(probe):
+            self._authority_lost = True
+            return False
+        try:
+            admitted = bool(await probe())
+        except Exception:
+            admitted = False
+        if not admitted:
+            self._authority_lost = True
+            self._interrupt = "hard"
+            self.hard_interrupt_event.set()
+        return admitted and self._admission_open()
+
     def _admission_open(self) -> bool:
         try:
             return bool(self.host.provider_admission())
@@ -857,6 +938,7 @@ class SubagentDriver:
             on_usage=self.on_usage,
             hard_interrupt_event=self.hard_interrupt_event,
             before_provider_admission=self.before_provider_admission,
+            before_provider_execution=self.before_provider_execution,
         )
 
     # ------------------------------------------------------------------
@@ -941,7 +1023,11 @@ class SubagentDriver:
             placeholder_hit = False
         has_text = bool(text)
 
-        if self._stopped:
+        if getattr(self, "_authority_lost", False):
+            status = "interrupted:authority"
+            partial = has_text
+            error = error or "the parent execution authority is no longer current"
+        elif self._stopped:
             status = "interrupted:stopped"
             partial = has_text
         elif self._stale_hard:
@@ -1004,6 +1090,7 @@ __all__ = [
     "SYNTH_PROMPT",
     "TRUNCATION_MARKER",
     "SubagentDriver",
+    "SubagentAuthorityLost",
     "SubagentResult",
     "message_text",
 ]

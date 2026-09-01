@@ -9,6 +9,7 @@ simple parents use :class:`SimpleParentHost`.
 from __future__ import annotations
 
 import logging
+import inspect
 from dataclasses import dataclass, field
 from typing import (
     Any,
@@ -65,6 +66,16 @@ class ParentHost(Protocol):
         the child then ends at its next provider boundary without spend."""
         ...
 
+    async def effect_authority(self) -> bool:
+        """Await the parent's exact, remote execution-authority proof.
+
+        This is the last fence before provider I/O and before a child's real
+        tool invocation.  Unlike :meth:`provider_admission`, failures are
+        closed: a stale owner or an unavailable authority store must never be
+        mistaken for permission to spend or mutate.
+        """
+        ...
+
     def context_probe(self) -> Optional[ContextProbe]:
         """The parent's current context accounting (``None`` = unknown)."""
         ...
@@ -99,6 +110,7 @@ class SimpleParentHost:
     #: merged under the child's ``subagent_*`` keys on every tool audit row.
     audit_metadata: Dict[str, Any] = field(default_factory=dict)
     admission_fn: Optional[Callable[[], bool]] = None
+    effect_authority_fn: Optional[Callable[[], Any]] = None
     probe_fn: Optional[Callable[[], Optional[ContextProbe]]] = None
     fork_source_fn: Optional[Callable[[], List[Any]]] = None
     events: List[str] = field(default_factory=list)
@@ -109,6 +121,24 @@ class SimpleParentHost:
         try:
             return bool(self.admission_fn())
         except Exception:
+            return False
+
+    async def effect_authority(self) -> bool:
+        probe = self.effect_authority_fn
+        if probe is None:
+            # Lightweight/test hosts have no remote owner to prove.  Their
+            # process-local fence is still consulted at both boundaries.
+            return self.provider_admission()
+        try:
+            value = probe()
+            if inspect.isawaitable(value):
+                value = await value
+            return bool(value) and self.provider_admission()
+        except Exception:
+            logger.warning(
+                "subagent host: exact effect-authority probe failed — closing",
+                exc_info=True,
+            )
             return False
 
     def context_probe(self) -> Optional[ContextProbe]:
@@ -161,6 +191,7 @@ class WorkerHost:
     #: Overrides the context's ``provider_admission`` callable when set
     #: (tests); ``None`` = the context's fence, else the dual-app drain seam.
     admission_fn: Optional[Callable[[], bool]] = None
+    effect_authority_fn: Optional[Callable[[], Any]] = None
     events: List[str] = field(default_factory=list)
 
     @property
@@ -184,6 +215,48 @@ class WorkerHost:
         except Exception:
             logger.warning(
                 "subagent host: admission fence raised — closing", exc_info=True
+            )
+            return False
+
+    async def effect_authority(self) -> bool:
+        """Prove the immutable worker execution against Postgres.
+
+        Production worker contexts carry both the captured authority and the
+        agent-side Postgres facade.  A partially wired production context
+        fails closed; local/test parents with neither retain the process-local
+        U3 behavior.
+        """
+        if not self.provider_admission():
+            return False
+        explicit = self.effect_authority_fn
+        if explicit is not None:
+            try:
+                value = explicit()
+                if inspect.isawaitable(value):
+                    value = await value
+                return bool(value) and self.provider_admission()
+            except Exception:
+                logger.warning(
+                    "subagent host: exact effect-authority probe failed — closing",
+                    exc_info=True,
+                )
+                return False
+
+        authority = getattr(self.tool_context, "_parent_execution_authority", None)
+        probe = getattr(self.postgres, "parent_execution_authority_current", None)
+        if authority is None and self.postgres is None:
+            return self.provider_admission()
+        if authority is None or not callable(probe):
+            logger.warning(
+                "subagent host: exact worker authority is incompletely wired — closing"
+            )
+            return False
+        try:
+            return bool(await probe(authority)) and self.provider_admission()
+        except Exception:
+            logger.warning(
+                "subagent host: worker execution authority is stale or unavailable",
+                exc_info=True,
             )
             return False
 
