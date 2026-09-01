@@ -4888,8 +4888,25 @@ def delegation_system_floor(
     no prompt cost. The tool description already lists the configured roster
     and concurrency cap, so this floor intentionally names neither.
     """
-    if "delegate_agent" not in set(tool_names or ()):
+    names = set(tool_names or ())
+    if "delegate_agent" not in names:
         return ""
+    control_guidance = ""
+    controls = {
+        "wait_agent",
+        "message_agent",
+        "stop_agent",
+        "list_agents",
+    }
+    if controls <= names:
+        control_guidance = (
+            " list_agents is an occasional bounded status view, never a "
+            "transcript reader. Use message_agent to steer an addressable "
+            "child and stop_agent to request a bounded partial synthesis "
+            "before stopping it. Use wait_agent once only when a child's next "
+            "update is immediately blocking your work; never call wait_agent "
+            "or list_agents in a polling loop."
+        )
     return (
         "<delegation>\n"
         "A child sees nothing from your conversation. Give it a self-contained "
@@ -4906,8 +4923,11 @@ def delegation_system_floor(
         "gates. Every child shares your working tree — partition writes by "
         "`owned_paths` or sequence the waves; never two writers on the same "
         "files. A delegation batch runs in a turn of its own: any other tool call "
-        "in the same turn is rejected. Delegation is foreground-only: the call "
-        "returns when the child finishes; do not poll.\n"
+        "in the same turn is rejected. Foreground delegation waits and returns "
+        "the report as the tool result. Background delegation returns an "
+        "immediate durable receipt; keep doing useful work and let the "
+        "completion report push into a later turn automatically — do not poll."
+        f"{control_guidance}\n"
         "</delegation>"
     )
 

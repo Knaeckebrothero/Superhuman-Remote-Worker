@@ -181,8 +181,9 @@ tools:
     - kb_provenance
     - kb_unanswered
     - kb_export
-  # Delegation tools - the built-in subagents' delegate_agent (src/tools/delegation/);
-  # bound only when the expert names it here AND sets delegation.enabled
+  # Delegation tools - delegate_agent plus its background control plane
+  # (src/tools/delegation/); every name is bound only when the expert names it
+  # here AND sets delegation.enabled. Children strip this whole category.
   delegation: []
   # Orchestrator tools - job delegation for persistent agents (src/tools/orchestrator/)
   # Empty by default; persistent agents auto-load these via PersistentSession

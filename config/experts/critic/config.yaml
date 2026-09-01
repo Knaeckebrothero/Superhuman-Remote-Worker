@@ -72,6 +72,10 @@ tools:
   # here would advertise tools the pod never binds.
   delegation:
     - delegate_agent
+    - wait_agent
+    - message_agent
+    - stop_agent
+    - list_agents
   # SQL injected when system datasource attached (for querying job data)
   sql: []
   # Not needed

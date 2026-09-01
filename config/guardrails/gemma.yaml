@@ -166,6 +166,23 @@ tool_examples:
   delegate_agent: |-
     Examples:
         <|tool_call>call:delegate_agent{description:<|"|>Map the rate limiter module<|"|>,prompt:<|"|>Objective: explain how src/ratelimit/ enforces per-user quotas. Expected output: at most 10 evidence bullets. Context: this maps the module before implementation. Read src/ratelimit/*.py and tests/test_ratelimit.py. Report entry points, the data model, the quota check (file:line), and gaps. Scope: no changes.<|"|>,subagent_type:<|"|>explorer<|"|>}<tool_call|>
+        <|tool_call>call:delegate_agent{description:<|"|>Probe refresh races<|"|>,prompt:<|"|>Objective: probe refresh-token rotation races. Expected output: exact commands, timestamps, status codes, and a compact conclusion. Scope: read and execute tests only; do not change files.<|"|>,subagent_type:<|"|>probe<|"|>,run_in_background:true}<tool_call|>
+
+  wait_agent: |-
+    Examples:
+        <|tool_call>call:wait_agent{handle:<|"|>probe-7f3a<|"|>,timeout_s:120}<tool_call|>
+
+  message_agent: |-
+    Examples:
+        <|tool_call>call:message_agent{handle:<|"|>probe-7f3a<|"|>,message:<|"|>Also test two simultaneous refreshes for the same token.<|"|>}<tool_call|>
+
+  stop_agent: |-
+    Examples:
+        <|tool_call>call:stop_agent{handle:<|"|>probe-7f3a<|"|>,grace_s:30}<tool_call|>
+
+  list_agents: |-
+    Examples:
+        <|tool_call>call:list_agents{}<tool_call|>
 
   # ----- src/tools/research/web.py -----
   web_search: |-

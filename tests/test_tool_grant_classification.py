@@ -308,11 +308,16 @@ class TestExplicitGrants:
             item.name for item in JOB_DESCRIPTORS if item.grant == "explicit"
         }
         assert _classified("explicit") == descriptor_explicit | {
-            # Built-in subagents (U3): named outright in tools.delegation AND
-            # gated on delegation.enabled; `delegation: true` never expands
-            # to a spawn tool. (The heavy pair delegate_work /
+            # Built-in subagents (U3/U4): each name is written outright in
+            # tools.delegation AND gated on delegation.enabled; legacy
+            # `delegation: true` expands only to delegate_agent, never the U4
+            # controls. (The heavy pair delegate_work /
             # resume_delegation_child was deleted in U3 WP4.)
             "delegate_agent",
+            "wait_agent",
+            "message_agent",
+            "stop_agent",
+            "list_agents",
         }
         assert {"steer_job", "get_stuck_jobs"} <= descriptor_explicit
         # The six `*_bundle` tools left this tier on 2026-08-03. They did not

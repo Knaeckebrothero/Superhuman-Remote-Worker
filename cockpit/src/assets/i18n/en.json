@@ -63,6 +63,10 @@
       "cite_document": "Cite document",
       "send_message": "Send message",
       "delegate_agent": "Delegate to subagent",
+      "wait_agent": "Wait for subagent",
+      "message_agent": "Message subagent",
+      "stop_agent": "Stop subagent",
+      "list_agents": "List subagents",
       "job_complete": "Complete job",
       "mark_complete": "Mark complete",
       "set_canvas": "Present in Canvas",
@@ -2021,6 +2025,10 @@
       "search_library": "Searching library",
       "send_message": "Sending message",
       "delegate_agent": "Delegating to subagent",
+      "wait_agent": "Waiting for subagent",
+      "message_agent": "Messaging subagent",
+      "stop_agent": "Stopping subagent",
+      "list_agents": "Listing subagents",
       "mark_complete": "Marking complete",
       "job_complete": "Completing job"
     },
@@ -3154,7 +3162,7 @@
       },
       "delegation": {
         "label": "Delegation",
-        "description": "Ability to spawn subagents that work in parallel"
+        "description": "Ability to spawn and control foreground or background subagents"
       },
       "email": {
         "label": "Email",

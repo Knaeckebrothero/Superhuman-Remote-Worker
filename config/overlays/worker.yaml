@@ -216,17 +216,17 @@ scholar:
   scholar_config: scholar   # Which expert config to use
 
 # Built-in subagents (universal_experts_and_subagents.md §0 D7; runtime in
-# src/subagents/). `enabled` is the binding gate of the `delegate_agent` tool:
-# the tool is created only when this is true AND the expert names it in
-# tools.delegation. Which children exist, their model, tools and budgets live
-# in the expert's `subagents.roster` (see config/subagents/README.md). A child
-# never delegates (depth 1). The pre-U3 keys (max_depth, default_timeout,
+# src/subagents/). `enabled` gates `delegate_agent` and the four background
+# controls: true still binds nothing unless the expert explicitly names each
+# tool under tools.delegation. Which children exist, their model, tools and
+# budgets live in the expert's `subagents.roster` (see config/subagents/README.md).
+# A child never delegates (depth 1). The pre-U3 keys (max_depth, default_timeout,
 # max_timeout, allowed_configs, mode, light) are dropped by the loader with a
 # deprecation warning wherever an older layer still carries them.
 delegation:
   enabled: false             # Experts opt in; base workers never spawn children
   max_concurrent: 4          # Concurrently running children per parent (>= 1)
-  run_in_background_default: false   # Default for a call that does not say run_in_background
+  run_in_background_default: false   # Omitted arg: false=report now, true=receipt + pushed completion
 
 # Autonomy level — controls when the agent pauses for human review
 # full | review | partial | guided | dependent

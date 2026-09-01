@@ -409,13 +409,18 @@ class TestShellMustEnumerate:
             with pytest.raises(ToolPolicyError):
                 normalize_tool_policy({"tools": {"coding": value}})
 
-    def test_schema_json_refuses_true_and_except_on_shell(self):
+    @pytest.mark.parametrize("category", sorted(ENUMERATE_ONLY_CATEGORIES))
+    def test_schema_json_refuses_true_and_except_on_enumerated_categories(
+        self, category
+    ):
         schema = json.loads((_REPO_ROOT / "config" / "schema.json").read_text())
-        block = schema["properties"]["tools"]["properties"]["shell"]
+        block = schema["properties"]["tools"]["properties"][category]
         boolean, array, mapping = block["oneOf"]
-        assert boolean["const"] is False, "shell must not accept `true`"
+        assert boolean["const"] is False, f"{category} must not accept `true`"
         assert array["type"] == "array", "bare lists stay legal"
-        assert set(mapping["properties"]) == {"only"}, "shell must not accept `except`"
+        assert set(mapping["properties"]) == {"only"}, (
+            f"{category} must not accept `except`"
+        )
         assert mapping["required"] == ["only"]
 
 
@@ -901,7 +906,13 @@ class TestEnumerateOnlyMembersAreServable:
         for names in enumerate_only_members().values():
             for name in names:
                 assert TOOL_REGISTRY[name].get("grant") != "code", name
-        assert enumerate_only_members()["delegation"] == ["delegate_agent"]
+        assert enumerate_only_members()["delegation"] == [
+            "delegate_agent",
+            "list_agents",
+            "message_agent",
+            "stop_agent",
+            "wait_agent",
+        ]
 
     def test_shell_is_the_current_membership(self):
         assert enumerate_only_members()["shell"] == [

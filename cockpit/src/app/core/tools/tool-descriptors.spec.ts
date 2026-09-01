@@ -131,6 +131,29 @@ describe('buildToolCardView', () => {
         })).subtitle).toBe('Review the diff');
     });
 
+    it.each([
+        ['wait_agent', 'Wait for subagent', 'hourglass_top', {handle: 'probe-7f3a', timeout_s: 120}],
+        ['message_agent', 'Message subagent', 'forum', {handle: 'probe-7f3a', message: 'Check the retry path'}],
+        ['stop_agent', 'Stop subagent', 'stop_circle', {handle: 'probe-7f3a', grace_s: 30}],
+    ])('%s renders as an addressable subagent control', (tool, title, icon, args) => {
+        const v = buildToolCardView(norm({tool, args, result: '{"accepted":true}'}));
+        expect(v.title).toBe(title);
+        expect(v.icon).toBe(icon);
+        expect(v.subtitle).toBe('probe-7f3a');
+        expect(v.result?.kind).toBe('json');
+    });
+
+    it('list_agents is a bounded roster card with no invented parameters', () => {
+        const v = buildToolCardView(norm({
+            tool: 'list_agents',
+            result: '[{"handle":"probe-7f3a","status":"running"}]',
+        }));
+        expect(v.title).toBe('List subagents');
+        expect(v.icon).toBe('groups');
+        expect(v.params).toEqual([]);
+        expect(v.result?.kind).toBe('json');
+    });
+
     it('edit_file replace → a real old→new diff', () => {
         const v = buildToolCardView(
             norm({tool: 'edit_file', args: {path: 'a.ts', old_string: 'foo', new_string: 'bar'}}),

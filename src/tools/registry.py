@@ -955,8 +955,8 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
     # Delegation tools (subagent spawning)
     if "delegation" in tools_by_category:
         try:
-            delegation_tools = create_delegation_tools(context)
             requested = set(tools_by_category["delegation"])
+            delegation_tools = create_delegation_tools(context, requested)
             for tool in delegation_tools:
                 if tool.name in requested:
                     all_tools.append(tool)

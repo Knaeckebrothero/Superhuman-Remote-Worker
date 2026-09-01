@@ -300,15 +300,21 @@ def test_session_base_is_safe_for_a_new_principal():
 
 
 def test_specialists_explicitly_opt_in_to_delegation():
-    """Profiles that declare delegate_agent must not inherit the safe-base off."""
+    """The five delegating profiles explicitly grant spawn and controls."""
     from orchestrator.services.config_resolver import resolve_config
 
-    for name in ("developer", "critic", "scholar"):
+    for name in ("bughunter", "critic", "developer", "product-qa", "scholar"):
         cap: dict = {}
         resolve_config(base_config_name=name, capture=cap, expert_type="worker")
         fragment = cap["merged_fragment"]
         assert fragment["delegation"]["enabled"] is True
-        assert fragment["tools"]["delegation"] == ["delegate_agent"]
+        assert fragment["tools"]["delegation"] == [
+            "delegate_agent",
+            "wait_agent",
+            "message_agent",
+            "stop_agent",
+            "list_agents",
+        ]
 
 
 # --- strip_to_grants (2026-08-04 plan, expert-write-gate-holes, task 3) ------

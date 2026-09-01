@@ -1,10 +1,10 @@
-"""Delegation toolkit — the built-in subagents.
+"""Delegation toolkit — built-in subagent spawning and controls.
 
-One tool: ``delegate_agent`` (U3) — one bounded brief to a roster subagent
-running in-process on ``run_persistent_loop``; the child's report returns as
-the tool result. Created only when ``delegation.enabled`` is true AND the
-config names the tool in ``tools.delegation`` (``grant: explicit``). See
-knowledge-base/knowledge/features/universal_experts_and_subagents.md.
+``delegate_agent`` runs a roster child in the foreground or starts it durably
+in the background.  ``wait_agent`` / ``message_agent`` / ``stop_agent`` /
+``list_agents`` are the U4 control plane. Every member is created only when
+``delegation.enabled`` is true AND explicitly named in ``tools.delegation``
+(``grant: explicit``). See universal_experts_and_subagents.md.
 
 The heavyweight pair (``delegate_work`` / ``resume_delegation_child``: child
 JOBS on git worktree branches, the parent frozen until they finished) and the
@@ -19,25 +19,53 @@ knowledge-base/knowledge/issues/delegation_child_machinery_retirement.md.
 the ``isolation: worktree`` path of ``src.subagents.child``.
 """
 
-from typing import Any, Dict, List
+from collections.abc import Iterable, Mapping
+from typing import Any, Dict, List, Optional
 
 from ..context import ToolContext
 
 
-def create_delegation_tools(context: ToolContext) -> List[Any]:
+def _configured_grants(context: ToolContext) -> set[str]:
+    """The resolved ``tools.delegation`` list when no caller supplies it."""
+    config = getattr(context, "config", None) or {}
+    tools = config.get("tools") if isinstance(config, Mapping) else None
+    raw = tools.get("delegation") if isinstance(tools, Mapping) else None
+    if not isinstance(raw, (list, tuple, set, frozenset)):
+        return set()
+    return {str(name) for name in raw}
+
+
+def create_delegation_tools(
+    context: ToolContext,
+    requested_names: Optional[Iterable[str]] = None,
+) -> List[Any]:
     """Create the delegation tools with injected context.
 
-    Returns ``[]`` unless ``delegation.enabled`` is true on the context's
-    tool config — the binding follows the settings flag as well as the
-    ``tools.delegation`` grant (B.12).
+    Returns only names in the already-resolved explicit category grant, and
+    returns ``[]`` unless ``delegation.enabled`` is true. ``load_tools`` passes
+    that resolved membership directly; standalone callers may put it under
+    ``context.config.tools.delegation``.
     """
     from .delegate_agent import create_delegate_agent_tools
+    from .control_plane import create_control_plane_tools
 
-    return list(create_delegate_agent_tools(context))
+    granted = (
+        {str(name) for name in requested_names}
+        if requested_names is not None
+        else _configured_grants(context)
+    )
+    if not granted:
+        return []
+    tools = [
+        *create_delegate_agent_tools(context),
+        *create_control_plane_tools(context),
+    ]
+    return [tool for tool in tools if tool.name in granted]
 
 
 def get_delegation_metadata() -> Dict[str, Dict[str, Any]]:
     """Registry metadata for the delegation category."""
     from .delegate_agent import DELEGATE_AGENT_METADATA
+    from .control_plane import CONTROL_PLANE_METADATA
 
-    return dict(DELEGATE_AGENT_METADATA)
+    return {**DELEGATE_AGENT_METADATA, **CONTROL_PLANE_METADATA}

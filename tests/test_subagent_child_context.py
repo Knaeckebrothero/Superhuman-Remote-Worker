@@ -150,6 +150,10 @@ class TestToolSelection:
         parent = [
             "read_file",
             "delegate_agent",
+            "wait_agent",
+            "message_agent",
+            "stop_agent",
+            "list_agents",
             "job_complete",
             "todo_complete",
             "send_message",
@@ -167,7 +171,13 @@ class TestToolSelection:
         names, dropped = select_child_tool_names(parent, parent)
         assert names == ["read_file", "get_job"]  # job_inspection reads survive
         assert DELEGATION_TOOL_NAMES == {"delegate_agent"}
-        for name in DELEGATION_TOOL_NAMES:
+        for name in (
+            "delegate_agent",
+            "wait_agent",
+            "message_agent",
+            "stop_agent",
+            "list_agents",
+        ):
             assert dropped[name] == "control plane (delegation)"
         assert dropped["job_complete"] == "control plane (core)"
         assert dropped["send_message"] == "control plane (communication)"

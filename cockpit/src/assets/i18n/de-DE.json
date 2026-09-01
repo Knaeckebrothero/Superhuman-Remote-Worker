@@ -63,6 +63,10 @@
       "cite_document": "Dokument zitieren",
       "send_message": "Nachricht senden",
       "delegate_agent": "An Subagent delegieren",
+      "wait_agent": "Auf Subagent warten",
+      "message_agent": "Subagent Nachricht senden",
+      "stop_agent": "Subagent stoppen",
+      "list_agents": "Subagents auflisten",
       "job_complete": "Job abschließen",
       "mark_complete": "Als erledigt markieren",
       "set_canvas": "In Canvas präsentieren",
@@ -2021,6 +2025,10 @@
       "search_library": "Sucht in Bibliothek",
       "send_message": "Sendet Nachricht",
       "delegate_agent": "Delegiert an Subagent",
+      "wait_agent": "Wartet auf Subagent",
+      "message_agent": "Sendet Subagent eine Nachricht",
+      "stop_agent": "Stoppt Subagent",
+      "list_agents": "Listet Subagents auf",
       "mark_complete": "Markiert als abgeschlossen",
       "job_complete": "Schließt Auftrag ab"
     },
@@ -3145,7 +3153,7 @@
       },
       "delegation": {
         "label": "Delegation",
-        "description": "Kann Subagenten starten, die parallel arbeiten"
+        "description": "Kann Subagenten im Vorder- oder Hintergrund starten und steuern"
       },
       "email": {
         "label": "E-Mail",

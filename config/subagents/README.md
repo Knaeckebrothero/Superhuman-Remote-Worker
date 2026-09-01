@@ -101,9 +101,12 @@ Everything the expert schema allows (`config/schema.json`), plus, per entry:
 | `return`       | carried verbatim (`summary` \| `structured` \| `evidence` \| `diff`) | shapes the result |
 
 The resolved entry is data until a `delegate_agent` call names it: the roster
-runtime (`src/subagents/`, U3) turns the entry into a running child. The tool
-itself is bound only when the parent sets `delegation.enabled` AND names
-`delegate_agent` in `tools.delegation`.
+runtime (`src/subagents/`) turns the entry into a running child. Foreground
+calls return the report directly; background calls return a durable receipt
+and push the completion automatically. `delegate_agent` and each control
+(`wait_agent`, `message_agent`, `stop_agent`, `list_agents`) are bound only
+when the parent sets `delegation.enabled` AND explicitly names that tool in
+`tools.delegation`. Children strip the entire category and cannot delegate.
 
 ## Adding a library entry
 

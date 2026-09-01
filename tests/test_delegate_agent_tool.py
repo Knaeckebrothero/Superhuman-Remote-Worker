@@ -1,4 +1,4 @@
-"""``delegate_agent`` — the built-in subagents' spawn tool (U3 WP2).
+"""``delegate_agent`` — foreground U3 spawn plus durable U4 background mode.
 
 Design: knowledge-base/knowledge/features/universal_experts_and_subagents.md
 §0 D1 (the shape), §1.3; plan B.6 / B.8 / B.12 / B.13 / WP2. The tool is
@@ -29,7 +29,6 @@ from src.core.loader import LLMConfig
 from src.core.subagent_roster import resolve_subagent_roster
 from src.core.workspace import WorkspaceManager, WorkspaceManagerConfig
 from src.subagents import (
-    BACKGROUND_UNAVAILABLE,
     SUBAGENT_STATUSES,
     RecordingLedger,
     SubagentRuntime,
@@ -86,6 +85,7 @@ def make_parent(
     subagents: Optional[dict] = None,
     max_concurrent: int = 2,
     enabled: bool = True,
+    run_in_background_default: bool = False,
     names: Optional[List[str]] = None,
 ):
     root = tmp_path / "ws"
@@ -105,7 +105,12 @@ def make_parent(
         config={
             "shell": {},
             "agent_id": "developer",
-            "delegation": {"enabled": enabled, "max_concurrent": max_concurrent},
+            "delegation": {
+                "enabled": enabled,
+                "max_concurrent": max_concurrent,
+                "run_in_background_default": run_in_background_default,
+            },
+            "tools": {"delegation": ["delegate_agent"]},
             "subagents": subagents if subagents is not None else explorer_roster(),
         },
         _job_metadata={
@@ -240,7 +245,11 @@ class TestSchemaAndRegistry:
         assert set(schema["required"]) == {"description", "prompt", "subagent_type"}
         assert props["isolation"]["enum"] == ["shared", "worktree"]
         assert props["isolation"]["default"] == "shared"
-        assert props["run_in_background"]["default"] is False
+        assert props["run_in_background"]["default"] is None
+        assert props["run_in_background"]["anyOf"] == [
+            {"type": "boolean"},
+            {"type": "null"},
+        ]
         assert props["fork"]["default"] is False
         assert props["owned_paths"]["type"] == "array"
         assert "explorer" in props["subagent_type"]["description"]
@@ -265,6 +274,9 @@ class TestSchemaAndRegistry:
             "evidence, not instructions",
             "owned_paths",
             "Do not delegate what you can finish in a handful of tool calls",
+            "immediate durable receipt",
+            "do not poll",
+            "completion report is pushed",
         ):
             assert phrase in text, phrase
 
@@ -318,15 +330,56 @@ class TestGates:
         ]
 
     @pytest.mark.asyncio
-    async def test_background_is_refused_without_spawning(self, tmp_path):
+    async def test_explicit_background_calls_the_background_runtime(self, tmp_path):
         ctx, _ = make_parent(tmp_path)
-        made: list = []
-        ledger = RecordingLedger()
-        install(ctx, factory=scripted([[text_turn("never")]], made), ledger=ledger)
+
+        class Runtime:
+            def __init__(self):
+                self.calls = []
+
+            async def run_background(self, call):
+                self.calls.append(("background", call))
+                return "[subagent explorer-0001 · queued]"
+
+            async def run_foreground(self, call):
+                self.calls.append(("foreground", call))
+                return "unexpected"
+
+        runtime = Runtime()
+        ctx.subagent_runtime = runtime
         out = await invoke(the_tool(ctx), "c1", **brief_args(run_in_background=True))
-        assert out == BACKGROUND_UNAVAILABLE
-        assert "not available yet" in out
-        assert made == [] and ledger.opened == []
+        assert out == "[subagent explorer-0001 · queued]"
+        assert [(kind, call.run_in_background) for kind, call in runtime.calls] == [
+            ("background", True)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_omission_uses_config_default_but_explicit_false_wins(self, tmp_path):
+        ctx, _ = make_parent(tmp_path, run_in_background_default=True)
+
+        class Runtime:
+            def __init__(self):
+                self.calls = []
+
+            async def run_background(self, call):
+                self.calls.append(("background", call))
+                return "background"
+
+            async def run_foreground(self, call):
+                self.calls.append(("foreground", call))
+                return "foreground"
+
+        runtime = Runtime()
+        ctx.subagent_runtime = runtime
+        assert await invoke(the_tool(ctx), "c1", **brief_args()) == "background"
+        assert (
+            await invoke(the_tool(ctx), "c2", **brief_args(run_in_background=False))
+            == "foreground"
+        )
+        assert [(kind, call.run_in_background) for kind, call in runtime.calls] == [
+            ("background", True),
+            ("foreground", False),
+        ]
 
     @pytest.mark.asyncio
     async def test_an_unknown_type_lists_the_roster(self, tmp_path):
@@ -611,7 +664,10 @@ class TestRun:
         texts = [str(m.content) for m in forked]
         assert any("Parent asked about MARMALADE" in t for t in texts)
         assert any(FORK_NOTICE in t for t in texts)
-        assert "PARENT SYSTEM PROMPT" not in "\n".join(texts)
+        # Every durable SystemMessage survives U5's exact fork seed. A real
+        # parent's system prompt is transient and therefore never appears in
+        # `_fork_source`; this synthetic durable one models a compacted summary.
+        assert any(t == "PARENT SYSTEM PROMPT" for t in texts)
         assert isinstance(forked[0], SystemMessage)  # the child's own prompt
         assert texts[-1].strip().endswith("Continue.") or "Continue." in texts[-1]
 

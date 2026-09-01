@@ -99,9 +99,13 @@ tools:
   research:
     - web_search
     - extract_webpage
-  # The built-in subagents' spawn tool (bound only with delegation.enabled).
+  # Spawn + background controls (each bound only with delegation.enabled).
   delegation:
     - delegate_agent
+    - wait_agent
+    - message_agent
+    - stop_agent
+    - list_agents
   # Not needed
   citation: []
   graph: []

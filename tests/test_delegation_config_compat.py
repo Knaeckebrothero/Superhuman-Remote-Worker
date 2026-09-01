@@ -1,6 +1,9 @@
-"""U3 WP4 — the delegation block is ``{enabled, max_concurrent,
-run_in_background_default}`` and ``delegate_agent`` is the one delegation tool;
-every layer authored before that keeps resolving.
+"""U3/U4 delegation compatibility and explicit control-plane grants.
+
+The settings block is ``{enabled, max_concurrent,
+run_in_background_default}``. ``delegate_agent`` plus four U4 controls are the
+current delegation tools, while every layer authored before them keeps
+resolving to the foreground spawn tool only.
 
 Contract (u3_plan.md B.12, universal_experts_and_subagents.md §0 D1/D2/D7):
 
@@ -130,10 +133,31 @@ def test_merged_dict_path_logs_the_frozen_blob_once(caplog):
 # --- the tool name -------------------------------------------------------------
 
 
-def test_the_old_delegation_tools_are_gone_from_the_registry():
+def test_the_old_delegation_tools_are_gone_and_u4_controls_are_explicit():
     for old in ("spawn_subagent", "delegate_work", "resume_delegation_child"):
         assert old not in TOOL_REGISTRY, old
     assert TOOL_REGISTRY["delegate_agent"]["category"] == "delegation"
+    assert {
+        name
+        for name, metadata in TOOL_REGISTRY.items()
+        if metadata.get("category") == "delegation"
+    } == {
+        "delegate_agent",
+        "wait_agent",
+        "message_agent",
+        "stop_agent",
+        "list_agents",
+    }
+    assert all(
+        TOOL_REGISTRY[name].get("grant") == "explicit"
+        for name in (
+            "delegate_agent",
+            "wait_agent",
+            "message_agent",
+            "stop_agent",
+            "list_agents",
+        )
+    )
     assert set(LEGACY_TOOL_NAME_ALIASES) == {"delegation"}
     assert set(LEGACY_TOOL_NAME_ALIASES["delegation"].values()) == {"delegate_agent"}
 
@@ -201,7 +225,13 @@ def test_delegation_enumerates_and_a_stored_true_maps_to_delegate_agent(caplog):
     )
 
     assert "delegation" in ENUMERATE_ONLY_CATEGORIES
-    assert enumerate_only_members()["delegation"] == ["delegate_agent"]
+    assert enumerate_only_members()["delegation"] == [
+        "delegate_agent",
+        "list_agents",
+        "message_agent",
+        "stop_agent",
+        "wait_agent",
+    ]
     assert LEGACY_TRUE_EXPANSIONS == {"delegation": ("delegate_agent",)}
     with pytest.raises(ToolPolicyError, match="must enumerate"):
         expand_category_true("delegation")
@@ -323,12 +353,20 @@ def test_delegation_enabled_gates_the_binding():
 # --- the shipped configs --------------------------------------------------------
 
 
-@pytest.mark.parametrize("name", ["developer", "critic", "scholar"])
-def test_the_three_experts_grant_delegate_agent(name):
+@pytest.mark.parametrize(
+    "name", ["bughunter", "critic", "developer", "product-qa", "scholar"]
+)
+def test_the_five_delegating_experts_grant_spawn_and_controls(name):
     from src.core.loader import load_agent_config, resolve_config_path
 
     cfg = load_agent_config(*resolve_config_path(name))
-    assert cfg.tools.delegation == ["delegate_agent"], name
+    assert cfg.tools.delegation == [
+        "delegate_agent",
+        "wait_agent",
+        "message_agent",
+        "stop_agent",
+        "list_agents",
+    ], name
     assert cfg.delegation.enabled is True, name
 
 

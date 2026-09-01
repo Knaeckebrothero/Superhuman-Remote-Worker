@@ -108,22 +108,29 @@ non-admin users need the delegation grant.
 
 A delegated subagent is a short-lived, fresh-context helper of a type the
 expert's roster defines (for example an explorer that reads and reports). It
-runs inside the parent's job on the same workspace, sees only the brief it was
-given, and returns its report as the parent's tool result; the parent keeps
-working from that report. Which subagent types exist, their tools, write
-access and turn/token budgets are set by the expert's configuration, not by
-the parent at call time. Subagents cannot delegate further, and the full
-report of every child is kept under `.subagents/<handle>/report.md` in the
-job workspace.
+runs inside the parent's job on the same workspace and sees only the brief it
+was given. Foreground delegation waits and returns the report as the tool
+result. Background delegation first creates a durable child record, returns
+its handle in an immediate receipt, and pushes the completion report into a
+later parent turn automatically. Which subagent types exist, their tools,
+write access and turn/token budgets are set by the expert's configuration,
+not by the parent at call time. Subagents cannot delegate further, and the
+full report of every child is kept under `.subagents/<handle>/report.md` in
+the job workspace.
 
 The bundled rosters use `implementer` for one bounded owned-path change,
 `tester` for commands, `reviewer` for diff findings, `verifier` for criterion
 evidence, `reader` for one research question, and `probe` for one raw-evidence
 vector. Run only one shared-tree writer at a time; partition its `owned_paths`
 and let the parent review and commit. Foreground delegation returns when the
-child finishes, so there is nothing to poll. Interactive sessions still use
+child finishes. For background children, `list_agents` gives a bounded status
+roster, `message_agent` steers a child, and `stop_agent` requests a bounded
+partial report before stopping. Completion is pushed without any control call:
+do not poll `list_agents` or `wait_agent`; wait once only when the child's next
+update is immediately blocking progress. Interactive sessions still use
 `create_job` when the work should run as an independently managed Fleet job.
 
-Delegation does not make one job fire-and-forget: the parent remains
-responsible for the shared outcome. For user-visible, independently managed
-background tasks, create separate Fleet jobs instead.
+Background delegation does not make the child an independently managed Fleet
+job: the parent remains responsible for its shared outcome and cannot complete
+while child work or a pushed report is outstanding. For user-visible,
+independently managed tasks, create separate Fleet jobs instead.

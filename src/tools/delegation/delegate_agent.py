@@ -8,9 +8,10 @@ parent-side batch), B.8 (``owned_paths``), B.12 (registry entry + the
 The tool is thin on purpose: it validates the call, hands a
 ``SubagentCall`` to the per-parent ``SubagentRuntime`` (roster lookup,
 semaphore, handle, build, driver, envelope, ledger, idempotent replay) and
-returns the envelope as its result. The description is REBUILT per factory
-call from the expert's resolved roster, so the model sees the types it can
-actually delegate to and the concurrency cap it runs under.
+returns either the foreground envelope or a durable background receipt. The
+description is REBUILT per factory call from the expert's resolved roster, so
+the model sees the types it can actually delegate to, its concurrency cap and
+the expert's background default.
 
 Import rule: ``src.subagents`` is imported lazily inside the factory and the
 coroutine (registry → delegation → subagents → persistent_graph would cycle
@@ -37,13 +38,16 @@ DELEGATE_AGENT_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "delegate_agent",
         "description": (
             "Delegate ONE bounded brief to a built-in subagent of the given "
-            "type and get its report back as this tool's result. Subagents "
-            "run in-process on the parent's workspace with a fresh context "
-            "and their own turn/token budgets; they cannot delegate further."
+            "type. Foreground calls return its report as this tool's result. "
+            "Background calls return an immediate durable receipt and push "
+            "the completion into a later parent turn automatically; never "
+            "poll for it. Subagents run in-process on the parent's workspace "
+            "with a fresh context and their own turn/token budgets; they "
+            "cannot delegate further."
         ),
         "category": "delegation",
         "short_description": (
-            "Delegate a bounded brief to a roster subagent; returns its report."
+            "Delegate a bounded brief in the foreground or durable background."
         ),
         "phases": ["strategic", "tactical"],
         "grant": "explicit",
@@ -95,16 +99,18 @@ def build_description(
     *,
     default: Optional[str] = None,
     max_concurrent: int = 4,
+    run_in_background_default: bool = False,
 ) -> str:
     """The model-facing description for THIS parent's roster and cap."""
     cap = max(1, int(max_concurrent or 1))
     names = [n for n, e in roster.items() if isinstance(e, Mapping)]
     lines = [
-        "Delegate ONE bounded brief to a subagent and get its report back as "
-        "this tool's result. The child runs in-process on your workspace with "
-        "a fresh context: it sees ONLY `prompt`, so write the brief "
-        "self-contained — objective, expected output, context and how it fits "
-        "the plan, key questions, sources/tools to use, scope boundaries, "
+        "Delegate ONE bounded brief to a subagent. A foreground call returns "
+        "the report as this tool's result; a background call returns a durable "
+        "receipt and pushes the report later. The child runs in-process on your "
+        "workspace with a fresh context: it sees ONLY `prompt`, so write the "
+        "brief self-contained — objective, expected output, context and how it "
+        "fits the plan, key questions, sources/tools to use, scope boundaries, "
         "what to report.",
     ]
     if names:
@@ -122,6 +128,17 @@ def build_description(
         "waves). Delegation runs in a turn of its own — any other tool batched "
         "with delegate_agent is not executed and must be re-issued in the next "
         "turn. Subagents cannot delegate: you cannot nest."
+    )
+    background_default = "true" if run_in_background_default else "false"
+    lines.append(
+        "run_in_background=true returns an immediate durable receipt only "
+        "after the child row is created, then the child runs while you "
+        "continue. Its completion "
+        "report is pushed into a later turn automatically — do not poll with "
+        "wait_agent or list_agents. Use wait_agent once only when the result "
+        "is immediately blocking your next step. Foreground (false) waits and "
+        "returns the report as this tool result. If omitted, this expert's "
+        f"run_in_background default is {background_default}."
     )
     lines.append(
         "All agents share the working tree — partition writes or sequence "
@@ -210,6 +227,7 @@ def create_delegate_agent_tools(context: ToolContext) -> List[Any]:
         max_concurrent = int(settings.get("max_concurrent") or 4)
     except (TypeError, ValueError):
         max_concurrent = 4
+    run_in_background_default = bool(settings.get("run_in_background_default", False))
     type_names = ", ".join(n for n, e in roster.items() if isinstance(e, Mapping))
 
     class DelegateAgentInput(BaseModel):
@@ -234,11 +252,14 @@ def create_delegate_agent_tools(context: ToolContext) -> List[Any]:
                 else "Which roster subagent runs the brief (none configured)."
             )
         )
-        run_in_background: bool = Field(
-            default=False,
+        run_in_background: Optional[bool] = Field(
+            default=None,
             description=(
-                "Must be false: background subagents are not available yet — "
-                "the child runs now and its report is this tool's result."
+                "true = return an immediate durable receipt and let the "
+                "completion report push into a later turn automatically; "
+                "false = wait and return the report now. Omit to use this "
+                f"expert's configured default ({run_in_background_default}). "
+                "Never poll for a background completion."
             ),
         )
         isolation: Literal["shared", "worktree"] = Field(
@@ -272,18 +293,21 @@ def create_delegate_agent_tools(context: ToolContext) -> List[Any]:
         description: str,
         prompt: str,
         subagent_type: str,
-        run_in_background: bool = False,
+        run_in_background: Optional[bool] = None,
         isolation: str = "shared",
         fork: bool = False,
         owned_paths: Optional[List[str]] = None,
         tool_call_id: str = "",
     ) -> str:
-        from src.subagents.runtime import BACKGROUND_UNAVAILABLE, SubagentCall
+        from src.subagents.runtime import SubagentCall
 
         if not prompt or not str(prompt).strip():
             return "Error: prompt is required — the child's complete, self-contained brief."
-        if run_in_background:
-            return BACKGROUND_UNAVAILABLE
+        background = (
+            run_in_background_default
+            if run_in_background is None
+            else bool(run_in_background)
+        )
         runtime = ensure_runtime(context)
         call = SubagentCall(
             tool_call_id=str(tool_call_id or ""),
@@ -293,15 +317,20 @@ def create_delegate_agent_tools(context: ToolContext) -> List[Any]:
             isolation=str(isolation) if isolation else None,
             fork=bool(fork),
             owned_paths=[str(p) for p in (owned_paths or []) if str(p).strip()],
-            run_in_background=False,
+            run_in_background=background,
         )
+        if background:
+            return await runtime.run_background(call)
         return await runtime.run_foreground(call)
 
     tool = StructuredTool.from_function(
         coroutine=_delegate_agent,
         name="delegate_agent",
         description=build_description(
-            roster, default=default, max_concurrent=max_concurrent
+            roster,
+            default=default,
+            max_concurrent=max_concurrent,
+            run_in_background_default=run_in_background_default,
         ),
         args_schema=DelegateAgentInput,
     )

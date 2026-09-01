@@ -207,6 +207,28 @@ tool_examples:
             prompt="Objective: explain how src/ratelimit/ enforces per-user quotas. Expected output: at most 10 evidence bullets. Context: this maps the module before implementation. Read src/ratelimit/*.py and tests/test_ratelimit.py. Report entry points, the data model, the quota check (file:line), and gaps. Scope: no changes.",
             subagent_type="explorer",
         )
+        delegate_agent(
+            description="Probe refresh races",
+            prompt="Objective: probe refresh-token rotation races. Expected output: exact commands, timestamps, status codes, and a compact conclusion. Scope: read and execute tests only; do not change files.",
+            subagent_type="probe",
+            run_in_background=True,
+        )
+
+  wait_agent: |-
+    Examples:
+        wait_agent(handle="probe-7f3a", timeout_s=120)
+
+  message_agent: |-
+    Examples:
+        message_agent(handle="probe-7f3a", message="Also test two simultaneous refreshes for the same token.")
+
+  stop_agent: |-
+    Examples:
+        stop_agent(handle="probe-7f3a", grace_s=30)
+
+  list_agents: |-
+    Examples:
+        list_agents()
 
   # ----- src/tools/research/web.py -----
   web_search: |-

@@ -684,15 +684,21 @@
           ]
         },
         "delegation": {
-          "description": "Delegation tools: the built-in subagents' `delegate_agent` (src/tools/delegation/), bound only when named here AND `delegation.enabled` is true. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list — `true` never expands to the spawn tool (grant: explicit). The deleted names `spawn_subagent` / `delegate_work` / `resume_delegation_child` are mapped to `delegate_agent` by the loader with a deprecation warning.",
+          "description": "Built-in subagent tools: `delegate_agent` plus `wait_agent`, `message_agent`, `stop_agent`, and `list_agents` (src/tools/delegation/). Every tool is explicit: it binds only when named here AND `delegation.enabled` is true. New configuration must use false, a bare list, or {only: [...]} — true and {except: [...]} are rejected so later control tools never appear without a reviewed grant. Stored legacy true and the deleted names `spawn_subagent` / `delegate_work` / `resume_delegation_child` normalize only to `delegate_agent`, with a deprecation warning.",
           "examples": [
             [
-              "delegate_agent"
+              "delegate_agent",
+              "wait_agent",
+              "message_agent",
+              "stop_agent",
+              "list_agents"
             ]
           ],
           "oneOf": [
             {
-              "type": "boolean"
+              "type": "boolean",
+              "const": false,
+              "description": "Only `false` is accepted here. delegation must enumerate its tools: only `{only: [...]}` (or a bare list, the same thing) and `false` (or []) are accepted. `true` and `except` both auto-track the registry, so later background controls would otherwise land in an expert with no reviewed grant."
             },
             {
               "type": "array",
@@ -712,28 +718,12 @@
                   },
                   "uniqueItems": true,
                   "minItems": 1
-                },
-                "except": {
-                  "type": "array",
-                  "items": {
-                    "type": "string"
-                  },
-                  "uniqueItems": true,
-                  "minItems": 1
                 }
               },
-              "oneOf": [
-                {
-                  "required": [
-                    "only"
-                  ]
-                },
-                {
-                  "required": [
-                    "except"
-                  ]
-                }
-              ]
+              "required": [
+                "only"
+              ],
+              "description": "Only `{only: [...]}` is accepted here. delegation must enumerate its tools: only `{only: [...]}` (or a bare list, the same thing) and `false` (or []) are accepted. `true` and `except` both auto-track the registry, so later background controls would otherwise land in an expert with no reviewed grant."
             }
           ]
         },
@@ -2273,12 +2263,12 @@
     },
     "delegation": {
       "type": "object",
-      "description": "The built-in subagents' settings (universal_experts_and_subagents.md §0 D7; runtime in src/subagents/). `enabled` is the binding gate of the `delegate_agent` tool — the tool exists only when this is true AND the expert names it in `tools.delegation`. Which children exist, their model, tools, write policy and budgets live in `subagents.roster`; a child never delegates (depth 1). The pre-U3 keys (`max_depth`, `default_timeout`, `max_timeout`, `allowed_configs`, `mode`, `light`) are no longer accepted by this schema; the loader still drops them from any authored layer with a deprecation warning.",
+      "description": "The built-in subagents' settings (universal_experts_and_subagents.md §0 D7; runtime in src/subagents/). `enabled` gates `delegate_agent` and all four background controls; each tool exists only when also named in `tools.delegation`. Which children exist, their model, tools, write policy and budgets live in `subagents.roster`; a child never delegates or receives the control plane (depth 1). The pre-U3 keys (`max_depth`, `default_timeout`, `max_timeout`, `allowed_configs`, `mode`, `light`) are no longer accepted by this schema; the loader still drops them from any authored layer with a deprecation warning.",
       "properties": {
         "enabled": {
           "type": "boolean",
           "default": false,
-          "description": "Opt-in: the expert may bind `delegate_agent` (it must also name the tool in `tools.delegation`)"
+          "description": "Opt-in: the expert may bind explicitly named spawn/control tools from `tools.delegation`"
         },
         "max_concurrent": {
           "type": "integer",
@@ -2289,7 +2279,7 @@
         "run_in_background_default": {
           "type": "boolean",
           "default": false,
-          "description": "Roster runtime: the `run_in_background` a `delegate_agent` call gets when it does not say. false = the result returns as the tool result; true = the child's completion re-enters the parent as a message (U4)."
+          "description": "Roster runtime: the `run_in_background` value used only when a `delegate_agent` call omits the argument. false = wait for the report as this tool result; true = return a durable receipt and push the child's completion automatically. An explicit false always wins."
         }
       },
       "additionalProperties": false

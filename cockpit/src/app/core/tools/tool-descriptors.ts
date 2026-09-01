@@ -200,6 +200,46 @@ export const TOOL_DESCRIPTORS: Record<string, ToolDescriptor> = {
             return type && description ? `${type}: ${description}` : type || description;
         },
     },
+    wait_agent: {
+        title: 'Wait for subagent',
+        icon: 'hourglass_top',
+        category: 'delegation',
+        params: [
+            {key: 'handle', label: 'Subagent', kind: 'text'},
+            {key: 'timeout_s', label: 'Timeout (s)', kind: 'text'},
+        ],
+        result: {kind: 'json'},
+        subtitle: (a) => pickArg(a, 'handle') || 'Any subagent',
+    },
+    message_agent: {
+        title: 'Message subagent',
+        icon: 'forum',
+        category: 'delegation',
+        params: [
+            {key: 'handle', label: 'Subagent', kind: 'text'},
+            {key: 'message', label: 'Message', kind: 'text'},
+        ],
+        result: {kind: 'json'},
+        subtitle: (a) => pickArg(a, 'handle'),
+    },
+    stop_agent: {
+        title: 'Stop subagent',
+        icon: 'stop_circle',
+        category: 'delegation',
+        params: [
+            {key: 'handle', label: 'Subagent', kind: 'text'},
+            {key: 'grace_s', label: 'Grace (s)', kind: 'text'},
+        ],
+        result: {kind: 'json'},
+        subtitle: (a) => pickArg(a, 'handle'),
+    },
+    list_agents: {
+        title: 'List subagents',
+        icon: 'groups',
+        category: 'delegation',
+        params: [],
+        result: {kind: 'json'},
+    },
     // notify_user renders as a first-class officer→user bubble (see `notify`
     // on ToolCardView); this descriptor is the fallback surface only.
     notify_user: {title: 'Message the user', icon: 'campaign', category: 'communication', params: [{key: 'subject', label: 'Subject', kind: 'text'}, {key: 'message', label: 'Message', kind: 'text'}, {key: 'urgency', label: 'Urgency', kind: 'text'}], result: {kind: 'text'}, subtitle: (a) => pickArg(a, ['subject', 'message'])},

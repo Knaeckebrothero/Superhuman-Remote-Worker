@@ -194,6 +194,10 @@ const TOOL_LABELS: Record<string, string> = {
     // Communication & delegation
     send_message: 'Sending message',
     delegate_agent: 'Delegating to subagent',
+    wait_agent: 'Waiting for subagent',
+    message_agent: 'Messaging subagent',
+    stop_agent: 'Stopping subagent',
+    list_agents: 'Listing subagents',
 
     // Job lifecycle
     mark_complete: 'Marking complete',

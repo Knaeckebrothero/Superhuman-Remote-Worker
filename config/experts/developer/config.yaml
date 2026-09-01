@@ -84,9 +84,13 @@ tools:
     - crawl_website
     - map_website
     - research_topic
-  # The built-in subagents' spawn tool (bound only with delegation.enabled).
+  # Spawn + background controls (each bound only with delegation.enabled).
   delegation:
     - delegate_agent
+    - wait_agent
+    - message_agent
+    - stop_agent
+    - list_agents
   # Disable unused tool categories
   citation: []
   graph: []
