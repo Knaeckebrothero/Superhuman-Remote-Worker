@@ -60,6 +60,56 @@ _stop_completed: asyncio.Event = (
 )  # Signals waiting endpoint that stop finished
 
 _PINNED_RECIPIENT_MISMATCH = {"code": "pinned_recipient_mismatch"}
+_JOB_STREAM_CLOSE_TIMEOUT_SECONDS = 60.0
+
+
+async def _close_job_stream(streaming_gen: Any, *, job_id: str) -> None:
+    """Bound and shield generator finalization before releasing a pinned job.
+
+    Closing the graph stream flushes its pending asynchronous checkpoint writes
+    and runs the agent's job-scoped cleanup. A caller cancellation must still
+    propagate, but only after the bounded close owner has reached a terminal
+    outcome; otherwise the app can report/reset while cleanup is still running.
+    """
+
+    async def _bounded_close() -> None:
+        try:
+            await asyncio.wait_for(
+                streaming_gen.aclose(), timeout=_JOB_STREAM_CLOSE_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError as exc:
+            logger.error(
+                "Job %s stream close timed out after %.0fs",
+                job_id,
+                _JOB_STREAM_CLOSE_TIMEOUT_SECONDS,
+            )
+            raise RuntimeError(f"job {job_id} stream cleanup timed out") from exc
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Job %s stream close failed", job_id)
+            raise
+
+    close_task = asyncio.create_task(
+        _bounded_close(), name=f"job-stream-close-{job_id[:12]}"
+    )
+    cancellation: asyncio.CancelledError | None = None
+    while not close_task.done():
+        try:
+            await asyncio.shield(close_task)
+        except asyncio.CancelledError as exc:
+            # Keep the close task as the sole finalizer and restore caller
+            # cancellation once it is terminal. Repeated cancellation remains
+            # harmless and cannot start a second aclose().
+            cancellation = exc
+
+    try:
+        close_task.result()
+    except asyncio.CancelledError:
+        if cancellation is None:
+            raise
+    if cancellation is not None:
+        raise cancellation
 
 
 def _require_pinned_job_recipient(
@@ -636,23 +686,26 @@ async def _process_orchestrator_job(
         final_state = None
         last_iteration = "?"
         streaming_gen = await _agent.process_job(job_id, metadata, stream=True)
-        async for state in streaming_gen:
-            final_state = state
-            if isinstance(state, dict):
-                iteration = state.get("iteration")
-                if iteration is not None:
-                    last_iteration = iteration
-                has_error = state.get("error") is not None
-                logger.info(
-                    f"[Iteration {last_iteration}] job={job_id} error={has_error}"
-                )
+        try:
+            async for state in streaming_gen:
+                final_state = state
+                if isinstance(state, dict):
+                    iteration = state.get("iteration")
+                    if iteration is not None:
+                        last_iteration = iteration
+                    has_error = state.get("error") is not None
+                    logger.info(
+                        f"[Iteration {last_iteration}] job={job_id} error={has_error}"
+                    )
 
-            # Cooperative stop check: exit after the current node completes
-            if _stop_requested.is_set():
-                logger.info(
-                    f"Stop requested ({_stop_reason}) for job {job_id} — stopping after current node"
-                )
-                break
+                # Cooperative stop check: exit after the current node completes
+                if _stop_requested.is_set():
+                    logger.info(
+                        f"Stop requested ({_stop_reason}) for job {job_id} — stopping after current node"
+                    )
+                    break
+        finally:
+            await _close_job_stream(streaming_gen, job_id=job_id)
 
         # Handle cooperative stop (pause or cancel) vs normal completion.
         # NOTE: The orchestrator already set the DB status (cancelled/paused)
@@ -1290,22 +1343,25 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                     stream=True,
                 )
                 last_iteration = "?"
-                async for state in streaming_gen:
-                    final_state = state
-                    if isinstance(state, dict):
-                        iteration = state.get("iteration")
-                        if iteration is not None:
-                            last_iteration = iteration
-                        logger.info(
-                            f"[Resume iteration {last_iteration}] job={request.job_id}"
-                        )
+                try:
+                    async for state in streaming_gen:
+                        final_state = state
+                        if isinstance(state, dict):
+                            iteration = state.get("iteration")
+                            if iteration is not None:
+                                last_iteration = iteration
+                            logger.info(
+                                f"[Resume iteration {last_iteration}] job={request.job_id}"
+                            )
 
-                    # Cooperative stop check
-                    if _stop_requested.is_set():
-                        logger.info(
-                            f"Stop requested ({_stop_reason}) for resumed job {request.job_id}"
-                        )
-                        break
+                        # Cooperative stop check
+                        if _stop_requested.is_set():
+                            logger.info(
+                                f"Stop requested ({_stop_reason}) for resumed job {request.job_id}"
+                            )
+                            break
+                finally:
+                    await _close_job_stream(streaming_gen, job_id=request.job_id)
 
                 # Handle cooperative stop vs normal completion.
                 # NOTE: The orchestrator already set the DB status (cancelled/paused)

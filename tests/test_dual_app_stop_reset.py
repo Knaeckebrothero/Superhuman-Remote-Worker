@@ -22,6 +22,34 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 
+class _TrackedStream:
+    """Async iterator whose explicit close is observable independently."""
+
+    def __init__(self, states, events, *, before_yield=None, error=None):
+        self._states = list(states)
+        self._events = events
+        self._before_yield = before_yield
+        self._error = error
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._states:
+            if self._before_yield is not None:
+                self._before_yield()
+                self._before_yield = None
+            return self._states.pop(0)
+        if self._error is not None:
+            error = self._error
+            self._error = None
+            raise error
+        raise StopAsyncIteration
+
+    async def aclose(self):
+        self._events.append("close")
+
+
 @pytest.fixture(autouse=True)
 def _restore_dual_app_globals():
     """Snapshot and restore the dual_app module globals these tests mutate so
@@ -108,14 +136,16 @@ class TestProcessJobCooperativeStop:
         dual_app._current_job_id = "job-A"
         dual_app._stop_completed.clear()
 
-        # The agent's stream requests a cooperative stop mid-flight, then ends.
-        async def _streaming_then_stop():
-            dual_app._request_stop("cancel")
-            yield {"iteration": 1}
+        events: list[str] = []
+        stream = _TrackedStream(
+            [{"iteration": 1}],
+            events,
+            before_yield=lambda: dual_app._request_stop("cancel"),
+        )
 
         agent = MagicMock()
-        # process_job is awaited, then async-iterated → hand back the async gen.
-        agent.process_job = AsyncMock(return_value=_streaming_then_stop())
+        # process_job is awaited, then async-iterated → hand back the stream.
+        agent.process_job = AsyncMock(return_value=stream)
         dual_app._agent = agent
 
         # Keep per-job file logging inside tmp_path.
@@ -125,9 +155,18 @@ class TestProcessJobCooperativeStop:
 
         sched = MagicMock()
         monkeypatch.setattr(dual_app, "_schedule_exit", sched)
+        complete_stop = dual_app._complete_stop
+
+        async def _tracked_complete_stop(source):
+            assert events == ["close"]
+            events.append("reset")
+            await complete_stop(source)
+
+        monkeypatch.setattr(dual_app, "_complete_stop", _tracked_complete_stop)
 
         await dual_app._process_orchestrator_job("job-A", "desc")
 
+        assert events[:2] == ["close", "reset"]
         assert dual_app._pod_state == dual_app.PodState.IDLE
         assert dual_app._current_job_id is None
         assert dual_app._stop_completed.is_set()
@@ -169,12 +208,10 @@ class TestProcessJobCompletionOrdering:
             "error": None,
             "freeze_data": None,
         }
-
-        async def _stream():
-            yield final
+        stream = _TrackedStream([final], events)
 
         agent = MagicMock()
-        agent.process_job = AsyncMock(return_value=_stream())
+        agent.process_job = AsyncMock(return_value=stream)
         dual_app._agent = agent
 
         from src.core import workspace as ws_mod
@@ -183,13 +220,146 @@ class TestProcessJobCompletionOrdering:
 
         await dual_app._process_orchestrator_job("job-complete", "desc")
 
-        assert events[0] == "report"
+        assert events[:2] == ["close", "report"]
         client.report_completion.assert_awaited_once_with(
             "job-complete",
             final,
             agent_id="agent-1",
         )
         assert client.heartbeat.await_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_stream_error_closes_before_error_report_and_reset(
+        self, tmp_path, monkeypatch
+    ):
+        from src.api import dual_app
+
+        client = _reset_module(dual_app, pod_state=dual_app.PodState.WORKING)
+        dual_app._current_job_id = "job-error"
+        monkeypatch.setenv("AGENT_LOOP", "1")
+        events: list[str] = []
+
+        async def _report(*_args, **_kwargs):
+            assert events == ["close"]
+            events.append("report")
+
+        async def _reset(*_args, **_kwargs):
+            assert events == ["close", "report"]
+            events.append("reset")
+
+        client.report_completion = AsyncMock(side_effect=_report)
+        agent = MagicMock()
+        agent.process_job = AsyncMock(
+            return_value=_TrackedStream([], events, error=RuntimeError("stream failed"))
+        )
+        dual_app._agent = agent
+        monkeypatch.setattr(dual_app, "_reset_to_idle", _reset)
+
+        from src.core import workspace as ws_mod
+
+        monkeypatch.setattr(ws_mod, "get_logs_path", lambda: tmp_path)
+
+        await dual_app._process_orchestrator_job("job-error", "desc")
+
+        assert events == ["close", "report", "reset"]
+
+
+class TestJobStreamCloseCancellation:
+    @pytest.mark.asyncio
+    async def test_caller_cancellation_waits_for_close_owner(self):
+        from src.api import dual_app
+
+        close_started = asyncio.Event()
+        release_close = asyncio.Event()
+        closed = asyncio.Event()
+
+        class _BlockingCloseStream:
+            async def aclose(self):
+                close_started.set()
+                await release_close.wait()
+                closed.set()
+
+        task = asyncio.create_task(
+            dual_app._close_job_stream(_BlockingCloseStream(), job_id="job-cancel")
+        )
+        await close_started.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+
+        assert not task.done()
+        assert not closed.is_set()
+
+        release_close.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert closed.is_set()
+
+
+class TestResumeJobStreamClose:
+    @pytest.mark.asyncio
+    async def test_normal_resume_closes_before_report_and_reset(
+        self, tmp_path, monkeypatch
+    ):
+        from src.api import dual_app
+        from src.api.models import JobResumeRequest, PinnedJobRecipient
+
+        client = _reset_module(dual_app)
+        client.dispatch_process_generation = "process-resume"
+        monkeypatch.delenv("POD_UID", raising=False)
+        events: list[str] = []
+        final = {"should_stop": True, "error": None}
+
+        async def _report(*_args, **_kwargs):
+            assert events == ["close"]
+            events.append("report")
+
+        async def _reset(*_args, **_kwargs):
+            assert events == ["close", "report"]
+            events.append("reset")
+
+        client.report_completion = AsyncMock(side_effect=_report)
+        agent = MagicMock()
+        agent.process_job = AsyncMock(return_value=_TrackedStream([final], events))
+        dual_app._agent = agent
+        monkeypatch.setattr(dual_app, "_reset_to_idle", _reset)
+        monkeypatch.setattr(dual_app, "_should_loop", lambda: True)
+
+        from src.core import workspace as ws_mod
+
+        monkeypatch.setattr(ws_mod, "get_logs_path", lambda: tmp_path)
+        app = dual_app.create_dual_app()
+        resume_ep = next(
+            route.endpoint
+            for route in app.routes
+            if getattr(route, "path", "") == "/job/resume"
+        )
+
+        await resume_ep(
+            JobResumeRequest(
+                job_id="job-resume",
+                config_override={
+                    "workspace": {
+                        "backend": "sandbox",
+                        "remote": {"host": "workspace.test"},
+                    }
+                },
+                workspace_runtime={
+                    "requested_backend": None,
+                    "assigned_backend": "sandbox",
+                    "effective_backend": "sandbox",
+                    "state": "ready",
+                },
+                recipient=PinnedJobRecipient(
+                    expected_agent_id="agent-1",
+                    expected_pod_uid=None,
+                    expected_process_generation="process-resume",
+                    expected_job_id="job-resume",
+                ),
+            )
+        )
+        await dual_app._current_job_task
+
+        assert events == ["close", "report", "reset"]
 
 
 class TestCancelHardKillResets:

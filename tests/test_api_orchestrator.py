@@ -10,6 +10,30 @@ AGENT_ID = "11111111-1111-4111-8111-111111111111"
 PROCESS_GENERATION = "22222222-2222-4222-8222-222222222222"
 
 
+class _TrackedStream:
+    """Async iterator whose explicit close is observable independently."""
+
+    def __init__(self, states, events, *, error=None):
+        self._states = list(states)
+        self._events = events
+        self._error = error
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._states:
+            return self._states.pop(0)
+        if self._error is not None:
+            error = self._error
+            self._error = None
+            raise error
+        raise StopAsyncIteration
+
+    async def aclose(self):
+        self._events.append("close")
+
+
 def _recipient(job_id: str) -> dict:
     """A pinned worker mutation names the exact registered process."""
 
@@ -373,6 +397,102 @@ class TestGetCurrentJobEndpoint:
 
         # Reset
         app_module._current_job_id = None
+
+
+class TestPinnedJobStreamClose:
+    @pytest.mark.asyncio
+    async def test_fresh_job_closes_before_completion_report_and_cleanup(
+        self, monkeypatch
+    ):
+        import src.api.app as app_module
+
+        events: list[str] = []
+        final = {"should_stop": True, "error": None}
+
+        async def _report(*_args, **_kwargs):
+            assert events == ["close"]
+            events.append("report")
+
+        client = MagicMock()
+        client.agent_id = AGENT_ID
+        client.report_completion = AsyncMock(side_effect=_report)
+        client.heartbeat = AsyncMock(return_value={})
+        agent = MagicMock()
+        agent._tool_context = None
+        agent.process_job = AsyncMock(return_value=_TrackedStream([final], events))
+
+        monkeypatch.setattr(app_module, "_agent", agent)
+        monkeypatch.setattr(app_module, "_orchestrator_client", client)
+        monkeypatch.setattr(app_module, "_current_job_id", "fresh-close")
+        app_module._clear_stop()
+        monkeypatch.setattr(app_module, "_setup_job_file_logging", MagicMock())
+        monkeypatch.setattr(
+            app_module,
+            "_cleanup_job_file_handler",
+            MagicMock(side_effect=lambda _job_id: events.append("cleanup")),
+        )
+
+        await app_module._process_orchestrator_job("fresh-close", "description")
+
+        assert events == ["close", "report", "cleanup"]
+
+    @pytest.mark.asyncio
+    async def test_resumed_job_error_closes_before_error_report_and_cleanup(
+        self, monkeypatch
+    ):
+        import src.api.app as app_module
+        from src.api.models import JobResumeRequest
+
+        events: list[str] = []
+
+        async def _report(*_args, **_kwargs):
+            assert events == ["close"]
+            events.append("report")
+
+        client = MagicMock()
+        client.agent_id = AGENT_ID
+        client.dispatch_process_generation = PROCESS_GENERATION
+        client.report_completion = AsyncMock(side_effect=_report)
+        client.heartbeat = AsyncMock(return_value={})
+        agent = MagicMock()
+        agent.config.agent_id = "worker_base"
+        agent.process_job = AsyncMock(
+            return_value=_TrackedStream(
+                [], events, error=RuntimeError("resume stream failed")
+            )
+        )
+
+        monkeypatch.delenv("POD_UID", raising=False)
+        monkeypatch.setattr(app_module, "_agent", agent)
+        monkeypatch.setattr(app_module, "_orchestrator_client", client)
+        monkeypatch.setattr(app_module, "_current_job_id", None)
+        monkeypatch.setattr(app_module, "_current_job_task", None)
+        monkeypatch.setattr(app_module, "_shutdown_requested", False)
+        app_module._clear_stop()
+        monkeypatch.setattr(app_module, "_setup_job_file_logging", MagicMock())
+        monkeypatch.setattr(
+            app_module,
+            "_cleanup_job_file_handler",
+            MagicMock(side_effect=lambda _job_id: events.append("cleanup")),
+        )
+
+        app = app_module.create_app()
+        resume_ep = next(
+            route.endpoint
+            for route in app.routes
+            if getattr(route, "path", "") == "/job/resume"
+        )
+        await resume_ep(
+            JobResumeRequest(
+                job_id="resume-close",
+                recipient=_recipient("resume-close"),
+                **_workspace_bundle(),
+            ),
+            MagicMock(),
+        )
+        await app_module._current_job_task
+
+        assert events == ["close", "report", "cleanup"]
 
 
 def create_app_for_testing():
