@@ -43,6 +43,7 @@ export const SEARCH_ADAPTER_OPTIONS: ReadonlyArray<{
   ops: readonly ResearchOperation[];
 }> = [
   {name: 'brave', ops: ['search']},
+  {name: 'crawl4ai', ops: ['extract', 'crawl']},
   {name: 'firecrawl', ops: RESEARCH_OPERATIONS},
   {name: 'searxng', ops: ['search']},
   {name: 'tavily', ops: RESEARCH_OPERATIONS},

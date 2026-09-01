@@ -226,6 +226,23 @@ class TestCreateWebTools:
             "web_search"
         ]
 
+    def test_crawl4ai_constructs_only_its_fetch_tools(self, mock_tool_context):
+        mock_tool_context.config = {
+            "research": {
+                "fetch": {
+                    "provider": "crawl4ai",
+                    "base_url": "https://crawl4ai.internal",
+                    "api_key": "crawl4ai-test",
+                    "ops": ["extract", "crawl"],
+                }
+            }
+        }
+
+        assert [tool.name for tool in create_web_tools(mock_tool_context)] == [
+            "extract_webpage",
+            "crawl_website",
+        ]
+
 
 # ── web_search ─────────────────────────────────────────────────────
 

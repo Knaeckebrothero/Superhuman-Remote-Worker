@@ -76,7 +76,7 @@ describe('AdminCatalogComponent search/fetch form', () => {
     )
       .map((option) => option.value)
       .filter(Boolean);
-    expect(adapters).toEqual(['brave', 'firecrawl', 'searxng', 'tavily']);
+    expect(adapters).toEqual(['brave', 'crawl4ai', 'firecrawl', 'searxng', 'tavily']);
   });
 
   it('requires adapter and matching operations, then writes params_json', () => {
@@ -102,5 +102,19 @@ describe('AdminCatalogComponent search/fetch form', () => {
       context_window: null,
       params_json: {provider: 'tavily', ops: ['search', 'extract']},
     }));
+  });
+
+  it('limits Crawl4AI rows to extract and crawl', () => {
+    const fixture = TestBed.createComponent(AdminCatalogComponent);
+    const component = fixture.componentInstance;
+    component.formSearchOps.set(['search', 'extract', 'crawl', 'map']);
+
+    component.onSearchProviderChange('crawl4ai');
+
+    expect(component.formSearchOps()).toEqual(['extract', 'crawl']);
+    expect(component.isResearchOpSupported('extract')).toBe(true);
+    expect(component.isResearchOpSupported('crawl')).toBe(true);
+    expect(component.isResearchOpSupported('search')).toBe(false);
+    expect(component.isResearchOpSupported('map')).toBe(false);
   });
 });

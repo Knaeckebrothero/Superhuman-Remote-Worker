@@ -8,6 +8,7 @@ from typing import Any
 
 from .base import Page, Result, SearchAdapter
 from .brave import BraveAdapter
+from .crawl4ai import Crawl4AIAdapter
 from .errors import (
     ProviderAuthError,
     ProviderError,
@@ -22,7 +23,7 @@ from .tavily import TavilyAdapter
 
 logger = logging.getLogger(__name__)
 
-ADAPTER_NAMES = frozenset({"brave", "firecrawl", "searxng", "tavily"})
+ADAPTER_NAMES = frozenset({"brave", "crawl4ai", "firecrawl", "searxng", "tavily"})
 
 
 def create_search_adapter(config: Any) -> SearchAdapter | None:
@@ -57,6 +58,12 @@ def create_search_adapter(config: Any) -> SearchAdapter | None:
             base_url=config.get("base_url"),
             ops=ops,
         )
+    if provider == "crawl4ai":
+        return Crawl4AIAdapter(
+            api_key=config.get("api_key"),
+            base_url=config.get("base_url"),
+            ops=ops,
+        )
     if provider == "firecrawl":
         return FirecrawlAdapter(
             api_key=config.get("api_key"),
@@ -71,6 +78,7 @@ def create_search_adapter(config: Any) -> SearchAdapter | None:
 __all__ = [
     "ADAPTER_NAMES",
     "BraveAdapter",
+    "Crawl4AIAdapter",
     "FirecrawlAdapter",
     "Page",
     "ProviderAuthError",

@@ -373,8 +373,10 @@ Crawl4AI is available with `crawl4ai.enabled=true`, but remains off by default
 because its browser service has a 4 GiB memory limit. Before enabling it, add a
 strong `CRAWL4AI_API_TOKEN` to the Secret selected by
 `crawl4ai.apiTokenSecret`. Registering a Crawl4AI catalog endpoint is an
-explicit admin action; its `api_key` carries this bearer credential. The chart
-also uses the same high-entropy value as Crawl4AI's stable JWT signing key.
+explicit admin action; its `api_key` carries this bearer credential. In the
+catalog model, select the `crawl4ai` adapter and its `extract` and/or `crawl`
+operations. The chart also uses the same high-entropy value as Crawl4AI's
+stable JWT signing key.
 
 Both workloads always render an egress NetworkPolicy. They may resolve DNS and
 reach public HTTP(S), but RFC1918, cluster/service, link-local/metadata, and

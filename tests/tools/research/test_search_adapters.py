@@ -9,6 +9,7 @@ import pytest
 from src.tools.research.search import (
     ADAPTER_NAMES,
     BraveAdapter,
+    Crawl4AIAdapter,
     FirecrawlAdapter,
     Page,
     ProviderAuthError,
@@ -535,3 +536,201 @@ def test_firecrawl_accepts_api_root_with_or_without_v2():
 
     assert root.search_endpoint == "https://firecrawl.internal/v2/search"
     assert versioned.search_endpoint == "https://firecrawl.internal/v2/search"
+
+
+def test_crawl4ai_declared_ops_return_normalized_shapes():
+    client = MagicMock()
+    client.post.side_effect = [
+        httpx.Response(
+            200,
+            json={
+                "success": True,
+                "results": [
+                    {
+                        "url": "https://result.example/extract",
+                        "success": True,
+                        "markdown": {"raw_markdown": "Extracted body"},
+                    },
+                    {
+                        "url": "https://result.example/blocked",
+                        "success": False,
+                        "error_message": "blocked by robots.txt",
+                    },
+                ],
+            },
+        ),
+        httpx.Response(
+            200,
+            json={
+                "success": True,
+                "results": [
+                    {
+                        "url": "https://result.example/",
+                        "success": True,
+                        "markdown": {"raw_markdown": "Root body"},
+                        "links": {
+                            "internal": [
+                                {"href": "https://result.example/docs"},
+                                {"href": "https://result.example/api"},
+                            ]
+                        },
+                    }
+                ],
+            },
+        ),
+        httpx.Response(
+            200,
+            json={
+                "success": True,
+                "results": [
+                    {
+                        "url": "https://result.example/docs",
+                        "success": True,
+                        "markdown": {"fit_markdown": "Docs body"},
+                    }
+                ],
+            },
+        ),
+    ]
+    manager = MagicMock()
+    manager.__enter__.return_value = client
+    manager.__exit__.return_value = False
+    adapter = Crawl4AIAdapter(
+        base_url="https://crawl4ai.internal/api",
+        api_key="crawl4ai-test",
+    )
+
+    with patch("src.tools.research.search.crawl4ai.httpx.Client", return_value=manager):
+        assert adapter.extract(
+            [
+                "https://result.example/extract",
+                "https://result.example/blocked",
+            ]
+        ) == [
+            Page(url="https://result.example/extract", content="Extracted body"),
+            Page(
+                url="https://result.example/blocked",
+                content="",
+                failed="blocked by robots.txt",
+            ),
+        ]
+        assert adapter.crawl(
+            "https://result.example/",
+            max_depth=1,
+            max_breadth=1,
+            limit=2,
+        ) == [
+            Page(url="https://result.example/", content="Root body"),
+            Page(url="https://result.example/docs", content="Docs body"),
+        ]
+
+    assert adapter.ops == frozenset({"extract", "crawl"})
+    assert all(
+        call.args[0] == "https://crawl4ai.internal/api/crawl"
+        for call in client.post.call_args_list
+    )
+    assert client.post.call_args_list[-1].kwargs["json"] == {
+        "urls": ["https://result.example/docs"]
+    }
+    assert client.post.call_args_list[-1].kwargs["headers"]["Authorization"] == (
+        "Bearer crawl4ai-test"
+    )
+
+
+@pytest.mark.parametrize("op", ["search", "map"])
+def test_crawl4ai_undeclared_ops_raise(op):
+    adapter = Crawl4AIAdapter(
+        base_url="https://crawl4ai.internal",
+        api_key="crawl4ai-test",
+    )
+
+    with pytest.raises(ProviderRequestError):
+        if op == "search":
+            adapter.search("query", 5)
+        else:
+            adapter.map("https://example.com")
+
+
+@pytest.mark.parametrize("op", ["extract", "crawl"])
+def test_crawl4ai_restricted_ops_raise(op):
+    declared_op = "crawl" if op == "extract" else "extract"
+    adapter = Crawl4AIAdapter(
+        base_url="https://crawl4ai.internal",
+        api_key="crawl4ai-test",
+        ops=frozenset({declared_op}),
+    )
+
+    with pytest.raises(ProviderRequestError):
+        if op == "extract":
+            adapter.extract(["https://example.com"])
+        else:
+            adapter.crawl("https://example.com")
+
+
+def test_crawl4ai_empty_results_is_answer_and_target_stays_payload():
+    response = httpx.Response(200, json={"success": True, "results": []})
+    manager, client = _http_client(response)
+    client.post.return_value = response
+    influenced_url = "http://169.254.169.254/latest/meta-data"
+    adapter = Crawl4AIAdapter(
+        base_url="https://crawl4ai.internal/root",
+        api_key="crawl4ai-test",
+    )
+
+    with patch(
+        "src.tools.research.search.crawl4ai.httpx.Client", return_value=manager
+    ) as client_class:
+        assert adapter.extract([influenced_url]) == []
+
+    client_class.assert_called_once_with(timeout=120.0, follow_redirects=False)
+    assert client.post.call_args.args[0] == "https://crawl4ai.internal/root/crawl"
+    assert client.post.call_args.kwargs["json"] == {"urls": [influenced_url]}
+
+
+def test_crawl4ai_requires_token():
+    with pytest.raises(ProviderAuthError):
+        Crawl4AIAdapter(base_url="https://crawl4ai.internal").extract(
+            ["https://example.com"]
+        )
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        (401, ProviderAuthError),
+        (408, ProviderUnavailableError),
+        (429, ProviderRateLimitError),
+        (500, ProviderUnavailableError),
+    ],
+)
+def test_crawl4ai_classifies_provider_errors(status, expected):
+    response = httpx.Response(status)
+    manager, client = _http_client(response)
+    client.post.return_value = response
+    adapter = Crawl4AIAdapter(
+        base_url="https://crawl4ai.internal",
+        api_key="crawl4ai-test",
+    )
+    with (
+        patch(
+            "src.tools.research.search.crawl4ai.httpx.Client",
+            return_value=manager,
+        ),
+        pytest.raises(expected),
+    ):
+        adapter.extract(["https://example.com"])
+
+
+def test_crawl4ai_is_registered_and_constructed_with_supported_ops_only():
+    assert "crawl4ai" in ADAPTER_NAMES
+    adapter = create_search_adapter(
+        {
+            "provider": "crawl4ai",
+            "base_url": "https://crawl4ai.internal",
+            "api_key": "crawl4ai-test",
+            "ops": ["search", "extract", "crawl", "map"],
+        }
+    )
+
+    assert isinstance(adapter, Crawl4AIAdapter)
+    assert adapter.ops == frozenset({"extract", "crawl"})
