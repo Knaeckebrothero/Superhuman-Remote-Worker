@@ -28087,11 +28087,16 @@ def _critic_config_override(parent_llm: dict[str, Any] | None) -> dict[str, Any]
       leaves its target in 'reviewing' forever. A verification critic has no
       business blocking on a human reply — removing the state upstream is
       strictly better than adding a reaper for it.
+    - ``job_inspection: true`` expands through the tool-policy registry to the
+      safe, non-explicit evidence reads.  The critic's verifier children may
+      inherit those reads through the parent-tool ceiling, while the explicit
+      audit/debug surface remains unavailable unless separately named.
     """
     override: dict[str, Any] = {
         "autonomy": "full",
         "tools": {
             "evaluation": ["approve_job_verdict", "return_job_with_feedback"],
+            "job_inspection": True,
             "core": ["next_phase_todos", "todo_complete", "todo_list", "todo_rewind"],
             "communication": [],
         },

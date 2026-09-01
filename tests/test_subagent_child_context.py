@@ -193,6 +193,66 @@ class TestToolSelection:
         assert len(names) == len(set(names))
         assert not (set(names) & DELEGATION_TOOL_NAMES)
 
+    @pytest.mark.asyncio
+    async def test_verifier_inherits_safe_inspection_but_not_parent_verdicts(
+        self, tmp_path
+    ):
+        """A dispatched critic's real verifier roster entry crosses the ceiling.
+
+        The critic owns the verdict; its child gets only the non-explicit
+        inspection reads shared by the roster allowlist and parent toolset.
+        """
+        from orchestrator.main import _critic_config_override
+        from orchestrator.services.config_resolver import resolve_config
+        from src.core.loader import get_all_tool_names, load_config_from_resolved
+        from src.core.tool_policy import expand_category_true
+        from src.tools.registry import TOOL_REGISTRY
+
+        blob = resolve_config(
+            base_config_name="critic",
+            expert_type="worker",
+            request_override=_critic_config_override(parent_llm=None),
+        )
+        parent_names = get_all_tool_names(load_config_from_resolved(blob))
+        parent_name_set = set(parent_names)
+        verdicts = {"approve_job_verdict", "return_job_with_feedback"}
+        assert verdicts <= parent_name_set
+
+        entry = blob["agent"]["subagents"]["roster"]["verifier"]
+        ctx, _ = _parent(tmp_path, names=parent_names)
+        build = await _build(
+            ctx,
+            entry,
+            handle="verifier-abcd",
+            subagent_type="verifier",
+        )
+        try:
+            child_names = set(build.tool_names)
+            effective_inspection = {
+                name
+                for name in child_names
+                if TOOL_REGISTRY[name].get("category") == "job_inspection"
+            }
+            assert effective_inspection == set(expand_category_true("job_inspection"))
+            assert effective_inspection
+            assert verdicts.isdisjoint(child_names)
+            assert not {
+                name
+                for name in child_names
+                if TOOL_REGISTRY[name].get("category") == "evaluation"
+            }
+
+            # The category deny is structural too: even a malformed verifier
+            # entry asking for the parent's verdict tools cannot cross it.
+            _, dropped = select_child_tool_names(
+                [*entry_tool_names(entry), *sorted(verdicts)], parent_names
+            )
+            assert {name: dropped[name] for name in verdicts} == {
+                name: "control plane (evaluation)" for name in verdicts
+            }
+        finally:
+            await build.release()
+
 
 # ---------------------------------------------------------------------------
 # The build: shared vs worktree, the copy resets, officer
