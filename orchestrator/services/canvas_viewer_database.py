@@ -167,6 +167,8 @@ _IDENTITY_ATTESTATION_SQL = """
     SELECT current_user::text AS role_name,
            session_user::text AS session_role_name,
            current_user = session_user AS session_role_matches,
+           pg_catalog.current_setting('search_path') =
+               'pg_catalog, public, pg_temp' AS search_path_safe,
            pg_catalog.has_database_privilege(
                current_user, pg_catalog.current_database(), 'CONNECT'
            ) AS database_connect,
@@ -487,6 +489,8 @@ async def attest_canvas_viewer_database_privileges(conn: Any) -> None:
         dangerous.append("superuser-like role attributes")
     if identity.get("session_role_matches") is not True:
         dangerous.append("authenticated session role differs from current role")
+    if identity.get("search_path_safe") is not True:
+        dangerous.append("search_path differs from pg_catalog, public, pg_temp")
     if identity.get("direct_role_membership") is not False:
         dangerous.append("direct role membership")
     if identity.get("database_create") is not False:
@@ -554,6 +558,7 @@ def create_canvas_viewer_database() -> PostgresDB:
         env_prefix=prefix,
         default_min_connections=_DEFAULT_MIN_CONNECTIONS,
         default_max_connections=_DEFAULT_MAX_CONNECTIONS,
+        server_settings={"search_path": "pg_catalog, public, pg_temp"},
     )
 
 

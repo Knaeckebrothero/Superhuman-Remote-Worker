@@ -5,6 +5,7 @@
 {{- $hasExistingSecret := ne (trim $credentials.existingSecret) "" -}}
 {{- $vaultPath := trim $credentials.vaultPath -}}
 {{- $hasVaultPath := ne $vaultPath "" -}}
+{{- $postgresEngine := include "srw.dbEngine" (dict "context" . "db" .Values.databases.postgres) -}}
 {{- $validCredentialSource := or
       (and $credentials.create (not $hasExistingSecret) (not $hasVaultPath))
       (and (not $credentials.create) $hasExistingSecret (not $hasVaultPath))
@@ -21,17 +22,26 @@
 {{- if gt (int $database.pool.min) (int $database.pool.max) -}}
 {{- fail "canvas.livePreview.viewer.database.pool.min must not exceed pool.max" -}}
 {{- end -}}
-{{- if and $credentials.create (ne $database.username "srw_canvas_gateway") -}}
-{{- fail "chart-created Canvas database credentials require the fixed srw_canvas_gateway role" -}}
+{{- if eq $credentials.passwordKey "username" -}}
+{{- fail "canvas.livePreview.viewer.database.credentials.passwordKey cannot be username" -}}
+{{- end -}}
+{{- if and $database.provisionRole (ne $database.username "srw_canvas_gateway") -}}
+{{- fail "automatic Canvas database role provisioning requires the fixed srw_canvas_gateway role" -}}
 {{- end -}}
 {{- if and $credentials.create (not $database.provisionRole) -}}
 {{- fail "chart-created Canvas database credentials require database.provisionRole=true" -}}
 {{- end -}}
+{{- if and $credentials.existingSecretCnpgCompatible (not $hasExistingSecret) -}}
+{{- fail "database.credentials.existingSecretCnpgCompatible=true requires database.credentials.existingSecret" -}}
+{{- end -}}
 {{- if and $database.provisionRole (not .Values.databases.postgres.internal) -}}
 {{- fail "Canvas database role provisioning is supported only for chart-owned internal Postgres" -}}
 {{- end -}}
-{{- if and (eq $viewer.deploymentProfile "production") (or $credentials.create $database.provisionRole) -}}
-{{- fail "production Canvas viewers require operator-provisioned credentials through database.credentials.existingSecret or database.credentials.vaultPath" -}}
+{{- if and $database.provisionRole (has $postgresEngine (list "migrating" "cnpg")) $hasExistingSecret (not $credentials.existingSecretCnpgCompatible) -}}
+{{- fail "automatic CNPG Canvas role provisioning with credentials.existingSecret requires credentials.existingSecretCnpgCompatible=true" -}}
+{{- end -}}
+{{- if and (eq $viewer.deploymentProfile "production") (or $credentials.create $database.provisionRole) (not (and .Values.databases.postgres.internal (eq $postgresEngine "cnpg") $database.provisionRole)) -}}
+{{- fail "automatic production Canvas role provisioning requires chart-owned databases.postgres.engine=cnpg" -}}
 {{- end -}}
 {{- if and (eq $viewer.deploymentProfile "production") (eq $credentials.existingSecret (include "srw.secretName" .)) -}}
 {{- fail "production Canvas viewer database credentials must use a dedicated Secret, not the shared application Secret" -}}

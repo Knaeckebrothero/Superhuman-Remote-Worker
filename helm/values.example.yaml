@@ -194,7 +194,9 @@ ingress:
 # normalizing proxies are supported (see
 # knowledge-base/knowledge/issues/canvas_hosted_edge_use_cloudflare_tunnel.md). An enabled
 # production viewer must reference a separately provisioned, least-privilege
-# database credential Secret.
+# database credential. A chart-owned CNPG database can provision that identity
+# declaratively during the same Helm install; external Postgres remains an
+# operator-owned setup.
 canvas:
   livePreview:
     enabled: false
@@ -220,12 +222,19 @@ canvas:
       database:
         username: "srw_canvas_gateway"
         credentials:
+          # Set true with provisionRole on chart-owned CNPG to keep the whole
+          # Canvas database setup inside this Helm release.
           create: false
           existingSecret: ""
+          # Required only when an existing Secret is used with automatic CNPG
+          # provisioning; asserts basic-auth keys + cnpg.io/reload metadata.
+          existingSecretCnpgCompatible: false
           # Alternatively, set a Vault path while using externalSecrets; it is
           # synced only after viewer.enabled becomes true.
           vaultPath: ""
           passwordKey: "CANVAS_VIEWER_POSTGRES_PASSWORD"
+        # With engine=cnpg, CNPG 1.30+ owns the role/password and a normal
+        # revision Job owns the object grants. No pre-install role step.
         provisionRole: false
         pool:
           min: 1

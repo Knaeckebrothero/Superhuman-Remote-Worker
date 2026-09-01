@@ -52,9 +52,10 @@ Optional but recommended:
 - **External Secrets Operator** + a backing store (Vault, AWS Secrets Manager, etc.) — see `externalSecrets.*`
 - **An OIDC IdP** if you don't want the bundled Keycloak (Azure AD, Google Workspace, Okta, etc.)
 - **Managed databases** for production (any standard Postgres 14+ for app + pgvector + audit, Neo4j 5+)
-- **CloudNativePG** + the **Barman Cloud plugin**, only if you run the bundled
-  databases on `databases.<name>.engine: cnpg` and want backups — see
-  [Bundled databases on CloudNativePG](#bundled-databases-on-cloudnativepg) below.
+- **CloudNativePG 1.30+ on Kubernetes 1.29+**, only if a bundled database uses
+  `databases.<name>.engine: cnpg|migrating`; add the **Barman Cloud plugin**
+  only for object-store backups — see
+  [Bundled databases on CloudNativePG](#bundled-databases-on-cloudnativepg).
   Neither is needed for the default StatefulSet engine.
 
 ---
@@ -69,16 +70,131 @@ Each bundled database carries its own `databases.<name>.engine`:
 | `migrating` | **both** — the Cluster imports from the legacy Service | the legacy Service |
 | `cnpg` | the CloudNativePG `Cluster` only | `<name>-rw` |
 
-`statefulset` is the default and needs nothing installed. The rest of this
-section applies only if you change it.
+`statefulset` is the default for every database. Together with
+`databases.profile: single`, it is the supported non-HA posture and requires no
+CNPG installation. The profile controls replica counts only; setting
+`profile: ha` does **not** silently replace database engines.
 
-### The operator
+### Default non-HA installation
 
-`databases.operator.install` ships **false**, because one operator serving many
-namespaces is the normal deployment and a second install fights the first over
-cluster-scoped CRDs — which Helm neither upgrades on `helm upgrade` nor removes
-on `helm uninstall`. Set it to `true` only on a cluster that has no
-CloudNativePG operator yet.
+No database override is required. These are the effective defaults:
+
+```yaml
+databases:
+  profile: single
+  postgres:
+    engine: statefulset
+  vector:
+    engine: statefulset
+  audit:
+    engine: statefulset
+  gitea:
+    engine: statefulset
+  keycloak:
+    engine: statefulset
+```
+
+This keeps each enabled internal PostgreSQL database on one chart-owned
+StatefulSet. It is appropriate for evaluation, local development, and
+non-HA/self-hosted installations that accept single-node database availability.
+
+### HA installation: install CNPG first
+
+The SRW chart owns its namespaced `Cluster`, `DatabaseRole`, credential, backup,
+and policy resources. It deliberately does **not** install, upgrade, or remove
+the cluster-scoped CNPG operator and CRDs. One operator normally serves many
+application namespaces and needs an independent lifecycle.
+
+First check whether the cluster already has CNPG. Never install a second
+cluster-wide operator:
+
+```bash
+kubectl get deployment --all-namespaces \
+  -l app.kubernetes.io/name=cloudnative-pg
+kubectl get crd clusters.postgresql.cnpg.io databaseroles.postgresql.cnpg.io
+```
+
+If an operator exists, record its namespace and verify its controller image is
+CNPG 1.30 or newer. Automatic Dynamic Canvas role provisioning uses the 1.30
+`DatabaseRole` API.
+
+If none exists, install the pinned official operator as its own Helm release:
+
+```bash
+helm repo add cloudnative-pg https://cloudnative-pg.github.io/charts --force-update
+helm upgrade --install cnpg cloudnative-pg/cloudnative-pg \
+  --version 0.29.0 \
+  --namespace cnpg-system \
+  --create-namespace \
+  --wait \
+  --timeout 10m
+```
+
+Do not proceed merely because Helm returned successfully. Verify the
+controller, its admission-webhook endpoint, and both CRDs used by this chart:
+
+```bash
+kubectl -n cnpg-system rollout status deployment/cnpg-cloudnative-pg \
+  --timeout=5m
+test -n "$(kubectl -n cnpg-system get endpoints cnpg-webhook-service \
+  -o jsonpath='{.subsets[0].addresses[0].ip}')"
+kubectl wait --for=condition=Established \
+  crd/clusters.postgresql.cnpg.io \
+  crd/databaseroles.postgresql.cnpg.io \
+  --timeout=2m
+kubectl -n cnpg-system get deployment/cnpg-cloudnative-pg \
+  -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+```
+
+Then select CNPG explicitly in the SRW values. The operator namespace must
+match the namespace verified above because database NetworkPolicies permit its
+health and failover traffic by that exact label:
+
+```yaml
+databases:
+  profile: ha
+  operator:
+    namespace: cnpg-system
+  postgres:
+    engine: cnpg
+  vector:
+    engine: cnpg
+  audit:
+    engine: cnpg
+  gitea:
+    engine: cnpg
+  keycloak:
+    engine: cnpg
+```
+
+Install SRW normally, then wait for every enabled internal cluster:
+
+```bash
+helm upgrade --install srw \
+  oci://ghcr.io/knaeckebrothero/charts/superhuman-remote-worker \
+  --version <chart-version> \
+  --namespace srw \
+  --create-namespace \
+  --values my-values.yaml \
+  --wait \
+  --timeout 20m
+
+kubectl -n srw get clusters.postgresql.cnpg.io
+kubectl -n srw wait --for=condition=Ready \
+  clusters.postgresql.cnpg.io --all --timeout=15m
+```
+
+For an existing StatefulSet installation, do not jump directly to `cnpg`.
+Migrate one database at a time through `engine: migrating`, verify the imported
+target, and only then cut over. CNPG/CRD upgrades likewise happen in the
+separate operator release before an SRW chart version that needs the newer API.
+
+The removed `databases.operator.install` key remains only as a schema tombstone:
+an old stored value of `false` is accepted during upgrade, while `true` fails
+before Helm changes anything. If a prior release actually installed the
+operator subchart, do not bypass that failure with `--reset-values`; hand the
+operator to a separate infrastructure release first or the upgrade could remove
+the controller while retained database clusters are still running.
 
 ### The Barman Cloud plugin — the chart cannot install this
 
@@ -298,19 +414,27 @@ from `databases.<which>.externalHost/externalPort/externalDb` in values;
 only the credentials live in Vault.
 
 An enabled Dynamic Canvas viewer uses a separate PostgreSQL login and never
-receives the application `POSTGRES_*` credential. Production accepts either a
-pre-created dedicated Secret named by
-`canvas.livePreview.viewer.database.credentials.existingSecret`, or a dedicated
-Vault KV path in `credentials.vaultPath` that the chart maps into such a Secret
-through ESO. The Vault-backed ExternalSecret is rendered only while
-`viewer.enabled=true`; preconfiguring the path while the gateway is disabled
-does not contact the provider or require the properties to exist. Pick exactly
-one source and provision that role with only the documented Canvas viewer
-grants. For development with the bundled database, `credentials.create=true`
-plus `provisionRole=true` generates a dedicated Secret and runs the bounded
-role reconciler. That mode is rejected for a production viewer.
-The secret-safe production workflow, preflight, direct-Secret option, and
-rotation cautions are documented in
+receives the application `POSTGRES_*` credential. For a chart-owned
+`databases.postgres.engine=cnpg` database, set `provisionRole=true` and choose
+exactly one credential source. `credentials.create=true` is the completely
+self-contained path: the chart creates a CNPG basic-auth Secret, CNPG 1.30's
+`DatabaseRole` reconciles the fixed login and password, and a tracked
+revision-scoped Job applies and attests the database/object allowlist as the
+ordinary application owner. This works for production and development and
+requires no database administrator credential or pre-install role step.
+
+`credentials.vaultPath` provides the same automatic path through ESO without
+changing the Vault property. A pre-created `credentials.existingSecret` can
+also be used; with automatic CNPG provisioning it must already be
+`kubernetes.io/basic-auth`, contain matching `username`/`password`, carry
+`cnpg.io/reload=true`, and set `existingSecretCnpgCompatible=true` as an
+explicit offline-render assertion. The Vault-backed ExternalSecret is rendered
+only while `viewer.enabled=true`.
+
+External PostgreSQL remains operator-provisioned because the Helm release does
+not own its control plane. The legacy bundled StatefulSet keeps its existing
+development-only identity branch until that engine is retired. The external
+workflow, Secret contract, and rotation cautions are documented in
 `knowledge-base/knowledge/operations/dynamic_canvas_gateway_database.md`.
 
 **OIDC / SSO** (when Keycloak or external IdP enabled):

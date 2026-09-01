@@ -37,6 +37,17 @@ _DATABASE_URL = os.getenv("CANVAS_TEST_DATABASE_URL", "").strip()
 _ROOT = Path(__file__).resolve().parents[1]
 _GATEWAY_ROLE = "srw_canvas_gateway_ci"
 _GATEWAY_PASSWORD = "canvas_gateway_ci_password_123"
+_OWNER_ROLE = "srw_canvas_owner_ci"
+_OWNER_PASSWORD = "canvas_owner_ci_password_123"
+_GATEWAY_RELATIONS = (
+    "users",
+    "threads",
+    "srw_sessions",
+    "canvases",
+    "canvas_view_attachments",
+    "canvas_view_bootstraps",
+    "canvas_origin_sessions",
+)
 pytestmark = [
     pytest.mark.asyncio,
     pytest.mark.skipif(
@@ -87,30 +98,32 @@ def _bootstrap_attachment_id(url: str, *, expected_origin: str) -> UUID:
     return attachment_id
 
 
-def _role_database_url() -> str:
+def _database_url_for(role: str, password: str) -> str:
     parsed = urlsplit(_DATABASE_URL)
     hostname = parsed.hostname or ""
     if ":" in hostname:
         hostname = f"[{hostname}]"
     if parsed.port is not None:
         hostname = f"{hostname}:{parsed.port}"
-    netloc = f"{quote(_GATEWAY_ROLE, safe='')}:{quote(_GATEWAY_PASSWORD, safe='')}@{hostname}"
+    netloc = f"{quote(role, safe='')}:{quote(password, safe='')}@{hostname}"
     return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, ""))
 
 
-def _apply_packaged_role_script() -> None:
-    """Reconcile the disposable gateway role from the packaged Helm SQL."""
+def _role_database_url() -> str:
+    return _database_url_for(_GATEWAY_ROLE, _GATEWAY_PASSWORD)
 
+
+def _run_packaged_sql(database_url: str, filename: str) -> None:
     result = subprocess.run(
         [
             "psql",
-            _DATABASE_URL,
+            database_url,
             "--no-psqlrc",
             "--quiet",
             "--set",
             "ON_ERROR_STOP=1",
             "--file",
-            str(_ROOT / "helm/files/canvas-viewer-role.sql"),
+            str(_ROOT / "helm/files" / filename),
         ],
         check=False,
         capture_output=True,
@@ -121,7 +134,20 @@ def _apply_packaged_role_script() -> None:
             "CANVAS_VIEWER_POSTGRES_PASSWORD": _GATEWAY_PASSWORD,
         },
     )
-    assert result.returncode == 0, result.stderr
+    assert result.returncode == 0, f"{filename}: {result.stderr}"
+
+
+def _apply_packaged_role_script() -> None:
+    """Run the chart's identity/target/owner phases in release order."""
+
+    phases = (
+        (_DATABASE_URL, "canvas-viewer-role.sql"),
+        (_DATABASE_URL, "canvas-viewer-role-safety.sql"),
+        (_role_database_url(), "canvas-viewer-self-configure.sql"),
+        (_DATABASE_URL, "canvas-viewer-grants.sql"),
+    )
+    for database_url, filename in phases:
+        _run_packaged_sql(database_url, filename)
 
 
 async def _drop_gateway_test_role(conn: asyncpg.Connection) -> None:
@@ -152,6 +178,7 @@ async def test_restricted_gateway_role_script_and_runtime_attestation() -> None:
         await admin.execute(
             f"GRANT CREATE ON DATABASE {database_identifier} TO {_GATEWAY_ROLE}"
         )
+        await admin.execute(f"GRANT CREATE ON SCHEMA public TO {_GATEWAY_ROLE}")
         _apply_packaged_role_script()
 
         await admin.execute(f"SET ROLE {_GATEWAY_ROLE}")
@@ -183,6 +210,68 @@ async def test_restricted_gateway_role_script_and_runtime_attestation() -> None:
         if restricted is not None:
             await restricted.close()
         await _drop_gateway_test_role(admin)
+        await admin.close()
+
+
+async def test_cnpg_acl_path_needs_only_unprivileged_object_owner() -> None:
+    """Prove the long-term ACL half has no hidden role-admin dependency."""
+
+    admin = await asyncpg.connect(_DATABASE_URL)
+    restricted: asyncpg.Connection | None = None
+    owner_created = False
+    try:
+        await _drop_gateway_test_role(admin)
+        await admin.execute(
+            f"CREATE ROLE {_OWNER_ROLE} WITH LOGIN NOSUPERUSER NOCREATEDB "
+            f"NOCREATEROLE INHERIT NOREPLICATION NOBYPASSRLS "
+            f"PASSWORD '{_OWNER_PASSWORD}'"
+        )
+        owner_created = True
+        await admin.execute(
+            f"CREATE ROLE {_GATEWAY_ROLE} WITH LOGIN NOSUPERUSER NOCREATEDB "
+            f"NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS "
+            f"PASSWORD '{_GATEWAY_PASSWORD}'"
+        )
+        database_identifier = await admin.fetchval(
+            "SELECT quote_ident(current_database())"
+        )
+        await admin.execute(
+            f"ALTER DATABASE {database_identifier} OWNER TO {_OWNER_ROLE}"
+        )
+        for relation in _GATEWAY_RELATIONS:
+            await admin.execute(
+                f"ALTER TABLE public.{relation} OWNER TO {_OWNER_ROLE}"
+            )
+
+        owner_url = _database_url_for(_OWNER_ROLE, _OWNER_PASSWORD)
+        _run_packaged_sql(owner_url, "canvas-viewer-role-safety.sql")
+        _run_packaged_sql(_role_database_url(), "canvas-viewer-self-configure.sql")
+        _run_packaged_sql(owner_url, "canvas-viewer-grants.sql")
+
+        restricted = await asyncpg.connect(_role_database_url())
+        await attest_canvas_viewer_database_privileges(restricted)
+        owner_is_unprivileged = await admin.fetchval(
+            """
+            SELECT NOT rolsuper AND NOT rolcreaterole AND NOT rolcreatedb
+                   AND NOT rolreplication AND NOT rolbypassrls
+            FROM pg_roles
+            WHERE rolname = $1
+            """,
+            _OWNER_ROLE,
+        )
+        assert owner_is_unprivileged is True
+    finally:
+        if restricted is not None:
+            await restricted.close()
+        if owner_created:
+            admin_identifier = await admin.fetchval("SELECT quote_ident(current_user)")
+            await admin.execute(
+                f"REASSIGN OWNED BY {_OWNER_ROLE} TO {admin_identifier}"
+            )
+            await admin.execute(f"DROP OWNED BY {_OWNER_ROLE}")
+        await _drop_gateway_test_role(admin)
+        if owner_created:
+            await admin.execute(f"DROP ROLE {_OWNER_ROLE}")
         await admin.close()
 
 

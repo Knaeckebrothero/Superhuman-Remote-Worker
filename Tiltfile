@@ -330,7 +330,6 @@ local(
     """
     if helm dependency list ./helm | grep -q 'missing'; then
         helm repo add collabora https://collaboraonline.github.io/online --force-update
-        helm repo add cloudnative-pg https://cloudnative-pg.github.io/charts --force-update
         helm dependency build ./helm
     fi
     """,

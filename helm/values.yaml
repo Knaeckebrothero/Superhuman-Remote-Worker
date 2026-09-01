@@ -737,24 +737,34 @@ canvas:
       # database credential. It connects with a dedicated login whose grants
       # are limited to the viewer/session query surface.
       database:
-        # -- Dedicated PostgreSQL login. Chart-managed development credentials
-        # use this fixed name so an uninstall/reinstall cannot strand older
-        # privileged roles under operator-selected names.
+        # -- Dedicated PostgreSQL login. Automatic provisioning uses this fixed
+        # name so an uninstall/reinstall cannot strand older privileged roles
+        # under operator-selected names.
         username: "srw_canvas_gateway"
         credentials:
-          # -- Generate a dedicated Secret. Development/internal-Postgres only;
-          # production must reference an operator-managed Secret instead.
+          # -- Generate a dedicated CNPG basic-auth Secret. Valid for a
+          # self-contained chart-owned database, including production CNPG;
+          # values and Helm release storage must receive normal Secret-grade
+          # access controls.
           create: false
-          # -- Existing Secret containing only the gateway DB credential.
+          # -- Existing Secret containing the gateway DB credential.
           existingSecret: ""
-          # -- Vault KV path containing exactly `username` and `password`.
-          # This selects a chart-rendered ExternalSecret instead of a
-          # pre-created Kubernetes Secret and requires externalSecrets.enabled.
+          # -- Explicit assertion for automatic CNPG role management: the
+          # existing Secret is kubernetes.io/basic-auth, has username/password,
+          # carries cnpg.io/reload=true, and passwordKey resolves to the same
+          # password. Helm cannot inspect it during an offline/Fleet render.
+          existingSecretCnpgCompatible: false
+          # -- Vault KV path containing the property named by passwordKey. The
+          # chart projects it into a CNPG basic-auth Secret with the fixed
+          # username plus password and compatibility keys. This selects a
+          # chart-rendered ExternalSecret instead of a pre-created Kubernetes
+          # Secret and requires externalSecrets.enabled.
           # The path is inert while viewer.enabled=false: no provider lookup or
           # credential requirement is created until the gateway is enabled.
           vaultPath: ""
           passwordKey: "CANVAS_VIEWER_POSTGRES_PASSWORD"
-        # -- Reconcile the restricted login/grants with a bounded one-shot Job.
+        # -- Reconcile the restricted login and grants. CNPG owns identity and
+        # password through DatabaseRole; a bounded normal Job owns object ACLs.
         # Allowed only for bundled Postgres and required with credentials.create.
         provisionRole: false
         pool:
@@ -1192,26 +1202,15 @@ llmOutage:
   ceilingSeconds: 43200
 
 databases:
-  # -- CloudNativePG operator. The chart can install it as a subchart for a
-  #    batteries-included self-host, or defer to one the cluster already runs
-  #    (one operator serving many namespaces is the normal deployment, and is
-  #    how the dev cluster is set up — cnpg-system, cluster-wide).
+  # -- Externally managed CloudNativePG operator integration. The application
+  #    chart deliberately does not install, upgrade, or uninstall the
+  #    cluster-scoped operator/CRDs. Install CNPG first when any database uses
+  #    `engine: migrating|cnpg`; the default StatefulSet engine needs none.
   operator:
-    # -- Install the CloudNativePG operator as a subchart. OFF while every
-    #    database still runs on `engine: statefulset` — an operator with no
-    #    Cluster to reconcile is pure risk, and one operator serving many
-    #    namespaces is the normal deployment (the dev cluster is set up that
-    #    way: cnpg-system, cluster-wide, installed out of band).
-    #    Turn it on for a self-host whose cluster has no operator yet.
-    #    NOTE: Helm does not upgrade CRDs installed by a subchart, and
-    #    `helm uninstall` does not remove them, so this is close to a one-way
-    #    door. A cluster that already runs CloudNativePG must leave it off, or
-    #    the two installs fight over the same cluster-scoped CRDs.
-    install: false
-    # -- Namespace the CloudNativePG operator runs in. The database
-    #    NetworkPolicies allow it in so it can poll instance health and
-    #    orchestrate failover; without this the operator is silently locked
-    #    out and a failover simply never happens. Dev: cnpg-system.
+    # -- Namespace the separately installed CloudNativePG operator runs in.
+    #    The database NetworkPolicies allow it in so it can poll instance
+    #    health and orchestrate failover; without this the operator is silently
+    #    locked out and a failover simply never happens. Dev: cnpg-system.
     namespace: "cnpg-system"
 
   # -- Seconds Postgres spends in SMART shutdown before CloudNativePG escalates
@@ -1256,6 +1255,8 @@ databases:
   credentialsPreCreated: false
 
   # -- Replica profile. Resolves DEFAULT instance counts and nothing else.
+  #    `single` is the non-HA default and all database engines independently
+  #    default to `statefulset`, so it requires no CNPG operator.
   #    single -> 1 each.  ha -> 2 each.  Per-database `instances` overrides it.
   #    Anti-affinity, PDBs and topology all derive from the RESOLVED count, so
   #    an explicit `instances: 3` behaves correctly without naming a profile.

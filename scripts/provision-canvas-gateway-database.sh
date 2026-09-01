@@ -20,6 +20,9 @@ unset CANVAS_VIEWER_POSTGRES_PASSWORD || true
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROLE_SQL="$ROOT_DIR/helm/files/canvas-viewer-role.sql"
+SAFETY_SQL="$ROOT_DIR/helm/files/canvas-viewer-role-safety.sql"
+SELF_CONFIGURE_SQL="$ROOT_DIR/helm/files/canvas-viewer-self-configure.sql"
+GRANTS_SQL="$ROOT_DIR/helm/files/canvas-viewer-grants.sql"
 APPLY=false
 APPLY_SECRET=false
 TMP_DIR=""
@@ -90,13 +93,13 @@ role_admin_psql() {
 }
 
 validate_secret_shape() {
-  local secret_type immutable actual_keys expected_keys
+  local secret_type immutable actual_keys expected_keys secret_username reload_label
   secret_type="$(
     kubectl --context "$KUBE_CONTEXT" --namespace "$KUBE_NAMESPACE" \
       get secret "$CANVAS_VIEWER_SECRET_NAME" -o jsonpath='{.type}'
   )"
-  [[ "$secret_type" == "Opaque" ]] \
-    || die "the dedicated Canvas database Secret must have type Opaque"
+  [[ "$secret_type" == "kubernetes.io/basic-auth" ]] \
+    || die "the dedicated Canvas database Secret must have type kubernetes.io/basic-auth"
   immutable="$(
     kubectl --context "$KUBE_CONTEXT" --namespace "$KUBE_NAMESPACE" \
       get secret "$CANVAS_VIEWER_SECRET_NAME" -o jsonpath='{.immutable}'
@@ -109,9 +112,28 @@ validate_secret_shape() {
       -o go-template='{{range $key, $_ := .data}}{{$key}}{{"\n"}}{{end}}' \
       | LC_ALL=C sort
   )"
-  expected_keys="$CANVAS_VIEWER_SECRET_PASSWORD_KEY"
+  if [[ "$CANVAS_VIEWER_SECRET_PASSWORD_KEY" == "password" ]]; then
+    expected_keys=$'password\nusername'
+  else
+    expected_keys="$(printf '%s\n' \
+      "$CANVAS_VIEWER_SECRET_PASSWORD_KEY" password username | LC_ALL=C sort)"
+  fi
   [[ "$actual_keys" == "$expected_keys" ]] \
-    || die "the dedicated Canvas database Secret must contain exactly the configured password key"
+    || die "the dedicated Canvas database Secret must contain exactly username, password, and the configured compatibility key"
+  secret_username="$(
+    kubectl --context "$KUBE_CONTEXT" --namespace "$KUBE_NAMESPACE" \
+      get secret "$CANVAS_VIEWER_SECRET_NAME" \
+      -o jsonpath='{.data.username}' | base64 --decode
+  )"
+  [[ "$secret_username" == "$CANVAS_VIEWER_POSTGRES_USER" ]] \
+    || die "the dedicated Canvas database Secret username does not match the restricted role"
+  reload_label="$(
+    kubectl --context "$KUBE_CONTEXT" --namespace "$KUBE_NAMESPACE" \
+      get secret "$CANVAS_VIEWER_SECRET_NAME" \
+      -o jsonpath='{.metadata.labels.cnpg\.io/reload}'
+  )"
+  [[ "$reload_label" == "true" ]] \
+    || die "the dedicated Canvas database Secret must carry cnpg.io/reload=true"
 }
 
 for argument in "$@"; do
@@ -153,6 +175,8 @@ CANVAS_VIEWER_SECRET_PASSWORD_KEY="${CANVAS_VIEWER_SECRET_PASSWORD_KEY:-CANVAS_V
   || die "CANVAS_VIEWER_POSTGRES_USER is not a valid restricted role name"
 [[ "$CANVAS_VIEWER_SECRET_PASSWORD_KEY" =~ ^[A-Za-z0-9._-]+$ ]] \
   || die "CANVAS_VIEWER_SECRET_PASSWORD_KEY is not a valid Secret data key"
+[[ "$CANVAS_VIEWER_SECRET_PASSWORD_KEY" != "username" ]] \
+  || die "CANVAS_VIEWER_SECRET_PASSWORD_KEY cannot replace the basic-auth username key"
 
 PASSWORD_FILE="$CANVAS_VIEWER_POSTGRES_PASSWORD_FILE"
 [[ -f "$PASSWORD_FILE" && ! -L "$PASSWORD_FILE" ]] \
@@ -182,7 +206,10 @@ schema_ready="$(
   || die "Canvas viewer schema is not ready; apply migrations through 0062 first"
 
 if [[ "$APPLY_SECRET" == true ]]; then
-  command -v kubectl >/dev/null 2>&1 || die "missing required binary: kubectl"
+  for binary in kubectl base64; do
+    command -v "$binary" >/dev/null 2>&1 \
+      || die "missing required binary: $binary"
+  done
   for variable in KUBE_CONTEXT KUBE_NAMESPACE CANVAS_VIEWER_SECRET_NAME; do
     [[ -n "${!variable:-}" ]] || die "$variable is required with --apply-secret"
   done
@@ -211,13 +238,20 @@ if [[ "$APPLY" != true ]]; then
 fi
 
 role_admin_psql --no-psqlrc --quiet --set ON_ERROR_STOP=1 --file "$ROLE_SQL"
+role_admin_psql --no-psqlrc --quiet --set ON_ERROR_STOP=1 --file "$SAFETY_SQL"
+PGUSER="$CANVAS_VIEWER_POSTGRES_USER" \
+PGPASSWORD="$CANVAS_VIEWER_POSTGRES_PASSWORD" \
+CANVAS_VIEWER_POSTGRES_USER="$CANVAS_VIEWER_POSTGRES_USER" \
+  psql --no-psqlrc --quiet --set ON_ERROR_STOP=1 \
+    --file "$SELF_CONFIGURE_SQL"
+role_admin_psql --no-psqlrc --quiet --set ON_ERROR_STOP=1 --file "$GRANTS_SQL"
 
 restricted_identity_ok="$(
   PGUSER="$CANVAS_VIEWER_POSTGRES_USER" \
   PGPASSWORD="$CANVAS_VIEWER_POSTGRES_PASSWORD" \
   psql --no-psqlrc --quiet --tuples-only --no-align \
     --set ON_ERROR_STOP=1 \
-    --command "SELECT session_user = current_user AND current_user = '$CANVAS_VIEWER_POSTGRES_USER' AND has_database_privilege(current_user, current_database(), 'CONNECT') AND NOT has_database_privilege(current_user, current_database(), 'CREATE') AND has_schema_privilege(current_user, 'public', 'USAGE') AND NOT has_schema_privilege(current_user, 'public', 'CREATE')"
+    --command "SELECT session_user = current_user AND current_user = '$CANVAS_VIEWER_POSTGRES_USER' AND current_setting('search_path') = 'pg_catalog, public, pg_temp' AND has_database_privilege(current_user, current_database(), 'CONNECT') AND NOT has_database_privilege(current_user, current_database(), 'CREATE') AND has_schema_privilege(current_user, 'public', 'USAGE') AND NOT has_schema_privilege(current_user, 'public', 'CREATE')"
 )"
 [[ "$restricted_identity_ok" == "t" ]] \
   || die "restricted Canvas database identity verification failed"
@@ -230,11 +264,25 @@ if [[ "$APPLY_SECRET" == true ]]; then
 
   TMP_DIR="$(mktemp -d)"
   printf '%s' "$CANVAS_VIEWER_POSTGRES_PASSWORD" >"$TMP_DIR/password"
+  printf '%s' "$CANVAS_VIEWER_POSTGRES_USER" >"$TMP_DIR/username"
+
+  secret_file_args=(
+    --from-file="username=$TMP_DIR/username"
+    --from-file="password=$TMP_DIR/password"
+  )
+  if [[ "$CANVAS_VIEWER_SECRET_PASSWORD_KEY" != "password" ]]; then
+    secret_file_args+=(
+      --from-file="$CANVAS_VIEWER_SECRET_PASSWORD_KEY=$TMP_DIR/password"
+    )
+  fi
 
   kubectl --context "$KUBE_CONTEXT" --namespace "$KUBE_NAMESPACE" \
     create secret generic "$CANVAS_VIEWER_SECRET_NAME" \
-    --from-file="$CANVAS_VIEWER_SECRET_PASSWORD_KEY=$TMP_DIR/password" \
+    --type=kubernetes.io/basic-auth \
+    "${secret_file_args[@]}" \
     --dry-run=client -o yaml \
+    | kubectl --context "$KUBE_CONTEXT" --namespace "$KUBE_NAMESPACE" \
+        label --local -f - cnpg.io/reload=true -o yaml \
     | kubectl --context "$KUBE_CONTEXT" --namespace "$KUBE_NAMESPACE" \
         apply -f - >/dev/null
 

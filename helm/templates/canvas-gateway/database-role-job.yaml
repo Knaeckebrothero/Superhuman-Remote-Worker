@@ -2,6 +2,7 @@
 {{- $database := .Values.canvas.livePreview.viewer.database -}}
 {{- $credentials := $database.credentials -}}
 {{- $databaseSecretName := include "srw.canvasGatewayDatabaseSecretName" . -}}
+{{- $postgresEngine := include "srw.dbEngine" (dict "context" . "db" .Values.databases.postgres) -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -9,89 +10,75 @@ metadata:
   labels:
     {{- include "srw.componentLabels" (dict "context" . "component" "canvas-gateway-role") | nindent 4 }}
 data:
-  provision.sql: |
+  identity.sql: |
 {{ .Files.Get "files/canvas-viewer-role.sql" | indent 4 }}
+  safety.sql: |
+{{ .Files.Get "files/canvas-viewer-role-safety.sql" | indent 4 }}
+  self-configure.sql: |
+{{ .Files.Get "files/canvas-viewer-self-configure.sql" | indent 4 }}
+  grants.sql: |
+{{ .Files.Get "files/canvas-viewer-grants.sql" | indent 4 }}
 {{- /*
-A Helm hook, not a plain resource. As a plain resource this Job was rendered
-into the release manifest, ran, and was then deleted by its own
-ttlSecondsAfterFinished — so Fleet, which builds its monitored set from
-release.Manifest, reported `job.batch <name> missing` and parked the bundle in
-Modified about five minutes after every single deploy. Hooks live in
-release.Hooks, which Fleet never reads, so the bundle stays green and a real
-failure surfaces as a failed release instead of the same generic Modified.
+A regular revision-scoped resource, deliberately not a Helm hook. The gateway
+cannot become Ready until these grants exist, while a post-install hook under
+`helm --wait` runs only after normal resources are Ready. A hook therefore
+creates a fresh-install readiness cycle.
 
-The `-{{ .Release.Revision }}` name suffix went with it: it only existed to dodge
-Job-spec immutability across upgrades, which `before-hook-creation` now handles.
+Do not add ttlSecondsAfterFinished. Fleet monitors release.Manifest; deleting
+the current Job makes success and failure both look like a missing resource.
+The revision suffix avoids immutable Job-field collisions, and Helm removes the
+previous revision when the next manifest is applied.
 
-The orchestrator.replicas guard is NOT optional — Helm blocks on a post-upgrade
-hook until it finishes, and this Job waits on a schema the orchestrator applies
-at startup. At replicas:0 it can never pass, wedging the release in
-pending-upgrade and blocking every later apply INCLUDING the one that scales the
-orchestrator back up. That deadlock cost two manual recoveries on 2026-08-23;
-see the same guard and the same reasoning in ../orchestrator/llm-seed-job.yaml.
-Use `gt (int ...) 0`, never `default` — Helm's `default` treats 0 as empty.
-
-The payload ConfigMap and the NetworkPolicy stay plain resources: post-* hooks
-run after the main manifest is applied, so both are already in place when this
-runs, and leaving them out of the hook set keeps them under Fleet's watch.
+The orchestrator guard keeps a migration-dependent Job out of deliberately
+quiesced releases. Unlike the former hook, a mistake here cannot wedge Helm in
+pending-upgrade, but a Job that can never observe migrations is still noise.
 */ -}}
 {{- if gt (int .Values.orchestrator.replicas) 0 }}
 ---
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ include "srw.fullname" . }}-canvas-gateway-role
+  name: {{ include "srw.fullname" . }}-canvas-gateway-role-{{ .Release.Revision }}
   labels:
     {{- include "srw.componentLabels" (dict "context" . "component" "canvas-gateway-role") | nindent 4 }}
-  annotations:
-    # hook-weight 10 matches the seed Jobs: run after all weight<10 hooks and
-    # after the main manifest, so the orchestrator is up and migrating.
-    "helm.sh/hook": post-install,post-upgrade
-    "helm.sh/hook-weight": "10"
-    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
 spec:
-  activeDeadlineSeconds: 600
-  backoffLimit: 4
-  ttlSecondsAfterFinished: 300
+  activeDeadlineSeconds: 1200
+  backoffLimit: 2
   template:
     metadata:
       labels:
         {{- include "srw.componentSelectorLabels" (dict "context" . "component" "canvas-gateway-role") | nindent 8 }}
     spec:
       automountServiceAccountToken: false
-      restartPolicy: OnFailure
+      restartPolicy: Never
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      containers:
-        - name: provision-role
+      initContainers:
+        - name: wait-for-owner-schema
           image: {{ .Values.databases.postgres.image }}
           command:
             - sh
             - -ec
             - |
               set +x
-              if [ "${#CANVAS_VIEWER_POSTGRES_PASSWORD}" -lt 16 ]; then
-                echo "Canvas gateway database password must contain at least 16 characters" >&2
-                exit 1
-              fi
-              ready=false
-              for attempt in $(seq 1 120); do
-                if psql --no-psqlrc --quiet --tuples-only --no-align \
-                    --command "SELECT to_regclass('public.canvas_origin_sessions') IS NOT NULL AND COUNT(*) = 5 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'canvas_view_bootstraps' AND column_name IN ('authorized_at', 'browser_binding_hash', 'challenge_hash', 'exchange_token_hash', 'ready_receipt_hash')" \
-                    2>/dev/null | grep -qx t; then
-                  ready=true
-                  break
+              error_file=/tmp/canvas-wait-error
+              for attempt in $(seq 1 300); do
+                if result="$(psql --no-psqlrc --quiet --tuples-only --no-align \
+                    --set ON_ERROR_STOP=1 \
+                    --command "SELECT to_regclass('public.canvas_origin_sessions') IS NOT NULL AND COUNT(*) = 5{{ if eq $postgresEngine "cnpg" }} AND EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'srw_canvas_gateway' AND rolcanlogin AND NOT rolsuper AND NOT rolcreaterole AND NOT rolcreatedb AND NOT rolinherit AND NOT rolreplication AND NOT rolbypassrls AND rolconnlimit = -1){{ end }} FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'canvas_view_bootstraps' AND column_name IN ('authorized_at', 'browser_binding_hash', 'challenge_hash', 'exchange_token_hash', 'ready_receipt_hash')" \
+                    2>"$error_file")" && [ "$result" = t ]; then
+                  exit 0
                 fi
                 sleep 2
               done
-              if [ "$ready" != true ]; then
-                echo "Canvas viewer schema was not ready before the role-provisioning deadline" >&2
-                exit 1
+              echo "Canvas database owner, migrated schema, or declarative role was not ready before the provisioning deadline" >&2
+              if [ -s "$error_file" ]; then
+                echo "Last database error:" >&2
+                tail -n 20 "$error_file" >&2
               fi
-              exec psql --no-psqlrc --quiet --set ON_ERROR_STOP=1 \
-                --file /etc/srw-canvas-db/provision.sql
+              exit 1
           env:
             - name: PGHOST
               value: {{ include "srw.postgresHost" . | quote }}
@@ -109,7 +96,42 @@ spec:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: POSTGRES_PASSWORD
-            # Role name is chart configuration, not secret material.
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+        {{- if ne $postgresEngine "cnpg" }}
+        - name: reconcile-legacy-identity
+          image: {{ .Values.databases.postgres.image }}
+          command:
+            - sh
+            - -ec
+            - |
+              set +x
+              if [ "${#CANVAS_VIEWER_POSTGRES_PASSWORD}" -lt 16 ]; then
+                echo "Canvas gateway database password must contain at least 16 characters" >&2
+                exit 1
+              fi
+              exec psql --no-psqlrc --quiet --set ON_ERROR_STOP=1 \
+                --file /etc/srw-canvas-db/identity.sql
+          env:
+            - name: PGHOST
+              value: {{ include "srw.postgresHost" . | quote }}
+            - name: PGPORT
+              value: {{ include "srw.postgresPort" . | quote }}
+            - name: PGDATABASE
+              value: {{ include "srw.postgresDb" . | quote }}
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: POSTGRES_USER
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: POSTGRES_PASSWORD
             - name: CANVAS_VIEWER_POSTGRES_USER
               value: {{ $database.username | quote }}
             - name: CANVAS_VIEWER_POSTGRES_PASSWORD
@@ -121,6 +143,152 @@ spec:
             - name: role-sql
               mountPath: /etc/srw-canvas-db
               readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+        {{- end }}
+        - name: preflight-owner-contract
+          image: {{ .Values.databases.postgres.image }}
+          command:
+            - psql
+            - --no-psqlrc
+            - --quiet
+            - --set
+            - ON_ERROR_STOP=1
+            - --file
+            - /etc/srw-canvas-db/safety.sql
+          env:
+            - name: PGHOST
+              value: {{ include "srw.postgresHost" . | quote }}
+            - name: PGPORT
+              value: {{ include "srw.postgresPort" . | quote }}
+            - name: PGDATABASE
+              value: {{ include "srw.postgresDb" . | quote }}
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: POSTGRES_USER
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: POSTGRES_PASSWORD
+            - name: CANVAS_VIEWER_POSTGRES_USER
+              value: {{ $database.username | quote }}
+          volumeMounts:
+            - name: role-sql
+              mountPath: /etc/srw-canvas-db
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+        - name: prove-target-password
+          image: {{ .Values.databases.postgres.image }}
+          command:
+            - sh
+            - -ec
+            - |
+              set +x
+              error_file=/tmp/canvas-target-error
+              for attempt in $(seq 1 150); do
+                if psql --no-psqlrc --quiet --set ON_ERROR_STOP=1 \
+                    --file /etc/srw-canvas-db/self-configure.sql \
+                    2>"$error_file"; then
+                  exit 0
+                fi
+                sleep 2
+              done
+              echo "Canvas restricted login did not accept the expected credential before the provisioning deadline" >&2
+              if [ -s "$error_file" ]; then
+                echo "Last restricted-login error:" >&2
+                tail -n 20 "$error_file" >&2
+              fi
+              exit 1
+          env:
+            - name: PGHOST
+              value: {{ include "srw.postgresHost" . | quote }}
+            - name: PGPORT
+              value: {{ include "srw.postgresPort" . | quote }}
+            - name: PGDATABASE
+              value: {{ include "srw.postgresDb" . | quote }}
+            - name: PGUSER
+              value: {{ $database.username | quote }}
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $databaseSecretName }}
+                  key: {{ $credentials.passwordKey }}
+            - name: CANVAS_VIEWER_POSTGRES_USER
+              value: {{ $database.username | quote }}
+          volumeMounts:
+            - name: role-sql
+              mountPath: /etc/srw-canvas-db
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+        - name: reconcile-owner-grants
+          image: {{ .Values.databases.postgres.image }}
+          command:
+            - psql
+            - --no-psqlrc
+            - --quiet
+            - --set
+            - ON_ERROR_STOP=1
+            - --file
+            - /etc/srw-canvas-db/grants.sql
+          env:
+            - name: PGHOST
+              value: {{ include "srw.postgresHost" . | quote }}
+            - name: PGPORT
+              value: {{ include "srw.postgresPort" . | quote }}
+            - name: PGDATABASE
+              value: {{ include "srw.postgresDb" . | quote }}
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: POSTGRES_USER
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: POSTGRES_PASSWORD
+            - name: CANVAS_VIEWER_POSTGRES_USER
+              value: {{ $database.username | quote }}
+          volumeMounts:
+            - name: role-sql
+              mountPath: /etc/srw-canvas-db
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+      containers:
+        - name: attest-effective-privileges
+          image: {{ include "srw.imageRef" (dict "image" .Values.image.orchestrator) | quote }}
+          imagePullPolicy: {{ .Values.image.orchestrator.pullPolicy }}
+          command:
+            - python
+            - -m
+            - operator_cli.canvas_viewer_database_attestation
+          envFrom:
+            - configMapRef:
+                name: {{ include "srw.fullname" . }}-canvas-gateway-config
+          env:
+            - name: CANVAS_VIEWER_POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $databaseSecretName }}
+                  key: {{ $credentials.passwordKey }}
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

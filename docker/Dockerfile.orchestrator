@@ -106,6 +106,10 @@ RUN python -m operator_cli.managed_repository_reconciliation --help >/dev/null
 # Keep the bounded stateless-wake rollout gate executable through the same
 # flattened-image import path. ``--help`` is inert and never opens storage.
 RUN python -m operator_cli.stateless_wake_acceptance --help >/dev/null
+# The Canvas role reconciliation Job runs this same runtime attestation before
+# a Helm revision becomes ready. ``--help`` proves the flattened image imports
+# it without opening a database connection.
+RUN python -m operator_cli.canvas_viewer_database_attestation --help >/dev/null
 
 # Marker so get_project_root() finds /app (no .git in container)
 RUN touch /app/pyproject.toml && chown srw:srw /app/pyproject.toml

@@ -2786,6 +2786,7 @@ class PostgresDB:
         env_prefix: str = "POSTGRES",
         default_min_connections: int = 2,
         default_max_connections: int = 10,
+        server_settings: Optional[Mapping[str, str]] = None,
     ):
         """Initialize PostgreSQL database manager.
 
@@ -2809,6 +2810,9 @@ class PostgresDB:
                 asyncpg's own ``create_pool`` default (min 10).
             default_max_connections: Baked-in max when the env var is unset
                 (control 10, vector 5, audit 4).
+            server_settings: PostgreSQL session settings applied by asyncpg to
+                every pooled connection. Values are copied at construction so
+                callers cannot mutate a live pool's contract.
 
         Raises:
             ImportError: If asyncpg is not installed
@@ -2836,6 +2840,7 @@ class PostgresDB:
             os.getenv(f"{env_prefix}_MAX_CONNECTIONS", str(default_max_connections))
         )
         self._command_timeout = command_timeout or 60.0
+        self._server_settings = dict(server_settings or {})
 
         self._pool: Optional[asyncpg.Pool] = None
         self._queries: Dict[str, str] = {}  # Cache for loaded queries
@@ -2877,12 +2882,17 @@ class PostgresDB:
                 except (ImportError, ValueError):
                     pass  # pgvector not installed or extension not on this DB
 
+            pool_options = {
+                "min_size": self._min_connections,
+                "max_size": self._max_connections,
+                "command_timeout": self._command_timeout,
+                "init": _init_connection,
+            }
+            if self._server_settings:
+                pool_options["server_settings"] = self._server_settings
             self._pool = await asyncpg.create_pool(
                 self._connection_string,
-                min_size=self._min_connections,
-                max_size=self._max_connections,
-                command_timeout=self._command_timeout,
-                init=_init_connection,
+                **pool_options,
             )
             logger.info(
                 f"PostgreSQL connection pool established "

@@ -53,6 +53,9 @@ def _fake_commands(tmp_path: Path) -> Path:
         printf 'psql %s\n' "$*" >>"$FAKE_COMMAND_LOG"
         if [[ "$*" == *"to_regclass('public.canvas_origin_sessions')"* ]]; then
           printf 't\n'
+        elif [[ "$*" == *"canvas-viewer-self-configure.sql"* ]]; then
+          [[ "$PGPASSWORD" == "$EXPECTED_VIEWER_PASSWORD" ]]
+          touch "$FAKE_ROLE_MARKER"
         elif [[ "$*" == *"--file"* ]]; then
           [[ "$CANVAS_VIEWER_POSTGRES_PASSWORD" == "$EXPECTED_VIEWER_PASSWORD" ]]
           touch "$FAKE_ROLE_MARKER"
@@ -78,15 +81,21 @@ def _fake_commands(tmp_path: Path) -> Path:
           exit 0
         elif [[ "$*" == *"create secret generic srw-canvas-gateway-db"* ]]; then
           printf 'apiVersion: v1\nkind: Secret\nmetadata:\n  name: placeholder\n'
+        elif [[ "$*" == *"label --local -f - cnpg.io/reload=true"* ]]; then
+          cat
         elif [[ "$*" == *"apply -f -"* ]]; then
           cat >/dev/null
           touch "$FAKE_SECRET_MARKER"
         elif [[ "$*" == *"get secret srw-canvas-gateway-db -o jsonpath={.type}"* ]]; then
-          printf 'Opaque'
+          printf 'kubernetes.io/basic-auth'
         elif [[ "$*" == *"get secret srw-canvas-gateway-db -o jsonpath={.immutable}"* ]]; then
           printf 'false'
+        elif [[ "$*" == *"get secret srw-canvas-gateway-db -o jsonpath={.data.username}"* ]]; then
+          printf 'c3J3X2NhbnZhc19nYXRld2F5'
+        elif [[ "$*" == *"get secret srw-canvas-gateway-db -o jsonpath={.metadata.labels.cnpg\\.io/reload}"* ]]; then
+          printf 'true'
         elif [[ "$*" == *"get secret srw-canvas-gateway-db -o go-template="* ]]; then
-          printf '%b' "${FAKE_SECRET_KEYS:-CANVAS_VIEWER_POSTGRES_PASSWORD\\n}"
+          printf '%b' "${FAKE_SECRET_KEYS:-CANVAS_VIEWER_POSTGRES_PASSWORD\\npassword\\nusername\\n}"
         elif [[ "$*" == *"get secret srw-canvas-gateway-db"* ]]; then
           exit 0
         else
@@ -131,8 +140,15 @@ def test_operator_apply_secret_uses_files_and_explicit_context(tmp_path: Path) -
     assert Path(environment["FAKE_ROLE_MARKER"]).exists()
     assert Path(environment["FAKE_SECRET_MARKER"]).exists()
     command_log = Path(environment["FAKE_COMMAND_LOG"]).read_text()
-    assert "--from-file=CANVAS_VIEWER_POSTGRES_USER=" not in command_log
+    assert "--from-file=username=" in command_log
+    assert "--from-file=password=" in command_log
     assert "--from-file=CANVAS_VIEWER_POSTGRES_PASSWORD=" in command_log
+    assert "--type=kubernetes.io/basic-auth" in command_log
+    assert "label --local -f - cnpg.io/reload=true" in command_log
+    assert "canvas-viewer-role.sql" in command_log
+    assert "canvas-viewer-role-safety.sql" in command_log
+    assert "canvas-viewer-self-configure.sql" in command_log
+    assert "canvas-viewer-grants.sql" in command_log
     assert "--context production-context --namespace srw" in command_log
     assert viewer_password not in command_log
     assert environment["PGPASSWORD"] not in command_log
@@ -156,7 +172,7 @@ def test_conflicting_existing_secret_is_rejected_before_role_change(
     )
 
     assert result.returncode != 0
-    assert "exactly the configured password key" in result.stderr
+    assert "exactly username, password" in result.stderr
     assert not Path(environment["FAKE_ROLE_MARKER"]).exists()
     assert not Path(environment["FAKE_SECRET_MARKER"]).exists()
     assert viewer_password not in result.stdout

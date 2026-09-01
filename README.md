@@ -191,12 +191,18 @@ kubectl --context=k3d-srw -n srw create secret generic srw-session-jwt \
 cp deployment/values-local.yaml.example deployment/values-local.yaml
 $EDITOR deployment/values-local.yaml
 helm repo add collabora https://collaboraonline.github.io/online --force-update
-helm repo add cloudnative-pg https://cloudnative-pg.github.io/charts --force-update
 helm dependency build ./helm
 helm install srw ./helm -n srw --kube-context=k3d-srw -f deployment/values-local.yaml
 
 # Log in at https://localhost/ as test / test and create a job
 ```
+
+The default and local-development database posture is deliberately non-HA:
+`databases.profile: single` with every internal PostgreSQL engine on its
+chart-owned `statefulset`. It does not require CloudNativePG. For HA, install
+CNPG as a separate cluster-infrastructure release before SRW, then opt each
+database into `engine: cnpg`; follow the
+[HA/CNPG installation guide](helm/README.md#ha-installation-install-cnpg-first).
 
 Full prerequisites, the two k3d-specific traps, and the smoke-test checklist
 are in [Local Kubernetes Setup (k3d)](#local-kubernetes-setup-k3d) below.
@@ -271,10 +277,13 @@ $EDITOR deployment/values-local.yaml
 # the chart depends on the Collabora subchart (Canvas Office rendering), so its
 # repo must be registered before `helm dependency build` will resolve Chart.lock
 helm repo add collabora https://collaboraonline.github.io/online --force-update
-helm repo add cloudnative-pg https://cloudnative-pg.github.io/charts --force-update
 helm dependency build ./helm
 helm install srw ./helm -n srw --kube-context=k3d-srw -f deployment/values-local.yaml
 ```
+
+Local k3d intentionally keeps the non-HA StatefulSet database defaults; do not
+install CNPG for this workflow unless you are specifically exercising the HA
+migration path from the chart guide.
 
 `deployment/values-local.yaml` is gitignored (it holds your LLM keys). Everything else in it is dev-only stub credentials.
 

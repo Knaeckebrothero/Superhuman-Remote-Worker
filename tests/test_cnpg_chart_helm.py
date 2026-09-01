@@ -500,42 +500,43 @@ def test_statefulset_engine_never_gets_a_database_pdb():
     assert result.returncode != 0 or "kind: PodDisruptionBudget" not in result.stdout
 
 
-# --- operator subchart -----------------------------------------------------
+# --- external operator contract -------------------------------------------
 
 
-def test_chart_declares_the_operator_dependency_conditionally():
+def test_application_chart_does_not_own_the_cnpg_operator():
     chart = yaml.safe_load((CHART / "Chart.yaml").read_text())
-    dependency = [d for d in chart["dependencies"] if d["name"] == "cloudnative-pg"]
-    assert len(dependency) == 1
-    assert dependency[0]["condition"] == "databases.operator.install"
-    assert dependency[0]["repository"] == "https://cloudnative-pg.github.io/charts"
-
-
-def test_chart_lock_pins_the_operator():
-    """CI runs `helm dependency build`, which resolves from the lock, not the
-    range. An unpinned lock means a silently different operator per build."""
-    lock = yaml.safe_load((CHART / "Chart.lock").read_text())
-    pinned = {d["name"]: d["version"] for d in lock["dependencies"]}
-    chart = yaml.safe_load((CHART / "Chart.yaml").read_text())
-    declared = {d["name"]: d["version"] for d in chart["dependencies"]}
-    assert pinned["cloudnative-pg"] == declared["cloudnative-pg"]
-
-
-def test_operator_is_not_installed_by_default():
-    """Phase 2 is inert: nothing renders a Cluster, so an operator would
-    manage nothing -- and on a cluster that already runs one (dev runs 1.29.1
-    cluster-wide) a second install fights it over cluster-scoped CRDs. Helm
-    neither upgrades nor removes subchart CRDs, so that is a one-way door."""
-    documents = _render()
     assert not [
-        d for d in documents if "cloudnative-pg" in d["metadata"].get("name", "")
+        dependency
+        for dependency in chart["dependencies"]
+        if dependency["name"] == "cloudnative-pg"
     ]
 
 
-def test_operator_renders_when_asked_for():
-    documents = _render("databases.operator.install=true")
-    names = [d["metadata"].get("name", "") for d in documents]
-    assert any("cloudnative-pg" in name for name in names)
+def test_chart_lock_does_not_vendor_the_cnpg_operator():
+    lock = yaml.safe_load((CHART / "Chart.lock").read_text())
+    assert "cloudnative-pg" not in {
+        dependency["name"] for dependency in lock["dependencies"]
+    }
+
+
+def test_operator_values_are_namespace_only():
+    values = yaml.safe_load((CHART / "values.yaml").read_text())
+    assert values["databases"]["operator"] == {"namespace": "cnpg-system"}
+
+
+def test_removed_operator_install_true_is_rejected_fail_safe():
+    result = subprocess.run(
+        _template_command("databases.operator.install=true"),
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "operator" in result.stderr
+    assert "install" in result.stderr
+
+
+def test_stored_operator_install_false_remains_upgrade_compatible():
+    _render("databases.operator.install=false")
 
 
 class TestInitdbLocale:

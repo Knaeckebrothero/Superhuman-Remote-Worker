@@ -213,6 +213,7 @@ canvas:
           # viewer may set create=true together with provisionRole=true.
           create: false
           existingSecret: ""
+          existingSecretCnpgCompatible: false
           vaultPath: ""
           passwordKey: "CANVAS_VIEWER_POSTGRES_PASSWORD"
         provisionRole: false
@@ -266,6 +267,9 @@ orchestrator:
       cpu: "500m"
 
 databases:
+  # Non-HA local default. All five PostgreSQL engines continue to inherit
+  # `statefulset`; no CloudNativePG operator is needed for this overlay.
+  profile: single
   postgres:
     storageSize: "5Gi"
   vector:

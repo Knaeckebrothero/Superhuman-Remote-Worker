@@ -150,6 +150,7 @@ def test_canvas_viewer_chart_values_are_default_off_and_fail_closed() -> None:
         "credentials": {
             "create": False,
             "existingSecret": "",
+            "existingSecretCnpgCompatible": False,
             "vaultPath": "",
             "passwordKey": "CANVAS_VIEWER_POSTGRES_PASSWORD",
         },
@@ -186,6 +187,7 @@ def test_canvas_gateway_templates_default_dark_with_optional_ingress() -> None:
         "configmap.yaml",
         "database-external-secret.yaml",
         "database-role-job.yaml",
+        "database-role.yaml",
         "database-secret.yaml",
         "deployment.yaml",
         "ingress.yaml",
@@ -242,7 +244,15 @@ def test_canvas_gateway_templates_default_dark_with_optional_ingress() -> None:
     assert "kind: NetworkPolicy" in role_job
     assert "automountServiceAccountToken: false" in role_job
     assert "activeDeadlineSeconds:" in role_job
-    assert "ttlSecondsAfterFinished:" in role_job
+    assert "ttlSecondsAfterFinished:" not in role_job
+    assert "helm.sh/hook" not in role_job
+    assert ".Release.Revision" in role_job
+    assert "operator_cli.canvas_viewer_database_attestation" in role_job
+
+    database_role = templates["database-role.yaml"]
+    assert "kind: DatabaseRole" in database_role
+    assert "databaseRoleReclaimPolicy: retain" in database_role
+    assert "passwordSecret:" in database_role
 
     policy = templates["network-policy.yaml"]
     assert "non-empty networkPolicy.edgeNamespaceSelector" in policy
@@ -366,9 +376,9 @@ def test_canvas_gateway_helm_render_contract_and_selector_gate() -> None:
         capture_output=True,
         text=True,
     )
-    assert_schema_rejected(
-        generated_production_credentials,
-        "canvas.livePreview.viewer.database.credentials.create",
+    assert generated_production_credentials.returncode != 0
+    assert "requires chart-owned databases.postgres.engine=cnpg" in (
+        generated_production_credentials.stderr
     )
 
     provisioned_production_role = subprocess.run(
@@ -386,10 +396,73 @@ def test_canvas_gateway_helm_render_contract_and_selector_gate() -> None:
         capture_output=True,
         text=True,
     )
-    assert_schema_rejected(
-        provisioned_production_role,
-        "canvas.livePreview.viewer.database.provisionRole",
+    assert provisioned_production_role.returncode != 0
+    assert "requires chart-owned databases.postgres.engine=cnpg" in (
+        provisioned_production_role.stderr
     )
+
+    # Render coverage only: this proves the manifests compose, not that Helm can
+    # readiness-order a newly installed operator/webhook before the CNPG CRs.
+    # The supported empty-cluster sequence installs the operator first.
+    cnpg_render = subprocess.run(
+        [
+            *base,
+            *enabled_args,
+            "--set-string",
+            "canvas.livePreview.viewer.database.credentials.existingSecret=",
+            "--set",
+            "canvas.livePreview.viewer.database.credentials.create=true",
+            "--set",
+            "canvas.livePreview.viewer.database.provisionRole=true",
+            "--set-string",
+            "canvas.livePreview.viewer.networkPolicy.edgeNamespaceSelector.matchLabels.edge=trusted",
+            "--set-string",
+            "canvas.livePreview.viewer.networkPolicy.edgePodSelector.matchLabels.app=viewer-edge",
+            "--set-string",
+            "databases.postgres.engine=cnpg",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    cnpg_objects = [item for item in yaml.safe_load_all(cnpg_render) if item]
+    database_role = next(
+        item
+        for item in cnpg_objects
+        if item.get("kind") == "DatabaseRole"
+        and item.get("metadata", {})
+        .get("labels", {})
+        .get("app.kubernetes.io/component")
+        == "canvas-gateway-role"
+    )
+    assert database_role["spec"]["name"] == "srw_canvas_gateway"
+    assert database_role["spec"]["ensure"] == "present"
+    assert database_role["spec"]["passwordSecret"]["name"]
+    credential_secret = next(
+        item
+        for item in cnpg_objects
+        if item.get("kind") == "Secret"
+        and item.get("metadata", {})
+        .get("labels", {})
+        .get("app.kubernetes.io/component")
+        == "canvas-gateway-credentials"
+    )
+    assert credential_secret["type"] == "kubernetes.io/basic-auth"
+    assert {"username", "password", "CANVAS_VIEWER_POSTGRES_PASSWORD"} == set(
+        credential_secret["stringData"]
+    )
+    assert credential_secret["metadata"]["labels"]["cnpg.io/reload"] == "true"
+    role_job = next(
+        item
+        for item in cnpg_objects
+        if item.get("kind") == "Job"
+        and item.get("metadata", {})
+        .get("labels", {})
+        .get("app.kubernetes.io/component")
+        == "canvas-gateway-role"
+    )
+    assert "helm.sh/hook" not in role_job["metadata"].get("annotations", {})
+    assert "ttlSecondsAfterFinished" not in role_job["spec"]
 
     rendered = subprocess.run(
         [
@@ -647,17 +720,25 @@ def test_canvas_gateway_vault_credentials_follow_viewer_lifecycle() -> None:
     )
     external_secret = external_secrets[0]
     assert "dataFrom" not in external_secret["spec"]
-    # One property: the password. The role name is chart configuration, and
-    # the Vault property name equals the Secret key name (bundle convention).
+    # One Vault property feeds a CNPG basic-auth Secret plus the gateway's
+    # compatibility key. The role name remains fixed chart configuration.
     assert external_secret["spec"]["data"] == [
         {
-            "secretKey": "CANVAS_VIEWER_POSTGRES_PASSWORD",
+            "secretKey": "password",
             "remoteRef": {
                 "key": vault_path,
                 "property": "CANVAS_VIEWER_POSTGRES_PASSWORD",
             },
         },
     ]
+    target_template = external_secret["spec"]["target"]["template"]
+    assert target_template["type"] == "kubernetes.io/basic-auth"
+    assert target_template["metadata"]["labels"]["cnpg.io/reload"] == "true"
+    assert set(target_template["data"]) == {
+        "username",
+        "password",
+        "CANVAS_VIEWER_POSTGRES_PASSWORD",
+    }
     secret_name = external_secret["spec"]["target"]["name"]
     assert secret_name == external_secret["metadata"]["name"]
 
@@ -732,7 +813,12 @@ def test_canvas_gateway_development_can_provision_restricted_internal_role() -> 
     ]
     assert len(credentials) == 1
     assert credentials[0]["kind"] == "Secret"
-    assert set(credentials[0]["stringData"]) == {"CANVAS_VIEWER_POSTGRES_PASSWORD"}
+    assert credentials[0]["type"] == "kubernetes.io/basic-auth"
+    assert set(credentials[0]["stringData"]) == {
+        "username",
+        "password",
+        "CANVAS_VIEWER_POSTGRES_PASSWORD",
+    }
 
     role_objects = [
         item
@@ -747,22 +833,31 @@ def test_canvas_gateway_development_can_provision_restricted_internal_role() -> 
     }
     role_by_kind = {item["kind"]: item for item in role_objects}
     job_spec = role_by_kind["Job"]["spec"]
-    assert job_spec["activeDeadlineSeconds"] <= 600
+    assert role_by_kind["Job"]["metadata"]["name"].endswith("-role-1")
+    assert job_spec["activeDeadlineSeconds"] <= 1200
     assert job_spec["backoffLimit"] <= 4
-    assert job_spec["ttlSecondsAfterFinished"] <= 300
+    assert "ttlSecondsAfterFinished" not in job_spec
     assert job_spec["template"]["spec"]["automountServiceAccountToken"] is False
-    job_environment_names = {
-        entry["name"] for entry in job_spec["template"]["spec"]["containers"][0]["env"]
+    init_container_names = {
+        container["name"]
+        for container in job_spec["template"]["spec"]["initContainers"]
     }
     assert {
-        "PGHOST",
-        "PGPORT",
-        "PGDATABASE",
-        "PGUSER",
-        "PGPASSWORD",
-        "CANVAS_VIEWER_POSTGRES_USER",
-        "CANVAS_VIEWER_POSTGRES_PASSWORD",
-    } == job_environment_names
+        "wait-for-owner-schema",
+        "reconcile-legacy-identity",
+        "preflight-owner-contract",
+        "prove-target-password",
+        "reconcile-owner-grants",
+    } == init_container_names
+    attestation = job_spec["template"]["spec"]["containers"][0]
+    assert attestation["command"] == [
+        "python",
+        "-m",
+        "operator_cli.canvas_viewer_database_attestation",
+    ]
+    assert {entry["name"] for entry in attestation["env"]} == {
+        "CANVAS_VIEWER_POSTGRES_PASSWORD"
+    }
 
     role_policy = role_by_kind["NetworkPolicy"]["spec"]
     assert role_policy["ingress"] == []
@@ -770,3 +865,97 @@ def test_canvas_gateway_development_can_provision_restricted_internal_role() -> 
         port["port"] for rule in role_policy["egress"] for port in rule.get("ports", [])
     }
     assert egress_ports == {53, 5432}
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+def test_canvas_gateway_cnpg_topologies_require_compatible_existing_secret() -> None:
+    chart = ROOT / "helm"
+    test_values = chart / "ci/test-values.yaml"
+    common = [
+        "helm",
+        "template",
+        "canvas-test",
+        str(chart),
+        "-f",
+        str(test_values),
+        "--set",
+        "canvas.livePreview.enabled=true",
+        "--set",
+        "canvas.livePreview.viewer.enabled=true",
+        "--set-string",
+        "canvas.livePreview.viewer.deploymentProfile=development",
+        "--set-string",
+        "canvas.livePreview.viewer.cookieMode=development-cookie-free",
+        "--set-string",
+        "canvas.livePreview.viewer.domain=example-userland.test",
+        "--set-string",
+        "canvas.livePreview.viewer.hostSuffix=.canvas.example-userland.test",
+        "--set-string",
+        "canvas.livePreview.viewer.cockpitOrigins[0]=https://cockpit.example.test",
+        "--set-string",
+        "canvas.livePreview.viewer.networkPolicy.edgeNamespaceSelector.matchLabels.edge=trusted",
+        "--set-string",
+        "canvas.livePreview.viewer.networkPolicy.edgePodSelector.matchLabels.app=viewer-edge",
+        "--set-string",
+        "canvas.livePreview.viewer.database.credentials.existingSecret=canvas-viewer-db",
+        "--set",
+        "canvas.livePreview.viewer.database.provisionRole=true",
+    ]
+
+    rejected = subprocess.run(
+        [*common, "--set-string", "databases.postgres.engine=cnpg"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert rejected.returncode != 0
+    assert "existingSecretCnpgCompatible=true" in rejected.stderr
+
+    for engine, expects_legacy_identity in (("migrating", True), ("cnpg", False)):
+        rendered = subprocess.run(
+            [
+                *common,
+                "--set",
+                "canvas.livePreview.viewer.database.credentials.existingSecretCnpgCompatible=true",
+                "--set-string",
+                f"databases.postgres.engine={engine}",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        objects = [item for item in yaml.safe_load_all(rendered) if item]
+        assert any(
+            item.get("kind") == "DatabaseRole"
+            and item.get("spec", {}).get("name") == "srw_canvas_gateway"
+            for item in objects
+        )
+        job = next(
+            item
+            for item in objects
+            if item.get("kind") == "Job"
+            and item.get("metadata", {})
+            .get("labels", {})
+            .get("app.kubernetes.io/component")
+            == "canvas-gateway-role"
+        )
+        init_names = {
+            container["name"]
+            for container in job["spec"]["template"]["spec"]["initContainers"]
+        }
+        assert ("reconcile-legacy-identity" in init_names) is expects_legacy_identity
+
+    external = subprocess.run(
+        [
+            *common,
+            "--set",
+            "databases.postgres.internal=false",
+            "--set-string",
+            "databases.postgres.externalHost=postgres.example.test",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert external.returncode != 0
+    assert "supported only for chart-owned internal Postgres" in external.stderr

@@ -869,6 +869,9 @@
                           "maxLength": 253,
                           "pattern": "^$|^[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?$"
                         },
+                        "existingSecretCnpgCompatible": {
+                          "type": "boolean"
+                        },
                         "vaultPath": {
                           "type": "string",
                           "maxLength": 512
@@ -1031,6 +1034,7 @@
                             "required": [
                               "create",
                               "existingSecret",
+                              "existingSecretCnpgCompatible",
                               "vaultPath",
                               "passwordKey"
                             ]
@@ -1082,42 +1086,6 @@
                       },
                       "pslBoundaryVerified": {
                         "const": true
-                      },
-                      "database": {
-                        "properties": {
-                          "credentials": {
-                            "properties": {
-                              "create": {
-                                "const": false
-                              }
-                            },
-                            "oneOf": [
-                              {
-                                "properties": {
-                                  "existingSecret": {
-                                    "minLength": 1
-                                  },
-                                  "vaultPath": {
-                                    "maxLength": 0
-                                  }
-                                }
-                              },
-                              {
-                                "properties": {
-                                  "existingSecret": {
-                                    "maxLength": 0
-                                  },
-                                  "vaultPath": {
-                                    "minLength": 1
-                                  }
-                                }
-                              }
-                            ]
-                          },
-                          "provisionRole": {
-                            "const": false
-                          }
-                        }
                       }
                     }
                   }
@@ -1279,6 +1247,23 @@
     "databases": {
       "type": "object",
       "properties": {
+        "operator": {
+          "type": "object",
+          "properties": {
+            "namespace": {
+              "type": "string",
+              "minLength": 1
+            },
+            "install": {
+              "const": false,
+              "description": "Removed compatibility tombstone. CloudNativePG must be installed as a separate infrastructure release; true is rejected to prevent unsafe operator deletion during upgrade."
+            }
+          },
+          "required": [
+            "namespace"
+          ],
+          "additionalProperties": false
+        },
         "postgres": {
           "type": "object",
           "properties": {
