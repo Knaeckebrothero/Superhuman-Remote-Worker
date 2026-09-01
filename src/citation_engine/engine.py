@@ -243,17 +243,36 @@ class CitationEngine:
         name: str | None = None,
         version: str | None = None,
         metadata: Metadata | None = None,
+        content: str | None = None,
     ) -> Source:
         """
         Register a website source.
 
-        Downloads and archives page content at registration time (stored for
-        verification). Network fetch runs in a worker thread.
+        When ``content`` is supplied, archive those provider-returned bytes and
+        perform no network request. Otherwise, download the page at registration
+        time for legacy direct-citation callers.
         """
         log.debug(f"Registering web source: {url}")
 
-        content, fetch_metadata = await asyncio.to_thread(self._fetch_web_content, url)
-        log.debug(f"Fetched {len(content)} characters from web page")
+        if content is None:
+            content, fetch_metadata = await asyncio.to_thread(
+                self._fetch_web_content, url
+            )
+            log.debug(f"Fetched {len(content)} characters from web page")
+        else:
+            fetch_metadata = {
+                "url": url,
+                "accessed_at": datetime.now(timezone.utc).isoformat(),
+                "status_code": None,
+                "content_type": "text/plain",
+                "title": name,
+                "content_source": "provider",
+            }
+            log.debug(
+                "Using %d characters supplied by the web provider for %s",
+                len(content),
+                url,
+            )
 
         content_hash = hashlib.sha256(content.encode()).hexdigest()
 

@@ -443,8 +443,15 @@ def _direct_web_search(
                 title = r.get("title", "Untitled")
                 if url:
                     try:
+                        provider_content = (
+                            r.get("raw_content") or r.get("content") or title
+                        )
                         source_id, fetch_error = _run_async(
-                            context.get_or_register_web_source(url, name=title),
+                            context.get_or_register_web_source(
+                                url,
+                                name=title,
+                                content=provider_content,
+                            ),
                             creator_loop,
                         )
                         registered_sources.append((url, source_id))
@@ -590,8 +597,15 @@ def _extract_webpage(
                 url = r.get("url", "")
                 if url:
                     try:
+                        provider_content = r.get("raw_content") or (
+                            f"Provider returned no page content for {url}"
+                        )
                         source_id, fetch_error = _run_async(
-                            context.get_or_register_web_source(url), creator_loop
+                            context.get_or_register_web_source(
+                                url,
+                                content=provider_content,
+                            ),
+                            creator_loop,
                         )
                         registered.append((url, source_id))
                     except Exception as e:
@@ -733,8 +747,14 @@ def _crawl_website(
                 page_url = r.get("url", "")
                 if page_url:
                     try:
+                        provider_content = r.get("raw_content") or (
+                            f"Provider returned no page content for {page_url}"
+                        )
                         source_id, fetch_error = _run_async(
-                            context.get_or_register_web_source(page_url),
+                            context.get_or_register_web_source(
+                                page_url,
+                                content=provider_content,
+                            ),
                             creator_loop,
                         )
                         registered.append((page_url, source_id))

@@ -784,17 +784,23 @@ class ToolContext:
         return source.id
 
     async def get_or_register_web_source(
-        self, url: str, name: Optional[str] = None
+        self,
+        url: str,
+        name: Optional[str] = None,
+        content: Optional[str] = None,
     ) -> tuple[int, Optional[str]]:
         """Get cached source_id or register new web source.
 
         Checks the source registry first to avoid re-registering the same URL.
-        If the URL cannot be fetched (e.g. 403 Forbidden), the source is still
-        registered with metadata only and a fetch_error is returned.
+        Provider-returned ``content`` is archived without dereferencing ``url``.
+        Legacy callers that omit content retain the citation engine's fetch
+        behavior. If that fetch fails, the source is still registered with
+        metadata only and a fetch_error is returned.
 
         Args:
             url: URL of the web source
             name: Optional human-readable name for the source
+            content: Optional content already returned by an off-pod provider
 
         Returns:
             Tuple of (source_id, fetch_error). fetch_error is None if content
@@ -806,7 +812,7 @@ class ToolContext:
             return source_id, fetch_error
 
         engine = self.get_citation_engine()
-        source = await engine.add_web_source(url, name=name)
+        source = await engine.add_web_source(url, name=name, content=content)
         self._source_registry[url] = source.id
 
         # Check if content was actually fetched

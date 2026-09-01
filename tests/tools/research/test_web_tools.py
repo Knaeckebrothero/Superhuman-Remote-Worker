@@ -103,7 +103,8 @@ def _make_disk_context(tmp_path, register_side_effect=None):
     if register_side_effect is None:
         source_ids = {}
 
-        async def default_register_source(url, name=None):
+        async def default_register_source(url, name=None, content=None):
+            del name, content
             source_ids.setdefault(url, len(source_ids) + 1)
             return source_ids[url], None
 
@@ -117,7 +118,8 @@ def _make_no_workspace_context():
     """Create a ToolContext whose web source registration works but saving fails."""
     context = _configure_tavily(ToolContext())
 
-    async def register_source(url, name=None):
+    async def register_source(url, name=None, content=None):
+        del url, name, content
         return 1, None
 
     context.get_or_register_web_source = AsyncMock(side_effect=register_source)
@@ -503,6 +505,8 @@ class TestWebSearch:
         result = ws.invoke({"query": "test"})
 
         assert mock_tool_context.get_or_register_web_source.called
+        first_call = mock_tool_context.get_or_register_web_source.call_args_list[0]
+        assert first_call.kwargs["content"] == "Short snippet for result 0"
         assert "archived" in result
 
     def test_inaccessible_sources_warning(
@@ -606,7 +610,8 @@ class TestWebSearch:
         }
         mock_langchain_tavily.TavilySearch.return_value = mock_instance
 
-        async def register_inaccessible(url, name=None):
+        async def register_inaccessible(url, name=None, content=None):
+            del url, name, content
             return 42, "HTTP 403"
 
         output = _direct_web_search(
@@ -706,7 +711,10 @@ class TestExtractWebpage:
         t = next(t for t in tools if t.name == "extract_webpage")
         result = t.invoke({"urls": "https://example.com/page1"})
 
-        mock_tool_context.get_or_register_web_source.assert_called()
+        mock_tool_context.get_or_register_web_source.assert_called_with(
+            "https://example.com/page1",
+            content="Full page content here",
+        )
         assert "archived" in result
 
     def test_missing_api_key(self, mock_tool_context):
@@ -880,6 +888,12 @@ class TestCrawlWebsite:
         result = t.invoke({"url": "https://docs.example.com/"})
 
         assert mock_tool_context.get_or_register_web_source.call_count == 2
+        assert (
+            mock_tool_context.get_or_register_web_source.call_args_list[0].kwargs[
+                "content"
+            ]
+            == "Homepage content"
+        )
         assert "archived" in result
 
     def test_missing_api_key(self, mock_tool_context):

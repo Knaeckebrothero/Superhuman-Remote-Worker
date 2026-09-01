@@ -6,7 +6,7 @@ and async job status updates.
 """
 
 from dataclasses import dataclass
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -707,6 +707,62 @@ class TestPhaseAndMultimodal:
         ctx = ToolContext(config={"multimodal": True})
         ctx._llm_config = MagicMock()  # has llm_config but _current_phase is None
         assert ctx.get_phase_multimodal() is True
+
+
+# =============================================================================
+# Web source registration
+# =============================================================================
+
+
+class TestWebSourceRegistration:
+    """Provider content must archive without making the URL a request origin."""
+
+    @pytest.mark.asyncio
+    async def test_tool_context_passes_provider_content_to_citation_engine(self):
+        source = MagicMock(id=7, metadata={"content_source": "provider"})
+        engine = MagicMock()
+        engine.add_web_source = AsyncMock(return_value=source)
+        ctx = ToolContext(citation_engine=engine)
+
+        result = await ctx.get_or_register_web_source(
+            "https://result.example/page",
+            name="Result",
+            content="Provider-returned snippet",
+        )
+
+        assert result == (7, None)
+        engine.add_web_source.assert_awaited_once_with(
+            "https://result.example/page",
+            name="Result",
+            content="Provider-returned snippet",
+        )
+
+    @pytest.mark.asyncio
+    async def test_citation_engine_does_not_fetch_when_content_is_supplied(self):
+        from src.citation_engine import CitationEngine
+
+        source = MagicMock()
+        engine = CitationEngine(db=MagicMock())
+        engine._fetch_web_content = MagicMock(
+            side_effect=AssertionError("provider URL must not be fetched in-process")
+        )
+        engine._register_source = AsyncMock(return_value=source)
+
+        result = await engine.add_web_source(
+            "https://result.example/page",
+            name="Result",
+            content="Provider-returned snippet",
+        )
+
+        assert result is source
+        engine._fetch_web_content.assert_not_called()
+        assert engine._register_source.await_args.kwargs["content"] == (
+            "Provider-returned snippet"
+        )
+        assert (
+            engine._register_source.await_args.kwargs["metadata"]["content_source"]
+            == "provider"
+        )
 
 
 # =============================================================================
