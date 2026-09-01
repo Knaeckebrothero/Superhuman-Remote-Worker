@@ -501,7 +501,17 @@ async def test_search_job_scenario_drives_search_completion_and_todos(
             if chunk["choices"] and chunk["choices"][0]["delta"].get("tool_calls")
         )
 
-    strategic_tools = ("todo_complete", "next_phase_todos", "job_complete")
+    strategic_tools = (
+        "read_file",
+        "todo_complete",
+        "next_phase_todos",
+        "job_complete",
+    )
+    guide = await next_function(*strategic_tools)
+    assert guide == {
+        "name": "read_file",
+        "arguments": '{"path":"skills/todo-guide/SKILL.md"}',
+    }
     for _ in range(4):
         strategic = await next_function(*strategic_tools)
         assert strategic["name"] == "todo_complete"
@@ -518,7 +528,12 @@ async def test_search_job_scenario_drives_search_completion_and_todos(
     transition = await next_function(*strategic_tools)
     assert transition["name"] == "todo_complete"
 
-    tactical_tools = ("todo_complete", "web_search")
+    tactical_tools = ("read_file", "todo_complete", "web_search")
+    verification = await next_function(*tactical_tools)
+    assert verification == {
+        "name": "read_file",
+        "arguments": '{"path":"skills/verify-before-done/SKILL.md"}',
+    }
     search_function = await next_function(*tactical_tools)
     assert search_function["name"] == "web_search"
     assert json.loads(search_function["arguments"]) == {
@@ -529,6 +544,11 @@ async def test_search_job_scenario_drives_search_completion_and_todos(
         tactical = await next_function(*tactical_tools)
         assert tactical["name"] == "todo_complete"
 
+    verification = await next_function(*strategic_tools)
+    assert verification == {
+        "name": "read_file",
+        "arguments": '{"path":"skills/verify-before-done/SKILL.md"}',
+    }
     complete_function = await next_function(*strategic_tools)
     assert complete_function["name"] == "job_complete"
     assert json.loads(complete_function["arguments"]) == {
@@ -547,8 +567,8 @@ async def test_search_job_scenario_drives_search_completion_and_todos(
     assert state["unexpected_count"] == 0
     assert state["pending_calls"] == 0
     assert state["remaining_required_responses"] == 1
-    assert state["search_job_tool_steps"] == 11
-    assert len(state["calls"]) == 12
+    assert state["search_job_tool_steps"] == 14
+    assert len(state["calls"]) == 15
 
 
 async def test_search_job_scenario_refuses_an_expected_phase_tool_gap(
@@ -579,6 +599,154 @@ async def test_search_job_scenario_refuses_an_expected_phase_tool_gap(
     state = (await control.get(f"/control/scenarios/{run_id}")).json()
     assert state["unexpected_count"] == 1
     assert state["search_job_tool_steps"] == 0
+
+
+async def test_fetch_job_scenario_drives_extract_crawl_completion_and_todos(
+    control: httpx.AsyncClient,
+    inference: httpx.AsyncClient,
+) -> None:
+    run_id = "fetch-job-001"
+    await arm(control, run_id, scenario="fetch-job", required_responses=2)
+
+    def tools(*names: str) -> list[dict]:
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": "test",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+            for name in names
+        ]
+
+    async def next_function(*names: str, stream: bool = False) -> dict:
+        response = await inference.post(
+            "/v1/chat/completions",
+            json=chat_request(
+                run_id,
+                stream=stream,
+                extra={"tools": tools(*names)},
+            ),
+        )
+        assert response.status_code == 200
+        if not stream:
+            return response.json()["choices"][0]["message"]["tool_calls"][0]["function"]
+        chunks = [event for event in sse_payloads(response) if isinstance(event, dict)]
+        return next(
+            chunk["choices"][0]["delta"]["tool_calls"][0]["function"]
+            for chunk in chunks
+            if chunk["choices"] and chunk["choices"][0]["delta"].get("tool_calls")
+        )
+
+    strategic_tools = (
+        "read_file",
+        "todo_complete",
+        "next_phase_todos",
+        "job_complete",
+    )
+    guide = await next_function(*strategic_tools)
+    assert guide == {
+        "name": "read_file",
+        "arguments": '{"path":"skills/todo-guide/SKILL.md"}',
+    }
+    for _ in range(4):
+        assert (await next_function(*strategic_tools))["name"] == "todo_complete"
+
+    staged = await next_function(*strategic_tools)
+    assert staged["name"] == "next_phase_todos"
+    assert json.loads(staged["arguments"]) == {
+        "todos": [
+            "Extract the stable public example page through Crawl4AI.",
+            "Crawl the same public origin through Crawl4AI.",
+            "Verify both fetch answers and close the research phase.",
+        ],
+        "phase_name": "Crawl4AI live fetch gate",
+    }
+    assert (await next_function(*strategic_tools))["name"] == "todo_complete"
+
+    tactical_tools = (
+        "read_file",
+        "todo_complete",
+        "extract_webpage",
+        "crawl_website",
+    )
+    verification = await next_function(*tactical_tools)
+    assert verification == {
+        "name": "read_file",
+        "arguments": '{"path":"skills/verify-before-done/SKILL.md"}',
+    }
+    extracted = await next_function(*tactical_tools)
+    assert extracted == {
+        "name": "extract_webpage",
+        "arguments": '{"urls":"https://example.com/"}',
+    }
+    assert (await next_function(*tactical_tools))["name"] == "todo_complete"
+    crawled = await next_function(*tactical_tools)
+    assert crawled["name"] == "crawl_website"
+    assert json.loads(crawled["arguments"]) == {
+        "url": "https://example.com/",
+        "max_depth": 1,
+        "max_breadth": 2,
+        "limit": 2,
+    }
+    for _ in range(2):
+        assert (await next_function(*tactical_tools))["name"] == "todo_complete"
+
+    verification = await next_function(*strategic_tools)
+    assert verification == {
+        "name": "read_file",
+        "arguments": '{"path":"skills/verify-before-done/SKILL.md"}',
+    }
+    complete_function = await next_function(*strategic_tools)
+    assert complete_function["name"] == "job_complete"
+    assert json.loads(complete_function["arguments"]) == {
+        "summary": f"Completed the Crawl4AI live fetch gate for E2E-{run_id}.",
+        "deliverables": [],
+        "confidence": 1.0,
+    }
+    assert await next_function(*strategic_tools, stream=True) == {
+        "name": "todo_complete",
+        "arguments": '{"completion_note":"PASS: Crawl4AI live fetch gate completed."}',
+    }
+
+    state = (await control.get(f"/control/scenarios/{run_id}")).json()
+    assert state["unexpected_count"] == 0
+    assert state["pending_calls"] == 0
+    assert state["remaining_required_responses"] == 2
+    assert state["fetch_job_tool_steps"] == 16
+    assert len(state["calls"]) == 16
+
+
+async def test_fetch_job_scenario_refuses_an_expected_fetch_tool_gap(
+    control: httpx.AsyncClient,
+    inference: httpx.AsyncClient,
+) -> None:
+    run_id = "fetch-job-gap-001"
+    await arm(control, run_id, scenario="fetch-job")
+    request = chat_request(
+        run_id,
+        extra={
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "job_complete",
+                        "description": "test",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ]
+        },
+    )
+
+    rejected = await inference.post("/v1/chat/completions", json=request)
+    assert rejected.status_code == 422
+    assert rejected.json()["error"]["type"] == "required_tool_missing"
+    state = (await control.get(f"/control/scenarios/{run_id}")).json()
+    assert state["unexpected_count"] == 1
+    assert state["fetch_job_tool_steps"] == 0
 
 
 async def test_numbered_stream_is_ordered_and_exactly_once(

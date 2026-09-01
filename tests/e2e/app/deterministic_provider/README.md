@@ -40,8 +40,16 @@ ambiguous, exhausted, unsupported-schema, and wrong-model requests fail closed.
 
 The `search-job` scenario is a narrow live-gate driver. It advances the real agent
 through its strategic setup, stages a two-todo tactical phase, calls `web_search`,
-then returns through `job_complete` and the remaining strategic todos. Tool results
-still pass through SRW normally and are never retained by the fixture.
+then returns through `job_complete` and the remaining strategic todos. It reads the
+todo guide required by the enforced staging contract before staging, and reads the
+verification guide at each completion boundary. Tool results still pass through SRW
+normally and are never retained by the fixture.
+
+The `fetch-job` scenario follows the same fail-closed pattern for the off-pod fetch
+boundary. It calls `extract_webpage` and `crawl_website` against `example.com` before
+completing the job. It reads both guides required by the runtime's enforced staging and
+completion contracts at their phase boundaries; fetched content still flows only through
+SRW and is not retained.
 
 ## Local contract tests
 

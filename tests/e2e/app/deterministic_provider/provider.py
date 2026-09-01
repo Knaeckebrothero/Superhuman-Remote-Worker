@@ -40,6 +40,7 @@ SUPPORTED_SCENARIOS = frozenset(
         "tool-call",
         "numbered-stream",
         "search-job",
+        "fetch-job",
     }
 )
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,127}$")
@@ -61,6 +62,7 @@ class ArmScenarioRequest(BaseModel):
         "tool-call",
         "numbered-stream",
         "search-job",
+        "fetch-job",
     ] = "reply"
     required_responses: int = Field(default=1, ge=1, le=100)
     chunk_delay_ms: int = Field(default=100, ge=0, le=2_000)
@@ -103,6 +105,7 @@ class RunState:
     unexpected_calls: int = 0
     error_once_emitted: bool = False
     search_job_tool_steps: int = 0
+    fetch_job_tool_steps: int = 0
     next_sequence: int = 1
     counters: Counter[tuple[str, str, bool, str]] = field(default_factory=Counter)
     calls: list[dict[str, Any]] = field(default_factory=list)
@@ -400,6 +403,12 @@ class ScenarioStore:
                 and decision.tool_phase
             ):
                 state.search_job_tool_steps += 1
+            if (
+                outcome == "success"
+                and decision.scenario == "fetch-job"
+                and decision.tool_phase
+            ):
+                state.fetch_job_tool_steps += 1
             if outcome != "success":
                 state.unexpected_calls += 1
             duration_ms = max(0, int((time.monotonic() - pending.started_at) * 1000))
@@ -470,6 +479,7 @@ class ScenarioStore:
             "reserved_required_responses": state.reserved_required_responses,
             "remaining_required_responses": state.remaining_required_responses,
             "search_job_tool_steps": state.search_job_tool_steps,
+            "fetch_job_tool_steps": state.fetch_job_tool_steps,
             "unexpected_count": state.unexpected_calls,
             "pending_calls": len(state.pending),
             "counters": counters,
@@ -604,6 +614,7 @@ def create_inference_app(
             elif structured_name is None and state["scenario"] == "search-job":
                 tool_names = _tool_names(payload)
                 if tool_names & {
+                    "read_file",
                     "todo_complete",
                     "next_phase_todos",
                     "web_search",
@@ -625,6 +636,33 @@ def create_inference_app(
                         422,
                         "required_tool_missing",
                         "The search-job scenario requires a tool that was not bound.",
+                    )
+            elif structured_name is None and state["scenario"] == "fetch-job":
+                tool_names = _tool_names(payload)
+                if tool_names & {
+                    "read_file",
+                    "todo_complete",
+                    "next_phase_todos",
+                    "extract_webpage",
+                    "crawl_website",
+                    "job_complete",
+                }:
+                    tool_call = _fetch_job_tool_call(
+                        state["fetch_job_tool_steps"], run_id
+                    )
+                if tool_call is not None and tool_call.name not in tool_names:
+                    await _account_rejection(
+                        store,
+                        run_id=run_id,
+                        endpoint="chat.completions",
+                        model=model,
+                        stream=stream,
+                        outcome="unexpected_required_tool_missing",
+                    )
+                    raise ScenarioError(
+                        422,
+                        "required_tool_missing",
+                        "The fetch-job scenario requires a tool that was not bound.",
                     )
 
             tool_phase = tool_call is not None
@@ -1188,7 +1226,15 @@ def _tool_names(payload: dict[str, Any]) -> set[str]:
 def _search_job_tool_call(step: int, run_id: str) -> ToolCallSpec:
     """Drive the real phased agent through one off-pod search and completion."""
 
-    if step < 4:
+    if step == 0:
+        return ToolCallSpec(
+            name="read_file",
+            arguments=json.dumps(
+                {"path": "skills/todo-guide/SKILL.md"},
+                separators=(",", ":"),
+            ),
+        )
+    if step < 5:
         return ToolCallSpec(
             name="todo_complete",
             arguments=json.dumps(
@@ -1196,7 +1242,7 @@ def _search_job_tool_call(step: int, run_id: str) -> ToolCallSpec:
                 separators=(",", ":"),
             ),
         )
-    if step == 4:
+    if step == 5:
         return ToolCallSpec(
             name="next_phase_todos",
             arguments=json.dumps(
@@ -1210,7 +1256,7 @@ def _search_job_tool_call(step: int, run_id: str) -> ToolCallSpec:
                 separators=(",", ":"),
             ),
         )
-    if step == 5:
+    if step == 6:
         return ToolCallSpec(
             name="todo_complete",
             arguments=json.dumps(
@@ -1218,7 +1264,15 @@ def _search_job_tool_call(step: int, run_id: str) -> ToolCallSpec:
                 separators=(",", ":"),
             ),
         )
-    if step == 6:
+    if step == 7:
+        return ToolCallSpec(
+            name="read_file",
+            arguments=json.dumps(
+                {"path": "skills/verify-before-done/SKILL.md"},
+                separators=(",", ":"),
+            ),
+        )
+    if step == 8:
         return ToolCallSpec(
             name="web_search",
             arguments=json.dumps(
@@ -1229,7 +1283,7 @@ def _search_job_tool_call(step: int, run_id: str) -> ToolCallSpec:
                 separators=(",", ":"),
             ),
         )
-    if step in {7, 8}:
+    if step in {9, 10}:
         return ToolCallSpec(
             name="todo_complete",
             arguments=json.dumps(
@@ -1237,7 +1291,15 @@ def _search_job_tool_call(step: int, run_id: str) -> ToolCallSpec:
                 separators=(",", ":"),
             ),
         )
-    if step == 9:
+    if step == 11:
+        return ToolCallSpec(
+            name="read_file",
+            arguments=json.dumps(
+                {"path": "skills/verify-before-done/SKILL.md"},
+                separators=(",", ":"),
+            ),
+        )
+    if step == 12:
         return ToolCallSpec(
             name="job_complete",
             arguments=json.dumps(
@@ -1255,6 +1317,124 @@ def _search_job_tool_call(step: int, run_id: str) -> ToolCallSpec:
         name="todo_complete",
         arguments=json.dumps(
             {"completion_note": "PASS: SearXNG live search gate completed."},
+            separators=(",", ":"),
+        ),
+    )
+
+
+def _fetch_job_tool_call(step: int, run_id: str) -> ToolCallSpec:
+    """Drive the real phased agent through both off-pod fetch operations."""
+
+    if step == 0:
+        return ToolCallSpec(
+            name="read_file",
+            arguments=json.dumps(
+                {"path": "skills/todo-guide/SKILL.md"},
+                separators=(",", ":"),
+            ),
+        )
+    if step < 5:
+        return ToolCallSpec(
+            name="todo_complete",
+            arguments=json.dumps(
+                {"completion_note": "PASS: live-gate strategic setup step."},
+                separators=(",", ":"),
+            ),
+        )
+    if step == 5:
+        return ToolCallSpec(
+            name="next_phase_todos",
+            arguments=json.dumps(
+                {
+                    "todos": [
+                        "Extract the stable public example page through Crawl4AI.",
+                        "Crawl the same public origin through Crawl4AI.",
+                        "Verify both fetch answers and close the research phase.",
+                    ],
+                    "phase_name": "Crawl4AI live fetch gate",
+                },
+                separators=(",", ":"),
+            ),
+        )
+    if step == 6:
+        return ToolCallSpec(
+            name="todo_complete",
+            arguments=json.dumps(
+                {"completion_note": "PASS: tactical fetch phase staged."},
+                separators=(",", ":"),
+            ),
+        )
+    if step == 7:
+        return ToolCallSpec(
+            name="read_file",
+            arguments=json.dumps(
+                {"path": "skills/verify-before-done/SKILL.md"},
+                separators=(",", ":"),
+            ),
+        )
+    if step == 8:
+        return ToolCallSpec(
+            name="extract_webpage",
+            arguments=json.dumps(
+                {"urls": "https://example.com/"},
+                separators=(",", ":"),
+            ),
+        )
+    if step == 9:
+        return ToolCallSpec(
+            name="todo_complete",
+            arguments=json.dumps(
+                {"completion_note": "PASS: Crawl4AI extract completed."},
+                separators=(",", ":"),
+            ),
+        )
+    if step == 10:
+        return ToolCallSpec(
+            name="crawl_website",
+            arguments=json.dumps(
+                {
+                    "url": "https://example.com/",
+                    "max_depth": 1,
+                    "max_breadth": 2,
+                    "limit": 2,
+                },
+                separators=(",", ":"),
+            ),
+        )
+    if step in {11, 12}:
+        return ToolCallSpec(
+            name="todo_complete",
+            arguments=json.dumps(
+                {"completion_note": "PASS: Crawl4AI tactical fetch step."},
+                separators=(",", ":"),
+            ),
+        )
+    if step == 13:
+        return ToolCallSpec(
+            name="read_file",
+            arguments=json.dumps(
+                {"path": "skills/verify-before-done/SKILL.md"},
+                separators=(",", ":"),
+            ),
+        )
+    if step == 14:
+        return ToolCallSpec(
+            name="job_complete",
+            arguments=json.dumps(
+                {
+                    "summary": (
+                        f"Completed the Crawl4AI live fetch gate for E2E-{run_id}."
+                    ),
+                    "deliverables": [],
+                    "confidence": 1.0,
+                },
+                separators=(",", ":"),
+            ),
+        )
+    return ToolCallSpec(
+        name="todo_complete",
+        arguments=json.dumps(
+            {"completion_note": "PASS: Crawl4AI live fetch gate completed."},
             separators=(",", ":"),
         ),
     )
