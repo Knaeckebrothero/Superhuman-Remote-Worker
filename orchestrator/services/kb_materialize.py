@@ -1503,6 +1503,32 @@ async def materialize_knowledge_note_delete(
             "retry_state": "none",
         }
     elif not intent.get("attempt_claimed"):
+        if str(intent.get("retry_state") or "") == "permanent":
+            # The identical delete (same reason, same token) was already
+            # refused for good — typically `precondition-failed` on a stale
+            # token. Say so, instead of "in progress": the caller must
+            # re-read (the sweep restamps the row's blob_sha) and ask again
+            # with the current token, which is a different intent.
+            prior = str(
+                intent.get("last_error")
+                or intent.get("last_error_class")
+                or "permanent-failure"
+            )
+            return {
+                **_result(
+                    _STATUS_FAILED,
+                    reason=prior,
+                    repo=intent.get("repo"),
+                    branch=intent.get("branch"),
+                    path=intent.get("path"),
+                    operation="delete",
+                ),
+                "intent_id": intent_id,
+                "canonical_state": intent.get("canonical_state") or "failed",
+                "projection_state": intent.get("projection_state") or "pending",
+                "retry_state": "permanent",
+                "row_deleted": False,
+            }
         return {
             **_result(_STATUS_SKIPPED, reason="attempt-in-progress"),
             "intent_id": intent_id,

@@ -702,6 +702,44 @@ class TestMaterializeDelete:
         assert result["row_deleted"] is False
 
     @pytest.mark.asyncio
+    async def test_a_previously_refused_identical_delete_reports_the_refusal(self):
+        """E6 run 3: the purge lane re-asked with the same stale token; the
+        ledger held a permanent intent for that payload and the op said
+        `attempt-in-progress`. It must say what actually happened."""
+        g = _make_gitea(tree_paths={PATH: _blob_sha(BODY)})
+        g.delete_path = AsyncMock(return_value="deleted")
+        db = _ledger_db()
+
+        async def _begin(**kwargs):
+            return {
+                "id": uuid.uuid4(),
+                "canonical_state": "failed",
+                "projection_state": "pending",
+                "retry_state": "permanent",
+                "attempt_claimed": False,
+                "last_error": "precondition-failed",
+                "path": PATH,
+            }
+
+        db.begin_knowledge_materialization.side_effect = _begin
+        store = self._store()
+        with _patch_resolve(_ref()):
+            result = await materialize_knowledge_note_delete(
+                postgres_db=db,
+                gitea_client=g,
+                project_id=PROJECT,
+                slug=SLUG,
+                expected_blob_sha="0" * 40,
+                store=store,
+            )
+        assert result["status"] == "failed"
+        assert result["reason"] == "precondition-failed"
+        assert result["retry_state"] == "permanent"
+        assert result["row_deleted"] is False
+        g.delete_path.assert_not_awaited()
+        store.delete_kb_note.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_retry_dispatch_routes_a_delete_intent(self):
         from services.kb_materialize import retry_knowledge_materialization_intent
 
