@@ -95,6 +95,11 @@ _CATEGORY_LABELS = {
     "workspace": "workspace file",
 }
 
+# Polling/listing are lifecycle observations, not repeated attempts at an
+# external effect.  They still count toward the officer's overall action
+# budget, but must not become the "hot action" that force-ends a wake.
+_OFFICER_GUARD_FINGERPRINT_EXEMPT = frozenset({"list_agents", "wait_agent"})
+
 
 def _unavailable_tool_message(tool_name: str) -> str:
     """Explain why a called tool is not here, rather than just that it isn't.
@@ -146,6 +151,25 @@ def _charter_injection_enabled(config: Any) -> bool:
     )
 
 
+def _active_subagents_block(tool_context: Optional[Any]) -> str:
+    """Render one transient parent-tail status block, or ``""`` when idle.
+
+    The runtime mirror is deliberately best-effort prompt context.  Durable
+    child state remains in the subagent ledger, so a renderer failure must not
+    fail the parent turn or leak a half-updated message into session history.
+    """
+    runtime = getattr(tool_context, "subagent_runtime", None)
+    render = getattr(runtime, "active_subagents_block", None)
+    if not callable(render):
+        return ""
+    try:
+        value = render()
+    except Exception:
+        logger.debug("Failed to render active subagent status", exc_info=True)
+        return ""
+    return str(value or "").strip()
+
+
 def _inject_context_pairs(
     prepared: List[BaseMessage],
     manager_injection: List[BaseMessage],
@@ -154,9 +178,10 @@ def _inject_context_pairs(
     citation_feedback_block: str = "",
     *,
     charter_block: str = "",
+    active_subagents_block: str = "",
     product_guide_turn_boundary: str = "",
 ) -> int:
-    """Insert transient memory/knowledge/citation context pairs into ``prepared``.
+    """Insert transient context at the prompt-cache tail of ``prepared``.
 
     Mutates ``prepared`` in place and returns the number of messages inserted.
     The pairs are anchored at the tail (see ``_injection_anchor_index``) so the
@@ -164,10 +189,11 @@ def _inject_context_pairs(
     prompt caches, while remaining valid for providers that enforce
     function-call turn ordering (Gemini). When the managed App Guide is live,
     a runtime-owned HumanMessage follows the durable turn and any transient
-    block. This restores the current user request as the final instruction
-    even on calls without recalled context. Memory, knowledge, and
-    citation-feedback injection failures are non-fatal — the turn proceeds
-    without that context.
+    block. Active-child state sits immediately before that final boundary, as
+    a provider-portable event message. This restores the current user request
+    as the final instruction even on calls without recalled context. Memory,
+    knowledge, and citation-feedback injection failures are non-fatal — the
+    turn proceeds without that context.
 
     The same message objects may be reused across inner-loop iterations; pair
     ids are only prefix-checked downstream.
@@ -221,6 +247,16 @@ def _inject_context_pairs(
             injected_count += 2
         except Exception as e:
             logger.warning(f"Citation feedback injection failed (non-fatal): {e}")
+
+    if active_subagents_block:
+        prepared.insert(
+            base_inject_idx + injected_count,
+            HumanMessage(
+                content=active_subagents_block,
+                additional_kwargs={PERSIST_ROLE_KEY: "event"},
+            ),
+        )
+        injected_count += 1
 
     if product_guide_turn_boundary:
         # A HumanMessage is deliberate: several providers/models give a
@@ -397,6 +433,37 @@ def _maybe_estimate_reasoning_tokens(turn_metrics: dict, reasoning_text: str) ->
         turn_metrics["reasoning_estimated"] = True
 
 
+def _llm_response_metrics(response: Any, latency_ms: int) -> Optional[dict]:
+    """Normalize one completed provider attempt's usage metadata."""
+
+    meta = getattr(response, "response_metadata", None) or {}
+    token_usage = meta.get("token_usage", {}) or {}
+    usage_md = getattr(response, "usage_metadata", None) or {}
+    if not token_usage and not usage_md:
+        return None
+
+    usage_details = usage_md.get("output_token_details") or {}
+    input_details = usage_md.get("input_token_details") or {}
+    metrics = {
+        "input_tokens": token_usage.get("input_tokens")
+        or token_usage.get("prompt_tokens")
+        or usage_md.get("input_tokens"),
+        "output_tokens": token_usage.get("output_tokens")
+        or token_usage.get("completion_tokens")
+        or usage_md.get("output_tokens"),
+        "reasoning_tokens": token_usage.get("reasoning_tokens")
+        or usage_details.get("reasoning"),
+        # Cached prompt tokens. LangChain normalizes both Chat Completions and
+        # the Responses API to input_token_details.cache_read; the raw
+        # token_usage path covers providers that only expose prompt details.
+        "cached_tokens": input_details.get("cache_read")
+        or (token_usage.get("prompt_tokens_details") or {}).get("cached_tokens"),
+        "latency_ms": latency_ms,
+        "model": meta.get("model_name"),
+    }
+    return {key: value for key, value in metrics.items() if value is not None}
+
+
 class IdleTimeoutError(Exception):
     """Raised when the user has been idle beyond the configured timeout."""
 
@@ -558,7 +625,15 @@ class PersistentLoopCallbacks:
     # appended to history; the turn-complete save reconciles (fills in
     # turn-level metrics / approval decisions via an idempotent upsert).
     # Optional: None ⇒ persist only at turn-complete (back-compat).
-    persist_message: Optional[Callable[[Any], Awaitable[None]]] = None
+    persist_message: Optional[Callable[[Any], Awaitable[Optional[bool]]]] = None
+
+    # Persistent-session foreground delegation crosses an external-effect
+    # boundary: once a child starts, recovery needs the parent's exact durable
+    # AI tool-call row to distinguish a crash from a rewind.  Transports that
+    # set this flag must have ``persist_message`` return True only after that
+    # row is authoritative; a missing/failed acknowledgement prevents every
+    # delegate_agent call in the response from starting.
+    require_delegation_persistence: bool = False
 
     # Full turn-unwind acknowledgement.  Unlike ``on_turn_complete`` (which
     # persists the transcript before the workspace commit is mapped), this
@@ -1029,6 +1104,7 @@ async def run_persistent_loop(
         input_delivery_id: Optional[str] = None
         input_claim_generation: Optional[int] = None
         input_delivery_source: Optional[str] = None
+        input_supersedes_seq: Optional[int] = None
         if isinstance(user_input, dict):
             input_msg_id = user_input.get("id")
             input_delivery_id = user_input.get("delivery_id")
@@ -1041,6 +1117,12 @@ async def run_persistent_loop(
                     input_claim_generation = int(raw_claim_generation)
                 except (TypeError, ValueError):
                     input_claim_generation = None
+            raw_supersedes_seq = user_input.get("supersedes_input_seq")
+            if raw_supersedes_seq is not None:
+                try:
+                    input_supersedes_seq = int(raw_supersedes_seq)
+                except (TypeError, ValueError):
+                    input_supersedes_seq = None
             # System-injected input (e.g. a worker job this session created
             # finished) persists under its own transcript role. Carried through
             # so the turn-start reconcile below re-writes the SAME role the
@@ -1350,24 +1432,42 @@ async def run_persistent_loop(
             return input_delivery_admitted
 
         try:
-            result = await _execute_turn(
-                llm_with_tools=llm_with_tools,
-                tool_map=tool_map,
-                context_manager=context_manager,
-                messages=messages,
-                callbacks=turn_callbacks,
-                llm_timeout=llm_timeout,
-                auxiliary_llm=auxiliary_llm,
-                config=config,
-                recall_store=recall_store,
-                knowledge_store=knowledge_store,
-                project_id=project_id,
-                project_ids=project_ids,
-                tool_context=tool_context,
-                memory_service=memory_service,
-                defer_memory_capture_to_outbox=defer_memory_extraction_to_outbox,
-                before_first_provider_admission=_admit_current_delivery,
-            )
+            if tool_context is not None:
+                # Session children use the durable parent turn as their
+                # parent_iteration, matching the worker graph's checkpoint
+                # stamp.  This is process-local context only; the session
+                # transcript remains the durable source of the turn number.
+                tool_context._current_turn_count = turn_id
+                tool_context._current_input_message_id = str(user_msg.id)
+                tool_context._current_ai_message_id = None
+                tool_context._stateless_subagent_recovery_active = bool(
+                    input_delivery_source == "subagent"
+                    and input_supersedes_seq is not None
+                )
+            try:
+                result = await _execute_turn(
+                    llm_with_tools=llm_with_tools,
+                    tool_map=tool_map,
+                    context_manager=context_manager,
+                    messages=messages,
+                    callbacks=turn_callbacks,
+                    llm_timeout=llm_timeout,
+                    auxiliary_llm=auxiliary_llm,
+                    config=config,
+                    recall_store=recall_store,
+                    knowledge_store=knowledge_store,
+                    project_id=project_id,
+                    project_ids=project_ids,
+                    tool_context=tool_context,
+                    memory_service=memory_service,
+                    defer_memory_capture_to_outbox=(defer_memory_extraction_to_outbox),
+                    before_first_provider_admission=_admit_current_delivery,
+                )
+            finally:
+                if tool_context is not None:
+                    tool_context._stateless_subagent_recovery_active = False
+                    tool_context._current_input_message_id = None
+                    tool_context._current_ai_message_id = None
             tool_calls_this_turn = result.tool_calls_made
             if input_delivery_authority_failed:
                 halt_after_turn = True
@@ -1827,7 +1927,7 @@ async def _execute_turn(
                 return False
         return not _provider_admission_closed()
 
-    async def _persist(msg: Any) -> None:
+    async def _persist(msg: Any) -> Optional[bool]:
         """Persist a message the instant it's appended to history.
 
         Incremental durability: a crash mid-turn keeps everything produced so
@@ -1836,7 +1936,8 @@ async def _execute_turn(
         reconciles either way.
         """
         if callbacks.persist_message is not None:
-            await callbacks.persist_message(msg)
+            return await callbacks.persist_message(msg)
+        return None
 
     async def _record_unexecuted_tool_batch(
         tool_calls: Sequence[dict[str, Any]], *, reason: str
@@ -2349,7 +2450,6 @@ async def _execute_turn(
             knowledge_block,
             citation_feedback_block,
             charter_block=charter_block,
-            product_guide_turn_boundary=product_guide_turn_nudge,
         )
 
         # Repair tool-call pairing before the LLM call. Compaction thrash, an
@@ -2360,19 +2460,131 @@ async def _execute_turn(
         # sanitizes at the same point (src/graph.py:867); the resume path
         # repairs on restore (persistent_app). This is the equivalent guard for
         # the live turn loop, which previously had none.
-        def _provider_input() -> List[BaseMessage]:
-            """Return the repaired input for one concrete provider call."""
+        provider_attempt_input: Optional[List[BaseMessage]] = None
+        provider_attempt_started_at: Optional[float] = None
+        completed_provider_attempts: list[
+            tuple[List[BaseMessage], AIMessage, dict, bool]
+        ] = []
+        archived_provider_attempts = 0
+        published_provider_attempts = 0
+        last_provider_metrics: Optional[dict] = None
 
+        def _provider_input() -> List[BaseMessage]:
+            """Return repaired input plus freshly rendered transient tail."""
+
+            nonlocal provider_attempt_input, provider_attempt_started_at
             messages[:] = repair_tool_pairing(messages)
             prepared[:] = scrub_history_tool_call_arguments(
                 repair_tool_pairing(prepared)
             )
-            return prepared
+            provider_messages = list(prepared)
+            _inject_context_pairs(
+                provider_messages,
+                [],
+                "",
+                "",
+                active_subagents_block=_active_subagents_block(tool_context),
+                product_guide_turn_boundary=product_guide_turn_nudge,
+            )
+            provider_attempt_input = provider_messages
+            provider_attempt_started_at = time.monotonic()
+            return provider_messages
+
+        def _complete_provider_attempt(
+            attempt_response: Optional[AIMessage],
+            *,
+            reasoning_text: str = "",
+        ) -> Optional[dict]:
+            """Bind one completed response to its exact transient input."""
+
+            nonlocal provider_attempt_input, provider_attempt_started_at
+            nonlocal last_provider_metrics
+            if (
+                attempt_response is None
+                or provider_attempt_input is None
+                or provider_attempt_started_at is None
+            ):
+                return None
+            latency_ms = int((time.monotonic() - provider_attempt_started_at) * 1000)
+            attempt_metrics = _llm_response_metrics(attempt_response, latency_ms)
+            if attempt_metrics is not None:
+                _maybe_estimate_reasoning_tokens(
+                    attempt_metrics,
+                    reasoning_text
+                    or (
+                        (
+                            getattr(attempt_response, "additional_kwargs", None) or {}
+                        ).get("reasoning_content")
+                        or ""
+                    ),
+                )
+                last_provider_metrics = attempt_metrics
+            completed_provider_attempts.append(
+                (
+                    provider_attempt_input,
+                    attempt_response,
+                    attempt_metrics or {"latency_ms": latency_ms},
+                    attempt_metrics is not None,
+                )
+            )
+            provider_attempt_input = None
+            provider_attempt_started_at = None
+            return attempt_metrics
+
+        def _archive_completed_provider_attempts() -> None:
+            """Archive every completed response exactly once, input-matched."""
+
+            nonlocal archived_provider_attempts
+            while archived_provider_attempts < len(completed_provider_attempts):
+                provider_input, attempt_response, metrics, _has_usage = (
+                    completed_provider_attempts[archived_provider_attempts]
+                )
+                archived_provider_attempts += 1
+                if callbacks.archive_llm_call is None:
+                    continue
+                try:
+                    callbacks.archive_llm_call(
+                        provider_input,
+                        attempt_response,
+                        metrics,
+                    )
+                except Exception as e:
+                    logger.debug(f"LLM call archive failed (non-fatal): {e}")
+
+        async def _publish_completed_provider_usage() -> None:
+            """Publish every usage-bearing attempt and leave the final anchor."""
+
+            nonlocal published_provider_attempts
+            while published_provider_attempts < len(completed_provider_attempts):
+                _provider_input_snapshot, _attempt_response, metrics, has_usage = (
+                    completed_provider_attempts[published_provider_attempts]
+                )
+                published_provider_attempts += 1
+                if not has_usage:
+                    continue
+                record_usage = getattr(context_manager, "record_provider_usage", None)
+                if record_usage is not None:
+                    record_usage(metrics.get("input_tokens"))
+                if callbacks.on_usage is None:
+                    continue
+                try:
+                    await callbacks.on_usage(
+                        {
+                            **metrics,
+                            "ctx_limit_tokens": (
+                                config.limits.model_max_context_tokens
+                            ),
+                            "compaction_threshold_tokens": getattr(
+                                config.limits, "context_threshold_tokens", None
+                            ),
+                        }
+                    )
+                except Exception as e:
+                    logger.debug(f"usage callback failed (non-fatal): {e}")
 
         # --- LLM call with streaming ---
         response_content = ""
         response: Optional[AIMessage] = None
-        llm_start = time.monotonic()
 
         # Pre-allocate this LLM call's message id so every reasoning frame we
         # broadcast (live deltas below, or the post-stream fallback) shares a
@@ -2564,6 +2776,9 @@ async def _execute_turn(
                     response = chunks[0]
                     for chunk in chunks[1:]:
                         response = response + chunk
+                    _complete_provider_attempt(
+                        response, reasoning_text="".join(_reasoning_buf)
+                    )
 
                 # Streaming bug workaround: some Responses API endpoints
                 # don't send function_call_arguments.delta events, so
@@ -2587,6 +2802,7 @@ async def _execute_turn(
                         llm_with_tools.ainvoke(_provider_input()),
                         timeout=llm_timeout,
                     )
+                    _complete_provider_attempt(response)
                     # Reasoning first: the non-streaming capture path parks it
                     # in additional_kwargs, so emit it before the answer text.
                     if await _emit_reasoning_content(
@@ -2658,6 +2874,8 @@ async def _execute_turn(
                 # Any other truthy mode (graceful, or a legacy bool True)
                 # preserves the partial response so the work is visible.
                 if streaming_interrupted:
+                    _archive_completed_provider_attempts()
+                    await _publish_completed_provider_usage()
                     if streaming_interrupted == "hard":
                         logger.info(
                             "Hard interrupt: dropping partial AIMessage "
@@ -2709,6 +2927,7 @@ async def _execute_turn(
                     if not await _admit_provider_execution():
                         return _closed_result()
                     response = await llm_with_tools.ainvoke(_provider_input())
+                    _complete_provider_attempt(response)
                     # Reasoning first: the non-streaming capture path parks it
                     # in additional_kwargs, so emit it before the answer text.
                     if await _emit_reasoning_content(
@@ -2796,90 +3015,15 @@ async def _execute_turn(
         # chunk carries LangChain's normalized ``usage_metadata`` instead, so
         # read both (verified live on k3d: gemma via the vLLM router reports
         # usage only through usage_metadata).
-        llm_latency_ms = int((time.monotonic() - llm_start) * 1000)
-        turn_metrics: Optional[dict] = None
         meta = getattr(response, "response_metadata", None) or {}
-        token_usage = meta.get("token_usage", {}) or {}
-        usage_md = getattr(response, "usage_metadata", None) or {}
-        if response is not None and (token_usage or usage_md):
-            usage_details = usage_md.get("output_token_details") or {}
-            input_details = usage_md.get("input_token_details") or {}
-            turn_metrics = {
-                "input_tokens": token_usage.get("input_tokens")
-                or token_usage.get("prompt_tokens")
-                or usage_md.get("input_tokens"),
-                "output_tokens": token_usage.get("output_tokens")
-                or token_usage.get("completion_tokens")
-                or usage_md.get("output_tokens"),
-                "reasoning_tokens": token_usage.get("reasoning_tokens")
-                or usage_details.get("reasoning"),
-                # Cached prompt tokens. LangChain normalizes both Chat Completions
-                # and the Responses API (codex/gpt-5.x) to input_token_details.
-                # cache_read; the raw token_usage path is a fallback for providers
-                # that surface prompt_tokens_details but no usage_metadata.
-                "cached_tokens": input_details.get("cache_read")
-                or (token_usage.get("prompt_tokens_details") or {}).get(
-                    "cached_tokens"
-                ),
-                "latency_ms": llm_latency_ms,
-                "model": meta.get("model_name"),
-            }
-            turn_metrics = {k: v for k, v in turn_metrics.items() if v is not None}
-
-            # Backfill a reasoning-token estimate for models that surface
-            # reasoning *text* but no provider reasoning-token count (gemma via
-            # the vLLM router folds it into output_tokens). We hold the streamed
-            # reasoning text (or the post-hoc reasoning_content), so tokenize it
-            # ourselves — a SUBSET of output_tokens, flagged estimated.
-            _reasoning_text = "".join(_reasoning_buf) or (
-                (getattr(response, "additional_kwargs", None) or {}).get(
-                    "reasoning_content"
-                )
-                or ""
-            )
-            _maybe_estimate_reasoning_tokens(turn_metrics, _reasoning_text)
-
-            # Anchor the compaction trigger on the real provider input_tokens
-            # (context_token_accounting.md S1). Guarded so test stubs and
-            # empty-usage turns are no-ops.
-            _record_usage = getattr(context_manager, "record_provider_usage", None)
-            if _record_usage is not None:
-                _record_usage(turn_metrics.get("input_tokens"))
+        turn_metrics = last_provider_metrics
 
         # Audit the call. Sessions previously wrote no llm_requests rows at
         # all — job agents were auditable, session hangs were not
         # (session_silent_failure_audit.md #14). The callback schedules its
         # own background write; failures are non-fatal by contract.
-        if callbacks.archive_llm_call is not None and response is not None:
-            try:
-                callbacks.archive_llm_call(
-                    prepared,
-                    response,
-                    turn_metrics or {"latency_ms": llm_latency_ms},
-                )
-            except Exception as e:
-                logger.debug(f"LLM call archive failed (non-fatal): {e}")
-
-        # Live token telemetry for the cockpit's usage panel (same numbers as
-        # the audit row — one accumulator, two sinks).
-        if callbacks.on_usage is not None and turn_metrics:
-            try:
-                await callbacks.on_usage(
-                    {
-                        **turn_metrics,
-                        "ctx_limit_tokens": config.limits.model_max_context_tokens,
-                        # The absolute token count at which auto-compaction
-                        # fires (limits.context_threshold_tokens → ContextConfig).
-                        # The cockpit anchors its ctx gauge + colour ramp on this,
-                        # not the raw model window, so "danger" means compaction
-                        # is imminent rather than an arbitrary % of the window.
-                        "compaction_threshold_tokens": getattr(
-                            config.limits, "context_threshold_tokens", None
-                        ),
-                    }
-                )
-            except Exception as e:
-                logger.debug(f"usage callback failed (non-fatal): {e}")
+        _archive_completed_provider_attempts()
+        await _publish_completed_provider_usage()
 
         if response is None:
             return TurnResult(
@@ -2956,17 +3100,23 @@ async def _execute_turn(
                     "retrying once via ainvoke"
                 )
                 retry: Optional[AIMessage] = None
+                retry_metrics: Optional[dict] = None
                 try:
                     if not await _admit_provider_execution():
                         return _closed_result()
                     retry = await asyncio.wait_for(
                         llm_with_tools.ainvoke(_provider_input()), timeout=llm_timeout
                     )
+                    retry_metrics = _complete_provider_attempt(retry)
                 except Exception as retry_err:
                     logger.warning(
                         "Empty-response ainvoke retry failed: %s",
                         type(retry_err).__name__,
                     )
+                _archive_completed_provider_attempts()
+                await _publish_completed_provider_usage()
+                if retry_metrics is not None:
+                    turn_metrics = retry_metrics
                 retry_extra = (
                     (getattr(retry, "additional_kwargs", None) or {})
                     if retry is not None
@@ -3097,10 +3247,30 @@ async def _execute_turn(
         messages_added += 1
         # Persist the LLM step immediately — it carries the reasoning + tool
         # calls and is the expensive bit to lose on a mid-turn crash.
-        await _persist(response)
+        persisted_response = await _persist(response)
+
+        # A session child is opened by a tool in this exact assistant message.
+        # Publish its stable in-memory id only after the strict incremental
+        # persistence boundary; the session ledger coerces it to the same DB
+        # UUID and the server verifies that exact row before inserting a child.
+        if tool_context is not None:
+            tool_context._current_ai_message_id = str(response.id)
+
+        response_tool_calls = list(getattr(response, "tool_calls", None) or [])
+        if (
+            callbacks.require_delegation_persistence
+            and any(
+                call.get("name") == "delegate_agent" for call in response_tool_calls
+            )
+            and persisted_response is not True
+        ):
+            raise RuntimeError(
+                "Refusing to start delegated work because the parent AI tool-call "
+                "message was not durably persisted"
+            )
 
         # No tool calls? Turn is done.
-        if not hasattr(response, "tool_calls") or not response.tool_calls:
+        if not response_tool_calls:
             break
 
         if callbacks.after_assistant_tool_calls_persisted is not None:
@@ -3561,7 +3731,10 @@ async def _execute_turn(
             )
             messages_added += 1
             tool_calls_made += 1
-            if officer_max_actions:
+            if (
+                officer_max_actions
+                and tool_name not in _OFFICER_GUARD_FINGERPRINT_EXEMPT
+            ):
                 try:
                     fingerprint = (tool_name, repr(tool_args))
                 except Exception:

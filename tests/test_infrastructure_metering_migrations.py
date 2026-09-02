@@ -353,7 +353,10 @@ APP_INPUT_DELIVERY_CONSTRAINTS_NOT_VALID = (
     ROOT
     / "orchestrator/database/migrations/app/0213_input_delivery_constraints_not_valid.sql"
 )
-APP_CURRENT_MIGRATION_HEAD = APP_INPUT_DELIVERY_CONSTRAINTS_NOT_VALID
+APP_CURRENT_MIGRATION_HEAD = (
+    ROOT
+    / "orchestrator/database/migrations/app/0220_stateless_subagent_recovery_events.sql"
+)
 AUDIT_EXPANSION = (
     ROOT
     / "orchestrator/database/migrations/audit/0003_infrastructure_usage_events_v2.sql"

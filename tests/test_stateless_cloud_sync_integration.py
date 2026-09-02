@@ -1196,6 +1196,9 @@ async def test_none_agent_cloud_suppression_is_stateless_only(
         async def cleanup(self, **kwargs):
             return None
 
+        async def recover_subagents(self):
+            return []
+
     cloud_sync = {"backend": "nextcloud", "webdav_url": "http://historical"}
     workspace_payload = {
         "cloud_mount": None,
@@ -1295,6 +1298,9 @@ async def test_late_workspace_fetch_retains_generation_without_coordinator():
 
         async def setup(self, **kwargs):
             return None
+
+        async def recover_subagents(self):
+            return []
 
     # The readiness response has no generation. The first metadata hydration
     # fetch also lacks it; only the later cloud-config fetch carries the binding

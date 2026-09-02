@@ -25,6 +25,25 @@ from typing import (
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True, slots=True)
+class ParentRef:
+    """The one durable object that owns a child runtime.
+
+    Worker children belong to a job; persistent-session children belong to a
+    thread.  Keeping the discriminator beside the identifier prevents a
+    session UUID from being smuggled through ``parent_job_id`` merely because
+    both columns happen to be UUIDs.
+    """
+
+    kind: str
+    id: str
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"job", "thread"}:
+            raise ValueError(f"unknown subagent parent kind: {self.kind!r}")
+        object.__setattr__(self, "id", str(self.id or "").strip())
+
+
 class ContextProbe(NamedTuple):
     """A snapshot of the PARENT's context accounting, read at envelope time.
 
@@ -44,10 +63,14 @@ class ContextProbe(NamedTuple):
 class ParentHost(Protocol):
     """The parent seen from a child (worker job today, session in U5)."""
 
-    #: Parent job id — the audit / metering identity every child row hangs off.
-    job_id: str
-    #: Parent session thread (U5); ``None`` for a worker job.
-    thread_id: Optional[str]
+    #: Exact durable parent identity.  Exactly one of job/thread is present.
+    parent_ref: ParentRef
+    #: UUID-shaped audit/metering correlation identity.  For a session this is
+    #: the parent thread UUID; the audit store deliberately has no jobs FK.
+    correlation_id: str
+    #: ``lane_b`` mirrors a committed delivery into the worker's local drain;
+    #: ``event`` means the durable transaction already queued session input.
+    delivery_channel: str
     #: Owning user (forwarded on agent→orchestrator calls); may be ``None``.
     user_id: Optional[str]
     #: Parent ``agent_id`` — the ``agent_type`` column of the child's audit rows.
@@ -85,9 +108,13 @@ class ParentHost(Protocol):
         (the compacted history, never a prepared/transient copy)."""
         ...
 
-    def enqueue_event(self, text: str) -> None:
+    def enqueue_event(self, text: str) -> Any:
         """Deliver a ``role=event`` notice to the parent (U4 background
-        delivery); a foreground parent may ignore it."""
+        delivery), or wake a durable session inbox after its transaction.
+
+        The return may be awaitable.  Delivery is already durable before this
+        hint runs, so callers treat failures as latency-only.
+        """
         ...
 
 
@@ -114,6 +141,15 @@ class SimpleParentHost:
     probe_fn: Optional[Callable[[], Optional[ContextProbe]]] = None
     fork_source_fn: Optional[Callable[[], List[Any]]] = None
     events: List[str] = field(default_factory=list)
+    delivery_channel: str = "lane_b"
+
+    @property
+    def parent_ref(self) -> ParentRef:
+        return ParentRef("job", self.job_id)
+
+    @property
+    def correlation_id(self) -> str:
+        return self.parent_ref.id
 
     def provider_admission(self) -> bool:
         if self.admission_fn is None:
@@ -193,6 +229,15 @@ class WorkerHost:
     admission_fn: Optional[Callable[[], bool]] = None
     effect_authority_fn: Optional[Callable[[], Any]] = None
     events: List[str] = field(default_factory=list)
+    delivery_channel: str = "lane_b"
+
+    @property
+    def parent_ref(self) -> ParentRef:
+        return ParentRef("job", self.job_id)
+
+    @property
+    def correlation_id(self) -> str:
+        return self.parent_ref.id
 
     @property
     def audit_metadata(self) -> Dict[str, Any]:
@@ -305,4 +350,117 @@ class WorkerHost:
         return cls(**values)
 
 
-__all__ = ["ContextProbe", "ParentHost", "SimpleParentHost", "WorkerHost"]
+@dataclass
+class SessionHost:
+    """A persistent thread as a true subagent parent (U5).
+
+    Exact owner/lease proof remains outside this transport-neutral class and
+    is injected from ``persistent_app``.  Unlike the lightweight test host,
+    a missing proof is a closed boundary for a production session.
+    """
+
+    thread_id: str
+    agent_type: str
+    tool_context: Any
+    user_id: Optional[str] = None
+    auxiliary_llm: Optional[Any] = None
+    live_llm_config: Optional[Any] = None
+    postgres: Optional[Any] = None
+    admission_fn: Optional[Callable[[], bool]] = None
+    effect_authority_fn: Optional[Callable[[], Any]] = None
+    settlement_authority_fn: Optional[Callable[[], Any]] = None
+    event_fn: Optional[Callable[[str], Any]] = None
+    delivery_channel: str = "event"
+
+    @property
+    def parent_ref(self) -> ParentRef:
+        return ParentRef("thread", self.thread_id)
+
+    @property
+    def correlation_id(self) -> str:
+        return self.parent_ref.id
+
+    @property
+    def audit_metadata(self) -> Dict[str, Any]:
+        stamped = getattr(self.tool_context, "_parent_audit_metadata", None)
+        if isinstance(stamped, dict):
+            return stamped
+        return {"parent_thread_id": self.thread_id}
+
+    def provider_admission(self) -> bool:
+        if not callable(self.admission_fn):
+            return False
+        try:
+            return bool(self.admission_fn())
+        except Exception:
+            logger.warning(
+                "session subagent host: admission fence raised — closing",
+                exc_info=True,
+            )
+            return False
+
+    async def effect_authority(self) -> bool:
+        if not self.provider_admission() or not callable(self.effect_authority_fn):
+            return False
+        try:
+            value = self.effect_authority_fn()
+            if inspect.isawaitable(value):
+                value = await value
+            return bool(value) and self.provider_admission()
+        except Exception:
+            logger.warning(
+                "session subagent host: exact authority proof failed — closing",
+                exc_info=True,
+            )
+            return False
+
+    async def settlement_authority(self) -> bool:
+        """Prove authority for already-admitted child settlement.
+
+        The injected callback ignores only the local pre-retirement admission
+        latch. It retains the remote generation, attach-token, pod, and
+        process-termination fences.
+        """
+
+        probe = self.settlement_authority_fn or self.effect_authority_fn
+        if not callable(probe):
+            return False
+        try:
+            value = probe()
+            if inspect.isawaitable(value):
+                value = await value
+            return bool(value)
+        except Exception:
+            logger.warning(
+                "session subagent host: settlement-authority proof failed — closing",
+                exc_info=True,
+            )
+            return False
+
+    def context_probe(self) -> Optional[ContextProbe]:
+        probe = getattr(self.tool_context, "parent_context_probe", None)
+        if not callable(probe):
+            return None
+        try:
+            return probe()
+        except Exception:
+            logger.debug("session subagent context probe failed", exc_info=True)
+            return None
+
+    def fork_source(self) -> List[Any]:
+        return list(getattr(self.tool_context, "_fork_source", None) or [])
+
+    def enqueue_event(self, text: str) -> Any:
+        if not callable(self.event_fn):
+            return None
+        return self.event_fn(text)
+
+
+__all__ = [
+    "ContextProbe",
+    "ParentHost",
+    "ParentRef",
+    "SessionHost",
+    "SimpleParentHost",
+    "WorkerHost",
+]

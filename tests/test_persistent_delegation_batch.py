@@ -107,6 +107,25 @@ async def _run_batch(
 
 
 @pytest.mark.asyncio
+async def test_delegation_requires_durable_parent_tool_call_before_child_starts():
+    delegate = _tool("delegate_agent", AsyncMock(return_value="child result"))
+    callbacks = _callbacks(
+        persist_message=AsyncMock(return_value=False),
+        require_delegation_persistence=True,
+    )
+
+    with pytest.raises(RuntimeError, match="parent AI tool-call message"):
+        await _run_batch(
+            [_tool_call("delegate_agent", "child-1", task="inspect")],
+            {"delegate_agent": delegate},
+            callbacks=callbacks,
+        )
+
+    delegate.ainvoke.assert_not_awaited()
+    callbacks.permission_check.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_delegation_only_batch_fans_out_and_keeps_result_order():
     """The second child may finish first; provider pairing remains call order."""
 

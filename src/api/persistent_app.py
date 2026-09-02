@@ -1768,6 +1768,7 @@ def _ensure_persistent_loop_started(
             on_workspace_commit=_loop_on_workspace_commit,
             on_context_compacted=_loop_on_context_compacted,
             persist_message=_loop_persist_message,
+            require_delegation_persistence=True,
             on_turn_settled=_loop_on_turn_settled,
             archive_llm_call=_loop_archive_llm_call,
             on_usage=_loop_on_usage,
@@ -4644,6 +4645,12 @@ async def _attach_session_inner(
         pinned_runtime_identity_required=bool(
             _pinned_runtime_generation_enabled and shell_owner_token is None
         ),
+        orchestrator_client=_orchestrator_client,
+        session_parent_authority_provider=_session_subagent_parent_authority,
+        subagent_provider_admission=_loop_provider_admission_open,
+        subagent_effect_authority=_loop_runtime_effect_authority_current,
+        subagent_settlement_authority=(_loop_runtime_settlement_authority_current),
+        subagent_event_callback=_session_subagent_event_available,
         project_ids=project_ids or [],
         datasources=datasources_dict,
         knowledge_bindings=knowledge_bindings,
@@ -5031,7 +5038,10 @@ async def _attach_session_inner(
     global _loop_last_user_content
     global _hard_interrupt_event, _input_runtime_generation
     global _input_delivery_reclaim_lock
-    _loop_user_queue = asyncio.Queue()
+    # Keep readiness closed until durable child recovery has completely
+    # converged.  Publishing the queue earlier lets a concurrent status/input
+    # request start the provider between two orphan reconciliations.
+    _loop_user_queue = None
     _loop_interrupt_flag = None
     _loop_interrupt_target_turn_id = None
     _hard_interrupt_event = asyncio.Event()
@@ -5039,6 +5049,12 @@ async def _attach_session_inner(
     _input_runtime_generation = str(uuid4())
     _input_delivery_reclaim_lock = asyncio.Lock()
     _queued_input_claims.clear()
+
+    # Child generations survive their parent process. Reconcile predecessors
+    # under this exact authority before any provider can become ready;
+    # recovered background evidence joins the durable-input reclaim below.
+    await _session.recover_subagents()
+    _loop_user_queue = asyncio.Queue()
 
     # Publish mount state only after the authoritative active CAS and queue
     # barrier.  An End racing message/repository restore must not observe a
@@ -5268,10 +5284,7 @@ async def _terminate_session(
                         and _session is termination_session
                         and _attached_retirement_identity() == termination_identity
                         and (
-                            (
-                                retry_identity == termination_identity
-                                and _retirement_admission_token is not None
-                            )
+                            retry_identity == termination_identity
                             or (mark_thread and retry_identity is None)
                         )
                     )
@@ -6375,20 +6388,125 @@ def _pinned_input_runtime_identity() -> tuple[str, str, str, str]:
     return agent_id, pod_uid, generation, attach_token
 
 
-async def _loop_runtime_effect_authority_current() -> bool:
-    """Fail closed unless this exact pinned life may start a new effect.
+def _session_subagent_parent_authority():
+    """Snapshot the exact current pinned life or stateless turn lease."""
+
+    from ..shared.session_subagent_authority import (
+        SessionParentAuthority,
+        SessionParentAuthorityRefused,
+    )
+
+    thread_id = str(_thread_id or "").strip()
+    if not thread_id:
+        raise SessionParentAuthorityRefused("parent_missing")
+    lease = _current_lease_var.get()
+    if lease is not None:
+        if (
+            not lease.active
+            or lease.lost.is_set()
+            or str(lease.unit_id or "") != thread_id
+            or type(lease.lease_token) is not int
+            or lease.lease_token <= 0
+            or not isinstance(lease.executor_id, str)
+            or not lease.executor_id
+            or not isinstance(lease.pod_uid, str)
+            or not lease.pod_uid
+        ):
+            raise SessionParentAuthorityRefused("stateless_parent_not_current")
+        return SessionParentAuthority(
+            execution_lane="stateless",
+            parent_thread_id=thread_id,
+            lease_token=lease.lease_token,
+            executor_id=lease.executor_id,
+            executor_pod_uid=lease.pod_uid,
+        )
+
+    agent_id = _registered_pinned_agent_id()
+    pod_uid = str(os.environ.get("POD_UID") or "").strip()
+    generation = str(_session_runtime_generation or "").strip()
+    attach_token = str(_session_runtime_attach_token or "").strip()
+    if not agent_id or not pod_uid or not generation or not attach_token:
+        raise SessionParentAuthorityRefused("pinned_parent_not_current")
+    return SessionParentAuthority(
+        execution_lane="pinned",
+        parent_thread_id=thread_id,
+        agent_id=agent_id,
+        pod_uid=pod_uid,
+        session_runtime_generation=generation,
+        runtime_attach_token=attach_token,
+    )
+
+
+async def _session_subagent_event_available(_message: str) -> None:
+    """Low-latency wake after the terminal transaction queued role=event."""
+
+    if _stateless_mode() or _session is None or _loop_user_queue is None:
+        return
+    await _reclaim_pending_pinned_inputs()
+
+
+async def _loop_runtime_authority_current(
+    *, allow_retirement_settlement: bool = False
+) -> bool:
+    """Fail closed unless this exact session life may start a new effect.
 
     A process-local retirement latch is fast but owner Force-End can authorize
     a durable retirement token between 60-second lifecycle watchdog polls.
     This exact DB proof is therefore awaited immediately before every provider
-    invocation and real tool ``ainvoke``. Stateless turns retain their lease-
-    fenced execution path and use the local admission/protected-mount gates.
+    invocation and real tool ``ainvoke``. Stateless turns need the same awaited
+    proof: a reaper may rotate their queue lease before the mutable local lease
+    handle observes its lost event.
     """
 
-    if _runtime_admission_closed() or not _protected_cloud_runtime_ready():
+    def local_authority_open() -> bool:
+        return bool(
+            not _termination_admission_closed()
+            and (allow_retirement_settlement or not _retirement_admission_closed())
+        )
+
+    if not local_authority_open() or not _protected_cloud_runtime_ready():
         return False
     if _stateless_mode():
-        return _current_stateless_lease_token() is not None
+        session = _session
+        if session is None or session.postgres_conn is None:
+            return False
+        authority = None
+        try:
+            authority = _session_subagent_parent_authority()
+            if authority.execution_lane != "stateless":
+                return False
+            current = await session.postgres_conn.session_parent_authority_current(
+                authority
+            )
+        except Exception as exc:
+            logger.warning(
+                "Stateless runtime effect-authority proof failed (%s)",
+                type(exc).__name__,
+            )
+            current = False
+        try:
+            authority_after = _session_subagent_parent_authority()
+        except Exception:
+            authority_after = None
+        same_local_life = bool(
+            session is _session
+            and authority is not None
+            and authority_after == authority
+            and str(authority.parent_thread_id) == str(_thread_id or "")
+        )
+        if current is not True and same_local_life:
+            # Wake the executor immediately when the DB rejects a lease whose
+            # local identity has not already rotated. Never mark a freshly
+            # mutated successor handle lost on the TOCTOU branch.
+            handle = _current_lease_var.get()
+            if handle is not None:
+                handle.mark_lost()
+        return bool(
+            current is True
+            and same_local_life
+            and local_authority_open()
+            and _protected_cloud_runtime_ready()
+        )
     if not _pinned_runtime_generation_enabled:
         # Compatibility phase for old orchestrators. Strict mode/new attaches
         # advertise the additive contract and always take the exact DB fence.
@@ -6423,9 +6541,21 @@ async def _loop_runtime_effect_authority_current() -> bool:
         and str(thread_id) == str(_thread_id)
         and _process_generation == _input_runtime_generation
         and attach_token == _session_runtime_attach_token
-        and not _runtime_admission_closed()
+        and local_authority_open()
         and _protected_cloud_runtime_ready()
     )
+
+
+async def _loop_runtime_effect_authority_current() -> bool:
+    """Exact authority for new provider/tool effects."""
+
+    return await _loop_runtime_authority_current()
+
+
+async def _loop_runtime_settlement_authority_current() -> bool:
+    """Exact authority for work admitted before retirement preflight."""
+
+    return await _loop_runtime_authority_current(allow_retirement_settlement=True)
 
 
 async def _transition_claimed_input(
@@ -6546,16 +6676,17 @@ async def _queue_claimed_input(row: dict[str, Any]) -> bool:
     # in this process observes the set; a process death loses the set and its
     # new runtime generation reclaims the durable queued row.
     _queued_input_claims.add(key)
-    queue.put_nowait(
-        {
-            "content": str(row["content"]),
-            "id": str(row["message_id"]),
-            "role": str(row["role"]),
-            "source": str(row["source"]),
-            "delivery_id": delivery_id,
-            "claim_generation": claim_generation,
-        }
-    )
+    queue_item = {
+        "content": str(row["content"]),
+        "id": str(row["message_id"]),
+        "role": str(row["role"]),
+        "source": str(row["source"]),
+        "delivery_id": delivery_id,
+        "claim_generation": claim_generation,
+    }
+    if row.get("supersedes_input_seq") is not None:
+        queue_item["supersedes_input_seq"] = int(row["supersedes_input_seq"])
+    queue.put_nowait(queue_item)
     return True
 
 
@@ -13299,7 +13430,7 @@ def _loop_archive_llm_call(prepared: Any, response: Any, metrics: dict) -> None:
     asyncio.create_task(asyncio.to_thread(_do), name="archive-llm-call")
 
 
-async def _loop_persist_message(msg: Any) -> None:
+async def _loop_persist_message(msg: Any) -> bool:
     """Persist a single message the instant the loop produces it (incremental
     durability — closes Symptom 1).
 
@@ -13313,7 +13444,7 @@ async def _loop_persist_message(msg: Any) -> None:
     turn id (same convention as ``_record_compaction``).
     """
     if _session is None or _session.postgres_conn is None or _thread_id is None:
-        return
+        return False
     try:
         await asyncio.wait_for(
             _persist_one_message(
@@ -13325,10 +13456,12 @@ async def _loop_persist_message(msg: Any) -> None:
             ),
             timeout=5.0,
         )
+        return True
     except asyncio.TimeoutError:
         logger.warning("Incremental message save timed out (5s) — proceeding")
     except Exception as e:
         logger.warning(f"Incremental message save failed (non-fatal): {e}")
+    return False
 
 
 async def _loop_on_error(message: str, turn_id: Optional[int] = None) -> None:
@@ -15614,16 +15747,85 @@ async def _reconcile_retirement_begin_or_reopen_controls(
     if _attached_retirement_identity() != identity:
         return False
 
+    async def reopen_exact_runtime() -> bool | None:
+        """Reopen durable controls and the already-settled child runtime.
+
+        The DB CAS proves this exact life is still token-null.  Child resume
+        then performs its own awaited effect-authority proof.  If that second
+        proof or the settled-state check fails, close controls again and latch
+        local admission: an otherwise-live session must not resume only half
+        of its execution surfaces.
+        """
+
+        global _retirement_admission_identity, _retirement_admission_disposition
+        global _retirement_admission_token, _retirement_admission_permanent
+
+        if _attached_retirement_identity() != identity:
+            return None
+        if (
+            _retirement_admission_identity == identity
+            and _retirement_admission_token is not None
+        ):
+            return None
+        if not await _set_pinned_control_admission(
+            agent_id=exact_agent_id,
+            open_for_admission=True,
+        ):
+            return None
+        if _retirement_admission_identity == identity:
+            # A prior local resume failure may have latched a token-less
+            # admission fence. The exact token-null CAS above proves that
+            # fence is now safe to clear before SessionHost re-proves effect
+            # authority. An authorized token is never reopenable here.
+            _retirement_admission_identity = None
+            _retirement_admission_disposition = None
+            _retirement_admission_token = None
+            _retirement_admission_permanent = None
+        session = _session
+        resume = getattr(session, "resume_subagents", None)
+        try:
+            if session is None or not callable(resume):
+                raise RuntimeError("session has no child-runtime resume boundary")
+            await resume()
+            if _session is not session or _attached_retirement_identity() != identity:
+                raise RuntimeError("session identity moved during child-runtime resume")
+            return True
+        except Exception:
+            logger.warning(
+                "Child runtime could not resume after retirement abort "
+                "(thread=%s agent=%s)",
+                identity[0],
+                exact_agent_id,
+                exc_info=True,
+            )
+            try:
+                if _attached_retirement_identity() == identity:
+                    await _set_pinned_control_admission(
+                        agent_id=exact_agent_id,
+                        open_for_admission=False,
+                    )
+            except Exception:
+                logger.warning(
+                    "Control admission re-close failed after child-runtime "
+                    "resume refusal (thread=%s agent=%s)",
+                    identity[0],
+                    exact_agent_id,
+                    exc_info=True,
+                )
+            if _attached_retirement_identity() == identity:
+                _retirement_admission_identity = identity
+                _retirement_admission_disposition = retirement_disposition
+                _retirement_admission_token = None
+                _retirement_admission_permanent = retirement_permanent
+            return False
+
     if not begin_was_sent:
         # No retirement request crossed the process boundary. Reopening still
         # uses the exact token-null DB CAS: a concurrent owner Begin or a moved
         # successor wins and leaves this process closed.
         if reopen_if_uncommitted:
             try:
-                await _set_pinned_control_admission(
-                    agent_id=exact_agent_id,
-                    open_for_admission=True,
-                )
+                await reopen_exact_runtime()
             except Exception:
                 logger.warning(
                     "Exact control admission reopen failed after local retirement "
@@ -15703,10 +15905,8 @@ async def _reconcile_retirement_begin_or_reopen_controls(
             if not reopen_if_uncommitted:
                 return False
             try:
-                if await _set_pinned_control_admission(
-                    agent_id=exact_agent_id,
-                    open_for_admission=True,
-                ):
+                reopened = await reopen_exact_runtime()
+                if reopened is not None:
                     return False
             except Exception:
                 logger.warning(
@@ -15752,6 +15952,35 @@ async def _begin_exact_session_retirement(
     identity = _attached_retirement_identity()
     if identity is None:
         return False
+    # Close the whole parent admission surface before child quiescence. A
+    # timeout or ambiguous terminal-delivery write leaves the child runtime
+    # non-accepting; keeping parent providers/inputs open in that state would
+    # create a half-live session. The common termination owner retries this
+    # exact tokenless identity until child settlement and Begin converge.
+    if _retirement_admission_identity != identity:
+        _retirement_admission_identity = identity
+        _retirement_admission_disposition = retirement_disposition
+        _retirement_admission_token = None
+        _retirement_admission_permanent = retirement_permanent
+    # Child terminal/transcript writes require the still-current parent
+    # authority. Close child admission and settle every generation before the
+    # server installs the retirement token that revokes it.
+    try:
+        await _session.quiesce_subagents(
+            f"parent session retiring as {retirement_disposition}"
+        )
+    except Exception:
+        logger.warning(
+            "Session child runtime did not quiesce before retirement "
+            "(thread=%s disposition=%s)",
+            _thread_id,
+            retirement_disposition,
+            exc_info=True,
+        )
+        return False
+    # From this point onward every child is settled. Exact no-retirement
+    # reconciliation clears the tokenless latch and resumes both surfaces
+    # together; every other failure stays safely fail-closed.
     if _retirement_admission_identity == identity:
         if _retirement_admission_disposition != retirement_disposition:
             return False

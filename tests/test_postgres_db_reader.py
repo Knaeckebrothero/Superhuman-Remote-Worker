@@ -46,15 +46,17 @@ async def test_agent_db_terminal_status_closes_control_admission():
 @pytest.mark.asyncio
 async def test_history_projects_only_resume_fields():
     """HF-7 thread-read diet: the resume reader returns exactly what the resume
-    consumers use — role/content/tool_calls/tool_call_id/turn_number — and does
+    consumers use — id/role/content/tool_calls/tool_call_id/turn_number — and does
     NOT fetch the resume-unused component columns (thinking/reasoning/
-    tool_results/provider*/response_metadata/additional_kwargs/metrics/id/
+    tool_results/provider*/response_metadata/additional_kwargs/metrics/
     created_at). Those are never read on resume; the rebuilt AIMessage doesn't
-    carry them."""
+    carry them. Stable message IDs are retained for exact subagent-call
+    correlation across recovery."""
     db = PostgresDB.__new__(PostgresDB)  # bypass __init__/connection
     db.fetch = AsyncMock(
         return_value=[
             {
+                "id": "00000000-0000-0000-0000-000000000001",
                 "role": "tool",
                 "content": "result",
                 "tool_calls": None,
@@ -65,6 +67,7 @@ async def test_history_projects_only_resume_fields():
     )
     rows = await db.get_thread_messages_history("t1")
     assert rows[0] == {
+        "id": "00000000-0000-0000-0000-000000000001",
         "role": "tool",
         "content": "result",
         "tool_calls": None,

@@ -68,6 +68,7 @@ class FakeDB:
     def __init__(self, pending_rows: Optional[List[Dict[str, Any]]] = None):
         self.pending_rows = list(pending_rows or [])
         self.fetch_calls: List[tuple] = []
+        self.refreshed_consumed_seq: Optional[int] = None
 
     async def fetch(self, sql: str, *args):
         self.fetch_calls.append((sql, args))
@@ -79,6 +80,12 @@ class FakeDB:
 
     async def fetchval(self, sql: str, *args):
         self.fetch_calls.append((sql, args))
+        if sql == te._EXACT_CONSUMED_SEQ_AFTER_ATTACH_SQL:
+            return (
+                self.refreshed_consumed_seq
+                if self.refreshed_consumed_seq is not None
+                else int(args[3])
+            )
         if sql == te._PENDING_EVENT_EXISTS_SQL:
             return any(row.get("delivery_id") for row in self.pending_rows)
         return None
@@ -97,6 +104,7 @@ class FakeSession:
         self.shell_owner_tokens: List[int] = []
         self.stateless_warm_reuse_safe = stateless_warm_reuse_safe
         self.turn_count = 0
+        self.tool_context = SimpleNamespace(_stateless_subagent_recovery_active=False)
 
     def set_shell_owner_token(self, token: int) -> None:
         self.shell_owner_tokens.append(token)
@@ -626,6 +634,45 @@ class TestHappyPath:
         ]
 
     @pytest.mark.asyncio
+    async def test_subagent_recovery_reuses_abandoned_turn_and_watermark(self, harness):
+        unit = uuid4()
+        row_id = str(uuid4())
+        delivery_id = str(uuid4())
+        harness.db.pending_rows = [
+            {
+                "id": row_id,
+                "seq": 9,
+                "content": "[subagent recovery] use durable evidence",
+                "turn_number": 3,
+                "role": "event",
+                "delivery_id": delivery_id,
+                "supersedes_input_seq": 5,
+            }
+        ]
+        harness.restored_turn_count = 4
+        harness.db.claim_stateless_input_delivery = AsyncMock(
+            return_value={
+                "message_id": row_id,
+                "seq": 9,
+                "claim_generation": 4,
+            }
+        )
+
+        await harness.executor._serve_claim(
+            make_claim(unit_id=unit, token=12, input_seq=9, consumed_seq=5)
+        )
+        await _finish(harness)
+
+        assert harness.sessions[0].turn_count == 3
+        assert (
+            harness.sessions[0].tool_context._stateless_subagent_recovery_active
+            is False
+        )
+        assert harness.calls["complete"] == [
+            {"unit_id": unit, "lease_token": 12, "consumed_seq": 5}
+        ]
+
+    @pytest.mark.asyncio
     async def test_recovered_interrupted_input_is_never_injected(self, harness):
         unit = uuid4()
         stopped_id = str(uuid4())
@@ -652,6 +699,38 @@ class TestHappyPath:
         assert all(item["id"] != stopped_id for item in harness.consumed)
         assert harness.calls["complete"] == [
             {"unit_id": unit, "lease_token": 10, "consumed_seq": 9}
+        ]
+
+    @pytest.mark.asyncio
+    async def test_attach_recovery_refreshes_consumed_watermark_before_selection(
+        self, harness
+    ):
+        unit = uuid4()
+        later_id = str(uuid4())
+        # Foreground recovery during fresh attach proves input 5 already has a
+        # final response and advances the DB watermark without an event.
+        harness.db.refreshed_consumed_seq = 5
+        fetch_pending = AsyncMock(
+            return_value=[
+                {
+                    "id": later_id,
+                    "seq": 9,
+                    "content": "later input",
+                    "turn_number": 2,
+                }
+            ]
+        )
+
+        with patch.object(harness.executor, "_fetch_pending_rows", fetch_pending):
+            await harness.executor._serve_claim(
+                make_claim(unit_id=unit, token=11, input_seq=9, consumed_seq=4)
+            )
+        await _finish(harness)
+
+        fetch_pending.assert_awaited_once_with(str(unit), 5)
+        assert harness.consumed == [{"content": "later input", "id": later_id}]
+        assert harness.calls["complete"] == [
+            {"unit_id": unit, "lease_token": 11, "consumed_seq": 9}
         ]
 
     @pytest.mark.asyncio

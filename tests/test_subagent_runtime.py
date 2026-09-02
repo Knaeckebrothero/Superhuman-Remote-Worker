@@ -467,6 +467,50 @@ class TestLedgerReplay:
         assert len(ledger.opened) == 1
 
     @pytest.mark.asyncio
+    async def test_worker_foreground_preserves_best_effort_on_an_exposed_live_row(
+        self, tmp_path
+    ):
+        class ExposingLedger(RecordingLedger):
+            async def lookup(self, parent_job_id, parent_tool_call_id):
+                self.lookups.append((parent_job_id, parent_tool_call_id))
+                return _stored_row(subagent_status="running", subagent_outcome=None)
+
+        ctx, _ = make_parent(tmp_path)
+        ledger = ExposingLedger()
+        runtime = runtime_for(
+            ctx,
+            factory=lambda cfg, lim: FakeChatModel([text_turn("fresh")]),
+            ledger=ledger,
+        )
+
+        envelope = await runtime.run_foreground(call("c9"))
+
+        assert "fresh" in envelope and "Replayed" not in envelope
+        assert len(ledger.opened) == 1
+
+    @pytest.mark.asyncio
+    async def test_worker_background_refuses_an_exposed_live_durable_row(
+        self, tmp_path
+    ):
+        class ExposingLedger(RecordingLedger):
+            async def lookup(self, parent_job_id, parent_tool_call_id):
+                self.lookups.append((parent_job_id, parent_tool_call_id))
+                return _stored_row(subagent_status="queued", subagent_outcome=None)
+
+        ctx, _ = make_parent(tmp_path)
+        ledger = ExposingLedger()
+        runtime = runtime_for(
+            ctx,
+            factory=lambda cfg, lim: FakeChatModel([text_turn("never")]),
+            ledger=ledger,
+        )
+
+        with pytest.raises(RuntimeError, match="live durable child"):
+            await runtime.run_background(call("c10", run_in_background=True))
+
+        assert ledger.opened == []
+
+    @pytest.mark.asyncio
     async def test_a_ledger_without_lookup_or_a_failing_one_spawns(self, tmp_path):
         class NoLookup:
             async def open(self, *a, **k):

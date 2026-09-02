@@ -12142,7 +12142,7 @@ BEGIN
          WHERE message.id = NEW.message_id
            AND message.thread_id = NEW.thread_id;
         IF message_role IS DISTINCT FROM 'event'
-           OR NEW.source IS DISTINCT FROM 'officer_wake' THEN
+           OR NEW.source NOT IN ('officer_wake', 'subagent') THEN
             RAISE EXCEPTION USING
                 ERRCODE = '23514',
                 CONSTRAINT = 'stateless_input_delivery_event_only',
@@ -18308,12 +18308,14 @@ CREATE TABLE public.thread_input_deliveries (
     owner_run_queue_lease_token bigint,
     owner_executor text,
     owner_executor_pod_uid text,
+    supersedes_input_seq bigint,
     CONSTRAINT thread_input_deliveries_admission_shape CHECK ((((state <> ALL (ARRAY['admitted'::text, 'settled'::text])) AND (admitted_at IS NULL) AND (admitted_turn_number IS NULL)) OR ((state = ANY (ARRAY['admitted'::text, 'settled'::text])) AND (admitted_at IS NOT NULL) AND (admitted_turn_number IS NOT NULL)))),
     CONSTRAINT thread_input_deliveries_claim_generation_check CHECK ((claim_generation >= 0)),
     CONSTRAINT thread_input_deliveries_claim_shape CHECK ((((execution_lane = 'pinned'::text) AND (((claim_generation = 0) AND (owner_agent_id IS NULL)) OR ((claim_generation > 0) AND (owner_agent_id IS NOT NULL)))) OR (execution_lane = 'stateless'::text))),
     CONSTRAINT thread_input_deliveries_lane_check CHECK ((execution_lane = ANY (ARRAY['pinned'::text, 'stateless'::text]))),
     CONSTRAINT thread_input_deliveries_owner_shape CHECK ((((execution_lane = 'pinned'::text) AND (owner_run_queue_lease_token IS NULL) AND (owner_executor IS NULL) AND (owner_executor_pod_uid IS NULL) AND (((owner_agent_id IS NULL) AND (owner_pod_uid IS NULL) AND (owner_runtime_generation IS NULL)) OR ((owner_agent_id IS NOT NULL) AND (owner_pod_uid IS NOT NULL) AND (owner_runtime_generation IS NOT NULL)))) OR ((execution_lane = 'stateless'::text) AND (owner_agent_id IS NULL) AND (owner_pod_uid IS NULL) AND (owner_runtime_generation IS NULL) AND (((claim_generation = 0) AND (owner_run_queue_lease_token IS NULL) AND (owner_executor IS NULL) AND (owner_executor_pod_uid IS NULL)) OR ((claim_generation > 0) AND (owner_run_queue_lease_token IS NOT NULL) AND (owner_run_queue_lease_token > 0) AND (owner_executor IS NOT NULL) AND (btrim(owner_executor) <> ''::text) AND (owner_executor_pod_uid IS NOT NULL) AND (btrim(owner_executor_pod_uid) <> ''::text)))))),
-    CONSTRAINT thread_input_deliveries_settlement_shape CHECK (((state = 'settled'::text) = (settled_at IS NOT NULL)))
+    CONSTRAINT thread_input_deliveries_settlement_shape CHECK (((state = 'settled'::text) = (settled_at IS NOT NULL))),
+    CONSTRAINT thread_input_deliveries_supersedes_input_seq_check CHECK (((supersedes_input_seq IS NULL) OR (supersedes_input_seq > 0)))
 );
 
 
@@ -18350,6 +18352,13 @@ COMMENT ON COLUMN public.thread_input_deliveries.cancelled_at IS 'Terminal times
 --
 
 COMMENT ON COLUMN public.thread_input_deliveries.cancelled_turn_number IS 'Exact transcript turn whose pre-provider Stop cancelled this delivery.';
+
+
+--
+-- Name: COLUMN thread_input_deliveries.supersedes_input_seq; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_input_deliveries.supersedes_input_seq IS 'For a foreground-child recovery event, the exact abandoned parent input sequence replaced by this evidence/continuation turn. NULL otherwise.';
 
 
 --
@@ -18967,6 +18976,7 @@ CREATE TABLE public.threads (
     subagent_error text,
     report_path text,
     CONSTRAINT threads_kind_check CHECK ((kind = ANY (ARRAY['session'::text, 'subagent'::text]))),
+    CONSTRAINT threads_parent_shape_check CHECK ((((kind = 'session'::text) AND (parent_job_id IS NULL) AND (parent_thread_id IS NULL)) OR ((kind = 'subagent'::text) AND (num_nonnulls(parent_job_id, parent_thread_id) = 1)))),
     CONSTRAINT threads_runtime_retirement_external_cleanup_shape CHECK (((runtime_retirement_external_cleanup IS NULL) OR ((runtime_retirement_token IS NOT NULL) AND (runtime_retirement_permanent = true) AND (jsonb_typeof(runtime_retirement_external_cleanup) = 'object'::text)))),
     CONSTRAINT threads_runtime_retirement_local_quiescence_shape CHECK (((runtime_retirement_local_quiescence IS NULL) OR ((runtime_retirement_token IS NOT NULL) AND (jsonb_typeof(runtime_retirement_local_quiescence) = 'object'::text)))),
     CONSTRAINT threads_runtime_retirement_shape CHECK ((((runtime_retirement_token IS NULL) AND (runtime_retirement_permanent IS NULL) AND (runtime_retirement_started_at IS NULL) AND (runtime_retirement_authorized_at IS NULL) AND (runtime_retirement_context IS NULL)) OR ((runtime_retirement_token IS NOT NULL) AND (runtime_retirement_permanent IS NOT NULL) AND (runtime_retirement_started_at IS NOT NULL) AND (jsonb_typeof(runtime_retirement_context) = 'object'::text)))),
@@ -19121,7 +19131,7 @@ COMMENT ON COLUMN public.threads.parent_thread_id IS 'kind=subagent only: the se
 -- Name: COLUMN threads.parent_tool_call_id; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON COLUMN public.threads.parent_tool_call_id IS 'kind=subagent only: the parent''s delegate_agent tool call this child answered. (parent_job_id, parent_tool_call_id) is the idempotency key: a parent re-running its tools node after a hard kill replays the stored report instead of spawning again.';
+COMMENT ON COLUMN public.threads.parent_tool_call_id IS 'kind=subagent only: the parent''s delegate_agent tool call this child answered. The non-NULL parent plus parent_tool_call_id is the idempotency key: a parent re-running its tools node after a hard kill replays the stored report instead of spawning again; both parent forms are unique in the database.';
 
 
 --
@@ -22950,6 +22960,27 @@ CREATE INDEX idx_threads_awaiting_user_since ON public.threads USING btree (awai
 --
 
 CREATE INDEX idx_threads_parent_job ON public.threads USING btree (parent_job_id) WHERE (parent_job_id IS NOT NULL);
+
+
+--
+-- Name: idx_threads_job_parent_tool_call; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX idx_threads_job_parent_tool_call ON public.threads USING btree (parent_job_id, parent_tool_call_id) WHERE ((kind = 'subagent'::text) AND (parent_job_id IS NOT NULL) AND (parent_thread_id IS NULL) AND (parent_tool_call_id IS NOT NULL));
+
+
+--
+-- Name: idx_threads_parent_thread; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_threads_parent_thread ON public.threads USING btree (parent_thread_id) WHERE (parent_thread_id IS NOT NULL);
+
+
+--
+-- Name: idx_threads_session_parent_tool_call; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX idx_threads_session_parent_tool_call ON public.threads USING btree (parent_thread_id, parent_tool_call_id) WHERE ((kind = 'subagent'::text) AND (parent_job_id IS NULL) AND (parent_thread_id IS NOT NULL) AND (parent_tool_call_id IS NOT NULL));
 
 
 --

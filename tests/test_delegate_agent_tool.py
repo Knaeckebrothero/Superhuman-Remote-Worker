@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from types import SimpleNamespace
 from typing import Any, Callable, List, Optional
 
 import pytest
@@ -352,6 +353,43 @@ class TestGates:
         assert [(kind, call.run_in_background) for kind, call in runtime.calls] == [
             ("background", True)
         ]
+
+    @pytest.mark.asyncio
+    async def test_stateless_session_fanout_and_recovery_fail_before_child_start(
+        self, tmp_path
+    ):
+        ctx, _ = make_parent(tmp_path)
+
+        class Runtime:
+            batch_size = 2
+
+            def __init__(self):
+                self.calls = []
+
+            async def run_background(self, call):
+                self.calls.append(call)
+                return "unexpected"
+
+            async def run_foreground(self, call):
+                self.calls.append(call)
+                return "unexpected"
+
+        runtime = Runtime()
+        ctx.subagent_runtime = runtime
+        ctx._subagent_parent_kind = "session"
+        ctx._session_parent_authority_provider = lambda: SimpleNamespace(
+            execution_lane="stateless"
+        )
+
+        fanout = await invoke(the_tool(ctx), "c1", **brief_args())
+        assert fanout.startswith("Error: sessions may delegate only one")
+        assert runtime.calls == []
+
+        runtime.batch_size = 1
+        ctx._stateless_subagent_recovery_active = True
+        recovery = await invoke(the_tool(ctx), "c2", **brief_args())
+        assert recovery.startswith("Error: delegate_agent is disabled")
+        assert runtime.calls == []
 
     @pytest.mark.asyncio
     async def test_omission_uses_config_default_but_explicit_false_wins(self, tmp_path):

@@ -93,6 +93,12 @@ POST   /api/agents/jobs/{job_id}/subagents/{thread_id}/reopen                   
 POST   /api/agents/jobs/{job_id}/subagents/{thread_id}/terminal                         internal:require_internal
 POST   /api/agents/register                                                             internal:require_internal
 POST   /api/agents/threads                                                              internal:require_internal
+POST   /api/agents/threads/{parent_thread_id}/subagents                                 internal:require_internal
+POST   /api/agents/threads/{parent_thread_id}/subagents/by-call                         internal:require_internal
+POST   /api/agents/threads/{parent_thread_id}/subagents/live                            internal:require_internal
+POST   /api/agents/threads/{parent_thread_id}/subagents/{thread_id}                     internal:require_internal
+POST   /api/agents/threads/{parent_thread_id}/subagents/{thread_id}/reopen              internal:require_internal
+POST   /api/agents/threads/{parent_thread_id}/subagents/{thread_id}/terminal            internal:require_internal
 POST   /api/agents/threads/{thread_id}/abort-vm-upgrade                                 internal:require_internal
 GET    /api/agents/threads/{thread_id}/cloud-diff                                       gated:require_thread_owner
 POST   /api/agents/threads/{thread_id}/cloud-diff/apply                                 gated:require_thread_owner
@@ -327,6 +333,7 @@ GET    /api/persistent/threads/{thread_id}/messages                             
 POST   /api/persistent/threads/{thread_id}/resume                                       gated:require_thread_owner
 GET    /api/persistent/threads/{thread_id}/state                                        gated:require_thread_owner
 GET    /api/persistent/threads/{thread_id}/stream                                       gated:require_thread_owner
+GET    /api/persistent/threads/{thread_id}/subagents                                    gated:require_thread_owner
 GET    /api/persistent/threads/{thread_id}/tool-groups                                  gated:require_thread_owner
 POST   /api/persistent/threads/{thread_id}/transcribe                                   gated:require_thread_owner
 POST   /api/persistent/threads/{thread_id}/tts                                          gated:require_thread_owner

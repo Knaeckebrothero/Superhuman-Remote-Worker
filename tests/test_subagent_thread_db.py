@@ -31,7 +31,6 @@ from src.shared.subagent_parent_authority import ParentExecutionAuthority
 
 JOB = UUID("aaaaaaaa-1111-4222-8333-444444444444")
 CHILD = UUID("bbbbbbbb-1111-4222-8333-444444444444")
-PARENT_THREAD = UUID("cccccccc-1111-4222-8333-444444444444")
 GENERATION = UUID("dddddddd-1111-4222-8333-444444444444")
 NEXT_GENERATION = UUID("eeeeeeee-1111-4222-8333-444444444444")
 DELIVERY = UUID("ffffffff-1111-4222-8333-444444444444")
@@ -153,9 +152,9 @@ class TestCreateSubagentThread:
             handle="implementer-7f3a",
             subagent_type="implementer",
             parent_tool_call_id="call-1",
-            parent_thread_id=str(PARENT_THREAD),
             isolation="worktree",
             write_policy="owned_paths",
+            owned_paths=["src/**", "tests/test_parser.py"],
             brief_description="implement   the parser",
             parent_iteration=12,
             fork=True,
@@ -177,11 +176,11 @@ class TestCreateSubagentThread:
             "subagent_handle, subagent_type, subagent_status )" in sql
         )
         assert (
-            "SELECT $1, 'subagent', j.user_id, j.project_id, $3, $9, "
-            "'autonomous', 'silent', 'pinned', $4::jsonb, j.id, $5, $6, $7, $8, "
-            "$10 FROM jobs j WHERE j.id = $2" in sql
+            "SELECT $1, 'subagent', j.user_id, j.project_id, $3, $8, "
+            "'autonomous', 'silent', 'pinned', $4::jsonb, j.id, NULL, $5, $6, "
+            "$7, $9 FROM jobs j WHERE j.id = $2" in sql
         )
-        assert "ON CONFLICT (id) DO NOTHING RETURNING id, runtime_generation" in sql
+        assert "ON CONFLICT DO NOTHING RETURNING id, runtime_generation" in sql
         assert args[0] == CHILD and args[1] == JOB
         assert args[2] == "implementer-7f3a: implement the parser"
         metadata = json.loads(args[3])
@@ -191,16 +190,16 @@ class TestCreateSubagentThread:
             "handle": "implementer-7f3a",
             "isolation": "worktree",
             "write_policy": "owned_paths",
+            "owned_paths": ["src/**", "tests/test_parser.py"],
             "brief_description": "implement the parser",
             "parent_iteration": 12,
             "fork": True,
             "run_in_background": False,
         }
-        assert args[4] == PARENT_THREAD
-        assert args[5] == "call-1"
-        assert args[6] == "implementer-7f3a"
-        assert args[7] == "implementer"
-        assert args[8:] == ("active", "running")
+        assert args[4] == "call-1"
+        assert args[5] == "implementer-7f3a"
+        assert args[6] == "implementer"
+        assert args[7:] == ("active", "running")
         assert conn.fetchrow.await_count == 1
 
     @pytest.mark.asyncio
@@ -220,7 +219,7 @@ class TestCreateSubagentThread:
         assert created["runtime_generation"] == str(GENERATION)
         args = conn.fetchrow.call_args[0][1:]
         assert args[2] == "subagent h-0001"  # no brief → the handle titles it
-        assert args[4] is None and args[5] is None
+        assert args[4] is None
 
     @pytest.mark.asyncio
     async def test_queued_create_is_durable_before_it_can_run(self):
@@ -257,14 +256,19 @@ class TestCreateSubagentThread:
         probe = _compact(conn.fetchrow.call_args_list[1].args[0])
         assert "SELECT id, runtime_generation FROM threads" in probe
         assert "parent_job_id = $2" in probe
-        assert conn.fetchrow.call_args_list[1].args[1:] == (
-            CHILD,
-            JOB,
-            "h-0001",
-            "explorer",
-            None,
-            False,
-        )
+        args = conn.fetchrow.call_args_list[1].args[1:]
+        assert args[:-1] == (CHILD, JOB, "h-0001", "explorer", None, False)
+        assert json.loads(args[-1]) == {
+            "brief_description": "",
+            "fork": False,
+            "handle": "h-0001",
+            "isolation": "shared",
+            "owned_paths": [],
+            "parent_iteration": None,
+            "run_in_background": False,
+            "type": "explorer",
+            "write_policy": "none",
+        }
 
     @pytest.mark.asyncio
     async def test_a_retried_create_returns_the_existing_id(self):
@@ -287,7 +291,10 @@ class TestCreateSubagentThread:
         }
         probe = _compact(conn.fetchrow.call_args_list[1].args[0])
         assert "run_in_background" in probe
-        assert conn.fetchrow.call_args_list[1].args[-1] is False
+        assert "metadata->'subagent' = $7::jsonb" in probe
+        args = conn.fetchrow.call_args_list[1].args
+        assert args[-2] is False
+        assert json.loads(args[-1])["owned_paths"] == []
 
     @pytest.mark.asyncio
     async def test_malformed_ids_never_reach_sql(self):
@@ -308,15 +315,13 @@ class TestCreateSubagentThread:
             )
             is None
         )
-        assert (
+        with pytest.raises(ValueError, match="cannot also carry parent_thread_id"):
             await db.create_subagent_thread(
                 parent_job_id=str(JOB),
                 parent_thread_id="nope",
                 handle="h",
                 subagent_type="explorer",
             )
-            is None
-        )
         conn.fetchrow.assert_not_awaited()
 
     @pytest.mark.asyncio

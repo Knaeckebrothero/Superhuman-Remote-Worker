@@ -162,7 +162,7 @@ def _enabled_env(name: str, default: bool = False) -> bool:
 # means nothing was ever answered, so the oldest human row qualifies.
 _PENDING_INPUT_SQL = """
     SELECT message.id, message.seq, message.content, message.turn_number,
-           message.role, delivery.delivery_id
+           message.role, delivery.delivery_id, delivery.supersedes_input_seq
     FROM thread_messages AS message
     LEFT JOIN thread_input_deliveries AS delivery
       ON delivery.message_id = message.id
@@ -178,8 +178,26 @@ _PENDING_INPUT_SQL = """
               AND delivery.state IN ('persisted', 'queued', 'deferred')
           )
       )
-    ORDER BY seq ASC
+    ORDER BY
+        CASE
+            WHEN delivery.source = 'subagent'
+             AND delivery.supersedes_input_seq IS NOT NULL
+            THEN 0
+            ELSE 1
+        END,
+        seq ASC
     LIMIT $3
+"""
+
+_EXACT_CONSUMED_SEQ_AFTER_ATTACH_SQL = """
+SELECT GREATEST(COALESCE(consumed_seq, -1), $4::bigint)
+  FROM run_queue
+ WHERE unit_id = $1
+   AND unit_kind = 'session_turn'
+   AND state = 'leased'
+   AND lease_token = $2
+   AND leased_by = $3
+   AND input_delivery_capable_lease_token = $2
 """
 
 _PENDING_EVENT_EXISTS_SQL = """
@@ -2545,6 +2563,27 @@ class StatelessTurnExecutor:
             return
         timing["attach"] = time.perf_counter() - t0
 
+        # Fresh attach performs foreground-child recovery before publishing
+        # readiness. That transaction may advance ``consumed_seq`` without
+        # enqueueing a replacement event when the parent's final AI response
+        # is already durable. The claim snapshot predates attach, so re-read
+        # the exact still-leased row before selecting pending input; otherwise
+        # this executor can inject the superseded input and pay the provider a
+        # second time. The identity predicate also serves as the post-recovery
+        # lease fence.
+        refreshed_consumed_seq = await self._db.fetchval(
+            _EXACT_CONSUMED_SEQ_AFTER_ATTACH_SQL,
+            unit_id,
+            token,
+            self._pod_name,
+            consumed_seq if consumed_seq is not None else -1,
+        )
+        if refreshed_consumed_seq is None:
+            self._lease.mark_lost()
+            await self._detach_cached_session("lease_lost_after_attach_recovery")
+            return
+        consumed_seq = int(refreshed_consumed_seq)
+
         # Bind every remote tmux mutation to this monotonic queue token before
         # controls or user input can start tool work. Reuse invalidates the
         # previous claim's local tab cache; fresh attach records the token for
@@ -2816,15 +2855,30 @@ class StatelessTurnExecutor:
                     "claim_generation": delivery_claim_generation,
                 }
             )
-        await pa._loop_user_queue.put(queue_item)
+            if target.get("supersedes_input_seq") is not None:
+                queue_item["supersedes_input_seq"] = int(target["supersedes_input_seq"])
+        recovery_context = (
+            getattr(pa._session, "tool_context", None)
+            if pa._session is not None
+            else None
+        )
+        is_subagent_recovery = target.get("supersedes_input_seq") is not None
+        if recovery_context is not None:
+            recovery_context._stateless_subagent_recovery_active = is_subagent_recovery
+        try:
+            await pa._loop_user_queue.put(queue_item)
 
-        # (i) Wait for the full-turn settlement hook (event, not a poll), the
-        # lease-lost signal, or the loop dying under us. PersistentApp publishes
-        # it only after transcript persistence and Git push/turn-ledger mapping,
-        # so detach cannot cancel a half-recorded workspace turn.
-        t0 = time.perf_counter()
-        outcome = await self._await_turn(turn_done, loop_task)
-        timing["turn"] = time.perf_counter() - t0
+            # (i) Wait for the full-turn settlement hook (event, not a poll),
+            # the lease-lost signal, or the loop dying under us. PersistentApp
+            # publishes it only after transcript persistence and Git push/turn-
+            # ledger mapping, so detach cannot cancel a half-recorded workspace
+            # turn.
+            t0 = time.perf_counter()
+            outcome = await self._await_turn(turn_done, loop_task)
+            timing["turn"] = time.perf_counter() - t0
+        finally:
+            if recovery_context is not None:
+                recovery_context._stateless_subagent_recovery_active = False
 
         if outcome == "turn_done":
             interrupt_turn_id = pa._interrupt_owner_turn_id
@@ -2850,8 +2904,13 @@ class StatelessTurnExecutor:
             t0 = time.perf_counter()
             await self._await_cloud_push(pa)
             timing["push"] = time.perf_counter() - t0
+            superseded_input_seq = target.get("supersedes_input_seq")
             completed_input_seq = max(
-                int(target["seq"]),
+                int(
+                    superseded_input_seq
+                    if superseded_input_seq is not None
+                    else target["seq"]
+                ),
                 int(claim.consumed_seq) if claim.consumed_seq is not None else -1,
             )
             self._pending_settled_close = (
@@ -3260,6 +3319,11 @@ class StatelessTurnExecutor:
                 "delivery_id": (
                     str(r.get("delivery_id"))
                     if r.get("delivery_id") is not None
+                    else None
+                ),
+                "supersedes_input_seq": (
+                    int(r.get("supersedes_input_seq"))
+                    if r.get("supersedes_input_seq") is not None
                     else None
                 ),
             }

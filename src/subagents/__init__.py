@@ -33,7 +33,14 @@ from .child import (
 from .driver import STOP, SubagentDriver, SubagentResult
 from .envelope import build_envelope, neutralise_control_markers, return_budget
 from .fork import seed_fork_history
-from .host import ContextProbe, ParentHost, SimpleParentHost, WorkerHost
+from .host import (
+    ContextProbe,
+    ParentHost,
+    ParentRef,
+    SessionHost,
+    SimpleParentHost,
+    WorkerHost,
+)
 from .ledger import (
     SUBAGENT_STATUSES,
     NullLedger,
@@ -53,8 +60,10 @@ __all__ = [
     "DbSubagentLedger",
     "NullLedger",
     "ParentHost",
+    "ParentRef",
     "RecordingLedger",
     "SharedWriterGuard",
+    "SessionHost",
     "SimpleParentHost",
     "SpawnRefused",
     "StalenessWatcher",

@@ -22,6 +22,10 @@ from src.shared.subagent_parent_authority import (
     ParentExecutionAuthority,
     require_parent_execution_authority,
 )
+from src.shared.session_subagent_authority import (
+    SessionParentAuthority,
+    require_session_parent_authority,
+)
 
 try:
     import asyncpg
@@ -861,6 +865,437 @@ class PostgresDB:
                 )
         return self._row_to_dict(row)
 
+    async def get_subagent_thread_by_handle(
+        self,
+        parent_job_id: str,
+        handle: str,
+        *,
+        parent_authority: ParentExecutionAuthority,
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve one addressable worker child; duplicate handles fail closed."""
+
+        label = str(handle or "").strip()
+        try:
+            parent_uuid = uuid.UUID(str(parent_job_id))
+        except (ValueError, TypeError, AttributeError):
+            return None
+        if not label:
+            return None
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                await require_parent_execution_authority(
+                    conn,
+                    parent_authority,
+                    parent_job_id=parent_uuid,
+                    mutation=False,
+                )
+                rows = await conn.fetch(
+                    f"""
+                    SELECT {self._SUBAGENT_THREAD_COLUMNS}
+                      FROM threads
+                     WHERE kind = 'subagent'
+                       AND parent_job_id = $1::uuid
+                       AND subagent_handle = $2
+                     ORDER BY created_at DESC, id DESC
+                     LIMIT 2
+                     FOR SHARE
+                    """,
+                    str(parent_uuid),
+                    label,
+                )
+        if len(rows) > 1:
+            raise RuntimeError("subagent handle is ambiguous for this parent")
+        return self._row_to_dict(rows[0]) if rows else None
+
+    async def session_parent_authority_current(
+        self, parent_authority: SessionParentAuthority
+    ) -> bool:
+        """Probe one immutable session authority immediately before an effect."""
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                await require_session_parent_authority(
+                    conn,
+                    parent_authority,
+                    parent_thread_id=parent_authority.parent_thread_id,
+                )
+        return True
+
+    async def update_session_subagent_thread(
+        self,
+        thread_id: str,
+        *,
+        parent_thread_id: str,
+        parent_authority: SessionParentAuthority,
+        runtime_generation: str,
+        status: Optional[str] = None,
+        subagent_status: Optional[str] = None,
+        outcome: Optional[str] = None,
+        turns: Optional[int] = None,
+        tokens: Optional[int] = None,
+        report_path: Optional[str] = None,
+        error: Optional[str] = None,
+        ended: bool = False,
+    ) -> bool:
+        """Update a foreground session child under parent + generation fences.
+
+        Background ``queued -> running`` is a local lifecycle update, but its
+        terminal state must use the orchestrator's atomic terminal and input-
+        delivery transaction.  The SQL therefore permits non-terminal updates
+        for either shape and permits ``ended=True`` only for foreground rows.
+        """
+
+        try:
+            parent_uuid = uuid.UUID(str(parent_thread_id))
+            child_uuid = uuid.UUID(str(thread_id))
+            generation_uuid = uuid.UUID(str(runtime_generation))
+        except (ValueError, TypeError, AttributeError):
+            return False
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                await require_session_parent_authority(
+                    conn,
+                    parent_authority,
+                    parent_thread_id=parent_uuid,
+                )
+                result = await conn.execute(
+                    """
+                    UPDATE threads
+                       SET status           = COALESCE($2::text, status),
+                           subagent_status  = COALESCE($3::text, subagent_status),
+                           subagent_outcome = COALESCE($4::text, subagent_outcome),
+                           total_turns      = COALESCE($5::integer, total_turns),
+                           total_tokens     = COALESCE($6::integer, total_tokens),
+                           report_path      = COALESCE($7::text, report_path),
+                           subagent_error   = COALESCE($8::text, subagent_error),
+                           ended_at         = CASE
+                               WHEN $9::boolean
+                               THEN COALESCE(ended_at, CURRENT_TIMESTAMP)
+                               ELSE ended_at
+                           END,
+                           last_activity    = CURRENT_TIMESTAMP
+                     WHERE id = $1::uuid
+                       AND kind = 'subagent'
+                       AND parent_job_id IS NULL
+                       AND parent_thread_id = $11::uuid
+                       AND runtime_generation = $10::uuid
+                       AND status <> 'ended'
+                       AND (
+                             NOT $9::boolean
+                             OR COALESCE(
+                                  metadata->'subagent'->>'run_in_background',
+                                  'false'
+                                ) = 'false'
+                           )
+                    """,
+                    str(child_uuid),
+                    status,
+                    subagent_status,
+                    outcome,
+                    turns,
+                    tokens,
+                    report_path,
+                    error,
+                    bool(ended),
+                    str(generation_uuid),
+                    str(parent_uuid),
+                )
+                if result == "UPDATE 0" and ended:
+                    existing = await conn.fetchrow(
+                        """
+                        SELECT status, subagent_status, subagent_outcome,
+                               total_turns, total_tokens, report_path,
+                               subagent_error,
+                               COALESCE(
+                                   metadata->'subagent'->>'run_in_background',
+                                   'false'
+                               ) AS run_in_background
+                          FROM threads
+                         WHERE id = $1::uuid
+                           AND kind = 'subagent'
+                           AND parent_job_id IS NULL
+                           AND parent_thread_id = $2::uuid
+                           AND runtime_generation = $3::uuid
+                         FOR UPDATE
+                        """,
+                        child_uuid,
+                        parent_uuid,
+                        generation_uuid,
+                    )
+                    expected = (
+                        ("status", status),
+                        ("subagent_status", subagent_status),
+                        ("subagent_outcome", outcome),
+                        ("total_turns", turns),
+                        ("total_tokens", tokens),
+                        ("report_path", report_path),
+                        ("subagent_error", error),
+                    )
+                    if (
+                        existing is not None
+                        and existing.get("status") == "ended"
+                        and existing.get("run_in_background") == "false"
+                        and all(
+                            supplied is None or existing.get(column) == supplied
+                            for column, supplied in expected
+                        )
+                    ):
+                        result = "UPDATE 1"
+        return result == "UPDATE 1"
+
+    async def save_session_subagent_thread_message(
+        self,
+        thread_id: str,
+        *,
+        parent_thread_id: str,
+        parent_authority: SessionParentAuthority,
+        runtime_generation: str,
+        role: str,
+        content: Optional[str] = None,
+        tool_calls: Optional[Any] = None,
+        turn_number: Optional[int] = None,
+        metrics: Optional[dict] = None,
+        tool_call_id: Optional[str] = None,
+        thinking: Optional[str] = None,
+        reasoning: Optional[Any] = None,
+        tool_results: Optional[Any] = None,
+        provider: Optional[str] = None,
+        provider_raw: Optional[Any] = None,
+        additional_kwargs: Optional[dict] = None,
+        response_metadata: Optional[dict] = None,
+        id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Persist one session-child transcript row under exact authority."""
+
+        try:
+            parent_uuid = uuid.UUID(str(parent_thread_id))
+            child_uuid = uuid.UUID(str(thread_id))
+            generation_uuid = uuid.UUID(str(runtime_generation))
+        except (ValueError, TypeError, AttributeError):
+            return None
+        insert_args = (
+            _coerce_row_id(id),
+            str(child_uuid),
+            role,
+            content,
+            json.dumps(tool_calls) if tool_calls is not None else None,
+            turn_number,
+            json.dumps(metrics) if metrics is not None else None,
+            tool_call_id,
+            thinking,
+            json.dumps(reasoning) if reasoning is not None else None,
+            json.dumps(tool_results) if tool_results is not None else None,
+            provider,
+            json.dumps(provider_raw) if provider_raw is not None else None,
+            json.dumps(additional_kwargs) if additional_kwargs is not None else None,
+            json.dumps(response_metadata) if response_metadata is not None else None,
+        )
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                await require_session_parent_authority(
+                    conn,
+                    parent_authority,
+                    parent_thread_id=parent_uuid,
+                )
+                child = await conn.fetchrow(
+                    """
+                    SELECT runtime_generation, status
+                      FROM threads
+                     WHERE id = $1::uuid
+                       AND kind = 'subagent'
+                       AND parent_job_id IS NULL
+                       AND parent_thread_id = $2::uuid
+                     FOR UPDATE
+                    """,
+                    child_uuid,
+                    parent_uuid,
+                )
+                if (
+                    child is None
+                    or str(child["runtime_generation"]) != str(generation_uuid)
+                    or child["status"] == "ended"
+                ):
+                    return None
+                row = await conn.fetchrow(self._THREAD_MESSAGE_UPSERT_SQL, *insert_args)
+                await conn.execute(
+                    self._THREAD_ACTIVITY_BUMP_SQL,
+                    str(child_uuid),
+                    turn_number,
+                )
+        return {"id": str(row["id"]), "seq": row["seq"]}
+
+    async def save_session_subagent_thread_messages(
+        self,
+        thread_id: str,
+        *,
+        parent_thread_id: str,
+        parent_authority: SessionParentAuthority,
+        runtime_generation: str,
+        messages: List[Dict[str, Any]],
+    ) -> bool:
+        """Atomically persist a reminted session-child fork seed."""
+
+        try:
+            parent_uuid = uuid.UUID(str(parent_thread_id))
+            child_uuid = uuid.UUID(str(thread_id))
+            generation_uuid = uuid.UUID(str(runtime_generation))
+        except (ValueError, TypeError, AttributeError):
+            return False
+        args: List[Tuple[Any, ...]] = []
+        max_turn = 0
+        for message in messages:
+            turn_number = message.get("turn_number")
+            max_turn = max(max_turn, int(turn_number or 0))
+            args.append(
+                (
+                    _coerce_row_id(message.get("id")),
+                    str(child_uuid),
+                    message["role"],
+                    message.get("content"),
+                    json.dumps(message.get("tool_calls"))
+                    if message.get("tool_calls") is not None
+                    else None,
+                    turn_number,
+                    json.dumps(message.get("metrics"))
+                    if message.get("metrics") is not None
+                    else None,
+                    message.get("tool_call_id"),
+                    message.get("thinking"),
+                    json.dumps(message.get("reasoning"))
+                    if message.get("reasoning") is not None
+                    else None,
+                    json.dumps(message.get("tool_results"))
+                    if message.get("tool_results") is not None
+                    else None,
+                    message.get("provider"),
+                    json.dumps(message.get("provider_raw"))
+                    if message.get("provider_raw") is not None
+                    else None,
+                    json.dumps(message.get("additional_kwargs"))
+                    if message.get("additional_kwargs") is not None
+                    else None,
+                    json.dumps(message.get("response_metadata"))
+                    if message.get("response_metadata") is not None
+                    else None,
+                )
+            )
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                await require_session_parent_authority(
+                    conn,
+                    parent_authority,
+                    parent_thread_id=parent_uuid,
+                )
+                child = await conn.fetchrow(
+                    """
+                    SELECT runtime_generation, status
+                      FROM threads
+                     WHERE id = $1::uuid
+                       AND kind = 'subagent'
+                       AND parent_job_id IS NULL
+                       AND parent_thread_id = $2::uuid
+                     FOR UPDATE
+                    """,
+                    child_uuid,
+                    parent_uuid,
+                )
+                if (
+                    child is None
+                    or str(child["runtime_generation"]) != str(generation_uuid)
+                    or child["status"] == "ended"
+                ):
+                    return False
+                if args:
+                    await conn.executemany(self._THREAD_MESSAGE_UPSERT_BATCH_SQL, args)
+                    await conn.execute(
+                        self._THREAD_ACTIVITY_BUMP_SQL,
+                        str(child_uuid),
+                        max_turn,
+                    )
+        return True
+
+    async def get_session_subagent_thread_by_call(
+        self,
+        parent_thread_id: str,
+        parent_tool_call_id: str,
+        *,
+        parent_authority: SessionParentAuthority,
+    ) -> Optional[Dict[str, Any]]:
+        """Newest child for one session delegation call, under exact authority."""
+
+        call_id = str(parent_tool_call_id or "").strip()
+        if not call_id:
+            return None
+        try:
+            parent_uuid = uuid.UUID(str(parent_thread_id))
+        except (ValueError, TypeError, AttributeError):
+            return None
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                await require_session_parent_authority(
+                    conn,
+                    parent_authority,
+                    parent_thread_id=parent_uuid,
+                )
+                row = await conn.fetchrow(
+                    f"""
+                    SELECT {self._SUBAGENT_THREAD_COLUMNS}
+                      FROM threads
+                     WHERE kind = 'subagent'
+                       AND parent_job_id IS NULL
+                       AND parent_thread_id = $1::uuid
+                       AND parent_tool_call_id = $2
+                     ORDER BY created_at DESC, id DESC
+                     LIMIT 1
+                     FOR SHARE
+                    """,
+                    str(parent_uuid),
+                    call_id,
+                )
+        return self._row_to_dict(row)
+
+    async def get_session_subagent_thread_by_handle(
+        self,
+        parent_thread_id: str,
+        handle: str,
+        *,
+        parent_authority: SessionParentAuthority,
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve one session child by handle under exact parent authority."""
+
+        label = str(handle or "").strip()
+        try:
+            parent_uuid = uuid.UUID(str(parent_thread_id))
+        except (ValueError, TypeError, AttributeError):
+            return None
+        if not label:
+            return None
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                await require_session_parent_authority(
+                    conn,
+                    parent_authority,
+                    parent_thread_id=parent_uuid,
+                )
+                rows = await conn.fetch(
+                    f"""
+                    SELECT {self._SUBAGENT_THREAD_COLUMNS}
+                      FROM threads
+                     WHERE kind = 'subagent'
+                       AND parent_job_id IS NULL
+                       AND parent_thread_id = $1::uuid
+                       AND subagent_handle = $2
+                     ORDER BY created_at DESC, id DESC
+                     LIMIT 2
+                     FOR SHARE
+                    """,
+                    str(parent_uuid),
+                    label,
+                )
+        if len(rows) > 1:
+            raise RuntimeError("session subagent handle is ambiguous for this parent")
+        return self._row_to_dict(rows[0]) if rows else None
+
     async def get_thread_messages_history(
         self,
         thread_id: str,
@@ -869,6 +1304,8 @@ class PostgresDB:
         since_turn: Optional[int] = None,
         seq_gt: Optional[int] = None,
         newest_first: bool = False,
+        include_provider_raw: bool = False,
+        order_by_seq: bool = False,
     ) -> List[Dict[str, Any]]:
         """Load thread message history. Ordered by turn_number, created_at ASC.
 
@@ -906,10 +1343,11 @@ class PostgresDB:
         # every resume and never read (the rebuilt AIMessage doesn't carry them).
         # Select only what resume consumes. The seq / turn_number / created_at
         # ORDER BYs below don't require the column in the projection.
-        query = """
+        provider_projection = ", message.provider_raw" if include_provider_raw else ""
+        query = f"""
             SELECT message.id, message.role, message.content,
                    message.tool_calls, message.tool_call_id,
-                   message.turn_number
+                   message.turn_number{provider_projection}
             FROM thread_messages AS message
             WHERE message.thread_id = $1
               AND message.role NOT IN ('summary', 'error')
@@ -934,7 +1372,7 @@ class PostgresDB:
         # cursor) or turn/created_at (legacy since_turn / full-load callers).
         if newest_first:
             query += "\n            ORDER BY seq DESC"
-        elif seq_gt is not None:
+        elif seq_gt is not None or order_by_seq:
             query += "\n            ORDER BY seq ASC"
         else:
             query += "\n            ORDER BY turn_number ASC, created_at ASC"
@@ -953,11 +1391,17 @@ class PostgresDB:
         for row in rows:
             result.append(
                 {
+                    "id": str(row["id"]),
                     "role": row["role"],
                     "content": row["content"],
                     "tool_calls": _j(row["tool_calls"]) if row["tool_calls"] else None,
                     "tool_call_id": row["tool_call_id"],
                     "turn_number": row["turn_number"],
+                    **(
+                        {"provider_raw": _j(row["provider_raw"])}
+                        if include_provider_raw
+                        else {}
+                    ),
                 }
             )
         if newest_first:

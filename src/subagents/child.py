@@ -799,6 +799,9 @@ def rebase_context(
     # admission fence of its own (the driver consults the HOST's).
     ctx.subagent_runtime = None
     ctx._parent_host = None
+    ctx._subagent_parent_kind = None
+    ctx._session_parent_authority_provider = None
+    ctx._session_parent_authority = None
     ctx.parent_context_probe = None
     ctx.provider_admission = None
     ctx._fork_source = None
@@ -940,6 +943,7 @@ async def build_child(
     parent_tool_names: Optional[Sequence[str]] = None,
     llm_factory: Optional[Callable[[Any, Any], Any]] = None,
     worktree_index: Optional[int] = None,
+    reuse_worktree: bool = False,
     budgets: Any = None,
 ) -> ChildBuild:
     """Build the child of ``entry`` for ``parent_context`` (see module doc).
@@ -1012,7 +1016,14 @@ async def build_child(
             index = (
                 worktree_index if worktree_index is not None else next(_WORKTREE_INDEX)
             )
-            env = await acquire_reader_env(parent_context, [], index=index, name=handle)
+            env = await acquire_reader_env(
+                parent_context,
+                [],
+                index=index,
+                name=handle,
+                reuse_existing_branch=reuse_worktree,
+                shell_tab_prefix=child_tab_prefix(handle),
+            )
             ctx = env.context
             workspace_manager = ctx.workspace_manager
             if getattr(workspace_manager, "_git_manager", None) is not None:

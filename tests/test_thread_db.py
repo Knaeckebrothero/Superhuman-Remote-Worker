@@ -857,8 +857,10 @@ class TestEndThread:
                 },
                 queue,
                 {"lease_token": 1, "attempts_since_completion": 0},
+                {"id": "tid-1", "kind": "session", "execution_lane": "stateless"},
             ]
         )
+        conn.fetch = AsyncMock(return_value=[])
         conn.fetchval = AsyncMock(side_effect=[False, False, 1, "tid-1"])
         db = _make_db_with_conn(conn)
 
@@ -899,8 +901,14 @@ class TestEndThread:
                         "state": "done",
                         "lease_token": 1,
                     },
+                    {
+                        "id": "tid-1",
+                        "kind": "session",
+                        "execution_lane": "stateless",
+                    },
                 ]
             )
+            finish_conn.fetch = AsyncMock(return_value=[])
             finish_conn.fetchval = AsyncMock(return_value="tid-1")
             finish_db = _make_db_with_conn(finish_conn)
 
@@ -958,8 +966,10 @@ class TestEndThread:
                 },
                 queue,
                 {"lease_token": 1, "attempts_since_completion": 0},
+                {"id": "tid-1", "kind": "session", "execution_lane": "stateless"},
             ]
         )
+        conn.fetch = AsyncMock(return_value=[])
         conn.fetchval = AsyncMock(side_effect=[False, True, 1, "tid-1"])
         retirement = MagicMock(epoch_bumped=True, count=1)
         retire = AsyncMock(return_value=retirement)
@@ -1034,8 +1044,10 @@ class TestEndThread:
                 None,
                 synthetic,
                 {"lease_token": 1, "attempts_since_completion": 0},
+                {"id": "tid-1", "kind": "session", "execution_lane": "stateless"},
             ]
         )
+        conn.fetch = AsyncMock(return_value=[])
         conn.fetchval = AsyncMock(side_effect=[False, False, 1, "tid-1"])
         db = _make_db_with_conn(conn)
 
@@ -1350,8 +1362,10 @@ class TestEndThread:
                     "metadata": _proven_soft_retirement_metadata(retain_runtime=False),
                 },
                 {"unit_kind": "session_turn", "state": "done", "lease_token": 8},
+                {"id": "tid-1", "kind": "session", "execution_lane": "stateless"},
             ]
         )
+        conn.fetch = AsyncMock(return_value=[])
         conn.fetchval = AsyncMock(return_value="tid-1")
         db = _make_db_with_conn(conn)
 

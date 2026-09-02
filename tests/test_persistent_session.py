@@ -3924,12 +3924,39 @@ def test_runtime_backend_id_comes_from_active_backend_features(backend, expected
 
 class TestCleanup:
     @pytest.mark.asyncio
+    async def test_quiesces_subagents_before_other_background_writers(self):
+        order: list[str] = []
+        session = _make_session(shell_owner_token=19)
+        runtime = SimpleNamespace(
+            quiesce=AsyncMock(side_effect=lambda _reason: order.append("subagents"))
+        )
+        citation = SimpleNamespace(
+            aclose=AsyncMock(side_effect=lambda: order.append("citation"))
+        )
+        session.tool_context = SimpleNamespace(
+            subagent_runtime=runtime,
+            citation_engine=citation,
+            close_citation_engine=MagicMock(
+                side_effect=lambda: order.append("citation-cache")
+            ),
+        )
+        session.memory_service = SimpleNamespace(
+            close_background=AsyncMock(side_effect=lambda: order.append("memory"))
+        )
+
+        await session.quiesce_background_tasks()
+
+        assert order == ["subagents", "citation", "citation-cache", "memory"]
+        runtime.quiesce.assert_awaited_once_with("session background work quiescing")
+
+    @pytest.mark.asyncio
     async def test_quiesces_memory_and_citation_before_cleanup(self):
         session = _make_session(shell_owner_token=19)
         citation = SimpleNamespace(aclose=AsyncMock())
         context = MagicMock()
         context.citation_engine = citation
         context.close_citation_engine = MagicMock()
+        context.subagent_runtime = None
         session.tool_context = context
         session.memory_service = SimpleNamespace(close_background=AsyncMock())
 

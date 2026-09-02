@@ -1297,6 +1297,8 @@ def _archive_session(service: RecordingManager) -> MagicMock:
     session.auxiliary_llm = None
     session.postgres_conn = None
     session.workspace_sync = None
+    session.quiesce_subagents = AsyncMock()
+    session.resume_subagents = AsyncMock()
     return session
 
 
@@ -1371,6 +1373,8 @@ class TestTeardownWiring:
         session.workspace_sync = None
         session.workspace_manager = None
         session.cleanup = AsyncMock()
+        session.quiesce_subagents = AsyncMock()
+        session.resume_subagents = AsyncMock()
         persistent_app._session = session
         persistent_app._thread_id = "tid-b11-1"
         persistent_app._terminating = False

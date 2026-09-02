@@ -178,13 +178,12 @@ class TestCreateEndpoint:
         self, create_env
     ):
         subagent_id = uuid.uuid4()
-        parent_thread = uuid.uuid4()
         payload = await create_env.call(
             subagent_id=subagent_id,
             parent_tool_call_id="call-1",
-            parent_thread_id=parent_thread,
             isolation="worktree",
             write_policy="owned_paths",
+            owned_paths=["src/**"],
             brief_description="implement the parser",
             parent_iteration=12,
             fork=True,
@@ -203,9 +202,9 @@ class TestCreateEndpoint:
             handle="explorer-7f3a",
             subagent_type="explorer",
             parent_tool_call_id="call-1",
-            parent_thread_id=str(parent_thread),
             isolation="worktree",
             write_policy="owned_paths",
+            owned_paths=["src/**"],
             brief_description="implement the parser",
             parent_iteration=12,
             fork=True,
@@ -219,7 +218,6 @@ class TestCreateEndpoint:
         kwargs = create_env.db.create_subagent_thread.await_args.kwargs
         assert kwargs["thread_id"] is None
         assert kwargs["parent_tool_call_id"] is None
-        assert kwargs["parent_thread_id"] is None
         assert kwargs["isolation"] == "shared"
         assert kwargs["write_policy"] == "none"
         assert kwargs["brief_description"] == ""
@@ -243,6 +241,10 @@ class TestCreateEndpoint:
             create_env.body(subagent_type="")
         with pytest.raises(ValueError):
             create_env.body(subagent_id="not-a-uuid")
+
+    def test_worker_body_rejects_a_thread_parent(self, create_env):
+        with pytest.raises(ValueError):
+            create_env.body(parent_thread_id=uuid.uuid4())
 
     @pytest.mark.asyncio
     async def test_a_missing_job_is_404(self, create_env):
@@ -509,10 +511,13 @@ class TestRosterShape:
             "tokens": 1200,
             "report_path": ".subagents/explorer-7f3a/report.md",
             "parent_tool_call_id": "call-1",
+            "parent_input_message_id": None,
+            "parent_ai_message_id": None,
             "parent_thread_id": None,
             "description": "find the secret",
             "isolation": "shared",
             "write_policy": "none",
+            "owned_paths": [],
             "parent_iteration": 4,
             "fork": False,
             "run_in_background": False,

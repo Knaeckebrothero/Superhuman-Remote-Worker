@@ -243,6 +243,7 @@ from src.shared.session_retirement import (  # noqa: E402
     stateless_stop_markers,
 )
 from src.shared.pinned_session_identity import PinnedSessionBinding  # noqa: E402
+from src.shared.persistent_input_delivery import InputDeliveryConflict  # noqa: E402
 from services.stateless_workspace_gate import (  # noqa: E402
     declared_thread_workspace_backend,
     stateless_session_workspace_check,
@@ -510,6 +511,10 @@ from src.shared.pinned_session_identity import (  # noqa: E402
 from src.shared.subagent_parent_authority import (  # noqa: E402
     ParentExecutionAuthority,
     ParentExecutionAuthorityRefused,
+)
+from src.shared.session_subagent_authority import (  # noqa: E402
+    SessionParentAuthority as AgentSessionSubagentAuthority,
+    SessionParentAuthorityRefused,
 )
 
 # Lite (no-workspace-pod) backend names. Canonical set lives agent-side in the
@@ -36182,7 +36187,7 @@ def _subagent_thread_payload(row: dict[str, Any]) -> dict[str, Any]:
     spawn = metadata.get("subagent")
     if not isinstance(spawn, dict):
         spawn = {}
-    return {
+    payload = {
         "thread_id": str(row["id"]),
         "parent_job_id": (
             str(row["parent_job_id"]) if row.get("parent_job_id") else None
@@ -36208,13 +36213,19 @@ def _subagent_thread_payload(row: dict[str, Any]) -> dict[str, Any]:
         "description": spawn.get("brief_description") or "",
         "isolation": spawn.get("isolation"),
         "write_policy": spawn.get("write_policy"),
+        "owned_paths": list(spawn.get("owned_paths") or []),
         "parent_iteration": spawn.get("parent_iteration"),
+        "parent_input_message_id": spawn.get("parent_input_message_id"),
+        "parent_ai_message_id": spawn.get("parent_ai_message_id"),
         "fork": bool(spawn.get("fork", False)),
         "run_in_background": bool(spawn.get("run_in_background", False)),
         "started_at": row.get("created_at"),
         "ended_at": row.get("ended_at"),
         "last_activity": row.get("last_activity"),
     }
+    if row.get("recovery_kind") is not None:
+        payload["recovery_kind"] = row.get("recovery_kind")
+    return payload
 
 
 @app.get("/api/jobs/{job_id}/subagents")
@@ -36249,6 +36260,24 @@ async def get_job_subagents(request: Request, job_id: str) -> dict[str, Any]:
 
     return {
         "job_id": job_id,
+        "count": len(rows),
+        "subagents": [_subagent_thread_payload(row) for row in rows],
+    }
+
+
+@app.get("/api/persistent/threads/{thread_id}/subagents")
+async def get_session_subagents(request: Request, thread_id: str) -> dict[str, Any]:
+    """Owner-visible roster of children delegated by one session root."""
+
+    _user, parent = await require_thread_owner(request, postgres_db, thread_id)
+    if str(parent.get("kind") or "session") != "session":
+        raise HTTPException(status_code=404, detail="Parent session not found")
+    try:
+        rows = await postgres_db.list_session_subagent_threads(thread_id)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return {
+        "parent_thread_id": thread_id,
         "count": len(rows),
         "subagents": [_subagent_thread_payload(row) for row in rows],
     }
@@ -43452,9 +43481,13 @@ class AgentSubagentThreadCreateRequest(BaseModel):
     # rows, the llm_requests rows and the thread share one identity.
     subagent_id: UUID | None = None
     parent_tool_call_id: str | None = Field(default=None, max_length=512)
-    parent_thread_id: UUID | None = None
+    # Kept as an explicit NULL-only compatibility field while rolling agents
+    # stop sending it. A worker child belongs solely to the job in the path;
+    # session children use the separate /api/agents/threads/... routes below.
+    parent_thread_id: None = None
     isolation: str = Field(default="shared", max_length=32)
     write_policy: str = Field(default="none", max_length=32)
+    owned_paths: list[str] = Field(default_factory=list, max_length=128)
     brief_description: str = Field(default="", max_length=2000)
     parent_iteration: int | None = None
     fork: bool = False
@@ -43491,6 +43524,51 @@ class AgentSubagentThreadTerminalRequest(BaseModel):
     error: str | None = Field(default=None, max_length=20_000)
 
 
+class AgentSessionSubagentCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    parent_authority: AgentSessionSubagentAuthority
+    handle: str = Field(..., min_length=1, max_length=120)
+    subagent_type: str = Field(..., min_length=1, max_length=120)
+    subagent_id: UUID | None = None
+    parent_tool_call_id: str | None = Field(default=None, max_length=512)
+    parent_input_message_id: UUID | None = None
+    parent_ai_message_id: UUID | None = None
+    isolation: str = Field(default="shared", max_length=32)
+    write_policy: str = Field(default="none", max_length=32)
+    owned_paths: list[str] = Field(default_factory=list, max_length=128)
+    brief_description: str = Field(default="", max_length=2000)
+    parent_iteration: int | None = None
+    fork: bool = False
+    run_in_background: bool = False
+    initial_status: Literal["queued", "running"] = "running"
+
+
+class AgentSessionSubagentQueryRequest(BaseModel):
+    parent_authority: AgentSessionSubagentAuthority
+
+
+class AgentSessionSubagentByCallRequest(AgentSessionSubagentQueryRequest):
+    parent_tool_call_id: str = Field(..., min_length=1, max_length=512)
+
+
+class AgentSessionSubagentReopenRequest(AgentSessionSubagentQueryRequest):
+    runtime_generation: UUID
+
+
+class AgentSessionSubagentTerminalRequest(AgentSessionSubagentQueryRequest):
+    runtime_generation: UUID
+    subagent_status: str = Field(..., min_length=1, max_length=120)
+    delivery_id: UUID | None = None
+    message: str | None = Field(default=None, max_length=200_000)
+    outcome: str | None = Field(default=None, max_length=4000)
+    turns: int | None = Field(default=None, ge=0)
+    tokens: int | None = Field(default=None, ge=0)
+    report_path: str | None = Field(default=None, max_length=4000)
+    error: str | None = Field(default=None, max_length=20_000)
+    foreground_orphan_recovery: bool = False
+
+
 @app.post("/api/agents/jobs/{job_id}/subagents")
 async def agent_create_subagent_thread(
     request: Request, job_id: str, body: AgentSubagentThreadCreateRequest
@@ -43520,11 +43598,9 @@ async def agent_create_subagent_thread(
             handle=body.handle,
             subagent_type=body.subagent_type,
             parent_tool_call_id=body.parent_tool_call_id,
-            parent_thread_id=(
-                str(body.parent_thread_id) if body.parent_thread_id else None
-            ),
             isolation=body.isolation,
             write_policy=body.write_policy,
+            owned_paths=body.owned_paths,
             brief_description=body.brief_description,
             parent_iteration=body.parent_iteration,
             fork=body.fork,
@@ -43648,6 +43724,209 @@ async def agent_terminalize_subagent_thread(
     if result is None:
         raise HTTPException(status_code=404, detail="Job or subagent thread not found")
     if result.get("result") not in {"applied", "idempotent"}:
+        raise HTTPException(status_code=409, detail=result)
+    return result
+
+
+def _session_subagent_authority_wire(
+    authority: AgentSessionSubagentAuthority,
+) -> dict[str, Any]:
+    return authority.model_dump(mode="json")
+
+
+@app.post("/api/agents/threads/{parent_thread_id}/subagents")
+async def agent_create_session_subagent_thread(
+    request: Request,
+    parent_thread_id: str,
+    body: AgentSessionSubagentCreateRequest,
+) -> dict[str, Any]:
+    """Create a child of one exact persistent-session runtime. Internal only."""
+
+    await require_internal(request)
+    try:
+        created = await postgres_db.create_session_subagent_thread(
+            parent_thread_id=parent_thread_id,
+            parent_authority=_session_subagent_authority_wire(body.parent_authority),
+            thread_id=str(body.subagent_id) if body.subagent_id else None,
+            handle=body.handle,
+            subagent_type=body.subagent_type,
+            parent_tool_call_id=body.parent_tool_call_id,
+            parent_input_message_id=(
+                str(body.parent_input_message_id)
+                if body.parent_input_message_id is not None
+                else None
+            ),
+            parent_ai_message_id=(
+                str(body.parent_ai_message_id)
+                if body.parent_ai_message_id is not None
+                else None
+            ),
+            isolation=body.isolation,
+            write_policy=body.write_policy,
+            owned_paths=body.owned_paths,
+            brief_description=body.brief_description,
+            parent_iteration=body.parent_iteration,
+            fork=body.fork,
+            run_in_background=body.run_in_background,
+            initial_status=body.initial_status,
+        )
+    except SessionParentAuthorityRefused as exc:
+        raise HTTPException(status_code=409, detail=exc.detail()) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    if created is None:
+        raise HTTPException(status_code=404, detail="Parent session not found")
+    return {**created, "status": "created"}
+
+
+@app.post("/api/agents/threads/{parent_thread_id}/subagents/live")
+async def agent_list_live_session_subagent_threads(
+    request: Request,
+    parent_thread_id: str,
+    body: AgentSessionSubagentQueryRequest,
+) -> dict[str, Any]:
+    """List session child recovery candidates under exact authority."""
+
+    await require_internal(request)
+    try:
+        rows = await postgres_db.list_live_session_subagent_threads(
+            parent_thread_id,
+            parent_authority=_session_subagent_authority_wire(body.parent_authority),
+        )
+    except SessionParentAuthorityRefused as exc:
+        raise HTTPException(status_code=409, detail=exc.detail()) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return {
+        "parent_thread_id": parent_thread_id,
+        "count": len(rows),
+        "subagents": [_subagent_thread_payload(row) for row in rows],
+    }
+
+
+@app.post("/api/agents/threads/{parent_thread_id}/subagents/by-call")
+async def agent_get_session_subagent_thread_by_call(
+    request: Request,
+    parent_thread_id: str,
+    body: AgentSessionSubagentByCallRequest,
+) -> dict[str, Any]:
+    """Resolve a replayed session delegation call. Internal only."""
+
+    await require_internal(request)
+    try:
+        row = await postgres_db.get_session_subagent_thread_by_call(
+            parent_thread_id,
+            body.parent_tool_call_id,
+            parent_authority=_session_subagent_authority_wire(body.parent_authority),
+        )
+    except SessionParentAuthorityRefused as exc:
+        raise HTTPException(status_code=409, detail=exc.detail()) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    if row is None:
+        raise HTTPException(status_code=404, detail="Subagent thread not found")
+    return _subagent_thread_payload(row)
+
+
+@app.post("/api/agents/threads/{parent_thread_id}/subagents/{thread_id}")
+async def agent_get_session_subagent_thread(
+    request: Request,
+    parent_thread_id: str,
+    thread_id: UUID,
+    body: AgentSessionSubagentQueryRequest,
+) -> dict[str, Any]:
+    """Read one session child and its generation. Internal only."""
+
+    await require_internal(request)
+    try:
+        row = await postgres_db.get_session_subagent_thread(
+            parent_thread_id,
+            str(thread_id),
+            parent_authority=_session_subagent_authority_wire(body.parent_authority),
+        )
+    except SessionParentAuthorityRefused as exc:
+        raise HTTPException(status_code=409, detail=exc.detail()) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    if row is None:
+        raise HTTPException(status_code=404, detail="Subagent thread not found")
+    return _subagent_thread_payload(row)
+
+
+@app.post("/api/agents/threads/{parent_thread_id}/subagents/{thread_id}/reopen")
+async def agent_reopen_session_subagent_thread(
+    request: Request,
+    parent_thread_id: str,
+    thread_id: UUID,
+    body: AgentSessionSubagentReopenRequest,
+) -> dict[str, Any]:
+    """Rotate one terminal session child generation. Internal only."""
+
+    await require_internal(request)
+    try:
+        result = await postgres_db.reopen_session_subagent_thread(
+            parent_thread_id=parent_thread_id,
+            thread_id=str(thread_id),
+            runtime_generation=str(body.runtime_generation),
+            parent_authority=_session_subagent_authority_wire(body.parent_authority),
+        )
+    except SessionParentAuthorityRefused as exc:
+        raise HTTPException(status_code=409, detail=exc.detail()) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail="Session or child not found")
+    if result.get("result") != "reopened":
+        raise HTTPException(status_code=409, detail=result)
+    return result
+
+
+@app.post("/api/agents/threads/{parent_thread_id}/subagents/{thread_id}/terminal")
+async def agent_terminalize_session_subagent_thread(
+    request: Request,
+    parent_thread_id: str,
+    thread_id: UUID,
+    body: AgentSessionSubagentTerminalRequest,
+) -> dict[str, Any]:
+    """End a session child and atomically persist a background report event."""
+
+    await require_internal(request)
+    try:
+        result = await postgres_db.terminalize_session_subagent_thread(
+            parent_thread_id=parent_thread_id,
+            thread_id=str(thread_id),
+            runtime_generation=str(body.runtime_generation),
+            parent_authority=_session_subagent_authority_wire(body.parent_authority),
+            subagent_status=body.subagent_status,
+            delivery_id=str(body.delivery_id) if body.delivery_id else None,
+            message=body.message,
+            outcome=body.outcome,
+            turns=body.turns,
+            tokens=body.tokens,
+            report_path=body.report_path,
+            error=body.error,
+            foreground_orphan_recovery=body.foreground_orphan_recovery,
+        )
+    except SessionParentAuthorityRefused as exc:
+        raise HTTPException(status_code=409, detail=exc.detail()) from exc
+    except InputDeliveryConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "subagent_delivery_conflict", "message": str(exc)},
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail="Session or child not found")
+    if result.get("result") not in {
+        "applied",
+        "idempotent",
+        "already_delivered",
+    }:
         raise HTTPException(status_code=409, detail=result)
     return result
 

@@ -50,6 +50,15 @@ from src.api.persistent_app import (
 )
 
 
+def _retirement_session_mock(**kwargs):
+    """Build a session double with the async child-quiescence contract."""
+
+    session = MagicMock(**kwargs)
+    session.quiesce_subagents = AsyncMock()
+    session.resume_subagents = AsyncMock()
+    return session
+
+
 # ---------------------------------------------------------------------------
 # 3.1 _get_agent_metrics()
 # ---------------------------------------------------------------------------
@@ -1352,7 +1361,8 @@ class TestLoopPersistMessage:
             patch.object(pa, "_session", mock_session),
             patch.object(pa, "_thread_id", "tid"),
         ):
-            await _loop_persist_message(AIMessage(content="hi", id="msg_1"))
+            persisted = await _loop_persist_message(AIMessage(content="hi", id="msg_1"))
+        assert persisted is True
         kwargs = mock_session.postgres_conn.save_thread_message.call_args.kwargs
         assert kwargs["role"] == "ai"
         assert kwargs["turn_number"] == 4, "turn number comes from _session.turn_count"
@@ -1368,7 +1378,10 @@ class TestLoopPersistMessage:
             patch.object(pa, "_session", mock_session),
             patch.object(pa, "_thread_id", "tid"),
         ):
-            await _loop_persist_message(AIMessage(content="hi"))  # must not raise
+            persisted = await _loop_persist_message(
+                AIMessage(content="hi")
+            )  # must not raise
+        assert persisted is False
 
     @pytest.mark.asyncio
     async def test_non_fatal_on_db_error(self):
@@ -1384,9 +1397,10 @@ class TestLoopPersistMessage:
             patch.object(pa, "_session", mock_session),
             patch.object(pa, "_thread_id", "tid"),
         ):
-            await _loop_persist_message(
+            persisted = await _loop_persist_message(
                 AIMessage(content="hi", id="x")
             )  # must not raise
+        assert persisted is False
 
 
 # ---------------------------------------------------------------------------
@@ -2829,7 +2843,7 @@ class TestHandleArchive:
     async def test_gets_recall_store_from_tool_context(self):
         """recall_store read from _session.tool_context.recall_store."""
         ws = AsyncMock()
-        mock_session = MagicMock()
+        mock_session = _retirement_session_mock()
         mock_session.memory_service = None  # legacy path (manager flag off)
         mock_session.tool_context.recall_store = None
         mock_session.auxiliary_llm = None
@@ -2855,7 +2869,7 @@ class TestHandleArchive:
     async def test_memory_extraction_requires_all_three(self):
         """Memory extraction only runs when recall_store, aux_llm, and messages all truthy."""
         ws = AsyncMock()
-        mock_session = MagicMock()
+        mock_session = _retirement_session_mock()
         mock_session.memory_service = None  # legacy path (manager flag off)
         mock_session.tool_context.recall_store = MagicMock()
         mock_session.auxiliary_llm = MagicMock()
@@ -2875,7 +2889,7 @@ class TestHandleArchive:
     async def test_memory_extraction_failure_non_fatal(self):
         """Memory extraction failure doesn't prevent session.ended."""
         ws = AsyncMock()
-        mock_session = MagicMock()
+        mock_session = _retirement_session_mock()
         mock_session.memory_service = None  # legacy path (manager flag off)
         mock_session.tool_context.recall_store = MagicMock()
         mock_session.auxiliary_llm = MagicMock()
@@ -2906,7 +2920,7 @@ class TestHandleArchive:
     async def test_title_generation_on_untitled(self):
         """Generates title when existing title is 'Untitled Session'."""
         ws = AsyncMock()
-        mock_session = MagicMock()
+        mock_session = _retirement_session_mock()
         mock_session.memory_service = None  # legacy path (manager flag off)
         mock_session.tool_context.recall_store = None
         mock_session.auxiliary_llm = MagicMock()
@@ -2934,7 +2948,7 @@ class TestHandleArchive:
     async def test_title_failure_non_fatal(self):
         """Title generation failure doesn't crash archive."""
         ws = AsyncMock()
-        mock_session = MagicMock()
+        mock_session = _retirement_session_mock()
         mock_session.memory_service = None  # legacy path (manager flag off)
         mock_session.tool_context.recall_store = None
         mock_session.auxiliary_llm = None
@@ -2962,7 +2976,7 @@ class TestHandleArchive:
     async def test_sends_session_ended_event(self):
         """Sends session.ended with thread_id."""
         ws = AsyncMock()
-        mock_session = MagicMock()
+        mock_session = _retirement_session_mock()
         mock_session.memory_service = None  # legacy path (manager flag off)
         mock_session.tool_context.recall_store = None
         mock_session.auxiliary_llm = None
@@ -2995,7 +3009,7 @@ class TestHandleArchive:
             lambda *_args, **_kwargs: order.append("ending") or True
         )
         self.teardown.side_effect = lambda *_args, **_kwargs: order.append("settle")
-        mock_session = MagicMock()
+        mock_session = _retirement_session_mock()
         mock_session.memory_service = None
         mock_session.tool_context.recall_store = None
         mock_session.auxiliary_llm = None
@@ -3027,7 +3041,7 @@ class TestHandleArchive:
     @pytest.mark.asyncio
     async def test_officer_archive_settles_and_echoes_suspended_disposition(self):
         ws = AsyncMock()
-        mock_session = MagicMock()
+        mock_session = _retirement_session_mock()
         mock_session.config = SimpleNamespace(officer=SimpleNamespace(enabled=True))
         mock_session.memory_service = None
         mock_session.tool_context.recall_store = None
@@ -3066,7 +3080,7 @@ class TestHandleArchive:
     async def test_retirement_admission_refusal_never_publishes_terminal_frame(self):
         ws = AsyncMock()
         self.status_update.return_value = False
-        mock_session = MagicMock()
+        mock_session = _retirement_session_mock()
         mock_session.memory_service = None
         mock_session.tool_context.recall_store = None
         mock_session.auxiliary_llm = None
@@ -3087,7 +3101,7 @@ class TestHandleArchive:
     async def test_retirement_refusal_runs_no_archive_finalization(self):
         ws = AsyncMock()
         self.status_update.return_value = False
-        session = MagicMock()
+        session = _retirement_session_mock()
         session.workspace_sync.push_all = AsyncMock()
         session.workspace_sync.pull_all = AsyncMock()
         session.workspace_sync.aclose = AsyncMock()
@@ -3111,7 +3125,7 @@ class TestHandleArchive:
     async def test_retirement_settlement_failure_never_publishes_terminal_frame(self):
         ws = AsyncMock()
         self.teardown.side_effect = RuntimeError("retirement did not settle")
-        mock_session = MagicMock()
+        mock_session = _retirement_session_mock()
         mock_session.memory_service = None
         mock_session.tool_context.recall_store = None
         mock_session.auxiliary_llm = None
@@ -3145,7 +3159,7 @@ class TestHandleIdleArchive:
 
     @staticmethod
     def _session():
-        session = MagicMock()
+        session = _retirement_session_mock()
         session.memory_service = None
         session.tool_context.recall_store = None
         session.auxiliary_llm = None
@@ -3215,7 +3229,7 @@ async def test_pinned_terminal_status_never_uses_direct_db_fallback(status):
     postgres = MagicMock()
     postgres.end_thread = AsyncMock()
     postgres.update_thread_status = AsyncMock()
-    session = MagicMock(postgres_conn=postgres)
+    session = _retirement_session_mock(postgres_conn=postgres)
     client = MagicMock()
     client.update_thread_status = AsyncMock(return_value=False)
 
@@ -3244,7 +3258,7 @@ async def test_begun_retirement_closes_local_input_and_readiness_before_finaliza
 
     postgres = MagicMock()
     postgres.persist_pinned_input_delivery = AsyncMock()
-    session = MagicMock(postgres_conn=postgres)
+    session = _retirement_session_mock(postgres_conn=postgres)
     session.llm_with_tools = object()
     update = AsyncMock(return_value=True)
     generation = "88888888-8888-4888-8888-888888888888"
@@ -3281,6 +3295,95 @@ async def test_begun_retirement_closes_local_input_and_readiness_before_finaliza
     postgres.persist_pinned_input_delivery.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_child_quiescence_precedes_retirement_authority_revocation():
+    from src.api import persistent_app as mod
+
+    order: list[str] = []
+    session = _retirement_session_mock()
+    session.quiesce_subagents.side_effect = lambda _reason: order.append("children")
+    close_controls = AsyncMock(
+        side_effect=lambda **_kwargs: order.append("controls") or True
+    )
+    update = AsyncMock(
+        side_effect=lambda *_args, **_kwargs: order.append("retirement") or True
+    )
+
+    with (
+        patch.object(mod, "_session", session),
+        patch.object(mod, "_thread_id", "retirement-order-thread"),
+        patch.object(
+            mod,
+            "_session_runtime_generation",
+            "88888888-8888-4888-8888-888888888888",
+        ),
+        patch.object(
+            mod,
+            "_session_runtime_attach_token",
+            "99999999-9999-4999-8999-999999999999",
+        ),
+        patch.object(mod, "_retirement_admission_identity", None),
+        patch.object(mod, "_retirement_admission_disposition", None),
+        patch.object(mod, "_retirement_admission_token", None),
+        patch.object(mod, "_retirement_admission_permanent", None),
+        patch.object(mod, "_pinned_runtime_generation_enabled", False),
+        patch.object(mod, "_stateless_mode", return_value=False),
+        patch.object(mod, "_registered_pinned_agent_id", return_value="agent-a"),
+        patch.object(mod, "_close_pinned_control_inbox", close_controls),
+        patch.object(mod, "_update_thread_status", update),
+    ):
+        assert await mod._begin_exact_session_retirement() is True
+
+    assert order == ["children", "controls", "retirement"]
+    session.quiesce_subagents.assert_awaited_once_with(
+        "parent session retiring as ended"
+    )
+
+
+@pytest.mark.asyncio
+async def test_child_quiescence_failure_refuses_retirement_begin():
+    from src.api import persistent_app as mod
+
+    session = _retirement_session_mock()
+    session.quiesce_subagents.side_effect = RuntimeError("child still running")
+    close_controls = AsyncMock(return_value=True)
+    update = AsyncMock(return_value=True)
+
+    with (
+        patch.object(mod, "_session", session),
+        patch.object(mod, "_thread_id", "retirement-quiesce-failure"),
+        patch.object(
+            mod,
+            "_session_runtime_generation",
+            "88888888-8888-4888-8888-888888888888",
+        ),
+        patch.object(
+            mod,
+            "_session_runtime_attach_token",
+            "99999999-9999-4999-8999-999999999999",
+        ),
+        patch.object(mod, "_retirement_admission_identity", None),
+        patch.object(mod, "_retirement_admission_disposition", None),
+        patch.object(mod, "_retirement_admission_token", None),
+        patch.object(mod, "_retirement_admission_permanent", None),
+        patch.object(mod, "_pinned_runtime_generation_enabled", False),
+        patch.object(mod, "_stateless_mode", return_value=False),
+        patch.object(mod, "_registered_pinned_agent_id", return_value="agent-a"),
+        patch.object(mod, "_close_pinned_control_inbox", close_controls),
+        patch.object(mod, "_update_thread_status", update),
+    ):
+        assert await mod._begin_exact_session_retirement() is False
+        assert mod._retirement_admission_identity == (
+            "retirement-quiesce-failure",
+            "88888888-8888-4888-8888-888888888888",
+            "99999999-9999-4999-8999-999999999999",
+        )
+        assert mod._runtime_admission_closed() is True
+
+    close_controls.assert_not_awaited()
+    update.assert_not_awaited()
+
+
 class TestExactRetirementBeginReconciliation:
     generation = "88888888-8888-4888-8888-888888888888"
     attach_token = "99999999-9999-4999-8999-999999999999"
@@ -3290,8 +3393,9 @@ class TestExactRetirementBeginReconciliation:
 
     @contextmanager
     def _patch_runtime(self, mod, *, client):
+        session = _retirement_session_mock()
         patchers = (
-            patch.object(mod, "_session", MagicMock()),
+            patch.object(mod, "_session", session),
             patch.object(mod, "_thread_id", self.thread_id),
             patch.object(mod, "_session_runtime_generation", self.generation),
             patch.object(mod, "_session_runtime_attach_token", self.attach_token),
@@ -3309,7 +3413,7 @@ class TestExactRetirementBeginReconciliation:
         with ExitStack() as stack:
             for patcher in patchers:
                 stack.enter_context(patcher)
-            yield
+            yield session
 
     def _live_lifecycle(self, **extra):
         return {
@@ -3329,7 +3433,7 @@ class TestExactRetirementBeginReconciliation:
         client = SimpleNamespace(begin_thread_retirement=AsyncMock())
         reopen = AsyncMock(return_value=True)
         with (
-            self._patch_runtime(mod, client=client),
+            self._patch_runtime(mod, client=client) as session,
             patch.object(
                 mod,
                 "_close_pinned_control_inbox",
@@ -3344,6 +3448,21 @@ class TestExactRetirementBeginReconciliation:
             agent_id=self.agent_id,
             open_for_admission=True,
         )
+        session.resume_subagents.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
+    async def test_missing_exact_owner_after_child_quiesce_fences_whole_runtime(self):
+        from src.api import persistent_app as mod
+
+        client = SimpleNamespace(begin_thread_retirement=AsyncMock())
+        with (
+            self._patch_runtime(mod, client=client),
+            patch.object(mod, "_registered_pinned_agent_id", return_value=None),
+        ):
+            assert await mod._begin_exact_session_retirement() is False
+            assert mod._runtime_admission_closed() is True
+
+        client.begin_thread_retirement.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_no_commit_response_reopens_only_after_exact_lifecycle_proof(self):
@@ -3355,7 +3474,7 @@ class TestExactRetirementBeginReconciliation:
         )
         reopen = AsyncMock(return_value=True)
         with (
-            self._patch_runtime(mod, client=client),
+            self._patch_runtime(mod, client=client) as session,
             patch.object(
                 mod, "_close_pinned_control_inbox", new=AsyncMock(return_value=True)
             ),
@@ -3368,6 +3487,33 @@ class TestExactRetirementBeginReconciliation:
             agent_id=self.agent_id,
             open_for_admission=True,
         )
+        session.resume_subagents.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
+    async def test_child_resume_failure_recloses_controls_and_latches_admission(self):
+        from src.api import persistent_app as mod
+
+        client = SimpleNamespace(
+            begin_thread_retirement=AsyncMock(return_value=None),
+            get_thread_lifecycle=AsyncMock(return_value=self._live_lifecycle()),
+        )
+        control_admission = AsyncMock(side_effect=[True, True])
+        with (
+            self._patch_runtime(mod, client=client) as session,
+            patch.object(
+                mod, "_close_pinned_control_inbox", new=AsyncMock(return_value=True)
+            ),
+            patch.object(mod, "_set_pinned_control_admission", control_admission),
+        ):
+            session.resume_subagents.side_effect = RuntimeError("not settled")
+
+            assert await mod._begin_exact_session_retirement() is False
+            assert mod._runtime_admission_closed() is True
+
+        assert control_admission.await_args_list == [
+            mock_call(agent_id=self.agent_id, open_for_admission=True),
+            mock_call(agent_id=self.agent_id, open_for_admission=False),
+        ]
 
     @pytest.mark.asyncio
     async def test_malformed_commit_response_adopts_exact_authorized_permanent_intent(
@@ -3418,7 +3564,7 @@ async def test_loop_gone_terminal_begin_retries_without_reopening_controls():
 
     generation = "88888888-8888-4888-8888-888888888888"
     attach_token = "99999999-9999-4999-8999-999999999999"
-    session = MagicMock()
+    session = _retirement_session_mock()
     session.config = SimpleNamespace(officer=SimpleNamespace(enabled=False))
     session.workspace_sync = None
     session.workspace_manager = None
@@ -4402,7 +4548,7 @@ class TestTerminateSession:
 
         loop_task = asyncio.create_task(loop_body())
         await loop_started.wait()
-        session = MagicMock()
+        session = _retirement_session_mock()
         session.workspace_sync = SimpleNamespace(
             push_all=AsyncMock(side_effect=lambda: order.append("cloud:push")),
             pull_all=AsyncMock(side_effect=lambda: order.append("cloud:pull")),
@@ -4498,7 +4644,7 @@ class TestTerminateSession:
     async def test_officer_shutdown_begins_suspended_disposition(self):
         import src.api.persistent_app as mod
 
-        session = MagicMock()
+        session = _retirement_session_mock()
         session.config = SimpleNamespace(officer=SimpleNamespace(enabled=True))
         session.workspace_sync = None
         session.workspace_manager = None
@@ -4554,7 +4700,7 @@ class TestTerminateSession:
             side_task_entered.set()
             await release_side_task.wait()
 
-        session = MagicMock()
+        session = _retirement_session_mock()
         session.workspace_sync = None
         session.workspace_manager = None
         session.memory_service = None
@@ -4613,7 +4759,7 @@ class TestTerminateSession:
 
         watchdog = asyncio.create_task(stubborn_watchdog())
         await asyncio.sleep(0)
-        session = MagicMock()
+        session = _retirement_session_mock()
         session.workspace_sync = None
         session.workspace_manager = None
         session.memory_service = None
@@ -4656,7 +4802,7 @@ class TestTerminateSession:
     async def test_uncertain_pinned_quiescence_blocks_remote_settlement(self, failure):
         import src.api.persistent_app as mod
 
-        session = MagicMock()
+        session = _retirement_session_mock()
         session.workspace_sync = None
         session.workspace_manager = None
         session.memory_service = None
@@ -4702,7 +4848,7 @@ class TestTerminateSession:
     async def test_failed_settlement_retains_exact_local_retirement_fence(self):
         import src.api.persistent_app as mod
 
-        session = MagicMock()
+        session = _retirement_session_mock()
         session.workspace_sync = None
         session.workspace_manager = None
         session.memory_service = None
@@ -4835,7 +4981,7 @@ class TestTerminateSession:
         mod._thread_id = "t1"
 
         # Minimal _session double that records when it's torn down.
-        fake_session = MagicMock()
+        fake_session = _retirement_session_mock()
         fake_session.workspace_sync = None
         git_mgr = MagicMock()
         git_mgr.is_active = True
@@ -4904,7 +5050,7 @@ class TestTerminateSession:
         mod._event_writer = None
         mod._terminating = False
         mod._max_sessions_per_process = 0
-        fake_session = MagicMock()
+        fake_session = _retirement_session_mock()
         fake_session.shell_owner_token = 31
         fake_session.workspace_sync = None
         fake_session.workspace_manager = None
@@ -4936,7 +5082,7 @@ class TestTerminateSession:
         mod._event_writer = None
         mod._terminating = False
         mod._max_sessions_per_process = 0
-        fake_session = MagicMock()
+        fake_session = _retirement_session_mock()
         fake_session.workspace_sync = None
         fake_session.workspace_manager = None
         fake_session.cleanup = AsyncMock()
@@ -4967,7 +5113,7 @@ class TestTerminateSession:
         mod._event_writer = None
         mod._terminating = False
         mod._max_sessions_per_process = 0
-        fake_session = MagicMock()
+        fake_session = _retirement_session_mock()
         fake_session.workspace_sync = None
         fake_session.workspace_manager = None
         fake_session.memory_service = None
@@ -5017,7 +5163,7 @@ class TestTerminateSession:
         mod._next_seq = 42
         mod._event_writer = None
 
-        fake_session = MagicMock()
+        fake_session = _retirement_session_mock()
         fake_session.workspace_sync = None
         fake_session.workspace_manager = None
         fake_session.cleanup = AsyncMock()
@@ -5090,6 +5236,9 @@ class TestAttachSessionEventJournalFailure:
             async def setup(self, **kwargs):
                 return None
 
+            async def recover_subagents(self):
+                return None
+
         workspace_override = {"remote": {"host": "10.42.0.10"}}
         fake_agent = SimpleNamespace(
             config=object(),
@@ -5154,6 +5303,8 @@ class TestAttachSessionCloudMount:
         """A mounted cloud workspace must not also start legacy WebDAV sync."""
         import src.api.persistent_app as mod
 
+        recovery_queue_states = []
+
         class FakeSession:
             def __init__(self, *args, **kwargs):
                 self.cloud_mount_manager = SimpleNamespace(
@@ -5181,6 +5332,9 @@ class TestAttachSessionCloudMount:
 
             async def setup(self, **kwargs):
                 return None
+
+            async def recover_subagents(self):
+                recovery_queue_states.append(mod._loop_user_queue)
 
         workspace_override = {
             "remote": {"host": "10.42.0.10"},
@@ -5217,11 +5371,14 @@ class TestAttachSessionCloudMount:
         ):
             try:
                 await mod._attach_session("thread-1")
+                queue_after_recovery = mod._loop_user_queue
             finally:
                 mod._session = None
                 mod._thread_id = None
 
         build_sync.assert_not_called()
+        assert recovery_queue_states == [None]
+        assert isinstance(queue_after_recovery, asyncio.Queue)
 
 
 class TestAttachSessionProtectedCloudFailClose:
@@ -5249,6 +5406,9 @@ class TestAttachSessionProtectedCloudFailClose:
                 self.tool_context = None
 
             async def setup(self, **kwargs):
+                return None
+
+            async def recover_subagents(self):
                 return None
 
         return FakeSession
@@ -5401,6 +5561,9 @@ class TestAttachSessionProtectedCloudSingletonIsolation:
                 self.tool_context = None
 
             async def setup(self, **kwargs):
+                return None
+
+            async def recover_subagents(self):
                 return None
 
             def protected_cloud_ready(self):

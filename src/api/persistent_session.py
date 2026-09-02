@@ -19,7 +19,7 @@ from dataclasses import is_dataclass as _dc_is_dataclass
 from dataclasses import replace as _dc_replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import BaseMessage
@@ -201,6 +201,15 @@ class PersistentSession:
     # tier-specific local zero-writer proof before settlement can be ACKed.
     pinned_runtime_identity_required: bool = False
 
+    # U5 session-parent delegation.  These are injected by persistent_app so
+    # this state object never imports process-global owner/lease machinery.
+    orchestrator_client: Optional[Any] = None
+    session_parent_authority_provider: Optional[Callable[[], Any]] = None
+    subagent_provider_admission: Optional[Callable[[], bool]] = None
+    subagent_effect_authority: Optional[Callable[[], Any]] = None
+    subagent_settlement_authority: Optional[Callable[[], Any]] = None
+    subagent_event_callback: Optional[Callable[[str], Any]] = None
+
     # Permission mode (switchable at runtime)
     permission_mode: str = "supervised"
     # Narration mode (switchable at runtime)
@@ -242,6 +251,7 @@ class PersistentSession:
     # Set only after every detached memory/citation writer has been terminally
     # joined.  Queue transitions and claimant-loss ACKs depend on this proof.
     _background_tasks_quiesced: bool = False
+    _subagent_runtime_quiesced: bool = False
     # B11 double-extraction guard: set after a manager-path session_end/
     # idle_archive capture so _terminate_session doesn't re-extract.
     final_memory_extracted: bool = False
@@ -498,6 +508,7 @@ class PersistentSession:
 
         # 7. Create context manager
         self._setup_context_manager()
+        self._wire_subagent_context_probe()
         _steps["context"] = time.perf_counter() - _t
         _t = time.perf_counter()
 
@@ -1955,7 +1966,19 @@ class PersistentSession:
             knowledge_store=self.knowledge_store,
             knowledge_bindings=list(self.knowledge_bindings),
             runtime_actor=self.runtime_actor,
+            orchestrator_client=self.orchestrator_client,
         )
+        # Mark the parent before factories close over this context.  Even if a
+        # malformed config exposes a delegation control without a runtime,
+        # ensure_runtime must fail closed instead of constructing WorkerHost
+        # from the session's legacy `_job_id = thread_id` alias.
+        self.tool_context._subagent_parent_kind = "session"
+        self.tool_context._session_parent_authority_provider = (
+            self.session_parent_authority_provider
+        )
+        self.tool_context.provider_admission = self.subagent_provider_admission
+        self.tool_context.auxiliary_llm = self.auxiliary_llm
+        self.tool_context._limits = self.config.limits
         if self.project_ids:
             self.tool_context.project_ids = self.project_ids
 
@@ -1973,6 +1996,135 @@ class PersistentSession:
             self.tool_context.cloud_anchor_persist_callback = _persist_cloud_anchor
 
         self._load_tools_for_backend()
+        self._install_session_subagent_runtime()
+
+    def _install_session_subagent_runtime(self) -> None:
+        """Install the strict thread-parent host/ledger when tools require it."""
+
+        context = self.tool_context
+        if context is None:
+            return
+        runtime_tools = {
+            "delegate_agent",
+            "list_agents",
+            "wait_agent",
+            "message_agent",
+            "stop_agent",
+        }
+        loaded = set(getattr(context, "_resolved_tool_names", None) or [])
+        if context.subagent_runtime is not None:
+            return
+        delegation_enabled = bool(loaded.intersection(runtime_tools))
+        authority_wired = not (
+            self.orchestrator_client is None
+            or self.postgres_conn is None
+            or not callable(self.session_parent_authority_provider)
+            or not callable(self.subagent_provider_admission)
+            or not callable(self.subagent_effect_authority)
+        )
+        if not authority_wired and not delegation_enabled:
+            return
+        if not authority_wired:
+            raise RuntimeError(
+                "delegation-enabled session lacks exact durable parent authority"
+            )
+
+        # Install the hidden lifecycle runtime even when the current config no
+        # longer exposes delegation controls. A prior session life may have
+        # durable live children; config revocation must not strand those rows
+        # by skipping attach-time orphan recovery. No model-facing tool is
+        # added here, so a session without the grant still cannot delegate.
+
+        from ..subagents.host import SessionHost
+        from ..subagents.runtime import SubagentRuntime
+        from ..subagents.session_persistence import SessionSubagentLedger
+
+        ledger = SessionSubagentLedger.from_context(context)
+        if ledger is None:
+            raise RuntimeError(
+                "delegation-enabled session could not construct its durable ledger"
+            )
+        host = SessionHost(
+            thread_id=self.thread_id,
+            # Audit/metering treats this field as the execution tier.  The
+            # expert config's agent_id may itself be a UUID, which would be
+            # misclassified as a child job instead of this parent session.
+            agent_type="persistent",
+            tool_context=context,
+            user_id=self.user_id,
+            auxiliary_llm=self.auxiliary_llm,
+            live_llm_config=self.config.llm,
+            postgres=self.postgres_conn,
+            admission_fn=self.subagent_provider_admission,
+            effect_authority_fn=self.subagent_effect_authority,
+            settlement_authority_fn=self.subagent_settlement_authority,
+            event_fn=self.subagent_event_callback,
+        )
+        context._parent_host = host
+        context.subagent_runtime = SubagentRuntime.from_context(
+            context,
+            host,
+            ledger=ledger,
+        )
+
+    def _wire_subagent_context_probe(self) -> None:
+        """Expose live parent headroom after ContextManager construction."""
+
+        context = self.tool_context
+        manager = self.context_manager
+        if context is None or manager is None:
+            return
+
+        def _probe():
+            from ..subagents.host import ContextProbe
+
+            live = manager.state
+            config = manager.config
+            return ContextProbe(
+                last_provider_input_tokens=live.last_provider_input_tokens,
+                current_token_count=int(live.current_token_count or 0),
+                compaction_threshold_tokens=int(config.compaction_threshold_tokens),
+                model_max_context_tokens=int(config.model_max_context_tokens),
+            )
+
+        context.parent_context_probe = _probe
+
+    async def recover_subagents(self) -> None:
+        """Reconcile predecessor child generations before parent readiness."""
+
+        runtime = getattr(self.tool_context, "subagent_runtime", None)
+        if runtime is None:
+            return
+        recover = getattr(runtime, "recover_orphans", None)
+        if not callable(recover):
+            raise RuntimeError("session subagent runtime has no orphan recovery")
+        await recover()
+
+    async def quiesce_subagents(self, reason: str) -> None:
+        """Close child admission/work while this session still has authority."""
+
+        if self._subagent_runtime_quiesced:
+            return
+        runtime = getattr(self.tool_context, "subagent_runtime", None)
+        if runtime is not None:
+            quiesce = getattr(runtime, "quiesce", None)
+            if not callable(quiesce):
+                raise RuntimeError("session subagent runtime has no quiesce boundary")
+            await quiesce(reason)
+        self._subagent_runtime_quiesced = True
+
+    async def resume_subagents(self) -> None:
+        """Re-arm a settled child runtime after exact retirement abort proof."""
+
+        if not self._subagent_runtime_quiesced:
+            return
+        runtime = getattr(self.tool_context, "subagent_runtime", None)
+        if runtime is not None:
+            resume = getattr(runtime, "resume", None)
+            if not callable(resume):
+                raise RuntimeError("session subagent runtime has no resume boundary")
+            await resume()
+        self._subagent_runtime_quiesced = False
 
     async def _hydrate_durable_session_state(self) -> None:
         """Restore migration-0133 state before this claimant serves tools.
@@ -3266,6 +3418,8 @@ class PersistentSession:
 
         if self._background_tasks_quiesced:
             return
+
+        await self.quiesce_subagents("session background work quiescing")
 
         if self.tool_context is not None:
             citation_engine = getattr(self.tool_context, "citation_engine", None)

@@ -554,6 +554,7 @@ async def test_dedicated_attach_initial_engaging_polls_to_ready(monkeypatch):
     )
     session = MagicMock()
     session.setup = AsyncMock()
+    session.recover_subagents = AsyncMock()
     session.cleanup = AsyncMock()
     session.protected_cloud_ready.return_value = True
     session.cloud_mount_manager = SimpleNamespace(active=True, mounts=[])

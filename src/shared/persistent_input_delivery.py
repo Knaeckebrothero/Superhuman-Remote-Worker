@@ -97,6 +97,7 @@ async def _lock_stateless_runtime_authority(
     lease_token: int,
     executor_id: str,
     pod_uid: str,
+    for_update: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Lock and prove one exact stateless ``session_turn`` claimant.
 
@@ -110,9 +111,11 @@ async def _lock_stateless_runtime_authority(
     pod = str(pod_uid or "").strip()
     if int(lease_token) <= 0 or not executor or not pod:
         raise InputDeliveryAuthorityLost("stateless runtime identity is incomplete")
+    lock_clause = "FOR UPDATE" if for_update else "FOR SHARE"
     thread = await conn.fetchrow(
-        "SELECT id, agent_id, status, execution_lane, user_id, total_turns "
-        "FROM threads WHERE id = $1 FOR SHARE",
+        "SELECT id, agent_id, status, execution_lane, user_id, total_turns, "
+        "metadata "
+        f"FROM threads WHERE id = $1 {lock_clause}",
         thread_uuid,
     )
     if (
@@ -122,10 +125,27 @@ async def _lock_stateless_runtime_authority(
         or str(thread["status"] or "") in {"ended", "suspended"}
     ):
         raise InputDeliveryAuthorityLost("stateless thread authority was lost")
+    # Queue rows identify a pod by its reusable name.  The credential bundle
+    # additionally stamps the immutable Kubernetes UID in thread metadata;
+    # require the exact three-part claim so a restarted pod with the same name
+    # cannot inherit another incarnation's DB mutation authority.
+    from .session_retirement import active_claim_authority
+
+    try:
+        active_claim = active_claim_authority(thread["metadata"])
+    except RuntimeError as exc:
+        raise InputDeliveryAuthorityLost("stateless active claim is malformed") from exc
+    if (
+        active_claim is None
+        or int(active_claim[0]) != int(lease_token)
+        or active_claim[1].pod != executor
+        or active_claim[1].pod_uid != pod
+    ):
+        raise InputDeliveryAuthorityLost("stateless pod incarnation was lost")
     queue = await conn.fetchrow(
         "SELECT unit_id, unit_kind, state, lease_token, leased_by, "
         "input_delivery_capable_lease_token FROM run_queue "
-        "WHERE unit_id = $1 FOR SHARE",
+        f"WHERE unit_id = $1 {lock_clause}",
         thread_uuid,
     )
     if (
@@ -154,6 +174,8 @@ async def persist_input_delivery(
     runtime_generation: str | UUID | None = None,
     session_runtime_generation: str | UUID | None = None,
     runtime_attach_token: str | UUID | None = None,
+    allow_stateless_subagent_event: bool = False,
+    supersedes_input_seq: int | None = None,
 ) -> dict[str, Any]:
     """Atomically persist one transcript row and optionally claim execution.
 
@@ -166,6 +188,11 @@ async def persist_input_delivery(
     thread_uuid = UUID(str(thread_id))
     row_id = message_row_id(delivery_uuid)
     source_value = str(source or "unknown")[:80]
+    if isinstance(supersedes_input_seq, bool) or (
+        supersedes_input_seq is not None
+        and (not isinstance(supersedes_input_seq, int) or supersedes_input_seq <= 0)
+    ):
+        raise InputDeliveryConflict("superseded input sequence is invalid")
     session_runtime_generation = session_runtime_generation or runtime_generation
     identity = (
         agent_id,
@@ -221,6 +248,11 @@ async def persist_input_delivery(
             or str(terminal_replay["role"]) != str(role)
             or str(terminal_replay["execution_lane"] or "")
             not in {"pinned", "stateless"}
+            or terminal_replay.get("supersedes_input_seq") != supersedes_input_seq
+            or (
+                turn_number is not None
+                and terminal_replay.get("turn_number") != turn_number
+            )
         ):
             raise InputDeliveryConflict(
                 "stable input identity conflicts with terminal delivery"
@@ -282,19 +314,34 @@ async def persist_input_delivery(
     if has_identity and execution_lane != "pinned":
         raise InputDeliveryAuthorityLost("pinned runtime cannot claim stateless input")
     if not has_identity and execution_lane == "stateless":
-        if str(role) != "event" or source_value != "officer_wake":
+        accepted_source = source_value == "officer_wake" or (
+            allow_stateless_subagent_event and source_value == "subagent"
+        )
+        if str(role) != "event" or not accepted_source:
             raise InputDeliveryAuthorityLost(
                 "stateless durable input is reserved for server events"
             )
         if thread.get("agent_id") is not None:
             raise InputDeliveryAuthorityLost("stateless thread is unexpectedly bound")
 
-    effective_turn_number = turn_number
+    # Stable delivery identity owns the immutable transcript row. A retry may
+    # be rendered after the session's turn counter advanced, or may carry a
+    # newly derived turn hint; neither is allowed to reinterpret that row.
+    existing_turn_number = await conn.fetchval(
+        "SELECT turn_number FROM thread_messages WHERE id=$1 AND thread_id=$2",
+        row_id,
+        thread_uuid,
+    )
+    effective_turn_number = (
+        int(existing_turn_number) if existing_turn_number is not None else turn_number
+    )
     if execution_lane == "stateless" and (
         isinstance(effective_turn_number, bool)
         or not isinstance(effective_turn_number, int)
         or effective_turn_number <= 0
     ):
+        # The first stateless writer derives its turn exactly once. Concurrent
+        # retries then take the committed branch above.
         effective_turn_number = int(thread.get("total_turns") or 0) + 1
 
     inserted = await conn.fetchrow(
@@ -321,6 +368,7 @@ async def persist_input_delivery(
         message is None
         or str(message["thread_id"]) != str(thread_uuid)
         or str(message["role"]) != str(role)
+        or message.get("turn_number") != effective_turn_number
     ):
         raise InputDeliveryConflict("stable input identity conflicts with transcript")
 
@@ -408,8 +456,9 @@ async def persist_input_delivery(
     await conn.execute(
         """
         INSERT INTO thread_input_deliveries
-            (delivery_id, thread_id, message_id, source, execution_lane)
-        VALUES ($1, $2, $3, $4, $5)
+            (delivery_id, thread_id, message_id, source, execution_lane,
+             supersedes_input_seq)
+        VALUES ($1, $2, $3, $4, $5, $6)
         ON CONFLICT (delivery_id) DO NOTHING
         """,
         delivery_uuid,
@@ -417,6 +466,7 @@ async def persist_input_delivery(
         row_id,
         source_value,
         execution_lane,
+        supersedes_input_seq,
     )
     delivery = await conn.fetchrow(
         "SELECT * FROM thread_input_deliveries WHERE delivery_id = $1 FOR UPDATE",
@@ -428,6 +478,7 @@ async def persist_input_delivery(
         or str(delivery["message_id"]) != str(row_id)
         or str(delivery["source"]) != source_value
         or str(delivery["execution_lane"] or "") != execution_lane
+        or delivery.get("supersedes_input_seq") != supersedes_input_seq
     ):
         raise InputDeliveryConflict("stable input identity conflicts with delivery")
 
@@ -710,7 +761,12 @@ async def claim_pending_input_deliveries(
           JOIN thread_messages AS message ON message.id = delivery.message_id
          WHERE delivery.thread_id = $1
            AND delivery.state IN ('persisted', 'owned', 'queued', 'deferred')
-         ORDER BY message.seq, delivery.delivery_id
+         ORDER BY
+             CASE WHEN delivery.source = 'subagent'
+                        AND delivery.supersedes_input_seq IS NOT NULL
+                  THEN 0 ELSE 1 END,
+             message.seq,
+             delivery.delivery_id
          FOR UPDATE OF delivery
         """,
         thread_uuid,

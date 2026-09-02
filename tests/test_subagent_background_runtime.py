@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
-from langchain_core.messages import AIMessageChunk
+from langchain_core.messages import AIMessage, AIMessageChunk
 
+import src.subagents.runtime as runtime_mod
 from src.subagents import NullLedger, RecordingLedger
+from src.subagents.persistence import RestoredSubagentTranscript
 from tests._fake_chat_model import HANG, FakeChatModel, text_turn
 from tests.test_subagent_runtime import call, make_parent, runtime_for
 
@@ -43,8 +46,11 @@ class StrictLedger(RecordingLedger):
         self.allow_open.set()
         self.terminal = asyncio.Event()
         self.terminal_calls: list[tuple[str, dict[str, Any]]] = []
+        self.foreground_terminal_calls: list[tuple[str, dict[str, Any]]] = []
         self.live: list[dict[str, Any]] = []
         self.refuse_open = False
+        self.generations: dict[str, str] = {}
+        self.reopen_calls: list[str] = []
 
     async def open(self, subagent_id: str, **fields: Any) -> dict[str, str] | None:
         self.open_started.set()
@@ -52,9 +58,32 @@ class StrictLedger(RecordingLedger):
         self.opened.append((subagent_id, dict(fields)))
         if self.refuse_open:
             return None
+        generation = "aaaaaaaa-1111-4222-8333-444444444444"
+        self.generations[subagent_id] = generation
         return {
             "thread_id": subagent_id,
-            "runtime_generation": "aaaaaaaa-1111-4222-8333-444444444444",
+            "runtime_generation": generation,
+        }
+
+    async def load_messages(self, subagent_id: str) -> RestoredSubagentTranscript:
+        rows = [
+            (message, turn)
+            for child, message, turn in self.messages
+            if child == subagent_id
+        ]
+        return RestoredSubagentTranscript(
+            messages=[message for message, _turn in rows],
+            turn_number=max((turn for _message, turn in rows), default=0),
+        )
+
+    async def reopen(self, subagent_id: str) -> dict[str, Any]:
+        self.reopen_calls.append(subagent_id)
+        generation = "bbbbbbbb-1111-4222-8333-444444444444"
+        self.generations[subagent_id] = generation
+        return {
+            "result": "reopened",
+            "thread_id": subagent_id,
+            "runtime_generation": generation,
         }
 
     async def terminalize_and_enqueue(
@@ -67,7 +96,9 @@ class StrictLedger(RecordingLedger):
             "source": "subagent",
             "thread_id": subagent_id,
             "handle": opened["handle"],
-            "run_generation": "aaaaaaaa-1111-4222-8333-444444444444",
+            "run_generation": self.generations.get(
+                subagent_id, "aaaaaaaa-1111-4222-8333-444444444444"
+            ),
             "message": fields["message"],
             "timestamp": fields["timestamp"],
         }
@@ -78,8 +109,68 @@ class StrictLedger(RecordingLedger):
             "delivery": delivery,
         }
 
+    async def terminalize_foreground_orphan_and_enqueue(
+        self, subagent_id: str, **fields: Any
+    ) -> dict[str, Any]:
+        self.foreground_terminal_calls.append((subagent_id, dict(fields)))
+        return {
+            "result": "applied",
+            "delivery_state": "queued",
+            "delivery": {
+                "id": fields["delivery_id"],
+                "source": "subagent",
+                "role": "event",
+            },
+        }
+
     async def list_live(self, parent_job_id: str) -> list[dict[str, Any]]:
         return [dict(row) for row in self.live]
+
+
+class DurableStateLedger(StrictLedger):
+    """Expose any by-call row, like the production worker ledger."""
+
+    def __init__(self, row: dict[str, Any] | None = None) -> None:
+        super().__init__()
+        self.lookup_row = row
+        self.fail_lookup = False
+
+    async def lookup(
+        self, parent_job_id: str, parent_tool_call_id: str
+    ) -> dict[str, Any] | None:
+        self.lookups.append((str(parent_job_id), str(parent_tool_call_id)))
+        if self.fail_lookup:
+            raise RuntimeError("lookup unavailable")
+        return dict(self.lookup_row) if self.lookup_row is not None else None
+
+
+@pytest.mark.asyncio
+async def test_quiesced_runtime_resumes_only_with_exact_authority(tmp_path):
+    ctx, _ = make_parent(tmp_path)
+    runtime = runtime_for(ctx)
+    authority = AsyncMock(return_value=True)
+    runtime.host.effect_authority_fn = authority
+
+    await runtime.quiesce("retirement preflight")
+    assert runtime._accepting is False
+    await runtime.resume()
+
+    assert runtime._accepting is True
+    assert authority.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_quiesced_runtime_refuses_resume_after_authority_loss(tmp_path):
+    ctx, _ = make_parent(tmp_path)
+    runtime = runtime_for(ctx)
+    runtime.host.effect_authority_fn = AsyncMock(return_value=True)
+    await runtime.quiesce("retirement preflight")
+    runtime.host.effect_authority_fn = AsyncMock(return_value=False)
+
+    with pytest.raises(RuntimeError, match="exact parent authority"):
+        await runtime.resume()
+
+    assert runtime._accepting is False
 
 
 @pytest.mark.asyncio
@@ -143,6 +234,78 @@ async def test_null_ledger_refuses_before_build_or_provider_task(tmp_path):
     assert await runtime.list_agents() == []
 
 
+@pytest.mark.parametrize("status", ["queued", "running"])
+@pytest.mark.asyncio
+async def test_worker_background_live_durable_call_refuses_before_create(
+    tmp_path, status: str
+):
+    ctx, _ = make_parent(tmp_path)
+    ledger = DurableStateLedger(
+        {
+            "id": "bbbbbbbb-1111-4222-8333-444444444444",
+            "parent_job_id": "parent-job",
+            "parent_tool_call_id": "c1",
+            "subagent_status": status,
+        }
+    )
+    made: list[Any] = []
+    runtime = runtime_for(
+        ctx,
+        factory=lambda config, limits: made.append(object()),
+        ledger=ledger,
+    )
+
+    with pytest.raises(RuntimeError, match="already has a live durable child"):
+        await runtime.run_background(call(run_in_background=True))
+
+    assert ledger.opened == []
+    assert made == []
+
+
+@pytest.mark.asyncio
+async def test_worker_background_lookup_failure_is_strict_before_create(tmp_path):
+    ctx, _ = make_parent(tmp_path)
+    ledger = DurableStateLedger()
+    ledger.fail_lookup = True
+    runtime = runtime_for(ctx, ledger=ledger)
+
+    with pytest.raises(RuntimeError, match="idempotency lookup failed"):
+        await runtime.run_background(call(run_in_background=True))
+
+    assert ledger.opened == []
+
+
+@pytest.mark.asyncio
+async def test_worker_background_cold_terminal_replays_without_create(tmp_path):
+    ctx, _ = make_parent(tmp_path)
+    ledger = DurableStateLedger(
+        {
+            "id": "bbbbbbbb-1111-4222-8333-444444444444",
+            "parent_job_id": "parent-job",
+            "parent_tool_call_id": "c1",
+            "subagent_handle": "explorer-dead",
+            "subagent_type": "explorer",
+            "subagent_status": "completed",
+            "subagent_outcome": "completed",
+            "status": "ended",
+            "total_turns": 2,
+            "total_tokens": 50,
+        }
+    )
+    made: list[Any] = []
+    runtime = runtime_for(
+        ctx,
+        factory=lambda config, limits: made.append(object()),
+        ledger=ledger,
+    )
+
+    replay = await runtime.run_background(call(run_in_background=True))
+
+    assert "Replayed: this child already ran for tool call c1" in replay
+    assert ledger.opened == []
+    assert made == []
+
+
 @pytest.mark.asyncio
 async def test_terminal_commit_precedes_local_publish_and_drain_releases_backpressure(
     tmp_path,
@@ -204,8 +367,110 @@ async def test_steer_wins_before_finish_and_is_included_before_terminalization(
     model.release_first.set()
     await asyncio.wait_for(ledger.terminal.wait(), 5)
     assert "steered evidence" in ledger.terminal_calls[0][1]["message"]
-    assert (await runtime.message_agent(handle, "too late"))["result"] == "not_live"
+    assert (await runtime.message_agent(handle, "too late"))["result"] == (
+        "report_pending"
+    )
     assert len(ledger.terminal_calls) == 1
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_message_rotates_generation_and_resumes_durable_history(
+    tmp_path,
+):
+    ctx, _ = make_parent(tmp_path)
+    ledger = StrictLedger()
+    first = FakeChatModel([text_turn("first report")])
+    second = FakeChatModel([text_turn("second report")])
+    models = [first, second]
+    runtime = runtime_for(
+        ctx,
+        factory=lambda config, limits: models.pop(0),
+        ledger=ledger,
+    )
+
+    receipt = await runtime.run_background(call(run_in_background=True))
+    handle = receipt.split()[1]
+    first_task = runtime._background[handle].task
+    assert first_task is not None
+    await asyncio.wait_for(first_task, 5)
+    first_delivery = ledger.terminal_calls[0][1]["delivery_id"]
+    first_turn = max(turn for _child, _message, turn in ledger.messages)
+    assert runtime.drain_local_deliveries()
+
+    revived = await runtime.message_agent(handle, "check the new evidence")
+    assert revived == {
+        "result": "revived",
+        "handle": handle,
+        "status": "queued",
+        "runtime_generation": "bbbbbbbb-1111-4222-8333-444444444444",
+    }
+    second_task = runtime._background[handle].task
+    assert second_task is not None and second_task is not first_task
+    await asyncio.wait_for(second_task, 5)
+
+    assert ledger.reopen_calls == [runtime._background[handle].subagent_id]
+    assert len(first.calls) == 1
+    assert len(second.calls) == 1
+    resumed = second.calls[0]
+    assert any(getattr(message, "content", "") == "first report" for message in resumed)
+    assert any(
+        getattr(message, "content", "") == "check the new evidence"
+        for message in resumed
+    )
+    assert max(turn for _child, _message, turn in ledger.messages) > first_turn
+    assert len(ledger.terminal_calls) == 2
+    assert ledger.terminal_calls[1][1]["delivery_id"] != first_delivery
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_revival_reconciles_a_timed_out_reopen(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class LostAckLedger(StrictLedger):
+        async def reopen(self, subagent_id: str) -> dict[str, Any]:
+            self.reopen_calls.append(subagent_id)
+            generation = "bbbbbbbb-1111-4222-8333-444444444444"
+            self.generations[subagent_id] = generation
+            if len(self.reopen_calls) == 1:
+                # The durable rotation committed, but its response never
+                # reached the caller before the local ledger deadline.
+                await asyncio.sleep(1)
+            return {
+                "result": "reopened",
+                "thread_id": subagent_id,
+                "runtime_generation": generation,
+                "reconciled": len(self.reopen_calls) > 1,
+            }
+
+    monkeypatch.setattr(runtime_mod, "_LEDGER_TIMEOUT_S", 0.01)
+    ctx, _ = make_parent(tmp_path)
+    ledger = LostAckLedger()
+    models = [
+        FakeChatModel([text_turn("first report")]),
+        FakeChatModel([text_turn("second report")]),
+    ]
+    runtime = runtime_for(
+        ctx,
+        factory=lambda config, limits: models.pop(0),
+        ledger=ledger,
+    )
+    receipt = await runtime.run_background(call(run_in_background=True))
+    handle = receipt.split()[1]
+    first_task = runtime._background[handle].task
+    assert first_task is not None
+    await asyncio.wait_for(first_task, 5)
+    runtime.drain_local_deliveries()
+
+    revived = await runtime.message_agent(handle, "resume after lost ack")
+
+    assert revived["result"] == "revived"
+    assert len(ledger.reopen_calls) == 2
+    assert runtime._background[handle].runtime_generation == (
+        "bbbbbbbb-1111-4222-8333-444444444444"
+    )
     await runtime.close()
 
 
@@ -225,9 +490,10 @@ async def test_multiple_live_steers_remain_in_one_tracked_brief(tmp_path):
     model.release_first.set()
     await asyncio.wait_for(ledger.terminal.wait(), 5)
     assert len(model.calls) == 3
-    # The interrupted first stream has no completed usage record; both
-    # accepted steer turns are nevertheless inside the terminalized brief.
-    assert ledger.terminal_calls[0][1]["turns"] == 2
+    # The interrupted first stream still reached the provider and is now
+    # truthfully audited; both accepted steer continuations remain inside the
+    # same single terminalized brief.
+    assert ledger.terminal_calls[0][1]["turns"] == 3
     tasks = list(runtime._background_tasks.values())
     if tasks:
         await asyncio.gather(*tasks)
@@ -370,9 +636,100 @@ async def test_orphan_recovery_delivers_background_once_and_never_calls_provider
     assert len(ledger.terminal_calls) == 1
     replay = await runtime.run_background(call("old-call", run_in_background=True))
     assert child in replay
-    assert "aaaaaaaa-1111-4222-8333-444444444444" in replay
+    assert "interrupted:parent_restart" in replay
     assert len(ledger.opened) == 1
     assert made == []
+
+
+@pytest.mark.asyncio
+async def test_session_foreground_orphan_becomes_durable_partial_without_provider(
+    tmp_path,
+):
+    ctx, _ = make_parent(tmp_path)
+    ledger = StrictLedger()
+    child = "cccccccc-1111-4222-8333-444444444444"
+    ledger.live = [
+        {
+            "thread_id": child,
+            "runtime_generation": "aaaaaaaa-1111-4222-8333-444444444444",
+            "parent_thread_id": "parent-job",
+            "handle": "explorer-dead",
+            "subagent_type": "explorer",
+            "parent_tool_call_id": "old-call",
+            "run_in_background": False,
+            "total_turns": 2,
+            "total_tokens": 50,
+        }
+    ]
+    ledger.messages.append((child, AIMessage(content="the latest durable finding"), 2))
+    made: list[Any] = []
+    runtime = runtime_for(
+        ctx,
+        factory=lambda config, limits: made.append(object()),
+        ledger=ledger,
+    )
+    runtime.host.delivery_channel = "event"
+
+    recovered = await runtime.recover_orphans()
+
+    assert recovered == [
+        {
+            "handle": "explorer-dead",
+            "thread_id": child,
+            "status": "interrupted",
+            "run_in_background": False,
+            "delivery_id": runtime._delivery_id(
+                child, "aaaaaaaa-1111-4222-8333-444444444444"
+            ),
+            "supersedes_input_seq": None,
+        }
+    ]
+    assert made == []
+    assert len(ledger.foreground_terminal_calls) == 1
+    _, fields = ledger.foreground_terminal_calls[0]
+    assert fields["outcome"] == "interrupted:parent_restart"
+    assert "the latest durable finding" in fields["message"]
+    assert "durable partial transcript" in fields["message"]
+    assert runtime.host.events == [fields["message"]]
+    assert await runtime.recover_orphans() == []
+    assert len(ledger.foreground_terminal_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_terminal_foreground_gap_preserves_child_outcome(tmp_path):
+    ctx, _ = make_parent(tmp_path)
+    ledger = StrictLedger()
+    child = "dddddddd-1111-4222-8333-444444444444"
+    ledger.live = [
+        {
+            "thread_id": child,
+            "runtime_generation": "aaaaaaaa-1111-4222-8333-444444444444",
+            "parent_thread_id": "parent-job",
+            "handle": "reviewer-done",
+            "subagent_type": "reviewer",
+            "parent_tool_call_id": "completed-call",
+            "run_in_background": False,
+            "thread_status": "ended",
+            "status": "completed",
+            "outcome": "completed",
+            "recovery_kind": "terminal_foreground",
+            "total_turns": 3,
+            "total_tokens": 75,
+        }
+    ]
+    ledger.messages.append((child, AIMessage(content="final durable review"), 3))
+    runtime = runtime_for(
+        ctx, factory=lambda *_: pytest.fail("provider ran"), ledger=ledger
+    )
+    runtime.host.delivery_channel = "event"
+
+    recovered = await runtime.recover_orphans()
+
+    assert recovered[0]["status"] == "completed"
+    _, fields = ledger.foreground_terminal_calls[0]
+    assert fields["status"] == "completed"
+    assert fields["outcome"] == "completed"
+    assert "final durable review" in fields["message"]
 
 
 @pytest.mark.asyncio

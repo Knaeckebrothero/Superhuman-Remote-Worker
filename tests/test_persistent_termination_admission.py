@@ -925,6 +925,99 @@ async def test_authorized_retirement_fences_provider_and_tool_before_effect(
 
 
 @pytest.mark.asyncio
+async def test_stateless_effect_boundary_awaits_exact_queue_lease(monkeypatch):
+    from src.api.lease_context import LeaseHandle, current_lease
+
+    thread_id = str(uuid4())
+    lease = LeaseHandle()
+    lease.update(
+        thread_id,
+        17,
+        executor_id="executor-a",
+        pod_uid="pod-a",
+    )
+    probe = AsyncMock(return_value=False)
+    token = current_lease.set(lease)
+    try:
+        monkeypatch.setenv("STATELESS_EXECUTOR", "1")
+        monkeypatch.setattr(persistent_app, "_thread_id", thread_id)
+        monkeypatch.setattr(
+            persistent_app,
+            "_session",
+            SimpleNamespace(
+                postgres_conn=SimpleNamespace(
+                    session_parent_authority_current=probe,
+                ),
+                protected_cloud_required=False,
+            ),
+        )
+        monkeypatch.setattr(persistent_app, "_runtime_admission_closed", lambda: False)
+
+        assert await persistent_app._loop_runtime_effect_authority_current() is False
+
+        authority = probe.await_args.args[0]
+        assert authority.model_dump(exclude_none=True, mode="json") == {
+            "version": 1,
+            "execution_lane": "stateless",
+            "parent_thread_id": thread_id,
+            "lease_token": 17,
+            "executor_id": "executor-a",
+            "executor_pod_uid": "pod-a",
+        }
+        assert lease.lost.is_set()
+    finally:
+        current_lease.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_stateless_effect_boundary_rechecks_local_life_after_db_await(
+    monkeypatch,
+):
+    from src.api.lease_context import LeaseHandle, current_lease
+
+    thread_id = str(uuid4())
+    lease = LeaseHandle()
+    lease.update(
+        thread_id,
+        17,
+        executor_id="executor-a",
+        pod_uid="pod-a",
+    )
+
+    async def rotate_while_proving(_authority):
+        lease.update(
+            thread_id,
+            18,
+            executor_id="executor-a",
+            pod_uid="pod-a",
+        )
+        return True
+
+    probe = AsyncMock(side_effect=rotate_while_proving)
+    token = current_lease.set(lease)
+    try:
+        monkeypatch.setenv("STATELESS_EXECUTOR", "1")
+        monkeypatch.setattr(persistent_app, "_thread_id", thread_id)
+        monkeypatch.setattr(
+            persistent_app,
+            "_session",
+            SimpleNamespace(
+                postgres_conn=SimpleNamespace(
+                    session_parent_authority_current=probe,
+                ),
+                protected_cloud_required=False,
+            ),
+        )
+        monkeypatch.setattr(persistent_app, "_runtime_admission_closed", lambda: False)
+
+        assert await persistent_app._loop_runtime_effect_authority_current() is False
+        assert lease.lease_token == 18
+        assert not lease.lost.is_set()
+    finally:
+        current_lease.reset(token)
+
+
+@pytest.mark.asyncio
 async def test_force_end_after_provider_response_blocks_real_tool_effect(
     monkeypatch, tmp_path
 ):

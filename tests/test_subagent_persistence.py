@@ -5,8 +5,9 @@ With a fake orchestrator client (row creation) and a fake agent-side pool
 persist_message → the lifted serialisers' rows; update → the thread status
 stays ``active`` while running and becomes ``ended`` on ANY terminal kind,
 with the kind in ``subagent_status`` and the driver's classification in
-``subagent_outcome``; lookup → only a terminal row replays. Then the same
-ledger under the REAL runtime with a scripted child, end to end.
+``subagent_outcome``; lookup exposes absent/live/terminal so the runtime can
+apply foreground versus strict-background policy. Then the same ledger under
+the REAL runtime with a scripted child, end to end.
 """
 
 from __future__ import annotations
@@ -167,6 +168,7 @@ class TestOpen:
             parent_thread_id=None,
             isolation="shared",
             write_policy="none",
+            owned_paths=[],
             brief_description="find the secret",
             parent_iteration=None,
             fork=False,
@@ -218,6 +220,16 @@ class TestOpen:
         assert (
             client.create_subagent_thread.await_args.kwargs["initial_status"]
             == "queued"
+        )
+
+    @pytest.mark.asyncio
+    async def test_open_normalizes_the_durable_tool_call_key(self):
+        client = _client()
+        ledger = DbSubagentLedger(client, _pool())
+        await ledger.open(CHILD, **_open_fields(parent_tool_call_id="  call-1  "))
+        assert (
+            client.create_subagent_thread.await_args.kwargs["parent_tool_call_id"]
+            == "call-1"
         )
 
     @pytest.mark.asyncio
@@ -717,11 +729,10 @@ class TestLookup:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("status", ["running", None, ""])
-    async def test_a_live_or_statusless_row_does_not(self, status):
-        ledger = DbSubagentLedger(
-            _client(), _pool({"id": CHILD, "subagent_status": status})
-        )
-        assert await ledger.lookup(JOB, "call-1") is None
+    async def test_a_live_or_statusless_row_is_exposed_to_runtime_policy(self, status):
+        row = {"id": CHILD, "subagent_status": status}
+        ledger = DbSubagentLedger(_client(), _pool(row))
+        assert await ledger.lookup(JOB, "call-1") == row
 
     @pytest.mark.asyncio
     async def test_no_row_is_none(self):
@@ -876,3 +887,16 @@ async def test_agent_and_tool_install_the_db_ledger_when_the_context_carries_bot
     assert isinstance(ensure_runtime(ctx).ledger, DbSubagentLedger)
     bare = _parent(tmp_path / "bare", client=None, pool=None)
     assert isinstance(ensure_runtime(bare).ledger, NullLedger)
+
+
+def test_lazy_runtime_never_downgrades_a_session_to_worker_or_null_ledger():
+    from src.tools.delegation.delegate_agent import ensure_runtime
+
+    context = ToolContext(
+        _job_id="11111111-2222-4333-8444-555555555555",
+        _thread_id="11111111-2222-4333-8444-555555555555",
+    )
+    context._subagent_parent_kind = "session"
+
+    with pytest.raises(RuntimeError, match="durable parent authority"):
+        ensure_runtime(context)

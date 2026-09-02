@@ -28,6 +28,12 @@ from src.shared.subagent_parent_authority import (
     ParentExecutionAuthorityRefused,
     coerce_parent_execution_authority,
 )
+from src.shared.session_subagent_authority import (
+    SessionParentAuthority,
+    SessionParentAuthorityRefused,
+    coerce_session_parent_authority,
+    session_subagent_delivery_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +152,66 @@ def _raise_subagent_authority_refusal(response: Any) -> None:
         raise ParentExecutionAuthorityRefused(
             str(detail.get("reason") or "remote_refusal")
         )
+
+
+def _raise_session_subagent_authority_refusal(response: Any) -> None:
+    """Raise the typed stale-session signal for the internal authority 409."""
+
+    if getattr(response, "status_code", None) != 409:
+        return
+    try:
+        detail = response.json().get("detail")
+    except Exception:
+        detail = None
+    if isinstance(detail, dict) and detail.get("code") == (
+        SessionParentAuthorityRefused.code
+    ):
+        raise SessionParentAuthorityRefused(
+            str(detail.get("reason") or "remote_refusal")
+        )
+
+
+def _session_subagent_authority_for_thread(
+    value: Any, parent_thread_id: str
+) -> SessionParentAuthority:
+    """Coerce malformed local identity into the same typed refusal as HTTP."""
+
+    try:
+        parsed = coerce_session_parent_authority(value)
+    except SessionParentAuthorityRefused:
+        raise
+    except Exception as exc:
+        raise SessionParentAuthorityRefused("invalid") from exc
+    if not parsed.for_thread(parent_thread_id):
+        raise SessionParentAuthorityRefused("parent_mismatch")
+    return parsed
+
+
+def _normalize_session_subagent_roster_row(
+    value: Any,
+    *,
+    parent_thread_id: str,
+    expected_thread_id: str | None = None,
+) -> dict[str, Any]:
+    """Validate the non-job identity coordinates of an internal roster row."""
+
+    if not isinstance(value, dict):
+        raise ValueError("session subagent row is not an object")
+    parent = UUID(str(parent_thread_id))
+    returned_parent = UUID(str(value.get("parent_thread_id")))
+    child = UUID(str(value.get("thread_id") or value.get("id")))
+    generation = UUID(str(value.get("runtime_generation")))
+    if returned_parent != parent or value.get("parent_job_id") not in (None, ""):
+        raise ValueError("session subagent row returned a different parent")
+    if expected_thread_id is not None and child != UUID(str(expected_thread_id)):
+        raise ValueError("session subagent row returned a different thread")
+    return {
+        **dict(value),
+        "thread_id": str(child),
+        "parent_thread_id": str(parent),
+        "parent_job_id": None,
+        "runtime_generation": str(generation),
+    }
 
 
 class VerdictRecordingError(Exception):
@@ -720,6 +786,7 @@ class OrchestratorClient:
         parent_thread_id: Optional[str] = None,
         isolation: str = "shared",
         write_policy: str = "none",
+        owned_paths: Optional[list[str]] = None,
         brief_description: str = "",
         parent_iteration: Optional[int] = None,
         fork: bool = False,
@@ -751,6 +818,7 @@ class OrchestratorClient:
             "parent_thread_id": parent_thread_id,
             "isolation": isolation,
             "write_policy": write_policy,
+            "owned_paths": list(owned_paths or []),
             "brief_description": brief_description,
             "parent_iteration": parent_iteration,
             "fork": bool(fork),
@@ -974,6 +1042,376 @@ class OrchestratorClient:
             raise
         except Exception as exc:
             raise SubagentPersistenceError("terminalize") from exc
+
+    async def create_session_subagent_thread(
+        self,
+        parent_thread_id: str,
+        *,
+        parent_authority: SessionParentAuthority,
+        handle: str,
+        subagent_type: str,
+        subagent_id: Optional[str] = None,
+        parent_tool_call_id: Optional[str] = None,
+        parent_input_message_id: Optional[str] = None,
+        parent_ai_message_id: Optional[str] = None,
+        isolation: str = "shared",
+        write_policy: str = "none",
+        owned_paths: Optional[list[str]] = None,
+        brief_description: str = "",
+        parent_iteration: Optional[int] = None,
+        fork: bool = False,
+        run_in_background: bool = False,
+        initial_status: str = "running",
+    ) -> Optional[dict[str, str]]:
+        """Create a child derived from one exact parent-session execution."""
+
+        parsed = _session_subagent_authority_for_thread(
+            parent_authority, parent_thread_id
+        )
+        if run_in_background and parsed.execution_lane == "stateless":
+            raise SessionParentAuthorityRefused("stateless_background_unsupported")
+        if not self._client:
+            await self.connect()
+
+        url = f"{self.orchestrator_url}/api/agents/threads/{parent_thread_id}/subagents"
+        payload: dict[str, Any] = {
+            "parent_authority": parsed.to_wire(),
+            "handle": handle,
+            "subagent_type": subagent_type,
+            "subagent_id": subagent_id,
+            "parent_tool_call_id": parent_tool_call_id,
+            "parent_input_message_id": parent_input_message_id,
+            "parent_ai_message_id": parent_ai_message_id,
+            "isolation": isolation,
+            "write_policy": write_policy,
+            "owned_paths": list(owned_paths or []),
+            "brief_description": brief_description,
+            "parent_iteration": parent_iteration,
+            "fork": bool(fork),
+            "run_in_background": bool(run_in_background),
+            "initial_status": initial_status,
+        }
+        try:
+            response = await self._client.post(url, json=payload)
+            _raise_session_subagent_authority_refusal(response)
+            if response.status_code != 200:
+                if run_in_background:
+                    raise SubagentPersistenceError(
+                        "session-background-create", int(response.status_code)
+                    )
+                logger.error(
+                    "Failed to create session subagent for thread %s: HTTP %s",
+                    parent_thread_id,
+                    response.status_code,
+                )
+                return None
+            data = response.json()
+            returned_thread_id = UUID(str(data.get("thread_id")))
+            generation = UUID(str(data.get("runtime_generation")))
+            expected_thread_id = (
+                UUID(str(subagent_id)) if subagent_id is not None else None
+            )
+            if (
+                expected_thread_id is not None
+                and returned_thread_id != expected_thread_id
+            ):
+                raise ValueError(
+                    "session subagent create receipt returned a different thread id"
+                )
+            return {
+                "thread_id": str(returned_thread_id),
+                "runtime_generation": str(generation),
+            }
+        except (SessionParentAuthorityRefused, SubagentPersistenceError):
+            raise
+        except Exception as exc:
+            if run_in_background:
+                raise SubagentPersistenceError(
+                    "session-background-create-payload"
+                ) from exc
+            logger.error(
+                "Failed to create foreground session subagent for thread %s",
+                parent_thread_id,
+                exc_info=True,
+            )
+            return None
+
+    async def list_live_session_subagent_threads(
+        self,
+        parent_thread_id: str,
+        *,
+        parent_authority: SessionParentAuthority,
+    ) -> list[dict[str, Any]]:
+        """Return generation-bearing session child recovery candidates."""
+
+        parsed = _session_subagent_authority_for_thread(
+            parent_authority, parent_thread_id
+        )
+        if not self._client:
+            await self.connect()
+        url = (
+            f"{self.orchestrator_url}/api/agents/threads/"
+            f"{parent_thread_id}/subagents/live"
+        )
+        try:
+            response = await self._client.post(
+                url, json={"parent_authority": parsed.to_wire()}
+            )
+            _raise_session_subagent_authority_refusal(response)
+            if response.status_code != 200:
+                raise SubagentPersistenceError(
+                    "session-live-list", int(response.status_code)
+                )
+            rows = response.json().get("subagents")
+            if not isinstance(rows, list) or not all(
+                isinstance(row, dict) for row in rows
+            ):
+                raise SubagentPersistenceError("session-live-list-payload")
+            normalized = [
+                _normalize_session_subagent_roster_row(
+                    row, parent_thread_id=parent_thread_id
+                )
+                for row in rows
+            ]
+            if len({row["thread_id"] for row in normalized}) != len(normalized):
+                raise SubagentPersistenceError("session-live-list-payload")
+            return normalized
+        except (SessionParentAuthorityRefused, SubagentPersistenceError):
+            raise
+        except Exception as exc:
+            raise SubagentPersistenceError("session-live-list") from exc
+
+    async def get_session_subagent_thread(
+        self,
+        parent_thread_id: str,
+        thread_id: str,
+        *,
+        parent_authority: SessionParentAuthority,
+    ) -> Optional[dict[str, Any]]:
+        """Read one exact child under its session parent."""
+
+        parsed = _session_subagent_authority_for_thread(
+            parent_authority, parent_thread_id
+        )
+        child = str(UUID(str(thread_id)))
+        if not self._client:
+            await self.connect()
+        url = (
+            f"{self.orchestrator_url}/api/agents/threads/{parent_thread_id}/"
+            f"subagents/{child}"
+        )
+        try:
+            response = await self._client.post(
+                url, json={"parent_authority": parsed.to_wire()}
+            )
+            _raise_session_subagent_authority_refusal(response)
+            if response.status_code == 404:
+                return None
+            if response.status_code != 200:
+                raise SubagentPersistenceError(
+                    "session-exact-read", int(response.status_code)
+                )
+            return _normalize_session_subagent_roster_row(
+                response.json(),
+                parent_thread_id=parent_thread_id,
+                expected_thread_id=child,
+            )
+        except (SessionParentAuthorityRefused, SubagentPersistenceError):
+            raise
+        except Exception as exc:
+            raise SubagentPersistenceError("session-exact-read-payload") from exc
+
+    async def get_session_subagent_thread_by_call(
+        self,
+        parent_thread_id: str,
+        parent_tool_call_id: str,
+        *,
+        parent_authority: SessionParentAuthority,
+    ) -> Optional[dict[str, Any]]:
+        """Resolve a session's durable delegation call without job semantics."""
+
+        parsed = _session_subagent_authority_for_thread(
+            parent_authority, parent_thread_id
+        )
+        call_id = str(parent_tool_call_id or "").strip()
+        if not call_id:
+            return None
+        if not self._client:
+            await self.connect()
+        url = (
+            f"{self.orchestrator_url}/api/agents/threads/{parent_thread_id}/"
+            "subagents/by-call"
+        )
+        try:
+            response = await self._client.post(
+                url,
+                json={
+                    "parent_authority": parsed.to_wire(),
+                    "parent_tool_call_id": call_id,
+                },
+            )
+            _raise_session_subagent_authority_refusal(response)
+            if response.status_code == 404:
+                return None
+            if response.status_code != 200:
+                raise SubagentPersistenceError(
+                    "session-by-call", int(response.status_code)
+                )
+            return _normalize_session_subagent_roster_row(
+                response.json(), parent_thread_id=parent_thread_id
+            )
+        except (SessionParentAuthorityRefused, SubagentPersistenceError):
+            raise
+        except Exception as exc:
+            raise SubagentPersistenceError("session-by-call-payload") from exc
+
+    async def reopen_session_subagent_thread(
+        self,
+        parent_thread_id: str,
+        thread_id: str,
+        *,
+        parent_authority: SessionParentAuthority,
+        runtime_generation: str,
+    ) -> Optional[dict[str, Any]]:
+        """Rotate one ended session child to a queued successor generation."""
+
+        parsed = _session_subagent_authority_for_thread(
+            parent_authority, parent_thread_id
+        )
+        child = str(UUID(str(thread_id)))
+        generation = str(UUID(str(runtime_generation)))
+        if not self._client:
+            await self.connect()
+        url = (
+            f"{self.orchestrator_url}/api/agents/threads/{parent_thread_id}/"
+            f"subagents/{child}/reopen"
+        )
+        try:
+            response = await self._client.post(
+                url,
+                json={
+                    "parent_authority": parsed.to_wire(),
+                    "runtime_generation": generation,
+                },
+            )
+            _raise_session_subagent_authority_refusal(response)
+            data = response.json()
+            if response.status_code == 409 and isinstance(data.get("detail"), dict):
+                return dict(data["detail"])
+            if response.status_code != 200:
+                raise SubagentPersistenceError(
+                    "session-reopen", int(response.status_code)
+                )
+            if data.get("result") != "reopened":
+                raise SubagentPersistenceError("session-reopen-payload")
+            if UUID(str(data.get("thread_id"))) != UUID(child):
+                raise SubagentPersistenceError("session-reopen-payload")
+            successor = str(UUID(str(data.get("runtime_generation"))))
+            return {**dict(data), "thread_id": child, "runtime_generation": successor}
+        except (SessionParentAuthorityRefused, SubagentPersistenceError):
+            raise
+        except Exception as exc:
+            raise SubagentPersistenceError("session-reopen") from exc
+
+    async def terminalize_session_subagent_thread(
+        self,
+        parent_thread_id: str,
+        thread_id: str,
+        *,
+        parent_authority: SessionParentAuthority,
+        runtime_generation: str,
+        subagent_status: str,
+        run_in_background: bool,
+        message: Optional[str] = None,
+        outcome: Optional[str] = None,
+        turns: Optional[int] = None,
+        tokens: Optional[int] = None,
+        report_path: Optional[str] = None,
+        error: Optional[str] = None,
+        foreground_orphan_recovery: bool = False,
+    ) -> Optional[dict[str, Any]]:
+        """End one child and let the server derive any durable delivery id."""
+
+        parsed = _session_subagent_authority_for_thread(
+            parent_authority, parent_thread_id
+        )
+        if run_in_background and parsed.execution_lane == "stateless":
+            raise SessionParentAuthorityRefused("stateless_background_unsupported")
+        child = str(UUID(str(thread_id)))
+        generation = str(UUID(str(runtime_generation)))
+        expected_delivery = str(session_subagent_delivery_id(child, generation))
+        if not self._client:
+            await self.connect()
+        url = (
+            f"{self.orchestrator_url}/api/agents/threads/{parent_thread_id}/"
+            f"subagents/{child}/terminal"
+        )
+        payload = {
+            "parent_authority": parsed.to_wire(),
+            "runtime_generation": generation,
+            "subagent_status": subagent_status,
+            # The stable id is deliberately not accepted from the driver.  The
+            # server derives it from (child, generation) inside the terminal tx.
+            "delivery_id": None,
+            "message": (
+                message if run_in_background or foreground_orphan_recovery else None
+            ),
+            "outcome": outcome,
+            "turns": turns,
+            "tokens": tokens,
+            "report_path": report_path,
+            "error": error,
+            "foreground_orphan_recovery": foreground_orphan_recovery,
+        }
+        try:
+            response = await self._client.post(url, json=payload)
+            _raise_session_subagent_authority_refusal(response)
+            data = response.json()
+            if response.status_code == 409 and isinstance(data.get("detail"), dict):
+                return dict(data["detail"])
+            if response.status_code != 200:
+                raise SubagentPersistenceError(
+                    "session-terminalize", int(response.status_code)
+                )
+            if data.get("result") not in {
+                "applied",
+                "idempotent",
+                "already_delivered",
+            }:
+                raise SubagentPersistenceError("session-terminalize-payload")
+            if UUID(str(data.get("thread_id"))) != UUID(child) or UUID(
+                str(data.get("runtime_generation"))
+            ) != UUID(generation):
+                raise SubagentPersistenceError("session-terminalize-payload")
+            delivery_id = data.get("delivery_id")
+            if data.get("result") == "already_delivered":
+                if delivery_id is not None:
+                    raise SubagentPersistenceError("session-terminalize-payload")
+                return {
+                    **dict(data),
+                    "thread_id": child,
+                    "runtime_generation": generation,
+                }
+            if run_in_background or foreground_orphan_recovery:
+                if str(UUID(str(delivery_id))) != expected_delivery:
+                    raise SubagentPersistenceError(
+                        "session-terminalize-delivery-payload"
+                    )
+                if not str(data.get("delivery_state") or "").strip():
+                    raise SubagentPersistenceError(
+                        "session-terminalize-delivery-payload"
+                    )
+            elif delivery_id is not None:
+                raise SubagentPersistenceError("session-terminalize-payload")
+            return {
+                **dict(data),
+                "thread_id": child,
+                "runtime_generation": generation,
+            }
+        except (SessionParentAuthorityRefused, SubagentPersistenceError):
+            raise
+        except Exception as exc:
+            raise SubagentPersistenceError("session-terminalize") from exc
 
     async def save_thread_message(
         self,

@@ -73,6 +73,9 @@ def _job_tools(workspace, job_id="job-deliverables-test"):
     # MagicMock would auto-create a non-awaitable client and trip the
     # journal-before-observe POST; None takes the in-memory-only path.
     context.orchestrator_client = None
+    # This suite exercises the deliverable contract, not delegation.  Avoid
+    # MagicMock fabricating a truthy has_completion_blockers() result.
+    context.subagent_runtime = None
     return create_job_tools(context)
 
 

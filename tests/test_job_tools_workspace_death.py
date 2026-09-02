@@ -41,6 +41,9 @@ def _tools(workspace, job_id="job-under-test"):
     context.has_workspace.return_value = True
     context.workspace_manager = workspace
     context.has_todo.return_value = False
+    # These tests isolate workspace failure propagation.  Do not let
+    # MagicMock fabricate a truthy background-child completion blocker.
+    context.subagent_runtime = None
     return create_job_tools(context)
 
 

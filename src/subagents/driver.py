@@ -154,6 +154,8 @@ class SubagentDriver:
         archive_fn: Optional[Callable[..., Any]] = None,
         watcher_poll_interval: float = 1.0,
         messages: Optional[List[BaseMessage]] = None,
+        messages_already_persisted: bool = False,
+        initial_turn_count: int = 0,
     ) -> None:
         self.build = build
         self.host = host
@@ -173,7 +175,8 @@ class SubagentDriver:
         #: the child's transient system prompt; ``_loop_messages`` adds that
         #: prompt only to the provider working view.
         self.messages: List[BaseMessage] = messages if messages is not None else []
-        self._seed_required = messages is not None
+        self._history_supplied = messages is not None
+        self._seed_required = self._history_supplied and not messages_already_persisted
         self._seed_persist_attempted = False
         self._seed_persisted = not self._seed_required
         self._seed_persist_error: Optional[BaseException] = None
@@ -191,7 +194,8 @@ class SubagentDriver:
         self.stale_armed_at: Optional[float] = None
 
         # Per-brief counters and flags.
-        self.turn_number = 0
+        self.turn_number = max(0, int(initial_turn_count))
+        self._initial_turn_count = self.turn_number
         self.loop_turns = 0
         self.provider_calls = 0
         self.tokens_in = 0
@@ -276,7 +280,7 @@ class SubagentDriver:
 
     async def _run_loop(self) -> None:
         build = self.build
-        if self._seed_required:
+        if self._history_supplied:
             self._transient_prompt = SystemMessage(
                 content=build.system_prompt,
                 id=self._transient_prompt_id,
@@ -303,7 +307,7 @@ class SubagentDriver:
                 project_id=None,
                 project_ids=None,
                 tool_context=build.tool_context,
-                initial_turn_count=0,
+                initial_turn_count=self._initial_turn_count,
                 get_current_tools=self.current_tools,
                 get_current_context=None,
                 get_current_system_prompt=lambda: build.system_prompt,
@@ -321,7 +325,7 @@ class SubagentDriver:
 
     def _ensure_transient_prompt(self) -> None:
         """Keep the child prompt ahead of a compacted durable summary."""
-        if not self._seed_required or self._loop_messages is None:
+        if not self._history_supplied or self._loop_messages is None:
             return
         prompt = next(
             (msg for msg in self._loop_messages if self._is_transient_prompt(msg)),
@@ -340,7 +344,7 @@ class SubagentDriver:
 
     def _sync_durable_messages_from_loop(self) -> None:
         """Mirror the provider loop without its transient child prompt."""
-        if not self._seed_required or self._loop_messages is None:
+        if not self._history_supplied or self._loop_messages is None:
             return
         self._ensure_transient_prompt()
         self.messages[:] = [
@@ -639,6 +643,17 @@ class SubagentDriver:
         )
         return meta
 
+    def _parent_correlation_id(self) -> str:
+        """UUID-shaped audit identity for either a job or a session thread."""
+        value = getattr(self.host, "correlation_id", None)
+        if value is None:
+            value = getattr(self.host, "job_id", "")
+        return str(value or "")
+
+    def _requires_strict_persistence(self) -> bool:
+        ref = getattr(self.host, "parent_ref", None)
+        return getattr(ref, "kind", None) == "thread"
+
     async def on_tool_start(
         self, name: str, args: Dict[str, Any], call_id: str, *rest: Any, **kwargs: Any
     ) -> None:
@@ -651,7 +666,7 @@ class SubagentDriver:
         if archiver is not None:
             try:
                 audit_id = archiver.audit_tool_call(
-                    job_id=self.host.job_id,
+                    job_id=self._parent_correlation_id(),
                     agent_type=self.host.agent_type,
                     iteration=self.turn_number,
                     tool_name=name,
@@ -785,10 +800,14 @@ class SubagentDriver:
                 timeout=5.0,
             )
         except asyncio.TimeoutError:
+            if self._requires_strict_persistence():
+                raise
             logger.warning("subagent %s: transcript save timed out (5s)", self.handle)
         except asyncio.CancelledError:
             raise
         except Exception as e:
+            if self._requires_strict_persistence():
+                raise
             logger.warning(
                 "subagent %s: transcript save failed (non-fatal): %s", self.handle, e
             )
@@ -824,7 +843,7 @@ class SubagentDriver:
                 if fn is None:
                     from src.core.archiver import archive_llm_request as fn  # type: ignore[no-redef]
                 fn(
-                    job_id=self.host.job_id,
+                    job_id=self._parent_correlation_id(),
                     agent_type=self.host.agent_type,
                     messages=prepared,
                     response=response,

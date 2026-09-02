@@ -894,6 +894,9 @@ class TestSubagentFields:
     FIELDS = (
         "subagent_runtime",
         "_parent_host",
+        "_subagent_parent_kind",
+        "_session_parent_authority_provider",
+        "_session_parent_authority",
         "parent_context_probe",
         "auxiliary_llm",
         "provider_admission",

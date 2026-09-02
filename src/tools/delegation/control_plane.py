@@ -57,11 +57,12 @@ CONTROL_PLANE_METADATA: Dict[str, Dict[str, Any]] = {
     "message_agent": {
         **_metadata(
             "Send a concise steering message to an addressable background "
-            "subagent by handle. Only a queued or running child accepts "
-            "steering; a terminal child reports that revival is unavailable, "
-            "so delegate a new brief instead. Its eventual report is pushed "
-            "automatically; do not poll after messaging.",
-            "Steer a queued or running background subagent by handle.",
+            "subagent by handle. A queued or running child accepts steering. "
+            "A terminal child is durably revived on its existing transcript "
+            "and worktree with a new fenced generation. Consume its prior "
+            "report first. The next report is pushed automatically; do not "
+            "poll after messaging.",
+            "Steer a live child or durably revive a terminal one.",
         ),
         "function": "message_agent",
     },

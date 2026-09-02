@@ -46,6 +46,8 @@ def _mock_session(permission_mode: str = "supervised"):
     session = MagicMock()
     session.permission_mode = permission_mode
     session.tool_decisions = {}
+    session.quiesce_subagents = AsyncMock()
+    session.resume_subagents = AsyncMock()
     # None (not an unconfigured MagicMock): a bare MagicMock auto-chains
     # through `async with conn.acquire() as c: await c.fetchval(...)` and
     # returns a truthy AsyncMock rather than raising or returning None,

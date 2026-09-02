@@ -507,6 +507,8 @@ class TestTeardownExtraction:
         session.postgres_conn = None
         session.workspace_sync = None
         session.workspace_manager = None
+        session.quiesce_subagents = AsyncMock()
+        session.resume_subagents = AsyncMock()
         return session
 
     @pytest.mark.asyncio

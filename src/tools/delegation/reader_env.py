@@ -90,6 +90,8 @@ async def acquire_reader_env(
     index: int,
     total: Optional[int] = None,
     name: Optional[str] = None,
+    reuse_existing_branch: bool = False,
+    shell_tab_prefix: Optional[str] = None,
 ) -> ReaderEnv:
     """Build one child's isolated worktree + tools. See module docstring.
 
@@ -111,13 +113,39 @@ async def acquire_reader_env(
     worktree_rel = f".worktrees/sub_{index}" if not name else f".worktrees/{name}"
     branch = f"sub/{label}"
     worktree_ready = False
+    validate_reused_worktree = False
+    worktree_added = False
+
+    if reuse_existing_branch and (
+        parent_git is None or not getattr(parent_git, "is_active", False)
+    ):
+        raise RuntimeError(
+            f"reader {index}: durable worktree branch {branch!r} cannot be "
+            "reconstructed without an active git workspace"
+        )
 
     if parent_git is not None and getattr(parent_git, "is_active", False):
         async with _WORKTREE_LOCK:
             worktree_ready = await loop.run_in_executor(
-                None, parent_git.worktree_add, worktree_rel, branch
+                None,
+                parent_git.worktree_add,
+                worktree_rel,
+                branch,
+                not reuse_existing_branch,
             )
+        worktree_added = worktree_ready
+        if not worktree_ready and reuse_existing_branch:
+            try:
+                validate_reused_worktree = bool(parent_backend.exists(worktree_rel))
+            except Exception:
+                validate_reused_worktree = False
+            worktree_ready = validate_reused_worktree
         if not worktree_ready:
+            if reuse_existing_branch:
+                raise RuntimeError(
+                    f"reader {index}: durable worktree branch {branch!r} "
+                    "could not be reconstructed"
+                )
             logger.warning(
                 "reader %d: worktree_add failed; falling back to a scratch subdir",
                 index,
@@ -139,7 +167,7 @@ async def acquire_reader_env(
     subdir_backend = SubdirBackend(
         parent_backend,
         worktree_rel,
-        shell_tab_prefix=f"sub{index}__" if not name else f"{name}__",
+        shell_tab_prefix=shell_tab_prefix or f"s{index}-",
     )
 
     # Reader workspace manager rooted at the worktree (no re-init / no rm -rf).
@@ -166,6 +194,20 @@ async def acquire_reader_env(
                 remote_cwd=worktree_rel,
             ),
         )
+        reused_branch = (
+            await loop.run_in_executor(None, reader_git.current_branch)
+            if reuse_existing_branch and reader_git is not None
+            else None
+        )
+        if reuse_existing_branch and (reader_git is None or reused_branch != branch):
+            if worktree_added:
+                async with _WORKTREE_LOCK:
+                    await loop.run_in_executor(
+                        None, parent_git.worktree_remove, worktree_rel, True
+                    )
+            raise RuntimeError(
+                f"reader {index}: reconstructed worktree does not own branch {branch!r}"
+            )
         if reader_git is not None:
             reader_ws._git_manager = reader_git
 

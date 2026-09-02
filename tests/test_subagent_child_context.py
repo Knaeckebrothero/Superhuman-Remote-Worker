@@ -595,6 +595,49 @@ class TestBuildWorktree:
         assert not (root / ".worktrees" / "implementer-7f3a").exists()
 
     @pytest.mark.asyncio
+    async def test_revival_reuses_exact_branch_and_transport_safe_tab_prefix(
+        self, tmp_path
+    ):
+        from src.core.backends.remote import TAB_NAME_PATTERN
+
+        ctx, root = _parent(tmp_path, git=True)
+        entry = _entry(
+            tools={"workspace": ["read_file", "write_file"]},
+            isolation="worktree",
+            write_policy="full",
+        )
+        first = await _build(ctx, entry, handle="implementer-7f3a")
+        first.workspace_manager.write_file("revival.txt", "durable branch")
+        assert first.workspace_manager.git_manager.commit("child state") is True
+        await first.release()
+
+        revived = await _build(
+            ctx,
+            entry,
+            handle="implementer-7f3a",
+            reuse_worktree=True,
+        )
+        assert revived.workspace_manager.read_file("revival.txt") == "durable branch"
+        assert revived.reader_env.branch == "sub/implementer-7f3a"
+        assert revived.reader_env._subdir_backend._tab_prefix == "7f3a-"
+        assert TAB_NAME_PATTERN.fullmatch(
+            revived.reader_env._subdir_backend._tab("default")
+        )
+        await revived.release()
+        assert not (root / ".worktrees" / "implementer-7f3a").exists()
+
+    @pytest.mark.asyncio
+    async def test_revival_never_falls_back_to_scratch_without_git(self, tmp_path):
+        ctx, _ = _parent(tmp_path, git=False)
+        with pytest.raises(RuntimeError, match="cannot be reconstructed"):
+            await _build(
+                ctx,
+                _entry(isolation="worktree"),
+                handle="explorer-7f3a",
+                reuse_worktree=True,
+            )
+
+    @pytest.mark.asyncio
     async def test_unknown_isolation_is_refused(self, tmp_path):
         ctx, _ = _parent(tmp_path)
         with pytest.raises(SpawnRefused, match="isolation"):
@@ -932,6 +975,9 @@ def test_rebase_context_resets_the_parent_side_subagent_stashes():
     )
     parent.subagent_runtime = object()
     parent._parent_host = object()
+    parent._subagent_parent_kind = "session"
+    parent._session_parent_authority_provider = lambda: object()
+    parent._session_parent_authority = object()
     parent.parent_context_probe = lambda: None
     parent.provider_admission = lambda: True
     parent._fork_source = [object()]
@@ -950,6 +996,9 @@ def test_rebase_context_resets_the_parent_side_subagent_stashes():
     for name in (
         "subagent_runtime",
         "_parent_host",
+        "_subagent_parent_kind",
+        "_session_parent_authority_provider",
+        "_session_parent_authority",
         "parent_context_probe",
         "provider_admission",
         "_fork_source",

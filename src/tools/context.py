@@ -267,6 +267,12 @@ class ToolContext:
     _current_phase: Optional[str] = None
     _current_phase_number: Optional[int] = None
     _current_turn_count: int = 0
+    # Exact durable parent rows for a session delegation.  The persistent
+    # loop publishes these only while executing one assistant tool-call batch;
+    # session child creation copies them into immutable spawn metadata so
+    # crash recovery never has to infer identity from a reusable turn number.
+    _current_input_message_id: Optional[str] = None
+    _current_ai_message_id: Optional[str] = None
     _llm_config: Optional[Any] = None  # LLMConfig for phase-aware multimodal
     _instruction_files: List[Any] = field(
         default_factory=list
@@ -377,6 +383,26 @@ class ToolContext:
     )
     _parent_host: Optional[Any] = (
         None  # ParentHost (WorkerHost for jobs) the runtime hands to children.
+    )
+    _subagent_parent_kind: Optional[str] = (
+        None  # Explicit ``job``/``session`` discriminator.  Session contexts
+        # set this before tool loading so lazy runtime construction can never
+        # mistake their thread UUID for the legacy ``_job_id`` alias.
+    )
+    _session_parent_authority_provider: Optional[Callable[[], Any]] = (
+        None  # Fresh pinned/stateless SessionParentAuthority for every child
+        # persistence operation.  Stateless warm sessions repoint leases
+        # between turns, so this must be a provider rather than a captured
+        # token.
+    )
+    _session_parent_authority: Optional[Any] = (
+        None  # Fixed pinned authority convenience for tests/embedders.
+    )
+    _stateless_subagent_recovery_active: bool = (
+        False  # True only while a stateless executor is feeding an orphaned
+        # foreground child's evidence back through the abandoned parent turn.
+        # delegate_agent fails closed for that turn: recovery evidence must
+        # not recursively create replacement child work.
     )
     parent_context_probe: Optional[Callable[[], Any]] = (
         None  # () -> ContextProbe of the parent's live ContextManager, stashed

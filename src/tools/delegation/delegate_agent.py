@@ -191,6 +191,15 @@ def ensure_runtime(context: ToolContext) -> Any:
     runtime = getattr(context, "subagent_runtime", None)
     if runtime is not None:
         return runtime
+    if getattr(context, "_subagent_parent_kind", None) == "session":
+        # A session requires its thread-parent ledger and an exact pinned or
+        # stateless authority provider. Falling through to WorkerHost would
+        # mislabel its UUID as parent_job_id; NullLedger would make background
+        # acceptance non-durable. PersistentSession installs U5 during attach.
+        raise RuntimeError(
+            "session delegation runtime is unavailable; the session attach "
+            "did not establish durable parent authority"
+        )
     from src.subagents.host import WorkerHost
     from src.subagents.ledger import NullLedger
     from src.subagents.persistence import DbSubagentLedger
@@ -309,6 +318,20 @@ def create_delegate_agent_tools(context: ToolContext) -> List[Any]:
             else bool(run_in_background)
         )
         runtime = ensure_runtime(context)
+        if getattr(context, "_stateless_subagent_recovery_active", False):
+            return (
+                "Error: delegate_agent is disabled while a stateless parent "
+                "is recovering an orphaned foreground child result. Use the "
+                "recovered evidence to answer the abandoned turn directly."
+            )
+        if (
+            getattr(context, "_subagent_parent_kind", None) == "session"
+            and runtime.batch_size > 1
+        ):
+            return (
+                "Error: sessions may delegate only one child per parent turn. "
+                "Re-issue one delegate_agent call."
+            )
         call = SubagentCall(
             tool_call_id=str(tool_call_id or ""),
             subagent_type=str(subagent_type or ""),

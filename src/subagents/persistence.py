@@ -40,13 +40,22 @@ parent process.
 
 from __future__ import annotations
 
-import logging
 import json
+import logging
+from dataclasses import dataclass
 from typing import Any, Dict, Mapping, Optional, Sequence
 from uuid import UUID
 
-from langchain_core.messages import BaseMessage, message_to_dict, messages_from_dict
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    ToolMessage,
+    message_to_dict,
+    messages_from_dict,
+)
 
+from ..core.context import repair_tool_pairing
 from ..core.thread_messages import _serialize_message_row
 from ..shared.subagent_parent_authority import (
     ParentExecutionAuthority,
@@ -65,6 +74,18 @@ class SubagentPersistenceRefused(RuntimeError):
 
 class SubagentForkSeedDecodeError(ValueError):
     """A stored lossless fork-seed envelope is malformed or unsupported."""
+
+
+class SubagentTranscriptDecodeError(ValueError):
+    """A durable child transcript cannot be reconstructed without data loss."""
+
+
+@dataclass(frozen=True)
+class RestoredSubagentTranscript:
+    """Provider messages plus the monotonic durable turn cursor."""
+
+    messages: list[BaseMessage]
+    turn_number: int
 
 
 def _serialize_seed_message(message: Any) -> Dict[str, Any]:
@@ -126,6 +147,95 @@ def restore_subagent_fork_seed_message(provider_raw: Any) -> BaseMessage | None:
     if len(restored) != 1 or not isinstance(restored[0], BaseMessage):
         raise SubagentForkSeedDecodeError("fork seed envelope restored no message")
     return restored[0]
+
+
+def restore_subagent_messages(rows: Sequence[Mapping[str, Any]]) -> list[BaseMessage]:
+    """Rebuild a child's durable provider history for terminal revival.
+
+    Fork-seed rows use their lossless ``provider_raw`` LangChain envelope; all
+    later rows use the ordinary transcript columns.  The child's system prompt
+    remains transient and is therefore skipped unless it is a fork seed (for
+    example a compacted summary).  Malformed rows fail closed: revival must not
+    silently forget evidence before spending a successor generation.
+    """
+
+    restored: list[BaseMessage] = []
+    pending_tool_call_ids: list[str] = []
+    for raw in rows:
+        if not isinstance(raw, Mapping):
+            raise SubagentTranscriptDecodeError("transcript row is not an object")
+
+        exact = restore_subagent_fork_seed_message(raw.get("provider_raw"))
+        if exact is not None:
+            restored.append(exact)
+            if isinstance(exact, AIMessage):
+                pending_tool_call_ids = [
+                    str(call.get("id") or "")
+                    for call in (exact.tool_calls or [])
+                    if call.get("id")
+                ]
+            elif isinstance(exact, ToolMessage):
+                tool_id = str(exact.tool_call_id or "")
+                if tool_id in pending_tool_call_ids:
+                    pending_tool_call_ids.remove(tool_id)
+            continue
+
+        role = str(raw.get("role") or "").strip().lower()
+        content = raw.get("content") or ""
+        message_id = str(raw.get("id") or "").strip() or None
+        identity = {"id": message_id} if message_id is not None else {}
+        tool_calls = raw.get("tool_calls")
+        if isinstance(tool_calls, (str, bytes)):
+            try:
+                tool_calls = json.loads(tool_calls)
+            except (TypeError, ValueError) as exc:
+                raise SubagentTranscriptDecodeError(
+                    "transcript tool_calls is invalid JSON"
+                ) from exc
+
+        if role in {"human", "user", "event"}:
+            restored.append(HumanMessage(content=content, **identity))
+        elif role in {"ai", "assistant"}:
+            if tool_calls is not None and not isinstance(tool_calls, list):
+                raise SubagentTranscriptDecodeError(
+                    "assistant transcript tool_calls is not a list"
+                )
+            canonical: list[dict[str, Any]] = []
+            for call in tool_calls or []:
+                if not isinstance(call, Mapping):
+                    raise SubagentTranscriptDecodeError(
+                        "assistant transcript tool call is not an object"
+                    )
+                canonical.append(
+                    {
+                        "id": str(call.get("id") or ""),
+                        "name": str(call.get("name") or ""),
+                        "args": call.get("args")
+                        if isinstance(call.get("args"), Mapping)
+                        else {},
+                    }
+                )
+            pending_tool_call_ids = [call["id"] for call in canonical if call["id"]]
+            restored.append(
+                AIMessage(content=content, tool_calls=canonical, **identity)
+            )
+        elif role == "tool":
+            fallback = pending_tool_call_ids.pop(0) if pending_tool_call_ids else ""
+            tool_call_id = str(raw.get("tool_call_id") or fallback)
+            restored.append(
+                ToolMessage(
+                    content=content,
+                    tool_call_id=tool_call_id,
+                    **identity,
+                )
+            )
+        elif role == "system":
+            # The framework-owned child prompt is rebuilt from current config.
+            continue
+        else:
+            raise SubagentTranscriptDecodeError(f"unsupported transcript role {role!r}")
+
+    return list(repair_tool_pairing(restored))
 
 
 class DbSubagentLedger:
@@ -327,16 +437,20 @@ class DbSubagentLedger:
         initial_status = str(fields.get("status") or "running").strip()
         if initial_status not in {"queued", "running"}:
             raise ValueError("a subagent must open queued or running")
+        parent_tool_call_id = (
+            str(fields.get("parent_tool_call_id") or "").strip() or None
+        )
         created = await self.client.create_subagent_thread(
             job_id,
             parent_authority=self.parent_authority,
             subagent_id=subagent_id,
             handle=str(fields.get("handle") or ""),
             subagent_type=str(fields.get("subagent_type") or ""),
-            parent_tool_call_id=fields.get("parent_tool_call_id") or None,
+            parent_tool_call_id=parent_tool_call_id,
             parent_thread_id=fields.get("parent_thread_id") or None,
             isolation=str(fields.get("isolation") or "shared"),
             write_policy=str(fields.get("write_policy") or "none"),
+            owned_paths=[str(path) for path in (fields.get("owned_paths") or [])],
             brief_description=str(fields.get("brief_description") or ""),
             parent_iteration=self._parent_iteration(fields),
             fork=bool(fields.get("fork", False)),
@@ -549,6 +663,37 @@ class DbSubagentLedger:
             self._generations[child_key] = successor
         return dict(result) if result else None
 
+    async def load_messages(self, subagent_id: str) -> RestoredSubagentTranscript:
+        """Load an adopted child's complete durable transcript under authority."""
+
+        child_key = str(subagent_id)
+        thread_id = self._rows.get(child_key)
+        if thread_id is None:
+            raise SubagentPersistenceRefused(
+                f"subagent transcript identity is unknown for {child_key}"
+            )
+        await self.postgres.parent_execution_authority_current(self.parent_authority)
+        rows = await self.postgres.get_thread_messages_history(
+            thread_id,
+            limit=None,
+            include_provider_raw=True,
+            order_by_seq=True,
+        )
+        if not isinstance(rows, list):
+            raise SubagentPersistenceRefused("subagent transcript is not a list")
+        try:
+            turn_number = max(
+                (int(row.get("turn_number") or 0) for row in rows), default=0
+            )
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise SubagentTranscriptDecodeError(
+                "subagent transcript has an invalid turn cursor"
+            ) from exc
+        return RestoredSubagentTranscript(
+            messages=restore_subagent_messages(rows),
+            turn_number=turn_number,
+        )
+
     async def list_live(self, parent_job_id: str) -> list[Dict[str, Any]]:
         """Read and atomically adopt durable children for recovery bootstrap."""
         if not self.parent_authority.for_job(parent_job_id):
@@ -598,15 +743,107 @@ class DbSubagentLedger:
             str(parent_tool_call_id),
             parent_authority=self.parent_authority,
         )
-        if not row or not is_terminal_status(row.get("subagent_status")):
+        if not row:
             return None
-        return dict(row)
+        result = dict(row)
+        self._adopt_terminal_lookup(
+            result,
+            parent_job_id=str(parent_job_id),
+            parent_tool_call_id=str(parent_tool_call_id),
+        )
+        return result
+
+    async def lookup_handle(
+        self, parent_job_id: str, handle: str
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve and adopt one terminal background child after a restart."""
+
+        row = await self.postgres.get_subagent_thread_by_handle(
+            str(parent_job_id),
+            str(handle),
+            parent_authority=self.parent_authority,
+        )
+        if not row:
+            return None
+        result = dict(row)
+        status = str(result.get("subagent_status") or "").strip()
+        if not is_terminal_status(status):
+            raise SubagentPersistenceRefused(
+                f"subagent {handle} still has a live durable generation"
+            )
+        call_id = str(result.get("parent_tool_call_id") or "").strip()
+        if str(result.get("subagent_handle") or "").strip() != str(
+            handle
+        ).strip() or not self._adopt_terminal_lookup(
+            result,
+            parent_job_id=str(parent_job_id),
+            parent_tool_call_id=call_id,
+        ):
+            raise SubagentPersistenceRefused(
+                f"subagent {handle} is not an addressable background child"
+            )
+        return result
+
+    def _adopt_terminal_lookup(
+        self,
+        row: Mapping[str, Any],
+        *,
+        parent_job_id: str,
+        parent_tool_call_id: str,
+    ) -> bool:
+        """Seed the old generation maps needed by a cold terminal revival."""
+
+        metadata = row.get("metadata")
+        if isinstance(metadata, (str, bytes)):
+            try:
+                metadata = json.loads(metadata)
+            except (TypeError, ValueError):
+                return False
+        spawn = metadata.get("subagent") if isinstance(metadata, Mapping) else None
+        try:
+            child_id = str(UUID(str(row.get("id") or row.get("thread_id"))))
+            generation = str(UUID(str(row.get("runtime_generation"))))
+            parent_id = str(UUID(str(row.get("parent_job_id"))))
+            expected_parent = str(UUID(str(parent_job_id)))
+        except (TypeError, ValueError, AttributeError):
+            return False
+        handle = str(row.get("subagent_handle") or row.get("handle") or "").strip()
+        call_id = str(row.get("parent_tool_call_id") or "").strip()
+        if (
+            parent_id != expected_parent
+            or not self.parent_authority.for_job(parent_id)
+            or call_id != str(parent_tool_call_id or "").strip()
+            or not handle
+            or row.get("status") not in {"ended", None}
+            or not is_terminal_status(row.get("subagent_status") or row.get("status"))
+            or not isinstance(spawn, Mapping)
+            or spawn.get("run_in_background") is not True
+        ):
+            return False
+        identity = (
+            child_id,
+            child_id,
+            generation,
+            parent_id,
+            handle,
+        )
+        if not self._can_adopt_live_identity(identity):
+            return False
+        self._rows[child_id] = child_id
+        self._generations[child_id] = generation
+        self._parent_jobs[child_id] = parent_id
+        self._handles[child_id] = handle
+        self._failed.discard(child_id)
+        return True
 
 
 __all__ = [
     "DbSubagentLedger",
+    "RestoredSubagentTranscript",
     "SUBAGENT_FORK_SEED_PROVIDER_KEY",
     "SubagentForkSeedDecodeError",
+    "SubagentTranscriptDecodeError",
     "SubagentPersistenceRefused",
     "restore_subagent_fork_seed_message",
+    "restore_subagent_messages",
 ]

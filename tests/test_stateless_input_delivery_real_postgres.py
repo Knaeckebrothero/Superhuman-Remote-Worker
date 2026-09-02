@@ -213,6 +213,26 @@ async def _persist_event(
 async def _claim_delivery(db: PostgresDB, **kwargs):
     async with db.acquire() as conn:
         async with conn.transaction():
+            await conn.execute(
+                """
+                UPDATE threads
+                   SET metadata = jsonb_set(
+                       COALESCE(metadata, '{}'::jsonb),
+                       '{_stateless_active_claim}',
+                       jsonb_build_object(
+                           'lease_token', $2::bigint,
+                           'pod', $3::text,
+                           'pod_uid', $4::text
+                       ),
+                       true
+                   )
+                 WHERE id = $1
+                """,
+                UUID(str(kwargs["thread_id"])),
+                int(kwargs["lease_token"]),
+                str(kwargs["executor_id"]),
+                str(kwargs["pod_uid"]),
+            )
             return await claim_stateless_input_delivery(conn, **kwargs)
 
 
@@ -428,6 +448,20 @@ async def test_exact_lease_fences_stale_claim_and_outbox_settlement(db):
         pod_uid="pod-a",
     )
     assert first_delivery is not None
+    # Pod names are reusable.  A replacement incarnation with the same name
+    # and queue token cannot borrow the credential-bound UID stamped by the
+    # bundle response.
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            with pytest.raises(InputDeliveryAuthorityLost):
+                await claim_stateless_input_delivery(
+                    conn,
+                    thread_id=str(thread_id),
+                    delivery_id=str(delivery_id),
+                    lease_token=first.lease_token,
+                    executor_id="executor-a",
+                    pod_uid="replacement-pod-uid",
+                )
     async with db.acquire() as conn:
         assert (
             await release_unit(
