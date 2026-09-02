@@ -509,6 +509,16 @@ class TestCriticVerdictInstructionsToolAgreement:
                     "prompt has drifted from the tool surface."
                 )
 
+    def test_verification_requires_independent_verifier_evidence(self):
+        text = VERIFICATION_INSTRUCTIONS_PATH.read_text(encoding="utf-8")
+        assert "MUST delegate one independent evidence pass" in text
+        assert '`subagent_type="verifier"`' in text
+        assert '`isolation="shared"`' in text
+        assert "`run_in_background=false`" in text
+        assert "Call `delegate_agent` in a turn by itself" in text
+        assert "The verifier gathers evidence only" in text
+        assert "YOU still inspect the work" in text
+
 
 # =============================================================================
 # Round limit enforcement tests

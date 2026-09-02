@@ -384,6 +384,10 @@ class TestFormatVerificationInstructions:
         assert "output/data.json" in result
         assert "Completed the analysis" in result
         assert "85%" in result
+        assert "MUST delegate one independent evidence pass" in result
+        assert '`subagent_type="verifier"`' in result
+        assert '`isolation="shared"`' in result
+        assert "`run_in_background=false`" in result
 
     def test_no_deliverables(self):
         freeze_data = {"summary": "Done", "confidence": 0.5}
