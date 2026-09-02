@@ -17,12 +17,111 @@ import shlex
 import tempfile
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import quote, unquote, urlparse
 from uuid import UUID
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+
+class GiteaPathError(ValueError):
+    """A caller-shaped repository path, git ref, or name refused at the sink.
+
+    Raised before any request leaves the process. This client authenticates
+    as the Gitea instance administrator and every managed repository lives
+    under one owner, so a ``..`` segment spliced into a URL -- which httpx
+    normalises away before sending -- would re-target the request at any
+    other repository in the instance (security audit 2026-08-27, findings
+    #3/#4: ``/api/jobs/{id}/repo/file``, ``/repo/contents`` and the MCP
+    ``get_job_file`` tool all funnel into this client). The validation
+    therefore lives here, once, rather than in each route.
+    """
+
+
+# Gitea's own name charset (``validation.AlphaDashDotPattern``): ASCII
+# letters, digits, ``.``, ``-``, ``_``. A validated name is therefore already
+# one safe URL path segment and needs no further encoding.
+_GITEA_NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def validate_gitea_name(name: str, *, kind: str = "repository") -> str:
+    """Return ``name`` unchanged if it is a usable Gitea owner/repo/user name.
+
+    ``kind`` only labels the error. ``.``, ``..`` and any name containing
+    ``..`` are refused outright: Gitea reserves the first two and nothing
+    the orchestrator manages is ever named with the third.
+    """
+    if not isinstance(name, str) or not name:
+        raise GiteaPathError(f"Gitea {kind} name must be a non-empty string")
+    if not _GITEA_NAME_RE.fullmatch(name) or ".." in name or name == ".":
+        raise GiteaPathError(f"Gitea {kind} name {name!r} is not allowed")
+    return name
+
+
+def _check_path_shape(value: str, *, what: str) -> None:
+    """Refuse every shape that lets a repo-relative path leave its repository."""
+    if _CONTROL_CHARS_RE.search(value):
+        raise GiteaPathError(f"{what} contains a control character")
+    if "\\" in value:
+        raise GiteaPathError(f"{what} contains a backslash")
+    if value.startswith("/"):
+        raise GiteaPathError(f"{what} must be repository-relative, not absolute")
+    for segment in value.split("/"):
+        if segment == "":
+            raise GiteaPathError(f"{what} contains an empty segment")
+        if segment in (".", ".."):
+            raise GiteaPathError(f"{what} contains a dot segment")
+
+
+def _validated_repo_path(value: str, *, what: str, allow_empty: bool) -> str:
+    if not isinstance(value, str):
+        raise GiteaPathError(f"{what} must be a string")
+    # Exactly one trailing slash is directory spelling (``docs/``), not an
+    # empty segment; a second one (``docs//``) still is.
+    if value.endswith("/"):
+        value = value[:-1]
+    if value == "":
+        if allow_empty:
+            return ""
+        raise GiteaPathError(f"{what} must not be empty")
+    _check_path_shape(value, what=what)
+    # ``..%2F`` is one decode away from the same traversal, so the decoded
+    # form has to satisfy the same rules before the raw form is encoded.
+    _check_path_shape(unquote(value), what=what)
+    return value
+
+
+def encode_repo_path(path: str, *, allow_empty: bool = False) -> str:
+    """Validate a repository-relative path and percent-encode it per segment.
+
+    Rejects absolute paths, ``.`` and ``..`` segments, empty segments
+    (``a//b``), backslashes, NUL and other control characters, and any value
+    whose percent-decoded form would fail those rules (``..%2F``). Every
+    surviving segment is ``quote(segment, safe="")``-encoded and the segments
+    are re-joined with ``/``: the separators are the only bytes that reach
+    the URL unencoded, so nothing the caller wrote can change which
+    repository the request addresses. ``allow_empty`` admits ``""`` (the
+    repository root) and returns it unchanged.
+    """
+    raw = _validated_repo_path(path, what="Repository path", allow_empty=allow_empty)
+    if not raw:
+        return ""
+    return "/".join(quote(segment, safe="") for segment in raw.split("/"))
+
+
+def encode_repo_ref(ref: str) -> str:
+    """Validate a git ref and encode it as exactly one URL path segment.
+
+    Same shape rules as :func:`encode_repo_path` (git itself forbids ``..``,
+    control characters and empty components in ref names, so no legitimate
+    ref is refused). Slashes become ``%2F`` because Gitea's
+    ``git/trees/{sha}`` and ``branches/*`` routes take the ref as a single
+    parameter: ``job/abc`` must travel as ``job%2Fabc``.
+    """
+    raw = _validated_repo_path(ref, what="Git ref", allow_empty=False)
+    return quote(raw, safe="")
 
 
 class GiteaClient:
@@ -74,6 +173,22 @@ class GiteaClient:
     def clean_repo_url(self, repo_name: str) -> str:
         """Credential-free canonical URL safe for durable state."""
         return self._build_clone_url(repo_name)
+
+    def _repo_api_url(self, repo_name: str, *segments: str) -> str:
+        """Build ``/api/v1/repos/{owner}/{repo}[/segments...]``.
+
+        The owner and repository names are validated here; every
+        caller-shaped value in ``segments`` must already have gone through
+        :func:`encode_repo_path` / :func:`encode_repo_ref`, so the only raw
+        strings that reach the URL are literal API words. Empty segments
+        (the repository root from ``encode_repo_path(..., allow_empty=True)``)
+        are dropped rather than emitted as a trailing slash.
+        """
+        owner = validate_gitea_name(self._user, kind="owner")
+        repo = validate_gitea_name(repo_name)
+        url = f"{self._url}/api/v1/repos/{owner}/{repo}"
+        tail = "/".join(segment for segment in segments if segment)
+        return f"{url}/{tail}" if tail else url
 
     def _get_client(self) -> httpx.AsyncClient:
         """Get or create the httpx client."""
@@ -353,10 +468,9 @@ class GiteaClient:
             marker_description = self._repository_intent_description(intent_marker)
         except (TypeError, ValueError):
             return "conflict"
+        url = self._repo_api_url(name)
         try:
-            response = await self._get_client().get(
-                f"{self._url}/api/v1/repos/{self._user}/{name}"
-            )
+            response = await self._get_client().get(url)
         except httpx.HTTPError:
             return "unavailable"
         if response.status_code == 404:
@@ -389,6 +503,7 @@ class GiteaClient:
         if not self._initialized:
             return None
 
+        validate_gitea_name(name)
         client = self._get_client()
 
         try:
@@ -461,8 +576,9 @@ class GiteaClient:
                 logger.warning("Managed Gitea repository cleanup marker refused")
                 return False
 
+        url = self._repo_api_url(name)
         try:
-            resp = await client.delete(f"{self._url}/api/v1/repos/{self._user}/{name}")
+            resp = await client.delete(url)
             if resp.status_code == 204:
                 logger.info(f"Deleted Gitea repo '{name}'")
                 return True
@@ -491,10 +607,9 @@ class GiteaClient:
             raise RuntimeError("Gitea URL has no hostname")
         netloc = host + (f":{parsed.port}" if parsed.port else "")
         base_path = parsed.path.rstrip("/")
-        return (
-            f"{parsed.scheme or 'http'}://{netloc}{base_path}/"
-            f"{self._user}/{repo_name}.git"
-        )
+        owner = validate_gitea_name(self._user, kind="owner")
+        repo = validate_gitea_name(repo_name)
+        return f"{parsed.scheme or 'http'}://{netloc}{base_path}/{owner}/{repo}.git"
 
     def _ssh_internal_endpoint(self) -> tuple[str, int]:
         """Return the server-to-server SSH endpoint used to prove deploy keys."""
@@ -538,7 +653,7 @@ class GiteaClient:
         if access_mode not in {"read", "write"}:
             return None
         client = self._get_client()
-        endpoint = f"{self._url}/api/v1/repos/{self._user}/{repo_name}/keys"
+        endpoint = self._repo_api_url(repo_name, "keys")
         wanted = self._normalized_public_key(public_key)
         wanted_read_only = access_mode == "read"
 
@@ -608,10 +723,9 @@ class GiteaClient:
         """Revoke one exact repository deploy key; 404 is idempotent success."""
         if not self._initialized:
             return False
+        endpoint = self._repo_api_url(repo_name, "keys")
         try:
-            response = await self._get_client().delete(
-                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/keys/{int(key_id)}"
-            )
+            response = await self._get_client().delete(f"{endpoint}/{int(key_id)}")
             return response.status_code in (204, 404)
         except (httpx.HTTPError, TypeError, ValueError):
             logger.warning("Managed repository deploy-key revocation failed")
@@ -639,8 +753,9 @@ class GiteaClient:
             host, port = self._ssh_internal_endpoint()
         except RuntimeError:
             return False
-        target = target_repo_name or repo_name
-        remote = f"ssh://{host}:{port}/{self._user}/{target}.git"
+        owner = validate_gitea_name(self._user, kind="owner")
+        target = validate_gitea_name(target_repo_name or repo_name)
+        remote = f"ssh://{host}:{port}/{owner}/{target}.git"
         with tempfile.TemporaryDirectory(prefix="srw-repo-authority-") as temp_dir:
             key_path = Path(temp_dir) / "identity"
             key_path.write_text(private_key, encoding="utf-8")
@@ -728,12 +843,10 @@ class GiteaClient:
 
         client = self._get_client()
         params = {"ref": ref} if ref else {}
+        url = self._repo_api_url(repo_name, "contents", encode_repo_path(file_path))
 
         try:
-            resp = await client.get(
-                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/contents/{file_path}",
-                params=params,
-            )
+            resp = await client.get(url, params=params)
             if resp.status_code == 404:
                 return None
             if resp.status_code != 200:
@@ -783,13 +896,14 @@ class GiteaClient:
         client = self._get_client()
         content_b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
 
+        contents_url = self._repo_api_url(
+            repo_name, "contents", encode_repo_path(file_path)
+        )
+
         try:
             # Check if file already exists (need SHA for update)
             params = {"ref": branch} if branch else {}
-            resp = await client.get(
-                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/contents/{file_path}",
-                params=params,
-            )
+            resp = await client.get(contents_url, params=params)
 
             payload: dict = {
                 "content": content_b64,
@@ -799,10 +913,6 @@ class GiteaClient:
             if branch:
                 payload["branch"] = branch
 
-            contents_url = (
-                f"{self._url}/api/v1/repos/{self._user}/{repo_name}"
-                f"/contents/{file_path}"
-            )
             if resp.status_code == 200:
                 # File exists — include SHA and PUT to update.
                 existing = resp.json()
@@ -876,11 +986,9 @@ class GiteaClient:
                 for f in files
             ],
         }
+        url = self._repo_api_url(repo_name, "contents")
         try:
-            resp = await client.post(
-                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/contents",
-                json=payload,
-            )
+            resp = await client.post(url, json=payload)
             if resp.status_code in (200, 201):
                 return True
             logger.warning(
@@ -919,7 +1027,7 @@ class GiteaClient:
         if not self._initialized:
             return "error"
         client = self._get_client()
-        url = f"{self._url}/api/v1/repos/{self._user}/{repo_name}/contents/{path}"
+        url = self._repo_api_url(repo_name, "contents", encode_repo_path(path))
         try:
             sha = str(expected_sha or "").strip()
             if not sha:
@@ -982,13 +1090,12 @@ class GiteaClient:
 
         client = self._get_client()
 
+        url = self._repo_api_url(repo_name, "contents", encode_repo_path(file_path))
+
         try:
             # Get current SHA (required for delete)
             params = {"ref": branch} if branch else {}
-            resp = await client.get(
-                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/contents/{file_path}",
-                params=params,
-            )
+            resp = await client.get(url, params=params)
             if resp.status_code == 404:
                 return True  # Already gone
             if resp.status_code != 200:
@@ -1000,11 +1107,7 @@ class GiteaClient:
             if branch:
                 delete_payload["branch"] = branch
 
-            resp = await client.request(
-                "DELETE",
-                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/contents/{file_path}",
-                json=delete_payload,
-            )
+            resp = await client.request("DELETE", url, json=delete_payload)
 
             return resp.status_code == 200
 
@@ -1031,9 +1134,9 @@ class GiteaClient:
 
         client = self._get_client()
         params = {"ref": ref} if ref else {}
-        url_path = f"{self._url}/api/v1/repos/{self._user}/{repo_name}/contents"
-        if path:
-            url_path += f"/{path}"
+        url_path = self._repo_api_url(
+            repo_name, "contents", encode_repo_path(path, allow_empty=True)
+        )
 
         try:
             resp = await client.get(url_path, params=params)
@@ -1089,12 +1192,10 @@ class GiteaClient:
 
         client = self._get_client()
         params = {"ref": ref} if ref else {}
+        url = self._repo_api_url(repo_name, "contents", encode_repo_path(file_path))
 
         try:
-            resp = await client.get(
-                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/contents/{file_path}",
-                params=params,
-            )
+            resp = await client.get(url, params=params)
             if resp.status_code == 404:
                 return None
             if resp.status_code != 200:
@@ -1137,12 +1238,10 @@ class GiteaClient:
 
         client = self._get_client()
         params = {"ref": ref} if ref else {}
+        url = self._repo_api_url(repo_name, "contents", encode_repo_path(file_path))
 
         try:
-            resp = await client.get(
-                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/contents/{file_path}",
-                params=params,
-            )
+            resp = await client.get(url, params=params)
             if resp.status_code == 404:
                 return None
             if resp.status_code != 200:
@@ -1193,12 +1292,13 @@ class GiteaClient:
             return None
 
         client = self._get_client()
+        url = self._repo_api_url(repo_name, "commits")
 
         try:
             # NOTE: this must be `/commits`, not `/git/commits` — the latter
             # only resolves specific commit SHAs and 404s on branch names.
             resp = await client.get(
-                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/commits",
+                url,
                 params={
                     "sha": sha,
                     "page": page,
@@ -1251,10 +1351,13 @@ class GiteaClient:
             return None
 
         client = self._get_client()
+        url = self._repo_api_url(
+            repo_name, "compare", f"{encode_repo_path(base)}...{encode_repo_path(head)}"
+        )
 
         try:
             resp = await client.get(
-                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/compare/{base}...{head}",
+                url,
                 # Same fast flags as get_commits — we only read sha/message/
                 # author/date below. Gitea 1.22 only honors `files`; `stat`
                 # (the expensive per-commit `git diff` subprocess) is
@@ -1374,7 +1477,9 @@ class GiteaClient:
             return False
 
         client = self._get_client()
-        url = f"{self._url}/api/v1/repos/{self._user}/{repo_name}/archive/{ref}.tar.gz"
+        url = self._repo_api_url(
+            repo_name, "archive", f"{encode_repo_path(ref)}.tar.gz"
+        )
         try:
             # Generous read timeout: Gitea generates the archive server-side
             # before the first byte (seconds for large repos, then cached).
@@ -1412,11 +1517,14 @@ class GiteaClient:
             return None
 
         client = self._get_client()
+        url = self._repo_api_url(
+            repo_name,
+            "compare",
+            f"{encode_repo_path(base)}...{encode_repo_path(head)}.diff",
+        )
 
         try:
-            resp = await client.get(
-                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/compare/{base}...{head}.diff",
-            )
+            resp = await client.get(url)
             if resp.status_code == 404:
                 return None
             if resp.status_code != 200:
@@ -1449,10 +1557,11 @@ class GiteaClient:
             return None
 
         client = self._get_client()
+        url = self._repo_api_url(repo_name, "tags")
 
         try:
             resp = await client.get(
-                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/tags",
+                url,
                 params={"page": page, "limit": limit},
             )
             if resp.status_code == 404:
@@ -1498,10 +1607,11 @@ class GiteaClient:
             return False
 
         client = self._get_client()
+        url = self._repo_api_url(repo_name, "branches")
 
         try:
             resp = await client.post(
-                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/branches",
+                url,
                 json={
                     "new_branch_name": new_branch,
                     "old_branch_name": from_branch,
@@ -1546,15 +1656,10 @@ class GiteaClient:
         if not self._initialized:
             return None
 
-        from urllib.parse import quote as _q
-
         client = self._get_client()
-        safe_branch = _q(branch, safe="")
+        url = self._repo_api_url(repo_name, "branches", encode_repo_ref(branch))
         try:
-            resp = await client.get(
-                f"{self._url}/api/v1/repos/{self._user}/{repo_name}"
-                f"/branches/{safe_branch}",
-            )
+            resp = await client.get(url)
             if resp.status_code == 404:
                 return None
             if resp.status_code != 200:
@@ -1601,18 +1706,15 @@ class GiteaClient:
         """
         if not self._initialized:
             return None
-        from urllib.parse import quote as _q
-
         client = self._get_client()
-        safe_ref = _q(ref, safe="")
+        url = self._repo_api_url(repo_name, "git", "trees", encode_repo_ref(ref))
         out: list[dict[str, str]] = []
         page = 1
         per_page = 1000
         try:
             while True:
                 resp = await client.get(
-                    f"{self._url}/api/v1/repos/{self._user}/{repo_name}"
-                    f"/git/trees/{safe_ref}",
+                    url,
                     params={"recursive": "true", "per_page": per_page, "page": page},
                 )
                 if resp.status_code == 404:
@@ -1649,11 +1751,10 @@ class GiteaClient:
             return None
 
         client = self._get_client()
+        url = self._repo_api_url(repo_name, "branches")
 
         try:
-            resp = await client.get(
-                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/branches",
-            )
+            resp = await client.get(url)
             if resp.status_code == 404:
                 return None
             if resp.status_code != 200:
@@ -1690,11 +1791,10 @@ class GiteaClient:
             return False
 
         client = self._get_client()
+        url = self._repo_api_url(repo_name, "branches", encode_repo_ref(branch))
 
         try:
-            resp = await client.delete(
-                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/branches/{branch}",
-            )
+            resp = await client.delete(url)
             if resp.status_code == 204:
                 logger.info(f"Deleted branch '{branch}' from {repo_name}")
                 return True
@@ -1736,10 +1836,11 @@ class GiteaClient:
             return None
 
         client = self._get_client()
+        url = self._repo_api_url(repo_name, "pulls")
 
         try:
             resp = await client.post(
-                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/pulls",
+                url,
                 json={
                     "title": title,
                     "head": head,
@@ -1786,9 +1887,10 @@ class GiteaClient:
             return None
 
         client = self._get_client()
+        url = self._repo_api_url(repo_name, "pulls")
         try:
             resp = await client.get(
-                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/pulls",
+                url,
                 params={"state": state, "page": page, "limit": limit},
             )
             if resp.status_code != 200:
@@ -1839,10 +1941,11 @@ class GiteaClient:
             return False
 
         client = self._get_client()
+        url = self._repo_api_url(repo_name, "pulls", str(int(pr_index)), "merge")
 
         try:
             resp = await client.post(
-                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/pulls/{pr_index}/merge",
+                url,
                 json={
                     "Do": merge_strategy,
                     "delete_branch_after_merge": delete_branch_after_merge,
@@ -1882,11 +1985,9 @@ class GiteaClient:
             return None
 
         client = self._get_client()
+        url = self._repo_api_url(repo_name, "pulls", str(int(pr_index)), "merge")
         try:
-            resp = await client.get(
-                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/pulls/"
-                f"{pr_index}/merge"
-            )
+            resp = await client.get(url)
         except httpx.HTTPError as exc:
             logger.warning(
                 "Failed to probe merge state for PR #%s in %s: %s",
@@ -1926,12 +2027,10 @@ class GiteaClient:
             return False
 
         client = self._get_client()
+        url = self._repo_api_url(repo_name, "pulls", str(int(pr_index)))
 
         try:
-            resp = await client.patch(
-                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/pulls/{pr_index}",
-                json={"state": "closed"},
-            )
+            resp = await client.patch(url, json={"state": "closed"})
             if resp.status_code in (200, 201):
                 logger.info(f"Closed PR #{pr_index} in {repo_name} (unmerged)")
                 return True
@@ -1962,13 +2061,10 @@ class GiteaClient:
             return False
 
         client = self._get_client()
+        url = self._repo_api_url(repo_name, "issues", str(int(pr_index)), "comments")
 
         try:
-            resp = await client.post(
-                f"{self._url}/api/v1/repos/{self._user}/{repo_name}"
-                f"/issues/{pr_index}/comments",
-                json={"body": body},
-            )
+            resp = await client.post(url, json={"body": body})
             if resp.status_code in (200, 201):
                 return True
             logger.warning(
@@ -1994,12 +2090,11 @@ class GiteaClient:
             return False
 
         client = self._get_client()
+        url = self._repo_api_url(old_name)
+        validate_gitea_name(new_name)
 
         try:
-            resp = await client.patch(
-                f"{self._url}/api/v1/repos/{self._user}/{old_name}",
-                json={"name": new_name},
-            )
+            resp = await client.patch(url, json={"name": new_name})
 
             if resp.status_code == 200:
                 logger.info(f"Renamed Gitea repo '{old_name}' -> '{new_name}'")
@@ -2090,13 +2185,12 @@ class GiteaClient:
             return False
 
         client = self._get_client()
+        url = self._repo_api_url(
+            repo_name, "collaborators", validate_gitea_name(username, kind="user")
+        )
 
         try:
-            resp = await client.put(
-                f"{self._url}/api/v1/repos/{self._user}/{repo_name}"
-                f"/collaborators/{username}",
-                json={"permission": permission},
-            )
+            resp = await client.put(url, json={"permission": permission})
 
             if resp.status_code in (204, 200):
                 logger.debug(
@@ -2133,12 +2227,12 @@ class GiteaClient:
             return False
 
         client = self._get_client()
+        url = self._repo_api_url(
+            repo_name, "collaborators", validate_gitea_name(username, kind="user")
+        )
 
         try:
-            resp = await client.delete(
-                f"{self._url}/api/v1/repos/{self._user}/{repo_name}"
-                f"/collaborators/{username}",
-            )
+            resp = await client.delete(url)
 
             if resp.status_code in (204, 404):
                 return True
@@ -2208,8 +2302,9 @@ class GiteaClient:
         if not self._initialized or not username:
             return None
         client = self._get_client()
+        url = f"{self._url}/api/v1/users/{validate_gitea_name(username, kind='user')}"
         try:
-            resp = await client.get(f"{self._url}/api/v1/users/{username}")
+            resp = await client.get(url)
             if resp.status_code == 200:
                 return resp.json()
         except httpx.HTTPError:
@@ -2233,9 +2328,10 @@ class GiteaClient:
         if not self._initialized or not username:
             return False
         client = self._get_client()
+        user = validate_gitea_name(username, kind="user")
         try:
             resp = await client.patch(
-                f"{self._url}/api/v1/admin/users/{username}",
+                f"{self._url}/api/v1/admin/users/{user}",
                 json={
                     "source_id": source_id,
                     "login_name": login_name,

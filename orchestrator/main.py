@@ -410,7 +410,11 @@ from services.job_todos import (  # noqa: E402
     parse_archived_todos,
     parse_current_todos,
 )
-from services.gitea import GiteaClient  # noqa: E402
+from services.gitea import (  # noqa: E402
+    GiteaClient,
+    GiteaPathError,
+    validate_gitea_name,
+)
 from services.managed_repository_authority import (  # noqa: E402
     ManagedRepositoryAuthorityError,
     authorize_job_repository_transport,
@@ -18065,6 +18069,23 @@ async def _unknown_model_handler(
             ),
         },
     )
+
+
+@app.exception_handler(GiteaPathError)
+async def _gitea_path_error_handler(
+    request: Request, exc: GiteaPathError
+) -> JSONResponse:
+    """Refuse a caller-shaped repository path or name with a 400, not a 500.
+
+    ``services.gitea`` validates every path, ref and repository name before
+    a request leaves the process (the client authenticates as the Gitea
+    instance administrator, so an unencoded ``..`` would re-target another
+    owner's repository). The refusal is about the caller's input, not a
+    server fault, so surface it as such -- this covers every route that
+    reaches the sink, including the MCP-facing ``/repo/file`` and
+    ``/repo/contents`` proxies.
+    """
+    return JSONResponse(status_code=400, content={"detail": str(exc)})
 
 
 @app.exception_handler(Exception)
@@ -60543,8 +60564,17 @@ async def get_thread_ide_status(thread_id: str, request: Request) -> dict[str, A
     if repo_name:
         gitea_base = os.environ.get("GITEA_URL", "").rstrip("/")
         gitea_user = os.environ.get("GITEA_ADMIN_USER", "srw")
-        if gitea_base:
-            gitea_url = f"{gitea_base}/{gitea_user}/{repo_name}"
+        try:
+            repo_path = (
+                f"{validate_gitea_name(gitea_user, kind='owner')}"
+                f"/{validate_gitea_name(str(repo_name))}"
+            )
+        except GiteaPathError:
+            # Job context is caller-writable; never echo an unvalidated
+            # name into a link, even a display-only one.
+            repo_path = None
+        if gitea_base and repo_path:
+            gitea_url = f"{gitea_base}/{repo_path}"
 
     # Check VM first (takes precedence over container)
     vm_ctx = metadata.get("vm", {})
