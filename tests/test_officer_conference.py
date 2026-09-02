@@ -561,3 +561,41 @@ class TestConferenceBrainInheritance:
         )
         assert got == []
         assert "llm" not in override
+
+
+class TestOpenConferenceAction:
+    """The notification's `open_conference` action lands in a conference —
+    via the cockpit launcher route that owns create-or-resume
+    (officer_visibility_streamline.md §3.5). Before this it navigated to the
+    project page with a `hint` nothing read."""
+
+    @staticmethod
+    async def _run(category, params):
+        from services.notification_catalog import ActionContext, action_handler
+
+        main._register_notification_actions()
+        handler = action_handler(category, "open_conference")
+        assert handler is not None, f"{category} lost its open_conference action"
+        return await handler(
+            ActionContext(notification={}, user={"id": "u1"}, params=params)
+        )
+
+    @pytest.mark.asyncio
+    async def test_navigates_to_the_launcher_when_the_project_is_known(self):
+        result = await self._run(
+            "officer_question", {"project_id": "p1", "thread_id": "t1"}
+        )
+        assert result.result["navigate"] == "/projects/p1/officer/conference"
+        assert "hint" not in result.result
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_the_session_without_a_project(self):
+        result = await self._run("officer_question", {"thread_id": "t1"})
+        assert result.result["navigate"] == "/sessions/t1"
+
+    @pytest.mark.asyncio
+    async def test_officer_runtime_shares_the_handler(self):
+        result = await self._run(
+            "officer_runtime", {"project_id": "p2", "thread_id": "t2"}
+        )
+        assert result.result["navigate"] == "/projects/p2/officer/conference"

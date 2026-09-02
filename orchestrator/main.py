@@ -23916,12 +23916,15 @@ def _register_notification_actions() -> None:
         )
 
     async def _open_conference(ctx: ActionContext) -> ActionResult:
+        """Land the user in the officer's conference. The cockpit's launcher
+        route owns create-or-resume, so this action, the project card and
+        the sessions list share one path (officer_visibility_streamline.md
+        §3.5). Without a project there is no post to confer with — fall back
+        to the thread itself."""
         project_id = ctx.params.get("project_id")
         thread_id = ctx.params.get("thread_id")
         if project_id:
-            return ActionResult(
-                result={"navigate": f"/projects/{project_id}", "hint": "officer"}
-            )
+            return _navigate(f"/projects/{project_id}/officer/conference")
         return _navigate(f"/sessions/{thread_id}")
 
     register_action("officer_question", "open_conference")(_open_conference)
