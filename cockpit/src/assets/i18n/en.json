@@ -3512,6 +3512,11 @@
     "deliveryFailed": "delivery failed; retry state retained",
     "notQueued": "not queued"
   },
+  "conferenceLauncher": {
+    "opening": "Opening the conference…",
+    "error": "Could not open the conference:",
+    "back": "Back to the project"
+  },
   "officerCard": {
     "title": "Centurion",
     "intro": "A standing officer for this project: he holds the charge, watches jobs and fleet, dispatches workers from his kit, and pages you only when something genuinely needs you. You talk to him in a conference; his background log is the session transcript. The post outlives him — kit, budgets, and memory stay with it between incarnations.",

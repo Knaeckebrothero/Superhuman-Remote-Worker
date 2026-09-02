@@ -6,6 +6,7 @@ import {JobReviewPageComponent} from './views/job-review/job-review-page.compone
 import {CreatePageComponent} from './views/create/create-page.component';
 import {ProjectListPageComponent} from './views/projects/project-list.component';
 import {ProjectDetailPageComponent} from './views/project-detail/project-detail.component';
+import {ConferenceLauncherComponent} from './views/project-detail/conference-launcher.component';
 import {InboxPageComponent} from './views/inbox/inbox-page.component';
 import {MessageRedirectComponent} from './core/routing/message-redirect/message-redirect.component';
 import {ChatPageComponent} from './views/chat/chat-page.component';
@@ -42,6 +43,11 @@ export const routes: Routes = [
   { path: 'inbox', component: InboxPageComponent, canActivate: [authGuard] },
   { path: 'projects', component: ProjectListPageComponent, canActivate: [authGuard] },
   { path: 'projects/:id', component: ProjectDetailPageComponent, canActivate: [authGuard, projectAccessGuard] },
+  {
+    path: 'projects/:id/officer/conference',
+    component: ConferenceLauncherComponent,
+    canActivate: [authGuard, projectAccessGuard],
+  },
   {
     path: 'datasources',
     loadComponent: () =>

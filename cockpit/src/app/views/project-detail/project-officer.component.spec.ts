@@ -20,7 +20,6 @@ import de from '../../../assets/i18n/de-DE.json';
 import {
   ProjectOfficerComponent,
   STARTER_SLOT_DRAFT,
-  buildConferenceThreadCreateBody,
   buildOfficerConfig,
   buildOfficerPatch,
   buildSlotsSpec,
@@ -36,6 +35,7 @@ import {
   type OfficerEditorDraft,
   type SlotDraft,
 } from './project-officer.component';
+import { buildConferenceThreadCreateBody } from '../../core/officer/conference';
 import { ApiService } from '../../core/services/api.service';
 import { NotificationService } from '../../core/services/notification.service';
 import { ModelService } from '../../core/services/model.service';
@@ -1821,17 +1821,5 @@ describe('nextWakeLabel', () => {
 
   it('falls back to the raw value on garbage', () => {
     expect(nextWakeLabel('not-a-date', trEn)).toBe('not-a-date');
-  });
-});
-
-describe('conference thread create request', () => {
-  it('explicitly requests connector defaults for a conference', () => {
-    expect(buildConferenceThreadCreateBody('project-1', 'Apollo', 'Conference')).toEqual({
-      title: 'Conference — Apollo',
-      config_name: 'centurion',
-      project_ids: ['project-1'],
-      use_datasource_defaults: true,
-      config_override: { officer: { conference: true } },
-    });
   });
 });

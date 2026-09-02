@@ -3512,6 +3512,11 @@
     "deliveryFailed": "Zustellung fehlgeschlagen; Wiederholungsstatus beibehalten",
     "notQueued": "nicht eingereiht"
   },
+  "conferenceLauncher": {
+    "opening": "Konferenz wird geöffnet …",
+    "error": "Konferenz konnte nicht geöffnet werden:",
+    "back": "Zurück zum Projekt"
+  },
   "officerCard": {
     "title": "Centurio",
     "intro": "Ein ständiger Offizier für dieses Projekt: Er führt den Auftrag, überwacht Jobs und Flotte, entsendet Arbeiter aus seiner Ausrüstung und meldet sich nur, wenn du wirklich gebraucht wirst. In einer Konferenz sprichst du mit ihm; sein Hintergrundprotokoll ist das Sitzungsprotokoll. Der Posten überdauert ihn — Ausrüstung, Budgets und Gedächtnis bleiben zwischen Inkarnationen erhalten.",

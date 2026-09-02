@@ -8,6 +8,7 @@ import { TranslocoPipe, TranslocoService } from '@jsverse/transloco';
 import { environment } from '../../core/environment';
 import { ApiService } from '../../core/services/api.service';
 import { NotificationService } from '../../core/services/notification.service';
+import { buildConferenceThreadCreateBody } from '../../core/officer/conference';
 import type { Notification } from '../../core/models/notification.model';
 import { ModelService } from '../../core/services/model.service';
 import type {
@@ -359,21 +360,6 @@ export function vacantLedgerOf(
   const dropped = Array.isArray(raw) ? 0 : (raw.dropped ?? 0);
   if (!entries.length && !dropped) return null;
   return { entries, dropped };
-}
-
-/** Build the officer conference's trusted thread-create request. */
-export function buildConferenceThreadCreateBody(
-  projectId: string,
-  projectName: string,
-  conferenceLabel: string,
-): Record<string, unknown> {
-  return {
-    title: `${conferenceLabel} — ${projectName}`,
-    config_name: 'centurion',
-    project_ids: [projectId],
-    use_datasource_defaults: true,
-    config_override: { officer: { conference: true } },
-  };
 }
 
 /** "in 42 min" / "overdue 3 min" — the next-wake label. */
