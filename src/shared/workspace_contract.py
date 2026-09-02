@@ -208,14 +208,8 @@ def strip_and_stamp_workspace_creation(
     *,
     requested_backend: Any = None,
     assignment_source: str | None = None,
-    preserve_runtime_context: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any], WorkspaceContract]:
-    """Strip caller authority and stamp the canonical creation-time contract.
-
-    ``preserve_runtime_context`` is reserved for server-built child jobs that
-    intentionally inherit a parent's already-authoritative runtime.  Raw REST,
-    session, tool, automation and ordinary direct DB callers must leave it off.
-    """
+    """Strip runtime authority and stamp the canonical creation-time contract."""
 
     clean_context = _object(context)
     clean_context.pop(WORKSPACE_CONTRACT_CONTEXT_KEY, None)
@@ -224,9 +218,8 @@ def strip_and_stamp_workspace_creation(
     # Historical callers used this unnamespaced hint.  It was never runtime
     # attestation and must not survive a creation boundary.
     clean_context.pop("workspace_backend", None)
-    if not preserve_runtime_context:
-        clean_context.pop("vm", None)
-        clean_context.pop("workspace_container", None)
+    clean_context.pop("vm", None)
+    clean_context.pop("workspace_container", None)
 
     contract = build_workspace_contract(
         config_override,

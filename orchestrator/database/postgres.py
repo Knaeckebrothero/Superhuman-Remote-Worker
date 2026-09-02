@@ -3756,7 +3756,6 @@ class PostgresDB:
         authoritative_officer_admission: bool = False,
         requested_workspace_backend: Any = _WORKSPACE_REQUEST_UNSET,
         workspace_assignment_source: str | None = None,
-        authoritative_workspace_context: bool = False,
         delivery_contract: Mapping[str, Any] | None = None,
         conn: Any = None,
     ) -> Dict[str, Any]:
@@ -3823,10 +3822,6 @@ class PostgresDB:
                 service callers describe their final explicit override.
             workspace_assignment_source: Safe server-owned description of the
                 layer that selected the assigned tier.
-            authoritative_workspace_context: Preserve a server-built parent's
-                runtime context for an inheriting child. Raw REST/session/tool
-                callers must never set this; the default strips both runtime
-                context branches before stamping the contract.
             delivery_contract: Server-prepared immutable contract, including
                 exact attached PR bindings. Raw callers may select semantic
                 deliverables through context, but cannot author this proof.
@@ -3915,7 +3910,6 @@ class PostgresDB:
                 config_override,
                 requested_backend=requested_workspace_backend,
                 assignment_source=workspace_assignment_source,
-                preserve_runtime_context=authoritative_workspace_context,
             )
         )
         safe_provenance = dict(datasource_selection_provenance or {})

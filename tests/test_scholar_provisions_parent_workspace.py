@@ -256,13 +256,13 @@ class TestProvisionParentWorkspaceForScholar:
 
         assert result == "promoted"
         wire["fail"].assert_not_awaited()
-        # The scholar row now inherits the READY parent container (re-read, with host).
+        # Persist only the inherit discriminator. Dispatch re-reads and overlays
+        # the parent's ready runtime in memory; copying it here would claim
+        # parent-owned Kubernetes authority on the child row.
         assert len(wire["merge"]) == 1
         jid, delta = wire["merge"][0]
         assert jid == scholar_job["id"]
-        assert delta["inherits_parent_workspace"] is True
-        assert delta["workspace_container"]["status"] == "ready"
-        assert delta["workspace_container"]["host"] == READY_CONTAINER["host"]
+        assert delta == {"inherits_parent_workspace": True}
         # worktree_path persisted for the injector: <scholarId[:8]>-<config_name>.
         assert len(wire["conn"].executed) == 1
         query, args = wire["conn"].executed[0]

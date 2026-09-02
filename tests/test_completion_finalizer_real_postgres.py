@@ -670,7 +670,7 @@ async def test_s27_human_decision_supersedes_effect_without_followup(pg, monkeyp
         )
 
 
-async def _verification_parent_fixture(pg):
+async def _verification_parent_fixture(pg, *, with_workspace: bool = False):
     async with pg.acquire() as conn:
         agent_id = await conn.fetchval(
             "INSERT INTO agents (config_name, hostname, status) "
@@ -688,6 +688,57 @@ async def _verification_parent_fixture(pg):
             '\'{"freeze_type":"job_complete","summary":"done",'
             '"deliverables":["output/result.md"]}\'::jsonb) RETURNING id',
             agent_id,
+        )
+    if with_workspace:
+        db = _pool_db(pg)
+        runtime_uid = str(uuid4())
+        reservation = await db.reserve_managed_repository_workspace_creation(
+            str(parent_id),
+            owner_kind="job",
+            scope="workspace_container",
+            claimant="verification-parent-fixture",
+            desired_manifest_digest="0" * 64,
+        )
+        assert reservation is not None
+        reservation = await db.mark_managed_repository_workspace_creation_started(
+            str(parent_id),
+            owner_kind="job",
+            scope="workspace_container",
+            reservation_generation=int(reservation["reservation_generation"]),
+            claimant="verification-parent-fixture",
+            claim_token=int(reservation["claim_token"]),
+        )
+        assert reservation is not None
+        assert await db.authorize_managed_repository_workspace_creation_runtime(
+            str(parent_id),
+            owner_kind="job",
+            scope="workspace_container",
+            reservation_generation=int(reservation["reservation_generation"]),
+            claimant="verification-parent-fixture",
+            claim_token=int(reservation["claim_token"]),
+            runtime_incarnation=runtime_uid,
+        )
+        workspace = {
+            "provisioner": "k8s",
+            "status": "ready",
+            "_runtime_incarnation": runtime_uid,
+            "_creation_reservation_id": str(reservation["id"]),
+            "_creation_claim_token": str(reservation["claim_token"]),
+        }
+        async with pg.acquire() as conn:
+            await conn.execute(
+                "UPDATE jobs SET context=context || $2::jsonb WHERE id=$1",
+                parent_id,
+                json.dumps({"workspace_container": workspace}),
+            )
+        assert await db.settle_managed_repository_workspace_creation_reservation(
+            str(parent_id),
+            owner_kind="job",
+            scope="workspace_container",
+            reservation_generation=int(reservation["reservation_generation"]),
+            claimant="verification-parent-fixture",
+            claim_token=int(reservation["claim_token"]),
+            runtime_incarnation=runtime_uid,
         )
     accepted = await accept_completion_command(
         pg,
@@ -750,6 +801,38 @@ async def test_s30_materializes_one_critic_before_external_handoff(pg, monkeypat
     assert critics[0]["branch_name"] is None
     assert effect["state"] == "done"
     assert effect["detail_bytes"] < 8 * 1024
+
+
+@pytest.mark.asyncio
+async def test_s30_inherits_parent_workspace_without_rebinding_runtime(pg, monkeypatch):
+    accepted, parent_id = await _verification_parent_fixture(pg, with_workspace=True)
+    db = _pool_db(pg)
+    monkeypatch.setattr(main, "postgres_db", db)
+    runner = await _claimed_runner(db, accepted.command_id)
+    parent = await db.get_job(str(parent_id))
+
+    plan = await runner.run_transactional(
+        name="verification_critic_spawn",
+        group="verification",
+        callback=lambda: main._materialize_verification_critic_transactional(
+            parent,
+            {"should_stop": True, "goal_achieved": True, "error": None},
+            expected_round=0,
+        ),
+        supersede_if=lambda output: output["world_cas_won"] is False,
+    )
+
+    assert plan["action"] == "handoff"
+    critic = await db.get_job(plan["critic_job_id"])
+    critic_context = critic["context"]
+    if isinstance(critic_context, str):
+        critic_context = json.loads(critic_context)
+    assert critic_context["inherits_parent_workspace"] is True
+    assert "workspace_container" not in critic_context
+    assert "vm" not in critic_context
+    assert critic_context["_workspace_contract"]["assignment_source"] == (
+        "parent_inheritance"
+    )
 
 
 @pytest.mark.asyncio

@@ -96,10 +96,10 @@ def _inherited(container=None, vm=None):
     """Context of a subjob that INHERITED its parent's workspace at spawn.
 
     Carries the explicit ``inherits_parent_workspace`` flag (stamped by
-    ``_spawn_scholar_subjob`` / ``_trigger_verification_on_complete`` when they
-    copy the parent's ``vm`` / ``workspace_container``) plus the copied snapshot.
-    Contrast a *self-provisioned* subjob, whose context carries the same
-    workspace key with NO flag.
+    ``_spawn_scholar_subjob`` / ``_trigger_verification_on_complete``). Optional
+    workspace snapshots here exercise compatibility with historical rows.
+    Contrast a *self-provisioned* subjob, whose context carries a workspace key
+    with NO flag.
     """
     ctx: dict = {"inherits_parent_workspace": True}
     if container is not None:

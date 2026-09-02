@@ -9782,9 +9782,8 @@ def _scholar_should_provision_parent_container(config_override: Any) -> bool:
 # Bounded wait for a subjob to inherit its parent's provisioned workspace.
 # Parent container/VM readiness is an async event that lands AFTER the subjob is
 # spawned (a scholar is created ~3s after its parent, mid-provisioning), so we
-# re-resolve from the parent's live row every dispatch tick rather than trust
-# the subjob's creation-time snapshot. This bounds how long we wait before
-# giving up with a diagnosable failure instead of stranding the job.
+# resolve from the parent's live row every dispatch tick. This bounds how long
+# we wait before giving up with a diagnosable failure instead of stranding the job.
 _INHERIT_WORKSPACE_MAX_WAIT_S = int(
     os.environ.get("WORKSPACE_INHERIT_MAX_WAIT_S", "600")
 )
@@ -9794,18 +9793,13 @@ async def _resolve_subjob_inherited_workspace(job: dict) -> tuple[str, str | Non
     """Refresh a subjob's inherited workspace from its parent's LIVE context.
 
     Subjobs that share a parent's workspace (scholar research,
-    verification/critic) copy the parent's ``context.workspace_container`` /
-    ``vm`` **by value** at spawn time (``_spawn_scholar_subjob`` /
-    ``_trigger_verification_on_complete``). A scholar is spawned ~3s after its
-    parent is created — before the parent's pod is ready — so that snapshot
-    carries ``status='created'`` with no SSH host and never self-updates,
-    stranding the subjob at ``init_workspace`` with ``no workspace.remote``
-    (knowledge-base/knowledge/issues/subjob_inherits_stale_workspace_container_snapshot.md).
-
-    We re-read the parent's current workspace here and overlay it onto the
-    in-memory ``job['context']`` (never persisted — persisting would re-freeze a
-    snapshot that goes stale again on pod reattach). The subjob rides the
-    parent's pod via its ``worktree_path``; it must never provision its own.
+    verification/critic) persist only ``inherits_parent_workspace`` and a
+    parent-inheritance workspace contract. We re-read the parent's current
+    workspace here and overlay it onto the in-memory ``job['context']``. The
+    live runtime is never copied into the child row: doing so both creates a
+    stale snapshot and claims the parent's Kubernetes authority under the
+    child's identity. The subjob rides the parent's pod via its
+    ``worktree_path``; it must never provision its own.
 
     Returns one of:
       ``("proceed", None)`` — not an inheriting subjob, or the parent workspace
@@ -10183,9 +10177,10 @@ async def _provision_parent_workspace_for_scholar(job: dict, parent_id: str) -> 
         )
         return "wait"
 
-    # READY — re-read the parent row for the host/pod_ip create_workspace wrote,
-    # then promote the scholar to inherit the now-ready shared workspace so the
-    # normal inherit path (resolver overlay + worktree injection) dispatches it.
+    # READY — promote the scholar to inherit the now-ready shared workspace so
+    # the normal inherit path (fresh parent resolver overlay + worktree injection)
+    # dispatches it. The child row must not copy the parent's live runtime
+    # authority; doing so looks like an unreserved runtime bind for the child.
     fresh_parent = await postgres_db.get_job(parent_id)
     fresh_ctx = (fresh_parent or {}).get("context") or {}
     if isinstance(fresh_ctx, str):
@@ -10201,10 +10196,7 @@ async def _provision_parent_workspace_for_scholar(job: dict, parent_id: str) -> 
     )
     await postgres_db.merge_job_context(
         scholar_id,
-        {
-            "inherits_parent_workspace": True,
-            "workspace_container": ready_container,
-        },
+        {"inherits_parent_workspace": True},
     )
     async with postgres_db.acquire() as conn:
         await conn.execute(
@@ -26654,22 +26646,22 @@ async def _spawn_scholar_subjob(
             parent_ctx = json.loads(parent_ctx)
         except (json.JSONDecodeError, ValueError):
             parent_ctx = {}
-    # Stamp the explicit inherit flag ONLY when we actually copy the parent's
-    # existing workspace (busy cluster — the parent already provisioned). When the
-    # parent has none yet (idle cluster), the scholar instead provisions the
-    # parent's ONE shared workspace under the parent's identity and rides it
-    # (marker below) — never a throwaway pod of its own. The flag and the marker
-    # are mutually exclusive: the flag routes into the inherit/wait path, the
-    # marker into the provision-under-parent path. See
+    # Stamp the explicit inherit flag ONLY when the parent already has a workspace
+    # (busy cluster — the parent already provisioned). Do not copy the live
+    # runtime into the child row: it belongs to the parent, and the dispatch-time
+    # resolver re-reads and overlays it in memory. When the parent has none yet
+    # (idle cluster), the scholar instead provisions the parent's ONE shared
+    # workspace under the parent's identity and rides it (marker below) — never
+    # a throwaway pod of its own. The flag and the marker are mutually exclusive:
+    # the flag routes into the inherit/wait path, the marker into the
+    # provision-under-parent path. See
     # knowledge-base/knowledge/issues/scholar_selfprovisioned_workspace_misclassified_as_inherited.md.
     parent_workspace_backend = resolve_workspace_contract(job).assigned_backend
     if parent_workspace_backend == "vm" and parent_ctx.get("vm"):
-        scholar_context["vm"] = parent_ctx["vm"]
         scholar_context["inherits_parent_workspace"] = True
     elif parent_workspace_backend == "sandbox" and parent_ctx.get(
         "workspace_container"
     ):
-        scholar_context["workspace_container"] = parent_ctx["workspace_container"]
         scholar_context["inherits_parent_workspace"] = True
     elif _scholar_should_provision_parent_container(config_override):
         # Container/sandbox backend: provision the parent's shared pod (Phase 1).
@@ -26743,7 +26735,6 @@ async def _spawn_scholar_subjob(
             ),
             requested_workspace_backend=None,
             workspace_assignment_source="parent_inheritance",
-            authoritative_workspace_context=True,
         )
     except Exception:
         logger.exception(
@@ -28410,19 +28401,17 @@ async def _trigger_verification_on_complete(
             parent_ctx = json.loads(parent_ctx)
         except (json.JSONDecodeError, ValueError):
             parent_ctx = {}
-    # A critic is spawned after the parent completes, so the parent's
-    # workspace is ready and always inherited here. Stamp the explicit flag
-    # (same discriminator the scholar uses) so the dispatch-time resolver
-    # overlays the parent's LIVE workspace instead of skipping it — the flag,
-    # not key presence, now gates the inherit path.
+    # A critic is spawned after the parent completes, so the parent's workspace
+    # is ready and inherited here. Persist only the discriminator; the
+    # dispatch-time resolver re-reads and overlays the parent's live runtime in
+    # memory. Copying that runtime into the child row would claim parent-owned
+    # Kubernetes authority without a child creation reservation.
     parent_workspace_backend = resolve_workspace_contract(job).assigned_backend
     if parent_workspace_backend == "vm" and parent_ctx.get("vm"):
-        context["vm"] = parent_ctx["vm"]
         context["inherits_parent_workspace"] = True
     elif parent_workspace_backend == "sandbox" and parent_ctx.get(
         "workspace_container"
     ):
-        context["workspace_container"] = parent_ctx["workspace_container"]
         context["inherits_parent_workspace"] = True
 
     # Extract parent's LLM override so the critic uses the same model
@@ -28504,7 +28493,6 @@ async def _trigger_verification_on_complete(
             ),
             requested_workspace_backend=None,
             workspace_assignment_source="parent_inheritance",
-            authoritative_workspace_context=True,
         )
     except asyncpg.UniqueViolationError as exc:
         # The optimistic has_live_verification_critic read is intentionally
@@ -28788,14 +28776,10 @@ async def _materialize_verification_critic_transactional(
                 parent_context = {}
         parent_workspace_backend = resolve_workspace_contract(parent).assigned_backend
         if parent_workspace_backend == "vm" and parent_context.get("vm"):
-            critic_context["vm"] = parent_context["vm"]
             critic_context["inherits_parent_workspace"] = True
         elif parent_workspace_backend == "sandbox" and parent_context.get(
             "workspace_container"
         ):
-            critic_context["workspace_container"] = parent_context[
-                "workspace_container"
-            ]
             critic_context["inherits_parent_workspace"] = True
 
         parent_override = parent.get("config_override")
@@ -28876,7 +28860,6 @@ async def _materialize_verification_critic_transactional(
                     ),
                     requested_workspace_backend=None,
                     workspace_assignment_source="parent_inheritance",
-                    authoritative_workspace_context=True,
                 )
         except asyncpg.UniqueViolationError as exc:
             if getattr(exc, "constraint_name", None) != "jobs_verification_uniq":
