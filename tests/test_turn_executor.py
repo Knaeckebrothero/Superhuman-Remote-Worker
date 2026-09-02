@@ -2258,6 +2258,43 @@ class TestAffinity:
         }
         assert te.attach_fingerprint(first) == te.attach_fingerprint(second)
 
+    def test_fingerprint_ignores_rotating_runtime_actor_credentials_only(self):
+        first = {
+            "thread_id": "t1",
+            "runtime_actor": {
+                "caller_kind": "human",
+                "user_id": "u1",
+                "project_id": "p1",
+                "project_role": "member",
+                "thread_id": "t1",
+                "officer_incarnation": None,
+                "access_credential": "access-a",
+                "refresh_credential": "refresh-a",
+                "access_expires_at": "2026-09-02T18:00:00Z",
+                "refresh_expires_at": "2026-09-03T18:00:00Z",
+            },
+        }
+        rotated = {
+            "thread_id": "t1",
+            "runtime_actor": {
+                **first["runtime_actor"],
+                "access_credential": "access-b",
+                "refresh_credential": "refresh-b",
+                "access_expires_at": "2026-09-02T18:05:00Z",
+                "refresh_expires_at": "2026-09-03T18:05:00Z",
+            },
+        }
+        changed_identity = {
+            "thread_id": "t1",
+            "runtime_actor": {
+                **rotated["runtime_actor"],
+                "project_role": "admin",
+            },
+        }
+
+        assert te.attach_fingerprint(first) == te.attach_fingerprint(rotated)
+        assert te.attach_fingerprint(first) != te.attach_fingerprint(changed_identity)
+
     @pytest.mark.asyncio
     async def test_lite_same_thread_same_fingerprint_skips_reattach(self, harness):
         unit = uuid4()

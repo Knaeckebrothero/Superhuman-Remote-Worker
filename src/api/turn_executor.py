@@ -244,6 +244,9 @@ def attach_fingerprint(attach: Dict[str, Any]) -> str:
 
     * ``resolved_config.resolved_at`` is a wall-clock stamp minted by every
       resolver call and consumed by nothing.
+    * ``runtime_actor`` bearer credentials and expiries rotate on every claim.
+      The warm session keeps its still-live actor (and refresh token); its
+      stable caller/user/project/thread identity remains in the hash.
     * ``interactive.permission_mode`` / ``narration_mode`` are first-class
       control-inbox scalars. A cold attach must receive them for crash/handoff
       convergence, but a warm owner applies their ordered pending request in
@@ -289,6 +292,22 @@ def attach_fingerprint(attach: Dict[str, Any]) -> str:
         attach = {
             **attach,
             "config_override": _without_control_scalars(override),
+        }
+    runtime_actor = attach.get("runtime_actor")
+    if isinstance(runtime_actor, dict):
+        attach = {
+            **attach,
+            "runtime_actor": {
+                key: value
+                for key, value in runtime_actor.items()
+                if key
+                not in {
+                    "access_credential",
+                    "refresh_credential",
+                    "access_expires_at",
+                    "refresh_expires_at",
+                }
+            },
         }
     canonical = json.dumps(attach, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
