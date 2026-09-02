@@ -31,6 +31,7 @@ os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 from services import gitea as gitea_mod  # noqa: E402
 from services.gitea import (  # noqa: E402
     GiteaPathError,
+    encode_compare_ref,
     encode_repo_path,
     encode_repo_ref,
     validate_gitea_name,
@@ -357,3 +358,67 @@ class TestProxyRoutes:
         response = await handler(_request(), GiteaPathError("nope"))
         assert response.status_code == 400
         assert json.loads(response.body) == {"detail": "nope"}
+
+
+# ---------------------------------------------------------------------------
+# compare/{base}...{head}: the cross-repository separator
+# ---------------------------------------------------------------------------
+
+
+class TestCompareRefSeparator:
+    """``owner:branch`` is Gitea's cross-repository compare syntax.
+
+    Its REST handler resolves the owner only through a real fork relation, so
+    SRW's sibling job repositories are unreachable that way today — but that
+    is upstream's invariant, and ``base``/``head`` arrive straight from the
+    caller on ``/api/jobs/{id}/repo/diff``. The separator is refused here so
+    the boundary does not depend on it.
+    """
+
+    @pytest.mark.parametrize(
+        "ref",
+        [
+            "srw:job-0519ea8f",
+            "other-owner:main",
+            "main...srw:secret",
+            "srw%3Ajob-2",
+            ":main",
+            "main:",
+        ],
+    )
+    def test_rejects_the_repository_separator(self, ref):
+        with pytest.raises(GiteaPathError):
+            encode_compare_ref(ref)
+
+    @pytest.mark.parametrize(
+        ("ref", "encoded"),
+        [
+            ("main", "main"),
+            ("job/abc", "job/abc"),
+            ("a" * 40, "a" * 40),
+            ("release/1.2", "release/1.2"),
+        ],
+    )
+    def test_keeps_legitimate_refs_and_their_slashes(self, ref, encoded):
+        assert encode_compare_ref(ref) == encoded
+
+    @pytest.mark.parametrize("ref", TRAVERSAL_PATHS)
+    def test_still_rejects_every_escape_shape(self, ref):
+        with pytest.raises(GiteaPathError):
+            encode_compare_ref(ref)
+
+    @pytest.mark.asyncio
+    async def test_compare_and_diff_refuse_before_any_request(self):
+        gc, seen = _client()
+        for call in (gc.get_compare, gc.get_diff):
+            with pytest.raises(GiteaPathError):
+                await call(REPO, "main", "srw:job-0519ea8f")
+            with pytest.raises(GiteaPathError):
+                await call(REPO, "srw:job-0519ea8f", "main")
+        assert seen == []
+
+    @pytest.mark.asyncio
+    async def test_legitimate_compare_still_reaches_the_wire(self):
+        gc, seen = _client()
+        await gc.get_compare(REPO, "main", "job/abc")
+        assert _wire_path(seen[-1]) == b"/api/v1/repos/srw/job-1/compare/main...job/abc"

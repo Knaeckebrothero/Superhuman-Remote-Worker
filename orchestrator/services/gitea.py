@@ -111,6 +111,25 @@ def encode_repo_path(path: str, *, allow_empty: bool = False) -> str:
     return "/".join(quote(segment, safe="") for segment in raw.split("/"))
 
 
+def encode_compare_ref(ref: str) -> str:
+    """Validate one side of a ``compare/{base}...{head}`` pair.
+
+    Same rules as :func:`encode_repo_path` (slashes stay literal — a branch
+    is spelled ``job/abc`` here, not ``job%2Fabc``), plus a refusal of ``:``.
+    Gitea's compare route reads ``{owner}:{branch}`` as a cross-repository
+    reference; on the REST API that resolution is confined to real forks, so
+    SRW's sibling job repositories are not reachable through it today. That
+    is Gitea's invariant, not ours, and it is the only thing standing between
+    a caller-supplied ``base``/``head`` and another repository — so refuse the
+    separator here rather than inherit an upstream guarantee we do not own.
+    A legitimate ref cannot contain ``:`` (git forbids it in ref names).
+    """
+    raw = _validated_repo_path(ref, what="Compare ref", allow_empty=False)
+    if ":" in raw or ":" in unquote(raw):
+        raise GiteaPathError("Compare ref contains a repository separator")
+    return "/".join(quote(segment, safe="") for segment in raw.split("/"))
+
+
 def encode_repo_ref(ref: str) -> str:
     """Validate a git ref and encode it as exactly one URL path segment.
 
@@ -1352,7 +1371,9 @@ class GiteaClient:
 
         client = self._get_client()
         url = self._repo_api_url(
-            repo_name, "compare", f"{encode_repo_path(base)}...{encode_repo_path(head)}"
+            repo_name,
+            "compare",
+            f"{encode_compare_ref(base)}...{encode_compare_ref(head)}",
         )
 
         try:
@@ -1520,7 +1541,7 @@ class GiteaClient:
         url = self._repo_api_url(
             repo_name,
             "compare",
-            f"{encode_repo_path(base)}...{encode_repo_path(head)}.diff",
+            f"{encode_compare_ref(base)}...{encode_compare_ref(head)}.diff",
         )
 
         try:
