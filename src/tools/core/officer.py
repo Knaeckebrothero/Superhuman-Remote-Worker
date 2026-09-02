@@ -51,9 +51,10 @@ OFFICER_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "notify_user",
         "description": (
             "Message your Legate (the user) out-of-band. urgency='log' for "
-            "the record only, 'digest' for the next briefing, 'page' for an "
-            "immediate notification (budgeted per day — over budget it "
-            "downgrades to digest). Officer sessions only."
+            "the record only, 'digest' for their next look at the "
+            "notification center, 'page' for an immediate notification. "
+            "Also how you answer a Legate note when they are not live in "
+            "your session. Officer sessions only."
         ),
         "category": "core",
         "short_description": "Message the user: log, digest, or page.",
@@ -127,6 +128,10 @@ def create_officer_tools(context: ToolContext) -> List[Any]:
             repeats (identical text on one day is one notification), but a
             page still interrupts a human — spend them like the scarce
             resource they are.
+
+        This is also how you answer a Legate note when the Legate is not live
+        in your session: ``digest`` for an answer, ``page`` only if the
+        answer cannot wait.
 
         Args:
             message: What the Legate needs to know, in 1-5 sentences.
