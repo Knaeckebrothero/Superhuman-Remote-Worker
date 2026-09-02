@@ -98,8 +98,9 @@ async def prefilter_kb_tick(
     A file the materializer cannot rewrite is skipped and counted, never
     flipped row-only — the file stays the truth. Returns counts; never raises.
     """
-    min_age = min_age or prefilter_min_age()
-    limit = limit or prefilter_max_per_tick()
+    # Explicit None checks: timedelta(0) is falsy and means "no minimum age".
+    min_age = prefilter_min_age() if min_age is None else min_age
+    limit = prefilter_max_per_tick() if limit is None else max(1, int(limit))
     counts = {"candidates": 0, "archived": 0, "unchanged": 0, "failed": 0}
     try:
         candidates = await store.list_unreachable_nursery(

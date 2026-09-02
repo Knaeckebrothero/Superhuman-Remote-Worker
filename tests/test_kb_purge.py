@@ -146,6 +146,21 @@ class TestPurgeTick:
         }
 
     @pytest.mark.asyncio
+    async def test_zero_grace_is_zero_not_the_default(self):
+        """timedelta(0) is falsy; it must still mean 'purge now' (E6 found
+        the `grace or default` wart)."""
+        store = _store([])
+        with patch("services.kb_purge.materialize_knowledge_note_delete"):
+            await purge_kb_tick(
+                postgres_db="db",
+                store=store,
+                gitea_client="g",
+                kb_id=KB,
+                grace=timedelta(0),
+            )
+        assert store.list_purge_candidates.await_args.kwargs["grace"] == timedelta(0)
+
+    @pytest.mark.asyncio
     async def test_enumeration_failure_is_a_no_op(self):
         store = MagicMock()
         store.list_purge_candidates = AsyncMock(side_effect=RuntimeError("db down"))

@@ -77,8 +77,10 @@ async def purge_kb_tick(
     so a note edited (or un-archived and re-indexed) after enumeration is
     refused, not purged. Returns counts; never raises.
     """
-    grace = grace or purge_grace()
-    limit = limit or purge_max_per_tick()
+    # Explicit None checks: timedelta(0) is falsy, and a caller passing it
+    # means "no grace" (tests, operator tooling), not "use the default".
+    grace = purge_grace() if grace is None else grace
+    limit = purge_max_per_tick() if limit is None else max(1, int(limit))
     counts = {"candidates": 0, "purged": 0, "absent": 0, "refused": 0, "failed": 0}
     try:
         candidates = await store.list_purge_candidates(
