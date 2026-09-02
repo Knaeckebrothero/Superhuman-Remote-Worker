@@ -18,7 +18,7 @@ import {
     ViewChild,
     ViewChildren,
 } from '@angular/core';
-import {NgTemplateOutlet, TitleCasePipe} from '@angular/common';
+import {DatePipe, NgTemplateOutlet, TitleCasePipe} from '@angular/common';
 import {HttpClient} from '@angular/common/http';
 import {FormsModule} from '@angular/forms';
 import {Router, RouterLink} from '@angular/router';
@@ -36,6 +36,7 @@ import {
     EventGroup,
     firstSentence,
     firstTextOf,
+    foldWakeCycles,
     FoldableEvent,
     FoldedSummary,
     groupEvents,
@@ -51,6 +52,7 @@ import {
     ToolCallEvent,
     Turn,
     TurnEvent,
+    TurnView,
     UserTurn,
 } from '../../core/models/turn.model';
 import {ToolCardView} from '../../core/models/tool-card.model';
@@ -848,6 +850,7 @@ export function clearDraft(threadId: string | null): void {
         FormsModule,
         NgTemplateOutlet,
         TitleCasePipe,
+        DatePipe,
         RouterLink,
         MarkdownComponent,
         ExternalImageDirective,
@@ -1177,6 +1180,17 @@ export function clearDraft(threadId: string | null): void {
               <option value="large">{{ 'chat.settings.textLarge' | transloco }}</option>
             </app-select>
           </div>
+          @if (chat.isOfficerThread()) {
+            <div class="settings-row">
+              <label class="settings-label">{{ 'chat.settings.officerLens' | transloco }}</label>
+              <app-select size="sm" [fullWidth]="false"
+                          [value]="chatPrefs.officerLensFolded() ? 'folded' : 'all'"
+                          (changed)="onOfficerLensChange($event)">
+                <option value="folded">{{ 'chat.settings.officerLensFolded' | transloco }}</option>
+                <option value="all">{{ 'chat.settings.officerLensAll' | transloco }}</option>
+              </app-select>
+            </div>
+          }
         </div>
       }
 
@@ -1330,7 +1344,23 @@ export function clearDraft(threadId: string | null): void {
              stays at the pane edge. .jump-latest is kept OUTSIDE this wrapper so
              it floats over the scroll container (sticky + align-self:center). -->
         <div class="messages-inner" #messagesInner>
-        @for (turn of chat.visibleTurns(); track turn.id; let isLast = $last) {
+        @for (view of turnViews(); track view.id; let isLast = $last) {
+          @if (view.kind === 'wake_cycle') {
+            <details class="message message-system wake-cycle" data-testid="wake-cycle">
+              <summary class="system-message wake-cycle-summary">
+                <app-icon size="sm" class="system-icon">bedtime</app-icon>
+                {{ 'chat.settings.wakeLine' | transloco:{
+                    time: (view.sitrep.timestamp | date:'HH:mm'),
+                    minutes: view.minutes ?? '?',
+                    reason: view.reason || ('chat.settings.wakeNoReason' | transloco)
+                  } }}
+              </summary>
+              <div class="wake-cycle-body">
+                <pre class="wake-cycle-sitrep">{{ view.sitrep.content }}</pre>
+              </div>
+            </details>
+          } @else {
+          @let turn = view.turn;
           @switch (turn.kind) {
             @case ('system') {
               <div class="message message-system">
@@ -1661,6 +1691,7 @@ export function clearDraft(threadId: string | null): void {
               <span class="divider-text">{{ 'chat.system.sessionResumed' | transloco }}</span>
               <span class="divider-line"></span>
             </div>
+          }
           }
         } @empty {
           @if (!chat.isStreaming()) {
@@ -4086,6 +4117,19 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     /** Per-type event counts for the chevron badge. */
     turnEventCounts(turn: AssistantTurn) {
         return countEvents(turn);
+    }
+
+    /** Officer lens (§3.2): fold quiet wake cycles on officer threads unless the user asked for everything. */
+    readonly turnViews = computed<TurnView[]>(() => {
+        const turns = this.chat.visibleTurns();
+        if (this.chat.isOfficerThread() && this.chatPrefs.officerLensFolded()) {
+            return foldWakeCycles(turns);
+        }
+        return turns.map((turn) => ({kind: 'turn' as const, id: turn.id, turn}));
+    });
+
+    onOfficerLensChange(value: string | null): void {
+        this.chatPrefs.setOfficerLensFolded(value === 'folded');
     }
 
     /** Coalesce a turn's events into render groups (live edge pinned, rest folded). */

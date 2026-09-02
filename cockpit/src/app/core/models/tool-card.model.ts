@@ -110,6 +110,9 @@ export interface CanvasPresentationSummary {
  */
 export const NOTIFY_USER_TOOL = 'notify_user';
 
+/** The officer's park verb (src/tools/core/officer.py); args `{minutes, reason}`. */
+export const SLEEP_TOOL = 'sleep';
+
 /**
  * The fleet tool whose calls are a durable, *actionable* handle rather than a
  * record of finished work. Shared by the card descriptor, the id parser and the

@@ -994,6 +994,32 @@
         margin: 0 auto;
       }
 
+      .wake-cycle {
+        width: fit-content;
+        max-width: 100%;
+        margin: 0 auto;
+      }
+      .wake-cycle-summary {
+        cursor: pointer;
+        list-style: none;
+      }
+      .wake-cycle-summary::-webkit-details-marker {
+        display: none;
+      }
+      .wake-cycle[open] .wake-cycle-summary {
+        border-bottom-left-radius: 0;
+        border-bottom-right-radius: 0;
+      }
+      .wake-cycle-sitrep {
+        margin: 0;
+        padding: 8px 12px;
+        white-space: pre-wrap;
+        font-size: 11px;
+        color: var(--text-muted);
+        background: var(--surface-0);
+        border-radius: 0 0 var(--radius-control) var(--radius-control);
+      }
+
 
       .resume-icon {
         margin-right: 4px;

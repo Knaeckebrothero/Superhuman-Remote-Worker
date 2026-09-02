@@ -1730,7 +1730,12 @@
       "textSize": "Text size",
       "textSmall": "Small",
       "textMedium": "Medium",
-      "textLarge": "Large"
+      "textLarge": "Large",
+      "officerLens": "Officer log",
+      "officerLensFolded": "Fold quiet wakes",
+      "officerLensAll": "Show everything",
+      "wakeLine": "wake · {{time}} · slept ~{{minutes}} min — {{reason}}",
+      "wakeNoReason": "no reason given"
     },
     "tasks": {
       "header": "Tasks {{done}}/{{total}}",

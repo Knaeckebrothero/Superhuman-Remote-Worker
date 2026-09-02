@@ -1,5 +1,5 @@
 import {ChatAttachment, ToolCallInfo} from '../services/persistent-chat.service';
-import {JOB_TOOL, NOTIFY_USER_TOOL} from './tool-card.model';
+import {JOB_TOOL, NOTIFY_USER_TOOL, SLEEP_TOOL} from './tool-card.model';
 
 /**
  * Turn-based conversation model for the persistent chat UI.
@@ -563,4 +563,79 @@ export function summarizeFolded(events: FoldableEvent[]): FoldedSummary {
         .map(([category, count]) => ({category, count}))
         .sort((a, b) => b.count - a.count);
     return {parts, failed};
+}
+
+// =============================================================================
+// Officer log lens (officer_visibility_streamline.md §3.2)
+// =============================================================================
+
+/** Every officer wake opens with a server-computed `[SITREP]` system turn. */
+export const SITREP_PREFIX = '[SITREP]';
+
+export function isSitrepTurn(t: Turn): t is SystemTurn {
+    return t.kind === 'system' && t.content.trimStart().startsWith(SITREP_PREFIX);
+}
+
+/**
+ * A quiet wake: the officer thought, maybe said a line, and filed his sleep.
+ * Any other tool call — a dispatch, a steer, a `notify_user`, a worker
+ * reply — makes the wake worth reading, so it stays expanded.
+ */
+export function isQuietWakeTurn(t: Turn): t is AssistantTurn {
+    if (t.kind !== 'assistant' || t.status === 'streaming') return false;
+    let slept = false;
+    for (const e of t.events) {
+        if (e.kind !== 'tool_call') continue;
+        if (e.tool !== SLEEP_TOOL) return false;
+        slept = true;
+    }
+    return slept;
+}
+
+/** The last sleep call's request, for the folded line. */
+export function sleepRequest(turn: AssistantTurn): {minutes: number | null; reason: string} {
+    let call: ToolCallEvent | undefined;
+    for (const e of turn.events) {
+        if (e.kind === 'tool_call' && e.tool === SLEEP_TOOL) call = e;
+    }
+    const args = call?.args ?? {};
+    const raw = args['minutes'];
+    const minutes = typeof raw === 'number' ? raw : raw == null ? NaN : Number(raw);
+    return {
+        minutes: Number.isFinite(minutes) ? minutes : null,
+        reason: typeof args['reason'] === 'string' ? args['reason'] : '',
+    };
+}
+
+/** A sitrep and the quiet wake it produced, folded into one line. */
+export interface WakeCycle {
+    kind: 'wake_cycle';
+    /** The sitrep turn's id — stable across re-folds. */
+    id: string;
+    sitrep: SystemTurn;
+    wake: AssistantTurn;
+    minutes: number | null;
+    reason: string;
+}
+
+export type TurnView = {kind: 'turn'; id: string; turn: Turn} | WakeCycle;
+
+/**
+ * Fold each `[SITREP]` + quiet-wake pair into a `WakeCycle`; every other turn
+ * passes through untouched and in order. Pure and cheap — safe in a computed.
+ */
+export function foldWakeCycles(turns: readonly Turn[]): TurnView[] {
+    const out: TurnView[] = [];
+    for (let i = 0; i < turns.length; i++) {
+        const t = turns[i];
+        const next = turns[i + 1];
+        if (isSitrepTurn(t) && next !== undefined && isQuietWakeTurn(next)) {
+            const {minutes, reason} = sleepRequest(next);
+            out.push({kind: 'wake_cycle', id: t.id, sitrep: t, wake: next, minutes, reason});
+            i++;
+            continue;
+        }
+        out.push({kind: 'turn', id: t.id, turn: t});
+    }
+    return out;
 }

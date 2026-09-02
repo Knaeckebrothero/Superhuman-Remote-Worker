@@ -890,6 +890,8 @@ export class PersistentChatService {
   // --- Session metadata (loaded from REST on connect) ---
   readonly sessionTitle = signal<string | null>(null);
   readonly modelName = signal<string | null>(null);
+  /** True on a commissioned background officer's own thread (metadata.config_override.officer.enabled). */
+  readonly isOfficerThread = signal<boolean>(false);
   readonly temperature = signal<number>(0);
   readonly turnCount = signal<number>(0);
   readonly ncSessionFolder = signal<string | null>(null);
@@ -1814,6 +1816,7 @@ export class PersistentChatService {
       if (!opts.carryOutbox) this.isVmSession.set(false);
       this.sessionTitle.set(null);
       this.modelName.set(null);
+      this.isOfficerThread.set(false);
       this.temperature.set(0);
       this.turnCount.set(0);
       // Token telemetry is per-thread. `currentUsage` would refuse to render
@@ -2242,6 +2245,8 @@ export class PersistentChatService {
       // not an LLM model.  Leave the display unknown until the resolved
       // session-state snapshot supplies the effective model.
       this.modelName.set(model || null);
+      const officer = thread.metadata?.config_override?.officer;
+      this.isOfficerThread.set(officer?.enabled === true || officer?.enabled === 'true');
       const temperature = thread.metadata?.config_override?.llm?.temperature;
       if (temperature != null) {
         this.temperature.set(temperature);
@@ -3822,6 +3827,7 @@ export class PersistentChatService {
     this.continueAfterUpgrade.set(false);
     this.sessionTitle.set(null);
     this.modelName.set(null);
+    this.isOfficerThread.set(false);
     this.temperature.set(0);
     this.turnCount.set(0);
     this.ncSessionFolder.set(null);

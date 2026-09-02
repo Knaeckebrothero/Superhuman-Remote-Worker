@@ -6,17 +6,24 @@ import {
     EventGroup,
     firstSentence,
     firstTextOf,
+    foldWakeCycles,
     FoldableEvent,
     groupEvents,
+    isQuietWakeTurn,
+    isSitrepTurn,
     lastTextOf,
     notifyToolCalls,
+    sleepRequest,
     summarizeFolded,
     TextEvent,
     ThoughtEvent,
     ToolCallEvent,
     ToolCallStatus,
     trailingText,
+    Turn,
+    TurnEvent,
 } from './turn.model';
+import {SLEEP_TOOL} from './tool-card.model';
 
 function mkTurn(events: AssistantTurn['events']): AssistantTurn {
     return {kind: 'assistant', id: 't1', events, status: 'done', startedAt: 0};
@@ -417,5 +424,81 @@ describe('summarizeFolded', () => {
             tool('a', 'completed', 'shell'), tool('b', 'completed', 'research'), tht('c'),
         ];
         expect(sum(evts).parts.reduce((n, p) => n + p.count, 0)).toBe(evts.length);
+    });
+});
+
+describe('officer log lens', () => {
+    const sys = (id: string, content: string): Turn =>
+        ({kind: 'system', id, content, timestamp: 1000} as unknown as Turn);
+    const asst = (id: string, events: TurnEvent[], status = 'done'): Turn =>
+        ({kind: 'assistant', id, events, status, timestamp: 2000} as unknown as Turn);
+    const call = (id: string, tool: string, args: Record<string, unknown> = {}): TurnEvent =>
+        ({kind: 'tool_call', id, tool, args, status: 'completed', startedAt: 0} as unknown as TurnEvent);
+    const thought = (id: string): TurnEvent =>
+        ({kind: 'thought', id, content: 'hm', status: 'done'} as unknown as TurnEvent);
+    const text = (id: string): TurnEvent =>
+        ({kind: 'text', id, content: 'Nothing changed.', status: 'done'} as unknown as TurnEvent);
+    const sleep = (id: string, minutes = 30, reason = 'all jobs terminal') =>
+        call(id, SLEEP_TOOL, {minutes, reason});
+    const shape = (views: ReturnType<typeof foldWakeCycles>) =>
+        views.map((v) => (v.kind === 'wake_cycle' ? `cycle(${v.sitrep.id}+${v.wake.id})` : `turn(${v.id})`));
+
+    it('recognises a sitrep by its prefix only', () => {
+        expect(isSitrepTurn(sys('s', '[SITREP] 2026-08-19 06:11 UTC — delta'))).toBe(true);
+        expect(isSitrepTurn(sys('s', '  [SITREP] leading space'))).toBe(true);
+        expect(isSitrepTurn(sys('s', 'Session resumed'))).toBe(false);
+        expect(isSitrepTurn(asst('a', [sleep('c')]))).toBe(false);
+    });
+
+    it('a quiet wake is thoughts, text and a sleep — nothing else', () => {
+        expect(isQuietWakeTurn(asst('a', [thought('t'), text('x'), sleep('c')]))).toBe(true);
+        expect(isQuietWakeTurn(asst('a', [thought('t')]))).toBe(false); // never slept
+        expect(isQuietWakeTurn(asst('a', [call('j', 'create_job'), sleep('c')]))).toBe(false);
+        expect(isQuietWakeTurn(asst('a', [call('n', 'notify_user'), sleep('c')]))).toBe(false);
+        expect(isQuietWakeTurn(asst('a', [sleep('c')], 'streaming'))).toBe(false);
+    });
+
+    it('reads the sleep request off the last sleep call', () => {
+        expect(sleepRequest(asst('a', [sleep('c', 45, 'waiting on migration')]) as never))
+            .toEqual({minutes: 45, reason: 'waiting on migration'});
+        expect(sleepRequest(asst('a', [call('c', SLEEP_TOOL, {minutes: '10'})]) as never))
+            .toEqual({minutes: 10, reason: ''});
+        expect(sleepRequest(asst('a', [call('c', SLEEP_TOOL, {})]) as never))
+            .toEqual({minutes: null, reason: ''});
+    });
+
+    it('folds sitrep + quiet wake into one cycle, leaves everything else alone', () => {
+        const turns = [
+            sys('s1', '[SITREP] one'),
+            asst('a1', [thought('t1'), sleep('c1')]),
+            sys('s2', '[SITREP] two'),
+            asst('a2', [call('j', 'create_job'), sleep('c2')]),
+            sys('r', 'Session resumed'),
+            sys('s3', '[SITREP] three'),
+            asst('a3', [sleep('c3')]),
+        ];
+        expect(shape(foldWakeCycles(turns))).toEqual([
+            'cycle(s1+a1)',
+            'turn(s2)',
+            'turn(a2)',
+            'turn(r)',
+            'cycle(s3+a3)',
+        ]);
+    });
+
+    it('a sitrep with no completed wake behind it stays a plain turn', () => {
+        expect(shape(foldWakeCycles([sys('s1', '[SITREP] one')]))).toEqual(['turn(s1)']);
+        expect(shape(foldWakeCycles([sys('s1', '[SITREP] one'), asst('a1', [sleep('c')], 'streaming')])))
+            .toEqual(['turn(s1)', 'turn(a1)']);
+    });
+
+    it('carries the sleep request on the cycle', () => {
+        const [cycle] = foldWakeCycles([sys('s', '[SITREP] x'), asst('a', [sleep('c', 20, 'quiet')])]);
+        expect(cycle.kind).toBe('wake_cycle');
+        if (cycle.kind === 'wake_cycle') {
+            expect(cycle.minutes).toBe(20);
+            expect(cycle.reason).toBe('quiet');
+            expect(cycle.id).toBe('s');
+        }
     });
 });
