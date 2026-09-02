@@ -35,7 +35,6 @@ import {
   type OfficerEditorDraft,
   type SlotDraft,
 } from './project-officer.component';
-import { buildConferenceThreadCreateBody } from '../../core/officer/conference';
 import { ApiService } from '../../core/services/api.service';
 import { NotificationService } from '../../core/services/notification.service';
 import { ModelService } from '../../core/services/model.service';
