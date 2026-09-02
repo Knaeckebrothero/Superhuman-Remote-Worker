@@ -161,6 +161,7 @@ async def test_k8s_replacement_is_refused_after_capability_probe():
             "attest_pinned_job_recipient",
             attest,
         ),
+        patch.object(main.asyncio, "sleep", AsyncMock()) as sleep,
     ):
         target = await main._prepare_pinned_job_mutation_target(
             agent_id=AGENT_ID,
@@ -169,11 +170,76 @@ async def test_k8s_replacement_is_refused_after_capability_probe():
         )
 
     assert target is None
-    attest.assert_awaited_once_with(
+    assert attest.await_count == main._FRESH_PINNED_RECIPIENT_ATTESTATION_ATTEMPTS
+    attest.assert_awaited_with(
         "pod-a",
         expected_pod_uid=POD_UID,
         expected_pod_ip="10.0.0.9",
     )
+    assert sleep.await_count == main._FRESH_PINNED_RECIPIENT_ATTESTATION_ATTEMPTS - 1
+
+
+@pytest.mark.asyncio
+async def test_fresh_k8s_recipient_tolerates_readiness_publication_race():
+    _ReadyClient.urls = []
+    attest = AsyncMock(side_effect=[False, False, True])
+    with (
+        patch.object(
+            main.postgres_db,
+            "get_agent",
+            AsyncMock(return_value=_agent(pod_uid=POD_UID)),
+        ),
+        patch.object(main.httpx, "AsyncClient", _ReadyClient),
+        patch.object(
+            main.agent_provisioner,
+            "attest_pinned_job_recipient",
+            attest,
+        ),
+        patch.object(main.asyncio, "sleep", AsyncMock()) as sleep,
+    ):
+        target = await main._prepare_pinned_job_mutation_target(
+            agent_id=AGENT_ID,
+            job_id=JOB_ID,
+            require_idle=True,
+        )
+
+    assert target is not None
+    assert attest.await_count == 3
+    assert sleep.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_working_k8s_recipient_attestation_remains_fail_fast():
+    attest = AsyncMock(return_value=False)
+    with (
+        patch.object(
+            main.postgres_db,
+            "get_agent",
+            AsyncMock(
+                return_value=_agent(
+                    pod_uid=POD_UID,
+                    status="working",
+                    current_job_id=JOB_ID,
+                )
+            ),
+        ),
+        patch.object(main.httpx, "AsyncClient", _ReadyClient),
+        patch.object(
+            main.agent_provisioner,
+            "attest_pinned_job_recipient",
+            attest,
+        ),
+        patch.object(main.asyncio, "sleep", AsyncMock()) as sleep,
+    ):
+        target = await main._prepare_pinned_job_mutation_target(
+            agent_id=AGENT_ID,
+            job_id=JOB_ID,
+            require_idle=False,
+        )
+
+    assert target is None
+    attest.assert_awaited_once()
+    sleep.assert_not_awaited()
 
 
 @pytest.mark.asyncio

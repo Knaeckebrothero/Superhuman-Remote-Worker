@@ -5602,6 +5602,10 @@ class _PinnedJobMutationTarget(NamedTuple):
     recipient: PinnedJobRecipient
 
 
+_FRESH_PINNED_RECIPIENT_ATTESTATION_ATTEMPTS = 8
+_FRESH_PINNED_RECIPIENT_ATTESTATION_DELAY_S = 0.25
+
+
 async def _prepare_pinned_job_mutation_target(
     *,
     agent_id: str,
@@ -5619,8 +5623,8 @@ async def _prepare_pinned_job_mutation_target(
 
     status = str(fresh.get("status") or "")
     current_job_id = str(fresh.get("current_job_id") or "") or None
+    is_fresh_accept = status == "ready" and current_job_id is None
     if require_idle:
-        is_fresh_accept = status == "ready" and current_job_id is None
         is_exact_retry = status == "working" and current_job_id == job_id
         if not (is_fresh_accept or is_exact_retry):
             logger.warning(
@@ -5687,17 +5691,45 @@ async def _prepare_pinned_job_mutation_target(
         )
         return None
 
-    if pod_uid is not None and not await agent_provisioner.attest_pinned_job_recipient(
-        str(fresh.get("hostname") or ""),
-        expected_pod_uid=pod_uid,
-        expected_pod_ip=str(fresh["pod_ip"]),
-    ):
-        logger.warning(
-            "Pinned recipient Pod attestation failed for job %s (agent=%s)",
-            job_id,
-            agent_id,
+    if pod_uid is not None:
+        # A newly started agent can answer its own /ready probe one API-cache
+        # beat before Kubernetes publishes containerStatuses[*].ready=true.
+        # A single false result after the dispatcher has claimed the job then
+        # strands that safe pre-delivery claim until lease recovery. Give only
+        # the fresh-idle path a short startup grace while re-attesting the same
+        # immutable Pod UID and IP every time. Existing working recipients and
+        # all control mutations remain fail-fast.
+        attempts = (
+            _FRESH_PINNED_RECIPIENT_ATTESTATION_ATTEMPTS
+            if require_idle and is_fresh_accept
+            else 1
         )
-        return None
+        attested = False
+        for attempt in range(attempts):
+            attested = await agent_provisioner.attest_pinned_job_recipient(
+                str(fresh.get("hostname") or ""),
+                expected_pod_uid=pod_uid,
+                expected_pod_ip=str(fresh["pod_ip"]),
+            )
+            if attested:
+                if attempt:
+                    logger.info(
+                        "Pinned recipient Pod became attestable for job %s "
+                        "after %s retries (agent=%s)",
+                        job_id,
+                        attempt,
+                        agent_id,
+                    )
+                break
+            if attempt + 1 < attempts:
+                await asyncio.sleep(_FRESH_PINNED_RECIPIENT_ATTESTATION_DELAY_S)
+        if not attested:
+            logger.warning(
+                "Pinned recipient Pod attestation failed for job %s (agent=%s)",
+                job_id,
+                agent_id,
+            )
+            return None
 
     return _PinnedJobMutationTarget(
         agent=fresh,
