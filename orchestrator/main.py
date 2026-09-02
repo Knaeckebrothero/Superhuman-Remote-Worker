@@ -7638,6 +7638,10 @@ async def _assemble_session_attach_payload(
         timeout_s=0,
         allow_schedule=False,
     ):
+        logger.info(
+            "Session attach: thread %s refused — protected cloud runtime not ready",
+            thread_id,
+        )
         return None
 
     # Datasource selections are mutable authorization grants, not frozen
@@ -7751,6 +7755,13 @@ async def _assemble_session_attach_payload(
     if protected_marker == "on":
         prepared_runtime_authority = thread_runtime_authority(_thread)
         if prepared_runtime_authority is None:
+            logger.info(
+                "Session attach: thread %s refused — no runtime authority at "
+                "protected-selection prepare (status=%r generation=%r)",
+                thread_id,
+                (_thread or {}).get("status"),
+                (_thread or {}).get("runtime_generation"),
+            )
             return None
         ro_row, mount_rows = await asyncio.gather(
             postgres_db.get_ro_mount_by_thread(thread_id),
@@ -7771,8 +7782,18 @@ async def _assemble_session_attach_payload(
                 runtime_generation=prepared_runtime_authority.generation,
             )
         ):
+            logger.info(
+                "Session attach: thread %s refused — ro-mount does not match the "
+                "protected selection",
+                thread_id,
+            )
             return None
         if _build_protected_cloud_mount(ro_row, thread_id=thread_id) is None:
+            logger.info(
+                "Session attach: thread %s refused — protected cloud mount could "
+                "not be built",
+                thread_id,
+            )
             return None
 
     # Config/datasource/repository assembly crosses several awaits. End may
@@ -7791,19 +7812,51 @@ async def _assemble_session_attach_payload(
     final_meta = thread_metadata_object(final_thread)
     final_marker = protected_cloud_marker_state(final_meta)
     if final_marker == "malformed":
+        logger.info(
+            "Session attach: thread %s refused — protected-cloud marker malformed",
+            thread_id,
+        )
         return None
     if final_marker != protected_marker:
+        logger.info(
+            "Session attach: thread %s refused — protected-cloud marker changed "
+            "mid-assembly (%r -> %r)",
+            thread_id,
+            protected_marker,
+            final_marker,
+        )
         return None
     if final_marker == "on" and prepared_protected_selection is None:
+        logger.info(
+            "Session attach: thread %s refused — protected marker on but no "
+            "prepared selection",
+            thread_id,
+        )
         return None
     final_runtime_authority = thread_runtime_authority(final_thread)
     if final_runtime_authority is None and (
         final_marker != "off" or _require_pinned_status_identity()
     ):
+        logger.info(
+            "Session attach: thread %s refused — no final runtime authority "
+            "(status=%r generation=%r marker=%r require_pinned=%s)",
+            thread_id,
+            (final_thread or {}).get("status"),
+            (final_thread or {}).get("runtime_generation"),
+            final_marker,
+            _require_pinned_status_identity(),
+        )
         return None
     final_workspace = final_meta.get("workspace_container") or {}
     final_binding = final_meta.get("_workspace_binding") or {}
     if not isinstance(final_workspace, dict) or not isinstance(final_binding, dict):
+        logger.info(
+            "Session attach: thread %s refused — workspace_container/_workspace_binding "
+            "are not objects (types %s/%s)",
+            thread_id,
+            type(final_workspace).__name__,
+            type(final_binding).__name__,
+        )
         return None
     final_workspace_generation = final_binding.get("generation")
     final_workspace_runtime = (
@@ -7822,9 +7875,30 @@ async def _assemble_session_attach_payload(
         # while sandbox/VM workspaces carry an exact generation+incarnation
         # pair.  Never let physical residue hide behind a lite declaration.
         if final_workspace_runtime:
+            logger.info(
+                "Session attach: thread %s refused — lite workspace (binding "
+                "kind=virtual backend=%r) carries a physical "
+                "runtime_incarnation=%r",
+                thread_id,
+                final_workspace_backend,
+                final_workspace_runtime,
+            )
             return None
         final_workspace_generation = None
     elif bool(final_workspace_generation) != bool(final_workspace_runtime):
+        logger.info(
+            "Session attach: thread %s refused — workspace identity pair "
+            "incomplete (generation=%r from _workspace_binding, "
+            "runtime_incarnation=%r from workspace_container, binding kind=%r "
+            "backend=%r). NOTE: the two halves are read from DIFFERENT metadata "
+            "objects — see the vault note on the stateless attach livelock "
+            "before changing this gate.",
+            thread_id,
+            final_workspace_generation,
+            final_workspace_runtime,
+            final_binding.get("kind"),
+            final_workspace_backend,
+        )
         return None
     try:
         final_workspace_generation = (
@@ -7836,6 +7910,13 @@ async def _assemble_session_attach_payload(
             str(UUID(str(final_workspace_runtime))) if final_workspace_runtime else None
         )
     except (TypeError, ValueError):
+        logger.info(
+            "Session attach: thread %s refused — workspace generation/incarnation "
+            "not valid UUIDs (generation=%r runtime_incarnation=%r)",
+            thread_id,
+            final_workspace_generation,
+            final_workspace_runtime,
+        )
         return None
 
     return {
