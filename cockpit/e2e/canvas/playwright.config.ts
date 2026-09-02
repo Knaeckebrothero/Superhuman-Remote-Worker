@@ -4,7 +4,11 @@ const baseURL = process.env['CANVAS_E2E_BASE_URL'] || 'http://127.0.0.1:4173';
 
 export default defineConfig({
   testDir: '.',
-  testMatch: ['canvas-conformance.spec.ts', 'shared-browser-conformance.spec.ts'],
+  testMatch: [
+    'canvas-conformance.spec.ts',
+    'file-html-conformance.spec.ts',
+    'shared-browser-conformance.spec.ts',
+  ],
   timeout: 30_000,
   expect: {timeout: 8_000},
   fullyParallel: false,
