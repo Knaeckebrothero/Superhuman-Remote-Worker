@@ -2559,8 +2559,13 @@ class TestEnsureGolden:
         assert kwargs["plural"] == "datavolumes"
         # golden manifest: explicit spec.pvc + Filesystem + bind-immediate + keep-handle
         body = kwargs["body"]
-        assert body["spec"]["pvc"]["volumeMode"] == "Filesystem"
-        assert body["spec"]["pvc"]["accessModes"] == ["ReadWriteOnce"]
+        # spec.storage, never spec.pvc: only the storage form is inflated by
+        # CDI's filesystemOverhead, and a literal 20Gi filesystem cannot hold a
+        # 20 GiB image on a real CSI (DataVolume too small to contain image).
+        assert "pvc" not in body["spec"]
+        assert body["spec"]["storage"]["volumeMode"] == "Filesystem"
+        assert body["spec"]["storage"]["accessModes"] == ["ReadWriteOnce"]
+        assert body["spec"]["storage"]["resources"]["requests"]["storage"]
         ann = body["metadata"]["annotations"]
         assert ann["cdi.kubevirt.io/storage.bind.immediate.requested"] == "true"
         assert ann["cdi.kubevirt.io/storage.deleteAfterCompletion"] == "false"

@@ -1922,9 +1922,18 @@ class VMController:
     def _golden_dv_manifest(self, name: str, image: str) -> dict:
         """Build a standalone golden DataVolume that imports ``image`` once.
 
-        Uses the explicit ``spec.pvc`` form with accessModes + volumeMode set —
-        local-path has no StorageProfile, so the size-only ``spec.storage``
-        inference form fails validation. ``bind.immediate`` forces populate on
+        Uses the ``spec.storage`` form WITH accessModes + volumeMode named, the
+        same shape as the rootdisk template. The old ``spec.pvc`` form requested
+        the literal size, which bypasses CDI's ``filesystemOverhead`` inflation:
+        on any CSI that honours the requested size, a 20Gi *filesystem* holds
+        ~19.5 GiB, so a 20 GiB virtual image failed with "DataVolume too small
+        to contain image" and the golden never succeeded (single_cluster_vm_
+        deployment.md §11.16). It only ever worked on local-path, whose importer
+        writes into a host directory and reports the host's free space.
+        ``spec.storage`` inflates the request by the profile's overhead (6 %
+        here), exactly as §4.7 assumes; naming the modes explicitly keeps it
+        valid on local-path's empty StorageProfile, where only the *size-only*
+        inference form is rejected. ``bind.immediate`` forces populate on
         WaitForFirstConsumer storage (the golden is never VM-mounted, so nothing
         else would trigger it); ``deleteAfterCompletion:false`` keeps the DV
         object as our reuse handle after CDI would otherwise GC it post-import.
@@ -1947,7 +1956,7 @@ class VMController:
             },
             "spec": {
                 "source": {"registry": {"url": f"docker://{image}"}},
-                "pvc": {
+                "storage": {
                     "accessModes": ["ReadWriteOnce"],
                     "volumeMode": "Filesystem",
                     "storageClassName": VM_STORAGE_CLASS,
