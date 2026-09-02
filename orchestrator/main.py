@@ -9484,8 +9484,11 @@ async def _pinned_k8s_job_workspace_authority_is_current(
         latest = await postgres_db.get_job(str(durable_job["id"]))
         if latest is None:
             return False
-        _, confirmed = await _attest_pinned_k8s_job_workspace(latest)
-        return confirmed == authority
+        expected_owner = _stateless_worker_workspace_owner(latest)
+        if expected_owner != authority.owner:
+            return False
+        confirmed = await container_provisioner.attest_workspace_runtime(expected_owner)
+        return confirmed == authority.attestation
     except Exception:
         return False
 

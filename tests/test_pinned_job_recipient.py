@@ -397,3 +397,45 @@ async def test_fresh_start_delivers_exact_k8s_authority_and_refuses_final_drift(
     assert current.await_count == 2
     target.assert_not_awaited()
     assert _MutationClient.posts == []
+
+
+@pytest.mark.asyncio
+async def test_final_recheck_attests_inherited_parent_without_child_runtime_snapshot():
+    parent_id = "55555555-5555-4555-8555-555555555555"
+    child = {
+        "id": JOB_ID,
+        "parent_job_id": parent_id,
+        "context": {"inherits_parent_workspace": True},
+    }
+    attestation = main.WorkspaceRuntimeAttestation(
+        backing_id="k8s-pvc:default:66666666-6666-4666-8666-666666666666",
+        workspace_generation="66666666-6666-4666-8666-666666666666",
+        runtime_incarnation=POD_UID,
+        ssh_host_key_fingerprint="SHA256:" + "A" * 43,
+        host="workspace-parent.svc.cluster.local",
+        pod_ip="10.42.0.9",
+        port=30022,
+    )
+    authority = main._PinnedK8sJobWorkspaceAuthority(
+        main.WorkspaceOwner.job(parent_id),
+        attestation,
+    )
+
+    with (
+        patch.object(
+            main,
+            "_workspace_runtime_unchanged_before_delivery",
+            AsyncMock(return_value=True),
+        ),
+        patch.object(main.postgres_db, "get_job", AsyncMock(return_value=child)),
+        patch.object(
+            main.container_provisioner,
+            "attest_workspace_runtime",
+            AsyncMock(return_value=attestation),
+        ) as attest,
+    ):
+        assert await main._pinned_k8s_job_workspace_authority_is_current(
+            child, authority
+        )
+
+    attest.assert_awaited_once_with(main.WorkspaceOwner.job(parent_id))
