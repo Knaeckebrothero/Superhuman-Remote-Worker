@@ -356,8 +356,8 @@ class ToolContext:
         # `X-MCP-User-Id` alongside `X-Internal-Key`. The orchestrator's
         # `_get_user_from_mcp_headers` then resolves the user and the
         # call is accepted by `require_approved_user` / `require_job_access`
-        # instead of 401-ing. Unset in worker-job mode (no user identity
-        # to forward; lifecycle calls still rely on the internal key alone).
+        # instead of 401-ing. Worker jobs derive it below from their hidden,
+        # server-minted runtime actor rather than from model-visible config.
     )
     _job_metadata: Dict[str, Any] = field(
         default_factory=dict
@@ -429,6 +429,16 @@ class ToolContext:
 
     def __post_init__(self):
         """Validate context after initialization."""
+        # A worker's runtime actor is minted from the durable job row by the
+        # orchestrator and delivered on the internal start wire.  Treat that
+        # hidden actor as the authoritative identity source for application
+        # calls made by worker tools.  Without this bridge, lifecycle critics
+        # receive the job-inspection tools but omit X-MCP-User-Id, so every
+        # require_job_access endpoint truthfully returns 401.
+        actor_user_id = getattr(self.runtime_actor, "user_id", None)
+        if self.user_id is None and actor_user_id:
+            self.user_id = str(actor_user_id)
+
         # Workspace manager is required for workspace tools
         if (
             self.workspace_manager is not None

@@ -176,6 +176,14 @@ def _officer_actor(project_id: str) -> RuntimeActorContext:
     )
 
 
+def _worker_actor(user_id: str) -> RuntimeActorContext:
+    return RuntimeActorContext(
+        caller_kind="worker",
+        user_id=user_id,
+        access_credential="sra_abcdefghijklmnopqrstuvwxyzABCDEFG123456789",
+    )
+
+
 def test_caller_ctx_detects_officer_only_from_runtime_actor() -> None:
     """Parsed config may shape tools, but it can never mint actor authority."""
     context = ToolContext(
@@ -196,6 +204,32 @@ def test_caller_ctx_detects_officer_only_from_runtime_actor() -> None:
         config={"officer_session": True},
     )
     assert jobs_module._caller_ctx(config_only_context).kind == "session"
+
+
+@pytest.mark.asyncio
+async def test_worker_runtime_actor_forwards_job_owner_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lifecycle workers authenticate guarded job reads as the owning user."""
+    monkeypatch.setenv("MCP_INTERNAL_KEY", "internal-test-key")
+    recorder = Recorder()
+    client = _install_surface_client(monkeypatch, recorder)
+    context = ToolContext(
+        runtime_actor=_worker_actor("user-1"),
+        _job_metadata={"job_id": JOB_ID},
+    )
+
+    try:
+        await _tool(create_orchestrator_tools(context), "get_job").ainvoke(
+            {"job_id": JOB_ID}
+        )
+    finally:
+        await client.close()
+
+    request = recorder.requests[-1]
+    assert request.headers["X-MCP-User-Id"] == "user-1"
+    assert request.headers[RUNTIME_ACTOR_HEADER].startswith("sra_")
+    assert request.headers["X-Internal-Key"] == "internal-test-key"
 
 
 @pytest.mark.asyncio

@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from src.core.loader import InstructionFileEntry
+from src.shared.runtime_actor import RuntimeActorContext
 from src.tools.context import ToolContext
 
 
@@ -80,6 +81,22 @@ class TestToolContextConstruction:
         """None workspace_manager is fine (tools that don't need workspace)."""
         ctx = ToolContext(workspace_manager=None)
         assert ctx.workspace_manager is None
+
+    def test_worker_user_id_is_derived_from_trusted_runtime_actor(self):
+        """Worker application calls inherit the durable job owner's identity."""
+        actor = RuntimeActorContext(caller_kind="worker", user_id="user-123")
+
+        ctx = ToolContext(runtime_actor=actor)
+
+        assert ctx.user_id == "user-123"
+
+    def test_explicit_user_id_is_not_replaced_by_actor_without_user(self):
+        """A system worker actor must not erase an explicitly bound session user."""
+        actor = RuntimeActorContext(caller_kind="worker")
+
+        ctx = ToolContext(runtime_actor=actor, user_id="session-user")
+
+        assert ctx.user_id == "session-user"
 
     def test_accepts_all_optional_fields(self):
         """All optional fields should accept values."""
