@@ -17,6 +17,12 @@ from .errors import (
 
 _STATUS_RE = re.compile(r"(?:error|http|status(?: code)?)\s*[:=]?\s*(\d{3})", re.I)
 
+# langchain_tavily raises ``ToolException("No <search|extracted|crawl> results
+# found for ...")`` for a genuinely empty result set, and its clients ship with
+# ``handle_tool_error=True``, so ``invoke`` hands that notice back as a bare
+# string instead of a results dict. It is an answer, not a provider failure.
+_EMPTY_NOTICE_RE = re.compile(r"^\s*No \w+ results found for\b")
+
 
 def _status_code(value: Any) -> int | None:
     """Extract an HTTP-like status from vendor responses and exceptions."""
@@ -36,13 +42,21 @@ def _status_code(value: Any) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def classify_tavily_error(error: Any) -> ProviderError:
-    """Map a Tavily response/exception to the public provider taxonomy."""
+def classify_tavily_error(error: Any, *, redact: str | None = None) -> ProviderError:
+    """Map a Tavily response/exception to the public provider taxonomy.
+
+    ``error`` is whatever the client handed back in-band: the HTTP layer's
+    ``ValueError("Error <status>: <detail>")`` itself on current releases, its
+    text on older ones. ``redact`` is the API key, masked should the vendor
+    ever echo it into a message that reaches the model or the logs.
+    """
 
     if isinstance(error, ProviderError):
         return error
 
     message = str(error).strip() or "Tavily request failed"
+    if redact:
+        message = message.replace(redact, "***")
     status_code = _status_code(error)
     lowered = message.lower()
 
@@ -108,12 +122,20 @@ class TavilyAdapter:
             raise ProviderAuthError("Tavily API key is not configured")
         return self.api_key
 
-    @staticmethod
-    def _response(response: Any) -> Mapping[str, Any]:
+    def _classify(self, error: Any) -> ProviderError:
+        return classify_tavily_error(error, redact=self.api_key)
+
+    def _response(self, response: Any) -> Mapping[str, Any]:
+        if isinstance(response, str) and _EMPTY_NOTICE_RE.match(response):
+            return {}
         if not isinstance(response, Mapping):
             raise ProviderUnavailableError("Tavily returned an invalid response")
         if response.get("error"):
-            raise classify_tavily_error(response["error"])
+            # langchain_tavily never raises on an HTTP failure: its ``_run``
+            # catches the HTTP layer's error and returns it here, with no
+            # ``results`` key. Read it before anything looks at ``results``,
+            # or a quota/auth/rate-limit failure becomes "no results".
+            raise self._classify(response["error"])
         return response
 
     def search(self, query: str, max_results: int, **kw: Any) -> list[Result]:
@@ -166,7 +188,7 @@ class TavilyAdapter:
         except ProviderError:
             raise
         except Exception as exc:
-            raise classify_tavily_error(exc) from exc
+            raise self._classify(exc) from exc
 
     def extract(self, urls: list[str], **kw: Any) -> list[Page]:
         api_key = self._require("extract")
@@ -206,7 +228,7 @@ class TavilyAdapter:
         except ProviderError:
             raise
         except Exception as exc:
-            raise classify_tavily_error(exc) from exc
+            raise self._classify(exc) from exc
 
     def crawl(self, url: str, **kw: Any) -> list[Page]:
         api_key = self._require("crawl")
@@ -239,7 +261,7 @@ class TavilyAdapter:
         except ProviderError:
             raise
         except Exception as exc:
-            raise classify_tavily_error(exc) from exc
+            raise self._classify(exc) from exc
 
     def map(self, url: str, **kw: Any) -> list[str]:
         api_key = self._require("map")
@@ -270,4 +292,4 @@ class TavilyAdapter:
         except ProviderError:
             raise
         except Exception as exc:
-            raise classify_tavily_error(exc) from exc
+            raise self._classify(exc) from exc

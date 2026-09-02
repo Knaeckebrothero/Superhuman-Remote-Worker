@@ -1,5 +1,6 @@
 """Tests for web search tools (Tavily Search, Extract, Crawl, Map)."""
 
+import logging
 import sys
 from types import ModuleType
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -14,6 +15,7 @@ from src.tools.research.search import (
     ProviderRequestError,
     ProviderUnavailableError,
     Result,
+    TavilyAdapter,
 )
 from src.tools.research.web import (
     MAX_TOTAL_INLINE_CHARS,
@@ -21,6 +23,7 @@ from src.tools.research.web import (
     _crawl_website,
     _direct_web_search,
     _extract_webpage,
+    _map_website,
     _parse_comma_list,
     _truncate_content,
     create_web_tools,
@@ -642,6 +645,284 @@ class TestWebSearch:
         assert "INACCESSIBLE" in output
         assert "Full text saved:" not in output
         assert "Content excerpt (not saved):" not in output
+
+
+# ── provider errors vs. genuinely empty results ────────────────────
+
+
+# Verbatim Tavily HTTP error messages as langchain_tavily's HTTP layer renders
+# them (``ValueError(f"Error {status}: {detail['error']}")``).
+TAVILY_ERRORS = {
+    401: "Error 401: Unauthorized: missing or invalid API key.",
+    429: "Error 429: Too many requests. Please try again later.",
+    432: (
+        "Error 432: This request exceeds this API key's set usage limit. "
+        "You can increase its limit on the Tavily dashboard."
+    ),
+}
+
+# What the wrappers really return for a genuinely empty result set: ``_run``
+# raises ``ToolException`` and ``handle_tool_error=True`` renders it as a bare
+# string, so ``invoke`` hands back text rather than a dict.
+TAVILY_EMPTY_SEARCH = (
+    "No search results found for 'obscure'. Suggestions: Try a more detailed "
+    "search using 'advanced' search_depth. Try modifying your search parameters "
+    "with one of these approaches."
+)
+TAVILY_EMPTY_EXTRACT = (
+    "No extracted results found for '['https://a.com']'. Suggestions: Try a more "
+    "detailed extraction using 'advanced' extract_depth."
+)
+TAVILY_EMPTY_CRAWL = (
+    "No crawl results found for 'https://a.com'. Suggestions: . Try modifying "
+    "your crawl parameters with one of these approaches."
+)
+
+
+def _returning(mock_langchain_tavily, tool_class_name, response):
+    """Make ``langchain_tavily.<tool_class_name>().invoke`` return ``response``."""
+    instance = MagicMock()
+    instance.invoke.return_value = response
+    getattr(mock_langchain_tavily, tool_class_name).return_value = instance
+    return instance
+
+
+def _tavily_adapter():
+    """The real Tavily adapter over the mocked ``langchain_tavily`` module."""
+    return TavilyAdapter(api_key="tvly-secret-key")
+
+
+class TestWebSearchProviderErrors:
+    """A provider failure must never be rendered as an empty result set.
+
+    ``langchain_tavily`` does not raise on an HTTP failure: it returns
+    ``{"error": <exception>}`` (older releases: the message string) with no
+    ``results`` key. Only a real empty set may say "No web results found".
+    """
+
+    def test_error_dict_with_exception_is_surfaced(self, mock_langchain_tavily):
+        _returning(
+            mock_langchain_tavily,
+            "TavilySearch",
+            {"error": ValueError(TAVILY_ERRORS[432])},
+        )
+
+        result = _direct_web_search(
+            "Michelstadt Vereine", 5, None, adapter=_tavily_adapter()
+        )
+
+        assert result.startswith("Web search failed:")
+        assert "Error 432" in result
+        assert "usage limit" in result
+        assert "No web results" not in result
+
+    def test_error_dict_with_string_is_surfaced(self, mock_langchain_tavily):
+        _returning(mock_langchain_tavily, "TavilySearch", {"error": TAVILY_ERRORS[432]})
+
+        result = _direct_web_search("q", 5, None, adapter=_tavily_adapter())
+
+        assert result.startswith("Web search failed:")
+        assert "usage limit" in result
+        assert "No web results" not in result
+
+    @pytest.mark.parametrize("status", [401, 429, 432])
+    def test_http_error_statuses_are_surfaced(self, mock_langchain_tavily, status):
+        _returning(
+            mock_langchain_tavily,
+            "TavilySearch",
+            {"error": ValueError(TAVILY_ERRORS[status])},
+        )
+
+        result = _direct_web_search("q", 5, None, adapter=_tavily_adapter())
+
+        assert result.startswith("Web search failed:")
+        assert f"Error {status}" in result
+        assert "No web results" not in result
+
+    def test_error_logs_warning_with_provider_and_status_but_never_the_key(
+        self, mock_langchain_tavily, caplog
+    ):
+        _returning(
+            mock_langchain_tavily,
+            "TavilySearch",
+            {"error": ValueError("Error 401: rejected key tvly-secret-key")},
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = _direct_web_search("q", 5, None, adapter=_tavily_adapter())
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warnings, "expected a WARNING log for the provider failure"
+        logged = warnings[-1].getMessage()
+        assert "tavily" in logged.lower()
+        assert "401" in logged
+        assert "tvly-secret-key" not in logged
+        assert result.startswith("Web search failed:")
+        assert "tvly-secret-key" not in result
+
+    def test_error_skips_source_registration(
+        self, mock_tool_context, mock_langchain_tavily
+    ):
+        _returning(
+            mock_langchain_tavily,
+            "TavilySearch",
+            {"error": ValueError(TAVILY_ERRORS[429])},
+        )
+
+        tools = create_web_tools(mock_tool_context)
+        ws = next(t for t in tools if t.name == "web_search")
+        result = ws.invoke({"query": "q"})
+
+        assert result.startswith("Web search failed:")
+        mock_tool_context.get_or_register_web_source.assert_not_called()
+
+    def test_empty_results_list_is_reported_as_no_results(self, mock_langchain_tavily):
+        _returning(mock_langchain_tavily, "TavilySearch", {"results": []})
+
+        result = _direct_web_search("obscure", 5, None, adapter=_tavily_adapter())
+
+        assert result == "No web results found for: obscure"
+
+    def test_library_empty_notice_string_is_reported_as_no_results(
+        self, mock_langchain_tavily
+    ):
+        _returning(mock_langchain_tavily, "TavilySearch", TAVILY_EMPTY_SEARCH)
+
+        result = _direct_web_search("obscure", 5, None, adapter=_tavily_adapter())
+
+        assert result == "No web results found for: obscure"
+
+    def test_library_empty_notice_does_not_fail_over(self, mock_langchain_tavily):
+        # An empty set is an answer; it must not be mistaken for an outage and
+        # burn a call on the fallback provider.
+        _returning(mock_langchain_tavily, "TavilySearch", TAVILY_EMPTY_SEARCH)
+        fallback = MagicMock(provider="searxng")
+
+        result = _direct_web_search(
+            "obscure",
+            5,
+            None,
+            adapter=_tavily_adapter(),
+            fallback_adapter=fallback,
+        )
+
+        fallback.search.assert_not_called()
+        assert result == "No web results found for: obscure"
+
+    def test_normal_payload_is_unchanged(self, mock_langchain_tavily):
+        _returning(
+            mock_langchain_tavily,
+            "TavilySearch",
+            {
+                "results": [
+                    {
+                        "url": "https://example0.com",
+                        "title": "Result 0",
+                        "content": "Short snippet for result 0",
+                    },
+                    {
+                        "url": "https://example1.com",
+                        "title": "Result 1",
+                        "content": "Short snippet for result 1",
+                    },
+                ]
+            },
+        )
+
+        result = _direct_web_search("test query", 5, None, adapter=_tavily_adapter())
+
+        assert result.startswith("Web Search Results for: test query\nResults: 2\n\n")
+        assert (
+            "1. Result 0\n   URL: https://example0.com\n"
+            "   Snippet: Short snippet for result 0\n" in result
+        )
+        assert "2. Result 1\n   URL: https://example1.com\n" in result
+        assert "failed" not in result.lower()
+
+
+class TestSiblingProviderErrors:
+    """Extract / Crawl / Map share the wrapper's in-band error shape."""
+
+    @staticmethod
+    def _provider_warning(caplog, status):
+        return any(
+            "tavily" in r.getMessage().lower() and str(status) in r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+        )
+
+    def test_extract_error_is_surfaced(self, mock_langchain_tavily, caplog):
+        _returning(
+            mock_langchain_tavily,
+            "TavilyExtract",
+            {"error": ValueError(TAVILY_ERRORS[401])},
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = _extract_webpage("https://a.com", None, adapter=_tavily_adapter())
+
+        assert result.startswith("Webpage extraction failed:")
+        assert "Error 401" in result
+        assert "No content could be extracted" not in result
+        assert self._provider_warning(caplog, 401)
+
+    def test_extract_library_empty_notice_is_reported_as_no_content(
+        self, mock_langchain_tavily
+    ):
+        _returning(mock_langchain_tavily, "TavilyExtract", TAVILY_EMPTY_EXTRACT)
+
+        result = _extract_webpage("https://a.com", None, adapter=_tavily_adapter())
+
+        assert result == "No content could be extracted from the provided URL(s)."
+
+    def test_crawl_error_is_surfaced(self, mock_langchain_tavily, caplog):
+        _returning(
+            mock_langchain_tavily,
+            "TavilyCrawl",
+            {"error": ValueError(TAVILY_ERRORS[429])},
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = _crawl_website("https://a.com", None, adapter=_tavily_adapter())
+
+        assert result.startswith("Website crawl failed:")
+        assert "Error 429" in result
+        assert "No pages could be crawled" not in result
+        assert self._provider_warning(caplog, 429)
+
+    def test_crawl_library_empty_notice_is_reported_as_no_pages(
+        self, mock_langchain_tavily
+    ):
+        _returning(mock_langchain_tavily, "TavilyCrawl", TAVILY_EMPTY_CRAWL)
+
+        result = _crawl_website("https://a.com", None, adapter=_tavily_adapter())
+
+        assert result == "No pages could be crawled from: https://a.com"
+
+    def test_map_error_is_surfaced(self, mock_langchain_tavily, caplog):
+        _returning(
+            mock_langchain_tavily,
+            "TavilyMap",
+            {"error": ValueError(TAVILY_ERRORS[432])},
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = _map_website("https://a.com", adapter=_tavily_adapter())
+
+        assert result.startswith("Website map failed:")
+        assert "Error 432" in result
+        assert "No URLs discovered" not in result
+        assert self._provider_warning(caplog, 432)
+
+    def test_map_library_empty_notice_is_reported_as_no_urls(
+        self, mock_langchain_tavily
+    ):
+        # TavilyMap reuses the crawl wording for its empty-result notice.
+        _returning(mock_langchain_tavily, "TavilyMap", TAVILY_EMPTY_CRAWL)
+
+        result = _map_website("https://a.com", adapter=_tavily_adapter())
+
+        assert result == "No URLs discovered for: https://a.com"
 
 
 # ── extract_webpage ────────────────────────────────────────────────

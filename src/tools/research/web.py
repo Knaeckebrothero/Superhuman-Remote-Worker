@@ -158,6 +158,28 @@ def _research_adapter(
     return create_search_adapter(research.get(capability))
 
 
+def _provider_failure(
+    label: str, adapter: SearchAdapter, error: ProviderError, subject: str
+) -> str:
+    """Render a provider failure so it can never read as an empty result set.
+
+    A quota-exhausted, invalid-key or rate-limited call is a broken tool, not
+    "no results": the model gets a distinct ``<label> failed:`` result carrying
+    the provider's message, and the operator gets provider + status in the log.
+    The provider adapters already redact their own API key from the message.
+    """
+    logger.warning(
+        "%s provider %s failed (%s, status=%s) for %s: %s",
+        label,
+        getattr(adapter, "provider", "unknown"),
+        type(error).__name__,
+        error.status_code,
+        subject,
+        error,
+    )
+    return f"{label} failed: {error}"
+
+
 def create_web_tools(context: ToolContext) -> List[Any]:
     """Create web search tools with injected context.
 
@@ -538,8 +560,7 @@ def _direct_web_search(
         return result
 
     except ProviderError as e:
-        logger.warning("Web search provider failed for query %s: %s", query, e)
-        return f"Error searching web: {str(e)}"
+        return _provider_failure("Web search", adapter, e, f"query {query!r}")
     except Exception as e:
         logger.exception("Web search failed for query: %s", query)
         return f"Error searching web: {str(e)}"
@@ -676,8 +697,7 @@ def _extract_webpage(
         return output
 
     except ProviderError as e:
-        logger.warning("Web extract provider failed for URLs %s: %s", urls, e)
-        return f"Error extracting content: {str(e)}"
+        return _provider_failure("Webpage extraction", adapter, e, f"URLs {urls}")
     except Exception as e:
         logger.exception("Web extract failed for URLs: %s", urls)
         return f"Error extracting content: {str(e)}"
@@ -812,8 +832,7 @@ def _crawl_website(
         return output
 
     except ProviderError as e:
-        logger.warning("Web crawl provider failed for URL %s: %s", url, e)
-        return f"Error crawling website: {str(e)}"
+        return _provider_failure("Website crawl", adapter, e, f"URL {url}")
     except Exception as e:
         logger.exception("Web crawl failed for URL: %s", url)
         return f"Error crawling website: {str(e)}"
@@ -878,7 +897,6 @@ def _map_website(
         return output
 
     except ProviderError as e:
-        logger.warning("Web map provider failed for URL %s: %s", url, e)
-        return f"Error mapping website: {str(e)}"
+        return _provider_failure("Website map", adapter, e, f"URL {url}")
     except Exception as e:
         return f"Error mapping website: {str(e)}"

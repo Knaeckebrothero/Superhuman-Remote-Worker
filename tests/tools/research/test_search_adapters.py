@@ -157,6 +157,83 @@ def test_tavily_zero_results_is_an_answer(tavily_module):
     assert TavilyAdapter(api_key="tvly-test").search("query", 5) == []
 
 
+def test_tavily_error_carried_as_exception_object_is_classified(tavily_module):
+    # langchain_tavily 0.2.x returns the HTTP layer's exception itself, not its
+    # text: {"error": ValueError("Error 432: ...")}.
+    _client(
+        tavily_module,
+        "TavilySearch",
+        {
+            "error": ValueError(
+                "Error 432: This request exceeds this API key's set usage limit."
+            )
+        },
+    )
+
+    with pytest.raises(ProviderQuotaError, match="usage limit") as raised:
+        TavilyAdapter(api_key="tvly-test").search("query", 5)
+    assert raised.value.status_code == 432
+
+
+@pytest.mark.parametrize(
+    ("op", "client", "notice"),
+    [
+        (
+            "search",
+            "TavilySearch",
+            "No search results found for 'query'. Suggestions: Try a more "
+            "detailed search using 'advanced' search_depth.",
+        ),
+        (
+            "extract",
+            "TavilyExtract",
+            "No extracted results found for '['https://example.com']'. "
+            "Suggestions: Try a more detailed extraction.",
+        ),
+        (
+            "crawl",
+            "TavilyCrawl",
+            "No crawl results found for 'https://example.com'. Suggestions: .",
+        ),
+        # TavilyMap reuses the crawl wording for its empty-result notice.
+        (
+            "map",
+            "TavilyMap",
+            "No crawl results found for 'https://example.com'. Suggestions: .",
+        ),
+    ],
+)
+def test_tavily_empty_notice_string_is_an_answer_not_a_failure(
+    tavily_module, op, client, notice
+):
+    # The wrappers raise ToolException for an empty result set and ship with
+    # handle_tool_error=True, so invoke() returns that notice as a bare string.
+    # A real empty set never arrives as a dict; it must not become a failover-
+    # eligible ProviderUnavailableError.
+    _client(tavily_module, client, notice)
+    adapter = TavilyAdapter(api_key="tvly-test")
+
+    if op == "search":
+        assert adapter.search("query", 5) == []
+    elif op == "extract":
+        assert adapter.extract(["https://example.com"]) == []
+    else:
+        assert getattr(adapter, op)("https://example.com") == []
+
+
+def test_tavily_error_message_never_carries_the_api_key(tavily_module):
+    _client(
+        tavily_module,
+        "TavilySearch",
+        {"error": "Error 401: key tvly-secret rejected"},
+    )
+
+    with pytest.raises(ProviderAuthError) as raised:
+        TavilyAdapter(api_key="tvly-secret").search("query", 5)
+    assert "tvly-secret" not in str(raised.value)
+    assert "***" in str(raised.value)
+
+
 def test_model_supplied_fetch_url_is_only_a_provider_argument(tavily_module):
     instance = _client(
         tavily_module,
