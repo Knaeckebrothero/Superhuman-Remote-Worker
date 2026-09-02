@@ -107,13 +107,17 @@ def test_fenced_db_phase_prompt_never_reaches_the_renderer(payload):
     assert "{{" not in out and "{%" not in out
 
 
-def test_render_has_no_unsandboxed_environment_left_under_src():
-    """Every ``jinja2`` import under ``src/`` must come from ``jinja2.sandbox``.
-    A plain ``Environment`` / ``Template`` anywhere in the agent tree would be
-    a second, unsandboxed render path."""
+@pytest.mark.parametrize("tree", ["src", "orchestrator"])
+def test_render_has_no_unsandboxed_environment_left_under_src(tree):
+    """Every ``jinja2`` import under ``src/`` **and** ``orchestrator/`` must come
+    from ``jinja2.sandbox``. A plain ``Environment`` / ``Template`` anywhere in
+    either tree would be a second, unsandboxed render path — and the
+    orchestrator is where prompt text is resolved and frozen, so the
+    single-render-site guarantee has to be enforced on both sides of the
+    dispatch, not only in the agent."""
     offenders = []
     pattern = re.compile(r"^\s*(from|import)\s+jinja2\b")
-    for path in (_REPO_ROOT / "src").rglob("*.py"):
+    for path in (_REPO_ROOT / tree).rglob("*.py"):
         for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
             if pattern.match(line) and "jinja2.sandbox" not in line:
                 offenders.append(

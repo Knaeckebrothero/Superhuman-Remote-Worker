@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field, fields as dataclass_fields
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1297,6 +1298,144 @@ class PromptRenderSecurityError(RuntimeError):
     """
 
 
+# ── Render budget: a sandboxed template can still ask for ten gigabytes ──────
+#
+# ``ImmutableSandboxedEnvironment`` stops a template reaching Python internals.
+# It does not stop one allocating: Jinja caps ``range()`` at ``MAX_RANGE`` but
+# string/sequence repetition is unbounded, so
+# ``{% set a = 'x' * 100000 %}{% set b = a * 100000 %}`` is ~10 GB in a few
+# milliseconds. That is a denial of service on the agent process, and NOT one a
+# ``MemoryError`` handler can be relied on to catch — under a container memory
+# limit the kernel OOM-kills the pod, nothing raises. Bound skills and
+# instruction files are rendered through this same function with no brace fence,
+# so the bound belongs here, at the single render site, not at any one caller.
+#
+# 1 MiB of rendered prompt is ~250k tokens, well past any model's context
+# window: a legitimate prompt is nowhere near the cap and every bomb is far
+# past it. The same number bounds intermediate values, so a template cannot
+# build a giant string it never emits.
+MAX_RENDERED_PROMPT_CHARS = 1024 * 1024
+# Wall-clock ceiling for one render. Bundled prompts render in microseconds.
+PROMPT_RENDER_TIME_BUDGET_SECONDS = 5.0
+# How often the deadline is re-checked while a ``range()`` is iterated — a loop
+# that emits nothing never reaches a chunk boundary, so the per-chunk check
+# below cannot see it.
+_RANGE_DEADLINE_STRIDE = 1024
+
+_SIZED_SEQUENCE_TYPES = (str, bytes, bytearray, list, tuple)
+# ``%``-format fields that declare their own output width/precision:
+# ``'%2000000000d' % 1`` is 2 GB from a 13-character template.
+_PERCENT_FORMAT_FIELD = re.compile(r"%[-+ #0]*(\*|\d+)?(?:\.(\*|\d+))?")
+
+
+class PromptRenderBudgetError(PromptRenderSecurityError):
+    """A prompt/instruction template exceeded the render budget.
+
+    A subclass of ``PromptRenderSecurityError`` on purpose: a resource bomb is
+    the same class of refusal as a sandbox escape (fail closed, nothing
+    rendered, origin named), and every existing handler already catches it.
+    """
+
+
+def _refuse_oversized_binop(operator: str, left: Any, right: Any) -> None:
+    """Raise before an arithmetic operator can allocate a bomb.
+
+    Every check is a *pre-flight* size prediction from the operands: once
+    ``'x' * 100000 * 100000`` has actually run there is nothing left to catch
+    it with. Non-amplifying uses (``loop.index + 1``, ``n % 2``) fall through
+    untouched and delegate to the ordinary operator.
+    """
+    limit = MAX_RENDERED_PROMPT_CHARS
+    if operator == "*":
+        for seq, count in ((left, right), (right, left)):
+            if isinstance(seq, _SIZED_SEQUENCE_TYPES) and isinstance(count, int):
+                size = len(seq) * max(count, 0)
+                if size > limit:
+                    raise PromptRenderBudgetError(
+                        f"sequence repetition would produce {size} items "
+                        f"(limit {limit})"
+                    )
+    elif operator == "+":
+        if isinstance(left, _SIZED_SEQUENCE_TYPES) and isinstance(
+            right, _SIZED_SEQUENCE_TYPES
+        ):
+            size = len(left) + len(right)
+            if size > limit:
+                raise PromptRenderBudgetError(
+                    f"concatenation would produce {size} items (limit {limit})"
+                )
+    elif operator == "**":
+        if isinstance(left, int) and isinstance(right, int) and right > 0:
+            if left.bit_length() * right > 8 * limit:
+                raise PromptRenderBudgetError(
+                    f"exponentiation would produce a number wider than {limit} bytes"
+                )
+    elif operator == "%":
+        if isinstance(left, (str, bytes)):
+            _refuse_oversized_percent_format(left)
+
+
+def _refuse_oversized_percent_format(fmt: Union[str, bytes]) -> None:
+    """Refuse a printf-style format whose own width/precision is a bomb."""
+    text = fmt.decode("latin-1", "replace") if isinstance(fmt, bytes) else fmt
+    for width, precision in _PERCENT_FORMAT_FIELD.findall(text):
+        for field_value in (width, precision):
+            if field_value == "*":
+                # A ``*`` width takes its size from an argument, so it cannot be
+                # predicted here. Never legitimate in a prompt — refuse.
+                raise PromptRenderBudgetError(
+                    "%-format with a '*' width/precision is not allowed"
+                )
+            if field_value and int(field_value) > MAX_RENDERED_PROMPT_CHARS:
+                raise PromptRenderBudgetError(
+                    f"%-format field width {field_value} exceeds "
+                    f"{MAX_RENDERED_PROMPT_CHARS}"
+                )
+
+
+class _BudgetedRange:
+    """A ``range`` that re-checks the render deadline while it is iterated.
+
+    ``{% for a in range(100000) %}{% for b in range(100000) %}{% endfor %}
+    {% endfor %}`` emits nothing, so neither the output cap nor the per-chunk
+    deadline check ever sees it — it is 10^10 iterations of pure CPU. Putting
+    the check inside the iterator is the only place it can fire. Every other
+    ``range`` behaviour (``|length``, slicing, ``in``, ``reversed``, ``repr``)
+    is delegated so rendering is otherwise unchanged.
+    """
+
+    __slots__ = ("_range", "_check")
+
+    def __init__(self, values: range, check: Any) -> None:
+        self._range = values
+        self._check = check
+
+    def __iter__(self):
+        check = self._check
+        for index, value in enumerate(self._range):
+            if index % _RANGE_DEADLINE_STRIDE == 0:
+                check()
+            yield value
+
+    def __len__(self) -> int:
+        return len(self._range)
+
+    def __getitem__(self, item):
+        value = self._range[item]
+        if isinstance(value, range):
+            return _BudgetedRange(value, self._check)
+        return value
+
+    def __contains__(self, value) -> bool:
+        return value in self._range
+
+    def __reversed__(self):
+        return iter(_BudgetedRange(self._range[::-1], self._check))
+
+    def __repr__(self) -> str:
+        return repr(self._range)
+
+
 @functools.lru_cache(maxsize=1)
 def _prompt_template_environment():
     """The one Jinja2 environment every prompt/instruction render goes through.
@@ -1311,10 +1450,28 @@ def _prompt_template_environment():
     environment so bundled prompts render byte-identically; the vocabulary
     they use (``{% if has_tool(...) %}``, ``{{ tools }}``, ``{% for %}``) is
     fully inside the sandbox.
+
+    The subclass adds the resource half of the same refusal: the arithmetic
+    operators that can amplify (``*``, ``+``, ``%``, ``**``) are intercepted
+    (``intercepted_binops`` — Jinja's own hook for exactly this) and their
+    result size is predicted BEFORE the allocation happens. No bundled prompt,
+    skill or template uses arithmetic at all, so this is transparent to every
+    template that ships.
     """
     from jinja2.sandbox import ImmutableSandboxedEnvironment
 
-    return ImmutableSandboxedEnvironment(keep_trailing_newline=True)
+    # Defined here rather than at module scope so the jinja2 import stays lazy,
+    # as it was before the budget was added.
+    class _BoundedPromptEnvironment(ImmutableSandboxedEnvironment):
+        """Sandboxed, and additionally bounded against allocation bombs."""
+
+        intercepted_binops = frozenset({"+", "*", "%", "**"})
+
+        def call_binop(self, context, operator, left, right):
+            _refuse_oversized_binop(operator, left, right)
+            return super().call_binop(context, operator, left, right)
+
+    return _BoundedPromptEnvironment(keep_trailing_newline=True)
 
 
 def render_instruction_content(
@@ -1336,10 +1493,20 @@ def render_instruction_content(
     ``extra_context`` adds caller-owned variables (the worker system prompt
     passes ``legacy_phase_prompt``); it can never shadow the built-ins.
 
-    Rendering is sandboxed (see ``_prompt_template_environment``). A template
-    that reaches for Python internals raises ``PromptRenderSecurityError``
-    naming ``origin``; nothing is rendered and nothing falls back to an
-    unsandboxed environment.
+    Rendering is sandboxed (see ``_prompt_template_environment``) AND bounded.
+    A template that reaches for Python internals raises
+    ``PromptRenderSecurityError`` naming ``origin``; one that tries to exhaust
+    memory or CPU raises ``PromptRenderBudgetError`` (a subclass) the same way.
+    Nothing is rendered, nothing falls back to an unsandboxed environment, and
+    a partial render is never returned as if it were complete.
+
+    The budget has three layers, because no single one covers every shape:
+    the operator interception in the environment (pre-allocation, catches
+    ``'x' * 100000 * 100000``), the output cap + deadline enforced over
+    ``generate()``'s chunks here (catches ``{{ lipsum(200000) }}`` and loops
+    that emit), and ``MemoryError`` / ``RecursionError`` / ``OverflowError``
+    converted into the same fail-closed refusal (the backstop for anything
+    that gets past the first two).
 
     Args:
         content: Raw instruction file content (may contain Jinja2 markers).
@@ -1365,13 +1532,30 @@ def render_instruction_content(
         PromptRenderSecurityError: the template attempted an operation the
             sandbox forbids (attribute traversal into Python internals, unsafe
             calls, mutation). Fails closed.
+        PromptRenderBudgetError: the template exceeded the render budget
+            (output size, wall clock, or an allocation the operators refused).
+            A subclass of the above — fails closed the same way.
     """
     if "{%" not in content and "{{" not in content:
         return content  # Fast path: no template markers
 
-    from jinja2.sandbox import SecurityError
+    from jinja2.sandbox import SecurityError, safe_range
 
     env = _prompt_template_environment()
+    deadline = time.monotonic() + PROMPT_RENDER_TIME_BUDGET_SECONDS
+
+    def _check_deadline() -> None:
+        if time.monotonic() > deadline:
+            raise PromptRenderBudgetError(
+                f"render exceeded its {PROMPT_RENDER_TIME_BUDGET_SECONDS:g}s "
+                "wall-clock budget"
+            )
+
+    def _budgeted_range(*args: Any) -> "_BudgetedRange":
+        # safe_range keeps Jinja's own MAX_RANGE cap (and its OverflowError,
+        # converted below); the wrapper adds the per-iteration deadline check.
+        return _BudgetedRange(safe_range(*args), _check_deadline)
+
     tool_set = set(tool_names)
     ds_set = set(cli_datasources or [])
     context: Dict[str, Any] = dict(extra_context or {})
@@ -1382,12 +1566,37 @@ def render_instruction_content(
         cli_datasources=list(ds_set),
         has_cli_datasource=lambda ds_type: ds_type in ds_set,
         protected_cloud=protected_cloud,
+        # Shadows the environment global for THIS render only, so the deadline
+        # closure is per-call and the shared cached environment stays stateless.
+        range=_budgeted_range,
     )
+    label = origin or "prompt template"
     try:
         template = env.from_string(content)
-        return template.render(**context)
+        chunks: List[str] = []
+        rendered_chars = 0
+        for chunk in template.generate(**context):
+            rendered_chars += len(chunk)
+            if rendered_chars > MAX_RENDERED_PROMPT_CHARS:
+                raise PromptRenderBudgetError(
+                    f"rendered output exceeded {MAX_RENDERED_PROMPT_CHARS} characters"
+                )
+            _check_deadline()
+            chunks.append(chunk)
+        return "".join(chunks)
+    except PromptRenderBudgetError as exc:
+        # Never return the chunks collected so far: a truncated prompt that
+        # looks complete is worse than a refusal.
+        logger.error(
+            "Refusing to render %s: the template exceeded the render budget "
+            "(%s). No fallback — the content is not rendered.",
+            label,
+            exc,
+        )
+        raise PromptRenderBudgetError(
+            f"Prompt template {label!r} exceeded the render budget: {exc}"
+        ) from exc
     except SecurityError as exc:
-        label = origin or "prompt template"
         logger.error(
             "Refusing to render %s: the template was rejected by the render "
             "sandbox (%s). No fallback — the content is not rendered.",
@@ -1396,6 +1605,21 @@ def render_instruction_content(
         )
         raise PromptRenderSecurityError(
             f"Prompt template {label!r} was rejected by the render sandbox: {exc}"
+        ) from exc
+    except (MemoryError, RecursionError, OverflowError) as exc:
+        # The backstop for a bomb the pre-flight checks could not predict (an
+        # amplifying filter/method, an oversized range). Converted rather than
+        # propagated so a bomb can never escape as an uncaught exception.
+        logger.error(
+            "Refusing to render %s: the template exhausted a resource during "
+            "rendering (%s: %s). No fallback — the content is not rendered.",
+            label,
+            type(exc).__name__,
+            exc,
+        )
+        raise PromptRenderBudgetError(
+            f"Prompt template {label!r} exhausted a resource during rendering: "
+            f"{type(exc).__name__}: {exc}"
         ) from exc
 
 

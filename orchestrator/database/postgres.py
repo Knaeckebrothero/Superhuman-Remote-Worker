@@ -19614,7 +19614,19 @@ class PostgresDB:
         """
         import json as json_module
 
+        from src.core.loader import strip_loader_owned_keys
+
         config_updates = _strip_managed_repository_authority(config_updates)
+        # Loader-owned (``_``-prefixed) keys are provenance, not config: a
+        # thread override carrying ``_db_prompt_keys: []`` or its own
+        # ``_resolved_prompts`` must never become durable. ``resolve_config``
+        # strips every authored layer on the READ path, so nothing renders
+        # unfenced today — but persisting the poisoned fragment leaves an
+        # unfenced prompt sitting at rest, one missed strip away from being
+        # rendered (security audit 2026-08-27, finding #2). Stripped here, at
+        # the single write path both the live (agent) and owner-facing PATCH
+        # funnel through, for the same reason as the line above.
+        config_updates = strip_loader_owned_keys(config_updates)
         try:
             uuid_val = UUID(thread_id)
         except ValueError:
