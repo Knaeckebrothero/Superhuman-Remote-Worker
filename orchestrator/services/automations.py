@@ -22,6 +22,7 @@ from uuid import UUID
 
 from security.access import project_is_archived
 
+from .agent_pod_entrypoint import InvalidConfigNameError, validate_config_name
 from .datasource_policy import default_datasource_selection
 from .default_experts import ExpertSelectionError, resolve_root_expert
 from src.core.loader import canonical_config_name, deep_merge
@@ -87,7 +88,15 @@ async def validate_automation_expert_selection(
     ``expert_id`` while ``expert`` stays at the structural ``worker_base``.
     The visibility check runs as the automation owner because that is the
     identity used when a future scheduled fire creates its job.
+
+    The bundled selector also gets the pod entrypoint's allow-list here: this
+    is the write boundary for a value that is copied into ``jobs.config_name``
+    by every future scheduled fire, long after the request that stored it.
     """
+    try:
+        validate_config_name(expert)
+    except InvalidConfigNameError as exc:
+        raise ExpertSelectionError(str(exc)) from exc
     config_name = canonical_config_name(expert)
     if not expert_id:
         return config_name

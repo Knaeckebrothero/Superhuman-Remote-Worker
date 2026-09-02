@@ -9,10 +9,11 @@ from typing import Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from security.access import mcp_scope_project_id, require_project_member
 from security.auth import require_approved_user
+from services.agent_pod_entrypoint import validate_config_name
 from services.automations import validate_automation_expert_selection
 from services.bench import (
     BenchStateError,
@@ -38,6 +39,15 @@ class BenchTaskSpec(BaseModel):
     config_name: str = Field("worker_base", min_length=1, max_length=300)
     config_override: dict[str, Any] = Field(default_factory=dict)
     priority: int = Field(5, ge=0, le=10)
+
+    # A run's specs are persisted before any job is created, and every
+    # replicate later hands this word to the agent pod's entrypoint. Same
+    # allow-list, applied on write, so the 422 names the spec instead of a
+    # sweeper failing task after task.
+    @field_validator("config_name")
+    @classmethod
+    def _bundled_config_selector(cls, value: str) -> str:
+        return validate_config_name(value)
 
 
 class BenchArmSpec(BaseModel):
@@ -69,6 +79,11 @@ class BenchArmSpec(BaseModel):
             "needs a VM is pinned by capability whatever the arm asks for."
         ),
     )
+
+    @field_validator("config_name")
+    @classmethod
+    def _bundled_config_selector(cls, value: str | None) -> str | None:
+        return validate_config_name(value)
 
     @model_validator(mode="after")
     def one_expert_source(self) -> "BenchArmSpec":

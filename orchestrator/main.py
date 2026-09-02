@@ -610,6 +610,10 @@ from services.pinned_agent_authority import (  # noqa: E402
     reserve_pinned_warm_agent_binding,
 )
 from services.agent_provisioner import agent_provisioner  # noqa: E402
+from services.agent_pod_entrypoint import (  # noqa: E402
+    InvalidConfigNameError,
+    validate_config_name,
+)
 from services.runtime_actor import (  # noqa: E402
     RuntimeActorCredentialError,
     authorize_runtime_actor_request,
@@ -8942,6 +8946,117 @@ def _with_validated_tool_overrides(
     if not isinstance(config_override, dict) or "tools" not in config_override:
         return config_override
     return {**config_override, "tools": _validated_tool_overrides(config_override)}
+
+
+def _validated_config_name(config_name: str | None) -> str | None:
+    """Return a caller-supplied ``config_name``, or 422 naming the rule it broke.
+
+    ``config_name`` is the one caller-controlled word in the agent pod's
+    ``sh -c`` entrypoint. Both provisioners re-check it at their own boundary
+    (``services/agent_pod_entrypoint.validate_config_name``, security audit
+    2026-08-27 finding #3), but they are reached from fire-and-forget tasks and
+    from rows read back long after the request that wrote them — a hostile
+    value that gets *persisted* explodes on every later resume, recycle and
+    magic-link wake, with no request left to answer. So the allow-list also
+    runs here, on WRITE, exactly like ``_with_validated_tool_overrides``: the
+    caller gets one clean 422 and the row is never created.
+
+    Deliberately NOT applied to values read back out of the database. A row
+    poisoned before this guard existed must still be listable, resumable-to-a
+    -clear-failure and deletable; it fails loudly at its provisioning attempt
+    instead (see the fire-and-forget handlers in this module).
+    """
+    try:
+        return validate_config_name(config_name)
+    except InvalidConfigNameError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+async def _emit_session_provisioning_failure(
+    thread_id: str,
+    user_id: str | None,
+    runtime_authority: Any | None,
+    reason: str,
+) -> None:
+    """Record a fire-and-forget provisioning failure on the owner's feed.
+
+    Same shape as ``routers/sessions.py::_do_prepare`` and
+    ``services/provision_or_assign.py``: re-read the row, refuse to speak for a
+    generation that has moved on, then emit ``session.lifecycle: failed`` with
+    the reason. Without it a task that raises after the handler returned 200 is
+    swallowed by ``asyncio`` and the session simply never becomes ready.
+    """
+    if not user_id:
+        return
+    from services.session_lifecycle import emit as lifecycle_emit
+
+    try:
+        if runtime_authority is not None:
+            current = await postgres_db.get_thread(thread_id)
+            if not same_thread_runtime_authority(current, runtime_authority):
+                return
+            lifecycle_emit(
+                str(user_id),
+                thread_id,
+                "failed",
+                reason=reason,
+                session_runtime_generation=runtime_authority.generation,
+            )
+            return
+        lifecycle_emit(str(user_id), thread_id, "failed", reason=reason)
+    except Exception:
+        logger.exception(
+            "Could not publish the provisioning failure for thread %s", thread_id
+        )
+
+
+async def _provision_commissioned_officer(
+    thread_id: str,
+    *,
+    user_id: str,
+    config_name: str,
+    runtime_authority: Any,
+) -> None:
+    """Commission an Officer straight onto a dedicated persistent Pod.
+
+    Scheduled by ``create_thread`` as its own task, after the handler has
+    already answered 200 — so this is the last line before the work
+    disappears. Anything raised here (a ``config_name`` the provisioner
+    boundary refuses, a K8s outage) is otherwise swallowed by asyncio and the
+    post never becomes ready and never reports why. Guarded whole, recording
+    the failure the way ``services/provision_or_assign.py`` does.
+
+    Module level rather than a closure so the guard is directly testable.
+    """
+    try:
+        result = await persistent_provisioner.create_agent_pod(
+            thread_id,
+            config_name=config_name,
+            expected_runtime_generation=runtime_authority.generation,
+        )
+        if not result.usable:
+            logger.warning(
+                "Commissioned Officer %s: dedicated persistent provisioning is %s (%s)",
+                thread_id,
+                result.status.value,
+                result.failure_class or "no-detail",
+            )
+            await _emit_session_provisioning_failure(
+                thread_id,
+                user_id,
+                runtime_authority,
+                f"officer runtime provisioning {result.status.value}"
+                f" ({result.failure_class or 'no-detail'})",
+            )
+    except Exception as exc:
+        logger.exception(
+            "Commissioned Officer %s: dedicated persistent provisioning raised: %s",
+            thread_id,
+            exc,
+        )
+        await _emit_session_provisioning_failure(
+            thread_id, user_id, runtime_authority, str(exc)
+        )
 
 
 def _validated_session_fleet_tools_override(
@@ -19378,7 +19493,14 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
                     ),
                 )
         explicit_expert_id = expert_choice.expert_id
-        config_name = canonical_config_name(expert_choice.config_name or "worker_base")
+        # Write boundary for the pod entrypoint's one caller-controlled word.
+        # `config_name` still accepts non-catalogue deployment configs (the
+        # branch above only vets `expert`), so this is the only charset check
+        # a job's stored selector ever gets — and jobs.config_name is read back
+        # by dispatch, resume, subjob grafting and every recovery path.
+        config_name = canonical_config_name(
+            _validated_config_name(expert_choice.config_name) or "worker_base"
+        )
         # The resolver can never emit both halves; assert it rather than trust
         # it, because "a DB expert layered over someone else's bundled base"
         # is a config nobody reviewed.
@@ -43652,7 +43774,11 @@ async def agent_create_thread(
     """
     await require_internal(request)
     try:
-        config_name = canonical_config_name(body.config_name or "session_base")
+        # Same write boundary as the user-facing funnel: the internal key
+        # authenticates the transport, not the body it carries.
+        config_name = canonical_config_name(
+            _validated_config_name(body.config_name) or "session_base"
+        )
         selected_expert = None
         if _is_experts_db_enabled() and config_name == "session_base":
             selected_expert = await postgres_db.get_application_expert_default(
@@ -47532,13 +47658,31 @@ async def recycle_project_officer(request: Request, project_id: str) -> dict[str
             status_code=503, detail="Persistent runtime lifecycle is unavailable"
         )
     thread_id = str(officer["id"])
-    result = await recycler.request_and_reconcile(
-        thread_id=thread_id,
-        reason="operator_requested",
-        expected_build_sha=persistent_provisioner.expected_build_sha,
-        observation=await recycler.observe(thread_id),
-        expected_project_id=project_id,
-    )
+    # The recycler provisions from the STORED threads.config_name, so a row
+    # poisoned before that column was validated on write reaches the pod
+    # entrypoint's allow-list here and raises. That is a bad row, not a broken
+    # server: answer it with the validator's own sentence and a 4xx the
+    # operator can act on, instead of letting the generic Exception handler
+    # turn it into an opaque 500.
+    try:
+        result = await recycler.request_and_reconcile(
+            thread_id=thread_id,
+            reason="operator_requested",
+            expected_build_sha=persistent_provisioner.expected_build_sha,
+            observation=await recycler.observe(thread_id),
+            expected_project_id=project_id,
+        )
+    except InvalidConfigNameError as exc:
+        logger.warning(
+            "Officer runtime recycle refused for thread %s: %s", thread_id, exc
+        )
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"This Officer's stored session config cannot be booted: {exc} "
+                "Decommission and re-commission the post to reset it."
+            ),
+        ) from exc
     if result.state in {"blocked", "cancelled"}:
         raise HTTPException(
             status_code=409,
@@ -51066,7 +51210,13 @@ async def create_thread(
             str(user["id"]), all_user_settings or {}
         )
 
-        config_name = canonical_config_name(request_body.config_name or "session_base")
+        # Write boundary: threads.config_name is read back by /resume, by the
+        # Officer recycler and by the magic-link wake, all of which provision
+        # from a fire-and-forget task with no request left to answer. Refuse a
+        # value none of them could ever boot, here, before the INSERT.
+        config_name = canonical_config_name(
+            _validated_config_name(request_body.config_name) or "session_base"
+        )
         if request_body.expert_id and config_name != "session_base":
             raise HTTPException(
                 status_code=400,
@@ -51975,23 +52125,13 @@ async def create_thread(
             # hold on its next pass.  Commission directly onto the substrate
             # whose exact Pod/PVC UID and provision attempt the recycler owns.
             # Ordinary pinned sessions retain the warm-pool fast path below.
-            async def _provision_commissioned_officer() -> None:
-                result = await persistent_provisioner.create_agent_pod(
-                    thread_id,
-                    config_name=config_name,
-                    expected_runtime_generation=created_runtime_authority.generation,
-                )
-                if not result.usable:
-                    logger.warning(
-                        "Commissioned Officer %s: dedicated persistent "
-                        "provisioning is %s (%s)",
-                        thread_id,
-                        result.status.value,
-                        result.failure_class or "no-detail",
-                    )
-
             asyncio.create_task(
-                _provision_commissioned_officer(),
+                _provision_commissioned_officer(
+                    thread_id,
+                    user_id=str(user["id"]),
+                    config_name=config_name,
+                    runtime_authority=created_runtime_authority,
+                ),
                 name=f"commission-officer-pod-{thread_id[:8]}",
             )
         elif use_k8s_agent:
@@ -56902,112 +57042,37 @@ async def resume_thread(
         config_name = canonical_config_name(thread.get("config_name", "session_base"))
 
         async def _reprovision(tid: str, cfg: str) -> None:
-            # Let any in-flight session-folder provisioning land before an
-            # agent is bound — the agent reads its cloud config within ~150ms
-            # of attach and never re-reads. Outside the advisory lock below:
-            # this can take seconds and the fresh pod's /register needs that
-            # same lock.
-            # knowledge-history/done/session_resume_cloud_sync_race_late_provision.md
-            await _await_late_cloud_setup(tid)
-            if not await _resume_runtime_is_current():
-                return
-            if not await _await_protected_cloud_runtime_ready(tid):
-                return
-            if not await _resume_runtime_is_current():
-                return
+            """Bind an agent to the resumed thread. Fire-and-forget.
 
-            # Serialise concurrent provisioning attempts for the same
-            # thread (knowledge-base/knowledge/issues/persistent_thread_double_provisioning_race.md).
-            # A concurrent /prepare or /resume on the same thread blocks
-            # here; the second arrival observes the binding written by
-            # the first and exits. Lifecycle SSE events for the cockpit's
-            # resume progress card come from /api/sessions/{tid}/prepare,
-            # which the cockpit drives in parallel with this endpoint.
-            async with postgres_db.thread_advisory_lock(tid):
-                cur = await postgres_db.get_thread(tid)
-                if not _thread_uses_pinned_execution(
-                    cur
-                ) or not same_thread_runtime_authority(cur, resume_runtime_authority):
-                    logger.warning(
-                        "Thread %s: resume reprovision refused for execution lane %r",
-                        tid,
-                        cur.get("execution_lane") if cur else None,
-                    )
+            The whole body is guarded because this runs as its own task after
+            the handler returned 200. An exception here — a config_name the
+            provisioner boundary refuses, a K8s outage — is otherwise dropped
+            by asyncio and the session never becomes ready and never fails.
+            Same recording shape as services/provision_or_assign.py.
+            """
+            try:
+                # Let any in-flight session-folder provisioning land before an
+                # agent is bound — the agent reads its cloud config within ~150ms
+                # of attach and never re-reads. Outside the advisory lock below:
+                # this can take seconds and the fresh pod's /register needs that
+                # same lock.
+                # knowledge-history/done/session_resume_cloud_sync_race_late_provision.md
+                await _await_late_cloud_setup(tid)
+                if not await _resume_runtime_is_current():
                     return
-                if cur and cur.get("agent_id"):
-                    logger.info(
-                        "Thread %s: already bound to agent %s — "
-                        "skipping duplicate reprovision.",
-                        tid,
-                        cur["agent_id"],
-                    )
+                if not await _await_protected_cloud_runtime_ready(tid):
+                    return
+                if not await _resume_runtime_is_current():
                     return
 
-                # Try idle pool agent first (instant attach, no pod boot).
-                idle_agent = await _find_idle_persistent_agent()
-                cur = await postgres_db.get_thread(tid)
-                if not same_thread_runtime_authority(cur, resume_runtime_authority):
-                    return
-                if idle_agent:
-                    # config_override lives in metadata (no top-level column) and
-                    # is stripped of secrets at rest — re-inject from source so the
-                    # attach payload carries the agent's keys. Needed in addition
-                    # to the workspace-endpoint re-inject because datasource
-                    # sessions make `co` truthy, suppressing the agent's
-                    # fetch-fallback (persistent_app.py).
-                    md = cur.get("metadata") or {}
-                    if isinstance(md, str):
-                        try:
-                            md = json.loads(md)
-                        except (json.JSONDecodeError, TypeError):
-                            md = {}
-                    co = (
-                        (md.get("config_override") or {})
-                        if isinstance(md, dict)
-                        else {}
-                    )
-                    pids = await _thread_project_ids(tid)
-                    include_kb_profile = await _thread_has_knowledge_scope(
-                        project_ids=pids,
-                        datasource_ids=(
-                            md.get("datasource_ids") if isinstance(md, dict) else None
-                        ),
-                    )
-                    co = await _inject_thread_dispatch_credentials(
-                        co,
-                        user_id=str(cur["user_id"]) if cur.get("user_id") else None,
-                        project_id=str(cur["project_id"])
-                        if cur.get("project_id")
-                        else None,
-                        include_kb_profile=include_kb_profile,
-                    )
-                    # The attach boundary owns the authoritative datasource
-                    # re-read. Passing a pre-resolved payload here recreated
-                    # credentials from a stale A selection after an A -> B/[]
-                    # live edit. Canonical project IDs come from thread_mounts,
-                    # never the obsolete thread.project_ids field.
-                    ok = await _send_session_attach(
-                        idle_agent,
-                        tid,
-                        co,
-                        pids,
-                        datasources=None,
-                        config_name=cfg,
-                        expected_runtime_generation=(
-                            resume_runtime_authority.generation
-                        ),
-                    )
-                    if ok:
-                        logger.info(
-                            "Thread %s: resumed via idle pool agent %s",
-                            tid,
-                            idle_agent["hostname"],
-                        )
-                        return
-
-                    # The attach attempt crossed await points.  Do not trust
-                    # the snapshot from before it: a lane transition or a
-                    # sibling bind must suppress the dedicated-pod fallback.
+                # Serialise concurrent provisioning attempts for the same
+                # thread (knowledge-base/knowledge/issues/persistent_thread_double_provisioning_race.md).
+                # A concurrent /prepare or /resume on the same thread blocks
+                # here; the second arrival observes the binding written by
+                # the first and exits. Lifecycle SSE events for the cockpit's
+                # resume progress card come from /api/sessions/{tid}/prepare,
+                # which the cockpit drives in parallel with this endpoint.
+                async with postgres_db.thread_advisory_lock(tid):
                     cur = await postgres_db.get_thread(tid)
                     if not _thread_uses_pinned_execution(
                         cur
@@ -57015,34 +57080,132 @@ async def resume_thread(
                         cur, resume_runtime_authority
                     ):
                         logger.warning(
-                            "Thread %s: resume pod fallback refused for "
-                            "execution lane %r",
+                            "Thread %s: resume reprovision refused for execution lane %r",
                             tid,
                             cur.get("execution_lane") if cur else None,
                         )
                         return
-                    if cur.get("agent_id"):
+                    if cur and cur.get("agent_id"):
                         logger.info(
-                            "Thread %s: attach reservation lost to agent %s; "
-                            "skipping duplicate pod fallback",
+                            "Thread %s: already bound to agent %s — "
+                            "skipping duplicate reprovision.",
                             tid,
                             cur["agent_id"],
                         )
                         return
 
-                # No idle agent — create a dedicated session pod.
-                pod_name = await agent_provisioner.provision_agent(
-                    purpose="session",
-                    thread_id=tid,
-                    config_name=cfg,
-                    expected_runtime_generation=(resume_runtime_authority.generation),
-                )
-                if pod_name:
-                    return
+                    # Try idle pool agent first (instant attach, no pod boot).
+                    idle_agent = await _find_idle_persistent_agent()
+                    cur = await postgres_db.get_thread(tid)
+                    if not same_thread_runtime_authority(cur, resume_runtime_authority):
+                        return
+                    if idle_agent:
+                        # config_override lives in metadata (no top-level column) and
+                        # is stripped of secrets at rest — re-inject from source so the
+                        # attach payload carries the agent's keys. Needed in addition
+                        # to the workspace-endpoint re-inject because datasource
+                        # sessions make `co` truthy, suppressing the agent's
+                        # fetch-fallback (persistent_app.py).
+                        md = cur.get("metadata") or {}
+                        if isinstance(md, str):
+                            try:
+                                md = json.loads(md)
+                            except (json.JSONDecodeError, TypeError):
+                                md = {}
+                        co = (
+                            (md.get("config_override") or {})
+                            if isinstance(md, dict)
+                            else {}
+                        )
+                        pids = await _thread_project_ids(tid)
+                        include_kb_profile = await _thread_has_knowledge_scope(
+                            project_ids=pids,
+                            datasource_ids=(
+                                md.get("datasource_ids")
+                                if isinstance(md, dict)
+                                else None
+                            ),
+                        )
+                        co = await _inject_thread_dispatch_credentials(
+                            co,
+                            user_id=str(cur["user_id"]) if cur.get("user_id") else None,
+                            project_id=str(cur["project_id"])
+                            if cur.get("project_id")
+                            else None,
+                            include_kb_profile=include_kb_profile,
+                        )
+                        # The attach boundary owns the authoritative datasource
+                        # re-read. Passing a pre-resolved payload here recreated
+                        # credentials from a stale A selection after an A -> B/[]
+                        # live edit. Canonical project IDs come from thread_mounts,
+                        # never the obsolete thread.project_ids field.
+                        ok = await _send_session_attach(
+                            idle_agent,
+                            tid,
+                            co,
+                            pids,
+                            datasources=None,
+                            config_name=cfg,
+                            expected_runtime_generation=(
+                                resume_runtime_authority.generation
+                            ),
+                        )
+                        if ok:
+                            logger.info(
+                                "Thread %s: resumed via idle pool agent %s",
+                                tid,
+                                idle_agent["hostname"],
+                            )
+                            return
 
-                logger.error(
-                    "Thread %s: resume failed — no idle agents and pod provisioning failed",
+                        # The attach attempt crossed await points.  Do not trust
+                        # the snapshot from before it: a lane transition or a
+                        # sibling bind must suppress the dedicated-pod fallback.
+                        cur = await postgres_db.get_thread(tid)
+                        if not _thread_uses_pinned_execution(
+                            cur
+                        ) or not same_thread_runtime_authority(
+                            cur, resume_runtime_authority
+                        ):
+                            logger.warning(
+                                "Thread %s: resume pod fallback refused for "
+                                "execution lane %r",
+                                tid,
+                                cur.get("execution_lane") if cur else None,
+                            )
+                            return
+                        if cur.get("agent_id"):
+                            logger.info(
+                                "Thread %s: attach reservation lost to agent %s; "
+                                "skipping duplicate pod fallback",
+                                tid,
+                                cur["agent_id"],
+                            )
+                            return
+
+                    # No idle agent — create a dedicated session pod.
+                    pod_name = await agent_provisioner.provision_agent(
+                        purpose="session",
+                        thread_id=tid,
+                        config_name=cfg,
+                        expected_runtime_generation=(
+                            resume_runtime_authority.generation
+                        ),
+                    )
+                    if pod_name:
+                        return
+
+                    logger.error(
+                        "Thread %s: resume failed — no idle agents and pod provisioning failed",
+                        tid,
+                    )
+            except Exception as exc:
+                logger.exception("Thread %s: resume reprovision failed: %s", tid, exc)
+                await _emit_session_provisioning_failure(
                     tid,
+                    str(thread.get("user_id") or "") or None,
+                    resume_runtime_authority,
+                    str(exc),
                 )
 
         asyncio.create_task(_reprovision(thread_id, config_name))
@@ -57050,36 +57213,59 @@ async def resume_thread(
         config_name = canonical_config_name(thread.get("config_name", "session_base"))
 
         async def _reprovision_legacy(tid: str, cfg: str) -> None:
-            if not await _resume_runtime_is_current():
-                return
-            if not await _await_protected_cloud_runtime_ready(tid):
-                return
-            if not await _resume_runtime_is_current():
-                return
-            cur = await postgres_db.get_thread(tid)
-            if not _thread_uses_pinned_execution(
-                cur
-            ) or not same_thread_runtime_authority(cur, resume_runtime_authority):
-                logger.warning(
-                    "Thread %s: legacy resume provisioning refused for "
-                    "execution lane %r",
+            """Legacy dedicated-pod resume. Fire-and-forget, so guarded whole.
+
+            Same reasoning as ``_reprovision`` above: a raise inside a detached
+            task is swallowed and the session hangs in "provisioning" forever.
+            """
+            try:
+                if not await _resume_runtime_is_current():
+                    return
+                if not await _await_protected_cloud_runtime_ready(tid):
+                    return
+                if not await _resume_runtime_is_current():
+                    return
+                cur = await postgres_db.get_thread(tid)
+                if not _thread_uses_pinned_execution(
+                    cur
+                ) or not same_thread_runtime_authority(cur, resume_runtime_authority):
+                    logger.warning(
+                        "Thread %s: legacy resume provisioning refused for "
+                        "execution lane %r",
+                        tid,
+                        cur.get("execution_lane") if cur else None,
+                    )
+                    return
+                result = await persistent_provisioner.create_agent_pod(
                     tid,
-                    cur.get("execution_lane") if cur else None,
+                    config_name=cfg,
+                    expected_runtime_generation=resume_runtime_authority.generation,
                 )
-                return
-            result = await persistent_provisioner.create_agent_pod(
-                tid,
-                config_name=cfg,
-                expected_runtime_generation=resume_runtime_authority.generation,
-            )
-            if not await _resume_runtime_is_current():
-                return
-            if not result.usable:
-                logger.warning(
-                    "Thread %s: legacy persistent resume is %s (%s)",
+                if not await _resume_runtime_is_current():
+                    return
+                if not result.usable:
+                    logger.warning(
+                        "Thread %s: legacy persistent resume is %s (%s)",
+                        tid,
+                        result.status.value,
+                        result.failure_class or "no-detail",
+                    )
+                    await _emit_session_provisioning_failure(
+                        tid,
+                        str(thread.get("user_id") or "") or None,
+                        resume_runtime_authority,
+                        f"legacy persistent resume {result.status.value}"
+                        f" ({result.failure_class or 'no-detail'})",
+                    )
+            except Exception as exc:
+                logger.exception(
+                    "Thread %s: legacy resume reprovision failed: %s", tid, exc
+                )
+                await _emit_session_provisioning_failure(
                     tid,
-                    result.status.value,
-                    result.failure_class or "no-detail",
+                    str(thread.get("user_id") or "") or None,
+                    resume_runtime_authority,
+                    str(exc),
                 )
 
         asyncio.create_task(_reprovision_legacy(thread_id, config_name))
@@ -60066,17 +60252,42 @@ async def _phase5_wake_if_suspended(
             )
 
             async def _create_after_magic_link() -> None:
-                result = await persistent_provisioner.create_agent_pod(
-                    thread_id,
-                    config_name=config_name,
-                    expected_runtime_generation=wake_authority.generation,
-                )
-                if not result.usable:
-                    logger.warning(
-                        "magic-link persistent provisioning for thread %s is %s (%s)",
+                # This closure sits lexically inside the wake handler's
+                # try/except, but it is scheduled as its own task — so that
+                # handler NEVER sees anything raised here. Its own guard is the
+                # only thing between a raise and a silently vanished wake.
+                try:
+                    result = await persistent_provisioner.create_agent_pod(
                         thread_id,
-                        result.status.value,
-                        result.failure_class or "no-detail",
+                        config_name=config_name,
+                        expected_runtime_generation=wake_authority.generation,
+                    )
+                    if not result.usable:
+                        logger.warning(
+                            "magic-link persistent provisioning for thread %s "
+                            "is %s (%s)",
+                            thread_id,
+                            result.status.value,
+                            result.failure_class or "no-detail",
+                        )
+                        await _emit_session_provisioning_failure(
+                            thread_id,
+                            str(thread.get("user_id") or "") or None,
+                            wake_authority,
+                            f"magic-link wake provisioning {result.status.value}"
+                            f" ({result.failure_class or 'no-detail'})",
+                        )
+                except Exception as exc:
+                    logger.exception(
+                        "magic-link persistent provisioning for thread %s raised: %s",
+                        thread_id,
+                        exc,
+                    )
+                    await _emit_session_provisioning_failure(
+                        thread_id,
+                        str(thread.get("user_id") or "") or None,
+                        wake_authority,
+                        str(exc),
                     )
 
             asyncio.create_task(
@@ -69227,6 +69438,10 @@ async def create_project(body: ProjectCreate, request: Request) -> dict[str, Any
     validated_project_override = _with_validated_tool_overrides(
         body.default_config_override
     )
+    # Same write-only rule for the project's default selector: create_job
+    # copies it into jobs.config_name in the legacy compatibility branch, and
+    # from there it reaches the pod entrypoint.
+    validated_default_config_name = _validated_config_name(body.default_config_name)
     # Resolve the full vault target — URL, auth, forge, and for a connector
     # request every reason it may not be adopted — before creating the project,
     # so a rejected external-vault request cannot leave a half-created one.
@@ -69240,7 +69455,7 @@ async def create_project(body: ProjectCreate, request: Request) -> dict[str, Any
             name=body.name,
             description=body.description,
             goal=body.goal,
-            default_config_name=body.default_config_name,
+            default_config_name=validated_default_config_name,
             default_config_override=validated_project_override,
         )
 
@@ -69615,6 +69830,13 @@ async def update_project(
     if "default_config_override" in kwargs:
         kwargs["default_config_override"] = _with_validated_tool_overrides(
             kwargs["default_config_override"]
+        )
+    # Write-only for the same reason: a project already holding an unbootable
+    # default surfaces it when a caller re-submits the field, never on a PATCH
+    # that does not name it.
+    if "default_config_name" in kwargs:
+        kwargs["default_config_name"] = _validated_config_name(
+            kwargs["default_config_name"]
         )
     # network_tier is admin-gated: a tier change widens what the project's
     # workspaces can reach at the pod-network layer (e.g. home-allowed

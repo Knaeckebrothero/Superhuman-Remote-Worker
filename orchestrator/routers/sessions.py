@@ -32,6 +32,10 @@ from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
 from security.auth import require_approved_user
+from services.agent_pod_entrypoint import (
+    InvalidConfigNameError,
+    validate_config_name,
+)
 from services.session_lifecycle import emit as lifecycle_emit
 from services.session_lifecycle import probe_ready, wait_for_binding, wait_for_ready
 from services.session_provisioning_state import agent_pod_provisioning_in_progress
@@ -256,6 +260,18 @@ async def prepare_session(
         )
 
     _require_supported_protected_prepare_override(thread, body.config_override)
+
+    # The body's own config_name is a caller boundary, so it gets the pod
+    # entrypoint's allow-list here: a hostile value is one 422 rather than a
+    # lifecycle failure the caller has to subscribe to. The PERSISTED value is
+    # deliberately NOT checked — a row poisoned before that column was validated
+    # on write must still be preparable-to-a-clear-failure, which _do_prepare's
+    # own handler records.
+    if body.config_name is not None:
+        try:
+            validate_config_name(body.config_name)
+        except InvalidConfigNameError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     # The agent boots `--config <config_name>` and must load a real base YAML.
     # The cockpit's expert picker sends the expert UUID in config_name (here and
