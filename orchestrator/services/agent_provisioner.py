@@ -2519,8 +2519,11 @@ class AgentProvisioner:
                 },
                 "startupProbe": {
                     "httpGet": {"path": "/health", "port": 8001},
-                    "failureThreshold": 10,
-                    "periodSeconds": 10,
+                    # Poll quickly so the Kubernetes Ready bit can catch up
+                    # with the agent's own ready heartbeat before dispatch.
+                    # Keep the original 100s total startup allowance.
+                    "failureThreshold": 100,
+                    "periodSeconds": 1,
                 },
                 "resources": {
                     "requests": {

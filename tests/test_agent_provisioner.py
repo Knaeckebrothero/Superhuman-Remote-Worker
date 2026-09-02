@@ -1669,6 +1669,8 @@ def test_pod_manifest_checks_readiness_immediately_after_startup_probe():
 
     container = manifest["spec"]["containers"][0]
     assert container["startupProbe"]["httpGet"]["path"] == "/health"
+    assert container["startupProbe"]["periodSeconds"] == 1
+    assert container["startupProbe"]["failureThreshold"] == 100
     assert container["readinessProbe"]["httpGet"]["path"] == "/ready"
     assert container["readinessProbe"]["initialDelaySeconds"] == 0
 
