@@ -704,7 +704,7 @@ from services.notification_catalog import (  # noqa: E402
 from services.notification_steps import notification_steps_loop  # noqa: E402
 import httpx  # noqa: E402
 from graph_routes import router as graph_router, set_audit_reader, set_postgres_db  # noqa: E402
-from uploads import router as uploads_router  # noqa: E402
+from uploads import authorize_upload_reference, router as uploads_router  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -19296,6 +19296,27 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
             internal_principal = caller
             effective_user_id = job.user_id
             scoped_project_id = str(job.project_id) if job.project_id else None
+
+        # Uploads are bound to their creator (uploads.py). Every upload this
+        # job references — the three body fields merged above, or the same
+        # keys arriving through ``context`` — must belong to the principal
+        # the job runs as, checked here before anything is persisted or
+        # dispatched: the agent later loads ``config_upload_id`` as its own
+        # config, so a foreign id would run someone else's YAML under this
+        # user. Admins reach any upload; legacy uploads with no recorded
+        # owner are admin-only. Only a userless system child (internal
+        # origin that resolved to no user at all) is exempt — there is no
+        # identity to check against, and the runtime's own download path is
+        # internal-key-only for the same reason.
+        upload_principal = internal_principal if internal_call else caller
+        for upload_key in ("upload_id", "config_upload_id", "instructions_upload_id"):
+            referenced_upload = context.get(upload_key)
+            if referenced_upload:
+                authorize_upload_reference(
+                    upload_principal,
+                    str(referenced_upload),
+                    internal=internal_call and upload_principal is None,
+                )
 
         # Resolve project_id: authoritative internal origin / public request,
         # then the user's default only when no thread/parent constrained scope.

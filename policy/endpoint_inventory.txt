@@ -453,11 +453,11 @@ GET    /api/system/readiness                                                    
 GET    /api/tables                                                                      admin:_require_admin
 GET    /api/tables/{table_name}                                                         admin:_require_admin
 GET    /api/tables/{table_name}/schema                                                  admin:_require_admin
-POST   /api/uploads                                                                     unscoped
-DELETE /api/uploads/{upload_id}                                                         unscoped
-GET    /api/uploads/{upload_id}                                                         unscoped
-GET    /api/uploads/{upload_id}/files                                                   unscoped
-GET    /api/uploads/{upload_id}/files/{filename}                                        unscoped
+POST   /api/uploads                                                                     internal:is_internal_call
+DELETE /api/uploads/{upload_id}                                                         internal:is_internal_call
+GET    /api/uploads/{upload_id}                                                         internal:is_internal_call
+GET    /api/uploads/{upload_id}/files                                                   internal:is_internal_call
+GET    /api/uploads/{upload_id}/files/{filename}                                        internal:is_internal_call
 GET    /api/usage                                                                       gated:require_approved_user
 GET    /api/usage/breakdown                                                             gated:require_approved_user
 GET    /api/usage/timeseries                                                            gated:require_approved_user

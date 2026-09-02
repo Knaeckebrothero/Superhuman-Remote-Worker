@@ -64,11 +64,12 @@ def test_endpoint_inventory_matches_manifest():
 def test_no_new_unscoped_endpoints():
     """The number of unscoped endpoints must not increase.
 
-    main.py carries no unscoped endpoints at all. The remaining backlog is the
-    five ``/api/uploads`` routes, which surfaced when the walk was extended to
-    include_router-mounted modules and take no user identity of any kind — not
-    grandfathered on purpose, just not yet gated. New unscoped endpoints have
-    to be acknowledged either by adding a gate or by marking them
+    Neither main.py nor any mounted router carries an unscoped endpoint. The
+    last five — the ``/api/uploads`` routes, which surfaced when the walk was
+    extended to include_router-mounted modules and took no user identity of
+    any kind — were gated in the 2026-08-27 security audit follow-up
+    (``tests/test_uploads_security.py``). New unscoped endpoints have to be
+    acknowledged either by adding a gate or by marking them
     ``# nosec: public <reason>`` above the decorator.
     """
     script = _load_script()
