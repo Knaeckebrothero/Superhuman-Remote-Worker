@@ -4,9 +4,14 @@ Guards knowledge-base/knowledge/issues/openrouter_auxiliary_crashes_session_via_
 a session/role that can never start must be caught before a pod spawns.
 """
 
+import pytest
+
 from src.core.transport_resolution import (
+    CitationTransportError,
     embedding_role_violation,
+    is_openai_default_endpoint,
     llm_role_violation,
+    resolve_citation_transport,
 )
 
 
@@ -96,3 +101,131 @@ class TestEmbeddingRoleViolation:
         # endpoint — a missing EMBEDDING_BASE_URL is not a violation.
         env_keys = {"EMBEDDING_MODEL": "voyage-3", "EMBEDDING_PROVIDER": "voyage"}
         assert embedding_role_violation(env_keys) is None
+
+
+class TestCitationTransport:
+    """Citation-client credential isolation
+    (knowledge-base/knowledge/issues/citation_llm_api_key_isolation.md).
+
+    ``OPENAI_API_KEY`` belongs to the chat model: it may be sent to
+    api.openai.com and nowhere else. A dedicated ``CITATION_LLM_API_KEY`` is
+    the citation client's key whenever it is set.
+    """
+
+    CUSTOM = "http://cite.internal:8080/v1"
+
+    def test_dedicated_key_wins_over_openai_key(self):
+        t = resolve_citation_transport(
+            {
+                "CITATION_LLM_URL": self.CUSTOM,
+                "CITATION_LLM_API_KEY": "sk-cit",
+                "OPENAI_API_KEY": "sk-openai",
+            }
+        )
+        assert t.api_key == "sk-cit"
+        assert t.base_url == self.CUSTOM
+        assert t.key_source == "CITATION_LLM_API_KEY"
+
+    def test_dedicated_key_wins_even_for_openai_endpoint(self):
+        t = resolve_citation_transport(
+            {"CITATION_LLM_API_KEY": "sk-cit", "OPENAI_API_KEY": "sk-openai"}
+        )
+        assert t.api_key == "sk-cit"
+        assert t.base_url is None
+
+    def test_base_url_alias_beats_env_name(self):
+        # The orchestrator dispatches CITATION_LLM_BASE_URL and aliases it to
+        # CITATION_LLM_URL; the dispatched name wins if both are present.
+        t = resolve_citation_transport(
+            {
+                "CITATION_LLM_BASE_URL": "http://dispatched:1/v1",
+                "CITATION_LLM_URL": "http://stale:2/v1",
+                "CITATION_LLM_API_KEY": "sk-cit",
+            }
+        )
+        assert t.base_url == "http://dispatched:1/v1"
+
+    def test_custom_url_without_dedicated_key_never_leaks_openai_key(self):
+        with pytest.raises(CitationTransportError) as exc:
+            resolve_citation_transport(
+                {"CITATION_LLM_URL": self.CUSTOM, "OPENAI_API_KEY": "sk-openai"}
+            )
+        msg = str(exc.value)
+        assert "CITATION_LLM_API_KEY" in msg
+        assert self.CUSTOM in msg
+        assert "sk-openai" not in msg  # never echo the secret
+
+    def test_custom_url_with_empty_dedicated_key_is_unset(self):
+        # `CITATION_LLM_API_KEY=` in a .env file must not fall through to the
+        # chat key either.
+        with pytest.raises(CitationTransportError):
+            resolve_citation_transport(
+                {
+                    "CITATION_LLM_URL": self.CUSTOM,
+                    "CITATION_LLM_API_KEY": "",
+                    "OPENAI_API_KEY": "sk-openai",
+                }
+            )
+
+    def test_custom_url_without_any_key_is_still_a_config_error(self):
+        # Fail closed: validity must not depend on whether OPENAI_API_KEY
+        # happens to be present in the process.
+        with pytest.raises(CitationTransportError) as exc:
+            resolve_citation_transport({"CITATION_LLM_BASE_URL": self.CUSTOM})
+        assert "CITATION_LLM_BASE_URL" in str(exc.value)
+
+    def test_no_citation_vars_keeps_openai_default(self):
+        t = resolve_citation_transport({"OPENAI_API_KEY": "sk-openai"})
+        assert t.base_url is None
+        assert t.api_key == "sk-openai"
+        assert t.key_source == "OPENAI_API_KEY"
+
+    def test_no_citation_vars_and_no_openai_key(self):
+        # None → the openai factory's "not-needed" sentinel, as before.
+        t = resolve_citation_transport({})
+        assert t.base_url is None
+        assert t.api_key is None
+        assert t.key_source == "none"
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://api.openai.com/v1",
+            "https://api.openai.com/v1/",
+            "https://API.OpenAI.com/v1",
+            "api.openai.com/v1",
+        ],
+    )
+    def test_openai_default_endpoint_may_use_openai_key(self, url):
+        t = resolve_citation_transport(
+            {"CITATION_LLM_URL": url, "OPENAI_API_KEY": "sk-openai"}
+        )
+        assert t.api_key == "sk-openai"
+        assert t.base_url == url
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://cite.internal:8080/v1",
+            "https://openrouter.ai/api/v1",
+            "https://api.openai.com.evil.example/v1",
+            "https://evil.example/api.openai.com/v1",
+            "http://[not-a-url",
+        ],
+    )
+    def test_non_openai_hosts_are_custom(self, url):
+        assert not is_openai_default_endpoint(url)
+
+    def test_reads_process_env_by_default(self, monkeypatch):
+        for var in (
+            "CITATION_LLM_BASE_URL",
+            "CITATION_LLM_URL",
+            "CITATION_LLM_API_KEY",
+            "OPENAI_API_KEY",
+        ):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("CITATION_LLM_URL", self.CUSTOM)
+        monkeypatch.setenv("CITATION_LLM_API_KEY", "sk-cit")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
+        t = resolve_citation_transport()
+        assert (t.base_url, t.api_key) == (self.CUSTOM, "sk-cit")

@@ -26,7 +26,9 @@ Per-provider base_url / api_key behaviour, from the loader factories:
 - ``codex``: default base_url (CODEX proxy), keyless. Never flagged.
 """
 
+from dataclasses import dataclass
 from typing import Mapping, Optional
+from urllib.parse import urlsplit
 
 # Providers whose create_llm factory RAISES when no api_key resolves.
 KEY_REQUIRED_PROVIDERS = frozenset(
@@ -107,3 +109,111 @@ def embedding_role_violation(
             f"embedding endpoint"
         )
     return None
+
+
+# ---------------------------------------------------------------------------
+# Citation LLM credential isolation
+# ---------------------------------------------------------------------------
+#
+# The citation verifier is a second, independently-endpointed OpenAI-shaped
+# client (``CITATION_LLM_MODEL`` / ``CITATION_LLM_{BASE_}URL`` /
+# ``CITATION_LLM_API_KEY``, dispatched by the orchestrator or set in ``.env``).
+# ``OPENAI_API_KEY`` belongs to the *chat* model and may only ever be sent to
+# api.openai.com itself — never to whatever host the citation URL names. See
+# knowledge-base/knowledge/issues/citation_llm_api_key_isolation.md.
+
+# Hosts that ARE OpenAI — the only endpoints ``OPENAI_API_KEY`` is sent to
+# implicitly. Anything else is third-party / self-hosted and must carry its own
+# ``CITATION_LLM_API_KEY``.
+OPENAI_DEFAULT_HOSTS = frozenset({"api.openai.com"})
+
+
+class CitationTransportError(ValueError):
+    """The citation LLM endpoint is set but carries no credential of its own.
+
+    Raised by :func:`resolve_citation_transport` instead of falling back to
+    ``OPENAI_API_KEY`` for a non-OpenAI endpoint. The agent catches it, logs the
+    misconfiguration, and degrades citation verification to the auxiliary model
+    (the same path any other dedicated-client build failure takes).
+    """
+
+
+@dataclass(frozen=True)
+class CitationTransport:
+    """Resolved citation-client endpoint + credential.
+
+    ``key_source`` names where ``api_key`` came from (``"CITATION_LLM_API_KEY"``,
+    ``"OPENAI_API_KEY"`` or ``"none"``) so the agent can log *which* key it is
+    using without logging the key.
+    """
+
+    base_url: Optional[str]
+    api_key: Optional[str]
+    key_source: str
+
+
+def is_openai_default_endpoint(base_url: Optional[str]) -> bool:
+    """True when ``base_url`` is unset or names api.openai.com (the SDK default).
+
+    Only these endpoints may receive ``OPENAI_API_KEY`` implicitly. A URL that
+    cannot be parsed to a hostname is treated as custom (fail closed).
+    """
+    if not base_url or not base_url.strip():
+        return True
+    raw = base_url.strip()
+    if "://" not in raw:
+        raw = "//" + raw
+    try:
+        host = urlsplit(raw).hostname
+    except ValueError:
+        return False
+    return (host or "").lower() in OPENAI_DEFAULT_HOSTS
+
+
+def resolve_citation_transport(env: Optional[Mapping] = None) -> CitationTransport:
+    """Resolve the citation client's endpoint and credential from ``env``.
+
+    Precedence:
+
+    1. ``CITATION_LLM_API_KEY`` set (non-empty) → it is the key, whatever the
+       endpoint. ``CITATION_LLM_BASE_URL`` (orchestrator name) wins over
+       ``CITATION_LLM_URL`` (``.env`` name) for the endpoint.
+    2. No dedicated key and the endpoint is api.openai.com / unset → today's
+       behaviour: ``OPENAI_API_KEY`` (or ``None``, which the openai factory
+       turns into its ``"not-needed"`` sentinel).
+    3. No dedicated key and a custom endpoint → :class:`CitationTransportError`.
+       ``OPENAI_API_KEY`` is never sent to a host the operator did not name it
+       for; a keyless self-hosted server wants ``CITATION_LLM_API_KEY=not-needed``.
+
+    Empty-string values count as unset (the dispatcher never injects a
+    half-credential, but a ``.env`` line like ``CITATION_LLM_API_KEY=`` does).
+    """
+    if env is None:
+        import os
+
+        env = os.environ
+    base_url = env.get("CITATION_LLM_BASE_URL") or env.get("CITATION_LLM_URL") or None
+    dedicated = env.get("CITATION_LLM_API_KEY") or None
+    if dedicated:
+        return CitationTransport(
+            base_url=base_url, api_key=dedicated, key_source="CITATION_LLM_API_KEY"
+        )
+    if not is_openai_default_endpoint(base_url):
+        url_var = (
+            "CITATION_LLM_BASE_URL"
+            if env.get("CITATION_LLM_BASE_URL")
+            else "CITATION_LLM_URL"
+        )
+        raise CitationTransportError(
+            f"{url_var}={base_url!r} names a non-OpenAI endpoint but "
+            "CITATION_LLM_API_KEY is unset; refusing to send OPENAI_API_KEY "
+            "there. Set CITATION_LLM_API_KEY for that endpoint (any placeholder "
+            "such as 'not-needed' for a keyless self-hosted server), or unset "
+            f"{url_var} to use api.openai.com"
+        )
+    shared = env.get("OPENAI_API_KEY") or None
+    return CitationTransport(
+        base_url=base_url,
+        api_key=shared,
+        key_source="OPENAI_API_KEY" if shared else "none",
+    )

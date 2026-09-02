@@ -705,6 +705,10 @@ class UniversalAgent:
         """
         import os
 
+        from src.core.transport_resolution import (
+            CitationTransportError,
+            resolve_citation_transport,
+        )
         from src.services.auxiliary import AuxiliaryLLM
 
         aux_cfg = self.config.auxiliary
@@ -723,20 +727,26 @@ class UniversalAgent:
             model_settings = resolve_model_settings(
                 citation_model, self.config._deployment_dir
             )
-            verify_cfg = LLMConfig(
-                model=citation_model,
-                base_url=os.getenv("CITATION_LLM_BASE_URL")
-                or os.getenv("CITATION_LLM_URL"),
-                api_key=os.getenv("CITATION_LLM_API_KEY")
-                or os.getenv("OPENAI_API_KEY"),
-                temperature=0.0,
-                top_p=model_settings.get("top_p"),
-                top_k=model_settings.get("top_k"),
-                model_max_context_tokens=model_settings.get("model_max_context_tokens"),
-                extra_body=model_settings.get("extra_body"),
-                max_retries=1,
-            )
             try:
+                # Credential isolation: CITATION_LLM_API_KEY is the citation
+                # client's key whenever it is set; OPENAI_API_KEY is only ever
+                # used for api.openai.com itself. A custom endpoint without its
+                # own key raises CitationTransportError (handled below) — never
+                # a silent fallback to the chat model's key.
+                transport = resolve_citation_transport()
+                verify_cfg = LLMConfig(
+                    model=citation_model,
+                    base_url=transport.base_url,
+                    api_key=transport.api_key,
+                    temperature=0.0,
+                    top_p=model_settings.get("top_p"),
+                    top_k=model_settings.get("top_k"),
+                    model_max_context_tokens=model_settings.get(
+                        "model_max_context_tokens"
+                    ),
+                    extra_body=model_settings.get("extra_body"),
+                    max_retries=1,
+                )
                 verify_llm = create_llm(verify_cfg, limits=limits)
                 self._citation_verify_aux = AuxiliaryLLM(
                     llm=verify_llm,
@@ -749,7 +759,21 @@ class UniversalAgent:
                 # Same mid-job rebuild hazard as _initialize_auxiliary_llm.
                 self._wire_aux_job_context(_prev_verify, self._citation_verify_aux)
                 prompt_model = citation_model
-                logger.info(f"Citation verifier: dedicated model {citation_model}")
+                logger.info(
+                    "Citation verifier: dedicated model %s (endpoint=%s, key=%s)",
+                    citation_model,
+                    transport.base_url or "api.openai.com",
+                    transport.key_source,
+                )
+            except CitationTransportError as e:
+                logger.error(
+                    "Citation verifier: %s — not building a dedicated citation "
+                    "client for '%s'; falling back to the auxiliary model",
+                    e,
+                    citation_model,
+                )
+                self._citation_verify_aux = self._auxiliary_llm
+                prompt_model = aux_cfg.model or self.config.llm.model
             except Exception as e:
                 logger.warning(
                     f"Could not build dedicated citation model '{citation_model}' "
