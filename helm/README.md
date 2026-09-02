@@ -136,8 +136,9 @@ controller, its admission-webhook endpoint, and both CRDs used by this chart:
 ```bash
 kubectl -n cnpg-system rollout status deployment/cnpg-cloudnative-pg \
   --timeout=5m
-test -n "$(kubectl -n cnpg-system get endpoints cnpg-webhook-service \
-  -o jsonpath='{.subsets[0].addresses[0].ip}')"
+test -n "$(kubectl -n cnpg-system get endpointslice \
+  -l kubernetes.io/service-name=cnpg-webhook-service \
+  -o jsonpath='{.items[0].endpoints[0].addresses[0]}')"
 kubectl wait --for=condition=Established \
   crd/clusters.postgresql.cnpg.io \
   crd/databaseroles.postgresql.cnpg.io \
@@ -201,7 +202,7 @@ the controller while retained database clusters are still running.
 Backups (`databases.backup.method: objectstore`) additionally require the
 [Barman Cloud plugin](https://github.com/cloudnative-pg/plugin-barman-cloud).
 `barmanObjectStore` on the `Cluster` resource was deprecated in CloudNativePG
-1.26 and is slated for removal in 1.30, so the plugin is the supported path.
+1.26 and is slated for removal in 1.31, so the plugin is the supported path.
 
 **This chart cannot install it, and will not try.** The plugin ships as a raw
 manifest with no Helm chart, and every namespaced object in it hardcodes the
