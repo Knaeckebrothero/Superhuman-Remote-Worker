@@ -491,6 +491,29 @@ def test_canvas_gateway_helm_render_contract_and_selector_gate() -> None:
     )
     assert "helm.sh/hook" not in role_job["metadata"].get("annotations", {})
     assert "ttlSecondsAfterFinished" not in role_job["spec"]
+    role_config = next(
+        item
+        for item in cnpg_objects
+        if item.get("kind") == "ConfigMap"
+        and item.get("metadata", {})
+        .get("labels", {})
+        .get("app.kubernetes.io/component")
+        == "canvas-gateway-role"
+    )
+    packaged_sql = role_config["data"]
+    assert set(packaged_sql) == {
+        "canvas-viewer-role.sql",
+        "canvas-viewer-role-safety.sql",
+        "canvas-viewer-self-configure.sql",
+        "canvas-viewer-grants.sql",
+    }
+    included_files = {
+        line.removeprefix("\\ir ").strip()
+        for source in packaged_sql.values()
+        for line in source.splitlines()
+        if line.startswith("\\ir ")
+    }
+    assert included_files <= set(packaged_sql)
 
     rendered = subprocess.run(
         [

@@ -97,6 +97,8 @@ def test_canvas_gateway_role_script_is_packaged_for_helm() -> None:
         "canvas-viewer-grants.sql",
     ):
         assert f'.Files.Get "files/{filename}"' in helm_job
+        assert f"  {filename}: |" in helm_job
+        assert f"/etc/srw-canvas-db/{filename}" in helm_job
     assert "helm.sh/hook" not in helm_job
     assert "ttlSecondsAfterFinished:" not in helm_job
     assert ".Release.Revision" in helm_job
