@@ -756,6 +756,18 @@ spec:
                   name: {{ include "srw.secretName" . }}
                   key: MCP_INTERNAL_KEY
                   optional: true
+            # Root key for per-workspace code-server credentials. The IDE proxy
+            # derives one credential per workspace runtime and injects it into
+            # the workspace Pod; code-server refuses anything else, so a proxy
+            # that dialled a reused Pod IP is rejected by the destination.
+            # `optional` keeps the fail-closed default: without the key no
+            # credential exists and the browser IDE stays contained.
+            - name: IDE_CREDENTIAL_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: IDE_CREDENTIAL_KEY
+                  optional: true
             {{- if .Values.mcp.enabled }}
             # MCP_DEV_TOKEN — dev-only fixed admin MCP token. When set, the
             # orchestrator seeds this exact token for the admin user at startup

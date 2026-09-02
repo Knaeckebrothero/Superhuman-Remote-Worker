@@ -713,6 +713,118 @@ async def test_build_agent_cloud_mount_uses_container_runtime_by_default(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_build_agent_cloud_mount_reconstructs_only_exact_terminal_runtime(
+    monkeypatch,
+):
+    """End may retire an existing mount after Begin projects process-zero,
+    without making that terminal workspace eligible for ordinary delivery.
+    """
+    from main import _build_agent_cloud_mount
+    from services.cloud import RcloneMountSpec
+
+    runtime_incarnation = "33333333-3333-4333-8333-333333333333"
+    fingerprint = "SHA256:" + ("A" * 43)
+
+    class Backend:
+        backend_id = "nextcloud"
+        is_initialized = True
+
+        async def build_rclone_mount_spec(self, *, mount_kind, target_path, **kwargs):
+            assert mount_kind == "session_folder"
+            assert target_path == "/cloud/home"
+            return RcloneMountSpec(
+                source_type="webdav",
+                source_config={
+                    "url": "https://nc.test/remote.php/dav/files/agent/session/",
+                    "vendor": "nextcloud",
+                    "user": "agent-service",
+                },
+                auth={"type": "basic", "password": "agent-pass"},
+            )
+
+    metadata = {
+        "workspace_container": {
+            "status": "retiring_process_zero",
+            "provisioner": "k8s",
+            "pod_ip": "10.42.0.10",
+            "port": 30022,
+            "_canvas_workspace_generation": _RUNTIME_GENERATION,
+            "_runtime_incarnation": runtime_incarnation,
+        },
+        "_workspace_binding": {
+            "generation": _RUNTIME_GENERATION,
+            "kind": "remote",
+            "backing_id": "k8s-pvc:agent-workspaces:pvc-uid",
+            "ssh_host_key_fingerprint": fingerprint,
+        },
+        "_stateless_workspace_retirement_pending": True,
+        "_stateless_claim_retirement": {
+            "terminal_token": 8,
+            "claimant_quiesced": True,
+            "shell_retirement_required": True,
+            "resident_cleanup_required": True,
+            "residents_retired": False,
+            "remote_retired": False,
+            "permanent": True,
+            "workspace_absence_proven": False,
+            "workspace_generation": _RUNTIME_GENERATION,
+            "endpoint_generation": _RUNTIME_GENERATION,
+            "runtime_incarnation": runtime_incarnation,
+            "host_key_fingerprint": fingerprint,
+        },
+    }
+    thread = {
+        "id": _THREAD_ID,
+        "status": "ended",
+        "execution_lane": "stateless",
+        "main_cloud_backend": "nextcloud",
+        "main_cloud_backend_instance_id": _BACKEND_INSTANCE_ID,
+        "main_cloud_session_handle": f"sessions/{_THREAD_ID}",
+        "metadata": metadata,
+    }
+    router = MagicMock()
+    router.for_thread.return_value = Backend()
+    monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
+    monkeypatch.delenv("CLOUD_RCLONE_ALLOW_CONTAINER", raising=False)
+
+    with patch("main.main_cloud_router", router):
+        ordinary_payload = await _build_agent_cloud_mount(
+            thread,
+            mount_rows=[],
+            metadata=metadata,
+        )
+        wrong_token_payload = await _build_agent_cloud_mount(
+            thread,
+            mount_rows=[],
+            metadata=metadata,
+            terminal_retirement_token=9,
+        )
+        terminal_payload = await _build_agent_cloud_mount(
+            thread,
+            mount_rows=[],
+            metadata=metadata,
+            terminal_retirement_token=8,
+        )
+
+        metadata["_stateless_claim_retirement"]["runtime_incarnation"] = (
+            "44444444-4444-4444-8444-444444444444"
+        )
+        mismatched_payload = await _build_agent_cloud_mount(
+            thread,
+            mount_rows=[],
+            metadata=metadata,
+            terminal_retirement_token=8,
+        )
+
+    assert ordinary_payload is None
+    assert wrong_token_payload is None
+    assert terminal_payload is not None
+    assert terminal_payload["driver"] == "rclone"
+    assert terminal_payload["mounts"][0]["mount_kind"] == "session_folder"
+    assert mismatched_payload is None
+
+
+@pytest.mark.asyncio
 async def test_build_agent_cloud_mount_container_runtime_can_be_disabled(monkeypatch):
     from main import _build_agent_cloud_mount
 

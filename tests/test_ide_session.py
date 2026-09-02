@@ -45,18 +45,25 @@ class _ExactIdeRuntimeDB:
 
 @pytest.fixture
 def browser_ide_transport_available(monkeypatch):
-    """Lift the browser-transport containment for one test.
+    """Present a deployment whose workspace is credential-bound.
 
-    The restore machinery is dormant while the IDE proxy refuses every browser
-    transport, but it is not dead code — these tests keep covering it so that
-    lifting the proxy guards does not land on an untested path. Patching the
-    single ``services.ide_proxy`` entry point lifts it for every consumer at
-    once (status advertisement and ``start_session`` alike).
+    Both halves are needed: a root key, so the cheap environment gate passes,
+    and a resolved target carrying a credential, so the per-workspace check
+    does too. Tests that care about the *underlying* status resolution take
+    this fixture so the advertisement layer stays out of their way.
     """
+
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock as _AsyncMock
 
     import services.ide_proxy as ide_proxy
 
-    monkeypatch.setattr(ide_proxy, "browser_ide_refusal", lambda: None)
+    monkeypatch.setenv("IDE_CREDENTIAL_KEY", "test-root-key")
+    monkeypatch.setattr(
+        ide_proxy.ide_proxy_service,
+        "resolve_target",
+        _AsyncMock(return_value=SimpleNamespace(backend="k8s", credential="bound")),
+    )
 
 
 @pytest.fixture
@@ -1492,8 +1499,11 @@ async def test_live_vm_status_is_active_when_code_server_answers(
 
 
 @pytest.mark.asyncio
-async def test_live_workspace_status_withholds_url_while_contained(service_factory):
+async def test_live_workspace_status_withholds_url_while_contained(
+    service_factory, monkeypatch
+):
     """A ready workspace resolves normally, then loses only its URL."""
+    monkeypatch.delenv("IDE_CREDENTIAL_KEY", raising=False)
     svc = service_factory
     svc._get_job = AsyncMock(
         return_value={
@@ -1508,7 +1518,7 @@ async def test_live_workspace_status_withholds_url_while_contained(service_facto
 
     assert result["status"] == "unavailable"
     assert result["code_server_url"] is None
-    assert result["code"] == "ide_stream_operation_lease_unavailable"
+    assert result["code"] == "ide_credential_key_unconfigured"
     assert result["error"]
     # The underlying resolution is preserved, not discarded: only the
     # advertisement is withheld.
@@ -1516,8 +1526,9 @@ async def test_live_workspace_status_withholds_url_while_contained(service_facto
 
 
 @pytest.mark.asyncio
-async def test_start_session_refuses_before_it_can_spend(service_factory):
+async def test_start_session_refuses_before_it_can_spend(service_factory, monkeypatch):
     """No job read, no snapshot pull, no VM — the refusal precedes all of it."""
+    monkeypatch.delenv("IDE_CREDENTIAL_KEY", raising=False)
     svc = service_factory
     svc._get_job = AsyncMock()
 
@@ -1525,6 +1536,6 @@ async def test_start_session_refuses_before_it_can_spend(service_factory):
 
     assert result["status"] == "unavailable"
     assert result["code_server_url"] is None
-    assert result["code"] == "ide_stream_operation_lease_unavailable"
+    assert result["code"] == "ide_credential_key_unconfigured"
     svc._get_job.assert_not_awaited()
     svc._db.merge_ide_session_context.assert_not_awaited()

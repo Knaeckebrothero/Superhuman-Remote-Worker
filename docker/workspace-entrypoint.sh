@@ -167,11 +167,41 @@ if [ -n "${SRW_WORKSPACE_PROCESS_TAG:-}" ]; then
 else
     CODE_SERVER_PROCESS_PREFIX="exec"
 fi
-su -s /bin/sh agent-host -c "$CODE_SERVER_PROCESS_PREFIX code-server \
-    --bind-addr 0.0.0.0:38080 \
-    --user-data-dir /var/lib/code-server \
-    --extensions-dir /var/lib/code-server/extensions \
-    /home/agent-host/workspace" &
+
+# 3a. Recipient binding. The orchestrator derives one credential per workspace
+#     runtime (orchestrator/services/ide_credentials.py) and presents it on
+#     every proxied request, so a proxy that dialled a reused Pod IP meets a
+#     credential this code-server does not accept and is refused HERE — the
+#     one check the control plane cannot get wrong. Without the credential we
+#     do NOT fall back to `auth: none`: an unauthenticated IDE on the Pod
+#     network is the hole this closes, so code-server simply does not start.
+#     The workspace itself is unaffected — SSH is the primary transport and is
+#     already listening.
+#
+#     Written to a file rather than passed in argv or through `su`: the value
+#     would otherwise sit in `ps` output, and env does not reliably survive
+#     `su` (which is why the process tag above is re-exported explicitly).
+#     /var/lib/code-server is container-local, not the workspace PVC, so the
+#     credential dies with the Pod and never lands in a snapshot.
+CODE_SERVER_CONFIG=/var/lib/code-server/.srw-auth.yaml
+if [ -z "${HASHED_PASSWORD:-}" ]; then
+    echo "code-server NOT started: no workspace credential was injected" >&2
+    echo "  (set IDE_CREDENTIAL_KEY on the orchestrator; see ide_credentials.py)" >&2
+else
+    printf 'auth: password\nhashed-password: "%s"\n' "$HASHED_PASSWORD" \
+        > "$CODE_SERVER_CONFIG"
+    chown agent-host:agent-host "$CODE_SERVER_CONFIG"
+    chmod 0600 "$CODE_SERVER_CONFIG"
+    # Drop it from this process's environment so it is not inherited by the
+    # agent's own shells further down the tree.
+    unset HASHED_PASSWORD
+    su -s /bin/sh agent-host -c "$CODE_SERVER_PROCESS_PREFIX code-server \
+        --config $CODE_SERVER_CONFIG \
+        --bind-addr 0.0.0.0:38080 \
+        --user-data-dir /var/lib/code-server \
+        --extensions-dir /var/lib/code-server/extensions \
+        /home/agent-host/workspace" &
+fi
 
 # ---------------------------------------------------------------------------
 # 4. Keep the container alive, anchored to SSHD (PID exits → container exits,

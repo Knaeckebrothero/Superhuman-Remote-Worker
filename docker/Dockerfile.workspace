@@ -354,7 +354,13 @@ RUN su -c 'git config --global init.defaultBranch main' agent-host \
 RUN mkdir -p /home/agent-host/.config/code-server \
     && tee /home/agent-host/.config/code-server/config.yaml > /dev/null <<'CSEOF'
 bind-addr: 0.0.0.0:38080
-auth: none
+# Never `auth: none`. The entrypoint writes the real config (with the
+# orchestrator-derived per-workspace credential) to
+# /var/lib/code-server/.srw-auth.yaml and passes it via --config; this file is
+# shadowed by the workspace PVC mount at /home/agent-host anyway. It stays
+# `password` so that any invocation which somehow reads it still refuses
+# anonymous callers instead of serving the workspace to the Pod network.
+auth: password
 cert: false
 disable-telemetry: true
 CSEOF

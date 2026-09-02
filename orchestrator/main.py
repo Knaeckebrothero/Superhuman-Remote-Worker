@@ -8,6 +8,7 @@ Or from orchestrator directory:
 """
 
 import asyncio
+import contextlib
 import copy
 import functools
 import hashlib
@@ -95,6 +96,7 @@ from fastapi import (  # noqa: E402
     Request,
     UploadFile,
     WebSocket,
+    WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import (  # noqa: E402
@@ -671,9 +673,10 @@ from services.snapshot_service import snapshot_service  # noqa: E402
 from services.ide_session import ide_session_service  # noqa: E402
 from services.ide_proxy import (  # noqa: E402
     IdeProxyUnavailable,
-    contain_ide_status,
+    contain_ide_status_for,
     ide_proxy_service,
 )
+from services.ide_credentials import ide_credential_cookie_header  # noqa: E402
 from services.email import email_service  # noqa: E402
 from services import headless_notifications  # noqa: E402
 from services.brand import TRAVERTINE as _BRAND  # noqa: E402
@@ -35421,12 +35424,16 @@ async def _request_exact_ide_http(
             "ide_mutation_operation_lease_unavailable",
             "IDE mutation transport requires a durable operation lease",
         )
-    if getattr(target, "backend", None) != "docker":
-        # A fresh Pod-UID/owner attestation is still point-in-time authority.
-        # Kubernetes may delete the Pod and reuse its IP after that proof but
-        # before the first HTTP byte is written. Until traffic is carried by an
-        # exact guest/container-bound tunnel or a durable lifecycle lease,
-        # remote K8s and VM transports remain availability-contained.
+    credential = getattr(target, "credential", None)
+    if not credential and getattr(target, "backend", None) != "docker":
+        # A fresh Pod-UID/owner attestation is only point-in-time authority:
+        # Kubernetes may delete the Pod and reuse its IP after the proof, and
+        # re-reading the API server cannot see that, because its Pod status
+        # lags the CNI that assigns the address. A remote target is therefore
+        # allowed only once the destination itself can refuse a connection it
+        # should not have received — see services/ide_credentials.py. Local
+        # Docker keeps its explicit single-host development trust contract; it
+        # is not provisioned by us and has no credential to bind.
         raise IdeProxyUnavailable(
             "ide_remote_transport_unavailable",
             "Remote IDE transport requires a connection-level exact identity",
@@ -35454,6 +35461,13 @@ async def _request_exact_ide_http(
             if callable(close):
                 await close()
             raise _IdeProxyAuthorityLost
+
+    if credential:
+        # Server-minted, like the x-forwarded-* fields above — never a browser
+        # cookie, and never sent back to the browser. Copy rather than mutate:
+        # the caller's dict is built per request and must not accumulate
+        # another runtime's credential.
+        headers = {**headers, "cookie": ide_credential_cookie_header(credential)}
 
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(connect=5.0, read=300.0, write=30.0, pool=5.0),
@@ -35693,16 +35707,63 @@ async def shared_browser_stream_ws(ws: WebSocket, thread_id: str):
     await relay_browser_stream(ws, thread_id, db=postgres_db)
 
 
+async def _ide_ws_runtime_is_current(job_id: str, target: Any) -> bool:
+    """Whether an open IDE stream is still talking to the runtime it opened on.
+
+    Deliberately *not* ``revalidate_target``. That compares the whole target,
+    including the owner lifecycle projection — and a session's status moves
+    between ``active`` and ``awaiting_user`` during ordinary use, so exact
+    equality would drop a working IDE every time the user stopped typing. What
+    matters here is narrower: the runtime behind the socket must still be the
+    same one, and the owner must still admit IDE traffic.
+
+    ``credential`` carries namespace, owner and Pod name, so comparing it plus
+    the address covers "same runtime" without being brittle to status churn.
+    """
+
+    try:
+        await _require_stateless_ide_lifecycle(job_id)
+        current = await ide_proxy_service.resolve_target(job_id)
+    except (HTTPException, IdeProxyUnavailable):
+        return False
+    except Exception:
+        # Never hold a stream open on an inconclusive check.
+        return False
+    if current is None:
+        return False
+    return (
+        current.credential == target.credential
+        and current.host == target.host
+        and current.port == target.port
+        and current.backend == target.backend
+    )
+
+
+# How often an open stream re-checks that its runtime still exists and still
+# admits traffic. A WebSocket outlives the proof that opened it, so the honest
+# guarantee is a bound, not an instant: End closes the socket within this
+# window rather than the moment it commits. The credential is what makes that
+# bound safe — a stream can only ever have reached the runtime that accepted
+# this owner's credential, so the residue is a user reading their own workspace
+# a few seconds too long, not a stranger reading someone else's.
+_IDE_WS_LIFECYCLE_RECHECK_S = 15.0
+
+
 @app.websocket("/api/ide/{job_id}/proxy/{path:path}")
 async def ide_proxy_ws(ws: WebSocket, job_id: str, path: str = ""):
-    """Authorize, then contain IDE WebSockets until operation leases exist.
+    """Reverse proxy an IDE WebSocket to the exact attested workspace runtime.
 
-    A WebSocket is an unbounded mutating operation. Point-in-time runtime
-    attestations cannot serialize it against End/recycle, and rechecking before
-    each message still leaves a check-to-write race. Refuse before resolving or
-    connecting to auth-none code-server so browser cookies, bearer credentials,
-    and proxy-auth material cannot cross this boundary.
+    code-server cannot render a workbench without this socket, so the HTTP
+    half is useless on its own. It was contained while an ``auth: none``
+    upstream meant a mis-routed stream would be *served* by whatever answered
+    the address. It no longer can be: the handshake carries the per-workspace
+    credential (services/ide_credentials.py) and a runtime that did not accept
+    it refuses the upgrade. Browser cookies, bearer tokens and proxy-auth
+    material still never cross this boundary — the only credential sent is the
+    one this server derived for this owner.
     """
+    import websockets
+
     user = await resolve_ws_user(ws, postgres_db)
     if not user:
         await ws.close(code=4401, reason="Authentication required")
@@ -35728,7 +35789,100 @@ async def ide_proxy_ws(ws: WebSocket, job_id: str, path: str = ""):
     except HTTPException:
         await ws.close(code=4409, reason="Workspace lifecycle fenced")
         return
-    await ws.close(code=4503, reason="ide_stream_operation_lease_unavailable")
+
+    try:
+        target = await ide_proxy_service.resolve_target(job_id)
+    except IdeProxyUnavailable as exc:
+        await ws.close(code=4503, reason=exc.code)
+        return
+    if target is None:
+        await ws.close(code=4503, reason="IDE session not active")
+        return
+
+    credential = getattr(target, "credential", None)
+    if not credential and getattr(target, "backend", None) != "docker":
+        # Same rule as the HTTP transport: a remote runtime is reachable only
+        # once it can refuse a stream it should not have received.
+        await ws.close(code=4503, reason="ide_remote_transport_unavailable")
+        return
+
+    from services.ssh_helpers import orchestrator_can_reach
+
+    if not orchestrator_can_reach(target.host):
+        await ws.close(code=4503, reason="IDE not available for VM workspaces")
+        return
+
+    upstream_url = f"ws://{target.authority}/{path}"
+    safe_query = _ide_proxy_query(ws.url.query)
+    if safe_query:
+        upstream_url += f"?{safe_query}"
+    upstream_headers = {}
+    if credential:
+        upstream_headers["Cookie"] = ide_credential_cookie_header(credential)
+
+    try:
+        await ws.accept()
+        async with websockets.connect(
+            upstream_url,
+            additional_headers=upstream_headers,
+            max_size=16 * 1024 * 1024,
+            ping_interval=30,
+            ping_timeout=10,
+            close_timeout=5,
+        ) as upstream_ws:
+
+            async def browser_to_pod():
+                while True:
+                    message = await ws.receive()
+                    if message["type"] == "websocket.disconnect":
+                        break
+                    if message["type"] != "websocket.receive":
+                        continue
+                    if message.get("text") is not None:
+                        await upstream_ws.send(message["text"])
+                    elif message.get("bytes") is not None:
+                        await upstream_ws.send(message["bytes"])
+
+            async def pod_to_browser():
+                async for message in upstream_ws:
+                    if isinstance(message, str):
+                        await ws.send_text(message)
+                    else:
+                        await ws.send_bytes(message)
+
+            async def lifecycle_supervisor():
+                """Close the stream once its runtime stops admitting traffic."""
+                while True:
+                    await asyncio.sleep(_IDE_WS_LIFECYCLE_RECHECK_S)
+                    if not await _ide_ws_runtime_is_current(job_id, target):
+                        return
+
+            tasks = [
+                asyncio.create_task(browser_to_pod()),
+                asyncio.create_task(pod_to_browser()),
+                asyncio.create_task(lifecycle_supervisor()),
+            ]
+            try:
+                _done, pending = await asyncio.wait(
+                    tasks, return_when=asyncio.FIRST_COMPLETED
+                )
+            finally:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+    except WebSocketDisconnect:
+        pass
+    except (OSError, websockets.InvalidURI, websockets.InvalidHandshake) as exc:
+        ide_proxy_service.evict(job_id)
+        logger.debug("IDE WS proxy failed for %s: %s", job_id, exc)
+        with contextlib.suppress(Exception):
+            await ws.close(code=4502, reason="code-server unreachable")
+    except websockets.ConnectionClosed:
+        pass
+    finally:
+        with contextlib.suppress(Exception):
+            await ws.close()
 
 
 @app.post("/api/jobs/{job_id}/ensure-workspace-access")
@@ -51977,6 +52131,61 @@ def _runtime_supports_rclone_mount(metadata: dict[str, Any]) -> bool:
     )
 
 
+def _runtime_supports_terminal_rclone_retirement(
+    thread: dict[str, Any],
+    metadata: dict[str, Any],
+    *,
+    terminal_token: int,
+) -> bool:
+    """Whether End may reconstruct rclone identity for exact-runtime cleanup.
+
+    ``retiring_process_zero`` must never enter the ordinary delivery gate: it
+    is an absorbing no-new-work projection.  Terminal cleanup nevertheless
+    needs the byte-identical non-secret mount specification so it can adopt
+    and remove an already-resident rclone process.  Bind that exception to the
+    same ended thread, pending token, workspace generation, Pod UID, and SSH
+    fingerprint that the terminal shell protocol accepts.
+    """
+
+    if (
+        _cloud_workspace_driver() != "rclone_mount"
+        or thread.get("status") != "ended"
+        or thread.get("execution_lane") != "stateless"
+        or thread_metadata_object(thread) != metadata
+    ):
+        return False
+    allow_container = os.getenv("CLOUD_RCLONE_ALLOW_CONTAINER", "true").lower()
+    if allow_container in {"0", "false", "no", "off"}:
+        return False
+    workspace = metadata.get("workspace_container") or {}
+    if not isinstance(workspace, dict) or workspace.get("status") not in {
+        "ready",
+        "retiring_process_zero",
+    }:
+        return False
+
+    from services.stateless_session_retirement import resolve_shell_retirement_authority
+    from src.shared.session_retirement import stateless_retirement_authority
+
+    try:
+        retirement = stateless_retirement_authority(metadata)
+        authority = resolve_shell_retirement_authority(
+            thread, terminal_token=terminal_token
+        )
+    except (RuntimeError, TypeError, ValueError):
+        return False
+    return bool(
+        retirement is not None
+        and retirement.get("terminal_token") == terminal_token
+        and retirement.get("claimant_quiesced") is True
+        and retirement.get("resident_cleanup_required") is True
+        and retirement.get("workspace_generation") == authority.workspace_generation
+        and retirement.get("endpoint_generation") == authority.workspace_generation
+        and retirement.get("runtime_incarnation") == authority.runtime_incarnation
+        and retirement.get("host_key_fingerprint") == authority.host_key_fingerprint
+    )
+
+
 def _cloud_mount_name(row: dict[str, Any], used: set[str]) -> str:
     if row.get("mount_kind") == "project_default":
         base = "home"
@@ -52781,15 +52990,26 @@ async def _build_agent_cloud_mount(
     *,
     mount_rows: list[dict[str, Any]] | None,
     metadata: dict[str, Any],
+    terminal_retirement_token: int | None = None,
 ) -> Optional[dict[str, Any]]:
     """Build the rclone ``cloud_mount`` payload for capable runtimes.
 
     v1 is all-or-fallback: if every requested thread_mount can be represented
     safely, mount those. If any requested mount is unsupported, mount the
     regular session folder instead when it exists. This prevents a default
-    user-home row from falling back to the eager clone path.
+    user-home row from falling back to the eager clone path. A terminal token
+    selects the narrower End-only reconstruction gate; it does not widen
+    normal runtime delivery.
     """
-    if not _runtime_supports_rclone_mount(metadata):
+    if terminal_retirement_token is None:
+        runtime_supported = _runtime_supports_rclone_mount(metadata)
+    else:
+        runtime_supported = _runtime_supports_terminal_rclone_retirement(
+            thread,
+            metadata,
+            terminal_token=terminal_retirement_token,
+        )
+    if not runtime_supported:
         return None
 
     # Protected cloud mode: the marker ALONE routes a thread into this branch —
@@ -52820,6 +53040,13 @@ async def _build_agent_cloud_mount(
             )
             return None
         tid = str(thread.get("id"))
+        if terminal_retirement_token is not None:
+            # End must never restart or wait for an engage task. It only
+            # reconstructs a grant that the exact retiring runtime could
+            # already have mounted; absent/non-active rows correctly leave no
+            # payload for the terminal zero scan to accept.
+            row = await postgres_db.get_ro_mount_by_thread(tid)
+            return _build_protected_cloud_mount(row, thread_id=tid) if row else None
         runtime_authority = thread_runtime_authority(thread)
         if runtime_authority is None:
             logger.warning(
@@ -54502,6 +54729,7 @@ async def _reconcile_stateless_thread_retirement(
                 current,
                 mount_rows=await postgres_db.list_thread_mounts(thread_id),
                 metadata=metadata,
+                terminal_retirement_token=terminal_token,
             )
             try:
                 proof = await retire_stateless_workspace_residents(
@@ -54510,6 +54738,19 @@ async def _reconcile_stateless_thread_retirement(
                     cloud_mount_cfg=terminal_cloud_mount_cfg,
                 )
             except ShellRetirementUnavailable as exc:
+                cause = exc.__cause__
+                logger.warning(
+                    "Stateless terminal cleanup remains pending: thread=%s "
+                    "stage=resident workspace_status=%s cloud_mount=%s cause=%s",
+                    thread_id,
+                    workspace.get("status"),
+                    terminal_cloud_mount_cfg is not None,
+                    (
+                        f"{type(cause).__name__}: {str(cause)[:300]}"
+                        if cause is not None
+                        else type(exc).__name__
+                    ),
+                )
                 raise HTTPException(
                     status_code=503,
                     detail="Workspace resident retirement is not yet acknowledged",
@@ -54589,6 +54830,7 @@ async def _reconcile_stateless_thread_retirement(
                     current,
                     mount_rows=await postgres_db.list_thread_mounts(thread_id),
                     metadata=metadata,
+                    terminal_retirement_token=terminal_token,
                 )
             try:
                 authority = await retire_stateless_session_shell(
@@ -54605,6 +54847,20 @@ async def _reconcile_stateless_thread_retirement(
                         cloud_mount_cfg=terminal_cloud_mount_cfg,
                     )
             except ShellRetirementUnavailable as exc:
+                cause = exc.__cause__
+                logger.warning(
+                    "Stateless terminal cleanup remains pending: thread=%s "
+                    "stage=shell_or_postcheck workspace_status=%s "
+                    "cloud_mount=%s cause=%s",
+                    thread_id,
+                    workspace.get("status"),
+                    terminal_cloud_mount_cfg is not None,
+                    (
+                        f"{type(cause).__name__}: {str(cause)[:300]}"
+                        if cause is not None
+                        else type(exc).__name__
+                    ),
+                )
                 raise HTTPException(
                     status_code=503,
                     detail="Remote shell retirement is not yet acknowledged",
@@ -60136,13 +60392,14 @@ async def get_thread_ide_status(thread_id: str, request: Request) -> dict[str, A
         ssh_host = vm_ctx.get("ssh_host") or vm_ctx.get("pod_ip")
         if ssh_host:
             proxy_base = os.environ.get("IDE_PROXY_BASE_URL", "http://localhost:8085")
-            return contain_ide_status(
+            return await contain_ide_status_for(
+                thread_id,
                 {
                     "status": "active",
                     "code_server_url": f"{proxy_base}/api/ide/{thread_id}/proxy/?folder=/home/agent-host/workspace",
                     "source": "live_vm",
                     "gitea_url": gitea_url,
-                }
+                },
             )
 
     # Check workspace container (K8s pod_ip or Docker Compose ide_host)
@@ -60152,13 +60409,14 @@ async def get_thread_ide_status(thread_id: str, request: Request) -> dict[str, A
         proxy_base = os.environ.get("IDE_PROXY_BASE_URL", "http://localhost:8085")
         # Withhold a URL the proxy would refuse; the Gitea link survives so the
         # header keeps its one working way into the workspace.
-        return contain_ide_status(
+        return await contain_ide_status_for(
+            thread_id,
             {
                 "status": "active",
                 "code_server_url": f"{proxy_base}/api/ide/{thread_id}/proxy/?folder=/home/agent-host/workspace",
                 "source": "live_workspace",
                 "gitea_url": gitea_url,
-            }
+            },
         )
 
     # Workspace is provisioning (includes "pending" from pre-provision signal)

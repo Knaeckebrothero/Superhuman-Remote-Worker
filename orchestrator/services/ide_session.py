@@ -36,7 +36,7 @@ from services.container_provisioner import (
     WorkspaceRuntimeAttestation,
     WorkspaceRuntimeAuthorityError,
 )
-from services.ide_proxy import contain_ide_status, contained_ide_status
+from services.ide_proxy import contain_ide_status_for, contained_ide_status
 from services.ssh_helpers import (
     EXTRACT_HOME_REMOTE_CMD,
     SSHHostKeyVerificationError,
@@ -209,7 +209,9 @@ class IdeSessionService:
             Dict with status, code_server_url, expires_at, etc.
         """
 
-        return contain_ide_status(await self._resolve_session_status(job_id))
+        return await contain_ide_status_for(
+            job_id, await self._resolve_session_status(job_id)
+        )
 
     async def _resolve_session_status(self, job_id: str) -> dict[str, Any]:
         """Resolve the status a reachable code-server would be advertised at."""

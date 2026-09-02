@@ -36,6 +36,7 @@ from services.ssh_helpers import (
     workspace_private_key_fingerprint,
 )
 from services.workspace_binding import CANVAS_WORKSPACE_GENERATION_KEY
+from services.ide_credentials import IDE_CREDENTIAL_ENV, ide_credential
 from services.workspace_lifecycle import WorkspaceOwner
 from services.managed_repository_process_retirement import (
     retire_managed_repository_processes,
@@ -12477,6 +12478,12 @@ class ContainerProvisioner:
         ``/mnt/code-server-config`` so the entrypoint can apply it before
         code-server starts.
         """
+        code_server_credential = ide_credential(
+            namespace=self._namespace,
+            owner_kind=owner.kind,
+            owner_id=owner.id,
+            pod_name=pod_name,
+        )
         manifest = {
             "apiVersion": "v1",
             "kind": "Pod",
@@ -12566,6 +12573,22 @@ class ContainerProvisioner:
                                     }
                                 },
                             },
+                            # code-server's recipient binding. Absent, the
+                            # entrypoint refuses to start code-server at all
+                            # rather than serving an `auth: none` IDE that any
+                            # caller reaching the Pod IP could read — including
+                            # a proxy that dialled a reused address. See
+                            # services/ide_credentials.py.
+                            *(
+                                [
+                                    {
+                                        "name": IDE_CREDENTIAL_ENV,
+                                        "value": code_server_credential,
+                                    }
+                                ]
+                                if code_server_credential
+                                else []
+                            ),
                         ],
                         "resources": {
                             "requests": {"cpu": cpu, "memory": memory},

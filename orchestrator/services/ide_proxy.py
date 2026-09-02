@@ -11,8 +11,9 @@ for the explicit single-host Docker development contract.
 """
 
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
+import hmac
 import ipaddress
 import json
 import logging
@@ -21,6 +22,11 @@ from typing import Any, Literal, Optional
 from uuid import UUID
 
 from services.blocking_effect import joined_blocking_call
+from services.ide_credentials import (
+    IDE_CREDENTIAL_ENV,
+    ide_credential,
+    ide_credential_root,
+)
 from services.stateless_workspace_gate import stateless_session_workspace_check
 from services.workspace_lifecycle import WorkspaceOwner
 from src.shared.session_retirement import stateless_stop_markers
@@ -39,35 +45,39 @@ class IdeProxyUnavailable(RuntimeError):
         self.detail = detail
 
 
-# Two transport guards in ``orchestrator/main.py`` currently contain the
-# browser IDE, and neither of them depends on target resolution:
+# Both IDE transports in ``orchestrator/main.py`` — the buffered HTTP helper
+# and the WebSocket proxy — carry the per-workspace code-server credential and
+# refuse a remote runtime that has none. The advertisement must agree with
+# them: an "Open IDE" button that 503s is worse than an honest absence, and on
+# the job path ``start_session`` would otherwise pay for a snapshot restore
+# nobody can open.
 #
-#   * ``ide_proxy_ws`` refuses every IDE WebSocket with
-#     ``ide_stream_operation_lease_unavailable`` before resolving a target;
-#   * ``_request_exact_ide_http`` refuses every non-Docker target with
-#     ``ide_remote_transport_unavailable``.
-#
-# code-server cannot render a workbench without its WebSocket, so while the
-# stream guard stands no backend serves a usable IDE — the HTTP guard only
-# decides whether the refusal arrives as a blank page or as JSON. Status
-# endpoints therefore ask here before advertising a ``code_server_url``: an
-# "Open IDE" button that 503s is worse than an honest absence, and on the job
-# path ``start_session`` would otherwise pay for a snapshot restore nobody can
-# open.
-#
-# When the guards are lifted, make ``browser_ide_refusal`` return ``None``;
-# the advertisement returns with it.
-BROWSER_IDE_REFUSAL_CODE = "ide_stream_operation_lease_unavailable"
+# Two questions, deliberately separate. Whether this *deployment* can bind a
+# credential at all is a pure environment check (``browser_ide_refusal``, no
+# I/O, safe to call anywhere). Whether *this workspace* enforces one can only
+# be answered by attesting the runtime, so it lives in the async
+# entity-scoped call below and is what the status endpoints actually use.
+BROWSER_IDE_REFUSAL_CODE = "ide_credential_key_unconfigured"
 BROWSER_IDE_REFUSAL_MESSAGE = (
-    "The browser IDE is unavailable: its transport is contained pending a "
-    "durable proxy-operation lease. Use the Git view to browse the workspace."
+    "The browser IDE is unavailable: this deployment has no IDE credential "
+    "key, so no workspace can be bound to one. Use the Git view to browse the "
+    "workspace."
+)
+
+BROWSER_IDE_UNBOUND_CODE = "ide_remote_transport_unavailable"
+BROWSER_IDE_UNBOUND_MESSAGE = (
+    "The browser IDE is unavailable for this workspace: it predates the "
+    "per-workspace credential and will become available when the workspace is "
+    "recreated. Use the Git view to browse it meanwhile."
 )
 
 
 def browser_ide_refusal() -> tuple[str, str] | None:
-    """Return ``(code, message)`` while no backend can serve code-server."""
+    """Return ``(code, message)`` when no workspace here could serve an IDE."""
 
-    return BROWSER_IDE_REFUSAL_CODE, BROWSER_IDE_REFUSAL_MESSAGE
+    if ide_credential_root() is None:
+        return BROWSER_IDE_REFUSAL_CODE, BROWSER_IDE_REFUSAL_MESSAGE
+    return None
 
 
 def contained_ide_status() -> dict[str, Any] | None:
@@ -81,7 +91,12 @@ def contained_ide_status() -> dict[str, Any] | None:
     refusal = browser_ide_refusal()
     if refusal is None:
         return None
-    code, message = refusal
+    return _contained_payload(*refusal)
+
+
+def _contained_payload(code: str, message: str) -> dict[str, Any]:
+    """The shape every withheld advertisement collapses to."""
+
     return {
         "status": "unavailable",
         "code_server_url": None,
@@ -104,6 +119,34 @@ def contain_ide_status(status: dict[str, Any]) -> dict[str, Any]:
     return {**status, **contained}
 
 
+async def contain_ide_status_for(entity_id: str, status: dict[str, Any]) -> dict:
+    """Advertise a ``code_server_url`` only if this workspace would serve it.
+
+    Resolution costs one attestation, which is affordable here: the cockpit
+    polls IDE status while a workspace provisions and stops once it reads
+    active, and otherwise only asks when the user reaches for the button.
+    Paying it buys an honest answer during the window where some Pods enforce
+    a credential and older ones do not.
+    """
+
+    contained = contain_ide_status(status)
+    if contained is not status or not status.get("code_server_url"):
+        return contained
+    try:
+        target = await ide_proxy_service.resolve_target(entity_id)
+    except IdeProxyUnavailable as exc:
+        return {**status, **_contained_payload(exc.code, exc.detail)}
+    except Exception:
+        logger.debug("IDE advertisement resolution failed", exc_info=True)
+        target = None
+    if target is None or (target.credential is None and target.backend != "docker"):
+        return {
+            **status,
+            **_contained_payload(BROWSER_IDE_UNBOUND_CODE, BROWSER_IDE_UNBOUND_MESSAGE),
+        }
+    return status
+
+
 @dataclass(frozen=True, slots=True)
 class IdeProxyTarget:
     """One exact, server-attested code-server network target.
@@ -121,6 +164,14 @@ class IdeProxyTarget:
     host: str
     port: int
     identity: tuple[str, ...]
+    # The credential this runtime's code-server will accept, when one can be
+    # derived AND the Pod is observed to enforce it. It is the recipient
+    # binding: a connection that reaches a foreign runtime is refused at that
+    # runtime, so routing no longer has to be perfect for the boundary to
+    # hold. ``repr=False`` keeps it out of log lines and tracebacks; it still
+    # participates in equality, so a target whose credential changed fails
+    # revalidation like any other drift.
+    credential: str | None = field(default=None, repr=False)
 
     @property
     def authority(self) -> str:
@@ -598,7 +649,58 @@ class IdeProxyService:
                 *lifecycle_projection,
                 self._runtime_digest(initial_runtime),
             ),
+            credential=self._enforced_credential(pod, owner, namespace, expected_name),
         )
+
+    @staticmethod
+    def _enforced_credential(
+        pod: Any,
+        owner: WorkspaceOwner,
+        namespace: str,
+        pod_name: str,
+    ) -> str | None:
+        """Return the credential this Pod *actually enforces*, else ``None``.
+
+        Deriving a credential proves only what this orchestrator would send.
+        A Pod created before the credential existed runs ``auth: none`` and
+        would serve that request to anyone who reached it — so read the value
+        back off the attested Pod spec and require an exact match. The
+        transition therefore needs no flag day: an old Pod simply has no
+        credential, stays contained, and becomes reachable when it is
+        recreated on an image that enforces one.
+
+        Derived from the shared ``WorkspaceOwner`` rather than from this
+        service's own vocabulary: ``WorkspaceOwner.session()`` reports kind
+        "session" while the proxy calls the same thing a "thread", and the two
+        must not derive different values.
+        """
+
+        expected = ide_credential(
+            namespace=namespace,
+            owner_kind=owner.kind,
+            owner_id=owner.id,
+            pod_name=pod_name,
+        )
+        if not expected:
+            return None
+        spec = getattr(pod, "spec", None)
+        containers = getattr(spec, "containers", None)
+        if not isinstance(containers, (list, tuple)):
+            return None
+        for container in containers:
+            for entry in getattr(container, "env", None) or ():
+                if str(getattr(entry, "name", "") or "") != IDE_CREDENTIAL_ENV:
+                    continue
+                observed = getattr(entry, "value", None)
+                if isinstance(observed, str) and hmac.compare_digest(
+                    observed, expected
+                ):
+                    return expected
+                # A container carrying a *different* value is not this owner's
+                # runtime as this server understands it. Refuse rather than
+                # send a credential it will reject anyway.
+                return None
+        return None
 
     @staticmethod
     def _docker_identity(

@@ -229,6 +229,10 @@ async def test_http_stateless_remote_is_contained_before_network_connect():
     target.backend = "k8s"
     target.host = "10.0.0.2"
     target.authority = "10.0.0.2:38080"
+    # Explicit, not left to the mock: an unset attribute auto-vivifies to a
+    # truthy MagicMock, which would look like a bound credential and let this
+    # very containment pass by accident.
+    target.credential = None
     proxy.resolve_target = AsyncMock(return_value=target)
     request = MagicMock()
     request.headers = {}
@@ -255,13 +259,27 @@ async def test_http_stateless_remote_is_contained_before_network_connect():
 
 
 @pytest.mark.asyncio
-async def test_ws_stateless_remote_is_contained_before_resolution_or_connect():
+async def test_ws_stateless_remote_without_a_credential_is_refused():
+    """A remote stream is opened only once its runtime can refuse a stranger.
+
+    Was an unconditional refusal while code-server ran `auth: none`. The rule
+    is now the same as the HTTP transport's: no credential, no stream — and
+    still decided before `accept()` and before any upstream handshake, so a
+    browser never gets an open socket it cannot use.
+    """
     from orchestrator import main
 
     db = MagicMock()
     db.get_thread = AsyncMock(return_value=_valid_sandbox_thread())
     proxy = MagicMock()
-    proxy.resolve_target = AsyncMock()
+    target = MagicMock()
+    target.backend = "k8s"
+    target.host = "10.0.0.2"
+    target.authority = "10.0.0.2:38080"
+    # Explicit: an unset attribute auto-vivifies truthy and would read as a
+    # bound credential.
+    target.credential = None
+    proxy.resolve_target = AsyncMock(return_value=target)
     ws = MagicMock()
     ws.url.query = ""
     ws.accept = AsyncMock()
@@ -307,12 +325,11 @@ async def test_ws_stateless_remote_is_contained_before_resolution_or_connect():
     ):
         await main.ide_proxy_ws(ws, "thread-a", "workspace")
 
-    proxy.resolve_target.assert_not_awaited()
     assert connected_urls == []
     ws.accept.assert_not_awaited()
     ws.close.assert_awaited_once_with(
         code=4503,
-        reason="ide_stream_operation_lease_unavailable",
+        reason="ide_remote_transport_unavailable",
     )
 
 

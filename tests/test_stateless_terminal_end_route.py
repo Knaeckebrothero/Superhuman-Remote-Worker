@@ -367,10 +367,20 @@ def test_process_zero_without_pending_retirement_stays_fail_closed() -> None:
 
 
 @pytest.mark.asyncio
-async def test_process_zero_retry_retires_exact_live_residents_and_shell() -> None:
+async def test_process_zero_retry_retires_exact_live_residents_and_shell(
+    monkeypatch,
+) -> None:
     from services import stateless_session_retirement as retirement_service
+    from services.cloud import RcloneMountSpec
 
     settled = _retiring_process_zero_thread()
+    settled.update(
+        {
+            "main_cloud_backend": "nextcloud",
+            "main_cloud_backend_instance_id": ("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+            "main_cloud_session_handle": f"sessions/{THREAD_ID}",
+        }
+    )
     settled_marker = settled["metadata"]["_stateless_claim_retirement"]
     settled_marker["permanent"] = True
 
@@ -450,10 +460,29 @@ async def test_process_zero_retry_retires_exact_live_residents_and_shell() -> No
     retire_shell = AsyncMock(return_value=authority)
     verify_residents = AsyncMock(return_value=authority)
 
+    class Backend:
+        backend_id = "nextcloud"
+        is_initialized = True
+
+        async def build_rclone_mount_spec(self, *, mount_kind, target_path, **kwargs):
+            return RcloneMountSpec(
+                source_type="webdav",
+                source_config={
+                    "url": "https://nc.test/remote.php/dav/files/agent/session/",
+                    "vendor": "nextcloud",
+                    "user": "agent-service",
+                },
+                auth={"type": "basic", "password": "agent-pass"},
+            )
+
+    cloud_router = SimpleNamespace(for_thread=lambda _thread: Backend())
+    monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
+    monkeypatch.delenv("CLOUD_RCLONE_ALLOW_CONTAINER", raising=False)
+
     with (
         patch.object(main, "postgres_db", db),
         patch.object(main, "container_provisioner", provisioner),
-        patch.object(main, "_build_agent_cloud_mount", AsyncMock(return_value=None)),
+        patch.object(main, "main_cloud_router", cloud_router),
         patch.object(
             retirement_service,
             "retire_stateless_workspace_residents",
@@ -478,6 +507,10 @@ async def test_process_zero_retry_retires_exact_live_residents_and_shell() -> No
 
     assert result["state"] == "settled"
     retire_residents.assert_awaited_once()
+    terminal_cloud_mount = retire_residents.await_args.kwargs["cloud_mount_cfg"]
+    assert terminal_cloud_mount is not None
+    assert terminal_cloud_mount["driver"] == "rclone"
+    assert terminal_cloud_mount["mounts"][0]["mount_kind"] == "session_folder"
     db.record_managed_repository_workspace_process_zero.assert_awaited_once_with(
         THREAD_ID,
         owner_kind="thread",
@@ -487,6 +520,7 @@ async def test_process_zero_retry_retires_exact_live_residents_and_shell() -> No
     )
     retire_shell.assert_awaited_once()
     verify_residents.assert_awaited_once()
+    assert verify_residents.await_args.kwargs["cloud_mount_cfg"] is terminal_cloud_mount
     provisioner.prepare_workspace_cleanup_intent.assert_awaited_once()
     assert provisioner.prepare_workspace_cleanup_intent.await_args.kwargs == {
         "expected_runtime_incarnation": RUNTIME,

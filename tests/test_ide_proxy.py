@@ -1274,6 +1274,80 @@ class TestIdeProxySecurityBoundary:
         constructor.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_credential_bound_remote_target_is_allowed_and_binds_upstream(self):
+        """A K8s target may proceed once the destination can refuse a stranger.
+
+        The credential is the recipient binding: code-server compares it to its
+        own injected value, so a connection that reached a foreign runtime is
+        rejected there. Assert both halves — the refusal is lifted, and the
+        request actually carries the credential.
+        """
+        from orchestrator import main
+
+        sent: list[dict] = []
+
+        class Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            @asynccontextmanager
+            async def stream(self, **kwargs):
+                sent.append(kwargs)
+
+                class _Streamed:
+                    status_code = 200
+                    headers = httpx.Headers({"content-type": "text/html"})
+
+                    async def aiter_raw(self):
+                        yield b"ok"
+
+                yield _Streamed()
+
+        proxy = SimpleNamespace(revalidate_target=AsyncMock(return_value=True))
+        browser_headers = {"accept": "text/html"}
+        with (
+            patch.object(main, "ide_proxy_service", proxy),
+            patch.object(main.httpx, "AsyncClient", MagicMock(return_value=Client())),
+        ):
+            response = await main._request_exact_ide_http(
+                target=SimpleNamespace(backend="k8s", credential="c0ffee"),
+                method="GET",
+                url="http://10.42.0.7:38080/data",
+                headers=browser_headers,
+                content=None,
+            )
+
+        assert response.status_code == 200
+        assert sent[0]["headers"]["cookie"] == "code-server-session=c0ffee"
+        # The caller's dict is per-request and must not accumulate a runtime's
+        # credential for the next one.
+        assert "cookie" not in browser_headers
+
+    @pytest.mark.asyncio
+    async def test_remote_target_without_a_credential_is_still_refused(self):
+        """Re-scoping the guard must not become "K8s is fine now"."""
+        from orchestrator import main
+
+        constructor = MagicMock()
+        with (
+            patch.object(main.httpx, "AsyncClient", constructor),
+            pytest.raises(main.IdeProxyUnavailable) as exc,
+        ):
+            await main._request_exact_ide_http(
+                target=SimpleNamespace(backend="k8s", credential=None),
+                method="GET",
+                url="http://10.42.0.7:38080/data",
+                headers={},
+                content=None,
+            )
+
+        assert exc.value.code == "ide_remote_transport_unavailable"
+        constructor.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_http_connection_trace_refuses_authority_loss_before_send(self):
         from orchestrator import main
 
@@ -1605,52 +1679,278 @@ class TestIdeProxyHttpAuthRedirect:
 class TestBrowserIdeAdvertisement:
     """The status advertisement must agree with what the proxy will serve."""
 
-    def test_contained_status_withholds_url_and_keeps_the_git_link(self):
+    ACTIVE = {
+        "status": "active",
+        "code_server_url": "http://proxy/api/ide/thread-a/proxy/",
+        "source": "live_workspace",
+        "gitea_url": "https://git.example/srw/thread-a",
+    }
+
+    def test_deployment_without_a_root_key_advertises_nothing(self, monkeypatch):
+        """No key means no workspace here can bind one — say so once, cheaply."""
         from services.ide_proxy import contain_ide_status
 
-        result = contain_ide_status(
-            {
-                "status": "active",
-                "code_server_url": "http://proxy/api/ide/thread-a/proxy/",
-                "source": "live_workspace",
-                "gitea_url": "https://git.example/srw/thread-a",
-            }
-        )
+        monkeypatch.delenv("IDE_CREDENTIAL_KEY", raising=False)
+
+        result = contain_ide_status(dict(self.ACTIVE))
 
         assert result["status"] == "unavailable"
         assert result["code_server_url"] is None
-        assert result["code"] == "ide_stream_operation_lease_unavailable"
+        assert result["code"] == "ide_credential_key_unconfigured"
         assert result["error"]
         # The Git view reads the same workspace and still works; dropping it
         # would take away the only remaining way in.
         assert result["gitea_url"] == "https://git.example/srw/thread-a"
         assert result["source"] == "live_workspace"
 
-    def test_payload_without_a_url_is_returned_untouched(self):
+    def test_payload_without_a_url_is_returned_untouched(self, monkeypatch):
         from services.ide_proxy import contain_ide_status
 
+        monkeypatch.delenv("IDE_CREDENTIAL_KEY", raising=False)
         payload = {"status": "restoring", "code_server_url": None, "gitea_url": None}
 
         assert contain_ide_status(payload) is payload
 
-    def test_lifting_the_refusal_restores_the_advertisement(self, monkeypatch):
-        """One function is the whole gate — flipping it re-advertises."""
+    def test_configured_deployment_defers_to_the_per_workspace_check(self, monkeypatch):
+        """The cheap gate must not answer a question only the runtime can."""
         import services.ide_proxy as ide_proxy
 
-        monkeypatch.setattr(ide_proxy, "browser_ide_refusal", lambda: None)
-        payload = {"status": "active", "code_server_url": "http://proxy/x/"}
+        monkeypatch.setenv("IDE_CREDENTIAL_KEY", "k")
+        payload = dict(self.ACTIVE)
 
         assert ide_proxy.contain_ide_status(payload) is payload
         assert ide_proxy.contained_ide_status() is None
 
-    def test_advertisement_stays_contained_while_the_stream_guard_stands(self):
-        """Anti-drift: re-enabling the transport must re-enable the advert.
+    @pytest.mark.asyncio
+    async def test_bound_workspace_keeps_its_url(self, monkeypatch):
+        import services.ide_proxy as ide_proxy
 
-        ``ide_proxy_ws`` refuses every IDE WebSocket, and code-server cannot
-        render a workbench without one. If that guard is ever lifted without
-        lifting ``browser_ide_refusal``, the cockpit would keep hiding a
-        working IDE — so the two are asserted together here.
+        monkeypatch.setenv("IDE_CREDENTIAL_KEY", "k")
+        target = SimpleNamespace(backend="k8s", credential="c0ffee")
+        payload = dict(self.ACTIVE)
+        with patch.object(
+            ide_proxy.ide_proxy_service,
+            "resolve_target",
+            AsyncMock(return_value=target),
+        ):
+            result = await ide_proxy.contain_ide_status_for("thread-a", payload)
+
+        assert result is payload
+
+    @pytest.mark.asyncio
+    async def test_workspace_predating_the_credential_is_not_advertised(
+        self, monkeypatch
+    ):
+        """The button must not appear for a Pod the proxy will refuse."""
+        import services.ide_proxy as ide_proxy
+
+        monkeypatch.setenv("IDE_CREDENTIAL_KEY", "k")
+        target = SimpleNamespace(backend="k8s", credential=None)
+        with patch.object(
+            ide_proxy.ide_proxy_service,
+            "resolve_target",
+            AsyncMock(return_value=target),
+        ):
+            result = await ide_proxy.contain_ide_status_for(
+                "thread-a", dict(self.ACTIVE)
+            )
+
+        assert result["status"] == "unavailable"
+        assert result["code"] == "ide_remote_transport_unavailable"
+        assert result["gitea_url"] == "https://git.example/srw/thread-a"
+
+    @pytest.mark.asyncio
+    async def test_typed_backend_refusal_is_passed_through(self, monkeypatch):
+        import services.ide_proxy as ide_proxy
+
+        monkeypatch.setenv("IDE_CREDENTIAL_KEY", "k")
+        with patch.object(
+            ide_proxy.ide_proxy_service,
+            "resolve_target",
+            AsyncMock(
+                side_effect=ide_proxy.IdeProxyUnavailable(
+                    "vm_ide_transport_unavailable", "VM IDE needs an exact tunnel"
+                )
+            ),
+        ):
+            result = await ide_proxy.contain_ide_status_for(
+                "thread-a", dict(self.ACTIVE)
+            )
+
+        assert result["code"] == "vm_ide_transport_unavailable"
+
+
+class TestIdeWebSocketTransport:
+    """The stream half — code-server cannot render a workbench without it."""
+
+    def _ws(self):
+        ws = MagicMock()
+        ws.url.query = ""
+        ws.accept = AsyncMock()
+        ws.close = AsyncMock()
+        ws.receive = AsyncMock(return_value={"type": "websocket.disconnect"})
+        ws.send_text = AsyncMock()
+        ws.send_bytes = AsyncMock()
+        return ws
+
+    @asynccontextmanager
+    async def _upstream(self):
+        class _Upstream:
+            async def send(self, _message):
+                return None
+
+            def __aiter__(self):
+                async def empty():
+                    if False:
+                        yield None
+
+                return empty()
+
+        yield _Upstream()
+
+    @pytest.mark.asyncio
+    async def test_credential_bound_stream_carries_the_cookie(self):
+        """The handshake is what a foreign runtime refuses — bind it there."""
+        from orchestrator import main
+
+        target = SimpleNamespace(
+            backend="k8s",
+            credential="c0ffee",
+            host="10.42.0.7",
+            port=38080,
+            authority="10.42.0.7:38080",
+        )
+        proxy = MagicMock()
+        proxy.resolve_target = AsyncMock(return_value=target)
+        ws = self._ws()
+        ws.url.query = "token=leak-me&reconnectionToken=keep-me"
+        calls = []
+
+        def connect(url, **kwargs):
+            calls.append((url, kwargs))
+            return self._upstream()
+
+        with (
+            patch.object(main, "ide_proxy_service", proxy),
+            patch.object(
+                main,
+                "resolve_ws_user",
+                AsyncMock(return_value={"id": "u", "is_approved": True}),
+            ),
+            patch.object(
+                main, "user_can_access_ide_entity", AsyncMock(return_value=True)
+            ),
+            patch.object(
+                main, "_require_stateless_ide_lifecycle", AsyncMock(return_value=None)
+            ),
+            patch("services.ssh_helpers.orchestrator_can_reach", return_value=True),
+            patch("websockets.connect", side_effect=connect),
+        ):
+            await main.ide_proxy_ws(ws, "thread-a", "stable/connection")
+
+        ws.accept.assert_awaited_once()
+        url, kwargs = calls[0]
+        assert kwargs["additional_headers"]["Cookie"] == "code-server-session=c0ffee"
+        # Browser-auth material is stripped from the upgrade URL exactly as it
+        # is on the HTTP path; code-server's own state fields survive.
+        assert "token=leak-me" not in url
+        assert "reconnectionToken=keep-me" in url
+
+    @pytest.mark.asyncio
+    async def test_vm_refusal_closes_instead_of_raising(self):
+        from orchestrator import main
+
+        proxy = MagicMock()
+        proxy.resolve_target = AsyncMock(
+            side_effect=main.IdeProxyUnavailable(
+                "vm_ide_transport_unavailable", "VM IDE needs an exact tunnel"
+            )
+        )
+        ws = self._ws()
+        with (
+            patch.object(main, "ide_proxy_service", proxy),
+            patch.object(
+                main,
+                "resolve_ws_user",
+                AsyncMock(return_value={"id": "u", "is_approved": True}),
+            ),
+            patch.object(
+                main, "user_can_access_ide_entity", AsyncMock(return_value=True)
+            ),
+            patch.object(
+                main, "_require_stateless_ide_lifecycle", AsyncMock(return_value=None)
+            ),
+        ):
+            await main.ide_proxy_ws(ws, "thread-a", "")
+
+        ws.accept.assert_not_awaited()
+        ws.close.assert_awaited_once_with(
+            code=4503, reason="vm_ide_transport_unavailable"
+        )
+
+
+class TestIdeWebSocketLifecycleSupervisor:
+    """A stream outlives the proof that opened it; the bound is this check."""
+
+    TARGET = SimpleNamespace(
+        backend="k8s", credential="c0ffee", host="10.42.0.7", port=38080
+    )
+
+    async def _current(self, main, *, resolve):
+        with (
+            patch.object(main, "ide_proxy_service", MagicMock(resolve_target=resolve)),
+            patch.object(
+                main, "_require_stateless_ide_lifecycle", AsyncMock(return_value=None)
+            ),
+        ):
+            return await main._ide_ws_runtime_is_current("thread-a", self.TARGET)
+
+    @pytest.mark.asyncio
+    async def test_same_runtime_keeps_the_stream(self):
+        from orchestrator import main
+
+        assert await self._current(main, resolve=AsyncMock(return_value=self.TARGET))
+
+    @pytest.mark.asyncio
+    async def test_status_churn_alone_does_not_drop_a_working_ide(self):
+        """A session flipping active/awaiting_user must not close the socket.
+
+        This is why the check is not ``revalidate_target``: that compares the
+        owner lifecycle projection too, which moves during ordinary use.
         """
-        from services.ide_proxy import browser_ide_refusal
+        from orchestrator import main
 
-        assert browser_ide_refusal() is not None
+        churned = SimpleNamespace(
+            backend="k8s",
+            credential="c0ffee",
+            host="10.42.0.7",
+            port=38080,
+            identity=("something", "else"),
+        )
+
+        assert await self._current(main, resolve=AsyncMock(return_value=churned))
+
+    @pytest.mark.asyncio
+    async def test_replacement_runtime_closes_the_stream(self):
+        from orchestrator import main
+
+        successor = SimpleNamespace(
+            backend="k8s", credential="decafbad", host="10.42.0.9", port=38080
+        )
+
+        assert not await self._current(main, resolve=AsyncMock(return_value=successor))
+
+    @pytest.mark.asyncio
+    async def test_ended_owner_closes_the_stream(self):
+        from orchestrator import main
+
+        assert not await self._current(main, resolve=AsyncMock(return_value=None))
+
+    @pytest.mark.asyncio
+    async def test_inconclusive_check_closes_the_stream(self):
+        """Never hold a stream open because the check itself failed."""
+        from orchestrator import main
+
+        assert not await self._current(
+            main, resolve=AsyncMock(side_effect=RuntimeError("api down"))
+        )
