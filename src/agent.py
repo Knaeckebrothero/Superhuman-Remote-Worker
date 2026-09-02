@@ -3090,6 +3090,7 @@ class UniversalAgent:
                 load_agent_config_from_dict,
                 normalize_delegation_block,
                 normalize_llm_tiers,
+                strip_loader_owned_keys,
             )
             from .core.tool_policy import normalize_tool_policy
             import dataclasses
@@ -3100,14 +3101,19 @@ class UniversalAgent:
             # already carries canonical lists.) Same seam for a legacy
             # llm.strategic/tactical pin: the whole block — model plus the
             # transport the dispatcher injected into it — lifts to llm.model.
-            config_override = normalize_delegation_block(
-                normalize_llm_tiers(
-                    normalize_tool_policy(
-                        metadata["config_override"], source="job-override"
+            # It is caller-authored either way: loader-owned keys (the DB-
+            # prompt fence markers, pre-resolved content) are stripped before
+            # it can merge onto config.extra.
+            config_override = strip_loader_owned_keys(
+                normalize_delegation_block(
+                    normalize_llm_tiers(
+                        normalize_tool_policy(
+                            metadata["config_override"], source="job-override"
+                        ),
+                        source="job-override",
                     ),
                     source="job-override",
-                ),
-                source="job-override",
+                )
             )
             logger.info(
                 f"Applying inline config override: {list(config_override.keys())}"
@@ -4794,7 +4800,11 @@ class UniversalAgent:
 
         def _rendered_template():
             content = load_instructions(self.config, model=self.config.llm.model)
-            return render_instruction_content(content, loaded_tool_names)
+            return render_instruction_content(
+                content,
+                loaded_tool_names,
+                origin=f"expert {getattr(self.config, 'agent_id', '?')!r} instructions",
+            )
 
         def _task_brief():
             meta = self._job_metadata or {}
@@ -4858,7 +4868,11 @@ class UniversalAgent:
                                 f"Bound skill content missing from blob: {entry.skill}"
                             )
                             continue
-                        content = render_instruction_content(content, loaded_tool_names)
+                        content = render_instruction_content(
+                            content,
+                            loaded_tool_names,
+                            origin=f"bound skill {entry.skill!r}",
+                        )
                         parent_dir = str(Path(entry.path).parent)
                         if parent_dir and parent_dir != ".":
                             self._workspace_manager.backend.mkdir(parent_dir)
@@ -4872,7 +4886,11 @@ class UniversalAgent:
                     content = resolved_instructions.get(basename)
                     if not content:
                         content = file_resolver.load(Path(entry.file).name)
-                    content = render_instruction_content(content, loaded_tool_names)
+                    content = render_instruction_content(
+                        content,
+                        loaded_tool_names,
+                        origin=f"instruction file {entry.file!r}",
+                    )
                     # Ensure parent directory exists (use backend, not local mkdir)
                     parent_dir = str(Path(entry.file).parent)
                     if parent_dir and parent_dir != ".":

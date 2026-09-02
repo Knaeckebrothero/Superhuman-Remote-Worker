@@ -207,6 +207,7 @@ def build_expert_config(base: dict, row: dict) -> tuple[dict, dict]:
         deep_merge,
         normalize_delegation_block,
         normalize_llm_tiers,
+        strip_loader_owned_keys,
     )
     from src.core.tool_policy import normalize_tool_policy
 
@@ -230,6 +231,10 @@ def build_expert_config(base: dict, row: dict) -> tuple[dict, dict]:
     # And the pre-U3 delegation keys (``mode`` / ``light`` / the heavy-path
     # timeouts) a stored row may still carry: dropped with one warning.
     config = normalize_delegation_block(config, source=expert_layer_source(row))
+    # Authored also means it may not carry loader-owned provenance keys
+    # (``_db_prompt_keys`` and friends): those belong to the resolver that
+    # marks this row's prompts as DB-authored, never to the row itself.
+    config = strip_loader_owned_keys(config)
     merged = deep_merge(base, config)
     merged.pop("connections", None)  # belt-and-braces; deny-scan already ran at save
     return merged, prompts

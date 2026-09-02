@@ -80,6 +80,7 @@ from src.core.loader import (
     normalize_llm_tiers,
     prune_ignored_keys,
     resolve_config_path,
+    strip_loader_owned_keys,
 )
 from src.core.tool_policy import normalize_tool_policy
 
@@ -385,7 +386,11 @@ def _resolve_entry(ctx: _Context, name: str, raw: Any) -> Dict[str, Any]:
         normalize_tool_policy(raw, source=f"roster:{name}"), source=f"roster:{name}"
     )
     ref = layer.get("$ref")
-    overrides = {k: v for k, v in layer.items() if k != "$ref"}
+    # The entry merges on top of a DB target that was just marked
+    # ``_db_prompt_keys`` / ``_persona_source``: its sibling keys are authored
+    # (they come from the parent expert's roster) and may not carry those
+    # markers, or the child's DB prompts would render unfenced.
+    overrides = strip_loader_owned_keys({k: v for k, v in layer.items() if k != "$ref"})
 
     if ref is None:
         merged = copy.deepcopy(ctx.base)

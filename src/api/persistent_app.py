@@ -3289,7 +3289,11 @@ def _sanitize_live_session_config_override(
 
     if not isinstance(config_override, dict):
         raise ValueError("Session config override must be an object")
-    sanitized = dict(config_override)
+    # Loader-owned provenance keys are never a live-update surface (see
+    # strip_loader_owned_keys) — dropped, not honoured.
+    from ..core.loader import strip_loader_owned_keys
+
+    sanitized = strip_loader_owned_keys(dict(config_override))
     interactive = sanitized.get("interactive")
     if isinstance(interactive, dict) and {
         "permission_mode",
@@ -4336,6 +4340,17 @@ async def _attach_session_inner(
                 raise ProtectedCloudUnavailable(
                     "protected-cloud workspace revalidation failed"
                 )
+
+    # config_override is final here (request > workspace_override > ws_info)
+    # and caller-authored on every one of those routes. Strip loader-owned
+    # keys ONCE, before the runtime decorates it (``extra._cli_datasources``
+    # below) and before the deep-merge onto config.extra further down: a
+    # thread override carrying ``_db_prompt_keys: []`` must not unfence the
+    # expert's DB prompts (security audit 2026-08-27, finding #2).
+    if isinstance(config_override, dict):
+        from ..core.loader import strip_loader_owned_keys
+
+        config_override = strip_loader_owned_keys(config_override)
 
     # Crossing this one-way boundary means config/datasource/session setup may
     # have created local or remote actors. Any later delivered-attach abort
@@ -14971,6 +14986,7 @@ async def _handle_config_update(
             create_llm,
             deep_merge,
             load_agent_config_from_dict,
+            strip_loader_owned_keys,
         )
 
         # Resolve credentials with the orchestrator first when any
@@ -15077,12 +15093,16 @@ async def _handle_config_update(
 
         # Live `config.update` is the same raw-override shape as the legacy
         # attach path above; normalise before both the merge and the markers.
-        effective_override = normalize_delegation_block(
-            normalize_llm_tiers(
-                normalize_tool_policy(effective_override, source="thread-override"),
+        # The orchestrator-enriched copy is re-stripped too: whichever side
+        # produced it, loader-owned keys never ride an override onto extra.
+        effective_override = strip_loader_owned_keys(
+            normalize_delegation_block(
+                normalize_llm_tiers(
+                    normalize_tool_policy(effective_override, source="thread-override"),
+                    source="thread-override",
+                ),
                 source="thread-override",
-            ),
-            source="thread-override",
+            )
         )
         base_dict = dataclasses.asdict(_session.config)
         merged = deep_merge(base_dict, effective_override)

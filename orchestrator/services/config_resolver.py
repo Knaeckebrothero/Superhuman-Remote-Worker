@@ -37,6 +37,7 @@ from src.core.loader import (
     reroot_extends,
     resolve_config_path,
     serialize_resolved_config,
+    strip_loader_owned_keys,
 )
 from src.core.subagent_roster import resolve_subagent_roster
 from src.core.tool_policy import normalize_tool_policy
@@ -177,12 +178,14 @@ def resolve_config(
     # Default-model floor: replace the base placeholder model before the expert
     # merges (the expert/request still override it).
     if base_defaults:
-        base_defaults = normalize_delegation_block(
-            normalize_llm_tiers(
-                normalize_tool_policy(base_defaults, source="base-defaults"),
+        base_defaults = strip_loader_owned_keys(
+            normalize_delegation_block(
+                normalize_llm_tiers(
+                    normalize_tool_policy(base_defaults, source="base-defaults"),
+                    source="base-defaults",
+                ),
                 source="base-defaults",
-            ),
-            source="base-defaults",
+            )
         )
         if base_defaults.get("llm"):
             explicit_llm_keys |= set(base_defaults["llm"].keys())
@@ -217,15 +220,6 @@ def resolve_config(
         )
         explicit_llm_keys |= set((expert_cfg.get("llm") or {}).keys())
         data, prompts_override = build_expert_config(data, expert_row)
-        # decision 7: mark the DB-authored persona so the render path fences it.
-        data["_persona_source"] = "db"
-        # Part 2: record which prompt segments are DB-authored (untrusted) so the
-        # render path fences strategic/tactical (fence_phase_directive) and brace-
-        # escapes summarization. Only the segments actually present in the row —
-        # inherited (disk) segments stay trusted.
-        data["_db_prompt_keys"] = [
-            k for k in _OVERLAY_PROMPT_KEYS if prompts_override.get(k)
-        ]
 
     # Every remaining authored layer, normalised at birth. Layer-local
     # expansion is what lets deep_merge stay untouched: each layer is already
@@ -235,7 +229,11 @@ def resolve_config(
     # the campaign-loop {"loop": ["loop_plan"]}) ride this same path and need
     # no special handling. The legacy llm tiers are mapped per layer for the
     # same reason: a job override's strategic pin resolves against THAT
-    # layer's own llm.model, never against a lower layer's.
+    # layer's own llm.model, never against a lower layer's. Every layer is
+    # caller-authored, so loader-owned (``_``-prefixed) keys are stripped
+    # before the merge: a request override carrying ``_db_prompt_keys: []``
+    # must not be able to unfence the DB prompts marked below (security
+    # audit 2026-08-27, finding #2).
     for _source, layer in (
         ("project-override", project_overrides),
         ("db-override", db_overrides),
@@ -243,15 +241,31 @@ def resolve_config(
         ("request-override", request_override),
     ):
         if layer:
-            layer = normalize_delegation_block(
-                normalize_llm_tiers(
-                    normalize_tool_policy(layer, source=_source), source=_source
-                ),
-                source=_source,
+            layer = strip_loader_owned_keys(
+                normalize_delegation_block(
+                    normalize_llm_tiers(
+                        normalize_tool_policy(layer, source=_source), source=_source
+                    ),
+                    source=_source,
+                )
             )
             if layer.get("llm"):
                 explicit_llm_keys |= set(layer["llm"].keys())
             data = deep_merge(data, layer)
+
+    # Provenance markers are written LAST, after every authored layer has
+    # merged, so this DB-loading path is their only writer: no layer above or
+    # below can set, clear, or replace them.
+    if expert_row is not None:
+        # decision 7: mark the DB-authored persona so the render path fences it.
+        data["_persona_source"] = "db"
+        # Part 2: record which prompt segments are DB-authored (untrusted) so the
+        # render path fences strategic/tactical (fence_phase_directive) and brace-
+        # escapes summarization. Only the segments actually present in the row —
+        # inherited (disk) segments stay trusted.
+        data["_db_prompt_keys"] = [
+            k for k in _OVERLAY_PROMPT_KEYS if prompts_override.get(k)
+        ]
 
     # Pruning point 2 of 3: the role overlay's ignored keys are dropped again
     # after the request layers, so a job/thread override cannot re-introduce

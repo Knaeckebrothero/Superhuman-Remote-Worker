@@ -236,6 +236,56 @@ def deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]
     return result
 
 
+# Keys of the agent config that the loader / orchestrator resolver own: the
+# provenance markers (``_persona_source``, ``_db_prompt_keys``) and the
+# pre-resolved content (``_resolved_prompts``, ``_resolved_instructions``,
+# ``_resolved_skills``) that the resolution path writes and the render path
+# reads back. They describe WHERE config came from, so no authored layer may
+# write them — a job/thread ``config_override``, a live ``config.update``,
+# project/user settings, a roster entry, or a DB expert's own fragment carrying
+# ``_db_prompt_keys: []`` would otherwise switch the render-side fence off and
+# hand an untrusted prompt the trusted (unfenced) path (security audit
+# 2026-08-27, finding #2). The rule is by prefix, not by name, so a marker
+# added later is covered without touching this seam: every ``_`` key at the
+# top level and inside ``extra`` (the loader's own namespace, which
+# ``dataclasses.asdict`` round-trips as a nested mapping) is dropped before the
+# merge. Runtime-derived ``_`` keys (``_cli_datasources``, ``_protected_cloud``,
+# the session tool-group markers, the roster's ``_ref*`` meta) are written by
+# the runtime AFTER this strip, straight onto the merged config or the
+# delivered blob, so they are unaffected.
+LOADER_OWNED_KEY_PREFIX = "_"
+
+
+def strip_loader_owned_keys(override: Any) -> Any:
+    """Return ``override`` without loader-owned (``_``-prefixed) keys.
+
+    Applies at the top level and, recursively, inside ``extra`` — the two
+    places a caller-supplied layer can reach ``config.extra`` through
+    ``deep_merge`` + ``load_agent_config_from_dict``. Every other nested
+    mapping is authored config and passes through untouched. A ``None`` value
+    is dropped like any other (``deep_merge`` would treat it as "clear the
+    key", which is exactly the bypass). Never mutates its input; a non-mapping
+    is returned as is. Call it on every caller-supplied layer right before
+    that layer is merged.
+    """
+    if not isinstance(override, dict):
+        return override
+    dropped = sorted(
+        k
+        for k in override
+        if isinstance(k, str) and k.startswith(LOADER_OWNED_KEY_PREFIX)
+    )
+    cleaned = {k: v for k, v in override.items() if k not in dropped}
+    nested_extra = cleaned.get("extra")
+    if isinstance(nested_extra, dict):
+        cleaned["extra"] = strip_loader_owned_keys(nested_extra)
+    if dropped:
+        logger.warning(
+            "Dropped loader-owned keys from a config override layer: %s", dropped
+        )
+    return cleaned
+
+
 # Legacy per-phase model tiers (pre-U1). Still ACCEPTED in every authored layer
 # but mapped onto the single ``llm.model`` (+ ``subagents.llm``) by
 # ``normalize_llm_tiers`` and never parsed into ``LLMConfig`` any more. See
@@ -1238,12 +1288,42 @@ def _has_shell_tools(tool_set: Set[str]) -> bool:
     return False
 
 
+class PromptRenderSecurityError(RuntimeError):
+    """A prompt/instruction template tried something the render sandbox forbids.
+
+    Raised instead of rendering — there is deliberately no fallback to a plain
+    environment. The message names the template's origin (expert / prompt key)
+    so the refusal is attributable in the job log.
+    """
+
+
+@functools.lru_cache(maxsize=1)
+def _prompt_template_environment():
+    """The one Jinja2 environment every prompt/instruction render goes through.
+
+    ``ImmutableSandboxedEnvironment`` rather than ``Environment``: prompt text
+    can be DB-authored (any approved user can create an expert with its own
+    prompts), and an unsandboxed render of ``{{ ''.__class__.__mro__ }}`` is
+    arbitrary code execution inside the agent process (security audit
+    2026-08-27, finding #2). The sandbox refuses attribute traversal into
+    Python internals, calls on unsafe callables and — immutable — in-place
+    mutation of the context objects. The options match the former plain
+    environment so bundled prompts render byte-identically; the vocabulary
+    they use (``{% if has_tool(...) %}``, ``{{ tools }}``, ``{% for %}``) is
+    fully inside the sandbox.
+    """
+    from jinja2.sandbox import ImmutableSandboxedEnvironment
+
+    return ImmutableSandboxedEnvironment(keep_trailing_newline=True)
+
+
 def render_instruction_content(
     content: str,
     tool_names: List[str],
     cli_datasources: Optional[List[str]] = None,
     protected_cloud: bool = False,
     extra_context: Optional[Dict[str, Any]] = None,
+    origin: str = "",
 ) -> str:
     """Render Jinja2 template markers in instruction file content.
 
@@ -1255,6 +1335,11 @@ def render_instruction_content(
     or ``{{`` markers) passes through unchanged with zero overhead.
     ``extra_context`` adds caller-owned variables (the worker system prompt
     passes ``legacy_phase_prompt``); it can never shadow the built-ins.
+
+    Rendering is sandboxed (see ``_prompt_template_environment``). A template
+    that reaches for Python internals raises ``PromptRenderSecurityError``
+    naming ``origin``; nothing is rendered and nothing falls back to an
+    unsandboxed environment.
 
     Args:
         content: Raw instruction file content (may contain Jinja2 markers).
@@ -1269,17 +1354,24 @@ def render_instruction_content(
             instructs the agent to describe cloud writes as "staged", never
             "saved"/"uploaded"/"shared". Defaults to False so a non-protected
             session never sees the block.
+        origin: Label for the template (expert + prompt key, template file
+            name) used only in the refusal log/error when the sandbox rejects
+            the content.
 
     Returns:
         Rendered content with conditionals resolved.
+
+    Raises:
+        PromptRenderSecurityError: the template attempted an operation the
+            sandbox forbids (attribute traversal into Python internals, unsafe
+            calls, mutation). Fails closed.
     """
     if "{%" not in content and "{{" not in content:
         return content  # Fast path: no template markers
 
-    from jinja2 import Environment
+    from jinja2.sandbox import SecurityError
 
-    env = Environment(keep_trailing_newline=True)
-    template = env.from_string(content)
+    env = _prompt_template_environment()
     tool_set = set(tool_names)
     ds_set = set(cli_datasources or [])
     context: Dict[str, Any] = dict(extra_context or {})
@@ -1291,7 +1383,26 @@ def render_instruction_content(
         has_cli_datasource=lambda ds_type: ds_type in ds_set,
         protected_cloud=protected_cloud,
     )
-    return template.render(**context)
+    try:
+        template = env.from_string(content)
+        return template.render(**context)
+    except SecurityError as exc:
+        label = origin or "prompt template"
+        logger.error(
+            "Refusing to render %s: the template was rejected by the render "
+            "sandbox (%s). No fallback — the content is not rendered.",
+            label,
+            exc,
+        )
+        raise PromptRenderSecurityError(
+            f"Prompt template {label!r} was rejected by the render sandbox: {exc}"
+        ) from exc
+
+
+def _prompt_origin(config: Any, prompt_key: str) -> str:
+    """Attributable label for a prompt render: which expert, which segment.
+    Tolerates config doubles (``getattr``) — this is a log label, never a gate."""
+    return f"expert {getattr(config, 'agent_id', '?')!r} prompt {prompt_key!r}"
 
 
 class MatrixResolver:
@@ -3446,6 +3557,8 @@ def load_uploaded_config(uploaded_config_path: Path) -> Dict[str, Any]:
     uploaded_data = normalize_delegation_block(
         uploaded_data, source=f"upload:{Path(uploaded_config_path).name}"
     )
+    # Authored also means it may not carry loader-owned provenance keys.
+    uploaded_data = strip_loader_owned_keys(uploaded_data)
 
     # Merge: defaults as base, uploaded as override (then honour the base's
     # ignored keys, should the worker overlay ever declare any)
@@ -5055,6 +5168,7 @@ def get_phase_system_prompt(
                 tool_names,
                 cli_datasources=cli_ds_interactive,
                 protected_cloud=protected_cloud_interactive,
+                origin=_prompt_origin(config, "systemprompt_interactive"),
             )
 
         # Slice-2 skills menu (L1): fenced, untrusted user content. Empty when no
@@ -5156,6 +5270,7 @@ def get_phase_system_prompt(
         expert_identity,
         phase_component=phase_component,
         phase_number=phase_number,
+        phase_key=prompt_type_key,
     )
 
 
@@ -5188,13 +5303,15 @@ def _render_worker_prompt(
     *,
     phase_component: Optional[str] = None,
     phase_number: int = 0,
+    phase_key: str = "",
 ) -> str:
     """Render the worker system prompt from its parts.
 
     ``phase_component`` is None on the phase-agnostic path (the template's
     ``legacy_phase_prompt`` branch renders False and a bare ``{prompt_content}``
     of a pre-U2 template renders empty) and the loaded strategic/tactical
-    component on the legacy swap.
+    component on the legacy swap. ``phase_key`` names that component
+    (``strategic`` / ``tactical``) for the sandbox refusal log only.
     """
     legacy = phase_component is not None
     # Render Jinja2 conditionals BEFORE placeholder substitution — Jinja2 owns
@@ -5203,13 +5320,17 @@ def _render_worker_prompt(
     if tool_names is not None:
         if legacy:
             phase_component = render_instruction_content(
-                phase_component, tool_names, cli_datasources=cli_ds
+                phase_component,
+                tool_names,
+                cli_datasources=cli_ds,
+                origin=_prompt_origin(config, phase_key or "phase component"),
             )
         base_template = render_instruction_content(
             base_template,
             tool_names,
             cli_datasources=cli_ds,
             extra_context={LEGACY_PHASE_PROMPT_FLAG: legacy},
+            origin=_prompt_origin(config, "systemprompt"),
         )
 
     # Render the phase component's {phase_number} placeholder. Uses
@@ -5333,6 +5454,7 @@ def get_subagent_system_prompt(
             template,
             tool_names,
             cli_datasources=cli_ds,
+            origin=_prompt_origin(config, "systemprompt_subagent"),
         )
 
     from src.core.expert_resolution import fence_skills_menu
@@ -6022,7 +6144,9 @@ def load_strategic_todos_template(
     if resolved_content and isinstance(resolved_content, str):
         logger.debug("Loading strategic todos from resolved content")
         if tool_names is not None:
-            resolved_content = render_instruction_content(resolved_content, tool_names)
+            resolved_content = render_instruction_content(
+                resolved_content, tool_names, origin=f"template {template_name!r}"
+            )
         return _parse_strategic_todos_yaml_from_string(resolved_content)
 
     # Use InstructionMatrixResolver for 4-level fallback
@@ -6038,7 +6162,9 @@ def load_strategic_todos_template(
         # Render Jinja2 templates before YAML parsing
         if tool_names is not None:
             raw_content = path.read_text(encoding="utf-8")
-            rendered = render_instruction_content(raw_content, tool_names)
+            rendered = render_instruction_content(
+                raw_content, tool_names, origin=f"template {template_name!r}"
+            )
             return _parse_strategic_todos_yaml_from_string(rendered)
         return _parse_strategic_todos_yaml(path)
     except FileNotFoundError:

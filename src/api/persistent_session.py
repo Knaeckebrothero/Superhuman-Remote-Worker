@@ -1728,7 +1728,9 @@ class PersistentSession:
                             f"Bound skill content missing from blob: {entry.skill}"
                         )
                         continue
-                    content = render_instruction_content(content, [])
+                    content = render_instruction_content(
+                        content, [], origin=f"bound skill {entry.skill!r}"
+                    )
                     parent_dir = str(Path(entry.path).parent)
                     if parent_dir and parent_dir != ".":
                         self.workspace_manager.backend.mkdir(parent_dir)
@@ -1746,7 +1748,9 @@ class PersistentSession:
                     )
                     continue
                 content = file_resolver.load(Path(entry.file).name)
-                content = render_instruction_content(content, [])
+                content = render_instruction_content(
+                    content, [], origin=f"instruction file {entry.file!r}"
+                )
                 # Ensure parent directory exists
                 parent_dir = str(Path(entry.file).parent)
                 if parent_dir and parent_dir != ".":
