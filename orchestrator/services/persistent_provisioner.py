@@ -16,6 +16,7 @@ For local development, persistent agents are started manually via:
 import asyncio
 import logging
 import os
+import shlex
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -24,6 +25,7 @@ from typing import Any, Dict, Optional
 
 from src.core.loader import canonical_config_name
 
+from .agent_pod_entrypoint import agent_exec_command, validate_config_name
 from .runtime_actor import issue_runtime_actor_bootstrap
 from .pinned_k8s_effect import (
     PINNED_AUTHORITY_FINALIZER,
@@ -81,9 +83,16 @@ def _normalize_config_name(config_name: str) -> str:
     wrong slot — it has no on-disk ``<uuid>.yaml`` and ``--config <uuid>``
     crashes startup. Sessions apply the bound expert via ``config_override``,
     so fall back to the session base. See
-    knowledge-history/done/global_expert_management.md."""
+    knowledge-history/done/global_expert_management.md.
+
+    This is also the provisioner boundary for the value: ``config_name`` is
+    the one caller-controlled word in the pod's ``sh -c`` entrypoint, so it is
+    validated here — before any Kubernetes call or pod spec — and the
+    entrypoint itself is built from a quoted argv (``agent_exec_command``).
+    Security audit 2026-08-27, finding #3."""
     if not config_name:
         return canonical_config_name(config_name)
+    config_name = validate_config_name(config_name)
     try:
         uuid.UUID(str(config_name))
     except (ValueError, TypeError, AttributeError):
@@ -1812,6 +1821,26 @@ class PersistentProvisioner:
         Deployment.  Pod-specific overrides (AGENT_CONFIG, AGENT_PORT) are
         set via ``env``.
         """
+        # The sink re-checks what the boundary already checked: whichever
+        # path reaches this builder, a name that is not a bundled-config
+        # selector never becomes a pod spec.
+        validate_config_name(config_name)
+        # Shell-quoted as a list, never string-formatted — see
+        # agent_pod_entrypoint.
+        agent_argv = [
+            "python",
+            "agent.py",
+            "--mode",
+            "persistent",
+            "--thread-id",
+            str(thread_id),
+            "--config",
+            config_name,
+            "--port",
+            "8001",
+            "--host",
+            "0.0.0.0",
+        ]
         labels = {
             "app": "srw-persistent-agent",
             "srw/thread-id": thread_id,
@@ -1865,8 +1894,10 @@ class PersistentProvisioner:
                         "command": [
                             "sh",
                             "-c",
-                            f"until nc -z {self._orchestrator_host} "
-                            f"{self._orchestrator_port}; do sleep 2; done",
+                            "until nc -z "
+                            f"{shlex.quote(str(self._orchestrator_host))} "
+                            f"{shlex.quote(str(self._orchestrator_port))}; "
+                            "do sleep 2; done",
                         ],
                     }
                 ],
@@ -1875,16 +1906,11 @@ class PersistentProvisioner:
                         "name": "agent",
                         "image": selected_image,
                         "imagePullPolicy": self._agent_image_pull_policy,
-                        "command": [
-                            "sh",
-                            "-c",
-                            f"exec python agent.py"
-                            f" --mode persistent"
-                            f" --thread-id {thread_id}"
-                            f" --config {config_name}"
-                            f" --port 8001"
-                            f" --host 0.0.0.0",
-                        ],
+                        # ``exec`` so python, not ``sh``, is PID 1 and the
+                        # kubelet's SIGTERM reaches the drain handler; every
+                        # argv word is shell-quoted, so the shell only ever
+                        # sees the one command.
+                        "command": agent_exec_command(agent_argv),
                         # Kubernetes exposes deletionTimestamp outside the
                         # container before the process can observe it.  preStop
                         # creates a pod-local sentinel first, closing input and

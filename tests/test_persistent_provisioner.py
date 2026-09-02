@@ -11,10 +11,12 @@ Covers section 7 of persistent_agent_tests.md:
   7.8 K8s interaction (create/delete/status with mocked API)
 """
 
+import shlex
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from orchestrator.services.agent_pod_entrypoint import InvalidConfigNameError
 from orchestrator.services.persistent_provisioner import (
     PersistentProvisioner,
     PersistentPodCreateStatus,
@@ -833,3 +835,159 @@ class TestGetPodStatusK8s:
             result = await p.get_pod_status("thread-abc")
 
         assert result is None
+
+
+# =============================================================================
+# config_name at the provisioner boundary
+# (security audit 2026-08-27, finding #3: caller-controlled config_name was
+#  f-spliced unquoted into the agent pod's ``sh -c`` entrypoint, in a pod
+#  carrying the platform Secret via envFrom)
+# =============================================================================
+
+_HOSTILE_CONFIG_NAMES = [
+    "worker_base; touch /tmp/pwned",
+    "$(id)",
+    "`id`",
+    "a b",
+    "../x",
+    "x" * 1000,
+]
+
+# PersistentProvisioner._normalize_config_name rewrites only the UUID case;
+# every other name reaches ``--config`` exactly as given (aliases included).
+_VALID_CONFIG_NAMES = [
+    "worker_base",
+    "session_base",
+    "scholar",
+    "config/experts/scholar/config.yaml",
+    "default",
+    "defaults",
+    "persistent_default",
+    "persistent_defaults",
+]
+
+_TID = "11111111-1111-4111-8111-111111111111"
+
+
+def _expected_agent_argv(thread_id, config_name):
+    return [
+        "exec",
+        "python",
+        "agent.py",
+        "--mode",
+        "persistent",
+        "--thread-id",
+        thread_id,
+        "--config",
+        config_name,
+        "--port",
+        "8001",
+        "--host",
+        "0.0.0.0",
+    ]
+
+
+def _manifest(p, thread_id, config_name):
+    return p._build_agent_pod_manifest(
+        pod_name="persistent-abc123def456",
+        thread_id=thread_id,
+        config_name=config_name,
+        cpu_request="250m",
+        memory_request="512Mi",
+        cpu_limit="1000m",
+        memory_limit="2Gi",
+    )
+
+
+class TestConfigNameBoundary:
+    """A hostile name never reaches Kubernetes or a pod spec; valid ones boot."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("hostile", _HOSTILE_CONFIG_NAMES)
+    async def test_hostile_name_is_rejected_before_any_kubernetes_or_db_call(
+        self, hostile
+    ):
+        p, _conn = _make_provisioner_with_k8s()
+        with patch.object(p, "_build_agent_pod_manifest") as build:
+            with pytest.raises(InvalidConfigNameError):
+                await p.create_agent_pod(_TID, config_name=hostile)
+        build.assert_not_called()
+        assert p._core_api.mock_calls == []
+        p._db.get_thread.assert_not_awaited()
+        p._db.reserve_pinned_agent_pod_provision_intent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_hostile_name_is_rejected_even_without_kubernetes(self):
+        """The check precedes the availability short-circuit: a rejected name
+        is loud everywhere, not folded into a FAILED result."""
+        p = PersistentProvisioner()
+        with pytest.raises(InvalidConfigNameError):
+            await p.create_agent_pod("tid-1", config_name="$(id)")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("name", _VALID_CONFIG_NAMES)
+    async def test_valid_names_still_create_the_pod(self, name):
+        p, _ = _make_provisioner_with_k8s()
+        bodies = []
+
+        def _create(**kw):
+            bodies.append(kw["body"])
+            created = MagicMock()
+            created.metadata.uid = "pod-uid-new"
+            return created
+
+        p._core_api.create_namespaced_pod.side_effect = _create
+        pod = MagicMock()
+        pod.status.phase = "Running"
+        pod.status.pod_ip = "10.0.0.5"
+        cs = MagicMock()
+        cs.ready = True
+        pod.status.container_statuses = [cs]
+        not_found = Exception("Not found")
+        not_found.status = 404
+        p._core_api.read_namespaced_pod.side_effect = [not_found, pod]
+
+        async def fake_to_thread(fn, *args, **kwargs):
+            return fn(*args, **kwargs)
+
+        with patch(
+            "orchestrator.services.persistent_provisioner.asyncio.to_thread",
+            side_effect=fake_to_thread,
+        ):
+            result = await p.create_agent_pod("thread-abc123def456", config_name=name)
+
+        assert result.status == PersistentPodCreateStatus.CREATED
+        assert len(bodies) == 1
+        container = bodies[0]["spec"]["containers"][0]
+        assert container["command"][:2] == ["sh", "-c"]
+        assert shlex.split(container["command"][2]) == _expected_agent_argv(
+            "thread-abc123def456", name
+        )
+        env = {e["name"]: e.get("value") for e in container["env"]}
+        assert env["AGENT_CONFIG"] == name
+
+    @pytest.mark.parametrize("hostile", _HOSTILE_CONFIG_NAMES)
+    def test_manifest_builder_itself_refuses_a_hostile_name(self, hostile):
+        """The sink re-checks: no path to a pod spec bypasses the allow-list."""
+        with pytest.raises(InvalidConfigNameError):
+            _manifest(PersistentProvisioner(), _TID, hostile)
+
+    def test_manifest_command_parses_back_to_exactly_the_intended_argv(self):
+        name = "config/experts/scholar/config.yaml"
+        manifest = _manifest(PersistentProvisioner(), _TID, name)
+        command = manifest["spec"]["containers"][0]["command"]
+        assert command[:2] == ["sh", "-c"]
+        assert shlex.split(command[2]) == _expected_agent_argv(_TID, name)
+        init = manifest["spec"]["initContainers"][0]["command"]
+        assert init[:2] == ["sh", "-c"]
+        assert "nc -z srw-orchestrator 8085" in init[2]
+
+    def test_manifest_quotes_every_argv_word_not_just_config_name(self):
+        """``thread_id`` is a DB UUID today; the sink still quotes it as one
+        word so no future caller can turn it into shell syntax."""
+        hostile_thread = "a b;$(id)"
+        manifest = _manifest(PersistentProvisioner(), hostile_thread, "scholar")
+        command = manifest["spec"]["containers"][0]["command"]
+        assert shlex.split(command[2]) == _expected_agent_argv(
+            hostile_thread, "scholar"
+        )

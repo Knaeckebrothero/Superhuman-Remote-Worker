@@ -17,12 +17,14 @@ Docker Compose mode is unaffected — agents use the static container pool.
 import asyncio
 import logging
 import os
+import shlex
 from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import UUID, uuid4
 
 from src.core.loader import canonical_config_name
 
+from .agent_pod_entrypoint import agent_exec_command, validate_config_name
 from .runtime_actor import (
     issue_runtime_actor_bootstrap,
     issue_runtime_actor_pod_bootstrap,
@@ -81,9 +83,16 @@ def _normalize_config_name(config_name: str, purpose: str) -> str:
     bound expert is applied via the thread's ``config_override`` (sessions) or
     ``AGENT_EXPERT_ID`` (jobs), so a UUID in this slot is always wrong — boot
     the purpose's base config instead. See
-    knowledge-history/done/global_expert_management.md."""
+    knowledge-history/done/global_expert_management.md.
+
+    This is also the provisioner boundary for the value: ``config_name`` is
+    the one caller-controlled word in the pod's ``sh -c`` entrypoint, so it is
+    validated here — before any Kubernetes call or pod spec — and the
+    entrypoint itself is built from a quoted argv (``agent_exec_command``).
+    Security audit 2026-08-27, finding #3."""
     if not config_name:
         return config_name
+    config_name = validate_config_name(config_name)
     try:
         UUID(str(config_name))
     except (ValueError, TypeError, AttributeError):
@@ -324,7 +333,14 @@ class AgentProvisioner:
 
         Returns:
             Pod name if created, None if at capacity or on error.
+
+        Raises:
+            InvalidConfigNameError: ``config_name`` is not a bundled-config
+                selector. Raised before any Kubernetes or database call.
         """
+        # Boundary check first: a bad name is not worth a K8s round-trip, and
+        # the manifest builder must never see one.
+        config_name = _normalize_config_name(config_name, purpose)
         if not self._k8s_available:
             logger.info(
                 "K8s not available — start agent manually: "
@@ -400,7 +416,6 @@ class AgentProvisioner:
                 )
                 return None
 
-        config_name = _normalize_config_name(config_name, purpose)
         short_id = uuid4().hex[:8]
         pod_name = f"srw-agent-{purpose[0]}-{short_id}"
         provision_attempt: str | None = None
@@ -2325,20 +2340,17 @@ class AgentProvisioner:
         set) backs ``/workspace`` with that claim; ``None`` keeps the emptyDir
         this file has always used.
         """
-        # Build agent command based on purpose
+        # The sink re-checks what the boundary already checked: whichever
+        # path reaches this builder, a name that is not a bundled-config
+        # selector never becomes a pod spec.
+        validate_config_name(config_name)
+
+        # Build the agent argv based on purpose. It is shell-quoted as a
+        # list, never string-formatted — see agent_pod_entrypoint.
+        agent_argv: list[str] = ["python", "agent.py"]
         if purpose == "session" and thread_id:
-            command = (
-                f"python agent.py"
-                f" --mode persistent"
-                f" --thread-id {thread_id}"
-                f" --config {config_name}"
-                f" --port 8001"
-                f" --host 0.0.0.0"
-            )
-        else:
-            command = (
-                f"python agent.py --config {config_name} --port 8001 --host 0.0.0.0"
-            )
+            agent_argv += ["--mode", "persistent", "--thread-id", str(thread_id)]
+        agent_argv += ["--config", config_name, "--port", "8001", "--host", "0.0.0.0"]
 
         # Labels
         labels = {
@@ -2388,8 +2400,9 @@ class AgentProvisioner:
                 # with older manifests, but it must not remain PID 1.  Without
                 # ``exec`` kubelet's SIGTERM stops at ``sh`` and the Python
                 # drain handler never runs; the pod survives until SIGKILL at
-                # the end of its termination grace period.
-                "command": ["sh", "-c", f"exec {command}"],
+                # the end of its termination grace period.  Every argv word is
+                # shell-quoted, so the shell only ever sees the one command.
+                "command": agent_exec_command(agent_argv),
                 "ports": [{"containerPort": 8001}],
                 # Inject all env from shared ConfigMap + Secret
                 "envFrom": [
@@ -2705,8 +2718,10 @@ class AgentProvisioner:
                         "command": [
                             "sh",
                             "-c",
-                            f"until nc -z {self._orchestrator_host} "
-                            f"{self._orchestrator_port}; do sleep 2; done",
+                            "until nc -z "
+                            f"{shlex.quote(str(self._orchestrator_host))} "
+                            f"{shlex.quote(str(self._orchestrator_port))}; "
+                            "do sleep 2; done",
                         ],
                     }
                 ],

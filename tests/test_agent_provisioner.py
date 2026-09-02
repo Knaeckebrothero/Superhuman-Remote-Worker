@@ -8,6 +8,7 @@ Covers the new pool management and reservation-aware provisioning:
   - Pool fallback paths are tested indirectly via the provisioner methods
 """
 
+import shlex
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -15,7 +16,9 @@ from uuid import UUID
 
 import pytest
 
+from orchestrator.services.agent_pod_entrypoint import InvalidConfigNameError
 from orchestrator.services.agent_provisioner import AgentProvisioner
+from src.core.loader import canonical_config_name
 from orchestrator.services.pinned_k8s_effect import (
     K8S_MUTATION_REQUEST_TIMEOUT,
     PINNED_AUTHORITY_FINALIZER,
@@ -2005,4 +2008,165 @@ class TestExactClaimantPodAuthority:
             grace_period_seconds=180,
             body={"preconditions": {"uid": "uid-a"}},
             _request_timeout=K8S_MUTATION_REQUEST_TIMEOUT,
+        )
+
+
+# =============================================================================
+# config_name at the provisioner boundary
+# (security audit 2026-08-27, finding #3: caller-controlled config_name was
+#  f-spliced unquoted into the agent pod's ``sh -c`` entrypoint, in a pod
+#  carrying the platform Secret via envFrom)
+# =============================================================================
+
+_HOSTILE_CONFIG_NAMES = [
+    "worker_base; touch /tmp/pwned",
+    "$(id)",
+    "`id`",
+    "a b",
+    "../x",
+    "x" * 1000,
+]
+
+# Bare names, a relative YAML path, and the compatibility aliases in both the
+# name and the path form. The alias mapping itself belongs to
+# canonical_config_name() (covered by test_unified_expert_selection.py); here
+# the point is that every one of these survives the validator and boots with
+# the alias layer's answer on ``--config``.
+_VALID_CONFIG_NAMES = [
+    "worker_base",
+    "session_base",
+    "scholar",
+    "config/experts/scholar/config.yaml",
+    "default",
+    "defaults",
+    "persistent_default",
+    "persistent_defaults",
+    "experts/default.yaml",
+]
+
+
+def _expected_agent_argv(config_name, thread_id=None):
+    argv = ["exec", "python", "agent.py"]
+    if thread_id:
+        argv += ["--mode", "persistent", "--thread-id", thread_id]
+    return argv + ["--config", config_name, "--port", "8001", "--host", "0.0.0.0"]
+
+
+def _manifest(p, purpose, thread_id, config_name):
+    return p._build_pod_manifest(
+        pod_name=f"srw-agent-{purpose[0]}-deadbeef",
+        purpose=purpose,
+        thread_id=thread_id,
+        config_name=config_name,
+        cpu_request="100m",
+        memory_request="256Mi",
+        cpu_limit="1",
+        memory_limit="2Gi",
+    )
+
+
+class TestConfigNameBoundary:
+    """A hostile name never reaches Kubernetes or a pod spec; valid ones boot."""
+
+    _TID = "11111111-2222-3333-4444-555555555555"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("hostile", _HOSTILE_CONFIG_NAMES)
+    async def test_job_rejects_hostile_name_before_any_kubernetes_call(self, hostile):
+        p, _conn = _make_provisioner()
+        with patch.object(p, "_build_pod_manifest") as build:
+            with pytest.raises(InvalidConfigNameError):
+                await p.provision_agent(purpose="job", config_name=hostile)
+        build.assert_not_called()
+        assert p._core_api.mock_calls == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("hostile", _HOSTILE_CONFIG_NAMES)
+    async def test_session_rejects_hostile_name_before_any_kubernetes_or_db_call(
+        self, hostile
+    ):
+        p, _conn = _make_provisioner()
+        with patch.object(p, "_build_pod_manifest") as build:
+            with pytest.raises(InvalidConfigNameError):
+                await p.provision_agent(
+                    purpose="session", thread_id=self._TID, config_name=hostile
+                )
+        build.assert_not_called()
+        assert p._core_api.mock_calls == []
+        p._db.get_thread.assert_not_awaited()
+        p._db.reserve_pinned_agent_pod_provision_intent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_hostile_name_is_rejected_even_without_kubernetes(self):
+        """The check precedes the availability short-circuit: a rejected name
+        is loud everywhere, not silently swallowed into ``None``."""
+        p, _ = _make_provisioner(k8s_available=False)
+        with pytest.raises(InvalidConfigNameError):
+            await p.provision_agent(purpose="job", config_name="$(id)")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("given", _VALID_CONFIG_NAMES)
+    async def test_valid_names_still_boot_a_job_pod(self, given):
+        booted = canonical_config_name(given)
+        p, _conn = _make_provisioner()
+        pods_list = MagicMock()
+        pods_list.items = []
+        p._core_api.list_namespaced_pod.return_value = pods_list
+        bodies = []
+
+        def _create(**kw):
+            bodies.append(kw["body"])
+            created = MagicMock()
+            created.metadata.uid = "pod-uid-created"
+            return created
+
+        p._core_api.create_namespaced_pod.side_effect = _create
+
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            name = await p.provision_agent(purpose="job", config_name=given)
+
+        assert name is not None and name.startswith("srw-agent-j-")
+        assert len(bodies) == 1
+        container = bodies[0]["spec"]["containers"][0]
+        assert container["command"][:2] == ["sh", "-c"]
+        assert shlex.split(container["command"][2]) == _expected_agent_argv(booted)
+        env = {e["name"]: e.get("value") for e in container["env"]}
+        assert env["AGENT_CONFIG"] == booted
+
+    @pytest.mark.parametrize("hostile", _HOSTILE_CONFIG_NAMES)
+    def test_manifest_builder_itself_refuses_a_hostile_name(self, hostile):
+        """The sink re-checks: no path to a pod spec bypasses the allow-list."""
+        p = _bare_provisioner_for_manifest()
+        with pytest.raises(InvalidConfigNameError):
+            _manifest(p, "job", None, hostile)
+
+    @pytest.mark.parametrize(
+        ("purpose", "thread_id"),
+        [("job", None), ("session", _TID)],
+    )
+    def test_manifest_command_parses_back_to_exactly_the_intended_argv(
+        self, purpose, thread_id
+    ):
+        p = _bare_provisioner_for_manifest()
+        name = "config/experts/scholar/config.yaml"
+        manifest = _manifest(p, purpose, thread_id, name)
+        command = manifest["spec"]["containers"][0]["command"]
+        assert command[:2] == ["sh", "-c"]
+        assert shlex.split(command[2]) == _expected_agent_argv(name, thread_id)
+        init = manifest["spec"]["initContainers"][0]["command"]
+        assert init[:2] == ["sh", "-c"]
+        assert "nc -z srw-orchestrator 8085" in init[2]
+
+    def test_manifest_quotes_every_argv_word_not_just_config_name(self):
+        """``thread_id`` is a DB UUID today; the sink still quotes it as one
+        word so no future caller can turn it into shell syntax."""
+        p = _bare_provisioner_for_manifest()
+        hostile_thread = "a b;$(id)"
+        manifest = _manifest(p, "session", hostile_thread, "scholar")
+        command = manifest["spec"]["containers"][0]["command"]
+        assert shlex.split(command[2]) == _expected_agent_argv(
+            "scholar", hostile_thread
         )
