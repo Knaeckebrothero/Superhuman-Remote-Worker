@@ -13,8 +13,8 @@
 #   - All credentials are stub/dev passwords (NOT for production)
 #   - APP_ENCRYPTION_KEY is a fixed dev key — local DB only, regenerate with
 #     `openssl rand -base64 32` if you want a unique one per machine
-#   - The Keycloak realm ships with a pre-seeded `test`/`test` user that has
-#     `admin` + `user` roles — log into the cockpit straight away with that
+#   - The Keycloak realm ships with a pre-seeded local admin user — log into
+#     the cockpit as `test` / `srw-k3d-dev-test`
 #   - TLS via mkcert + cert-manager CAIssuer (set up out of band; see README)
 #   - Agent pool: no warm/buffer slots (spin up on demand)
 #   - Database storage trimmed for a single-dev cluster
@@ -93,8 +93,8 @@ secrets:
     # expressive voices + Voice Library). One account per deployment; the key
     # stays orchestrator-side (TTS is orchestrator-only, never fanned out to
     # agents). Leave blank to skip — Kokoro/OpenAI still work. Get a key at
-    # https://elevenlabs.io, then `helm upgrade`. See
-    # knowledge-base/knowledge/features/tts_vendor_providers.md for registering the voice model row.
+    # https://elevenlabs.io, then `helm upgrade`. Register the corresponding
+    # voice model through the administrator Settings page.
     ELEVENLABS_API_KEY: ""
 
     # App DBs (dev passwords, never rotate locally)
@@ -360,8 +360,7 @@ workspace:
 # the agent pod. Without a SESSION_JWT_SECRET, /connection 500s and sessions
 # never come up.
 #
-#   kubectl -n srw create secret generic srw-session-jwt \
-#     --from-literal=jwt-secret="$(openssl rand -base64 48 | tr -d '\n' | head -c 64)"
+#   scripts/local-dev-up.sh creates this Secret idempotently.
 #
 # `ingressHost: localhost` keeps the WS same-origin with the cockpit (matches
 # the `/p` route already in the cockpit ingress).
@@ -406,17 +405,17 @@ opencloud:
   enabled: false
 
 logLevel: "DEBUG"
-# Local k3d keeps human-readable logs ("json" once Loki lands — see
-# knowledge-base/knowledge/features/centralized_logging.md).
+# Local k3d keeps human-readable logs; production log aggregation generally
+# prefers `json`.
 logFormat: "text"
 
 # --- VM workspaces on the local k3d cluster (optional) -----------------------
 # Run `scripts/local-kubevirt-up.sh` first (KubeVirt + CDI on k3d, KVM passthrough,
 # smoke test), create the two Secrets below, then uncomment. Tilt applies values
-# on the next image rebuild, not on save (see tilt_inner_loop_dev.md).
+# on the next image rebuild, not on save (see docs/development.md).
 #
 #   kubectl -n srw create secret generic srw-vm-lifecycle-hmac \
-#     --from-literal=VM_LIFECYCLE_HMAC_SECRET="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+#     --from-literal=VM_LIFECYCLE_HMAC_SECRET="$(openssl rand -hex 32)"
 #   # srw-vm-ssh-key is minted by scripts/local-dev-up.sh
 #
 # vm:

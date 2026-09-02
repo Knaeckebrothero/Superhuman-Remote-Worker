@@ -246,7 +246,7 @@ Neo4j, Keycloak, Gitea, OpenCloud all bundled):
 
 ```bash
 helm install srw oci://ghcr.io/knaeckebrothero/charts/superhuman-remote-worker \
-  --version 0.0.1 \
+  --version <chart-version> \
   --namespace srw --create-namespace \
   --set license.acceptTerms=true \
   --set global.domain=srw.example.com \
@@ -269,7 +269,7 @@ manage your own secrets. Start by extracting the example values:
 
 ```bash
 helm pull oci://ghcr.io/knaeckebrothero/charts/superhuman-remote-worker \
-  --version 0.0.1 --untar
+  --version <chart-version> --untar
 cp superhuman-remote-worker/values.example.yaml my-values.yaml
 $EDITOR my-values.yaml
 ```
@@ -277,12 +277,20 @@ $EDITOR my-values.yaml
 Edit at minimum:
 - `license.acceptTerms` → `true`
 - `global.domain` → your base hostname
+- `image.{orchestrator,agent,cockpit,mcp,workspace}.tag` → the matching
+  `vX.Y.Z` release tag, or set each component's verified `digest`
 - `secrets.existingSecret` → name of a Secret you create yourself (see below)
 - `databases.*.externalUrl` → connection strings for managed Postgres, vector
 - `keycloak.externalIssuerUrl` → your IdP issuer URL
 - `gitea.internal: false` + `*.externalUrl` → your git server URLs
 - `cloud.externalBackend` + `cloud.externalUrl` → your cloud storage endpoint
 - `ingress.className` and `ingress.tls.issuerName` → your cluster's ingress + cert-manager issuer
+
+The chart source keeps those five image tags at `latest` for the development
+workflow, and selecting an OCI chart version alone does not pin them. Production
+values must override every component tag or digest. If VM workspaces are
+enabled, pin `vmController.image.tag` as well; the default VM base image already
+derives its version from the released chart unless explicitly overridden.
 
 ### Per-component hostname overrides
 
@@ -319,7 +327,7 @@ Install:
 
 ```bash
 helm install srw oci://ghcr.io/knaeckebrothero/charts/superhuman-remote-worker \
-  --version 0.0.1 \
+  --version <chart-version> \
   --namespace srw \
   -f my-values.yaml
 ```
@@ -396,9 +404,7 @@ aren't set), but the URL form is legacy and a footgun under `urlsplit`.
   leak on one instance doesn't compromise the other. Citations, embeddings,
   and memories all live in this instance (`srw_vector`); the citation engine
   is a native SRW subsystem on the vector pool, **not** a separate role or
-  database (the former `srw_citations` / `citation_engine` DB was retired in
-  the citation-engine native integration — see
-  `knowledge-history/done/citation_engine_integration.md`).
+  database. The former `srw_citations` / `citation_engine` database is retired.
 - `NEO4J_USERNAME`, `NEO4J_PASSWORD` — both live in Vault (mirroring
   the `POSTGRES_USER` / `VECTOR_POSTGRES_USER`
   pattern, so all DB credentials sit in one place). Community edition
@@ -443,9 +449,9 @@ only while `viewer.enabled=true`.
 
 External PostgreSQL remains operator-provisioned because the Helm release does
 not own its control plane. The legacy bundled StatefulSet keeps its existing
-development-only identity branch until that engine is retired. The external
-workflow, Secret contract, and rotation cautions are documented in
-`knowledge-base/knowledge/operations/dynamic_canvas_gateway_database.md`.
+development-only identity branch until that engine is retired. Keep the
+gateway's database lifecycle, Secret rotation, and backup policy aligned with
+the operator that owns the external database.
 
 **OIDC / SSO** (when Keycloak or external IdP enabled):
 - `KEYCLOAK_ADMIN_USER`, `KEYCLOAK_ADMIN_PASSWORD` (internal Keycloak only)
@@ -978,8 +984,8 @@ veth. Pod-level NetworkPolicy therefore only sees the encrypted WireGuard
 envelope (UDP/41641 + DERP/443), not the in-VM traffic. Egress restriction
 on virt-launcher pods is meaningful for boot-time + tunnel handshake
 traffic and meaningless for everything inside the tunnel — Headscale ACLs
-are the right layer for tailnet-source filtering. See
-`knowledge-base/knowledge/features/workspace_network_policy_unification.md` for details.
+are the right layer for tailnet-source filtering. See the public
+[security model](../docs/security-model.md) for the surrounding trust assumptions.
 
 ## Post-install verification
 
@@ -1061,7 +1067,7 @@ The full configurable surface is documented inline in `values.yaml`
 
 ```bash
 helm show values oci://ghcr.io/knaeckebrothero/charts/superhuman-remote-worker \
-  --version 0.0.1
+  --version <chart-version>
 ```
 
 A reference customer overlay is shipped as `values.example.yaml` inside the

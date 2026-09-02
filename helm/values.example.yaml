@@ -191,12 +191,10 @@ ingress:
 # gateway can be fronted three ways: the optional chart Ingress below
 # (viewer.ingress, wildcard host + cert-manager DNS-01), a Cloudflare tunnel
 # entry pointing at the gateway Service, or an operator-owned edge. Ordinary
-# normalizing proxies are supported (see
-# knowledge-base/knowledge/issues/canvas_hosted_edge_use_cloudflare_tunnel.md). An enabled
-# production viewer must reference a separately provisioned, least-privilege
-# database credential. A chart-owned CNPG database can provision that identity
-# declaratively during the same Helm install; external Postgres remains an
-# operator-owned setup.
+# normalizing proxies are supported. An enabled production viewer must
+# reference a separately provisioned, least-privilege database credential. A
+# chart-owned CNPG database can provision that identity declaratively during
+# the same Helm install; external Postgres remains an operator-owned setup.
 canvas:
   livePreview:
     enabled: false
@@ -292,7 +290,6 @@ canvas:
 
 # -----------------------------------------------------------------------------
 # Session router — Direct Session WebSockets
-# (knowledge-base/knowledge/features/direct_session_websockets.md)
 #
 # Generate a strong key with:  openssl rand -hex 32
 # Then pass at install time so it never lives in the repo:

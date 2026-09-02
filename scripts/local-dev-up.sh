@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 # =============================================================================
 # Local development bootstrap: k3d cluster + cert-manager + mkcert ClusterIssuer
-# + namespace + vm-ssh-key Secret + vendored Helm chart dependencies.
+# + namespace + local runtime Secrets + vendored Helm chart dependencies.
 #
 # Idempotent: re-runs are safe. Skips anything that already exists.
 #
 # After this, copy the values template and `helm install`:
 #   cp deployment/values-local.yaml.example deployment/values-local.yaml
 #   $EDITOR deployment/values-local.yaml      # paste at least one LLM key
-#   helm install srw ./helm -n srw -f deployment/values-local.yaml
+#   helm install srw ./helm -n srw --kube-context k3d-srw \
+#     -f deployment/values-local.yaml
 #
 # Prerequisites (must be done once on the host BEFORE running this):
-#   - docker + k3d + kubectl + helm + mkcert installed
+#   - docker + k3d + kubectl + helm + mkcert + openssl installed
 #   - `mkcert -install` (user-level trust)
 #   - `sudo CAROOT="$HOME/.local/share/mkcert" mkcert -install` (system + Chrome trust)
 # =============================================================================
@@ -32,7 +33,7 @@ skip() { printf '\033[1;33m[skip]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
 
 # --- Prereq checks ----------------------------------------------------------
-for bin in docker k3d kubectl helm mkcert ssh-keygen; do
+for bin in docker k3d kubectl helm mkcert openssl ssh-keygen; do
   command -v "$bin" >/dev/null || die "missing required binary: $bin"
 done
 
@@ -99,8 +100,18 @@ EOF
   ok "ClusterIssuer created"
 fi
 
-# --- 4. SRW namespace + vm-ssh-key Secret -----------------------------------
+# --- 4. SRW namespace + local runtime Secrets -------------------------------
 $KCTL create namespace "$NAMESPACE" --dry-run=client -o yaml | $KCTL apply -f - >/dev/null
+
+if $KCTL -n "$NAMESPACE" get secret srw-session-jwt >/dev/null 2>&1; then
+  skip "secret srw-session-jwt already exists in namespace $NAMESPACE"
+else
+  log "minting session-router JWT secret"
+  JWT_SECRET=$(openssl rand -base64 48 | tr -d '\n' | head -c 64)
+  $KCTL -n "$NAMESPACE" create secret generic srw-session-jwt \
+    --from-literal=jwt-secret="$JWT_SECRET"
+  ok "session-jwt Secret created"
+fi
 
 if $KCTL -n "$NAMESPACE" get secret srw-vm-ssh-key >/dev/null 2>&1; then
   skip "secret srw-vm-ssh-key already exists in namespace $NAMESPACE"
@@ -119,14 +130,11 @@ fi
 
 # --- 5. In-cluster DNS for *.localhost ingress hosts -------------------------
 # Pods cannot resolve cloud.localhost / auth.localhost / git.localhost (no
-# DNS exists for .localhost), but several in-cluster flows must reach the
-# ingress hostnames: OpenCloud's ocdav forwards every upload to its public
-# data-gateway URL (https://cloud.localhost/data), rclone tus uploads PATCH
-# the same URL from workspace pods, and OpenCloud's OIDC verifier fetches
-# JWKS from auth.localhost. Map them to Traefik's ClusterIP via the k3s
-# coredns-custom hook so every pod resolves them — supersedes per-pod
-# hostAliases workarounds. Idempotent; the ClusterIP is stable for the life
-# of the cluster (re-run this script after `k3d cluster delete && create`).
+# ordinary DNS exists for .localhost), but cloud, git, OIDC, and workspace
+# flows must reach those ingress hostnames from inside the cluster. Map them
+# to Traefik's ClusterIP through the k3s coredns-custom hook so every pod gets
+# the same answer. Idempotent; the ClusterIP is stable for the life of the
+# cluster (re-run this script after `k3d cluster delete && create`).
 TRAEFIK_IP=$($KCTL -n kube-system get svc traefik -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)
 if [ -z "$TRAEFIK_IP" ]; then
   skip "traefik svc not up yet — re-run this script later to install the *.localhost DNS override"
@@ -180,9 +188,10 @@ $(printf '\033[1;32m✓ Local cluster ready.\033[0m')
 Next:
   cp deployment/values-local.yaml.example deployment/values-local.yaml
   \$EDITOR deployment/values-local.yaml      # paste at least one LLM key
-  helm install srw ./helm -n $NAMESPACE -f deployment/values-local.yaml
+  helm install srw ./helm -n $NAMESPACE --kube-context $KUBE_CONTEXT \
+    -f deployment/values-local.yaml
 
-Then open https://localhost/ and log in as test / test.
+Then open https://localhost/ and log in as test / srw-k3d-dev-test.
 
 Cluster lifecycle:
   k3d cluster stop  $CLUSTER_NAME

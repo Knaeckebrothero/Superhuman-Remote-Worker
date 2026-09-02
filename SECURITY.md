@@ -1,48 +1,69 @@
-# Security Policy
+# Security policy
 
-## Deployment Model
+## Supported versions
 
-This project uses continuous deployment with SHA-based image tags — there are no versioned releases. The `main` branch is always the supported version. Kubernetes manifests are synced via Fleet, and secrets are managed through Vault/ESO.
+Superhuman Remote Worker is under active development. Security reports are
+evaluated against the current `main` branch and the latest published tag. If a
+report affects an older release, maintainers may ask the reporter to confirm
+whether the issue is still present in a current version.
 
-**Keep your deployment up to date by pulling the latest images.**
+Deployments should use matching, immutable chart and component versions rather
+than a moving development branch. Operators remain responsible for Kubernetes,
+container-runtime, hypervisor, identity-provider, database, and bundled-service
+updates.
 
-## Reporting a Vulnerability
+## Report a vulnerability
 
-If you discover a security vulnerability, please report it responsibly:
+Do not open a public issue for a suspected vulnerability.
 
-1. **Do not open a public issue.**
-2. Use [GitHub Private Vulnerability Reporting](https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/security/advisories/new) to submit a report.
-3. Include:
-   - A description of the vulnerability and its potential impact
-   - Steps to reproduce or a proof of concept
-   - The component affected (Orchestrator, Agent, Cockpit, MCP Server, etc.)
+Use
+[GitHub Private Vulnerability Reporting](https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/security/advisories/new)
+and include:
 
-You can expect an initial response within **7 days**. Accepted vulnerabilities will be patched on `main` and deployed as soon as possible.
+- a description of the vulnerability and likely impact;
+- the affected component and release or commit;
+- deployment assumptions needed to reproduce it;
+- reproduction steps or a proof of concept; and
+- any known mitigation or evidence that the issue is being exploited.
+
+You can expect an initial response within seven days. Please keep the report and
+proof of concept private until maintainers have coordinated a fix and
+disclosure.
 
 ## Scope
 
-The following areas are considered in scope for security reports:
+Security reports may include:
 
 | Area | Examples |
-|------|----------|
-| **Authentication & Authorization** | Keycloak OIDC bypass, MCP token leaks, privilege escalation between roles |
-| **Workspace Isolation** | Container/VM escape, cross-job data access, SSH credential exposure |
-| **Agent Execution** | Prompt injection leading to unauthorized tool use, sudo gate bypass |
-| **API Security** | Injection via job descriptions or config overrides, IDOR on REST endpoints |
-| **Data Stores** | SQL injection (PostgreSQL), NoSQL injection (MongoDB), unauthorized vector store access |
-| **Secrets Management** | Leaked API keys, Vault/ESO misconfigurations, credentials in logs or artifacts |
-| **Supply Chain** | Compromised dependencies, CI/CD pipeline tampering |
+|---|---|
+| Authentication and authorization | OIDC/BFF bypass, role or grant bypass, IDOR, token confusion |
+| Workspace isolation | Container or VM escape, harness/workspace boundary bypass, cross-job access |
+| Agent execution | Prompt injection that crosses an enforced capability boundary, privileged-command gate bypass |
+| APIs and realtime transport | Injection, cross-user WebSocket access, unsafe dispatch or lifecycle mutation |
+| Data stores | Query injection, tenant-scope bypass, unauthorized knowledge or audit access |
+| Secrets | Credential exposure in workspaces, logs, images, APIs, or rendered manifests |
+| Supply chain | Dependency, image, build, release, or CI/CD compromise |
 
-### Out of Scope
+Ordinary model mistakes, incorrect answers, or prompt injection that causes only
+actions already and intentionally authorized for that user are generally
+product-safety issues rather than security-boundary vulnerabilities. Reports
+that demonstrate a bypass of an enforced boundary are in scope.
 
-- Vulnerabilities in third-party services (Keycloak, Neo4j, etc.) that are not caused by this project's configuration
-- Denial-of-service attacks against development environments
-- Social engineering
+The following are normally out of scope:
 
-## Security Architecture Overview
+- vulnerabilities wholly inside an unmodified third-party service that should
+  be reported to its upstream project;
+- denial of service against a disposable local development deployment;
+- social engineering without a product vulnerability; and
+- reports produced only by automated scanners without a reproducible impact.
 
-- **Auth**: Keycloak OIDC with Bearer tokens for the Cockpit and REST API; `X-MCP-Token` header for Claude Code MCP integration
-- **Workspace Isolation**: Agents execute in isolated Docker containers, Kubernetes pods, or QEMU VMs — never on the host
-- **Secrets**: Injected at runtime via Vault/ESO; never stored in git or image layers
-- **Network**: Internal services are not exposed externally; the Orchestrator API is the single entry point
-- **Autonomy Controls**: Configurable autonomy levels (`full` → `dependent`) gate agent actions with human review
+## Security architecture
+
+SRW treats agent inputs, generated code, repositories, and shell-capable
+workspaces as potentially hostile. The orchestrator and agent harness are kept
+outside those workspaces, and the orchestrator remains authoritative for final
+job state. Containers provide a weaker boundary than dedicated VMs, especially
+when privileged FUSE support is enabled.
+
+Read the public [security model](docs/security-model.md) for trust assumptions,
+defense in depth, known limitations, and deployment guidance.
