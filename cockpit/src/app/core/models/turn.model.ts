@@ -582,11 +582,11 @@ export function isSitrepTurn(t: Turn): t is SystemTurn {
  * reply — makes the wake worth reading, so it stays expanded.
  */
 export function isQuietWakeTurn(t: Turn): t is AssistantTurn {
-    if (t.kind !== 'assistant' || t.status === 'streaming') return false;
+    if (t.kind !== 'assistant' || t.status !== 'done') return false;
     let slept = false;
     for (const e of t.events) {
         if (e.kind !== 'tool_call') continue;
-        if (e.tool !== SLEEP_TOOL) return false;
+        if (e.tool !== SLEEP_TOOL || e.status !== 'completed') return false;
         slept = true;
     }
     return slept;
@@ -653,7 +653,19 @@ export function lastTurnOf(view: TurnView): Turn {
     return view.kind === 'wake_cycle' ? view.wake : view.turn;
 }
 
-/** The first underlying turn a view renders (a cycle opens with its sitrep). */
-export function firstTurnOf(view: TurnView): Turn {
-    return view.kind === 'wake_cycle' ? view.sitrep : view.turn;
+/**
+ * The next turn that speaks — assistant or user — after view `index`, walking
+ * each later view's turns in render order. System and compaction rows never
+ * mark a session boundary: a history-loaded sitrep between two history wakes
+ * is not a reload.
+ */
+export function nextSpeakingTurn(views: readonly TurnView[], index: number): Turn | undefined {
+    for (let i = index + 1; i < views.length; i++) {
+        const v = views[i];
+        const turns = v.kind === 'wake_cycle' ? [v.sitrep, v.wake] : [v.turn];
+        for (const t of turns) {
+            if (t.kind === 'assistant' || t.kind === 'user') return t;
+        }
+    }
+    return undefined;
 }

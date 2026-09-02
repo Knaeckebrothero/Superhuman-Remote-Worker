@@ -6,7 +6,6 @@ import {
     EventGroup,
     firstSentence,
     firstTextOf,
-    firstTurnOf,
     foldWakeCycles,
     FoldableEvent,
     groupEvents,
@@ -15,6 +14,7 @@ import {
     isSitrepTurn,
     lastTextOf,
     lastTurnOf,
+    nextSpeakingTurn,
     notifyToolCalls,
     sleepRequest,
     summarizeFolded,
@@ -516,10 +516,33 @@ describe('officer log lens', () => {
 
     it('exposes the outer turns of a view so dividers land between views', () => {
         const [cycle] = foldWakeCycles([sys('s', '[SITREP] x'), asst('a', [sleep('c')])]);
-        expect(firstTurnOf(cycle).id).toBe('s');
         expect(lastTurnOf(cycle).id).toBe('a');
         const [plain] = foldWakeCycles([sys('r', 'Session resumed')]);
-        expect(firstTurnOf(plain).id).toBe('r');
         expect(lastTurnOf(plain).id).toBe('r');
+    });
+
+    it('a wake that errored, was interrupted, or whose sleep failed is not quiet', () => {
+        expect(isQuietWakeTurn(asst('a', [sleep('c')], 'error'))).toBe(false);
+        expect(isQuietWakeTurn(asst('a', [sleep('c')], 'interrupted'))).toBe(false);
+        const failedSleep = {...(call('c', SLEEP_TOOL, {minutes: 5}) as object), status: 'error'} as unknown as TurnEvent;
+        expect(isQuietWakeTurn(asst('a', [failedSleep]))).toBe(false);
+    });
+
+    it('finds the next speaker past sitreps and compaction rows', () => {
+        const histWake = {...(asst('h', [sleep('c')]) as object), historical: true} as unknown as Turn;
+        const views = foldWakeCycles([histWake, sys('s', '[SITREP] x'), asst('l', [sleep('d')])]);
+        expect(nextSpeakingTurn(views, 0)?.id).toBe('l');
+        expect(nextSpeakingTurn(views, 1)).toBeUndefined();
+        const marker = foldWakeCycles([histWake, sys('r', 'Session resumed'), histWake]);
+        expect(nextSpeakingTurn(marker, 0)?.id).toBe('h');
+    });
+
+    it('a history sitrep between two history wakes is not a reload boundary', () => {
+        const histWake = (id: string) =>
+            ({...(asst(id, [sleep('c-' + id)]) as object), historical: true} as unknown as Turn);
+        const allHistory = foldWakeCycles([histWake('h1'), sys('s', '[SITREP] x'), histWake('h2')]);
+        expect(isSessionBoundary(lastTurnOf(allHistory[0]), nextSpeakingTurn(allHistory, 0))).toBe(false);
+        const thenLive = foldWakeCycles([histWake('h1'), sys('s', '[SITREP] x'), asst('l', [sleep('c')])]);
+        expect(isSessionBoundary(lastTurnOf(thenLive[0]), nextSpeakingTurn(thenLive, 0))).toBe(true);
     });
 });

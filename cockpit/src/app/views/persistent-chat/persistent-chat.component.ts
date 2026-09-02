@@ -36,7 +36,6 @@ import {
     EventGroup,
     firstSentence,
     firstTextOf,
-    firstTurnOf,
     foldWakeCycles,
     FoldableEvent,
     FoldedSummary,
@@ -48,11 +47,13 @@ import {
     lastTextOf,
     lastTurnOf,
     MIN_FOLD_RUN,
+    nextSpeakingTurn,
     notifyToolCalls,
     summarizeFolded,
     TextEvent,
     ThoughtEvent,
     ToolCallEvent,
+    trailingText,
     Turn,
     TurnEvent,
     TurnView,
@@ -1360,6 +1361,16 @@ export function clearDraft(threadId: string | null): void {
               </summary>
               <div class="wake-cycle-body">
                 <pre class="wake-cycle-sitrep">{{ view.sitrep.content }}</pre>
+                @if (trailingText(view.wake); as said) {
+                  <div class="wake-cycle-said">{{ said }}</div>
+                }
+                <div class="wake-cycle-sleep">
+                  <app-icon size="sm">bedtime</app-icon>
+                  {{ 'chat.settings.wakeSleepLine' | transloco:{
+                      minutes: view.minutes ?? '?',
+                      reason: view.reason || ('chat.settings.wakeNoReason' | transloco)
+                    } }}
+                </div>
               </div>
             </details>
           } @else {
@@ -4135,6 +4146,9 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         this.chatPrefs.setOfficerLensFolded(value === 'folded');
     }
 
+    /** Exposed for the wake-cycle template: what the officer said, if anything, before sleeping. */
+    readonly trailingText = trailingText;
+
     /** Coalesce a turn's events into render groups (live edge pinned, rest folded). */
     // Memoized per turn object. The reducer rebuilds the turn immutably on
     // every update, so a changed turn is a new key and the cache invalidates
@@ -4362,18 +4376,9 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         };
     }
 
-    /**
-     * True when the current turn is historical and the next turn isn't —
-     * the boundary between session reload and live activity.
-     */
-    showSessionDividerAfter(turn: Turn, index: number): boolean {
-        return isSessionBoundary(turn, this.chat.visibleTurns()[index + 1]);
-    }
-
     /** Divider placement under the lens: boundaries are judged between VIEWS (a folded cycle counts as its wake). */
     showSessionDividerAfterView(view: TurnView, index: number): boolean {
-        const nextView = this.turnViews()[index + 1];
-        return isSessionBoundary(lastTurnOf(view), nextView ? firstTurnOf(nextView) : undefined);
+        return isSessionBoundary(lastTurnOf(view), nextSpeakingTurn(this.turnViews(), index));
     }
 
     // Tool call display helpers

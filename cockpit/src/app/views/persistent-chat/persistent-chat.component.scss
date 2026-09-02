@@ -1010,6 +1010,12 @@
         border-bottom-left-radius: 0;
         border-bottom-right-radius: 0;
       }
+      .wake-cycle-body {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        padding-bottom: 6px;
+      }
       .wake-cycle-sitrep {
         margin: 0;
         padding: 8px 12px;
@@ -1019,7 +1025,20 @@
         background: var(--surface-0);
         border-radius: 0 0 var(--radius-control) var(--radius-control);
       }
-
+      .wake-cycle-said {
+        padding: 0 12px;
+        font-size: 12px;
+        color: var(--text);
+        white-space: pre-wrap;
+      }
+      .wake-cycle-sleep {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 0 12px;
+        font-size: 11px;
+        color: var(--text-muted);
+      }
 
       .resume-icon {
         margin-right: 4px;

@@ -1735,7 +1735,8 @@
       "officerLensFolded": "Ruhige Wachen einklappen",
       "officerLensAll": "Alles anzeigen",
       "wakeLine": "Wache · {{time}} · geschlafen ~{{minutes}} Min — {{reason}}",
-      "wakeNoReason": "kein Grund angegeben"
+      "wakeNoReason": "kein Grund angegeben",
+      "wakeSleepLine": "Schlaf · ~{{minutes}} Min — {{reason}}"
     },
     "tasks": {
       "header": "Aufgaben {{done}}/{{total}}",
@@ -3522,7 +3523,8 @@
     "missingProject": "Die Adresse nennt kein Projekt.",
     "opening": "Konferenz wird geöffnet …",
     "error": "Konferenz konnte nicht geöffnet werden:",
-    "back": "Zurück zum Projekt"
+    "back": "Zurück zum Projekt",
+    "unreachable": "Der Server war nicht erreichbar."
   },
   "officerCard": {
     "title": "Centurio",

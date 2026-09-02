@@ -1735,7 +1735,8 @@
       "officerLensFolded": "Fold quiet wakes",
       "officerLensAll": "Show everything",
       "wakeLine": "wake · {{time}} · slept ~{{minutes}} min — {{reason}}",
-      "wakeNoReason": "no reason given"
+      "wakeNoReason": "no reason given",
+      "wakeSleepLine": "sleep · ~{{minutes}} min — {{reason}}"
     },
     "tasks": {
       "header": "Tasks {{done}}/{{total}}",
@@ -3522,7 +3523,8 @@
     "missingProject": "The address names no project.",
     "opening": "Opening the conference…",
     "error": "Could not open the conference:",
-    "back": "Back to the project"
+    "back": "Back to the project",
+    "unreachable": "The server could not be reached."
   },
   "officerCard": {
     "title": "Centurion",

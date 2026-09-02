@@ -76,7 +76,11 @@ export class ConferenceLauncherComponent implements OnInit {
       await this.router.navigate(['/sessions', result.threadId], {replaceUrl: true});
       return;
     }
-    this.error.set(result.detail || String(result.status));
+    const fallback =
+      result.status === 0
+        ? this.transloco.translate('conferenceLauncher.unreachable')
+        : String(result.status);
+    this.error.set(result.detail || fallback);
   }
 
   back(): void {
