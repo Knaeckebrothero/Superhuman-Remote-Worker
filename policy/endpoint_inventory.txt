@@ -366,6 +366,7 @@ GET    /api/projects/{project_id}/job-records                                   
 GET    /api/projects/{project_id}/jobs                                                  gated:require_project_member
 POST   /api/projects/{project_id}/jobs                                                  gated:require_project_member
 GET    /api/projects/{project_id}/knowledge                                             gated:require_project_member
+POST   /api/projects/{project_id}/knowledge/delete                                      internal:require_internal
 POST   /api/projects/{project_id}/knowledge/export                                      gated:require_project_member
 POST   /api/projects/{project_id}/knowledge/materialize                                 internal:require_internal
 POST   /api/projects/{project_id}/knowledge/materialize/{intent_id}/projection          internal:require_internal

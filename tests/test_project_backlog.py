@@ -68,7 +68,14 @@ def _capture_materialize():
     """
     rendered: dict = {}
 
-    def _fake(project_id, slug, content, job_id, retrieval_messages=None):
+    def _fake(
+        project_id,
+        slug,
+        content,
+        job_id,
+        retrieval_messages=None,
+        expected_blob_sha=None,
+    ):
         rendered[slug] = content
         return {"status": "committed", "path": f"knowledge/{slug}.md"}
 

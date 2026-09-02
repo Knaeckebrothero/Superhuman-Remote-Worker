@@ -104,6 +104,20 @@ _POST_SPLIT_OVERLAY_REMOVALS: dict[str, tuple[str, ...]] = {
     "worker": ("limits.tool_category_timeouts.delegation",),
     "session": (),
 }
+#: Tool names later work packages added to a tool CATEGORY on top of the
+#: frozen baseline (role -> category -> names, with the work that added them).
+#: A category list replaces wholesale on merge, so a dotted path cannot name
+#: one entry and an expert that restates the category carries the addition in
+#: its own leaf: they are matched by name and stripped from BOTH sides of the
+#: comparison. Presence is guarded once, on the role base, by
+#: ``test_post_split_tool_additions_are_actually_there`` — a stale entry here
+#: cannot hide a real leak either.
+_POST_SPLIT_TOOL_ADDITIONS: dict[str, dict[str, tuple[str, ...]]] = {
+    # KB gardening slice 1: kb_delete (the retire tombstone) joined the shared
+    # root's knowledge category, so every expert that inherits it gained it.
+    "worker": {"knowledge": ("kb_delete",)},
+    "session": {"knowledge": ("kb_delete",)},
+}
 #: Bindings later work added to an overlay's ``instruction_files`` (role ->
 #: skill names). The list replaces wholesale on merge, so a dotted path cannot
 #: name one entry: they are matched by ``skill``, asserted PRESENT first (in
@@ -178,7 +192,27 @@ def _without_post_split_additions(
             assert not _dotted_present(out, dotted), (
                 f"{dotted} is listed as removed but present"
             )
+    out = _without_post_split_tools(out, role)
     return _without_post_split_bindings(out, role, require=require)
+
+
+def _without_post_split_tools(data: dict, role: str) -> dict:
+    """``data`` (a merged dict or the effective ``agent`` blob) minus the tool
+    names added to a category after the baseline was frozen
+    (``_POST_SPLIT_TOOL_ADDITIONS``). Stripped wherever they appear, on both
+    sides and without a presence assertion: an expert that restates the
+    category carries the addition in its own leaf, and one that empties the
+    category (``interactive``) never had it."""
+    additions = _POST_SPLIT_TOOL_ADDITIONS.get(role, {})
+    tools = data.get("tools")
+    if not additions or not isinstance(tools, dict):
+        return data
+    out = copy.deepcopy(data)
+    for category, names in additions.items():
+        entries = out["tools"].get(category)
+        if isinstance(entries, list):
+            out["tools"][category] = [t for t in entries if t not in names]
+    return out
 
 
 def _without_post_split_removals(data: dict, role: str, *, require: bool) -> dict:
@@ -236,7 +270,7 @@ def _without_effective_additions(agent: dict, role: str) -> dict:
                 break
         if isinstance(node, dict):
             node.pop(leaf, None)
-    return out
+    return _without_post_split_tools(out, role)
 
 
 def _effective(
@@ -305,6 +339,23 @@ def test_pre_split_fixture_is_the_a8950251_base(role):
 # ---------------------------------------------------------------------------
 # 1. Neutrality
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("role", sorted(_PRE_SPLIT))
+def test_post_split_tool_additions_are_actually_there(role):
+    """The ledger the neutrality compare strips by must stay honest: every
+    declared name is in the role base today and was NOT in the frozen
+    baseline. A stale entry would silently excuse a real leak."""
+    post = load_role_base(role).get("tools", {})
+    pre = load_and_merge_config(str(_PRE_SPLIT[role])).get("tools", {})
+    for category, names in _POST_SPLIT_TOOL_ADDITIONS.get(role, {}).items():
+        for name in names:
+            assert name in post.get(category, ()), (
+                f"{category}.{name} is listed as added but absent"
+            )
+            assert name not in pre.get(category, ()), (
+                f"{category}.{name} is listed as added but is in the baseline"
+            )
 
 
 @pytest.mark.parametrize("role", sorted(_PRE_SPLIT))
