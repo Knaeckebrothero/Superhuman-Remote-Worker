@@ -899,7 +899,6 @@ export interface ResolvedDefaults {
     model?: string;
     permission_mode?: string;
     idle_timeout_minutes?: number;
-    config_name?: string;
     workspace_backend?: string;
   };
 }
@@ -917,7 +916,6 @@ export interface UserSettings {
   default_tts_model?: string | null;
   /** User's chosen read-aloud voice (overrides the admin/per-language default). */
   default_tts_voice?: string | null;
-  default_session_model?: string | null;
   default_embedding_model?: string | null;
   embedding_provider?: string | null;
   language?: 'en' | 'de-DE' | null;
@@ -954,16 +952,12 @@ export interface PersistentAgentSettings {
     permission_mode?: string | null;
     /** Default session workspace tier; null tracks the system default (virtual). */
     workspace_backend?: 'virtual' | 'sandbox' | 'none' | null;
-    config_name?: string | null;
-    greeting?: string | null;
     idle_timeout_minutes?: number | null;
-    command_allowlist?: string[] | null;
-    // Phase 6 headless controls. Backend reads these as direct children of
-    // users.settings.persistent_agent (see orchestrator/main.py create_thread
+    // Headless controls. The backend reads these as direct children of
+    // users.settings.persistent_agent (orchestrator/main.py create_thread
     // merge + attention_sleep_sweeper COALESCE).
     headless_mode?: 'eager' | 'polite' | null;
     headless_attention_sleep_minutes?: number | null;
-    notification_channels?: string[] | null;
 }
 
 /**

@@ -373,7 +373,10 @@ class TestSessionWorkspaceBackendDefaultChain:
             orch_main.UserSettingsUpdate(persistent_agent={"workspace_backend": bad})
 
     def test_settings_patch_leaves_other_keys_free_form(self):
-        # Phase 6 contract: persistent_agent stays a free dict for other keys.
+        # persistent_agent stays a free dict for other keys. `greeting` is the
+        # deliberate example: it is a legacy key from a removed control, and a
+        # stored blob that still carries one must round-trip rather than 422 —
+        # nothing reads it any more.
         upd = orch_main.UserSettingsUpdate(
             persistent_agent={"headless_mode": "eager", "greeting": "hi"}
         )

@@ -30,15 +30,6 @@ class TestHeadlessConfigDefaults:
     def test_attention_sleep_minutes_defaults_to_60(self):
         assert HeadlessConfig().attention_sleep_minutes == 60
 
-    def test_notification_channels_defaults_to_email(self):
-        assert HeadlessConfig().notification_channels == ["email"]
-
-    def test_notification_channels_default_is_fresh_list(self):
-        """Two instances must not share the default list (mutability hazard)."""
-        a, b = HeadlessConfig(), HeadlessConfig()
-        a.notification_channels.append("sms")
-        assert b.notification_channels == ["email"]
-
     def test_agent_config_has_headless_field(self):
         ac = AgentConfig(agent_id="x", display_name="X")
         assert isinstance(ac.headless, HeadlessConfig)
@@ -56,7 +47,6 @@ class TestHeadlessConfigParsing:
         cfg = load_agent_config_from_dict(_minimal())
         assert cfg.headless.mode == "eager"
         assert cfg.headless.attention_sleep_minutes == 60
-        assert cfg.headless.notification_channels == ["email"]
 
     def test_explicit_polite_mode(self):
         cfg = load_agent_config_from_dict(_minimal(headless={"mode": "polite"}))
@@ -67,12 +57,6 @@ class TestHeadlessConfigParsing:
             _minimal(headless={"attention_sleep_minutes": 15})
         )
         assert cfg.headless.attention_sleep_minutes == 15
-
-    def test_notification_channels_override(self):
-        cfg = load_agent_config_from_dict(
-            _minimal(headless={"notification_channels": ["email", "sms"]})
-        )
-        assert cfg.headless.notification_channels == ["email", "sms"]
 
     def test_headless_not_in_extra(self):
         """headless is a known field and must not leak into AgentConfig.extra."""

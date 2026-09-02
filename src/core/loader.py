@@ -2301,7 +2301,6 @@ class InteractiveConfig:
     permission_mode: str = "supervised"  # supervised | auto_accept | autonomous
     narration_mode: str = "auto"  # silent | verbose | auto
     idle_timeout_minutes: int = 30  # 0 = disabled
-    greeting: str = "Hello! I'm ready to help. What would you like to work on?"
 
 
 @dataclass
@@ -2313,8 +2312,9 @@ class HeadlessConfig:
     """
 
     mode: str = "eager"  # eager | polite
+    #: Read by the orchestrator's ``attention_sleep_sweeper`` straight out of
+    #: JSONB, not from here — this field is the agent-side mirror.
     attention_sleep_minutes: int = 60  # 0 disables the watchdog
-    notification_channels: List[str] = field(default_factory=lambda: ["email"])
 
 
 @dataclass
@@ -3074,9 +3074,6 @@ def load_agent_config(
     headless_config = HeadlessConfig(
         mode=headless_data.get("mode") or "eager",
         attention_sleep_minutes=int(headless_data.get("attention_sleep_minutes") or 60),
-        notification_channels=list(
-            headless_data.get("notification_channels") or ["email"]
-        ),
     )
 
     # Parse officer config (centurion — shared helper, both loader paths)
@@ -3367,9 +3364,6 @@ def load_agent_config_from_dict(
     headless_config = HeadlessConfig(
         mode=headless_data.get("mode") or "eager",
         attention_sleep_minutes=int(headless_data.get("attention_sleep_minutes") or 60),
-        notification_channels=list(
-            headless_data.get("notification_channels") or ["email"]
-        ),
     )
 
     # Parse officer config (centurion — shared helper, both loader paths)

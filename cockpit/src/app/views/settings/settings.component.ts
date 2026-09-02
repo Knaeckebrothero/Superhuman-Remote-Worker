@@ -943,13 +943,6 @@ const EXPIRY_OPTIONS = [
                 </option>
               </app-select>
             </app-form-field>
-            <app-form-field [label]="'settings.persistent.greeting' | transloco">
-              <app-input
-                [value]="paGreeting()"
-                [placeholder]="'settings.persistent.greetingPlaceholder' | transloco"
-                (changed)="paGreeting.set($event)"
-              />
-            </app-form-field>
             <div class="form-row two-col">
               <app-form-field [label]="'settings.persistent.idleTimeout' | transloco">
                 <app-input
@@ -959,15 +952,6 @@ const EXPIRY_OPTIONS = [
                   (changed)="onPaIdleTimeoutChange($event)"
                 />
               </app-form-field>
-              <app-form-field [label]="'settings.persistent.commandAllowlist' | transloco">
-                <app-input
-                  [value]="paCommandAllowlist()"
-                  [placeholder]="'settings.persistent.commandAllowlistPlaceholder' | transloco"
-                  (changed)="paCommandAllowlist.set($event)"
-                />
-              </app-form-field>
-            </div>
-            <div class="form-row two-col">
               <app-form-field [label]="'settings.persistent.headlessMode' | transloco">
                 <app-select
                   [value]="paHeadlessMode() ?? ''"
@@ -984,28 +968,17 @@ const EXPIRY_OPTIONS = [
                   </option>
                 </app-select>
               </app-form-field>
-              <app-form-field
-                [label]="'settings.persistent.attentionSleep' | transloco"
-                [hint]="'settings.persistent.attentionSleepHint' | transloco"
-              >
-                <app-input
-                  type="number"
-                  [value]="paAttentionSleepText()"
-                  placeholder="60"
-                  (changed)="onPaAttentionSleepChange($event)"
-                />
-              </app-form-field>
             </div>
-            <app-form-field [label]="'settings.persistent.notificationChannels' | transloco">
-              <div class="channel-list">
-                <app-checkbox
-                  size="sm"
-                  [checked]="paNotifEmail()"
-                  (changed)="paNotifEmail.set($event)"
-                >
-                  {{ 'settings.persistent.notificationChannelEmail' | transloco }}
-                </app-checkbox>
-              </div>
+            <app-form-field
+              [label]="'settings.persistent.attentionSleep' | transloco"
+              [hint]="'settings.persistent.attentionSleepHint' | transloco"
+            >
+              <app-input
+                type="number"
+                [value]="paAttentionSleepText()"
+                placeholder="60"
+                (changed)="onPaAttentionSleepChange($event)"
+              />
             </app-form-field>
             <div class="actions-row">
               <app-button
@@ -2884,13 +2857,11 @@ export class SettingsComponent implements OnInit {
   // Default session workspace tier (null = track the resolved system default,
   // which is "virtual" — see knowledge-base/knowledge/features/instant_landing_session.md).
   readonly paWorkspaceBackend = signal<string | null>(null);
-  readonly paGreeting = signal('');
   readonly paIdleTimeout = signal<number | null>(null);
   readonly paIdleTimeoutText = computed(() => {
     const v = this.paIdleTimeout();
     return v == null ? '' : String(v);
   });
-  readonly paCommandAllowlist = signal('');
   // Phase 6 headless controls. null = user has not overridden, fall back to
   // the framework default at the agent loader / sweeper layer.
   readonly paHeadlessMode = signal<'eager' | 'polite' | null>(null);
@@ -2899,7 +2870,6 @@ export class SettingsComponent implements OnInit {
     const v = this.paAttentionSleepMinutes();
     return v == null ? '' : String(v);
   });
-  readonly paNotifEmail = signal(true);
   readonly savingPA = signal(false);
   readonly paSaved = signal(false);
 
@@ -2996,15 +2966,9 @@ export class SettingsComponent implements OnInit {
           this.paModel.set(pa.model ?? null);
           this.paPermissionMode.set(pa.permission_mode ?? null);
           this.paWorkspaceBackend.set(pa.workspace_backend ?? null);
-          this.paGreeting.set(pa.greeting || '');
           this.paIdleTimeout.set(pa.idle_timeout_minutes ?? null);
-          this.paCommandAllowlist.set((pa.command_allowlist || []).join(', '));
           this.paHeadlessMode.set(pa.headless_mode ?? null);
           this.paAttentionSleepMinutes.set(pa.headless_attention_sleep_minutes ?? null);
-          // Absence ⇒ email on (matches backend default ["email"]); explicit
-          // empty array (user opted out) ⇒ off.
-          const channels = pa.notification_channels;
-          this.paNotifEmail.set(channels == null ? true : channels.includes('email'));
         }
 
         // Sync communication preferences
@@ -3353,30 +3317,14 @@ export class SettingsComponent implements OnInit {
     this.savingPA.set(true);
     this.paSaved.set(false);
 
-    const allowlistText = this.paCommandAllowlist().trim();
-    const allowlist = allowlistText
-      ? allowlistText
-          .split(',')
-          .map((s) => s.trim())
-          .filter(Boolean)
-      : null;
-
-    // notification_channels: v1 only ships email. We always send an explicit
-    // list (never null) so the user's choice round-trips cleanly even when
-    // they opt out of every channel.
-    const channels: string[] = this.paNotifEmail() ? ['email'] : [];
-
     const settings: Record<string, unknown> = {
       persistent_agent: {
         model: this.paModel()?.trim() || null,
         permission_mode: this.paPermissionMode() || null,
         workspace_backend: this.paWorkspaceBackend() || null,
-        greeting: this.paGreeting().trim() || null,
         idle_timeout_minutes: this.paIdleTimeout() || null,
-        command_allowlist: allowlist,
         headless_mode: this.paHeadlessMode() || null,
         headless_attention_sleep_minutes: this.paAttentionSleepMinutes(),
-        notification_channels: channels,
       },
     };
 

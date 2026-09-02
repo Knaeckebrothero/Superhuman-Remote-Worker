@@ -55,12 +55,11 @@ describe('AdvancedAccordionComponent — lite workspace gating', () => {
     expect(component.isNoneBackend()).toBe(true);
   });
 
-  it('omits shell/git/browser overrides for a virtual backend but keeps file limits', () => {
+  it('omits shell/git overrides for a virtual backend but keeps file limits', () => {
     const {component, backend} = createComponent();
     backend.set('virtual');
     component.gitVersioning.set(true);
     component.shellMode.set('persistent');
-    component.browserVision.set(true);
     component.maxReadWords.set(5000);
 
     const o = component.getOverrides() as Record<string, any>;
@@ -69,6 +68,8 @@ describe('AdvancedAccordionComponent — lite workspace gating', () => {
     expect(o['workspace'].git_versioning).toBeUndefined();
     expect(o['workspace'].max_read_words).toBe(5000); // virtual keeps file tools
     expect(o['shell']).toBeUndefined();
+    // No `browser` fragment on any tier: this group's two browser toggles were
+    // `browse_website` knobs and nothing read them.
     expect(o['browser']).toBeUndefined();
   });
 

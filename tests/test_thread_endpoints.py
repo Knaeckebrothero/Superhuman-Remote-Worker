@@ -1315,14 +1315,6 @@ class TestUserCreateThread:
             config_override["interactive"] = {"permission_mode": pa["permission_mode"]}
         assert config_override == {"interactive": {"permission_mode": "autonomous"}}
 
-    def test_greeting_nested_under_interactive(self):
-        settings = {"persistent_agent": {"greeting": "Hello!"}}
-        config_override = {}
-        pa = settings.get("persistent_agent", {})
-        if pa.get("greeting"):
-            config_override.setdefault("interactive", {})["greeting"] = pa["greeting"]
-        assert config_override == {"interactive": {"greeting": "Hello!"}}
-
     def test_idle_timeout_nested_under_interactive(self):
         settings = {"persistent_agent": {"idle_timeout_minutes": 30}}
         config_override = {}
@@ -1330,14 +1322,6 @@ class TestUserCreateThread:
         if pa.get("idle_timeout_minutes"):
             config_override.setdefault("interactive", {})["idle_timeout_minutes"] = 30
         assert config_override == {"interactive": {"idle_timeout_minutes": 30}}
-
-    def test_command_allowlist_top_level(self):
-        settings = {"persistent_agent": {"command_allowlist": ["ls", "cat"]}}
-        config_override = {}
-        pa = settings.get("persistent_agent", {})
-        if pa.get("command_allowlist"):
-            config_override["command_allowlist"] = pa["command_allowlist"]
-        assert config_override == {"command_allowlist": ["ls", "cat"]}
 
     def test_request_model_overrides_user_default(self):
         """Per-session model override takes priority over user defaults."""

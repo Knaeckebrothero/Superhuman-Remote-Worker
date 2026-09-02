@@ -442,7 +442,7 @@ import {liftLegacyTiers} from '../experts/expert-config';
         }
       </div>
 
-      <!-- Research & Browser -->
+      <!-- Research -->
       <div class="accordion-section" [class.expanded]="expanded().has('research')">
         <button type="button" class="accordion-header" (click)="toggleSection('research')">
           <app-icon size="md" class="accordion-icon">{{ expanded().has('research') ? 'expand_less' : 'expand_more' }}</app-icon>
@@ -460,30 +460,6 @@ import {liftLegacyTiers} from '../experts/expert-config';
               </label>
               @if (proxyEnabled() !== null) {
                 <button type="button" class="reset-btn" (click)="proxyEnabled.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
-              }
-            </div>
-            <div class="field-row toggle-row" [class.modified]="browserHeadless() !== null">
-              <label class="toggle-label">
-                <input type="checkbox"
-                  [checked]="browserHeadless() ?? resolvedBrowserHeadless()"
-                  (change)="onBrowserHeadlessChange($event)"
-                  [disabled]="disabled() || isLiteBackend()">
-                <span>{{ 'advanced.labels.browserHeadless' | transloco }}</span>
-              </label>
-              @if (browserHeadless() !== null) {
-                <button type="button" class="reset-btn" (click)="browserHeadless.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
-              }
-            </div>
-            <div class="field-row toggle-row" [class.modified]="browserVision() !== null">
-              <label class="toggle-label">
-                <input type="checkbox"
-                  [checked]="browserVision() ?? resolvedBrowserVision()"
-                  (change)="onBrowserVisionChange($event)"
-                  [disabled]="disabled() || isLiteBackend()">
-                <span>{{ 'advanced.labels.browserVision' | transloco }}</span>
-              </label>
-              @if (browserVision() !== null) {
-                <button type="button" class="reset-btn" (click)="browserVision.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
               }
             </div>
           </div>
@@ -545,7 +521,7 @@ import {liftLegacyTiers} from '../experts/expert-config';
         }
       </div>
 
-      <!-- Session-specific: idle timeout, greeting, claude code -->
+      <!-- Session-specific: idle timeout -->
       @if (mode() === 'session') {
         <div class="accordion-section" [class.expanded]="expanded().has('session')">
           <button type="button" class="accordion-header" (click)="toggleSection('session')">
@@ -566,18 +542,6 @@ import {liftLegacyTiers} from '../experts/expert-config';
                   }
                 </div>
                 <span class="field-hint">{{ 'advanced.hints.idleDisabled' | transloco }}</span>
-              </div>
-              <div class="field-row" [class.modified]="greeting() !== null">
-                <label class="field-label">{{ 'advanced.labels.greeting' | transloco }}</label>
-                <div class="field-control">
-                  <input type="text" class="form-input"
-                    [ngModel]="greeting() ?? resolvedGreeting()"
-                    (ngModelChange)="greeting.set($event); emitChange()"
-                    [disabled]="disabled()">
-                  @if (greeting() !== null) {
-                    <button type="button" class="reset-btn" (click)="greeting.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
-                  }
-                </div>
               </div>
             </div>
           }
@@ -814,8 +778,6 @@ export class AdvancedAccordionComponent {
 
   // --- Research ---
   readonly proxyEnabled = signal<boolean | null>(null);
-  readonly browserHeadless = signal<boolean | null>(null);
-  readonly browserVision = signal<boolean | null>(null);
 
   // --- Auxiliary ---
   readonly auxEnabled = signal<boolean | null>(null);
@@ -824,7 +786,6 @@ export class AdvancedAccordionComponent {
 
   // --- Session-specific ---
   readonly idleTimeout = signal<number | null>(null);
-  readonly greeting = signal<string | null>(null);
   // ===== Resolved defaults =====
   // Resolution order: matrix for the effective model → base config → hardcoded.
   // The server sends raw config (no matrix baked in) + the raw settings_matrix.
@@ -901,15 +862,12 @@ export class AdvancedAccordionComponent {
   readonly resolvedSudoAction = computed(() => (this.r('shell.sudo_action') ?? 'freeze') as string);
 
   readonly resolvedProxyEnabled = computed(() => (this.r('research.proxy.enabled') ?? false) as boolean);
-  readonly resolvedBrowserHeadless = computed(() => (this.r('browser.headless') ?? true) as boolean);
-  readonly resolvedBrowserVision = computed(() => (this.r('browser.use_vision') ?? false) as boolean);
 
   readonly resolvedAuxEnabled = computed(() => (this.r('auxiliary.enabled') ?? true) as boolean);
   readonly resolvedAuxModel = computed(() => (this.r('auxiliary.model') ?? 'RedHatAI/gemma-4-31B-it-FP8-Dynamic') as string);
   readonly resolvedAuxTemperature = computed(() => (this.r('auxiliary.temperature') ?? 0) as number);
 
   readonly resolvedIdleTimeout = computed(() => (this.r('interactive.idle_timeout_minutes') ?? 30) as number);
-  readonly resolvedGreeting = computed(() => (this.r('interactive.greeting') ?? '') as string);
   // ===== Computed helpers =====
   readonly effectiveAuxEnabled = computed(() => this.auxEnabled() ?? this.resolvedAuxEnabled());
   readonly effectiveTemp = computed(() => this.temperature() ?? this.resolvedTemp());
@@ -967,8 +925,6 @@ export class AdvancedAccordionComponent {
   onGitVersioningChange(e: Event): void { this.gitVersioning.set((e.target as HTMLInputElement).checked); this.emitChange(); }
   onShellSandboxChange(e: Event): void { this.shellSandbox.set((e.target as HTMLInputElement).checked); this.emitChange(); }
   onProxyEnabledChange(e: Event): void { this.proxyEnabled.set((e.target as HTMLInputElement).checked); this.emitChange(); }
-  onBrowserHeadlessChange(e: Event): void { this.browserHeadless.set((e.target as HTMLInputElement).checked); this.emitChange(); }
-  onBrowserVisionChange(e: Event): void { this.browserVision.set((e.target as HTMLInputElement).checked); this.emitChange(); }
   onAuxEnabledChange(e: Event): void { this.auxEnabled.set((e.target as HTMLInputElement).checked); this.emitChange(); }
   /** Build the advanced settings config_override fragment. */
   getOverrides(): Record<string, unknown> {
@@ -1040,15 +996,12 @@ export class AdvancedAccordionComponent {
       if (Object.keys(sh).length) o['shell'] = sh;
     }
 
-    // Research & Browser — browser tools are gated off on lite tiers; the proxy
-    // toggle stays (web_search egress still applies).
+    // Research — the proxy toggle applies on every tier (web_search egress).
+    // The browser fragment that used to live here emitted `browser.headless` /
+    // `browser.use_vision`, knobs of the removed `browse_website` sub-agent;
+    // the live browser config is `browser.snapshot.*` / `browser.security.*`
+    // and vision is derived from the model's multimodal flag.
     if (this.proxyEnabled() !== null) o['research'] = { proxy: { enabled: this.proxyEnabled() } };
-    if (!lite) {
-      const br: Record<string, unknown> = {};
-      if (this.browserHeadless() !== null) br['headless'] = this.browserHeadless();
-      if (this.browserVision() !== null) br['use_vision'] = this.browserVision();
-      if (Object.keys(br).length) o['browser'] = br;
-    }
 
     // Auxiliary
     const aux: Record<string, unknown> = {};
@@ -1061,7 +1014,6 @@ export class AdvancedAccordionComponent {
     if (this.mode() === 'session') {
       const inter: Record<string, unknown> = {};
       if (this.idleTimeout() !== null) inter['idle_timeout_minutes'] = this.idleTimeout();
-      if (this.greeting() !== null) inter['greeting'] = this.greeting();
       if (Object.keys(inter).length) o['interactive'] = { ...(o['interactive'] as any ?? {}), ...inter };
     }
 
@@ -1109,13 +1061,10 @@ export class AdvancedAccordionComponent {
     this.shellTimeout.set(null);
     this.sudoAction.set(null);
     this.proxyEnabled.set(null);
-    this.browserHeadless.set(null);
-    this.browserVision.set(null);
     this.auxEnabled.set(null);
     this.auxModel.set(null);
     this.auxTemperature.set(null);
     this.idleTimeout.set(null);
-    this.greeting.set(null);
     this.expanded.set(new Set());
   }
 }

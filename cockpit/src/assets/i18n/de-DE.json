@@ -1182,12 +1182,7 @@
       "modelPlaceholder": "z. B. claude-sonnet-4-6",
       "defaultPrefix": "Standard:",
       "permissionMode": "Berechtigungsmodus",
-      "config": "Konfiguration",
-      "greeting": "Begrüßung",
-      "greetingPlaceholder": "Hallo! Ich bin bereit zu helfen.",
       "idleTimeout": "Leerlauf-Timeout (Minuten)",
-      "commandAllowlist": "Befehls-Allowlist",
-      "commandAllowlistPlaceholder": "pytest*, npm test, git status",
       "permissionSupervised": "Beaufsichtigt",
       "permissionAutoAccept": "Auto-akzeptieren",
       "permissionAutonomous": "Autonom",
@@ -1196,17 +1191,12 @@
       "workspaceVirtual": "Virtuell — sofort, Dateien im Cloud-Speicher",
       "workspaceSandbox": "Container — volle Shell & Git, langsamerer Start",
       "workspaceNone": "Ohne — nur Chat, keine Dateien",
-      "configDefault": "Standard",
-      "configDeveloper": "Entwickler",
-      "configScholar": "Forscher",
       "headlessMode": "Headless-Verhalten",
       "headlessModeDefault": "Standard (Eifrig)",
       "headlessModeEager": "Eifrig — arbeitet weiter, auch ohne offene Sitzung",
       "headlessModePolite": "Höflich — pausiert zwischen Runden bis zur Rückkehr",
       "attentionSleep": "Aufmerksamkeits-Timeout (Minuten)",
       "attentionSleepHint": "Wie lange der Arbeitsbereich warm bleibt, nachdem der Agent eine natürliche Pause erreicht hat und niemand zuschaut. Leer lassen für den Systemstandard (60 Min).",
-      "notificationChannels": "Benachrichtigungskanäle",
-      "notificationChannelEmail": "Per E-Mail benachrichtigen, wenn der Agent Aufmerksamkeit benötigt",
       "save": "Einstellungen für persistenten Agent speichern"
     },
     "communication": {
@@ -2654,7 +2644,7 @@
       "context": "Kontextverwaltung",
       "workspace": "Arbeitsbereich",
       "shell": "Shell",
-      "research": "Recherche & Browser",
+      "research": "Recherche",
       "auxiliary": "Hilfs-LLM",
       "session": "Sitzung"
     },
@@ -2685,12 +2675,9 @@
       "defaultTimeout": "Standard-Timeout (Sekunden)",
       "sudoAction": "Sudo-Aktion",
       "proxyEnabled": "Proxy aktiviert",
-      "browserHeadless": "Browser headless",
-      "browserVision": "Browser verwendet Vision",
       "auxEnabled": "Hilfs-LLM aktiviert",
       "model": "Modell",
-      "idleTimeout": "Leerlauf-Timeout (Minuten)",
-      "greeting": "Begrüßung"
+      "idleTimeout": "Leerlauf-Timeout (Minuten)"
     },
     "options": {
       "container": "Container",

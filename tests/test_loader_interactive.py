@@ -48,12 +48,6 @@ class TestInteractiveConfigDefaults:
         ic = InteractiveConfig()
         assert ic.idle_timeout_minutes == 30
 
-    def test_greeting_default(self):
-        ic = InteractiveConfig()
-        assert (
-            ic.greeting == "Hello! I'm ready to help. What would you like to work on?"
-        )
-
     def test_agent_config_has_interactive_field(self):
         """AgentConfig includes interactive as a field with default factory."""
         ac = AgentConfig(agent_id="x", display_name="X")
@@ -65,7 +59,6 @@ class TestInteractiveConfigDefaults:
         standalone = InteractiveConfig()
         assert ac.interactive.permission_mode == standalone.permission_mode
         assert ac.interactive.idle_timeout_minutes == standalone.idle_timeout_minutes
-        assert ac.interactive.greeting == standalone.greeting
 
 
 # =============================================================================

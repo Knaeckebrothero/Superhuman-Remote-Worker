@@ -3660,13 +3660,11 @@ async def _resolve_session_account_defaults(
     if persistent.get("model"):
         layer["llm"] = {"model": persistent["model"]}
     interactive: dict[str, Any] = {}
-    for key in ("permission_mode", "greeting", "idle_timeout_minutes"):
+    for key in ("permission_mode", "idle_timeout_minutes"):
         if persistent.get(key) is not None:
             interactive[key] = persistent[key]
     if interactive:
         layer["interactive"] = interactive
-    if persistent.get("command_allowlist"):
-        layer["command_allowlist"] = persistent["command_allowlist"]
     headless: dict[str, Any] = {}
     if persistent.get("headless_mode"):
         headless["mode"] = persistent["headless_mode"]
@@ -3674,8 +3672,6 @@ async def _resolve_session_account_defaults(
         headless["attention_sleep_minutes"] = int(
             persistent["headless_attention_sleep_minutes"]
         )
-    if persistent.get("notification_channels"):
-        headless["notification_channels"] = list(persistent["notification_channels"])
     if headless:
         layer["headless"] = headless
     layer["workspace"] = {"backend": _default_session_workspace_backend(persistent)}
@@ -3937,8 +3933,8 @@ def _merged_session_tool_groups(
     explicit:
 
     - ``base_defaults`` (``_resolve_session_account_defaults``) emits only
-      ``llm``/``auxiliary``/``interactive``/``command_allowlist``/``headless``/
-      ``workspace``, and the settings matrix its model choice feeds
+      ``llm``/``auxiliary``/``interactive``/``headless``/``workspace``, and
+      the settings matrix its model choice feeds
       (``src/core/loader._apply_settings_matrix``) writes only ``llm``,
       ``limits`` and ``shell.mode``. Saves 2 round trips.
     - ``_seed_registry_model_overrides`` only ``setdefault``s ``llm.*``.
@@ -15595,6 +15591,7 @@ VALID_API_KEY_PROVIDERS = {
     "google",
     "groq",
     "openrouter",
+    "mistral",
     "codex",
     "vision",
 }
@@ -15857,7 +15854,6 @@ class UserSettingsUpdate(BaseModel):
     default_model: str | None = None
     default_autonomy: str | None = None
     default_reasoning_level: str | None = None
-    default_chat_model: str | None = None
     default_auxiliary_model: str | None = None
     default_vision_model: str | None = None
     default_whisper_model: str | None = None
@@ -15866,11 +15862,15 @@ class UserSettingsUpdate(BaseModel):
     default_fetch_model: str | None = None
     default_search_fallback_model: str | None = None
     default_tts_voice: str | None = None
-    default_session_model: str | None = None
     # NOTE: per-phase model defaults (default_strategic_model /
     # default_tactical_model) were removed — see Layer 1 in
     # knowledge-base/knowledge/issues/loop_ran_codex_spark_not_selected_model_then_hung_on_cooldown.md.
-    # Old clients PATCHing them are ignored (BaseModel drops unknown fields).
+    # ``default_chat_model`` and ``default_session_model`` were removed for a
+    # duller reason: nothing ever read them. The account-level chat model is
+    # ``default_model``, and a session's is ``persistent_agent.model``.
+    # Old clients PATCHing any of them are ignored (BaseModel drops unknown
+    # fields) — but a PATCH carrying ONLY a dropped key now 400s as "No
+    # settings provided", which is the honest answer.
     default_embedding_model: str | None = None
     embedding_provider: str | None = None
     # Admin "View as" preference: 'all' = fleet-wide visibility (default),
@@ -15878,11 +15878,13 @@ class UserSettingsUpdate(BaseModel):
     # ViewModeService; the live request narrowing rides the X-Admin-View-As
     # header (orchestrator/security/auth.py), this just persists the choice.
     admin_view_mode: Literal["me", "all"] | None = None
-    # Phase 6: persistent_agent sub-object covers headless_mode,
-    # headless_attention_sleep_minutes, notification_channels, plus the
-    # existing model/permission_mode/greeting/idle_timeout_minutes/command_allowlist
-    # keys already read in create_thread. Also workspace_backend — the user's
-    # default session workspace tier. Patch-replaces the whole sub-object.
+    # persistent_agent sub-object: model, permission_mode,
+    # idle_timeout_minutes, headless_mode, headless_attention_sleep_minutes,
+    # and workspace_backend (the user's default session workspace tier).
+    # Patch-replaces the whole sub-object. Free-form by design, so legacy keys
+    # from removed controls (greeting, command_allowlist,
+    # notification_channels) still round-trip harmlessly if a stored blob
+    # carries them — nothing reads them any more.
     persistent_agent: dict[str, Any] | None = None
     # Read-aloud rewrite preferences: {reasoning_level, custom_prompt}. Controls
     # how the auxiliary LLM rewrites a message for speech — reasoning_level (off
@@ -66625,7 +66627,6 @@ async def _resolve_preference_defaults() -> dict[str, Any]:
             "model": registry_chat or p_llm.get("model"),
             "permission_mode": "supervised",
             "idle_timeout_minutes": 30,
-            "config_name": "",
             "workspace_backend": SESSION_DEFAULT_WORKSPACE_BACKEND,
         },
     }

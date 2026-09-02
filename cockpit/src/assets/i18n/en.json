@@ -1182,12 +1182,7 @@
       "modelPlaceholder": "e.g. claude-sonnet-4-6",
       "defaultPrefix": "Default:",
       "permissionMode": "Permission Mode",
-      "config": "Config",
-      "greeting": "Greeting",
-      "greetingPlaceholder": "Hello! I'm ready to help.",
       "idleTimeout": "Idle Timeout (minutes)",
-      "commandAllowlist": "Command Allowlist",
-      "commandAllowlistPlaceholder": "pytest*, npm test, git status",
       "permissionSupervised": "Supervised",
       "permissionAutoAccept": "Auto-accept",
       "permissionAutonomous": "Autonomous",
@@ -1196,17 +1191,12 @@
       "workspaceVirtual": "Virtual — instant, cloud file storage",
       "workspaceSandbox": "Container — full shell & git, slower start",
       "workspaceNone": "None — chat only, no files",
-      "configDefault": "Default",
-      "configDeveloper": "Developer",
-      "configScholar": "Scholar",
       "headlessMode": "Headless Behavior",
       "headlessModeDefault": "Default (Eager)",
       "headlessModeEager": "Eager — keep working while untethered",
       "headlessModePolite": "Polite — park between turns until you return",
       "attentionSleep": "Attention Sleep (minutes)",
       "attentionSleepHint": "How long to keep the workspace warm after the agent reaches a natural pause and no one is watching. Leave blank for the system default (60 min).",
-      "notificationChannels": "Notification Channels",
-      "notificationChannelEmail": "Email me when the agent needs my attention",
       "save": "Save Persistent Agent Settings"
     },
     "communication": {
@@ -2654,7 +2644,7 @@
       "context": "Context Management",
       "workspace": "Workspace",
       "shell": "Shell",
-      "research": "Research & Browser",
+      "research": "Research",
       "auxiliary": "Auxiliary LLM",
       "session": "Session"
     },
@@ -2685,12 +2675,9 @@
       "defaultTimeout": "Default timeout (seconds)",
       "sudoAction": "Sudo action",
       "proxyEnabled": "Proxy enabled",
-      "browserHeadless": "Browser headless",
-      "browserVision": "Browser use vision",
       "auxEnabled": "Auxiliary LLM enabled",
       "model": "Model",
-      "idleTimeout": "Idle timeout (minutes)",
-      "greeting": "Greeting"
+      "idleTimeout": "Idle timeout (minutes)"
     },
     "options": {
       "container": "Container",
