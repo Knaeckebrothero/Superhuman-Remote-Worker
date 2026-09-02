@@ -6,12 +6,15 @@ import {
     EventGroup,
     firstSentence,
     firstTextOf,
+    firstTurnOf,
     foldWakeCycles,
     FoldableEvent,
     groupEvents,
     isQuietWakeTurn,
+    isSessionBoundary,
     isSitrepTurn,
     lastTextOf,
+    lastTurnOf,
     notifyToolCalls,
     sleepRequest,
     summarizeFolded,
@@ -500,5 +503,23 @@ describe('officer log lens', () => {
             expect(cycle.reason).toBe('quiet');
             expect(cycle.id).toBe('s');
         }
+    });
+
+    it('finds the reload boundary between a historical turn and a live one', () => {
+        const hist = {...asst('h', [sleep('c')]), historical: true} as unknown as Turn;
+        const live = asst('l', [sleep('d')]);
+        expect(isSessionBoundary(hist, live)).toBe(true);
+        expect(isSessionBoundary(live, hist)).toBe(false);
+        expect(isSessionBoundary(hist, undefined)).toBe(false);
+        expect(isSessionBoundary(sys('s', '[SITREP] x'), live)).toBe(false);
+    });
+
+    it('exposes the outer turns of a view so dividers land between views', () => {
+        const [cycle] = foldWakeCycles([sys('s', '[SITREP] x'), asst('a', [sleep('c')])]);
+        expect(firstTurnOf(cycle).id).toBe('s');
+        expect(lastTurnOf(cycle).id).toBe('a');
+        const [plain] = foldWakeCycles([sys('r', 'Session resumed')]);
+        expect(firstTurnOf(plain).id).toBe('r');
+        expect(lastTurnOf(plain).id).toBe('r');
     });
 });

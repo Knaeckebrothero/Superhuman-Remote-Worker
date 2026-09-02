@@ -639,3 +639,21 @@ export function foldWakeCycles(turns: readonly Turn[]): TurnView[] {
     }
     return out;
 }
+
+/** The session-reload boundary: `turn` was loaded from history and `next` was not. */
+export function isSessionBoundary(turn: Turn, next: Turn | undefined): boolean {
+    if (!next) return false;
+    const turnHistorical = (turn.kind === 'assistant' || turn.kind === 'user') && !!turn.historical;
+    const nextHistorical = (next.kind === 'assistant' || next.kind === 'user') && !!next.historical;
+    return turnHistorical && !nextHistorical;
+}
+
+/** The last underlying turn a view renders (a cycle ends with its wake). */
+export function lastTurnOf(view: TurnView): Turn {
+    return view.kind === 'wake_cycle' ? view.wake : view.turn;
+}
+
+/** The first underlying turn a view renders (a cycle opens with its sitrep). */
+export function firstTurnOf(view: TurnView): Turn {
+    return view.kind === 'wake_cycle' ? view.sitrep : view.turn;
+}

@@ -36,14 +36,17 @@ import {
     EventGroup,
     firstSentence,
     firstTextOf,
+    firstTurnOf,
     foldWakeCycles,
     FoldableEvent,
     FoldedSummary,
     groupEvents,
     isAssistantTurn,
+    isSessionBoundary,
     isSystemTurn,
     isUserTurn,
     lastTextOf,
+    lastTurnOf,
     MIN_FOLD_RUN,
     notifyToolCalls,
     summarizeFolded,
@@ -1684,14 +1687,14 @@ export function clearDraft(threadId: string | null): void {
               </div>
             }
           }
+          }
           <!-- Divider between historical-loaded turns and the live session. -->
-          @if (showSessionDividerAfter(turn, $index)) {
+          @if (showSessionDividerAfterView(view, $index)) {
             <div class="session-divider">
               <span class="divider-line"></span>
               <span class="divider-text">{{ 'chat.system.sessionResumed' | transloco }}</span>
               <span class="divider-line"></span>
             </div>
-          }
           }
         } @empty {
           @if (!chat.isStreaming()) {
@@ -4364,11 +4367,13 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
      * the boundary between session reload and live activity.
      */
     showSessionDividerAfter(turn: Turn, index: number): boolean {
-        const next = this.chat.visibleTurns()[index + 1];
-        if (!next) return false;
-        const turnHistorical = (turn.kind === 'assistant' || turn.kind === 'user') && !!turn.historical;
-        const nextHistorical = (next.kind === 'assistant' || next.kind === 'user') && !!next.historical;
-        return turnHistorical && !nextHistorical;
+        return isSessionBoundary(turn, this.chat.visibleTurns()[index + 1]);
+    }
+
+    /** Divider placement under the lens: boundaries are judged between VIEWS (a folded cycle counts as its wake). */
+    showSessionDividerAfterView(view: TurnView, index: number): boolean {
+        const nextView = this.turnViews()[index + 1];
+        return isSessionBoundary(lastTurnOf(view), nextView ? firstTurnOf(nextView) : undefined);
     }
 
     // Tool call display helpers
