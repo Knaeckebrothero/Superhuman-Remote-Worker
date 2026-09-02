@@ -418,15 +418,24 @@ An enabled Dynamic Canvas viewer uses a separate PostgreSQL login and never
 receives the application `POSTGRES_*` credential. For a chart-owned
 `databases.postgres.engine=cnpg` database, set `provisionRole=true` and choose
 exactly one credential source. `credentials.create=true` is the completely
-self-contained path: the chart creates a CNPG basic-auth Secret, CNPG 1.30's
-`DatabaseRole` reconciles the fixed login and password, and a tracked
+self-contained path: the chart creates a gateway credential Secret plus a
+dedicated CNPG basic-auth projection from the same generated password. CNPG
+1.30's `DatabaseRole` reconciles the fixed login and password, and a tracked
 revision-scoped Job applies and attests the database/object allowlist as the
 ordinary application owner. This works for production and development and
-requires no database administrator credential or pre-install role step.
+requires no database administrator credential, pre-created Secret, or
+pre-install role step.
 
-`credentials.vaultPath` provides the same automatic path through ESO without
-changing the Vault property. A pre-created `credentials.existingSecret` can
-also be used; with automatic CNPG provisioning it must already be
+`credentials.vaultPath` provides the same automatic path through ESO. Both
+Kubernetes Secrets read the property named by `passwordKey` from that one Vault
+entry; do not create or copy a second Vault value. The separate Kubernetes
+objects are deliberate because Kubernetes does not permit an existing Opaque
+Secret to be changed to `kubernetes.io/basic-auth` during an upgrade. The
+gateway Secret keeps its existing type, while the CNPG-only Secret always has
+the operator-required shape.
+
+A pre-created `credentials.existingSecret` can also be used; with automatic
+CNPG provisioning it must already be
 `kubernetes.io/basic-auth`, contain matching `username`/`password`, carry
 `cnpg.io/reload=true`, and set `existingSecretCnpgCompatible=true` as an
 explicit offline-render assertion. The Vault-backed ExternalSecret is rendered

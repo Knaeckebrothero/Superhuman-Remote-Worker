@@ -437,8 +437,19 @@ def test_canvas_gateway_helm_render_contract_and_selector_gate() -> None:
     )
     assert database_role["spec"]["name"] == "srw_canvas_gateway"
     assert database_role["spec"]["ensure"] == "present"
-    assert database_role["spec"]["passwordSecret"]["name"]
-    credential_secret = next(
+    role_secret_name = database_role["spec"]["passwordSecret"]["name"]
+    assert role_secret_name.endswith("-canvas-gateway-db-cnpg")
+    # CNPG defaults these fields and omits them from the persisted CR. Rendering
+    # them explicitly makes a GitOps controller report permanent false drift.
+    assert {
+        "superuser",
+        "createdb",
+        "createrole",
+        "replication",
+        "bypassrls",
+        "inRoles",
+    }.isdisjoint(database_role["spec"])
+    credential_secrets = [
         item
         for item in cnpg_objects
         if item.get("kind") == "Secret"
@@ -446,12 +457,29 @@ def test_canvas_gateway_helm_render_contract_and_selector_gate() -> None:
         .get("labels", {})
         .get("app.kubernetes.io/component")
         == "canvas-gateway-credentials"
+    ]
+    assert len(credential_secrets) == 2
+    role_secret = next(
+        item
+        for item in credential_secrets
+        if item["metadata"]["name"] == role_secret_name
     )
-    assert credential_secret["type"] == "kubernetes.io/basic-auth"
+    gateway_secret = next(
+        item
+        for item in credential_secrets
+        if item["metadata"]["name"] != role_secret_name
+    )
+    assert gateway_secret["type"] == "Opaque"
     assert {"username", "password", "CANVAS_VIEWER_POSTGRES_PASSWORD"} == set(
-        credential_secret["stringData"]
+        gateway_secret["stringData"]
     )
-    assert credential_secret["metadata"]["labels"]["cnpg.io/reload"] == "true"
+    assert role_secret["type"] == "kubernetes.io/basic-auth"
+    assert set(role_secret["stringData"]) == {"username", "password"}
+    assert (
+        gateway_secret["stringData"]["CANVAS_VIEWER_POSTGRES_PASSWORD"]
+        == role_secret["stringData"]["password"]
+    )
+    assert role_secret["metadata"]["labels"]["cnpg.io/reload"] == "true"
     role_job = next(
         item
         for item in cnpg_objects
@@ -692,6 +720,10 @@ def test_canvas_gateway_vault_credentials_follow_viewer_lifecycle() -> None:
             *enabled_args,
             "--set-string",
             f"canvas.livePreview.viewer.database.credentials.vaultPath={vault_path}",
+            "--set",
+            "canvas.livePreview.viewer.database.provisionRole=true",
+            "--set-string",
+            "databases.postgres.engine=cnpg",
         ],
         check=True,
         capture_output=True,
@@ -707,7 +739,7 @@ def test_canvas_gateway_vault_credentials_follow_viewer_lifecycle() -> None:
         .get("app.kubernetes.io/component")
         == "canvas-gateway-credentials"
     ]
-    assert len(external_secrets) == 1
+    assert len(external_secrets) == 2
     # Viewer on + Vault coordinates renders the gateway itself too — the
     # credential mapping follows the gate rather than existing on its own.
     assert any(
@@ -718,29 +750,45 @@ def test_canvas_gateway_vault_credentials_follow_viewer_lifecycle() -> None:
         == "canvas-gateway"
         for item in objects
     )
-    external_secret = external_secrets[0]
-    assert "dataFrom" not in external_secret["spec"]
-    # One Vault property feeds a CNPG basic-auth Secret plus the gateway's
-    # compatibility key. The role name remains fixed chart configuration.
-    assert external_secret["spec"]["data"] == [
+    database_role = next(item for item in objects if item.get("kind") == "DatabaseRole")
+    role_secret_name = database_role["spec"]["passwordSecret"]["name"]
+    by_target_name = {item["spec"]["target"]["name"]: item for item in external_secrets}
+    role_external_secret = by_target_name[role_secret_name]
+    gateway_secret_name = next(
+        name for name in by_target_name if name != role_secret_name
+    )
+    gateway_external_secret = by_target_name[gateway_secret_name]
+
+    # Both Kubernetes projections read the same existing Vault property; no
+    # second Vault entry or manual password copy is part of the install flow.
+    expected_remote_mapping = [
         {
             "secretKey": "password",
             "remoteRef": {
                 "key": vault_path,
                 "property": "CANVAS_VIEWER_POSTGRES_PASSWORD",
             },
-        },
+        }
     ]
-    target_template = external_secret["spec"]["target"]["template"]
-    assert target_template["type"] == "kubernetes.io/basic-auth"
-    assert target_template["metadata"]["labels"]["cnpg.io/reload"] == "true"
-    assert set(target_template["data"]) == {
+    for external_secret in external_secrets:
+        assert "dataFrom" not in external_secret["spec"]
+        assert external_secret["spec"]["data"] == expected_remote_mapping
+        assert (
+            external_secret["spec"]["target"]["name"]
+            == external_secret["metadata"]["name"]
+        )
+
+    gateway_template = gateway_external_secret["spec"]["target"]["template"]
+    assert "type" not in gateway_template
+    assert set(gateway_template["data"]) == {
         "username",
         "password",
         "CANVAS_VIEWER_POSTGRES_PASSWORD",
     }
-    secret_name = external_secret["spec"]["target"]["name"]
-    assert secret_name == external_secret["metadata"]["name"]
+    role_template = role_external_secret["spec"]["target"]["template"]
+    assert role_template["type"] == "kubernetes.io/basic-auth"
+    assert role_template["metadata"]["labels"]["cnpg.io/reload"] == "true"
+    assert set(role_template["data"]) == {"username", "password"}
 
     gateway = next(
         item
@@ -758,7 +806,7 @@ def test_canvas_gateway_vault_credentials_follow_viewer_lifecycle() -> None:
     }
     assert credential_refs == {
         "CANVAS_VIEWER_POSTGRES_PASSWORD": {
-            "name": secret_name,
+            "name": gateway_secret_name,
             "key": "CANVAS_VIEWER_POSTGRES_PASSWORD",
         },
     }
@@ -813,7 +861,7 @@ def test_canvas_gateway_development_can_provision_restricted_internal_role() -> 
     ]
     assert len(credentials) == 1
     assert credentials[0]["kind"] == "Secret"
-    assert credentials[0]["type"] == "kubernetes.io/basic-auth"
+    assert credentials[0]["type"] == "Opaque"
     assert set(credentials[0]["stringData"]) == {
         "username",
         "password",

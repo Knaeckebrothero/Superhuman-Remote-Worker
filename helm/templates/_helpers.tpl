@@ -956,6 +956,21 @@ operator-precreated Secret keeps its explicit name.
 {{- end -}}
 
 {{/*
+Effective Secret name consumed by CloudNativePG's DatabaseRole. Chart-created
+and Vault/ESO credentials get a dedicated basic-auth projection so upgrades do
+not have to mutate the type of the gateway's long-lived Opaque Secret. An
+operator-precreated CNPG-compatible Secret can serve both consumers.
+*/}}
+{{- define "srw.canvasGatewayDatabaseRoleSecretName" -}}
+{{- $credentials := .Values.canvas.livePreview.viewer.database.credentials -}}
+{{- if or $credentials.create (ne (trim $credentials.vaultPath) "") -}}
+{{- printf "%s-canvas-gateway-db-cnpg" (include "srw.fullname" .) -}}
+{{- else -}}
+{{- $credentials.existingSecret -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Keycloak SMTP port and STARTTLS flag for the realm bootstrap (kcadm).
 
 Both are WHITELISTS, not sanitizers: each emits either a literal drawn from a

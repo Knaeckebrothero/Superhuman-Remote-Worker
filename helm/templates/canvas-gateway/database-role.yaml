@@ -1,7 +1,7 @@
 {{- $viewer := .Values.canvas.livePreview.viewer -}}
 {{- $database := $viewer.database -}}
 {{- if and $viewer.enabled $database.provisionRole (include "srw.dbRendersCnpg" (dict "context" . "key" "postgres")) }}
-{{- $databaseSecretName := include "srw.canvasGatewayDatabaseSecretName" . -}}
+{{- $databaseSecretName := include "srw.canvasGatewayDatabaseRoleSecretName" . -}}
 # CloudNativePG owns cluster-global identity and password state. The normal
 # revision-scoped Job owns only database/schema/relation ACLs.
 apiVersion: postgresql.cnpg.io/v1
@@ -17,14 +17,8 @@ spec:
   ensure: present
   comment: Restricted Dynamic Canvas gateway login
   login: true
-  superuser: false
-  createdb: false
-  createrole: false
   inherit: false
-  replication: false
-  bypassrls: false
   connectionLimit: -1
-  inRoles: []
   databaseRoleReclaimPolicy: retain
   passwordSecret:
     name: {{ $databaseSecretName }}

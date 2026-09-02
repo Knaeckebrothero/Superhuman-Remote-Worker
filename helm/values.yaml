@@ -742,9 +742,10 @@ canvas:
         # under operator-selected names.
         username: "srw_canvas_gateway"
         credentials:
-          # -- Generate a dedicated CNPG basic-auth Secret. Valid for a
-          # self-contained chart-owned database, including production CNPG;
-          # values and Helm release storage must receive normal Secret-grade
+          # -- Generate a dedicated gateway Secret. With automatic CNPG role
+          # provisioning, the chart also creates a CNPG basic-auth projection
+          # from the same password; no pre-install role or Secret is required.
+          # Values and Helm release storage must receive normal Secret-grade
           # access controls.
           create: false
           # -- Existing Secret containing the gateway DB credential.
@@ -755,9 +756,10 @@ canvas:
           # password. Helm cannot inspect it during an offline/Fleet render.
           existingSecretCnpgCompatible: false
           # -- Vault KV path containing the property named by passwordKey. The
-          # chart projects it into a CNPG basic-auth Secret with the fixed
-          # username plus password and compatibility keys. This selects a
-          # chart-rendered ExternalSecret instead of a pre-created Kubernetes
+          # chart projects that one property into the gateway Secret and, when
+          # CNPG role provisioning is enabled, a separate CNPG basic-auth
+          # Secret. No second Vault entry is required. This selects
+          # chart-rendered ExternalSecrets instead of a pre-created Kubernetes
           # Secret and requires externalSecrets.enabled.
           # The path is inert while viewer.enabled=false: no provider lookup or
           # credential requirement is created until the gateway is enabled.
