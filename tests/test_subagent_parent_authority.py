@@ -12,6 +12,7 @@ from src.shared.subagent_parent_authority import (
     ParentExecutionAuthority,
     ParentExecutionAuthorityRefused,
     require_parent_execution_authority,
+    require_parent_execution_settlement_authority,
 )
 
 JOB = UUID("aaaaaaaa-1111-4222-8333-444444444444")
@@ -114,6 +115,31 @@ async def test_stateless_stolen_lease_refuses_before_job_or_child():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["paused", "failed", "cancelled"])
+async def test_stateless_exact_lease_retains_only_settlement_authority(status):
+    parent = {
+        "id": JOB,
+        "status": status,
+        "execution_lane": "stateless",
+        "assigned_agent_id": None,
+    }
+    strict = AsyncMock()
+    strict.fetchrow = AsyncMock(side_effect=[{"one": 1}, parent])
+    with pytest.raises(ParentExecutionAuthorityRefused):
+        await require_parent_execution_authority(
+            strict, _stateless(), parent_job_id=JOB, mutation=True
+        )
+
+    settling = AsyncMock()
+    settling.fetchrow = AsyncMock(side_effect=[{"one": 1}, parent])
+    assert (
+        await require_parent_execution_settlement_authority(
+            settling, _stateless(), parent_job_id=JOB, mutation=True
+        )
+    )["status"] == status
+
+
+@pytest.mark.asyncio
 async def test_pinned_gate_locks_job_then_exact_reciprocal_process():
     conn = AsyncMock()
     conn.fetchrow = AsyncMock(
@@ -163,6 +189,56 @@ async def test_pinned_replacement_refuses_before_child_access():
 
     assert excinfo.value.reason == "pinned_process_not_current"
     assert conn.fetchrow.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["paused", "failed", "cancelled"])
+async def test_pinned_exact_process_retains_only_settlement_authority(status):
+    parent = {
+        "id": JOB,
+        "status": status,
+        "execution_lane": "pinned",
+        "assigned_agent_id": None,
+    }
+    strict = AsyncMock()
+    strict.fetchrow = AsyncMock(return_value=parent)
+    with pytest.raises(ParentExecutionAuthorityRefused):
+        await require_parent_execution_authority(
+            strict, _pinned(), parent_job_id=JOB, mutation=True
+        )
+    assert strict.fetchrow.await_count == 1
+
+    settling = AsyncMock()
+    settling.fetchrow = AsyncMock(side_effect=[parent, {"id": AGENT}])
+    assert (
+        await require_parent_execution_settlement_authority(
+            settling, _pinned(), parent_job_id=JOB, mutation=True
+        )
+    )["status"] == status
+    assert "FROM agents" in _compact(settling.fetchrow.await_args_list[1].args[0])
+
+
+@pytest.mark.asyncio
+async def test_pinned_settlement_still_refuses_a_replaced_process():
+    conn = AsyncMock()
+    conn.fetchrow = AsyncMock(
+        side_effect=[
+            {
+                "id": JOB,
+                "status": "cancelled",
+                "execution_lane": "pinned",
+                "assigned_agent_id": None,
+            },
+            None,
+        ]
+    )
+
+    with pytest.raises(ParentExecutionAuthorityRefused) as excinfo:
+        await require_parent_execution_settlement_authority(
+            conn, _pinned(), parent_job_id=JOB, mutation=True
+        )
+
+    assert excinfo.value.reason == "pinned_process_not_current"
 
 
 @pytest.mark.asyncio

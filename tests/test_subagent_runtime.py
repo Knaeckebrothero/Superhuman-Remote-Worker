@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import asyncio
 import re
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -18,6 +20,7 @@ from src.subagents import (
     ChildBudgets,
     ContextProbe,
     RecordingLedger,
+    SimpleParentHost,
     SubagentCall,
     SubagentRuntime,
     WorkerHost,
@@ -99,6 +102,40 @@ def call(call_id="c1", **kw) -> SubagentCall:
     kw.setdefault("subagent_type", "explorer")
     kw.setdefault("prompt", "Say hello.")
     return SubagentCall(tool_call_id=call_id, **kw)
+
+
+@pytest.mark.asyncio
+async def test_simple_host_settlement_keeps_its_local_effect_fence():
+    admitted = True
+    host = SimpleParentHost(
+        job_id="parent-job",
+        admission_fn=lambda: admitted,
+        effect_authority_fn=lambda: True,
+    )
+
+    assert await host.settlement_authority() is True
+    admitted = False
+    assert await host.settlement_authority() is False
+
+
+@pytest.mark.asyncio
+async def test_worker_settlement_authority_survives_closed_effect_admission(tmp_path):
+    ctx, _ = make_parent(tmp_path)
+    authority = object()
+    effect_probe = AsyncMock(return_value=True)
+    settlement_probe = AsyncMock(return_value=True)
+    ctx.provider_admission = lambda: False
+    ctx._parent_execution_authority = authority
+    ctx.postgres_db = SimpleNamespace(
+        parent_execution_authority_current=effect_probe,
+        parent_execution_settlement_authority_current=settlement_probe,
+    )
+    host = WorkerHost.from_context(ctx)
+
+    assert await host.effect_authority() is False
+    assert await host.settlement_authority() is True
+    effect_probe.assert_not_awaited()
+    settlement_probe.assert_awaited_once_with(authority)
 
 
 # ---------------------------------------------------------------------------

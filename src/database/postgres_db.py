@@ -21,6 +21,7 @@ from typing import Optional, Any, List, Dict, Tuple
 from src.shared.subagent_parent_authority import (
     ParentExecutionAuthority,
     require_parent_execution_authority,
+    require_parent_execution_settlement_authority,
 )
 from src.shared.session_subagent_authority import (
     SessionParentAuthority,
@@ -488,6 +489,21 @@ class PostgresDB:
                 )
         return True
 
+    async def parent_execution_settlement_authority_current(
+        self, parent_authority: ParentExecutionAuthority
+    ) -> bool:
+        """Prove this exact worker can finish already-admitted child writes."""
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                await require_parent_execution_settlement_authority(
+                    conn,
+                    parent_authority,
+                    parent_job_id=parent_authority.parent_job_id,
+                    mutation=False,
+                )
+        return True
+
     async def update_subagent_thread(
         self,
         thread_id: str,
@@ -526,7 +542,12 @@ class PostgresDB:
             return False
         async with self.acquire() as conn:
             async with conn.transaction():
-                await require_parent_execution_authority(
+                authority_gate = (
+                    require_parent_execution_settlement_authority
+                    if ended
+                    else require_parent_execution_authority
+                )
+                await authority_gate(
                     conn,
                     parent_authority,
                     parent_job_id=parent_uuid,

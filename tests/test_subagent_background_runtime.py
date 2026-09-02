@@ -201,6 +201,38 @@ async def test_provider_is_not_constructed_before_durable_receipt(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_preempted_parent_terminal_receipt_never_creates_lane_b_backlog(tmp_path):
+    class SuppressedTerminalLedger(StrictLedger):
+        async def terminalize_and_enqueue(
+            self, subagent_id: str, **fields: Any
+        ) -> dict[str, Any]:
+            self.terminal_calls.append((subagent_id, dict(fields)))
+            self.terminal.set()
+            return {"result": "applied", "delivery_state": "suppressed"}
+
+    ctx, _ = make_parent(tmp_path)
+    ledger = SuppressedTerminalLedger()
+    runtime = runtime_for(
+        ctx,
+        factory=lambda config, limits: FakeChatModel([text_turn("done")]),
+        ledger=ledger,
+    )
+
+    receipt = await runtime.run_background(call(run_in_background=True))
+    handle = receipt.split()[1]
+    await asyncio.wait_for(ledger.terminal.wait(), 5)
+    tasks = list(runtime._background_tasks.values())
+    if tasks:
+        await asyncio.gather(*tasks)
+
+    assert runtime._background[handle].status == "completed"
+    assert runtime._background[handle].delivery_pending is False
+    assert runtime.drain_local_deliveries() == []
+    assert not runtime.has_completion_blockers()
+    await runtime.close()
+
+
+@pytest.mark.asyncio
 async def test_create_refusal_never_schedules_provider(tmp_path):
     ctx, _ = make_parent(tmp_path)
     ledger = StrictLedger()

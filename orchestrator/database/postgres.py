@@ -58,6 +58,7 @@ from src.shared.subagent_parent_authority import (
     ParentExecutionAuthority,
     ParentExecutionAuthorityRefused,
     require_parent_execution_authority,
+    require_parent_execution_settlement_authority,
 )
 from src.shared.session_subagent_authority import (
     SessionParentAuthorityRefused,
@@ -30165,8 +30166,10 @@ class PostgresDB:
 
         The job row is locked before the child row.  ``delivery_id`` is the
         stable queued-reply identity, and retries succeed after either the
-        queued or consumed copy is found.  A generation-mismatched writer can
-        neither end the successor nor publish evidence for it.
+        queued or consumed copy is found.  A preempted parent permits its exact
+        worker to end an already-admitted child but suppresses the now-dead
+        parent delivery.  A generation-mismatched writer can neither end the
+        successor nor publish evidence for it.
         """
         try:
             job_uuid = UUID(str(parent_job_id))
@@ -30196,7 +30199,7 @@ class PostgresDB:
             async with conn.transaction():
                 # Authority helper establishes queue->job for stateless and
                 # job->agent for pinned.  The child lock below is always last.
-                await require_parent_execution_authority(
+                await require_parent_execution_settlement_authority(
                     conn,
                     parent_authority,
                     parent_job_id=job_uuid,
@@ -30242,16 +30245,11 @@ class PostgresDB:
                                 "queued" if lane == "queued_replies" else "consumed"
                             ),
                         }
-                if parent.get("status") in {"completed", "failed", "cancelled"}:
-                    return {
-                        "result": "parent_terminal",
-                        "thread_id": str(child_uuid),
-                        "runtime_generation": str(expected_generation),
-                    }
-
                 child = await conn.fetchrow(
                     """
-                    SELECT runtime_generation, status, subagent_handle
+                    SELECT runtime_generation, status, subagent_handle,
+                           subagent_status, subagent_outcome, total_turns,
+                           total_tokens, report_path, subagent_error
                       FROM threads
                      WHERE id = $1
                        AND kind = 'subagent'
@@ -30268,7 +30266,33 @@ class PostgresDB:
                         "result": "stale",
                         "thread_id": str(child_uuid),
                     }
+                parent_terminal = str(parent.get("status") or "") in {
+                    "failed",
+                    "cancelled",
+                }
                 if child["status"] == "ended":
+                    if parent_terminal:
+                        retry_fields = (
+                            ("status", terminal_kind, child.get("subagent_status")),
+                            ("outcome", outcome, child.get("subagent_outcome")),
+                            ("turns", turns, child.get("total_turns")),
+                            ("tokens", tokens, child.get("total_tokens")),
+                            ("report_path", report_path, child.get("report_path")),
+                            ("error", error, child.get("subagent_error")),
+                        )
+                        for field, supplied, stored in retry_fields:
+                            if supplied is not None and supplied != stored:
+                                raise ValueError(
+                                    "suppressed terminal child retry changed its "
+                                    + field
+                                )
+                        return {
+                            "result": "idempotent",
+                            "thread_id": str(child_uuid),
+                            "runtime_generation": str(expected_generation),
+                            "delivery_id": str(reply_uuid),
+                            "delivery_state": "suppressed",
+                        }
                     return {
                         "result": "already_terminal",
                         "thread_id": str(child_uuid),
@@ -30309,6 +30333,15 @@ class PostgresDB:
                         "result": "stale",
                         "thread_id": str(child_uuid),
                         "runtime_generation": str(expected_generation),
+                    }
+
+                if parent_terminal:
+                    return {
+                        "result": "applied",
+                        "thread_id": str(child_uuid),
+                        "runtime_generation": str(expected_generation),
+                        "delivery_id": str(reply_uuid),
+                        "delivery_state": "suppressed",
                     }
 
                 delivery = {

@@ -125,6 +125,50 @@ async def require_parent_execution_authority(
     always the first SQL statement, preserving the run-queue fence contract.
     """
 
+    return await _require_parent_execution_authority(
+        conn,
+        authority,
+        parent_job_id=parent_job_id,
+        mutation=mutation,
+        settlement=False,
+    )
+
+
+async def require_parent_execution_settlement_authority(
+    conn: Any,
+    authority: ParentExecutionAuthority | Mapping[str, Any],
+    *,
+    parent_job_id: UUID | str,
+    mutation: bool,
+) -> Mapping[str, Any]:
+    """Prove an exact worker may settle children after parent preemption.
+
+    Cancellation, pause, and failure publish the parent status before asking
+    its process to stop.  That closes provider/tool effects immediately, but
+    the exact lease/process must retain one narrower authority: ending child
+    generations it admitted while it was current.  Stateless callers still
+    need the live queue lease; pinned callers still need the reciprocal agent
+    process identity.  A replacement process can therefore never inherit this
+    settlement window.
+    """
+
+    return await _require_parent_execution_authority(
+        conn,
+        authority,
+        parent_job_id=parent_job_id,
+        mutation=mutation,
+        settlement=True,
+    )
+
+
+async def _require_parent_execution_authority(
+    conn: Any,
+    authority: ParentExecutionAuthority | Mapping[str, Any],
+    *,
+    parent_job_id: UUID | str,
+    mutation: bool,
+    settlement: bool,
+) -> Mapping[str, Any]:
     try:
         parsed = coerce_parent_execution_authority(authority)
         job_uuid = UUID(str(parent_job_id))
@@ -155,9 +199,13 @@ async def require_parent_execution_authority(
             """,
             job_uuid,
         )
+        parent_status = str(parent["status"]) if parent is not None else ""
+        admitted_status = parent_status == "processing" or (
+            settlement and parent_status in {"paused", "failed", "cancelled"}
+        )
         if (
             parent is None
-            or str(parent["status"]) != "processing"
+            or not admitted_status
             or str(parent["execution_lane"]) != "stateless"
             or parent["assigned_agent_id"] is not None
         ):
@@ -173,11 +221,20 @@ async def require_parent_execution_authority(
         """,
         job_uuid,
     )
+    parent_status = str(parent["status"]) if parent is not None else ""
+    assigned_agent = str(parent["assigned_agent_id"] or "") if parent else ""
+    live_binding = parent_status == "processing" and assigned_agent == str(
+        parsed.agent_id
+    )
+    settling_binding = (
+        settlement
+        and parent_status in {"paused", "failed", "cancelled"}
+        and not assigned_agent
+    )
     if (
         parent is None
-        or str(parent["status"]) != "processing"
         or str(parent["execution_lane"]) != "pinned"
-        or str(parent["assigned_agent_id"] or "") != str(parsed.agent_id)
+        or not (live_binding or settling_binding)
     ):
         raise ParentExecutionAuthorityRefused("pinned_parent_not_current")
 
@@ -209,4 +266,5 @@ __all__ = [
     "ParentExecutionAuthorityRefused",
     "coerce_parent_execution_authority",
     "require_parent_execution_authority",
+    "require_parent_execution_settlement_authority",
 ]

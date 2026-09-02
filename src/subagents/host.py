@@ -99,6 +99,14 @@ class ParentHost(Protocol):
         """
         ...
 
+    async def settlement_authority(self) -> bool:
+        """Prove already-admitted child state may be terminally settled.
+
+        This narrower authority can outlive provider/tool admission while an
+        exact parent owner cooperatively handles cancellation or pause.
+        """
+        ...
+
     def context_probe(self) -> Optional[ContextProbe]:
         """The parent's current context accounting (``None`` = unknown)."""
         ...
@@ -177,6 +185,11 @@ class SimpleParentHost:
             )
             return False
 
+    async def settlement_authority(self) -> bool:
+        """Use the ordinary local fence for lightweight/test parents."""
+
+        return await self.effect_authority()
+
     def context_probe(self) -> Optional[ContextProbe]:
         if self.probe_fn is None:
             return None
@@ -228,6 +241,7 @@ class WorkerHost:
     #: (tests); ``None`` = the context's fence, else the dual-app drain seam.
     admission_fn: Optional[Callable[[], bool]] = None
     effect_authority_fn: Optional[Callable[[], Any]] = None
+    settlement_authority_fn: Optional[Callable[[], Any]] = None
     events: List[str] = field(default_factory=list)
     delivery_channel: str = "lane_b"
 
@@ -301,6 +315,50 @@ class WorkerHost:
         except Exception:
             logger.warning(
                 "subagent host: worker execution authority is stale or unavailable",
+                exc_info=True,
+            )
+            return False
+
+    async def settlement_authority(self) -> bool:
+        """Retain terminal-write authority after local admission closes.
+
+        The normal effect fence intentionally includes provider admission and
+        therefore closes as soon as cancellation is requested.  Durable child
+        terminalization instead uses the captured worker lease/process and the
+        database's preemption-aware settlement predicate.
+        """
+
+        explicit = self.settlement_authority_fn
+        if explicit is not None:
+            try:
+                value = explicit()
+                if inspect.isawaitable(value):
+                    value = await value
+                return bool(value)
+            except Exception:
+                logger.warning(
+                    "subagent host: exact settlement-authority probe failed",
+                    exc_info=True,
+                )
+                return False
+
+        authority = getattr(self.tool_context, "_parent_execution_authority", None)
+        probe = getattr(
+            self.postgres, "parent_execution_settlement_authority_current", None
+        )
+        if authority is None and self.postgres is None:
+            return await self.effect_authority()
+        if authority is None or not callable(probe):
+            logger.warning(
+                "subagent host: exact worker settlement authority is "
+                "incompletely wired — closing"
+            )
+            return False
+        try:
+            return bool(await probe(authority))
+        except Exception:
+            logger.warning(
+                "subagent host: worker settlement authority is stale or unavailable",
                 exc_info=True,
             )
             return False

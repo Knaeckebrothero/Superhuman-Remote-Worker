@@ -1013,7 +1013,10 @@ class SubagentRuntime:
             )
             return False
 
-        publish = outcome == "applied" or delivery_state == "queued"
+        delivery_suppressed = delivery_state == "suppressed"
+        publish = not delivery_suppressed and (
+            outcome == "applied" or delivery_state == "queued"
+        )
         delivery = committed.get("delivery")
         if publish and not isinstance(delivery, Mapping):
             delivery = self._delivery_shape(run)
@@ -1039,6 +1042,11 @@ class SubagentRuntime:
                     ):
                         self._local_deliveries.append(exact)
                     run.delivery_pending = True
+            elif delivery_suppressed:
+                # Cancellation/failure keeps exact terminal-write authority
+                # only long enough to close the child generation.  There is
+                # no live parent turn to consume a Lane-B report.
+                run.delivery_pending = False
             else:
                 # An idempotent consumed response proves the durable parent
                 # already observed it; do not resurrect it into the mailbox.

@@ -61,6 +61,25 @@ def _exact_parent_authority_gate(monkeypatch):
         orchestrator_postgres, "require_parent_execution_authority", gate
     )
     monkeypatch.setattr(agent_postgres, "require_parent_execution_authority", gate)
+    settlement_gate = AsyncMock(
+        return_value={
+            "id": JOB,
+            "status": "cancelled",
+            "execution_lane": "pinned",
+            "assigned_agent_id": None,
+        }
+    )
+    monkeypatch.setattr(
+        orchestrator_postgres,
+        "require_parent_execution_settlement_authority",
+        settlement_gate,
+    )
+    monkeypatch.setattr(
+        agent_postgres,
+        "require_parent_execution_settlement_authority",
+        settlement_gate,
+    )
+    gate.settlement_gate = settlement_gate
     return gate
 
 
@@ -541,6 +560,50 @@ class TestTerminalizeSubagentAndEnqueue:
         assert queued == [result["delivery"]]
 
     @pytest.mark.asyncio
+    async def test_cancelled_parent_settles_child_without_dead_lane_b_delivery(self):
+        conn = _conn()
+        conn.fetchrow = AsyncMock(
+            side_effect=[
+                {"status": "cancelled", "context": {"keep": "yes"}},
+                {
+                    "runtime_generation": GENERATION,
+                    "status": "active",
+                    "subagent_handle": "reader-aa09",
+                    "subagent_status": "running",
+                    "subagent_outcome": None,
+                    "total_turns": 1,
+                    "total_tokens": 10,
+                    "report_path": None,
+                    "subagent_error": None,
+                },
+            ]
+        )
+        conn.fetchval = AsyncMock(return_value=CHILD)
+        db = _orchestrator_db(conn)
+
+        result = await db.terminalize_subagent_thread_and_enqueue(
+            parent_job_id=str(JOB),
+            thread_id=str(CHILD),
+            runtime_generation=str(GENERATION),
+            delivery_id=str(DELIVERY),
+            message="cancelled child evidence",
+            timestamp=self.timestamp,
+            subagent_status="interrupted",
+            outcome="interrupted:parent_cancelled",
+            turns=1,
+            tokens=10,
+        )
+
+        assert result == {
+            "result": "applied",
+            "thread_id": str(CHILD),
+            "runtime_generation": str(GENERATION),
+            "delivery_id": str(DELIVERY),
+            "delivery_state": "suppressed",
+        }
+        conn.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "lane,state", [("queued_replies", "queued"), ("consumed_replies", "consumed")]
     )
@@ -703,6 +766,23 @@ class TestAgentParentAuthorityProbe:
         conn.fetchrow.assert_not_awaited()
         conn.execute.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_settlement_probe_uses_the_preemption_aware_gate(
+        self, _exact_parent_authority_gate
+    ):
+        conn = _conn()
+        db = _agent_db(conn)
+
+        assert await db.parent_execution_settlement_authority_current(AUTHORITY) is True
+
+        _exact_parent_authority_gate.assert_not_awaited()
+        _exact_parent_authority_gate.settlement_gate.assert_awaited_once_with(
+            conn,
+            AUTHORITY,
+            parent_job_id=AUTHORITY.parent_job_id,
+            mutation=False,
+        )
+
 
 class TestAgentSubagentTranscript:
     @pytest.mark.asyncio
@@ -832,6 +912,31 @@ class TestUpdateSubagentThread:
             True,
             str(GENERATION),
             str(JOB),
+        )
+
+    @pytest.mark.asyncio
+    async def test_terminal_update_uses_preemption_settlement_authority(
+        self, _exact_parent_authority_gate
+    ):
+        conn = _conn()
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+        db = _agent_db(conn)
+
+        assert await db.update_subagent_thread(
+            str(CHILD),
+            runtime_generation=str(GENERATION),
+            status="ended",
+            subagent_status="interrupted",
+            outcome="interrupted:parent_cancelled",
+            ended=True,
+        )
+
+        _exact_parent_authority_gate.assert_not_awaited()
+        _exact_parent_authority_gate.settlement_gate.assert_awaited_once_with(
+            conn,
+            AUTHORITY,
+            parent_job_id=JOB,
+            mutation=True,
         )
 
     @pytest.mark.asyncio
