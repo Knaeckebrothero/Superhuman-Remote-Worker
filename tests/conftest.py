@@ -48,6 +48,40 @@ def _isolate_encryption_cipher_cache():
     _encryption_crypto.reset_cipher_cache()
 
 
+from services import notification_catalog as _notification_catalog  # noqa: E402
+
+_NOTIFICATION_REGISTRIES = (
+    _notification_catalog._ACTION_HANDLERS,
+    _notification_catalog._SOURCE_LOADERS,
+    _notification_catalog._SOURCE_PROBES,
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_notification_registries():
+    """Keep the notification catalog's process-global registries per-test.
+
+    ``main._register_notification_actions()`` installs the live action
+    handlers, source loaders and source probes into module-level dicts. A
+    test that calls it leaves them installed for every later test in the
+    same xdist worker, and under ``--dist loadfile`` which files share a
+    worker is a scheduling detail — so the damage lands as an intermittent,
+    order-dependent CI failure far from the test that caused it. The live
+    ``job`` probe, for one, reads a non-existent job as *resolved* ("deleted:
+    nothing left to decide"), which silently cancels the deferred steps a
+    sweeper test is asserting on.
+
+    Restoring the snapshot keeps the registries the caller's own business,
+    the way ``tests/test_notification_record.py``'s ``handlers`` fixture
+    already does for its own registrations.
+    """
+    saved = [dict(registry) for registry in _NOTIFICATION_REGISTRIES]
+    yield
+    for registry, snapshot in zip(_NOTIFICATION_REGISTRIES, saved):
+        registry.clear()
+        registry.update(snapshot)
+
+
 # orchestrator/main.py also guards on vector-DB credentials at import time.
 # Tests only exercise its utility functions / pure models, never the vector
 # store, so provide a dummy URL. setdefault never overrides a real CI/prod value.
