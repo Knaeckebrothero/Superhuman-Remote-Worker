@@ -4149,6 +4149,70 @@ class TestRemoteBackendShellRun:
         assert lifecycle.mock_calls[-1] == call.clear("default", self._SENTINEL)
         assert "Exit code: 0" in result
 
+    def test_commands_on_distinct_tabs_do_not_serialize(self, remote_backend):
+        backend, _, _ = remote_backend
+        self._ready(backend)
+        backend._tabs["git"] = _RemoteTab("git", pane_id="%2")
+        polling_child = threading.Event()
+        release_child = threading.Event()
+        git_finished = threading.Event()
+        sentinels = {}
+        capture_counts = {"default": 0, "git": 0}
+        results = {}
+
+        def reserve(tab_name, *, sentinel, **_kwargs):
+            sentinels[tab_name] = sentinel
+            backend._tabs[tab_name].pending_sentinel = sentinel
+
+        def capture(tab_name):
+            capture_counts[tab_name] += 1
+            if capture_counts[tab_name] == 1:
+                return []
+            if tab_name == "default":
+                polling_child.set()
+                release_child.wait(timeout=2)
+            return [f"{sentinels[tab_name]} 0 {self._ROOT}"]
+
+        def clear(tab_name, _expected):
+            backend._tabs[tab_name].pending_sentinel = None
+
+        def run_child():
+            results["child"] = backend.shell_run("sleep 180", tab_name="default")
+
+        def run_git():
+            results["git"] = backend.shell_run("git status", tab_name="git")
+            git_finished.set()
+
+        with (
+            patch("src.core.backends.remote.time.sleep"),
+            patch.object(backend, "_tmux_capture", side_effect=capture),
+            patch.object(
+                backend, "_reserve_and_send_shell_command", side_effect=reserve
+            ),
+            patch.object(backend, "_clear_tab_pending_if_current", side_effect=clear),
+        ):
+            child_thread = threading.Thread(target=run_child)
+            git_thread = threading.Thread(target=run_git)
+            child_thread.start()
+            assert polling_child.wait(timeout=1)
+            git_thread.start()
+            ran_concurrently = git_finished.wait(timeout=1)
+            release_child.set()
+            child_thread.join(timeout=2)
+            git_thread.join(timeout=2)
+
+        assert ran_concurrently
+        assert not child_thread.is_alive()
+        assert not git_thread.is_alive()
+        assert "Exit code: 0" in results["child"]
+        assert "Exit code: 0" in results["git"]
+
+    def test_commands_on_same_tab_share_serialization_lock(self, remote_backend):
+        backend, _, _ = remote_backend
+
+        assert backend._shell_tab_lock("default") is backend._shell_tab_lock("default")
+        assert backend._shell_tab_lock("default") is not backend._shell_tab_lock("git")
+
     def test_long_cwd_completion_survives_tmux_display_wrapping(self, remote_backend):
         backend, _, _ = remote_backend
         self._ready(backend)

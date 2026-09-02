@@ -23,6 +23,7 @@ import stat as stat_module
 import threading
 import time
 import uuid
+import weakref
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -568,7 +569,16 @@ class RemoteBackend(WorkspaceBackend):
         # A pane pruned while reattaching must be reported to the agent once,
         # before the usual ensure-tab path is allowed to recreate it.
         self._lost_tab_notices: set[str] = set()
-        self._sync_lock = threading.Lock()
+        # Synchronous commands must serialize per pane, not per backend.  A
+        # shared-tree child can wait on its own tmux tab while the parent uses
+        # another tab (notably ``git`` during turn finalization).  A backend-
+        # wide lock makes that wait freeze the parent's event loop and prevents
+        # live child controls from being accepted.  Weak values avoid retaining
+        # locks forever when a long-lived session churns through tab names.
+        self._tab_sync_locks_guard = threading.Lock()
+        self._tab_sync_locks: weakref.WeakValueDictionary[str, threading.Lock] = (
+            weakref.WeakValueDictionary()
+        )
         self._shell_init_lock = threading.Lock()
         # Serializes the final local admission check with each remote tmux I/O.
         # cleanup can therefore retire this backend's shell owner without a
@@ -3884,6 +3894,15 @@ __SRW_WORKSPACE_UID_ZERO_PY__
 
         return None
 
+    def _shell_tab_lock(self, tab_name: str) -> Any:
+        """Return the process-local serialization lock for one tmux pane."""
+        with self._tab_sync_locks_guard:
+            lock = self._tab_sync_locks.get(tab_name)
+            if lock is None:
+                lock = threading.Lock()
+                self._tab_sync_locks[tab_name] = lock
+            return lock
+
     def _build_guarded_shell_command(
         self,
         command: str,
@@ -3956,7 +3975,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                 f"Use shell_send for interactive tabs."
             )
 
-        with self._sync_lock:
+        with self._shell_tab_lock(tab_name):
             # Pre-flight check
             pre_lines = self._tmux_capture(tab_name)
             # The durable guard, not scrollback that merely resembles a
@@ -4192,7 +4211,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                 f"Tab '{tab_name}' not found. Available: {', '.join(self._tabs.keys())}"
             )
 
-        with self._sync_lock:
+        with self._shell_tab_lock(tab_name):
             tab = self._tabs[tab_name]
             if (
                 enter
@@ -4260,7 +4279,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
             )
         tab = self._tabs[tab_name]
 
-        with self._sync_lock:
+        with self._shell_tab_lock(tab_name):
             if tab.pending_sentinel is None:
                 return f"Tab '{tab_name}': nothing to cancel (no pending command)."
 
