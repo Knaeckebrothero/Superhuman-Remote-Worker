@@ -85,6 +85,21 @@ with that role's overlay. So a session expert dispatched as a job gains the
 worker keys underneath it, and a worker expert used in a session sits on the
 session overlay; the expert's own values always win ("expert wins").
 
+**Session account layer — `workspace.backend` needs an owner.** For sessions
+the orchestrator inserts an *account* layer between the merged role base and
+the expert's own file: the owner's saved `settings.persistent_agent.
+workspace_backend`, else the platform default `virtual`. That layer always
+emits `workspace.backend`, so `expert_base`'s `backend: sandbox` never reaches
+a session. An expert whose role needs a shell (build, run, browser, git) must
+declare `workspace.backend` in its **own** `config.yaml`; the New Session form
+then shows it like an expert-pinned model and the user may still change it.
+An expert that lists shell tools without declaring a backend starts on the
+lite tier with shell/browser/git stripped — a tripwire in
+`tests/test_expert_defaults.py::TestShellBoundBundledExpertsPinTheirTier`
+fails on that unless the expert is on its documented exception list
+(`scholar`). Jobs ignore the key: the workspace contract stamps a job's tier
+from `config_override` (default `sandbox`).
+
 **Ignored keys.** A role overlay may declare `$ignore_keys`, a list of dotted
 paths its role never reads. They are pruned from the merged config after every
 merge, again after the job/thread override layers, and after a roster
