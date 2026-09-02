@@ -1107,6 +1107,107 @@ class TestSendSessionAttachPayload:
         }
 
     @pytest.mark.asyncio
+    async def test_virtual_binding_generation_is_not_a_physical_attach_identity(self):
+        thread = self._thread(
+            user_id="owner-1",
+            metadata={
+                "config_override": {"workspace": {"backend": "virtual"}},
+                "workspace_container": {
+                    "git_remote_url": "https://git.invalid/project.git",
+                    "repo_name": "project",
+                },
+                "_workspace_binding": {
+                    "generation": "50000000-0000-4000-8000-000000000001",
+                    "kind": "virtual",
+                    "backing_id": "rclone:test-backing",
+                    "ssh_host_key_fingerprint": None,
+                },
+            },
+        )
+        with (
+            patch.object(
+                orch_main.postgres_db,
+                "get_thread",
+                AsyncMock(return_value=thread),
+            ),
+            patch.object(
+                orch_main,
+                "_inject_lite_workspace_config",
+                side_effect=lambda value, **_kwargs: value,
+            ),
+            patch.object(orch_main, "_thread_project_ids", AsyncMock(return_value=[])),
+            patch.object(
+                orch_main,
+                "_revalidate_thread_project_ids",
+                AsyncMock(return_value=[]),
+            ),
+            patch.object(
+                orch_main,
+                "_resolve_authorized_thread_datasources",
+                AsyncMock(return_value=[]),
+            ),
+            patch.object(
+                orch_main, "_resolve_session_config", AsyncMock(return_value=None)
+            ),
+        ):
+            payload = await orch_main._assemble_session_attach_payload(
+                self.thread_id,
+                config_override={"workspace": {"backend": "virtual"}},
+            )
+
+        assert payload is not None
+        assert payload["workspace_generation"] is None
+        assert payload["workspace_runtime_incarnation"] is None
+
+    @pytest.mark.asyncio
+    async def test_remote_binding_still_requires_a_physical_runtime_pair(self):
+        thread = self._thread(
+            user_id="owner-1",
+            metadata={
+                "config_override": {"workspace": {"backend": "sandbox"}},
+                "workspace_container": {"provisioner": "k8s"},
+                "_workspace_binding": {
+                    "generation": "50000000-0000-4000-8000-000000000001",
+                    "kind": "remote",
+                    "backing_id": "k8s-pvc:test",
+                    "ssh_host_key_fingerprint": "SHA256:test",
+                },
+            },
+        )
+        with (
+            patch.object(
+                orch_main.postgres_db,
+                "get_thread",
+                AsyncMock(return_value=thread),
+            ),
+            patch.object(
+                orch_main,
+                "_inject_lite_workspace_config",
+                side_effect=lambda value, **_kwargs: value,
+            ),
+            patch.object(orch_main, "_thread_project_ids", AsyncMock(return_value=[])),
+            patch.object(
+                orch_main,
+                "_revalidate_thread_project_ids",
+                AsyncMock(return_value=[]),
+            ),
+            patch.object(
+                orch_main,
+                "_resolve_authorized_thread_datasources",
+                AsyncMock(return_value=[]),
+            ),
+            patch.object(
+                orch_main, "_resolve_session_config", AsyncMock(return_value=None)
+            ),
+        ):
+            payload = await orch_main._assemble_session_attach_payload(
+                self.thread_id,
+                config_override={"workspace": {"backend": "sandbox"}},
+            )
+
+        assert payload is None
+
+    @pytest.mark.asyncio
     async def test_payload_carries_config_name(self):
         _FakeAsyncClient.response_status = 500
         thread = self._thread()

@@ -7815,7 +7815,20 @@ async def _assemble_session_attach_payload(
         if final_workspace.get("provisioner") == "docker"
         else final_workspace.get(WORKSPACE_RUNTIME_INCARNATION_KEY)
     )
-    if bool(final_workspace_generation) != bool(final_workspace_runtime):
+    final_workspace_backend = declared_thread_workspace_backend(final_thread)
+    if (
+        final_binding.get("kind") == "virtual"
+        and final_workspace_backend in LITE_BACKENDS
+    ):
+        # A virtual binding generation fences the durable object-store
+        # namespace; it is not a physical runtime identity.  The attach
+        # contract deliberately represents lite workspaces as (None, None),
+        # while sandbox/VM workspaces carry an exact generation+incarnation
+        # pair.  Never let physical residue hide behind a lite declaration.
+        if final_workspace_runtime:
+            return None
+        final_workspace_generation = None
+    elif bool(final_workspace_generation) != bool(final_workspace_runtime):
         return None
     try:
         final_workspace_generation = (
