@@ -4548,6 +4548,42 @@ class TestStrictStatelessWorkspaceCreation:
                 )
 
     @pytest.mark.asyncio
+    async def test_host_key_probe_isolates_websocket_transport_from_shared_client(self):
+        p = self._provisioner()
+        p._core_api.read_namespaced_pod.side_effect = [self._pod(), self._pod()]
+        isolated_client = MagicMock()
+        isolated_api = MagicMock()
+
+        with (
+            patch(
+                "orchestrator.services.container_provisioner.k8s_client.ApiClient",
+                return_value=isolated_client,
+            ) as api_client_factory,
+            patch(
+                "orchestrator.services.container_provisioner.k8s_client.CoreV1Api",
+                return_value=isolated_api,
+            ) as core_api_factory,
+            patch(
+                "orchestrator.services.container_provisioner.k8s_stream",
+                return_value="256 SHA256:trusted host (ED25519)",
+            ) as stream,
+        ):
+            await p._trusted_pod_ssh_identity(
+                self._owner().pod_name,
+                expected_owner=self._owner(),
+                expected_runtime_incarnation=self.RUNTIME,
+                expected_creation_generation=self.GENERATION,
+            )
+
+        api_client_factory.assert_called_once_with()
+        core_api_factory.assert_called_once_with(isolated_client)
+        assert stream.call_args.args[0] is isolated_api.connect_get_namespaced_pod_exec
+        assert (
+            stream.call_args.args[0] is not p._core_api.connect_get_namespaced_pod_exec
+        )
+        isolated_client.close.assert_called_once_with()
+
+    @pytest.mark.asyncio
     async def test_host_key_probe_rechecks_full_pvc_owner_and_uid_after_exec(self):
         from orchestrator.services.container_provisioner import (
             WorkspaceRuntimeAuthorityError,

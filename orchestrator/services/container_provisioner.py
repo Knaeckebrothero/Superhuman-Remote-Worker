@@ -55,6 +55,25 @@ except ImportError:
     K8S_AVAILABLE = False
 
 
+def _isolated_pod_exec(*args: Any, **kwargs: Any) -> Any:
+    """Run one pod exec without mutating the provisioner's shared API client.
+
+    ``kubernetes.stream.stream`` temporarily replaces ``ApiClient.request``
+    with its websocket transport.  Reusing the provisioner's client therefore
+    lets concurrent ordinary Kubernetes calls observe the websocket request
+    function.  A dedicated client confines that mutation to this exec call.
+    """
+
+    if k8s_client is None or k8s_stream is None:
+        raise RuntimeError("Kubernetes exec transport is unavailable")
+    api_client = k8s_client.ApiClient()
+    try:
+        api = k8s_client.CoreV1Api(api_client)
+        return k8s_stream(api.connect_get_namespaced_pod_exec, *args, **kwargs)
+    finally:
+        api_client.close()
+
+
 # Pod-network egress tier applied to workspaces whose owning project has
 # no resolvable tier (no DB, no project, or pre-migration project rows).
 # Matches the projects.network_tier column default; the closed CHECK set
@@ -13262,8 +13281,7 @@ class ContainerProvisioner:
         if not backing_uid:
             raise RuntimeError("workspace pod has no Kubernetes UID")
         output = await self._bounded_kubernetes_call(
-            k8s_stream,
-            self._core_api.connect_get_namespaced_pod_exec,
+            _isolated_pod_exec,
             pod_name,
             self._namespace,
             command=[
