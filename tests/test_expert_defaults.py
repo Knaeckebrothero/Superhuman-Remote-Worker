@@ -533,3 +533,116 @@ class TestRoleParameter:
         assert effective["session"] == effective["model"]
         # The per-phase aliases went with U1 WP6 (the cockpit reads `model`).
         assert set(effective) == {"model", "subagent", "session"}
+
+
+class TestShellBoundBundledExpertsPinTheirTier:
+    """A shell-bound bundled expert must not start a session on the lite tier.
+
+    Session resolution is ``expert_base < account layer < the expert's own
+    file``. The account layer ALWAYS emits ``workspace.backend`` (the owner's
+    saved tier, else the platform default ``virtual``), so ``expert_base.yaml``'s
+    ``backend: sandbox`` is dead for sessions; only a backend declared in the
+    expert's OWN ``config.yaml`` sits above that layer. On ``virtual`` the
+    capability gate strips shell, browser and git, and the agent can only ask a
+    human for an upgrade — a designer that cannot render, or a developer that
+    cannot run anything, is not the expert the picker advertised.
+
+    Ruling 2026-09-02 (vault issue
+    ``expert_workspace_requirements_do_not_select_runtime_tier``): experts are
+    templates — the create form shows the expert's backend the way it shows its
+    model, and the user may still change it before create — so a shell-bound
+    expert declares ``sandbox`` itself. Jobs are unaffected either way: the
+    workspace contract stamps the job tier from ``config_override`` and drops
+    the expert YAML's backend.
+    """
+
+    PINNED_TO_SANDBOX = (
+        "designer",
+        "designer-interactive",
+        "developer",
+        "bughunter",
+        "product-qa",
+        "critic",
+    )
+    # Deliberately takes no position: its shell exists for the rare LaTeX
+    # build, so it follows the account default and asks for an upgrade when
+    # a command is actually needed.
+    FOLLOWS_ACCOUNT_DEFAULT = ("scholar",)
+
+    @pytest.fixture
+    def virtual_default_user(self, monkeypatch):
+        """A logged-in owner with no saved tier → the platform default ``virtual``."""
+        monkeypatch.setattr(
+            orchestrator_main.postgres_db,
+            "get_user_settings",
+            AsyncMock(return_value={}),
+        )
+        monkeypatch.setattr(
+            orchestrator_main.postgres_db,
+            "resolve_default_for_capability",
+            AsyncMock(return_value=None),
+        )
+        return "22222222-2222-4222-8222-222222222222"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("expert_id", PINNED_TO_SANDBOX)
+    async def test_shell_bound_expert_starts_a_session_on_sandbox(
+        self, expert_id, virtual_default_user
+    ):
+        detail = await _load_expert_detail(
+            expert_id,
+            user_id=virtual_default_user,
+            include_account_defaults=True,
+            role="session",
+        )
+
+        assert detail["config"]["workspace"]["backend"] == "sandbox"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("expert_id", FOLLOWS_ACCOUNT_DEFAULT)
+    async def test_upgrade_on_demand_expert_follows_the_account_default(
+        self, expert_id, virtual_default_user
+    ):
+        detail = await _load_expert_detail(
+            expert_id,
+            user_id=virtual_default_user,
+            include_account_defaults=True,
+            role="session",
+        )
+
+        assert detail["config"]["workspace"]["backend"] == "virtual"
+
+    def test_every_bundled_expert_with_shell_tools_takes_a_position_on_its_tier(
+        self,
+    ):
+        """Tripwire: the next shell-bound expert must decide, not inherit.
+
+        Reads each bundled file raw (not merged) so an inherited
+        ``expert_base`` value cannot satisfy it. Listing shell tools without
+        declaring ``workspace.backend`` is a silent vote for "starts blind";
+        either pin a tier here or add the expert to the documented exception
+        list above.
+        """
+        from pathlib import Path
+
+        experts_dir = Path(__file__).resolve().parents[1] / "config" / "experts"
+        undecided: list[str] = []
+        for path in sorted(experts_dir.glob("*/config.yaml")):
+            raw = yaml.safe_load(path.read_text()) or {}
+            shell = (raw.get("tools") or {}).get("shell")
+            lists_shell = isinstance(shell, list) and len(shell) > 0
+            declared = (raw.get("workspace") or {}).get("backend")
+            expert = path.parent.name
+            if expert in self.FOLLOWS_ACCOUNT_DEFAULT:
+                assert declared is None, (
+                    f"{expert} is listed as following the account default but "
+                    f"declares workspace.backend={declared!r}; drop one or the other"
+                )
+                continue
+            if lists_shell and declared is None:
+                undecided.append(expert)
+
+        assert not undecided, (
+            "Bundled experts list shell tools but declare no workspace.backend "
+            f"in their own config.yaml: {undecided}"
+        )

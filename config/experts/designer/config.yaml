@@ -21,6 +21,14 @@ llm:
   reasoning_level: high
 
 workspace:
+  # Pinned: this expert's role needs a shell, and a session's account layer
+  # overrides expert_base's `sandbox` with the owner's default (platform
+  # default `virtual`, which strips shell/browser/git). Declaring it HERE
+  # sits above that layer; the New Session form shows it and the user may
+  # still change it. Jobs ignore this key (the workspace contract stamps
+  # the job tier from config_override). See tests/test_expert_defaults.py
+  # ::TestShellBoundBundledExpertsPinTheirTier.
+  backend: sandbox
   structure:
     - archive/
     - documents/
