@@ -144,6 +144,7 @@ jobs:
           path: |
             ${{ env.APP_E2E_STATE_DIR }}/*/ledger.json
             ${{ env.APP_E2E_STATE_DIR }}/*/readiness.json
+            ${{ env.APP_E2E_STATE_DIR }}/*/helm-dependency-build.txt
             ${{ env.APP_E2E_STATE_DIR }}/*/cleanup.json
             ${{ env.APP_E2E_STATE_DIR }}/*/playwright-output.txt
             ${{ env.APP_E2E_STATE_DIR }}/*/browser/browser-resources.json
