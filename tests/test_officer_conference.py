@@ -10,6 +10,7 @@ enqueues the coalescing `conference` brief wake. Live delivery is k3d-smoke
 territory, as with the substrate suite.
 """
 
+import json
 import uuid
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -502,3 +503,61 @@ class TestOfficerSummaryEndpoint:
         assert out["officer"]["thread_id"] is None
         assert out["officer"]["status"] is None
         assert out["kit"] == {"line": {"count": 2, "in_flight": 0}}
+
+
+class TestConferenceBrainInheritance:
+    """A conference is the officer's embodiment: it thinks with his model and
+    effort unless the request says otherwise (officer_visibility_streamline.md
+    §3.1 — closes conference live-fire F2)."""
+
+    @staticmethod
+    def _officer(llm, *, as_string=False):
+        meta = {"config_override": {"officer": {"enabled": True}, "llm": llm}}
+        return {"id": "off-1", "metadata": json.dumps(meta) if as_string else meta}
+
+    def test_fills_model_and_reasoning_from_the_standing_officer(self):
+        override = {"officer": {"conference": True}}
+        got = main._inherit_conference_brain(
+            override, self._officer({"model": "gpt-5.6-sol", "reasoning_level": "high"})
+        )
+        assert got == ["model", "reasoning_level"]
+        assert override["llm"] == {"model": "gpt-5.6-sol", "reasoning_level": "high"}
+        assert override["officer"] == {"conference": True}
+
+    def test_request_provided_values_win(self):
+        override = {"llm": {"model": "MiniMax-M3"}}
+        got = main._inherit_conference_brain(
+            override, self._officer({"model": "gpt-5.6-sol", "reasoning_level": "high"})
+        )
+        assert got == ["reasoning_level"]
+        assert override["llm"] == {"model": "MiniMax-M3", "reasoning_level": "high"}
+
+    def test_reads_jsonb_metadata_delivered_as_a_string(self):
+        override = {}
+        got = main._inherit_conference_brain(
+            override, self._officer({"model": "gpt-5.6-sol"}, as_string=True)
+        )
+        assert got == ["model"]
+        assert override["llm"]["model"] == "gpt-5.6-sol"
+
+    def test_no_officer_or_brainless_officer_leaves_the_override_alone(self):
+        override = {"officer": {"conference": True}}
+        assert main._inherit_conference_brain(override, None) == []
+        assert (
+            main._inherit_conference_brain(override, {"id": "x", "metadata": {}}) == []
+        )
+        assert (
+            main._inherit_conference_brain(
+                override, {"id": "x", "metadata": "{not json"}
+            )
+            == []
+        )
+        assert "llm" not in override
+
+    def test_ignores_blank_or_non_string_values(self):
+        override = {}
+        got = main._inherit_conference_brain(
+            override, self._officer({"model": "   ", "reasoning_level": 3})
+        )
+        assert got == []
+        assert "llm" not in override

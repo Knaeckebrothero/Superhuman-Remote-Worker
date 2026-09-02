@@ -46105,6 +46105,45 @@ def _officer_meta_enabled(officer_meta: dict) -> bool:
     return officer_meta.get("enabled") in (True, "true", "True", 1)
 
 
+_CONFERENCE_BRAIN_KEYS = ("model", "reasoning_level")
+
+
+def _inherit_conference_brain(
+    config_override: dict, officer: Optional[dict]
+) -> list[str]:
+    """Fill the conference's ``llm`` gaps from the standing officer's brain.
+
+    A conference is his embodiment, so it thinks with his model and effort
+    unless the request says otherwise (officer_visibility_streamline.md §3.1,
+    closing conference live-fire F2 — every conference used to boot on the
+    platform default). Request-provided keys win; only absent ones are
+    filled. Returns the keys inherited, for the log line. Never raises: a
+    vacant post or a brainless officer means today's behavior.
+    """
+    if not officer:
+        return []
+    metadata = officer.get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+    brain = (metadata.get("config_override") or {}).get("llm") or {}
+    if not isinstance(brain, dict):
+        return []
+    inherited: list[str] = []
+    for key in _CONFERENCE_BRAIN_KEYS:
+        value = brain.get(key)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        llm = config_override.setdefault("llm", {})
+        if llm.get(key):
+            continue
+        llm[key] = value
+        inherited.append(key)
+    return inherited
+
+
 def _thread_is_conference(thread: dict) -> bool:
     """True for a conference embodiment (centurion.md §2/S9) — a normal
     interactive session wearing the officer's identity via
@@ -51110,6 +51149,20 @@ async def create_thread(
                         f"conference session ({_open_conf['id']}) — resume it "
                         "instead of opening a second one."
                     ),
+                )
+            # His embodiment thinks with his brain (§3.1). Request keys were
+            # bridged into config_override["llm"] above, so they win here.
+            _standing_officer = await postgres_db.get_officer_thread_for_project(
+                primary_project_id
+            )
+            _inherited_brain = _inherit_conference_brain(
+                config_override, _standing_officer
+            )
+            if _inherited_brain:
+                logger.info(
+                    "conference on project %s inherits the officer's brain: %s",
+                    str(primary_project_id)[:8],
+                    ", ".join(_inherited_brain),
                 )
 
         # Officer post admission (officer_post.md §4): the create funnel is
