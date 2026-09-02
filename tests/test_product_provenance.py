@@ -546,13 +546,14 @@ def test_image_workflows_pass_full_source_revision_separately_from_short_sha():
     # Six ident steps: the five service components plus vm-controller.
     assert develop.count("short=${FULL::7}") == 6
     # The chart-stamping step derives every baked tag from the same identity
-    # sha whose full form ships as that component's provenance revision.
-    assert len(re.findall(r'="sha-\$\{SHA_[A-Z]+::7\}"', develop)) == 5
+    # sha whose full form ships as that component's provenance revision —
+    # six of them since the VM controller stopped being left at "latest".
+    assert len(re.findall(r'="sha-\$\{SHA_[A-Z]+::7\}"', develop)) == 6
 
     assert (
         ".provenance.components[strenv(component)].sourceRevision = strenv(GITHUB_SHA)"
     ) in main
-    assert len(re.findall(r"sourceRevision\s*= strenv\(REV_[A-Z]+\)", develop)) == 5
+    assert len(re.findall(r"sourceRevision\s*= strenv\(REV_[A-Z]+\)", develop)) == 6
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="helm is unavailable")

@@ -115,6 +115,9 @@ provenance:
     workspace:
       sourceRevision: ""
       releaseVersion: ""
+    vmController:
+      sourceRevision: ""
+      releaseVersion: ""
 
 # =============================================================================
 # Orchestrator

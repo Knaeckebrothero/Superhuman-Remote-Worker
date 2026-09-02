@@ -320,6 +320,9 @@
             },
             "workspace": {
               "$ref": "#/definitions/componentProvenanceDeclaration"
+            },
+            "vmController": {
+              "$ref": "#/definitions/componentProvenanceDeclaration"
             }
           }
         }

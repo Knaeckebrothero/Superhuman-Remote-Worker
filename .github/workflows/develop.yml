@@ -1806,6 +1806,7 @@ jobs:
       - build-cockpit
       - build-mcp
       - build-workspace
+      - build-vm-controller
       - chart-test
     if: >-
       always() && !cancelled() &&
@@ -1881,6 +1882,7 @@ jobs:
           SHA_COCKPIT: ${{ needs.changes.outputs.cockpit-sha }}
           SHA_MCP: ${{ needs.changes.outputs.mcp-sha }}
           SHA_WORKSPACE: ${{ needs.changes.outputs.workspace-sha }}
+          SHA_VMCONTROLLER: ${{ needs.changes.outputs.vm-controller-sha }}
         run: |
           helm repo add collabora https://collaboraonline.github.io/online --force-update
           helm dependency build helm/
@@ -1905,16 +1907,19 @@ jobs:
           : "${SHA_COCKPIT:=$GITHUB_SHA}"
           : "${SHA_MCP:=$GITHUB_SHA}"
           : "${SHA_WORKSPACE:=$GITHUB_SHA}"
+          : "${SHA_VMCONTROLLER:=$GITHUB_SHA}"
           export TAG_ORCHESTRATOR="sha-${SHA_ORCHESTRATOR::7}"
           export TAG_AGENT="sha-${SHA_AGENT::7}"
           export TAG_COCKPIT="sha-${SHA_COCKPIT::7}"
           export TAG_MCP="sha-${SHA_MCP::7}"
           export TAG_WORKSPACE="sha-${SHA_WORKSPACE::7}"
+          export TAG_VMCONTROLLER="sha-${SHA_VMCONTROLLER::7}"
           export REV_ORCHESTRATOR="$SHA_ORCHESTRATOR"
           export REV_AGENT="$SHA_AGENT"
           export REV_COCKPIT="$SHA_COCKPIT"
           export REV_MCP="$SHA_MCP"
           export REV_WORKSPACE="$SHA_WORKSPACE"
+          export REV_VMCONTROLLER="$SHA_VMCONTROLLER"
           export CHART_VERSION="${{ steps.tag.outputs.chart_version }}"
 
           # mcp.requireImageDigest is true on the dev overlay, and the chart
@@ -1940,22 +1945,32 @@ jobs:
             .image.mcp.tag          = strenv(TAG_MCP) |
             .image.mcp.digest       = strenv(MCP_DIGEST) |
             .image.workspace.tag    = strenv(TAG_WORKSPACE) |
+            .vmController.image.tag = strenv(TAG_VMCONTROLLER) |
             .provenance.releaseVersion = strenv(CHART_VERSION) |
             .provenance.components.orchestrator.sourceRevision = strenv(REV_ORCHESTRATOR) |
             .provenance.components.agent.sourceRevision        = strenv(REV_AGENT) |
             .provenance.components.cockpit.sourceRevision      = strenv(REV_COCKPIT) |
             .provenance.components.mcp.sourceRevision          = strenv(REV_MCP) |
-            .provenance.components.workspace.sourceRevision    = strenv(REV_WORKSPACE)
+            .provenance.components.workspace.sourceRevision    = strenv(REV_WORKSPACE) |
+            .provenance.components.vmController.sourceRevision = strenv(REV_VMCONTROLLER)
           ' helm/values.yaml
 
           # Fail closed: a silently-unstamped chart would deploy ":latest" to
           # every component — the exact failure this step exists to prevent, and
           # invisible until pods started rolling. Checked structurally and scoped
-          # to .image.*: vmController.image.tag is legitimately "latest" in this
-          # chart, so a text grep for "tag: latest" blocks every publish.
+          # to .image.*; vmController.image.tag lives outside that map and is
+          # checked on its own right below.
           UNSTAMPED=$(yq '[.image[] | select(.tag == "latest")] | length' helm/values.yaml)
           if [ "$UNSTAMPED" != "0" ]; then
             echo "::error::${UNSTAMPED} image tag(s) under .image are still 'latest' in helm/values.yaml; refusing to publish a chart that would deploy :latest"
+            exit 1
+          fi
+          # The controller was the one component this step used to leave at
+          # "latest" — and only main.yml ever pushes that tag, so dev ran a
+          # main-released controller beside develop-built everything else until
+          # 2026-09-02 (design note single_cluster_vm_deployment.md §11.15).
+          if [ "$(yq '.vmController.image.tag' helm/values.yaml)" = "latest" ]; then
+            echo "::error::vmController.image.tag is still 'latest' in helm/values.yaml; refusing to publish a chart that would deploy an unpinned VM controller"
             exit 1
           fi
 
