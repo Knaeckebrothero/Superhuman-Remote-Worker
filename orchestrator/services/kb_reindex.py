@@ -1344,6 +1344,18 @@ async def _default_purge(**kwargs: Any) -> Dict[str, Any]:
     return await purge_kb_tick(**kwargs)
 
 
+def _default_prefilter_enabled() -> bool:
+    from .kb_prefilter import prefilter_enabled
+
+    return prefilter_enabled()
+
+
+async def _default_prefilter(**kwargs: Any) -> Dict[str, Any]:
+    from .kb_prefilter import prefilter_kb_tick
+
+    return await prefilter_kb_tick(**kwargs)
+
+
 async def kb_sweep_tick(
     *,
     postgres_db: Any,
@@ -1353,6 +1365,8 @@ async def kb_sweep_tick(
     reindex_fn: Callable[..., Awaitable[Dict[str, Any]]] = reindex_kb,
     purge_fn: Callable[..., Awaitable[Dict[str, Any]]] = _default_purge,
     purge_enabled_fn: Callable[[], bool] = _default_purge_enabled,
+    prefilter_fn: Callable[..., Awaitable[Dict[str, Any]]] = _default_prefilter,
+    prefilter_enabled_fn: Callable[[], bool] = _default_prefilter_enabled,
 ) -> int:
     """One sweep: refresh external datasource and active-project KBs.
 
@@ -1503,9 +1517,27 @@ async def kb_sweep_tick(
                         "kb_sweep: projection ledger update failed for project %s",
                         project_id,
                     )
-                # Purge lane (kb_gardening G2): only after this KB's index is
-                # known to match its tree, so the candidate query sees current
-                # statuses and links, and only when an operator turned it on.
+                # Gardening lanes (kb_gardening G7/G2): only after this KB's
+                # index is known to match its tree, so the candidate queries
+                # see current statuses and links, and only when an operator
+                # turned each lane on. Prefilter (archive unreachable nursery)
+                # runs before purge (remove long-archived files); the purge
+                # lane's own grace keeps the two from ever touching the same
+                # note in one tick.
+                if prefilter_enabled_fn():
+                    try:
+                        archived = await prefilter_fn(
+                            postgres_db=postgres_db,
+                            store=store,
+                            gitea_client=repo_client,
+                            kb_id=project_id,
+                        )
+                        if archived.get("archived"):
+                            worked += 1
+                    except Exception:
+                        logger.exception(
+                            "kb_sweep: prefilter failed for project %s", project_id
+                        )
                 if purge_enabled_fn():
                     try:
                         purged = await purge_fn(

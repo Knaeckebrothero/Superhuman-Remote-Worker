@@ -1551,6 +1551,100 @@ class KnowledgeStore:
             "grace_days": grace.days,
         }
 
+    async def list_unreachable_nursery(
+        self,
+        kb_id: uuid.UUID,
+        *,
+        root_types: List[str],
+        nursery_types: List[str],
+        protected_tags: List[str],
+        min_age: timedelta,
+        limit: int = 25,
+    ) -> List[Dict[str, Any]]:
+        """Active nursery notes no active durable note reaches, even transitively.
+
+        kb_gardening G7 rule **R4** — the GC mark-and-sweep: roots are the
+        active notes of ``root_types`` (decision/goal/plan/charter/tickets/…);
+        marking follows links out of *active* notes only; an active note of a
+        ``nursery_type`` that is never marked is a candidate. E1b on the Better
+        Resavio dump: 644 of 1,719 active history notes, zero anchor
+        violations. Protected tags and a minimum age are applied here so the
+        caller never even sees a note the guard would refuse. Oldest first,
+        bounded.
+        """
+        rows = await self.db.fetch(
+            """
+            WITH RECURSIVE roots AS (
+                SELECT note_id
+                FROM knowledge_index
+                WHERE kb_id = $1 AND path IS NOT NULL AND status = 'active'
+                  AND note_type = ANY($2::text[])
+            ),
+            reach AS (
+                SELECT note_id FROM roots
+                UNION
+                SELECT kl.target_id
+                FROM knowledge_links kl
+                JOIN reach r ON r.note_id = kl.source_id
+                JOIN knowledge_index src
+                  ON src.kb_id = kl.kb_id AND src.note_id = kl.source_id
+                WHERE kl.kb_id = $1 AND src.status = 'active'
+            )
+            SELECT ki.note_id, ki.path, ki.blob_sha, ki.note_type, ki.title,
+                   ki.created_at, ki.modified_at
+            FROM knowledge_index ki
+            WHERE ki.kb_id = $1
+              AND ki.path IS NOT NULL
+              AND ki.status = 'active'
+              AND ki.note_type = ANY($3::text[])
+              AND NOT (COALESCE(ki.tags, '{}'::text[]) && $4::text[])
+              AND ki.ready_at IS NULL
+              AND COALESCE(ki.created_at, ki.indexed_at) < now() - $5::interval
+              AND NOT EXISTS (SELECT 1 FROM reach r WHERE r.note_id = ki.note_id)
+            ORDER BY COALESCE(ki.modified_at, ki.created_at, ki.indexed_at) ASC NULLS FIRST,
+                     ki.note_id
+            LIMIT $6
+            """,
+            kb_id,
+            [str(t) for t in root_types],
+            [str(t) for t in nursery_types],
+            [str(t) for t in protected_tags],
+            min_age,
+            limit,
+        )
+        return [dict(r) for r in rows]
+
+    async def set_note_status(
+        self,
+        kb_id: uuid.UUID,
+        note_id: str,
+        status: str,
+        *,
+        invalidated: bool = False,
+    ) -> bool:
+        """Flip a row's status after the canonical file already says so.
+
+        The file is the truth and the sweep would converge the row anyway;
+        this makes the projection agree immediately (search and injection
+        stop returning the note now, not in 15 minutes). ``invalidated``
+        stamps ``invalidated_at`` so the purge lane's grace period starts at
+        the retirement, not at the note's last edit. Returns True if a row
+        changed.
+        """
+        result = await self.db.execute(
+            """
+            UPDATE knowledge_index
+               SET status = $3,
+                   invalidated_at = CASE WHEN $4 THEN now() ELSE invalidated_at END
+             WHERE kb_id = $1 AND note_id = $2 AND status <> $3
+            """,
+            kb_id,
+            note_id,
+            status,
+            invalidated,
+        )
+        return str(result).endswith(" 1")
+
     async def list_purge_candidates(
         self,
         kb_id: uuid.UUID,

@@ -1141,6 +1141,74 @@ class TestGardeningHealth:
         assert out["grace_days"] == 14
 
 
+class TestListUnreachableNursery:
+    """kb_gardening G7 R4 — GC mark-and-sweep as one recursive query."""
+
+    @pytest.mark.asyncio
+    async def test_query_marks_from_active_roots_through_active_links(self):
+        from datetime import timedelta
+
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = [
+            {"note_id": "orphan-retro", "note_type": "retrospective"}
+        ]
+        kb = uuid.uuid4()
+        out = await store.list_unreachable_nursery(
+            kb,
+            root_types=["decision", "goal"],
+            nursery_types=["learning", "retrospective", "state"],
+            protected_tags=["pinned", "ready"],
+            min_age=timedelta(days=7),
+            limit=25,
+        )
+        sql, *params = mock_db.fetch.call_args[0]
+        flat = " ".join(sql.split())
+        assert "WITH RECURSIVE roots AS" in flat
+        assert "note_type = ANY($2::text[])" in flat  # roots
+        assert "JOIN reach r ON r.note_id = kl.source_id" in flat
+        assert "src.status = 'active'" in flat  # marking follows active sources only
+        assert "ki.note_type = ANY($3::text[])" in flat  # nursery
+        assert "&& $4::text[]" in flat  # protected tags
+        assert "ki.ready_at IS NULL" in flat
+        assert "< now() - $5::interval" in flat
+        assert "NOT EXISTS (SELECT 1 FROM reach r WHERE r.note_id = ki.note_id)" in flat
+        assert "LIMIT $6" in flat
+        assert params == [
+            kb,
+            ["decision", "goal"],
+            ["learning", "retrospective", "state"],
+            ["pinned", "ready"],
+            timedelta(days=7),
+            25,
+        ]
+        assert out[0]["note_id"] == "orphan-retro"
+
+
+class TestSetNoteStatus:
+    @pytest.mark.asyncio
+    async def test_flips_status_and_stamps_invalidated_at(self):
+        store, mock_db, _ = _make_store()
+        mock_db.execute.return_value = "UPDATE 1"
+        kb = uuid.uuid4()
+        assert (
+            await store.set_note_status(kb, "n1", "archived", invalidated=True) is True
+        )
+        sql, *params = mock_db.execute.call_args[0]
+        flat = " ".join(sql.split())
+        assert "SET status = $3" in flat
+        assert (
+            "invalidated_at = CASE WHEN $4 THEN now() ELSE invalidated_at END" in flat
+        )
+        assert "AND status <> $3" in flat
+        assert params == [kb, "n1", "archived", True]
+
+    @pytest.mark.asyncio
+    async def test_no_change_reports_false(self):
+        store, mock_db, _ = _make_store()
+        mock_db.execute.return_value = "UPDATE 0"
+        assert await store.set_note_status(uuid.uuid4(), "n1", "archived") is False
+
+
 class TestListPurgeCandidates:
     """kb_gardening G2: the three-signal purge rule lives in one query."""
 
