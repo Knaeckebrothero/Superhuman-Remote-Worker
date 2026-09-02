@@ -555,7 +555,8 @@
     "tooltip": {
       "sessionFiles": "Sitzungsdateien",
       "resume": "Fortsetzen",
-      "delete": "Löschen"
+      "delete": "Löschen",
+      "talk": "Mit dem Offizier sprechen"
     },
     "create": {
       "title": "Neue Sitzung",

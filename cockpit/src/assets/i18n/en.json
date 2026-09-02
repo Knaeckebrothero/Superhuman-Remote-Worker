@@ -555,7 +555,8 @@
     "tooltip": {
       "sessionFiles": "Session Files",
       "resume": "Resume",
-      "delete": "Delete"
+      "delete": "Delete",
+      "talk": "Talk to the officer"
     },
     "create": {
       "title": "New Session",

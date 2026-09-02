@@ -485,6 +485,37 @@ describe('SessionsPageComponent', () => {
         });
     });
 
+    describe('talkToOfficer()', () => {
+        it('navigates to the conference launcher for the thread project', () => {
+            const thread = makeThread({
+                id: 'officer-1',
+                project_id: 'proj-9',
+                metadata: {config_override: {officer: {enabled: true}}},
+            });
+            component.talkToOfficer(thread);
+            expect(mockRouter.navigate).toHaveBeenCalledWith(['/projects', 'proj-9', 'officer', 'conference']);
+        });
+
+        it('does nothing without a project', () => {
+            component.talkToOfficer(makeThread({project_id: null}));
+            expect(mockRouter.navigate).not.toHaveBeenCalled();
+        });
+
+        it('only officer rows offer it', () => {
+            expect(component.canTalk(makeThread({project_id: 'p'}))).toBe(false);
+            expect(
+                component.canTalk(
+                    makeThread({project_id: 'p', metadata: {config_override: {officer: {enabled: true}}}}),
+                ),
+            ).toBe(true);
+            expect(
+                component.canTalk(
+                    makeThread({project_id: 'p', metadata: {config_override: {officer: {conference: true}}}}),
+                ),
+            ).toBe(false);
+        });
+    });
+
     // =========================================================================
     // 9.2.6: toggleProject() / isProjectSelected()
     // =========================================================================

@@ -5,6 +5,7 @@ import {TitleCasePipe} from '@angular/common';
 import {TranslocoDatePipe} from '@jsverse/transloco-locale';
 import {firstValueFrom} from 'rxjs';
 import {environment} from '../../core/environment';
+import {conferenceLauncherCommands} from '../../core/officer/conference';
 import {PersistentChatService} from '../../core/services/persistent-chat.service';
 import {classifyResumeError} from '../../core/services/resume-error';
 import {ModelService} from '../../core/services/model.service';
@@ -199,6 +200,15 @@ interface Project {
                 <span class="meta-item">{{ thread.last_activity | translocoDate:{dateStyle:'short', timeStyle:'short'} }}</span>
               </div>
               <div class="session-actions">
+                @if (canTalk(thread)) {
+                  <app-icon-button
+                    [ariaLabel]="'sessions.tooltip.talk' | transloco"
+                    [tooltip]="'sessions.tooltip.talk' | transloco"
+                    (clicked)="talkToOfficer(thread)"
+                  >
+                    <app-icon size="sm">forum</app-icon>
+                  </app-icon-button>
+                }
                 @if (thread.cloud_session_url || thread.nc_session_folder) {
                   <app-icon-button
                     [ariaLabel]="'sessions.tooltip.sessionFiles' | transloco"
@@ -746,6 +756,17 @@ export class SessionsPageComponent implements OnInit {
 
     openSession(thread: Thread): void {
         this.router.navigate(['/sessions', thread.id]);
+    }
+
+    /** Only a standing officer's row can convene him; conferences are already meetings. */
+    canTalk(thread: Thread): boolean {
+        return this.officerBadge(thread) === 'centurion' && !!thread.project_id;
+    }
+
+    /** Talk = create-or-resume his conference via the launcher route (§3.5). */
+    talkToOfficer(thread: Thread): void {
+        if (!thread.project_id) return;
+        void this.router.navigate(conferenceLauncherCommands(thread.project_id));
     }
 
     async resumeSession(thread: Thread): Promise<void> {
