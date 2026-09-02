@@ -820,6 +820,37 @@ and the ClusterIP Service always carries it, so a port-forward works with `tcp.e
 want the NetworkPolicy's ipBlock rules and the per-source connection bucket to see real client
 addresses — `Cluster` SNATs every client to a node IP and collapses them into one source.
 
+### Behind a CDN or tunnel (Cloudflare Tunnel, etc.)
+
+The Ingress above is only half the path when something other than Traefik terminates the public
+hostname. Verified end to end on the dev deployment 2026-09-02; each of these cost a debugging round.
+
+1. **The CDN must be told to route `/api/ssh/attach` to Traefik.** If it forwards `api.<domain>`
+   straight to the orchestrator Service — a very normal setup, since every *other* `/api` route
+   belongs there — then Traefik, and therefore this Ingress, is never consulted. The attach lands on
+   the orchestrator's ASGI app, which has no route for it, and every client gets a bare rejection
+   with **nothing in the gateway pod's log**, indistinguishable from an auth failure. Add a
+   CDN-side rule for exactly `^/api/ssh/attach$`, ahead of the catch-all, and **anchor it**:
+   swallowing `/api/ssh/attach-token` kills the feature one layer further in.
+
+2. **Send it to Traefik's TLS entrypoint, not port 80.** With `ingress.tls.enabled` this Ingress
+   carries `router.entrypoints: websecure`, so no router for it exists on `web`. Port 80 returns
+   Traefik's own 404 while the config looks entirely correct.
+
+3. **Tell the three 404s apart by body, not status.** They come from three different components:
+
+   | Body | Length | Who answered | Meaning |
+   |---|---|---|---|
+   | `{"detail":"Not Found"}` | 22 B, JSON | FastAPI — the orchestrator | the CDN never handed off to Traefik (step 1) |
+   | `404 page not found` | 19 B, plain | Traefik | no router matched: host, path, or **entrypoint** (step 2) |
+   | `Not Found` | 9 B, plain | the gateway itself | **routing is correct** — this is the right answer to a non-WebSocket GET |
+
+4. **Probe with `--http1.1`.** A `curl` upgrade probe that negotiates HTTP/2 returns 404 and looks
+   exactly like the CDN stripping the upgrade; the classic `Upgrade:` handshake does not exist in
+   h2. Over HTTP/1.1 a *successful* upgrade presents as curl hanging on 101, not as a 200.
+
+5. Many tunnel daemons do not hot-reload their config — restart the daemon after editing it.
+
 ### Concurrency
 
 The gateway's caps are `GatewayConfig` dataclass defaults with no environment lever, so there is
