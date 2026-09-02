@@ -16197,6 +16197,14 @@ class KnowledgeMaterializeRequest(BaseModel):
     job_id: str | None = Field(
         None, description="Writing job UUID, for per-job commit attribution"
     )
+    expected_blob_sha: str | None = Field(
+        None,
+        description=(
+            "Compare-and-swap token: the note's blob SHA as the caller read it. "
+            "When set, the write is refused (failed/precondition-failed) if the "
+            "KB repo holds a different blob — or none — at the path."
+        ),
+    )
     retrieval_messages: list[str] | None = Field(
         None,
         description=(
@@ -70678,11 +70686,32 @@ async def get_knowledge_summary(request: Request, project_id: str) -> dict[str, 
             )
             recent = [dict(r) for r in recent_rows]
 
+        # kb_gardening G10: hygiene counters beside the raw totals, so the
+        # cockpit and MCP summary can show retired-but-on-disk, orphaned
+        # nursery, and the oldest tombstone. Best-effort — never fails the
+        # summary.
+        gardening: dict[str, Any] | None = None
+        try:
+            from uuid import UUID as _UUID
+
+            from src.services.knowledge_store import KnowledgeStore
+
+            gardening = await KnowledgeStore(
+                db=vector_db, embedding_service=None
+            ).get_gardening_health(_UUID(project_id))
+        except Exception:
+            logger.debug(
+                "knowledge summary: gardening health unavailable for %s",
+                project_id,
+                exc_info=True,
+            )
+
         return {
             "total": total,
             "by_type": by_type,
             "by_status": by_status,
             "recent": recent,
+            "gardening": gardening,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
@@ -71200,6 +71229,7 @@ async def materialize_knowledge_note(
         store=store,
         embedding_service=svc,
         retrieval_messages=body.retrieval_messages,
+        expected_blob_sha=body.expected_blob_sha,
     )
 
 
@@ -71480,39 +71510,115 @@ async def update_knowledge_note(
 @app.delete("/api/projects/{project_id}/knowledge/{note_id}")
 async def delete_knowledge_note(
     request: Request, project_id: str, note_id: str
-) -> dict[str, str]:
-    """Hard delete a knowledge note from both stores. F5: member-only."""
+) -> dict[str, Any]:
+    """Purge a knowledge note: file-removal commit, then both index stores.
+
+    F5: member-only. A human's delete is immediate and unconditional (no
+    compare-and-swap token) — that authority is the point of the cockpit
+    button. Before kb_gardening G2 this removed only the index row, and the
+    next sweep resurrected the note from the file it never touched.
+    """
     await require_project_member(request, postgres_db, project_id)
+    from services.kb_materialize import materialize_knowledge_note_delete
+    from src.services.knowledge_store import KnowledgeStore
+
+    store = KnowledgeStore(db=vector_db, embedding_service=None)
     try:
-        # Delete from vector DB
-        async with vector_db.acquire() as conn:
-            result = await conn.execute(
-                "DELETE FROM knowledge_index WHERE project_id = $1 AND note_id = $2",
-                project_id,
-                note_id,
-            )
-            if result == "DELETE 0":
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Note '{note_id}' not found in project '{project_id}'",
-                )
-
-        # Delete from Neo4j if available
-        kg = _get_knowledge_graph()
-        if kg:
-            try:
-                kg._db.execute_write(
-                    "MATCH (n:Note {project_id: $pid, id: $nid}) DETACH DELETE n",
-                    {"pid": project_id, "nid": note_id},
-                )
-            except Exception as e:
-                logger.warning(f"Neo4j delete failed for {note_id}: {e}")
-
-        return {"status": "deleted"}
-    except HTTPException:
-        raise
+        result = await materialize_knowledge_note_delete(
+            postgres_db=postgres_db,
+            gitea_client=gitea_client,
+            project_id=project_id,
+            slug=note_id,
+            reason="deleted from the cockpit",
+            store=store,
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+    status, reason = result.get("status"), result.get("reason")
+    if status == "failed":
+        raise HTTPException(
+            status_code=409 if reason == "precondition-failed" else 502,
+            detail=f"Note '{note_id}' was not removed from the knowledge repo ({reason}).",
+        )
+    if status == "skipped" and reason not in {"absent", "already-canonical", "no-repo"}:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Note '{note_id}' delete is still in progress ({reason}).",
+        )
+    file_removed = status == "committed"
+    row_deleted = bool(result.get("row_deleted"))
+    if not file_removed and not row_deleted and reason in {"absent", "no-repo"}:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Note '{note_id}' not found in project '{project_id}'",
+        )
+
+    # Delete from Neo4j if available (optional projection; best-effort).
+    kg = _get_knowledge_graph()
+    if kg:
+        try:
+            kg._db.execute_write(
+                "MATCH (n:Note {project_id: $pid, id: $nid}) DETACH DELETE n",
+                {"pid": project_id, "nid": note_id},
+            )
+        except Exception as e:
+            logger.warning(f"Neo4j delete failed for {note_id}: {e}")
+
+    return {
+        "status": "deleted",
+        "file_removed": file_removed,
+        "row_deleted": row_deleted,
+        "path": result.get("path"),
+    }
+
+
+class KnowledgeDeleteRequest(BaseModel):
+    """Request body for the internal purge of one note (agent/purge callers)."""
+
+    slug: str = Field(..., description="Note id — knowledge/<slug>.md in the KB repo")
+    job_id: str | None = Field(
+        None, description="Calling job UUID, for commit attribution"
+    )
+    reason: str | None = Field(
+        None, description="Why — journaled in the commit message"
+    )
+    expected_blob_sha: str | None = Field(
+        None,
+        description=(
+            "Compare-and-swap token: the blob SHA the caller read. The delete is "
+            "refused (failed/precondition-failed) if the repo holds another blob."
+        ),
+    )
+
+
+@app.post("/api/projects/{project_id}/knowledge/delete")
+async def delete_knowledge_note_internal(
+    request: Request,
+    project_id: str,
+    body: KnowledgeDeleteRequest,
+) -> dict[str, Any]:
+    """Purge one note from the KB repo and its index. **Internal** — requires
+    ``X-Internal-Key``. Same result vocabulary as the materialize endpoint
+    (HTTP 200 always; ``status``/``reason`` carry the outcome) plus
+    ``row_deleted``. Agents do not call this directly — ``kb_delete`` is a
+    tombstone — it exists for the purge lane and for operator tooling.
+    """
+    await require_internal(request)
+    from services.kb_materialize import materialize_knowledge_note_delete
+    from src.services.knowledge_store import KnowledgeStore
+
+    store = KnowledgeStore(db=vector_db, embedding_service=None)
+    return await materialize_knowledge_note_delete(
+        postgres_db=postgres_db,
+        gitea_client=gitea_client,
+        project_id=project_id,
+        slug=body.slug,
+        job_id=body.job_id,
+        reason=body.reason,
+        expected_blob_sha=body.expected_blob_sha,
+        store=store,
+    )
 
 
 @app.post("/api/projects/{project_id}/knowledge/export")

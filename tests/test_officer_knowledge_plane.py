@@ -7,7 +7,7 @@ Covers the three shipped slices:
   no override can replace the write target) plus degraded availability: a
   vector/KB outage never kills the officer — KB tools fail closed with a clear
   `project knowledge unavailable` error and the wake sitrep says so.
-- **K2** the Centurion expert's explicit nine-tool knowledge grant, without
+- **K2** the Centurion expert's explicit ten-tool knowledge grant, without
   ``kb_export`` (the snapshot test pins the fixture; this file pins intent).
 - **K3** the background-officer capability ceiling: object-plane tools are
   suppressed regardless of overrides or backend capability, while conferences
@@ -40,10 +40,12 @@ PROJECT_A = str(uuid.uuid4())
 PROJECT_B = str(uuid.uuid4())
 EXTERNAL_KB = str(uuid.uuid4())
 
-#: The reviewed grant (officer_knowledge_plane.md §3) — exactly these nine.
-NINE_KB_TOOLS = [
+#: The reviewed grant (officer_knowledge_plane.md §3) — exactly these ten (kb_delete added by kb_gardening G1).
+OFFICER_KB_TOOLS = [
     "kb_write",
     "kb_update",
+    # kb_gardening G1: retire (archive with a reason) — reversible, guarded.
+    "kb_delete",
     "kb_read",
     "kb_list",
     "kb_search",
@@ -294,7 +296,7 @@ OBJECT_PLANE_SAMPLE = [
 ]
 
 CONTROL_AND_KNOWLEDGE_SAMPLE = [
-    *NINE_KB_TOOLS,
+    *OFFICER_KB_TOOLS,
     "create_job",
     "approve_job",
     "cancel_job",
@@ -625,7 +627,7 @@ class TestGetCurrentProjectTrim:
 
 
 class TestCenturionKnowledgeGrant:
-    def test_grant_is_exactly_the_nine_kb_tools(self):
+    def test_grant_is_exactly_the_officer_kb_tools(self):
         from src.core.loader import (
             get_all_tool_names,
             load_agent_config,
@@ -638,11 +640,11 @@ class TestCenturionKnowledgeGrant:
         granted = set(expand_tool_wildcards(get_all_tool_names(config)))
 
         kb_granted = {name for name in granted if name.startswith("kb_")}
-        assert kb_granted == set(NINE_KB_TOOLS)
+        assert kb_granted == set(OFFICER_KB_TOOLS)
         assert "kb_export" not in granted
         # Every granted name is a real registry tool (registration test's
         # guarantee, restated here so a rename breaks THIS intent pin too).
-        for name in NINE_KB_TOOLS:
+        for name in OFFICER_KB_TOOLS:
             assert name in TOOL_REGISTRY, name
 
 
@@ -658,8 +660,8 @@ class TestDegradedKnowledgeTools:
             create_degraded_knowledge_tools,
         )
 
-        stubs = create_degraded_knowledge_tools(NINE_KB_TOOLS)
-        assert [t.name for t in stubs] == NINE_KB_TOOLS
+        stubs = create_degraded_knowledge_tools(OFFICER_KB_TOOLS)
+        assert [t.name for t in stubs] == OFFICER_KB_TOOLS
         # Arbitrary args must validate (extra=allow) and answer the outage.
         out = stubs[0].invoke(
             {"title": "x", "type": "decision", "content": "y", "tags": ["a"]}
@@ -697,7 +699,7 @@ class TestDegradedKnowledgeTools:
         with (
             patch(
                 "src.api.persistent_session.get_all_tool_names",
-                return_value=["web_search", *NINE_KB_TOOLS],
+                return_value=["web_search", *OFFICER_KB_TOOLS],
             ),
             patch("src.api.persistent_session.load_tools", side_effect=load),
             patch(
@@ -714,12 +716,12 @@ class TestDegradedKnowledgeTools:
             session._setup_tools(None)
 
         by_name = {t.name: t for t in session.tools}
-        for name in NINE_KB_TOOLS:
+        for name in OFFICER_KB_TOOLS:
             assert name in by_name, name
         assert "kb_export" not in by_name
         out = by_name["kb_write"].invoke({"title": "t", "content": "c"})
         assert "project knowledge unavailable" in out
-        assert set(NINE_KB_TOOLS) <= set(session.tool_context._resolved_tool_names)
+        assert set(OFFICER_KB_TOOLS) <= set(session.tool_context._resolved_tool_names)
 
     def test_plain_session_outage_gets_no_stubs(self):
         session = _make_session(project_ids=[PROJECT_A])

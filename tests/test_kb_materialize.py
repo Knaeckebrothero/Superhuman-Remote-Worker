@@ -28,6 +28,7 @@ import security.access as access_module
 from services.kb_materialize import (
     materialize_knowledge_metadata_update,
     materialize_knowledge_note,
+    materialize_knowledge_note_delete,
     note_repo_path,
     slug_error,
 )
@@ -406,6 +407,323 @@ class TestSkips:
 
         assert result["branch"] == "main"
         g.list_tree.assert_awaited_once_with(REPO, "main")
+
+
+class TestCompareAndSwap:
+    """`expected_blob_sha` on writes (kb_gardening G3): a stale writer fails
+    loudly instead of winning, and a rewrite of a removed note does not
+    re-create it."""
+
+    NEW_BODY = "---\nid: chose-jwt-over-oauth\n---\n\n# Chose JWT (revised)\n"
+
+    async def _write(self, gitea, *, expected):
+        db = _ledger_db()
+        with _patch_resolve(_ref()):
+            result = await materialize_knowledge_note(
+                postgres_db=db,
+                gitea_client=gitea,
+                project_id=PROJECT,
+                slug=SLUG,
+                content=self.NEW_BODY,
+                job_id=JOB,
+                expected_blob_sha=expected,
+            )
+        return result, db
+
+    @pytest.mark.asyncio
+    async def test_matching_token_commits_as_update(self):
+        current = _blob_sha(BODY)
+        g = _make_gitea(tree_paths={PATH: current})
+        result, _ = await self._write(g, expected=current)
+        assert result["status"] == "committed"
+        assert result["operation"] == "update"
+
+    @pytest.mark.asyncio
+    async def test_stale_token_is_refused_permanently_and_never_reaches_git(self):
+        g = _make_gitea(tree_paths={PATH: _blob_sha(BODY)})
+        result, db = await self._write(g, expected="f" * 40)
+        assert result["status"] == "failed"
+        assert result["reason"] == "precondition-failed"
+        assert result["retry_state"] == "permanent"
+        assert result["indexed"] is False
+        g.change_files.assert_not_awaited()
+        assert (
+            db.finish_knowledge_materialization.await_args.kwargs["permanent"] is True
+        )
+
+    @pytest.mark.asyncio
+    async def test_token_on_a_removed_note_does_not_recreate_it(self):
+        """The resurrection hole: the row still exists, the file is gone, a
+        stale kb_update used to `create` the file back."""
+        g = _make_gitea(tree_paths={})
+        result, _ = await self._write(g, expected=_blob_sha(BODY))
+        assert result["status"] == "failed"
+        assert result["reason"] == "precondition-failed"
+        g.change_files.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unreadable_tree_with_a_token_is_retryable_not_guessed(self):
+        g = _make_gitea(tree_ok=False)
+        result, _ = await self._write(g, expected=_blob_sha(BODY))
+        assert result["status"] == "failed"
+        assert result["reason"] == "tree-unreadable"
+        assert result["retry_state"] == "retryable"
+        g.change_files.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_forge_refusal_of_a_conditional_write_is_precondition_failed(self):
+        """E4 S2: two writers whose tree probes both preceded either commit.
+        The probe passes for both; the forge (given the SHA) refuses the
+        second. That refusal is final — no flip to `create`, no retry."""
+        current = _blob_sha(BODY)
+        g = _make_gitea(tree_paths={PATH: current}, change_results=[False, False])
+        result, db = await self._write(g, expected=current)
+        assert result["status"] == "failed"
+        assert result["reason"] == "precondition-failed"
+        assert result["retry_state"] == "permanent"
+        assert g.change_files.await_count == 1  # no opposite-operation retry
+        sent = g.change_files.await_args.args[2][0]
+        assert sent["sha"] == current and sent["operation"] == "update"
+
+    @pytest.mark.asyncio
+    async def test_no_token_keeps_last_writer_wins(self):
+        """Unconditional writes are unchanged: a mismatch is not even looked at."""
+        g = _make_gitea(tree_paths={PATH: "0" * 40})
+        result, _ = await self._write(g, expected=None)
+        assert result["status"] == "committed"
+
+    @pytest.mark.asyncio
+    async def test_endpoint_forwards_the_token(self, fake_request):
+        from main import KnowledgeMaterializeRequest, materialize_knowledge_note
+
+        g = _make_gitea(tree_paths={PATH: _blob_sha(BODY)})
+        fake_request.headers = {"X-Internal-Key": "secret"}
+        body = KnowledgeMaterializeRequest(
+            slug=SLUG, content=self.NEW_BODY, job_id=JOB, expected_blob_sha="e" * 40
+        )
+        with (
+            patch.object(access_module, "_INTERNAL_KEY", "secret"),
+            patch("main.postgres_db", _ledger_db()),
+            patch("main.gitea_client", g),
+            _patch_resolve(_ref()),
+        ):
+            result = await materialize_knowledge_note(fake_request, PROJECT, body)
+        assert result["reason"] == "precondition-failed"
+        g.change_files.assert_not_awaited()
+
+
+class TestMaterializeDelete:
+    """The purge primitive (kb_gardening G2): a file-removal commit, idempotent
+    on an absent path, compare-and-swap on the blob SHA, ledgered like writes."""
+
+    @staticmethod
+    def _store() -> AsyncMock:
+        store = AsyncMock()
+        store.delete_kb_note.return_value = True
+        store.delete_note.return_value = False
+        return store
+
+    async def _delete(self, gitea, *, store=None, **kwargs):
+        db = _ledger_db()
+        with _patch_resolve(_ref()):
+            result = await materialize_knowledge_note_delete(
+                postgres_db=db,
+                gitea_client=gitea,
+                project_id=PROJECT,
+                slug=SLUG,
+                job_id=JOB,
+                store=store,
+                **kwargs,
+            )
+        return result, db
+
+    @pytest.mark.asyncio
+    async def test_existing_file_is_removed_with_the_tree_sha_and_the_row_dropped(self):
+        sha = _blob_sha(BODY)
+        g = _make_gitea(tree_paths={PATH: sha})
+        g.delete_path = AsyncMock(return_value="deleted")
+        store = self._store()
+
+        result, db = await self._delete(g, store=store, reason="near-duplicate of x")
+
+        assert result["status"] == "committed"
+        assert result["operation"] == "delete"
+        assert result["path"] == PATH
+        assert result["canonical_state"] == "canonical"
+        assert result["row_deleted"] is True
+        args = g.delete_path.await_args
+        assert args.args[0] == REPO
+        assert args.args[1] == "main"
+        assert args.args[2] == PATH
+        assert args.kwargs["expected_sha"] == sha
+        message = args.args[3]
+        assert message.startswith(f"kb: delete {SLUG}")
+        assert "near-duplicate of x" in message
+        assert JOB in message
+        store.delete_kb_note.assert_awaited_once_with(uuid.UUID(PROJECT), PATH)
+        db.begin_knowledge_materialization.assert_awaited_once()
+        assert (
+            db.begin_knowledge_materialization.await_args.kwargs["operation"]
+            == "delete"
+        )
+
+    @pytest.mark.asyncio
+    async def test_absent_file_is_success_without_a_commit(self):
+        """Idempotent: delete-of-missing is the desired state, not an error."""
+        g = _make_gitea(tree_paths={})
+        g.delete_path = AsyncMock(return_value="deleted")
+        store = self._store()
+
+        result, _ = await self._delete(g, store=store)
+
+        assert result["status"] == "skipped"
+        assert result["reason"] == "absent"
+        assert result["canonical_state"] == "canonical"
+        g.delete_path.assert_not_awaited()
+        # The row (a legacy pathless twin, or a row the sweep has not reaped
+        # yet) is still cleaned up — the caller asked for the note to be gone.
+        store.delete_kb_note.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_expected_sha_mismatch_is_a_permanent_precondition_failure(self):
+        """CAS (G3): the caller read one version, the tree holds another."""
+        g = _make_gitea(tree_paths={PATH: _blob_sha(BODY)})
+        g.delete_path = AsyncMock(return_value="deleted")
+        store = self._store()
+
+        result, db = await self._delete(g, store=store, expected_blob_sha="0" * 40)
+
+        assert result["status"] == "failed"
+        assert result["reason"] == "precondition-failed"
+        assert result["retry_state"] == "permanent"
+        g.delete_path.assert_not_awaited()
+        store.delete_kb_note.assert_not_awaited()
+        assert (
+            db.finish_knowledge_materialization.await_args.kwargs["permanent"] is True
+        )
+
+    @pytest.mark.asyncio
+    async def test_forge_conflict_is_a_permanent_precondition_failure(self):
+        """The tree matched at probe time but the forge refused the SHA — a
+        concurrent writer landed in between. Never retried blindly."""
+        g = _make_gitea(tree_paths={PATH: _blob_sha(BODY)})
+        g.delete_path = AsyncMock(return_value="conflict")
+        store = self._store()
+
+        result, db = await self._delete(g, store=store)
+
+        assert result["status"] == "failed"
+        assert result["reason"] == "precondition-failed"
+        assert result["retry_state"] == "permanent"
+        store.delete_kb_note.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_forge_error_is_retryable_and_leaves_the_row(self):
+        g = _make_gitea(tree_paths={PATH: _blob_sha(BODY)})
+        g.delete_path = AsyncMock(return_value="error")
+        store = self._store()
+
+        result, _ = await self._delete(g, store=store)
+
+        assert result["status"] == "failed"
+        assert result["reason"] == "commit-error"
+        assert result["retry_state"] == "retryable"
+        store.delete_kb_note.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_forge_reports_absent_after_probe_said_present(self):
+        """Probe saw the file, the forge 404s on delete: someone else removed
+        it first. Still the desired state."""
+        g = _make_gitea(tree_paths={PATH: _blob_sha(BODY)})
+        g.delete_path = AsyncMock(return_value="absent")
+        store = self._store()
+
+        result, _ = await self._delete(g, store=store)
+
+        assert result["status"] == "skipped"
+        assert result["reason"] == "absent"
+        assert result["canonical_state"] == "canonical"
+        store.delete_kb_note.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_unreadable_tree_is_retryable_and_never_deletes(self):
+        g = _make_gitea(tree_ok=False)
+        g.delete_path = AsyncMock(return_value="deleted")
+        store = self._store()
+
+        result, _ = await self._delete(g, store=store)
+
+        assert result["status"] == "failed"
+        assert result["reason"] == "tree-unreadable"
+        assert result["retry_state"] == "retryable"
+        g.delete_path.assert_not_awaited()
+        store.delete_kb_note.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unsafe_slug_never_reaches_the_forge(self):
+        g = _make_gitea(tree_paths={PATH: _blob_sha(BODY)})
+        g.delete_path = AsyncMock(return_value="deleted")
+        db = _ledger_db()
+        with _patch_resolve(_ref()):
+            result = await materialize_knowledge_note_delete(
+                postgres_db=db,
+                gitea_client=g,
+                project_id=PROJECT,
+                slug="../etc/passwd",
+                store=self._store(),
+            )
+        assert result["status"] == "failed"
+        assert result["reason"] == "invalid-slug"
+        g.delete_path.assert_not_awaited()
+        g.list_tree.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_row_cleanup_failure_does_not_undo_the_commit(self):
+        """The file is gone; the sweep reaps the row on its next tree-diff."""
+        g = _make_gitea(tree_paths={PATH: _blob_sha(BODY)})
+        g.delete_path = AsyncMock(return_value="deleted")
+        store = self._store()
+        store.delete_kb_note.side_effect = RuntimeError("vector db down")
+
+        result, _ = await self._delete(g, store=store)
+
+        assert result["status"] == "committed"
+        assert result["canonical_state"] == "canonical"
+        assert result["row_deleted"] is False
+
+    @pytest.mark.asyncio
+    async def test_without_a_store_the_commit_still_lands(self):
+        g = _make_gitea(tree_paths={PATH: _blob_sha(BODY)})
+        g.delete_path = AsyncMock(return_value="deleted")
+
+        result, _ = await self._delete(g, store=None)
+
+        assert result["status"] == "committed"
+        assert result["row_deleted"] is False
+
+    @pytest.mark.asyncio
+    async def test_retry_dispatch_routes_a_delete_intent(self):
+        from services.kb_materialize import retry_knowledge_materialization_intent
+
+        g = _make_gitea(tree_paths={PATH: _blob_sha(BODY)})
+        g.delete_path = AsyncMock(return_value="deleted")
+        db = _ledger_db()
+        intent = {
+            "id": uuid.uuid4(),
+            "project_id": PROJECT,
+            "note_id": SLUG,
+            "job_id": JOB,
+            "operation": "delete",
+            "content": '{"reason": "stale", "expected_blob_sha": null}',
+            "attempt_token": uuid.uuid4(),
+        }
+        with _patch_resolve(_ref()):
+            result = await retry_knowledge_materialization_intent(
+                postgres_db=db, gitea_client=g, intent=intent
+            )
+        assert result["status"] == "committed"
+        assert result["operation"] == "delete"
+        assert "stale" in g.delete_path.await_args.args[3]
 
 
 class TestFailures:
@@ -803,6 +1121,138 @@ class TestMaterializeEndpoint:
 
         assert result["status"] == "failed"
         assert result["reason"] == "commit-error"
+
+
+class TestDeleteEndpoints:
+    """kb_gardening G2: the internal purge endpoint and the rerouted member
+    DELETE both go through the ledgered file-removal op."""
+
+    @pytest.mark.asyncio
+    async def test_internal_delete_requires_the_internal_key(self, fake_request):
+        from main import KnowledgeDeleteRequest, delete_knowledge_note_internal
+
+        fake_request.headers = {}
+        with patch.object(access_module, "_INTERNAL_KEY", "secret"):
+            with pytest.raises(HTTPException) as exc:
+                await delete_knowledge_note_internal(
+                    fake_request, PROJECT, KnowledgeDeleteRequest(slug=SLUG)
+                )
+        assert exc.value.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_internal_delete_forwards_token_and_reason(self, fake_request):
+        from main import KnowledgeDeleteRequest, delete_knowledge_note_internal
+
+        sha = _blob_sha(BODY)
+        g = _make_gitea(tree_paths={PATH: sha})
+        g.delete_path = AsyncMock(return_value="deleted")
+        fake_request.headers = {"X-Internal-Key": "secret"}
+        body = KnowledgeDeleteRequest(
+            slug=SLUG, job_id=JOB, reason="purge test", expected_blob_sha=sha
+        )
+        store_cls = MagicMock()
+        store = MagicMock()
+        store.delete_kb_note = AsyncMock(return_value=True)
+        store.delete_note = AsyncMock(return_value=False)
+        store_cls.return_value = store
+        with (
+            patch.object(access_module, "_INTERNAL_KEY", "secret"),
+            patch("main.postgres_db", _ledger_db()),
+            patch("main.gitea_client", g),
+            patch("main.vector_db", MagicMock()),
+            patch("src.services.knowledge_store.KnowledgeStore", store_cls),
+            _patch_resolve(_ref()),
+        ):
+            result = await delete_knowledge_note_internal(fake_request, PROJECT, body)
+        assert result["status"] == "committed"
+        assert result["operation"] == "delete"
+        assert result["row_deleted"] is True
+        assert "purge test" in g.delete_path.await_args.args[3]
+        assert g.delete_path.await_args.kwargs["expected_sha"] == sha
+
+    @pytest.mark.asyncio
+    async def test_member_delete_removes_the_file_unconditionally(self, fake_request):
+        """A human's delete carries no CAS token: the cockpit button is the
+        authority. It used to remove only the row, which the next sweep
+        resurrected from the untouched file."""
+        from main import delete_knowledge_note
+
+        g = _make_gitea(tree_paths={PATH: _blob_sha(BODY)})
+        g.delete_path = AsyncMock(return_value="deleted")
+        store_cls = MagicMock()
+        store = MagicMock()
+        store.delete_kb_note = AsyncMock(return_value=True)
+        store.delete_note = AsyncMock(return_value=False)
+        store_cls.return_value = store
+        with (
+            patch("main.require_project_member", AsyncMock(return_value=None)),
+            patch("main.postgres_db", _ledger_db()),
+            patch("main.gitea_client", g),
+            patch("main.vector_db", MagicMock()),
+            patch("main._get_knowledge_graph", MagicMock(return_value=None)),
+            patch("src.services.knowledge_store.KnowledgeStore", store_cls),
+            _patch_resolve(_ref()),
+        ):
+            result = await delete_knowledge_note(fake_request, PROJECT, SLUG)
+        assert result == {
+            "status": "deleted",
+            "file_removed": True,
+            "row_deleted": True,
+            "path": PATH,
+        }
+        assert g.delete_path.await_args.kwargs["expected_sha"] == _blob_sha(BODY)
+        assert "cockpit" in g.delete_path.await_args.args[3]
+
+    @pytest.mark.asyncio
+    async def test_member_delete_of_a_note_that_exists_nowhere_is_404(
+        self, fake_request
+    ):
+        from main import delete_knowledge_note
+
+        g = _make_gitea(tree_paths={})
+        g.delete_path = AsyncMock(return_value="deleted")
+        store_cls = MagicMock()
+        store = MagicMock()
+        store.delete_kb_note = AsyncMock(return_value=False)
+        store.delete_note = AsyncMock(return_value=False)
+        store_cls.return_value = store
+        with (
+            patch("main.require_project_member", AsyncMock(return_value=None)),
+            patch("main.postgres_db", _ledger_db()),
+            patch("main.gitea_client", g),
+            patch("main.vector_db", MagicMock()),
+            patch("main._get_knowledge_graph", MagicMock(return_value=None)),
+            patch("src.services.knowledge_store.KnowledgeStore", store_cls),
+            _patch_resolve(_ref()),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await delete_knowledge_note(fake_request, PROJECT, SLUG)
+        assert exc.value.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_member_delete_forge_failure_is_502_not_a_row_only_delete(
+        self, fake_request
+    ):
+        from main import delete_knowledge_note
+
+        g = _make_gitea(tree_paths={PATH: _blob_sha(BODY)})
+        g.delete_path = AsyncMock(return_value="error")
+        store_cls = MagicMock()
+        store = MagicMock()
+        store.delete_kb_note = AsyncMock(return_value=True)
+        store_cls.return_value = store
+        with (
+            patch("main.require_project_member", AsyncMock(return_value=None)),
+            patch("main.postgres_db", _ledger_db()),
+            patch("main.gitea_client", g),
+            patch("main.vector_db", MagicMock()),
+            patch("src.services.knowledge_store.KnowledgeStore", store_cls),
+            _patch_resolve(_ref()),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await delete_knowledge_note(fake_request, PROJECT, SLUG)
+        assert exc.value.status_code == 502
+        store.delete_kb_note.assert_not_awaited()
 
 
 class TestKnowledgeMutationEndpoint:

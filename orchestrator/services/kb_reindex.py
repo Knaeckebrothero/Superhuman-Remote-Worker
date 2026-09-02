@@ -1332,6 +1332,18 @@ async def resolve_kb_repo(postgres_db: Any, project_id: str) -> Optional[KbRepoR
     return None
 
 
+def _default_purge_enabled() -> bool:
+    from .kb_purge import purge_enabled
+
+    return purge_enabled()
+
+
+async def _default_purge(**kwargs: Any) -> Dict[str, Any]:
+    from .kb_purge import purge_kb_tick
+
+    return await purge_kb_tick(**kwargs)
+
+
 async def kb_sweep_tick(
     *,
     postgres_db: Any,
@@ -1339,6 +1351,8 @@ async def kb_sweep_tick(
     gitea_client: Any,
     embedding_service: Any,
     reindex_fn: Callable[..., Awaitable[Dict[str, Any]]] = reindex_kb,
+    purge_fn: Callable[..., Awaitable[Dict[str, Any]]] = _default_purge,
+    purge_enabled_fn: Callable[[], bool] = _default_purge_enabled,
 ) -> int:
     """One sweep: refresh external datasource and active-project KBs.
 
@@ -1489,6 +1503,23 @@ async def kb_sweep_tick(
                         "kb_sweep: projection ledger update failed for project %s",
                         project_id,
                     )
+                # Purge lane (kb_gardening G2): only after this KB's index is
+                # known to match its tree, so the candidate query sees current
+                # statuses and links, and only when an operator turned it on.
+                if purge_enabled_fn():
+                    try:
+                        purged = await purge_fn(
+                            postgres_db=postgres_db,
+                            store=store,
+                            gitea_client=repo_client,
+                            kb_id=project_id,
+                        )
+                        if purged.get("purged"):
+                            worked += 1
+                    except Exception:
+                        logger.exception(
+                            "kb_sweep: purge failed for project %s", project_id
+                        )
             if result.get("status") not in ("up-to-date", "no-head"):
                 worked += 1
         except Exception:

@@ -18,7 +18,7 @@ import logging
 import os
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Literal, NamedTuple, Optional
 
 import httpx
@@ -102,6 +102,70 @@ PriorityValue = Literal["high", "normal", "low"]
 # pgvector row, which always carries the rank the caller asked for (or
 # DEFAULT_PRIORITY_RANK), so a note's priority survives a later re-index.
 _TICKET_TYPES = ("feature", "issue", "idea")
+
+# kb_gardening G5 — the retirement guard. A note that one of these ACTIVE
+# note types links to is that note's evidence and must not be retired by an
+# agent; the guard is enforced here, in the tool, not in any prompt.
+_RETIRE_ROOT_TYPES = (
+    "decision",
+    "goal",
+    "plan",
+    "charter",
+    "feature",
+    "issue",
+    "idea",
+    "code",
+    "question",
+)
+#: Tags that mark a note as protected from agent retirement.
+_RETIRE_PROTECTED_TAGS = frozenset({"pinned", "ready", "parallel-safe"})
+#: Notes younger than this are never retired by an agent (a curator racing
+#: the main agent's freshly written note is the case this closes).
+_RETIRE_MIN_AGE = timedelta(hours=24)
+
+
+def _retire_denied(
+    existing: Dict[str, Any], inbound_durable: List[Dict[str, Any]]
+) -> Optional[str]:
+    """Why ``existing`` may not be retired by an agent, or None if it may.
+
+    Pure function over the row (``get_note_by_slug`` shape) and the active
+    durable notes that link to it (``get_inbound_links``). Every refusal names
+    its rule so the agent can pick the right alternative (supersede, close a
+    ticket, ask the officer).
+    """
+    note_type = str(existing.get("type") or "")
+    if note_type == "charter":
+        return "the charter is never retired"
+    if note_type in _TICKET_TYPES:
+        return (
+            "it is a backlog ticket — close it with "
+            "kb_update(status='resolved' or 'archived') so the pipeline records the outcome"
+        )
+    if note_type == "report":
+        return "officer reports are retired by the officer, not by workers"
+    tags = set(normalize_tags(existing.get("tags") or []))
+    protected = sorted(tags & _RETIRE_PROTECTED_TAGS)
+    if protected:
+        return f"it is tagged {', '.join(protected)}"
+    if existing.get("ready_at"):
+        return "it is authorised for dispatch (ready_at is set)"
+    if inbound_durable:
+        names = ", ".join(
+            f"{link.get('id')} ({link.get('type')})" for link in inbound_durable[:5]
+        )
+        more = (
+            "" if len(inbound_durable) <= 5 else f" and {len(inbound_durable) - 5} more"
+        )
+        return f"active durable notes link to it as evidence: {names}{more}"
+    created = existing.get("created")
+    if isinstance(created, datetime):
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) - created < _RETIRE_MIN_AGE:
+            return "it is younger than 24 hours"
+    return None
+
 
 # Shown by the genuinely graph-shaped tools when Neo4j is absent (slice-3 PR4c).
 # CONTRADICTS / DERIVED_FROM / ANSWERS edges and the Neo4j export have no
@@ -554,6 +618,17 @@ KNOWLEDGE_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "short_description": "Update a knowledge note (append, status, tags, links).",
         "phases": ["strategic", "tactical"],
     },
+    "kb_delete": {
+        "module": "knowledge.knowledge_tools",
+        "function": "kb_delete",
+        "description": (
+            "Retire a knowledge note (archive with a reason; reversible, "
+            "hidden from search, purged later by the grace-period lane)"
+        ),
+        "category": "knowledge",
+        "short_description": "Retire a knowledge note with a reason (archive, reversible).",
+        "phases": ["strategic", "tactical"],
+    },
     # Read tools
     "kb_read": {
         "module": "knowledge.knowledge_tools",
@@ -1001,6 +1076,7 @@ def _post_vault_file(
     content: str,
     job_id: Optional[str],
     retrieval_messages: Optional[List[str]] = None,
+    expected_blob_sha: Optional[str] = None,
 ) -> Dict[str, Any]:
     """POST one rendered note to the orchestrator's materialisation endpoint.
 
@@ -1032,6 +1108,10 @@ def _post_vault_file(
         payload["job_id"] = str(job_id)
     if retrieval_messages:
         payload["retrieval_messages"] = list(retrieval_messages)
+    if expected_blob_sha:
+        # Compare-and-swap (kb_gardening G3): the endpoint refuses the write
+        # if the repo no longer holds this blob at the path.
+        payload["expected_blob_sha"] = str(expected_blob_sha)
 
     try:
         with httpx.Client(
@@ -1058,6 +1138,7 @@ def _materialize_note(
     slug: str,
     note: Dict[str, Any],
     retrieval_messages: Optional[List[str]] = None,
+    expected_blob_sha: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Commit a note as ``knowledge/<slug>.md`` in the project's KB repo.
 
@@ -1111,7 +1192,12 @@ def _materialize_note(
         return {"status": "failed", "reason": "render-error"}
 
     result = _post_vault_file(
-        project_id, slug, content, job_id, retrieval_messages=retrieval_messages
+        project_id,
+        slug,
+        content,
+        job_id,
+        retrieval_messages=retrieval_messages,
+        expected_blob_sha=expected_blob_sha,
     )
 
     if str(result.get("status")) == "failed":
@@ -1150,6 +1236,15 @@ def _canonical_materialization_error(slug: str, result: Dict[str, Any]) -> str:
     state = result.get("canonical_state") or "failed"
     reason = result.get("reason") or "unknown"
     retry = result.get("retry_state") or "unknown"
+    if reason == "precondition-failed":
+        # The compare-and-swap token did not match: another writer changed or
+        # removed the note between this caller's read and its write. Nothing
+        # was applied and nothing will be replayed — re-read, then decide.
+        return (
+            f"Error: '{slug}' changed (or was removed) since you read it — "
+            "your update was NOT applied to avoid overwriting the other "
+            "writer's version. kb_read it again and re-apply what still holds."
+        )
     return (
         f"Error: canonical knowledge write for '{slug}' did not complete "
         f"(state={state}, reason={reason}, retry={retry}). The mutation remains "
@@ -1641,6 +1736,11 @@ def create_kb_tools(
                 # None. Simplify that guard away and BOTH become blanking
                 # writes (see test_omits_retrieval_messages_entirely_...).
                 existing.get("retrieval_messages"),
+                # Compare-and-swap on the blob this row was indexed from
+                # (kb_gardening G3): a concurrent rewrite or removal of the
+                # note makes this write fail loudly instead of silently
+                # winning — or silently re-creating a deleted file.
+                expected_blob_sha=existing.get("blob_sha"),
             )
             if not _canonical_materialization_succeeded(materialization):
                 return _canonical_materialization_error(note, materialization)
@@ -1753,16 +1853,19 @@ def create_kb_tools(
 
             prior_row: Optional[Dict[str, Any]] = None
             new_priority: Optional[int] = None
-            if new_type in _TICKET_TYPES:
-                try:
-                    prior_row = _run_async(
-                        ks.get_note_by_slug(uuid.UUID(project_id), note)
-                    )
-                except Exception as exc:
+            # The graph is the read source on this tier, but the row carries
+            # the compare-and-swap token (blob_sha) — read it for every
+            # rewrite, not only the ticket-priority case it used to serve.
+            try:
+                prior_row = _run_async(ks.get_note_by_slug(uuid.UUID(project_id), note))
+            except Exception as exc:
+                if new_type in _TICKET_TYPES:
                     return (
                         "Error: could not read the ticket's current READY/priority "
                         f"state before canonical update ({exc.__class__.__name__})."
                     )
+                prior_row = None
+            if new_type in _TICKET_TYPES:
                 new_priority = (
                     priority
                     if priority is not None
@@ -1801,6 +1904,7 @@ def create_kb_tools(
                 # protection lives; None is only the better-typed way to say
                 # "no opinion" (see test_omits_retrieval_messages_entirely_...).
                 existing.get("retrieval_messages"),
+                expected_blob_sha=(prior_row or {}).get("blob_sha"),
             )
             if not _canonical_materialization_succeeded(materialization):
                 return _canonical_materialization_error(note, materialization)
@@ -2266,6 +2370,119 @@ def create_kb_tools(
             add_links=add_links,
             remove_tags=remove_tags,
             set_tags=set_tags,
+        )
+
+    @tool
+    def kb_delete(note: str, reason: str) -> str:
+        """Retire a knowledge note: archive it with a reason.
+
+        This is NOT a hard delete. The note's status becomes ``archived``: it
+        drops out of kb_search and prompt injection immediately, stays
+        readable by slug with kb_read, and is undone with
+        ``kb_update(note, status="active")``. The file stays in the knowledge
+        repository; physical removal happens later in a separate grace-period
+        lane, and git history keeps every byte either way. The reason is
+        written into the note (and its revision history), so a reviewer can
+        see who retired what and why.
+
+        Refused, naming the rule, when the note is: the project charter; a
+        backlog ticket (close those with kb_update status resolved/archived);
+        tagged ``pinned``; tagged ``ready`` / ``parallel-safe`` or otherwise
+        authorised for dispatch; linked from an ACTIVE decision, goal, plan,
+        charter or ticket (it is that note's evidence); or younger than 24 h.
+        Retiring an already-archived note is a no-op, not an error.
+
+        Args:
+            note: Note slug ID (e.g. "iter-12-state-snapshot")
+            reason: One line: why this note no longer earns its place
+                (superseded by X, duplicate of Y, snapshot of a moved-on
+                state, ...). Required.
+
+        Returns:
+            Confirmation with the undo instruction, or a refusal naming the rule.
+        """
+        reason_text = " ".join(str(reason or "").split())
+        if len(reason_text) < 8:
+            return (
+                "Error: give a reason of at least a few words — it is journaled "
+                "in the note so a reviewer can see why it was retired."
+            )
+        alias, note_slug = split_note_handle(note)
+        if alias and _has_bound_scopes:
+            binding = _resolve_binding(context, alias)
+            if binding is None:
+                return (
+                    f"Error: Knowledge base '{alias}' is not selected. Available: "
+                    f"{_binding_choices(_read_bindings(context))}."
+                )
+            if not binding.is_native or not binding.writable:
+                return (
+                    f"Error: Knowledge base '{binding.alias}' is read-only. "
+                    "External knowledge bases cannot be retired from."
+                )
+            note = note_slug
+        project_id = _get_project_id(context)
+        if not project_id:
+            return _write_scope_error(context)
+        try:
+            project_uuid = uuid.UUID(project_id)
+            existing = _run_async(ks.get_note_by_slug(project_uuid, note))
+            if not existing:
+                return f"Error: Note '{note}' not found in project."
+            if (existing.get("status") or "") == "archived":
+                return f"'{note}' is already archived — nothing to do."
+            try:
+                inbound_durable = _run_async(
+                    ks.get_inbound_links(
+                        project_uuid,
+                        note,
+                        active_only=True,
+                        note_types=list(_RETIRE_ROOT_TYPES),
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 — fail closed on the guard
+                return (
+                    f"Error: could not check what links to '{note}' "
+                    f"({exc.__class__.__name__}); refusing to retire blind."
+                )
+            denied = _retire_denied(existing, inbound_durable)
+            if denied:
+                return (
+                    f"Refused: '{note}' was not retired — {denied}. "
+                    "If it is genuinely stale, say so in a note the officer "
+                    "reads, or supersede it with a newer note instead."
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"kb_delete failed: {e}")
+            return f"Error retiring note: {e}"
+
+        provenance = _note_provenance(context)
+        who = provenance.get("author") or "agent"
+        job = str(provenance.get("job") or "")
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        footer = (
+            f"> **Retired** {stamp} by {who}"
+            f"{f' (job {job[:8]})' if job else ''}: {reason_text}"
+        )
+        result = _update_existing(
+            note,
+            content=None,
+            append=footer,
+            status="archived",
+            confidence=None,
+            priority=None,
+            add_tags=None,
+            add_links=None,
+            remove_tags=None,
+            set_tags=None,
+        )
+        if result.startswith("Error"):
+            return result
+        suffix = result[result.rfind("[") :] if "[" in result else ""
+        return (
+            f"Retired **{note}** (status=archived): {reason_text}. Hidden from "
+            "kb_search and injection; still readable with kb_read; undo with "
+            f'kb_update(note="{note}", status="active"). {suffix}'.rstrip()
         )
 
     # =========================================================================
@@ -3200,6 +3417,7 @@ def create_kb_tools(
     return [
         kb_write,
         kb_update,
+        kb_delete,
         kb_read,
         kb_list,
         kb_search,

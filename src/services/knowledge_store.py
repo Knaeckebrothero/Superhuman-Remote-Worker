@@ -663,6 +663,39 @@ class KnowledgeStore:
             hashlib.sha256(kb_id.bytes).digest()[:8], "big", signed=True
         )
 
+    @staticmethod
+    def _converge_lock_key(kb_id: uuid.UUID) -> int:
+        """Advisory-lock key for the KB convergence pass — distinct from the
+        reindex key on purpose: a converge run is minutes of aux-LLM time,
+        and holding the *reindex* lock that long would defer every inline
+        index in the project (``deferred:reindex-running``)."""
+        return int.from_bytes(
+            hashlib.sha256(kb_id.bytes + b":converge").digest()[:8],
+            "big",
+            signed=True,
+        )
+
+    @asynccontextmanager
+    async def try_converge_lock(self, kb_id: uuid.UUID):
+        """Non-blocking claim of the per-KB convergence lock (kb_gardening G4).
+
+        Yields True when this caller is the single consolidator for the KB
+        right now, False when another pass (another fan-out member, another
+        replica) holds it — the caller then skips its run; the stale queue is
+        still there next time. Session-scoped like the reindex lock, so it
+        coordinates across orchestrator replicas and agent pods alike.
+        """
+        lock_key = self._converge_lock_key(kb_id)
+        async with self.db.acquire() as conn:
+            claimed = bool(
+                await conn.fetchval("SELECT pg_try_advisory_lock($1)", lock_key)
+            )
+            try:
+                yield claimed
+            finally:
+                if claimed:
+                    await conn.fetchval("SELECT pg_advisory_unlock($1)", lock_key)
+
     async def upsert_watermark(
         self,
         kb_id: uuid.UUID,
@@ -1456,6 +1489,164 @@ class KnowledgeStore:
             for r in rows
         ]
 
+    async def get_gardening_health(
+        self, kb_id: uuid.UUID, *, grace: timedelta = timedelta(days=14)
+    ) -> Dict[str, Any]:
+        """Corpus-level hygiene counters (kb_gardening G10).
+
+        The numbers that turn "the KB is getting worse" from a feeling into a
+        graph: how much is retired but still on disk, how much of the active
+        corpus nothing durable reaches, how old the oldest tombstone is. One
+        query; cheap enough for the summary endpoint. Near-duplicate density
+        stays in ``kb_lint`` (it is an O(n²) self-join).
+        """
+        row = await self.db.fetchrow(
+            """
+            WITH scoped AS (
+                SELECT * FROM knowledge_index WHERE kb_id = $1 AND path IS NOT NULL
+            ),
+            active_src AS (
+                SELECT DISTINCT kl.target_id
+                FROM knowledge_links kl
+                JOIN scoped src ON src.note_id = kl.source_id
+                WHERE kl.kb_id = $1 AND src.status = 'active'
+            )
+            SELECT
+                COUNT(*) FILTER (WHERE status = 'active') AS active,
+                COUNT(*) FILTER (WHERE status IN ('archived', 'superseded')) AS retired,
+                COUNT(*) FILTER (
+                    WHERE status IN ('archived', 'superseded')
+                      AND COALESCE(invalidated_at, modified_at, indexed_at)
+                            < now() - $2::interval
+                ) AS retired_past_grace,
+                COUNT(*) FILTER (
+                    WHERE status = 'active'
+                      AND note_type IN ('learning', 'retrospective', 'state')
+                      AND note_id NOT IN (SELECT target_id FROM active_src)
+                ) AS nursery_orphans,
+                COUNT(*) FILTER (
+                    WHERE status = 'active'
+                      AND note_type IN ('learning', 'retrospective', 'state')
+                ) AS nursery_active,
+                EXTRACT(EPOCH FROM (
+                    now() - MIN(COALESCE(invalidated_at, modified_at, indexed_at))
+                        FILTER (WHERE status IN ('archived', 'superseded'))
+                )) / 86400.0 AS oldest_retired_days
+            FROM scoped
+            """,
+            kb_id,
+            grace,
+        )
+        r = dict(row) if row else {}
+        oldest = r.get("oldest_retired_days")
+        return {
+            "active": int(r.get("active") or 0),
+            "retired": int(r.get("retired") or 0),
+            "retired_past_grace": int(r.get("retired_past_grace") or 0),
+            "nursery_active": int(r.get("nursery_active") or 0),
+            "nursery_orphans": int(r.get("nursery_orphans") or 0),
+            "oldest_retired_days": round(float(oldest), 1)
+            if oldest is not None
+            else None,
+            "grace_days": grace.days,
+        }
+
+    async def list_purge_candidates(
+        self,
+        kb_id: uuid.UUID,
+        *,
+        grace: timedelta,
+        limit: int = 25,
+        excluded_types: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Retired notes that have earned physical removal (kb_gardening G2).
+
+        Three signals must agree: the row has been non-active for at least
+        ``grace`` (measured from ``invalidated_at`` when the retirement
+        stamped it, else the file's ``modified_at``, else ``indexed_at``); no
+        *active* note links to it; and its type is not excluded. Oldest first,
+        bounded by ``limit`` so one tick cannot purge a whole vault. Only
+        path-backed rows qualify — a pathless legacy row has no file to remove
+        and is the reconciler's business.
+        """
+        excluded = [str(t) for t in (excluded_types or [])]
+        rows = await self.db.fetch(
+            """
+            SELECT ki.note_id, ki.path, ki.blob_sha, ki.status, ki.note_type,
+                   COALESCE(ki.invalidated_at, ki.modified_at, ki.indexed_at) AS retired_at
+            FROM knowledge_index ki
+            WHERE ki.kb_id = $1
+              AND ki.path IS NOT NULL
+              AND ki.status IN ('archived', 'superseded')
+              AND NOT (ki.note_type = ANY($2::text[]))
+              AND COALESCE(ki.invalidated_at, ki.modified_at, ki.indexed_at)
+                    < now() - $3::interval
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM knowledge_links kl
+                    JOIN knowledge_index src
+                      ON src.kb_id = kl.kb_id AND src.note_id = kl.source_id
+                    WHERE kl.kb_id = ki.kb_id
+                      AND kl.target_id = ki.note_id
+                      AND src.status = 'active'
+              )
+            ORDER BY retired_at ASC NULLS LAST, ki.note_id
+            LIMIT $4
+            """,
+            kb_id,
+            excluded,
+            grace,
+            limit,
+        )
+        return [dict(r) for r in rows]
+
+    async def get_inbound_links(
+        self,
+        kb_id: uuid.UUID,
+        note_id: str,
+        *,
+        active_only: bool = True,
+        note_types: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Notes that link *to* ``note_id`` (the retirement guard's evidence).
+
+        kb_gardening G5: a note an active decision/goal/plan/ticket links to
+        is load-bearing and must not be retired by an agent. This is the
+        one-hop inbound side of :meth:`get_related_notes`, with the filters
+        the guard needs — ``active_only`` drops retired sources (a link from
+        an archived note protects nothing), ``note_types`` narrows to the
+        durable root types. Returns ``[{id, title, type, status}]``.
+        """
+        clauses = ["kl.kb_id = $1", "kl.target_id = $2"]
+        params: List[Any] = [kb_id, note_id]
+        if active_only:
+            clauses.append("ki.status = 'active'")
+        if note_types:
+            params.append([str(t) for t in note_types])
+            clauses.append(f"ki.note_type = ANY(${len(params)}::text[])")
+        rows = await self.db.fetch(
+            f"""
+            SELECT DISTINCT ki.note_id AS id, ki.title AS title,
+                   ki.note_type AS type, ki.status AS status
+            FROM knowledge_links kl
+            JOIN knowledge_index ki
+              ON ki.kb_id = kl.kb_id AND ki.note_id = kl.source_id
+            WHERE {" AND ".join(clauses)}
+            ORDER BY ki.title
+            LIMIT 50
+            """,
+            *params,
+        )
+        return [
+            {
+                "id": r["id"],
+                "title": r["title"],
+                "type": r["type"],
+                "status": r["status"],
+            }
+            for r in rows
+        ]
+
     async def get_note_by_slug(
         self, kb_id: uuid.UUID, note_id: str
     ) -> Optional[Dict[str, Any]]:
@@ -1476,7 +1667,7 @@ class KnowledgeStore:
             """
             SELECT note_id, title, note_type, status, content, confidence,
                    tags, keywords, job_id, phase, created_at, modified_at,
-                   priority, ready_at
+                   priority, ready_at, blob_sha
             FROM knowledge_index
             WHERE kb_id = $1 AND note_id = $2 AND path IS NOT NULL
             LIMIT 1
@@ -1500,6 +1691,10 @@ class KnowledgeStore:
             "phase": r.get("phase"),
             "created": r.get("created_at"),
             "modified": r.get("modified_at"),
+            # The compare-and-swap token for rewrites/deletes (kb_gardening
+            # G3): the git blob the row was indexed from. NULL while an inline
+            # index is still deferred — callers then write unconditionally.
+            "blob_sha": r.get("blob_sha"),
             # Backlog rank (project-backlog-pipeline task 3) — read back so
             # kb_update can preserve an existing ticket's priority when the
             # caller doesn't specify a new one.

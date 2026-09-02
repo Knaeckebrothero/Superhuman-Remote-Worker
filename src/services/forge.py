@@ -250,6 +250,73 @@ class GitHubClient:
         logger.warning("GitHub KB write failed (HTTP %s)", response.status_code)
         return False
 
+    async def delete_path(
+        self,
+        repo_name: str,
+        branch: str,
+        path: str,
+        message: str,
+        expected_sha: str | None = None,
+    ) -> str:
+        """Remove one file through the Contents API with compare-and-swap.
+
+        Same verdict vocabulary as ``GiteaClient.delete_path``: ``deleted`` /
+        ``absent`` / ``conflict`` / ``error``. GitHub requires the blob SHA on
+        every delete and answers 409 when it no longer matches the branch —
+        the lost-update guard the KB purge relies on. Without ``expected_sha``
+        the current SHA is looked up first.
+        """
+        if not self._matches_repo(repo_name):
+            return "error"
+        content_path = self._content_path(path)
+        if content_path is None:
+            logger.warning("GitHub KB delete path was invalid")
+            return "error"
+        contents_url = f"{self._repo_api()}/contents/{content_path}"
+        sha = str(expected_sha or "").strip() or None
+        try:
+            async with httpx.AsyncClient(timeout=30.0, transport=_transport) as client:
+                if sha is None:
+                    lookup = await client.get(
+                        contents_url,
+                        params={"ref": branch},
+                        headers=self._headers(),
+                    )
+                    if lookup.status_code == 404:
+                        return "absent"
+                    if lookup.status_code != 200:
+                        logger.warning(
+                            "GitHub KB delete SHA lookup failed (HTTP %s)",
+                            lookup.status_code,
+                        )
+                        return "error"
+                    value = lookup.json().get("sha")
+                    sha = str(value).strip() if value else None
+                    if sha is None:
+                        return "error"
+                response = await client.request(
+                    "DELETE",
+                    contents_url,
+                    headers=self._headers(),
+                    json={
+                        "message": str(message),
+                        "sha": sha,
+                        "branch": str(branch or "main"),
+                    },
+                )
+        except (httpx.HTTPError, ValueError, AttributeError) as exc:
+            logger.warning("GitHub KB delete failed: %s", exc)
+            return "error"
+        if response.status_code == 200:
+            return "deleted"
+        if response.status_code == 404:
+            return "absent"
+        if response.status_code in (409, 422):
+            logger.info("GitHub KB delete refused (HTTP %s)", response.status_code)
+            return "conflict"
+        logger.warning("GitHub KB delete failed (HTTP %s)", response.status_code)
+        return "error"
+
     async def get_branch_head_sha(self, repo_name: str, branch: str) -> str | None:
         """Return the commit SHA at a GitHub branch head."""
         if not self._matches_repo(repo_name):

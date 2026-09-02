@@ -294,12 +294,26 @@ class TestAssembleKnowledgeTask:
 # =============================================================================
 
 
-def _make_tool_context(stale_notes):
+def _lock(claimed: bool):
+    """A ``try_converge_lock``-shaped async context manager."""
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def _cm(_kb_id):
+        yield claimed
+
+    return _cm
+
+
+def _make_tool_context(stale_notes, *, active_total=1000, lock_claimed=True):
     tc = MagicMock()
     tc.project_id = str(uuid.uuid4())
     ks = AsyncMock()
     ks.get_stale_notes = AsyncMock(return_value=stale_notes)
     ks.refresh_ttl = AsyncMock(return_value=len(stale_notes))
+    ks.get_summary = AsyncMock(return_value={"active": active_total})
+    ks.list_notes = AsyncMock(return_value=[])
+    ks.try_converge_lock = _lock(lock_claimed)
     tc.knowledge_store = ks
     kg = MagicMock()
     kg.list_notes = MagicMock(return_value=[])
@@ -374,6 +388,100 @@ class TestAssembleAndConvergeRunner:
 
         assert result is None
         aux.agent.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_runs_without_neo4j(self, monkeypatch):
+        """kb_gardening G9: the graph is optional; before this the pass
+        silently no-op'd on every graph-less pod."""
+        monkeypatch.setattr(
+            "src.tools.knowledge.knowledge_tools.create_kb_tools",
+            lambda tc: [],
+        )
+        stale = [KnowledgeRecord(note_id="n1", note_type="state", title="S")]
+        tc, ks, _kg = _make_tool_context(stale)
+        tc.knowledge_graph = None
+        ks.list_notes = AsyncMock(
+            return_value=[{"id": "other", "title": "Other", "type": "decision"}]
+        )
+        aux = _make_aux_llm()
+
+        result = await assemble_and_converge_knowledge(aux, tc, "prompt")
+
+        assert result is not None
+        aux.agent.assert_awaited_once()
+        task = aux.agent.await_args.args[0]
+        assert any("other" in line for line in task.related_notes)
+        ks.list_notes.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_skips_when_another_pass_holds_the_lock(self, monkeypatch):
+        """kb_gardening G4: one consolidator per KB. Fan-out members and
+        replicas that lose the claim skip; the queue waits for the holder."""
+        monkeypatch.setattr(
+            "src.tools.knowledge.knowledge_tools.create_kb_tools",
+            lambda tc: [],
+        )
+        stale = [KnowledgeRecord(note_id="n1", note_type="state", title="S")]
+        tc, ks, _kg = _make_tool_context(stale, lock_claimed=False)
+        aux = _make_aux_llm()
+
+        result = await assemble_and_converge_knowledge(aux, tc, "prompt")
+
+        assert result is None
+        aux.agent.assert_not_called()
+        ks.get_stale_notes.assert_not_called()
+        ks.refresh_ttl.assert_not_called()
+        aux.health.record_failure.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_queue_is_bounded_per_run(self, monkeypatch):
+        monkeypatch.setenv("KB_CONVERGE_MAX_NOTES", "7")
+        monkeypatch.setattr(
+            "src.tools.knowledge.knowledge_tools.create_kb_tools",
+            lambda tc: [],
+        )
+        stale = [KnowledgeRecord(note_id=f"n{i}", note_type="state") for i in range(3)]
+        tc, ks, _kg = _make_tool_context(stale)
+        aux = _make_aux_llm()
+
+        await assemble_and_converge_knowledge(aux, tc, "prompt")
+
+        assert ks.get_stale_notes.await_args.kwargs["limit"] == 7
+
+    @pytest.mark.asyncio
+    async def test_blast_radius_cap_against_the_active_corpus(self, monkeypatch):
+        """Never more than 25 % of the KB's active notes in one run, however
+        deep the stale queue is; the rest waits. Survivors of the truncated
+        list are the only ones refreshed."""
+        monkeypatch.setattr(
+            "src.tools.knowledge.knowledge_tools.create_kb_tools",
+            lambda tc: [],
+        )
+        stale = [KnowledgeRecord(note_id=f"n{i}", note_type="state") for i in range(10)]
+        tc, ks, _kg = _make_tool_context(stale, active_total=8)  # cap = 2
+        aux = _make_aux_llm()
+
+        await assemble_and_converge_knowledge(aux, tc, "prompt")
+
+        task = aux.agent.await_args.args[0]
+        assert len(task.stale_notes) == 2
+        refreshed_list = ks.refresh_ttl.await_args.args[1]
+        assert [n.note_id for n in refreshed_list] == ["n0", "n1"]
+
+    @pytest.mark.asyncio
+    async def test_unknown_corpus_size_does_not_cap(self, monkeypatch):
+        monkeypatch.setattr(
+            "src.tools.knowledge.knowledge_tools.create_kb_tools",
+            lambda tc: [],
+        )
+        stale = [KnowledgeRecord(note_id=f"n{i}", note_type="state") for i in range(5)]
+        tc, ks, _kg = _make_tool_context(stale)
+        ks.get_summary = AsyncMock(side_effect=RuntimeError("no summary"))
+        aux = _make_aux_llm()
+
+        await assemble_and_converge_knowledge(aux, tc, "prompt")
+
+        assert len(aux.agent.await_args.args[0].stale_notes) == 5
 
     @pytest.mark.asyncio
     async def test_agent_failure_is_non_fatal(self, monkeypatch):

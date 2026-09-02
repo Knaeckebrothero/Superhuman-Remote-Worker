@@ -117,7 +117,14 @@ def _capture_materialize(result=None):
     """
     calls: list = []
 
-    def _fake(project_id, slug, content, job_id, retrieval_messages=None):
+    def _fake(
+        project_id,
+        slug,
+        content,
+        job_id,
+        retrieval_messages=None,
+        expected_blob_sha=None,
+    ):
         calls.append(
             {
                 "project_id": project_id,
@@ -125,6 +132,7 @@ def _capture_materialize(result=None):
                 "content": content,
                 "job_id": job_id,
                 "retrieval_messages": retrieval_messages,
+                "expected_blob_sha": expected_blob_sha,
             }
         )
         return dict(result or {"status": "committed", "path": f"knowledge/{slug}.md"})
@@ -217,13 +225,14 @@ def _fake_kb_workspace(files: dict):
 class TestMetadataRegistry:
     """Tests for KNOWLEDGE_TOOLS_METADATA."""
 
-    def test_contains_exactly_12_tools(self):
-        assert len(KNOWLEDGE_TOOLS_METADATA) == 12
+    def test_contains_exactly_13_tools(self):
+        assert len(KNOWLEDGE_TOOLS_METADATA) == 13
 
     def test_expected_tool_names(self):
         expected = {
             "kb_write",
             "kb_update",
+            "kb_delete",
             "kb_read",
             "kb_list",
             "kb_search",
@@ -264,7 +273,7 @@ class TestCreateKbTools:
         with patch("src.tools.knowledge.knowledge_tools.asyncio") as ma:
             ma.get_running_loop.side_effect = RuntimeError
             tools = create_kb_tools(ctx)
-        assert len(tools) == 12
+        assert len(tools) == 13
 
     def test_raises_when_knowledge_store_is_none(self):
         ctx = _make_context()
@@ -274,9 +283,9 @@ class TestCreateKbTools:
                 ma.get_running_loop.side_effect = RuntimeError
                 create_kb_tools(ctx)
 
-    def test_returns_list_of_12_tools(self):
+    def test_returns_list_of_13_tools(self):
         tools, _ = _make_tools()
-        assert len(tools) == 12
+        assert len(tools) == 13
 
 
 # =============================================================================
@@ -2196,6 +2205,300 @@ class TestKbUpdateForwardsRetrievalMessages:
                 {"note": "an-existing-note", "append": "x"},
             )
         assert calls[0]["retrieval_messages"] is None
+
+
+class TestRetireDenied:
+    """kb_gardening G5 — the retirement guard as a pure function."""
+
+    @staticmethod
+    def _row(**over):
+        from datetime import datetime, timedelta, timezone
+
+        base = {
+            "id": "old-state",
+            "type": "state",
+            "status": "active",
+            "tags": [],
+            "ready_at": None,
+            "created": datetime.now(timezone.utc) - timedelta(days=3),
+        }
+        base.update(over)
+        return base
+
+    def test_plain_old_nursery_note_may_be_retired(self):
+        from src.tools.knowledge.knowledge_tools import _retire_denied
+
+        assert _retire_denied(self._row(), []) is None
+
+    def test_charter_is_never_retired(self):
+        from src.tools.knowledge.knowledge_tools import _retire_denied
+
+        assert "charter" in _retire_denied(self._row(type="charter"), [])
+
+    @pytest.mark.parametrize("ticket", ["feature", "issue", "idea"])
+    def test_tickets_are_closed_not_retired(self, ticket):
+        from src.tools.knowledge.knowledge_tools import _retire_denied
+
+        assert "ticket" in _retire_denied(self._row(type=ticket), [])
+
+    @pytest.mark.parametrize("tag", ["pinned", "ready", "parallel-safe", "Pinned"])
+    def test_protected_tags(self, tag):
+        from src.tools.knowledge.knowledge_tools import _retire_denied
+
+        assert "tagged" in _retire_denied(self._row(tags=[tag]), [])
+
+    def test_dispatch_authorised_note(self):
+        from src.tools.knowledge.knowledge_tools import _retire_denied
+
+        assert "dispatch" in _retire_denied(
+            self._row(ready_at="2026-09-01T00:00:00Z"), []
+        )
+
+    def test_evidence_of_an_active_durable_note(self):
+        from src.tools.knowledge.knowledge_tools import _retire_denied
+
+        denied = _retire_denied(
+            self._row(),
+            [{"id": "chose-jwt", "type": "decision", "status": "active"}],
+        )
+        assert "chose-jwt (decision)" in denied
+
+    def test_fresh_note_is_protected_from_a_racing_curator(self):
+        from datetime import datetime, timezone
+
+        from src.tools.knowledge.knowledge_tools import _retire_denied
+
+        assert "24 hours" in _retire_denied(
+            self._row(created=datetime.now(timezone.utc)), []
+        )
+
+    def test_naive_created_timestamp_is_treated_as_utc(self):
+        from datetime import datetime
+
+        from src.tools.knowledge.knowledge_tools import _retire_denied
+
+        assert "24 hours" in _retire_denied(self._row(created=datetime.utcnow()), [])
+
+
+class TestKbDelete:
+    """kb_delete = tombstone (kb_gardening G1): status archived + reason in the
+    note, through the same materialise path as kb_update; refusals name
+    their rule; already-archived is a no-op."""
+
+    def _tools(self, existing, inbound=None):
+        ctx = _make_gitless_context()
+        ctx.knowledge_graph = None
+        ctx.knowledge_store.get_note_by_slug = AsyncMock(return_value=existing)
+        ctx.knowledge_store.get_inbound_links = AsyncMock(return_value=inbound or [])
+        ctx.knowledge_store.upsert_note = AsyncMock(return_value=uuid.uuid4())
+        tools, _ = _make_tools(ctx)
+        return ctx, tools
+
+    @staticmethod
+    def _old(**over):
+        from datetime import datetime, timedelta, timezone
+
+        fields = {
+            "type": "state",
+            "created": datetime.now(timezone.utc) - timedelta(days=5),
+            "blob_sha": "c" * 40,
+        }
+        fields.update(over)
+        return _existing_note(
+            note_id="old-state", content="Iteration 12 state.", **fields
+        )
+
+    def test_is_registered(self):
+        ctx, tools = self._tools(self._old())
+        assert _get_tool(tools, "kb_delete") is not None
+
+    def test_retires_with_a_reason_and_forwards_the_cas_token(self):
+        ctx, tools = self._tools(self._old())
+        patcher, calls = _capture_materialize()
+        with patcher:
+            result = _invoke(
+                _get_tool(tools, "kb_delete"),
+                {"note": "old-state", "reason": "superseded by iter-13 state note"},
+            )
+        assert result.startswith("Retired **old-state**")
+        assert "kb_update" in result and 'status="active"' in result
+        assert len(calls) == 1
+        committed = calls[0]["content"]
+        assert "status: archived" in committed
+        assert "**Retired**" in committed
+        assert "superseded by iter-13 state note" in committed
+        assert calls[0]["expected_blob_sha"] == "c" * 40
+        ctx.knowledge_store.get_inbound_links.assert_awaited_once()
+        kwargs = ctx.knowledge_store.get_inbound_links.await_args.kwargs
+        assert kwargs["active_only"] is True
+        assert "decision" in kwargs["note_types"]
+
+    def test_requires_a_reason(self):
+        ctx, tools = self._tools(self._old())
+        patcher, calls = _capture_materialize()
+        with patcher:
+            result = _invoke(
+                _get_tool(tools, "kb_delete"), {"note": "old-state", "reason": "x"}
+            )
+        assert result.startswith("Error")
+        assert calls == []
+
+    def test_refuses_when_an_active_decision_links_to_it(self):
+        ctx, tools = self._tools(
+            self._old(),
+            inbound=[{"id": "chose-jwt", "type": "decision", "status": "active"}],
+        )
+        patcher, calls = _capture_materialize()
+        with patcher:
+            result = _invoke(
+                _get_tool(tools, "kb_delete"),
+                {"note": "old-state", "reason": "looks stale to me"},
+            )
+        assert result.startswith("Refused")
+        assert "chose-jwt (decision)" in result
+        assert calls == []
+
+    def test_refuses_the_charter(self):
+        ctx, tools = self._tools(self._old(type="charter"))
+        patcher, calls = _capture_materialize()
+        with patcher:
+            result = _invoke(
+                _get_tool(tools, "kb_delete"),
+                {"note": "old-state", "reason": "charter is long and boring"},
+            )
+        assert result.startswith("Refused")
+        assert calls == []
+
+    def test_already_archived_is_a_noop(self):
+        ctx, tools = self._tools(self._old(status="archived"))
+        patcher, calls = _capture_materialize()
+        with patcher:
+            result = _invoke(
+                _get_tool(tools, "kb_delete"),
+                {"note": "old-state", "reason": "duplicate of something"},
+            )
+        assert "already archived" in result
+        assert calls == []
+
+    def test_unknown_note(self):
+        ctx, tools = self._tools(None)
+        result = _invoke(
+            _get_tool(tools, "kb_delete"),
+            {"note": "nope", "reason": "duplicate of something"},
+        )
+        assert result.startswith("Error")
+
+    def test_guard_lookup_failure_fails_closed(self):
+        ctx, tools = self._tools(self._old())
+        ctx.knowledge_store.get_inbound_links = AsyncMock(
+            side_effect=RuntimeError("db")
+        )
+        patcher, calls = _capture_materialize()
+        with patcher:
+            result = _invoke(
+                _get_tool(tools, "kb_delete"),
+                {"note": "old-state", "reason": "duplicate of something"},
+            )
+        assert result.startswith("Error")
+        assert "refusing to retire blind" in result
+        assert calls == []
+
+    def test_precondition_failure_surfaces_as_a_re_read_error(self):
+        ctx, tools = self._tools(self._old())
+        patcher, _calls = _capture_materialize(
+            {
+                "status": "failed",
+                "reason": "precondition-failed",
+                "retry_state": "permanent",
+            }
+        )
+        with patcher:
+            result = _invoke(
+                _get_tool(tools, "kb_delete"),
+                {"note": "old-state", "reason": "duplicate of something"},
+            )
+        assert result.startswith("Error")
+        assert "since you read it" in result
+
+
+class TestKbUpdateForwardsCompareAndSwapToken:
+    """kb_gardening G3: every rewrite carries the blob SHA the row was indexed
+    from, so the endpoint can refuse a write that would overwrite a
+    concurrent edit — or re-create a note that was removed."""
+
+    def test_storeonly_path_sends_the_rows_blob_sha(self):
+        ctx = _make_gitless_context()
+        ctx.knowledge_graph = None
+        ctx.knowledge_store.get_note_by_slug = AsyncMock(
+            return_value=_existing_note(note_id="an-existing-note", blob_sha="a" * 40)
+        )
+        ctx.knowledge_store.upsert_note = AsyncMock(return_value=uuid.uuid4())
+        tools, _ = _make_tools(ctx)
+        patcher, calls = _capture_materialize()
+        with patcher:
+            _invoke(
+                _get_tool(tools, "kb_update"),
+                {"note": "an-existing-note", "append": "x"},
+            )
+        assert calls[0]["expected_blob_sha"] == "a" * 40
+
+    def test_storeonly_path_writes_unconditionally_while_the_index_is_deferred(self):
+        # blob_sha is NULL until the inline index (or the sweep) stamps it;
+        # a rewrite then has no token to send and stays last-writer-wins.
+        ctx = _make_gitless_context()
+        ctx.knowledge_graph = None
+        ctx.knowledge_store.get_note_by_slug = AsyncMock(
+            return_value=_existing_note(note_id="an-existing-note", blob_sha=None)
+        )
+        ctx.knowledge_store.upsert_note = AsyncMock(return_value=uuid.uuid4())
+        tools, _ = _make_tools(ctx)
+        patcher, calls = _capture_materialize()
+        with patcher:
+            _invoke(
+                _get_tool(tools, "kb_update"),
+                {"note": "an-existing-note", "append": "x"},
+            )
+        assert calls[0]["expected_blob_sha"] is None
+
+    def test_graph_path_reads_the_token_from_the_row(self):
+        ctx = _make_git_context()
+        ctx.knowledge_graph.read_note.return_value = _graph_existing()
+        ctx.knowledge_graph.update_note.return_value = True
+        ctx.knowledge_store.get_note_by_slug = AsyncMock(
+            return_value=_existing_note(note_id="an-existing-note", blob_sha="b" * 40)
+        )
+        tools, _ = _make_tools(ctx)
+        patcher, calls = _capture_materialize()
+        with patcher:
+            _invoke(
+                _get_tool(tools, "kb_update"),
+                {"note": "an-existing-note", "append": "more text"},
+            )
+        assert calls[0]["expected_blob_sha"] == "b" * 40
+
+    def test_precondition_failure_tells_the_agent_to_re_read(self):
+        ctx = _make_gitless_context()
+        ctx.knowledge_graph = None
+        ctx.knowledge_store.get_note_by_slug = AsyncMock(
+            return_value=_existing_note(note_id="an-existing-note", blob_sha="a" * 40)
+        )
+        tools, _ = _make_tools(ctx)
+        patcher, _calls = _capture_materialize(
+            {
+                "status": "failed",
+                "reason": "precondition-failed",
+                "canonical_state": "failed",
+                "retry_state": "permanent",
+            }
+        )
+        with patcher:
+            result = _invoke(
+                _get_tool(tools, "kb_update"),
+                {"note": "an-existing-note", "append": "x"},
+            )
+        assert result.startswith("Error:")
+        assert "changed (or was removed) since you read it" in result
+        assert "kb_read" in result
 
 
 class TestKbUpdateKeepsTheNotesTimestamps:

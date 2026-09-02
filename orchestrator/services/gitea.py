@@ -866,6 +866,12 @@ class GiteaClient:
                     "operation": f.get("operation", "create"),
                     "path": f["path"],
                     "content": f["content_b64"],
+                    # Compare-and-swap (kb_gardening G3): when the caller
+                    # names the blob it read, Gitea refuses the update with
+                    # 422 "sha does not match" if the file moved meanwhile.
+                    # Omitted (the historical default) Gitea validates only
+                    # against the branch head and the last writer wins.
+                    **({"sha": f["sha"]} if f.get("sha") else {}),
                 }
                 for f in files
             ],
@@ -885,6 +891,73 @@ class GiteaClient:
         except Exception as e:
             logger.warning(f"change_files failed for {repo_name}@{branch}: {e}")
             return False
+
+    async def delete_path(
+        self,
+        repo_name: str,
+        branch: str,
+        path: str,
+        message: str,
+        expected_sha: str | None = None,
+    ) -> str:
+        """Remove one file with compare-and-swap semantics.
+
+        The KB purge primitive's forge call (``services.kb_materialize``).
+        ``expected_sha`` is the blob SHA the caller believes is on ``branch``;
+        Gitea refuses the delete when the file's current SHA differs, which
+        is exactly the lost-update guard we want. With no SHA the current
+        one is looked up first (a human-authorised purge).
+
+        Returns a verdict string rather than a bool so the caller can tell a
+        race from an outage:
+
+        * ``deleted`` — commit landed.
+        * ``absent`` — no such path on the branch (already gone: success).
+        * ``conflict`` — the forge refused the SHA (409/422): re-read first.
+        * ``error`` — transport/auth/other failure: retryable.
+        """
+        if not self._initialized:
+            return "error"
+        client = self._get_client()
+        url = f"{self._url}/api/v1/repos/{self._user}/{repo_name}/contents/{path}"
+        try:
+            sha = str(expected_sha or "").strip()
+            if not sha:
+                resp = await client.get(url, params={"ref": branch})
+                if resp.status_code == 404:
+                    return "absent"
+                if resp.status_code != 200:
+                    logger.warning(
+                        f"delete_path lookup failed for {repo_name}@{branch}:{path} "
+                        f"(status {resp.status_code})"
+                    )
+                    return "error"
+                sha = str(resp.json().get("sha") or "")
+                if not sha:
+                    return "error"
+            resp = await client.request(
+                "DELETE",
+                url,
+                json={"sha": sha, "message": message, "branch": branch},
+            )
+            if resp.status_code == 200:
+                return "deleted"
+            if resp.status_code == 404:
+                return "absent"
+            if resp.status_code in (409, 422):
+                logger.info(
+                    f"delete_path refused for {repo_name}@{branch}:{path} "
+                    f"(status {resp.status_code}): {resp.text[:200]}"
+                )
+                return "conflict"
+            logger.warning(
+                f"delete_path failed for {repo_name}@{branch}:{path} "
+                f"(status {resp.status_code}): {resp.text[:200]}"
+            )
+            return "error"
+        except Exception as e:
+            logger.warning(f"delete_path failed for {repo_name}@{branch}:{path}: {e}")
+            return "error"
 
     async def delete_file(
         self,

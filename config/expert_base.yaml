@@ -173,6 +173,7 @@ tools:
   knowledge:
     - kb_write
     - kb_update
+    - kb_delete
     - kb_read
     - kb_list
     - kb_search

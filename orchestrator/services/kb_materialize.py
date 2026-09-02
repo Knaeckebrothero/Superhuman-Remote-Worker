@@ -217,6 +217,7 @@ async def _materialize_knowledge_note_once(
     job_id: Optional[str] = None,
     resolved_repo: Any = None,
     repo_client: Any = None,
+    expected_blob_sha: Optional[str] = None,
 ) -> dict[str, Any]:
     """Commit one rendered note to ``knowledge/<slug>.md`` in the project's KB repo.
 
@@ -230,6 +231,14 @@ async def _materialize_knowledge_note_once(
             the orchestrator does not know OKF's note format.
         job_id: Writing job, for per-job commit attribution (§3). Optional —
             persistent sessions have no job.
+        expected_blob_sha: Compare-and-swap token (kb_gardening G3). The blob
+            SHA the caller read before deciding to rewrite; when given, the
+            write is refused with ``failed/precondition-failed`` if the tree
+            holds a different blob at the path **or no blob at all** (the file
+            was removed under the caller — without this check a stale
+            ``kb_update`` silently re-creates a deleted note). A concurrent
+            writer therefore fails loudly instead of being overwritten.
+            ``None`` keeps the historical last-writer-wins behaviour.
 
     Returns:
         ``{status, reason, repo, branch, path, operation}``. ``status`` is one
@@ -312,6 +321,32 @@ async def _materialize_knowledge_note_once(
             )
 
     exists, blob_sha = await _path_exists(repo_client, repo_name, branch, path)
+    expected = str(expected_blob_sha or "").strip() or None
+    if expected:
+        if exists is None:
+            # A guess is fine for an unconditional write (it costs one retry);
+            # a conditional one must not proceed on a tree it could not read.
+            return _result(
+                _STATUS_FAILED,
+                reason="tree-unreadable",
+                repo=repo_name,
+                branch=branch,
+                path=path,
+            )
+        if not exists or (blob_sha and blob_sha != expected):
+            logger.info(
+                "kb-materialize: write of %s refused — caller read %s, tree holds %s",
+                path,
+                expected[:12],
+                (str(blob_sha)[:12] if exists else "nothing"),
+            )
+            return _result(
+                _STATUS_FAILED,
+                reason="precondition-failed",
+                repo=repo_name,
+                branch=branch,
+                path=path,
+            )
     if exists and blob_sha and blob_sha == _git_blob_sha(body):
         logger.debug(
             "kb-materialize: %s@%s already holds %s byte-for-byte — no commit",
@@ -339,13 +374,22 @@ async def _materialize_knowledge_note_once(
     message = _commit_message(slug, job_id)
     payload = {"path": path, "content_b64": base64.b64encode(body).decode("ascii")}
     if blob_sha:
-        # GitHub's contents API requires the current blob SHA for an update.
-        # GiteaClient deliberately ignores this extra duck-typed field.
+        # GitHub's contents API requires the current blob SHA for an update;
+        # Gitea enforces it too when present (422 on mismatch). With an
+        # ``expected_blob_sha`` this is what makes the check atomic: the tree
+        # probe above catches a writer that read long ago, the forge catches
+        # two writers whose probes both preceded either commit (E4, S2).
         payload["sha"] = blob_sha
 
-    for attempt, op in enumerate(
-        (operation, "create" if operation == "update" else "update")
-    ):
+    # A conditional write is never flipped to the opposite operation: the
+    # refusal IS the answer (the file moved), and retrying as ``create`` on an
+    # existing path would only manufacture a second refusal.
+    attempts = (
+        (operation,)
+        if expected
+        else (operation, "create" if operation == "update" else "update")
+    )
+    for attempt, op in enumerate(attempts):
         try:
             committed = await repo_client.change_files(
                 repo_name, branch, [{**payload, "operation": op}], message=message
@@ -391,6 +435,21 @@ async def _materialize_knowledge_note_once(
                 operation=op,
             )
 
+    if expected:
+        logger.info(
+            "kb-materialize: forge refused conditional write of %s@%s — the "
+            "blob moved between the caller's read and its write",
+            path,
+            branch,
+        )
+        return _result(
+            _STATUS_FAILED,
+            reason="precondition-failed",
+            repo=repo_name,
+            branch=branch,
+            path=path,
+            operation=operation,
+        )
     logger.error(
         "kb-materialize: Gitea refused %s on %s@%s as both '%s' and its "
         "opposite — the note is in the index but NOT readable until it is "
@@ -410,6 +469,12 @@ async def _materialize_knowledge_note_once(
     )
 
 
+#: ``skipped`` reasons that still prove the desired state is on the branch:
+#: the identical bytes are already there (write), or the path is already gone
+#: (delete). Both are "nothing needed to be done", not "nothing was done".
+_CANONICAL_SKIP_REASONS = frozenset({"unchanged", "absent"})
+
+
 async def _finish_attempt(
     *,
     postgres_db: Any,
@@ -419,7 +484,7 @@ async def _finish_attempt(
 ) -> dict[str, Any]:
     canonical = outcome.get("status") == _STATUS_COMMITTED or (
         outcome.get("status") == _STATUS_SKIPPED
-        and outcome.get("reason") == "unchanged"
+        and outcome.get("reason") in _CANONICAL_SKIP_REASONS
     )
     intent_id = str(intent["id"])
     token = intent.get("attempt_token")
@@ -482,6 +547,7 @@ async def _attempt_content_intent(
     slug: str,
     content: str,
     job_id: Optional[str],
+    expected_blob_sha: Optional[str] = None,
 ) -> dict[str, Any]:
     permanent_reason: str | None = None
     if slug_error(slug):
@@ -509,6 +575,7 @@ async def _attempt_content_intent(
                 slug=slug,
                 content=content,
                 job_id=job_id,
+                expected_blob_sha=expected_blob_sha,
             )
         except Exception as exc:
             logger.error(
@@ -519,9 +586,13 @@ async def _attempt_content_intent(
                 exc_info=True,
             )
             outcome = _result(_STATUS_FAILED, reason="materializer-exception")
+    # ``precondition-failed`` is permanent by design: the caller decided on a
+    # version that is no longer there, so replaying its bytes later would be
+    # exactly the lost update the token exists to prevent. It must re-read.
     permanent = permanent_reason is not None or outcome.get("reason") in {
         "invalid-slug",
         "empty-content",
+        "precondition-failed",
     }
     return await _finish_attempt(
         postgres_db=postgres_db,
@@ -552,7 +623,7 @@ def _is_canonical(result: dict[str, Any]) -> bool:
         return True
     return result.get("status") == _STATUS_COMMITTED or (
         result.get("status") == _STATUS_SKIPPED
-        and result.get("reason") in {"unchanged", "already-canonical"}
+        and result.get("reason") in {"unchanged", "absent", "already-canonical"}
     )
 
 
@@ -683,8 +754,15 @@ async def _materialize_note_canonical(
     slug: str,
     content: str,
     job_id: Optional[str] = None,
+    expected_blob_sha: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Persist intent, cross canonical git, and return both truth legs."""
+    """Persist intent, cross canonical git, and return both truth legs.
+
+    ``expected_blob_sha`` guards the *first* attempt only. The ledger does
+    not carry it, so a sweep retry of a deferred intent runs unconditionally
+    — the same replay behaviour as before this token existed. A refused first
+    attempt is recorded as permanent, so it is never replayed at all.
+    """
     content_text = str(content or "")
     content_hash = hashlib.sha256(content_text.encode("utf-8")).hexdigest()
     try:
@@ -741,6 +819,7 @@ async def _materialize_note_canonical(
         slug=slug,
         content=content_text,
         job_id=job_id,
+        expected_blob_sha=expected_blob_sha,
     )
 
 
@@ -755,6 +834,7 @@ async def materialize_knowledge_note(
     store: Any = None,
     embedding_service: Any = None,
     retrieval_messages: Optional[list[str]] = None,
+    expected_blob_sha: Optional[str] = None,
 ) -> dict[str, Any]:
     """Commit one note and, when an indexer is supplied, index it inline.
 
@@ -779,6 +859,7 @@ async def materialize_knowledge_note(
         slug=slug,
         content=content,
         job_id=job_id,
+        expected_blob_sha=expected_blob_sha,
     )
     if not _is_canonical(result):
         return {**result, "indexed": False, "index_reason": "not-canonical"}
@@ -1116,10 +1197,360 @@ async def materialize_knowledge_metadata_update(
     )
 
 
+# =============================================================================
+# Delete — the purge primitive (kb_gardening_retire_consolidate_purge.md G2)
+# =============================================================================
+
+
+def _delete_commit_message(
+    slug: str, job_id: Optional[str], reason: Optional[str]
+) -> str:
+    """Commit text for a file removal: subject names the note, body carries
+    the reason (the journal entry) and the full job id, like `_commit_message`."""
+    job = str(job_id or "").strip()
+    subject = f"kb: delete {slug}" + (f" (job {job[:8]})" if job else "")
+    body_lines = []
+    text = " ".join(str(reason or "").split())
+    if text:
+        body_lines.append(f"reason: {text[:500]}")
+    if job:
+        body_lines.append(f"job: {job}")
+    return subject + ("\n\n" + "\n".join(body_lines) if body_lines else "")
+
+
+async def _delete_note_once(
+    *,
+    postgres_db: Any,
+    gitea_client: Any,
+    project_id: str,
+    slug: str,
+    job_id: Optional[str],
+    reason: Optional[str],
+    expected_blob_sha: Optional[str],
+) -> dict[str, Any]:
+    """Remove ``knowledge/<slug>.md`` from the project's KB repo — once.
+
+    Returns the same ``{status, reason, repo, branch, path, operation}`` shape
+    as the write path. Outcomes:
+
+    * ``committed`` / ``delete`` — the file-removal commit landed.
+    * ``skipped`` / ``absent`` — the path is not on the branch. This is the
+      desired state, so it counts as canonical (idempotent delete: RFC 9110).
+    * ``skipped`` / ``no-repo`` — repo-less project; nothing in git to remove.
+    * ``failed`` / ``precondition-failed`` — ``expected_blob_sha`` did not
+      match the tree, or the forge refused the SHA because a concurrent
+      writer moved the file. **Permanent**: the caller must re-read and
+      decide again; a blind retry would delete something it never looked at.
+    * ``failed`` / ``tree-unreadable`` | ``commit-error`` | ``client-error``
+      | ``resolve-error`` — transient; retried by the intent sweep.
+
+    Never raises.
+    """
+    bad_slug = slug_error(slug)
+    if bad_slug:
+        logger.error(
+            "kb-materialize: refusing delete for project %s — %s", project_id, bad_slug
+        )
+        return _result(_STATUS_FAILED, reason="invalid-slug")
+    slug = str(slug).strip()
+    path = note_repo_path(slug)
+
+    try:
+        resolved = await resolve_kb_repo(postgres_db, project_id)
+    except Exception as e:  # noqa: BLE001 — resolution is not the caller's problem
+        logger.error(
+            "kb-materialize: KB repo resolution failed for delete %s/%s: %r",
+            project_id,
+            slug,
+            e,
+            exc_info=True,
+        )
+        return _result(_STATUS_FAILED, reason="resolve-error", path=path)
+    if not resolved:
+        return _result(_STATUS_SKIPPED, reason="no-repo", path=path)
+
+    repo_name, branch = resolved.repo, (resolved.branch or "main")
+    try:
+        repo_client = await kb_client_for_repo(postgres_db, gitea_client, resolved)
+    except Exception:  # noqa: BLE001 — credential/config failures stay non-fatal
+        logger.error(
+            "kb-materialize: no usable %s client for delete in project %s",
+            resolved.forge,
+            project_id,
+            exc_info=True,
+        )
+        return _result(
+            _STATUS_FAILED,
+            reason="client-error",
+            repo=repo_name,
+            branch=branch,
+            path=path,
+        )
+
+    exists, tree_sha = await _path_exists(repo_client, repo_name, branch, path)
+    if exists is None:
+        # Unlike a write (where a guess degrades to one wasted call), a delete
+        # against an unknown tree could remove a note nobody looked at. Refuse.
+        return _result(
+            _STATUS_FAILED,
+            reason="tree-unreadable",
+            repo=repo_name,
+            branch=branch,
+            path=path,
+            operation="delete",
+        )
+    if not exists:
+        return _result(
+            _STATUS_SKIPPED,
+            reason="absent",
+            repo=repo_name,
+            branch=branch,
+            path=path,
+            operation="delete",
+        )
+    expected = str(expected_blob_sha or "").strip() or None
+    if expected and tree_sha and expected != tree_sha:
+        logger.info(
+            "kb-materialize: delete of %s refused — caller read %s, tree holds %s",
+            path,
+            expected[:12],
+            str(tree_sha)[:12],
+        )
+        return _result(
+            _STATUS_FAILED,
+            reason="precondition-failed",
+            repo=repo_name,
+            branch=branch,
+            path=path,
+            operation="delete",
+        )
+
+    message = _delete_commit_message(slug, job_id, reason)
+    try:
+        verdict = await repo_client.delete_path(
+            repo_name, branch, path, message, expected_sha=expected or tree_sha
+        )
+    except Exception as e:  # noqa: BLE001 — non-fatal by contract
+        logger.error(
+            "kb-materialize: delete of %s from %s@%s raised: %r",
+            path,
+            repo_name,
+            branch,
+            e,
+            exc_info=True,
+        )
+        verdict = "error"
+
+    common = dict(repo=repo_name, branch=branch, path=path, operation="delete")
+    if verdict == "deleted":
+        logger.info(
+            "kb-materialize: %s removed from %s@%s%s",
+            path,
+            repo_name,
+            branch,
+            f", job {str(job_id)[:8]}" if job_id else "",
+        )
+        return _result(_STATUS_COMMITTED, **common)
+    if verdict == "absent":
+        return _result(_STATUS_SKIPPED, reason="absent", **common)
+    if verdict == "conflict":
+        return _result(_STATUS_FAILED, reason="precondition-failed", **common)
+    return _result(_STATUS_FAILED, reason="commit-error", **common)
+
+
+async def _attempt_delete_intent(
+    *,
+    postgres_db: Any,
+    gitea_client: Any,
+    intent: dict[str, Any],
+    project_id: str,
+    slug: str,
+    job_id: Optional[str],
+    mutation: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        outcome = await _delete_note_once(
+            postgres_db=postgres_db,
+            gitea_client=gitea_client,
+            project_id=project_id,
+            slug=slug,
+            job_id=job_id,
+            reason=mutation.get("reason"),
+            expected_blob_sha=mutation.get("expected_blob_sha"),
+        )
+    except Exception as exc:  # noqa: BLE001 — never let the ledger dangle
+        logger.error(
+            "kb-materialize: unexpected delete exception for %s/%s: %r",
+            project_id,
+            slug,
+            exc,
+            exc_info=True,
+        )
+        outcome = _result(_STATUS_FAILED, reason="materializer-exception")
+    permanent = outcome.get("reason") in {"invalid-slug", "precondition-failed"}
+    return await _finish_attempt(
+        postgres_db=postgres_db,
+        intent=intent,
+        outcome=outcome,
+        permanent=permanent,
+    )
+
+
+async def _drop_note_rows(*, store: Any, project_id: str, slug: str, path: str) -> bool:
+    """Remove the searchable projection of a note whose file is gone.
+
+    Both keyings, because both row shapes exist: path-backed rows the sweep
+    manages (``(kb_id, path)``; ``kb_id`` doubles as the project id for a
+    native vault) and legacy born-pathless rows (``(project_id, note_id)``).
+    Best-effort: a failure here leaves a row the next sweep's tree-diff reaps.
+    """
+    try:
+        project_uuid = uuid.UUID(str(project_id))
+    except (TypeError, ValueError):
+        return False
+    dropped = False
+    try:
+        dropped = bool(await store.delete_kb_note(project_uuid, path)) or dropped
+    except Exception:  # noqa: BLE001 — the sweep self-heals
+        logger.warning(
+            "kb-materialize: row cleanup by path failed for %s/%s (sweep will reap)",
+            project_id,
+            slug,
+            exc_info=True,
+        )
+        return False
+    try:
+        dropped = bool(await store.delete_note(project_uuid, slug)) or dropped
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "kb-materialize: legacy row cleanup skipped for %s/%s", project_id, slug
+        )
+    return dropped
+
+
+async def materialize_knowledge_note_delete(
+    *,
+    postgres_db: Any,
+    gitea_client: Any,
+    project_id: str,
+    slug: str,
+    job_id: Optional[str] = None,
+    reason: Optional[str] = None,
+    expected_blob_sha: Optional[str] = None,
+    store: Any = None,
+) -> dict[str, Any]:
+    """Purge one note: file-removal commit first, then drop its index rows.
+
+    The git leg is the delete; the row drop is derived from it and only runs
+    once the branch provably no longer holds the file (``committed`` or
+    ``skipped/absent``). Like writes, the intent is persisted before the
+    remote mutation so a crash mid-way is retried by the sweep — except a
+    ``precondition-failed`` outcome, which is permanent by design (§G3):
+    the caller must look again before asking again.
+
+    ``expected_blob_sha`` is the compare-and-swap token: pass the SHA the
+    caller read (``knowledge_index.blob_sha``) and the delete refuses if the
+    tree holds anything else. Omit it only for a human-authorised purge.
+
+    Returns the write path's result shape plus ``row_deleted``.
+    """
+    payload = json.dumps(
+        {
+            "reason": " ".join(str(reason or "").split())[:500] or None,
+            "expected_blob_sha": str(expected_blob_sha or "").strip() or None,
+        },
+        sort_keys=True,
+    )
+    content_hash = "delete:" + hashlib.sha256(payload.encode()).hexdigest()
+    try:
+        intent = await postgres_db.begin_knowledge_materialization(
+            project_id=project_id,
+            note_id=slug,
+            content=payload,
+            content_hash=content_hash,
+            job_id=job_id,
+            operation="delete",
+        )
+    except Exception as exc:
+        logger.error(
+            "kb-materialize: delete retry intent failed for %s/%s: %r",
+            project_id,
+            slug,
+            exc,
+            exc_info=True,
+        )
+        return {
+            **_result(_STATUS_FAILED, reason="intent-store-error"),
+            "canonical_state": "failed",
+            "projection_state": "projection_only",
+            "retry_state": "retryable",
+            "row_deleted": False,
+        }
+    intent_id = str(intent["id"])
+    if str(intent.get("canonical_state")) == "canonical":
+        result: dict[str, Any] = {
+            **_result(
+                _STATUS_SKIPPED,
+                reason="already-canonical",
+                repo=intent.get("repo"),
+                branch=intent.get("branch"),
+                path=intent.get("path") or note_repo_path(str(slug).strip()),
+                operation="delete",
+            ),
+            "intent_id": intent_id,
+            "canonical_state": "canonical",
+            "projection_state": intent.get("projection_state") or "pending",
+            "retry_state": "none",
+        }
+    elif not intent.get("attempt_claimed"):
+        return {
+            **_result(_STATUS_SKIPPED, reason="attempt-in-progress"),
+            "intent_id": intent_id,
+            "canonical_state": intent.get("canonical_state") or "pending_sync",
+            "projection_state": intent.get("projection_state") or "pending",
+            "retry_state": intent.get("retry_state") or "retryable",
+            "row_deleted": False,
+        }
+    else:
+        result = await _attempt_delete_intent(
+            postgres_db=postgres_db,
+            gitea_client=gitea_client,
+            intent=intent,
+            project_id=project_id,
+            slug=slug,
+            job_id=job_id,
+            mutation=json.loads(payload),
+        )
+
+    row_deleted = False
+    if store is not None and _is_canonical(result):
+        row_deleted = await _drop_note_rows(
+            store=store,
+            project_id=project_id,
+            slug=str(slug).strip(),
+            path=str(result.get("path") or note_repo_path(str(slug).strip())),
+        )
+    return {**result, "row_deleted": row_deleted}
+
+
 async def retry_knowledge_materialization_intent(
     *, postgres_db: Any, gitea_client: Any, intent: dict[str, Any]
 ) -> dict[str, Any]:
     operation = str(intent.get("operation") or "")
+    if operation == "delete":
+        try:
+            mutation = json.loads(str(intent.get("content") or "{}"))
+        except (TypeError, ValueError):
+            mutation = {}
+        return await _attempt_delete_intent(
+            postgres_db=postgres_db,
+            gitea_client=gitea_client,
+            intent=intent,
+            project_id=str(intent["project_id"]),
+            slug=str(intent["note_id"]),
+            job_id=str(intent["job_id"]) if intent.get("job_id") else None,
+            mutation=mutation if isinstance(mutation, dict) else {},
+        )
     if operation == "metadata-update":
         try:
             mutation = json.loads(str(intent.get("content") or "{}"))

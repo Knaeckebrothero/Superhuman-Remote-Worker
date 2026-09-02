@@ -22646,6 +22646,13 @@ class PostgresDB:
         attempt_token = uuid4()
         async with self.acquire() as conn:
             async with conn.transaction():
+                # A newer write for the same note supersedes older PENDING
+                # intents so the sweep never replays stale bytes over it — but
+                # not an attempt that is still in flight (lease unexpired):
+                # that is a concurrent writer, and stealing its lease makes
+                # its own commit report `intent-lease-lost` even when the
+                # bytes landed (kb_gardening E4 S2). A crashed attempt's lease
+                # expires (300 s) and is superseded by the next write as before.
                 await conn.execute(
                     """
                     UPDATE knowledge_materialization_intents
@@ -22655,6 +22662,7 @@ class PostgresDB:
                      WHERE project_id = $1 AND note_id = $2
                        AND content_hash <> $3
                        AND canonical_state IN ('pending_sync', 'failed')
+                       AND COALESCE(lease_expires_at, 'epoch'::timestamptz) <= now()
                     """,
                     project_uuid,
                     str(note_id),

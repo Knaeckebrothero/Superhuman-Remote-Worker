@@ -252,7 +252,10 @@ class TestKnowledgeGatePositivePaths:
                     await delete_knowledge_note(
                         fake_request, str(project_a["id"]), "note-1"
                     )
-        assert exc.value.status_code == 500
+        # The gate passed (not 403); the mutation then failed downstream. Since
+        # kb_gardening G2 the delete goes through the ledgered materialize op
+        # first, whose failure surfaces as 502 (intent store unavailable here).
+        assert exc.value.status_code in (500, 502)
 
     @pytest.mark.asyncio
     async def test_export_member_passes_gate(

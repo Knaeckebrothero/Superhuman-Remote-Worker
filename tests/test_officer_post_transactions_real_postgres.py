@@ -1494,6 +1494,53 @@ async def test_bp08_materialization_lease_and_projection_converge_once(db):
 
 
 @pytest.mark.asyncio
+async def test_bp08_in_flight_lease_is_not_superseded_by_a_concurrent_writer(db):
+    """kb_gardening E4 S2: two writers with different bytes for one note.
+    The second `begin` must not steal the first's unexpired lease — that made
+    the first writer report `intent-lease-lost` after its commit had landed.
+    Only an expired (crashed) attempt is superseded by a newer write."""
+    seed = await _seed_post(db)
+    base = {
+        "project_id": seed["project_id"],
+        "note_id": "bp08-race",
+    }
+    first = await db.begin_knowledge_materialization(
+        **base, content="v1", content_hash="race-v1"
+    )
+    assert first["attempt_claimed"] is True
+    second = await db.begin_knowledge_materialization(
+        **base, content="v2", content_hash="race-v2"
+    )
+    assert second["attempt_claimed"] is True
+
+    # The first writer's lease survives, so its own finish still lands.
+    finished = await db.finish_knowledge_materialization(
+        str(first["id"]),
+        canonical=True,
+        attempt_token=str(first["attempt_token"]),
+        path="knowledge/bp08-race.md",
+    )
+    assert finished is not None
+    assert finished["canonical_state"] == "canonical"
+
+    # An expired lease IS superseded by the next write (crash recovery).
+    third = await db.begin_knowledge_materialization(
+        **base, content="v3", content_hash="race-v3", lease_seconds=0
+    )
+    assert third["attempt_claimed"] is True
+    fourth = await db.begin_knowledge_materialization(
+        **base, content="v4", content_hash="race-v4"
+    )
+    assert fourth["attempt_claimed"] is True
+    stolen = await db.finish_knowledge_materialization(
+        str(third["id"]),
+        canonical=True,
+        attempt_token=str(third["attempt_token"]),
+    )
+    assert stolen is None  # third's attempt was superseded; its lease is gone
+
+
+@pytest.mark.asyncio
 async def test_bp08_a_prior_canonical_payload_can_become_current_again(db):
     seed = await _seed_post(db)
 

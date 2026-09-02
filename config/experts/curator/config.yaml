@@ -42,6 +42,7 @@ tools:
   knowledge:
     - kb_write
     - kb_update
+    - kb_delete
     - kb_read
     - kb_search
     - kb_list
