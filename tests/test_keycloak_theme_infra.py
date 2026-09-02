@@ -404,23 +404,24 @@ def test_dev_users_render_and_satisfy_the_password_policy() -> None:
     assert "admin" not in users["dev-user-1"]["realmRoles"]
 
 
-def test_readme_dev_credentials_match_the_chart() -> None:
-    """README publishes these passwords; a drifted table sends developers to a
-    login that fails, or worse, understates which accounts actually exist."""
+def test_local_kubernetes_dev_credentials_match_the_chart() -> None:
+    """The local guide publishes these passwords; a drifted table sends
+    developers to a login that fails, or understates which accounts exist."""
     values = yaml.safe_load((ROOT / "helm/values.yaml").read_text())
     chart = {
         u["username"]: u["password"] for u in values["keycloak"]["devUsers"]["users"]
     }
-    readme = dict(
+    guide = dict(
         re.findall(
             r"^\|\s*`(dev-[a-z0-9-]+)`\s*\|\s*`([^`]+)`",
-            (ROOT / "README.md").read_text(),
+            (ROOT / "docs/local-kubernetes.md").read_text(),
             re.M,
         )
     )
-    assert readme == chart, (
-        "README dev-credentials table is out of sync with keycloak.devUsers in "
-        f"helm/values.yaml.\n  README: {readme}\n  chart:  {chart}"
+    assert guide == chart, (
+        "Local Kubernetes dev-credentials table is out of sync with "
+        "keycloak.devUsers in helm/values.yaml.\n"
+        f"  guide: {guide}\n  chart:  {chart}"
     )
 
 

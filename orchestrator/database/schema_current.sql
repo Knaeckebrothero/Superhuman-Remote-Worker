@@ -18355,13 +18355,6 @@ COMMENT ON COLUMN public.thread_input_deliveries.cancelled_turn_number IS 'Exact
 
 
 --
--- Name: COLUMN thread_input_deliveries.supersedes_input_seq; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.thread_input_deliveries.supersedes_input_seq IS 'For a foreground-child recovery event, the exact abandoned parent input sequence replaced by this evidence/continuation turn. NULL otherwise.';
-
-
---
 -- Name: COLUMN thread_input_deliveries.cancelled_reason; Type: COMMENT; Schema: public; Owner: -
 --
 
@@ -18394,6 +18387,13 @@ COMMENT ON COLUMN public.thread_input_deliveries.owner_executor IS 'Stateless ex
 --
 
 COMMENT ON COLUMN public.thread_input_deliveries.owner_executor_pod_uid IS 'Kubernetes Pod UID snapshot for the stateless delivery claimant.';
+
+
+--
+-- Name: COLUMN thread_input_deliveries.supersedes_input_seq; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_input_deliveries.supersedes_input_seq IS 'For a foreground-child recovery event, the exact abandoned parent input sequence replaced by this evidence/continuation turn. NULL otherwise.';
 
 
 --
@@ -22956,17 +22956,17 @@ CREATE INDEX idx_threads_awaiting_user_since ON public.threads USING btree (awai
 
 
 --
--- Name: idx_threads_parent_job; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX idx_threads_parent_job ON public.threads USING btree (parent_job_id) WHERE (parent_job_id IS NOT NULL);
-
-
---
 -- Name: idx_threads_job_parent_tool_call; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE UNIQUE INDEX idx_threads_job_parent_tool_call ON public.threads USING btree (parent_job_id, parent_tool_call_id) WHERE ((kind = 'subagent'::text) AND (parent_job_id IS NOT NULL) AND (parent_thread_id IS NULL) AND (parent_tool_call_id IS NOT NULL));
+
+
+--
+-- Name: idx_threads_parent_job; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_threads_parent_job ON public.threads USING btree (parent_job_id) WHERE (parent_job_id IS NOT NULL);
 
 
 --
@@ -22977,17 +22977,17 @@ CREATE INDEX idx_threads_parent_thread ON public.threads USING btree (parent_thr
 
 
 --
--- Name: idx_threads_session_parent_tool_call; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE UNIQUE INDEX idx_threads_session_parent_tool_call ON public.threads USING btree (parent_thread_id, parent_tool_call_id) WHERE ((kind = 'subagent'::text) AND (parent_job_id IS NULL) AND (parent_thread_id IS NOT NULL) AND (parent_tool_call_id IS NOT NULL));
-
-
---
 -- Name: idx_threads_project; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_threads_project ON public.threads USING btree (project_id);
+
+
+--
+-- Name: idx_threads_session_parent_tool_call; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX idx_threads_session_parent_tool_call ON public.threads USING btree (parent_thread_id, parent_tool_call_id) WHERE ((kind = 'subagent'::text) AND (parent_job_id IS NULL) AND (parent_thread_id IS NOT NULL) AND (parent_tool_call_id IS NOT NULL));
 
 
 --

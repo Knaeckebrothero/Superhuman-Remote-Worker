@@ -62,7 +62,7 @@ orchestrator/services/container_provisioner.py  ContainerProvisioner._wait_for_r
 orchestrator/services/container_provisioner.py  ContainerProvisioner._wait_for_ready  ssh  wait_for_agent_ssh  0b47eaccbfa8  #1  pinned-host-key
 orchestrator/services/container_provisioner.py  ContainerProvisioner.release_workspace  remote-effect  self._snapshot_service.capture_vm_snapshot  8fbdf2e3ec4d  #1  fresh-k8s-attestation
 orchestrator/services/container_provisioner.py  ContainerProvisioner.wait_for_workspace_code_server  http  client.get  26953bc71144  #1  fresh-k8s-attestation
-orchestrator/services/ide_proxy.py  IdeProxyService._attest_k8s_target  remote-effect  IdeProxyTarget  6a87e9531a9a  #1  fresh-k8s-attestation
+orchestrator/services/ide_proxy.py  IdeProxyService._attest_k8s_target  remote-effect  IdeProxyTarget  e974ce0ee82c  #1  fresh-k8s-attestation
 orchestrator/services/ide_session.py  IdeSessionService._clone_gitea_to_vm  ssh  self._install_and_sync_managed_repository_over_ssh  c6fb8c5b7144  #1  vm-authority
 orchestrator/services/ide_session.py  IdeSessionService._current_ide_restore_runtime  http  session.get  a5f7a072e653  #1  fresh-k8s-attestation
 orchestrator/services/ide_session.py  IdeSessionService._extract_snapshot_to_k8s_pod  remote-effect  stream_extract_snapshot  82b5dd0c4392  #1  fresh-k8s-attestation
