@@ -298,6 +298,8 @@ def freeze_spec(spec: Mapping[str, Any]) -> dict[str, Any]:
             frozen_arm["config_name"] = canonical_config_name(str(arm["config_name"]))
         if arm.get("expert_id"):
             frozen_arm["expert_id"] = str(arm["expert_id"])
+        if arm.get("project_id"):
+            frozen_arm["project_id"] = str(arm["project_id"])
         if arm.get("execution_lane"):
             frozen_arm["execution_lane"] = str(arm["execution_lane"])
         arms.append(frozen_arm)
@@ -613,6 +615,7 @@ def build_bench_job_payload(
         # DB-backed experts use worker_base as their structural base, matching
         # the public create-job contract.
         config_name = "worker_base"
+    project_id = arm.get("project_id") or spec.get("project_id")
 
     return {
         "description": str(task["description"]),
@@ -622,7 +625,7 @@ def build_bench_job_payload(
         "context": context,
         "required_deliverables": required_deliverables or None,
         "user_id": str(run["created_by"]),
-        "project_id": str(spec["project_id"]) if spec.get("project_id") else None,
+        "project_id": str(project_id) if project_id else None,
         # Bench replicas must be reproducible. Never let an omitted selection
         # resolve against ambient auto-attach preferences that can change
         # between arms or replicas. A future connector-aware bench contract

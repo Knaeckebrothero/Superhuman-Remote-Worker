@@ -48,6 +48,13 @@ class BenchArmSpec(BaseModel):
     name: str = Field(..., min_length=1, max_length=200)
     config_name: str | None = Field(None, min_length=1, max_length=300)
     expert_id: UUID | None = None
+    project_id: UUID | None = Field(
+        None,
+        description=(
+            "Project used by this arm. Omitted arms inherit the run project. "
+            "Per-arm projects keep memory state from coupling A/B treatments."
+        ),
+    )
     config_override: dict[str, Any] = Field(default_factory=dict)
     model: str = Field(..., min_length=1, max_length=300)
     execution_lane: Literal["pinned", "stateless"] | None = Field(
@@ -219,6 +226,32 @@ async def create_run(request: Request, body: BenchRunCreate) -> dict[str, Any]:
             allow_archived=False,
         )
     payload["project_id"] = requested_project
+
+    # A paired run must be able to isolate each arm's project memory without
+    # splitting the arms into separate (and therefore non-adjacent) runs. Each
+    # explicit arm project receives the same scope/membership check as the run
+    # default; an omitted value inherits the already-validated run project.
+    checked_arm_projects: set[str] = set()
+    for arm in payload["arms"]:
+        arm_project = arm.get("project_id")
+        if arm_project is None:
+            continue
+        arm_project_id = str(arm_project)
+        if scoped_project is not None and arm_project_id != str(scoped_project):
+            raise HTTPException(
+                status_code=403,
+                detail="Bench arm is outside the token's project scope",
+            )
+        if arm_project_id not in checked_arm_projects:
+            await require_project_member(
+                request,
+                postgres_db,
+                arm_project_id,
+                min_role="editor",
+                allow_archived=False,
+            )
+            checked_arm_projects.add(arm_project_id)
+        arm["project_id"] = arm_project_id
 
     # Fail invalid tool vocabularies at run creation rather than persisting a
     # run whose sweeper can never create its first job. The regular handler

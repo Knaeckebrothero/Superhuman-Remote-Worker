@@ -9,7 +9,10 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from fastapi import HTTPException
+from starlette.requests import Request
 
+from routers import bench as bench_router
 from services.bench import (
     BenchStore,
     build_bench_job_payload,
@@ -21,6 +24,17 @@ from services.bench import (
 
 RUN_ID = "11111111-1111-1111-1111-111111111111"
 USER_ID = "22222222-2222-2222-2222-222222222222"
+
+
+def _request() -> Request:
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/bench/runs",
+            "headers": [],
+        }
+    )
 
 
 def _spec(*, max_in_flight: int = 2, replicates: int = 1) -> dict:
@@ -274,6 +288,122 @@ def test_omitted_lane_stays_none_so_existing_specs_are_unchanged():
         build_bench_job_payload(run, run["spec"]["tasks"][0], arm, 1)["execution_lane"]
         is None
     )
+
+
+def test_arm_project_is_frozen_and_overrides_the_run_project():
+    """Paired treatments need separate memory pools without separate runs."""
+
+    run_project = "33333333-3333-3333-3333-333333333333"
+    legacy_project = "44444444-4444-4444-4444-444444444444"
+    skills_project = "55555555-5555-5555-5555-555555555555"
+    spec = freeze_spec(
+        {
+            "tasks": [{"id": "t1", "description": "task"}],
+            "replicates": 1,
+            "max_in_flight": 1,
+            "project_id": run_project,
+            "arms": [
+                {
+                    "name": "legacy",
+                    "model": "m",
+                    "project_id": legacy_project,
+                },
+                {
+                    "name": "skills",
+                    "model": "m",
+                    "project_id": skills_project,
+                },
+                {"name": "inherited", "model": "m"},
+            ],
+        }
+    )
+    assert [arm.get("project_id") for arm in spec["arms"]] == [
+        legacy_project,
+        skills_project,
+        None,
+    ]
+
+    run = {"id": RUN_ID, "created_by": USER_ID, "spec": spec}
+    task = spec["tasks"][0]
+    assert [
+        build_bench_job_payload(run, task, arm, 1)["project_id"] for arm in spec["arms"]
+    ] == [legacy_project, skills_project, run_project]
+
+
+@pytest.mark.asyncio
+async def test_create_run_validates_and_persists_each_arm_project(monkeypatch):
+    import main
+
+    legacy_project = "44444444-4444-4444-4444-444444444444"
+    skills_project = "55555555-5555-5555-5555-555555555555"
+    caller = {"id": USER_ID, "is_admin": False, "scopes": []}
+    require_member = AsyncMock()
+    create = AsyncMock(return_value={"id": RUN_ID, "status": "running"})
+    monkeypatch.setattr(
+        bench_router, "require_approved_user", AsyncMock(return_value=caller)
+    )
+    monkeypatch.setattr(bench_router, "require_project_member", require_member)
+    monkeypatch.setattr(bench_router, "create_bench_run", create)
+    monkeypatch.setattr(main, "postgres_db", MagicMock())
+    monkeypatch.setattr(main, "_with_validated_tool_overrides", lambda value: value)
+
+    body = bench_router.BenchRunCreate(
+        name="paired",
+        tasks=[{"id": "t1", "description": "task"}],
+        replicates=1,
+        max_in_flight=1,
+        arms=[
+            {"name": "legacy", "model": "m", "project_id": legacy_project},
+            {"name": "skills", "model": "m", "project_id": skills_project},
+        ],
+    )
+    await bench_router.create_run(_request(), body)
+
+    assert [call.args[2] for call in require_member.await_args_list] == [
+        legacy_project,
+        skills_project,
+    ]
+    frozen_input = create.await_args.kwargs["spec"]
+    assert [arm["project_id"] for arm in frozen_input["arms"]] == [
+        legacy_project,
+        skills_project,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_create_run_rejects_arm_outside_token_project_scope(monkeypatch):
+    import main
+
+    allowed_project = "33333333-3333-3333-3333-333333333333"
+    other_project = "44444444-4444-4444-4444-444444444444"
+    caller = {
+        "id": USER_ID,
+        "is_admin": False,
+        "scopes": [f"project:{allowed_project}"],
+    }
+    monkeypatch.setattr(
+        bench_router, "require_approved_user", AsyncMock(return_value=caller)
+    )
+    require_member = AsyncMock()
+    monkeypatch.setattr(bench_router, "require_project_member", require_member)
+
+    body = bench_router.BenchRunCreate(
+        name="paired",
+        tasks=[{"id": "t1", "description": "task"}],
+        replicates=1,
+        max_in_flight=1,
+        arms=[{"name": "legacy", "model": "m", "project_id": other_project}],
+    )
+    with pytest.raises(HTTPException, match="outside the token's project scope") as exc:
+        await bench_router.create_run(_request(), body)
+
+    assert exc.value.status_code == 403
+    assert require_member.await_count == 1
+    assert require_member.await_args.args[1:] == (main.postgres_db, allowed_project)
+    assert require_member.await_args.kwargs == {
+        "min_role": "editor",
+        "allow_archived": False,
+    }
 
 
 def test_seeded_queue_is_stable_and_skips_ledger_entries():

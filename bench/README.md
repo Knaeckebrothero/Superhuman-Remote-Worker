@@ -112,7 +112,9 @@ absent from v1 — they change as the repo changes, which breaks pinning.
 
 - **Two-arm runs:** `submit.py --server` builds a single arm only. For A/Bs,
   build the spec yourself (tasks from `tasks.yaml`, `arms: [{name, model,
-  config_override}, ...]`) and POST `/api/bench/runs` directly. The sweeper
+  config_override, project_id}, ...]`) and POST `/api/bench/runs` directly.
+  Give each arm its own `project_id` when memory coupling could leak the
+  treatment; an arm without one inherits the run-level project. The sweeper
   schedules arms adjacent within each replicate's shuffled wave — that
   adjacency is what neutralizes time-varying confounds (pool growth,
   contention), so never split arms across runs or clusters.
