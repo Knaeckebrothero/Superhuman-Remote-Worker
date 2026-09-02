@@ -179,4 +179,4 @@ USER srw
 EXPOSE 8001
 EXPOSE 8002
 
-CMD ["sh", "-c", "python agent.py --config ${AGENT_CONFIG} --port ${AGENT_PORT} --host 0.0.0.0"]
+CMD ["sh", "-c", "exec python agent.py --config ${AGENT_CONFIG} --port ${AGENT_PORT} --host 0.0.0.0"]

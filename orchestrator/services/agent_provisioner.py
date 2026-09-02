@@ -2384,7 +2384,12 @@ class AgentProvisioner:
                 "name": "agent",
                 "image": self._agent_image,
                 "imagePullPolicy": "IfNotPresent",
-                "command": ["sh", "-c", command],
+                # The shell is needed to keep the command construction shared
+                # with older manifests, but it must not remain PID 1.  Without
+                # ``exec`` kubelet's SIGTERM stops at ``sh`` and the Python
+                # drain handler never runs; the pod survives until SIGKILL at
+                # the end of its termination grace period.
+                "command": ["sh", "-c", f"exec {command}"],
                 "ports": [{"containerPort": 8001}],
                 # Inject all env from shared ConfigMap + Secret
                 "envFrom": [

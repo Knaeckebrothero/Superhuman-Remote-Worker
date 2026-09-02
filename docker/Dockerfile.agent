@@ -163,4 +163,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:${AGENT_PORT}/health || exit 1
 
 # Run the Universal Agent with config from environment
-CMD ["sh", "-c", "python agent.py --config ${AGENT_CONFIG} --port ${AGENT_PORT} --host 0.0.0.0"]
+CMD ["sh", "-c", "exec python agent.py --config ${AGENT_CONFIG} --port ${AGENT_PORT} --host 0.0.0.0"]

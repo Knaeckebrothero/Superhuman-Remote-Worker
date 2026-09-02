@@ -1878,7 +1878,7 @@ class PersistentProvisioner:
                         "command": [
                             "sh",
                             "-c",
-                            f"python agent.py"
+                            f"exec python agent.py"
                             f" --mode persistent"
                             f" --thread-id {thread_id}"
                             f" --config {config_name}"

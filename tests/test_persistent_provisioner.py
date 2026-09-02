@@ -310,6 +310,7 @@ class TestPodManifest:
     def test_command_includes_thread_id_and_config(self):
         m = self._build(thread_id="my-thread-uuid", config_name="developer")
         cmd = m["spec"]["containers"][0]["command"][2]
+        assert cmd.startswith("exec python agent.py ")
         assert "--mode persistent" in cmd
         assert "--thread-id my-thread-uuid" in cmd
         assert "--config developer" in cmd

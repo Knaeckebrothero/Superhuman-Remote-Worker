@@ -1675,6 +1675,38 @@ def test_pod_manifest_checks_readiness_immediately_after_startup_probe():
     assert container["readinessProbe"]["initialDelaySeconds"] == 0
 
 
+@pytest.mark.parametrize(
+    ("purpose", "thread_id", "expected_mode"),
+    [
+        ("job", None, "--config developer"),
+        (
+            "session",
+            "11111111-2222-3333-4444-555555555555",
+            "--mode persistent",
+        ),
+    ],
+)
+def test_pod_manifest_execs_python_as_pid_one(purpose, thread_id, expected_mode):
+    """Kubelet SIGTERM must reach the agent's graceful-drain handler."""
+    p = _bare_provisioner_for_manifest()
+
+    manifest = p._build_pod_manifest(
+        pod_name=f"srw-agent-{purpose}-deadbeef",
+        purpose=purpose,
+        thread_id=thread_id,
+        config_name="developer",
+        cpu_request="100m",
+        memory_request="256Mi",
+        cpu_limit="1",
+        memory_limit="2Gi",
+    )
+
+    command = manifest["spec"]["containers"][0]["command"]
+    assert command[:2] == ["sh", "-c"]
+    assert command[2].startswith("exec python agent.py ")
+    assert expected_mode in command[2]
+
+
 def test_pod_manifest_injects_pod_uid_via_downward_api():
     """Each agent pod has POD_UID env populated from the K8s downward API
     so the agent can report its own metadata.uid back to the orchestrator
