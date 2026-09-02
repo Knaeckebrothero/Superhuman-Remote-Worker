@@ -59,6 +59,10 @@ DEPENDENCY_IMAGES: Final = (
 )
 PLAYWRIGHT_VERSION_FILE: Final = REPO_ROOT / ".playwright-version"
 NAMESPACE: Final = "srw-e2e"
+# helm/Chart.lock pins the Collabora subchart. With a lock file present,
+# `helm dependency build` refuses to resolve a repository URL that is not
+# registered, so the repo must be added first on every fresh runner.
+COLLABORA_HELM_REPOSITORY: Final = "https://collaboraonline.github.io/online"
 RELEASE: Final = "srw-e2e"
 BASE_HOST: Final = "srw-e2e.test"
 BASE_URL: Final = f"http://{BASE_HOST}"
@@ -1976,10 +1980,34 @@ class ApplicationE2EHarness:
         image_values = self._run_dir(ledger) / "values-images.yaml"
         profile = profile_from_ledger(ledger)
         self.runner.run(
+            [
+                "helm",
+                "repo",
+                "add",
+                "collabora",
+                COLLABORA_HELM_REPOSITORY,
+                "--force-update",
+            ],
+            timeout=120,
+            label="Collabora Helm repository registration",
+        )
+        dependency_result = self.runner.run(
             ["helm", "dependency", "build", str(REPO_ROOT / "helm")],
+            check=False,
             timeout=300,
             label="Helm dependency build",
         )
+        _atomic_private_write(
+            self._run_dir(ledger) / "helm-dependency-build.txt",
+            bound_diagnostic(
+                sanitize_diagnostic(dependency_result.stdout + dependency_result.stderr)
+            ),
+        )
+        if dependency_result.returncode:
+            raise HarnessError(
+                "Helm dependency build failed with exit code "
+                f"{dependency_result.returncode}"
+            )
         lint_command = ["helm", "lint", str(REPO_ROOT / "helm")]
         for values_file in profile.values_files:
             lint_command.extend(("-f", str(values_file)))
@@ -2737,6 +2765,7 @@ class ApplicationE2EHarness:
                 for index in range(1, len(DEPENDENCY_IMAGES) + 1)
             ),
             "image-import-application.txt",
+            "helm-dependency-build.txt",
         ]
         for filename in setup_logs:
             source = run_dir / filename

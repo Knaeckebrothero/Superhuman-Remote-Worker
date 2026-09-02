@@ -1246,3 +1246,84 @@ def test_generated_app_secret_covers_every_required_rendered_key() -> None:
         "key": "PERSISTENT_AGENT_IMAGE_PULL_POLICY",
         "optional": True,
     }
+
+
+def _deploy_chart_fixture(tmp_path: Path) -> tuple[harness.StateStore, dict]:
+    store = harness.StateStore(tmp_path / "state")
+    ledger = store.initialize("20260824-123456-ab12cd34")
+    return store, ledger
+
+
+def test_deploy_chart_registers_collabora_repo_before_dependency_build(
+    tmp_path: Path,
+) -> None:
+    store, ledger = _deploy_chart_fixture(tmp_path)
+    runner = FakeRunner(
+        [
+            harness.CommandResult(0),
+            harness.CommandResult(
+                1,
+                "",
+                "Error: no repository definition for "
+                "https://collaboraonline.github.io/online\n",
+            ),
+        ]
+    )
+
+    with pytest.raises(harness.HarnessError, match="Helm dependency build failed"):
+        harness.ApplicationE2EHarness(store.root, runner).deploy_chart(ledger)
+
+    assert runner.commands == [
+        [
+            "helm",
+            "repo",
+            "add",
+            "collabora",
+            "https://collaboraonline.github.io/online",
+            "--force-update",
+        ],
+        ["helm", "dependency", "build", str(harness.REPO_ROOT / "helm")],
+    ]
+
+
+def test_deploy_chart_persists_helm_dependency_output_when_the_build_fails(
+    tmp_path: Path,
+) -> None:
+    store, ledger = _deploy_chart_fixture(tmp_path)
+    runner = FakeRunner(
+        [
+            harness.CommandResult(0),
+            harness.CommandResult(
+                1,
+                "",
+                "Error: no repository definition for "
+                "https://collaboraonline.github.io/online\n",
+            ),
+        ]
+    )
+
+    with pytest.raises(harness.HarnessError):
+        harness.ApplicationE2EHarness(store.root, runner).deploy_chart(ledger)
+
+    output = (Path(ledger["run_dir"]) / "helm-dependency-build.txt").read_text(
+        encoding="utf-8"
+    )
+    assert "no repository definition" in output
+
+
+def test_diagnostics_collects_the_helm_dependency_build_output(
+    tmp_path: Path,
+) -> None:
+    store, ledger = _deploy_chart_fixture(tmp_path)
+    run_dir = Path(ledger["run_dir"])
+    (run_dir / "helm-dependency-build.txt").write_text(
+        "Error: no repository definition for https://collaboraonline.github.io/online\n",
+        encoding="utf-8",
+    )
+
+    diagnostics_dir = harness.ApplicationE2EHarness(
+        store.root, FakeRunner([])
+    ).diagnostics(ledger)
+
+    copied = (diagnostics_dir / "helm-dependency-build.txt").read_text(encoding="utf-8")
+    assert "no repository definition" in copied
