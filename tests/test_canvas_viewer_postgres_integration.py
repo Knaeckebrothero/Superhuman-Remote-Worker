@@ -239,9 +239,7 @@ async def test_cnpg_acl_path_needs_only_unprivileged_object_owner() -> None:
             f"ALTER DATABASE {database_identifier} OWNER TO {_OWNER_ROLE}"
         )
         for relation in _GATEWAY_RELATIONS:
-            await admin.execute(
-                f"ALTER TABLE public.{relation} OWNER TO {_OWNER_ROLE}"
-            )
+            await admin.execute(f"ALTER TABLE public.{relation} OWNER TO {_OWNER_ROLE}")
 
         owner_url = _database_url_for(_OWNER_ROLE, _OWNER_PASSWORD)
         _run_packaged_sql(owner_url, "canvas-viewer-role-safety.sql")
