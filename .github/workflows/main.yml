@@ -384,7 +384,13 @@ jobs:
   test-python:
     needs: [lint]
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 25, not 15: the suite is ~22.6k tests and takes ~14 min of test time on
+    # ubuntu-latest plus ~2 min of job setup. At 15 the 2026-09-02 develop run
+    # was killed at 91% while still progressing at full speed (46 progress
+    # marks in its final two minutes, largest single gap 62 s: no hang), and
+    # a timed-out job reports as 'cancelled', which the build jobs treat as a
+    # failure: nothing built and no chart published for that push.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
