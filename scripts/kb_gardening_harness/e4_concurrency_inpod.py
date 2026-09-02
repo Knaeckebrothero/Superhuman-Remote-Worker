@@ -4,7 +4,13 @@ orchestrator pod (python3 - < this file), where MCP_INTERNAL_KEY is in env.
 Usage: PROJECT=<uuid> python3 e4_concurrency_inpod.py
 Prints one line per step; final line is a JSON summary.
 """
-import hashlib, json, os, sys, threading, time, urllib.request
+
+import hashlib
+import json
+import os
+import threading
+import time
+import urllib.request
 
 BASE = os.environ.get("ORCHESTRATOR_URL", "http://localhost:8085").rstrip("/")
 KEY = os.environ["MCP_INTERNAL_KEY"]
@@ -20,7 +26,7 @@ def blob_sha(text):
 
 def note(version):
     return (
-        f"---\nid: {SLUG}\ntype: state\ndescription: \"E4 concurrency probe\"\n"
+        f'---\nid: {SLUG}\ntype: state\ndescription: "E4 concurrency probe"\n'
         f"tags: [e4, probe]\nstatus: active\ncreated: 2026-09-02T19:00:00+00:00\n"
         f"modified: 2026-09-02T19:0{version}:00+00:00\n---\n# E4 probe\n\nversion {version}\n"
     )
@@ -53,20 +59,35 @@ def delete(expected=None, reason="e4 probe"):
 
 def race(fn_a, fn_b):
     out = [None, None]
+
     def run(i, fn):
         try:
             out[i] = fn()
         except Exception as e:  # noqa: BLE001
             out[i] = {"status": "exception", "reason": repr(e)[:120]}
-    ta, tb = threading.Thread(target=run, args=(0, fn_a)), threading.Thread(target=run, args=(1, fn_b))
-    ta.start(); tb.start(); ta.join(); tb.join()
+
+    ta, tb = (
+        threading.Thread(target=run, args=(0, fn_a)),
+        threading.Thread(target=run, args=(1, fn_b)),
+    )
+    ta.start()
+    tb.start()
+    ta.join()
+    tb.join()
     return out
 
 
 summary = {}
 v1 = note(1)
 r = mat(v1)
-print("S1 create v1:", r.get("status"), r.get("reason"), "indexed=", r.get("indexed"), r.get("index_reason"))
+print(
+    "S1 create v1:",
+    r.get("status"),
+    r.get("reason"),
+    "indexed=",
+    r.get("indexed"),
+    r.get("index_reason"),
+)
 summary["create"] = r.get("status")
 sha1 = blob_sha(v1)
 
@@ -100,7 +121,13 @@ r = delete(expected="0" * 40)
 print("S5a delete with WRONG token:", r.get("status"), r.get("reason"))
 summary["delete_wrong_token"] = (r.get("status"), r.get("reason"))
 r = delete(expected=sha7)
-print("S5b delete with RIGHT token:", r.get("status"), r.get("reason"), "row_deleted=", r.get("row_deleted"))
+print(
+    "S5b delete with RIGHT token:",
+    r.get("status"),
+    r.get("reason"),
+    "row_deleted=",
+    r.get("row_deleted"),
+)
 summary["delete_cas"] = (r.get("status"), r.get("reason"), r.get("row_deleted"))
 
 # S6 — the resurrection hole: a rewrite carrying the pre-delete token must NOT re-create the file
@@ -115,7 +142,12 @@ summary["delete_idempotent"] = (r.get("status"), r.get("reason"))
 
 # S8 — an UNCONDITIONAL rewrite after delete re-creates (documented: no token = old behaviour)
 r = mat(note(9))
-print("S8 unconditional rewrite after delete:", r.get("status"), r.get("reason"), r.get("operation"))
+print(
+    "S8 unconditional rewrite after delete:",
+    r.get("status"),
+    r.get("reason"),
+    r.get("operation"),
+)
 summary["unconditional_recreates"] = (r.get("status"), r.get("operation"))
 r = delete(expected=None, reason="e4 cleanup")
 print("S9 cleanup delete:", r.get("status"), r.get("reason"))
