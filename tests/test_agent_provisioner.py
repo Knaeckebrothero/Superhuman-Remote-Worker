@@ -1653,6 +1653,26 @@ def test_pod_manifest_omits_thread_id_label_for_worker():
     assert "srw/thread-id" not in labels
 
 
+def test_pod_manifest_checks_readiness_immediately_after_startup_probe():
+    p = _bare_provisioner_for_manifest()
+
+    manifest = p._build_pod_manifest(
+        pod_name="srw-agent-j-deadbeef",
+        purpose="job",
+        thread_id=None,
+        config_name="developer",
+        cpu_request="100m",
+        memory_request="256Mi",
+        cpu_limit="1",
+        memory_limit="2Gi",
+    )
+
+    container = manifest["spec"]["containers"][0]
+    assert container["startupProbe"]["httpGet"]["path"] == "/health"
+    assert container["readinessProbe"]["httpGet"]["path"] == "/ready"
+    assert container["readinessProbe"]["initialDelaySeconds"] == 0
+
+
 def test_pod_manifest_injects_pod_uid_via_downward_api():
     """Each agent pod has POD_UID env populated from the K8s downward API
     so the agent can report its own metadata.uid back to the orchestrator

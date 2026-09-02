@@ -2502,7 +2502,13 @@ class AgentProvisioner:
                 },
                 "readinessProbe": {
                     "httpGet": {"path": "/ready", "port": 8001},
-                    "initialDelaySeconds": 30,
+                    # startupProbe already gates readiness checks until the
+                    # HTTP server is alive. A second 30s delay let the agent
+                    # register ready while Kubernetes still reported the
+                    # container unready; dispatch then claimed the job before
+                    # exact Pod attestation could succeed and waited for lease
+                    # recovery. Probe /ready immediately after startup clears.
+                    "initialDelaySeconds": 0,
                     "periodSeconds": 10,
                     # Same event-loop tax as the liveness probe above: the 1s
                     # default trips on a transient stall and drops the pod from

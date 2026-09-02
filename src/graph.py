@@ -3060,6 +3060,32 @@ def create_check_todos_node(
         # Validate todos exist before checking completion
         todos = todo_manager.list_all()
         if not todos:
+            # A finalization tool can be called immediately after a completed
+            # phase was archived but its unstaged transition was rejected. In
+            # that state the manager is intentionally empty. Reloading seed
+            # todos before honoring the journaled decision creates an
+            # impossible loop: every repeat of job_complete says the job is
+            # already final while check_todos keeps manufacturing new work.
+            # Route the empty final phase to its normal archive/transition
+            # finalizer. The durable decision mirrors are authoritative even
+            # if the last-writer-wins boolean was lost on checkpoint restore.
+            if (
+                state.get("is_final_phase", False)
+                or state.get("completion_decision")
+                or state.get("verdict_decision")
+            ):
+                todo_state = todo_manager.export_state()
+                logger.info(
+                    f"[{job_id}] Empty final phase detected - completing without "
+                    "reloading predefined todos"
+                )
+                return {
+                    "phase_complete": True,
+                    "todos": todo_state["todos"],
+                    "staged_todos": todo_state["staged_todos"],
+                    "todo_next_id": todo_state["next_id"],
+                }
+
             # Check if we're in tactical phase with no todos - this is a stuck state
             # (can happen after resume if todo state wasn't persisted)
             is_strategic = state.get("is_strategic_phase", True)

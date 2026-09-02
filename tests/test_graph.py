@@ -275,6 +275,28 @@ class TestCheckTodosNode:
         assert "todos" in result
         assert result["todos"][0]["status"] == "completed"
 
+    @pytest.mark.parametrize(
+        "decision_field", ["is_final_phase", "completion_decision", "verdict_decision"]
+    )
+    def test_empty_final_phase_does_not_reload_seed_todos(
+        self, managers, mock_config, decision_field
+    ):
+        node = create_check_todos_node(managers["todo"], mock_config)
+        decision = True if decision_field == "is_final_phase" else {"recorded": True}
+
+        result = node(
+            {
+                "job_id": "final-after-archive",
+                "iteration": 12,
+                "is_strategic_phase": True,
+                decision_field: decision,
+            }
+        )
+
+        assert result["phase_complete"] is True
+        assert result["todos"] == []
+        assert managers["todo"].list_all() == []
+
     def test_due_batch_freezes_only_at_safe_todo_check(self, managers, mock_config):
         managers["todo"].add("Task still in progress")
         node = create_check_todos_node(managers["todo"], mock_config)
