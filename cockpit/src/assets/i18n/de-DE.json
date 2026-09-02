@@ -3513,6 +3513,7 @@
     "notQueued": "nicht eingereiht"
   },
   "conferenceLauncher": {
+    "missingProject": "Die Adresse nennt kein Projekt.",
     "opening": "Konferenz wird geöffnet …",
     "error": "Konferenz konnte nicht geöffnet werden:",
     "back": "Zurück zum Projekt"

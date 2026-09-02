@@ -3513,6 +3513,7 @@
     "notQueued": "not queued"
   },
   "conferenceLauncher": {
+    "missingProject": "The address names no project.",
     "opening": "Opening the conference…",
     "error": "Could not open the conference:",
     "back": "Back to the project"

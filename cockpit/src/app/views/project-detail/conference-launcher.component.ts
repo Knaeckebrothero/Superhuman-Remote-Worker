@@ -62,7 +62,7 @@ export class ConferenceLauncherComponent implements OnInit {
   async ngOnInit(): Promise<void> {
     const projectId = this.route.snapshot.paramMap.get('id') ?? '';
     if (!projectId) {
-      this.error.set('missing project');
+      this.error.set(this.transloco.translate('conferenceLauncher.missingProject'));
       return;
     }
     const project = await firstValueFrom(this.api.getProject(projectId)).catch(() => null);
