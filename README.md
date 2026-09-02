@@ -1,6 +1,6 @@
 # Superhuman Remote Worker
 
-**Experts you can share, not agents you build.**
+**Stop building agents. Start delegating work.**
 
 [![Main CI](https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/actions/workflows/main.yml/badge.svg)](https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/actions/workflows/main.yml)
 [![Latest tag](https://img.shields.io/github/v/tag/Knaeckebrothero/Superhuman-Remote-Worker?label=release)](https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/tags)
@@ -10,7 +10,7 @@
 [Documentation](docs/README.md) ·
 [Helm install](helm/README.md)
 
-[![SRW — Experts you can share, not agents you build](docs/assets/readme-hero.png)](https://superhuman-remote-worker.com/)
+[![SRW — Stop building agents. Start delegating work.](docs/assets/readme-hero.png)](https://superhuman-remote-worker.com/)
 
 Superhuman Remote Worker (SRW) is a self-hosted platform for agents that need
 more than a chat window. It combines a web cockpit, a Kubernetes control plane,
