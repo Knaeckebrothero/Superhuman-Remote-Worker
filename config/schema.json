@@ -2015,6 +2015,12 @@
           "enum": ["skills", "legacy"],
           "default": "skills",
           "description": "How the worker receives its phase guidance (U2). `skills` (default): one phase-agnostic system prompt; the strategic-phase / tactical-phase skills are delivered once per concrete phase through their phase_start bindings as persistent, protected messages. `legacy`: the pre-U2 swap — strategic.txt / tactical.txt (and their model-family variants) rendered into the system prompt every turn, phase-filtered tool bindings, no phase-skill blocks. Kept only so the U2 bench can run both arms on one image; removed with the family variants (U2 WP6). Flows through config_override like every phase_settings key; the frozen config decides for an in-flight job."
+        },
+        "tool_binding_mode": {
+          "type": "string",
+          "enum": ["auto", "union"],
+          "default": "auto",
+          "description": "Temporary U2 WP5 attribution control. `auto` preserves shipped behavior (`skills` uses one stable union schema; `legacy` uses phase-filtered schemas). `union` permits the planned arm C—legacy phase prose with the skills arm's stable schema. Removed with the legacy path in WP6."
         }
       },
       "additionalProperties": false

@@ -984,12 +984,23 @@ class TestPromptMode:
             assert "{prompt_content}" not in out and "END" in out
 
     def test_prompt_mode_validates(self):
-        from src.core.loader import PhaseSettings
+        from src.core.loader import (
+            TOOL_BINDING_MODE_AUTO,
+            TOOL_BINDING_MODE_UNION,
+            PhaseSettings,
+        )
 
         assert PhaseSettings().prompt_mode == "skills"
+        assert PhaseSettings().tool_binding_mode == TOOL_BINDING_MODE_AUTO
         assert PhaseSettings(prompt_mode="legacy").prompt_mode == "legacy"
+        assert (
+            PhaseSettings(tool_binding_mode="union").tool_binding_mode
+            == TOOL_BINDING_MODE_UNION
+        )
         with pytest.raises(ValueError, match="prompt_mode"):
             PhaseSettings(prompt_mode="bogus")
+        with pytest.raises(ValueError, match="tool_binding_mode"):
+            PhaseSettings(tool_binding_mode="bogus")
         with pytest.raises(ValueError, match="prompt_mode"):
             load_agent_config_from_dict(
                 {
@@ -1008,15 +1019,43 @@ class TestPromptMode:
 
         data = deep_merge(
             load_role_base("worker"),
-            {"phase_settings": {"prompt_mode": "legacy"}},
+            {
+                "phase_settings": {
+                    "prompt_mode": "legacy",
+                    "tool_binding_mode": "union",
+                }
+            },
         )
         cfg = load_agent_config_from_dict(data)
         assert cfg.phase_settings.prompt_mode == "legacy"
+        assert cfg.phase_settings.tool_binding_mode == "union"
         assert cfg.phase_settings.min_todos == 2  # the override merged, not replaced
         cfg._deployment_dir = str(tmp_path)
         blob = serialize_resolved_config(cfg)
         assert blob["agent"]["phase_settings"]["prompt_mode"] == "legacy"
-        assert load_config_from_resolved(blob).phase_settings.prompt_mode == "legacy"
+        assert blob["agent"]["phase_settings"]["tool_binding_mode"] == "union"
+        hydrated = load_config_from_resolved(blob)
+        assert hydrated.phase_settings.prompt_mode == "legacy"
+        assert hydrated.phase_settings.tool_binding_mode == "union"
         # Default: skills, in the blob too.
         default = load_agent_config_from_dict(load_role_base("worker"))
         assert default.phase_settings.prompt_mode == "skills"
+        assert default.phase_settings.tool_binding_mode == "auto"
+
+    def test_tool_binding_mode_decouples_the_wp5_attribution_arms(self):
+        from src.core.loader import (
+            uses_legacy_phase_prompt,
+            uses_phase_filtered_tool_binding,
+        )
+
+        config = AgentConfig(agent_id="test", display_name="Test Agent")
+        assert uses_phase_filtered_tool_binding(config) is False
+
+        config.phase_settings.prompt_mode = "legacy"
+        assert uses_legacy_phase_prompt(config) is True
+        assert uses_phase_filtered_tool_binding(config) is True
+
+        # Planned arm C: legacy phase prose, stable union binding.
+        config.phase_settings.tool_binding_mode = "union"
+        assert uses_legacy_phase_prompt(config) is True
+        assert uses_phase_filtered_tool_binding(config) is False

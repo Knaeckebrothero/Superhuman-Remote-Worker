@@ -2355,6 +2355,20 @@ PROMPT_MODE_SKILLS = "skills"
 PROMPT_MODE_LEGACY = "legacy"
 VALID_PROMPT_MODES = frozenset({PROMPT_MODE_SKILLS, PROMPT_MODE_LEGACY})
 
+# Temporary WP5 attribution control. ``auto`` preserves the shipped coupling
+# (skills -> one union binding, legacy -> a phase-filtered pair). ``union``
+# permits the planned arm C: legacy phase prose with the same stable union
+# schema as skills mode. Defaults never change; WP6 removes this switch with
+# the legacy path.
+TOOL_BINDING_MODE_AUTO = "auto"
+TOOL_BINDING_MODE_UNION = "union"
+VALID_TOOL_BINDING_MODES = frozenset(
+    {
+        TOOL_BINDING_MODE_AUTO,
+        TOOL_BINDING_MODE_UNION,
+    }
+)
+
 
 @dataclass
 class PhaseSettings:
@@ -2364,19 +2378,28 @@ class PhaseSettings:
     the LIVE bounds: agent.py passes them into TodoManager at construction,
     where stage_tactical_todos enforces them. The worker overlay (worker_base) lowers the
     floor to 2. ``prompt_mode`` selects how the worker receives its phase
-    guidance (see ``PROMPT_MODE_SKILLS`` / ``PROMPT_MODE_LEGACY``); it rides
-    ``config_override`` like every other key here and is frozen with the job.
+    guidance (see ``PROMPT_MODE_SKILLS`` / ``PROMPT_MODE_LEGACY``).
+    ``tool_binding_mode`` is temporary WP5 measurement scaffolding that can
+    decouple schema shape from the prompt treatment. Both ride
+    ``config_override`` like every other key here and are frozen with the job.
     """
 
     min_todos: int = 5  # Minimum todos required for strategic->tactical transition
     max_todos: int = 20  # Maximum todos allowed for strategic->tactical transition
     prompt_mode: str = PROMPT_MODE_SKILLS  # skills | legacy (U2)
+    tool_binding_mode: str = TOOL_BINDING_MODE_AUTO  # temporary WP5 attribution
 
     def __post_init__(self) -> None:
         if self.prompt_mode not in VALID_PROMPT_MODES:
             raise ValueError(
                 "phase_settings.prompt_mode must be one of "
                 f"{sorted(VALID_PROMPT_MODES)} (got {self.prompt_mode!r})"
+            )
+        if self.tool_binding_mode not in VALID_TOOL_BINDING_MODES:
+            raise ValueError(
+                "phase_settings.tool_binding_mode must be one of "
+                f"{sorted(VALID_TOOL_BINDING_MODES)} "
+                f"(got {self.tool_binding_mode!r})"
             )
 
 
@@ -3328,6 +3351,7 @@ def load_agent_config(
         min_todos=phase_data.get("min_todos", 5),
         max_todos=phase_data.get("max_todos", 20),
         prompt_mode=phase_data.get("prompt_mode", PROMPT_MODE_SKILLS),
+        tool_binding_mode=phase_data.get("tool_binding_mode", TOOL_BINDING_MODE_AUTO),
     )
 
     memory_data = data.get("memory", {})
@@ -3599,6 +3623,7 @@ def load_agent_config_from_dict(
         min_todos=phase_data.get("min_todos", 5),
         max_todos=phase_data.get("max_todos", 20),
         prompt_mode=phase_data.get("prompt_mode", PROMPT_MODE_SKILLS),
+        tool_binding_mode=phase_data.get("tool_binding_mode", TOOL_BINDING_MODE_AUTO),
     )
 
     memory_data = data.get("memory", {})
@@ -5056,6 +5081,33 @@ def uses_legacy_phase_prompt(config: Any) -> bool:
     resolved = extra.get("_resolved_prompts") if isinstance(extra, dict) else None
     template = resolved.get("systemprompt") if isinstance(resolved, dict) else None
     return isinstance(template, str) and is_legacy_phase_template(template)
+
+
+def tool_binding_mode_of(config: Any) -> str:
+    """Resolved WP5 measurement mode, defaulting to ``auto``.
+
+    Lightweight test configs often expose only ``prompt_mode`` on a
+    ``SimpleNamespace``; treating a missing or mocked value as ``auto`` keeps
+    shipped behavior and makes the diagnostic opt-in.
+    """
+
+    settings = getattr(config, "phase_settings", None)
+    mode = getattr(settings, "tool_binding_mode", TOOL_BINDING_MODE_AUTO)
+    return mode if mode in VALID_TOOL_BINDING_MODES else TOOL_BINDING_MODE_AUTO
+
+
+def uses_phase_filtered_tool_binding(config: Any) -> bool:
+    """Whether this worker binds a strategic/tactical schema pair.
+
+    ``auto`` preserves the pre-attribution behavior, including old frozen
+    system-prompt templates. Explicit modes decouple tool schema shape from
+    phase prose solely so WP5 can attribute its A/B result.
+    """
+
+    mode = tool_binding_mode_of(config)
+    if mode == TOOL_BINDING_MODE_UNION:
+        return False
+    return uses_legacy_phase_prompt(config)
 
 
 def phase_skill_bindings() -> List[Dict[str, Any]]:

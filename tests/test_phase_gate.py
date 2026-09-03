@@ -51,10 +51,13 @@ class FakeConfig:
     phase_settings: Optional[Any] = None
 
 
-def legacy_config(**limits) -> FakeConfig:
+def legacy_config(*, tool_binding_mode="auto", **limits) -> FakeConfig:
     return FakeConfig(
         limits=LimitsConfig(**limits),
-        phase_settings=SimpleNamespace(prompt_mode=PROMPT_MODE_LEGACY),
+        phase_settings=SimpleNamespace(
+            prompt_mode=PROMPT_MODE_LEGACY,
+            tool_binding_mode=tool_binding_mode,
+        ),
     )
 
 
@@ -243,6 +246,31 @@ class TestPerCallGate:
             # one tool that stages the work for the next tactical phase.
             assert named <= {own, "next_phase_todos"}, named
         assert "next_phase_todos" not in STRATEGIC_IN_TACTICAL
+
+    @pytest.mark.asyncio
+    async def test_legacy_prose_union_binding_uses_the_per_call_gate(self, tool_node):
+        tool_node.ainvoke = AsyncMock(
+            return_value={"messages": [result_for("read_file", "c1", "body")]}
+        )
+        audited = create_audited_tool_node(
+            [tool("read_file"), tool("job_complete")],
+            legacy_config(tool_binding_mode="union"),
+        )
+        result = await audited(
+            state(
+                [tc("read_file", "c1"), tc("job_complete", "c2")],
+                is_strategic=False,
+                phase_number=4,
+            )
+        )
+
+        tool_node.ainvoke.assert_awaited_once()
+        assert [
+            (message.tool_call_id, message.name) for message in tool_messages(result)
+        ] == [("c1", "read_file"), ("c2", "job_complete")]
+        assert tool_messages(result)[1].content == (
+            f"{STRATEGIC_IN_TACTICAL} {BATCH_NOTE}"
+        )
 
 
 # ---------------------------------------------------------------------------

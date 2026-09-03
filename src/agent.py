@@ -38,7 +38,7 @@ from .core.loader import (
     resolve_config_path,
     resolve_model_settings,
     supports_parallel_tool_calls,
-    uses_legacy_phase_prompt,
+    uses_phase_filtered_tool_binding,
 )
 from .core.loader import get_project_root
 from .core.phase_snapshot import PhaseSnapshotManager
@@ -4499,7 +4499,9 @@ class UniversalAgent:
         like the guardrail Examples — the ToolNode's tool objects and the
         full-description originals stay untouched). Legacy prompt mode (the
         bench's "current" arm; deleted in WP6) keeps today's phase-filtered
-        pair and untouched descriptions, so arm A is honest.
+        pair and untouched descriptions, so arm A is honest. The temporary
+        WP5 ``tool_binding_mode`` can select either shape independently of the
+        prose mode for attribution arm C; ``auto`` preserves both defaults.
         """
         # parallel_tool_calls is an OpenAI Chat Completions param — suppressed
         # for providers/models that reject it (Google GenAI's
@@ -4521,10 +4523,11 @@ class UniversalAgent:
         strategic_names = set(filter_tools_by_phase(all_names, "strategic"))
         tactical_names = set(filter_tools_by_phase(all_names, "tactical"))
 
-        if uses_legacy_phase_prompt(self.config):
+        if uses_phase_filtered_tool_binding(self.config):
             # Phase-filter tools: each binding only sees tools declared for
             # its phase; the ToolNode keeps the full list and its batch-level
-            # gate is the backup.
+            # gate is the backup. This is automatic for legacy prompt mode or
+            # explicit in the temporary WP5 measurement control.
             strategic_tools = apply_guardrails_to_tools(
                 [t for t in self._tools if t.name in strategic_names],
                 model=llm_cfg.model,

@@ -167,9 +167,10 @@ def _bind(config, tools) -> _BindAgent:
     return agent
 
 
-def _legacy_config():
+def _legacy_config(*, tool_binding_mode="auto"):
     config = _make_config({})
     config.phase_settings.prompt_mode = PROMPT_MODE_LEGACY
+    config.phase_settings.tool_binding_mode = tool_binding_mode
     return config
 
 
@@ -222,6 +223,18 @@ class TestBindJobTools:
         assert agent._llm_with_tools is strategic  # the old compat alias
         for binding in (strategic, tactical):  # arm A: descriptions as before
             assert not any("-phase tool]" in d for d in binding.descriptions.values())
+
+    def test_legacy_prompt_with_union_binding_is_the_attribution_arm(self):
+        tools = [_structured(n) for n in _BIND_TOOLS]
+        agent = _bind(_legacy_config(tool_binding_mode="union"), tools)
+
+        (bound,) = agent._llm.calls
+        assert sorted(bound.tool_names) == sorted(_BIND_TOOLS)
+        assert (
+            agent._strategic_llm_with_tools is agent._tactical_llm_with_tools is bound
+        )
+        assert bound.descriptions["job_complete"].startswith("[strategic-phase tool]")
+        assert bound.descriptions["request_replan"].startswith("[tactical-phase tool]")
 
     def test_unregistered_tools_are_bound_in_neither_mode(self):
         for config in (_make_config({}), _legacy_config()):

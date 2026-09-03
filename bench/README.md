@@ -136,6 +136,12 @@ absent from v1 — they change as the repo changes, which breaks pinning.
   schedules arms adjacent within each replicate's shuffled wave — that
   adjacency is what neutralizes time-varying confounds (pool growth,
   contention), so never split arms across runs or clusters.
+- **U2 attribution arm C:** if the skills arm regresses, distinguish phase prose
+  from schema shape with `phase_settings: {prompt_mode: legacy,
+  tool_binding_mode: union}`. This keeps legacy phase text but binds the same
+  stable union schema as skills. The default `tool_binding_mode: auto` leaves
+  both primary arms unchanged; the switch is measurement scaffolding removed
+  with the legacy path in U2 WP6.
 - **Running on k3d:** mint the test id_token per the auth memo (admin-cli
   password grant, use `id_token` not `access_token`); `POST /api/projects`
   requires `user_id` in the body. Give memory-sensitive experiments a

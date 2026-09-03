@@ -670,15 +670,24 @@ def test_legacy_prompt_mode_flows_through_config_override_and_skips_the_floor():
     blob = resolve_config(
         base_config_name="assistant",
         expert_type="worker",
-        request_override={"phase_settings": {"prompt_mode": "legacy"}},
+        request_override={
+            "phase_settings": {
+                "prompt_mode": "legacy",
+                "tool_binding_mode": "union",
+            }
+        },
     )
     assert blob["agent"]["phase_settings"]["prompt_mode"] == "legacy"
+    assert blob["agent"]["phase_settings"]["tool_binding_mode"] == "union"
     assert blob["agent"]["phase_settings"]["min_todos"] == 2  # merged, not replaced
     assert _phase_bindings(blob["agent"]["instruction_files"]) == []
-    assert load_config_from_resolved(blob).phase_settings.prompt_mode == "legacy"
+    hydrated = load_config_from_resolved(blob)
+    assert hydrated.phase_settings.prompt_mode == "legacy"
+    assert hydrated.phase_settings.tool_binding_mode == "union"
     # Default is skills, and it is frozen explicitly.
     default = resolve_config(base_config_name="developer", expert_type="worker")
     assert default["agent"]["phase_settings"]["prompt_mode"] == "skills"
+    assert default["agent"]["phase_settings"]["tool_binding_mode"] == "auto"
 
 
 def test_invalid_prompt_mode_is_refused_at_resolution():
@@ -689,4 +698,11 @@ def test_invalid_prompt_mode_is_refused_at_resolution():
             base_config_name="developer",
             expert_type="worker",
             request_override={"phase_settings": {"prompt_mode": "bogus"}},
+        )
+
+    with pytest.raises(ValueError, match="tool_binding_mode"):
+        resolve_config(
+            base_config_name="developer",
+            expert_type="worker",
+            request_override={"phase_settings": {"tool_binding_mode": "bogus"}},
         )

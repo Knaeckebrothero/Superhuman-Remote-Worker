@@ -123,6 +123,7 @@ from .core.loader import (
     load_summarization_prompt,
     resolve_model_settings,
     uses_legacy_phase_prompt,
+    uses_phase_filtered_tool_binding,
     _is_output_truncated,
     _resolve_max_output_tokens,
 )
@@ -5130,9 +5131,9 @@ def create_audited_tool_node(
     # Phase gate. With one tool binding for every phase (U2 skills mode) this
     # runtime gate IS the enforcement: it decides per call, executes the
     # phase-legal calls of a batch and answers each illegal one with an error
-    # ToolMessage. Legacy prompt mode (the bench's "current" arm) keeps the
-    # phase-filtered bindings, where the gate is the backup layer that rejects
-    # a whole batch on a hallucinated call.
+    # ToolMessage. Phase-filtered bindings (automatic for the bench's legacy
+    # arm, or explicitly selected by the temporary WP5 attribution control)
+    # keep the backup layer that rejects a whole batch on a hallucinated call.
     from .tools.registry import (
         filter_tools_by_phase as _filter_phase,
         TOOL_REGISTRY as _TOOL_REG,
@@ -5146,7 +5147,7 @@ def create_audited_tool_node(
     # Only gate tools that have phase metadata in the registry.
     # Unregistered tools (dynamic, test) have no phase restriction.
     _phase_gated_names = set(n for n in _all_tool_names if n in _TOOL_REG)
-    _legacy_batch_gate = uses_legacy_phase_prompt(config)
+    _legacy_batch_gate = uses_phase_filtered_tool_binding(config)
 
     def _delegation_cobatch_text(tool_name: str, delegation_tool: str) -> str:
         """The per-call rejection of a non-delegation call that shared a batch
