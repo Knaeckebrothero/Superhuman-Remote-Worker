@@ -265,7 +265,7 @@ class TestGetProjectOffCriticalPath:
             patch("main._ensure_project_cloud_resources", slow_heal),
             patch("main.main_cloud_router") as router,
         ):
-            router.for_project.return_value.is_initialized = False
+            router.for_project_optional.return_value.is_initialized = False
             result = await get_project(fake_request, str(project_a["id"]))
             # Returned while the heal is parked on the event.
             assert result["id"] == project_a["id"]
@@ -286,7 +286,7 @@ class TestGetProjectOffCriticalPath:
             patch("main._ensure_project_cloud_resources", heal),
             patch("main.main_cloud_router") as router,
         ):
-            router.for_project.return_value.is_initialized = False
+            router.for_project_optional.return_value.is_initialized = False
             await get_project(fake_request, str(project_a["id"]))
             await get_project(fake_request, str(project_a["id"]))
             await _drain_repair_tasks()
@@ -316,7 +316,7 @@ class TestGetProjectOffCriticalPath:
             _patch_caller_and_db(user_a, fake_db),
             patch("main.main_cloud_router") as router,
         ):
-            router.for_project.return_value = backend
+            router.for_project_optional.return_value = backend
             result = await get_project(fake_request, str(project_a["id"]))
             await _drain_repair_tasks()
 
@@ -349,7 +349,7 @@ class TestGetProjectOffCriticalPath:
             _patch_caller_and_db(user_a, fake_db),
             patch("main.main_cloud_router") as router,
         ):
-            router.for_project.return_value = backend
+            router.for_project_optional.return_value = backend
             result = await get_project(fake_request, str(project_a["id"]))
             # This open serves the fallback; the resolve runs off-path.
             assert result["cloud_storage_url"] == "https://cloud/default"

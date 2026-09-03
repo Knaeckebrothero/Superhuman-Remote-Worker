@@ -454,7 +454,8 @@
       "unarchive": "Dieses Projekt wieder aktivieren, damit neue Aufträge und Sitzungen darauf laufen können"
     },
     "error": {
-      "noAccess": "Sie haben keinen Zugriff auf dieses Projekt."
+      "noAccess": "Sie haben keinen Zugriff auf dieses Projekt.",
+      "loadFailed": "Das Projekt konnte nicht geladen werden — Serverfehler. Bitte erneut versuchen."
     },
     "externalKb": {
       "toggle": "Externes Wissens-Repository verwenden",

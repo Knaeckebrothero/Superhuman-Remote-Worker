@@ -44531,11 +44531,15 @@ async def _build_default_project_mount_row(
     the thread with zero mounts.
     """
     backend = (
-        main_cloud_router.for_project(project)
+        main_cloud_router.for_project_optional(project)
         if project.get("main_cloud_backend")
         else main_cloud_router.for_owner()
     )
-    if not backend.is_initialized:
+    # An unresolvable installation authority is one more "can't resolve the
+    # user-home" case, which this function is documented to report as None so
+    # the caller falls back to the legacy session folder — not an exception
+    # that strands the thread with zero mounts.
+    if backend is None or not backend.is_initialized:
         return None
     members = await postgres_db.get_project_members(project_id)
     owner = next((m for m in members if m.get("role") == "owner"), None)
@@ -52269,11 +52273,8 @@ def _resolve_cloud_session_url(
         "nc_session_folder"
     )
     if handle_str:
-        try:
-            backend = main_cloud_router.for_thread(thread)
-        except Exception:
-            return None
-        if not backend.is_initialized:
+        backend = main_cloud_router.for_thread_optional(thread)
+        if backend is None or not backend.is_initialized:
             return None
         try:
             handle = SessionFolderHandle.from_db(handle_str, backend=backend.backend_id)
@@ -52399,10 +52400,7 @@ def _build_agent_cloud_sync(
         "nc_session_folder"
     )
     if handle_str:
-        try:
-            backend = main_cloud_router.for_thread(thread)
-        except Exception:
-            backend = None
+        backend = main_cloud_router.for_thread_optional(thread)
         if backend is not None and backend.is_initialized:
             try:
                 handle = SessionFolderHandle.from_db(
@@ -52622,11 +52620,12 @@ async def _build_rclone_session_mount(
     )
     if not handle_str:
         return None
-    try:
-        backend = main_cloud_router.for_thread(thread)
-    except Exception:
-        return None
-    if not backend.is_initialized or not isinstance(backend, SupportsRcloneMount):
+    backend = main_cloud_router.for_thread_optional(thread)
+    if (
+        backend is None
+        or not backend.is_initialized
+        or not isinstance(backend, SupportsRcloneMount)
+    ):
         return None
     try:
         handle = SessionFolderHandle.from_db(handle_str, backend=backend.backend_id)
@@ -68241,6 +68240,183 @@ async def reload_main_cloud_settings(request: Request) -> dict[str, Any]:
     }
 
 
+@app.post("/api/admin/system-settings/main_cloud/backfill-instance-authority")
+async def backfill_main_cloud_instance_authority(
+    request: Request, apply: bool = False
+) -> dict[str, Any]:
+    """Stamp pre-0186 rows with the installation they actually live on.
+
+    Admin-only. **Dry run by default** — pass ``?apply=true`` to write.
+
+    0186 added ``main_cloud_backend_instance_id`` nullable with no backfill, so
+    rows stamped before it name a provider but no installation. The router
+    fails closed on that shape, which is correct for effects: those projects
+    cannot grant membership, share, or have their folder deleted, because we
+    cannot say *which* installation to act on.
+
+    This is deliberately NOT a SQL migration. The design
+    (knowledge-base/knowledge/features/protected_session_lifecycle_and_mount_readiness.md)
+    requires "an operator-attested single-installation mapping plus a verified
+    remote proof", and a migration running inside psql at startup can obtain
+    neither. Stamping without that proof would launder a guess into recorded
+    authority — silently, permanently, and unquestioned by everything
+    downstream. A loud refusal is recoverable; a wrong instance UUID is not.
+
+    So the safety argument here is:
+
+    1. the active instance is **re-attested against the live installation**
+       before anything is read, so its proof reflects reality now;
+    2. every provider named by an unstamped row must resolve to exactly one
+       *installation* in the registry. Two registry rows for one provider are
+       not automatically ambiguous — they are commonly two routing snapshots
+       of the same installation, which share an
+       ``installation_proof_sha256``. Two distinct **proofs** are the genuine
+       ambiguity, and abort;
+    3. a provider we cannot re-attest right now (not the active backend) is
+       never stamped, because nothing proves where its rows live.
+    """
+    await _require_admin(request)
+
+    survey = await postgres_db.survey_unstamped_main_cloud_rows()
+    unstamped_projects = survey["projects"]
+    unstamped_threads = survey["threads"]
+    if not unstamped_projects and not unstamped_threads:
+        return {
+            "status": "noop",
+            "applied": False,
+            "detail": "No rows carry a provider without its backend instance.",
+            "projects": 0,
+            "threads": 0,
+        }
+
+    providers = sorted(
+        {str(r["main_cloud_backend"]) for r in unstamped_projects}
+        | {str(r["main_cloud_backend"]) for r in unstamped_threads}
+    )
+
+    # (1) Re-attest the active installation before trusting its proof.
+    try:
+        reattested = await reload_active_main_cloud_instance(
+            postgres_db,
+            main_cloud_router,
+            force_rebuild=True,
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"cannot verify the live installation proof: {e}",
+        ) from e
+    if reattested is not True:
+        raise HTTPException(
+            status_code=409,
+            detail="active instance changed during re-attestation; retry",
+        )
+
+    active = await postgres_db.get_active_main_cloud_backend_instance()
+    if not active:
+        raise HTTPException(
+            status_code=409,
+            detail="no active main-cloud instance to attest against",
+        )
+    active_authority = active["authority"]
+
+    registry = await postgres_db.list_main_cloud_backend_instances()
+
+    # (2)+(3) Resolve one installation per provider, or refuse.
+    plan: list[dict[str, Any]] = []
+    for provider in providers:
+        proofs = {
+            a.installation_proof_sha256 for a in registry if a.backend_id == provider
+        }
+        if len(proofs) != 1:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"provider {provider!r} has {len(proofs)} distinct "
+                    "installations in the registry; historical rows cannot be "
+                    "attributed to one of them automatically. Resolve this "
+                    "mapping by hand."
+                ),
+            )
+        if provider != active_authority.backend_id:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"provider {provider!r} is not the active backend "
+                    f"({active_authority.backend_id!r}), so its installation "
+                    "cannot be re-attested right now. Activate it first."
+                ),
+            )
+        if proofs != {active_authority.installation_proof_sha256}:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"provider {provider!r} registry proof does not match the "
+                    "installation just attested; refusing to attribute "
+                    "historical rows to it."
+                ),
+            )
+        plan.append(
+            {
+                "backend_id": provider,
+                "backend_instance_id": active_authority.backend_instance_id,
+                "installation_proof_sha256": (
+                    active_authority.installation_proof_sha256
+                ),
+                "projects": [
+                    {
+                        "id": str(r["id"]),
+                        "name": r.get("name"),
+                        "status": r.get("status"),
+                    }
+                    for r in unstamped_projects
+                    if str(r["main_cloud_backend"]) == provider
+                ],
+                "threads": [
+                    str(r["id"])
+                    for r in unstamped_threads
+                    if str(r["main_cloud_backend"]) == provider
+                ],
+            }
+        )
+
+    if not apply:
+        return {
+            "status": "dry_run",
+            "applied": False,
+            "detail": "Re-run with ?apply=true to write these stamps.",
+            "plan": plan,
+            "projects": len(unstamped_projects),
+            "threads": len(unstamped_threads),
+        }
+
+    stamped = {"projects": 0, "threads": 0}
+    for entry in plan:
+        counts = await postgres_db.stamp_main_cloud_instance_authority(
+            backend_id=entry["backend_id"],
+            backend_instance_id=entry["backend_instance_id"],
+        )
+        stamped["projects"] += counts["projects"]
+        stamped["threads"] += counts["threads"]
+        logger.warning(
+            "main-cloud instance authority backfill: stamped %d project(s) and "
+            "%d thread(s) for provider %r with instance %s (proof %s)",
+            counts["projects"],
+            counts["threads"],
+            entry["backend_id"],
+            entry["backend_instance_id"],
+            entry["installation_proof_sha256"],
+        )
+
+    return {
+        "status": "ok",
+        "applied": True,
+        "plan": plan,
+        "projects": stamped["projects"],
+        "threads": stamped["threads"],
+    }
+
+
 @app.delete("/api/admin/system-settings/main_cloud")
 async def delete_main_cloud_settings(request: Request) -> dict[str, Any]:
     """Attest and activate the current env-described installation.
@@ -68881,11 +69057,26 @@ async def _ensure_project_cloud_resources(
     project_id_str = str(project["id"])
     project_name = project["name"]
     group_name = f"project-{project_id_str}"
-    backend = (
-        main_cloud_router.for_project(project)
-        if project.get("main_cloud_backend")
-        else main_cloud_router.for_owner()
-    )
+    if project.get("main_cloud_backend"):
+        backend = main_cloud_router.for_project_optional(project)
+        if backend is None:
+            # Every step below is a remote effect (ensure_group,
+            # ensure_project_folder, LibreGraph member adds) and this row's
+            # installation authority is unresolvable — a pre-0186 row, or an
+            # instance this replica has not cached. Guessing an installation is
+            # exactly what we must not do, and this helper is drift repair, not
+            # a primary write path (add_project_member owns those). So skip,
+            # loudly. Stamping the row (backfill) is what re-enables it.
+            logger.warning(
+                "Project %s: skipping cloud resource heal — no resolvable "
+                "backend instance for provider %r (row needs a "
+                "main_cloud_backend_instance_id backfill).",
+                project_id_str,
+                project.get("main_cloud_backend"),
+            )
+            return project
+    else:
+        backend = main_cloud_router.for_owner()
 
     handle_str = project.get("main_cloud_folder_handle")
     legacy_folder_id = project.get("nextcloud_folder_id")
@@ -69641,10 +69832,19 @@ async def get_project(request: Request, project_id: str) -> dict[str, Any]:
         f"project-heal:{project_id}", _ensure_project_cloud_resources(project)
     )
 
-    # Compute cloud_storage_url for cockpit deep-links
+    # Compute cloud_storage_url for cockpit deep-links.
+    #
+    # Decorative-only: this whole block produces one optional URL for a button
+    # the cockpit hides when it is None. It must never fail the request — a
+    # pre-0186 row (provider name stamped, no backend-instance UUID) has no
+    # resolvable installation authority, and 500ing the project page over a
+    # missing deep-link took every cloud-backed project on dev offline behind a
+    # misleading "You don't have access to that project" toast. The row still
+    # refuses *effects* through the raising `for_project` at the mutation call
+    # sites, which is the behaviour we want.
     project["cloud_storage_url"] = None
-    backend = main_cloud_router.for_project(project)
-    if backend.is_initialized:
+    backend = main_cloud_router.for_project_optional(project)
+    if backend is not None and backend.is_initialized:
         if project.get("is_default"):
             # Default projects piggyback on the owner's personal home Space —
             # the deep-link must resolve to that home, not to a project Space
@@ -69932,14 +70132,30 @@ async def delete_project(project_id: str, request: Request) -> dict[str, str]:
     if keycloak_groups.is_initialized:
         await keycloak_groups.delete_project_group(project_id)
 
-    # Clean up main-cloud project folder via the row's backend dispatch
-    backend = main_cloud_router.for_project(project)
+    # Clean up main-cloud project folder via the row's backend dispatch.
+    #
+    # The DB row is already gone by this point, so raising here would report a
+    # delete that actually happened as a 500. An unresolvable installation
+    # authority means we cannot say *which* installation holds the folder, and
+    # deleting from a guessed one is unacceptable — so leave the folder in
+    # place, say so, and let the delete stand.
+    backend = main_cloud_router.for_project_optional(project)
     handle_str = project.get("main_cloud_folder_handle") or (
         str(project["nextcloud_folder_id"])
         if project.get("nextcloud_folder_id")
         else None
     )
-    if handle_str and backend.is_initialized:
+    if backend is None:
+        if handle_str:
+            logger.warning(
+                "Project %s deleted, but its main-cloud folder (%s on provider "
+                "%r) was left in place: no resolvable backend instance for the "
+                "row. The folder needs manual cleanup.",
+                project_id,
+                handle_str,
+                project.get("main_cloud_backend"),
+            )
+    elif handle_str and backend.is_initialized:
         try:
             handle = ProjectFolderHandle.from_db(
                 handle_str,
@@ -69974,6 +70190,26 @@ async def add_project_member(
     _, project = await require_project_owner(
         request, postgres_db, project_id, allow_archived=False
     )
+
+    # Resolve the cloud backend BEFORE writing the member row. The cloud group
+    # add below is load-bearing (a member without it cannot reach the project's
+    # files), so a row we cannot sync is a half-landed member: present in the
+    # DB, invisible in the cloud, and reported to the caller as a 500 by the
+    # blanket handler below. Refuse up front instead, with a diagnosis — a
+    # pre-0186 row has no resolvable installation authority until it is
+    # stamped, and we must not guess which installation to grant against.
+    backend = main_cloud_router.for_project_optional(project)
+    if backend is None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This project's main-cloud installation authority is "
+                "unresolved, so project membership cannot be granted on the "
+                "cloud backend. The project row needs a "
+                "main_cloud_backend_instance_id backfill."
+            ),
+        )
+
     try:
         result = await postgres_db.add_project_member(
             project_id=project_id,
@@ -69985,7 +70221,6 @@ async def add_project_member(
         # Both writes are load-bearing — see _sync_project_member_to_groups.
         user = await postgres_db.get_user(body.user_id)
         if user:
-            backend = main_cloud_router.for_project(project)
             await _sync_project_member_to_groups(
                 project_id, f"project-{project_id}", user, backend
             )

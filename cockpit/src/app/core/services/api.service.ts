@@ -2375,6 +2375,31 @@ export class ApiService {
     );
   }
 
+  /**
+   * `getProject` with the failure reason preserved.
+   *
+   * `getProject` collapses every failure into `null`, which is right for the
+   * dozen callers that just render nothing. It is wrong for the route guard,
+   * which turns the failure into a *sentence shown to the user*: a 500 from
+   * the orchestrator was reported as "you don't have access to that project",
+   * which is not merely vague but the opposite of true — the membership check
+   * had already passed. Callers that diagnose need the status; callers that
+   * only render should keep using `getProject`.
+   */
+  getProjectOrError(
+    id: string,
+  ): Observable<{project: Project | null; status: number | null}> {
+    return this.http.get<Project>(`${this.baseUrl}/projects/${id}`).pipe(
+      map((project) => ({project, status: 200})),
+      catchError((err: unknown) =>
+        of({
+          project: null,
+          status: err instanceof HttpErrorResponse ? err.status : null,
+        }),
+      ),
+    );
+  }
+
   /** Current user's resolved capabilities + the catalog (drives editor greying). */
   getMyCapabilities(): Observable<UserCapabilities | null> {
     return this.http

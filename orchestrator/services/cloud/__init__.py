@@ -346,6 +346,50 @@ class MainCloudRouter:
             )
         return self.for_backend(thread_row.get("main_cloud_backend"))
 
+    def for_project_optional(
+        self, project_row: dict[str, Any]
+    ) -> MainCloudBackend | None:
+        """``for_project`` for callers that only *decorate*, never act.
+
+        Returns ``None`` instead of raising when the row's installation
+        authority cannot be resolved — a pre-0186 row carrying a provider name
+        but no ``main_cloud_backend_instance_id``, or an instance UUID this
+        replica has not cached.
+
+        Use this **only** where the backend feeds presentation (a deep-link
+        URL, a badge) and its absence degrades to "render nothing". Anything
+        that reaches the remote — creating a folder, granting a group, sharing,
+        deleting — must keep using :meth:`for_project`, because acting on a
+        guessed installation is precisely the failure the raising form exists
+        to prevent. Refusing an effect is recoverable; performing it against
+        the wrong installation is not.
+        """
+        try:
+            return self.for_project(project_row)
+        except FeatureNotAvailable as e:
+            logger.debug(
+                "Main cloud router: no resolvable instance for project %s (%s) "
+                "— decorative caller degrading to None",
+                project_row.get("id"),
+                e,
+            )
+            return None
+
+    def for_thread_optional(
+        self, thread_row: dict[str, Any]
+    ) -> MainCloudBackend | None:
+        """``for_thread`` for decorative callers. See :meth:`for_project_optional`."""
+        try:
+            return self.for_thread(thread_row)
+        except FeatureNotAvailable as e:
+            logger.debug(
+                "Main cloud router: no resolvable instance for thread %s (%s) "
+                "— decorative caller degrading to None",
+                thread_row.get("id"),
+                e,
+            )
+            return None
+
     def for_owner(self, owner: dict[str, Any] | None = None) -> MainCloudBackend:
         """Resolve the backend for a *fresh* create on behalf of an owner.
 

@@ -475,7 +475,10 @@ async def test_process_zero_retry_retires_exact_live_residents_and_shell(
                 auth={"type": "basic", "password": "agent-pass"},
             )
 
-    cloud_router = SimpleNamespace(for_thread=lambda _thread: Backend())
+    cloud_router = SimpleNamespace(
+        for_thread=lambda _thread: Backend(),
+        for_thread_optional=lambda _thread: Backend(),
+    )
     monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
     monkeypatch.delenv("CLOUD_RCLONE_ALLOW_CONTAINER", raising=False)
 

@@ -216,7 +216,7 @@ class TestGetProject:
             ),
             patch("main.main_cloud_router") as router,
         ):
-            router.for_project.return_value.is_initialized = False
+            router.for_project_optional.return_value.is_initialized = False
             result = await get_project(fake_request, str(project_a["id"]))
         assert result["id"] == project_a["id"]
 
@@ -256,7 +256,7 @@ class TestGetProject:
             ),
             patch("main.main_cloud_router") as router,
         ):
-            router.for_project.return_value.is_initialized = False
+            router.for_project_optional.return_value.is_initialized = False
             result = await get_project(fake_request, str(project_a["id"]))
         assert result["id"] == project_a["id"]
 
@@ -274,7 +274,7 @@ class TestGetProject:
             ),
             patch("main.main_cloud_router") as router,
         ):
-            router.for_project.return_value.is_initialized = False
+            router.for_project_optional.return_value.is_initialized = False
             result = await get_project(fake_request, str(project_a["id"]))
         assert result["id"] == project_a["id"]
 

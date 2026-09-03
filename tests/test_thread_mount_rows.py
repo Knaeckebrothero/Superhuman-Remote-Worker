@@ -106,6 +106,7 @@ async def test_default_project_emits_user_home_row():
     fake_db.get_user = AsyncMock(return_value=_owner_user_record())
     router = MagicMock()
     router.for_project.return_value = backend
+    router.for_project_optional.return_value = backend
 
     with (
         patch("main.postgres_db", fake_db),
@@ -136,7 +137,9 @@ async def test_default_project_no_owner_returns_none():
     fake_db.get_project_members = AsyncMock(return_value=[])
     fake_db.get_user = AsyncMock(return_value=None)
     router = MagicMock()
-    router.for_project.return_value = _backend()
+    _b = _backend()
+    router.for_project.return_value = _b
+    router.for_project_optional.return_value = _b
 
     with (
         patch("main.postgres_db", fake_db),
@@ -161,7 +164,9 @@ async def test_default_project_owner_missing_keycloak_sub_returns_none():
         return_value={"id": "owner-uuid", "keycloak_sub": None}
     )
     router = MagicMock()
-    router.for_project.return_value = _backend()
+    _b = _backend()
+    router.for_project.return_value = _b
+    router.for_project_optional.return_value = _b
 
     with (
         patch("main.postgres_db", fake_db),
@@ -189,6 +194,7 @@ async def test_default_project_user_home_unresolvable_returns_none():
     fake_db.get_user = AsyncMock(return_value=_owner_user_record())
     router = MagicMock()
     router.for_project.return_value = backend
+    router.for_project_optional.return_value = backend
 
     with (
         patch("main.postgres_db", fake_db),
@@ -209,6 +215,7 @@ async def test_default_project_backend_uninitialized_returns_none():
     fake_db.get_user = AsyncMock(return_value=None)
     router = MagicMock()
     router.for_project.return_value = backend
+    router.for_project_optional.return_value = backend
 
     with (
         patch("main.postgres_db", fake_db),
@@ -243,6 +250,7 @@ async def test_build_thread_mount_rows_mixes_default_and_non_default():
     backend = _backend()
     router = MagicMock()
     router.for_project.return_value = backend
+    router.for_project_optional.return_value = backend
     router.for_backend.return_value = backend
 
     with (
@@ -462,7 +470,9 @@ async def test_build_agent_cloud_mount_falls_back_to_session_folder(monkeypatch)
 
     monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
     router = MagicMock()
-    router.for_thread.return_value = Backend()
+    _tb = Backend()
+    router.for_thread.return_value = _tb
+    router.for_thread_optional.return_value = _tb
     router.for_backend_instance.return_value = Backend()
     thread = {
         "id": "thread-1",
@@ -585,7 +595,9 @@ async def test_build_agent_cloud_mount_vm_runtime_is_readonly_and_public(monkeyp
 
     monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
     router = MagicMock()
-    router.for_thread.return_value = Backend()
+    _tb = Backend()
+    router.for_thread.return_value = _tb
+    router.for_thread_optional.return_value = _tb
     thread = {
         "id": "t1",
         "main_cloud_backend": "opencloud",
@@ -638,7 +650,9 @@ async def test_build_agent_cloud_mount_pod_runtime_is_readwrite_and_internal(
     monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
     monkeypatch.delenv("CLOUD_RCLONE_ALLOW_CONTAINER", raising=False)
     router = MagicMock()
-    router.for_thread.return_value = Backend()
+    _tb = Backend()
+    router.for_thread.return_value = _tb
+    router.for_thread_optional.return_value = _tb
     thread = {
         "id": "t1",
         "main_cloud_backend": "opencloud",
@@ -686,7 +700,9 @@ async def test_build_agent_cloud_mount_uses_container_runtime_by_default(monkeyp
     monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
     monkeypatch.delenv("CLOUD_RCLONE_ALLOW_CONTAINER", raising=False)
     router = MagicMock()
-    router.for_thread.return_value = Backend()
+    _tb = Backend()
+    router.for_thread.return_value = _tb
+    router.for_thread_optional.return_value = _tb
     thread = {
         "id": "thread-1",
         "main_cloud_backend": "nextcloud",
@@ -783,7 +799,9 @@ async def test_build_agent_cloud_mount_reconstructs_only_exact_terminal_runtime(
         "metadata": metadata,
     }
     router = MagicMock()
-    router.for_thread.return_value = Backend()
+    _tb = Backend()
+    router.for_thread.return_value = _tb
+    router.for_thread_optional.return_value = _tb
     monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
     monkeypatch.delenv("CLOUD_RCLONE_ALLOW_CONTAINER", raising=False)
 
@@ -870,6 +888,7 @@ def _multi_project_db(projects: list[dict]) -> MagicMock:
 def _router_for_backend(backend: MagicMock) -> MagicMock:
     router = MagicMock()
     router.for_project.return_value = backend
+    router.for_project_optional.return_value = backend
     router.for_backend.return_value = backend
     return router
 

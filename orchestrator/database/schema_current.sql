@@ -20618,6 +20618,21 @@ ALTER TABLE ONLY public.project_repositories
 
 
 --
+-- Name: projects projects_main_cloud_instance_pairing; Type: CHECK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE public.projects
+    ADD CONSTRAINT projects_main_cloud_instance_pairing CHECK (((main_cloud_backend IS NULL) OR (main_cloud_backend_instance_id IS NOT NULL))) NOT VALID;
+
+
+--
+-- Name: CONSTRAINT projects_main_cloud_instance_pairing ON projects; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON CONSTRAINT projects_main_cloud_instance_pairing ON public.projects IS 'A project that names a main-cloud provider must also record which installation of it holds the project folder. Deliberately NOT VALID: pre-0186 rows violate it until the operator-attested backfill stamps them, and they must stay readable in the meantime.';
+
+
+--
 -- Name: projects projects_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -21487,6 +21502,21 @@ ALTER TABLE ONLY public.thread_turn_commits
 
 ALTER TABLE ONLY public.thread_workspace_provision_intents
     ADD CONSTRAINT thread_workspace_provision_intents_pkey PRIMARY KEY (attempt_id);
+
+
+--
+-- Name: threads threads_main_cloud_instance_pairing; Type: CHECK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE public.threads
+    ADD CONSTRAINT threads_main_cloud_instance_pairing CHECK (((main_cloud_backend IS NULL) OR (main_cloud_backend_instance_id IS NOT NULL))) NOT VALID;
+
+
+--
+-- Name: CONSTRAINT threads_main_cloud_instance_pairing ON threads; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON CONSTRAINT threads_main_cloud_instance_pairing ON public.threads IS 'A thread that names a main-cloud provider must also record which installation of it holds the session folder. See the projects sibling.';
 
 
 --

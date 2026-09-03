@@ -53025,6 +53025,89 @@ class PostgresDB:
                     "activation_revision": expected_activation_revision + 1,
                 }
 
+    async def survey_unstamped_main_cloud_rows(self) -> dict[str, Any]:
+        """Report rows that name a main-cloud provider but no installation.
+
+        These are pre-0186 rows: the migration added
+        ``main_cloud_backend_instance_id`` nullable with no backfill, so every
+        row stamped before it carries a provider name and no authority. The
+        router fails closed on them, which is right for effects and was wrong
+        for the decorative read that used to 500 the project page.
+
+        Read-only survey used by the backfill's dry run so an operator can see
+        what would be stamped before anything is written.
+        """
+        async with self.acquire() as conn:
+            projects = await conn.fetch(
+                """
+                SELECT id, name, status, main_cloud_backend,
+                       main_cloud_folder_handle
+                  FROM projects
+                 WHERE main_cloud_backend IS NOT NULL
+                   AND main_cloud_backend_instance_id IS NULL
+                 ORDER BY created_at
+                """
+            )
+            threads = await conn.fetch(
+                """
+                SELECT id, kind, status, main_cloud_backend,
+                       main_cloud_session_handle
+                  FROM threads
+                 WHERE main_cloud_backend IS NOT NULL
+                   AND main_cloud_backend_instance_id IS NULL
+                 ORDER BY created_at
+                """
+            )
+        return {
+            "projects": [dict(r) for r in projects],
+            "threads": [dict(r) for r in threads],
+        }
+
+    async def stamp_main_cloud_instance_authority(
+        self,
+        *,
+        backend_id: str,
+        backend_instance_id: str,
+    ) -> dict[str, int]:
+        """Stamp unstamped rows of one provider with a verified instance.
+
+        Idempotent and narrow: touches only rows whose provider matches and
+        whose authority is still NULL, so re-running is a no-op and a row that
+        already names a *different* instance is never rewritten. The caller
+        owns the hard part — proving that ``backend_instance_id`` really is the
+        installation these rows live on. Do not call this without that proof;
+        stamping a guess launders it into recorded authority, which is worse
+        than the failure it replaces because nothing downstream ever questions
+        it again.
+        """
+        parsed_id = UUID(str(backend_instance_id))
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                projects = await conn.execute(
+                    """
+                    UPDATE projects
+                       SET main_cloud_backend_instance_id=$1::uuid
+                     WHERE main_cloud_backend=$2
+                       AND main_cloud_backend_instance_id IS NULL
+                    """,
+                    parsed_id,
+                    backend_id,
+                )
+                threads = await conn.execute(
+                    """
+                    UPDATE threads
+                       SET main_cloud_backend_instance_id=$1::uuid
+                     WHERE main_cloud_backend=$2
+                       AND main_cloud_backend_instance_id IS NULL
+                    """,
+                    parsed_id,
+                    backend_id,
+                )
+        return {
+            "projects": int(str(projects).rsplit(" ", 1)[-1]),
+            "threads": int(str(threads).rsplit(" ", 1)[-1]),
+        }
+
     async def rotate_main_cloud_backend_secret_refs(
         self,
         authority: MainCloudBackendInstanceAuthority,

@@ -454,7 +454,8 @@
       "unarchive": "Make this project active again so new jobs and sessions can target it"
     },
     "error": {
-      "noAccess": "You don't have access to that project."
+      "noAccess": "You don't have access to that project.",
+      "loadFailed": "Couldn’t load that project — the server returned an error. Please try again."
     },
     "externalKb": {
       "toggle": "Use an external knowledge repository",
