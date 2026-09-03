@@ -2436,6 +2436,20 @@ class ApplicationE2EHarness:
         else:
             canonical_mountpoint.mkdir(mode=0o700)
 
+        # Same trap, second mountpoint: ``cockpit/node_modules`` is bind-mounted
+        # over the read-only repository mount too. A developer checkout already
+        # has the directory from ``npm ci``, so this only ever bites a fresh
+        # runner -- which is why it read as a Helm failure for days rather than
+        # as what it is. Pre-create it for the identical reason; the real
+        # modules still land in run_dir through the nested bind.
+        canonical_modules = REPO_ROOT / "cockpit/node_modules"
+        reject_existing_symlink_components(canonical_modules, "cockpit node_modules")
+        if os.path.lexists(canonical_modules):
+            if canonical_modules.is_symlink() or not canonical_modules.is_dir():
+                raise SafetyError("cockpit node_modules is not a regular directory")
+        else:
+            canonical_modules.mkdir(parents=True)
+
     def _finish_browser_container(self, run_id: str, run_dir: Path) -> None:
         validate_run_id(run_id)
         container_name = f"srw-e2e-browser-{run_id}"
