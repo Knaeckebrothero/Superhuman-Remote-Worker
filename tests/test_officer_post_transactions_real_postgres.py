@@ -4714,3 +4714,61 @@ async def test_blocking_route_snapshot_cannot_land_after_decommission(db):
     assert stored_job["status"] == "processing"
     assert stored_job["freeze_data"] is None
     assert routes == wakes == messages == 0
+
+
+@pytest.mark.asyncio
+async def test_hold_with_route_reason_escalates_blocking_routes(db):
+    """A hold that carries a ``route_reason`` must reach PostgreSQL.
+
+    The route-escalation branch only runs when a hold is stamped *and* the
+    caller names a reason — the shape every real caller uses (conference
+    open, the maintenance-hold endpoint, archive quiesce) and the one shape
+    no other proof in this module exercised. Its ``jsonb_build_object``
+    arguments carry no inferable type, so an uncast parameter makes asyncpg
+    fail at PREPARE with ``IndeterminateDatatypeError`` — a failure the
+    conference path swallows as non-fatal and the endpoint returns as a 500.
+    """
+    seed = await _seed_post(db)
+    job = await _seed_officer_job(
+        db,
+        seed,
+        thread_id=seed["thread_id"],
+        status="processing",
+        label="hold route proof",
+    )
+    async with db.acquire() as conn:
+        route_id = await conn.fetchval(
+            """
+            INSERT INTO job_message_routes (
+                job_id, project_id, thread_id, officer_thread_id,
+                state, blocking
+            ) VALUES ($1, $2, $3, $4, 'pending_officer', TRUE)
+            RETURNING route_id
+            """,
+            job["id"],
+            UUID(seed["project_id"]),
+            seed["thread_id"],
+            UUID(seed["thread_id"]),
+        )
+
+    result = await db.set_project_officer_hold(
+        seed["project_id"],
+        expected_thread_id=seed["thread_id"],
+        hold={"kind": "conference", "since": "now", "thread_id": str(uuid4())},
+        route_reason="officer_hold",
+    )
+
+    metadata = _json(result["thread"]["metadata"])
+    assert metadata["config_override"]["officer"]["hold"]["kind"] == "conference"
+    assert [str(r["route_id"]) for r in result["routes"]] == [str(route_id)]
+
+    async with db.acquire() as conn:
+        stored = await conn.fetchrow(
+            "SELECT state, transitions FROM job_message_routes WHERE route_id=$1",
+            route_id,
+        )
+    assert stored["state"] == "escalated_to_user"
+    transition = _json(stored["transitions"])[-1]
+    assert transition["to"] == "escalated_to_user"
+    assert transition["note"] == "officer_hold"
+    assert transition["actor_id"] == "drain:officer_hold"

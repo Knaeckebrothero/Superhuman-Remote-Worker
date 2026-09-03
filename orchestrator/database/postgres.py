@@ -25197,8 +25197,8 @@ class PostgresDB:
                                        'from', state,
                                        'to', 'escalated_to_user',
                                        'actor_kind', 'system',
-                                       'actor_id', $3,
-                                       'note', $2)),
+                                       'actor_id', $3::text,
+                                       'note', $2::text)),
                                updated_at = now()
                          WHERE project_id = $1
                            AND officer_thread_id = $4
