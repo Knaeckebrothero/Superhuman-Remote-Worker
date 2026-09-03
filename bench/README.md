@@ -52,6 +52,24 @@ In `--server` mode the frozen spec and submission ledger instead live in the
 orchestrator's `bench_runs` row. The CLI reads and resolves `tasks.yaml` before
 posting it; the server never reads a mutable task registry.
 
+For the U2 phase-skills gate, run the audit helper against the audit database
+with the member job ids from the server report:
+
+```bash
+psql "$AUDIT_DB_URL" -v job_ids='uuid-1,uuid-2' \
+  -f bench/queries/phase_illegal_calls.sql
+```
+
+Its first result separates correctly rejected phase-mismatched attempts from
+unsafe or unclassified calls. The latter must be zero. Its second result checks
+the persistent `[phase: ...]` blocks: skills-mode jobs must have no requests
+without a block, and new phases normally increase the count one at a time;
+legacy-mode jobs intentionally have zero blocks. A compaction may drop older,
+superseded blocks, which is reported separately rather than treated as loss of
+the current block. The query's single-phase tool list has a test that compares
+it directly with `TOOL_REGISTRY`, so registry changes cannot silently stale the
+acceptance check.
+
 ## Task families
 
 | prefix | family | config | what it exercises |
