@@ -650,6 +650,7 @@ async def test_source_construction_failure_is_recorded_on_watermark():
         "upserted": 0,
         "deleted": 0,
         "skipped": 0,
+        "skipped_duplicates": 0,
         "errors": 1,
     }
     runner.assert_not_awaited()
@@ -660,6 +661,7 @@ async def test_source_construction_failure_is_recorded_on_watermark():
         last_error="Token/password authentication requires an HTTPS URL",
         repo_name=f"datasource:{datasource_id}",
         branch="main",
+        error_fingerprint=None,
     )
 
 
