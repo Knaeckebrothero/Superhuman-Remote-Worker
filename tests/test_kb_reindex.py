@@ -1854,6 +1854,67 @@ class TestReindexKbWedgeWarning:
             assert fp and len(fp) == 16
         assert warned == 1
 
+    @pytest.mark.asyncio
+    async def test_watermark_readback_failure_does_not_raise(self):
+        """_warn_if_wedged's own get_watermark read-back is advisory-only —
+        a DB blip there must not turn an otherwise-normal partial run into an
+        unhandled exception. The run's *first* get_watermark call (line ~996,
+        pre-existing and unrelated to the wedge check) still has to succeed
+        or the run never reaches the partial branch at all, so only the
+        second call — the wedge check's own — is made to fail."""
+        kb = uuid.uuid4()
+        wm = KbWatermark(
+            kb_id=kb, indexed_commit="old", pipeline_version=CURRENT_VERSION
+        )
+        gitea, store, svc = _make_deps(
+            head="h",
+            watermark=wm,
+            tree=[{"path": "knowledge/bad.md", "type": "blob", "sha": "s"}],
+            contents={},  # fetch failure -> partial, errors=1
+        )
+        store.get_watermark.side_effect = [wm, RuntimeError("db down")]
+
+        result = await reindex_kb(
+            gitea_client=gitea,
+            store=store,
+            embedding_service=svc,
+            kb_id=kb,
+            repo_name="r",
+        )
+
+        assert result["status"] == "partial"
+        assert result["errors"] == 1
+
+    @pytest.mark.asyncio
+    async def test_delete_only_failure_still_fingerprints(self):
+        """A run whose only failure is in the delete loop must still feed
+        the fingerprint — otherwise a delete-only wedge would never
+        accumulate a streak worth warning about."""
+        kb = uuid.uuid4()
+        wm = KbWatermark(
+            kb_id=kb, indexed_commit="old", pipeline_version=CURRENT_VERSION
+        )
+        gitea, store, svc = _make_deps(
+            head="h",
+            watermark=wm,
+            tree=[],  # nothing in the tree now — knowledge/old.md was deleted
+            indexed={"knowledge/old.md": "sha-1"},
+            contents={},
+        )
+        store.delete_kb_note.side_effect = RuntimeError("locked")
+
+        result = await reindex_kb(
+            gitea_client=gitea,
+            store=store,
+            embedding_service=svc,
+            kb_id=kb,
+            repo_name="r",
+        )
+
+        assert result["status"] == "partial"
+        fp = store.set_watermark_status.await_args.kwargs["error_fingerprint"]
+        assert fp is not None and len(fp) == 16
+
 
 # =============================================================================
 # reindex_kb — per-KB serialization (PR3.1)

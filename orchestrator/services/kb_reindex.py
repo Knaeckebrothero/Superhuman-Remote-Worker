@@ -31,6 +31,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from src.services.forge import parse_owner_repo
+from src.services.knowledge_store import WEDGE_STREAK_THRESHOLD
 from src.shared.backlog_tags import normalize_tags
 
 from src.tools.knowledge.chunker import (
@@ -76,11 +77,11 @@ _PROGRESS_BUMP_EVERY = 25
 # read costs ~130ms. Below the threshold the per-file path is cheaper.
 _ARCHIVE_PREFETCH_THRESHOLD = int(os.getenv("KB_REINDEX_ARCHIVE_THRESHOLD", "25"))
 
-# Consecutive `partial` sweeps carrying the same error fingerprint before the
-# sweep logs a one-shot WEDGED warning (spec WP3/H3). Mirrors
-# ``KnowledgeStore.WEDGE_STREAK_THRESHOLD``, which is what actually computes
-# the streak in SQL — this module's copy only decides when to log.
-WEDGE_STREAK_THRESHOLD = 4
+# WEDGE_STREAK_THRESHOLD (consecutive `partial` sweeps carrying the same error
+# fingerprint before the sweep logs a one-shot WEDGED warning, spec WP3/H3) is
+# imported from KnowledgeStore above — that's what actually computes the
+# streak in SQL; this module only decides when to log against it. A local
+# copy would drift silently if the store's bound ever changed.
 
 # The vault root within a project's KB repo (slice 1 dual-write target). Same
 # path whichever repo resolve_kb_repo lands on.
@@ -1300,6 +1301,7 @@ async def _reindex_snapshot(
         except Exception as exc:
             logger.warning("kb_reindex[%s]: delete error on %s: %s", kb_id, path, exc)
             errors += 1
+            note_errors.append(f"{path}: delete failed: {exc}")
 
     # Reconcile orphaned provisional rows (R-1): pathless active rows the tree can
     # never adopt (failed/squashed commit, slug mismatch, create-then-delete).
