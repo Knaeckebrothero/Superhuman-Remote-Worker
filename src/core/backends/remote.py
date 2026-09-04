@@ -576,7 +576,7 @@ class RemoteBackend(WorkspaceBackend):
         # live child controls from being accepted.  Weak values avoid retaining
         # locks forever when a long-lived session churns through tab names.
         self._tab_sync_locks_guard = threading.Lock()
-        self._tab_sync_locks: weakref.WeakValueDictionary[str, threading.Lock] = (
+        self._tab_sync_locks: weakref.WeakValueDictionary[str, Any] = (
             weakref.WeakValueDictionary()
         )
         self._shell_init_lock = threading.Lock()
@@ -3899,7 +3899,11 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         with self._tab_sync_locks_guard:
             lock = self._tab_sync_locks.get(tab_name)
             if lock is None:
-                lock = threading.Lock()
+                # Tab creation calls back through ``shell_open_tab`` while the
+                # ensure path owns this lock.  Keep it re-entrant so the
+                # absence check and the complete window setup are one local
+                # critical section without deadlocking that public wrapper.
+                lock = threading.RLock()
                 self._tab_sync_locks[tab_name] = lock
             return lock
 
@@ -4404,14 +4408,34 @@ __SRW_WORKSPACE_UID_ZERO_PY__
 
     def shell_ensure_tab(self, name: str) -> None:
         self._ensure_shell()
-        if name in self._tabs:
-            return
-        if name in self._lost_tab_notices:
-            self._lost_tab_notices.remove(name)
-            raise KeyError(self._lost_tab_message(name))
-        self.shell_open_tab(name)
+        # Tool calls from one model response execute concurrently.  Several
+        # shell_execute calls may therefore all target the same new name.  The
+        # existence check must share the pane lock with creation; otherwise
+        # each caller can create a duplicate tmux window before ``_tabs`` is
+        # populated and exact-name discovery becomes ambiguous.
+        with self._shell_tab_lock(name):
+            if name in self._tabs:
+                return
+            if name in self._lost_tab_notices:
+                self._lost_tab_notices.remove(name)
+                raise KeyError(self._lost_tab_message(name))
+            self.shell_open_tab(name)
 
     def shell_open_tab(
+        self,
+        name: str,
+        command: Optional[str] = None,
+        tab_type: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        self._ensure_shell()
+        with self._shell_tab_lock(name):
+            return self._shell_open_tab_locked(
+                name,
+                command=command,
+                tab_type=tab_type,
+            )
+
+    def _shell_open_tab_locked(
         self,
         name: str,
         command: Optional[str] = None,

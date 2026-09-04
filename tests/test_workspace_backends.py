@@ -3964,6 +3964,58 @@ class TestRemoteBackendShellOperations:
 
         assert list(backend._tabs.keys()).count("default") == 1
 
+    def test_concurrent_shell_ensure_tab_creates_named_window_once(
+        self, remote_backend
+    ):
+        """A same-response shell batch must not race a new named tmux tab."""
+        backend, _, _ = remote_backend
+        backend._shell_initialized = True
+        backend._tabs["default"] = _RemoteTab("default", pane_id="%1")
+        release_create = threading.Event()
+        first_create = threading.Event()
+        create_count = 0
+        count_lock = threading.Lock()
+        errors = []
+
+        def open_tab(name, command=None, tab_type=None):
+            nonlocal create_count
+            with count_lock:
+                create_count += 1
+                first_create.set()
+            assert release_create.wait(timeout=2)
+            backend._tabs[name] = _RemoteTab(name, pane_id="%2")
+            return backend._tabs[name].to_metadata()
+
+        def ensure():
+            try:
+                backend.shell_ensure_tab("verify")
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        with patch.object(backend, "shell_open_tab", side_effect=open_tab):
+            first = threading.Thread(target=ensure)
+            first.start()
+            assert first_create.wait(timeout=1)
+
+            followers = [threading.Thread(target=ensure) for _ in range(3)]
+            for thread in followers:
+                thread.start()
+
+            # Keep the first create in flight until every follower has had a
+            # chance to hit the absent-tab path.  With no admission lock all
+            # four enter open_tab; with the fix only the first can enter.
+            time.sleep(0.1)
+            release_create.set()
+            first.join(timeout=2)
+            for thread in followers:
+                thread.join(timeout=2)
+
+        assert not first.is_alive()
+        assert all(not thread.is_alive() for thread in followers)
+        assert errors == []
+        assert create_count == 1
+        assert backend._tabs["verify"].pane_id == "%2"
+
     def test_shell_is_alive(self, remote_backend):
         backend, mock_ssh, mock_sftp = remote_backend
         backend.connect()
