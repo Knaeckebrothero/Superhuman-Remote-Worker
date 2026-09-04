@@ -117,6 +117,12 @@ class KnowledgeRecord:
     modified_at: Optional[datetime] = None
     indexed_at: Optional[datetime] = None
     content_hash: Optional[str] = None
+    # Which retrieval arms matched this note, in the multi-angle function's
+    # declared order (dense, sparse, recency, exact, tag) — spec WP7. Attached
+    # by search_chunks from the function's `arms` column; NOT a knowledge_index
+    # column, so from_row never reads it and every other producer of a
+    # KnowledgeRecord leaves it empty.
+    matched_arms: List[str] = field(default_factory=list)
 
     @classmethod
     def from_row(cls, row: Dict[str, Any]) -> "KnowledgeRecord":
@@ -2575,6 +2581,11 @@ class KnowledgeStore:
         self,
         kb_ids: List[uuid.UUID],
         query: str = "",
+        *,
+        exact: Optional[List[str]] = None,
+        tags: Optional[List[str]] = None,
+        exact_weight: float = 0.6,
+        tag_weight: float = 0.2,
         embedding_version: Optional[str] = None,
         match_count: int = 15,
         over_fetch: int = 50,
@@ -2600,16 +2611,73 @@ class KnowledgeStore:
         ``match_count``. ``embedding_version`` filters mixed-model vectors out so
         a model migration can't silently drift the index; ``None`` disables the
         filter (single-model deployments). An empty ``kb_ids`` is the cost guard.
+
+        ``exact`` (literal substrings, trigram-ranked) and ``tags`` (a boost, not
+        a filter) add two more arms — spec WP7. They are what selects the
+        function: with neither supplied this method runs the *existing*
+        ``knowledge_chunk_hybrid_search`` call unchanged, so no current caller's
+        ranking moves (H6); supply either and it runs
+        ``knowledge_chunk_multi_angle_search`` (migration 0025) instead, which
+        returns per-note attribution the results carry back in
+        ``KnowledgeRecord.matched_arms``.
         """
         if not kb_ids:
             return []
 
-        query_embedding = await self.embedding_service.embed(query)
+        # Normalise the filter arms first — they decide which function runs.
+        # `exact` terms are LIKE-escaped because the SQL function builds its
+        # ILIKE pattern by plain concatenation and does not escape (0025's
+        # header), so an unescaped `%`/`_` inside an identifier would silently
+        # act as a wildcard. The escaped term is also what similarity() scores,
+        # so a term containing `%`, `_` or `\` gets a slightly perturbed trigram
+        # score; identifiers rarely contain those, and a wrong match SET is the
+        # worse failure. Tags are matched with `&&` (array containment), which
+        # has no pattern syntax to escape.
+        exact_terms = [
+            _escape_like(t.strip()) for t in (exact or []) if t and t.strip()
+        ]
+        tag_terms = [t.strip() for t in (tags or []) if t and t.strip()]
 
-        rows = await self.db.fetch(
+        if not exact_terms and not tag_terms:
+            # H6: the pre-existing path, byte-for-byte. Every caller that does
+            # not ask for the new arms — kb_search without exact/tags, memory
+            # injection — must keep today's ranking exactly. Do not touch this
+            # branch; the multi-angle path below is strictly additive.
+            query_embedding = await self.embedding_service.embed(query)
+
+            rows = await self.db.fetch(
+                """
+                SELECT * FROM knowledge_chunk_hybrid_search(
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9
+                )
+                """,
+                query,
+                query_embedding,
+                list(kb_ids),
+                embedding_version,
+                over_fetch,
+                dense_weight,
+                sparse_weight,
+                recency_weight,
+                rrf_k,
+            )
+
+            records = [KnowledgeRecord.from_row(dict(row)) for row in rows]
+            return self._rerank_chunks(records)[:match_count]
+
+        # Multi-angle path. The dense arm is optional here: a filter-only call
+        # ("find the notes mentioning this identifier") carries no query text,
+        # and a store can legitimately hold no embedding service — in both cases
+        # pass a NULL embedding and let the lexical arms decide, rather than
+        # paying for (or crashing on) an embedding nobody asked for.
+        query_embedding = None
+        if query.strip() and self.embedding_service is not None:
+            query_embedding = await self.embedding_service.embed(query)
+
+        ranked = await self.db.fetch(
             """
-            SELECT * FROM knowledge_chunk_hybrid_search(
-                $1, $2, $3, $4, $5, $6, $7, $8, $9
+            SELECT * FROM knowledge_chunk_multi_angle_search(
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
             )
             """,
             query,
@@ -2620,10 +2688,36 @@ class KnowledgeStore:
             dense_weight,
             sparse_weight,
             recency_weight,
+            exact_terms,
+            exact_weight,
+            tag_terms,
+            tag_weight,
             rrf_k,
         )
+        if not ranked:
+            return []
 
-        records = [KnowledgeRecord.from_row(dict(row)) for row in rows]
+        # The function returns (note_row, rrf_score, arms) already ordered by
+        # score; the note bodies come from a second query whose row order is
+        # arbitrary, so re-impose the function's order here. `exact` matches
+        # note rows directly, so a note with no current-version chunks can rank
+        # — and a row can vanish between the two queries: skip what's missing
+        # rather than assuming the second query returns every id.
+        order = [r["note_row"] for r in ranked]
+        arms = {r["note_row"]: list(r["arms"] or []) for r in ranked}
+        rows = await self.db.fetch(
+            "SELECT * FROM knowledge_index WHERE id = ANY($1)", order
+        )
+        by_id = {row["id"]: KnowledgeRecord.from_row(dict(row)) for row in rows}
+
+        records = []
+        for note_row in order:
+            record = by_id.get(note_row)
+            if record is None:
+                continue
+            record.matched_arms = arms.get(note_row, [])
+            records.append(record)
+
         return self._rerank_chunks(records)[:match_count]
 
     @staticmethod

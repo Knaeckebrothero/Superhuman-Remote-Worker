@@ -27,6 +27,7 @@ import asyncpg  # noqa: E402
 import pytest_asyncio  # noqa: E402
 
 from orchestrator.database.migrate import run_migrations  # noqa: E402
+from src.services.knowledge_store import KnowledgeStore  # noqa: E402
 
 PG_IMAGE = "pgvector/pgvector:pg15"
 VECTOR_MIGRATIONS = (
@@ -108,6 +109,15 @@ async def _chunk(pool, note_row, kb, text, version="v1"):
         text,
         version,
     )
+
+
+class _NullEmbeddings:
+    """Embedding service that yields no vector. The seeded chunks carry no
+    embedding either, so the dense arm is empty on both paths and the lexical
+    arms decide the ranking — which is what these tests are about."""
+
+    async def embed(self, text):
+        return None
 
 
 @pytest.mark.asyncio
@@ -196,3 +206,87 @@ async def test_existing_hybrid_search_is_untouched_by_0025(vector_pool):
         "knowledge_chunk_hybrid_search",
         "knowledge_chunk_multi_angle_search",
     }
+
+
+# =============================================================================
+# The KnowledgeStore seam (task S4): search_chunks(exact=, tags=) end-to-end
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_search_chunks_exact_sets_matched_arms(vector_pool):
+    """`search_chunks(exact=[...])` with no query text: only the exact arm can
+    fire (the recency arm is gated on a semantic query), so the identifier note
+    comes back alone, attributed `['exact']`. Same seeding as
+    test_exact_arm_finds_identifier_sparse_cannot, but driven through the store
+    — this is what proves the 13 params the method binds line up with the
+    function, and that `matched_arms` survives the second (knowledge_index)
+    query's arbitrary row order."""
+    kb = uuid.uuid4()
+    n1 = await _seed_returning_id(
+        vector_pool,
+        kb,
+        "sales_page_2026_09",
+        "Sales",
+        "the id is sales_page_2026_09 here",
+        tags=["sales"],
+    )
+    n2 = await _seed_returning_id(
+        vector_pool, kb, "other", "Other", "prose only", tags=["web"]
+    )
+    for n, t in ((n1, "the id is sales_page_2026_09 here"), (n2, "prose only")):
+        await _chunk(vector_pool, n, kb, t)
+
+    store = KnowledgeStore(db=vector_pool, embedding_service=None)
+    recs = await store.search_chunks(
+        [kb], "", exact=["sales_page_2026"], embedding_version="v1"
+    )
+    assert [r.note_id for r in recs] == ["sales_page_2026_09"]
+    assert recs[0].matched_arms == ["exact"]
+
+
+@pytest.mark.asyncio
+async def test_search_chunks_with_query_and_tags_reports_every_arm(vector_pool):
+    """With query text present the recency arm is ungated, so a tagged note that
+    also matches the sparse arm is attributed sparse + recency + tag. The
+    recency assertion is the live proof of the function's `$1 <> '' OR $2 IS NOT
+    NULL` gate (the difference between this and the exact-only call above)."""
+    kb = uuid.uuid4()
+    n1 = await _seed_returning_id(
+        vector_pool, kb, "hot_note", "Hot", "shared words", tags=["hot"]
+    )
+    n2 = await _seed_returning_id(
+        vector_pool, kb, "cold_note", "Cold", "shared words", tags=["cold"]
+    )
+    for n in (n1, n2):
+        await _chunk(vector_pool, n, kb, "shared words")
+
+    store = KnowledgeStore(db=vector_pool, embedding_service=None)
+    recs = await store.search_chunks(
+        [kb], "shared words", tags=["hot"], embedding_version="v1"
+    )
+    ids = [r.note_id for r in recs]
+    assert ids[0] == "hot_note" and "cold_note" in ids  # boost, not filter
+    assert "recency" in recs[0].matched_arms
+    assert {"sparse", "tag"} <= set(recs[0].matched_arms)
+    assert "tag" not in recs[ids.index("cold_note")].matched_arms
+
+
+@pytest.mark.asyncio
+async def test_search_chunks_without_exact_or_tags_still_runs_the_old_function(
+    vector_pool,
+):
+    """H6 at the seam, against a real server: a plain call must execute
+    knowledge_chunk_hybrid_search — which returns SETOF knowledge_index, an
+    entirely different shape from the new function's (note_row, rrf_score, arms)
+    — and must carry no arm attribution."""
+    kb = uuid.uuid4()
+    n1 = await _seed_returning_id(
+        vector_pool, kb, "plain_note", "Plain", "shared words", tags=["hot"]
+    )
+    await _chunk(vector_pool, n1, kb, "shared words")
+
+    store = KnowledgeStore(db=vector_pool, embedding_service=_NullEmbeddings())
+    recs = await store.search_chunks([kb], "shared words", embedding_version="v1")
+    assert [r.note_id for r in recs] == ["plain_note"]
+    assert recs[0].matched_arms == []
