@@ -406,6 +406,20 @@ def _scoped_reader(notes: dict):
     return read_note
 
 
+def _scoped_store_reader(notes: dict):
+    """A ``ks.get_note_by_slug`` stand-in keyed on (kb_id, slug).
+
+    The store half of ``_scoped_reader``: the kg-less update tier and
+    ``kb_delete``'s retire guards read rows, not graph nodes, and the same
+    cross-scope bug hides there.
+    """
+
+    def get_note_by_slug(kb_id, slug):
+        return notes.get((str(kb_id), slug))
+
+    return get_note_by_slug
+
+
 def _kb_note(slug: str, content: str, **extra):
     return {
         "id": slug,
@@ -492,7 +506,9 @@ def test_supersede_retire_under_kb_retires_in_the_target_not_the_default():
                 }
             )
 
-    assert "superseded stale-note" in result
+    # The retired handle is qualified too: a bare slug in the SUPERSEDE line
+    # does not say which knowledge base the retirement landed in.
+    assert "superseded project-c0d5edd4:stale-note" in result
     assert all(call.args[0] == str(srw.kb_id) for call in post.call_args_list), (
         post.call_args_list
     )
@@ -626,6 +642,245 @@ def test_write_to_non_primary_target_cannot_set_officer_only_tags():
     assert url.endswith("/api/runtime-actors/authorize")
     assert payload == {"action": "machine_tags", "project_id": str(srw.kb_id)}
     assert RUNTIME_ACTOR_HEADER not in sent
+
+
+# ---------------------------------------------------------------------------
+# WP5.4 — a permanent write failure names the knowledge base it failed in
+# ---------------------------------------------------------------------------
+
+
+def test_no_repo_renders_permanent_and_names_target_and_alternatives():
+    home = _binding("project", kind="native", writable=True, name="Personal")
+    srw = _binding("project-c0d5edd4", kind="native", name="SRW")
+    context = _context([home, srw])
+    context.knowledge_graph.read_note.return_value = None
+    with patch(
+        "src.tools.knowledge.knowledge_tools._post_vault_file",
+        return_value={
+            "status": "failed",
+            "reason": "no-repo",
+            "canonical_state": "failed",
+            "retry_state": "permanent",
+            "recorded": False,
+        },
+    ):
+        result = _tool(_tools(context), "kb_write").invoke(
+            {"title": "X", "type": "learning", "content": "Body"}
+        )
+    assert result.startswith("Error:")
+    assert "will not be retried" in result
+    assert "project — Personal" in result and "no vault repository" in result
+    assert "kb=" in result and "project-c0d5edd4 (SRW)" in result
+    # A permanent failure recorded nothing, so there is no ledger to inspect —
+    # telling the author to go look at one is the wrong instruction.
+    assert "ledger" not in result
+
+
+def test_permanent_failure_without_alternatives_omits_the_hint():
+    home = _binding("project", kind="native", writable=True, name="Personal")
+    context = _context([home])
+    context.knowledge_graph.read_note.return_value = None
+    with patch(
+        "src.tools.knowledge.knowledge_tools._post_vault_file",
+        return_value={
+            "status": "failed",
+            "reason": "no-repo",
+            "canonical_state": "failed",
+            "retry_state": "permanent",
+            "recorded": False,
+        },
+    ):
+        result = _tool(_tools(context), "kb_write").invoke(
+            {"title": "X", "type": "learning", "content": "Body"}
+        )
+    assert "project — Personal" in result
+    assert "kb=" not in result
+
+
+def test_transient_failure_keeps_the_ledger_wording():
+    home = _binding("project", kind="native", writable=True, name="Personal")
+    context = _context([home])
+    context.knowledge_graph.read_note.return_value = None
+    with patch(
+        "src.tools.knowledge.knowledge_tools._post_vault_file",
+        return_value={"status": "failed", "reason": "commit-refused"},
+    ):
+        result = _tool(_tools(context), "kb_write").invoke(
+            {"title": "X", "type": "learning", "content": "Body"}
+        )
+    assert result.startswith("Error: canonical knowledge write")
+    assert "pending-sync ledger" in result
+
+
+def test_permanent_update_failure_names_the_targeted_knowledge_base():
+    """The failure has to name the KB the handle selected, not the default."""
+    home = _binding("project", kind="native", writable=True, name="Personal")
+    srw = _binding("project-c0d5edd4", kind="native", name="SRW")
+    context = _context([home, srw])
+    context.knowledge_graph.read_note.side_effect = _scoped_reader(
+        {(str(srw.kb_id), "n"): _kb_note("n", "old")}
+    )
+    with patch(
+        "src.tools.knowledge.knowledge_tools._post_vault_file",
+        return_value={
+            "status": "failed",
+            "reason": "no-repo",
+            "canonical_state": "failed",
+            "retry_state": "permanent",
+            "recorded": False,
+        },
+    ):
+        result = _tool(_tools(context), "kb_update").invoke(
+            {"note": "project-c0d5edd4:n", "content": "new"}
+        )
+    assert "project-c0d5edd4 — SRW" in result
+    assert "will not be retried" in result
+    assert "project (Personal)" in result
+
+
+# ---------------------------------------------------------------------------
+# WP5.1 — kb_update / kb_delete follow the write target (B5)
+# ---------------------------------------------------------------------------
+
+
+def test_update_may_target_non_primary_native_via_handle():
+    home = _binding("project", kind="native", writable=True)
+    srw = _binding("project-c0d5edd4", kind="native", name="SRW")
+    context = _context([home, srw])
+    context.knowledge_graph.read_note.side_effect = _scoped_reader(
+        {
+            (str(srw.kb_id), "n"): _kb_note("n", "old"),
+            # The trap: a same-slug note in the default knowledge base.
+            (str(home.kb_id), "n"): _kb_note("n", "Home body, must not change"),
+        }
+    )
+    with patch(
+        "src.tools.knowledge.knowledge_tools._post_vault_file",
+        return_value={"status": "committed", "path": "knowledge/n.md"},
+    ) as post:
+        result = _tool(_tools(context), "kb_update").invoke(
+            {"note": "project-c0d5edd4:n", "content": "new"}
+        )
+    assert not result.startswith("Error:")
+    assert post.call_args.args[0] == str(srw.kb_id)
+    assert all(call.args[0] == str(srw.kb_id) for call in post.call_args_list), (
+        post.call_args_list
+    )
+    assert context.knowledge_graph.update_note.call_args.kwargs["project_id"] == str(
+        srw.kb_id
+    )
+    assert not [
+        call
+        for call in context.knowledge_graph.update_note.call_args_list
+        if call.kwargs.get("project_id") == str(home.kb_id)
+    ]
+    assert "Updated **project-c0d5edd4:n**" in result
+
+
+def test_update_without_a_handle_still_targets_the_default_native():
+    home = _binding("project", kind="native", writable=True)
+    srw = _binding("project-c0d5edd4", kind="native", name="SRW")
+    context = _context([home, srw])
+    context.knowledge_graph.read_note.side_effect = _scoped_reader(
+        {(str(home.kb_id), "n"): _kb_note("n", "old")}
+    )
+    with patch(
+        "src.tools.knowledge.knowledge_tools._post_vault_file",
+        return_value={"status": "committed", "path": "knowledge/n.md"},
+    ) as post:
+        result = _tool(_tools(context), "kb_update").invoke(
+            {"note": "n", "content": "new"}
+        )
+    assert post.call_args.args[0] == str(home.kb_id)
+    assert "Updated **project:n**" in result
+
+
+def test_update_kgless_tier_targets_the_handle_named_knowledge_base():
+    home = _binding("project", kind="native", writable=True)
+    srw = _binding("project-c0d5edd4", kind="native", name="SRW")
+    context = _context([home, srw], graph=False)
+    context.knowledge_store.get_note_by_slug.side_effect = _scoped_store_reader(
+        {
+            (str(srw.kb_id), "n"): _kb_note("n", "old"),
+            (str(home.kb_id), "n"): _kb_note("n", "Home body, must not change"),
+        }
+    )
+    with patch(
+        "src.tools.knowledge.knowledge_tools._post_vault_file",
+        return_value={"status": "committed", "path": "knowledge/n.md"},
+    ) as post:
+        result = _tool(_tools(context), "kb_update").invoke(
+            {"note": "project-c0d5edd4:n", "content": "new"}
+        )
+    assert post.call_args.args[0] == str(srw.kb_id)
+    assert "Updated **project-c0d5edd4:n**" in result
+
+
+def test_update_still_refuses_an_external_knowledge_base():
+    home = _binding("project", kind="native", writable=True)
+    docs = _binding("docs", name="Product Docs")
+    context = _context([home, docs])
+    with patch("src.tools.knowledge.knowledge_tools._post_vault_file") as post:
+        result = _tool(_tools(context), "kb_update").invoke(
+            {"note": "docs:n", "content": "new"}
+        )
+    assert result.startswith("Error:")
+    assert "read-only (external)" in result
+    post.assert_not_called()
+
+
+def test_delete_retires_in_the_handle_named_knowledge_base():
+    home = _binding("project", kind="native", writable=True)
+    srw = _binding("project-c0d5edd4", kind="native", name="SRW")
+    context = _context([home, srw])
+    old = "2020-01-01T00:00:00+00:00"
+    context.knowledge_store.get_note_by_slug.side_effect = _scoped_store_reader(
+        {
+            (str(srw.kb_id), "n"): _kb_note("n", "old", created=old),
+            (str(home.kb_id), "n"): _kb_note("n", "Home body", created=old),
+        }
+    )
+    context.knowledge_store.get_inbound_links.return_value = []
+    context.knowledge_graph.read_note.side_effect = _scoped_reader(
+        {
+            (str(srw.kb_id), "n"): _kb_note("n", "old"),
+            (str(home.kb_id), "n"): _kb_note("n", "Home body, must not change"),
+        }
+    )
+    with patch(
+        "src.tools.knowledge.knowledge_tools._post_vault_file",
+        return_value={"status": "committed", "path": "knowledge/n.md"},
+    ) as post:
+        result = _tool(_tools(context), "kb_delete").invoke(
+            {"note": "project-c0d5edd4:n", "reason": "superseded by the newer note"}
+        )
+    assert not result.startswith("Error:") and not result.startswith("Refused:")
+    # Every scope derivation in the retire path — the pre-read, the inbound
+    # link guard, the commit and the graph projection — names the target.
+    assert all(
+        call.args[0] == srw.kb_id
+        for call in context.knowledge_store.get_note_by_slug.call_args_list
+    ), context.knowledge_store.get_note_by_slug.call_args_list
+    assert context.knowledge_store.get_inbound_links.call_args.args[0] == srw.kb_id
+    assert all(call.args[0] == str(srw.kb_id) for call in post.call_args_list), (
+        post.call_args_list
+    )
+    assert context.knowledge_graph.update_note.call_args.kwargs["project_id"] == str(
+        srw.kb_id
+    )
+    # The undo instruction must come back to the same knowledge base.
+    assert 'kb_update(note="project-c0d5edd4:n"' in result
+
+
+def test_delete_still_refuses_an_external_knowledge_base():
+    home = _binding("project", kind="native", writable=True)
+    docs = _binding("docs", name="Product Docs")
+    context = _context([home, docs])
+    result = _tool(_tools(context), "kb_delete").invoke(
+        {"note": "docs:n", "reason": "not ours to retire"}
+    )
+    assert result.startswith("Error:")
+    assert "read-only (external)" in result
 
 
 def test_graph_only_tools_and_export_ignore_external_bindings():

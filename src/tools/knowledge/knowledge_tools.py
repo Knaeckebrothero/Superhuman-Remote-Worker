@@ -19,7 +19,7 @@ import os
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Literal, NamedTuple, Optional
+from typing import Any, Dict, List, Literal, NamedTuple, Optional, Sequence
 
 import httpx
 from langchain_core.tools import tool
@@ -832,6 +832,25 @@ def _native_bindings(context: ToolContext) -> List[KnowledgeBinding]:
     return [binding for binding in _read_bindings(context) if binding.is_native]
 
 
+def _binding_for_project_id(
+    context: ToolContext, project_id: Optional[str]
+) -> Optional[KnowledgeBinding]:
+    """The bound scope a resolved project id names, if any.
+
+    Inverse of ``str(binding.kb_id)``: the write helpers thread a resolved
+    *id* down, but naming the knowledge base in a message (or qualifying a
+    handle) needs the binding back. ``None`` for a legacy context with nothing
+    to resolve against — the caller then renders bare, as it always did.
+    """
+    if not project_id:
+        return None
+    needle = str(project_id)
+    for binding in _read_bindings(context):
+        if str(binding.kb_id) == needle:
+            return binding
+    return None
+
+
 def _resolve_binding(context: ToolContext, selector: str) -> Optional[KnowledgeBinding]:
     needle = str(selector or "").strip().lower()
     for binding in _read_bindings(context):
@@ -1299,10 +1318,26 @@ def _canonical_materialization_succeeded(result: Dict[str, Any]) -> bool:
     )
 
 
-def _canonical_materialization_error(slug: str, result: Dict[str, Any]) -> str:
+def _canonical_materialization_error(
+    slug: str,
+    result: Dict[str, Any],
+    *,
+    target: Optional[KnowledgeBinding] = None,
+    alternatives: Sequence[KnowledgeBinding] = (),
+) -> str:
+    """The tool's verbatim reply for a canonical write that did not land.
+
+    ``target`` is the knowledge base the write was aimed at and
+    ``alternatives`` the native ones the author could aim at instead. Both
+    matter only for a *permanent* failure: with several knowledge bases in
+    scope, "it failed" without naming which one leaves the author retrying
+    the same doomed target forever (WP5.4).
+    """
     state = result.get("canonical_state") or "failed"
     reason = result.get("reason") or "unknown"
     retry = result.get("retry_state") or "unknown"
+    # Older endpoint shapes omit the field; they always recorded their intent.
+    recorded = result.get("recorded", True)
     if reason == "precondition-failed":
         # The compare-and-swap token did not match: another writer changed or
         # removed the note between this caller's read and its write. Nothing
@@ -1312,10 +1347,35 @@ def _canonical_materialization_error(slug: str, result: Dict[str, Any]) -> str:
             "your update was NOT applied to avoid overwriting the other "
             "writer's version. kb_read it again and re-apply what still holds."
         )
+    if retry == "permanent":
+        if reason == "no-repo":
+            where = f"{target.alias} — {target.name}" if target else "the target"
+            others = ", ".join(
+                f"{binding.alias} ({binding.name})"
+                for binding in alternatives
+                if target is None or binding.kb_id != target.kb_id
+            )
+            hint = (
+                f" Native knowledge bases you can target with kb=: {others}."
+                if others
+                else ""
+            )
+            return (
+                f"Error: '{slug}' was NOT written and will not be retried — the "
+                f"target knowledge base ({where}) has no vault repository, so "
+                f"notes cannot be stored there.{hint}"
+            )
+        return (
+            f"Error: '{slug}' was NOT written and will not be retried "
+            f"(reason={reason})."
+        )
+    # Nothing was recorded means there is no pending-sync row to inspect —
+    # pointing the author at one would send them looking for nothing.
+    tail = " Retry, or inspect the pending-sync ledger." if recorded else " Retry."
     return (
         f"Error: canonical knowledge write for '{slug}' did not complete "
         f"(state={state}, reason={reason}, retry={retry}). The mutation remains "
-        "unapplied/ineligible; retry or inspect the pending-sync ledger."
+        f"unapplied.{tail}"
     )
 
 
@@ -1598,6 +1658,21 @@ def create_kb_tools(
     def _qualified(binding: KnowledgeBinding, note_id: str) -> str:
         return binding.handle(note_id) if _has_bound_scopes else note_id
 
+    def _updated_handle(project_id: Optional[str], note_id: str) -> str:
+        """What an ``Updated **…**`` line quotes back to the author.
+
+        The mutation may have landed in any native scope (``kb=``, or a
+        qualified handle), so a bare slug no longer says where — and it is the
+        string the author copies into the next kb_read/kb_update. Degrades to
+        the bare slug for single-scope and legacy runtimes.
+
+        Callers depend on the ``Updated **`` prefix surviving this (kb_write's
+        SUPERSEDE retire loop keys its success test on it), which it does: the
+        qualification happens *inside* the bold markers.
+        """
+        binding = _binding_for_project_id(context, project_id)
+        return _qualified(binding, note_id) if binding is not None else note_id
+
     def _external_snapshot_marker(bindings: List[KnowledgeBinding]) -> str:
         """Best-effort convergence marker for external indexed content."""
         snapshots: List[str] = []
@@ -1865,7 +1940,12 @@ def create_kb_tools(
                 project_id=project_id,
             )
             if not _canonical_materialization_succeeded(materialization):
-                return _canonical_materialization_error(note, materialization)
+                return _canonical_materialization_error(
+                    note,
+                    materialization,
+                    target=_binding_for_project_id(context, project_id),
+                    alternatives=_native_bindings(context),
+                )
 
             changes = _describe_update(
                 content=content,
@@ -1876,7 +1956,8 @@ def create_kb_tools(
                 tag_change=tag_change,
             )
             return (
-                f"Updated **{note}**: {', '.join(changes)}"
+                f"Updated **{_updated_handle(project_id, note)}**: "
+                f"{', '.join(changes)}"
                 f"{_dropped_tag_notice(tag_change.dropped)}"
                 f" {_index_state_suffix(materialization)}"
             )
@@ -2040,7 +2121,12 @@ def create_kb_tools(
                 project_id=project_id,
             )
             if not _canonical_materialization_succeeded(materialization):
-                return _canonical_materialization_error(note, materialization)
+                return _canonical_materialization_error(
+                    note,
+                    materialization,
+                    target=_binding_for_project_id(context, project_id),
+                    alternatives=_native_bindings(context),
+                )
 
             # Neo4j is an optional derived graph, not the dispatch/search
             # projection repaired by the canonical Git reindexer. Preserve its
@@ -2089,7 +2175,8 @@ def create_kb_tools(
             )
 
             return (
-                f"Updated **{note}**: {', '.join(changes)}"
+                f"Updated **{_updated_handle(project_id, note)}**: "
+                f"{', '.join(changes)}"
                 f"{_dropped_tag_notice(tag_change.dropped)}"
                 f" {_index_state_suffix(materialization)}"
             )
@@ -2368,7 +2455,12 @@ def create_kb_tools(
                 context, slug, new_note, retrieval_messages, project_id=project_id
             )
             if not _canonical_materialization_succeeded(materialization):
-                return _canonical_materialization_error(slug, materialization)
+                return _canonical_materialization_error(
+                    slug,
+                    materialization,
+                    target=target,
+                    alternatives=_native_bindings(context),
+                )
 
             graph_error: Optional[Exception] = None
             if kg is not None:
@@ -2419,7 +2511,10 @@ def create_kb_tools(
                             project_id=project_id,
                         )
                         if retire_result.startswith("Updated **"):
-                            retired.append(t.note_id)
+                            # Qualified: the retirement landed in `target`, and
+                            # a bare slug here would not say which knowledge
+                            # base the author should look in to undo it.
+                            retired.append(_qualified(target, t.note_id))
                         else:
                             retire_failures.append(f"{t.note_id}: {retire_result}")
                     except Exception as e:
@@ -2503,6 +2598,13 @@ def create_kb_tools(
                 "Error: set_tags replaces the whole tag list — do not combine "
                 "it with add_tags/remove_tags in one call."
             )
+        # A qualified handle picks the knowledge base this edit lands in.
+        # `writable` marks the DEFAULT native, not the only writable one (B5):
+        # gating on it here meant a session with two native knowledge bases
+        # could only ever edit the first, and — worse — the alias was dropped
+        # after validation, so the edit was derived against the default scope
+        # anyway. Refuse externals (no write path at all), honour the rest.
+        target: Optional[KnowledgeBinding] = None
         alias, note_slug = split_note_handle(note)
         if alias and _has_bound_scopes:
             binding = _resolve_binding(context, alias)
@@ -2511,11 +2613,12 @@ def create_kb_tools(
                     f"Error: Knowledge base '{alias}' is not selected. Available: "
                     f"{_binding_choices(_read_bindings(context))}."
                 )
-            if not binding.is_native or not binding.writable:
+            if not binding.is_native:
                 return (
-                    f"Error: Knowledge base '{binding.alias}' is read-only. "
-                    "External knowledge bases cannot be updated."
+                    f"Error: Knowledge base '{binding.alias}' is read-only "
+                    "(external). External knowledge bases cannot be updated."
                 )
+            target = binding
             note = note_slug
         return _update_existing(
             note,
@@ -2523,6 +2626,11 @@ def create_kb_tools(
             append=append,
             status=status,
             confidence=confidence,
+            # The resolved target, not the default writable native: every
+            # scope derivation inside `_update_existing` keys on this, and
+            # dropping it here would read and rewrite a same-slug note in the
+            # wrong knowledge base while reporting success.
+            project_id=str(target.kb_id) if target is not None else None,
             # None means "leave unchanged" — converted to a rank only when the
             # caller actually asked for a change (Global constraint: never
             # silently reset an existing ticket's priority to normal).
@@ -2568,6 +2676,11 @@ def create_kb_tools(
                 "Error: give a reason of at least a few words — it is journaled "
                 "in the note so a reviewer can see why it was retired."
             )
+        # As in kb_update: a qualified handle names the knowledge base being
+        # retired from, and every derivation below (the row pre-read, the
+        # inbound-link guard, the rewrite) has to use it rather than the
+        # session default (B5).
+        target: Optional[KnowledgeBinding] = None
         alias, note_slug = split_note_handle(note)
         if alias and _has_bound_scopes:
             binding = _resolve_binding(context, alias)
@@ -2576,13 +2689,16 @@ def create_kb_tools(
                     f"Error: Knowledge base '{alias}' is not selected. Available: "
                     f"{_binding_choices(_read_bindings(context))}."
                 )
-            if not binding.is_native or not binding.writable:
+            if not binding.is_native:
                 return (
-                    f"Error: Knowledge base '{binding.alias}' is read-only. "
-                    "External knowledge bases cannot be retired from."
+                    f"Error: Knowledge base '{binding.alias}' is read-only "
+                    "(external). External knowledge bases cannot be retired from."
                 )
+            target = binding
             note = note_slug
-        project_id = _get_project_id(context)
+        project_id = (
+            str(target.kb_id) if target is not None else _get_project_id(context)
+        )
         if not project_id:
             return _write_scope_error(context)
         try:
@@ -2636,14 +2752,19 @@ def create_kb_tools(
             add_links=None,
             remove_tags=None,
             set_tags=None,
+            project_id=project_id,
         )
         if result.startswith("Error"):
             return result
         suffix = result[result.rfind("[") :] if "[" in result else ""
+        # The undo instruction is a handle the author pastes back into
+        # kb_update — bare, it would reopen the DEFAULT knowledge base's
+        # same-slug note rather than the one just retired.
+        handle = _updated_handle(project_id, note)
         return (
-            f"Retired **{note}** (status=archived): {reason_text}. Hidden from "
+            f"Retired **{handle}** (status=archived): {reason_text}. Hidden from "
             "kb_search and injection; still readable with kb_read; undo with "
-            f'kb_update(note="{note}", status="active"). {suffix}'.rstrip()
+            f'kb_update(note="{handle}", status="active"). {suffix}'.rstrip()
         )
 
     # =========================================================================
