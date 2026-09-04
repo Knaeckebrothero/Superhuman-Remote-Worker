@@ -375,10 +375,9 @@ class TestOperationFlipRetry:
 
 class TestSkips:
     @pytest.mark.asyncio
-    async def test_no_repo_skips_cleanly(self):
-        """A repo-less project: the equivalent of the old ``has_git()`` skip."""
+    async def test_no_repo_is_a_permanent_unrecorded_failure(self):
+        """A repo-less project can never satisfy the intent — say so, don't retry."""
         g = _make_gitea()
-
         db = _ledger_db()
         with _patch_resolve(None):
             result = await materialize_knowledge_note(
@@ -389,15 +388,14 @@ class TestSkips:
                 content=BODY,
                 job_id=JOB,
             )
-
-        assert result["status"] == "skipped"
+        assert result["status"] == "failed"
         assert result["reason"] == "no-repo"
-        assert result["canonical_state"] == "pending_sync"
-        assert result["retry_state"] == "retryable"
-        assert result["path"] == PATH
-        assert result["repo"] is None
+        assert result["canonical_state"] == "failed"
+        assert result["retry_state"] == "permanent"
+        assert result["recorded"] is False
+        assert result["path"] == PATH and result["repo"] is None
+        db.begin_knowledge_materialization.assert_not_awaited()
         g.list_tree.assert_not_awaited()
-        g.change_files.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_missing_branch_falls_back_to_main(self):
@@ -1000,6 +998,7 @@ class TestFailures:
                 2026, 8, 17, 10, 11, 12, tzinfo=timezone.utc
             ),
             "canonical_metadata_complete": True,
+            "recorded": True,
             "intent_id": str(intent_id),
             "canonical_state": "canonical",
             "projection_state": "pending",

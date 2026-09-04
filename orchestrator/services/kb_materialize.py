@@ -169,7 +169,21 @@ def _result(
     branch: Optional[str] = None,
     path: Optional[str] = None,
     operation: Optional[str] = None,
+    canonical_state: Optional[str] = None,
+    retry_state: Optional[str] = None,
+    recorded: bool = True,
 ) -> dict[str, Any]:
+    """Base result shape every materialiser outcome extends.
+
+    ``canonical_state``/``retry_state`` default to ``None`` like the other
+    optional fields — the durable-intent wrapper (``_finish_attempt``)
+    overwrites both once an intent exists, so a caller that does not pass
+    them keeps today's shape exactly. ``recorded`` defaults ``True`` because
+    every existing caller of this function runs *after*
+    ``begin_knowledge_materialization`` already opened an intent row; a
+    caller returning before that call (a repo-less project can never satisfy
+    the intent, so none is opened) must pass ``recorded=False`` explicitly.
+    """
     return {
         "status": status,
         "reason": reason,
@@ -177,6 +191,9 @@ def _result(
         "branch": branch,
         "path": path,
         "operation": operation,
+        "canonical_state": canonical_state,
+        "retry_state": retry_state,
+        "recorded": recorded,
     }
 
 
@@ -246,13 +263,18 @@ async def _materialize_knowledge_note_once(
 
         * ``committed`` — the note is on the branch as of this call.
         * ``skipped`` — nothing was written and nothing needed to be:
-          ``no-repo`` (the project has no Gitea repo at all — the equivalent
-          of today's ``has_git()`` skip) or ``unchanged`` (the identical bytes
-          are already committed; writing again would add a no-op commit to the
-          very history §3 wants to be readable).
+          ``unchanged`` (the identical bytes are already committed; writing
+          again would add a no-op commit to the very history §3 wants to be
+          readable).
         * ``failed`` — the note is NOT materialised. ``reason`` is one of
           ``invalid-slug``, ``empty-content``, ``resolve-error``,
-          ``commit-refused``, ``commit-error``.
+          ``no-repo``, ``commit-refused``, ``commit-error``. ``no-repo`` (the
+          project has no Gitea repo at all) is **permanent** — a repo-less
+          project cannot grow one by retrying, so the caller
+          (``_materialize_note_canonical``) resolves the repo *before*
+          opening a durable intent and returns this outcome unrecorded; this
+          branch only fires if that early resolution raised and a same-call
+          retry then answers definitively "no repo".
 
         Never raises. A ``failed`` result means canonical durability was not
         established; callers must not mutate the searchable projection or
@@ -289,14 +311,20 @@ async def _materialize_knowledge_note_once(
             return _result(_STATUS_FAILED, reason="resolve-error", path=path)
 
     if not resolved:
-        # No jobs repo and no knowledge repo — a repo-less project. The old
-        # write path skipped these on has_git(); so do we, cleanly.
-        logger.debug(
-            "kb-materialize: project %s has no KB repo — skipping %s",
+        # No jobs repo and no knowledge repo — a repo-less project can never
+        # satisfy the intent by retrying. The common case never reaches this
+        # line at all: ``_materialize_note_canonical`` resolves before
+        # opening the intent and returns the unrecorded/permanent outcome
+        # itself. This is the rare fallback where that early resolution
+        # raised and this same-call retry (with an intent already open)
+        # answers definitively "no repo" — permanent, but recorded, since an
+        # intent row does exist by this point.
+        logger.info(
+            "kb-materialize: project %s has no KB repo — refusing %s permanently",
             project_id,
             path,
         )
-        return _result(_STATUS_SKIPPED, reason="no-repo", path=path)
+        return _result(_STATUS_FAILED, reason="no-repo", path=path)
 
     repo_name, branch = resolved.repo, resolved.branch
     branch = branch or "main"
@@ -548,6 +576,7 @@ async def _attempt_content_intent(
     content: str,
     job_id: Optional[str],
     expected_blob_sha: Optional[str] = None,
+    resolved_repo: Any = None,
 ) -> dict[str, Any]:
     permanent_reason: str | None = None
     if slug_error(slug):
@@ -576,6 +605,7 @@ async def _attempt_content_intent(
                 content=content,
                 job_id=job_id,
                 expected_blob_sha=expected_blob_sha,
+                resolved_repo=resolved_repo,
             )
         except Exception as exc:
             logger.error(
@@ -589,10 +619,14 @@ async def _attempt_content_intent(
     # ``precondition-failed`` is permanent by design: the caller decided on a
     # version that is no longer there, so replaying its bytes later would be
     # exactly the lost update the token exists to prevent. It must re-read.
+    # ``no-repo`` is permanent for the same reason a repo-less project always
+    # is (WP5.3) — reached here only via the rare fallback documented on
+    # ``_materialize_knowledge_note_once``'s own no-repo branch.
     permanent = permanent_reason is not None or outcome.get("reason") in {
         "invalid-slug",
         "empty-content",
         "precondition-failed",
+        "no-repo",
     }
     return await _finish_attempt(
         postgres_db=postgres_db,
@@ -762,9 +796,41 @@ async def _materialize_note_canonical(
     not carry it, so a sweep retry of a deferred intent runs unconditionally
     — the same replay behaviour as before this token existed. A refused first
     attempt is recorded as permanent, so it is never replayed at all.
+
+    A repo-less project is resolved *before* any intent is opened (WP5.3): it
+    can never satisfy the intent by retrying, so nothing should be durably
+    recorded to retry. ``resolve_kb_repo`` raising here is left to the normal
+    attempt below instead of being decided on the spot — that failure is
+    transient (DB/forge hiccup, not "no repo"), and moving it in front of the
+    intent would cost it the durable, ledger-tracked retry it has today.
     """
     content_text = str(content or "")
     content_hash = hashlib.sha256(content_text.encode("utf-8")).hexdigest()
+    path = note_repo_path(str(slug or "").strip())
+
+    resolved_repo: Any = None
+    if slug_error(slug) is None and content_text.strip():
+        try:
+            resolved_repo = await resolve_kb_repo(postgres_db, project_id)
+        except Exception:  # noqa: BLE001 — re-decided by the normal attempt below
+            resolved_repo = None
+        else:
+            if not resolved_repo:
+                logger.info(
+                    "kb-materialize: project %s has no KB repo — refusing %s "
+                    "permanently",
+                    project_id,
+                    path,
+                )
+                return _result(
+                    _STATUS_FAILED,
+                    reason="no-repo",
+                    path=path,
+                    canonical_state="failed",
+                    retry_state="permanent",
+                    recorded=False,
+                )
+
     try:
         intent = await postgres_db.begin_knowledge_materialization(
             project_id=project_id,
@@ -820,6 +886,7 @@ async def _materialize_note_canonical(
         content=content_text,
         job_id=job_id,
         expected_blob_sha=expected_blob_sha,
+        resolved_repo=resolved_repo,
     )
 
 
