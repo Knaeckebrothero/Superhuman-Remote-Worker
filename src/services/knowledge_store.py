@@ -56,8 +56,8 @@ logger = logging.getLogger(__name__)
 NOTE_ID_MAX = 100
 
 # Consecutive `partial` sweeps carrying the same error fingerprint before the
-# wedge detector alarms (spec WP3, H3). Interpolated (f-string, not a bound
-# parameter) into the set_watermark_status UPSERT.
+# wedge detector alarms (spec WP3, H3). Bound as a parameter into the
+# set_watermark_status UPSERT.
 WEDGE_STREAK_THRESHOLD = 4
 
 
@@ -828,20 +828,28 @@ class KnowledgeStore:
         WP3/H3): a ``partial`` run whose ``error_fingerprint`` matches the row
         already on file is the *same* failure repeating, so the streak
         increments and ``wedged_since`` stamps the first time it crosses
-        ``WEDGE_STREAK_THRESHOLD``; a different fingerprint (or a non-partial
-        status) starts over. All of this is computed inside the statement so
-        two concurrent sweeps can't race the counter with a read-modify-write
-        in Python.
+        ``WEDGE_STREAK_THRESHOLD``; a different fingerprint starts a new
+        streak at 1. Per spec H3 the three wedge fields reset ONLY on
+        ``ready`` or a fingerprint change — every other status (``indexing``,
+        ``failed``, ``pending``, ...) leaves them untouched. This matters
+        because ``kb_reindex.py`` writes an ``indexing`` status at the start
+        of every sweep, before that sweep's own terminal write; an earlier
+        version reset the streak on any non-``partial`` status, so that
+        ``indexing`` write silently wiped the streak every single run and the
+        counter could never reach the threshold. All of this is computed
+        inside the statement so two concurrent sweeps can't race the counter
+        with a read-modify-write in Python.
         """
         executor = conn if conn is not None else self.db
         await executor.execute(
-            f"""
+            """
             INSERT INTO kb_index_watermark
                 (kb_id, repo_name, branch, source_head, status,
                  last_attempt_at, last_error, updated_at,
                  error_fingerprint, error_streak, wedged_since)
             VALUES ($1, $2, $3, $4, $5, NOW(), $6, NOW(),
-                    $7, CASE WHEN $5 = 'partial' THEN 1 ELSE 0 END, NULL)
+                    CASE WHEN $5 = 'partial' THEN $7 ELSE NULL END,
+                    CASE WHEN $5 = 'partial' THEN 1 ELSE 0 END, NULL)
             ON CONFLICT (kb_id) DO UPDATE
                SET repo_name = COALESCE($2, kb_index_watermark.repo_name),
                    branch = COALESCE($3, kb_index_watermark.branch),
@@ -850,19 +858,25 @@ class KnowledgeStore:
                    last_attempt_at = NOW(),
                    last_error = $6,
                    updated_at = NOW(),
-                   error_fingerprint = CASE WHEN $5 = 'partial' THEN $7 ELSE NULL END,
+                   error_fingerprint = CASE
+                       WHEN $5 = 'ready' THEN NULL
+                       WHEN $5 = 'partial' THEN $7
+                       ELSE kb_index_watermark.error_fingerprint END,
                    error_streak = CASE
+                       WHEN $5 = 'ready' THEN 0
                        WHEN $5 = 'partial'
                             AND $7 IS NOT DISTINCT FROM kb_index_watermark.error_fingerprint
                            THEN kb_index_watermark.error_streak + 1
                        WHEN $5 = 'partial' THEN 1
-                       ELSE 0 END,
+                       ELSE kb_index_watermark.error_streak END,
                    wedged_since = CASE
+                       WHEN $5 = 'ready' THEN NULL
                        WHEN $5 = 'partial'
                             AND $7 IS NOT DISTINCT FROM kb_index_watermark.error_fingerprint
-                            AND kb_index_watermark.error_streak + 1 >= {WEDGE_STREAK_THRESHOLD}
+                            AND kb_index_watermark.error_streak + 1 >= $8
                            THEN COALESCE(kb_index_watermark.wedged_since, NOW())
-                       ELSE NULL END
+                       WHEN $5 = 'partial' THEN NULL
+                       ELSE kb_index_watermark.wedged_since END
             """,
             kb_id,
             repo_name,
@@ -871,6 +885,7 @@ class KnowledgeStore:
             status,
             last_error,
             error_fingerprint,
+            WEDGE_STREAK_THRESHOLD,
         )
 
     async def update_index_progress(

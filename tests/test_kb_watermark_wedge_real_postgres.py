@@ -65,10 +65,21 @@ async def vector_pool(pg_dsn):
 
 @pytest.mark.asyncio
 async def test_streak_counts_identical_partial_runs_and_resets_on_ready(vector_pool):
+    """Mirrors the real caller (``kb_reindex.py``): every sweep writes an
+    ``indexing`` status up front, before its own terminal ``partial``/``ready``
+    write. That ``indexing`` write must NOT reset the streak — only ``ready``
+    or a fingerprint change may (spec H3). A prior version reset on any
+    non-``partial`` status, so the intervening ``indexing`` write silently
+    wiped the streak every run and the counter could never reach the
+    threshold via the real call pattern; this test would have caught it.
+    """
     store = KnowledgeStore(db=vector_pool, embedding_service=None)
     kb = uuid.uuid4()
 
     for expected in (1, 2, 3, 4):
+        # The sweep-start write every real reindex run makes before its own
+        # terminal write.
+        await store.set_watermark_status(kb, "indexing", repo_name="r", branch="main")
         await store.set_watermark_status(
             kb,
             "partial",
@@ -81,7 +92,25 @@ async def test_streak_counts_identical_partial_runs_and_resets_on_ready(vector_p
         assert wm.error_streak == expected
         assert (wm.wedged_since is not None) == (expected >= 4)
 
-    # A different failure set is a new streak, not a continuation.
+    # wedged_since is preserved (not re-stamped) on further identical-fingerprint
+    # runs once the streak is already past the threshold.
+    wedged_at_four = wm.wedged_since
+    await store.set_watermark_status(kb, "indexing", repo_name="r", branch="main")
+    await store.set_watermark_status(
+        kb,
+        "partial",
+        last_error="1 note operation(s) failed",
+        error_fingerprint="abc123",
+        repo_name="r",
+        branch="main",
+    )
+    wm = await store.get_watermark(kb)
+    assert wm.error_streak == 5
+    assert wm.wedged_since == wedged_at_four
+
+    # A different failure set is a new streak, not a continuation — even with
+    # an intervening indexing write.
+    await store.set_watermark_status(kb, "indexing", repo_name="r", branch="main")
     await store.set_watermark_status(kb, "partial", error_fingerprint="zzz999")
     wm = await store.get_watermark(kb)
     assert wm.error_streak == 1 and wm.wedged_since is None
