@@ -2952,6 +2952,13 @@ def create_kb_tools(
                 for binding in bindings:
                     try:
                         vocab = _run_async(ks.tag_vocabulary(binding.kb_id))
+                        if isinstance(vocab, list) and vocab:
+                            prefix = f"[{binding.alias}] " if _has_bound_scopes else ""
+                            lines.append(
+                                prefix
+                                + "**Tags:** "
+                                + ", ".join(f"{t} ({n})" for t, n in vocab)
+                            )
                     except Exception as e:
                         logger.debug(
                             "kb_list tag_vocabulary skipped for %s: %s",
@@ -2959,13 +2966,6 @@ def create_kb_tools(
                             e,
                         )
                         continue
-                    if vocab:
-                        prefix = f"[{binding.alias}] " if _has_bound_scopes else ""
-                        lines.append(
-                            prefix
-                            + "**Tags:** "
-                            + ", ".join(f"{t} ({n})" for t, n in vocab)
-                        )
                 if lines:
                     lines.append("")
 

@@ -83,6 +83,7 @@ tools:
     - kb_read
     - kb_list
     - kb_search
+    - kb_grep
     - kb_related
     - kb_contradictions
     - kb_provenance

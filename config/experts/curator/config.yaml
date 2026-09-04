@@ -45,6 +45,7 @@ tools:
     - kb_delete
     - kb_read
     - kb_search
+    - kb_grep
     - kb_list
     - kb_related
     - kb_contradictions

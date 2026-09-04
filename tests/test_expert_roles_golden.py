@@ -115,8 +115,10 @@ _POST_SPLIT_OVERLAY_REMOVALS: dict[str, tuple[str, ...]] = {
 _POST_SPLIT_TOOL_ADDITIONS: dict[str, dict[str, tuple[str, ...]]] = {
     # KB gardening slice 1: kb_delete (the retire tombstone) joined the shared
     # root's knowledge category, so every expert that inherits it gained it.
-    "worker": {"knowledge": ("kb_delete",)},
-    "session": {"knowledge": ("kb_delete",)},
+    # kb_retrieval_hardening T7: kb_grep (literal/regex enumeration) joined
+    # the shared root's knowledge category alongside kb_search.
+    "worker": {"knowledge": ("kb_delete", "kb_grep")},
+    "session": {"knowledge": ("kb_delete", "kb_grep")},
 }
 #: Bindings later work added to an overlay's ``instruction_files`` (role ->
 #: skill names). The list replaces wholesale on merge, so a dotted path cannot

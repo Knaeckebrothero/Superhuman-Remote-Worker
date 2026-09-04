@@ -7,7 +7,7 @@ Covers the three shipped slices:
   no override can replace the write target) plus degraded availability: a
   vector/KB outage never kills the officer — KB tools fail closed with a clear
   `project knowledge unavailable` error and the wake sitrep says so.
-- **K2** the Centurion expert's explicit ten-tool knowledge grant, without
+- **K2** the Centurion expert's explicit eleven-tool knowledge grant, without
   ``kb_export`` (the snapshot test pins the fixture; this file pins intent).
 - **K3** the background-officer capability ceiling: object-plane tools are
   suppressed regardless of overrides or backend capability, while conferences
@@ -40,7 +40,8 @@ PROJECT_A = str(uuid.uuid4())
 PROJECT_B = str(uuid.uuid4())
 EXTERNAL_KB = str(uuid.uuid4())
 
-#: The reviewed grant (officer_knowledge_plane.md §3) — exactly these ten (kb_delete added by kb_gardening G1).
+#: The reviewed grant (officer_knowledge_plane.md §3) — exactly these eleven
+#: (kb_delete added by kb_gardening G1; kb_grep added by kb_retrieval_hardening T7).
 OFFICER_KB_TOOLS = [
     "kb_write",
     "kb_update",
@@ -49,6 +50,7 @@ OFFICER_KB_TOOLS = [
     "kb_read",
     "kb_list",
     "kb_search",
+    "kb_grep",
     "kb_related",
     "kb_contradictions",
     "kb_provenance",
