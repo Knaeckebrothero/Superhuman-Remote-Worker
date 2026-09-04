@@ -42,6 +42,13 @@ def _note_md(slug: str, body: str = "the body", note_type: str = "learning") -> 
     )
 
 
+def _dup_exc(note_id):
+    return RuntimeError(
+        f'duplicate key value violates unique constraint "uq_knowledge_project_note" '
+        f"DETAIL: Key (project_id, note_id)=(x, {note_id}) already exists."
+    )
+
+
 def _make_deps(
     *,
     head="headsha",
@@ -1301,6 +1308,9 @@ class TestReindexKbIncremental:
         # The real unique (project_id, note_id) constraint rejects the second
         # identity. Crucially, adoption was not authorized to move the existing
         # row because its canonical path remains in the current tree.
+        # This message does NOT name uq_knowledge_project_note, so it stays on
+        # the generic-error path (not the skip-with-advisory path below) —
+        # errors == 1 / status == "partial" is correct here, do not "fix" it.
         store.upsert_kb_note.side_effect = RuntimeError("duplicate note id")
 
         result = await reindex_kb(
@@ -1318,6 +1328,71 @@ class TestReindexKbIncremental:
             kb, "stable-id", duplicate, movable_paths=[]
         )
         store.upsert_watermark.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_duplicate_note_id_is_skipped_with_advisory_and_kb_reaches_ready(
+        self,
+    ):
+        kb = uuid.uuid4()
+        wm = KbWatermark(
+            kb_id=kb, indexed_commit="old", pipeline_version=CURRENT_VERSION
+        )
+        holder = "knowledge/research/single_cluster_vm/README.md"
+        loser = "knowledge/research/kb_gardening/README.md"
+        gitea, store, svc = _make_deps(
+            head="headsha",
+            watermark=wm,
+            tree=[
+                {"path": holder, "type": "blob", "sha": "same"},
+                {"path": loser, "type": "blob", "sha": "new"},
+            ],
+            indexed={holder: "same"},
+            contents={loser: _note_md("README")},
+        )
+        store.upsert_kb_note.side_effect = _dup_exc("README")
+        store.find_note_id_owner.return_value = {"path": holder, "id": "README"}
+
+        result = await reindex_kb(
+            gitea_client=gitea,
+            store=store,
+            embedding_service=svc,
+            kb_id=kb,
+            repo_name="r",
+        )
+
+        assert result["status"] == "completed"
+        assert result["errors"] == 0
+        assert result["skipped_duplicates"] == 1
+        assert result["indexed_commit"] == "headsha"
+        kwargs = store.upsert_watermark.await_args_list[-1].kwargs
+        assert kwargs["status"] == "ready"
+        assert (
+            "README" in kwargs["advisory"]
+            and loser in kwargs["advisory"]
+            and holder in kwargs["advisory"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_clean_run_clears_advisory(self):
+        kb = uuid.uuid4()
+        wm = KbWatermark(
+            kb_id=kb, indexed_commit="old", pipeline_version=CURRENT_VERSION
+        )
+        gitea, store, svc = _make_deps(
+            head="h2",
+            watermark=wm,
+            tree=[{"path": "knowledge/a.md", "type": "blob", "sha": "s"}],
+            contents={"knowledge/a.md": _note_md("a")},
+        )
+        result = await reindex_kb(
+            gitea_client=gitea,
+            store=store,
+            embedding_service=svc,
+            kb_id=kb,
+            repo_name="r",
+        )
+        assert result["skipped_duplicates"] == 0
+        assert store.upsert_watermark.await_args_list[-1].kwargs["advisory"] is None
 
     @pytest.mark.asyncio
     async def test_history_rewrite_reconciles_directly_from_current_tree(self):

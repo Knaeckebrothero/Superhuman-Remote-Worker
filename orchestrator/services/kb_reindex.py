@@ -633,6 +633,46 @@ async def _log_duplicate_note_id(
     return True
 
 
+async def _duplicate_holder_path(
+    store: Any, kb_id: uuid.UUID, note_id: Optional[str]
+) -> Optional[str]:
+    """The path the index already holds for ``note_id``, for the advisory text.
+
+    Best-effort and diagnostic only: a second lookup after
+    ``_log_duplicate_note_id`` already ran one, but this runs once per skipped
+    file per sweep, not per row, so the extra query is cheap. Never raises.
+    """
+    if not note_id:
+        return None
+    try:
+        row = await store.find_note_id_owner(kb_id, note_id)
+    except Exception:  # noqa: BLE001 — diagnostic only
+        return None
+    return (row or {}).get("path")
+
+
+def _duplicate_advisory(
+    skipped: List[Tuple[str, str, Optional[str]]],
+) -> Optional[str]:
+    """Render the skipped-duplicate list into the watermark's advisory text.
+
+    ``None`` when nothing was skipped, so a clean run clears a stale advisory
+    from a prior sweep instead of leaving it stuck.
+    """
+    if not skipped:
+        return None
+    parts = [
+        f"'{nid}' at {path} (index holds {holder or 'another path'})"
+        for nid, path, holder in skipped
+    ]
+    text = (
+        f"{len(skipped)} note(s) skipped — duplicate note id: "
+        + "; ".join(parts)
+        + ". Give one file an explicit `id:` or run kb_lint."
+    )
+    return text[:2000]
+
+
 _kb_locks: Dict[uuid.UUID, asyncio.Lock] = {}
 
 
@@ -693,6 +733,7 @@ def _empty_summary(
         "upserted": 0,
         "deleted": 0,
         "skipped": 0,
+        "skipped_duplicates": 0,
         "errors": errors,
     }
 
@@ -1138,6 +1179,7 @@ async def _reindex_snapshot(
         logger.debug("kb_reindex[%s]: progress reset skipped: %s", kb_id, exc)
 
     upserted = skipped = errors = 0
+    skipped_duplicates: List[Tuple[str, str, Optional[str]]] = []
     invalid_paths: List[str] = []
     for path in upsert_paths:
         try:
@@ -1157,12 +1199,13 @@ async def _reindex_snapshot(
                 movable_paths=delete_paths,
             )
         except NoteIndexError as err:
-            if not await _log_duplicate_note_id(
-                store, kb_id, path, err.note_id, err.cause
-            ):
-                logger.warning(
-                    "kb_reindex[%s]: error on %s: %s", kb_id, path, err.cause
-                )
+            if await _log_duplicate_note_id(store, kb_id, path, err.note_id, err.cause):
+                # H2: a second file claiming a live id is a lint condition, not a
+                # sweep failure. Skip it, say so once, and let the KB reach ready.
+                holder = await _duplicate_holder_path(store, kb_id, err.note_id)
+                skipped_duplicates.append((err.note_id or "?", path, holder))
+                continue
+            logger.warning("kb_reindex[%s]: error on %s: %s", kb_id, path, err.cause)
             errors += 1
             continue
         except Exception as exc:
@@ -1223,6 +1266,7 @@ async def _reindex_snapshot(
             source_head=head,
             status="ready",
             last_error=None,
+            advisory=_duplicate_advisory(skipped_duplicates),
         )
         status = "completed"
     else:
@@ -1246,7 +1290,7 @@ async def _reindex_snapshot(
 
     logger.info(
         "kb_reindex[%s]: %s at %s (full=%s upserted=%d deleted=%d "
-        "reconciled=%d skipped=%d errors=%d)",
+        "reconciled=%d skipped=%d skipped_dupes=%d errors=%d)",
         kb_id,
         status,
         head[:12],
@@ -1255,6 +1299,7 @@ async def _reindex_snapshot(
         deleted,
         reconciled,
         skipped,
+        len(skipped_duplicates),
         errors,
     )
     return {
@@ -1265,6 +1310,7 @@ async def _reindex_snapshot(
         "deleted": deleted,
         "reconciled": reconciled,
         "skipped": skipped,
+        "skipped_duplicates": len(skipped_duplicates),
         "errors": errors,
     }
 
