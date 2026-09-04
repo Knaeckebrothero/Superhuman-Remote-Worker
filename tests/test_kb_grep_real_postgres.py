@@ -11,6 +11,7 @@ extends this file with the grep-channel behavior it backs.
 from __future__ import annotations
 
 import re
+import uuid
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,7 @@ import asyncpg  # noqa: E402
 import pytest_asyncio  # noqa: E402
 
 from orchestrator.database.migrate import run_migrations  # noqa: E402
+from src.services.knowledge_store import KnowledgeStore  # noqa: E402
 
 PG_IMAGE = "pgvector/pgvector:pg15"
 VECTOR_MIGRATIONS = (
@@ -75,3 +77,173 @@ async def test_pg_trgm_extension_and_content_index_exist(vector_pool):
             )
         }
         assert "idx_knowledge_content_trgm" in indexnames
+
+
+async def _seed(pool, kb, note_id, title, content, tags=()):
+    # $3 is cast to ::text at both use sites (the note_id column value and the
+    # path concatenation) — reusing an untyped parameter in two positions that
+    # asyncpg would otherwise infer as different types (character varying for
+    # the column, text for the `||` concat) raises AmbiguousParameterError.
+    await pool.execute(
+        """
+        INSERT INTO knowledge_index
+            (id, project_id, kb_id, note_id, title, note_type, status, content,
+             tags, path, indexed_at)
+        VALUES ($1, $2, $2, $3::text, $4, 'learning', 'active', $5, $6,
+                'knowledge/' || $3::text || '.md', NOW())
+        """,
+        uuid.uuid4(),
+        kb,
+        note_id,
+        title,
+        content,
+        list(tags),
+    )
+
+
+@pytest.mark.asyncio
+async def test_substring_grep_returns_lines_with_context_and_note_count(vector_pool):
+    store = KnowledgeStore(db=vector_pool, embedding_service=None)
+    kb = uuid.uuid4()
+    await _seed(
+        vector_pool,
+        kb,
+        "sales_page_2026_09",
+        "Sales",
+        "intro\nsee sales_page_2026_09 for the page\noutro",
+        tags=["sales", "web"],
+    )
+    await _seed(vector_pool, kb, "other", "Other", "nothing here", tags=["web"])
+
+    matches, total = await store.grep_notes([kb], "SALES_PAGE_2026")
+    assert total == 1
+    assert [m.note_id for m in matches] == ["sales_page_2026_09"]
+    m = matches[0]
+    assert m.line_no == 2 and "sales_page_2026_09" in m.line
+    assert m.before == ["intro"] and m.after == ["outro"]
+
+
+@pytest.mark.asyncio
+async def test_substring_grep_pattern_with_percent_and_underscore_is_literal(
+    vector_pool,
+):
+    """`%` and `_` in the pattern must match themselves, not act as SQL
+    wildcards. The decoy line satisfies the *unescaped* ILIKE pattern
+    (`%50%_off%` reads as: contains "50", then anything, then exactly one
+    char, then "off") but not the literal string "50%_off" — so a match on
+    only the literal-target note proves the pattern was escaped."""
+    store = KnowledgeStore(db=vector_pool, embedding_service=None)
+    kb = uuid.uuid4()
+    await _seed(
+        vector_pool,
+        kb,
+        "literal-target",
+        "Literal",
+        "before\nprice is 50%_off today\nafter",
+    )
+    await _seed(
+        vector_pool,
+        kb,
+        "wildcard-decoy",
+        "Decoy",
+        "before\nprice is 50xyzZoff today\nafter",
+    )
+
+    matches, total = await store.grep_notes([kb], "50%_off")
+    assert total == 1
+    assert [m.note_id for m in matches] == ["literal-target"]
+    assert matches[0].line == "price is 50%_off today"
+
+
+@pytest.mark.asyncio
+async def test_regex_grep_and_cap(vector_pool):
+    store = KnowledgeStore(db=vector_pool, embedding_service=None)
+    kb = uuid.uuid4()
+    await _seed(vector_pool, kb, "a", "A", "\n".join(f"err-{i:03d}" for i in range(10)))
+    matches, total = await store.grep_notes(
+        [kb], r"err-00\d", regex=True, max_matches=3
+    )
+    assert total == 1 and len(matches) == 3
+
+
+@pytest.mark.asyncio
+async def test_pattern_guards(vector_pool):
+    store = KnowledgeStore(db=vector_pool, embedding_service=None)
+    with pytest.raises(ValueError):
+        await store.grep_notes([uuid.uuid4()], "")
+    with pytest.raises(ValueError):
+        await store.grep_notes([uuid.uuid4()], "x" * 257)
+
+
+@pytest.mark.asyncio
+async def test_grep_notes_empty_kb_ids_short_circuits(vector_pool):
+    store = KnowledgeStore(db=vector_pool, embedding_service=None)
+    assert await store.grep_notes([], "anything") == ([], 0)
+
+
+@pytest.mark.asyncio
+async def test_tag_vocabulary_counts_desc(vector_pool):
+    store = KnowledgeStore(db=vector_pool, embedding_service=None)
+    kb = uuid.uuid4()
+    await _seed(vector_pool, kb, "n1", "N1", "b", tags=["web", "sales"])
+    await _seed(vector_pool, kb, "n2", "N2", "b", tags=["web"])
+    assert await store.tag_vocabulary(kb) == [("web", 2), ("sales", 1)]
+
+
+@pytest.mark.asyncio
+async def test_ilike_path_uses_trigram_index(vector_pool):
+    async def _plan():
+        rows = await vector_pool.fetch(
+            "EXPLAIN SELECT id FROM knowledge_index WHERE content ILIKE '%needle-xyz%'"
+        )
+        return rows, any("idx_knowledge_content_trgm" in r[0] for r in rows)
+
+    plan, used = await _plan()
+    if not used:
+        # An almost-empty table makes a seq scan look cheaper than the GIN
+        # index to the planner. Measured directly against this schema+image:
+        # short (~60 byte) filler content never crosses over even at 4000
+        # rows (still a seq scan, cost ~180) — such small rows pack
+        # many-per-page. Content *identical* across every row is unreliable
+        # in the other direction: with only a handful of distinct trigrams
+        # in the whole table, ANALYZE's row-sampling estimate of the GIN
+        # index's selectivity is noisy enough to flip the chosen plan between
+        # otherwise-identical runs. ~1.1KB of shared filler text *plus a
+        # unique per-row marker* (so ANALYZE sees real trigram diversity)
+        # reliably crosses the seq-scan/index-scan cost crossover by 6000
+        # rows — seeded via a bulk multi-row INSERT (not a loop of
+        # single-row `_seed` calls, which took 12s+ for a third this many
+        # rows), then ANALYZE so the row-count estimate reflects the
+        # just-inserted rows instead of stale (empty-table) statistics
+        # autovacuum hasn't refreshed yet.
+        kb = uuid.uuid4()
+        filler = "lorem ipsum dolor sit amet consectetur adipiscing elit " * 20
+        rows_to_insert = [
+            (
+                uuid.uuid4(),
+                kb,
+                kb,
+                f"seed-{i:06d}",
+                f"Seed {i}",
+                "learning",
+                "active",
+                f"{filler} row-marker-{i:06d}",
+                [],
+                f"knowledge/seed-{i:06d}.md",
+            )
+            for i in range(6000)
+        ]
+        await vector_pool.executemany(
+            """
+            INSERT INTO knowledge_index
+                (id, project_id, kb_id, note_id, title, note_type, status,
+                 content, tags, path, indexed_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+            """,
+            rows_to_insert,
+        )
+        await vector_pool.execute("ANALYZE knowledge_index")
+        plan, used = await _plan()
+    assert used, "planner did not choose idx_knowledge_content_trgm:\n" + "\n".join(
+        r[0] for r in plan
+    )

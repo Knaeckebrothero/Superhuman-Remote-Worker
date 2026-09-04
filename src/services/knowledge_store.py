@@ -38,6 +38,7 @@ Usage:
 
 import hashlib
 import logging
+import re
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -234,6 +235,41 @@ class KnowledgeChunk:
             embedding_version=row.get("embedding_version"),
             created_at=row.get("created_at"),
         )
+
+
+@dataclass
+class GrepMatch:
+    """One matched line from :meth:`KnowledgeStore.grep_notes` (spec WP7, D9).
+
+    The lexical enumeration channel: a literal/regex hit an agent can act on by
+    exact text, which stemmed full-text search cannot do for identifiers like
+    ``sales_page_2026_09`` or a commit sha. ``line_no`` is 1-based within the
+    note body; ``before``/``after`` are the surrounding context lines (their
+    length is bounded by the caller's ``context`` argument, and can be shorter
+    at a note's head/tail).
+    """
+
+    kb_id: uuid.UUID
+    note_id: str
+    title: str
+    line_no: int
+    line: str
+    before: List[str]
+    after: List[str]
+
+
+# Grep pattern length cap (D9): both the ILIKE substring and the ~* regex are
+# bound as a single query parameter, but an unbounded pattern is still an easy
+# way to make Postgres do pathological work — reject before it ever reaches SQL.
+_GREP_PATTERN_MAX = 256
+
+
+def _escape_like(pattern: str) -> str:
+    """Escape ``\\``, ``%`` and ``_`` so a literal substring search behaves
+    literally under ``ILIKE ... ESCAPE '\\'`` (backslash must be escaped first,
+    or escaping ``%``/``_`` would itself introduce new backslashes that get
+    re-escaped)."""
+    return pattern.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 class KnowledgeStore:
@@ -2084,6 +2120,134 @@ class KnowledgeStore:
             }
             for r in rows
         ]
+
+    # =========================================================================
+    # Lexical enumeration channel — grep + tag vocabulary (spec WP7, D9/D11)
+    # =========================================================================
+
+    async def grep_notes(
+        self,
+        kb_ids: List[uuid.UUID],
+        pattern: str,
+        *,
+        regex: bool = False,
+        max_matches: int = 50,
+        context: int = 1,
+        statement_timeout_ms: int = 5000,
+        include_titles: bool = True,
+    ) -> Tuple[List[GrepMatch], int]:
+        """Deterministic literal/regex enumeration over note bodies (D9).
+
+        The only lexical channel agents have into the knowledge base besides
+        stemmed English full-text search, which cannot match an identifier
+        like ``sales_page_2026_09`` or a commit sha. One indexed SQL predicate
+        (S1's ``idx_knowledge_content_trgm`` trigram GIN index for the ILIKE
+        path; a plain ``~*`` regex match otherwise) selects the *candidate*
+        notes so Postgres never returns more bodies than actually match; line
+        extraction — including the ``before``/``after`` context window — then
+        happens here in Python, against exactly those bodies.
+
+        ``regex=False`` (the default) is a literal substring search: the
+        pattern is escaped for ``ILIKE`` (backslash, ``%``, ``_``) so a
+        pattern containing those characters matches itself, not a wildcard.
+        ``regex=True`` passes the pattern straight to Postgres's ``~*``
+        (case-insensitive POSIX regex); a malformed pattern raises from
+        Postgres and is left to propagate — the tool layer renders the error,
+        this method does not swallow it.
+
+        Only active, materialised (``path IS NOT NULL``) notes are candidates,
+        matching the read path's visibility rule. Candidates are ordered by
+        ``note_id`` for determinism; ``max_matches`` caps the number of
+        *matched lines* returned across all notes (not notes themselves), and
+        the second return value is always the number of candidate notes SQL
+        found — even when the line cap truncates before every candidate note
+        is scanned, so a caller can tell "there were more notes" from "there
+        were more lines in the notes we saw".
+        """
+        pattern = (pattern or "").strip()
+        if not pattern:
+            raise ValueError("pattern must not be empty")
+        if len(pattern) > _GREP_PATTERN_MAX:
+            raise ValueError(f"pattern longer than {_GREP_PATTERN_MAX} characters")
+        if not kb_ids:
+            return [], 0
+
+        if regex:
+            body_pred = "content ~* $2"
+            title_pred = "title ~* $2"
+            arg = pattern
+        else:
+            body_pred = "content ILIKE '%' || $2 || '%' ESCAPE '\\'"
+            title_pred = "title ILIKE '%' || $2 || '%' ESCAPE '\\'"
+            arg = _escape_like(pattern)
+        # `where` is assembled only from these fixed strings (chosen by the
+        # boolean flags, never by `pattern` or any other caller-supplied
+        # text) — the pattern itself only ever reaches Postgres as the bound
+        # parameter `$2`.
+        where = f"({body_pred} OR {title_pred})" if include_titles else body_pred
+
+        async with self.db.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    f"SET LOCAL statement_timeout = {int(statement_timeout_ms)}"
+                )
+                rows = await conn.fetch(
+                    f"""
+                    SELECT kb_id, note_id, title, content
+                    FROM knowledge_index
+                    WHERE kb_id = ANY($1::uuid[]) AND status = 'active'
+                      AND path IS NOT NULL
+                      AND {where}
+                    ORDER BY note_id
+                    """,
+                    list(kb_ids),
+                    arg,
+                )
+
+        rx = re.compile(pattern if regex else re.escape(pattern), re.IGNORECASE)
+        matches: List[GrepMatch] = []
+        for row in rows:
+            lines = (row["content"] or "").splitlines()
+            for ix, line in enumerate(lines):
+                if not rx.search(line):
+                    continue
+                matches.append(
+                    GrepMatch(
+                        kb_id=row["kb_id"],
+                        note_id=row["note_id"],
+                        title=row["title"] or "",
+                        line_no=ix + 1,
+                        line=line,
+                        before=lines[max(0, ix - context) : ix],
+                        after=lines[ix + 1 : ix + 1 + context],
+                    )
+                )
+                if len(matches) >= max_matches:
+                    return matches, len(rows)
+        return matches, len(rows)
+
+    async def tag_vocabulary(
+        self, kb_id: uuid.UUID, limit: int = 20
+    ) -> List[Tuple[str, int]]:
+        """Distinct tags in a KB with usage counts, most-used first (D11).
+
+        Backs ``kb_list``'s tag-vocabulary hint. Same visibility rule as
+        :meth:`grep_notes` (active + materialised notes only); ties break
+        alphabetically so the result is stable across calls.
+        """
+        rows = await self.db.fetch(
+            """
+            SELECT tag, COUNT(*) AS n
+            FROM knowledge_index, LATERAL unnest(tags) AS tag
+            WHERE kb_id = $1 AND status = 'active' AND path IS NOT NULL
+            GROUP BY tag
+            ORDER BY n DESC, tag ASC
+            LIMIT $2
+            """,
+            kb_id,
+            limit,
+        )
+        return [(r["tag"], int(r["n"])) for r in rows]
 
     # =========================================================================
     # TTL lifecycle — KB convergence
