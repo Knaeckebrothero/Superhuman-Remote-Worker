@@ -46,12 +46,12 @@ def _context(bindings: list[KnowledgeBinding], *, graph=True):
     return context
 
 
-def _tools(context):
+def _tools(context, **kwargs):
     with patch(
         "src.tools.knowledge.knowledge_tools.asyncio.get_running_loop",
         side_effect=RuntimeError,
     ):
-        return create_kb_tools(context)
+        return create_kb_tools(context, **kwargs)
 
 
 def _tool(tools, name):
@@ -390,6 +390,169 @@ def test_write_default_target_is_still_the_writable_native():
 
     assert post.call_args.args[0] == str(home.kb_id)
     assert "**project:x**" in result
+
+
+def _scoped_reader(notes: dict):
+    """A ``kg.read_note`` stand-in keyed on (project_id, slug).
+
+    Every cross-scope bug in this area looks the same: the read and the write
+    disagree about which knowledge base they are in. Keying the fixture on the
+    project id is what makes that visible instead of silently consistent.
+    """
+
+    def read_note(project_id, slug):
+        return notes.get((str(project_id), slug))
+
+    return read_note
+
+
+def _kb_note(slug: str, content: str, **extra):
+    return {
+        "id": slug,
+        "title": slug,
+        "type": "learning",
+        "status": "active",
+        "content": content,
+        "tags": [],
+        "keywords": [],
+        "relationships": [],
+        **extra,
+    }
+
+
+def test_duplicate_repair_under_kb_never_touches_the_default_knowledge_base():
+    """A byte-identical note in the target must not rewrite the default's twin."""
+    home = _binding("project", kind="native", writable=True)
+    srw = _binding("project-c0d5edd4", kind="native", name="SRW")
+    context = _context([home, srw])
+    context.knowledge_graph.read_note.side_effect = _scoped_reader(
+        {
+            # Identical body in the target: this is what routes kb_write into
+            # the canonical-but-unsearchable repair.
+            (str(srw.kb_id), "x"): _kb_note("x", "Body"),
+            # The trap: a same-slug note in the default knowledge base.
+            (str(home.kb_id), "x"): _kb_note("x", "Home body, must not change"),
+        }
+    )
+    context.knowledge_store.note_is_indexed.return_value = False
+
+    result, post = _write(context, kb="project-c0d5edd4")
+
+    assert "Updated" in result
+    assert post.call_args.args[0] == str(srw.kb_id)
+    assert all(call.args[0] == str(srw.kb_id) for call in post.call_args_list), (
+        post.call_args_list
+    )
+    assert context.knowledge_graph.update_note.call_args.kwargs["project_id"] == str(
+        srw.kb_id
+    )
+    assert not [
+        call
+        for call in context.knowledge_graph.update_note.call_args_list
+        if call.kwargs.get("project_id") == str(home.kb_id)
+    ]
+
+
+def test_supersede_retire_under_kb_retires_in_the_target_not_the_default():
+    """The worst cross-scope case: a false success with a dangling link."""
+    home = _binding("project", kind="native", writable=True)
+    srw = _binding("project-c0d5edd4", kind="native", name="SRW")
+    context = _context([home, srw])
+    context.knowledge_graph.read_note.side_effect = _scoped_reader(
+        {
+            (str(srw.kb_id), "stale-note"): _kb_note("stale-note", "Old body"),
+            # The trap: the default carries the same slug too.
+            (str(home.kb_id), "stale-note"): _kb_note("stale-note", "Home body"),
+        }
+    )
+
+    verdict = MagicMock()
+    verdict.verdict.action = "SUPERSEDE"
+    stale = MagicMock()
+    stale.note_id = "stale-note"
+    verdict.targets = [stale]
+
+    with patch(
+        "src.services.knowledge.ingestion.gate_candidate",
+        new=AsyncMock(return_value=verdict),
+    ):
+        with patch(
+            "src.tools.knowledge.knowledge_tools._post_vault_file",
+            return_value={"status": "committed", "path": "knowledge/x.md"},
+        ) as post:
+            tools = _tools(
+                context, verdict_service=MagicMock(), verdict_prompt="adjudicate"
+            )
+            result = _tool(tools, "kb_write").invoke(
+                {
+                    "title": "X",
+                    "type": "learning",
+                    "content": "Body",
+                    "kb": "project-c0d5edd4",
+                }
+            )
+
+    assert "superseded stale-note" in result
+    assert all(call.args[0] == str(srw.kb_id) for call in post.call_args_list), (
+        post.call_args_list
+    )
+    assert not [
+        call
+        for call in context.knowledge_graph.update_note.call_args_list
+        if call.kwargs.get("project_id") == str(home.kb_id)
+    ]
+    assert context.knowledge_graph.update_note.call_args.kwargs["project_id"] == str(
+        srw.kb_id
+    )
+
+
+def test_write_qualifies_the_no_op_line_for_an_identical_note():
+    home = _binding("project", kind="native", writable=True)
+    srw = _binding("project-c0d5edd4", kind="native", name="SRW")
+    context = _context([home, srw])
+    context.knowledge_graph.read_note.side_effect = _scoped_reader(
+        {(str(srw.kb_id), "x"): _kb_note("x", "Body")}
+    )
+    context.knowledge_store.note_is_indexed.return_value = True
+
+    result, post = _write(context, kb="project-c0d5edd4")
+
+    assert "'project-c0d5edd4:x' already exists" in result
+    post.assert_not_called()
+
+
+def test_write_refuses_an_unknown_kb_alias_and_lists_what_is_selected():
+    home = _binding("project", kind="native", writable=True)
+    docs = _binding("docs")
+    context = _context([home, docs])
+
+    result, post = _write(context, kb="nope")
+
+    assert result.startswith("Error: Knowledge base 'nope' is not selected.")
+    assert "project (Project)" in result and "docs (Docs)" in result
+    post.assert_not_called()
+
+
+def test_write_falls_back_to_a_bare_legacy_project_id():
+    """Legacy contexts set `project_id` with nothing in `project_ids`."""
+    project_id = str(uuid.uuid4())
+    context = MagicMock()
+    context.knowledge_bindings = None
+    context.project_ids = []
+    context.project_id = project_id
+    context.job_id = str(uuid.uuid4())
+    context.config = {}
+    context.knowledge_graph = MagicMock()
+    context.knowledge_graph.read_note.return_value = None
+    context.knowledge_store = AsyncMock()
+    context.has_git.return_value = False
+    context.has_workspace.return_value = False
+
+    result, post = _write(context)
+
+    assert post.call_args.args[0] == project_id
+    # No bound scopes, so the handle stays bare — legacy output is unchanged.
+    assert "**x**" in result
 
 
 def test_write_refuses_external_target_and_lists_native_choices():

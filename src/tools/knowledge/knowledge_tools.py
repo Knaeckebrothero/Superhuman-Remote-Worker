@@ -1746,6 +1746,7 @@ def create_kb_tools(
         priority: Optional[int] = None,
         remove_tags: Optional[List[str]] = None,
         set_tags: Optional[List[str]] = None,
+        project_id: Optional[str] = None,
     ) -> str:
         """Neo4j-less update: read the row from the store, apply the mutation in
         Python (the graph does this in Cypher), write the OKF file back.
@@ -1754,8 +1755,13 @@ def create_kb_tools(
         ``add_links`` round-trip as generic body links via the reindexer — the
         graph-only relationship *type* is not preserved (no Neo4j to hold it),
         consistent with the honest graph-tier degrade elsewhere in PR4c.
+
+        ``project_id`` names the knowledge base to read and rewrite in; omitted,
+        it is the session's default writable native scope. It must be threaded
+        wherever the scope is derived below: a read from one knowledge base and
+        a write into another silently mutates the wrong note (B5).
         """
-        project_id = _get_project_id(context)
+        project_id = project_id or _get_project_id(context)
         if not project_id:
             return _write_scope_error(context)
 
@@ -1856,6 +1862,7 @@ def create_kb_tools(
                 # note makes this write fail loudly instead of silently
                 # winning — or silently re-creating a deleted file.
                 expected_blob_sha=existing.get("blob_sha"),
+                project_id=project_id,
             )
             if not _canonical_materialization_succeeded(materialization):
                 return _canonical_materialization_error(note, materialization)
@@ -1888,12 +1895,21 @@ def create_kb_tools(
         add_links: Optional[List[dict]] = None,
         remove_tags: Optional[List[str]] = None,
         set_tags: Optional[List[str]] = None,
+        project_id: Optional[str] = None,
     ) -> str:
         """Update canonical git first, then the optional Neo4j projection.
 
         The searchable row is not written here: the materialisation endpoint
         indexes it from the commit this makes (Slice A). Neo4j is the only
         projection left for the tool to drive, and it degrades best-effort.
+
+        ``project_id`` names the knowledge base to read and rewrite in; omitted,
+        it is the session's default writable native scope, which is what
+        ``kb_update`` passes. ``kb_write`` delegates here with an explicit
+        target (``kb=``), and every scope derivation below has to honour it —
+        reading the note from one knowledge base and committing the rewrite
+        into another would silently mutate a same-slug note in the wrong place
+        and report success (B5).
         """
         if kg is None:
             return _update_existing_kgless(
@@ -1907,9 +1923,10 @@ def create_kb_tools(
                 priority=priority,
                 remove_tags=remove_tags,
                 set_tags=set_tags,
+                project_id=project_id,
             )
 
-        project_id = _get_project_id(context)
+        project_id = project_id or _get_project_id(context)
         if not project_id:
             return _write_scope_error(context)
 
@@ -2020,6 +2037,7 @@ def create_kb_tools(
                 # "no opinion" (see test_omits_retrieval_messages_entirely_...).
                 existing.get("retrieval_messages"),
                 expected_blob_sha=(prior_row or {}).get("blob_sha"),
+                project_id=project_id,
             )
             if not _canonical_materialization_succeeded(materialization):
                 return _canonical_materialization_error(note, materialization)
@@ -2136,8 +2154,9 @@ def create_kb_tools(
             Confirmation with the note's slug ID, or error message
         """
         target, target_error = _resolve_write_target(context, kb)
-        if target is None:
-            return target_error or _write_scope_error(context)
+        if target_error:
+            return target_error
+        assert target is not None  # _resolve_write_target never returns (None, None)
         project_id = str(target.kb_id)
 
         # Normalize machine tags (lowercase) and enforce the officer-only
@@ -2228,8 +2247,8 @@ def create_kb_tools(
                 already_indexed = True
             if already_indexed:
                 return (
-                    f"Note '{candidate_slug}' already exists with identical "
-                    f"content — no change written. "
+                    f"Note '{_qualified(target, candidate_slug)}' already exists "
+                    f"with identical content — no change written. "
                     f"{_index_state_suffix({'indexed': True})}"
                 )
             # Canonical but unsearchable. Route through the normal update path
@@ -2237,12 +2256,13 @@ def create_kb_tools(
             # the file is re-rendered and re-materialised by one code path
             # rather than a second, subtly different one here.
             #
-            # `_update_existing` still resolves the DEFAULT writable scope, so
-            # under a non-default `kb=` this repair (and the SUPERSEDE retire
-            # below) looks for the note in the wrong knowledge base and fails
-            # loudly with "not found" rather than editing the wrong note.
-            # Threading the target through it belongs with the kb_update work.
-            return _update_existing(candidate_slug, content=content)
+            # The probe above ran against `project_id`, so the repair has to as
+            # well: `_update_existing` otherwise resolves the DEFAULT writable
+            # scope, and under a non-default `kb=` it would read and overwrite
+            # a same-slug note in the wrong knowledge base and report success.
+            return _update_existing(
+                candidate_slug, content=content, project_id=project_id
+            )
 
         # Ingestion verdict gate (slice 2 PR2) — only when the curator wired a
         # service. Adjudicate the candidate against its nearest active notes
@@ -2275,8 +2295,12 @@ def create_kb_tools(
                         f"{decision.verdict.reason}"
                     )
                 if action == "UPDATE" and decision.targets:
+                    # The gate adjudicated against `project_id`'s notes, so the
+                    # redirected edit lands there too — never in the default.
                     return _update_existing(
-                        decision.targets[0].note_id, content=content
+                        decision.targets[0].note_id,
+                        content=content,
+                        project_id=project_id,
                     )
                 if action == "SUPERSEDE" and decision.targets:
                     supersede_targets = decision.targets
@@ -2388,6 +2412,11 @@ def create_kb_tools(
                             t.note_id,
                             status="superseded",
                             add_links=[{"target": slug, "type": "SUPERSEDED_BY"}],
+                            # The stale note lives in the knowledge base the
+                            # candidate was written to; retiring the default's
+                            # same-slug note instead would leave a dangling
+                            # SUPERSEDED_BY and still count as retired.
+                            project_id=project_id,
                         )
                         if retire_result.startswith("Updated **"):
                             retired.append(t.note_id)
