@@ -32,6 +32,9 @@ def test_phase_query_checks_gate_results_and_persistent_blocks():
     sql = QUERY.read_text()
     assert "unsafe_or_unclassified" in sql
     assert "result_payload->'tool'->>'success'" in sql
-    assert "LIKE '[phase: %'" in sql
+    assert "message->'additional_kwargs'->>'srw_protected' = 'true'" in sql
+    assert "message->'additional_kwargs'->>'srw_instruction_path'" in sql
+    assert "^skills/(strategic|tactical)-phase/SKILL[.]md$" in sql
+    assert "message->>'content' LIKE" not in sql
     assert "zero_block_requests" in sql
     assert "multi_block_additions" in sql

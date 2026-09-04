@@ -115,7 +115,9 @@ request_blocks AS (
         request.id,
         request.job_id,
         count(*) FILTER (
-            WHERE message->>'content' LIKE '[phase: %'
+            WHERE message->'additional_kwargs'->>'srw_protected' = 'true'
+              AND message->'additional_kwargs'->>'srw_instruction_path'
+                  ~ '^skills/(strategic|tactical)-phase/SKILL[.]md$'
         ) AS phase_blocks
     FROM llm_requests AS request
     JOIN selected_jobs USING (job_id)
