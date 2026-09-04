@@ -2989,7 +2989,8 @@ def create_kb_tools(
                   whenever you know the literal text — stemmed search cannot
                   match `sales_page_2026_09` or `KB_REINDEX_SWEEP_SECONDS`.
           tags  — boost notes carrying these tags (a nudge, not a filter; use
-                  kb_list(tag=) to filter).
+                  kb_list(tag=) to filter). Pass a list, not a comma-joined
+                  string (that is one tag).
         Each hit shows which angles matched it, e.g. ⟨dense+exact⟩. For every
         occurrence with surrounding lines use `kb_grep`.
         Plain `kb_search(query=...)` is unchanged.
@@ -3000,14 +3001,21 @@ def create_kb_tools(
         kb_ids = [binding.kb_id for binding in bindings]
         binding_by_id = {str(binding.kb_id): binding for binding in bindings}
 
-        def _normalise_terms(value):
+        def _as_list(value):
             if value is None:
                 return []
-            items = [value] if isinstance(value, str) else list(value)
-            return [item.strip() for item in items if item and item.strip()]
+            return [value] if isinstance(value, str) else list(value)
 
-        exact_terms = _normalise_terms(exact)
-        tag_terms = _normalise_terms(tags)
+        exact_terms = [
+            item.strip()
+            for item in _as_list(exact)
+            if isinstance(item, str) and item.strip()
+        ]
+        # Tags are canonicalised through the same case-fold as every other
+        # tag-consuming path in this file (kb_write, kb_update, the reindexer)
+        # so `tags=["Sales"]` matches what was actually stored as "sales".
+        # `exact` is left alone: it's a literal-text search, not a tag lookup.
+        tag_terms = normalize_tags(_as_list(tags))
 
         if not (query or exact_terms or tag_terms):
             return "Error: give at least one of query, exact, or tags."
@@ -3106,14 +3114,21 @@ def create_kb_tools(
 
             if extra_angles:
                 if exact_terms:
-                    exact_hits = sum(
-                        1
-                        for note in results
-                        if isinstance(getattr(note, "matched_arms", None), list)
-                        and "exact" in note.matched_arms
-                    )
+                    # Per-term, not per-arm: matched_arms only says a hit
+                    # matched *some* exact term, not which one, so an
+                    # aggregate count would misreport a term with zero hits
+                    # as having the same count as one that matched everything.
+                    # Plain case-insensitive substring over title+content —
+                    # the term is not escaped here (the store already does
+                    # that for the ILIKE it ran).
                     for term in exact_terms:
-                        lines.append(f"exact '{term}': {exact_hits} shown")
+                        term_lower = term.lower()
+                        count = sum(
+                            1
+                            for note in results
+                            if term_lower in f"{note.title}\n{note.content}".lower()
+                        )
+                        lines.append(f"exact '{term}': {count} shown")
                 if tag_terms:
                     tag_hits = sum(
                         1

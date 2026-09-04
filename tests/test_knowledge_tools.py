@@ -987,18 +987,35 @@ class TestKbSearchChunkCutover:
         assert out.startswith("Error:") and "query" in out and "exact" in out
 
     def test_coverage_line_reports_per_arm_hit_counts(self):
-        rec1 = _srec("n1")
-        rec1.matched_arms = ["exact", "dense"]
-        rec2 = _srec("n2")
-        rec2.matched_arms = ["dense"]
-        ctx = self._ctx_with_store([rec1, rec2])
+        # Per exact TERM, not per arm: "sales_page" and "billing_id" hit
+        # different, differently-sized subsets of the results, so the two
+        # coverage lines must carry their own counts rather than one
+        # aggregate "matched the exact arm at all" number.
+        rec1 = _srec("n1", content="ships the sales_page redesign")
+        rec2 = _srec("n2", content="also touches sales_page copy")
+        rec3 = _srec("n3", content="unrelated billing_id migration")
+        ctx = self._ctx_with_store([rec1, rec2, rec3])
         tools, _ = _make_tools(ctx)
         out = _invoke(
             _get_tool(tools, "kb_search"),
             {"query": "auth", "exact": ["sales_page", "billing_id"]},
         )
-        assert "exact 'sales_page': 1 shown" in out
+        assert "exact 'sales_page': 2 shown" in out
         assert "exact 'billing_id': 1 shown" in out
+
+    def test_tags_are_case_folded_to_match_storage(self):
+        ctx = self._ctx_with_store([])
+        tools, _ = _make_tools(ctx)
+        _invoke(_get_tool(tools, "kb_search"), {"query": "q", "tags": ["Sales"]})
+        kwargs = ctx.knowledge_store.search_chunks.call_args.kwargs
+        assert kwargs["tags"] == ["sales"]
+
+    def test_tags_accepts_a_bare_string(self):
+        ctx = self._ctx_with_store([])
+        tools, _ = _make_tools(ctx)
+        _invoke(_get_tool(tools, "kb_search"), {"query": "q", "tags": "sales"})
+        kwargs = ctx.knowledge_store.search_chunks.call_args.kwargs
+        assert kwargs["tags"] == ["sales"]
 
 
 # =============================================================================
