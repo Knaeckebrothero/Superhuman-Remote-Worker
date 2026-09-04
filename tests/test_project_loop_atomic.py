@@ -322,7 +322,7 @@ def test_vector_idempotency_ledgers_are_current_and_in_generated_snapshot():
     migrations = sorted(
         (REPO_ROOT / "orchestrator/database/migrations/vector").glob("*.sql")
     )
-    assert migrations[-1].name == "0022_kb_watermark_wedge_tracking.sql"
+    assert migrations[-1].name == "0025_knowledge_multi_angle_search.sql"
     snapshot = (
         REPO_ROOT / "orchestrator/database/vector_schema_current.sql"
     ).read_text()

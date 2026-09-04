@@ -765,11 +765,17 @@ class KnowledgeStore:
 
         ``advisory`` (migration 0022) is a line for conditions that were
         skipped rather than failed (spec H2, e.g. duplicate note ids). This
-        method is also the wedge detector's reset: every call — success or
-        not — clears ``error_fingerprint``/``error_streak``/``wedged_since``,
-        because reaching ``upsert_watermark`` at all means the run finished
-        far enough to advance the watermark, which is not the "same failure
-        repeating" state ``set_watermark_status`` tracks.
+        method is also the wedge detector's reset, but only when ``status`` is
+        ``'ready'``: that clears ``error_fingerprint``/``error_streak``/
+        ``wedged_since``, because reaching a ``ready`` write means the run
+        finished far enough to advance the watermark, which is not the "same
+        failure repeating" state ``set_watermark_status`` tracks. A
+        resumable-rebuild caller (``kb_reindex.py``) also calls this with
+        ``status="indexing"`` up front, purely to record ``pipeline_version``
+        before re-diffing — that write must NOT reset the streak, or a
+        mid-rebuild wedge would be silently wiped every time the rebuild
+        resumes (Controller addendum, S0 re-review 2026-09-04; same reset
+        class the S0 review caught in ``set_watermark_status``).
         """
         await self.db.execute(
             """
@@ -795,9 +801,18 @@ class KnowledgeStore:
                    last_error = $8,
                    updated_at = NOW(),
                    advisory = $9,
-                   error_fingerprint = NULL,
-                   error_streak = 0,
-                   wedged_since = NULL
+                   error_fingerprint = CASE
+                       WHEN $7 = 'ready' THEN NULL
+                       ELSE kb_index_watermark.error_fingerprint
+                   END,
+                   error_streak = CASE
+                       WHEN $7 = 'ready' THEN 0
+                       ELSE kb_index_watermark.error_streak
+                   END,
+                   wedged_since = CASE
+                       WHEN $7 = 'ready' THEN NULL
+                       ELSE kb_index_watermark.wedged_since
+                   END
             """,
             kb_id,
             repo_name,

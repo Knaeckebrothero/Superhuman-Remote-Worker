@@ -122,3 +122,45 @@ async def test_streak_counts_identical_partial_runs_and_resets_on_ready(vector_p
     wm = await store.get_watermark(kb)
     assert wm.error_streak == 0 and wm.error_fingerprint is None
     assert wm.wedged_since is None and wm.advisory == "1 note skipped"
+
+
+@pytest.mark.asyncio
+async def test_upsert_watermark_resets_wedge_fields_only_on_ready(vector_pool):
+    """Controller addendum (S0 re-review, 2026-09-04): a resumable-rebuild
+    call to ``upsert_watermark`` with ``status="indexing"`` (the
+    pipeline-version write ``kb_reindex.py`` makes before re-diffing, see
+    ``clear_note_stamps``) must not reset the wedge streak — only a
+    ``status="ready"`` write may. The prior unconditional reset in
+    ``upsert_watermark``'s ON CONFLICT branch would silently wipe a streak
+    mid-rebuild, the same reset class the S0 review caught in
+    ``set_watermark_status``.
+    """
+    store = KnowledgeStore(db=vector_pool, embedding_service=None)
+    kb = uuid.uuid4()
+
+    for expected in (1, 2):
+        await store.set_watermark_status(kb, "indexing", repo_name="r", branch="main")
+        await store.set_watermark_status(
+            kb,
+            "partial",
+            last_error="1 note operation(s) failed",
+            error_fingerprint="abc123",
+            repo_name="r",
+            branch="main",
+        )
+        wm = await store.get_watermark(kb)
+        assert wm.error_streak == expected
+
+    # A resumable-rebuild "indexing" write via upsert_watermark must leave
+    # the streak and fingerprint untouched.
+    await store.upsert_watermark(kb, "r", "main", None, "v2", status="indexing")
+    wm = await store.get_watermark(kb)
+    assert wm.error_streak == 2
+    assert wm.error_fingerprint == "abc123"
+
+    # Only a "ready" write clears all three wedge fields.
+    await store.upsert_watermark(kb, "r", "main", "deadbeef", "v2", status="ready")
+    wm = await store.get_watermark(kb)
+    assert wm.error_streak == 0
+    assert wm.error_fingerprint is None
+    assert wm.wedged_since is None

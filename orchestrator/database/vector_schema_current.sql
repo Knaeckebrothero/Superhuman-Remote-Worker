@@ -32,6 +32,20 @@ SET client_min_messages = warning;
 SET row_security = off;
 
 --
+-- Name: pg_trgm; Type: EXTENSION; Schema: -; Owner: -
+--
+
+CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA public;
+
+
+--
+-- Name: EXTENSION pg_trgm; Type: COMMENT; Schema: -; Owner: -
+--
+
+COMMENT ON EXTENSION pg_trgm IS 'text similarity measurement and index searching based on trigrams';
+
+
+--
 -- Name: uuid-ossp; Type: EXTENSION; Schema: -; Owner: -
 --
 
@@ -1300,6 +1314,13 @@ CREATE INDEX idx_knowledge_chunks_note ON public.knowledge_chunks USING btree (n
 --
 
 CREATE INDEX idx_knowledge_chunks_search ON public.knowledge_chunks USING gin (search_doc);
+
+
+--
+-- Name: idx_knowledge_content_trgm; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_knowledge_content_trgm ON public.knowledge_index USING gin (content public.gin_trgm_ops);
 
 
 --
