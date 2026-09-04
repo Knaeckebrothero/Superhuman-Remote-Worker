@@ -674,6 +674,10 @@ CREATE TABLE public.kb_index_watermark (
     last_error text,
     notes_done integer,
     notes_total integer,
+    error_fingerprint text,
+    error_streak integer DEFAULT 0 NOT NULL,
+    wedged_since timestamp with time zone,
+    advisory text,
     CONSTRAINT kb_index_watermark_status_valid CHECK ((status = ANY (ARRAY['pending'::text, 'indexing'::text, 'ready'::text, 'partial'::text, 'failed'::text])))
 );
 
