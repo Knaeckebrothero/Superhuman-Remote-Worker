@@ -19,7 +19,7 @@ import os
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Literal, NamedTuple, Optional, Sequence
+from typing import Any, Dict, List, Literal, NamedTuple, Optional, Sequence, Union
 
 import httpx
 from langchain_core.tools import tool
@@ -2973,26 +2973,55 @@ def create_kb_tools(
             return f"Error listing notes: {e}"
 
     @tool
-    def kb_search(query: str, max_results: int = 10, kb: Optional[str] = None) -> str:
-        """Search the project knowledge base using hybrid ranking.
+    def kb_search(
+        query: Optional[str] = None,
+        max_results: int = 10,
+        kb: Optional[str] = None,
+        exact: Optional[Union[str, List[str]]] = None,
+        tags: Optional[Union[str, List[str]]] = None,
+    ) -> str:
+        """Search the knowledge base from several angles in one call.
 
-        Combines semantic vector search, keyword matching, and recency
-        via Reciprocal Rank Fusion (RRF) over the chunk index. Searches active
-        notes only.
-
-        Args:
-            query: Search query (natural language or keywords)
-            max_results: Maximum number of results (default 10)
-            kb: Optional selected knowledge-base alias or UUID
-
-        Returns:
-            Ranked search results with note summaries
+        Angles (give at least one; they compose):
+          query — natural language, for MEANING (semantic + full-text + recency).
+          exact — an identifier, slug, commit sha, error string or exact phrase
+                  (case-insensitive substring; a list matches any). Use this
+                  whenever you know the literal text — stemmed search cannot
+                  match `sales_page_2026_09` or `KB_REINDEX_SWEEP_SECONDS`.
+          tags  — boost notes carrying these tags (a nudge, not a filter; use
+                  kb_list(tag=) to filter).
+        Each hit shows which angles matched it, e.g. ⟨dense+exact⟩. For every
+        occurrence with surrounding lines use `kb_grep`.
+        Plain `kb_search(query=...)` is unchanged.
         """
         bindings, error = _select_bindings(context, kb)
         if error:
             return error
         kb_ids = [binding.kb_id for binding in bindings]
         binding_by_id = {str(binding.kb_id): binding for binding in bindings}
+
+        def _normalise_terms(value):
+            if value is None:
+                return []
+            items = [value] if isinstance(value, str) else list(value)
+            return [item.strip() for item in items if item and item.strip()]
+
+        exact_terms = _normalise_terms(exact)
+        tag_terms = _normalise_terms(tags)
+
+        if not (query or exact_terms or tag_terms):
+            return "Error: give at least one of query, exact, or tags."
+
+        extra_angles = bool(exact_terms or tag_terms)
+
+        angle_parts = []
+        if query:
+            angle_parts.append(f"query '{query}'")
+        if exact_terms:
+            angle_parts.append("exact " + ", ".join(f"'{t}'" for t in exact_terms))
+        if tag_terms:
+            angle_parts.append("tags " + ", ".join(tag_terms))
+        angle_desc = ", ".join(angle_parts)
 
         # Filter to the live pipeline stamp so mixed-model/chunker vectors can't
         # drift into the result set. Resolved from the same EmbeddingService that
@@ -3004,21 +3033,33 @@ def create_kb_tools(
             current_version = None
 
         try:
-            results = _run_async(
-                ks.search_chunks(
-                    kb_ids=kb_ids,
-                    query=query,
-                    embedding_version=current_version,
-                    match_count=max_results,
-                )
-            )
+            search_kwargs = {
+                "kb_ids": kb_ids,
+                "query": (query or "") if extra_angles else query,
+                "embedding_version": current_version,
+                "match_count": max_results,
+            }
+            if exact_terms:
+                search_kwargs["exact"] = exact_terms
+            if tag_terms:
+                search_kwargs["tags"] = tag_terms
+
+            results = _run_async(ks.search_chunks(**search_kwargs))
 
             if not results:
-                base = f"No knowledge notes match '{query}'."
+                base = (
+                    f"No knowledge notes match ({angle_desc})."
+                    if extra_angles
+                    else f"No knowledge notes match '{query}'."
+                )
                 notice = _index_readiness_notice(bindings)
                 return f"{base}\n\n{notice}" if notice else base
 
-            header = f"**Search Results** ({len(results)} matches for '{query}')"
+            header = (
+                f"**Search Results** ({len(results)} matches — {angle_desc})"
+                if extra_angles
+                else f"**Search Results** ({len(results)} matches for '{query}')"
+            )
             # Native single-KB compatibility header. External bindings use the
             # richer convergence marker below so a partial mixed cache is never
             # mislabeled as an immutable snapshot at the last clean commit.
@@ -3052,11 +3093,35 @@ def create_kb_tools(
                 if _has_bound_scopes and result_binding is not None:
                     note_handle = result_binding.handle(note.note_id)
                     source = f"[{result_binding.alias}] "
+                arms = getattr(note, "matched_arms", None)
+                arm_suffix = (
+                    f" ⟨{'+'.join(arms)}⟩" if isinstance(arms, list) and arms else ""
+                )
                 lines.append(
-                    f"**[{i}]** {source}**{note_handle}** — {note.title} ({meta})"
+                    f"**[{i}]** {source}**{note_handle}** — {note.title} "
+                    f"({meta}){arm_suffix}"
                 )
                 lines.append(f"  {preview}")
                 lines.append("")
+
+            if extra_angles:
+                if exact_terms:
+                    exact_hits = sum(
+                        1
+                        for note in results
+                        if isinstance(getattr(note, "matched_arms", None), list)
+                        and "exact" in note.matched_arms
+                    )
+                    for term in exact_terms:
+                        lines.append(f"exact '{term}': {exact_hits} shown")
+                if tag_terms:
+                    tag_hits = sum(
+                        1
+                        for note in results
+                        if isinstance(getattr(note, "matched_arms", None), list)
+                        and "tag" in note.matched_arms
+                    )
+                    lines.append(f"tags {', '.join(tag_terms)}: {tag_hits} boosted")
 
             if _has_bound_scopes and len(kb_ids) > 1:
                 snapshots = []

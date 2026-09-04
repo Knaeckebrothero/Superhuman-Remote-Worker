@@ -959,6 +959,47 @@ class TestKbSearchChunkCutover:
         result = _invoke(_get_tool(tools, "kb_search"), {"query": "q"})
         assert "n1" in result
 
+    def test_plain_query_passes_no_new_arms(self):
+        ctx = self._ctx_with_store([_srec("n1")])
+        tools, _ = _make_tools(ctx)
+        _invoke(_get_tool(tools, "kb_search"), {"query": "auth"})
+        kwargs = ctx.knowledge_store.search_chunks.call_args.kwargs
+        assert kwargs.get("exact") in (None, []) and kwargs.get("tags") in (None, [])
+
+    def test_exact_and_tags_are_normalised_to_lists_and_attributed(self):
+        rec = _srec("n1")
+        rec.matched_arms = ["exact", "tag"]
+        ctx = self._ctx_with_store([rec])
+        tools, _ = _make_tools(ctx)
+        out = _invoke(
+            _get_tool(tools, "kb_search"), {"exact": "sales_page", "tags": ["sales"]}
+        )
+        kwargs = ctx.knowledge_store.search_chunks.call_args.kwargs
+        assert kwargs["exact"] == ["sales_page"] and kwargs["tags"] == ["sales"]
+        assert kwargs["query"] == ""
+        assert "⟨exact+tag⟩" in out
+        assert "exact 'sales_page'" in out  # per-arm coverage line
+
+    def test_requires_at_least_one_angle(self):
+        ctx = self._ctx_with_store([])
+        tools, _ = _make_tools(ctx)
+        out = _invoke(_get_tool(tools, "kb_search"), {})
+        assert out.startswith("Error:") and "query" in out and "exact" in out
+
+    def test_coverage_line_reports_per_arm_hit_counts(self):
+        rec1 = _srec("n1")
+        rec1.matched_arms = ["exact", "dense"]
+        rec2 = _srec("n2")
+        rec2.matched_arms = ["dense"]
+        ctx = self._ctx_with_store([rec1, rec2])
+        tools, _ = _make_tools(ctx)
+        out = _invoke(
+            _get_tool(tools, "kb_search"),
+            {"query": "auth", "exact": ["sales_page", "billing_id"]},
+        )
+        assert "exact 'sales_page': 1 shown" in out
+        assert "exact 'billing_id': 1 shown" in out
+
 
 # =============================================================================
 # 13.9: kb_related
