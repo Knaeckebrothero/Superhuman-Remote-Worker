@@ -256,6 +256,132 @@ $_$;
 
 
 --
+-- Name: knowledge_chunk_multi_angle_search(text, public.vector, uuid[], text, integer, double precision, double precision, double precision, text[], double precision, text[], double precision, integer); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.knowledge_chunk_multi_angle_search(query_text text, query_embedding public.vector, kb_ids_param uuid[], version_param text DEFAULT NULL::text, match_count integer DEFAULT 15, dense_weight double precision DEFAULT 0.6, sparse_weight double precision DEFAULT 0.3, recency_weight double precision DEFAULT 0.1, exact_terms text[] DEFAULT '{}'::text[], exact_weight double precision DEFAULT 0.6, tag_terms text[] DEFAULT '{}'::text[], tag_weight double precision DEFAULT 0.2, rrf_k integer DEFAULT 60) RETURNS TABLE(note_row uuid, rrf_score double precision, arms text[])
+    LANGUAGE plpgsql
+    SET "hnsw.iterative_scan" TO 'relaxed_order'
+    AS $_$
+BEGIN
+RETURN QUERY EXECUTE $q$
+-- Dense arm: copy of knowledge_chunk_hybrid_search's dense arm, empty when
+-- $2 IS NULL. Over-fetch $5 * 4 chunks so a note whose best chunk ranks behind
+-- several other notes' chunks still survives the per-note collapse.
+WITH dense AS (
+    SELECT mid, MIN(rank_ix) AS rank_ix FROM (
+        SELECT c.note_row AS mid,
+               ROW_NUMBER() OVER (
+                   ORDER BY subvector(c.embedding, 1, 4000)::halfvec(4000)
+                            <=> subvector($2, 1, 4000)::halfvec(4000)
+               ) AS rank_ix
+        FROM knowledge_chunks c
+        JOIN knowledge_index ki ON ki.id = c.note_row
+        WHERE $2 IS NOT NULL
+          AND c.kb_id = ANY($3)
+          AND ki.status = 'active'
+          AND c.embedding IS NOT NULL
+          AND ($4 IS NULL OR c.embedding_version = $4)
+        ORDER BY subvector(c.embedding, 1, 4000)::halfvec(4000)
+                 <=> subvector($2, 1, 4000)::halfvec(4000)
+        LIMIT $5 * 4
+    ) ranked_chunks
+    GROUP BY mid
+),
+-- Sparse arm: copy of the existing chunk-granular tsvector arm, empty when
+-- $1 = ''.
+sparse AS (
+    SELECT mid, MIN(rank_ix) AS rank_ix FROM (
+        SELECT c.note_row AS mid,
+               ROW_NUMBER() OVER (
+                   ORDER BY ts_rank_cd(c.search_doc, websearch_to_tsquery('english', $1)) DESC
+               ) AS rank_ix
+        FROM knowledge_chunks c
+        JOIN knowledge_index ki ON ki.id = c.note_row
+        WHERE $1 <> ''
+          AND c.kb_id = ANY($3)
+          AND ki.status = 'active'
+          AND ($4 IS NULL OR c.embedding_version = $4)
+          AND c.search_doc @@ websearch_to_tsquery('english', $1)
+        ORDER BY ts_rank_cd(c.search_doc, websearch_to_tsquery('english', $1)) DESC
+        LIMIT $5 * 4
+    ) ranked_chunks
+    GROUP BY mid
+),
+-- Recency arm: note-level freshness, restricted to notes that actually carry
+-- chunks of the current pipeline version (keeps ghosts out). Two deliberate
+-- differences from the old function, both explained in the header: NULLS LAST,
+-- and the "there is a semantic query to freshen" gate.
+recent AS (
+    SELECT ki.id AS mid,
+           ROW_NUMBER() OVER (ORDER BY ki.modified_at DESC NULLS LAST) AS rank_ix
+    FROM knowledge_index ki
+    WHERE ($1 <> '' OR $2 IS NOT NULL)
+      AND ki.kb_id = ANY($3) AND ki.status = 'active'
+      AND EXISTS (
+          SELECT 1 FROM knowledge_chunks c
+          WHERE c.note_row = ki.id
+            AND ($4 IS NULL OR c.embedding_version = $4)
+      )
+    ORDER BY rank_ix LIMIT $5
+),
+-- Exact arm: one row per note containing ANY term (case-insensitive substring),
+-- ranked by the best trigram similarity across terms. Uses
+-- idx_knowledge_content_trgm (0024).
+exact AS (
+    SELECT x.id AS mid, ROW_NUMBER() OVER (ORDER BY x.best DESC) AS rank_ix
+    FROM (
+        SELECT ki.id,
+               MAX(GREATEST(similarity(ki.content, t.term),
+                            similarity(ki.title, t.term))) AS best
+        FROM knowledge_index ki, unnest($9) AS t(term)
+        WHERE cardinality($9) > 0
+          AND ki.kb_id = ANY($3) AND ki.status = 'active'
+          AND ki.path IS NOT NULL
+          AND (ki.content ILIKE '%' || t.term || '%'
+               OR ki.title ILIKE '%' || t.term || '%')
+        GROUP BY ki.id
+    ) x
+    ORDER BY rank_ix LIMIT $5 * 4
+),
+-- Tag arm: a BOOST, not a filter — notes carrying any requested tag, by recency.
+tagged AS (
+    SELECT ki.id AS mid,
+           ROW_NUMBER() OVER (ORDER BY ki.modified_at DESC NULLS LAST) AS rank_ix
+    FROM knowledge_index ki
+    WHERE cardinality($11) > 0
+      AND ki.kb_id = ANY($3) AND ki.status = 'active'
+      AND ki.path IS NOT NULL AND ki.tags && $11
+    ORDER BY rank_ix LIMIT $5 * 4
+),
+fused AS (
+    SELECT COALESCE(d.mid, s.mid, r.mid, e.mid, g.mid) AS mid,
+           COALESCE(1.0 / ($13 + d.rank_ix), 0.0) * $6 +
+           COALESCE(1.0 / ($13 + s.rank_ix), 0.0) * $7 +
+           COALESCE(1.0 / ($13 + r.rank_ix), 0.0) * $8 +
+           COALESCE(1.0 / ($13 + e.rank_ix), 0.0) * $10 +
+           COALESCE(1.0 / ($13 + g.rank_ix), 0.0) * $12 AS score,
+           ARRAY_REMOVE(ARRAY[
+               CASE WHEN d.mid IS NOT NULL THEN 'dense'::text END,
+               CASE WHEN s.mid IS NOT NULL THEN 'sparse'::text END,
+               CASE WHEN r.mid IS NOT NULL THEN 'recency'::text END,
+               CASE WHEN e.mid IS NOT NULL THEN 'exact'::text END,
+               CASE WHEN g.mid IS NOT NULL THEN 'tag'::text END], NULL) AS arms
+    FROM dense d
+             FULL OUTER JOIN sparse s ON d.mid = s.mid
+             FULL OUTER JOIN recent r ON COALESCE(d.mid, s.mid) = r.mid
+             FULL OUTER JOIN exact  e ON COALESCE(d.mid, s.mid, r.mid) = e.mid
+             FULL OUTER JOIN tagged g ON COALESCE(d.mid, s.mid, r.mid, e.mid) = g.mid
+)
+SELECT mid, score, arms FROM fused ORDER BY score DESC LIMIT $5
+$q$ USING query_text, query_embedding, kb_ids_param, version_param, match_count,
+          dense_weight, sparse_weight, recency_weight, exact_terms, exact_weight,
+          tag_terms, tag_weight, rrf_k;
+END;
+$_$;
+
+
+--
 -- Name: knowledge_hybrid_search(text, public.vector, uuid, integer, double precision, double precision, double precision, integer); Type: FUNCTION; Schema: public; Owner: -
 --
 
