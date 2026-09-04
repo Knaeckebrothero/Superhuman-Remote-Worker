@@ -656,7 +656,7 @@ def _resolve_live_session(
         if (
             facts.knowledge_binding_available
             and facts.knowledge_store_available
-            and {"kb_read", "kb_search"}.intersection(loaded)
+            and {"kb_read", "kb_search", "kb_grep"}.intersection(loaded)
         ):
             return _session_result(
                 SessionState.READY,
@@ -673,7 +673,7 @@ def _resolve_live_session(
         if (
             facts.knowledge_binding_available
             and facts.knowledge_store_available
-            and {"kb_read", "kb_search"}.intersection(loaded)
+            and {"kb_read", "kb_search", "kb_grep"}.intersection(loaded)
         ):
             return _session_result(
                 SessionState.READY,
@@ -819,7 +819,7 @@ def _action_flags(
         return (
             facts.knowledge_binding_available
             and facts.knowledge_store_available
-            and bool({"kb_read", "kb_search"}.intersection(loaded)),
+            and bool({"kb_read", "kb_search", "kb_grep"}.intersection(loaded)),
             False,
         )
     if key is CapabilityResolverKey.CANVAS_FILES:

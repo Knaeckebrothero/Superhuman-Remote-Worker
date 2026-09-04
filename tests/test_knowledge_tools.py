@@ -225,8 +225,8 @@ def _fake_kb_workspace(files: dict):
 class TestMetadataRegistry:
     """Tests for KNOWLEDGE_TOOLS_METADATA."""
 
-    def test_contains_exactly_13_tools(self):
-        assert len(KNOWLEDGE_TOOLS_METADATA) == 13
+    def test_contains_exactly_14_tools(self):
+        assert len(KNOWLEDGE_TOOLS_METADATA) == 14
 
     def test_expected_tool_names(self):
         expected = {
@@ -236,6 +236,7 @@ class TestMetadataRegistry:
             "kb_read",
             "kb_list",
             "kb_search",
+            "kb_grep",
             "kb_related",
             "kb_contradictions",
             "kb_provenance",
@@ -273,7 +274,7 @@ class TestCreateKbTools:
         with patch("src.tools.knowledge.knowledge_tools.asyncio") as ma:
             ma.get_running_loop.side_effect = RuntimeError
             tools = create_kb_tools(ctx)
-        assert len(tools) == 13
+        assert len(tools) == 14
 
     def test_raises_when_knowledge_store_is_none(self):
         ctx = _make_context()
@@ -283,9 +284,9 @@ class TestCreateKbTools:
                 ma.get_running_loop.side_effect = RuntimeError
                 create_kb_tools(ctx)
 
-    def test_returns_list_of_13_tools(self):
+    def test_returns_list_of_14_tools(self):
         tools, _ = _make_tools()
-        assert len(tools) == 13
+        assert len(tools) == 14
 
 
 # =============================================================================
@@ -885,6 +886,84 @@ class TestKbSearch:
         tools, _ = _make_tools(ctx)
         result = _invoke(_get_tool(tools, "kb_search"), {"query": "q"})
         assert "..." in result
+
+
+# =============================================================================
+# 13.8c: kb_grep (spec WP8, D9)
+# =============================================================================
+
+
+class TestKbGrep:
+    def _ctx(self, matches, total):
+        from src.services.knowledge_store import GrepMatch
+
+        ctx = _make_context()
+        ctx.knowledge_store.grep_notes = AsyncMock(return_value=(matches, total))
+        ctx.knowledge_store.get_watermark.return_value = None
+        return ctx, GrepMatch
+
+    def test_renders_lines_with_context_and_truncation_tail(self):
+        ctx, GrepMatch = self._ctx([], 0)
+        kb = uuid.UUID(ctx.project_id)
+        m = GrepMatch(
+            kb_id=kb,
+            note_id="n1",
+            title="Note One",
+            line_no=7,
+            line="see sales_page_2026_09",
+            before=["ctx before"],
+            after=["ctx after"],
+        )
+        ctx.knowledge_store.grep_notes.return_value = ([m], 3)
+        tools, _ = _make_tools(ctx)
+        out = _invoke(
+            _get_tool(tools, "kb_grep"), {"pattern": "sales_page", "max_matches": 1}
+        )
+        assert "**n1** — Note One" in out
+        assert "L7: see sales_page_2026_09" in out
+        assert "ctx before" in out and "ctx after" in out
+        assert "2 more matching note(s)" in out
+
+    def test_zero_matches_says_so(self):
+        ctx, _ = self._ctx([], 0)
+        tools, _ = _make_tools(ctx)
+        out = _invoke(_get_tool(tools, "kb_grep"), {"pattern": "nope"})
+        assert "No lines match 'nope'" in out
+
+    def test_store_value_error_becomes_usage_error(self):
+        ctx, _ = self._ctx([], 0)
+        ctx.knowledge_store.grep_notes.side_effect = ValueError(
+            "pattern must not be empty"
+        )
+        tools, _ = _make_tools(ctx)
+        out = _invoke(_get_tool(tools, "kb_grep"), {"pattern": " "})
+        assert out.startswith("Error:") and "empty" in out
+
+    def test_registered_in_metadata(self):
+        from src.tools.knowledge.knowledge_tools import KNOWLEDGE_TOOLS_METADATA
+
+        assert KNOWLEDGE_TOOLS_METADATA["kb_grep"]["category"] == "knowledge"
+
+
+class TestKbListVocabulary:
+    def test_unfiltered_list_prefixes_tag_vocabulary(self):
+        tools, ctx = _make_tools()
+        ctx.knowledge_graph.list_notes.return_value = [
+            {"id": "n1", "title": "T", "type": "decision", "status": "active"}
+        ]
+        ctx.knowledge_store.tag_vocabulary = AsyncMock(
+            return_value=[("web", 12), ("sales", 7)]
+        )
+        out = _invoke(_get_tool(tools, "kb_list"), {})
+        assert "**Tags:** web (12), sales (7)" in out
+
+    def test_filtered_list_has_no_vocabulary(self):
+        tools, ctx = _make_tools()
+        ctx.knowledge_graph.list_notes.return_value = []
+        ctx.knowledge_store.list_notes.return_value = []
+        ctx.knowledge_store.tag_vocabulary = AsyncMock(return_value=[("web", 1)])
+        out = _invoke(_get_tool(tools, "kb_list"), {"tag": "web"})
+        assert "**Tags:**" not in out
 
 
 # =============================================================================

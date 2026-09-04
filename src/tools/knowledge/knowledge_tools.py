@@ -654,6 +654,14 @@ KNOWLEDGE_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "short_description": "Search knowledge base with hybrid ranking.",
         "phases": ["strategic", "tactical"],
     },
+    "kb_grep": {
+        "module": "knowledge.knowledge_tools",
+        "function": "kb_grep",
+        "description": "Enumerate every matching line in the knowledge base (substring or regex, with context)",
+        "category": "knowledge",
+        "short_description": "Grep the knowledge base for a literal or regex.",
+        "phases": ["strategic", "tactical"],
+    },
     # Graph query tools
     "kb_related": {
         "module": "knowledge.knowledge_tools",
@@ -2939,7 +2947,30 @@ def create_kb_tools(
                 notice = _index_readiness_notice(bindings)
                 return f"{base}\n\n{notice}" if notice else base
 
-            lines = [f"**Knowledge Notes** ({len(notes)} results):", ""]
+            lines: List[str] = []
+            if type is None and tag is None and status is None and job_id is None:
+                for binding in bindings:
+                    try:
+                        vocab = _run_async(ks.tag_vocabulary(binding.kb_id))
+                    except Exception as e:
+                        logger.debug(
+                            "kb_list tag_vocabulary skipped for %s: %s",
+                            binding.alias,
+                            e,
+                        )
+                        continue
+                    if vocab:
+                        prefix = f"[{binding.alias}] " if _has_bound_scopes else ""
+                        lines.append(
+                            prefix
+                            + "**Tags:** "
+                            + ", ".join(f"{t} ({n})" for t, n in vocab)
+                        )
+                if lines:
+                    lines.append("")
+
+            lines.append(f"**Knowledge Notes** ({len(notes)} results):")
+            lines.append("")
 
             for binding, n in notes:
                 status_icon = "●" if n.get("status") == "active" else "○"
@@ -3168,6 +3199,71 @@ def create_kb_tools(
         except Exception as e:
             logger.error(f"kb_search failed: {e}")
             return f"Error searching knowledge base: {e}"
+
+    @tool
+    def kb_grep(
+        pattern: str,
+        kb: Optional[str] = None,
+        regex: bool = False,
+        max_matches: int = 50,
+    ) -> str:
+        """List every line in the knowledge base matching a pattern, with context.
+
+        The enumeration counterpart to kb_search(exact=): no ranking, every
+        occurrence, one line of context each side. Case-insensitive substring by
+        default; regex=True for a POSIX regex; `^`/`$` anchor per line. Use it to
+        find all mentions of an identifier, error string or slug, or to confirm
+        something is absent. Capped at max_matches lines; the tail says how many
+        notes were cut.
+        """
+        bindings, error = _select_bindings(context, kb)
+        if error:
+            return error
+        try:
+            matches, total = _run_async(
+                ks.grep_notes(
+                    [b.kb_id for b in bindings],
+                    pattern,
+                    regex=regex,
+                    max_matches=max(1, min(int(max_matches), 500)),
+                )
+            )
+        except ValueError as e:
+            return f"Error: {e}"
+        except Exception as e:
+            logger.error(f"kb_grep failed: {e}")
+            return f"Error searching knowledge base: {e}"
+        if not matches:
+            notice = _index_readiness_notice(bindings)
+            base = f"No lines match '{pattern}'."
+            return f"{base}\n\n{notice}" if notice else base
+
+        by_id = {str(b.kb_id): b for b in bindings}
+        lines: List[str] = [f"**Grep** '{pattern}' — {total} matching note(s):", ""]
+        current = None
+        shown_notes = set()
+        for m in matches:
+            key = (str(m.kb_id), m.note_id)
+            if key != current:
+                binding = by_id.get(str(m.kb_id)) or bindings[0]
+                handle = _qualified(binding, m.note_id)
+                if current is not None:
+                    lines.append("")
+                lines.append(f"**{handle}** — {m.title}")
+                current = key
+                shown_notes.add(key)
+            for b in m.before:
+                lines.append(f"      {b}")
+            lines.append(f"  L{m.line_no}: {m.line}")
+            for a in m.after:
+                lines.append(f"      {a}")
+        rest = total - len(shown_notes)
+        if rest > 0:
+            lines.append("")
+            lines.append(
+                f"… {rest} more matching note(s); narrow the pattern or raise max_matches."
+            )
+        return "\n".join(lines)
 
     # =========================================================================
     # Graph Query Tools
@@ -3799,6 +3895,7 @@ def create_kb_tools(
         kb_read,
         kb_list,
         kb_search,
+        kb_grep,
         kb_related,
         kb_contradictions,
         kb_provenance,
