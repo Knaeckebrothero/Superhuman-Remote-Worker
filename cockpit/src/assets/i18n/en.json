@@ -2674,6 +2674,7 @@
       "keepRecentMessages": "Keep recent messages",
       "vmCpuCores": "VM CPU cores",
       "vmMemory": "VM memory",
+      "vmDiskSize": "VM disk",
       "maxReadWords": "Max read words",
       "maxWriteWords": "Max write words",
       "gitVersioning": "Git versioning",

@@ -332,6 +332,18 @@ import {liftLegacyTiers} from '../experts/expert-config';
                   }
                 </div>
               </div>
+              <div class="field-row" [class.modified]="vmDiskSize() !== null">
+                <label class="field-label">{{ 'advanced.labels.vmDiskSize' | transloco }}</label>
+                <div class="field-control">
+                  <input type="text" class="form-input compact-input" placeholder="20Gi"
+                    [ngModel]="vmDiskSize() ?? resolvedVmDiskSize()"
+                    (ngModelChange)="vmDiskSize.set($event); emitChange()"
+                    [disabled]="disabled()">
+                  @if (vmDiskSize() !== null) {
+                    <button type="button" class="reset-btn" (click)="vmDiskSize.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
+                  }
+                </div>
+              </div>
             }
             <div class="field-row" [class.modified]="maxReadWords() !== null">
               <label class="field-label">{{ 'advanced.labels.maxReadWords' | transloco }}</label>
@@ -766,6 +778,7 @@ export class AdvancedAccordionComponent {
   private readonly modelService = inject(ModelService);
   readonly vmCpuCores = signal<number | null>(null);
   readonly vmMemory = signal<string | null>(null);
+  readonly vmDiskSize = signal<string | null>(null);
   readonly maxReadWords = signal<number | null>(null);
   readonly maxWriteWords = signal<number | null>(null);
   readonly gitVersioning = signal<boolean | null>(null);
@@ -837,6 +850,9 @@ export class AdvancedAccordionComponent {
   readonly resolvedWorkspaceBackend = computed(() => (this.r('workspace.backend') ?? 'sandbox') as string);
   readonly resolvedVmCpuCores = computed(() => (this.r('workspace.vm.cpu_cores') ?? 8) as number);
   readonly resolvedVmMemory = computed(() => (this.r('workspace.vm.memory') ?? '16Gi') as string);
+  // Empty means "the deployment's controller default" — the orchestrator omits
+  // disk_size from the VM create payload unless a job sets it.
+  readonly resolvedVmDiskSize = computed(() => (this.r('workspace.vm.disk_size') ?? '') as string);
   readonly resolvedMaxReadWords = computed(() => (this.r('workspace.max_read_words') ?? 25000) as number);
   readonly resolvedMaxWriteWords = computed(() => (this.r('workspace.max_write_words') ?? 10000) as number);
   readonly resolvedGitVersioning = computed(() => {
@@ -977,6 +993,7 @@ export class AdvancedAccordionComponent {
       const vm: Record<string, unknown> = {};
       if (this.vmCpuCores() !== null) vm['cpu_cores'] = this.vmCpuCores();
       if (this.vmMemory() !== null) vm['memory'] = this.vmMemory();
+      if (this.vmDiskSize() !== null && this.vmDiskSize() !== '') vm['disk_size'] = this.vmDiskSize();
       if (Object.keys(vm).length) ws['vm'] = vm;
     }
     if (!this.isNoneBackend()) {
@@ -1053,6 +1070,7 @@ export class AdvancedAccordionComponent {
     this.keepRecentMessages.set(null);
     this.vmCpuCores.set(null);
     this.vmMemory.set(null);
+    this.vmDiskSize.set(null);
     this.maxReadWords.set(null);
     this.maxWriteWords.set(null);
     this.gitVersioning.set(null);

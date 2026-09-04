@@ -106,6 +106,25 @@ describe('AdvancedAccordionComponent — VM sizing', () => {
     expect(o['workspace'].vm).toEqual({cpu_cores: 4, memory: '8Gi'});
   });
 
+  it('emits the VM disk size next to cores and memory', () => {
+    const {component, backend} = createComponent();
+    backend.set('vm');
+    component.vmDiskSize.set('120Gi');
+
+    const o = component.getOverrides() as Record<string, any>;
+    expect(o['workspace'].vm).toEqual({disk_size: '120Gi'});
+  });
+
+  it('leaves disk_size out until the user sets it', () => {
+    const {component, backend} = createComponent();
+    backend.set('vm');
+    component.vmMemory.set('8Gi');
+
+    const o = component.getOverrides() as Record<string, any>;
+    expect(o['workspace'].vm).toEqual({memory: '8Gi'});
+    expect(component.resolvedVmDiskSize()).toBe('');
+  });
+
   it('drops VM sizing once the backend moves off vm', () => {
     const {component, backend} = createComponent();
     backend.set('vm');

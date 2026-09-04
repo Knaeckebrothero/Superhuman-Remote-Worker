@@ -208,6 +208,33 @@
           "default": 10000,
           "description": "Maximum word count for a single write_file call. Returns an error with guidance to split into multiple calls if exceeded."
         },
+        "vm": {
+          "type": "object",
+          "description": "Sizing of the VM workspace (workspace.backend = vm). Ignored on container and virtual backends. Jobs set these via config_override.workspace.vm.",
+          "properties": {
+            "image": {
+              "type": "string",
+              "description": "VM base image reference. Omit for the deployment default (the current golden image)."
+            },
+            "cpu_cores": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 8,
+              "description": "Virtual CPU cores for the VM."
+            },
+            "memory": {
+              "type": "string",
+              "pattern": "^[0-9]+(Ki|Mi|Gi|Ti)$",
+              "default": "16Gi",
+              "description": "Guest memory as a Kubernetes quantity (e.g. 24Gi)."
+            },
+            "disk_size": {
+              "type": "string",
+              "pattern": "^[0-9]+(Ki|Mi|Gi|Ti|K|M|G|T)$",
+              "description": "Rootdisk size as a Kubernetes quantity (e.g. 120Gi). Omit for the deployment's controller default; a value below that default is raised to it, because the clone target cannot be smaller than the golden image it is cloned from."
+            }
+          }
+        },
         "max_read_size": {
           "type": "integer",
           "minimum": 1000,

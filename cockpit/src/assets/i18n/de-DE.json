@@ -2674,6 +2674,7 @@
       "keepRecentMessages": "Letzte Nachrichten behalten",
       "vmCpuCores": "VM-CPU-Kerne",
       "vmMemory": "VM-Arbeitsspeicher",
+      "vmDiskSize": "VM-Festplatte",
       "maxReadWords": "Max. Lese-Wörter",
       "maxWriteWords": "Max. Schreib-Wörter",
       "gitVersioning": "Git-Versionierung",
