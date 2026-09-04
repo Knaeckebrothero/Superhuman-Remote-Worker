@@ -1,6 +1,7 @@
 """Runtime tool behavior for native + datasource-backed OKF KB bindings."""
 
 import uuid
+from dataclasses import replace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from src.services.knowledge.bindings import (
@@ -8,7 +9,7 @@ from src.services.knowledge.bindings import (
     build_knowledge_bindings,
 )
 from src.services.knowledge_store import KnowledgeRecord
-from src.shared.runtime_actor import RuntimeActorContext
+from src.shared.runtime_actor import RUNTIME_ACTOR_HEADER, RuntimeActorContext
 from src.tools.knowledge.knowledge_tools import create_kb_tools
 
 
@@ -348,6 +349,120 @@ def test_write_targets_only_writable_native_binding():
     assert context.knowledge_graph.create_note.call_args.kwargs["project_id"] == str(
         native.kb_id
     )
+
+
+def _write(context, **extra):
+    """Invoke kb_write with the vault endpoint stubbed; return (result, post)."""
+    with patch(
+        "src.tools.knowledge.knowledge_tools._post_vault_file",
+        return_value={"status": "committed", "path": "knowledge/x.md"},
+    ) as post:
+        result = _tool(_tools(context), "kb_write").invoke(
+            {"title": "X", "type": "learning", "content": "Body", **extra}
+        )
+    return result, post
+
+
+def test_write_can_target_a_non_primary_native_with_kb():
+    home = _binding("project", kind="native", writable=True)
+    srw = _binding("project-c0d5edd4", kind="native", writable=False, name="SRW")
+    context = _context([home, srw])
+    context.knowledge_graph.read_note.return_value = None
+    context.knowledge_graph.create_note.return_value = "x"
+
+    result, post = _write(context, kb="project-c0d5edd4")
+
+    assert post.call_args.args[0] == str(srw.kb_id)
+    assert context.knowledge_graph.create_note.call_args.kwargs["project_id"] == str(
+        srw.kb_id
+    )
+    assert "**project-c0d5edd4:x**" in result
+
+
+def test_write_default_target_is_still_the_writable_native():
+    home = _binding("project", kind="native", writable=True)
+    srw = _binding("project-c0d5edd4", kind="native")
+    context = _context([home, srw])
+    context.knowledge_graph.read_note.return_value = None
+    context.knowledge_graph.create_note.return_value = "x"
+
+    result, post = _write(context)
+
+    assert post.call_args.args[0] == str(home.kb_id)
+    assert "**project:x**" in result
+
+
+def test_write_refuses_external_target_and_lists_native_choices():
+    home = _binding("project", kind="native", writable=True)
+    docs = _binding("docs")
+    context = _context([home, docs])
+
+    result, post = _write(context, kb="docs")
+
+    assert result.startswith("Error:") and "read-only" in result and "project" in result
+    post.assert_not_called()
+
+
+class _CredentialGatedPEP:
+    """Fake PEP client authorizing only calls that present a runtime actor.
+
+    The real endpoint is server-side policy; what this test pins is the
+    *client* half — that a write aimed at a non-writable native binding
+    presents no runtime-actor credential, so it can only be denied.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self.requests: list[tuple[str, dict, dict]] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def post(self, url, headers=None, json=None):
+        sent = dict(headers or {})
+        self.requests.append((url, sent, json))
+        authorized = RUNTIME_ACTOR_HEADER in sent
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {
+            "authorized": authorized,
+            "code": "authorized" if authorized else "actor_unresolved",
+            "action": "machine_tags",
+            "message": "ok" if authorized else "Runtime actor was denied.",
+        }
+        return response
+
+
+def test_write_to_non_primary_target_cannot_set_officer_only_tags():
+    """kb= widens the write target, never the officer authority (WP5.2)."""
+    home = _binding("project", kind="native", writable=True)
+    srw = replace(
+        _binding("project-c0d5edd4", kind="native", name="SRW"),
+        runtime_actor=RuntimeActorContext(
+            caller_kind="human",
+            project_id=str(uuid.uuid4()),
+            project_role="owner",
+            thread_id=str(uuid.uuid4()),
+        ),
+    )
+    context = _context([home, srw])
+    context.knowledge_graph.read_note.return_value = None
+
+    pep = _CredentialGatedPEP()
+    with patch("src.tools.knowledge.knowledge_tools.httpx.Client", return_value=pep):
+        result, post = _write(context, kb="project-c0d5edd4", tags=["ready"])
+
+    post.assert_not_called()
+    context.knowledge_graph.create_note.assert_not_called()
+    assert "Authorization denied" in result and "No changes were made" in result
+    # Authority is asked for the *targeted* knowledge base, and the actor
+    # rides only the writable binding — so nothing was presented.
+    url, sent, payload = pep.requests[0]
+    assert url.endswith("/api/runtime-actors/authorize")
+    assert payload == {"action": "machine_tags", "project_id": str(srw.kb_id)}
+    assert RUNTIME_ACTOR_HEADER not in sent
 
 
 def test_graph_only_tools_and_export_ignore_external_bindings():

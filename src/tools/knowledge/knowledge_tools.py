@@ -870,6 +870,66 @@ def _write_scope_error(context: ToolContext) -> str:
     return "Error: No project_id available."
 
 
+def _resolve_write_target(
+    context: ToolContext, kb: Optional[str]
+) -> tuple[Optional[KnowledgeBinding], Optional[str]]:
+    """The native binding a write lands in (B5).
+
+    ``writable`` marks the *default* target, not the only one: an agent with
+    two native knowledge bases attached could previously only ever write to
+    the first, and a note meant for the other silently landed in the session's
+    own project. ``kb`` names any native binding explicitly; omitted, the
+    target is the writable (default) native, exactly as before.
+
+    External (datasource-backed) knowledge bases stay read-only — they are
+    mirrors of somebody else's repository, with no write path at all.
+
+    Returns ``(binding, None)`` or ``(None, error)``; the error is the tool's
+    verbatim reply.
+    """
+    if kb:
+        binding = _resolve_binding(context, kb)
+        if binding is None:
+            return None, (
+                f"Error: Knowledge base '{kb}' is not selected. Available: "
+                f"{_binding_choices(_read_bindings(context))}."
+            )
+        if not binding.is_native:
+            natives = _binding_choices(_native_bindings(context))
+            return None, (
+                f"Error: Knowledge base '{binding.alias}' is read-only "
+                f"(external). Native knowledge bases you can target with "
+                f"kb=: {natives}."
+            )
+        return binding, None
+
+    project_id = _get_project_id(context)
+    if not project_id:
+        return None, _write_scope_error(context)
+    for binding in _read_bindings(context):
+        if str(binding.kb_id) == project_id:
+            return binding, None
+    # A legacy context can carry a bare ``project_id`` with nothing in
+    # ``project_ids`` for ``_read_bindings`` to synthesize from. That scope has
+    # always been writable, so stand a binding up for it rather than refusing a
+    # write that worked before write targets existed.
+    try:
+        kb_id = uuid.UUID(str(project_id))
+    except (TypeError, ValueError):
+        return None, _write_scope_error(context)
+    return (
+        KnowledgeBinding(
+            kb_id=kb_id,
+            alias="project",
+            name="Project Knowledge",
+            kind="native",
+            writable=True,
+            root_path="knowledge",
+        ),
+        None,
+    )
+
+
 def _native_scope_error(context: ToolContext) -> str:
     if _explicit_bindings(context):
         return "No native knowledge base with a Graph tier is selected."
@@ -1139,6 +1199,8 @@ def _materialize_note(
     note: Dict[str, Any],
     retrieval_messages: Optional[List[str]] = None,
     expected_blob_sha: Optional[str] = None,
+    *,
+    project_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Commit a note as ``knowledge/<slug>.md`` in the project's KB repo.
 
@@ -1156,11 +1218,16 @@ def _materialize_note(
     nowhere to put it; ``None`` (the default, and what every caller with no
     opinion passes) means "leave whatever is stored alone".
 
+    ``project_id`` names the knowledge base to commit into. Callers that have
+    already resolved a write target (``kb_write``'s ``kb=``) pass it; omitted,
+    it falls back to the session's default writable native scope, which is
+    what every caller did before targets existed.
+
     Returns the endpoint's status dict, for callers that want to report the
     outcome. ``status`` is ``committed`` / ``skipped`` / ``failed``, and
     ``indexed`` / ``index_reason`` say whether it is searchable yet.
     """
-    project_id = _get_project_id(context)
+    project_id = project_id or _get_project_id(context)
     if not project_id:
         # No writable native KB in scope. The row write upstream already
         # failed its own scope check in that case, so this is belt-and-braces.
@@ -2025,6 +2092,7 @@ def create_kb_tools(
         priority: PriorityValue = "normal",
         links: Optional[List[dict]] = None,
         retrieval_messages: Optional[List[str]] = None,
+        kb: Optional[str] = None,
     ) -> str:
         """Create a new knowledge note in the project knowledge base.
 
@@ -2061,13 +2129,16 @@ def create_kb_tools(
                    Types: REFERENCES, DERIVED_FROM, SUPPORTS, CONTRADICTS, ANSWERS, DEPENDS_ON, SUPERSEDES, IMPLEMENTS
             retrieval_messages: Synthetic queries describing when this note should be retrieved
                                (e.g. ["What auth approach should I use?", "Why JWT over OAuth?"])
+            kb: Target knowledge base alias (native only). Default: the
+                session's primary project knowledge base.
 
         Returns:
             Confirmation with the note's slug ID, or error message
         """
-        project_id = _get_project_id(context)
-        if not project_id:
-            return _write_scope_error(context)
+        target, target_error = _resolve_write_target(context, kb)
+        if target is None:
+            return target_error or _write_scope_error(context)
+        project_id = str(target.kb_id)
 
         # Normalize machine tags (lowercase) and enforce the officer-only
         # namespace at the one write path that could otherwise create an
@@ -2165,6 +2236,12 @@ def create_kb_tools(
             # (the same delegation the verdict gate's UPDATE action uses) so
             # the file is re-rendered and re-materialised by one code path
             # rather than a second, subtly different one here.
+            #
+            # `_update_existing` still resolves the DEFAULT writable scope, so
+            # under a non-default `kb=` this repair (and the SUPERSEDE retire
+            # below) looks for the note in the wrong knowledge base and fails
+            # loudly with "not found" rather than editing the wrong note.
+            # Threading the target through it belongs with the kb_update work.
             return _update_existing(candidate_slug, content=content)
 
         # Ingestion verdict gate (slice 2 PR2) — only when the curator wired a
@@ -2225,6 +2302,13 @@ def create_kb_tools(
             else:
                 slug = candidate_slug
 
+            # What the author must quote to read or update this note again.
+            # With several knowledge bases in scope a bare slug is ambiguous —
+            # and, now that `kb=` can steer the write, it no longer even says
+            # which one it landed in. `_qualified` degrades to the bare slug
+            # for single-scope runtimes, so their output is unchanged.
+            handle = _qualified(target, slug)
+
             rank = PRIORITY_RANKS[priority]
             # Both timestamps go in the FILE, not down a side channel. The
             # column has no DEFAULT and `note_fields` sources created_at only
@@ -2257,7 +2341,7 @@ def create_kb_tools(
                 new_note["priority"] = rank
             _apply_ready_frontmatter(new_note, _new_tags.ready)
             materialization = _materialize_note(
-                context, slug, new_note, retrieval_messages
+                context, slug, new_note, retrieval_messages, project_id=project_id
             )
             if not _canonical_materialization_succeeded(materialization):
                 return _canonical_materialization_error(slug, materialization)
@@ -2321,7 +2405,7 @@ def create_kb_tools(
                     )
                 if retired:
                     return (
-                        f"Created knowledge note: **{slug}** (type={type}) — "
+                        f"Created knowledge note: **{handle}** (type={type}) — "
                         f"superseded {', '.join(retired)}{_tag_notice} "
                         f"{_index_state_suffix(materialization)}"
                     )
@@ -2331,7 +2415,7 @@ def create_kb_tools(
                 link_info = f", {len(links)} link(s)"
 
             return (
-                f"Created knowledge note: **{slug}** (type={type}{link_info})"
+                f"Created knowledge note: **{handle}** (type={type}{link_info})"
                 f"{_tag_notice} {_index_state_suffix(materialization)}"
             )
 
