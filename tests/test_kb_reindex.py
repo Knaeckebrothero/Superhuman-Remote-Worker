@@ -1815,6 +1815,46 @@ class TestReindexKbFailureHonesty:
         assert "headsha" not in _watermark_commits(store)
 
 
+class TestReindexKbWedgeWarning:
+    @pytest.mark.asyncio
+    async def test_same_failure_four_sweeps_warns_exactly_once(self, caplog):
+        kb = uuid.uuid4()
+        wm = KbWatermark(
+            kb_id=kb, indexed_commit="old", pipeline_version=CURRENT_VERSION
+        )
+        gitea, store, svc = _make_deps(
+            head="h",
+            watermark=wm,
+            tree=[{"path": "knowledge/bad.md", "type": "blob", "sha": "s"}],
+            contents={"knowledge/bad.md": _note_md("bad")},
+        )
+        store.upsert_kb_note.side_effect = RuntimeError("boom")  # generic, persistent
+
+        warned = 0
+        for streak in (1, 2, 3, 4, 5):
+            # S0 computes the streak in SQL; the mock store reports it back.
+            store.get_watermark.return_value = KbWatermark(
+                kb_id=kb,
+                indexed_commit="old",
+                pipeline_version=CURRENT_VERSION,
+                status="partial",
+                error_streak=streak,
+            )
+            with caplog.at_level("WARNING", logger="orchestrator.services.kb_reindex"):
+                caplog.clear()
+                await reindex_kb(
+                    gitea_client=gitea,
+                    store=store,
+                    embedding_service=svc,
+                    kb_id=kb,
+                    repo_name="r",
+                )
+            warned += sum("WEDGED" in r.message for r in caplog.records)
+            fp = store.set_watermark_status.await_args.kwargs["error_fingerprint"]
+            assert fp and len(fp) == 16
+        assert warned == 1
+
+
 # =============================================================================
 # reindex_kb — per-KB serialization (PR3.1)
 # =============================================================================

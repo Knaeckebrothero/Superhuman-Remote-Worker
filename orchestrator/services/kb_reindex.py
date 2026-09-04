@@ -76,6 +76,12 @@ _PROGRESS_BUMP_EVERY = 25
 # read costs ~130ms. Below the threshold the per-file path is cheaper.
 _ARCHIVE_PREFETCH_THRESHOLD = int(os.getenv("KB_REINDEX_ARCHIVE_THRESHOLD", "25"))
 
+# Consecutive `partial` sweeps carrying the same error fingerprint before the
+# sweep logs a one-shot WEDGED warning (spec WP3/H3). Mirrors
+# ``KnowledgeStore.WEDGE_STREAK_THRESHOLD``, which is what actually computes
+# the streak in SQL — this module's copy only decides when to log.
+WEDGE_STREAK_THRESHOLD = 4
+
 # The vault root within a project's KB repo (slice 1 dual-write target). Same
 # path whichever repo resolve_kb_repo lands on.
 KNOWLEDGE_PREFIX = "knowledge/"
@@ -747,6 +753,7 @@ async def _set_reindex_status(
     branch: Optional[str],
     source_head: Optional[str] = None,
     last_error: Optional[str] = None,
+    error_fingerprint: Optional[str] = None,
 ) -> None:
     """Best-effort operational state; never compromise index durability."""
     try:
@@ -757,9 +764,57 @@ async def _set_reindex_status(
             last_error=(last_error or "")[:2000] or None,
             repo_name=source_label[:255],
             branch=(branch or "")[:255] or None,
+            error_fingerprint=error_fingerprint,
         )
     except Exception as exc:
         logger.warning("kb_reindex[%s]: status update skipped: %s", kb_id, exc)
+
+
+def _error_fingerprint(note_errors: List[str]) -> Optional[str]:
+    """Fingerprint a run's per-note error set (spec WP3/H3).
+
+    Sorted so the same failure set fingerprints identically across runs
+    regardless of tree-walk order; truncated to 16 hex chars — a log/DB label,
+    not a security boundary.
+    """
+    if not note_errors:
+        return None
+    digest = hashlib.sha1("\n".join(sorted(note_errors)).encode("utf-8"))
+    return digest.hexdigest()[:16]
+
+
+async def _warn_if_wedged(
+    store: Any,
+    kb_id: uuid.UUID,
+    errors: int,
+    fingerprint: Optional[str],
+) -> None:
+    """Log a one-shot WEDGED warning once the streak crosses the threshold.
+
+    Advisory only: the streak itself is computed durably in SQL
+    (``KnowledgeStore.set_watermark_status``); this just reads it back and
+    decides whether to say something. WARNING fires exactly once, at
+    ``streak == WEDGE_STREAK_THRESHOLD``; every sweep after that logs at DEBUG
+    so an operator who missed the warning can still find it without the log
+    repeating a WARNING every 15 minutes forever.
+    """
+    try:
+        wm = await store.get_watermark(kb_id)
+    except Exception:  # noqa: BLE001 — advisory only
+        return
+    streak = int(getattr(wm, "error_streak", 0) or 0)
+    if streak == WEDGE_STREAK_THRESHOLD:
+        logger.warning(
+            "kb_reindex[%s]: WEDGED — the same %d note error(s) for %d consecutive "
+            "sweeps (fingerprint %s); retrying will not help. Last error: %s",
+            kb_id,
+            errors,
+            streak,
+            fingerprint,
+            getattr(wm, "last_error", None),
+        )
+    elif streak > WEDGE_STREAK_THRESHOLD:
+        logger.debug("kb_reindex[%s]: still wedged (%d sweeps)", kb_id, streak)
 
 
 async def record_reindex_source_failure(
@@ -1181,12 +1236,14 @@ async def _reindex_snapshot(
     upserted = skipped = errors = 0
     skipped_duplicates: List[Tuple[str, str, Optional[str]]] = []
     invalid_paths: List[str] = []
+    note_errors: List[str] = []
     for path in upsert_paths:
         try:
             text = await snapshot.get_file(path)
             if text is None:
                 logger.warning("kb_reindex[%s]: fetch failed for %s", kb_id, path)
                 errors += 1
+                note_errors.append(f"{path}: fetch failed")
                 continue
             outcome = await index_single_note(
                 store=store,
@@ -1207,10 +1264,12 @@ async def _reindex_snapshot(
                 continue
             logger.warning("kb_reindex[%s]: error on %s: %s", kb_id, path, err.cause)
             errors += 1
+            note_errors.append(f"{path}: {err.cause}")
             continue
         except Exception as exc:
             logger.warning("kb_reindex[%s]: error on %s: %s", kb_id, path, exc)
             errors += 1
+            note_errors.append(f"{path}: {exc}")
             continue
 
         if outcome.status == "malformed":
@@ -1271,6 +1330,7 @@ async def _reindex_snapshot(
         status = "completed"
     else:
         status = "partial"
+        fingerprint = _error_fingerprint(note_errors)
         await _set_reindex_status(
             store,
             kb_id,
@@ -1279,7 +1339,9 @@ async def _reindex_snapshot(
             branch=branch,
             source_head=head,
             last_error=f"{errors} note operation(s) failed; retry scheduled",
+            error_fingerprint=fingerprint,
         )
+        await _warn_if_wedged(store, kb_id, errors, fingerprint)
 
     # Final progress reflects what durably landed this run so the bar doesn't
     # stall between the last throttled bump and completion (best-effort).
