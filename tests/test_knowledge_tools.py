@@ -594,6 +594,57 @@ class TestKbRead:
 
 
 # =============================================================================
+# 13.6b: _index_readiness_notice — wedged vs rebuilding (WP4, decision H4)
+# =============================================================================
+
+
+class TestReadinessNotice:
+    def _read_missing(self, wm):
+        tools, ctx = _make_tools()
+        ctx.knowledge_graph.read_note.return_value = None
+        ctx.knowledge_store.get_note_by_slug.return_value = None
+        ctx.knowledge_store.get_watermark.return_value = wm
+        return _invoke(_get_tool(tools, "kb_read"), {"note": "missing"})
+
+    def test_rebuilding_keeps_todays_wording(self):
+        wm = MagicMock(
+            status="partial",
+            indexed_commit="a" * 40,
+            source_head="b" * 40,
+            error_streak=1,
+            wedged_since=None,
+            last_error="3 note operation(s) failed",
+        )
+        out = self._read_missing(wm)
+        assert "Still indexing — results may be incomplete" in out
+
+    def test_wedged_says_failed_not_incomplete(self):
+        from datetime import datetime, timedelta, timezone
+
+        wm = MagicMock(
+            status="partial",
+            indexed_commit="a" * 40,
+            source_head="b" * 40,
+            error_streak=9,
+            wedged_since=datetime.now(timezone.utc) - timedelta(hours=26),
+            last_error="1 note operation(s) failed; retry scheduled",
+        )
+        out = self._read_missing(wm)
+        assert "1 note(s) have failed to index for 26 h" in out
+        assert "rest of this knowledge base is current" in out
+        assert "may be incomplete" not in out
+
+    def test_old_watermark_row_without_new_fields_still_renders(self):
+        wm = MagicMock(
+            spec=["status", "indexed_commit", "source_head"],
+            status="partial",
+            indexed_commit="a" * 40,
+            source_head="b" * 40,
+        )
+        assert "Still indexing" in self._read_missing(wm)
+
+
+# =============================================================================
 # 13.7: kb_list
 # =============================================================================
 

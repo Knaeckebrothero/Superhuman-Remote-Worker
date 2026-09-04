@@ -1593,8 +1593,16 @@ def create_kb_tools(
         wrongly conclude the KB is empty. Only emits for an explicit non-ready
         watermark status; a missing watermark or lookup failure stays silent so we
         never raise a false "indexing" alarm.
+
+        A watermark whose ``wedged_since`` is set means the same note has failed to
+        index for several sweeps running — the KB is not "still indexing", it has a
+        stuck note that will not resolve itself. That case gets its own honest
+        wording instead of the rebuilding one. ``wedged_since``/``last_error`` are
+        read with ``getattr`` so an old watermark row (or a test double without the
+        new fields) degrades to today's rebuilding text.
         """
         notices: List[str] = []
+        wedged: List[str] = []
         for binding in bindings:
             try:
                 watermark = _run_async(ks.get_watermark(binding.kb_id))
@@ -1607,6 +1615,28 @@ def create_kb_tools(
                 continue
             status = getattr(watermark, "status", None)
             if not isinstance(status, str) or status == "ready":
+                continue
+            wedged_since = getattr(watermark, "wedged_since", None)
+            if isinstance(wedged_since, datetime):
+                if wedged_since.tzinfo is None:
+                    wedged_since = wedged_since.replace(tzinfo=timezone.utc)
+                hours = max(
+                    1,
+                    int(
+                        (datetime.now(timezone.utc) - wedged_since).total_seconds()
+                        // 3600
+                    ),
+                )
+                m = re.match(
+                    r"^(\d+) note operation",
+                    str(getattr(watermark, "last_error", "") or ""),
+                )
+                count = m.group(1) if m else "some"
+                wedged.append(
+                    f"[{binding.alias}] {count} note(s) have failed to index for {hours} h "
+                    f"(see orchestrator log `kb_reindex[{binding.kb_id}]`); the rest of this "
+                    "knowledge base is current."
+                )
                 continue
             commit = getattr(watermark, "indexed_commit", None)
             source_head = getattr(watermark, "source_head", None)
@@ -1621,9 +1651,16 @@ def create_kb_tools(
                 else ""
             )
             notices.append(f"[{binding.alias}] {status} — {clean}{attempted}")
-        if not notices:
+        if not notices and not wedged:
             return ""
-        return "⚠️ Still indexing — results may be incomplete: " + "; ".join(notices)
+        parts = []
+        if wedged:
+            parts.append("⚠️ " + "; ".join(wedged))
+        if notices:
+            parts.append(
+                "⚠️ Still indexing — results may be incomplete: " + "; ".join(notices)
+            )
+        return "\n".join(parts)
 
     # =========================================================================
     # Write Tools
