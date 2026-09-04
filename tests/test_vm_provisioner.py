@@ -1878,3 +1878,50 @@ class TestCapturedVmTeardown:
 
         assert client.delete.await_args.args[0] == "/vms/job-1"
         assert client.delete.await_args.kwargs["params"] == {}
+
+
+class TestCreateVmDiskSize:
+    """``disk_size`` rides the HTTP create payload only when a job asked for it."""
+
+    @staticmethod
+    def _http_provisioner(provisioner_disabled):
+        response = MagicMock()
+        response.raise_for_status = MagicMock()
+        response.json.return_value = {"status": "created", "vm_name": "agent-vm-j"}
+        provisioner_disabled._set_vm_context = AsyncMock()
+        provisioner_disabled._db = MagicMock()
+        provisioner_disabled._db.get_workspace_network_tier = AsyncMock(
+            return_value="internet-only"
+        )
+        provisioner_disabled._http_client = MagicMock()
+        provisioner_disabled._http_client.post = AsyncMock(return_value=response)
+        return provisioner_disabled
+
+    @pytest.mark.asyncio
+    async def test_http_create_forwards_disk_size(self, provisioner_disabled):
+        prov = self._http_provisioner(provisioner_disabled)
+        await prov._create_http(
+            job_id="job-disk",
+            agent_config="developer",
+            vm_image=None,
+            cpu_cores=12,
+            memory="24Gi",
+            description="",
+            disk_size="120Gi",
+        )
+        payload = prov._http_client.post.await_args.kwargs["json"]
+        assert payload["disk_size"] == "120Gi"
+
+    @pytest.mark.asyncio
+    async def test_http_create_omits_disk_size_when_unset(self, provisioner_disabled):
+        prov = self._http_provisioner(provisioner_disabled)
+        await prov._create_http(
+            job_id="job-nodisk",
+            agent_config="developer",
+            vm_image=None,
+            cpu_cores=8,
+            memory="16Gi",
+            description="",
+        )
+        payload = prov._http_client.post.await_args.kwargs["json"]
+        assert "disk_size" not in payload

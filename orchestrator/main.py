@@ -14466,6 +14466,7 @@ async def _try_dispatch_pending_jobs() -> None:
                             vm_image=vm_cfg.get("image"),
                             cpu_cores=vm_cfg.get("cpu_cores", 8),
                             memory=vm_cfg.get("memory", "16Gi"),
+                            disk_size=vm_cfg.get("disk_size"),
                             description=job.get("description", ""),
                         )
                         if ok:
@@ -14539,6 +14540,7 @@ async def _try_dispatch_pending_jobs() -> None:
                             vm_image=vm_cfg.get("image"),
                             cpu_cores=vm_cfg.get("cpu_cores", 8),
                             memory=vm_cfg.get("memory", "16Gi"),
+                            disk_size=vm_cfg.get("disk_size"),
                             description=job.get("description", ""),
                             fresh=False,
                         )
@@ -14631,6 +14633,7 @@ async def _try_dispatch_pending_jobs() -> None:
                             vm_image=vm_cfg.get("image"),
                             cpu_cores=vm_cfg.get("cpu_cores", 8),
                             memory=vm_cfg.get("memory", "16Gi"),
+                            disk_size=vm_cfg.get("disk_size"),
                             description=job.get("description", ""),
                             fresh=False,
                         )

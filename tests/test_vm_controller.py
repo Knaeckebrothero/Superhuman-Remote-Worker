@@ -3902,3 +3902,42 @@ class TestLifecycleIdentityGeneration:
         release_create.set()
         await asyncio.gather(create_task, delete_task)
         assert delete_entered.is_set()
+
+
+class TestRenderDiskSize:
+    """Per-job rootdisk size — ``job_config["disk_size"]`` overrides the
+    controller-wide ``VM_DISK_SIZE`` and lands in the DataVolume template."""
+
+    @staticmethod
+    def _dv_storage(result):
+        return result["spec"]["dataVolumeTemplates"][0]["spec"]["storage"]["resources"][
+            "requests"
+        ]["storage"]
+
+    def test_render_disk_size_default_when_absent(self, controller):
+        with patch("vm.controller.controller.VM_DISK_SIZE", "20Gi"):
+            result = controller.render_template({"job_id": "test-id"})
+        assert self._dv_storage(result) == "20Gi"
+
+    def test_render_disk_size_from_job_config(self, controller):
+        with patch("vm.controller.controller.VM_DISK_SIZE", "20Gi"):
+            result = controller.render_template(
+                {"job_id": "test-id", "disk_size": "120Gi"}
+            )
+        assert self._dv_storage(result) == "120Gi"
+
+    def test_render_disk_size_never_below_controller_default(self, controller):
+        """A clone target smaller than the golden source fails in CDI, and the
+        default is the golden floor by construction — so never shrink."""
+        with patch("vm.controller.controller.VM_DISK_SIZE", "20Gi"):
+            result = controller.render_template(
+                {"job_id": "test-id", "disk_size": "5Gi"}
+            )
+        assert self._dv_storage(result) == "20Gi"
+
+    def test_render_disk_size_invalid_falls_back(self, controller):
+        with patch("vm.controller.controller.VM_DISK_SIZE", "20Gi"):
+            result = controller.render_template(
+                {"job_id": "test-id", "disk_size": "lots; rm -rf /"}
+            )
+        assert self._dv_storage(result) == "20Gi"

@@ -131,6 +131,56 @@ VM_GOLDEN_IMAGE_ENABLED = os.environ.get(
 # Golden PVC size; falls back to VM_DISK_SIZE so the clone target (also
 # VM_DISK_SIZE) is never smaller than its source.
 VM_GOLDEN_DISK_SIZE = os.environ.get("VM_GOLDEN_DISK_SIZE", "").strip() or VM_DISK_SIZE
+
+_K8S_QUANTITY_RE = re.compile(r"^(\d+)(Ki|Mi|Gi|Ti|K|M|G|T)?$")
+_QUANTITY_MULT = {
+    None: 1,
+    "K": 10**3,
+    "M": 10**6,
+    "G": 10**9,
+    "T": 10**12,
+    "Ki": 2**10,
+    "Mi": 2**20,
+    "Gi": 2**30,
+    "Ti": 2**40,
+}
+
+
+def _quantity_bytes(value: object) -> int | None:
+    """Parse a Kubernetes storage quantity (``120Gi``) into bytes; None if malformed."""
+    m = _K8S_QUANTITY_RE.match(str(value).strip()) if value is not None else None
+    if not m:
+        return None
+    return int(m.group(1)) * _QUANTITY_MULT[m.group(2)]
+
+
+def effective_disk_size(job_config: Mapping[str, object]) -> str:
+    """Per-job rootdisk size: ``job_config["disk_size"]`` when it is a valid
+    quantity **not smaller than** ``VM_DISK_SIZE``; otherwise the controller
+    default. Never shrink: the golden clone target must not be smaller than
+    its source, and the default is that floor by construction (see
+    ``VM_GOLDEN_DISK_SIZE`` above).
+    """
+    requested = job_config.get("disk_size")
+    if requested in (None, ""):
+        return VM_DISK_SIZE
+    req_bytes = _quantity_bytes(requested)
+    default_bytes = _quantity_bytes(VM_DISK_SIZE)
+    if req_bytes is None:
+        log.warning(
+            "disk_size %r is not a k8s quantity; using %s", requested, VM_DISK_SIZE
+        )
+        return VM_DISK_SIZE
+    if default_bytes is not None and req_bytes < default_bytes:
+        log.warning(
+            "disk_size %s is below the controller default %s; using the default",
+            requested,
+            VM_DISK_SIZE,
+        )
+        return VM_DISK_SIZE
+    return str(requested).strip()
+
+
 # Bounded wait for a golden import/clone to reach Succeeded (mirrors the agent's
 # VM_UPGRADE_POLL_TIMEOUT=900 cold-import budget).
 VM_GOLDEN_POLL_TIMEOUT = int(os.environ.get("VM_GOLDEN_POLL_TIMEOUT", "900"))
@@ -820,7 +870,7 @@ class VMController:
             ),
             # CDI DataVolume storage
             "${VM_STORAGE_CLASS}": VM_STORAGE_CLASS,
-            "${VM_DISK_SIZE}": VM_DISK_SIZE,
+            "${VM_DISK_SIZE}": effective_disk_size(job_config),
             # Headscale mesh VPN — VM joins tailnet on boot
             "${TAILSCALE_AUTH_KEY}": tailscale_auth_key,
             "${HEADSCALE_URL}": headscale_url,

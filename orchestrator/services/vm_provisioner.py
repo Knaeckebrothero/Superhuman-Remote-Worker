@@ -667,6 +667,7 @@ class VMProvisioner:
         memory: str = "16Gi",
         description: str = "",
         fresh: bool = True,
+        disk_size: Optional[str] = None,
     ) -> bool | dict[str, Any]:
         """Create a VM for a job.
 
@@ -734,6 +735,7 @@ class VMProvisioner:
                 vm_image=vm_image,
                 cpu_cores=cpu_cores,
                 memory=memory,
+                disk_size=disk_size,
                 description=description,
                 entity_type="job",
                 set_provisioning=fresh,
@@ -1614,6 +1616,7 @@ class VMProvisioner:
         entity_type: str = "job",
         set_provisioning: bool = True,
         provision_generation: str | None = None,
+        disk_size: Optional[str] = None,
     ) -> bool | dict[str, Any]:
         """Create a VM by POSTing to the co-located VM controller.
 
@@ -1651,6 +1654,8 @@ class VMProvisioner:
         }
         if orchestrator_url := os.getenv("ORCHESTRATOR_URL"):
             payload["orchestrator_url"] = orchestrator_url
+        if disk_size:
+            payload["disk_size"] = disk_size
         generation = _provision_generation(provision_generation)
         if self._lifecycle_hmac_secret is not None and generation is None:
             logger.error(
@@ -2145,6 +2150,7 @@ class VMProvisioner:
         memory: str = "16Gi",
         description: str = "",
         *,
+        disk_size: Optional[str] = None,
         expected_runtime_generation: str | None = None,
         expected_agent_id: str | None = None,
         expected_attach_token: str | None = None,
@@ -2212,6 +2218,7 @@ class VMProvisioner:
                 vm_image=vm_image,
                 cpu_cores=cpu_cores,
                 memory=memory,
+                disk_size=disk_size,
                 description=description,
                 entity_type="thread",
                 set_provisioning=False,
