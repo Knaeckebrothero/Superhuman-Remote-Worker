@@ -324,6 +324,12 @@ def _grep_candidates_sql(*, regex: bool, include_titles: bool) -> str:
     independently plannable branches lets the ``content`` branch use the
     trigram index regardless of what the ``title`` branch does.
 
+    ``ORDER BY kb_id, note_id`` (final review, M3) rather than ``note_id``
+    alone: note ids are unique per ``(kb_id, note_id)``, not globally, and
+    ``kb_grep`` routinely passes several ``kb_ids`` at once — ordering on the
+    full identity keeps which rows survive ``LIMIT $3`` deterministic across
+    knowledge bases instead of leaving same-slug ties to the plan.
+
     ``LIMIT $3`` bounds the number of candidate *notes* fetched (fix round
     1, finding 4): a note contributes at least one matched line, so at most
     ``max_matches`` notes can ever render a line, and this avoids pulling
@@ -338,12 +344,12 @@ def _grep_candidates_sql(*, regex: bool, include_titles: bool) -> str:
         f"WHERE {_GREP_VISIBILITY} AND {body_pred}"
     )
     if not include_titles:
-        return f"{body_select}\nORDER BY note_id\nLIMIT $3"
+        return f"{body_select}\nORDER BY kb_id, note_id\nLIMIT $3"
     title_select = (
         "SELECT kb_id, note_id, title, content FROM knowledge_index "
         f"WHERE {_GREP_VISIBILITY} AND {title_pred}"
     )
-    return f"{body_select}\nUNION\n{title_select}\nORDER BY note_id\nLIMIT $3"
+    return f"{body_select}\nUNION\n{title_select}\nORDER BY kb_id, note_id\nLIMIT $3"
 
 
 def _grep_count_sql(*, regex: bool, include_titles: bool) -> str:
@@ -901,8 +907,16 @@ class KnowledgeStore:
         second argument is a column, which pins the type on its own.
 
         ``advisory`` (migration 0022) is a line for conditions that were
-        skipped rather than failed (spec H2, e.g. duplicate note ids). This
-        method is also the wedge detector's reset, but only when ``status`` is
+        skipped rather than failed (spec H2, e.g. duplicate note ids). Like the
+        wedge fields it is only *replaced* on a ``ready`` write (final review,
+        M1). The same resumable-rebuild call that must not reset the streak
+        passes no ``advisory`` at all, so an unconditional ``advisory = $9``
+        blanked the last sweep's "1 note skipped (duplicate id)" line the
+        moment a rebuild started — deleting exactly the explanation a reader
+        needs for the note that is missing from the index. The INSERT branch
+        keeps the plain ``$9``: there is no prior row to preserve.
+
+        This method is also the wedge detector's reset, but only when ``status`` is
         ``'ready'``: that clears ``error_fingerprint``/``error_streak``/
         ``wedged_since``, because reaching a ``ready`` write means the run
         finished far enough to advance the watermark, which is not the "same
@@ -937,7 +951,10 @@ class KnowledgeStore:
                    END,
                    last_error = $8,
                    updated_at = NOW(),
-                   advisory = $9,
+                   advisory = CASE
+                       WHEN $7 = 'ready' THEN $9
+                       ELSE kb_index_watermark.advisory
+                   END,
                    error_fingerprint = CASE
                        WHEN $7 = 'ready' THEN NULL
                        ELSE kb_index_watermark.error_fingerprint
@@ -2271,7 +2288,7 @@ class KnowledgeStore:
 
         Only active, materialised (``path IS NOT NULL``) notes are candidates,
         matching the read path's visibility rule. Candidates are ordered by
-        ``note_id`` for determinism; ``max_matches`` caps the number of
+        ``(kb_id, note_id)`` for determinism; ``max_matches`` caps the number of
         *matched lines* returned across all notes (not notes themselves), and
         the second return value is always the exact number of candidate notes
         — even when the capped fetch truncates before every candidate note is
@@ -2703,10 +2720,21 @@ class KnowledgeStore:
         # note rows directly, so a note with no current-version chunks can rank
         # — and a row can vanish between the two queries: skip what's missing
         # rather than assuming the second query returns every id.
+        #
+        # The body fetch re-states the caller's scope (final review, M4):
+        # `status = 'active'` and `kb_id = ANY($2)`. The ranking function
+        # already applies both, but the two queries do not run in one snapshot
+        # — a note archived (or re-homed) in between would otherwise be
+        # returned to the caller as a live result on the strength of a stale
+        # ranking row. Re-stating the predicate makes the second query
+        # fail-closed instead of trusting the first.
         order = [r["note_row"] for r in ranked]
         arms = {r["note_row"]: list(r["arms"] or []) for r in ranked}
         rows = await self.db.fetch(
-            "SELECT * FROM knowledge_index WHERE id = ANY($1)", order
+            "SELECT * FROM knowledge_index "
+            "WHERE id = ANY($1) AND status = 'active' AND kb_id = ANY($2)",
+            order,
+            list(kb_ids),
         )
         by_id = {row["id"]: KnowledgeRecord.from_row(dict(row)) for row in rows}
 

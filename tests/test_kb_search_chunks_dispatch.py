@@ -235,10 +235,17 @@ async def test_second_query_selects_notes_by_row_id():
         [{"note_row": a, "rrf_score": 0.9, "arms": ["exact"]}],
         [_row(a, "a")],
     ]
-    await store.search_chunks([uuid.uuid4()], "", exact=["x"])
+    kb = uuid.uuid4()
+    await store.search_chunks([kb], "", exact=["x"])
     second = db.fetch.call_args_list[1].args
     assert "knowledge_index" in second[0]
     assert second[1] == [a]
+    # Final review, M4: the body fetch re-states the caller's scope. The two
+    # queries do not share a snapshot, so trusting the ranking row alone could
+    # hand back a note archived (or re-homed) in between as a live result.
+    assert "status = 'active'" in second[0]
+    assert "kb_id = ANY($2)" in second[0]
+    assert second[2] == [kb]
 
 
 @pytest.mark.asyncio

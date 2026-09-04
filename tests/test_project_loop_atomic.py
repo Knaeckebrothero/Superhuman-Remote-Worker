@@ -335,3 +335,8 @@ def test_vector_idempotency_ledgers_are_current_and_in_generated_snapshot():
     assert "ready_at timestamp with time zone" in snapshot
     # 0022 (WP3/H3): wedge detector streak columns on the watermark row.
     assert "error_streak integer DEFAULT 0 NOT NULL" in snapshot
+    # 0024 (S1): the trigram index kb_grep's ILIKE path plans against — a
+    # regenerated snapshot missing it means `.notx.sql` migrations were skipped.
+    assert "idx_knowledge_content_trgm" in snapshot
+    # 0025: the multi-angle ranking function search_chunks dispatches to.
+    assert "knowledge_chunk_multi_angle_search" in snapshot

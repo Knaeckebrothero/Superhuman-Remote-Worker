@@ -716,6 +716,50 @@ class TestReadinessNotice:
         assert "current.\n⚠️ Still indexing" in result
         assert result.index("note(s) have failed") < result.index("Still indexing")
 
+    # -- advisory (final review, Important 2a) --------------------------------
+    # `advisory` had no reader anywhere: the reindexer wrote "1 note skipped
+    # (duplicate id)" and nothing ever showed it. A skipped duplicate is
+    # precisely the explanation a zero-result branch owes the reader, and it
+    # applies to a *ready* knowledge base — the index is clean and still
+    # incomplete.
+
+    def test_ready_watermark_still_surfaces_its_advisory(self):
+        wm = MagicMock(
+            spec=["status", "advisory"],
+            status="ready",
+            advisory="1 note skipped (duplicate id `foo`)",
+        )
+        out = self._read_missing(wm)
+        assert "ℹ️ [project] 1 note skipped (duplicate id `foo`)" in out
+        assert "Still indexing" not in out
+
+    def test_partial_watermark_renders_both_rebuilding_and_advisory(self):
+        wm = MagicMock(
+            status="partial",
+            indexed_commit="a" * 40,
+            source_head="b" * 40,
+            error_streak=1,
+            wedged_since=None,
+            last_error="3 note operation(s) failed",
+            advisory="2 notes skipped (duplicate ids)",
+        )
+        out = self._read_missing(wm)
+        assert "Still indexing — results may be incomplete" in out
+        assert "ℹ️ [project] 2 notes skipped (duplicate ids)" in out
+        # Advisory lines come last, after the rebuilding notice.
+        assert out.index("Still indexing") < out.index("ℹ️")
+
+    def test_blank_or_non_string_advisory_emits_nothing(self):
+        # A MagicMock-shaped watermark (every other test in this class) hands
+        # back a Mock for `.advisory`; a real row can hold "" or NULL. Neither
+        # may become an ℹ️ line.
+        for value in ("", "   ", None, MagicMock()):
+            wm = MagicMock(
+                status="ready",
+                advisory=value,
+            )
+            assert "ℹ️" not in self._read_missing(wm)
+
 
 # =============================================================================
 # 13.7: kb_list
@@ -943,6 +987,26 @@ class TestKbGrep:
         from src.tools.knowledge.knowledge_tools import KNOWLEDGE_TOOLS_METADATA
 
         assert KNOWLEDGE_TOOLS_METADATA["kb_grep"]["category"] == "knowledge"
+
+    def test_grep_is_a_body_tool_and_never_asks_for_title_candidates(self):
+        """Final review, Important 1. ``grep_notes``' title branch makes a
+        title-only hit a candidate — it counts toward ``total`` and burns a
+        LIMIT slot — but line extraction reads ``content`` only, so it renders
+        nothing. Left on, kb_grep answered "No lines match" for content that IS
+        present and offered "raise max_matches" for notes that can never render
+        a line. Titles belong to kb_search(exact=)."""
+        ctx, _ = self._ctx([], 0)
+        tools, _ = _make_tools(ctx)
+        _invoke(_get_tool(tools, "kb_grep"), {"pattern": "sales_page"})
+        assert (
+            ctx.knowledge_store.grep_notes.await_args.kwargs["include_titles"] is False
+        )
+
+    def test_docstring_points_titles_at_kb_search_exact(self):
+        tools, _ = _make_tools()
+        doc = _get_tool(tools, "kb_grep").description or ""
+        assert "matches note bodies" in doc.lower()
+        assert "kb_search(exact=)" in doc
 
 
 class TestKbListVocabulary:

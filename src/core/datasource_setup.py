@@ -1248,7 +1248,7 @@ def _render_connector_lines(
             root_hint = f", root `{root}`" if root else ""
             lines.append(
                 f"- **{name}** (centrally indexed, read-only{root_hint}) — "
-                "use `kb_search`, `kb_list`, and `kb_read`"
+                "use `kb_search`, `kb_grep`, `kb_list`, and `kb_read`"
             )
         lines.append("")
 

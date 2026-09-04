@@ -151,16 +151,50 @@ async def test_upsert_watermark_resets_wedge_fields_only_on_ready(vector_pool):
         wm = await store.get_watermark(kb)
         assert wm.error_streak == expected
 
+    # An advisory from the last clean sweep — the "1 note skipped (duplicate
+    # id)" line the readiness notice shows the reader.
+    await store.upsert_watermark(
+        kb, "r", "main", "cafe1234", "v1", status="ready", advisory="1 note skipped"
+    )
+    assert (await store.get_watermark(kb)).advisory == "1 note skipped"
+
     # A resumable-rebuild "indexing" write via upsert_watermark must leave
     # the streak and fingerprint untouched.
+    await store.set_watermark_status(
+        kb,
+        "partial",
+        last_error="1 note operation(s) failed",
+        error_fingerprint="abc123",
+        repo_name="r",
+        branch="main",
+    )
     await store.upsert_watermark(kb, "r", "main", None, "v2", status="indexing")
     wm = await store.get_watermark(kb)
-    assert wm.error_streak == 2
+    assert wm.error_streak == 1
     assert wm.error_fingerprint == "abc123"
+    # Final review, M1: that same write passes no advisory, and an
+    # unconditional `advisory = $9` blanked it — deleting the only explanation
+    # for a note missing from the index the moment a rebuild started.
+    assert wm.advisory == "1 note skipped"
 
-    # Only a "ready" write clears all three wedge fields.
-    await store.upsert_watermark(kb, "r", "main", "deadbeef", "v2", status="ready")
+    # Only a "ready" write clears all three wedge fields — and it is also the
+    # only write that may REPLACE the advisory.
+    await store.upsert_watermark(
+        kb,
+        "r",
+        "main",
+        "deadbeef",
+        "v2",
+        status="ready",
+        advisory="2 notes skipped",
+    )
     wm = await store.get_watermark(kb)
     assert wm.error_streak == 0
     assert wm.error_fingerprint is None
     assert wm.wedged_since is None
+    assert wm.advisory == "2 notes skipped"
+
+    # A clean ready sweep with nothing to report clears it, so a stale
+    # advisory cannot outlive the condition that produced it.
+    await store.upsert_watermark(kb, "r", "main", "f00dcafe", "v2", status="ready")
+    assert (await store.get_watermark(kb)).advisory is None

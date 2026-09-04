@@ -698,6 +698,43 @@ async def test_update_datasource_tool_reports_new_policy_revision():
     assert "Projects: project-a" in result
 
 
+@pytest.mark.asyncio
+async def test_reindex_summary_reports_skipped_duplicates():
+    """Final review, Important 2b. The reindexer counts notes it declined to
+    index because another path already holds the id; the summary omitted the
+    number, so a partially-indexed vault read as a clean run — the notes are
+    simply absent from search with nothing saying why."""
+    mock_client = AsyncMock()
+    mock_client.reindex_knowledge.return_value = {
+        "status": "ok",
+        "indexed_commit": "abcdef1234567890",
+        "full": False,
+        "upserted": 12,
+        "deleted": 1,
+        "skipped": 3,
+        "skipped_duplicates": 2,
+        "errors": 0,
+    }
+
+    with patch.object(_mcp_server_mod, "_get_client", return_value=mock_client):
+        result = await _mcp_server_mod.reindex_knowledge("project-1")
+
+    assert "skipped: 3" in result
+    assert "skipped_duplicates: 2" in result
+    assert "errors: 0" in result
+
+
+@pytest.mark.asyncio
+async def test_reindex_summary_defaults_skipped_duplicates_for_older_payloads():
+    mock_client = AsyncMock()
+    mock_client.reindex_knowledge.return_value = {"status": "ok"}
+
+    with patch.object(_mcp_server_mod, "_get_client", return_value=mock_client):
+        result = await _mcp_server_mod.reindex_knowledge("project-1")
+
+    assert "skipped_duplicates: 0" in result
+
+
 class TestMcpPersistentThreadTools:
     """Tests for MCP server persistent thread tool functions.
 

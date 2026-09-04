@@ -736,6 +736,87 @@ def test_permanent_update_failure_names_the_targeted_knowledge_base():
     assert "project-c0d5edd4 — SRW" in result
     assert "will not be retried" in result
     assert "project (Personal)" in result
+    # Final review, Important 3b: kb_update has no `kb=` argument. Naming one
+    # here sends the author looking for a parameter that does not exist; the
+    # retarget mechanism on this surface is the qualified handle.
+    assert (
+        "Native knowledge bases you can target with a qualified `alias:slug` "
+        "handle: project (Personal)." in result
+    )
+    assert "kb=" not in result
+
+
+def test_permanent_delete_failure_uses_the_handle_wording_too():
+    """kb_delete reaches the same renderer through ``_update_existing``."""
+    home = _binding("project", kind="native", writable=True, name="Personal")
+    srw = _binding("project-c0d5edd4", kind="native", name="SRW")
+    context = _context([home, srw])
+    old = _kb_note("n", "old", created="2020-01-01T00:00:00+00:00")
+    context.knowledge_graph.read_note.side_effect = _scoped_reader(
+        {(str(srw.kb_id), "n"): old}
+    )
+    context.knowledge_store.get_note_by_slug.side_effect = _scoped_store_reader(
+        {(str(srw.kb_id), "n"): old}
+    )
+    context.knowledge_store.get_inbound_links.return_value = []
+    with patch(
+        "src.tools.knowledge.knowledge_tools._post_vault_file",
+        return_value={
+            "status": "failed",
+            "reason": "no-repo",
+            "canonical_state": "failed",
+            "retry_state": "permanent",
+            "recorded": False,
+        },
+    ):
+        result = _tool(_tools(context), "kb_delete").invoke(
+            {"note": "project-c0d5edd4:n", "reason": "superseded by the new note"}
+        )
+    assert "will not be retried" in result
+    assert "a qualified `alias:slug` handle" in result
+    assert "kb=" not in result
+
+
+def test_permanent_write_failure_keeps_the_kb_argument_wording():
+    """The write surface DOES take ``kb=`` — the two hints must not converge."""
+    home = _binding("project", kind="native", writable=True, name="Personal")
+    srw = _binding("project-c0d5edd4", kind="native", name="SRW")
+    context = _context([home, srw])
+    context.knowledge_graph.read_note.return_value = None
+    with patch(
+        "src.tools.knowledge.knowledge_tools._post_vault_file",
+        return_value={
+            "status": "failed",
+            "reason": "no-repo",
+            "canonical_state": "failed",
+            "retry_state": "permanent",
+            "recorded": False,
+        },
+    ):
+        result = _tool(_tools(context), "kb_write").invoke(
+            {"title": "X", "type": "learning", "content": "Body"}
+        )
+    assert (
+        "Native knowledge bases you can target with kb=: "
+        "project-c0d5edd4 (SRW)." in result
+    )
+    assert "alias:slug" not in result
+
+
+def test_update_and_delete_docstrings_advertise_qualified_handles():
+    """Final review, Important 3a: B5 targeting was implemented on both tools
+    and mentioned in neither docstring, so no agent could discover it."""
+    context = _context(
+        [
+            _binding("project", kind="native", writable=True, name="Personal"),
+            _binding("project-c0d5edd4", kind="native", name="SRW"),
+        ]
+    )
+    tools = _tools(context)
+    for name in ("kb_update", "kb_delete"):
+        doc = _tool(tools, name).description or ""
+        assert "`alias:slug` handle" in doc, name
+        assert "another native knowledge base" in doc, name
 
 
 # ---------------------------------------------------------------------------

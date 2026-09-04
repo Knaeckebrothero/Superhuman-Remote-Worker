@@ -1944,18 +1944,25 @@ async def reindex_knowledge(project_id: str, full: bool = False) -> str:
         full: Re-embed every note instead of only changed blobs
 
     Returns:
-        Reindex summary (status, commit, upserted/deleted/skipped/errors)
+        Reindex summary (status, commit,
+        upserted/deleted/skipped/skipped_duplicates/errors)
     """
     client = _get_client()
     result = await client.reindex_knowledge(project_id, full=full)
     status = result.get("status", "unknown")
     commit = (result.get("indexed_commit") or "")[:12]
+    # `skipped_duplicates` is the reindexer's own counter for notes it declined
+    # to index because another path already holds the id. Omitting it made a
+    # partially-indexed vault read as a clean run: the notes are simply absent
+    # from search with nothing in the summary to say why. `.get` with a default
+    # so an older endpoint payload still renders.
     return (
         f"KB reindex: {status} (commit {commit or 'n/a'}, "
         f"full={result.get('full', False)}).\n"
         f"  Upserted: {result.get('upserted', 0)}, "
         f"deleted: {result.get('deleted', 0)}, "
         f"skipped: {result.get('skipped', 0)}, "
+        f"skipped_duplicates: {result.get('skipped_duplicates', 0)}, "
         f"errors: {result.get('errors', 0)}"
     )
 

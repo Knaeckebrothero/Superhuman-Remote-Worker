@@ -1332,6 +1332,7 @@ def _canonical_materialization_error(
     *,
     target: Optional[KnowledgeBinding] = None,
     alternatives: Sequence[KnowledgeBinding] = (),
+    surface: str = "write",
 ) -> str:
     """The tool's verbatim reply for a canonical write that did not land.
 
@@ -1340,6 +1341,12 @@ def _canonical_materialization_error(
     matter only for a *permanent* failure: with several knowledge bases in
     scope, "it failed" without naming which one leaves the author retrying
     the same doomed target forever (WP5.4).
+
+    ``surface`` names *how* the caller retargets, because the two surfaces do
+    not share a mechanism (final review, Important 3). ``kb_write`` takes a
+    ``kb=`` argument; ``kb_update``/``kb_delete`` have no such parameter — they
+    retarget by qualifying the note handle as ``alias:slug`` (B5). Naming
+    ``kb=`` on an update is an instruction the caller cannot follow.
     """
     state = result.get("canonical_state") or "failed"
     reason = result.get("reason") or "unknown"
@@ -1363,8 +1370,9 @@ def _canonical_materialization_error(
                 for binding in alternatives
                 if target is None or binding.kb_id != target.kb_id
             )
+            how = "a qualified `alias:slug` handle" if surface == "update" else "kb="
             hint = (
-                f" Native knowledge bases you can target with kb=: {others}."
+                f" Native knowledge bases you can target with {how}: {others}."
                 if others
                 else ""
             )
@@ -1750,9 +1758,18 @@ def create_kb_tools(
         wording instead of the rebuilding one. ``wedged_since``/``last_error`` are
         read with ``getattr`` so an old watermark row (or a test double without the
         new fields) degrades to today's rebuilding text.
+
+        A watermark's ``advisory`` (migration 0022) records what the last sweep
+        *skipped* rather than failed — a duplicate note id, say. That is exactly
+        the explanation a zero-result branch owes the reader ("the note you are
+        looking for exists in the vault but was not indexed"), and it holds for a
+        ``ready`` knowledge base too: a skipped duplicate leaves the index clean
+        and still incomplete. So the advisory is collected for every binding
+        regardless of status, and rendered last (final review, Important 2).
         """
         notices: List[str] = []
         wedged: List[str] = []
+        advisories: List[str] = []
         for binding in bindings:
             try:
                 watermark = _run_async(ks.get_watermark(binding.kb_id))
@@ -1763,6 +1780,12 @@ def create_kb_tools(
                     e,
                 )
                 continue
+            # ``isinstance`` rather than a bare truth test: a MagicMock-shaped
+            # watermark (or an old row) yields a non-string here, and a false
+            # advisory line is worse than none.
+            advisory = getattr(watermark, "advisory", None)
+            if isinstance(advisory, str) and advisory.strip():
+                advisories.append(f"[{binding.alias}] {advisory.strip()}")
             status = getattr(watermark, "status", None)
             if not isinstance(status, str) or status == "ready":
                 continue
@@ -1803,7 +1826,7 @@ def create_kb_tools(
                 else ""
             )
             notices.append(f"[{binding.alias}] {status} — {clean}{attempted}")
-        if not notices and not wedged:
+        if not notices and not wedged and not advisories:
             return ""
         parts = []
         if wedged:
@@ -1812,6 +1835,7 @@ def create_kb_tools(
             parts.append(
                 "⚠️ Still indexing — results may be incomplete: " + "; ".join(notices)
             )
+        parts.extend(f"ℹ️ {line}" for line in advisories)
         return "\n".join(parts)
 
     # =========================================================================
@@ -1953,6 +1977,9 @@ def create_kb_tools(
                     materialization,
                     target=_binding_for_project_id(context, project_id),
                     alternatives=_native_bindings(context),
+                    # kb_update/kb_delete have no `kb=` argument; they retarget
+                    # by qualifying the handle (`alias:slug`).
+                    surface="update",
                 )
 
             changes = _describe_update(
@@ -2134,6 +2161,9 @@ def create_kb_tools(
                     materialization,
                     target=_binding_for_project_id(context, project_id),
                     alternatives=_native_bindings(context),
+                    # As in `_update_existing_kgless`: the retarget mechanism on
+                    # this surface is the qualified handle, not `kb=`.
+                    surface="update",
                 )
 
             # Neo4j is an optional derived graph, not the dispatch/search
@@ -2468,6 +2498,7 @@ def create_kb_tools(
                     materialization,
                     target=target,
                     alternatives=_native_bindings(context),
+                    surface="write",
                 )
 
             graph_error: Optional[Exception] = None
@@ -2584,7 +2615,8 @@ def create_kb_tools(
         up on the next sweep.
 
         Args:
-            note: Note slug ID (e.g. "chose-jwt-over-oauth")
+            note: Note slug ID (e.g. "chose-jwt-over-oauth"), or a qualified
+                `alias:slug` handle to target another native knowledge base
             content: Replace the entire content (mutually exclusive with append)
             append: Append text to existing content (mutually exclusive with content)
             status: New status — active, resolved, superseded, or archived
@@ -2670,7 +2702,8 @@ def create_kb_tools(
         Retiring an already-archived note is a no-op, not an error.
 
         Args:
-            note: Note slug ID (e.g. "iter-12-state-snapshot")
+            note: Note slug ID (e.g. "iter-12-state-snapshot"), or a qualified
+                `alias:slug` handle to target another native knowledge base
             reason: One line: why this note no longer earns its place
                 (superseded by X, duplicate of Y, snapshot of a moved-on
                 state, ...). Required.
@@ -3213,8 +3246,9 @@ def create_kb_tools(
         occurrence, one line of context each side. Case-insensitive substring by
         default; regex=True for a POSIX regex; `^`/`$` anchor per line. Use it to
         find all mentions of an identifier, error string or slug, or to confirm
-        something is absent. Capped at max_matches lines; the tail says how many
-        notes were cut.
+        something is absent. Matches note bodies; use `kb_search(exact=)` to match
+        titles too. Capped at max_matches lines; the tail says how many notes were
+        cut.
         """
         bindings, error = _select_bindings(context, kb)
         if error:
@@ -3226,6 +3260,15 @@ def create_kb_tools(
                     pattern,
                     regex=regex,
                     max_matches=max(1, min(int(max_matches), 500)),
+                    # Body-only, deliberately (final review, Important 1). The
+                    # store's title branch makes a title-only hit a *candidate*:
+                    # it counts toward `total` and occupies a LIMIT slot, but
+                    # `grep_notes` extracts lines from `content` alone, so it
+                    # renders nothing. Left on, kb_grep printed "No lines match"
+                    # for content that IS present and offered "raise
+                    # max_matches" for notes that can never render a line.
+                    # Titles are `kb_search(exact=)`'s job; grep is a body tool.
+                    include_titles=False,
                 )
             )
         except ValueError as e:
