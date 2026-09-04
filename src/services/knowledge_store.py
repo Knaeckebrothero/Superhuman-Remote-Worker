@@ -345,16 +345,25 @@ def _grep_count_sql(*, regex: bool, include_titles: bool) -> str:
     :func:`_grep_candidates_sql` uses — ``$1`` kb_ids, ``$2`` pattern. Run
     alongside the capped fetch (fix round 1, finding 4) so
     ``matching_note_count`` stays accurate even when ``LIMIT`` truncated the
-    fetch itself."""
+    fetch itself.
+
+    Both branches select ``kb_id, note_id`` — not ``note_id`` alone (fix
+    round 2). Note identity is per ``(project_id, note_id)``, not globally
+    unique, and ``grep_notes`` is routinely called with several ``kb_ids`` at
+    once (``kb_grep`` fans it out across every KB binding). Deduping the
+    ``UNION`` on ``note_id`` alone would collapse two distinct notes in two
+    different KBs that happen to share a ``note_id`` into one row —
+    undercounting ``matching_note_count`` — while :func:`_grep_candidates_sql`
+    (which already selects ``kb_id, note_id, …``) keeps them apart. Matching
+    the dedup key to the candidate query's key fixes the mismatch: two notes
+    still count once only when they're the *same* ``(kb_id, note_id)`` pair
+    hit by both the body and title branches.
+    """
     body_pred, title_pred = _grep_where_clause(regex)
-    body_select = (
-        f"SELECT note_id FROM knowledge_index WHERE {_GREP_VISIBILITY} AND {body_pred}"
-    )
+    body_select = f"SELECT kb_id, note_id FROM knowledge_index WHERE {_GREP_VISIBILITY} AND {body_pred}"
     if not include_titles:
         return f"SELECT count(*) FROM ({body_select}) AS candidates"
-    title_select = (
-        f"SELECT note_id FROM knowledge_index WHERE {_GREP_VISIBILITY} AND {title_pred}"
-    )
+    title_select = f"SELECT kb_id, note_id FROM knowledge_index WHERE {_GREP_VISIBILITY} AND {title_pred}"
     return f"SELECT count(*) FROM ({body_select} UNION {title_select}) AS candidates"
 
 

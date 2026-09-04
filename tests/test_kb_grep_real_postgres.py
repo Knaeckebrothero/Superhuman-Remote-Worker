@@ -187,6 +187,42 @@ async def test_grep_notes_cap_across_multiple_notes_reports_full_count(vector_po
 
 
 @pytest.mark.asyncio
+async def test_grep_notes_count_dedups_by_kb_and_note_not_note_id_alone(vector_pool):
+    """Fix round 2: note identity is per (project_id, note_id), not globally
+    unique, and grep_notes is routinely called across several kb_ids at once
+    (kb_grep fans out over every KB binding). _grep_count_sql's UNION must
+    dedup on (kb_id, note_id) like the candidate query does — deduping on
+    note_id alone would collapse two distinct notes in two different KBs
+    that happen to share a note_id into one, undercounting the total."""
+    store = KnowledgeStore(db=vector_pool, embedding_service=None)
+    kb_a = uuid.uuid4()
+    kb_b = uuid.uuid4()
+    await _seed(vector_pool, kb_a, "shared-slug", "A", "needle in kb_a")
+    await _seed(vector_pool, kb_b, "shared-slug", "B", "needle in kb_b")
+
+    matches, total = await store.grep_notes([kb_a, kb_b], "needle")
+    assert total == 2
+    assert {(m.kb_id, m.note_id) for m in matches} == {
+        (kb_a, "shared-slug"),
+        (kb_b, "shared-slug"),
+    }
+
+
+@pytest.mark.asyncio
+async def test_grep_notes_count_dedups_a_note_matching_both_branches_once(vector_pool):
+    """Mirror of the above: within ONE kb, a note whose pattern appears in
+    BOTH the body and the title (so it's a candidate via both UNION
+    branches) must still count once, not twice."""
+    store = KnowledgeStore(db=vector_pool, embedding_service=None)
+    kb = uuid.uuid4()
+    await _seed(vector_pool, kb, "both-branches", "needle in title", "needle in body")
+
+    matches, total = await store.grep_notes([kb], "needle")
+    assert total == 1
+    assert [m.note_id for m in matches] == ["both-branches"]
+
+
+@pytest.mark.asyncio
 async def test_regex_grep_is_newline_sensitive_anchors_match_per_line(vector_pool):
     """Fix round 1, finding 2: Postgres's `~*` is newline-*insensitive* by
     default, so `^` anchors only the start of the WHOLE body, not each
