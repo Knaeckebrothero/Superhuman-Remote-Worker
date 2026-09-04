@@ -1490,9 +1490,18 @@ def create_kb_tools(
     def _read_from_binding(
         binding: KnowledgeBinding, note_id: str
     ) -> Optional[Dict[str, Any]]:
-        """Read one note through the backend appropriate to its KB kind."""
+        """Read one note through the backend appropriate to its KB kind.
+
+        Native KBs try the graph first and fall through to the index (H1):
+        a vault-imported note exists only in Postgres, an agent-written one
+        may exist only in Neo4j, and neither store is authoritative for the
+        other. A note present in either resolves.
+        """
         if binding.is_native and kg is not None:
-            return kg.read_note(str(binding.kb_id), note_id)
+            data = kg.read_note(str(binding.kb_id), note_id)
+            if data:
+                return data
+            logger.debug("kb_read: %s not in graph, trying index", note_id)
         return _run_async(ks.get_note_by_slug(binding.kb_id, note_id))
 
     def _matching_notes(
@@ -2616,6 +2625,22 @@ def create_kb_tools(
                         status=status,
                         job_id=job_id,
                     )
+                    # Same H1 fallback as _read_from_binding: a native KB
+                    # whose notes were imported by the reindex sweep lives
+                    # only in Postgres, so an empty graph result isn't
+                    # necessarily an empty KB. No merge of both stores'
+                    # results here — a KB lives in one world today; a future
+                    # merge would need de-dup by `id`.
+                    if not found:
+                        found = _run_async(
+                            ks.list_notes(
+                                kb_id=binding.kb_id,
+                                note_type=type,
+                                tag=tag,
+                                status=status,
+                                job_id=job_id,
+                            )
+                        )
                 else:
                     found = _run_async(
                         ks.list_notes(

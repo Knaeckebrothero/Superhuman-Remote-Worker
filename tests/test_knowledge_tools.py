@@ -505,6 +505,10 @@ class TestKbRead:
             None,
             {"id": "n1", "title": "Found", "content": "x"},
         ]
+        # The first binding's graph miss must not be masked by the index
+        # fallback's default (truthy) AsyncMock return — force a real miss
+        # there so the second binding's graph hit is what's exercised.
+        ctx.knowledge_store.get_note_by_slug.return_value = None
 
         result = _invoke(_get_tool(tools, "kb_read"), {"note": "n1"})
         assert "Found" in result
@@ -539,6 +543,9 @@ class TestKbRead:
     def test_not_found(self):
         tools, ctx = _make_tools()
         ctx.knowledge_graph.read_note.return_value = None
+        # The graph miss must be a genuine miss, not an accidental hit off
+        # AsyncMock's default (truthy) auto-speccing on the index fallback.
+        ctx.knowledge_store.get_note_by_slug.return_value = None
 
         result = _invoke(_get_tool(tools, "kb_read"), {"note": "missing"})
         assert "not found" in result
@@ -548,6 +555,7 @@ class TestKbRead:
         # look like a genuine miss (agent could otherwise conclude "KB empty").
         tools, ctx = _make_tools()
         ctx.knowledge_graph.read_note.return_value = None
+        ctx.knowledge_store.get_note_by_slug.return_value = None
         ctx.knowledge_store.get_watermark.return_value = MagicMock(
             status="pending", indexed_commit=None, source_head=None
         )
@@ -555,6 +563,34 @@ class TestKbRead:
         assert "not found" in result
         assert "Still indexing" in result
         assert "pending" in result
+
+    def test_read_falls_back_to_store_when_graph_has_no_node(self):
+        tools, ctx = _make_tools()
+        ctx.knowledge_graph.read_note.return_value = None
+        ctx.knowledge_store.get_note_by_slug.return_value = {
+            "id": "vault-note",
+            "title": "From the vault",
+            "type": "learning",
+            "status": "active",
+            "content": "imported by the sweep",
+        }
+        result = _invoke(_get_tool(tools, "kb_read"), {"note": "vault-note"})
+        assert "From the vault" in result and "not found" not in result
+        ctx.knowledge_store.get_note_by_slug.assert_called_once()
+
+    def test_read_does_not_touch_store_when_graph_has_the_note(self):
+        tools, ctx = _make_tools()
+        ctx.knowledge_graph.read_note.return_value = {
+            "id": "g",
+            "title": "Graph",
+            "type": "learning",
+            "status": "active",
+            "content": "c",
+            "relationships": [],
+            "incoming_relationships": [],
+        }
+        _invoke(_get_tool(tools, "kb_read"), {"note": "g"})
+        ctx.knowledge_store.get_note_by_slug.assert_not_called()
 
 
 # =============================================================================
@@ -587,6 +623,9 @@ class TestKbList:
     def test_empty_with_filter_description(self):
         tools, ctx = _make_tools()
         ctx.knowledge_graph.list_notes.return_value = []
+        # An empty graph must fall through to a genuinely empty index, not
+        # AsyncMock's default (non-iterable, truthy) auto-return.
+        ctx.knowledge_store.list_notes.return_value = []
 
         result = _invoke(
             _get_tool(tools, "kb_list"),
@@ -602,6 +641,7 @@ class TestKbList:
     def test_empty_surfaces_indexing_status(self):
         tools, ctx = _make_tools()
         ctx.knowledge_graph.list_notes.return_value = []
+        ctx.knowledge_store.list_notes.return_value = []
         ctx.knowledge_store.get_watermark.return_value = MagicMock(
             status="partial", indexed_commit="a" * 40, source_head="b" * 40
         )
@@ -609,6 +649,25 @@ class TestKbList:
         assert "No knowledge notes found" in result
         assert "Still indexing" in result
         assert "partial" in result
+
+    def test_list_falls_back_to_store_when_graph_is_empty(self):
+        tools, ctx = _make_tools()
+        ctx.knowledge_graph.list_notes.return_value = []
+        ctx.knowledge_store.list_notes.return_value = [
+            {
+                "id": "n1",
+                "title": "T",
+                "type": "decision",
+                "status": "active",
+                "confidence": None,
+            },
+        ]
+        # For T6 (tag_vocabulary): harmless here, keeps this test valid once
+        # kb_list starts consulting tag vocabulary.
+        ctx.knowledge_store.tag_vocabulary = AsyncMock(return_value=[])
+        result = _invoke(_get_tool(tools, "kb_list"), {})
+        assert "n1" in result
+        ctx.knowledge_store.list_notes.assert_called_once()
 
     def test_formats_with_status_icon(self):
         tools, ctx = _make_tools()
