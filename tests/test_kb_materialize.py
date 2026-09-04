@@ -398,6 +398,66 @@ class TestSkips:
         g.list_tree.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_sweep_retry_discovering_no_repo_is_also_permanent(self):
+        """The mainstream trigger for the *deep* no-repo branch: kb_reindex's
+        sweep dispatches a previously-retryable content intent through
+        ``retry_knowledge_materialization_intent``, which calls
+        ``_attempt_content_intent`` directly — the intent already exists, so
+        the early short-circuit in ``_materialize_note_canonical`` never runs.
+        If ``resolve_kb_repo`` now answers "no repo", this must still land as
+        permanent — via the ledger this time, since a row already exists."""
+        from services.kb_materialize import retry_knowledge_materialization_intent
+
+        g = _make_gitea()
+        db = _ledger_db()
+        intent = {
+            "id": uuid.uuid4(),
+            "project_id": PROJECT,
+            "note_id": SLUG,
+            "content": BODY,
+            "job_id": JOB,
+            "attempt_token": uuid.uuid4(),
+        }
+        with _patch_resolve(None):
+            result = await retry_knowledge_materialization_intent(
+                postgres_db=db,
+                gitea_client=g,
+                intent=intent,
+            )
+        assert result["status"] == "failed"
+        assert result["reason"] == "no-repo"
+        assert result["canonical_state"] == "failed"
+        assert result["retry_state"] == "permanent"
+        assert result["recorded"] is True
+        assert (
+            db.finish_knowledge_materialization.await_args.kwargs["permanent"] is True
+        )
+        g.list_tree.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_repo_wins_over_malformed_frontmatter(self):
+        """``_materialize_note_canonical`` resolves the repo before anything
+        parses the note, so a repo-less project reports ``no-repo`` even for
+        content that would separately fail as ``malformed-frontmatter``.
+        Pinning this precedence: both are permanent, but only the repo check
+        runs before an intent would be opened."""
+        g = _make_gitea()
+        db = _ledger_db()
+        with _patch_resolve(None):
+            result = await materialize_knowledge_note(
+                postgres_db=db,
+                gitea_client=g,
+                project_id=PROJECT,
+                slug=SLUG,
+                content="---\nid: [unterminated\n---\n# Broken\n",
+                job_id=JOB,
+            )
+        assert result["status"] == "failed"
+        assert result["reason"] == "no-repo"
+        assert result["recorded"] is False
+        db.begin_knowledge_materialization.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_missing_branch_falls_back_to_main(self):
         g = _make_gitea()
 

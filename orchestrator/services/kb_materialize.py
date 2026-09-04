@@ -517,7 +517,10 @@ async def _finish_attempt(
     intent_id = str(intent["id"])
     token = intent.get("attempt_token")
     try:
-        recorded = await postgres_db.finish_knowledge_materialization(
+        # Named for what it is — the ledger's post-write row — not "recorded",
+        # which is a distinct boolean already carried on `outcome` (whether an
+        # intent was ever opened at all; see `_result`).
+        ledger_row = await postgres_db.finish_knowledge_materialization(
             intent_id,
             canonical=canonical,
             permanent=permanent,
@@ -545,7 +548,7 @@ async def _finish_attempt(
             "projection_state": "projection_only",
             "retry_state": "retryable",
         }
-    if recorded is None:
+    if ledger_row is None:
         return {
             **outcome,
             "status": _STATUS_FAILED,
@@ -558,10 +561,10 @@ async def _finish_attempt(
     return {
         **outcome,
         "intent_id": intent_id,
-        "canonical_state": recorded.get("canonical_state")
+        "canonical_state": ledger_row.get("canonical_state")
         or ("canonical" if canonical else "pending_sync"),
-        "projection_state": recorded.get("projection_state") or "pending",
-        "retry_state": recorded.get("retry_state")
+        "projection_state": ledger_row.get("projection_state") or "pending",
+        "retry_state": ledger_row.get("retry_state")
         or ("none" if canonical else "retryable"),
     }
 
