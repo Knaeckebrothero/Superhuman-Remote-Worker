@@ -263,6 +263,12 @@ class GrepMatch:
 # way to make Postgres do pathological work — reject before it ever reaches SQL.
 _GREP_PATTERN_MAX = 256
 
+# kb_id / status / path visibility gate shared by every grep_notes query
+# (candidate fetch, candidate count) — same read-path rule as kb_read/kb_list
+# (active + materialised only). $1 is always the kb_ids array in every query
+# that includes this fragment.
+_GREP_VISIBILITY = "kb_id = ANY($1::uuid[]) AND status = 'active' AND path IS NOT NULL"
+
 
 def _escape_like(pattern: str) -> str:
     """Escape ``\\``, ``%`` and ``_`` so a literal substring search behaves
@@ -270,6 +276,86 @@ def _escape_like(pattern: str) -> str:
     or escaping ``%``/``_`` would itself introduce new backslashes that get
     re-escaped)."""
     return pattern.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _grep_where_clause(regex: bool) -> Tuple[str, str]:
+    """``(body_pred, title_pred)`` SQL fragments for one ``grep_notes`` call
+    shape. Both are fixed strings chosen only by ``regex`` — never built from
+    ``pattern`` or any other caller-supplied text; the pattern itself only
+    ever reaches Postgres as the bound parameter ``$2``.
+
+    The regex path prefixes the embedded ARE option ``(?n)`` (fix round 1,
+    finding 2): Postgres's ``~*`` is newline-*insensitive* by default, so
+    ``^``/``$`` anchor the whole note body (not each line) and ``.`` matches
+    ``\\n`` — while line extraction happens in Python one line at a time.
+    Left unaligned, ``^TODO`` silently misses a later line, and a pattern
+    like ``1.l`` can pick a note as a SQL candidate by matching *across* a
+    newline that no single extracted line then satisfies (``matches=[]``
+    with ``total=1``). ``(?n)`` makes ``^``/``$`` match every line boundary
+    and stops ``.`` crossing ``\\n``, so the SQL candidate filter agrees with
+    the per-line Python extraction it feeds.
+    """
+    if regex:
+        return "content ~* ('(?n)' || $2)", "title ~* ('(?n)' || $2)"
+    return (
+        "content ILIKE '%' || $2 || '%' ESCAPE '\\'",
+        "title ILIKE '%' || $2 || '%' ESCAPE '\\'",
+    )
+
+
+def _grep_candidates_sql(*, regex: bool, include_titles: bool) -> str:
+    """The exact candidate-fetch SQL ``grep_notes`` runs for one
+    ``(regex, include_titles)`` shape — ``$1`` kb_ids, ``$2`` pattern, ``$3``
+    ``max_matches`` (as a ``LIMIT``). Factored out (fix round 1, finding 1)
+    so the real-Postgres EXPLAIN test asserts against the literal query
+    ``grep_notes`` executes, not a hand-typed approximation of it.
+
+    A single ``(content ILIKE … OR title ILIKE …)`` predicate defeats the
+    trigram index: Postgres can't build a ``BitmapOr`` across an indexed
+    column (``content``, via ``idx_knowledge_content_trgm``) and an
+    unindexed one (``title``, H8), so the combined OR forces a seq scan —
+    including on the *default* call (``include_titles=True``). UNIONing two
+    independently plannable branches lets the ``content`` branch use the
+    trigram index regardless of what the ``title`` branch does.
+
+    ``LIMIT $3`` bounds the number of candidate *notes* fetched (fix round
+    1, finding 4): a note contributes at least one matched line, so at most
+    ``max_matches`` notes can ever render a line, and this avoids pulling
+    every matching body (up to ~250KB each) across the wire before the
+    Python-side cap applies. :func:`_grep_count_sql` computes the *true*
+    candidate count over the same predicate, uncapped, so a caller can still
+    tell "there were more notes" even when the fetch itself was capped.
+    """
+    body_pred, title_pred = _grep_where_clause(regex)
+    body_select = (
+        "SELECT kb_id, note_id, title, content FROM knowledge_index "
+        f"WHERE {_GREP_VISIBILITY} AND {body_pred}"
+    )
+    if not include_titles:
+        return f"{body_select}\nORDER BY note_id\nLIMIT $3"
+    title_select = (
+        "SELECT kb_id, note_id, title, content FROM knowledge_index "
+        f"WHERE {_GREP_VISIBILITY} AND {title_pred}"
+    )
+    return f"{body_select}\nUNION\n{title_select}\nORDER BY note_id\nLIMIT $3"
+
+
+def _grep_count_sql(*, regex: bool, include_titles: bool) -> str:
+    """Exact (uncapped) count of candidate notes for the same predicate
+    :func:`_grep_candidates_sql` uses — ``$1`` kb_ids, ``$2`` pattern. Run
+    alongside the capped fetch (fix round 1, finding 4) so
+    ``matching_note_count`` stays accurate even when ``LIMIT`` truncated the
+    fetch itself."""
+    body_pred, title_pred = _grep_where_clause(regex)
+    body_select = (
+        f"SELECT note_id FROM knowledge_index WHERE {_GREP_VISIBILITY} AND {body_pred}"
+    )
+    if not include_titles:
+        return f"SELECT count(*) FROM ({body_select}) AS candidates"
+    title_select = (
+        f"SELECT note_id FROM knowledge_index WHERE {_GREP_VISIBILITY} AND {title_pred}"
+    )
+    return f"SELECT count(*) FROM ({body_select} UNION {title_select}) AS candidates"
 
 
 class KnowledgeStore:
@@ -2145,23 +2231,36 @@ class KnowledgeStore:
         path; a plain ``~*`` regex match otherwise) selects the *candidate*
         notes so Postgres never returns more bodies than actually match; line
         extraction — including the ``before``/``after`` context window — then
-        happens here in Python, against exactly those bodies.
+        happens here in Python, against exactly those bodies. The candidate
+        fetch and its exact count run as two separate queries
+        (:func:`_grep_candidates_sql` / :func:`_grep_count_sql`, fix round 1
+        finding 4) so a broad pattern can't pull every matching body (up to
+        ~250KB each) across the wire before ``max_matches`` applies — the
+        fetch is itself ``LIMIT``-ed to ``max_matches`` candidate notes (a
+        note contributes at least one line, so no more than that can ever
+        render), while the count query still reports the true total.
 
         ``regex=False`` (the default) is a literal substring search: the
         pattern is escaped for ``ILIKE`` (backslash, ``%``, ``_``) so a
         pattern containing those characters matches itself, not a wildcard.
         ``regex=True`` passes the pattern straight to Postgres's ``~*``
-        (case-insensitive POSIX regex); a malformed pattern raises from
-        Postgres and is left to propagate — the tool layer renders the error,
-        this method does not swallow it.
+        (case-insensitive POSIX regex, newline-sensitive via an ``(?n)``
+        prefix — see :func:`_grep_where_clause`); a malformed pattern raises
+        from Postgres and is left to propagate — the tool layer renders the
+        error, this method does not swallow it.
+
+        ``include_titles=True`` (the default) unions the ``content`` and
+        ``title`` branches rather than OR-ing one predicate, so the trigram
+        index still applies to the ``content`` branch (fix round 1, finding
+        1 — see :func:`_grep_candidates_sql`).
 
         Only active, materialised (``path IS NOT NULL``) notes are candidates,
         matching the read path's visibility rule. Candidates are ordered by
         ``note_id`` for determinism; ``max_matches`` caps the number of
         *matched lines* returned across all notes (not notes themselves), and
-        the second return value is always the number of candidate notes SQL
-        found — even when the line cap truncates before every candidate note
-        is scanned, so a caller can tell "there were more notes" from "there
+        the second return value is always the exact number of candidate notes
+        — even when the capped fetch truncates before every candidate note is
+        scanned, so a caller can tell "there were more notes" from "there
         were more lines in the notes we saw".
         """
         pattern = (pattern or "").strip()
@@ -2169,40 +2268,24 @@ class KnowledgeStore:
             raise ValueError("pattern must not be empty")
         if len(pattern) > _GREP_PATTERN_MAX:
             raise ValueError(f"pattern longer than {_GREP_PATTERN_MAX} characters")
+        if max_matches < 1:
+            raise ValueError("max_matches must be at least 1")
         if not kb_ids:
             return [], 0
 
-        if regex:
-            body_pred = "content ~* $2"
-            title_pred = "title ~* $2"
-            arg = pattern
-        else:
-            body_pred = "content ILIKE '%' || $2 || '%' ESCAPE '\\'"
-            title_pred = "title ILIKE '%' || $2 || '%' ESCAPE '\\'"
-            arg = _escape_like(pattern)
-        # `where` is assembled only from these fixed strings (chosen by the
-        # boolean flags, never by `pattern` or any other caller-supplied
-        # text) — the pattern itself only ever reaches Postgres as the bound
-        # parameter `$2`.
-        where = f"({body_pred} OR {title_pred})" if include_titles else body_pred
+        arg = pattern if regex else _escape_like(pattern)
+        candidates_sql = _grep_candidates_sql(
+            regex=regex, include_titles=include_titles
+        )
+        count_sql = _grep_count_sql(regex=regex, include_titles=include_titles)
 
         async with self.db.acquire() as conn:
             async with conn.transaction():
                 await conn.execute(
                     f"SET LOCAL statement_timeout = {int(statement_timeout_ms)}"
                 )
-                rows = await conn.fetch(
-                    f"""
-                    SELECT kb_id, note_id, title, content
-                    FROM knowledge_index
-                    WHERE kb_id = ANY($1::uuid[]) AND status = 'active'
-                      AND path IS NOT NULL
-                      AND {where}
-                    ORDER BY note_id
-                    """,
-                    list(kb_ids),
-                    arg,
-                )
+                rows = await conn.fetch(candidates_sql, list(kb_ids), arg, max_matches)
+                total = await conn.fetchval(count_sql, list(kb_ids), arg)
 
         rx = re.compile(pattern if regex else re.escape(pattern), re.IGNORECASE)
         matches: List[GrepMatch] = []
@@ -2223,8 +2306,8 @@ class KnowledgeStore:
                     )
                 )
                 if len(matches) >= max_matches:
-                    return matches, len(rows)
-        return matches, len(rows)
+                    return matches, total
+        return matches, total
 
     async def tag_vocabulary(
         self, kb_id: uuid.UUID, limit: int = 20
