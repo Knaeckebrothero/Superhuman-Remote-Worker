@@ -1618,6 +1618,8 @@ def create_kb_tools(
                 continue
             wedged_since = getattr(watermark, "wedged_since", None)
             if isinstance(wedged_since, datetime):
+                # Defensive: asyncpg returns tz-aware datetimes for TIMESTAMPTZ;
+                # naive values only come from hand-built rows.
                 if wedged_since.tzinfo is None:
                     wedged_since = wedged_since.replace(tzinfo=timezone.utc)
                 hours = max(

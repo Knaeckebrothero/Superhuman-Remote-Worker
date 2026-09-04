@@ -643,6 +643,78 @@ class TestReadinessNotice:
         )
         assert "Still indexing" in self._read_missing(wm)
 
+    def test_wedged_since_recent_clamps_to_one_hour(self):
+        from datetime import datetime, timedelta, timezone
+
+        wm = MagicMock(
+            status="partial",
+            indexed_commit="a" * 40,
+            source_head="b" * 40,
+            error_streak=4,
+            wedged_since=datetime.now(timezone.utc) - timedelta(minutes=5),
+            last_error="1 note operation(s) failed",
+        )
+        out = self._read_missing(wm)
+        assert "for 1 h" in out
+
+    def test_wedged_last_error_none_falls_back_to_some(self):
+        from datetime import datetime, timedelta, timezone
+
+        wm = MagicMock(
+            status="partial",
+            indexed_commit="a" * 40,
+            source_head="b" * 40,
+            error_streak=4,
+            wedged_since=datetime.now(timezone.utc) - timedelta(hours=3),
+            last_error=None,
+        )
+        out = self._read_missing(wm)
+        assert "some note(s) have failed to index" in out
+
+    def test_mixed_wedged_and_rebuilding_join_with_newline(self):
+        # Two native bindings: the first's watermark is wedged, the second's
+        # is a plain rebuilding partial — the spec requires both notices,
+        # wedged first, joined with "\n".
+        from datetime import datetime, timedelta, timezone
+
+        id_a = str(uuid.uuid4())
+        id_b = str(uuid.uuid4())
+        ctx = _make_context(project_ids=[id_a, id_b])
+        tools, _ = _make_tools(ctx)
+        ctx.knowledge_graph.read_note.return_value = None
+        ctx.knowledge_store.get_note_by_slug.return_value = None
+
+        wedged_wm = MagicMock(
+            status="partial",
+            indexed_commit="a" * 40,
+            source_head="b" * 40,
+            error_streak=9,
+            wedged_since=datetime.now(timezone.utc) - timedelta(hours=5),
+            last_error="2 note operation(s) failed",
+        )
+        rebuilding_wm = MagicMock(
+            status="partial",
+            indexed_commit="c" * 40,
+            source_head="d" * 40,
+            error_streak=1,
+            wedged_since=None,
+            last_error="1 note operation(s) failed",
+        )
+
+        def _watermark_for(kb_id):
+            return wedged_wm if str(kb_id) == id_a else rebuilding_wm
+
+        ctx.knowledge_store.get_watermark.side_effect = _watermark_for
+
+        result = _invoke(_get_tool(tools, "kb_read"), {"note": "missing"})
+
+        second_alias = f"project-{uuid.UUID(id_b).hex[:8]}"
+        assert "[project] 2 note(s) have failed to index for 5 h" in result
+        assert f"Still indexing — results may be incomplete: [{second_alias}]" in result
+        # Wedged notice comes first, and the two notices are newline-joined.
+        assert "current.\n⚠️ Still indexing" in result
+        assert result.index("note(s) have failed") < result.index("Still indexing")
+
 
 # =============================================================================
 # 13.7: kb_list
