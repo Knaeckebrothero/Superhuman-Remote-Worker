@@ -17,23 +17,24 @@ Classifications:
 The CI snapshot lives at policy/endpoint_inventory.txt; a mismatch
 fails the regression test and forces a manual review of any new endpoint.
 
-Two route sources are walked:
+Discovery follows named FastAPI/APIRouter declarations and include_router
+edges without importing the application. Constructor and include prefixes are
+composed, literal api_route methods are expanded, and WebSockets use METHOD WS.
+Unincluded routers are excluded. Unsupported dynamic composition is an error.
 
-  * `@app.METHOD(...)` in src/orchestrator/main.py — restricted to /api/* paths,
-    which is every route main.py serves that this inventory cares about.
-  * `@<router>.METHOD(...)` in any module that builds an `APIRouter`, with the
-    router's `prefix=` folded into the path. These are mounted by main.py's
-    `app.include_router(...)` block and were invisible here until 2026-07-31;
-    the /auth/* and /wopi/* paths among them are listed in full rather than
-    filtered to /api/*, since those are the ones worth eyeballing.
+The policy inventory covers declared /api, /auth and /wopi routes; other mounted
+identities are reported separately. Framework-generated docs/OpenAPI routes are
+outside this source inventory. Gate-name classification is separate from route
+discovery and is not a proof of authorization behavior or control flow.
 """
 
 from __future__ import annotations
 
 import argparse
 import ast
+import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -41,7 +42,24 @@ ORCHESTRATOR = REPO_ROOT / "src" / "orchestrator"
 MAIN_PY = ORCHESTRATOR / "main.py"
 MANIFEST = REPO_ROOT / "policy" / "endpoint_inventory.txt"
 
-HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
+HTTP_METHODS = {"get", "post", "put", "patch", "delete", "head", "options", "trace"}
+INVENTORY_PREFIXES = ("/api", "/auth", "/wopi")
+ROUTE_DECORATORS = HTTP_METHODS | {"api_route", "websocket"}
+UNSUPPORTED_REGISTRATIONS = {
+    "add_api_route",
+    "add_api_websocket_route",
+    "add_route",
+    "add_websocket_route",
+    "mount",
+    "route",
+    "websocket_route",
+    "append",
+    "extend",
+    "insert",
+    "clear",
+    "pop",
+    "remove",
+}
 
 # Functions that gate access. `_require_admin` and `require_approved_user`
 # are also gates — even an auth-only gate beats no gate. P4b added
@@ -54,8 +72,13 @@ HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
 # ``_require_admin`` in ``_require_infrastructure_fleet_admin``, which
 # additionally rejects project-scoped MCP admins (403) so activation boundaries
 # can only be moved by a real fleet admin; main.py does not follow local
-# helpers (see _collect_module), so that wrapper has to be named here.
+# helpers (see classify_routes), so that wrapper has to be named here.
 GATE_NAMES = {
+    # Audited WebSocket boundary: services/browser_stream_broker.py validates
+    # origin, approved identity and thread ownership before viewer reservation
+    # or accept, then rechecks after startup. Behavioral authorization coverage
+    # remains in tests/test_shared_browser_broker.py; this is a source label.
+    "relay_browser_stream",
     "_dispatch_infrastructure_ingestion",
     "_require_admin",
     "_require_infrastructure_fleet_admin",
@@ -87,7 +110,7 @@ GATE_NAMES = {
 }
 
 
-# main.py does not follow local helpers in general (see _collect_module for
+# main.py does not follow local helpers in general (see classify_routes for
 # why). These names are the audited exception: each is a thin boundary shared
 # by a small family of routes, each calls its gate as the first statement, and
 # none reaches a second gate — so following it reports that family's real gate
@@ -121,55 +144,539 @@ class Endpoint:
         return f"{self.method.upper():<6} {self.path:<80} {self.classification}"
 
 
-def _decorator_call(decorator: ast.expr) -> ast.Call | None:
-    return decorator if isinstance(decorator, ast.Call) else None
+@dataclass(frozen=True)
+class DiscoveredRoute:
+    """A mounted identity and its source declaration; no auth-policy inference."""
+
+    method: str
+    path: str
+    func_name: str
+    source_path: Path
+    function_lineno: int
+    decorator_lineno: int
 
 
-def _route_info(
-    decorator: ast.Call, route_vars: dict[str, str]
-) -> tuple[str, str] | None:
-    """Return (method, path) if this decorator mounts a route on a known object.
+class UnsupportedRouteError(ValueError):
+    """Source composition cannot be enumerated completely by this static gate."""
 
-    ``route_vars`` maps the decorated variable to the prefix its routes hang
-    off — ``{"app": ""}`` for main.py, or one entry per ``APIRouter`` in a
-    router module (``{"router": "/api/contacts", ...}``).
+
+@dataclass(frozen=True)
+class _QualifiedName:
+    name: str
+
+
+@dataclass(frozen=True)
+class _Router:
+    source_path: Path
+    variable: str
+    prefix: str
+    is_app: bool
+
+
+@dataclass(frozen=True)
+class _RouteOperation:
+    router: _Router
+    name: str
+
+
+@dataclass
+class _Source:
+    path: Path
+    name: str
+    tree: ast.Module
+    lines: list[str]
+    statements: list[ast.stmt]
+    bindings: dict[str, list[ast.expr | _QualifiedName]]
+
+
+def _statements(nodes: list[ast.stmt]) -> list[ast.stmt]:
+    """Only literal branches are statically decidable; never evaluate app code."""
+    result = []
+    for node in nodes:
+        if isinstance(node, ast.If) and isinstance(node.test, ast.Constant):
+            if type(node.test.value) is bool:
+                result.extend(
+                    _statements(node.body if node.test.value else node.orelse)
+                )
+                continue
+        result.append(node)
+    return result
+
+
+class _RouteDiscovery:
+    """Resolve named, declarative routers and their include graph, without imports.
+
+    This is intentionally not a Python evaluator. Factories, dynamic paths or
+    methods, conditional registration and mutation of imported routers require
+    an explicit supported form before this gate can claim a complete inventory.
     """
-    func = decorator.func
-    if not isinstance(func, ast.Attribute):
-        return None
-    if not (isinstance(func.value, ast.Name) and func.value.id in route_vars):
-        return None
-    method = func.attr
-    if method not in HTTP_METHODS:
-        return None
-    if not decorator.args:
-        return None
-    path_node = decorator.args[0]
-    if not (isinstance(path_node, ast.Constant) and isinstance(path_node.value, str)):
-        return None
-    return method, route_vars[func.value.id] + path_node.value
 
+    def __init__(self, main_path: Path):
+        self.main_path = main_path.resolve()
+        self.source_root = self.main_path.parent
+        while (self.source_root / "__init__.py").is_file():
+            self.source_root = self.source_root.parent
+        self.sources: dict[Path, _Source] = {}
+        self.resolving: set[tuple[Path, str]] = set()
+        self.resolved: dict[
+            tuple[Path, str], _Router | _RouteOperation | _QualifiedName | None
+        ] = {}
 
-def _router_prefixes(tree: ast.Module) -> dict[str, str]:
-    """Map each `x = APIRouter(prefix=...)` variable to its prefix."""
-    prefixes: dict[str, str] = {}
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
-            continue
-        callee = node.value.func
-        name = (
-            callee.id if isinstance(callee, ast.Name) else getattr(callee, "attr", None)
+    def fail(self, source: _Source, node: ast.AST, message: str):
+        raise UnsupportedRouteError(
+            f"{source.path}:{getattr(node, 'lineno', 1)}: {message}"
         )
-        if name != "APIRouter":
-            continue
-        prefix = ""
-        for keyword in node.value.keywords:
-            if keyword.arg == "prefix" and isinstance(keyword.value, ast.Constant):
-                prefix = keyword.value.value
-        for target in node.targets:
-            if isinstance(target, ast.Name):
-                prefixes[target.id] = prefix
-    return prefixes
+
+    def source(self, path: Path) -> _Source:
+        path = path.resolve()
+        if path in self.sources:
+            return self.sources[path]
+        text = path.read_text()
+        tree = ast.parse(text, filename=str(path))
+        parts = list(path.relative_to(self.source_root).with_suffix("").parts)
+        if parts[-1] == "__init__":
+            parts.pop()
+        name = ".".join(parts)
+        source = _Source(
+            path, name, tree, text.splitlines(), _statements(tree.body), {}
+        )
+        self.sources[path] = source
+        package = name if path.name == "__init__.py" else name.rpartition(".")[0]
+        for node in source.statements:
+            entries = []
+            if isinstance(node, ast.ImportFrom):
+                module = node.module or ""
+                if node.level:
+                    parents = package.split(".") if package else []
+                    if node.level > len(parents):
+                        self.fail(
+                            source, node, "relative import escapes the source package"
+                        )
+                    module = ".".join(
+                        parents[: len(parents) - node.level + 1]
+                        + ([module] if module else [])
+                    )
+                entries = [
+                    (
+                        alias.asname or alias.name,
+                        _QualifiedName(f"{module}.{alias.name}"),
+                    )
+                    for alias in node.names
+                    if alias.name != "*"
+                ]
+            elif isinstance(node, ast.Import):
+                entries = [
+                    (
+                        alias.asname or alias.name.split(".")[0],
+                        _QualifiedName(
+                            alias.name if alias.asname else alias.name.split(".")[0]
+                        ),
+                    )
+                    for alias in node.names
+                ]
+            elif isinstance(node, ast.Assign):
+                entries = [
+                    (target.id, node.value)
+                    for target in node.targets
+                    if isinstance(target, ast.Name)
+                ]
+            elif (
+                isinstance(node, ast.AnnAssign)
+                and isinstance(node.target, ast.Name)
+                and node.value is not None
+            ):
+                entries = [(node.target.id, node.value)]
+            for variable, value in entries:
+                source.bindings.setdefault(variable, []).append(value)
+        return source
+
+    def qualified(self, name: str):
+        parts = name.split(".")
+        for length in range(len(parts), 0, -1):
+            candidate = self.source_root.joinpath(*parts[:length])
+            paths = (candidate.with_suffix(".py"), candidate / "__init__.py")
+            path = next((path for path in paths if path.is_file()), None)
+            if path is None:
+                continue
+            if length == len(parts):
+                return _QualifiedName(name)
+            value = self.binding(self.source(path), parts[length])
+            for attribute in parts[length + 1 :]:
+                value = self.attribute(value, attribute)
+            return value
+        return _QualifiedName(name)
+
+    def attribute(self, value, attribute: str):
+        if isinstance(value, _QualifiedName):
+            return self.qualified(f"{value.name}.{attribute}")
+        if isinstance(value, _Router) and value.is_app and attribute == "router":
+            return value
+        if isinstance(
+            value, _Router
+        ) and attribute in ROUTE_DECORATORS | UNSUPPORTED_REGISTRATIONS | {
+            "include_router"
+        }:
+            return _RouteOperation(value, attribute)
+        return None
+
+    def expression(self, source: _Source, node: ast.expr):
+        if isinstance(node, ast.Name):
+            return self.binding(source, node.id)
+        if isinstance(node, ast.Attribute):
+            return self.attribute(self.expression(source, node.value), node.attr)
+        return None
+
+    def literal(self, source: _Source, node: ast.expr, label: str) -> str:
+        if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+            self.fail(source, node, f"{label} must be a literal string")
+        return node.value
+
+    def prefix(self, source: _Source, call: ast.Call) -> str:
+        if any(keyword.arg is None for keyword in call.keywords):
+            self.fail(
+                source, call, "expanded keyword arguments can hide route composition"
+            )
+        node = next(
+            (item.value for item in call.keywords if item.arg == "prefix"), None
+        )
+        prefix = "" if node is None else self.literal(source, node, "router prefix")
+        if prefix and (not prefix.startswith("/") or prefix.endswith("/")):
+            self.fail(
+                source, call, "router prefix must start with '/' and not end with '/'"
+            )
+        return prefix
+
+    def binding(self, source: _Source, variable: str):
+        key = (source.path, variable)
+        if key in self.resolved:
+            return self.resolved[key]
+        values = source.bindings.get(variable, [])
+        if not values:
+            return None
+        if len(values) != 1:
+            self.fail(
+                source,
+                source.tree,
+                f"route-relevant binding {variable!r} is reassigned",
+            )
+        if key in self.resolving:
+            self.fail(
+                source, source.tree, f"cyclic route reference through {variable!r}"
+            )
+        self.resolving.add(key)
+        try:
+            value = values[0]
+            if isinstance(value, _QualifiedName):
+                result = self.qualified(value.name)
+            elif isinstance(value, ast.Call):
+                callee = self.expression(source, value.func)
+                name = callee.name if isinstance(callee, _QualifiedName) else ""
+                if name in {
+                    "fastapi.APIRouter",
+                    "fastapi.routing.APIRouter",
+                    "fastapi.FastAPI",
+                    "fastapi.applications.FastAPI",
+                }:
+                    if any(
+                        item.arg in {"routes", "route_class"} for item in value.keywords
+                    ):
+                        self.fail(
+                            source,
+                            value,
+                            "custom route objects/classes are not supported",
+                        )
+                    result = _Router(
+                        source.path,
+                        variable,
+                        self.prefix(source, value),
+                        name.endswith(".FastAPI"),
+                    )
+                else:
+                    result = None
+            else:
+                result = self.expression(source, value)
+            self.resolved[key] = result
+            return result
+        finally:
+            self.resolving.remove(key)
+
+    def mentions(self, source: _Source, node: ast.AST, router: _Router) -> bool:
+        for item in ast.walk(node):
+            if isinstance(item, (ast.Name, ast.Attribute)):
+                value = self.expression(source, item)
+                if (
+                    value == router
+                    or isinstance(value, _RouteOperation)
+                    and value.router == router
+                ):
+                    return True
+        return False
+
+    def events(self, router: _Router):
+        source = self.source(router.source_path)
+        for node in source.statements:
+            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                for call in ast.walk(node):
+                    if isinstance(call, ast.Call) and isinstance(
+                        call.func, ast.Attribute
+                    ):
+                        if (
+                            call.func.attr
+                            in ROUTE_DECORATORS
+                            | UNSUPPORTED_REGISTRATIONS
+                            | {"include_router"}
+                            and self.mentions(source, call.func.value, router)
+                        ):
+                            self.fail(
+                                source,
+                                call,
+                                "registration inside an assignment is not supported",
+                            )
+                targets = (
+                    node.targets if isinstance(node, ast.Assign) else [node.target]
+                )
+                if any(
+                    isinstance(attribute, ast.Attribute)
+                    and attribute.attr in {"routes", "router", "prefix", "route_class"}
+                    and self.expression(source, attribute.value) == router
+                    for target in targets
+                    for attribute in ast.walk(target)
+                ):
+                    self.fail(
+                        source, node, "assignment to router state is not supported"
+                    )
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for decorator in reversed(node.decorator_list):
+                    if not isinstance(decorator, ast.Call):
+                        continue
+                    if not isinstance(decorator.func, ast.Attribute):
+                        if self.mentions(source, decorator, router):
+                            self.fail(
+                                source,
+                                decorator,
+                                "dynamic route decorator is not supported",
+                            )
+                        continue
+                    owner = self.expression(source, decorator.func.value)
+                    method = decorator.func.attr
+                    if method not in ROUTE_DECORATORS | UNSUPPORTED_REGISTRATIONS:
+                        continue
+                    if isinstance(owner, _Router) and owner.source_path != source.path:
+                        self.fail(
+                            source,
+                            decorator,
+                            "registration on an imported router is not supported",
+                        )
+                    if owner != router:
+                        continue
+                    if method not in ROUTE_DECORATORS:
+                        self.fail(
+                            source, decorator, f"{method} registration is not supported"
+                        )
+                    yield node.lineno, (node, decorator)
+            elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+                call = node.value
+                if not isinstance(call.func, ast.Attribute):
+                    if self.mentions(source, call, router):
+                        self.fail(
+                            source,
+                            call,
+                            "passing a router to a registration helper is not supported",
+                        )
+                    continue
+                owner = self.expression(source, call.func.value)
+                if owner == router and call.func.attr == "include_router":
+                    yield node.lineno, call
+                elif call.func.attr in UNSUPPORTED_REGISTRATIONS and self.mentions(
+                    source, call.func.value, router
+                ):
+                    self.fail(
+                        source,
+                        call,
+                        f"{call.func.attr} route mutation is not supported",
+                    )
+                elif (
+                    owner != router
+                    and not (
+                        isinstance(owner, _Router)
+                        and call.func.attr == "include_router"
+                    )
+                    and any(
+                        self.mentions(source, argument, router)
+                        for argument in [
+                            *call.args,
+                            *(item.value for item in call.keywords),
+                        ]
+                    )
+                ):
+                    self.fail(
+                        source,
+                        call,
+                        "passing a router to a registration helper is not supported",
+                    )
+            elif isinstance(
+                node,
+                (
+                    ast.If,
+                    ast.For,
+                    ast.AsyncFor,
+                    ast.While,
+                    ast.With,
+                    ast.AsyncWith,
+                    ast.Try,
+                    ast.ClassDef,
+                ),
+            ):
+                for call in ast.walk(node):
+                    if isinstance(call, ast.Call) and isinstance(
+                        call.func, ast.Attribute
+                    ):
+                        if (
+                            call.func.attr
+                            in ROUTE_DECORATORS
+                            | UNSUPPORTED_REGISTRATIONS
+                            | {"include_router"}
+                            and self.mentions(source, call.func.value, router)
+                        ):
+                            self.fail(
+                                source,
+                                call,
+                                "conditional, looped or nested route registration is not supported",
+                            )
+
+    def declared(self, source: _Source, router: _Router, function, call: ast.Call):
+        if any(item.arg is None for item in call.keywords):
+            self.fail(source, call, "expanded decorator arguments are not supported")
+        path_node = (
+            call.args[0]
+            if call.args
+            else next(
+                (item.value for item in call.keywords if item.arg == "path"), None
+            )
+        )
+        if path_node is None:
+            self.fail(source, call, "route path is missing")
+        path = router.prefix + self.literal(source, path_node, "route path")
+        method = call.func.attr
+        if method == "websocket":
+            methods = ["WS"]
+        elif method == "api_route":
+            node = next(
+                (item.value for item in call.keywords if item.arg == "methods"), None
+            )
+            if node is None or (isinstance(node, ast.Constant) and node.value is None):
+                methods = ["GET"]
+            elif isinstance(node, (ast.List, ast.Tuple, ast.Set)) and node.elts:
+                methods = [
+                    self.literal(source, item, "HTTP method").upper()
+                    for item in node.elts
+                ]
+                if any(
+                    not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Z-]+", method)
+                    for method in methods
+                ):
+                    self.fail(
+                        source,
+                        node,
+                        "HTTP methods must be nonempty literal method names",
+                    )
+            else:
+                self.fail(
+                    source,
+                    node,
+                    "api_route methods must be a nonempty literal sequence",
+                )
+        else:
+            methods = [method.upper()]
+        return [
+            DiscoveredRoute(
+                method, path, function.name, source.path, function.lineno, call.lineno
+            )
+            for method in sorted(set(methods))
+        ]
+
+    def expand(
+        self, router: _Router, stack: tuple[_Router, ...] = (), included_at=None
+    ):
+        source = self.source(router.source_path)
+        if router in stack:
+            self.fail(source, source.tree, "cyclic include_router graph")
+        events = list(self.events(router))
+        if included_at and included_at[0] == source.path:
+            if any(line > included_at[1] for line, _event in events):
+                self.fail(
+                    source,
+                    source.tree,
+                    "route registration after include_router is version-dependent; declare routes before inclusion",
+                )
+        result = []
+        for _line, event in events:
+            if isinstance(event, tuple):
+                function, call = event
+                result.extend(self.declared(source, router, function, call))
+                continue
+            prefix = router.prefix + self.prefix(source, event)
+            child_node = (
+                event.args[0]
+                if event.args
+                else next(
+                    (item.value for item in event.keywords if item.arg == "router"),
+                    None,
+                )
+            )
+            child = self.expression(source, child_node) if child_node else None
+            if not isinstance(child, _Router) or child.is_app:
+                self.fail(
+                    source,
+                    event,
+                    "include_router requires a named APIRouter from a resolvable source module",
+                )
+            result.extend(
+                replace(route, path=prefix + route.path)
+                for route in self.expand(
+                    child, (*stack, router), (source.path, event.lineno)
+                )
+            )
+        return result
+
+
+def discover_routes(
+    main_path: Path = MAIN_PY, *, app_var: str = "app"
+) -> list[DiscoveredRoute]:
+    """Enumerate declared mounted identities, including WS and out-of-policy paths.
+
+    Framework-generated docs/OpenAPI routes and ASGI mounts are not inferred.
+    Unsupported source registration forms fail explicitly rather than producing
+    a misleading partial inventory.
+    """
+    if not main_path.is_file():
+        raise FileNotFoundError(f"Orchestrator route source is missing: {main_path}")
+    discovery = _RouteDiscovery(main_path)
+    source = discovery.source(main_path)
+    app = discovery.binding(source, app_var)
+    if app is None:
+        if any(
+            isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Load)
+            and node.id == app_var
+            for node in ast.walk(source.tree)
+        ):
+            discovery.fail(
+                source, source.tree, f"{app_var!r} must be a named FastAPI instance"
+            )
+        return []
+    if not isinstance(app, _Router) or not app.is_app:
+        discovery.fail(
+            source, source.tree, f"{app_var!r} must be a named FastAPI instance"
+        )
+    return sorted(discovery.expand(app), key=lambda route: (route.path, route.method))
+
+
+def in_inventory_scope(route: DiscoveredRoute) -> bool:
+    return any(
+        route.path == prefix or route.path.startswith(prefix + "/")
+        for prefix in INVENTORY_PREFIXES
+    )
 
 
 def _local_functions(
@@ -316,86 +823,58 @@ def _public_reason(source_lines: list[str], decorator_lineno: int) -> str | None
     return None
 
 
-def _collect_module(
-    path: Path, *, app_var: str | None = None, api_only: bool = False
+def classify_routes(
+    routes: list[DiscoveredRoute], *, main_path: Path = MAIN_PY
 ) -> list[Endpoint]:
-    """Endpoints declared in one module.
+    """Apply the existing static gate-name policy after identity discovery.
 
-    ``app_var`` walks a single FastAPI instance (main.py); otherwise every
-    ``APIRouter`` in the module is walked with its prefix applied.
-
-    Local-helper following is router-first. The routers are small,
-    single-purpose modules where a private wrapper around a gate is
-    unambiguous, so every module-level def is followable. main.py is not: its
-    handlers call large shared helpers that reach a gate somewhere downstream,
-    and following those conflates "this handler's gate" with "a gate reachable
-    from here" — which then outranks the real label and reports admin-only and
-    internal-only endpoints as ordinary resource-gated ones. main.py therefore
-    follows only the audited ``FOLLOW_LOCAL_MAIN`` names, which preserves every
-    classification the manifest already carried while letting a thin
-    delegating route report the gate its dispatch target enforces.
+    A gate name is source evidence, not a control-flow or authorization proof.
+    Preserve the main-module helper allowlist and router-local helper behavior.
+    Router-level/include dependencies are deliberately not reclassified here.
     """
-    source = path.read_text()
-    source_lines = source.splitlines()
-    tree = ast.parse(source, filename=str(path))
-    route_vars = {app_var: ""} if app_var else _router_prefixes(tree)
-    if not route_vars:
-        return []
-    local_funcs = _local_functions(tree)
-    if app_var:
-        local_funcs = {
-            name: node
-            for name, node in local_funcs.items()
-            if name in FOLLOW_LOCAL_MAIN
-        }
-    endpoints: list[Endpoint] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        for decorator in node.decorator_list:
-            call = _decorator_call(decorator)
-            if call is None:
-                continue
-            info = _route_info(call, route_vars)
-            if info is None:
-                continue
-            method, route = info
-            if api_only and not route.startswith("/api/"):
-                continue
-            reason = _public_reason(source_lines, decorator.lineno)
-            endpoints.append(
-                Endpoint(
-                    method=method,
-                    path=route,
-                    func_name=node.name,
-                    classification=_classify(node, reason, local_funcs),
-                )
+    sources = {}
+    endpoints = []
+    for route in routes:
+        if route.source_path not in sources:
+            text = route.source_path.read_text()
+            tree = ast.parse(text, filename=str(route.source_path))
+            functions = _local_functions(tree)
+            local = functions
+            if route.source_path == main_path.resolve():
+                local = {
+                    name: node
+                    for name, node in functions.items()
+                    if name in FOLLOW_LOCAL_MAIN
+                }
+            sources[route.source_path] = (
+                text.splitlines(),
+                {
+                    node.lineno: node
+                    for node in ast.walk(tree)
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                },
+                local,
             )
+        lines, functions, local = sources[route.source_path]
+        function = functions[route.function_lineno]
+        endpoints.append(
+            Endpoint(
+                route.method,
+                route.path,
+                route.func_name,
+                _classify(
+                    function, _public_reason(lines, route.decorator_lineno), local
+                ),
+            )
+        )
     return endpoints
-
-
-def _router_modules() -> list[Path]:
-    """Orchestrator modules that build an APIRouter, in stable order.
-
-    Discovered rather than listed so a new router file lands in the manifest
-    the day it is written — the failure mode this walk exists to close was a
-    router extraction silently dropping three endpoints off the inventory.
-    """
-    return sorted(
-        path
-        for path in ORCHESTRATOR.rglob("*.py")
-        if path != MAIN_PY and "APIRouter(" in path.read_text()
-    )
 
 
 def collect_endpoints(main_path: Path = MAIN_PY) -> list[Endpoint]:
-    if not main_path.is_file():
-        raise FileNotFoundError(f"Orchestrator route source is missing: {main_path}")
-    endpoints = _collect_module(main_path, app_var="app", api_only=True)
-    for module in _router_modules():
-        endpoints.extend(_collect_module(module))
-    endpoints.sort(key=lambda e: (e.path, e.method))
-    return endpoints
+    return classify_routes(
+        [route for route in discover_routes(main_path) if in_inventory_scope(route)],
+        main_path=main_path,
+    )
 
 
 def render_manifest(endpoints: list[Endpoint]) -> str:
@@ -403,9 +882,11 @@ def render_manifest(endpoints: list[Endpoint]) -> str:
         "# orchestrator endpoint inventory — generated by scripts/check_endpoint_auth.py\n"
         "# DO NOT EDIT BY HAND. Regenerate with `python scripts/check_endpoint_auth.py --write`.\n"
         "#\n"
-        "# SCOPE: main.py `@app.METHOD(...)` /api/* routes, plus every APIRouter the\n"
-        "# app mounts (src/orchestrator/routers/*, auth/bff.py, uploads.py, graph_routes.py)\n"
-        "# with its prefix folded in. Router /auth/* and /wopi/* are listed in full.\n"
+        "# SCOPE: declared mounted /api, /auth and /wopi routes, including all literal\n"
+        "# HTTP methods and WS. Router constructor/include prefixes are composed;\n"
+        "# unmounted routers and framework-generated docs/OpenAPI routes are excluded.\n"
+        "# Other mounted paths are reported separately; unsupported composition fails.\n"
+        "# Gate labels are static source evidence, not authorization/control-flow proof.\n"
         "#\n"
         "# Classifications:\n"
         "#   gated:<gate>           — protected by a require_* / user_can_access_* helper\n"
@@ -434,7 +915,22 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    endpoints = collect_endpoints()
+    try:
+        routes = discover_routes()
+    except UnsupportedRouteError as exc:
+        print(f"ERROR: unsupported route composition: {exc}", file=sys.stderr)
+        return 2
+    excluded = [route for route in routes if not in_inventory_scope(route)]
+    if excluded:
+        print(
+            f"# {len(excluded)} declared mounted route(s) outside inventory scope:",
+            file=sys.stderr,
+        )
+        for route in excluded:
+            print(f"#   {route.method} {route.path}", file=sys.stderr)
+    endpoints = classify_routes(
+        [route for route in routes if in_inventory_scope(route)]
+    )
     rendered = render_manifest(endpoints)
 
     unscoped = [e for e in endpoints if e.classification == "unscoped"]
