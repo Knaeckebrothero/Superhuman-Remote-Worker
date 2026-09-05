@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -961,6 +963,41 @@ async def _seed_officer(db: PostgresDB) -> tuple[str, str]:
     return str(project_id), str(thread_id)
 
 
+async def _await_post_lock_waiters(observer: Any, expected: int) -> None:
+    """Block until ``expected`` backends are queued on a heavyweight lock.
+
+    Postgres hands the contended tuple to waiters in arrival order, so staging
+    a winner means proving the first contender is *already queued* before the
+    second one starts.  A fixed sleep cannot prove that: each contender must
+    first open a fresh pool connection (the pool starts at ``min_size=1`` and
+    the blocker holds that one warm connection), and a slow handshake on the
+    first contender silently hands the lock to the second.
+
+    Must run outside a transaction — ``pg_stat_activity`` is served from a
+    per-transaction snapshot, so polling inside one returns the same stale
+    answer forever.
+    """
+
+    deadline = time.monotonic() + 30.0
+    while True:
+        waiting = await observer.fetchval(
+            """
+            SELECT count(*)
+              FROM pg_stat_activity
+             WHERE datname = current_database()
+               AND wait_event_type = 'Lock'
+               AND pid <> pg_backend_pid()
+            """
+        )
+        if waiting >= expected:
+            return
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"timed out waiting for {expected} lock waiter(s); saw {waiting}"
+            )
+        await asyncio.sleep(0.01)
+
+
 def _officer_job_kwargs(contract: dict) -> dict:
     deliverables = list(contract.get("deliverables") or [])
     return {
@@ -1083,7 +1120,9 @@ async def test_normalized_rejection_and_rewrite_serialize_on_the_post_lock(db):
             ],
         )
 
-    async with db.acquire() as blocker:
+    # The observer is acquired before the blocker so that polling never has to
+    # open a connection while the queue is being measured.
+    async with db.acquire() as observer, db.acquire() as blocker:
         transaction = blocker.transaction()
         await transaction.start()
         await blocker.fetchval(
@@ -1101,7 +1140,7 @@ async def test_normalized_rejection_and_rewrite_serialize_on_the_post_lock(db):
                 ],
             )
         )
-        await asyncio.sleep(0.05)
+        await _await_post_lock_waiters(observer, 1)
         rewrite_task = asyncio.create_task(
             admit_and_create_job(
                 db,
@@ -1112,7 +1151,7 @@ async def test_normalized_rejection_and_rewrite_serialize_on_the_post_lock(db):
                 ticket_claim_source="manual",
             )
         )
-        await asyncio.sleep(0.05)
+        await _await_post_lock_waiters(observer, 2)
         await transaction.commit()
 
     assert (await record_task)["recorded"] is True
