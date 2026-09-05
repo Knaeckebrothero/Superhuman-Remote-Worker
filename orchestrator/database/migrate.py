@@ -416,6 +416,27 @@ async def _force_runner_session_settings(conn: asyncpg.Connection) -> None:
         raise RuntimeError("database has no usable public migration schema")
 
 
+async def _load_installed_pgvector(conn: asyncpg.Connection) -> None:
+    """Register pgvector's settings in a cold upgrade connection.
+
+    Installing the extension persists its SQL objects, but its shared library
+    and USERSET GUC definitions load per backend. CREATE FUNCTION ... SET
+    rejects an unknown hnsw.iterative_scan for non-superusers, even though the
+    real setting is user-settable. Calling the vector input function loads the
+    library without privileged LOAD or changing any stored migration bytes.
+    Fresh databases without the extension continue through their bootstrap.
+    """
+
+    schema = await conn.fetchval(
+        "SELECT pg_catalog.quote_ident(n.nspname) "
+        "FROM pg_catalog.pg_extension e "
+        "JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace "
+        "WHERE e.extname = 'vector'"
+    )
+    if schema is not None:
+        await conn.execute(f"SELECT '[0]'::{schema}.vector")
+
+
 @asynccontextmanager
 async def _transactional_runner_connection(
     pool: asyncpg.Pool,
@@ -833,6 +854,7 @@ async def run_migrations(
                     return
 
                 if pending_tx:
+                    await _load_installed_pgvector(conn)
                     log.info(
                         "applying %d transactional migration(s) in %s",
                         len(pending_tx),
