@@ -16,10 +16,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.core.loader import OfficerConfig, _parse_officer_config
-from src.persistent_graph import TurnResult
-from src.tools.context import ToolContext
-from src.tools.core.officer import OFFICER_TOOLS_METADATA, create_officer_tools
+from shared.runtime.core.loader import OfficerConfig, _parse_officer_config
+from agent.persistent_graph import TurnResult
+from agent.tools.context import ToolContext
+from agent.tools.core.officer import OFFICER_TOOLS_METADATA, create_officer_tools
 
 
 @pytest.mark.asyncio
@@ -211,7 +211,7 @@ class TestOfficerConfigParse:
         assert OfficerConfig(sleep_max_minutes=90).backstop_seconds == 180 * 60
 
     def test_dict_loader_path_parses_officer_and_keeps_extra_clean(self):
-        from src.core.loader import load_agent_config_from_dict
+        from shared.runtime.core.loader import load_agent_config_from_dict
 
         config = load_agent_config_from_dict(
             {
@@ -275,7 +275,7 @@ class TestSleepSlotAndTool:
 
 
 def _reset_agent_globals():
-    import src.api.persistent_app as mod
+    import agent.api.persistent_app as mod
 
     mod._session = None
     mod._thread_id = None
@@ -289,7 +289,7 @@ def _reset_agent_globals():
 
 
 def _install_officer_session(*, officer_cfg, turn_count: int = 2):
-    import src.api.persistent_app as mod
+    import agent.api.persistent_app as mod
 
     session = MagicMock()
     session.turn_count = turn_count
@@ -317,7 +317,7 @@ class TestOfficerInputWait:
 
     @pytest.mark.asyncio
     async def test_sleep_request_files_clamped_wake_and_queue_wins(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         session, client = _install_officer_session(
             officer_cfg=OfficerConfig(
@@ -342,8 +342,8 @@ class TestOfficerInputWait:
 
     @pytest.mark.asyncio
     async def test_backstop_returns_labeled_wake_never_raises(self):
-        import src.api.persistent_app as mod
-        from src.persistent_graph import IdleTimeoutError
+        import agent.api.persistent_app as mod
+        from agent.persistent_graph import IdleTimeoutError
 
         _install_officer_session(
             officer_cfg=SimpleNamespace(
@@ -364,7 +364,7 @@ class TestOfficerInputWait:
 
     @pytest.mark.asyncio
     async def test_officer_never_flips_awaiting_user(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         _, client = _install_officer_session(
             officer_cfg=OfficerConfig(enabled=True), turn_count=3
@@ -379,7 +379,7 @@ class TestOfficerInputWait:
 
     @pytest.mark.asyncio
     async def test_no_sleep_request_files_nothing(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         session, client = _install_officer_session(
             officer_cfg=OfficerConfig(enabled=True)
@@ -404,7 +404,7 @@ class TestReadyMirrorSuppression:
 
     @pytest.mark.asyncio
     async def test_officer_ready_skips_nats(self, monkeypatch):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         _install_officer_session(officer_cfg=OfficerConfig(enabled=True))
         monkeypatch.setenv("SESSION_BOUND_THREAD_ID", "thread-test-uuid")
@@ -417,7 +417,7 @@ class TestReadyMirrorSuppression:
 
     @pytest.mark.asyncio
     async def test_non_officer_ready_still_mirrors(self, monkeypatch):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         # MagicMock config: officer gate must NOT trip on truthy mocks.
         session = MagicMock()
@@ -439,7 +439,7 @@ class TestReadyMirrorSuppression:
 class TestSessionWakeOfficerHelpers:
     @pytest.mark.asyncio
     async def test_file_officer_timer_enqueues_future_fire_at(self):
-        from services import session_wake
+        from orchestrator.services import session_wake
 
         db = MagicMock()
         db.enqueue_session_wake_event = AsyncMock(return_value=True)
@@ -457,7 +457,7 @@ class TestSessionWakeOfficerHelpers:
 
     @pytest.mark.asyncio
     async def test_file_officer_timer_never_raises(self):
-        from services import session_wake
+        from orchestrator.services import session_wake
 
         db = MagicMock()
         db.enqueue_session_wake_event = AsyncMock(side_effect=RuntimeError("boom"))
@@ -465,7 +465,7 @@ class TestSessionWakeOfficerHelpers:
 
     @pytest.mark.asyncio
     async def test_notify_officer_routes_to_project_officer(self):
-        from services import session_wake
+        from orchestrator.services import session_wake
 
         db = MagicMock()
         db.get_officer_thread_for_project = AsyncMock(
@@ -484,7 +484,7 @@ class TestSessionWakeOfficerHelpers:
 
     @pytest.mark.asyncio
     async def test_notify_officer_noop_without_officer(self):
-        from services import session_wake
+        from orchestrator.services import session_wake
 
         db = MagicMock()
         db.get_officer_thread_for_project = AsyncMock(return_value=None)
@@ -501,7 +501,7 @@ class TestSessionWakeOfficerHelpers:
     async def test_notify_owning_officers_scopes_to_each_projects_officer(self):
         """Two projects with a job-derived fleet event: only the project with
         a commissioned officer is woken, and only with its own payload."""
-        from services import session_wake
+        from orchestrator.services import session_wake
 
         officers = {"proj-a": {"id": "thread-a"}}
         db = MagicMock()
@@ -533,7 +533,7 @@ class TestSessionWakeOfficerHelpers:
     async def test_notify_owning_officers_without_an_officer_notifies_nobody(self):
         """No commissioned officer means no notification — the event is not
         rerouted to other projects' officers."""
-        from services import session_wake
+        from orchestrator.services import session_wake
 
         db = MagicMock()
         db.get_officer_thread_for_project = AsyncMock(return_value=None)
@@ -551,7 +551,7 @@ class TestSessionWakeOfficerHelpers:
 
     @pytest.mark.asyncio
     async def test_notify_owning_officers_never_raises_and_skips_blank_keys(self):
-        from services import session_wake
+        from orchestrator.services import session_wake
 
         db = MagicMock()
         db.get_officer_thread_for_project = AsyncMock(side_effect=RuntimeError("db"))
@@ -568,7 +568,7 @@ class TestSessionWakeOfficerHelpers:
         db.enqueue_session_wake_event.assert_not_awaited()
 
     def test_format_officer_wake_renders_sitrep_bracket(self):
-        from services import session_wake
+        from orchestrator.services import session_wake
 
         text = session_wake._format_officer_wake(
             [
@@ -590,7 +590,7 @@ class TestSessionWakeOfficerHelpers:
         assert "ab12cd34:completed" in text
 
     def test_timer_debounce_is_zero(self):
-        from services import session_wake
+        from orchestrator.services import session_wake
 
         assert session_wake.OFFICER_DEBOUNCE_BY_SOURCE["timer"] == 0
 
@@ -606,7 +606,7 @@ class TestBootWsWatchdogOfficerExemption:
         """Officers are headless by design — the abandoned-during-creation
         watchdog must stand down entirely, or every officer dies 600s after
         boot (observed live: exiting (likely abandoned during creation))."""
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         _reset_agent_globals()
         _install_officer_session(officer_cfg=OfficerConfig(enabled=True))
@@ -629,7 +629,7 @@ class TestBootWsWatchdogOfficerExemption:
 
     @pytest.mark.asyncio
     async def test_normal_session_still_boot_ws_killed(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         _reset_agent_globals()
         _install_officer_session(officer_cfg=OfficerConfig(enabled=False))

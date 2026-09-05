@@ -1,6 +1,6 @@
 """Typed parent-lifecycle failures for durable subagent runtimes.
 
-This module intentionally lives below ``src.subagents``.  Agent and executor
+This module intentionally lives below ``agent.subagents``.  Agent and executor
 drivers import it at module load time, while the subagent package itself stays
 lazy to avoid the registry/delegation/persistent-graph import cycle.
 """

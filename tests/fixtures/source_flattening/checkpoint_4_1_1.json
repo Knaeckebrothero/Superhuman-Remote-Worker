@@ -1,0 +1,260 @@
+{
+  "producer_versions": {
+    "langchain-core": "1.6.1",
+    "langgraph-checkpoint": "4.1.1",
+    "ormsgpack": "1.12.2",
+    "pydantic": "2.13.5"
+  },
+  "records": [
+    {
+      "blob_base64": "3gAsqG1lc3NhZ2VzlMe3BZS+bGFuZ2NoYWluX2NvcmUubWVzc2FnZXMuc3lzdGVtrVN5c3RlbU1lc3NhZ2WGp2NvbnRlbnS/U3ludGhldGljIGZpeHR1cmUgaW5zdHJ1Y3Rpb25zLrFhZGRpdGlvbmFsX2t3YXJnc4CxcmVzcG9uc2VfbWV0YWRhdGGApHR5cGWmc3lzdGVtpG5hbWXAomlksHN5bnRoZXRpYy1zeXN0ZW2zbW9kZWxfdmFsaWRhdGVfanNvbsfXBZS9bGFuZ2NoYWluX2NvcmUubWVzc2FnZXMuaHVtYW6sSHVtYW5NZXNzYWdlhqdjb250ZW50kYKkdHlwZaR0ZXh0pHRleHS4UmVhZCB0aGUgc3ludGhldGljIG5vdGUusWFkZGl0aW9uYWxfa3dhcmdzgbBmaXh0dXJlX2lkZW50aXR5qXN5bnRoZXRpY7FyZXNwb25zZV9tZXRhZGF0YYCkdHlwZaVodW1hbqRuYW1lwKJpZK5zeW50aGV0aWMtdXNlcrNtb2RlbF92YWxpZGF0ZV9qc29uyAEEBZS6bGFuZ2NoYWluX2NvcmUubWVzc2FnZXMuYWmpQUlNZXNzYWdliadjb250ZW50oLFhZGRpdGlvbmFsX2t3YXJnc4CxcmVzcG9uc2VfbWV0YWRhdGGApHR5cGWiYWmkbmFtZcCiaWSzc3ludGhldGljLWFzc2lzdGFudKp0b29sX2NhbGxzkYSkbmFtZalyZWFkX2ZpbGWkYXJnc4GkcGF0aKhub3RlLnR4dKJpZK5zeW50aGV0aWMtdG9vbKR0eXBlqXRvb2xfY2FsbLJpbnZhbGlkX3Rvb2xfY2FsbHOQrnVzYWdlX21ldGFkYXRhwLNtb2RlbF92YWxpZGF0ZV9qc29ux+gFlLxsYW5nY2hhaW5fY29yZS5tZXNzYWdlcy50b29sq1Rvb2xNZXNzYWdliadjb250ZW50uFN5bnRoZXRpYyBub3RlIGNvbnRlbnRzLrFhZGRpdGlvbmFsX2t3YXJnc4CxcmVzcG9uc2VfbWV0YWRhdGGApHR5cGWkdG9vbKRuYW1lqXJlYWRfZmlsZaJpZLBzeW50aGV0aWMtcmVzdWx0rHRvb2xfY2FsbF9pZK5zeW50aGV0aWMtdG9vbKhhcnRpZmFjdMCmc3RhdHVzp3N1Y2Nlc3OzbW9kZWxfdmFsaWRhdGVfanNvbqZqb2JfaWStc3ludGhldGljLWpvYq53b3Jrc3BhY2VfcGF0aLgvd29ya3NwYWNlL3N5bnRoZXRpYy1qb2KraW5pdGlhbGl6ZWTDrnBoYXNlX2NvbXBsZXRlwq1nb2FsX2FjaGlldmVkwqlpdGVyYXRpb24HsmlzX3N0cmF0ZWdpY19waGFzZcKscGhhc2VfbnVtYmVyAq5pc19maW5hbF9waGFzZcKzY29tcGxldGlvbl9kZWNpc2lvbsCwdmVyZGljdF9kZWNpc2lvbsCzbGFzdF9hcmNoaXZlZF9waGFzZcCqdHVybl9jb3VudAC8cGhhc2VfaW5zdHJ1Y3Rpb25faW5qZWN0aW9uc5CybGFzdF9vYnNlcnZlZF90dXJuALNsYXN0X2Fzc2VtYmxlZF90dXJuALRkZWxpdmVyZWRfcmVwbHlfa2V5c5Gvc3ludGhldGljLXJlcGx5tmRlbGl2ZXJlZF9ndWlkYW5jZV9pZHOQt2RlbGl2ZXJlZF9mZWVkYmFja19rZXlzkLlkZWxpdmVyZWRfZGVsZWdhdGlvbl9rZXlzkLlpbnN0cnVjdGlvbl9yZWFkX3JlY2VpcHRzga9pbnN0cnVjdGlvbnMubWSBpnNoYTI1NtlAMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMLB3b3Jrc3BhY2VfbWVtb3J5oKVlcnJvcsCrc2hvdWxkX3N0b3DCtmNvbnNlY3V0aXZlX2xsbV9lcnJvcnMAsGNsaWVudF9yZXBvcnRfaWTAuWNvbXBsZXRpb25fcmVwb3J0X3BheWxvYWSEq3Nob3VsZF9zdG9wwq1nb2FsX2FjaGlldmVkwqVlcnJvcsCrZnJlZXplX2RhdGHAt3dvcmtlcl9iYXRjaF9zdGFydGVkX2F0wLx3b3JrZXJfYmF0Y2hfc3RhcnRfaXRlcmF0aW9uwNkgd29ya2VyX2JhdGNoX3RhcmdldF93YWxsX3NlY29uZHPAvXdvcmtlcl9iYXRjaF9taW5fd2FsbF9zZWNvbmRzwLp3b3JrZXJfYmF0Y2hfaXRlcmF0aW9uX2NhcMCwd29ya2VyX3Jlc3VtZV9pZLBzeW50aGV0aWMtcmVzdW1lqG1ldGFkYXRhgalzeW50aGV0aWPDrWNvbnRleHRfc3RhdHPAsHRvb2xfcmV0cnlfc3RhdGXAsHBoYXNlX3RyYW5zaXRpb27ApXRvZG9zkYOiaWQBp2NvbnRlbnS1RmluaXNoIHN5bnRoZXRpYyB3b3JrpnN0YXR1c6tpbl9wcm9ncmVzc6xzdGFnZWRfdG9kb3PArHRvZG9fbmV4dF9pZAGrZnJlZXplX2RhdGGCq2ZyZWV6ZV90eXBlrGh1bWFuX3Jldmlld6dzdW1tYXJ5tlN5bnRoZXRpYyByZXZpZXcgcGF1c2WvcmVzdW1lX2ZlZWRiYWNrslN5bnRoZXRpYyBmZWVkYmFja61yZXN1bWVfcmVhc29uwA==",
+      "encoding": "msgpack",
+      "expectation": "preserve",
+      "expected": {
+        "fields": {
+          "client_report_id": null,
+          "completion_decision": null,
+          "completion_report_payload": {
+            "error": null,
+            "freeze_data": null,
+            "goal_achieved": false,
+            "should_stop": false
+          },
+          "consecutive_llm_errors": 0,
+          "context_stats": null,
+          "delivered_delegation_keys": [],
+          "delivered_feedback_keys": [],
+          "delivered_guidance_ids": [],
+          "delivered_reply_keys": [
+            "synthetic-reply"
+          ],
+          "error": null,
+          "freeze_data": {
+            "freeze_type": "human_review",
+            "summary": "Synthetic review pause"
+          },
+          "goal_achieved": false,
+          "initialized": true,
+          "instruction_read_receipts": {
+            "instructions.md": {
+              "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+            }
+          },
+          "is_final_phase": false,
+          "is_strategic_phase": false,
+          "iteration": 7,
+          "job_id": "synthetic-job",
+          "last_archived_phase": null,
+          "last_assembled_turn": 0,
+          "last_observed_turn": 0,
+          "metadata": {
+            "synthetic": true
+          },
+          "phase_complete": false,
+          "phase_instruction_injections": [],
+          "phase_number": 2,
+          "phase_transition": null,
+          "resume_feedback": "Synthetic feedback",
+          "resume_reason": null,
+          "should_stop": false,
+          "staged_todos": null,
+          "todo_next_id": 1,
+          "todos": [
+            {
+              "content": "Finish synthetic work",
+              "id": 1,
+              "status": "in_progress"
+            }
+          ],
+          "tool_retry_state": null,
+          "turn_count": 0,
+          "verdict_decision": null,
+          "worker_batch_iteration_cap": null,
+          "worker_batch_min_wall_seconds": null,
+          "worker_batch_start_iteration": null,
+          "worker_batch_started_at": null,
+          "worker_batch_target_wall_seconds": null,
+          "worker_resume_id": "synthetic-resume",
+          "workspace_memory": "",
+          "workspace_path": "/workspace/synthetic-job"
+        },
+        "messages": [
+          {
+            "data": {
+              "additional_kwargs": {},
+              "content": "Synthetic fixture instructions.",
+              "id": "synthetic-system",
+              "name": null,
+              "response_metadata": {},
+              "type": "system"
+            },
+            "type": "system"
+          },
+          {
+            "data": {
+              "additional_kwargs": {
+                "fixture_identity": "synthetic"
+              },
+              "content": [
+                {
+                  "text": "Read the synthetic note.",
+                  "type": "text"
+                }
+              ],
+              "id": "synthetic-user",
+              "name": null,
+              "response_metadata": {},
+              "type": "human"
+            },
+            "type": "human"
+          },
+          {
+            "data": {
+              "additional_kwargs": {},
+              "content": "",
+              "id": "synthetic-assistant",
+              "invalid_tool_calls": [],
+              "name": null,
+              "response_metadata": {},
+              "tool_calls": [
+                {
+                  "args": {
+                    "path": "note.txt"
+                  },
+                  "id": "synthetic-tool",
+                  "name": "read_file",
+                  "type": "tool_call"
+                }
+              ],
+              "type": "ai",
+              "usage_metadata": null
+            },
+            "type": "ai"
+          },
+          {
+            "data": {
+              "additional_kwargs": {},
+              "artifact": null,
+              "content": "Synthetic note contents.",
+              "id": "synthetic-result",
+              "name": "read_file",
+              "response_metadata": {},
+              "status": "success",
+              "tool_call_id": "synthetic-tool",
+              "type": "tool"
+            },
+            "type": "tool"
+          }
+        ]
+      },
+      "name": "worker-state"
+    },
+    {
+      "blob_base64": "yAEEBZS6bGFuZ2NoYWluX2NvcmUubWVzc2FnZXMuYWmpQUlNZXNzYWdliadjb250ZW50oLFhZGRpdGlvbmFsX2t3YXJnc4CxcmVzcG9uc2VfbWV0YWRhdGGApHR5cGWiYWmkbmFtZcCiaWSzc3ludGhldGljLWFzc2lzdGFudKp0b29sX2NhbGxzkYSkbmFtZalyZWFkX2ZpbGWkYXJnc4GkcGF0aKhub3RlLnR4dKJpZK5zeW50aGV0aWMtdG9vbKR0eXBlqXRvb2xfY2FsbLJpbnZhbGlkX3Rvb2xfY2FsbHOQrnVzYWdlX21ldGFkYXRhwLNtb2RlbF92YWxpZGF0ZV9qc29u",
+      "encoding": "msgpack",
+      "expectation": "preserve",
+      "expected": {
+        "data": {
+          "additional_kwargs": {},
+          "content": "",
+          "id": "synthetic-assistant",
+          "invalid_tool_calls": [],
+          "name": null,
+          "response_metadata": {},
+          "tool_calls": [
+            {
+              "args": {
+                "path": "note.txt"
+              },
+              "id": "synthetic-tool",
+              "name": "read_file",
+              "type": "tool_call"
+            }
+          ],
+          "type": "ai",
+          "usage_metadata": null
+        },
+        "type": "ai"
+      },
+      "name": "pending-write-message"
+    },
+    {
+      "blob_base64": "hKtzaG91bGRfc3RvcMKtZ29hbF9hY2hpZXZlZMKlZXJyb3LAq2ZyZWV6ZV9kYXRhwA==",
+      "encoding": "msgpack",
+      "expectation": "preserve",
+      "expected": {
+        "error": null,
+        "freeze_data": null,
+        "goal_achieved": false,
+        "should_stop": false
+      },
+      "name": "pending-write-completion"
+    },
+    {
+      "blob_base64": "x5kFlLBzcmMuY29yZS5jb250ZXh0rklkZW50aXR5QW5jaG9yg6phZ2VudF9yb2xlsFN5bnRoZXRpYyB3b3JrZXKsY3VycmVudF90YXNrrlN5bnRoZXRpYyB0YXNrsmFjdGl2ZV9jb25zdHJhaW50c5G2UmV0YWluIHN5bnRoZXRpYyBzdGF0ZbNtb2RlbF92YWxpZGF0ZV9qc29u",
+      "encoding": "msgpack",
+      "expectation": "first-party-type-requires-decision",
+      "expected": {
+        "active_constraints": [
+          "Retain synthetic state"
+        ],
+        "agent_role": "Synthetic worker",
+        "current_task": "Synthetic task"
+      },
+      "name": "old-identity-anchor"
+    },
+    {
+      "blob_base64": "yAGWBZSwc3JjLmNvcmUuY29udGV4dLNDb252ZXJzYXRpb25TdW1tYXJ5iqdzdW1tYXJ5vlN5bnRoZXRpYyBjb252ZXJzYXRpb24gc3VtbWFyea90YXNrc19jb21wbGV0ZWS4U3ludGhldGljIGNvbXBsZXRlZCB0YXNrsXRhc2tzX2luX3Byb2dyZXNzoK1rZXlfZGVjaXNpb25zslN5bnRoZXRpYyBkZWNpc2lvbq1jdXJyZW50X3N0YXRltlN5bnRoZXRpYyBhY3RpdmUgc3RhdGWoYmxvY2tlcnOgrmNyaXRpY2FsX2ZhY3RzoK1zdGF0ZV9jaGFuZ2VzoLNwaW5uZWRfaW5zdHJ1Y3Rpb25zoK9pZGVudGl0eV9hbmNob3KDqmFnZW50X3JvbGWwU3ludGhldGljIHdvcmtlcqxjdXJyZW50X3Rhc2uuU3ludGhldGljIHRhc2uyYWN0aXZlX2NvbnN0cmFpbnRzkbZSZXRhaW4gc3ludGhldGljIHN0YXRls21vZGVsX3ZhbGlkYXRlX2pzb24=",
+      "encoding": "msgpack",
+      "expectation": "first-party-type-requires-decision",
+      "expected": {
+        "blockers": "",
+        "critical_facts": "",
+        "current_state": "Synthetic active state",
+        "identity_anchor": {
+          "active_constraints": [
+            "Retain synthetic state"
+          ],
+          "agent_role": "Synthetic worker",
+          "current_task": "Synthetic task"
+        },
+        "key_decisions": "Synthetic decision",
+        "pinned_instructions": "",
+        "state_changes": "",
+        "summary": "Synthetic conversation summary",
+        "tasks_completed": "Synthetic completed task",
+        "tasks_in_progress": ""
+      },
+      "name": "old-conversation-summary"
+    }
+  ],
+  "source_sha256": {
+    "src/core/context.py": "faba8f248fd6fb2f9ea4b60bb4cf60ff876db35db53c708a511e05bc1e76f9f3",
+    "src/core/state.py": "e944bfa01425735779b4aab96417785301301db2138dbbd1457fe1e91c10354b",
+    "src/subagents/persistence.py": "92c18153a70b4188c41bf59dc0106a48fb541bad92a0565d3105c52b2e9ed5ee"
+  },
+  "subagent_fork_seed": {
+    "provider_raw": {
+      "_srw_subagent_fork_seed_v1": {
+        "data": {
+          "additional_kwargs": {
+            "fixture_identity": "synthetic"
+          },
+          "content": [
+            {
+              "text": "Read the synthetic note.",
+              "type": "text"
+            }
+          ],
+          "id": "synthetic-user",
+          "name": null,
+          "response_metadata": {},
+          "type": "human"
+        },
+        "type": "human"
+      }
+    }
+  },
+  "synthetic_only": true,
+  "version": 1
+}

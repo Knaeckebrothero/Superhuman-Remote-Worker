@@ -9,7 +9,10 @@ different config. Ported from the retired ``tests/test_phase_model_budget.py``
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from src.core.loader import _apply_settings_matrix, load_agent_config_from_dict
+from shared.runtime.core.loader import (
+    _apply_settings_matrix,
+    load_agent_config_from_dict,
+)
 
 GEMMA = "RedHatAI/gemma-4-31B-it-FP8-Dynamic"  # base default
 GPT55 = "gpt-5.5"
@@ -46,7 +49,7 @@ class _FakeAgent:
 
 
 def _run_create_phase_llms(config):
-    from src.agent import UniversalAgent
+    from agent.agent import UniversalAgent
 
     fake = _FakeAgent(config)
     created = []
@@ -55,7 +58,7 @@ def _run_create_phase_llms(config):
         created.append(cfg)
         return SimpleNamespace(model=cfg.model, cfg=cfg)
 
-    with patch("src.agent.create_llm", side_effect=fake_create_llm):
+    with patch("agent.agent.create_llm", side_effect=fake_create_llm):
         UniversalAgent._create_phase_llms(fake)
     return fake, created
 
@@ -113,12 +116,12 @@ class TestCreatePhaseLLMsSingleModel:
 
 from langchain_core.tools import StructuredTool  # noqa: E402
 
-from src.core.loader import (  # noqa: E402
+from shared.runtime.core.loader import (  # noqa: E402
     InstructionFileEntry,
     supports_parallel_tool_calls,
 )
-from src.tools.context import ToolContext  # noqa: E402
-from src.tools.registry import apply_instruction_enforcement  # noqa: E402
+from agent.tools.context import ToolContext  # noqa: E402
+from agent.tools.registry import apply_instruction_enforcement  # noqa: E402
 
 _BIND_TOOLS = ("job_complete", "request_replan", "read_file")
 
@@ -159,7 +162,7 @@ class _BindAgent:
 
 
 def _bind(config, tools) -> _BindAgent:
-    from src.agent import UniversalAgent
+    from agent.agent import UniversalAgent
 
     agent = _BindAgent(config, tools)
     UniversalAgent._bind_job_tools(agent)
@@ -269,7 +272,7 @@ class _HostAgent:
 
 
 def _install(ctx, agent=None):
-    from src.agent import UniversalAgent
+    from agent.agent import UniversalAgent
 
     agent = agent or _HostAgent(_make_config({}))
     UniversalAgent._install_subagent_runtime(agent, ctx)
@@ -313,7 +316,7 @@ class TestSubagentHostWiring:
         assert authority.dispatch_process_generation == "process-7"
 
     def test_enabled_delegation_installs_the_host_and_the_runtime(self):
-        from src.subagents import SubagentRuntime, WorkerHost
+        from agent.subagents import SubagentRuntime, WorkerHost
 
         ctx = _delegating_context()
         agent = _install(ctx)
@@ -336,7 +339,7 @@ class TestSubagentHostWiring:
 
     def test_the_admission_fence_follows_the_graphs_drain_seam(self):
         ctx = _delegating_context()
-        with patch("src.graph._is_drain_requested", return_value=False) as drain:
+        with patch("agent.graph._is_drain_requested", return_value=False) as drain:
             _install(ctx)
             host = ctx._parent_host
             assert callable(ctx.provider_admission)
@@ -356,7 +359,7 @@ class TestSubagentHostWiring:
         assert host.audit_metadata is stamped
 
     def test_probe_and_fork_source_are_empty_until_the_graph_stamps_them(self):
-        from src.subagents import ContextProbe
+        from agent.subagents import ContextProbe
 
         ctx = _delegating_context()
         _install(ctx)
@@ -375,8 +378,8 @@ class TestSubagentHostWiring:
         """WP3: durable child rows need the orchestrator client (row creation)
         and the agent-side pool (transcript + lifecycle); with either missing
         the runtime keeps the null ledger and a child leaves no trace."""
-        from src.shared.subagent_parent_authority import ParentExecutionAuthority
-        from src.subagents import DbSubagentLedger, NullLedger
+        from shared.subagent_parent_authority import ParentExecutionAuthority
+        from agent.subagents import DbSubagentLedger, NullLedger
 
         ctx = _delegating_context()
         _install(ctx)
@@ -413,15 +416,15 @@ class TestSubagentHostWiring:
     def test_an_install_failure_is_non_fatal(self):
         ctx = _delegating_context()
         with patch(
-            "src.subagents.runtime.SubagentRuntime.from_context",
+            "agent.subagents.runtime.SubagentRuntime.from_context",
             side_effect=RuntimeError("boom"),
         ):
             _install(ctx)
         assert ctx.subagent_runtime is None
 
     def test_the_tool_builds_a_runtime_lazily_when_none_was_installed(self):
-        from src.subagents import SubagentRuntime, WorkerHost
-        from src.tools.delegation.delegate_agent import ensure_runtime
+        from agent.subagents import SubagentRuntime, WorkerHost
+        from agent.tools.delegation.delegate_agent import ensure_runtime
 
         ctx = _delegating_context()
         ctx._llm_config = _make_config({}).llm

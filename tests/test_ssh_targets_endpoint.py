@@ -28,9 +28,9 @@ from uuid import UUID
 import pytest
 from fastapi import HTTPException
 
-import main
-from services.canvas_ssh import RemoteWorkspaceTarget
-from services.ssh_gateway_targets import resolve_workspace_state
+import orchestrator.main
+from orchestrator.services.canvas_ssh import RemoteWorkspaceTarget
+from orchestrator.services.ssh_gateway_targets import resolve_workspace_state
 from tests._route_inventory import mounted_routes
 
 USER = "00000000-0000-0000-0000-000000000001"
@@ -170,7 +170,7 @@ def internal(monkeypatch):
     async def _allow(request):
         return None
 
-    monkeypatch.setattr(main, "require_internal", _allow)
+    monkeypatch.setattr(orchestrator.main, "require_internal", _allow)
 
 
 @pytest.mark.asyncio
@@ -178,9 +178,9 @@ async def test_requires_internal_key(monkeypatch):
     async def _deny(request):
         raise HTTPException(status_code=401, detail="Invalid internal key")
 
-    monkeypatch.setattr(main, "require_internal", _deny)
+    monkeypatch.setattr(orchestrator.main, "require_internal", _deny)
     with pytest.raises(HTTPException) as excinfo:
-        await main.get_ssh_target(
+        await orchestrator.main.get_ssh_target(
             request=object(), handle="s-7f3a91c2", fingerprint=FINGERPRINT
         )
     assert excinfo.value.status_code == 401
@@ -203,10 +203,14 @@ async def test_unknown_handle_and_unauthorized_are_identical(internal, monkeypat
     async def _user(fp):
         return {"id": "00000000-0000-0000-0000-000000000009"}
 
-    monkeypatch.setattr(main.postgres_db, "get_thread_id_by_ssh_handle", _no_thread)
-    monkeypatch.setattr(main.postgres_db, "resolve_user_by_ssh_fingerprint", _user)
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db, "get_thread_id_by_ssh_handle", _no_thread
+    )
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db, "resolve_user_by_ssh_fingerprint", _user
+    )
     with pytest.raises(HTTPException) as unknown:
-        await main.get_ssh_target(
+        await orchestrator.main.get_ssh_target(
             request=object(), handle="s-aaaaaaaa", fingerprint=FINGERPRINT
         )
 
@@ -216,10 +220,12 @@ async def test_unknown_handle_and_unauthorized_are_identical(internal, monkeypat
     async def _no_access(user, db, entity_id):
         return False
 
-    monkeypatch.setattr(main.postgres_db, "get_thread_id_by_ssh_handle", _thread_ok)
-    monkeypatch.setattr(main, "user_can_access_ide_entity", _no_access)
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db, "get_thread_id_by_ssh_handle", _thread_ok
+    )
+    monkeypatch.setattr(orchestrator.main, "user_can_access_ide_entity", _no_access)
     with pytest.raises(HTTPException) as denied:
-        await main.get_ssh_target(
+        await orchestrator.main.get_ssh_target(
             request=object(), handle="s-7f3a91c2", fingerprint=FINGERPRINT
         )
 
@@ -253,12 +259,16 @@ async def test_unknown_key_is_the_same_404_as_the_other_two(internal, monkeypatc
     async def _access(user, db, entity_id):
         raise AssertionError("authorization must not run without an identity")
 
-    monkeypatch.setattr(main.postgres_db, "get_thread_id_by_ssh_handle", _thread_ok)
-    monkeypatch.setattr(main.postgres_db, "resolve_user_by_ssh_fingerprint", _no_user)
-    monkeypatch.setattr(main, "user_can_access_ide_entity", _access)
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db, "get_thread_id_by_ssh_handle", _thread_ok
+    )
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db, "resolve_user_by_ssh_fingerprint", _no_user
+    )
+    monkeypatch.setattr(orchestrator.main, "user_can_access_ide_entity", _access)
 
     with pytest.raises(HTTPException) as unknown_key:
-        await main.get_ssh_target(
+        await orchestrator.main.get_ssh_target(
             request=object(), handle="s-7f3a91c2", fingerprint=FINGERPRINT
         )
 
@@ -267,9 +277,11 @@ async def test_unknown_key_is_the_same_404_as_the_other_two(internal, monkeypatc
     async def _no_thread(handle):
         return None
 
-    monkeypatch.setattr(main.postgres_db, "get_thread_id_by_ssh_handle", _no_thread)
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db, "get_thread_id_by_ssh_handle", _no_thread
+    )
     with pytest.raises(HTTPException) as unknown_handle:
-        await main.get_ssh_target(
+        await orchestrator.main.get_ssh_target(
             request=object(), handle="s-aaaaaaaa", fingerprint=FINGERPRINT
         )
 
@@ -310,11 +322,15 @@ async def test_unknown_handle_still_reaches_the_fingerprint_resolver(
         called_with.append(fp)
         return {"id": USER}
 
-    monkeypatch.setattr(main.postgres_db, "get_thread_id_by_ssh_handle", _no_thread)
-    monkeypatch.setattr(main.postgres_db, "resolve_user_by_ssh_fingerprint", _user)
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db, "get_thread_id_by_ssh_handle", _no_thread
+    )
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db, "resolve_user_by_ssh_fingerprint", _user
+    )
 
     with pytest.raises(HTTPException):
-        await main.get_ssh_target(
+        await orchestrator.main.get_ssh_target(
             request=object(), handle="s-aaaaaaaa", fingerprint=FINGERPRINT
         )
 
@@ -332,9 +348,11 @@ async def test_rejects_a_malformed_handle_before_touching_the_database(
         called = True
         return None
 
-    monkeypatch.setattr(main.postgres_db, "get_thread_id_by_ssh_handle", _tripwire)
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db, "get_thread_id_by_ssh_handle", _tripwire
+    )
     with pytest.raises(HTTPException):
-        await main.get_ssh_target(
+        await orchestrator.main.get_ssh_target(
             request=object(), handle="s-abc\nProxyCommand x", fingerprint=FINGERPRINT
         )
     assert called is False
@@ -356,9 +374,11 @@ async def test_missing_fingerprint_is_opaque_404_not_a_422(internal, monkeypatch
         called = True
         return None
 
-    monkeypatch.setattr(main.postgres_db, "get_thread_id_by_ssh_handle", _tripwire)
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db, "get_thread_id_by_ssh_handle", _tripwire
+    )
     with pytest.raises(HTTPException) as excinfo:
-        await main.get_ssh_target(
+        await orchestrator.main.get_ssh_target(
             request=object(), handle="s-7f3a91c2", fingerprint=None
         )
     assert excinfo.value.status_code == 404
@@ -381,17 +401,21 @@ async def test_non_live_state_returns_200_with_no_pod_ip(internal, monkeypatch):
     async def _get_thread(tid):
         return _thread(status="active")
 
-    monkeypatch.setattr(main.postgres_db, "get_thread_id_by_ssh_handle", _thread_id)
-    monkeypatch.setattr(main.postgres_db, "resolve_user_by_ssh_fingerprint", _user)
-    monkeypatch.setattr(main, "user_can_access_ide_entity", _access)
-    monkeypatch.setattr(main.postgres_db, "get_thread", _get_thread)
     monkeypatch.setattr(
-        main,
+        orchestrator.main.postgres_db, "get_thread_id_by_ssh_handle", _thread_id
+    )
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db, "resolve_user_by_ssh_fingerprint", _user
+    )
+    monkeypatch.setattr(orchestrator.main, "user_can_access_ide_entity", _access)
+    monkeypatch.setattr(orchestrator.main.postgres_db, "get_thread", _get_thread)
+    monkeypatch.setattr(
+        orchestrator.main,
         "thread_metadata_object",
         lambda t: {"workspace_container": {"status": "suspended"}},
     )
 
-    result = await main.get_ssh_target(
+    result = await orchestrator.main.get_ssh_target(
         request=object(), handle="s-7f3a91c2", fingerprint=FINGERPRINT
     )
     assert result["state"] == "suspended"
@@ -436,14 +460,18 @@ async def test_live_state_maps_target_fields(internal, monkeypatch):
             fingerprint="SHA256:" + "B" * 43,
         )
 
-    monkeypatch.setattr(main.postgres_db, "get_thread_id_by_ssh_handle", _thread_id)
-    monkeypatch.setattr(main.postgres_db, "resolve_user_by_ssh_fingerprint", _user)
-    monkeypatch.setattr(main, "user_can_access_ide_entity", _access)
-    monkeypatch.setattr(main.postgres_db, "get_thread", _get_thread)
-    monkeypatch.setattr(main, "bound_workspace_generation", _generation)
-    monkeypatch.setattr(main, "resolve_remote_workspace_target", _target)
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db, "get_thread_id_by_ssh_handle", _thread_id
+    )
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db, "resolve_user_by_ssh_fingerprint", _user
+    )
+    monkeypatch.setattr(orchestrator.main, "user_can_access_ide_entity", _access)
+    monkeypatch.setattr(orchestrator.main.postgres_db, "get_thread", _get_thread)
+    monkeypatch.setattr(orchestrator.main, "bound_workspace_generation", _generation)
+    monkeypatch.setattr(orchestrator.main, "resolve_remote_workspace_target", _target)
 
-    result = await main.get_ssh_target(
+    result = await orchestrator.main.get_ssh_target(
         request=object(), handle="s-7f3a91c2", fingerprint=FINGERPRINT
     )
     assert result["state"] == "live"
@@ -476,12 +504,16 @@ async def test_vm_tier_state_from_json_string_metadata(internal, monkeypatch):
     async def _get_thread(tid):
         return _thread(status="active", metadata=metadata_json)
 
-    monkeypatch.setattr(main.postgres_db, "get_thread_id_by_ssh_handle", _thread_id)
-    monkeypatch.setattr(main.postgres_db, "resolve_user_by_ssh_fingerprint", _user)
-    monkeypatch.setattr(main, "user_can_access_ide_entity", _access)
-    monkeypatch.setattr(main.postgres_db, "get_thread", _get_thread)
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db, "get_thread_id_by_ssh_handle", _thread_id
+    )
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db, "resolve_user_by_ssh_fingerprint", _user
+    )
+    monkeypatch.setattr(orchestrator.main, "user_can_access_ide_entity", _access)
+    monkeypatch.setattr(orchestrator.main.postgres_db, "get_thread", _get_thread)
 
-    result = await main.get_ssh_target(
+    result = await orchestrator.main.get_ssh_target(
         request=object(), handle="s-7f3a91c2", fingerprint=FINGERPRINT
     )
     assert result["state"] == "vm_unsupported"
@@ -523,11 +555,11 @@ def test_the_resolver_really_would_hand_back_the_vm_endpoint():
     """Negative control for the test below. Without this, that test could pass
     because the metadata never resolved at all rather than because the
     endpoint refused a VM target it genuinely could have returned."""
-    from services.canvas_ssh import (
+    from orchestrator.services.canvas_ssh import (
         bound_workspace_generation,
         resolve_remote_workspace_target,
     )
-    from services.workspace_suspension import _thread_is_vm_tier
+    from orchestrator.services.workspace_suspension import _thread_is_vm_tier
 
     metadata = _both_ready_stale_backend_metadata()
     thread = _thread(status="active", metadata=metadata)
@@ -562,12 +594,16 @@ async def test_vm_endpoint_is_refused_even_when_the_guard_passes(internal, monke
             status="active", metadata=json.dumps(_both_ready_stale_backend_metadata())
         )
 
-    monkeypatch.setattr(main.postgres_db, "get_thread_id_by_ssh_handle", _thread_id)
-    monkeypatch.setattr(main.postgres_db, "resolve_user_by_ssh_fingerprint", _user)
-    monkeypatch.setattr(main, "user_can_access_ide_entity", _access)
-    monkeypatch.setattr(main.postgres_db, "get_thread", _get_thread)
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db, "get_thread_id_by_ssh_handle", _thread_id
+    )
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db, "resolve_user_by_ssh_fingerprint", _user
+    )
+    monkeypatch.setattr(orchestrator.main, "user_can_access_ide_entity", _access)
+    monkeypatch.setattr(orchestrator.main.postgres_db, "get_thread", _get_thread)
 
-    result = await main.get_ssh_target(
+    result = await orchestrator.main.get_ssh_target(
         request=object(), handle="s-7f3a91c2", fingerprint=FINGERPRINT
     )
     assert result["state"] == "vm_unsupported"
@@ -602,12 +638,16 @@ async def test_stale_binding_state_on_canvas_ssh_error(internal, monkeypatch):
             status="active", metadata={"workspace_container": {"status": "ready"}}
         )
 
-    monkeypatch.setattr(main.postgres_db, "get_thread_id_by_ssh_handle", _thread_id)
-    monkeypatch.setattr(main.postgres_db, "resolve_user_by_ssh_fingerprint", _user)
-    monkeypatch.setattr(main, "user_can_access_ide_entity", _access)
-    monkeypatch.setattr(main.postgres_db, "get_thread", _get_thread)
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db, "get_thread_id_by_ssh_handle", _thread_id
+    )
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db, "resolve_user_by_ssh_fingerprint", _user
+    )
+    monkeypatch.setattr(orchestrator.main, "user_can_access_ide_entity", _access)
+    monkeypatch.setattr(orchestrator.main.postgres_db, "get_thread", _get_thread)
 
-    result = await main.get_ssh_target(
+    result = await orchestrator.main.get_ssh_target(
         request=object(), handle="s-7f3a91c2", fingerprint=FINGERPRINT
     )
     assert result["state"] == "stale_binding"
@@ -630,7 +670,7 @@ def test_endpoint_does_not_use_the_restoring_resolver():
     """
     import inspect
 
-    source = inspect.getsource(main.get_ssh_target)
+    source = inspect.getsource(orchestrator.main.get_ssh_target)
     for forbidden in (
         "_resolve_thread_for_forwarding",
         "thread_runtime_is_preparable",
@@ -656,7 +696,7 @@ def test_endpoint_does_not_mark_a_key_used():
     """
     import inspect
 
-    source = inspect.getsource(main.get_ssh_target)
+    source = inspect.getsource(orchestrator.main.get_ssh_target)
     assert "mark_ssh_key_used(" not in source
 
 
@@ -666,5 +706,5 @@ def test_ssh_target_route_is_mounted():
     path or a route registered under the wrong verb would pass every other
     test here and still 404 in production. Same rationale as
     ``test_ssh_key_routes_are_mounted`` in test_ssh_key_endpoints.py."""
-    routes = mounted_routes(main.app)
+    routes = mounted_routes(orchestrator.main.app)
     assert ("GET", "/api/internal/ssh-targets/{handle}") in routes

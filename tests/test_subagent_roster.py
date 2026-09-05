@@ -25,8 +25,8 @@ import pytest
 import yaml
 
 from orchestrator.services.config_resolver import resolve_config
-from src.core import subagent_roster
-from src.core.loader import (
+from shared.runtime.core import subagent_roster
+from shared.runtime.core.loader import (
     IGNORE_KEYS_DIRECTIVE,
     INHERIT_MODEL,
     ROSTER_INHERIT_MARKER,
@@ -39,20 +39,20 @@ from src.core.loader import (
     resolve_config_path,
     serialize_resolved_config,
 )
-from src.core.subagent_roster import (
+from shared.runtime.core.subagent_roster import (
     MAX_REF_HOPS,
     ROSTER_WARNINGS_KEY,
     RosterResolutionError,
     resolve_subagent_roster,
 )
-from src.subagents.budgets import BUILTIN_DEFAULTS, ChildBudgets
-from src.subagents.child import (
+from agent.subagents.budgets import BUILTIN_DEFAULTS, ChildBudgets
+from agent.subagents.child import (
     CONTROL_PLANE_CATEGORIES,
     DELEGATION_TOOL_NAMES,
     entry_tool_names,
     select_child_tool_names,
 )
-from src.tools.registry import TOOL_REGISTRY
+from agent.tools.registry import TOOL_REGISTRY
 
 _REPO = Path(__file__).resolve().parents[1]
 _CONFIG = _REPO / "config"

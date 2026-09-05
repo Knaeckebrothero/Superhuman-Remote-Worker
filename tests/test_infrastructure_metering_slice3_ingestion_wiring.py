@@ -639,7 +639,7 @@ def test_slice3_capability_requires_complete_schema_and_fixed_activation_rows() 
 
 
 def test_slice3_schema_and_activation_readiness_do_not_enable_publication() -> None:
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
 
     settings = _vm_settings()
     ready = _ready_slice3_capabilities()
@@ -669,7 +669,7 @@ def test_slice3_schema_and_activation_readiness_do_not_enable_publication() -> N
 
 
 def test_durable_activation_keeps_collection_mutators_armed() -> None:
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
 
     settings = InfrastructureMeteringSettings(
         collector_enabled=True,
@@ -722,7 +722,7 @@ def test_durable_activation_keeps_collection_mutators_armed() -> None:
 
 
 def test_remote_only_durable_activation_does_not_enable_primary_pod_shadow() -> None:
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
 
     settings = InfrastructureMeteringSettings(
         collector_enabled=True,
@@ -752,7 +752,7 @@ def test_remote_only_durable_activation_does_not_enable_primary_pod_shadow() -> 
 
 
 def test_storage_only_durable_activation_does_not_enable_primary_pod_shadow() -> None:
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
 
     settings = InfrastructureMeteringSettings(
         collector_enabled=True,
@@ -789,7 +789,7 @@ def test_storage_only_durable_activation_does_not_enable_primary_pod_shadow() ->
 
 
 def test_active_compute_rollover_gate_is_not_reversed_by_helm(monkeypatch) -> None:
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
 
     monkeypatch.setattr(
         orchestrator_main,

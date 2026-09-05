@@ -9,9 +9,9 @@ from unittest.mock import AsyncMock
 import pytest
 from langchain_core.messages import AIMessage, AIMessageChunk
 
-import src.subagents.runtime as runtime_mod
-from src.subagents import NullLedger, RecordingLedger
-from src.subagents.persistence import RestoredSubagentTranscript
+import agent.subagents.runtime as runtime_mod
+from agent.subagents import NullLedger, RecordingLedger
+from agent.subagents.persistence import RestoredSubagentTranscript
 from tests._fake_chat_model import HANG, FakeChatModel, text_turn
 from tests.test_subagent_runtime import call, make_parent, runtime_for
 

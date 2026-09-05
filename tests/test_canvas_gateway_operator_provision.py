@@ -25,7 +25,7 @@ def _environment(tmp_path: Path, fake_bin: Path) -> tuple[dict[str, str], str]:
     environment = {
         **os.environ,
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
-        "PGHOST": "database.internal",
+        "PGHOST": "orchestrator.database.internal",
         "PGPORT": "5432",
         "PGDATABASE": "srw",
         "PGUSER": "srw_admin",

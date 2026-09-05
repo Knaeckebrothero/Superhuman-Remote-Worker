@@ -5,16 +5,9 @@ Tests cover explicit VM mode selection and the external/HTTP lifecycle paths.
 
 import asyncio
 import os
-import sys
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
-# Add project root to path
-project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
 
 PROVISION_GENERATION = "00000000-0000-4000-8000-000000000001"
 LAUNCHER_POD_UID = "00000000-0000-4000-8000-000000000002"

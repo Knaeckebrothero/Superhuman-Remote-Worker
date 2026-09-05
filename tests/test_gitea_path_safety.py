@@ -16,20 +16,15 @@ the bytes that would hit the wire, not on a string handed to a mock.
 import importlib
 import json
 import os
-import sys
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
 
-_orch_dir = str(Path(__file__).parent.parent / "orchestrator")
-if _orch_dir not in sys.path:
-    sys.path.insert(0, _orch_dir)
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
-from services import gitea as gitea_mod  # noqa: E402
-from services.gitea import (  # noqa: E402
+from orchestrator.services import gitea as gitea_mod  # noqa: E402
+from orchestrator.services.gitea import (  # noqa: E402
     GiteaPathError,
     encode_compare_ref,
     encode_repo_path,
@@ -306,7 +301,7 @@ class TestEncodedUrlOnTheWire:
 
 @pytest.fixture(scope="module")
 def orch_main():
-    return importlib.import_module("main")
+    return importlib.import_module("orchestrator.main")
 
 
 def _request() -> MagicMock:

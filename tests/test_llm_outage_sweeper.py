@@ -6,16 +6,10 @@ Live DB round-trips are covered by the k3d E2E in
 knowledge-base/knowledge/features/llm_outage_pause_and_backoff_redispatch.md.
 """
 
-import sys
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
-project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
 
 import orchestrator.main as main  # noqa: E402
 from orchestrator.services.completion import (  # noqa: E402

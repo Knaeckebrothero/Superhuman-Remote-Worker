@@ -28,21 +28,21 @@ import logging
 import pytest
 
 from orchestrator.services.config_resolver import resolve_config
-from src.core import loader, tool_policy
-from src.core.expert_resolution import build_expert_config
-from src.core.loader import (
+from shared.runtime.core import loader, tool_policy
+from shared.runtime.core.expert_resolution import build_expert_config
+from shared.runtime.core.loader import (
     DelegationConfig,
     load_agent_config_from_dict,
     load_role_base,
     normalize_delegation_block,
 )
-from src.core.tool_policy import (
+from shared.runtime.core.tool_policy import (
     LEGACY_TOOL_NAME_ALIASES,
     normalize_tool_policy,
     validate_tool_override_fragment,
 )
-from src.tools.context import ToolContext
-from src.tools.registry import TOOL_REGISTRY, load_tools
+from agent.tools.context import ToolContext
+from agent.tools.registry import TOOL_REGISTRY, load_tools
 
 _LEGACY_BLOCK = {
     "enabled": True,
@@ -90,7 +90,7 @@ def test_normalize_delegation_block_never_mutates_and_is_identity_when_clean():
 
 
 def test_one_deprecation_warning_per_source_and_layer(caplog):
-    with caplog.at_level(logging.WARNING, logger="src.core.loader"):
+    with caplog.at_level(logging.WARNING, logger="shared.runtime.core.loader"):
         for _ in range(3):
             normalize_delegation_block({"delegation": dict(_LEGACY_BLOCK)}, source="a")
         normalize_delegation_block({"delegation": {"mode": "heavy"}}, source="a")
@@ -121,7 +121,7 @@ def test_delegation_config_is_the_three_keys():
 def test_merged_dict_path_logs_the_frozen_blob_once(caplog):
     """A pre-U3 frozen ``resolved_config`` blob enters through the merged-dict
     seam (``load_agent_config_from_dict``) — the same drop, source ``merged:<id>``."""
-    with caplog.at_level(logging.WARNING, logger="src.core.loader"):
+    with caplog.at_level(logging.WARNING, logger="shared.runtime.core.loader"):
         for _ in range(2):
             load_agent_config_from_dict(
                 {"agent_id": "frozen", "display_name": "F", "delegation": _LEGACY_BLOCK}
@@ -178,7 +178,7 @@ def test_legacy_tool_names_map_to_delegate_agent_deduplicated(value):
 
 def test_tool_rename_is_layer_local_logged_once_and_never_mutates(caplog):
     fragment = {"tools": {"delegation": ["spawn_subagent"], "git": ["git_status"]}}
-    with caplog.at_level(logging.WARNING, logger="src.core.tool_policy"):
+    with caplog.at_level(logging.WARNING, logger="shared.runtime.core.tool_policy"):
         for _ in range(3):
             normalize_tool_policy(fragment, source="db-expert:critic")
         normalize_tool_policy(fragment, source="job-override")
@@ -216,7 +216,7 @@ def test_delegation_enumerates_and_a_stored_true_maps_to_delegate_agent(caplog):
     threads created through the toggle while ``true`` was legal) is compat:
     the config-layer seam maps it to exactly ``[delegate_agent]`` — never all
     members — with one warning per (source, category), never an error."""
-    from src.core.tool_policy import (
+    from shared.runtime.core.tool_policy import (
         ENUMERATE_ONLY_CATEGORIES,
         LEGACY_TRUE_EXPANSIONS,
         ToolPolicyError,
@@ -242,7 +242,7 @@ def test_delegation_enumerates_and_a_stored_true_maps_to_delegate_agent(caplog):
             boundary({"tools": {"delegation": {"except": ["delegate_agent"]}}})
 
     fragment = {"tools": {"delegation": True, "git": ["git_status"]}}
-    with caplog.at_level(logging.WARNING, logger="src.core.tool_policy"):
+    with caplog.at_level(logging.WARNING, logger="shared.runtime.core.tool_policy"):
         for _ in range(3):
             out = normalize_tool_policy(fragment, source="request-override")
         normalize_tool_policy(fragment, source="thread-override")
@@ -269,7 +269,7 @@ def test_a_stored_job_override_with_delegation_true_resolves(caplog):
     carries ``config_override.tools.delegation: true`` — its resume must
     resolve to ``[delegate_agent]`` with one warning and no error."""
     cap: dict = {}
-    with caplog.at_level(logging.WARNING, logger="src.core.tool_policy"):
+    with caplog.at_level(logging.WARNING, logger="shared.runtime.core.tool_policy"):
         blob = resolve_config(
             base_config_name="worker_base",
             request_override={
@@ -312,7 +312,7 @@ def test_an_authored_yaml_true_is_mapped_and_logged(tmp_path, caplog):
     """A bundled/uploaded YAML that still says ``delegation: true`` behaves
     like a stored layer: mapped to ``[delegate_agent]`` at the chain seam,
     logged once with the file as the source."""
-    from src.core.loader import load_agent_config
+    from shared.runtime.core.loader import load_agent_config
 
     leaf = tmp_path / "config.yaml"
     leaf.write_text(
@@ -320,7 +320,7 @@ def test_an_authored_yaml_true_is_mapped_and_logged(tmp_path, caplog):
         "tools:\n  delegation: true\ndelegation:\n  enabled: true\n",
         encoding="utf-8",
     )
-    with caplog.at_level(logging.WARNING, logger="src.core.tool_policy"):
+    with caplog.at_level(logging.WARNING, logger="shared.runtime.core.tool_policy"):
         cfg = load_agent_config(str(leaf))
         load_agent_config(str(leaf))
     assert cfg.tools.delegation == ["delegate_agent"]
@@ -357,7 +357,7 @@ def test_delegation_enabled_gates_the_binding():
     "name", ["bughunter", "critic", "developer", "product-qa", "scholar"]
 )
 def test_the_five_delegating_experts_grant_spawn_and_controls(name):
-    from src.core.loader import load_agent_config, resolve_config_path
+    from shared.runtime.core.loader import load_agent_config, resolve_config_path
 
     cfg = load_agent_config(*resolve_config_path(name))
     assert cfg.tools.delegation == [
@@ -371,7 +371,7 @@ def test_the_five_delegating_experts_grant_spawn_and_controls(name):
 
 
 def test_general_worker_and_the_bases_keep_delegation_off():
-    from src.core.loader import load_agent_config, resolve_config_path
+    from shared.runtime.core.loader import load_agent_config, resolve_config_path
 
     cfg = load_agent_config(*resolve_config_path("general-worker"))
     assert cfg.delegation.enabled is False and cfg.tools.delegation == []

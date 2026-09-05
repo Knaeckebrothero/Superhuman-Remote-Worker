@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from src.core.model_registry import (
+from shared.runtime.core.model_registry import (
     ModelMeta,
     UnknownModelError,
     _catalog_row_to_meta,

@@ -17,9 +17,9 @@ from unittest.mock import AsyncMock
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
-import src.subagents.runtime as runtime_mod
-from src.subagents import SessionHost, SubagentRuntime
-from src.subagents.fork import FORK_NOTICE
+import agent.subagents.runtime as runtime_mod
+from agent.subagents import SessionHost, SubagentRuntime
+from agent.subagents.fork import FORK_NOTICE
 from tests._fake_chat_model import HANG, FakeChatModel, text_turn
 from tests.test_subagent_runtime import call, make_parent
 

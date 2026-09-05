@@ -1,6 +1,6 @@
 import pytest
 
-from src.core.skill_format import (
+from shared.runtime.core.skill_format import (
     SkillFormatError,
     pack_skill_zip,
     parse_skill_md,

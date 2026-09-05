@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from src.shared.job_steering import (
+from shared.job_steering import (
     CheckpointSteeringAcker,
     context_delivery_key,
     queued_reply_key,

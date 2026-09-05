@@ -10,7 +10,7 @@ import logging
 import pytest
 
 from orchestrator import logging_config as orch_log
-from src.core import logging_config as agent_log
+from agent.core import logging_config as agent_log
 
 
 @pytest.fixture(params=[orch_log, agent_log], ids=["orchestrator", "agent"])

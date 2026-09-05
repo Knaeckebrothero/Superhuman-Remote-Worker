@@ -18,12 +18,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.services.knowledge_auxiliary import assemble_and_converge_knowledge  # noqa: E402
-from src.services.auxiliary import (
+from agent.services.knowledge_auxiliary import assemble_and_converge_knowledge  # noqa: E402
+from shared.runtime.services.auxiliary import (
     AssembleKnowledgeTask,
     KnowledgeAssemblyResult,
 )
-from src.services.knowledge_store import KnowledgeRecord, KnowledgeStore
+from shared.runtime.services.knowledge_store import KnowledgeRecord, KnowledgeStore
 
 
 def _make_store():
@@ -340,7 +340,7 @@ class TestAssembleAndConvergeRunner:
     @pytest.mark.asyncio
     async def test_empty_queue_skips_llm(self, monkeypatch):
         monkeypatch.setattr(
-            "src.tools.knowledge.knowledge_tools.create_kb_tools",
+            "agent.tools.knowledge.knowledge_tools.create_kb_tools",
             lambda tc: [],
         )
         tc, ks, kg = _make_tool_context([])
@@ -355,7 +355,7 @@ class TestAssembleAndConvergeRunner:
     @pytest.mark.asyncio
     async def test_nonempty_queue_runs_and_refreshes(self, monkeypatch):
         monkeypatch.setattr(
-            "src.tools.knowledge.knowledge_tools.create_kb_tools",
+            "agent.tools.knowledge.knowledge_tools.create_kb_tools",
             lambda tc: [],
         )
         stale = [
@@ -394,7 +394,7 @@ class TestAssembleAndConvergeRunner:
         """kb_gardening G9: the graph is optional; before this the pass
         silently no-op'd on every graph-less pod."""
         monkeypatch.setattr(
-            "src.tools.knowledge.knowledge_tools.create_kb_tools",
+            "agent.tools.knowledge.knowledge_tools.create_kb_tools",
             lambda tc: [],
         )
         stale = [KnowledgeRecord(note_id="n1", note_type="state", title="S")]
@@ -418,7 +418,7 @@ class TestAssembleAndConvergeRunner:
         """kb_gardening G4: one consolidator per KB. Fan-out members and
         replicas that lose the claim skip; the queue waits for the holder."""
         monkeypatch.setattr(
-            "src.tools.knowledge.knowledge_tools.create_kb_tools",
+            "agent.tools.knowledge.knowledge_tools.create_kb_tools",
             lambda tc: [],
         )
         stale = [KnowledgeRecord(note_id="n1", note_type="state", title="S")]
@@ -437,7 +437,7 @@ class TestAssembleAndConvergeRunner:
     async def test_queue_is_bounded_per_run(self, monkeypatch):
         monkeypatch.setenv("KB_CONVERGE_MAX_NOTES", "7")
         monkeypatch.setattr(
-            "src.tools.knowledge.knowledge_tools.create_kb_tools",
+            "agent.tools.knowledge.knowledge_tools.create_kb_tools",
             lambda tc: [],
         )
         stale = [KnowledgeRecord(note_id=f"n{i}", note_type="state") for i in range(3)]
@@ -454,7 +454,7 @@ class TestAssembleAndConvergeRunner:
         deep the stale queue is; the rest waits. Survivors of the truncated
         list are the only ones refreshed."""
         monkeypatch.setattr(
-            "src.tools.knowledge.knowledge_tools.create_kb_tools",
+            "agent.tools.knowledge.knowledge_tools.create_kb_tools",
             lambda tc: [],
         )
         stale = [KnowledgeRecord(note_id=f"n{i}", note_type="state") for i in range(10)]
@@ -471,7 +471,7 @@ class TestAssembleAndConvergeRunner:
     @pytest.mark.asyncio
     async def test_unknown_corpus_size_does_not_cap(self, monkeypatch):
         monkeypatch.setattr(
-            "src.tools.knowledge.knowledge_tools.create_kb_tools",
+            "agent.tools.knowledge.knowledge_tools.create_kb_tools",
             lambda tc: [],
         )
         stale = [KnowledgeRecord(note_id=f"n{i}", note_type="state") for i in range(5)]
@@ -486,7 +486,7 @@ class TestAssembleAndConvergeRunner:
     @pytest.mark.asyncio
     async def test_agent_failure_is_non_fatal(self, monkeypatch):
         monkeypatch.setattr(
-            "src.tools.knowledge.knowledge_tools.create_kb_tools",
+            "agent.tools.knowledge.knowledge_tools.create_kb_tools",
             lambda tc: [],
         )
         stale = [KnowledgeRecord(note_id="n1", note_type="state")]

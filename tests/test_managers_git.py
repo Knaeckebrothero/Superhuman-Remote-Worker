@@ -6,19 +6,13 @@ Tests git versioning functionality for agent workspaces.
 import logging
 import shutil
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-# Add project root to path
-project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-
-from src.managers.git_manager import GitManager, TagInvariantViolation  # noqa: E402
+from agent.managers.git_manager import GitManager, TagInvariantViolation  # noqa: E402
 
 
 @pytest.fixture
@@ -112,7 +106,7 @@ class TestPushSkipLogging:
 
     def test_inactive_repo_logs_reason(self, git_manager, caplog):
         """No .git → WARNING naming the path that was checked."""
-        with caplog.at_level(logging.WARNING, logger="src.managers.git_manager"):
+        with caplog.at_level(logging.WARNING, logger="agent.managers.git_manager"):
             assert git_manager.push() is False
         assert any(
             "git not active" in r.message and ".git" in r.message
@@ -121,7 +115,7 @@ class TestPushSkipLogging:
 
     def test_missing_remote_logs_reason(self, initialized_git, caplog):
         """Active repo but no remote → WARNING naming the remote."""
-        with caplog.at_level(logging.WARNING, logger="src.managers.git_manager"):
+        with caplog.at_level(logging.WARNING, logger="agent.managers.git_manager"):
             assert initialized_git.push() is False
         assert any("no 'origin' remote" in r.message for r in caplog.records), (
             caplog.text
@@ -129,7 +123,7 @@ class TestPushSkipLogging:
 
     def test_missing_remote_names_the_requested_remote(self, initialized_git, caplog):
         """A non-default remote name appears verbatim, not hardcoded 'origin'."""
-        with caplog.at_level(logging.WARNING, logger="src.managers.git_manager"):
+        with caplog.at_level(logging.WARNING, logger="agent.managers.git_manager"):
             assert initialized_git.push(remote="upstream") is False
         assert any("no 'upstream' remote" in r.message for r in caplog.records), (
             caplog.text
@@ -140,7 +134,7 @@ class TestPushSkipLogging:
     ):
         """Happy path stays quiet — the new logging must not become noise."""
         initialized_git.add_remote("origin", str(bare_remote))
-        with caplog.at_level(logging.WARNING, logger="src.managers.git_manager"):
+        with caplog.at_level(logging.WARNING, logger="agent.managers.git_manager"):
             assert initialized_git.push() is True
         assert not any("push skipped" in r.message for r in caplog.records), caplog.text
 
@@ -150,7 +144,7 @@ class TestPushSkipLogging:
         """A missing git binary reports as such, not as a missing .git."""
         with patch("shutil.which", return_value=None):
             gm = GitManager(temp_workspace)
-            with caplog.at_level(logging.WARNING, logger="src.managers.git_manager"):
+            with caplog.at_level(logging.WARNING, logger="agent.managers.git_manager"):
                 assert gm.push() is False
         assert any("git binary unavailable" in r.message for r in caplog.records), (
             caplog.text
@@ -178,7 +172,7 @@ class TestPushDetachedHead:
     ):
         initialized_git.add_remote("origin", str(bare_remote))
         self._detach(temp_workspace)
-        with caplog.at_level(logging.WARNING, logger="src.managers.git_manager"):
+        with caplog.at_level(logging.WARNING, logger="agent.managers.git_manager"):
             assert initialized_git.push() is False
         assert any(
             "push refused" in r.message and "detached" in r.message
@@ -714,7 +708,7 @@ class TestGitManagerTagIdempotency:
         (temp_workspace / "two.txt").write_text("two")
         initialized_git.commit("Second completion")
 
-        with caplog.at_level(logging.ERROR, logger="src.managers.git_manager"):
+        with caplog.at_level(logging.ERROR, logger="agent.managers.git_manager"):
             assert initialized_git.tag("phase-tag") is False
 
         assert "Phase tag invariant violation" in caplog.text
@@ -1397,7 +1391,7 @@ class _FakeTime:
 
 @pytest.fixture
 def fake_time(monkeypatch):
-    import src.managers.git_manager as git_manager_module
+    import agent.managers.git_manager as git_manager_module
 
     fake = _FakeTime()
     monkeypatch.setattr(git_manager_module, "time", fake, raising=False)

@@ -20,8 +20,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.tools.context import ToolContext
-from src.tools.webdav.tools import (
+from agent.tools.context import ToolContext
+from agent.tools.webdav.tools import (
     _build_cloud_anchor,
     _file_sha256,
     _webdav_base_url,

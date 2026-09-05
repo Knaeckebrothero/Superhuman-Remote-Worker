@@ -15,13 +15,13 @@ from unittest.mock import patch
 
 import pytest
 
-import src.services.cloud_mount as cloud_mount_module
-from src.services.cloud_mount import (
+import shared.runtime.services.cloud_mount as cloud_mount_module
+from shared.runtime.services.cloud_mount import (
     RcloneMountCleanFailure,
     RcloneMountError,
     RcloneMountManager,
 )
-from src.services.keycloak_token import BearerToken
+from shared.runtime.services.keycloak_token import BearerToken
 
 
 class FakeRemoteBackend:
@@ -1335,14 +1335,14 @@ async def test_failed_new_generation_rolls_back_with_its_exact_identity():
     )
     with (
         patch(
-            "src.services.cloud_mount.uuid.uuid4",
+            "shared.runtime.services.cloud_mount.uuid.uuid4",
             side_effect=[
                 SimpleNamespace(hex="1" * 32),
                 SimpleNamespace(hex="2" * 32),
             ],
         ),
         patch(
-            "src.services.cloud_mount.secrets.token_urlsafe",
+            "shared.runtime.services.cloud_mount.secrets.token_urlsafe",
             side_effect=["candidatePass_123456789012", "newPass_123456789012345678"],
         ),
     ):

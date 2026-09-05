@@ -44,7 +44,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-ORCHESTRATOR = REPO_ROOT / "orchestrator"
+ORCHESTRATOR = REPO_ROOT / "src" / "orchestrator"
 MANIFEST = REPO_ROOT / "policy" / "notification_producers.txt"
 
 FEED_FRAME_TYPES = frozenset(
@@ -200,7 +200,10 @@ class _Visitor(ast.NodeVisitor):
 
 def collect_sites() -> list[Site]:
     sites: list[Site] = []
-    for path in _roots():
+    paths = _roots()
+    if not paths:
+        raise RuntimeError("No Python sources discovered for the policy inventory")
+    for path in paths:
         source = path.read_text()
         tree = ast.parse(source, filename=str(path))
         visitor = _Visitor(str(path.relative_to(REPO_ROOT)), source.splitlines())

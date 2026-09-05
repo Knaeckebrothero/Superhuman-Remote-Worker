@@ -9,18 +9,11 @@ backend satisfies — plus the S3-isms the backend has to approximate
 content search) and the prefix-isolation / boundary-escape guarantees.
 """
 
-import sys
-from pathlib import Path
-
 import pytest
 
-project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-
-from src.core.backends.object_store import InMemoryObjectStore  # noqa: E402
-from src.core.backends.virtual import VirtualWorkspaceBackend  # noqa: E402
-from src.core.workspace_backend import WorkspaceBackend  # noqa: E402
+from shared.runtime.core.backends.object_store import InMemoryObjectStore  # noqa: E402
+from agent.core.backends.virtual import VirtualWorkspaceBackend  # noqa: E402
+from shared.runtime.core.workspace_backend import WorkspaceBackend  # noqa: E402
 
 PREFIX = "jobs/job-1/"
 

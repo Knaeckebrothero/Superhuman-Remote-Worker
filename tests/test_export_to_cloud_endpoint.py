@@ -26,7 +26,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import HTTPException
 
-import main
+import orchestrator.main
 from tests.cloud.fake import FakeMainCloudBackend
 
 
@@ -70,12 +70,14 @@ def _patch_endpoint(*, user, job, backend, gitea_files, repo=("job-682baab8", "m
     """
     stack = ExitStack()
     stack.enter_context(
-        patch("main.require_job_access", AsyncMock(return_value=(user, job)))
+        patch(
+            "orchestrator.main.require_job_access", AsyncMock(return_value=(user, job))
+        )
     )
 
     router = MagicMock()
     router.for_owner = MagicMock(return_value=backend)
-    stack.enter_context(patch("main.main_cloud_router", router))
+    stack.enter_context(patch("orchestrator.main.main_cloud_router", router))
 
     gitea = MagicMock()
     gitea.is_initialized = True
@@ -104,13 +106,15 @@ def _patch_endpoint(*, user, job, backend, gitea_files, repo=("job-682baab8", "m
         return out
 
     gitea.list_contents = AsyncMock(side_effect=_list_contents)
-    stack.enter_context(patch("main.gitea_client", gitea))
+    stack.enter_context(patch("orchestrator.main.gitea_client", gitea))
 
-    stack.enter_context(patch("main.resolve_job_repo", AsyncMock(return_value=repo)))
+    stack.enter_context(
+        patch("orchestrator.main.resolve_job_repo", AsyncMock(return_value=repo))
+    )
 
     db = MagicMock()
     db.update_job_exported_folder = AsyncMock(return_value=True)
-    stack.enter_context(patch("main.postgres_db", db))
+    stack.enter_context(patch("orchestrator.main.postgres_db", db))
 
     return stack, backend, db
 
@@ -127,14 +131,14 @@ def _copied_paths(backend: FakeMainCloudBackend) -> set[str]:
 
 class TestCloudReviewMode:
     def test_open_folder_when_no_cloud_folder(self):
-        out = main._with_cloud_review_mode(
+        out = orchestrator.main._with_cloud_review_mode(
             {"id": "x", "project_has_cloud_folder": False}
         )
         assert out["cloud_review_mode"] == "open_folder"
         assert "project_has_cloud_folder" not in out
 
     def test_diff_when_project_has_cloud_folder(self):
-        out = main._with_cloud_review_mode(
+        out = orchestrator.main._with_cloud_review_mode(
             {"id": "x", "project_has_cloud_folder": True}
         )
         assert out["cloud_review_mode"] == "diff"
@@ -142,12 +146,12 @@ class TestCloudReviewMode:
 
     def test_open_folder_when_column_absent(self):
         # Loose jobs / rows without the join column default to open_folder.
-        out = main._with_cloud_review_mode({"id": "x"})
+        out = orchestrator.main._with_cloud_review_mode({"id": "x"})
         assert out["cloud_review_mode"] == "open_folder"
 
     def test_does_not_mutate_input(self):
         src = {"id": "x", "project_has_cloud_folder": True}
-        main._with_cloud_review_mode(src)
+        orchestrator.main._with_cloud_review_mode(src)
         assert src["project_has_cloud_folder"] is True
         assert "cloud_review_mode" not in src
 
@@ -166,7 +170,7 @@ class TestExportRoutingGate:
             user=user, job=job, backend=FakeMainCloudBackend(), gitea_files={}
         )
         with stack, pytest.raises(HTTPException) as ei:
-            await main.export_job_to_shared_folder(fake_request, job["id"])
+            await orchestrator.main.export_job_to_shared_folder(fake_request, job["id"])
         assert ei.value.status_code == 409
         assert "diff-review" in ei.value.detail
 
@@ -178,7 +182,7 @@ class TestExportRoutingGate:
             user=user, job=job, backend=FakeMainCloudBackend(), gitea_files={}
         )
         with stack, pytest.raises(HTTPException) as ei:
-            await main.export_job_to_shared_folder(fake_request, job["id"])
+            await orchestrator.main.export_job_to_shared_folder(fake_request, job["id"])
         assert ei.value.status_code == 409
 
     @pytest.mark.asyncio
@@ -199,7 +203,9 @@ class TestExportRoutingGate:
             gitea_files={"spec.yaml": b"feature: x\n"},
         )
         with stack:
-            result = await main.export_job_to_shared_folder(fake_request, job["id"])
+            result = await orchestrator.main.export_job_to_shared_folder(
+                fake_request, job["id"]
+            )
         assert result["files_copied"] == 1
         assert db.update_job_exported_folder.await_count == 1
 
@@ -217,7 +223,9 @@ class TestExportRoutingGate:
             gitea_files={"spec.yaml": b"x"},
         )
         with stack:
-            result = await main.export_job_to_shared_folder(fake_request, job["id"])
+            result = await orchestrator.main.export_job_to_shared_folder(
+                fake_request, job["id"]
+            )
         assert result["files_copied"] == 1
 
 
@@ -249,7 +257,9 @@ class TestDeliverablesCopy:
             user=user, job=job, backend=backend, gitea_files=gitea_files
         )
         with stack:
-            result = await main.export_job_to_shared_folder(fake_request, job["id"])
+            result = await orchestrator.main.export_job_to_shared_folder(
+                fake_request, job["id"]
+            )
 
         assert result["files_copied"] == 5
         copied = _copied_paths(backend)
@@ -269,7 +279,9 @@ class TestDeliverablesCopy:
             user=user, job=job, backend=backend, gitea_files=gitea_files
         )
         with stack:
-            result = await main.export_job_to_shared_folder(fake_request, job["id"])
+            result = await orchestrator.main.export_job_to_shared_folder(
+                fake_request, job["id"]
+            )
         assert result["files_copied"] == 1
         # `output/` is NOT collapsed here: the prefix is computed over the
         # declared set, and root-level `gone.txt` is in it even though it turned
@@ -286,7 +298,9 @@ class TestDeliverablesCopy:
             user=user, job=job, backend=backend, gitea_files=gitea_files
         )
         with stack:
-            result = await main.export_job_to_shared_folder(fake_request, job["id"])
+            result = await orchestrator.main.export_job_to_shared_folder(
+                fake_request, job["id"]
+            )
         assert result["files_copied"] == 1
         assert _copied_paths(backend) == {"ok.md"}
 
@@ -300,7 +314,9 @@ class TestDeliverablesCopy:
             user=user, job=job, backend=backend, gitea_files=gitea_files
         )
         with stack:
-            result = await main.export_job_to_shared_folder(fake_request, job["id"])
+            result = await orchestrator.main.export_job_to_shared_folder(
+                fake_request, job["id"]
+            )
         assert result["files_copied"] == 2
         # `output/` is the shared wrapper and gets collapsed; `sub/` survives
         # because it distinguishes b.md from a.md.
@@ -316,7 +332,9 @@ class TestDeliverablesCopy:
             user=user, job=job, backend=backend, gitea_files={"spec.yaml": b"x"}
         )
         with stack:
-            result = await main.export_job_to_shared_folder(fake_request, job["id"])
+            result = await orchestrator.main.export_job_to_shared_folder(
+                fake_request, job["id"]
+            )
         assert result["files_copied"] == 1
         assert _copied_paths(backend) == {"spec.yaml"}
 
@@ -344,7 +362,9 @@ class TestExportSharing:
             user=user, job=job, backend=backend, gitea_files={"spec.yaml": b"x"}
         )
         with stack:
-            result = await main.export_job_to_shared_folder(fake_request, job["id"])
+            result = await orchestrator.main.export_job_to_shared_folder(
+                fake_request, job["id"]
+            )
         assert result["shared"] is True
         assert [c[0] for c in backend.calls].count("share_session_folder") == 1
 
@@ -359,7 +379,9 @@ class TestExportSharing:
             user=user, job=job, backend=backend, gitea_files={"spec.yaml": b"x"}
         )
         with stack:
-            result = await main.export_job_to_shared_folder(fake_request, job["id"])
+            result = await orchestrator.main.export_job_to_shared_folder(
+                fake_request, job["id"]
+            )
         assert result["shared"] is False
         assert "share_session_folder" not in [c[0] for c in backend.calls]
         # Still a real export: files copied and the job stamped, so a re-sync
@@ -376,26 +398,32 @@ class TestExportSharing:
 
 class TestCommonDirPrefix:
     def test_single_file_in_a_directory(self):
-        assert main._common_dir_prefix(["output/digest.md"]) == "output"
+        assert orchestrator.main._common_dir_prefix(["output/digest.md"]) == "output"
 
     def test_single_file_at_root(self):
-        assert main._common_dir_prefix(["done.txt"]) == ""
+        assert orchestrator.main._common_dir_prefix(["done.txt"]) == ""
 
     def test_shared_head_only(self):
-        assert main._common_dir_prefix(["repo/src/a.py", "repo/tests/b.py"]) == "repo"
+        assert (
+            orchestrator.main._common_dir_prefix(["repo/src/a.py", "repo/tests/b.py"])
+            == "repo"
+        )
 
     def test_nothing_shared(self):
-        assert main._common_dir_prefix(["spec.yaml", "repo/a.py"]) == ""
+        assert orchestrator.main._common_dir_prefix(["spec.yaml", "repo/a.py"]) == ""
 
     def test_whole_shared_path(self):
-        assert main._common_dir_prefix(["out/deep/a.md", "out/deep/b.md"]) == "out/deep"
+        assert (
+            orchestrator.main._common_dir_prefix(["out/deep/a.md", "out/deep/b.md"])
+            == "out/deep"
+        )
 
     def test_matches_whole_segments_not_string_prefixes(self):
         # "out" is a string prefix of "output" but a different directory.
-        assert main._common_dir_prefix(["out/a.md", "output/b.md"]) == ""
+        assert orchestrator.main._common_dir_prefix(["out/a.md", "output/b.md"]) == ""
 
     def test_empty(self):
-        assert main._common_dir_prefix([]) == ""
+        assert orchestrator.main._common_dir_prefix([]) == ""
 
 
 class TestWrapperCollapse:
@@ -415,7 +443,9 @@ class TestWrapperCollapse:
             gitea_files={"output/digest.md": b"# digest"},
         )
         with stack:
-            result = await main.export_job_to_shared_folder(fake_request, job["id"])
+            result = await orchestrator.main.export_job_to_shared_folder(
+                fake_request, job["id"]
+            )
         assert result["files_copied"] == 1
         assert _copied_paths(backend) == {"digest.md"}
 
@@ -431,7 +461,7 @@ class TestWrapperCollapse:
             gitea_files={"output/reports/q1.md": b"q1"},
         )
         with stack:
-            await main.export_job_to_shared_folder(fake_request, job["id"])
+            await orchestrator.main.export_job_to_shared_folder(fake_request, job["id"])
         assert _copied_paths(backend) == {"q1.md"}
 
     @pytest.mark.asyncio
@@ -447,7 +477,7 @@ class TestWrapperCollapse:
             gitea_files={p: b"x" for p in deliverables},
         )
         with stack:
-            await main.export_job_to_shared_folder(fake_request, job["id"])
+            await orchestrator.main.export_job_to_shared_folder(fake_request, job["id"])
         # Only the shared `repo/` head comes off.
         assert _copied_paths(backend) == {"src/app.py", "tests/test_app.py"}
 
@@ -464,7 +494,7 @@ class TestWrapperCollapse:
             gitea_files={p: b"x" for p in deliverables},
         )
         with stack:
-            await main.export_job_to_shared_folder(fake_request, job["id"])
+            await orchestrator.main.export_job_to_shared_folder(fake_request, job["id"])
         assert _copied_paths(backend) == {"spec.yaml", "output/report.md"}
 
 
@@ -482,23 +512,25 @@ class TestExportFolderName:
 
     def test_slugs_the_description_and_keeps_an_id_suffix(self):
         assert (
-            main._job_export_folder_name(self.JOB, "You maintain a daily digest.")
+            orchestrator.main._job_export_folder_name(
+                self.JOB, "You maintain a daily digest."
+            )
             == "you-maintain-a-daily-digest-a6fa6f2a"
         )
 
     def test_deterministic(self):
-        a = main._job_export_folder_name(self.JOB, "Same prompt")
-        b = main._job_export_folder_name(self.JOB, "Same prompt")
+        a = orchestrator.main._job_export_folder_name(self.JOB, "Same prompt")
+        b = orchestrator.main._job_export_folder_name(self.JOB, "Same prompt")
         assert a == b
 
     def test_same_description_different_jobs_do_not_collide(self):
         other = "11111111-2222-3333-4444-555555555555"
-        assert main._job_export_folder_name(
+        assert orchestrator.main._job_export_folder_name(
             self.JOB, "Shared prompt"
-        ) != main._job_export_folder_name(other, "Shared prompt")
+        ) != orchestrator.main._job_export_folder_name(other, "Shared prompt")
 
     def test_truncates_on_a_word_boundary(self):
-        name = main._job_export_folder_name(
+        name = orchestrator.main._job_export_folder_name(
             self.JOB,
             "Implement a small Python CLI tool in this workspace, test first",
         )
@@ -508,23 +540,28 @@ class TestExportFolderName:
         assert slug == "implement-a-small-python-cli-tool-in"
 
     def test_only_uses_the_first_line(self):
-        name = main._job_export_folder_name(self.JOB, "Daily digest\nSecond line")
+        name = orchestrator.main._job_export_folder_name(
+            self.JOB, "Daily digest\nSecond line"
+        )
         assert name == "daily-digest-a6fa6f2a"
 
     def test_folds_accents_rather_than_dropping_them(self):
-        assert main._job_export_folder_name(self.JOB, "Führe die Prüfung durch") == (
-            "fuhre-die-prufung-durch-a6fa6f2a"
-        )
+        assert orchestrator.main._job_export_folder_name(
+            self.JOB, "Führe die Prüfung durch"
+        ) == ("fuhre-die-prufung-durch-a6fa6f2a")
 
     def test_path_safe_charset(self):
-        name = main._job_export_folder_name(
+        name = orchestrator.main._job_export_folder_name(
             self.JOB, "../../etc/passwd & <script> 100% done"
         )
         assert re.fullmatch(r"[a-z0-9-]+", name), name
 
     def test_falls_back_when_nothing_slugs(self):
         for desc in ("", "   ", "!!! ???", None):
-            assert main._job_export_folder_name(self.JOB, desc) == "job-a6fa6f2a9101"
+            assert (
+                orchestrator.main._job_export_folder_name(self.JOB, desc)
+                == "job-a6fa6f2a9101"
+            )
 
 
 class TestExportFolderReuse:
@@ -543,7 +580,9 @@ class TestExportFolderReuse:
             user=user, job=job, backend=backend, gitea_files={"spec.yaml": b"x"}
         )
         with stack:
-            result = await main.export_job_to_shared_folder(fake_request, job["id"])
+            result = await orchestrator.main.export_job_to_shared_folder(
+                fake_request, job["id"]
+            )
         assert result["folder"]["name"] == "job-682baab87864"
         assert result["folder"]["path"] == "/job-682baab87864"
 
@@ -559,7 +598,9 @@ class TestExportFolderReuse:
             user=user, job=job, backend=backend, gitea_files={"spec.yaml": b"x"}
         )
         with stack:
-            result = await main.export_job_to_shared_folder(fake_request, job["id"])
+            result = await orchestrator.main.export_job_to_shared_folder(
+                fake_request, job["id"]
+            )
         assert result["folder"]["name"] == "write-the-quarterly-report-682baab8"
         assert result["folder"]["path"] == "/write-the-quarterly-report-682baab8"
 
@@ -577,18 +618,18 @@ class TestExportedFolderUrl:
     def _with_backend(self, backend):
         router = MagicMock()
         router.for_backend = MagicMock(return_value=backend)
-        return patch("main.main_cloud_router", router)
+        return patch("orchestrator.main.main_cloud_router", router)
 
     def test_resolves_handle_to_url(self):
         with self._with_backend(FakeMainCloudBackend()):
-            out = main._with_cloud_review_mode(
+            out = orchestrator.main._with_cloud_review_mode(
                 {"id": "x", "exported_folder_handle": "sessions/job-abc"}
             )
         assert out["exported_folder_url"] == "fake://session/sessions/job-abc"
 
     def test_null_when_never_exported(self):
         with self._with_backend(FakeMainCloudBackend()):
-            out = main._with_cloud_review_mode(
+            out = orchestrator.main._with_cloud_review_mode(
                 {"id": "x", "exported_folder_handle": None}
             )
         assert out["exported_folder_url"] is None
@@ -596,7 +637,7 @@ class TestExportedFolderUrl:
     def test_null_when_backend_down(self):
         # Cloud outage must degrade to "no button", not a broken link.
         with self._with_backend(FakeMainCloudBackend(start_initialized=False)):
-            out = main._with_cloud_review_mode(
+            out = orchestrator.main._with_cloud_review_mode(
                 {"id": "x", "exported_folder_handle": "sessions/job-abc"}
             )
         assert out["exported_folder_url"] is None

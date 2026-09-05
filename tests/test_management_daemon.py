@@ -816,7 +816,7 @@ class TestCheckSshReady:
 
 class TestReadAgentPid:
     def test_returns_pid_when_process_alive(self, tmp_path):
-        pid_file = tmp_path / "agent.pid"
+        pid_file = tmp_path / "agent.__main__.pid"
         pid_file.write_text("12345\n")
         with (
             patch.object(daemon_mod, "AGENT_PID_FILE", pid_file),
@@ -830,7 +830,7 @@ class TestReadAgentPid:
             assert read_agent_pid() is None
 
     def test_returns_none_when_process_not_alive(self, tmp_path):
-        pid_file = tmp_path / "agent.pid"
+        pid_file = tmp_path / "agent.__main__.pid"
         pid_file.write_text("99999\n")
         with (
             patch.object(daemon_mod, "AGENT_PID_FILE", pid_file),
@@ -839,13 +839,13 @@ class TestReadAgentPid:
             assert read_agent_pid() is None
 
     def test_returns_none_when_pid_file_contains_garbage(self, tmp_path):
-        pid_file = tmp_path / "agent.pid"
+        pid_file = tmp_path / "agent.__main__.pid"
         pid_file.write_text("not-a-number\n")
         with patch.object(daemon_mod, "AGENT_PID_FILE", pid_file):
             assert read_agent_pid() is None
 
     def test_returns_none_when_permission_denied(self, tmp_path):
-        pid_file = tmp_path / "agent.pid"
+        pid_file = tmp_path / "agent.__main__.pid"
         pid_file.write_text("1\n")
         with (
             patch.object(daemon_mod, "AGENT_PID_FILE", pid_file),
@@ -854,13 +854,13 @@ class TestReadAgentPid:
             assert read_agent_pid() is None
 
     def test_returns_none_when_pid_file_is_empty(self, tmp_path):
-        pid_file = tmp_path / "agent.pid"
+        pid_file = tmp_path / "agent.__main__.pid"
         pid_file.write_text("")
         with patch.object(daemon_mod, "AGENT_PID_FILE", pid_file):
             assert read_agent_pid() is None
 
     def test_strips_whitespace_from_pid(self, tmp_path):
-        pid_file = tmp_path / "agent.pid"
+        pid_file = tmp_path / "agent.__main__.pid"
         pid_file.write_text("  42  \n")
         with (
             patch.object(daemon_mod, "AGENT_PID_FILE", pid_file),
@@ -1245,7 +1245,7 @@ class TestAgentMonitorLoop:
     async def test_reports_completed_on_exit_code_zero(
         self, connected_daemon, tmp_path
     ):
-        exit_file = tmp_path / "agent.exit_code"
+        exit_file = tmp_path / "agent.__main__.exit_code"
         exit_file.write_text("0\n")
         with (
             patch.object(
@@ -1268,7 +1268,7 @@ class TestAgentMonitorLoop:
     async def test_reports_failed_on_nonzero_exit_code(
         self, connected_daemon, tmp_path
     ):
-        exit_file = tmp_path / "agent.exit_code"
+        exit_file = tmp_path / "agent.__main__.exit_code"
         exit_file.write_text("2\n")
         with (
             patch.object(
@@ -1304,7 +1304,7 @@ class TestAgentMonitorLoop:
 
     @pytest.mark.asyncio
     async def test_reports_exit_only_once(self, connected_daemon, tmp_path):
-        exit_file = tmp_path / "agent.exit_code"
+        exit_file = tmp_path / "agent.__main__.exit_code"
         exit_file.write_text("0\n")
         calls = 0
 
@@ -1349,7 +1349,7 @@ class TestAgentMonitorLoop:
         self, connected_daemon, tmp_path
     ):
         connected_daemon.nc.is_connected = False
-        exit_file = tmp_path / "agent.exit_code"
+        exit_file = tmp_path / "agent.__main__.exit_code"
         exit_file.write_text("0\n")
         calls = 0
 
@@ -1372,7 +1372,7 @@ class TestAgentMonitorLoop:
 
     @pytest.mark.asyncio
     async def test_uses_correct_nats_subject(self, connected_daemon, tmp_path):
-        exit_file = tmp_path / "agent.exit_code"
+        exit_file = tmp_path / "agent.__main__.exit_code"
         exit_file.write_text("0\n")
         with (
             patch.object(
@@ -1391,7 +1391,7 @@ class TestAgentMonitorLoop:
 
     @pytest.mark.asyncio
     async def test_handles_malformed_exit_code_file(self, connected_daemon, tmp_path):
-        exit_file = tmp_path / "agent.exit_code"
+        exit_file = tmp_path / "agent.__main__.exit_code"
         exit_file.write_text("crash!\n")
         with (
             patch.object(

@@ -33,13 +33,18 @@ import pytest
 import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
-from database.postgres import PostgresDB
+from orchestrator.database.postgres import PostgresDB
 
 _UID = uuid.UUID("bbbbbbbb-0000-0000-0000-000000000001")
 _TID = uuid.UUID("bbbbbbbb-0000-0000-0000-000000000002")
 _OTHER_TID = uuid.UUID("bbbbbbbb-0000-0000-0000-000000000003")
 _MIGRATIONS = (
-    Path(__file__).parents[1] / "orchestrator" / "database" / "migrations" / "app"
+    Path(__file__).parents[1]
+    / "src"
+    / "orchestrator"
+    / "database"
+    / "migrations"
+    / "app"
 )
 
 

@@ -8,8 +8,8 @@ import re
 
 import pytest
 
-from services import brand
-from services.email_layout import VARIANTS, Action, render_email
+from orchestrator.services import brand
+from orchestrator.services.email_layout import VARIANTS, Action, render_email
 
 PALETTE_HEXES = set(brand.TRAVERTINE.values())
 

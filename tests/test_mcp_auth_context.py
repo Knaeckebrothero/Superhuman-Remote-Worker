@@ -27,8 +27,8 @@ import sys
 import httpx
 import pytest
 
-from src.shared.orch_surface.client import AsyncCockpitClient
-from src.shared.orch_surface.jobs import (
+from shared.orch_surface.client import AsyncCockpitClient
+from shared.orch_surface.jobs import (
     AUTH_CONTEXT_FAILURE_NOTICE,
     CallerCtx,
     get_descriptor,
@@ -195,8 +195,8 @@ import httpx
 os.environ["MCP_INTERNAL_KEY"] = "internal-test-key"
 os.environ["MCP_TRANSPORT"] = "stdio"  # import-safe; flipped per case below
 
-from orchestrator.mcp import server
-from src.shared.orch_surface.client import AsyncCockpitClient
+from mcp_server import server
+from shared.orch_surface.client import AsyncCockpitClient
 
 import mcp.server.auth.middleware.auth_context as auth_context
 

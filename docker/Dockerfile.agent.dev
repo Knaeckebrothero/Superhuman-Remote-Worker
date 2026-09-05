@@ -20,7 +20,7 @@
 #   2. **No HEALTHCHECK**: K8s probes own liveness/readiness in the dev
 #      cluster; the dockerd-side HEALTHCHECK is redundant and just slows
 #      pod startup.
-#   3. **citation_engine lives under src/** (src/citation_engine/, folded in
+#   3. **citation_engine lives under src/** (src/agent/citation_engine/, folded in
 #      from its former separate repo): it's COPY'd as part of src/, so it's no
 #      longer a dev/prod difference and edits rebuild in the normal loop.
 #   4. **No BUILD_SHA stamping**: the Tilt loop tags `tilt-<hash>`, and
@@ -28,7 +28,7 @@
 #      no-op in dev.
 #
 # Layer ordering is identical to prod so the iteration loop hits Docker's
-# layer cache for everything except `src/`, `config/`, `agent.py` — and Tilt's
+# layer cache for everything except `src/agent/`, `src/shared/`, `config/`, `pyproject.toml` — and Tilt's
 # docker_build `only=` list pins watching to those.
 #
 # Live_update is intentionally not configured for the agent (agent pods
@@ -87,7 +87,7 @@ RUN groupadd -r srw && useradd -r -g srw -m srw
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONPATH=/app \
+    PYTHONSAFEPATH=1 \
     AGENT_CONFIG=defaults \
     AGENT_PORT=8001
 
@@ -157,11 +157,40 @@ RUN mkdir -p /opt/tiktoken-cache && \
 
 # Source code LAST — these COPYs are what Tilt's docker_build
 # `only=` list pins to.
-COPY --chown=srw:srw src/ ./src/
+COPY --chown=srw:srw src/agent/ ./src/agent/
+COPY --chown=srw:srw src/shared/ ./src/shared/
 COPY --chown=srw:srw config/ ./config/
-COPY --chown=srw:srw agent.py ./
+COPY --chown=srw:srw pyproject.toml ./
 
-RUN touch /app/pyproject.toml && chown srw:srw /app/pyproject.toml
+# Editable installation keeps imports at the source paths synchronized by Tilt.
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    pip install --no-deps -e .
+
+# Transitional image-only entry for old/new orchestrators and durable recycle
+# targets that still launch `python agent.py`. Keep package resolution canonical;
+# the repository has no agent.py shim. Remove only after that compatibility
+# window (including rollback targets) has closed.
+RUN printf '%s\n' 'import runpy' \
+    'runpy.run_module("agent", run_name="__main__", alter_sys=True)' \
+    > /app/agent.py
+
+# Older orchestrators also invoke this preStop module name. Provide just this
+# image-only namespace entry in system site-packages, with no src/__init__.py
+# or api/__init__.py and no alias for the former application source tree.
+RUN python - <<'SRW_TERMINATION_COMPAT'
+from pathlib import Path
+import sysconfig
+
+legacy_dir = Path(sysconfig.get_path("purelib")) / "src" / "api"
+legacy_dir.mkdir(parents=True, exist_ok=True)
+(legacy_dir / "persistent_termination.py").write_text(
+    'import runpy\n'
+    'if __name__ == "__main__":\n'
+    '    runpy.run_module("agent.api.persistent_termination", '
+    'run_name="__main__", alter_sys=True)\n',
+    encoding="utf-8",
+)
+SRW_TERMINATION_COMPAT
 
 RUN mkdir -p /app/workspace /app/logs && \
     chown -R srw:srw /app/workspace /app/logs
@@ -176,7 +205,58 @@ ENV PIP_TARGET=/home/srw/.local/lib/python3.11/site-packages \
 
 USER srw
 
+# Verify the image-only compatibility command and normal module command both
+# resolve the installed package, including under the non-root runtime user.
+RUN python -c "from pathlib import Path; import agent, sys; assert sys.flags.safe_path; assert Path(agent.__file__).resolve() == Path('/app/src/agent/__init__.py')" \
+    && python /app/agent.py --help >/dev/null \
+    && python -m agent --help >/dev/null
+
+# Exercise the actual old module command as the runtime user. Mock both the
+# sentinel and HTTP request so this build check cannot initiate a real drain.
+RUN --network=none python - <<'SRW_TERMINATION_SMOKE'
+import importlib.util
+from pathlib import Path
+import runpy
+import sys
+from unittest.mock import patch
+
+canonical = "agent.api.persistent_termination"
+canonical_file = importlib.util.find_spec(canonical).origin
+seen = {}
+sys.argv = ["src.api.persistent_termination", "--compatibility-smoke"]
+
+
+def observe(frame, event, _arg):
+    if event == "call" and frame.f_code.co_name == "main":
+        if frame.f_code.co_filename == canonical_file:
+            seen.update(
+                file=frame.f_globals["__file__"],
+                package=frame.f_globals["__package__"],
+                argv=list(sys.argv),
+            )
+
+
+with patch.object(Path, "mkdir"), patch.object(Path, "touch"):
+    with patch("urllib.request.urlopen") as request:
+        request.return_value.__enter__.return_value.status = 200
+        sys.setprofile(observe)
+        try:
+            runpy.run_module(
+                "src.api.persistent_termination", run_name="__main__", alter_sys=True
+            )
+        except SystemExit as result:
+            assert result.code == 0
+        finally:
+            sys.setprofile(None)
+        request.assert_called_once()
+assert seen == {
+    "file": canonical_file,
+    "package": "agent.api",
+    "argv": [canonical_file, "--compatibility-smoke"],
+}, seen
+SRW_TERMINATION_SMOKE
+
 EXPOSE 8001
 EXPOSE 8002
 
-CMD ["sh", "-c", "exec python agent.py --config ${AGENT_CONFIG} --port ${AGENT_PORT} --host 0.0.0.0"]
+CMD ["sh", "-c", "exec python -m agent --config ${AGENT_CONFIG} --port ${AGENT_PORT} --host 0.0.0.0"]

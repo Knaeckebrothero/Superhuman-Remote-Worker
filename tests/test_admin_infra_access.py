@@ -28,15 +28,15 @@ from fastapi import HTTPException
 def _patch_caller_and_db(user: dict, db):
     stack = ExitStack()
     stack.enter_context(
-        patch("main.require_approved_user", AsyncMock(return_value=user))
+        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user))
     )
     stack.enter_context(
         patch(
-            "security.access.require_approved_user",
+            "orchestrator.security.access.require_approved_user",
             AsyncMock(return_value=user),
         )
     )
-    stack.enter_context(patch("main.postgres_db", db))
+    stack.enter_context(patch("orchestrator.main.postgres_db", db))
     return stack
 
 
@@ -50,7 +50,7 @@ class TestAdminInfraGates:
     # ----- /api/tables family -----
     @pytest.mark.asyncio
     async def test_list_tables_non_admin_403(self, user_a, fake_db, fake_request):
-        from main import list_tables
+        from orchestrator.main import list_tables
 
         fake_db.get_tables = AsyncMock(
             side_effect=AssertionError("get_tables called past gate")
@@ -62,7 +62,7 @@ class TestAdminInfraGates:
 
     @pytest.mark.asyncio
     async def test_get_table_data_non_admin_403(self, user_a, fake_db, fake_request):
-        from main import get_table_data
+        from orchestrator.main import get_table_data
 
         fake_db.get_table_data = AsyncMock(
             side_effect=AssertionError("get_table_data called past gate")
@@ -74,7 +74,7 @@ class TestAdminInfraGates:
 
     @pytest.mark.asyncio
     async def test_get_table_schema_non_admin_403(self, user_a, fake_db, fake_request):
-        from main import get_table_schema
+        from orchestrator.main import get_table_schema
 
         fake_db.get_table_schema = AsyncMock(
             side_effect=AssertionError("get_table_schema called past gate")
@@ -87,11 +87,11 @@ class TestAdminInfraGates:
     # ----- /api/sudo/rules family -----
     @pytest.mark.asyncio
     async def test_list_sudo_rules_non_admin_403(self, user_a, fake_db, fake_request):
-        from main import list_sudo_rules
+        from orchestrator.main import list_sudo_rules
 
         with (
             _patch_caller_and_db(user_a, fake_db),
-            patch("main.sudo_gate", _exploding("sudo_gate")),
+            patch("orchestrator.main.sudo_gate", _exploding("sudo_gate")),
         ):
             with pytest.raises(HTTPException) as exc:
                 await list_sudo_rules(fake_request)
@@ -99,14 +99,14 @@ class TestAdminInfraGates:
 
     @pytest.mark.asyncio
     async def test_create_sudo_rule_non_admin_403(self, user_a, fake_db, fake_request):
-        from main import SudoRuleCreateRequest, create_sudo_rule
+        from orchestrator.main import SudoRuleCreateRequest, create_sudo_rule
 
         body = SudoRuleCreateRequest(
             pattern="apt-get *", action="approve", priority=10, description="test"
         )
         with (
             _patch_caller_and_db(user_a, fake_db),
-            patch("main.sudo_gate", _exploding("sudo_gate")),
+            patch("orchestrator.main.sudo_gate", _exploding("sudo_gate")),
         ):
             with pytest.raises(HTTPException) as exc:
                 await create_sudo_rule(fake_request, body)
@@ -114,11 +114,11 @@ class TestAdminInfraGates:
 
     @pytest.mark.asyncio
     async def test_delete_sudo_rule_non_admin_403(self, user_a, fake_db, fake_request):
-        from main import delete_sudo_rule
+        from orchestrator.main import delete_sudo_rule
 
         with (
             _patch_caller_and_db(user_a, fake_db),
-            patch("main.sudo_gate", _exploding("sudo_gate")),
+            patch("orchestrator.main.sudo_gate", _exploding("sudo_gate")),
         ):
             with pytest.raises(HTTPException) as exc:
                 await delete_sudo_rule(fake_request, "rule-abc")
@@ -127,11 +127,11 @@ class TestAdminInfraGates:
     # ----- /api/experts/reload -----
     @pytest.mark.asyncio
     async def test_reload_experts_non_admin_403(self, user_a, fake_db, fake_request):
-        from main import reload_experts
+        from orchestrator.main import reload_experts
 
         with (
             _patch_caller_and_db(user_a, fake_db),
-            patch("main._scan_experts", _exploding("_scan_experts")),
+            patch("orchestrator.main._scan_experts", _exploding("_scan_experts")),
         ):
             with pytest.raises(HTTPException) as exc:
                 await reload_experts(fake_request)
@@ -140,7 +140,7 @@ class TestAdminInfraGates:
     # ----- /api/vms -----
     @pytest.mark.asyncio
     async def test_list_vms_non_admin_403(self, user_a, fake_db, fake_request):
-        from main import list_vms
+        from orchestrator.main import list_vms
 
         # The handler uses postgres_db.acquire() as a context manager; the
         # gate fires before that so we don't need a deeper mock.
@@ -154,7 +154,7 @@ class TestAdminInfraGates:
     async def test_list_tables_admin_passes_gate(
         self, user_admin, fake_db, fake_request
     ):
-        from main import list_tables
+        from orchestrator.main import list_tables
 
         fake_db.get_tables = AsyncMock(return_value=[{"name": "users", "rows": 0}])
         with _patch_caller_and_db(user_admin, fake_db):

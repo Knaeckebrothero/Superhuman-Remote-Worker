@@ -4,13 +4,13 @@ import uuid
 from dataclasses import replace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from src.services.knowledge.bindings import (
+from agent.services.knowledge.bindings import (
     KnowledgeBinding,
     build_knowledge_bindings,
 )
-from src.services.knowledge_store import KnowledgeRecord
-from src.shared.runtime_actor import RUNTIME_ACTOR_HEADER, RuntimeActorContext
-from src.tools.knowledge.knowledge_tools import create_kb_tools
+from shared.runtime.services.knowledge_store import KnowledgeRecord
+from shared.runtime_actor import RUNTIME_ACTOR_HEADER, RuntimeActorContext
+from agent.tools.knowledge.knowledge_tools import create_kb_tools
 
 
 def _binding(
@@ -48,7 +48,7 @@ def _context(bindings: list[KnowledgeBinding], *, graph=True):
 
 def _tools(context, **kwargs):
     with patch(
-        "src.tools.knowledge.knowledge_tools.asyncio.get_running_loop",
+        "agent.tools.knowledge.knowledge_tools.asyncio.get_running_loop",
         side_effect=RuntimeError,
     ):
         return create_kb_tools(context, **kwargs)
@@ -338,7 +338,7 @@ def test_write_targets_only_writable_native_binding():
     context.knowledge_store.upsert_note.return_value = uuid.uuid4()
 
     with patch(
-        "src.tools.knowledge.knowledge_tools._post_vault_file",
+        "agent.tools.knowledge.knowledge_tools._post_vault_file",
         return_value={"status": "committed", "path": "knowledge/native-note.md"},
     ):
         result = _tool(_tools(context), "kb_write").invoke(
@@ -354,7 +354,7 @@ def test_write_targets_only_writable_native_binding():
 def _write(context, **extra):
     """Invoke kb_write with the vault endpoint stubbed; return (result, post)."""
     with patch(
-        "src.tools.knowledge.knowledge_tools._post_vault_file",
+        "agent.tools.knowledge.knowledge_tools._post_vault_file",
         return_value={"status": "committed", "path": "knowledge/x.md"},
     ) as post:
         result = _tool(_tools(context), "kb_write").invoke(
@@ -487,11 +487,11 @@ def test_supersede_retire_under_kb_retires_in_the_target_not_the_default():
     verdict.targets = [stale]
 
     with patch(
-        "src.services.knowledge.ingestion.gate_candidate",
+        "agent.services.knowledge.ingestion.gate_candidate",
         new=AsyncMock(return_value=verdict),
     ):
         with patch(
-            "src.tools.knowledge.knowledge_tools._post_vault_file",
+            "agent.tools.knowledge.knowledge_tools._post_vault_file",
             return_value={"status": "committed", "path": "knowledge/x.md"},
         ) as post:
             tools = _tools(
@@ -630,7 +630,7 @@ def test_write_to_non_primary_target_cannot_set_officer_only_tags():
     context.knowledge_graph.read_note.return_value = None
 
     pep = _CredentialGatedPEP()
-    with patch("src.tools.knowledge.knowledge_tools.httpx.Client", return_value=pep):
+    with patch("agent.tools.knowledge.knowledge_tools.httpx.Client", return_value=pep):
         result, post = _write(context, kb="project-c0d5edd4", tags=["ready"])
 
     post.assert_not_called()
@@ -655,7 +655,7 @@ def test_no_repo_renders_permanent_and_names_target_and_alternatives():
     context = _context([home, srw])
     context.knowledge_graph.read_note.return_value = None
     with patch(
-        "src.tools.knowledge.knowledge_tools._post_vault_file",
+        "agent.tools.knowledge.knowledge_tools._post_vault_file",
         return_value={
             "status": "failed",
             "reason": "no-repo",
@@ -681,7 +681,7 @@ def test_permanent_failure_without_alternatives_omits_the_hint():
     context = _context([home])
     context.knowledge_graph.read_note.return_value = None
     with patch(
-        "src.tools.knowledge.knowledge_tools._post_vault_file",
+        "agent.tools.knowledge.knowledge_tools._post_vault_file",
         return_value={
             "status": "failed",
             "reason": "no-repo",
@@ -702,7 +702,7 @@ def test_transient_failure_keeps_the_ledger_wording():
     context = _context([home])
     context.knowledge_graph.read_note.return_value = None
     with patch(
-        "src.tools.knowledge.knowledge_tools._post_vault_file",
+        "agent.tools.knowledge.knowledge_tools._post_vault_file",
         return_value={"status": "failed", "reason": "commit-refused"},
     ):
         result = _tool(_tools(context), "kb_write").invoke(
@@ -721,7 +721,7 @@ def test_permanent_update_failure_names_the_targeted_knowledge_base():
         {(str(srw.kb_id), "n"): _kb_note("n", "old")}
     )
     with patch(
-        "src.tools.knowledge.knowledge_tools._post_vault_file",
+        "agent.tools.knowledge.knowledge_tools._post_vault_file",
         return_value={
             "status": "failed",
             "reason": "no-repo",
@@ -760,7 +760,7 @@ def test_permanent_delete_failure_uses_the_handle_wording_too():
     )
     context.knowledge_store.get_inbound_links.return_value = []
     with patch(
-        "src.tools.knowledge.knowledge_tools._post_vault_file",
+        "agent.tools.knowledge.knowledge_tools._post_vault_file",
         return_value={
             "status": "failed",
             "reason": "no-repo",
@@ -784,7 +784,7 @@ def test_permanent_write_failure_keeps_the_kb_argument_wording():
     context = _context([home, srw])
     context.knowledge_graph.read_note.return_value = None
     with patch(
-        "src.tools.knowledge.knowledge_tools._post_vault_file",
+        "agent.tools.knowledge.knowledge_tools._post_vault_file",
         return_value={
             "status": "failed",
             "reason": "no-repo",
@@ -836,7 +836,7 @@ def test_update_may_target_non_primary_native_via_handle():
         }
     )
     with patch(
-        "src.tools.knowledge.knowledge_tools._post_vault_file",
+        "agent.tools.knowledge.knowledge_tools._post_vault_file",
         return_value={"status": "committed", "path": "knowledge/n.md"},
     ) as post:
         result = _tool(_tools(context), "kb_update").invoke(
@@ -866,7 +866,7 @@ def test_update_without_a_handle_still_targets_the_default_native():
         {(str(home.kb_id), "n"): _kb_note("n", "old")}
     )
     with patch(
-        "src.tools.knowledge.knowledge_tools._post_vault_file",
+        "agent.tools.knowledge.knowledge_tools._post_vault_file",
         return_value={"status": "committed", "path": "knowledge/n.md"},
     ) as post:
         result = _tool(_tools(context), "kb_update").invoke(
@@ -887,7 +887,7 @@ def test_update_kgless_tier_targets_the_handle_named_knowledge_base():
         }
     )
     with patch(
-        "src.tools.knowledge.knowledge_tools._post_vault_file",
+        "agent.tools.knowledge.knowledge_tools._post_vault_file",
         return_value={"status": "committed", "path": "knowledge/n.md"},
     ) as post:
         result = _tool(_tools(context), "kb_update").invoke(
@@ -901,7 +901,7 @@ def test_update_still_refuses_an_external_knowledge_base():
     home = _binding("project", kind="native", writable=True)
     docs = _binding("docs", name="Product Docs")
     context = _context([home, docs])
-    with patch("src.tools.knowledge.knowledge_tools._post_vault_file") as post:
+    with patch("agent.tools.knowledge.knowledge_tools._post_vault_file") as post:
         result = _tool(_tools(context), "kb_update").invoke(
             {"note": "docs:n", "content": "new"}
         )
@@ -929,7 +929,7 @@ def test_delete_retires_in_the_handle_named_knowledge_base():
         }
     )
     with patch(
-        "src.tools.knowledge.knowledge_tools._post_vault_file",
+        "agent.tools.knowledge.knowledge_tools._post_vault_file",
         return_value={"status": "committed", "path": "knowledge/n.md"},
     ) as post:
         result = _tool(_tools(context), "kb_delete").invoke(

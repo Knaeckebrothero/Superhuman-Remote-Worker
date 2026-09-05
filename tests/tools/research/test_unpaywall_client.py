@@ -5,11 +5,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.tools.research.utils.paper_types import AccessStatus, PaperSource
-from src.tools.research.utils.unpaywall_client import UnpaywallClient
+from agent.tools.research.utils.paper_types import AccessStatus, PaperSource
+from agent.tools.research.utils.unpaywall_client import UnpaywallClient
 
 # Patch target: research_request is imported locally inside UnpaywallClient methods
-_RESEARCH_REQUEST_PATCH = "src.tools.research.utils.network.research_request"
+_RESEARCH_REQUEST_PATCH = "agent.tools.research.utils.network.research_request"
 
 
 # Sample Unpaywall API response for an open access paper

@@ -27,10 +27,10 @@ from pathlib import Path
 import pytest
 import yaml
 
-from src.core.datasource_setup import DATASOURCE_TOOL_MAP
-from src.core.session_tool_overrides import SESSION_TOOL_OVERRIDE_NAMES
-from src.shared.orch_surface.jobs import JOB_DESCRIPTORS
-from src.tools.registry import (
+from agent.core.datasource_setup import DATASOURCE_TOOL_MAP
+from shared.runtime.core.session_tool_overrides import SESSION_TOOL_OVERRIDE_NAMES
+from shared.orch_surface.jobs import JOB_DESCRIPTORS
+from agent.tools.registry import (
     CODE_GRANTED_CATEGORIES,
     TOOL_REGISTRY,
     get_tools_by_category,
@@ -402,7 +402,7 @@ class TestTrueExpansionIsSafe:
         membership at all, and ``product_help`` / ``session_task`` do not even
         have a ``ToolsConfig`` field to name.
         """
-        from src.core.tool_policy import ENUMERATE_ONLY_CATEGORIES
+        from shared.runtime.core.tool_policy import ENUMERATE_ONLY_CATEGORIES
 
         empty = {
             category

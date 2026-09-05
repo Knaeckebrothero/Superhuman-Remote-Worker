@@ -21,7 +21,7 @@
 #     -e OPENAI_API_KEY=... \
 #     srw-agent
 #
-# Entry point: agent.py (Universal Agent CLI)
+# Entry point: python -m agent (Universal Agent CLI)
 # =============================================================================
 
 FROM python:3.11-slim AS builder
@@ -38,7 +38,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install CPU-only PyTorch first (separate layer — rarely changes, ~200MB vs ~2GB with CUDA)
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
 
-# The citation_engine package lives under src/ (src/citation_engine/) and is
+# The citation_engine package lives under src/ (src/agent/citation_engine/) and is
 # COPY'd with the rest of src/ below — no separate install. Its runtime deps
 # are in requirements.txt.
 COPY requirements.txt .
@@ -70,7 +70,7 @@ ARG UV_VERSION="0.7.12"
 # Set environment variables
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONPATH=/app \
+    PYTHONSAFEPATH=1 \
     AGENT_CONFIG=defaults \
     AGENT_PORT=8001 \
     BUILD_SHA=${BUILD_SHA} \
@@ -132,12 +132,39 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 # (browser-exec daemon). See knowledge-base/knowledge/issues/remove_local_browser_fallback.md.
 
 # Copy source code LAST (changes most frequently)
-COPY --chown=srw:srw src/ ./src/
+COPY --chown=srw:srw src/agent/ ./src/agent/
+COPY --chown=srw:srw src/shared/ ./src/shared/
 COPY --chown=srw:srw config/ ./config/
-COPY --chown=srw:srw agent.py ./
+COPY --chown=srw:srw pyproject.toml ./
 
-# Marker so get_project_root() finds /app (no .git in container)
-RUN touch /app/pyproject.toml && chown srw:srw /app/pyproject.toml
+# Editable installation keeps imports at the source paths synchronized by Tilt.
+RUN pip install --no-cache-dir --no-deps -e .
+
+# Transitional image-only entry for old/new orchestrators and durable recycle
+# targets that still launch `python agent.py`. Keep package resolution canonical;
+# the repository has no agent.py shim. Remove only after that compatibility
+# window (including rollback targets) has closed.
+RUN printf '%s\n' 'import runpy' \
+    'runpy.run_module("agent", run_name="__main__", alter_sys=True)' \
+    > /app/agent.py
+
+# Older orchestrators also invoke this preStop module name. Provide just this
+# image-only namespace entry in system site-packages, with no src/__init__.py
+# or api/__init__.py and no alias for the former application source tree.
+RUN python - <<'SRW_TERMINATION_COMPAT'
+from pathlib import Path
+import sysconfig
+
+legacy_dir = Path(sysconfig.get_path("purelib")) / "src" / "api"
+legacy_dir.mkdir(parents=True, exist_ok=True)
+(legacy_dir / "persistent_termination.py").write_text(
+    'import runpy\n'
+    'if __name__ == "__main__":\n'
+    '    runpy.run_module("agent.api.persistent_termination", '
+    'run_name="__main__", alter_sys=True)\n',
+    encoding="utf-8",
+)
+SRW_TERMINATION_COMPAT
 
 # Create runtime directories with correct ownership
 RUN mkdir -p /app/workspace /app/logs && \
@@ -154,6 +181,57 @@ ENV PIP_TARGET=/home/srw/.local/lib/python3.11/site-packages \
 
 USER srw
 
+# Verify the image-only compatibility command and normal module command both
+# resolve the installed package, including under the non-root runtime user.
+RUN python -c "from pathlib import Path; import agent, sys; assert sys.flags.safe_path; assert Path(agent.__file__).resolve() == Path('/app/src/agent/__init__.py')" \
+    && python /app/agent.py --help >/dev/null \
+    && python -m agent --help >/dev/null
+
+# Exercise the actual old module command as the runtime user. Mock both the
+# sentinel and HTTP request so this build check cannot initiate a real drain.
+RUN --network=none python - <<'SRW_TERMINATION_SMOKE'
+import importlib.util
+from pathlib import Path
+import runpy
+import sys
+from unittest.mock import patch
+
+canonical = "agent.api.persistent_termination"
+canonical_file = importlib.util.find_spec(canonical).origin
+seen = {}
+sys.argv = ["src.api.persistent_termination", "--compatibility-smoke"]
+
+
+def observe(frame, event, _arg):
+    if event == "call" and frame.f_code.co_name == "main":
+        if frame.f_code.co_filename == canonical_file:
+            seen.update(
+                file=frame.f_globals["__file__"],
+                package=frame.f_globals["__package__"],
+                argv=list(sys.argv),
+            )
+
+
+with patch.object(Path, "mkdir"), patch.object(Path, "touch"):
+    with patch("urllib.request.urlopen") as request:
+        request.return_value.__enter__.return_value.status = 200
+        sys.setprofile(observe)
+        try:
+            runpy.run_module(
+                "src.api.persistent_termination", run_name="__main__", alter_sys=True
+            )
+        except SystemExit as result:
+            assert result.code == 0
+        finally:
+            sys.setprofile(None)
+        request.assert_called_once()
+assert seen == {
+    "file": canonical_file,
+    "package": "agent.api",
+    "argv": [canonical_file, "--compatibility-smoke"],
+}, seen
+SRW_TERMINATION_SMOKE
+
 # Expose default port (can be overridden)
 EXPOSE 8001
 EXPOSE 8002
@@ -163,4 +241,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:${AGENT_PORT}/health || exit 1
 
 # Run the Universal Agent with config from environment
-CMD ["sh", "-c", "exec python agent.py --config ${AGENT_CONFIG} --port ${AGENT_PORT} --host 0.0.0.0"]
+CMD ["sh", "-c", "exec python -m agent --config ${AGENT_CONFIG} --port ${AGENT_PORT} --host 0.0.0.0"]

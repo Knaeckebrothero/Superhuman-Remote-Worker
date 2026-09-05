@@ -17,11 +17,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-import src.api.app as primary_app
-import src.api.dual_app as dual_app
+import agent.api.app as primary_app
+import agent.api.dual_app as dual_app
 from orchestrator.services.config_resolver import resolve_config
-from src.api.models import JobResumeRequest
-from src.core.loader import get_all_tool_names, load_config_from_resolved
+from agent.api.models import JobResumeRequest
+from shared.runtime.core.loader import get_all_tool_names, load_config_from_resolved
 
 
 AGENT_ID = "11111111-1111-4111-8111-111111111111"
@@ -126,7 +126,7 @@ async def test_dual_session_ready_serializes_exact_protected_contract(
     readiness contract as persistent mode; ordinary sessions remain ready
     without claiming an active protected mount."""
 
-    import src.api.persistent_app as persistent_app
+    import agent.api.persistent_app as persistent_app
 
     agent = MagicMock()
     agent.get_status.return_value = {

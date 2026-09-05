@@ -169,7 +169,7 @@ else
 fi
 
 # 3a. Recipient binding. The orchestrator derives one credential per workspace
-#     runtime (orchestrator/services/ide_credentials.py) and presents it on
+#     runtime (src/orchestrator/services/ide_credentials.py) and presents it on
 #     every proxied request, so a proxy that dialled a reused Pod IP meets a
 #     credential this code-server does not accept and is refused HERE — the
 #     one check the control plane cannot get wrong. Without the credential we

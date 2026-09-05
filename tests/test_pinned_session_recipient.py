@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.shared.pinned_session_identity import PinnedSessionBinding
+from shared.pinned_session_identity import PinnedSessionBinding
 
 THREAD_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 AGENT_ID = "11111111-1111-4111-8111-111111111111"
@@ -72,7 +72,7 @@ async def test_orchestrator_attests_receipt_backed_warm_pool_shape(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_status_wrong_fingerprint_returns_no_turn_state():
-    import src.api.persistent_app as mod
+    import agent.api.persistent_app as mod
 
     app = mod.create_persistent_app("config", THREAD_ID)
     route = _route(app, "/session/status")
@@ -96,7 +96,7 @@ async def test_status_wrong_fingerprint_returns_no_turn_state():
 async def test_status_exact_fingerprint_is_recipient_verified():
     import json
 
-    import src.api.persistent_app as mod
+    import agent.api.persistent_app as mod
 
     app = mod.create_persistent_app("config", THREAD_ID)
     route = _route(app, "/session/status")
@@ -121,7 +121,7 @@ async def test_status_exact_fingerprint_is_recipient_verified():
 
 @pytest.mark.asyncio
 async def test_detach_wrong_fingerprint_has_zero_effect():
-    import src.api.persistent_app as mod
+    import agent.api.persistent_app as mod
 
     app = mod.create_persistent_app("config", THREAD_ID)
     route = _route(app, "/session/detach")
@@ -212,7 +212,7 @@ async def test_orchestrator_detach_never_dials_without_exact_binding(monkeypatch
 
 @pytest.mark.asyncio
 async def test_parked_pinned_loop_reclaims_durable_input(monkeypatch):
-    import src.api.persistent_app as mod
+    import agent.api.persistent_app as mod
 
     queue: asyncio.Queue = asyncio.Queue()
 
@@ -235,7 +235,7 @@ async def test_parked_pinned_loop_reclaims_durable_input(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_persistent_attach_wrong_process_refuses_before_pool_claim(monkeypatch):
-    import src.api.persistent_app as mod
+    import agent.api.persistent_app as mod
 
     client = SimpleNamespace(
         agent_id=AGENT_ID,
@@ -270,7 +270,7 @@ async def test_persistent_attach_wrong_process_refuses_before_pool_claim(monkeyp
 
 @pytest.mark.asyncio
 async def test_dual_attach_wrong_process_refuses_before_state_flip(monkeypatch):
-    import src.api.dual_app as mod
+    import agent.api.dual_app as mod
 
     app = mod.create_dual_app("config")
     route = _route(app, "/session/attach")
@@ -303,7 +303,7 @@ async def test_dual_attach_wrong_process_refuses_before_state_flip(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_ready_advertises_session_recipient_only_with_process_epoch(monkeypatch):
-    import src.api.persistent_app as mod
+    import agent.api.persistent_app as mod
 
     app = mod.create_persistent_app("config", None)
     route = next(
@@ -327,7 +327,7 @@ async def test_ready_advertises_session_recipient_only_with_process_epoch(monkey
 async def test_dual_ready_advertises_session_recipient_only_with_process_epoch(
     monkeypatch,
 ):
-    import src.api.dual_app as mod
+    import agent.api.dual_app as mod
 
     app = mod.create_dual_app("config")
     route = next(

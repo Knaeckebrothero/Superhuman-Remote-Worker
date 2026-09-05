@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-import src.api.persistent_app as papp
+import agent.api.persistent_app as papp
 
 
 def _session_stub() -> MagicMock:

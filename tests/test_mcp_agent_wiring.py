@@ -5,10 +5,10 @@ import textwrap
 
 import pytest
 
-from src.core.datasource_setup import process_datasources
-from src.core.loader import get_all_tool_names, load_config_from_resolved
-from src.tools.context import ToolContext
-from src.tools.registry import (
+from agent.core.datasource_setup import process_datasources
+from shared.runtime.core.loader import get_all_tool_names, load_config_from_resolved
+from agent.tools.context import ToolContext
+from agent.tools.registry import (
     TOOL_REGISTRY,
     expand_tool_wildcards,
     load_tools,

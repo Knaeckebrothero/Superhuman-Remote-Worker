@@ -18,7 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.services.audio_helper import (
+from agent.services.audio_helper import (
     AudioHelper,
     AUDIO_EXTENSIONS,
     MAX_AUDIO_SIZE_BYTES,
@@ -43,7 +43,7 @@ def mock_env(monkeypatch):
 @pytest.fixture
 def mock_openai_client():
     """Mock AsyncOpenAI client so no real API calls are made."""
-    with patch("src.services.audio_helper.AsyncOpenAI") as mock_cls:
+    with patch("agent.services.audio_helper.AsyncOpenAI") as mock_cls:
         mock_client = MagicMock()
         mock_cls.return_value = mock_client
         yield mock_client, mock_cls
@@ -130,7 +130,7 @@ class TestAudioHelperSingleton:
 
     def test_singleton_returns_same_instance(self, mock_env, mock_openai_client):
         """get_audio_helper returns the same instance on repeated calls."""
-        import src.services.audio_helper as mod
+        import agent.services.audio_helper as mod
 
         mod._audio_helper = None
 
@@ -297,7 +297,7 @@ class TestFileValidation:
         large_file.write_bytes(b"\x00" * (MAX_AUDIO_SIZE_BYTES + 1))
 
         # Without ffmpeg, should get a clear error about needing ffmpeg
-        with patch("src.services.audio_helper.shutil.which", return_value=None):
+        with patch("agent.services.audio_helper.shutil.which", return_value=None):
             result = await audio_helper.transcribe(large_file)
 
         assert "ffmpeg is required" in result
@@ -395,7 +395,7 @@ class TestArchiving:
         )
 
         mock_archiver = MagicMock()
-        with patch("src.core.archiver.get_archiver", return_value=mock_archiver):
+        with patch("agent.core.archiver.get_archiver", return_value=mock_archiver):
             await audio_helper.transcribe(tmp_audio, job_id="job-123")
 
         mock_archiver.archive.assert_called_once()
@@ -422,7 +422,7 @@ class TestArchiving:
         )
 
         mock_archiver = MagicMock()
-        with patch("src.core.archiver.get_archiver", return_value=mock_archiver):
+        with patch("agent.core.archiver.get_archiver", return_value=mock_archiver):
             await audio_helper.transcribe(tmp_audio, job_id="job-456")
 
         call_kwargs = mock_archiver.archive.call_args.kwargs
@@ -437,7 +437,7 @@ class TestArchiving:
         mock_client, _ = mock_openai_client
         mock_client.audio.transcriptions.create = AsyncMock(return_value="text")
 
-        with patch("src.core.archiver.get_archiver") as mock_get:
+        with patch("agent.core.archiver.get_archiver") as mock_get:
             await audio_helper.transcribe(tmp_audio)  # No job_id
 
         mock_get.assert_not_called()
@@ -453,7 +453,7 @@ class TestArchiving:
         mock_archiver = MagicMock()
         mock_archiver.archive.side_effect = Exception("audit store down")
 
-        with patch("src.core.archiver.get_archiver", return_value=mock_archiver):
+        with patch("agent.core.archiver.get_archiver", return_value=mock_archiver):
             result = await audio_helper.transcribe(tmp_audio, job_id="job-789")
 
         assert result == "Still works"
@@ -531,7 +531,7 @@ class TestGetDuration:
         mock_result.stdout = "120.5\n"
 
         with patch(
-            "src.services.audio_helper.subprocess.run", return_value=mock_result
+            "agent.services.audio_helper.subprocess.run", return_value=mock_result
         ):
             duration = audio_helper._get_duration(tmp_audio)
 
@@ -544,7 +544,7 @@ class TestGetDuration:
         mock_result.stderr = "not a valid audio file"
 
         with patch(
-            "src.services.audio_helper.subprocess.run", return_value=mock_result
+            "agent.services.audio_helper.subprocess.run", return_value=mock_result
         ):
             with pytest.raises(RuntimeError, match="ffprobe failed"):
                 audio_helper._get_duration(tmp_audio)
@@ -554,7 +554,7 @@ class TestGetDuration:
         import subprocess
 
         with patch(
-            "src.services.audio_helper.subprocess.run",
+            "agent.services.audio_helper.subprocess.run",
             side_effect=subprocess.TimeoutExpired(cmd="ffprobe", timeout=30),
         ):
             with pytest.raises(RuntimeError, match="timed out"):
@@ -587,7 +587,7 @@ class TestSplitAudio:
                 output_path.write_bytes(b"\x00" * 100)
             return result
 
-        with patch("src.services.audio_helper.subprocess.run", side_effect=mock_run):
+        with patch("agent.services.audio_helper.subprocess.run", side_effect=mock_run):
             with patch.object(audio_helper, "_get_duration", return_value=600.0):
                 chunks, temp_dir = audio_helper._split_audio(audio_file, file_size)
 
@@ -613,7 +613,7 @@ class TestSplitAudio:
                 output_path.write_bytes(b"\x00" * 100)
             return result
 
-        with patch("src.services.audio_helper.subprocess.run", side_effect=mock_run):
+        with patch("agent.services.audio_helper.subprocess.run", side_effect=mock_run):
             with patch.object(audio_helper, "_get_duration", return_value=600.0):
                 chunks, temp_dir = audio_helper._split_audio(audio_file, file_size)
 
@@ -676,7 +676,8 @@ class TestChunkedTranscription:
             return_value=([chunk1, chunk2], str(chunk_dir)),
         ):
             with patch(
-                "src.services.audio_helper.shutil.which", return_value="/usr/bin/ffmpeg"
+                "agent.services.audio_helper.shutil.which",
+                return_value="/usr/bin/ffmpeg",
             ):
                 result = await audio_helper.transcribe(large_file)
 
@@ -718,7 +719,8 @@ class TestChunkedTranscription:
             return_value=([chunk1, chunk2], str(chunk_dir)),
         ):
             with patch(
-                "src.services.audio_helper.shutil.which", return_value="/usr/bin/ffmpeg"
+                "agent.services.audio_helper.shutil.which",
+                return_value="/usr/bin/ffmpeg",
             ):
                 await audio_helper.transcribe(large_file)
 
@@ -754,10 +756,11 @@ class TestChunkedTranscription:
             return_value=([chunk1, chunk2], str(chunk_dir)),
         ):
             with patch(
-                "src.services.audio_helper.shutil.which", return_value="/usr/bin/ffmpeg"
+                "agent.services.audio_helper.shutil.which",
+                return_value="/usr/bin/ffmpeg",
             ):
                 with patch(
-                    "src.core.archiver.get_archiver", return_value=mock_archiver
+                    "agent.core.archiver.get_archiver", return_value=mock_archiver
                 ):
                     await audio_helper.transcribe(large_file, job_id="job-chunk")
 
@@ -778,7 +781,7 @@ class TestChunkedTranscription:
         large_file = tmp_path / "large.mp3"
         large_file.write_bytes(b"\x00" * (MAX_AUDIO_SIZE_BYTES + 1))
 
-        with patch("src.services.audio_helper.shutil.which", return_value=None):
+        with patch("agent.services.audio_helper.shutil.which", return_value=None):
             result = await audio_helper.transcribe(large_file)
 
         assert "ffmpeg is required" in result
@@ -806,9 +809,10 @@ class TestChunkedTranscription:
             return_value=([chunk1], str(chunk_dir)),
         ):
             with patch(
-                "src.services.audio_helper.shutil.which", return_value="/usr/bin/ffmpeg"
+                "agent.services.audio_helper.shutil.which",
+                return_value="/usr/bin/ffmpeg",
             ):
-                with patch("src.services.audio_helper.shutil.rmtree") as mock_rmtree:
+                with patch("agent.services.audio_helper.shutil.rmtree") as mock_rmtree:
                     await audio_helper.transcribe(large_file)
 
         mock_rmtree.assert_called_once_with(str(chunk_dir), ignore_errors=True)
@@ -837,9 +841,10 @@ class TestChunkedTranscription:
             return_value=([chunk1], str(chunk_dir)),
         ):
             with patch(
-                "src.services.audio_helper.shutil.which", return_value="/usr/bin/ffmpeg"
+                "agent.services.audio_helper.shutil.which",
+                return_value="/usr/bin/ffmpeg",
             ):
-                with patch("src.services.audio_helper.shutil.rmtree") as mock_rmtree:
+                with patch("agent.services.audio_helper.shutil.rmtree") as mock_rmtree:
                     result = await audio_helper.transcribe(large_file)
 
         # Should still clean up

@@ -99,11 +99,11 @@ spec:
         - name: seed
           image: {{ include "srw.imageRef" (dict "image" .Values.image.orchestrator) | quote }}
           imagePullPolicy: {{ .Values.image.orchestrator.pullPolicy }}
-          command: ["python", "-m", "seed.llm_config"]
+          command: ["python", "-m", "orchestrator.seed.llm_config"]
           args: ["--payload", "/seed/llm.yaml"]
           env:
             # Postgres DSN is composed at runtime by the seeder
-            # (orchestrator/utils/db_url.py).
+            # (src/shared/db_url.py).
             - name: POSTGRES_USER
               valueFrom:
                 secretKeyRef:
@@ -148,7 +148,7 @@ spec:
                   key: {{ required "systemApiKeys entry missing key" $ref.key | quote }}
                   # A provider listed here whose key is absent from the Secret is
                   # tolerated: the env var stays unset and the seeder skips that
-                  # provider (orchestrator/seed/llm_config.py _resolve_secret_value).
+                  # provider (src/orchestrator/seed/llm_config.py _resolve_secret_value).
                   # Lets operators list providers without pre-creating empty keys.
                   optional: true
             {{- end }}

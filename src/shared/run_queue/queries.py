@@ -55,7 +55,12 @@ import random
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from uuid import UUID
 
-from .types import ClaimedUnit, EnqueueResult, QueueWatermarks, StolenUnit
+from shared.run_queue.types import (
+    ClaimedUnit,
+    EnqueueResult,
+    QueueWatermarks,
+    StolenUnit,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only; keeps runtime deps stdlib
     from collections.abc import Sequence
@@ -1136,7 +1141,7 @@ async def reap_expired(
 
     Layering: without that callback this module touches only ``run_queue``. The CALLER (the
     leader-gated reaper loop — advisory lock ``RUN_QUEUE_REAPER_ID`` in
-    ``orchestrator/database/lock_ids.py``) bumps ``threads.events_epoch`` for
+    ``src/orchestrator/database/lock_ids.py``) bumps ``threads.events_epoch`` for
     session units and writes the ``turn.interrupted`` / ``turn.parked``
     system frames from the returned records. Safe under a dual-leader window
     by the per-row CAS, not by the election.

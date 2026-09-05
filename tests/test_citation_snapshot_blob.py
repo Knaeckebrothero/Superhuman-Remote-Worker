@@ -20,8 +20,8 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 
-from src.api.orchestrator_client import OrchestratorClient
-from src.tools.context import ToolContext
+from agent.api.orchestrator_client import OrchestratorClient
+from agent.tools.context import ToolContext
 
 
 # ---------------------------------------------------------------------------

@@ -9,7 +9,7 @@ from uuid import UUID
 
 import pytest
 
-from src.api import persistent_app
+from agent.api import persistent_app
 
 
 def _protected_mount() -> dict:
@@ -596,9 +596,9 @@ async def test_dedicated_attach_initial_engaging_polls_to_ready(monkeypatch):
         patch.object(persistent_app, "_start_watchdogs"),
         patch.object(persistent_app, "_officer_cfg", return_value=None),
         patch.object(persistent_app, "_broadcast"),
-        patch("src.tools.registry.register_mcp_tools"),
+        patch("agent.tools.registry.register_mcp_tools"),
         patch(
-            "src.services.knowledge.bindings.build_knowledge_bindings",
+            "agent.services.knowledge.bindings.build_knowledge_bindings",
             return_value=[],
         ),
     ):
@@ -855,9 +855,10 @@ async def test_workspace_identity_change_during_setup_rolls_back(monkeypatch):
             side_effect=lambda value: value,
         ),
         patch(
-            "src.core.loader.load_config_from_resolved", return_value=effective_config
+            "shared.runtime.core.loader.load_config_from_resolved",
+            return_value=effective_config,
         ),
-        patch("src.core.loader.create_llm", return_value=object()),
+        patch("shared.runtime.core.loader.create_llm", return_value=object()),
     ):
         with pytest.raises(
             persistent_app.ProtectedCloudUnavailable,

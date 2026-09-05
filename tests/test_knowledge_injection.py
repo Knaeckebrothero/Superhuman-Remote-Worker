@@ -13,14 +13,14 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
-from src.core.knowledge_injection import (
+from agent.core.knowledge_injection import (
     KNOWLEDGE_TOOL_CALL_ID_PREFIX,
     create_knowledge_injection_messages,
     is_knowledge_injection_message,
     retrieve_bound_knowledge,
 )
-from src.services.knowledge.bindings import KnowledgeBinding
-from src.services.knowledge_store import KnowledgeRecord, KnowledgeStore
+from agent.services.knowledge.bindings import KnowledgeBinding
+from shared.runtime.services.knowledge_store import KnowledgeRecord, KnowledgeStore
 
 
 # =============================================================================

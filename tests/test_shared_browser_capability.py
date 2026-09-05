@@ -10,10 +10,10 @@ import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
-from routers import canvases as canvas_routes
-from routers import shared_browser as browser_routes
-from services import shared_browser_canvas as browser_canvas
-from services.canvas import BrowserSource, CanvasCapabilities, CanvasRecord
+from orchestrator.routers import canvases as canvas_routes
+from orchestrator.routers import shared_browser as browser_routes
+from orchestrator.services import shared_browser_canvas as browser_canvas
+from orchestrator.services.canvas import BrowserSource, CanvasCapabilities, CanvasRecord
 
 _THREAD_ID = "a3333333-3333-3333-3333-333333333333"
 _WORKSPACE_GENERATION = UUID("11111111-aaaa-4aaa-8aaa-111111111111")

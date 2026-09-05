@@ -192,7 +192,7 @@ def test_host_wrapper_has_context_artifact_and_confirmation_fences():
     assert "OFFICER_AUTO_PULL_RELEASE_ENABLED" in wrapper
     assert "K8s Pod IPs are not recipient authority" in wrapper
     assert "SRW_WAKE_GATE_CONTEXT" in wrapper
-    assert "python -m operator_cli.stateless_wake_acceptance" in wrapper
+    assert "python -m orchestrator.operator_cli.stateless_wake_acceptance" in wrapper
     assert "postgresql://" not in wrapper
 
 

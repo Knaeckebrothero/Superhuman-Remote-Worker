@@ -10,7 +10,7 @@ standing up an SSH-accessible workspace container.
 import shutil
 from pathlib import Path
 
-from src.core.workspace_backend import WorkspaceBackend
+from shared.runtime.core.workspace_backend import WorkspaceBackend
 
 
 class FilesystemTestBackend(WorkspaceBackend):

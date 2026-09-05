@@ -118,7 +118,7 @@ data:
     #    app:update matters: app:install is a no-op on an existing install,
     #    and the protected cloud feature refuses to engage RO mounts below
     #    groupfolders 20.1.2 (CVE floor GHSA-2vrq-fhmf-c49m, enforced by
-    #    check_version_floors in orchestrator/services/cloud/ro_probe.py).
+    #    check_version_floors in src/orchestrator/services/cloud/ro_probe.py).
     # =========================================================================
     echo "[nc-setup] Ensuring groupfolders app is installed and current..."
     occ app:install groupfolders 2>/dev/null || true

@@ -15,16 +15,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import HTTPException
 
-import src.api.persistent_app as papp
-from src.api.lease_context import LeaseHandle, current_lease
-from src.api.turn_executor import StatelessTurnExecutor
-from src.persistent_graph import PersistentLoopCallbacks, run_persistent_loop
-from src.services.cloud_sync.coordinator import (
+import agent.api.persistent_app as papp
+from agent.api.lease_context import LeaseHandle, current_lease
+from agent.api.turn_executor import StatelessTurnExecutor
+from agent.persistent_graph import PersistentLoopCallbacks, run_persistent_loop
+from agent.services.cloud_sync.coordinator import (
     CloudSyncGenerationError,
     MountSync,
     WorkspaceSyncCoordinator,
 )
-from src.shared.cloud_sync_generations import (
+from shared.cloud_sync_generations import (
     EMPTY_BASELINE_SHA256,
     CloudSyncRequirement,
 )
@@ -144,15 +144,15 @@ async def test_stateless_start_recovers_then_strict_pulls_then_arms(monkeypatch)
             patch.object(papp, "_session", session),
             patch.object(papp, "_thread_id", THREAD_ID),
             patch(
-                "src.shared.cloud_sync_generations.cloud_sync_lease_is_current",
+                "shared.cloud_sync_generations.cloud_sync_lease_is_current",
                 AsyncMock(return_value=True),
             ),
             patch(
-                "src.shared.cloud_sync_generations.load_cloud_sync_requirements",
+                "shared.cloud_sync_generations.load_cloud_sync_requirements",
                 AsyncMock(return_value={}),
             ),
             patch(
-                "src.shared.cloud_sync_generations.arm_cloud_sync_generations",
+                "shared.cloud_sync_generations.arm_cloud_sync_generations",
                 AsyncMock(side_effect=arm),
             ),
             patch.object(papp, "_broadcast"),
@@ -199,14 +199,14 @@ async def test_stateless_pull_failure_blocks_arm_and_turn_start(monkeypatch):
             patch.object(papp, "_session", session),
             patch.object(papp, "_thread_id", THREAD_ID),
             patch(
-                "src.shared.cloud_sync_generations.cloud_sync_lease_is_current",
+                "shared.cloud_sync_generations.cloud_sync_lease_is_current",
                 AsyncMock(return_value=True),
             ),
             patch(
-                "src.shared.cloud_sync_generations.load_cloud_sync_requirements",
+                "shared.cloud_sync_generations.load_cloud_sync_requirements",
                 AsyncMock(return_value={}),
             ),
-            patch("src.shared.cloud_sync_generations.arm_cloud_sync_generations", arm),
+            patch("shared.cloud_sync_generations.arm_cloud_sync_generations", arm),
             patch.object(papp.asyncio, "sleep", AsyncMock()),
             patch.object(papp, "_broadcast"),
         ):

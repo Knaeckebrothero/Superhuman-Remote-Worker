@@ -107,7 +107,7 @@ def _freeze_lines(job: dict[str, Any]) -> list[str]:
 
 def format_job_list_item(job: dict[str, Any]) -> list[str]:
     """Rich per-job list rendering (F5) — description, lineage, freeze, error."""
-    from ..job_outcome import effective_job_status
+    from shared.job_outcome import effective_job_status
 
     job_id = job.get("id", "unknown")
     lines = [
@@ -233,7 +233,7 @@ def format_job_detail(job: dict[str, Any]) -> str:
     'Config: N/A' forever), and supervision needs lineage, owner, priority,
     agent, repo/branch, and the freeze type/reason/requires-review facts.
     """
-    from ..job_outcome import effective_job_status
+    from shared.job_outcome import effective_job_status
 
     job_id = job.get("id", "unknown")
     lines = [
@@ -586,7 +586,7 @@ def format_job_summary(job_id: str, envelope: dict[str, Any]) -> str:
     if note:
         lines.append(note)
     elif job:
-        from ..job_outcome import effective_job_status
+        from shared.job_outcome import effective_job_status
 
         display_status = effective_job_status(job)
         status_icon = {

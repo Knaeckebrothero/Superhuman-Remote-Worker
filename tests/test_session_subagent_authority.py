@@ -8,9 +8,9 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 
-import src.shared.persistent_input_delivery as input_delivery
-from src.shared.persistent_input_delivery import InputDeliveryAuthorityLost
-from src.shared.session_subagent_authority import (
+import shared.persistent_input_delivery as input_delivery
+from shared.persistent_input_delivery import InputDeliveryAuthorityLost
+from shared.session_subagent_authority import (
     SessionParentAuthority,
     SessionParentAuthorityRefused,
     require_session_parent_authority,

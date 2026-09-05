@@ -140,7 +140,10 @@ async def test_archived_is_acknowledgeable_so_a_live_session_can_resume():
     """Without this, blocking_denials() would route an archived attachment
     through the "invalid rather than merely unavailable" refusal — telling the
     owner their session is corrupt when their project was merely archived."""
-    from services.config_drift import ACKNOWLEDGEABLE_REASONS, blocking_denials
+    from orchestrator.services.config_drift import (
+        ACKNOWLEDGEABLE_REASONS,
+        blocking_denials,
+    )
 
     assert "archived" in ACKNOWLEDGEABLE_REASONS
     assert (
@@ -156,7 +159,7 @@ async def test_archived_is_acknowledgeable_so_a_live_session_can_resume():
 @pytest.mark.asyncio
 async def test_authorize_raises_409_when_every_denial_is_archived():
     from orchestrator.main import _authorize_thread_project_ids
-    from security.access import PROJECT_ARCHIVED_DETAIL
+    from orchestrator.security.access import PROJECT_ARCHIVED_DETAIL
 
     with patch("orchestrator.main.postgres_db") as db:
         db.get_project = AsyncMock(

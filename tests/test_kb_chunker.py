@@ -15,7 +15,7 @@ import pytest
 
 from unittest.mock import AsyncMock, MagicMock
 
-from src.tools.knowledge.chunker import (
+from shared.runtime.knowledge.chunker import (
     CHUNKER_VERSION,
     NoteChunk,
     build_embed_text,

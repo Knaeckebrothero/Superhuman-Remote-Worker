@@ -13,13 +13,13 @@ import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
 from orchestrator.database.postgres import PostgresDB
-from src.shared.workspace_contract import workspace_contract_authority_identity
+from shared.workspace_contract import workspace_contract_authority_identity
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCHEMA_FILE = ROOT / "orchestrator/database/schema_current.sql"
+SCHEMA_FILE = ROOT / "src/orchestrator/database/schema_current.sql"
 MIGRATION = ROOT / (
-    "orchestrator/database/migrations/app/0199_vm_remote_operation_leases.sql"
+    "src/orchestrator/database/migrations/app/0199_vm_remote_operation_leases.sql"
 )
 FINGERPRINT = "SHA256:" + "A" * 43
 

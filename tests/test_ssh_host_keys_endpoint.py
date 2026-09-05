@@ -17,7 +17,7 @@ import subprocess
 import pytest
 from fastapi.testclient import TestClient
 
-import main
+import orchestrator.main
 
 
 def _keygen(path):
@@ -48,7 +48,7 @@ async def test_publishes_type_key_and_fingerprint(monkeypatch, tmp_path):
     monkeypatch.setenv("SSH_GATEWAY_PUBLIC_HOST_KEYS", str(pub))
     monkeypatch.setenv("SSH_GATEWAY_HOSTNAME", "ssh.srw.works")
 
-    result = await main.get_ssh_host_keys(request=object())
+    result = await orchestrator.main.get_ssh_host_keys(request=object())
     assert result["hostname"] == "ssh.srw.works"
     entry = result["host_keys"][0]
     assert entry["type"] == "ssh-ed25519"
@@ -93,7 +93,7 @@ async def test_never_emits_a_private_key(monkeypatch, tmp_path):
     monkeypatch.setenv("SSH_GATEWAY_PUBLIC_HOST_KEYS", str(key))
     monkeypatch.setenv("SSH_GATEWAY_HOSTNAME", "ssh.srw.works")
 
-    result = await main.get_ssh_host_keys(request=object())
+    result = await orchestrator.main.get_ssh_host_keys(request=object())
 
     assert result["host_keys"], (
         "expected asyncssh to leniently extract the public component from "
@@ -128,7 +128,7 @@ async def test_one_unreadable_path_does_not_suppress_the_good_ones(
     monkeypatch.setenv("SSH_GATEWAY_PUBLIC_HOST_KEYS", f"{missing}, {good_pub}")
     monkeypatch.setenv("SSH_GATEWAY_HOSTNAME", "ssh.srw.works")
 
-    result = await main.get_ssh_host_keys(request=object())
+    result = await orchestrator.main.get_ssh_host_keys(request=object())
 
     assert len(result["host_keys"]) == 1
     assert result["host_keys"][0]["public_key"].split()[1] == _blob(good_pub)
@@ -149,7 +149,7 @@ async def test_publishes_every_key_in_a_comma_separated_list(monkeypatch, tmp_pa
     monkeypatch.setenv("SSH_GATEWAY_PUBLIC_HOST_KEYS", f" {first_pub} , {second_pub} ")
     monkeypatch.setenv("SSH_GATEWAY_HOSTNAME", "ssh.srw.works")
 
-    result = await main.get_ssh_host_keys(request=object())
+    result = await orchestrator.main.get_ssh_host_keys(request=object())
 
     blobs = [entry["public_key"].split()[1] for entry in result["host_keys"]]
     assert blobs == [_blob(first_pub), _blob(second_pub)]
@@ -174,13 +174,13 @@ async def test_a_partial_read_is_retried_not_cached(monkeypatch, tmp_path):
     monkeypatch.setenv("SSH_GATEWAY_PUBLIC_HOST_KEYS", paths)
     monkeypatch.setenv("SSH_GATEWAY_HOSTNAME", "ssh.srw.works")
 
-    degraded = await main.get_ssh_host_keys(request=object())
+    degraded = await orchestrator.main.get_ssh_host_keys(request=object())
     assert len(degraded["host_keys"]) == 1
 
     _, late_source_pub = _keygen(tmp_path / "late_source")
     late.write_text(late_source_pub.read_text())
 
-    recovered = await main.get_ssh_host_keys(request=object())
+    recovered = await orchestrator.main.get_ssh_host_keys(request=object())
     assert len(recovered["host_keys"]) == 2, (
         "the failed read was cached under an env value that never changes"
     )
@@ -208,19 +208,23 @@ async def test_a_complete_read_is_cached(monkeypatch, tmp_path):
     # Defensive: if the memoization is removed outright, this test must still
     # reach its parse-count assertion and fail *there*, saying what broke —
     # not error out on a missing cache_clear before asserting anything.
-    getattr(main._memoized_ssh_gateway_host_keys, "cache_clear", lambda: None)()
+    getattr(
+        orchestrator.main._memoized_ssh_gateway_host_keys, "cache_clear", lambda: None
+    )()
 
     parses: list[str] = []
-    real_parse = main._parse_ssh_gateway_host_keys
+    real_parse = orchestrator.main._parse_ssh_gateway_host_keys
 
     def counting_parse(paths_value):
         parses.append(paths_value)
         return real_parse(paths_value)
 
-    monkeypatch.setattr(main, "_parse_ssh_gateway_host_keys", counting_parse)
+    monkeypatch.setattr(
+        orchestrator.main, "_parse_ssh_gateway_host_keys", counting_parse
+    )
 
-    first = await main.get_ssh_host_keys(request=object())
-    second = await main.get_ssh_host_keys(request=object())
+    first = await orchestrator.main.get_ssh_host_keys(request=object())
+    second = await orchestrator.main.get_ssh_host_keys(request=object())
 
     assert first["host_keys"], "guard: the read must have succeeded to be cacheable"
     assert first["host_keys"] == second["host_keys"]
@@ -235,7 +239,7 @@ async def test_a_complete_read_is_cached(monkeypatch, tmp_path):
 async def test_unconfigured_returns_an_empty_list(monkeypatch):
     monkeypatch.delenv("SSH_GATEWAY_PUBLIC_HOST_KEYS", raising=False)
     monkeypatch.delenv("SSH_GATEWAY_HOSTNAME", raising=False)
-    result = await main.get_ssh_host_keys(request=object())
+    result = await orchestrator.main.get_ssh_host_keys(request=object())
     assert result["host_keys"] == []
     assert result["hostname"] == ""
 
@@ -254,7 +258,7 @@ def test_anonymous_http_get_reaches_the_handler(monkeypatch, tmp_path):
     monkeypatch.setenv("SSH_GATEWAY_PUBLIC_HOST_KEYS", str(pub))
     monkeypatch.setenv("SSH_GATEWAY_HOSTNAME", "ssh.srw.works")
 
-    response = TestClient(main.app, raise_server_exceptions=False).get(
+    response = TestClient(orchestrator.main.app, raise_server_exceptions=False).get(
         "/api/ssh/host-keys"
     )
 

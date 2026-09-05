@@ -22,9 +22,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from services import notification_catalog as cat
-from services import notification_steps as engine
-from services.notification_service import NotificationService
+from orchestrator.services import notification_catalog as cat
+from orchestrator.services import notification_steps as engine
+from orchestrator.services.notification_service import NotificationService
 
 USER = "11111111-1111-1111-1111-111111111111"
 NOW = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)

@@ -13,10 +13,10 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
-from src.core.message_markers import PERSIST_ROLE_KEY
-from src.core.workspace_injection import create_phase_instruction_message
-from src.subagents import seed_fork_history
-from src.subagents.fork import FORK_NOTICE, _conforming_tool_call_id
+from shared.runtime.core.message_markers import PERSIST_ROLE_KEY
+from shared.runtime.core.workspace_injection import create_phase_instruction_message
+from agent.subagents import seed_fork_history
+from agent.subagents.fork import FORK_NOTICE, _conforming_tool_call_id
 
 
 def _parent_history():
@@ -228,7 +228,7 @@ class TestSeedForkHistory:
 
     def test_mistral_fork_ids_are_fresh_nine_alphanumeric_values(self):
         with patch(
-            "src.subagents.fork._conforming_tool_call_id",
+            "agent.subagents.fork._conforming_tool_call_id",
             wraps=_conforming_tool_call_id,
         ) as conforming:
             seed = seed_fork_history(
@@ -257,7 +257,7 @@ class TestSeedForkHistory:
     def test_sanitizes_across_model_families(self):
         history = [HumanMessage(content="hi"), AIMessage(content="ok")]
         with patch(
-            "src.subagents.fork.sanitize_history_for_provider_boundary",
+            "agent.subagents.fork.sanitize_history_for_provider_boundary",
             wraps=lambda msgs, model: list(msgs),
         ) as spy:
             seed_fork_history(
@@ -286,7 +286,7 @@ class TestSeedForkHistory:
             return list(messages)
 
         with patch(
-            "src.subagents.fork.sanitize_history_for_provider_boundary",
+            "agent.subagents.fork.sanitize_history_for_provider_boundary",
             side_effect=_sanitize,
         ):
             seed = seed_fork_history(

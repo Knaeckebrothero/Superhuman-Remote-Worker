@@ -15,18 +15,11 @@ Tests cover:
 
 import asyncio
 import json
-import sys
-from pathlib import Path
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
 from orchestrator.services.vm_lifecycle_auth import sign_payload
-
-# Add project root to path
-project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
 
 PROVISION_GENERATION = "00000000-0000-4000-8000-000000000001"
 
@@ -105,7 +98,7 @@ def mock_db():
 @pytest.fixture
 def leader():
     """Mark this replica as the elected leader for register/probe tests."""
-    from services.leader_election import is_leader
+    from orchestrator.services.leader_election import is_leader
 
     is_leader.set()
     try:
@@ -1072,8 +1065,10 @@ class TestOnDaemonRegister:
     async def test_current_generation_seed_is_pinned_and_post_revalidated(
         self, bridge_with_db, mock_db, monkeypatch
     ):
-        from security.vm_guest import VmGuestIdentity
-        from services.container_provisioner import WorkspaceRuntimeAttestation
+        from orchestrator.security.vm_guest import VmGuestIdentity
+        from orchestrator.services.container_provisioner import (
+            WorkspaceRuntimeAttestation,
+        )
 
         fingerprint = "SHA256:" + ("A" * 43)
         attestation = WorkspaceRuntimeAttestation(
@@ -1097,10 +1092,14 @@ class TestOnDaemonRegister:
                 effects.append(target)
             return target is not None
 
-        monkeypatch.setattr("services.vm_provisioner.vm_provisioner", provisioner)
-        monkeypatch.setattr("services.ide_settings.seed_ide_config_for_user", seed)
         monkeypatch.setattr(
-            "services.snapshot_service.snapshot_service",
+            "orchestrator.services.vm_provisioner.vm_provisioner", provisioner
+        )
+        monkeypatch.setattr(
+            "orchestrator.services.ide_settings.seed_ide_config_for_user", seed
+        )
+        monkeypatch.setattr(
+            "orchestrator.services.snapshot_service.snapshot_service",
             MagicMock(is_available=False),
         )
         identity = VmGuestIdentity("job", "job-current", PROVISION_GENERATION)
@@ -1138,8 +1137,10 @@ class TestOnDaemonRegister:
     async def test_replaced_vm_reusing_endpoint_receives_zero_seed_bytes(
         self, bridge_with_db, mock_db, monkeypatch
     ):
-        from security.vm_guest import VmGuestIdentity
-        from services.container_provisioner import WorkspaceRuntimeAttestation
+        from orchestrator.security.vm_guest import VmGuestIdentity
+        from orchestrator.services.container_provisioner import (
+            WorkspaceRuntimeAttestation,
+        )
 
         fingerprint_a = "SHA256:" + ("A" * 43)
         fingerprint_b = "SHA256:" + ("B" * 43)
@@ -1170,10 +1171,14 @@ class TestOnDaemonRegister:
                 effects.append(target)
             return target is not None
 
-        monkeypatch.setattr("services.vm_provisioner.vm_provisioner", provisioner)
-        monkeypatch.setattr("services.ide_settings.seed_ide_config_for_user", seed)
         monkeypatch.setattr(
-            "services.snapshot_service.snapshot_service",
+            "orchestrator.services.vm_provisioner.vm_provisioner", provisioner
+        )
+        monkeypatch.setattr(
+            "orchestrator.services.ide_settings.seed_ide_config_for_user", seed
+        )
+        monkeypatch.setattr(
+            "orchestrator.services.snapshot_service.snapshot_service",
             MagicMock(is_available=False),
         )
         identity = VmGuestIdentity("job", "job-replaced", PROVISION_GENERATION)
@@ -1486,7 +1491,7 @@ class TestOnDaemonRegister:
 
     @pytest.mark.asyncio
     async def test_register_ignored_on_follower(self, bridge_with_db, mock_db):
-        from services.leader_election import is_leader
+        from orchestrator.services.leader_election import is_leader
 
         is_leader.clear()
         callback = MagicMock()

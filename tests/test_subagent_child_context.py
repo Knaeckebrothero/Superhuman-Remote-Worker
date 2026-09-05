@@ -10,16 +10,16 @@ from collections import deque
 import pytest
 from langchain_core.tools import tool
 
-from src.core.loader import LLMConfig, ROSTER_INHERIT_MARKER
-from src.core.subagent_roster import resolve_subagent_roster
-from src.core.workspace import WorkspaceManager, WorkspaceManagerConfig
-from src.subagents import (
+from shared.runtime.core.loader import LLMConfig, ROSTER_INHERIT_MARKER
+from shared.runtime.core.subagent_roster import resolve_subagent_roster
+from agent.core.workspace import WorkspaceManager, WorkspaceManagerConfig
+from agent.subagents import (
     SimpleParentHost,
     SpawnRefused,
     build_child,
     build_child_config,
 )
-from src.subagents.child import (
+from agent.subagents.child import (
     CONTROL_PLANE_CATEGORIES,
     DELEGATION_TOOL_NAMES,
     WRITE_TOOLS,
@@ -36,7 +36,7 @@ from src.subagents.child import (
     select_child_tool_names,
     write_policy_violation,
 )
-from src.tools.context import ToolContext
+from agent.tools.context import ToolContext
 from tests._fake_chat_model import FakeChatModel
 from tests._fs_backend import FilesystemTestBackend
 
@@ -88,7 +88,7 @@ def _parent(tmp_path, *, git=False, names=None):
     )
     ws._initialized = True
     if git:
-        from src.managers.git_manager import GitManager
+        from agent.managers.git_manager import GitManager
 
         ws._git_manager = GitManager(root)
     ctx = ToolContext(
@@ -214,9 +214,12 @@ class TestToolSelection:
         """
         from orchestrator.main import _critic_config_override
         from orchestrator.services.config_resolver import resolve_config
-        from src.core.loader import get_all_tool_names, load_config_from_resolved
-        from src.core.tool_policy import expand_category_true
-        from src.tools.registry import TOOL_REGISTRY
+        from shared.runtime.core.loader import (
+            get_all_tool_names,
+            load_config_from_resolved,
+        )
+        from shared.runtime.core.tool_policy import expand_category_true
+        from agent.tools.registry import TOOL_REGISTRY
 
         blob = resolve_config(
             base_config_name="critic",
@@ -533,15 +536,15 @@ class TestChildTabNames:
     )
     @pytest.mark.parametrize("tab", ["default", "build", "a" * 15])
     def test_prefixed_tab_matches_the_transport_pattern(self, handle, tab):
-        from src.core.backends.remote import TAB_NAME_PATTERN
-        from src.subagents.child import child_tab_prefix
+        from shared.runtime.core.backends.remote import TAB_NAME_PATTERN
+        from agent.subagents.child import child_tab_prefix
 
         name = f"{child_tab_prefix(handle)}{tab}"
         assert TAB_NAME_PATTERN.fullmatch(name), name
 
     def test_prefix_is_short_enough_to_leave_the_child_a_usable_budget(self):
-        from src.core.backends.remote import TAB_NAME_PATTERN
-        from src.subagents.child import child_tab_prefix
+        from shared.runtime.core.backends.remote import TAB_NAME_PATTERN
+        from agent.subagents.child import child_tab_prefix
 
         prefix = child_tab_prefix("implementer-1cb8")
         assert len(prefix) == 5
@@ -550,7 +553,7 @@ class TestChildTabNames:
         assert not TAB_NAME_PATTERN.fullmatch(prefix + "a" * 16)
 
     def test_distinct_children_get_distinct_prefixes(self):
-        from src.subagents.child import child_tab_prefix
+        from agent.subagents.child import child_tab_prefix
 
         assert child_tab_prefix("implementer-1cb8") != child_tab_prefix("tester-afa0")
 
@@ -598,7 +601,7 @@ class TestBuildWorktree:
     async def test_revival_reuses_exact_branch_and_transport_safe_tab_prefix(
         self, tmp_path
     ):
-        from src.core.backends.remote import TAB_NAME_PATTERN
+        from shared.runtime.core.backends.remote import TAB_NAME_PATTERN
 
         ctx, root = _parent(tmp_path, git=True)
         entry = _entry(
@@ -941,7 +944,7 @@ class TestWritePolicy:
         await third.release()
 
     def test_write_tools_cover_the_registered_mutators(self):
-        from src.tools.registry import TOOL_REGISTRY
+        from agent.tools.registry import TOOL_REGISTRY
 
         registered = {
             n for n, m in TOOL_REGISTRY.items() if m.get("category") == "workspace"
@@ -967,7 +970,7 @@ def test_rebase_context_resets_the_parent_side_subagent_stashes():
     admission fence and audit stamp are cleared on the copy (depth 1)."""
     import copy
 
-    from src.core.loader import load_agent_config_from_dict
+    from shared.runtime.core.loader import load_agent_config_from_dict
 
     parent = ToolContext(
         config={"agent_id": "developer"},

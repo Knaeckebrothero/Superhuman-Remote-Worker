@@ -17,10 +17,10 @@ from pathlib import Path
 
 import pytest
 
-from database.postgres import KNOWN_JOB_ORIGINS
+from orchestrator.database.postgres import KNOWN_JOB_ORIGINS
 
 ROOT = Path(__file__).resolve().parents[1]
-ORCHESTRATOR = ROOT / "orchestrator"
+ORCHESTRATOR = ROOT / "src" / "orchestrator"
 
 
 class TestVocabulary:
@@ -51,7 +51,7 @@ class TestSubmittedJobOriginResolution:
 
     @pytest.fixture(autouse=True)
     def _resolver(self):
-        from main import _resolve_submitted_job_origin
+        from orchestrator.main import _resolve_submitted_job_origin
 
         self.resolve = _resolve_submitted_job_origin
 
@@ -109,7 +109,7 @@ class TestSubmittedJobOriginResolution:
 class TestCreateJobValidatesOrigin:
     @pytest.mark.asyncio
     async def test_an_unknown_origin_raises_rather_than_writing(self):
-        from database.postgres import PostgresDB
+        from orchestrator.database.postgres import PostgresDB
 
         db = PostgresDB.__new__(PostgresDB)
         with pytest.raises(ValueError, match="Unsupported job origin"):
@@ -117,7 +117,7 @@ class TestCreateJobValidatesOrigin:
 
     @pytest.mark.asyncio
     async def test_a_typo_in_a_known_value_still_raises(self):
-        from database.postgres import PostgresDB
+        from orchestrator.database.postgres import PostgresDB
 
         db = PostgresDB.__new__(PostgresDB)
         with pytest.raises(ValueError, match="Unsupported job origin"):
@@ -130,7 +130,7 @@ class TestAgentsCannotInsertJobs:
         """It was a raw INSERT INTO jobs bypassing the stamp, the authority
         columns and execution-lane inheritance. It had no callers, but
         src/agent.py holds the object and calls siblings on it."""
-        from src.database.postgres_db import JobsNamespace
+        from agent.database.postgres_db import JobsNamespace
 
         namespace = JobsNamespace(db=object())
         with pytest.raises(NotImplementedError, match="must not insert jobs"):
@@ -206,7 +206,7 @@ class TestEveryCreationPathStamps:
         """The helper is the only place the stamp can be applied, so anything
         writing the table directly bypasses it entirely."""
         offenders: list[str] = []
-        for root in (ORCHESTRATOR, ROOT / "src"):
+        for root in (ORCHESTRATOR, ROOT / "src" / "agent"):
             for path in sorted(root.rglob("*.py")):
                 text = path.read_text()
                 if "INSERT INTO jobs " not in text and "INSERT INTO jobs\n" not in text:

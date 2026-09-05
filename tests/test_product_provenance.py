@@ -16,19 +16,19 @@ from uuid import UUID
 import pytest
 import yaml
 
-from services.product_capabilities import (
+from orchestrator.services.product_capabilities import (
     ProductCapabilityService,
     ResolutionRequest,
     registered_agent_provenance,
 )
 from orchestrator.database.postgres import PostgresDB
-from src.core.product_capabilities import (
+from shared.runtime.core.product_capabilities import (
     ComponentProvenance,
     ProductComponent,
     ProvenanceStatus,
     REGISTRY_REVISION,
 )
-from src.core.runtime_provenance import (
+from shared.runtime.core.runtime_provenance import (
     build_product_provenance,
     component_provenance_from_environment,
     inherited_content_provenance,

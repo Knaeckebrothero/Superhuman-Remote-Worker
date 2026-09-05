@@ -246,7 +246,10 @@ async def test_http_stateless_remote_is_contained_before_network_connect():
             main, "require_approved_user", AsyncMock(return_value={"id": "u"})
         ),
         patch.object(main, "user_can_access_ide_entity", AsyncMock(return_value=True)),
-        patch("services.ssh_helpers.orchestrator_can_reach", return_value=True),
+        patch(
+            "orchestrator.services.ssh_helpers.orchestrator_can_reach",
+            return_value=True,
+        ),
         patch("httpx.AsyncClient") as client,
         pytest.raises(HTTPException) as exc,
     ):
@@ -320,7 +323,10 @@ async def test_ws_stateless_remote_without_a_credential_is_refused():
             AsyncMock(return_value={"id": "u", "is_approved": True}),
         ),
         patch.object(main, "user_can_access_ide_entity", AsyncMock(return_value=True)),
-        patch("services.ssh_helpers.orchestrator_can_reach", return_value=True),
+        patch(
+            "orchestrator.services.ssh_helpers.orchestrator_can_reach",
+            return_value=True,
+        ),
         patch("websockets.connect", side_effect=connect),
     ):
         await main.ide_proxy_ws(ws, "thread-a", "workspace")

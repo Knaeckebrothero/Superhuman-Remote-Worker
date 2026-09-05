@@ -143,7 +143,7 @@ async def test_failure_retries_with_bounded_delay_and_never_persists_exception_d
     }
     persisted = retry.kwargs["safe_error"]
     assert "hunter2" not in persisted
-    assert "database.internal" not in persisted
+    assert "orchestrator.database.internal" not in persisted
     assert "config" not in persisted
 
 

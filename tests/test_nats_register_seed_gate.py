@@ -18,8 +18,8 @@ import json
 import pytest
 from unittest.mock import AsyncMock
 
-from services.leader_election import is_leader
-from services.nats_bridge import NatsBridge
+from orchestrator.services.leader_election import is_leader
+from orchestrator.services.nats_bridge import NatsBridge
 
 
 class FakeMsg:

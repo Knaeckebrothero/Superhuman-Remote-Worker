@@ -108,17 +108,17 @@ A filed finding. Note the header (Type/Severity/Confidence) is *derived from* th
 > The report-export engine is fully implemented and unit-tested, but no UI, CLI, or documented API path invokes it. A user following the README cannot export anything: the feature exists only as an internal module.
 >
 > ## Evidence
-> - **Commands / searches run**: `grep -rn "export_report" src/ orchestrator/main.py cockpit/src/`; launched the app (`npm start`) and walked every menu.
-> - **Observed (actual)**: `export_report()` is defined at `src/export/engine.py:1` and called only from `tests/test_export.py:12`. No route in `orchestrator/main.py`, no control in the cockpit, no CLI flag. The running UI has no "export" affordance on any screen.
+> - **Commands / searches run**: `grep -rn "export_report" src/ src/orchestrator/main.py cockpit/src/`; launched the app (`npm start`) and walked every menu.
+> - **Observed (actual)**: `export_report()` is defined at `src/export/engine.py:1` and called only from `tests/test_export.py:12`. No route in `src/orchestrator/main.py`, no control in the cockpit, no CLI flag. The running UI has no "export" affordance on any screen.
 > - **Expected + source**: README §"What it does" lists "export your report as PDF" as a primary user capability (documented, not inferred).
 > - **Reproducibility**: always.
 > - **Environment**: build sha-3a8579c, cockpit at `https://localhost/`, user role `test`, checked 2026-07-07.
-> - **Locations**: present `src/export/engine.py:1`; absent from `orchestrator/main.py`, `cockpit/src/app/**`.
+> - **Locations**: present `src/export/engine.py:1`; absent from `src/orchestrator/main.py`, `cockpit/src/app/**`.
 >
 > ## Reproduction / Audit Trail
 > 1. Fresh checkout, `npm start`, log in as `test`.
 > 2. Open every page/menu; search the UI for "export" → none present.
-> 3. `grep -rn "export" cockpit/src/` → zero call sites; `grep -rn "export_report" orchestrator/main.py` → zero routes.
+> 3. `grep -rn "export" cockpit/src/` → zero call sites; `grep -rn "export_report" src/orchestrator/main.py` → zero routes.
 >
 > ## User Impact
 > The one capability the README sells as primary is unreachable. Every user who came to export a report is blocked with no workaround; the shipped, tested engine delivers zero user value.

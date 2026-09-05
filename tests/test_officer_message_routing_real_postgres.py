@@ -26,11 +26,12 @@ import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
 from orchestrator.database.postgres import PostgresDB
-from services import message_routing
-from services.notification_service import RecordResult
+from orchestrator.services import message_routing
+from orchestrator.services.notification_service import RecordResult
 
 SCHEMA_FILE = (
     Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "schema_current.sql"

@@ -4,8 +4,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.tools.context import ToolContext
-from src.tools.repo import create_repo_tools
+from agent.tools.context import ToolContext
+from agent.tools.repo import create_repo_tools
 
 
 def make_context(read_only=False, forge="github"):
@@ -246,7 +246,7 @@ async def test_repo_pr_status_is_allowed_on_read_only_datasource():
     tool = get_tool(create_repo_tools(context), "repo_pr_status")
 
     with patch(
-        "src.tools.repo.repo_tools.get_pull_request_status",
+        "agent.tools.repo.repo_tools.get_pull_request_status",
         return_value={
             "number": 9,
             "url": "https://github.com/acme/widget/pull/9",
@@ -273,11 +273,11 @@ async def test_repo_open_pr_calls_the_forge_adapter():
 
     with (
         patch(
-            "src.tools.repo.repo_tools.open_pull_request",
+            "agent.tools.repo.repo_tools.open_pull_request",
             return_value={"number": 9, "url": "https://gh/pr/9"},
         ) as mock_pr,
         patch(
-            "src.tools.repo.repo_tools.get_pull_request_status",
+            "agent.tools.repo.repo_tools.get_pull_request_status",
             return_value={
                 "number": 9,
                 "url": "https://gh/pr/9",
@@ -320,8 +320,8 @@ async def test_repo_open_pr_refuses_invalid_datasource_authority_before_forge(
     tool = get_tool(create_repo_tools(context), "repo_open_pr")
 
     with (
-        patch("src.tools.repo.repo_tools.open_pull_request") as mock_open,
-        patch("src.tools.repo.repo_tools.get_pull_request_status") as mock_status,
+        patch("agent.tools.repo.repo_tools.open_pull_request") as mock_open,
+        patch("agent.tools.repo.repo_tools.get_pull_request_status") as mock_status,
     ):
         out = await tool.ainvoke({"repo": "widget", "title": "T", "base": "develop"})
 
@@ -343,11 +343,11 @@ async def test_repo_open_pr_persists_structured_delivery_against_the_job():
 
     with (
         patch(
-            "src.tools.repo.repo_tools.open_pull_request",
+            "agent.tools.repo.repo_tools.open_pull_request",
             return_value={"number": 9, "url": "https://github.com/acme/widget/pull/9"},
         ),
         patch(
-            "src.tools.repo.repo_tools.get_pull_request_status",
+            "agent.tools.repo.repo_tools.get_pull_request_status",
             return_value={
                 "number": 9,
                 "url": "https://github.com/acme/widget/pull/9",
@@ -401,11 +401,11 @@ async def test_repo_open_pr_reports_when_the_opened_pr_cannot_be_persisted():
 
     with (
         patch(
-            "src.tools.repo.repo_tools.open_pull_request",
+            "agent.tools.repo.repo_tools.open_pull_request",
             return_value={"number": 9, "url": "https://github.com/acme/widget/pull/9"},
         ),
         patch(
-            "src.tools.repo.repo_tools.get_pull_request_status",
+            "agent.tools.repo.repo_tools.get_pull_request_status",
             return_value={
                 "number": 9,
                 "url": "https://github.com/acme/widget/pull/9",
@@ -435,11 +435,11 @@ async def test_repo_open_pr_does_not_hide_an_opened_pr_when_persistence_raises()
 
     with (
         patch(
-            "src.tools.repo.repo_tools.open_pull_request",
+            "agent.tools.repo.repo_tools.open_pull_request",
             return_value={"number": 9, "url": "https://github.com/acme/widget/pull/9"},
         ),
         patch(
-            "src.tools.repo.repo_tools.get_pull_request_status",
+            "agent.tools.repo.repo_tools.get_pull_request_status",
             return_value={
                 "number": 9,
                 "url": "https://github.com/acme/widget/pull/9",
@@ -462,7 +462,7 @@ async def test_repo_open_pr_refuses_a_model_selected_non_current_head():
     context, _ = make_context()
     tool = get_tool(create_repo_tools(context), "repo_open_pr")
 
-    with patch("src.tools.repo.repo_tools.open_pull_request") as mock_open:
+    with patch("agent.tools.repo.repo_tools.open_pull_request") as mock_open:
         out = await tool.ainvoke(
             {
                 "repo": "widget",
@@ -485,7 +485,7 @@ async def test_repo_open_pr_refuses_an_unpushed_current_branch():
     }.get(ref)
     tool = get_tool(create_repo_tools(context), "repo_open_pr")
 
-    with patch("src.tools.repo.repo_tools.open_pull_request") as mock_open:
+    with patch("agent.tools.repo.repo_tools.open_pull_request") as mock_open:
         out = await tool.ainvoke({"repo": "widget", "title": "T", "base": "develop"})
 
     assert "not proven at the pushed remote revision" in out

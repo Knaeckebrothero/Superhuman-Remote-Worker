@@ -14,8 +14,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
-from src.core.workspace_backend import WorkspaceUnavailableError
-from src.persistent_graph import PersistentLoopCallbacks, _execute_turn
+from shared.runtime.core.workspace_backend import WorkspaceUnavailableError
+from agent.persistent_graph import PersistentLoopCallbacks, _execute_turn
 
 
 def _callbacks(**overrides) -> PersistentLoopCallbacks:

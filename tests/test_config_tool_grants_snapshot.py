@@ -41,14 +41,14 @@ from pathlib import Path
 
 import pytest
 
-from src.core.loader import (
+from shared.runtime.core.loader import (
     ToolsConfig,
     get_all_tool_names,
     load_agent_config,
     load_and_merge_config,
     resolve_config_path,
 )
-from src.tools.registry import expand_tool_wildcards
+from agent.tools.registry import expand_tool_wildcards
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _CONFIG_DIR = _REPO_ROOT / "config"

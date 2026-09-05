@@ -7,20 +7,20 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.core.backends.object_store import InMemoryObjectStore
-from src.core.backends.virtual import VirtualWorkspaceBackend
-from src.core.workspace import WorkspaceManager
-from src.tools.citation.sources import create_source_tools
-from src.tools.context import ToolContext
-from src.tools.research.papers import create_paper_tools
-from src.tools.research.utils.paper_types import (
+from shared.runtime.core.backends.object_store import InMemoryObjectStore
+from agent.core.backends.virtual import VirtualWorkspaceBackend
+from agent.core.workspace import WorkspaceManager
+from agent.tools.citation.sources import create_source_tools
+from agent.tools.context import ToolContext
+from agent.tools.research.papers import create_paper_tools
+from agent.tools.research.utils.paper_types import (
     AccessStatus,
     DownloadResult,
     Paper,
     PaperSource,
 )
-from src.tools.research.workflow import _download_available_papers
-from src.tools.webdav.tools import create_webdav_tools
+from agent.tools.research.workflow import _download_available_papers
+from agent.tools.webdav.tools import create_webdav_tools
 
 
 def _virtual_workspace() -> tuple[WorkspaceManager, VirtualWorkspaceBackend]:
@@ -224,7 +224,7 @@ async def test_research_workflow_download_writes_hostless_virtual_backend() -> N
         return path
 
     with patch(
-        "src.tools.research.workflow._download_single_arxiv",
+        "agent.tools.research.workflow._download_single_arxiv",
         side_effect=_download,
     ):
         results = await _download_available_papers([paper], context)
@@ -266,7 +266,7 @@ async def test_download_paper_writes_virtual_backend_without_host_heuristic() ->
         )
 
     with patch(
-        "src.tools.research.papers._try_arxiv_download",
+        "agent.tools.research.papers._try_arxiv_download",
         side_effect=_download,
     ):
         result = await tools["download_paper"].ainvoke(

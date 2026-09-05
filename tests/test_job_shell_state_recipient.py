@@ -8,7 +8,7 @@ import pytest
 from fastapi import HTTPException
 
 from orchestrator import main
-from src.api.models import PinnedJobRecipient
+from agent.api.models import PinnedJobRecipient
 
 
 AGENT_ID = "11111111-1111-4111-8111-111111111111"
@@ -46,11 +46,11 @@ def _shell_agent() -> tuple[MagicMock, MagicMock]:
 @pytest.fixture(params=["app", "dual_app"])
 def runtime_shell_endpoint(request):
     if request.param == "app":
-        from src.api import app as module
+        from agent.api import app as module
 
         app = module.create_app()
     else:
-        from src.api import dual_app as module
+        from agent.api import dual_app as module
 
         app = module.create_dual_app()
 

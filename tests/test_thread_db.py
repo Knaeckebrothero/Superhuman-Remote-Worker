@@ -928,7 +928,7 @@ class TestEndThread:
     async def test_force_end_token_zero_retires_legacy_unbound_permission(
         self, monkeypatch
     ):
-        from src.shared import session_permission_retirement
+        from shared import session_permission_retirement
 
         metadata = {
             "config_override": {"workspace": {"backend": "virtual"}},

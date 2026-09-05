@@ -30,9 +30,12 @@ from orchestrator.services.cloud.protected_reader_authority import (
 from orchestrator.services.cloud_staging.source_identity import (
     ProtectedMountSourceIdentity,
 )
-from src.api.persistent_app import _load_expert_config
-from src.core.tool_policy import ToolPolicyError, validate_tool_override_fragment
-from src.shared.runtime_actor import RuntimeActorContext
+from agent.api.persistent_app import _load_expert_config
+from shared.runtime.core.tool_policy import (
+    ToolPolicyError,
+    validate_tool_override_fragment,
+)
+from shared.runtime_actor import RuntimeActorContext
 
 
 _ATTACH_THREAD_ID = "10000000-0000-4000-8000-000000000001"
@@ -1984,8 +1987,8 @@ class TestAttachRoutesForwardConfigName:
     def test_both_attach_routes_forward_config_name(self):
         import inspect
 
-        import src.api.dual_app as dual_app
-        import src.api.persistent_app as papp
+        import agent.api.dual_app as dual_app
+        import agent.api.persistent_app as papp
 
         assert 'config_name=request.get("config_name")' in inspect.getsource(dual_app)
         assert '"config_name": request.get("config_name")' in inspect.getsource(
@@ -1998,7 +2001,7 @@ class TestAttachRoutesForwardConfigName:
         which broke the greppable Terminate(rest_detach) signal."""
         import inspect
 
-        import src.api.dual_app as dual_app
+        import agent.api.dual_app as dual_app
 
         assert '_terminate_session("rest_detach")' in inspect.getsource(dual_app)
 
@@ -2515,7 +2518,7 @@ class TestEndedSessionKeepsItsVolume:
         # Same import path main.py uses — `services.*` and `orchestrator.services.*`
         # load as distinct modules, and the dataclass equality below needs the
         # class identity to match.
-        from services.workspace_lifecycle import WorkspaceOwner
+        from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 
         for reclaim in (False, True):
             thread = {
@@ -2557,7 +2560,7 @@ class TestEndedSessionKeepsItsVolume:
 
     @pytest.mark.asyncio
     async def test_archive_refuses_false_kubernetes_teardown_result(self):
-        from services.workspace_lifecycle import WorkspaceOwner
+        from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 
         thread = {
             "id": "t1",

@@ -32,7 +32,7 @@ import time
 
 import pytest
 
-from services.ssh_gateway_token import (
+from orchestrator.services.ssh_gateway_token import (
     ATTACH_TOKEN_MAX_LENGTH,
     ATTACH_TOKEN_TTL_SECONDS,
     ATTACH_TOKEN_VERSION,
@@ -62,11 +62,11 @@ def test_the_token_names_its_version_so_it_can_never_be_a_challenge():
     would sit silent if the *challenge* were renamed onto our string. Either
     side moving onto the other is the collision that matters.
     """
-    import main
+    import orchestrator.main
 
     token, _ = mint_attach_token(USER, SECRET)
     assert token.startswith(ATTACH_TOKEN_VERSION + ":")
-    assert ATTACH_TOKEN_VERSION != main._SSH_CHALLENGE_VERSION
+    assert ATTACH_TOKEN_VERSION != orchestrator.main._SSH_CHALLENGE_VERSION
 
 
 def test_a_challenge_versioned_head_is_refused_by_the_version_check_itself():
@@ -86,7 +86,7 @@ def test_a_challenge_versioned_head_is_refused_by_the_version_check_itself():
     check is removed, or if the two versions ever collide, this authenticates
     -- and returns a user id.
     """
-    import main
+    import orchestrator.main
 
     expires = int(time.time() + 300)
 
@@ -102,7 +102,10 @@ def test_a_challenge_versioned_head_is_refused_by_the_version_check_itself():
     # which is the exact failure this test was written to replace.
     assert verify_attach_token(_signed(ATTACH_TOKEN_VERSION), SECRET) == USER
 
-    assert verify_attach_token(_signed(main._SSH_CHALLENGE_VERSION), SECRET) is None
+    assert (
+        verify_attach_token(_signed(orchestrator.main._SSH_CHALLENGE_VERSION), SECRET)
+        is None
+    )
 
 
 def test_an_ssh_key_registration_challenge_is_not_an_attach_token():
@@ -117,31 +120,31 @@ def test_an_ssh_key_registration_challenge_is_not_an_attach_token():
     challenge's fifth clause makes the expiry unparseable. Do not treat a pass
     here as evidence about the version check.
     """
-    import main
+    import orchestrator.main
 
     # _mint_ssh_key_challenge reads main's module-level secret, bound once at
     # import time, so drive it through the same value this file uses.
-    original = main._session_jwt_secret
-    main._session_jwt_secret = SECRET
+    original = orchestrator.main._session_jwt_secret
+    orchestrator.main._session_jwt_secret = SECRET
     try:
-        challenge, _ = main._mint_ssh_key_challenge(USER, "alice")
+        challenge, _ = orchestrator.main._mint_ssh_key_challenge(USER, "alice")
     finally:
-        main._session_jwt_secret = original
+        orchestrator.main._session_jwt_secret = original
 
     assert verify_attach_token(challenge, SECRET) is None
 
 
 def test_an_attach_token_is_not_an_ssh_key_registration_challenge():
     """The other direction: an attach token must not register a key."""
-    import main
+    import orchestrator.main
 
     token, _ = mint_attach_token(USER, SECRET)
-    original = main._session_jwt_secret
-    main._session_jwt_secret = SECRET
+    original = orchestrator.main._session_jwt_secret
+    orchestrator.main._session_jwt_secret = SECRET
     try:
-        assert main._verify_ssh_key_challenge(token, USER) is False
+        assert orchestrator.main._verify_ssh_key_challenge(token, USER) is False
     finally:
-        main._session_jwt_secret = original
+        orchestrator.main._session_jwt_secret = original
 
 
 def test_an_expired_token_is_refused():
@@ -230,15 +233,15 @@ def test_a_non_string_token_is_refused_rather_than_crashing():
 
 @pytest.fixture
 def approved_user(monkeypatch):
-    import main
+    import orchestrator.main
 
     user = {"id": USER, "is_approved": True}
 
     async def _require(request, db):
         return user
 
-    monkeypatch.setattr(main, "require_approved_user", _require)
-    monkeypatch.setattr(main, "_session_jwt_secret", SECRET)
+    monkeypatch.setattr(orchestrator.main, "require_approved_user", _require)
+    monkeypatch.setattr(orchestrator.main, "_session_jwt_secret", SECRET)
     return user
 
 
@@ -246,17 +249,17 @@ def test_the_minting_route_is_registered():
     """Without a route, nobody can ever obtain the credential the gateway
     demands, and the WSS transport is unreachable by design rather than by
     accident."""
-    import main
+    import orchestrator.main
     from tests._route_inventory import mounted_routes
 
-    assert ("POST", "/api/ssh/attach-token") in mounted_routes(main.app)
+    assert ("POST", "/api/ssh/attach-token") in mounted_routes(orchestrator.main.app)
 
 
 @pytest.mark.asyncio
 async def test_the_endpoint_mints_a_token_the_gateway_accepts(approved_user):
-    import main
+    import orchestrator.main
 
-    result = await main.create_ssh_attach_token(request=object())
+    result = await orchestrator.main.create_ssh_attach_token(request=object())
     assert verify_attach_token(result["token"], SECRET) == USER
     assert result["expires_at"]
 
@@ -267,21 +270,21 @@ async def test_the_endpoint_never_hands_out_the_internal_key(
 ):
     """Ruling G38 in one assertion: whatever this returns, it is not the
     platform's service-to-service credential."""
-    import main
+    import orchestrator.main
 
     monkeypatch.setenv("MCP_INTERNAL_KEY", "the-master-internal-key")
-    result = await main.create_ssh_attach_token(request=object())
+    result = await orchestrator.main.create_ssh_attach_token(request=object())
     assert "the-master-internal-key" not in result["token"]
 
 
 @pytest.mark.asyncio
 async def test_the_endpoint_fails_closed_without_the_secret(approved_user, monkeypatch):
-    import main
+    import orchestrator.main
     from fastapi import HTTPException
 
-    monkeypatch.setattr(main, "_session_jwt_secret", "")
+    monkeypatch.setattr(orchestrator.main, "_session_jwt_secret", "")
     with pytest.raises(HTTPException) as excinfo:
-        await main.create_ssh_attach_token(request=object())
+        await orchestrator.main.create_ssh_attach_token(request=object())
     assert excinfo.value.status_code == 503
 
 
@@ -290,7 +293,7 @@ async def test_a_project_scoped_token_cannot_mint_an_attach_token(monkeypatch):
     """Same gate, same reason as ``create_ssh_key``: this token opens a
     transport into every workspace its holder's keys can reach, and by the
     time the SSH layer authorizes, the MCP token's scope is long gone."""
-    import main
+    import orchestrator.main
     from fastapi import HTTPException
 
     scoped = {
@@ -305,10 +308,12 @@ async def test_a_project_scoped_token_cannot_mint_an_attach_token(monkeypatch):
     async def _no_audit(**kwargs):
         return None
 
-    monkeypatch.setattr(main, "require_approved_user", _require)
-    monkeypatch.setattr(main, "_session_jwt_secret", SECRET)
-    monkeypatch.setattr(main.postgres_db, "record_security_event", _no_audit)
+    monkeypatch.setattr(orchestrator.main, "require_approved_user", _require)
+    monkeypatch.setattr(orchestrator.main, "_session_jwt_secret", SECRET)
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db, "record_security_event", _no_audit
+    )
 
     with pytest.raises(HTTPException) as excinfo:
-        await main.create_ssh_attach_token(request=object())
+        await orchestrator.main.create_ssh_attach_token(request=object())
     assert excinfo.value.status_code == 403

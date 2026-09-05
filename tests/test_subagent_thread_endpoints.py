@@ -152,7 +152,7 @@ class TestCreateEndpoint:
         """``is_internal_call`` compares the header with the configured key
         and returns False when none is configured — a request without the
         header is 401 either way."""
-        from security.access import require_internal
+        from orchestrator.security.access import require_internal
 
         monkeypatch.setattr(m, "require_internal", require_internal)
         monkeypatch.setattr(

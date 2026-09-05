@@ -8,8 +8,8 @@ from uuid import UUID
 
 import pytest
 
-from services import canvas_ssh
-from services.canvas_ssh import (
+from orchestrator.services import canvas_ssh
+from orchestrator.services.canvas_ssh import (
     CANVAS_LOOPBACK_HOST,
     CanvasDirectChannelUnavailable,
     CanvasSSHError,

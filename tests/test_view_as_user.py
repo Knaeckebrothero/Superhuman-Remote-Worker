@@ -22,7 +22,7 @@ from uuid import UUID
 import pytest
 from fastapi import HTTPException
 
-from security import auth
+from orchestrator.security import auth
 
 
 # =============================================================================
@@ -237,7 +237,10 @@ class TestInlinePrivilegeGates:
         full-access tokens) returns silently. This test catches that.
         """
         main_py = (
-            pathlib.Path(__file__).resolve().parents[1] / "orchestrator" / "main.py"
+            pathlib.Path(__file__).resolve().parents[1]
+            / "src"
+            / "orchestrator"
+            / "main.py"
         ).read_text()
 
         # Locate the endpoint body
@@ -267,7 +270,10 @@ class TestInlinePrivilegeGates:
         a partial revert (one fixed, one not) is caught.
         """
         main_py = (
-            pathlib.Path(__file__).resolve().parents[1] / "orchestrator" / "main.py"
+            pathlib.Path(__file__).resolve().parents[1]
+            / "src"
+            / "orchestrator"
+            / "main.py"
         ).read_text()
 
         marker = "async def create_api_key("

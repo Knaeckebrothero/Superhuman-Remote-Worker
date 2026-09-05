@@ -41,7 +41,7 @@ from orchestrator.services.canvas_awareness import (
     fetch_canvas_awareness_snapshot,
     mutate_canvas_awareness,
 )
-from src.shared.run_queue import (
+from shared.run_queue import (
     ENQUEUE_DEDUPED,
     ENQUEUE_INPUT_RECORDED,
     ENQUEUE_INSERTED,
@@ -71,12 +71,12 @@ from src.shared.run_queue import (
     release_unit,
     unpark_unit,
 )
-from src.shared.thread_controls import (
+from shared.thread_controls import (
     adopt_next_pinned_control_request,
     fetch_next_control_request,
     finalize_control_request,
 )
-from src.shared.cloud_sync_generations import (
+from shared.cloud_sync_generations import (
     CloudSyncScope,
     acknowledge_cloud_sync_generation,
     arm_cloud_sync_generations,
@@ -84,7 +84,7 @@ from src.shared.cloud_sync_generations import (
     encode_cloud_sync_baseline,
     load_cloud_sync_requirements,
 )
-from src.shared.thread_presence import (
+from shared.thread_presence import (
     expire_permission_if_untethered,
     mark_stateless_natural_pause,
     promote_expired_stateless_pauses,
@@ -102,6 +102,7 @@ pytestmark = [
 
 _MIGRATIONS_DIR = (
     Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "migrations"

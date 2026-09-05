@@ -18,19 +18,19 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
-from src.core.context import (
+from agent.core.context import (
     ContextManager,
     ContextConfig,
     ConversationSummary,
     place_pinned_after_summary,
 )
-from src.core.message_markers import (
+from shared.runtime.core.message_markers import (
     PROTECTED_KEY,
     is_protected_message,
     protected_phase_key,
 )
-from src.core.workspace_injection import create_phase_instruction_message
-from src.core.summarizer import (
+from shared.runtime.core.workspace_injection import create_phase_instruction_message
+from agent.core.summarizer import (
     SummarizationEngine,
     SummarizationFailed,
     is_overflow_error,
@@ -69,7 +69,7 @@ def context_manager(context_config):
 
 def make_mock_aux(max_context_tokens=15_000):
     """Create a mock AuxiliaryLLM that returns structured summaries."""
-    from src.services.auxiliary import AuxiliaryLLM
+    from shared.runtime.services.auxiliary import AuxiliaryLLM
 
     llm = MagicMock()
 
@@ -102,7 +102,7 @@ def mock_llm():
 
 def make_failing_aux(error: Exception, max_context_tokens=15_000):
     """Create a mock AuxiliaryLLM whose every call raises ``error``."""
-    from src.services.auxiliary import AuxiliaryLLM
+    from shared.runtime.services.auxiliary import AuxiliaryLLM
 
     llm = MagicMock()
     structured_llm = AsyncMock()
@@ -115,7 +115,7 @@ def make_failing_aux(error: Exception, max_context_tokens=15_000):
 @pytest.fixture(autouse=True)
 def fast_backoff(monkeypatch):
     """No real sleeps between summarization retries in tests."""
-    monkeypatch.setattr("src.core.summarizer.BACKOFF_SECONDS", (0.0, 0.0))
+    monkeypatch.setattr("agent.core.summarizer.BACKOFF_SECONDS", (0.0, 0.0))
 
 
 def create_large_message_history(
@@ -221,7 +221,7 @@ class TestSummarizationPlanner:
     def test_unknown_window_falls_back_conservative(self):
         aux = make_mock_aux(max_context_tokens=None)
         engine = make_engine(aux)
-        from src.core.summarizer import DEFAULT_AUX_WINDOW
+        from agent.core.summarizer import DEFAULT_AUX_WINDOW
 
         assert engine.aux_window == DEFAULT_AUX_WINDOW
 
@@ -240,7 +240,7 @@ class TestChunkPlannerParity:
     def test_engine_delegates_byte_identically(self, mock_llm):
         import math
 
-        from src.core.chunk_planner import ChunkPlanner
+        from shared.runtime.core.chunk_planner import ChunkPlanner
 
         engine = make_engine(mock_llm)
         # A standalone planner built from the same authority as the engine's
@@ -273,7 +273,7 @@ class TestChunkPlannerParity:
         silently oversize every fold chunk (the 5dbb5770-class failure)."""
         import math
 
-        from src.core.chunk_planner import SAFETY_MARGIN
+        from shared.runtime.core.chunk_planner import SAFETY_MARGIN
 
         engine = make_engine(mock_llm)
         expected = (
@@ -290,7 +290,7 @@ class TestChunkPlannerOverlap:
     exceeds the budget and every part is still covered."""
 
     def _planner(self, overlap_ratio):
-        from src.core.chunk_planner import ChunkPlanner
+        from shared.runtime.core.chunk_planner import ChunkPlanner
 
         # Window comfortably above the 1_000-token planning floor.
         return ChunkPlanner(
@@ -442,7 +442,7 @@ class TestRollingFold:
             await engine.run(plan)
 
         assert exc_info.value.reason == "aux_unavailable"
-        from src.core.summarizer import MAX_ATTEMPTS
+        from agent.core.summarizer import MAX_ATTEMPTS
 
         structured = aux.llm.with_structured_output.return_value
         assert structured.ainvoke.call_count == MAX_ATTEMPTS
@@ -491,7 +491,7 @@ class TestOverflowDetection:
         assert is_overflow_error(e)
 
     def test_detects_aux_preflight_guard(self):
-        from src.services.auxiliary import AuxInputTooLarge
+        from shared.runtime.services.auxiliary import AuxInputTooLarge
 
         assert is_overflow_error(AuxInputTooLarge(951_682, 131_072, "SummarizeTask"))
 
@@ -510,7 +510,7 @@ class TestAuxPreflightGuard:
     async def test_chain_rejects_oversized_input(self):
         """Non-summarization aux tasks fail fast instead of overflowing at
         the transport (951k memory-extraction payloads to a 131k model)."""
-        from src.services.auxiliary import AuxInputTooLarge, SummarizeTask
+        from shared.runtime.services.auxiliary import AuxInputTooLarge, SummarizeTask
 
         aux = make_mock_aux(max_context_tokens=100)
         task = SummarizeTask(
@@ -528,7 +528,7 @@ class TestAuxPreflightGuard:
 
     @pytest.mark.asyncio
     async def test_chain_allows_fitting_input(self, mock_llm):
-        from src.services.auxiliary import SummarizeTask
+        from shared.runtime.services.auxiliary import SummarizeTask
 
         task = SummarizeTask(
             conversation_text="User: short conversation",
@@ -540,7 +540,7 @@ class TestAuxPreflightGuard:
 
     @pytest.mark.asyncio
     async def test_no_guard_when_window_unknown(self):
-        from src.services.auxiliary import SummarizeTask
+        from shared.runtime.services.auxiliary import SummarizeTask
 
         aux = make_mock_aux(max_context_tokens=None)
         task = SummarizeTask(
@@ -1837,7 +1837,7 @@ class TestPreserveMessageIdentity:
 
     @staticmethod
     def _history(n: int = 12):
-        from src.core.message_markers import stamp_turn_membership
+        from shared.runtime.core.message_markers import stamp_turn_membership
 
         body = "The quick brown fox jumps over the lazy dog. " * 8
         messages = []
@@ -1855,7 +1855,7 @@ class TestPreserveMessageIdentity:
         self, context_config, mock_llm
     ):
         from langchain_core.messages import RemoveMessage
-        from src.core.message_markers import turn_membership
+        from shared.runtime.core.message_markers import turn_membership
 
         manager = self._manager(context_config, preserve=True)
         messages = self._history()
@@ -1891,7 +1891,7 @@ class TestPreserveMessageIdentity:
         self, context_config, mock_llm
     ):
         from langchain_core.messages import RemoveMessage
-        from src.core.message_markers import (
+        from shared.runtime.core.message_markers import (
             PROTECTED_KEY,
             pin_turn_input,
             unpin_turn_input,

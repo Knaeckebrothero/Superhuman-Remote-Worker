@@ -18,8 +18,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from services.officer_backlog import pool_status_lines, ready_depth_by_pool
-from services.officer_slots import (
+from orchestrator.services.officer_backlog import pool_status_lines, ready_depth_by_pool
+from orchestrator.services.officer_slots import (
     below_floor_pools,
     capacity_lines,
     validate_slots_spec,
@@ -342,7 +342,7 @@ class TestReadyDepth:
     async def test_candidate_ceiling_is_unavailable_not_a_truncated_depth(
         self, monkeypatch
     ):
-        import services.officer_backlog as module
+        import orchestrator.services.officer_backlog as module
 
         monkeypatch.setattr(module, "_READY_DEPTH_MAX_CANDIDATES", 2)
         rows = [
@@ -501,9 +501,9 @@ class TestPrecedenceLaw:
     """§6: the slot's category decides the contract; a mismatch is named."""
 
     def _main(self):
-        import main
+        import orchestrator.main
 
-        return main
+        return orchestrator.main
 
     def test_a_pool_slot_resolves_its_category(self):
         main = self._main()
@@ -596,7 +596,10 @@ class TestBacklogDoctrineMatchesTheMachinery:
         assert "Two jobs must never work one ticket" in doctrine
 
     def test_the_breaker_window_it_quotes_matches_the_constant(self):
-        from services.officer_backlog import BREAKER_FAILURES, BREAKER_OPEN_MINUTES
+        from orchestrator.services.officer_backlog import (
+            BREAKER_FAILURES,
+            BREAKER_OPEN_MINUTES,
+        )
 
         doctrine = self._doctrine()
         assert BREAKER_FAILURES == 2 and "fails twice in a row" in doctrine

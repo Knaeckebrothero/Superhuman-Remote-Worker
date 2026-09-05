@@ -21,10 +21,8 @@ import json
 import re
 import secrets
 import subprocess
-import sys
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Sequence
 from uuid import UUID, NAMESPACE_URL, uuid4, uuid5
 
@@ -351,19 +349,15 @@ import os
 import sys
 from uuid import UUID
 
-for candidate in ("/app", "/app/orchestrator"):
-    if candidate not in sys.path:
-        sys.path.insert(0, candidate)
-
-from database.postgres import PostgresDB
-from services.container_provisioner import (
+from orchestrator.database.postgres import PostgresDB
+from orchestrator.services.container_provisioner import (
     ContainerProvisioner,
     STATELESS_WORKSPACE_PROCESS_ZERO_FINALIZER,
     WORKSPACE_CREATION_RESERVATION_ANNOTATION,
     _pvc_name_for,
     _pod_has_exact_process_zero,
 )
-from services.workspace_lifecycle import WorkspaceOwner
+from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 
 
 GATE_LABEL = "srw.io/local-managed-repository-residue-gate"
@@ -1855,36 +1849,24 @@ class ManagedRepositoryResidueGate:
 
         orchestrator_check = (
             "import os, pathlib\n"
-            "from database.postgres import PostgresDB\n"
-            "from services.container_provisioner import ContainerProvisioner\n"
-            "assert os.environ.get('WORKSPACE_CLEANUP_RECONCILIATION_ENABLED') "
-            "== 'false'\n"
+            "from orchestrator.database.postgres import PostgresDB\n"
+            "from orchestrator.services.container_provisioner import ContainerProvisioner\n"
+            "assert os.environ.get('WORKSPACE_CLEANUP_RECONCILIATION_ENABLED') == 'false'\n"
             "assert os.environ.get('WORKSPACE_REATTACH_FRESH_FALLBACK') == 'false'\n"
             "assert os.environ.get('OFFICER_AUTO_PULL_RELEASE_ENABLED') == 'false'\n"
-            "assert hasattr(ContainerProvisioner, "
-            "'request_workspace_creation_cancellation')\n"
-            "assert hasattr(ContainerProvisioner, "
-            "'prepare_workspace_cleanup_intent')\n"
-            "assert hasattr(ContainerProvisioner, "
-            "'reconcile_workspace_cleanup_intent')\n"
+            "assert hasattr(ContainerProvisioner, 'request_workspace_creation_cancellation')\n"
+            "assert hasattr(ContainerProvisioner, 'prepare_workspace_cleanup_intent')\n"
+            "assert hasattr(ContainerProvisioner, 'reconcile_workspace_cleanup_intent')\n"
             "assert hasattr(ContainerProvisioner, '_create_pvc')\n"
             "assert hasattr(ContainerProvisioner, '_create_service')\n"
-            "assert hasattr(ContainerProvisioner, "
-            "'_managed_repository_process_zero_replay_is_current')\n"
-            "assert hasattr(PostgresDB, "
-            "'reserve_managed_repository_workspace_creation')\n"
-            "assert hasattr(PostgresDB, "
-            "'record_managed_repository_workspace_creation_resource')\n"
-            "assert hasattr(PostgresDB, "
-            "'prepare_managed_repository_workspace_cleanup_intent')\n"
-            "assert hasattr(PostgresDB, "
-            "'record_stale_managed_repository_workspace_process_zero')\n"
-            "assert pathlib.Path('/app/database/migrations/app/"
-            "0193_managed_repository_process_zero_authority.sql').is_file()\n"
-            "assert pathlib.Path('/app/database/migrations/app/"
-            "0197_non_pinned_workspace_process_zero.sql').is_file()\n"
-            "assert pathlib.Path('/app/database/migrations/app/"
-            "0198_non_pinned_workspace_lifecycle_authority.sql').is_file()\n"
+            "assert hasattr(ContainerProvisioner, '_managed_repository_process_zero_replay_is_current')\n"
+            "assert hasattr(PostgresDB, 'reserve_managed_repository_workspace_creation')\n"
+            "assert hasattr(PostgresDB, 'record_managed_repository_workspace_creation_resource')\n"
+            "assert hasattr(PostgresDB, 'prepare_managed_repository_workspace_cleanup_intent')\n"
+            "assert hasattr(PostgresDB, 'record_stale_managed_repository_workspace_process_zero')\n"
+            "assert pathlib.Path('/app/src/orchestrator/database/migrations/app/0193_managed_repository_process_zero_authority.sql').is_file()\n"
+            "assert pathlib.Path('/app/src/orchestrator/database/migrations/app/0197_non_pinned_workspace_process_zero.sql').is_file()\n"
+            "assert pathlib.Path('/app/src/orchestrator/database/migrations/app/0198_non_pinned_workspace_lifecycle_authority.sql').is_file()\n"
         ).encode()
         for pod_name in self.orchestrator_pods:
             self.runner.run(
@@ -1909,12 +1891,12 @@ class ManagedRepositoryResidueGate:
         )
         agent_check = (
             "import inspect\n"
-            "from src.core.managed_repository import (\n"
+            "from shared.runtime.core.managed_repository import (\n"
             "    managed_repository_agent_launch_command,\n"
             "    managed_repository_agent_retirement_command,\n"
             "    managed_repository_agent_zero_command,\n"
             ")\n"
-            "from src.services.cloud_mount import RcloneMountManager\n"
+            "from shared.runtime.services.cloud_mount import RcloneMountManager\n"
             "assert '9>&-' in inspect.getsource(\n"
             "    managed_repository_agent_launch_command\n"
             ")\n"
@@ -2053,12 +2035,8 @@ class ManagedRepositoryResidueGate:
             raise GateFailure("workspace Pod UID was not captured")
         # Imported lazily so --help/plan and safety unit tests need no crypto or
         # orchestrator runtime dependencies.
-        root = Path(__file__).resolve().parent.parent
-        for candidate in (root, root / "orchestrator"):
-            if str(candidate) not in sys.path:
-                sys.path.insert(0, str(candidate))
-        from services.managed_repository_authority import _deploy_keypair
-        from src.core.managed_repository import (
+        from orchestrator.services.managed_repository_authority import _deploy_keypair
+        from shared.runtime.core.managed_repository import (
             managed_repository_agent_launch_command,
             managed_repository_agent_retirement_command,
             managed_repository_agent_zero_command,
@@ -2136,10 +2114,7 @@ class ManagedRepositoryResidueGate:
                 private_buffer[index] = 0
 
     def _exercise_cloud_timeout(self) -> None:
-        root = Path(__file__).resolve().parent.parent
-        if str(root) not in sys.path:
-            sys.path.insert(0, str(root))
-        from src.services.cloud_mount import RcloneMountManager
+        from shared.runtime.services.cloud_mount import RcloneMountManager
 
         marker = f"srw-cloud-{self.config.gate_id.rsplit('-', 1)[-1]}"
         script_path = f"/tmp/{marker}.sh"

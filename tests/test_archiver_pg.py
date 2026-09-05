@@ -19,9 +19,9 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
-from src.core.archiver import LLMArchiver
-from src.core.knowledge_injection import KNOWLEDGE_TOOL_CALL_ID_PREFIX
-from src.core.workspace_injection import (
+from agent.core.archiver import LLMArchiver
+from agent.core.knowledge_injection import KNOWLEDGE_TOOL_CALL_ID_PREFIX
+from shared.runtime.core.workspace_injection import (
     create_instruction_tool_messages,
     create_todos_human_message,
 )
@@ -189,7 +189,7 @@ def test_archive_error_folds_status_into_metadata(archiver, fw):
 
 
 def test_lean_job_metadata_strips_only_heavy_keys():
-    from src.core.archiver import _lean_job_metadata
+    from agent.core.archiver import _lean_job_metadata
 
     # No heavy keys → same object back (cheap identity path); None passes through.
     light = {"description": "d", "project_id": "p"}
@@ -381,7 +381,7 @@ def test_chat_delta_labels_phase_instruction_block_as_context(archiver, fw):
     """A delivered phase block is history, not a user turn: on its delivery
     turn it is archived as a context descriptor (kind=phase_instruction,
     labelled by the artifact path), never as a human bubble."""
-    from src.core.workspace_injection import create_phase_instruction_message
+    from shared.runtime.core.workspace_injection import create_phase_instruction_message
 
     block = create_phase_instruction_message(
         "skills/research-guide/SKILL.md", "GUIDE BODY", "tactical", "2:tactical"

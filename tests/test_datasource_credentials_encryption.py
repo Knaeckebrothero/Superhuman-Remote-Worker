@@ -14,12 +14,12 @@ import logging
 
 import pytest
 
-from database.postgres import (
+from orchestrator.database.postgres import (
     _datasource_row_to_dict,
     _decrypt_credentials_field,
     _encrypt_credentials_dict,
 )
-from security import crypto
+from orchestrator.security import crypto
 
 
 @pytest.fixture(autouse=True)

@@ -14,19 +14,13 @@ from __future__ import annotations
 import base64
 import json
 import os
-import sys
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-# Allow importing the orchestrator main module (matches test_transcribe.py).
-_ORCH = Path(__file__).parent.parent / "orchestrator"
-if str(_ORCH) not in sys.path:
-    sys.path.insert(0, str(_ORCH))
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
-from services.capability_credentials import CapabilityCredentials  # noqa: E402
+from orchestrator.services.capability_credentials import CapabilityCredentials  # noqa: E402
 
 
 def _credentials(model, base_url=None, api_key=None, *, provider=None, params=None):
@@ -43,7 +37,7 @@ def _credentials(model, base_url=None, api_key=None, *, provider=None, params=No
 def _clear_tts_caches():
     """The audio/formulation caches are module-level and persist across the
     process — clear them so tests don't bleed cache hits into one another."""
-    from services import tts
+    from orchestrator.services import tts
 
     tts._audio_cache.clear()
     tts._formulation_cache.clear()
@@ -113,13 +107,13 @@ def _caps(tts=("kokoro-strix", None, "sk-key"), aux=("gemma-aux", None, "sk-key"
 class TestGenerateMessageTts:
     @pytest.mark.asyncio
     async def test_returns_text_and_audio_on_success(self):
-        from services.tts import generate_message_tts
+        from orchestrator.services.tts import generate_message_tts
 
         cls, client = _mock_openai(speech=b"AUDIOBYTES")
         with (
-            patch("services.tts.AsyncOpenAI", cls),
+            patch("orchestrator.services.tts.AsyncOpenAI", cls),
             patch(
-                "services.tts._resolve_capability_credentials",
+                "orchestrator.services.tts._resolve_capability_credentials",
                 AsyncMock(return_value=_credentials("tts-1", None, "sk-key")),
             ),
         ):
@@ -136,13 +130,13 @@ class TestGenerateMessageTts:
 
     @pytest.mark.asyncio
     async def test_none_when_no_model_configured(self):
-        from services.tts import generate_message_tts
+        from orchestrator.services.tts import generate_message_tts
 
         cls, _ = _mock_openai()
         with (
-            patch("services.tts.AsyncOpenAI", cls),
+            patch("orchestrator.services.tts.AsyncOpenAI", cls),
             patch(
-                "services.tts._resolve_capability_credentials",
+                "orchestrator.services.tts._resolve_capability_credentials",
                 AsyncMock(return_value=None),
             ),
         ):
@@ -158,7 +152,7 @@ class TestGenerateMessageTts:
 
     @pytest.mark.asyncio
     async def test_none_on_empty_content(self):
-        from services.tts import generate_message_tts
+        from orchestrator.services.tts import generate_message_tts
 
         result = await generate_message_tts(
             content="   ",
@@ -173,13 +167,13 @@ class TestGenerateMessageTts:
     async def test_raises_when_synthesis_fails(self):
         """A configured model whose synthesis call errors must raise (→ 502),
         not silently return None (→ 204) — the whole point of the fix."""
-        from services.tts import TtsSynthesisError, generate_message_tts
+        from orchestrator.services.tts import TtsSynthesisError, generate_message_tts
 
         cls, client = _mock_openai(speech_error=RuntimeError("upstream 503"))
         with (
-            patch("services.tts.AsyncOpenAI", cls),
+            patch("orchestrator.services.tts.AsyncOpenAI", cls),
             patch(
-                "services.tts._resolve_capability_credentials",
+                "orchestrator.services.tts._resolve_capability_credentials",
                 AsyncMock(return_value=_credentials("tts-1", None, "sk-key")),
             ),
         ):
@@ -197,13 +191,13 @@ class TestGenerateMessageTts:
     async def test_raises_when_no_api_key(self):
         """A configured model with no resolvable key is a real misconfig — it
         must raise (→ 502), not look like 'not configured' (→ 204)."""
-        from services.tts import TtsSynthesisError, generate_message_tts
+        from orchestrator.services.tts import TtsSynthesisError, generate_message_tts
 
         cls, client = _mock_openai(speech=b"X")
         with (
-            patch("services.tts.AsyncOpenAI", cls),
+            patch("orchestrator.services.tts.AsyncOpenAI", cls),
             patch(
-                "services.tts._resolve_capability_credentials",
+                "orchestrator.services.tts._resolve_capability_credentials",
                 AsyncMock(return_value=_credentials("tts-1", None, None)),  # no api_key
             ),
         ):
@@ -221,14 +215,14 @@ class TestGenerateMessageTts:
     async def test_reformulation_rewrites_spoken_text(self):
         """With reformulate=True and markdown present, the returned spoken text
         is the auxiliary-LLM rewrite, not the raw markdown."""
-        from services.tts import generate_message_tts
+        from orchestrator.services.tts import generate_message_tts
 
         cls, client = _mock_openai(speech=b"AUDIO", chat_text="plain spoken prose")
         markdown = "Here is a table:\n\n| a | b |\n| - | - |\n| 1 | 2 |\n\nThat's all."
         with (
-            patch("services.tts.AsyncOpenAI", cls),
+            patch("orchestrator.services.tts.AsyncOpenAI", cls),
             patch(
-                "services.tts._resolve_capability_credentials",
+                "orchestrator.services.tts._resolve_capability_credentials",
                 AsyncMock(return_value=_credentials("tts-1", None, "sk-key")),
             ),
         ):
@@ -248,14 +242,14 @@ class TestGenerateMessageTts:
     @pytest.mark.asyncio
     async def test_uses_voice_from_params_json(self):
         """A TTS catalog model with params_json.voice uses that voice."""
-        from services.tts import generate_message_tts
+        from orchestrator.services.tts import generate_message_tts
 
         cls, client = _mock_openai(speech=b"AUDIO")
         db = _mock_db()
         with (
-            patch("services.tts.AsyncOpenAI", cls),
+            patch("orchestrator.services.tts.AsyncOpenAI", cls),
             patch(
-                "services.tts._resolve_capability_credentials",
+                "orchestrator.services.tts._resolve_capability_credentials",
                 AsyncMock(
                     return_value=_credentials(
                         "kokoro-strix",
@@ -280,13 +274,13 @@ class TestGenerateMessageTts:
     @pytest.mark.asyncio
     async def test_falls_back_to_default_voice_without_params(self):
         """No params_json voice → the per-language default (alloy for en)."""
-        from services.tts import generate_message_tts
+        from orchestrator.services.tts import generate_message_tts
 
         cls, client = _mock_openai(speech=b"AUDIO")
         with (
-            patch("services.tts.AsyncOpenAI", cls),
+            patch("orchestrator.services.tts.AsyncOpenAI", cls),
             patch(
-                "services.tts._resolve_capability_credentials",
+                "orchestrator.services.tts._resolve_capability_credentials",
                 AsyncMock(return_value=_credentials("kokoro-strix", None, "sk-key")),
             ),
         ):
@@ -306,13 +300,13 @@ class TestSynthesizeVoicePreview:
 
     @pytest.mark.asyncio
     async def test_uses_candidate_voice_and_returns_audio(self):
-        from services.tts import synthesize_voice_preview
+        from orchestrator.services.tts import synthesize_voice_preview
 
         cls, client = _mock_openai(speech=b"PREVIEW")
         with (
-            patch("services.tts.AsyncOpenAI", cls),
+            patch("orchestrator.services.tts.AsyncOpenAI", cls),
             patch(
-                "services.tts._resolve_capability_credentials",
+                "orchestrator.services.tts._resolve_capability_credentials",
                 AsyncMock(return_value=_credentials("kokoro-strix", None, "sk-key")),
             ),
         ):
@@ -329,13 +323,13 @@ class TestSynthesizeVoicePreview:
 
     @pytest.mark.asyncio
     async def test_auto_voice_resolves_language_default(self):
-        from services.tts import synthesize_voice_preview
+        from orchestrator.services.tts import synthesize_voice_preview
 
         cls, client = _mock_openai(speech=b"PREVIEW")
         with (
-            patch("services.tts.AsyncOpenAI", cls),
+            patch("orchestrator.services.tts.AsyncOpenAI", cls),
             patch(
-                "services.tts._resolve_capability_credentials",
+                "orchestrator.services.tts._resolve_capability_credentials",
                 AsyncMock(return_value=_credentials("kokoro-strix", None, "sk-key")),
             ),
         ):
@@ -349,13 +343,13 @@ class TestSynthesizeVoicePreview:
 
     @pytest.mark.asyncio
     async def test_german_language_speaks_german_phrase(self):
-        from services.tts import _PREVIEW_TEXT, synthesize_voice_preview
+        from orchestrator.services.tts import _PREVIEW_TEXT, synthesize_voice_preview
 
         cls, client = _mock_openai(speech=b"PREVIEW")
         with (
-            patch("services.tts.AsyncOpenAI", cls),
+            patch("orchestrator.services.tts.AsyncOpenAI", cls),
             patch(
-                "services.tts._resolve_capability_credentials",
+                "orchestrator.services.tts._resolve_capability_credentials",
                 AsyncMock(return_value=_credentials("kokoro-strix", None, "sk-key")),
             ),
         ):
@@ -371,13 +365,13 @@ class TestSynthesizeVoicePreview:
 
     @pytest.mark.asyncio
     async def test_custom_text_spoken_verbatim(self):
-        from services.tts import synthesize_voice_preview
+        from orchestrator.services.tts import synthesize_voice_preview
 
         cls, client = _mock_openai(speech=b"PREVIEW")
         with (
-            patch("services.tts.AsyncOpenAI", cls),
+            patch("orchestrator.services.tts.AsyncOpenAI", cls),
             patch(
-                "services.tts._resolve_capability_credentials",
+                "orchestrator.services.tts._resolve_capability_credentials",
                 AsyncMock(return_value=_credentials("kokoro-strix", None, "sk-key")),
             ),
         ):
@@ -398,13 +392,16 @@ class TestSynthesizeVoicePreview:
 
     @pytest.mark.asyncio
     async def test_custom_text_clamped_to_max(self):
-        from services.tts import _PREVIEW_TEXT_MAX, synthesize_voice_preview
+        from orchestrator.services.tts import (
+            _PREVIEW_TEXT_MAX,
+            synthesize_voice_preview,
+        )
 
         cls, client = _mock_openai(speech=b"PREVIEW")
         with (
-            patch("services.tts.AsyncOpenAI", cls),
+            patch("orchestrator.services.tts.AsyncOpenAI", cls),
             patch(
-                "services.tts._resolve_capability_credentials",
+                "orchestrator.services.tts._resolve_capability_credentials",
                 AsyncMock(return_value=_credentials("kokoro-strix", None, "sk-key")),
             ),
         ):
@@ -423,10 +420,10 @@ class TestSynthesizeVoicePreview:
 
     @pytest.mark.asyncio
     async def test_returns_none_when_no_tts_model(self):
-        from services.tts import synthesize_voice_preview
+        from orchestrator.services.tts import synthesize_voice_preview
 
         with patch(
-            "services.tts._resolve_capability_credentials",
+            "orchestrator.services.tts._resolve_capability_credentials",
             AsyncMock(return_value=None),
         ):
             audio = await synthesize_voice_preview(
@@ -439,13 +436,16 @@ class TestSynthesizeVoicePreview:
 
     @pytest.mark.asyncio
     async def test_raises_on_synthesis_failure(self):
-        from services.tts import TtsSynthesisError, synthesize_voice_preview
+        from orchestrator.services.tts import (
+            TtsSynthesisError,
+            synthesize_voice_preview,
+        )
 
         cls, _ = _mock_openai(speech_error=RuntimeError("boom"))
         with (
-            patch("services.tts.AsyncOpenAI", cls),
+            patch("orchestrator.services.tts.AsyncOpenAI", cls),
             patch(
-                "services.tts._resolve_capability_credentials",
+                "orchestrator.services.tts._resolve_capability_credentials",
                 AsyncMock(return_value=_credentials("kokoro-strix", None, "sk-key")),
             ),
         ):
@@ -465,17 +465,17 @@ class TestSynthesizeVoicePreview:
 
 class TestVoiceSelectionAndInstructions:
     def test_detect_language_english(self):
-        from services.tts import _detect_language
+        from orchestrator.services.tts import _detect_language
 
         assert _detect_language("This is a plain English sentence about a cat.") == "en"
 
     def test_detect_language_german_umlaut(self):
-        from services.tts import _detect_language
+        from orchestrator.services.tts import _detect_language
 
         assert _detect_language("Größe und Qualität sind wichtig.") == "de"
 
     def test_detect_language_german_function_words(self):
-        from services.tts import _detect_language
+        from orchestrator.services.tts import _detect_language
 
         assert (
             _detect_language("Der Test ist nicht fertig und das ist ein Problem.")
@@ -486,13 +486,13 @@ class TestVoiceSelectionAndInstructions:
     async def test_voice_follows_content_language_not_request_hint(self):
         """A German message uses the German default voice even when the request's
         language hint says 'en' (voice follows content, fixing defect 5)."""
-        from services.tts import DEFAULT_VOICE_DE, generate_message_tts
+        from orchestrator.services.tts import DEFAULT_VOICE_DE, generate_message_tts
 
         cls, client = _mock_openai(speech=b"AUDIO")
         with (
-            patch("services.tts.AsyncOpenAI", cls),
+            patch("orchestrator.services.tts.AsyncOpenAI", cls),
             patch(
-                "services.tts._resolve_capability_credentials",
+                "orchestrator.services.tts._resolve_capability_credentials",
                 AsyncMock(return_value=_credentials("gpt-4o-mini-tts", None, "sk-key")),
             ),
         ):
@@ -507,7 +507,7 @@ class TestVoiceSelectionAndInstructions:
 
     @pytest.mark.asyncio
     async def test_user_default_voice_overrides_catalog(self):
-        from services.tts import generate_message_tts
+        from orchestrator.services.tts import generate_message_tts
 
         cls, client = _mock_openai(speech=b"AUDIO")
         db = _mock_db()
@@ -516,9 +516,9 @@ class TestVoiceSelectionAndInstructions:
             return_value={"params_json": {"voice": "af_heart"}}
         )
         with (
-            patch("services.tts.AsyncOpenAI", cls),
+            patch("orchestrator.services.tts.AsyncOpenAI", cls),
             patch(
-                "services.tts._resolve_capability_credentials",
+                "orchestrator.services.tts._resolve_capability_credentials",
                 AsyncMock(return_value=_credentials("kokoro", None, "sk-key")),
             ),
         ):
@@ -533,14 +533,14 @@ class TestVoiceSelectionAndInstructions:
 
     @pytest.mark.asyncio
     async def test_per_language_voice_map(self):
-        from services.tts import generate_message_tts
+        from orchestrator.services.tts import generate_message_tts
 
         cls, client = _mock_openai(speech=b"AUDIO")
         db = _mock_db()
         with (
-            patch("services.tts.AsyncOpenAI", cls),
+            patch("orchestrator.services.tts.AsyncOpenAI", cls),
             patch(
-                "services.tts._resolve_capability_credentials",
+                "orchestrator.services.tts._resolve_capability_credentials",
                 AsyncMock(
                     return_value=_credentials(
                         "gpt-4o-mini-tts",
@@ -563,14 +563,14 @@ class TestVoiceSelectionAndInstructions:
 
     @pytest.mark.asyncio
     async def test_instructions_passed_through_when_set(self):
-        from services.tts import generate_message_tts
+        from orchestrator.services.tts import generate_message_tts
 
         cls, client = _mock_openai(speech=b"AUDIO")
         db = _mock_db()
         with (
-            patch("services.tts.AsyncOpenAI", cls),
+            patch("orchestrator.services.tts.AsyncOpenAI", cls),
             patch(
-                "services.tts._resolve_capability_credentials",
+                "orchestrator.services.tts._resolve_capability_credentials",
                 AsyncMock(
                     return_value=_credentials(
                         "gpt-4o-mini-tts",
@@ -600,13 +600,13 @@ class TestVoiceSelectionAndInstructions:
     async def test_no_instructions_kwarg_when_unset(self):
         """tts-1 / Kokoro reject an `instructions` param, so it must be omitted
         entirely (not sent as None) when no catalog instructions are set."""
-        from services.tts import generate_message_tts
+        from orchestrator.services.tts import generate_message_tts
 
         cls, client = _mock_openai(speech=b"AUDIO")
         with (
-            patch("services.tts.AsyncOpenAI", cls),
+            patch("orchestrator.services.tts.AsyncOpenAI", cls),
             patch(
-                "services.tts._resolve_capability_credentials",
+                "orchestrator.services.tts._resolve_capability_credentials",
                 AsyncMock(return_value=_credentials("tts-1", None, "sk-key")),
             ),
         ):
@@ -627,7 +627,7 @@ class TestVoiceSelectionAndInstructions:
 
 class TestTtsEndpoint:
     def test_route_is_registered(self):
-        from main import app
+        from orchestrator.main import app
 
         routes = {
             (m, getattr(r, "path", ""))
@@ -638,20 +638,20 @@ class TestTtsEndpoint:
 
     @pytest.mark.asyncio
     async def test_returns_json_text_and_audio(self):
-        import main
+        import orchestrator.main
 
         with (
             patch.object(
-                main,
+                orchestrator.main,
                 "require_thread_owner",
                 AsyncMock(return_value=({"id": "u1"}, {"id": "t1"})),
             ),
             patch(
-                "services.tts.generate_message_tts",
+                "orchestrator.services.tts.generate_message_tts",
                 AsyncMock(return_value=("spoken words", b"\x00\x01\x02")),
             ),
         ):
-            resp = await main.synthesize_thread_message_tts(
+            resp = await orchestrator.main.synthesize_thread_message_tts(
                 thread_id="t1", request=MagicMock(), body={"content": "hello"}
             )
         assert resp.status_code == 200
@@ -661,60 +661,60 @@ class TestTtsEndpoint:
 
     @pytest.mark.asyncio
     async def test_204_when_not_configured(self):
-        import main
+        import orchestrator.main
 
         with (
             patch.object(
-                main,
+                orchestrator.main,
                 "require_thread_owner",
                 AsyncMock(return_value=({"id": "u1"}, {"id": "t1"})),
             ),
             patch(
-                "services.tts.generate_message_tts",
+                "orchestrator.services.tts.generate_message_tts",
                 AsyncMock(return_value=None),
             ),
         ):
-            resp = await main.synthesize_thread_message_tts(
+            resp = await orchestrator.main.synthesize_thread_message_tts(
                 thread_id="t1", request=MagicMock(), body={"content": "hello"}
             )
         assert resp.status_code == 204
 
     @pytest.mark.asyncio
     async def test_502_on_synthesis_failure(self):
-        import main
+        import orchestrator.main
         from fastapi import HTTPException
 
-        from services.tts import TtsSynthesisError
+        from orchestrator.services.tts import TtsSynthesisError
 
         with (
             patch.object(
-                main,
+                orchestrator.main,
                 "require_thread_owner",
                 AsyncMock(return_value=({"id": "u1"}, {"id": "t1"})),
             ),
             patch(
-                "services.tts.generate_message_tts",
+                "orchestrator.services.tts.generate_message_tts",
                 AsyncMock(side_effect=TtsSynthesisError("down")),
             ),
         ):
             with pytest.raises(HTTPException) as exc:
-                await main.synthesize_thread_message_tts(
+                await orchestrator.main.synthesize_thread_message_tts(
                     thread_id="t1", request=MagicMock(), body={"content": "hello"}
                 )
         assert exc.value.status_code == 502
 
     @pytest.mark.asyncio
     async def test_400_on_empty_content(self):
-        import main
+        import orchestrator.main
         from fastapi import HTTPException
 
         with patch.object(
-            main,
+            orchestrator.main,
             "require_thread_owner",
             AsyncMock(return_value=({"id": "u1"}, {"id": "t1"})),
         ):
             with pytest.raises(HTTPException) as exc:
-                await main.synthesize_thread_message_tts(
+                await orchestrator.main.synthesize_thread_message_tts(
                     thread_id="t1", request=MagicMock(), body={"content": "   "}
                 )
         assert exc.value.status_code == 400
@@ -727,12 +727,12 @@ class TestTtsEndpoint:
 
 class TestChunkSplitting:
     def test_short_text_is_one_chunk(self):
-        from services.tts import _split_text_into_chunks
+        from orchestrator.services.tts import _split_text_into_chunks
 
         assert _split_text_into_chunks("Just a short line.") == ["Just a short line."]
 
     def test_long_text_splits_under_limit(self):
-        from services.tts import TTS_CHUNK_LIMIT, _split_text_into_chunks
+        from orchestrator.services.tts import TTS_CHUNK_LIMIT, _split_text_into_chunks
 
         text = "\n\n".join(f"Paragraph number {i}. " * 30 for i in range(40))
         chunks = _split_text_into_chunks(text)
@@ -740,29 +740,29 @@ class TestChunkSplitting:
         assert all(len(c) <= TTS_CHUNK_LIMIT for c in chunks)
 
     def test_enforce_limit_resplits_oversized(self):
-        from services.tts import TTS_CHUNK_LIMIT, _enforce_chunk_limit
+        from orchestrator.services.tts import TTS_CHUNK_LIMIT, _enforce_chunk_limit
 
         out = _enforce_chunk_limit(["word " * 2000])  # ~10k, no breaks
         assert len(out) > 1
         assert all(len(c) <= TTS_CHUNK_LIMIT for c in out)
 
     def test_parse_plain_array(self):
-        from services.tts import _parse_chunk_array
+        from orchestrator.services.tts import _parse_chunk_array
 
         assert _parse_chunk_array('["a", "b"]') == ["a", "b"]
 
     def test_parse_fenced_array(self):
-        from services.tts import _parse_chunk_array
+        from orchestrator.services.tts import _parse_chunk_array
 
         assert _parse_chunk_array('```json\n["a", "b"]\n```') == ["a", "b"]
 
     def test_parse_array_with_prose(self):
-        from services.tts import _parse_chunk_array
+        from orchestrator.services.tts import _parse_chunk_array
 
         assert _parse_chunk_array('Sure! ["a", "b"] hope that helps') == ["a", "b"]
 
     def test_parse_non_array_is_none(self):
-        from services.tts import _parse_chunk_array
+        from orchestrator.services.tts import _parse_chunk_array
 
         assert _parse_chunk_array("I cannot do that") is None
         assert _parse_chunk_array("") is None
@@ -775,7 +775,7 @@ class TestAuxReasoningControl:
     non-vLLM endpoint would 400 on an unsupported ``chat_template_kwargs``."""
 
     def test_toggle_family_disables_thinking(self):
-        from services.tts import _aux_reasoning_off_body
+        from orchestrator.services.tts import _aux_reasoning_off_body
 
         # gemma is a hybrid-thinking family (chat_template_kwargs.enable_thinking).
         assert _aux_reasoning_off_body("gemma-4-moe") == {
@@ -783,7 +783,7 @@ class TestAuxReasoningControl:
         }
 
     def test_non_toggle_families_send_nothing(self):
-        from services.tts import _aux_reasoning_off_body
+        from orchestrator.services.tts import _aux_reasoning_off_body
 
         # No binary toggle → empty body, so we never send chat_template_kwargs to
         # a plain-OpenAI / effort-enum / no-reasoning endpoint that would reject it.
@@ -798,12 +798,14 @@ class TestAuxReasoningControl:
 
     @pytest.mark.asyncio
     async def test_plan_passes_thinking_off_for_gemma_aux(self):
-        from services.tts import plan_tts_chunks
+        from orchestrator.services.tts import plan_tts_chunks
 
         cls, client = _mock_openai_chat('["First chunk.", "Second chunk."]')
         with (
-            patch("services.tts.AsyncOpenAI", cls),
-            patch("services.tts._resolve_capability_credentials", _caps()),  # aux=gemma
+            patch("orchestrator.services.tts.AsyncOpenAI", cls),
+            patch(
+                "orchestrator.services.tts._resolve_capability_credentials", _caps()
+            ),  # aux=gemma
         ):
             await plan_tts_chunks(
                 content="some markdown **message**",
@@ -817,13 +819,13 @@ class TestAuxReasoningControl:
 
     @pytest.mark.asyncio
     async def test_plan_sends_no_toggle_for_openai_aux(self):
-        from services.tts import plan_tts_chunks
+        from orchestrator.services.tts import plan_tts_chunks
 
         cls, client = _mock_openai_chat('["First chunk.", "Second chunk."]')
         with (
-            patch("services.tts.AsyncOpenAI", cls),
+            patch("orchestrator.services.tts.AsyncOpenAI", cls),
             patch(
-                "services.tts._resolve_capability_credentials",
+                "orchestrator.services.tts._resolve_capability_credentials",
                 _caps(aux=("gpt-4o-mini", None, "sk-key")),
             ),
         ):
@@ -842,7 +844,7 @@ class TestReadAloudRewritePrefs:
 
     # ── reasoning level → aux extra_body ──────────────────────────────
     def test_toggle_family_off_disables_thinking(self):
-        from services.tts import _aux_reasoning_body
+        from orchestrator.services.tts import _aux_reasoning_body
 
         for level in (None, "off", "none"):
             assert _aux_reasoning_body("gemma-4-moe", level) == {
@@ -850,7 +852,7 @@ class TestReadAloudRewritePrefs:
             }, level
 
     def test_toggle_family_level_enables_thinking(self):
-        from services.tts import _aux_reasoning_body
+        from orchestrator.services.tts import _aux_reasoning_body
 
         # gemma has no low/medium/high — any requested level just flips it ON.
         for level in ("low", "medium", "high"):
@@ -859,7 +861,7 @@ class TestReadAloudRewritePrefs:
             }, level
 
     def test_effort_enum_family_maps_level_to_effort(self):
-        from services.tts import _aux_reasoning_body
+        from orchestrator.services.tts import _aux_reasoning_body
 
         fam = MagicMock()
         fam.family = "synthfam"
@@ -873,8 +875,8 @@ class TestReadAloudRewritePrefs:
             }
         }
         with (
-            patch("services.tts._model_config_matrix", lambda: matrix),
-            patch("services.tts.detect_family", lambda m: fam),
+            patch("orchestrator.services.tts._model_config_matrix", lambda: matrix),
+            patch("orchestrator.services.tts.detect_family", lambda m: fam),
         ):
             assert _aux_reasoning_body("x", "low") == {"reasoning_effort": "low"}
             assert _aux_reasoning_body("x", "high") == {"reasoning_effort": "high"}
@@ -884,7 +886,7 @@ class TestReadAloudRewritePrefs:
     def test_effort_enum_without_off_option_inherits_default(self):
         """A [low,medium,high]-only family has no real 'off' — the off default must
         inject nothing (inherit the endpoint default), never an unsupported value."""
-        from services.tts import _aux_reasoning_body
+        from orchestrator.services.tts import _aux_reasoning_body
 
         fam = MagicMock()
         fam.family = "synthfam"
@@ -898,15 +900,18 @@ class TestReadAloudRewritePrefs:
             }
         }
         with (
-            patch("services.tts._model_config_matrix", lambda: matrix),
-            patch("services.tts.detect_family", lambda m: fam),
+            patch("orchestrator.services.tts._model_config_matrix", lambda: matrix),
+            patch("orchestrator.services.tts.detect_family", lambda m: fam),
         ):
             assert _aux_reasoning_body("x", "off") == {}
             assert _aux_reasoning_body("x", "medium") == {"reasoning_effort": "medium"}
 
     # ── custom prompt injection ───────────────────────────────────────
     def test_augment_prompt_noop_when_empty(self):
-        from services.tts import FORMULATION_SYSTEM_PROMPT, _augment_rewrite_prompt
+        from orchestrator.services.tts import (
+            FORMULATION_SYSTEM_PROMPT,
+            _augment_rewrite_prompt,
+        )
 
         assert (
             _augment_rewrite_prompt(FORMULATION_SYSTEM_PROMPT, None)
@@ -918,7 +923,7 @@ class TestReadAloudRewritePrefs:
         )
 
     def test_augment_prompt_appends_pref_with_override_and_floor(self):
-        from services.tts import _augment_rewrite_prompt
+        from orchestrator.services.tts import _augment_rewrite_prompt
 
         out = _augment_rewrite_prompt("BASE RULES", "Give me a TLDR, skip tables")
         assert "BASE RULES" in out
@@ -932,7 +937,7 @@ class TestReadAloudRewritePrefs:
 
     # ── prefs extraction + cache-variant key ──────────────────────────
     def test_read_aloud_prefs_defaults_and_parse(self):
-        from services.tts import _read_aloud_prefs
+        from orchestrator.services.tts import _read_aloud_prefs
 
         assert _read_aloud_prefs({}) == (None, "off")
         assert _read_aloud_prefs({"read_aloud": {}}) == (None, "off")
@@ -951,7 +956,7 @@ class TestReadAloudRewritePrefs:
         )
 
     def test_variant_key_differs_by_prompt_and_level(self):
-        from services.tts import _rewrite_variant_key
+        from orchestrator.services.tts import _rewrite_variant_key
 
         base = _rewrite_variant_key(None, "off")
         by_prompt = _rewrite_variant_key("skip tables", "off")
@@ -963,7 +968,7 @@ class TestReadAloudRewritePrefs:
     # ── end-to-end wiring through plan_tts_chunks ─────────────────────
     @pytest.mark.asyncio
     async def test_plan_applies_custom_prompt_and_reasoning(self):
-        from services.tts import plan_tts_chunks
+        from orchestrator.services.tts import plan_tts_chunks
 
         cls, client = _mock_openai_chat('["A."]')
         db = _mock_db()
@@ -976,8 +981,10 @@ class TestReadAloudRewritePrefs:
             }
         )
         with (
-            patch("services.tts.AsyncOpenAI", cls),
-            patch("services.tts._resolve_capability_credentials", _caps()),  # aux=gemma
+            patch("orchestrator.services.tts.AsyncOpenAI", cls),
+            patch(
+                "orchestrator.services.tts._resolve_capability_credentials", _caps()
+            ),  # aux=gemma
         ):
             await plan_tts_chunks(
                 content="some **markdown** message", user_id="u1", postgres_db=db
@@ -996,8 +1003,8 @@ class TestReadAloudRewritePrefs:
     async def test_different_custom_prompt_busts_plan_cache(self):
         """Two different custom prompts over the SAME content must both hit the aux
         — the rewrite variant is part of the cache key, so no stale replay."""
-        from services import tts
-        from services.tts import plan_tts_chunks
+        from orchestrator.services import tts
+        from orchestrator.services.tts import plan_tts_chunks
 
         tts._plan_cache.clear()
         cls, client = _mock_openai_chat('["A."]')
@@ -1011,8 +1018,10 @@ class TestReadAloudRewritePrefs:
 
         try:
             with (
-                patch("services.tts.AsyncOpenAI", cls),
-                patch("services.tts._resolve_capability_credentials", _caps()),
+                patch("orchestrator.services.tts.AsyncOpenAI", cls),
+                patch(
+                    "orchestrator.services.tts._resolve_capability_credentials", _caps()
+                ),
             ):
                 await plan_tts_chunks(
                     content="same content here",
@@ -1034,7 +1043,7 @@ class TestReadAloudSettingsValidation:
     sub-object (level enum + prompt length) — 422 before it reaches the DB."""
 
     def test_valid_read_aloud_accepted_and_normalized(self):
-        from main import UserSettingsUpdate
+        from orchestrator.main import UserSettingsUpdate
 
         m = UserSettingsUpdate(
             read_aloud={"reasoning_level": "HIGH", "custom_prompt": "skip tables"}
@@ -1042,19 +1051,19 @@ class TestReadAloudSettingsValidation:
         assert m.read_aloud["reasoning_level"] == "high"  # lowercased
 
     def test_bad_level_rejected(self):
-        from main import UserSettingsUpdate
+        from orchestrator.main import UserSettingsUpdate
 
         with pytest.raises(Exception):
             UserSettingsUpdate(read_aloud={"reasoning_level": "ultra"})
 
     def test_overlong_prompt_rejected(self):
-        from main import UserSettingsUpdate
+        from orchestrator.main import UserSettingsUpdate
 
         with pytest.raises(Exception):
             UserSettingsUpdate(read_aloud={"custom_prompt": "z" * 1001})
 
     def test_prompt_at_cap_accepted(self):
-        from main import UserSettingsUpdate
+        from orchestrator.main import UserSettingsUpdate
 
         UserSettingsUpdate(read_aloud={"custom_prompt": "z" * 1000})
 
@@ -1062,9 +1071,11 @@ class TestReadAloudSettingsValidation:
 class TestPlanTtsChunks:
     @pytest.mark.asyncio
     async def test_none_when_no_tts_model(self):
-        from services.tts import plan_tts_chunks
+        from orchestrator.services.tts import plan_tts_chunks
 
-        with patch("services.tts._resolve_capability_credentials", _caps(tts=None)):
+        with patch(
+            "orchestrator.services.tts._resolve_capability_credentials", _caps(tts=None)
+        ):
             result = await plan_tts_chunks(
                 content="anything", user_id="u1", postgres_db=_mock_db()
             )
@@ -1072,12 +1083,12 @@ class TestPlanTtsChunks:
 
     @pytest.mark.asyncio
     async def test_uses_llm_chunks(self):
-        from services.tts import plan_tts_chunks
+        from orchestrator.services.tts import plan_tts_chunks
 
         cls, _ = _mock_openai_chat('["First chunk.", "Second chunk."]')
         with (
-            patch("services.tts.AsyncOpenAI", cls),
-            patch("services.tts._resolve_capability_credentials", _caps()),
+            patch("orchestrator.services.tts.AsyncOpenAI", cls),
+            patch("orchestrator.services.tts._resolve_capability_credentials", _caps()),
         ):
             result = await plan_tts_chunks(
                 content="some markdown **message**",
@@ -1089,10 +1100,12 @@ class TestPlanTtsChunks:
 
     @pytest.mark.asyncio
     async def test_falls_back_to_deterministic_without_aux(self):
-        from services.tts import TTS_CHUNK_LIMIT, plan_tts_chunks
+        from orchestrator.services.tts import TTS_CHUNK_LIMIT, plan_tts_chunks
 
         long_text = "\n\n".join(f"Paragraph {i}. " * 40 for i in range(40))
-        with patch("services.tts._resolve_capability_credentials", _caps(aux=None)):
+        with patch(
+            "orchestrator.services.tts._resolve_capability_credentials", _caps(aux=None)
+        ):
             result = await plan_tts_chunks(
                 content=long_text, user_id="u1", postgres_db=_mock_db()
             )
@@ -1103,12 +1116,12 @@ class TestPlanTtsChunks:
 
     @pytest.mark.asyncio
     async def test_falls_back_when_llm_unparseable(self):
-        from services.tts import plan_tts_chunks
+        from orchestrator.services.tts import plan_tts_chunks
 
         cls, _ = _mock_openai_chat("Sorry, I can't help with that")
         with (
-            patch("services.tts.AsyncOpenAI", cls),
-            patch("services.tts._resolve_capability_credentials", _caps()),
+            patch("orchestrator.services.tts.AsyncOpenAI", cls),
+            patch("orchestrator.services.tts._resolve_capability_credentials", _caps()),
         ):
             result = await plan_tts_chunks(
                 content="short message", user_id="u1", postgres_db=_mock_db()
@@ -1119,12 +1132,12 @@ class TestPlanTtsChunks:
 
     @pytest.mark.asyncio
     async def test_truncated_llm_output_falls_back(self):
-        from services.tts import plan_tts_chunks
+        from orchestrator.services.tts import plan_tts_chunks
 
         cls, _ = _mock_openai_chat('["partial', finish_reason="length")
         with (
-            patch("services.tts.AsyncOpenAI", cls),
-            patch("services.tts._resolve_capability_credentials", _caps()),
+            patch("orchestrator.services.tts.AsyncOpenAI", cls),
+            patch("orchestrator.services.tts._resolve_capability_credentials", _caps()),
         ):
             result = await plan_tts_chunks(
                 content="short message", user_id="u1", postgres_db=_mock_db()
@@ -1134,15 +1147,15 @@ class TestPlanTtsChunks:
 
     @pytest.mark.asyncio
     async def test_first_chunk_is_shortened_for_fast_ttfa(self):
-        from services.tts import TTS_FIRST_CHUNK_TARGET, plan_tts_chunks
+        from orchestrator.services.tts import TTS_FIRST_CHUNK_TARGET, plan_tts_chunks
 
         # A single long paragraph of many sentences the LLM returns as one chunk;
         # the planner must split off a short first chunk for fast time-to-first-audio.
         one_big = " ".join(f"This is sentence number {i}." for i in range(80))
         cls, _ = _mock_openai_chat(json.dumps([one_big]))
         with (
-            patch("services.tts.AsyncOpenAI", cls),
-            patch("services.tts._resolve_capability_credentials", _caps()),
+            patch("orchestrator.services.tts.AsyncOpenAI", cls),
+            patch("orchestrator.services.tts._resolve_capability_credentials", _caps()),
         ):
             result = await plan_tts_chunks(
                 content=one_big, user_id="u1", postgres_db=_mock_db()
@@ -1164,8 +1177,8 @@ class TestTtsSynthesisHttpError:
     provider-key problem must not look like the user's own session expiring."""
 
     def test_status_by_code(self):
-        from main import _tts_synthesis_http_error
-        from services.tts import TtsSynthesisError
+        from orchestrator.main import _tts_synthesis_http_error
+        from orchestrator.services.tts import TtsSynthesisError
 
         assert (
             _tts_synthesis_http_error(
@@ -1192,8 +1205,8 @@ class TestTtsSynthesisHttpError:
         )
 
     def test_detail_is_machine_readable(self):
-        from main import _tts_synthesis_http_error
-        from services.tts import TtsSynthesisError
+        from orchestrator.main import _tts_synthesis_http_error
+        from orchestrator.services.tts import TtsSynthesisError
 
         exc = _tts_synthesis_http_error(
             TtsSynthesisError("needs a paid plan", code="payment_required")
@@ -1206,7 +1219,7 @@ class TestTtsSynthesisHttpError:
 
 class TestTtsPlanEndpoint:
     def test_route_is_registered(self):
-        from main import app
+        from orchestrator.main import app
 
         routes = {
             (m, getattr(r, "path", ""))
@@ -1217,16 +1230,16 @@ class TestTtsPlanEndpoint:
 
     @pytest.mark.asyncio
     async def test_returns_chunks(self):
-        import main
+        import orchestrator.main
 
         with (
             patch.object(
-                main,
+                orchestrator.main,
                 "require_thread_owner",
                 AsyncMock(return_value=({"id": "u1"}, {"id": "t1"})),
             ),
             patch(
-                "services.tts.plan_tts_chunks",
+                "orchestrator.services.tts.plan_tts_chunks",
                 AsyncMock(
                     return_value={
                         "chunks": ["chunk one", "chunk two"],
@@ -1235,7 +1248,7 @@ class TestTtsPlanEndpoint:
                 ),
             ),
         ):
-            resp = await main.plan_thread_message_tts(
+            resp = await orchestrator.main.plan_thread_message_tts(
                 thread_id="t1", request=MagicMock(), body={"content": "long message"}
             )
         assert resp.status_code == 200
@@ -1246,33 +1259,36 @@ class TestTtsPlanEndpoint:
 
     @pytest.mark.asyncio
     async def test_204_when_not_configured(self):
-        import main
+        import orchestrator.main
 
         with (
             patch.object(
-                main,
+                orchestrator.main,
                 "require_thread_owner",
                 AsyncMock(return_value=({"id": "u1"}, {"id": "t1"})),
             ),
-            patch("services.tts.plan_tts_chunks", AsyncMock(return_value=None)),
+            patch(
+                "orchestrator.services.tts.plan_tts_chunks",
+                AsyncMock(return_value=None),
+            ),
         ):
-            resp = await main.plan_thread_message_tts(
+            resp = await orchestrator.main.plan_thread_message_tts(
                 thread_id="t1", request=MagicMock(), body={"content": "hello"}
             )
         assert resp.status_code == 204
 
     @pytest.mark.asyncio
     async def test_400_on_empty_content(self):
-        import main
+        import orchestrator.main
         from fastapi import HTTPException
 
         with patch.object(
-            main,
+            orchestrator.main,
             "require_thread_owner",
             AsyncMock(return_value=({"id": "u1"}, {"id": "t1"})),
         ):
             with pytest.raises(HTTPException) as exc:
-                await main.plan_thread_message_tts(
+                await orchestrator.main.plan_thread_message_tts(
                     thread_id="t1", request=MagicMock(), body={"content": ""}
                 )
         assert exc.value.status_code == 400
@@ -1294,14 +1310,14 @@ def _mock_ledger(*, available=True):
 class TestTtsMetering:
     @pytest.mark.asyncio
     async def test_records_tts_character_event(self):
-        from services.tts import generate_message_tts
+        from orchestrator.services.tts import generate_message_tts
 
         cls, _ = _mock_openai(speech=b"AUDIO")
         led = _mock_ledger()
         with (
-            patch("services.tts.AsyncOpenAI", cls),
+            patch("orchestrator.services.tts.AsyncOpenAI", cls),
             patch(
-                "services.tts._resolve_capability_credentials",
+                "orchestrator.services.tts._resolve_capability_credentials",
                 AsyncMock(return_value=_credentials("kokoro", None, "sk-key")),
             ),
         ):
@@ -1329,14 +1345,14 @@ class TestTtsMetering:
 
     @pytest.mark.asyncio
     async def test_no_write_when_ledger_unavailable(self):
-        from services.tts import generate_message_tts
+        from orchestrator.services.tts import generate_message_tts
 
         cls, _ = _mock_openai(speech=b"AUDIO")
         led = _mock_ledger(available=False)
         with (
-            patch("services.tts.AsyncOpenAI", cls),
+            patch("orchestrator.services.tts.AsyncOpenAI", cls),
             patch(
-                "services.tts._resolve_capability_credentials",
+                "orchestrator.services.tts._resolve_capability_credentials",
                 AsyncMock(return_value=_credentials("kokoro", None, "sk-key")),
             ),
         ):
@@ -1354,15 +1370,15 @@ class TestTtsMetering:
 
     @pytest.mark.asyncio
     async def test_metering_failure_is_non_fatal(self):
-        from services.tts import generate_message_tts
+        from orchestrator.services.tts import generate_message_tts
 
         cls, _ = _mock_openai(speech=b"AUDIO")
         led = _mock_ledger()
         led.record_events = AsyncMock(side_effect=RuntimeError("audit down"))
         with (
-            patch("services.tts.AsyncOpenAI", cls),
+            patch("orchestrator.services.tts.AsyncOpenAI", cls),
             patch(
-                "services.tts._resolve_capability_credentials",
+                "orchestrator.services.tts._resolve_capability_credentials",
                 AsyncMock(return_value=_credentials("kokoro", None, "sk-key")),
             ),
         ):
@@ -1386,7 +1402,7 @@ class TestTtsMetering:
 
 class TestVoiceCapabilitiesEndpoint:
     def test_route_is_registered(self):
-        from main import app
+        from orchestrator.main import app
 
         routes = {
             (m, getattr(r, "path", ""))
@@ -1397,23 +1413,25 @@ class TestVoiceCapabilitiesEndpoint:
 
     @pytest.mark.asyncio
     async def test_available_from_user_setting(self):
-        import main
+        import orchestrator.main
 
         db = MagicMock()
         db.get_user_settings = AsyncMock(return_value={"default_tts_model": "kokoro"})
         db.resolve_default_for_capability = AsyncMock(return_value=None)
         with (
             patch.object(
-                main, "require_approved_user", AsyncMock(return_value={"id": "u1"})
+                orchestrator.main,
+                "require_approved_user",
+                AsyncMock(return_value={"id": "u1"}),
             ),
-            patch.object(main, "postgres_db", db),
+            patch.object(orchestrator.main, "postgres_db", db),
         ):
-            result = await main.voice_capabilities(MagicMock())
+            result = await orchestrator.main.voice_capabilities(MagicMock())
         assert result == {"tts": True, "stt": False}
 
     @pytest.mark.asyncio
     async def test_available_from_system_default(self):
-        import main
+        import orchestrator.main
 
         db = MagicMock()
         db.get_user_settings = AsyncMock(return_value={})
@@ -1424,11 +1442,13 @@ class TestVoiceCapabilitiesEndpoint:
         db.resolve_default_for_capability = AsyncMock(side_effect=_resolve)
         with (
             patch.object(
-                main, "require_approved_user", AsyncMock(return_value={"id": "u1"})
+                orchestrator.main,
+                "require_approved_user",
+                AsyncMock(return_value={"id": "u1"}),
             ),
-            patch.object(main, "postgres_db", db),
+            patch.object(orchestrator.main, "postgres_db", db),
         ):
-            result = await main.voice_capabilities(MagicMock())
+            result = await orchestrator.main.voice_capabilities(MagicMock())
         assert result == {"tts": False, "stt": True}
 
 
@@ -1440,16 +1460,18 @@ class TestVoiceCapabilitiesEndpoint:
 class TestPreviewEndpoint:
     @pytest.mark.asyncio
     async def test_passes_custom_text_and_returns_audio(self):
-        import main
+        import orchestrator.main
 
         preview = AsyncMock(return_value=b"AUD")
         with (
             patch.object(
-                main, "require_approved_user", AsyncMock(return_value={"id": "u1"})
+                orchestrator.main,
+                "require_approved_user",
+                AsyncMock(return_value={"id": "u1"}),
             ),
-            patch("services.tts.synthesize_voice_preview", preview),
+            patch("orchestrator.services.tts.synthesize_voice_preview", preview),
         ):
-            resp = await main.preview_tts_voice(
+            resp = await orchestrator.main.preview_tts_voice(
                 request=MagicMock(),
                 body={"voice": "af_nova", "text": "hello there"},
             )
@@ -1459,16 +1481,18 @@ class TestPreviewEndpoint:
 
     @pytest.mark.asyncio
     async def test_422_on_overlength_text(self):
-        import main
+        import orchestrator.main
         from fastapi import HTTPException
 
-        from services.tts import _PREVIEW_TEXT_MAX
+        from orchestrator.services.tts import _PREVIEW_TEXT_MAX
 
         with patch.object(
-            main, "require_approved_user", AsyncMock(return_value={"id": "u1"})
+            orchestrator.main,
+            "require_approved_user",
+            AsyncMock(return_value={"id": "u1"}),
         ):
             with pytest.raises(HTTPException) as exc:
-                await main.preview_tts_voice(
+                await orchestrator.main.preview_tts_voice(
                     request=MagicMock(),
                     body={"text": "x" * (_PREVIEW_TEXT_MAX + 1)},
                 )
@@ -1499,18 +1523,18 @@ def _mock_httpx(*, content=b"EL_AUDIO", status_code=200, status_error=None):
 
 class TestResolveTtsProvider:
     def test_explicit_provider_wins(self):
-        from services.tts import _resolve_tts_provider
+        from orchestrator.services.tts import _resolve_tts_provider
 
         assert _resolve_tts_provider("anything", "ElevenLabs") == "elevenlabs"
 
     def test_sniffs_eleven_model_ids(self):
-        from services.tts import _resolve_tts_provider
+        from orchestrator.services.tts import _resolve_tts_provider
 
         assert _resolve_tts_provider("eleven_multilingual_v2", None) == "elevenlabs"
         assert _resolve_tts_provider("eleven_flash_v2_5", "") == "elevenlabs"
 
     def test_defaults_to_openai(self):
-        from services.tts import _resolve_tts_provider
+        from orchestrator.services.tts import _resolve_tts_provider
 
         assert _resolve_tts_provider("kokoro", None) == "openai"
         assert _resolve_tts_provider("gpt-4o-mini-tts", None) == "openai"
@@ -1519,10 +1543,10 @@ class TestResolveTtsProvider:
 class TestElevenLabsAdapter:
     @pytest.mark.asyncio
     async def test_success_builds_correct_request(self):
-        from services.tts import _synthesize_elevenlabs
+        from orchestrator.services.tts import _synthesize_elevenlabs
 
         factory, client = _mock_httpx(content=b"MP3")
-        with patch("services.tts.httpx.AsyncClient", factory):
+        with patch("orchestrator.services.tts.httpx.AsyncClient", factory):
             audio = await _synthesize_elevenlabs(
                 "hello world",
                 model="eleven_multilingual_v2",
@@ -1541,11 +1565,11 @@ class TestElevenLabsAdapter:
 
     @pytest.mark.asyncio
     async def test_falls_back_to_env_key(self):
-        from services.tts import _synthesize_elevenlabs
+        from orchestrator.services.tts import _synthesize_elevenlabs
 
         factory, client = _mock_httpx()
         with (
-            patch("services.tts.httpx.AsyncClient", factory),
+            patch("orchestrator.services.tts.httpx.AsyncClient", factory),
             patch.dict(os.environ, {"ELEVENLABS_API_KEY": "env-key"}),
         ):
             audio = await _synthesize_elevenlabs(
@@ -1556,7 +1580,7 @@ class TestElevenLabsAdapter:
 
     @pytest.mark.asyncio
     async def test_none_when_no_key(self):
-        from services.tts import _synthesize_elevenlabs
+        from orchestrator.services.tts import _synthesize_elevenlabs
 
         with patch.dict(os.environ, {}, clear=True):
             audio = await _synthesize_elevenlabs(
@@ -1566,7 +1590,7 @@ class TestElevenLabsAdapter:
 
     @pytest.mark.asyncio
     async def test_none_when_no_voice(self):
-        from services.tts import _synthesize_elevenlabs
+        from orchestrator.services.tts import _synthesize_elevenlabs
 
         audio = await _synthesize_elevenlabs(
             "hi", model="eleven_multilingual_v2", voice="", api_key="xi-key"
@@ -1577,10 +1601,10 @@ class TestElevenLabsAdapter:
     async def test_none_on_generic_http_error(self):
         """A non-actionable upstream status (5xx) → None (the caller maps that to
         a generic 502); actionable codes raise instead — see TestTtsErrorSurfacing."""
-        from services.tts import _synthesize_elevenlabs
+        from orchestrator.services.tts import _synthesize_elevenlabs
 
         factory, _ = _mock_httpx(status_code=500)
-        with patch("services.tts.httpx.AsyncClient", factory):
+        with patch("orchestrator.services.tts.httpx.AsyncClient", factory):
             audio = await _synthesize_elevenlabs(
                 "hi", model="eleven_multilingual_v2", voice="v", api_key="xi-key"
             )
@@ -1590,13 +1614,13 @@ class TestElevenLabsAdapter:
     async def test_synthesize_speech_routes_to_elevenlabs_not_openai(self):
         """The choke point forks to ElevenLabs on an eleven_* model and never
         constructs an OpenAI client (the ElevenLabs API isn't OpenAI-compatible)."""
-        from services.tts import _synthesize_speech
+        from orchestrator.services.tts import _synthesize_speech
 
         openai_cls = MagicMock()
         el = AsyncMock(return_value=b"MP3")
         with (
-            patch("services.tts.AsyncOpenAI", openai_cls),
-            patch("services.tts._synthesize_elevenlabs", el),
+            patch("orchestrator.services.tts.AsyncOpenAI", openai_cls),
+            patch("orchestrator.services.tts._synthesize_elevenlabs", el),
         ):
             audio = await _synthesize_speech(
                 "hi",
@@ -1613,13 +1637,13 @@ class TestElevenLabsAdapter:
     async def test_synthesize_speech_explicit_provider_overrides_openai_model_id(self):
         """An explicit params_json.provider forces the ElevenLabs path even when
         the model id doesn't contain 'eleven'."""
-        from services.tts import _synthesize_speech
+        from orchestrator.services.tts import _synthesize_speech
 
         openai_cls = MagicMock()
         el = AsyncMock(return_value=b"MP3")
         with (
-            patch("services.tts.AsyncOpenAI", openai_cls),
-            patch("services.tts._synthesize_elevenlabs", el),
+            patch("orchestrator.services.tts.AsyncOpenAI", openai_cls),
+            patch("orchestrator.services.tts._synthesize_elevenlabs", el),
         ):
             await _synthesize_speech(
                 "hi",
@@ -1641,7 +1665,7 @@ class TestElevenLabsAdapter:
 
 class TestStripMarkdownForSpeech:
     def test_strips_emphasis_and_headers(self):
-        from services.tts import _strip_markdown_for_speech
+        from orchestrator.services.tts import _strip_markdown_for_speech
 
         out = _strip_markdown_for_speech("# Title\n\nThis is **bold** and *italic*.")
         assert "*" not in out
@@ -1649,14 +1673,14 @@ class TestStripMarkdownForSpeech:
         assert "bold" in out and "italic" in out
 
     def test_links_become_text_images_dropped(self):
-        from services.tts import _strip_markdown_for_speech
+        from orchestrator.services.tts import _strip_markdown_for_speech
 
         out = _strip_markdown_for_speech("See [the docs](http://x) and ![alt](y.png).")
         assert "the docs" in out
         assert "http://x" not in out and "y.png" not in out and "alt" not in out
 
     def test_table_becomes_sentences_no_pipes(self):
-        from services.tts import _strip_markdown_for_speech
+        from orchestrator.services.tts import _strip_markdown_for_speech
 
         md = "| Metal | Price |\n| --- | --- |\n| Neodymium | 155 |\n| Terbium | 1103 |"
         out = _strip_markdown_for_speech(md)
@@ -1666,7 +1690,7 @@ class TestStripMarkdownForSpeech:
         assert "---" not in out
 
     def test_code_fence_becomes_placeholder(self):
-        from services.tts import _strip_markdown_for_speech
+        from orchestrator.services.tts import _strip_markdown_for_speech
 
         out = _strip_markdown_for_speech(
             "Before\n\n```python\nprint('hi')\n```\n\nAfter"
@@ -1727,7 +1751,7 @@ _EL_VOICES_BODY = {
 
 class TestMapElevenLabsVoice:
     def test_maps_fields(self):
-        from services.tts import _map_elevenlabs_voice
+        from orchestrator.services.tts import _map_elevenlabs_voice
 
         out = _map_elevenlabs_voice(_EL_VOICES_BODY["voices"][0])
         assert out == {
@@ -1738,7 +1762,7 @@ class TestMapElevenLabsVoice:
         }
 
     def test_missing_fields_degrade_gracefully(self):
-        from services.tts import _map_elevenlabs_voice
+        from orchestrator.services.tts import _map_elevenlabs_voice
 
         out = _map_elevenlabs_voice({"voice_id": "v1"})
         # name falls back to the id; labels default to {}, preview to None.
@@ -1748,7 +1772,7 @@ class TestMapElevenLabsVoice:
 class TestListAccountVoices:
     @pytest.fixture(autouse=True)
     def _clear_voice_cache(self):
-        from services import tts
+        from orchestrator.services import tts
 
         tts._voices_cache.clear()
         yield
@@ -1756,7 +1780,7 @@ class TestListAccountVoices:
 
     @pytest.mark.asyncio
     async def test_no_model_configured_returns_backend_none(self):
-        from services.tts import list_account_voices
+        from orchestrator.services.tts import list_account_voices
 
         db = MagicMock()
         db.get_user_settings = AsyncMock(return_value={})
@@ -1769,18 +1793,18 @@ class TestListAccountVoices:
     async def test_non_elevenlabs_backend_returns_empty_list(self):
         """Kokoro/OpenAI keep their static catalogs in the cockpit — the server
         returns the backend name but no voices, and never calls ElevenLabs."""
-        from services.tts import list_account_voices
+        from orchestrator.services.tts import list_account_voices
 
         db = _voices_db(tts_model="kokoro")
         factory, _ = _mock_httpx_get(json_body=_EL_VOICES_BODY)
-        with patch("services.tts.httpx.AsyncClient", factory):
+        with patch("orchestrator.services.tts.httpx.AsyncClient", factory):
             out = await list_account_voices(user_id="u1", postgres_db=db)
         assert out == {"backend": "openai", "voices": []}
         factory.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_elevenlabs_lists_account_voices(self):
-        from services.tts import list_account_voices
+        from orchestrator.services.tts import list_account_voices
 
         db = _voices_db(
             tts_model="eleven_multilingual_v2",
@@ -1788,7 +1812,7 @@ class TestListAccountVoices:
         )
         factory, client = _mock_httpx_get(json_body=_EL_VOICES_BODY)
         with (
-            patch("services.tts.httpx.AsyncClient", factory),
+            patch("orchestrator.services.tts.httpx.AsyncClient", factory),
             patch.dict(os.environ, {"ELEVENLABS_API_KEY": "env-key"}),
         ):
             out = await list_account_voices(user_id="u1", postgres_db=db)
@@ -1801,7 +1825,7 @@ class TestListAccountVoices:
 
     @pytest.mark.asyncio
     async def test_elevenlabs_no_key_returns_empty(self):
-        from services.tts import list_account_voices
+        from orchestrator.services.tts import list_account_voices
 
         db = _voices_db(
             tts_model="eleven_multilingual_v2",
@@ -1815,7 +1839,7 @@ class TestListAccountVoices:
     async def test_fetch_failure_degrades_to_empty(self):
         """A 5xx/timeout from ElevenLabs must not 500 the Settings page — the
         picker falls back to free-text, so an empty list is the contract."""
-        from services.tts import list_account_voices
+        from orchestrator.services.tts import list_account_voices
 
         db = _voices_db(
             tts_model="eleven_multilingual_v2",
@@ -1825,7 +1849,7 @@ class TestListAccountVoices:
             json_body={}, status_error=RuntimeError("503 upstream")
         )
         with (
-            patch("services.tts.httpx.AsyncClient", factory),
+            patch("orchestrator.services.tts.httpx.AsyncClient", factory),
             patch.dict(os.environ, {"ELEVENLABS_API_KEY": "env-key"}),
         ):
             out = await list_account_voices(user_id="u1", postgres_db=db)
@@ -1835,7 +1859,7 @@ class TestListAccountVoices:
     async def test_second_call_served_from_cache(self):
         """The ~5 min in-process cache means opening Settings twice hits
         ElevenLabs once."""
-        from services.tts import list_account_voices
+        from orchestrator.services.tts import list_account_voices
 
         db = _voices_db(
             tts_model="eleven_multilingual_v2",
@@ -1843,7 +1867,7 @@ class TestListAccountVoices:
         )
         factory, client = _mock_httpx_get(json_body=_EL_VOICES_BODY)
         with (
-            patch("services.tts.httpx.AsyncClient", factory),
+            patch("orchestrator.services.tts.httpx.AsyncClient", factory),
             patch.dict(os.environ, {"ELEVENLABS_API_KEY": "env-key"}),
         ):
             first = await list_account_voices(user_id="u1", postgres_db=db)
@@ -1853,7 +1877,10 @@ class TestListAccountVoices:
 
     @pytest.mark.asyncio
     async def test_invalidate_cache_forces_refetch(self):
-        from services.tts import invalidate_account_voices_cache, list_account_voices
+        from orchestrator.services.tts import (
+            invalidate_account_voices_cache,
+            list_account_voices,
+        )
 
         db = _voices_db(
             tts_model="eleven_multilingual_v2",
@@ -1861,7 +1888,7 @@ class TestListAccountVoices:
         )
         factory, client = _mock_httpx_get(json_body=_EL_VOICES_BODY)
         with (
-            patch("services.tts.httpx.AsyncClient", factory),
+            patch("orchestrator.services.tts.httpx.AsyncClient", factory),
             patch.dict(os.environ, {"ELEVENLABS_API_KEY": "env-key"}),
         ):
             await list_account_voices(user_id="u1", postgres_db=db)
@@ -1870,7 +1897,7 @@ class TestListAccountVoices:
         assert client.get.await_count == 2
 
     def test_preserves_snake_case_identifiers(self):
-        from services.tts import _strip_markdown_for_speech
+        from orchestrator.services.tts import _strip_markdown_for_speech
 
         # Single underscores (identifiers) must survive — only emphasis is stripped.
         assert "user_id" in _strip_markdown_for_speech("The user_id column is a key.")
@@ -1916,7 +1943,7 @@ _SHARED_VOICES_BODY = {
 
 class TestMapSharedVoice:
     def test_maps_fields(self):
-        from services.tts import _map_shared_voice
+        from orchestrator.services.tts import _map_shared_voice
 
         out = _map_shared_voice(_SHARED_VOICES_BODY["voices"][0])
         assert out["id"] == "pub_amelie"
@@ -1928,7 +1955,7 @@ class TestMapSharedVoice:
         assert out["free"] is True
 
     def test_missing_fields_degrade(self):
-        from services.tts import _map_shared_voice
+        from orchestrator.services.tts import _map_shared_voice
 
         out = _map_shared_voice({"voice_id": "v1", "public_owner_id": "o1"})
         assert out == {
@@ -1948,7 +1975,7 @@ class TestMapSharedVoice:
 class TestSearchVoiceLibrary:
     @pytest.fixture(autouse=True)
     def _clear_voice_cache(self):
-        from services import tts
+        from orchestrator.services import tts
 
         tts._voices_cache.clear()
         yield
@@ -1958,7 +1985,7 @@ class TestSearchVoiceLibrary:
     async def test_non_elevenlabs_backend_returns_empty(self):
         """The library is ElevenLabs-only; other backends short-circuit without
         an HTTP call."""
-        from services.tts import search_voice_library
+        from orchestrator.services.tts import search_voice_library
 
         db = _voices_db(tts_model="kokoro")
         out = await search_voice_library(user_id="u1", postgres_db=db, filters={})
@@ -1971,7 +1998,7 @@ class TestSearchVoiceLibrary:
 
     @pytest.mark.asyncio
     async def test_search_passes_filters_and_maps(self):
-        from services.tts import search_voice_library
+        from orchestrator.services.tts import search_voice_library
 
         db = _voices_db(
             tts_model="eleven_multilingual_v2",
@@ -1979,7 +2006,7 @@ class TestSearchVoiceLibrary:
         )
         factory, client = _mock_httpx_get(json_body=_SHARED_VOICES_BODY)
         with (
-            patch("services.tts.httpx.AsyncClient", factory),
+            patch("orchestrator.services.tts.httpx.AsyncClient", factory),
             patch.dict(os.environ, {"ELEVENLABS_API_KEY": "env-key"}),
         ):
             out = await search_voice_library(
@@ -2001,7 +2028,7 @@ class TestSearchVoiceLibrary:
 
     @pytest.mark.asyncio
     async def test_no_key_returns_error(self):
-        from services.tts import search_voice_library
+        from orchestrator.services.tts import search_voice_library
 
         db = _voices_db(
             tts_model="eleven_multilingual_v2",
@@ -2018,7 +2045,7 @@ class TestSearchVoiceLibrary:
         """A 5xx/timeout from ElevenLabs must not 500 the Settings page — the
         browser shows a banner, so an empty list + readable error is the
         contract."""
-        from services.tts import search_voice_library
+        from orchestrator.services.tts import search_voice_library
 
         db = _voices_db(
             tts_model="eleven_multilingual_v2",
@@ -2026,7 +2053,7 @@ class TestSearchVoiceLibrary:
         )
         factory, _ = _mock_httpx_get(json_body={}, status_error=RuntimeError("503"))
         with (
-            patch("services.tts.httpx.AsyncClient", factory),
+            patch("orchestrator.services.tts.httpx.AsyncClient", factory),
             patch.dict(os.environ, {"ELEVENLABS_API_KEY": "env-key"}),
         ):
             out = await search_voice_library(
@@ -2039,7 +2066,7 @@ class TestSearchVoiceLibrary:
 class TestAddLibraryVoice:
     @pytest.fixture(autouse=True)
     def _clear_voice_cache(self):
-        from services import tts
+        from orchestrator.services import tts
 
         tts._voices_cache.clear()
         yield
@@ -2047,8 +2074,8 @@ class TestAddLibraryVoice:
 
     @pytest.mark.asyncio
     async def test_add_success_returns_id_and_invalidates_cache(self):
-        from services import tts
-        from services.tts import add_library_voice
+        from orchestrator.services import tts
+        from orchestrator.services.tts import add_library_voice
 
         db = _voices_db(
             tts_model="eleven_multilingual_v2",
@@ -2059,7 +2086,7 @@ class TestAddLibraryVoice:
         tts._voices_cache["stale"] = (tts._now(), [{"id": "old"}])
         factory, client = _mock_httpx_post(json_body={"voice_id": "acct_new"})
         with (
-            patch("services.tts.httpx.AsyncClient", factory),
+            patch("orchestrator.services.tts.httpx.AsyncClient", factory),
             patch.dict(os.environ, {"ELEVENLABS_API_KEY": "env-key"}),
         ):
             out = await add_library_voice(
@@ -2081,7 +2108,7 @@ class TestAddLibraryVoice:
     async def test_slot_limit_raises_readable_error(self):
         """ElevenLabs' voice-slot-limit 400 becomes a readable TtsLibraryError
         carrying its status — never a bare 500."""
-        from services.tts import TtsLibraryError, add_library_voice
+        from orchestrator.services.tts import TtsLibraryError, add_library_voice
 
         db = _voices_db(
             tts_model="eleven_multilingual_v2",
@@ -2097,7 +2124,7 @@ class TestAddLibraryVoice:
             status_code=400,
         )
         with (
-            patch("services.tts.httpx.AsyncClient", factory),
+            patch("orchestrator.services.tts.httpx.AsyncClient", factory),
             patch.dict(os.environ, {"ELEVENLABS_API_KEY": "env-key"}),
         ):
             with pytest.raises(TtsLibraryError) as exc:
@@ -2113,7 +2140,7 @@ class TestAddLibraryVoice:
 
     @pytest.mark.asyncio
     async def test_non_elevenlabs_backend_raises(self):
-        from services.tts import TtsLibraryError, add_library_voice
+        from orchestrator.services.tts import TtsLibraryError, add_library_voice
 
         db = _voices_db(tts_model="kokoro")
         with pytest.raises(TtsLibraryError) as exc:
@@ -2128,7 +2155,7 @@ class TestAddLibraryVoice:
 
     @pytest.mark.asyncio
     async def test_network_failure_raises_502(self):
-        from services.tts import TtsLibraryError, add_library_voice
+        from orchestrator.services.tts import TtsLibraryError, add_library_voice
 
         db = _voices_db(
             tts_model="eleven_multilingual_v2",
@@ -2141,7 +2168,7 @@ class TestAddLibraryVoice:
         cm.__aexit__ = AsyncMock(return_value=False)
         factory = MagicMock(return_value=cm)
         with (
-            patch("services.tts.httpx.AsyncClient", factory),
+            patch("orchestrator.services.tts.httpx.AsyncClient", factory),
             patch.dict(os.environ, {"ELEVENLABS_API_KEY": "env-key"}),
         ):
             with pytest.raises(TtsLibraryError) as exc:
@@ -2162,7 +2189,7 @@ class TestTtsErrorSurfacing:
     case."""
 
     def test_error_code_mapping(self):
-        from services.tts import _tts_error_code
+        from orchestrator.services.tts import _tts_error_code
 
         assert _tts_error_code(402) == "payment_required"
         assert _tts_error_code(401) == "auth"
@@ -2173,7 +2200,7 @@ class TestTtsErrorSurfacing:
 
     @pytest.mark.asyncio
     async def test_elevenlabs_402_raises_payment_required(self):
-        from services.tts import TtsSynthesisError, _synthesize_elevenlabs
+        from orchestrator.services.tts import TtsSynthesisError, _synthesize_elevenlabs
 
         factory, _ = _mock_httpx_post(
             json_body={
@@ -2184,7 +2211,7 @@ class TestTtsErrorSurfacing:
             },
             status_code=402,
         )
-        with patch("services.tts.httpx.AsyncClient", factory):
+        with patch("orchestrator.services.tts.httpx.AsyncClient", factory):
             with pytest.raises(TtsSynthesisError) as exc:
                 await _synthesize_elevenlabs(
                     "hi", model="eleven_multilingual_v2", voice="v1", api_key="k"
@@ -2196,10 +2223,10 @@ class TestTtsErrorSurfacing:
     async def test_elevenlabs_500_returns_none(self):
         """A transient 5xx has no actionable code → return None (generic 502, the
         caller may retry), not a raise."""
-        from services.tts import _synthesize_elevenlabs
+        from orchestrator.services.tts import _synthesize_elevenlabs
 
         factory, _ = _mock_httpx_post(json_body={}, status_code=500)
-        with patch("services.tts.httpx.AsyncClient", factory):
+        with patch("orchestrator.services.tts.httpx.AsyncClient", factory):
             out = await _synthesize_elevenlabs(
                 "hi", model="eleven_x", voice="v1", api_key="k"
             )
@@ -2207,12 +2234,12 @@ class TestTtsErrorSurfacing:
 
     @pytest.mark.asyncio
     async def test_synthesize_speech_propagates_coded_error(self):
-        from services.tts import TtsSynthesisError, _synthesize_speech
+        from orchestrator.services.tts import TtsSynthesisError, _synthesize_speech
 
         factory, _ = _mock_httpx_post(
             json_body={"detail": {"message": "pay up"}}, status_code=402
         )
-        with patch("services.tts.httpx.AsyncClient", factory):
+        with patch("orchestrator.services.tts.httpx.AsyncClient", factory):
             with pytest.raises(TtsSynthesisError) as exc:
                 await _synthesize_speech(
                     "hi",
@@ -2232,19 +2259,19 @@ class TestAuxThinkLeakControl:
     2")."""
 
     def test_family_extra_body_from_matrix_minimax(self):
-        from services.tts import _aux_family_extra_body
+        from orchestrator.services.tts import _aux_family_extra_body
 
         # Real matrix: minimax-m3 carries reasoning_split to keep reasoning out of
         # `content` (returned as a separate reasoning_content field instead).
         assert _aux_family_extra_body("MiniMax-M3") == {"reasoning_split": True}
 
     def test_family_extra_body_empty_for_gemma(self):
-        from services.tts import _aux_family_extra_body
+        from orchestrator.services.tts import _aux_family_extra_body
 
         assert _aux_family_extra_body("gemma-4-moe") == {}
 
     def test_aux_extra_body_merges_reasoning_and_family(self):
-        from services.tts import _aux_extra_body
+        from orchestrator.services.tts import _aux_extra_body
 
         # gemma: reasoning toggle only (no family extra_body).
         assert _aux_extra_body("gemma-4-moe", "off") == {
@@ -2264,7 +2291,7 @@ class TestThinkStrip:
     if a provider leaks it into content despite reasoning_split."""
 
     def test_strip_complete_block(self):
-        from services.tts import _strip_think_tags
+        from orchestrator.services.tts import _strip_think_tags
 
         assert (
             _strip_think_tags("<think>reasoning here</think>Hello world.")
@@ -2272,41 +2299,41 @@ class TestThinkStrip:
         )
 
     def test_strip_multiline_block(self):
-        from services.tts import _strip_think_tags
+        from orchestrator.services.tts import _strip_think_tags
 
         t = "<think>\nline1\nline2\n</think>\n\nActual answer."
         assert _strip_think_tags(t) == "Actual answer."
 
     def test_unclosed_think_dropped_to_end(self):
-        from services.tts import _strip_think_tags
+        from orchestrator.services.tts import _strip_think_tags
 
         assert _strip_think_tags("Answer.<think>truncated reasoning") == "Answer."
 
     def test_no_think_unchanged(self):
-        from services.tts import _strip_think_tags
+        from orchestrator.services.tts import _strip_think_tags
 
         assert _strip_think_tags("Just plain text.") == "Just plain text."
 
     def test_case_insensitive(self):
-        from services.tts import _strip_think_tags
+        from orchestrator.services.tts import _strip_think_tags
 
         assert _strip_think_tags("<THINK>x</THINK>ok") == "ok"
 
 
 class TestThinkStreamStrip:
     def test_withholds_while_open_then_releases(self):
-        from services.tts import _strip_think_stream
+        from orchestrator.services.tts import _strip_think_stream
 
         assert _strip_think_stream("<think>reasoning so f") == ""
         assert _strip_think_stream("<think>reasoning</think>Hello") == "Hello"
 
     def test_withholds_partial_open_tag(self):
-        from services.tts import _strip_think_stream
+        from orchestrator.services.tts import _strip_think_stream
 
         assert _strip_think_stream("Hello <thi") == "Hello "
 
     def test_final_releases_partial_tail(self):
-        from services.tts import _strip_think_stream
+        from orchestrator.services.tts import _strip_think_stream
 
         assert _strip_think_stream("done <") == "done "  # withheld mid-stream
         assert _strip_think_stream("done <", final=True) == "done <"
@@ -2315,7 +2342,7 @@ class TestThinkStreamStrip:
         """Simulate the streaming loop: accumulate deltas (tags split across
         them), feed only newly-clean text — the think block must vanish and only
         the answer survive."""
-        from services.tts import _strip_think_stream
+        from orchestrator.services.tts import _strip_think_stream
 
         deltas = ["<thi", "nk>let me ", "reason</thi", "nk>The ", "answer is 42."]
         raw, emitted, out = "", 0, ""
@@ -2338,19 +2365,19 @@ class TestThinkStreamStrip:
 
 class TestDrainSentinels:
     def test_no_sentinel_all_remainder(self):
-        from services.tts import _drain_sentinels
+        from orchestrator.services.tts import _drain_sentinels
 
         assert _drain_sentinels("partial text") == ([], "partial text")
 
     def test_splits_complete_chunks_keeps_tail(self):
-        from services.tts import _drain_sentinels
+        from orchestrator.services.tts import _drain_sentinels
 
         chunks, rem = _drain_sentinels("First.[[BREAK]]Second.[[BREAK]]Third")
         assert chunks == ["First.", "Second."]
         assert rem == "Third"
 
     def test_partial_sentinel_stays_in_remainder(self):
-        from services.tts import _drain_sentinels
+        from orchestrator.services.tts import _drain_sentinels
 
         chunks, rem = _drain_sentinels("First.[[BR")
         assert chunks == []
@@ -2394,9 +2421,11 @@ async def _collect(agen):
 class TestStreamTtsChunks:
     @pytest.mark.asyncio
     async def test_unavailable_without_tts_model(self):
-        from services.tts import stream_tts_chunks
+        from orchestrator.services.tts import stream_tts_chunks
 
-        with patch("services.tts._resolve_capability_credentials", _caps(tts=None)):
+        with patch(
+            "orchestrator.services.tts._resolve_capability_credentials", _caps(tts=None)
+        ):
             events = await _collect(
                 stream_tts_chunks(content="hello", user_id="u1", postgres_db=_mock_db())
             )
@@ -2404,15 +2433,15 @@ class TestStreamTtsChunks:
 
     @pytest.mark.asyncio
     async def test_streams_chunks_split_on_sentinel(self):
-        from services.tts import stream_tts_chunks
+        from orchestrator.services.tts import stream_tts_chunks
 
         # Deltas deliberately split a sentinel across the boundary.
         cls, _ = _mock_openai_stream(
             ["First chunk.[[BR", "EAK]]Second chunk.[[BREAK]]Third chunk."]
         )
         with (
-            patch("services.tts.AsyncOpenAI", cls),
-            patch("services.tts._resolve_capability_credentials", _caps()),
+            patch("orchestrator.services.tts.AsyncOpenAI", cls),
+            patch("orchestrator.services.tts._resolve_capability_credentials", _caps()),
         ):
             events = await _collect(
                 stream_tts_chunks(
@@ -2435,13 +2464,13 @@ class TestStreamTtsChunks:
         """The real-world case: the model rewrites well but ignores the sentinel
         and streams one blob. The parser must still chunk incrementally by size at
         sentence boundaries — a short first chunk, then target-sized chunks."""
-        from services.tts import TTS_FIRST_CHUNK_TARGET, stream_tts_chunks
+        from orchestrator.services.tts import TTS_FIRST_CHUNK_TARGET, stream_tts_chunks
 
         pieces = [f"This is sentence number {i}. " for i in range(120)]  # ~3.3k chars
         cls, _ = _mock_openai_stream(pieces)
         with (
-            patch("services.tts.AsyncOpenAI", cls),
-            patch("services.tts._resolve_capability_credentials", _caps()),
+            patch("orchestrator.services.tts.AsyncOpenAI", cls),
+            patch("orchestrator.services.tts._resolve_capability_credentials", _caps()),
         ):
             events = await _collect(
                 stream_tts_chunks(content="long", user_id="u1", postgres_db=_mock_db())
@@ -2454,9 +2483,11 @@ class TestStreamTtsChunks:
 
     @pytest.mark.asyncio
     async def test_fallback_without_aux_strips_markdown(self):
-        from services.tts import stream_tts_chunks
+        from orchestrator.services.tts import stream_tts_chunks
 
-        with patch("services.tts._resolve_capability_credentials", _caps(aux=None)):
+        with patch(
+            "orchestrator.services.tts._resolve_capability_credentials", _caps(aux=None)
+        ):
             events = await _collect(
                 stream_tts_chunks(
                     content="Here is **bold** text with a | pipe | table.",
@@ -2472,12 +2503,12 @@ class TestStreamTtsChunks:
 
     @pytest.mark.asyncio
     async def test_empty_stream_falls_back(self):
-        from services.tts import stream_tts_chunks
+        from orchestrator.services.tts import stream_tts_chunks
 
         cls, _ = _mock_openai_stream([""])  # model produced nothing usable
         with (
-            patch("services.tts.AsyncOpenAI", cls),
-            patch("services.tts._resolve_capability_credentials", _caps()),
+            patch("orchestrator.services.tts.AsyncOpenAI", cls),
+            patch("orchestrator.services.tts._resolve_capability_credentials", _caps()),
         ):
             events = await _collect(
                 stream_tts_chunks(
@@ -2490,14 +2521,14 @@ class TestStreamTtsChunks:
 
     @pytest.mark.asyncio
     async def test_meters_stream_usage(self):
-        from services.tts import stream_tts_chunks
+        from orchestrator.services.tts import stream_tts_chunks
 
         usage = MagicMock(prompt_tokens=11, completion_tokens=22)
         cls, _ = _mock_openai_stream(["One.[[BREAK]]Two."], usage=usage)
         led = _mock_ledger()
         with (
-            patch("services.tts.AsyncOpenAI", cls),
-            patch("services.tts._resolve_capability_credentials", _caps()),
+            patch("orchestrator.services.tts.AsyncOpenAI", cls),
+            patch("orchestrator.services.tts._resolve_capability_credentials", _caps()),
         ):
             await _collect(
                 stream_tts_chunks(
@@ -2517,12 +2548,12 @@ class TestStreamTtsChunks:
 class TestPlanRawMode:
     @pytest.mark.asyncio
     async def test_reformulate_false_skips_aux_and_strips_markdown(self):
-        from services.tts import plan_tts_chunks
+        from orchestrator.services.tts import plan_tts_chunks
 
         cls, _ = _mock_openai_chat('["should not be used"]')
         with (
-            patch("services.tts.AsyncOpenAI", cls),
-            patch("services.tts._resolve_capability_credentials", _caps()),
+            patch("orchestrator.services.tts.AsyncOpenAI", cls),
+            patch("orchestrator.services.tts._resolve_capability_credentials", _caps()),
         ):
             result = await plan_tts_chunks(
                 content="This is **bold** and has a | table | row.",
@@ -2538,7 +2569,7 @@ class TestPlanRawMode:
 
 class TestTtsPlanStreamEndpoint:
     def test_route_is_registered(self):
-        from main import app
+        from orchestrator.main import app
 
         routes = {
             (m, getattr(r, "path", ""))
@@ -2554,7 +2585,7 @@ class TestTtsPlanStreamEndpoint:
     async def test_emits_sse_frames(self):
         """The handler must wrap the service generator into the house SSE wire
         format: a kickstart comment, `event: chunk` frames, then `event: done`."""
-        import main
+        import orchestrator.main
 
         async def _fake_stream(**_):
             yield {"type": "chunk", "index": 0, "text": "Hello.", "rewritten": True}
@@ -2563,13 +2594,13 @@ class TestTtsPlanStreamEndpoint:
 
         with (
             patch.object(
-                main,
+                orchestrator.main,
                 "require_thread_owner",
                 AsyncMock(return_value=({"id": "u1"}, {"id": "t1"})),
             ),
-            patch("services.tts.stream_tts_chunks", _fake_stream),
+            patch("orchestrator.services.tts.stream_tts_chunks", _fake_stream),
         ):
-            resp = await main.stream_thread_message_tts_plan(
+            resp = await orchestrator.main.stream_thread_message_tts_plan(
                 thread_id="t1", request=MagicMock(), body={"content": "hi"}
             )
             assert resp.media_type == "text/event-stream"
@@ -2582,20 +2613,20 @@ class TestTtsPlanStreamEndpoint:
 
     @pytest.mark.asyncio
     async def test_maps_unavailable_event(self):
-        import main
+        import orchestrator.main
 
         async def _fake_stream(**_):
             yield {"type": "unavailable"}
 
         with (
             patch.object(
-                main,
+                orchestrator.main,
                 "require_thread_owner",
                 AsyncMock(return_value=({"id": "u1"}, {"id": "t1"})),
             ),
-            patch("services.tts.stream_tts_chunks", _fake_stream),
+            patch("orchestrator.services.tts.stream_tts_chunks", _fake_stream),
         ):
-            resp = await main.stream_thread_message_tts_plan(
+            resp = await orchestrator.main.stream_thread_message_tts_plan(
                 thread_id="t1", request=MagicMock(), body={"content": "hi"}
             )
             frames = "".join([chunk async for chunk in resp.body_iterator])
@@ -2604,16 +2635,16 @@ class TestTtsPlanStreamEndpoint:
 
     @pytest.mark.asyncio
     async def test_400_on_empty_content(self):
-        import main
+        import orchestrator.main
         from fastapi import HTTPException
 
         with patch.object(
-            main,
+            orchestrator.main,
             "require_thread_owner",
             AsyncMock(return_value=({"id": "u1"}, {"id": "t1"})),
         ):
             with pytest.raises(HTTPException) as exc:
-                await main.stream_thread_message_tts_plan(
+                await orchestrator.main.stream_thread_message_tts_plan(
                     thread_id="t1", request=MagicMock(), body={"content": "  "}
                 )
         assert exc.value.status_code == 400

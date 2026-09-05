@@ -21,7 +21,7 @@ from eval.app_guide.run import (
     system_prompt,
     validate_corpus,
 )
-from src.core.skill_resolution import APP_GUIDE_LOADER_TOOL, APP_GUIDE_SKILL
+from shared.runtime.core.skill_resolution import APP_GUIDE_LOADER_TOOL, APP_GUIDE_SKILL
 
 
 @pytest.fixture(scope="module")

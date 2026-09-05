@@ -181,7 +181,7 @@ async def _require_parent_execution_authority(
     if parsed.execution_lane == "stateless":
         # Import lazily to keep this shared model usable in lightweight API
         # processes without eagerly loading the run-queue package.
-        from src.shared.run_queue import fence_lease
+        from shared.run_queue import fence_lease
 
         held = await fence_lease(
             conn,

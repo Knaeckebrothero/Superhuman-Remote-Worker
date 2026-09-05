@@ -6,7 +6,7 @@ import asyncio
 
 import pytest
 
-from src.subagents import SessionHost, SubagentRuntime
+from agent.subagents import SessionHost, SubagentRuntime
 from tests._fake_chat_model import FakeChatModel, text_turn
 from tests.test_subagent_background_runtime import StrictLedger
 from tests.test_subagent_runtime import call, make_parent

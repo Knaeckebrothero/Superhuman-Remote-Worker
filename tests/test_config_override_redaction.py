@@ -8,7 +8,7 @@ persistence, while every non-secret field is preserved verbatim.
 
 import copy
 
-from security import access
+from orchestrator.security import access
 
 
 def _full_config_override() -> dict:

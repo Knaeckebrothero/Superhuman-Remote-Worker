@@ -17,14 +17,14 @@ from pydantic import ValidationError
 from orchestrator import main
 from orchestrator.database.migrate import discover
 from orchestrator.services.default_experts import load_seed_bundle
-from src.core.expert_resolution import (
+from shared.runtime.core.expert_resolution import (
     ASSEMBLER_OWNED_PROMPT_TOKENS,
     validate_expert_persona_placeholders,
 )
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-MIGRATIONS = ROOT / "orchestrator" / "database" / "migrations" / "app"
+MIGRATIONS = ROOT / "src" / "orchestrator" / "database" / "migrations" / "app"
 NAME = "0209_expert_persona_identity_backfill.sql"
 SQL = MIGRATIONS / NAME
 PREDECESSOR = "0208_threads_subagent_validate.sql"

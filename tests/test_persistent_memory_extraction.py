@@ -14,13 +14,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
-from src.api.persistent_app import _handle_archive, _handle_idle_archive
-from src.api.persistent_session import (
+from agent.api.persistent_app import _handle_archive, _handle_idle_archive
+from agent.api.persistent_session import (
     PersistentSession,
     resolve_memory_extraction_prompt,
 )
-from src.core.loader import AgentConfig, MemoryConfig
-from src.persistent_graph import PersistentLoopCallbacks, run_persistent_loop
+from shared.runtime.core.loader import AgentConfig, MemoryConfig
+from agent.persistent_graph import PersistentLoopCallbacks, run_persistent_loop
 
 
 def _make_callbacks(**overrides) -> PersistentLoopCallbacks:
@@ -90,7 +90,7 @@ class TestResolveMemoryExtractionPrompt:
     def test_load_failure_returns_empty_not_raise(self):
         cfg = AgentConfig(agent_id="t", display_name="T")
         with patch(
-            "src.services.memory_prompts.load_auxiliary_prompt",
+            "shared.runtime.services.memory_prompts.load_auxiliary_prompt",
             side_effect=FileNotFoundError("missing"),
         ):
             assert resolve_memory_extraction_prompt(cfg) == ""
@@ -117,7 +117,9 @@ class TestLoopExtractionWiring:
             raise asyncio.CancelledError
 
         extraction = AsyncMock()
-        with patch("src.services.auxiliary.extract_and_store_memories", extraction):
+        with patch(
+            "shared.runtime.services.auxiliary.extract_and_store_memories", extraction
+        ):
             await run_persistent_loop(
                 llm_with_tools=_make_streaming_llm(),
                 tools=[],
@@ -312,7 +314,7 @@ class TestLoopExtractionWiring:
         )
 
         with (
-            patch("src.persistent_graph._SESSION_LLM_MAX_ATTEMPTS", 1),
+            patch("agent.persistent_graph._SESSION_LLM_MAX_ATTEMPTS", 1),
             pytest.raises(RuntimeError, match="persist failed"),
         ):
             await run_persistent_loop(
@@ -363,7 +365,7 @@ class TestLoopExtractionWiring:
             on_turn_complete=_complete,
             on_error=_error,
         )
-        with patch("src.persistent_graph._SESSION_LLM_MAX_ATTEMPTS", 1):
+        with patch("agent.persistent_graph._SESSION_LLM_MAX_ATTEMPTS", 1):
             await run_persistent_loop(
                 llm_with_tools=llm,
                 tools=[],
@@ -412,7 +414,7 @@ class TestLoopExtractionWiring:
             on_turn_complete=_complete,
             on_error=_error,
         )
-        with patch("src.persistent_graph._SESSION_LLM_MAX_ATTEMPTS", 1):
+        with patch("agent.persistent_graph._SESSION_LLM_MAX_ATTEMPTS", 1):
             await run_persistent_loop(
                 llm_with_tools=llm,
                 tools=[],
@@ -517,14 +519,17 @@ class TestTeardownExtraction:
         session = self._make_session()
         extraction = AsyncMock()
         with (
-            patch("src.api.persistent_app._session", session),
-            patch("src.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session", session),
+            patch("agent.api.persistent_app._thread_id", "tid"),
             patch(
-                "src.api.persistent_app._update_thread_status",
+                "agent.api.persistent_app._update_thread_status",
                 new=AsyncMock(return_value=True),
             ),
-            patch("src.api.persistent_app._terminate_session", AsyncMock()),
-            patch("src.services.auxiliary.extract_and_store_memories", extraction),
+            patch("agent.api.persistent_app._terminate_session", AsyncMock()),
+            patch(
+                "shared.runtime.services.auxiliary.extract_and_store_memories",
+                extraction,
+            ),
         ):
             await _handle_archive(ws)
 
@@ -538,15 +543,18 @@ class TestTeardownExtraction:
         session = self._make_session()
         extraction = AsyncMock()
         with (
-            patch("src.api.persistent_app._session", session),
-            patch("src.api.persistent_app._thread_id", "tid"),
-            patch("src.api.persistent_app._broadcast"),
+            patch("agent.api.persistent_app._session", session),
+            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._broadcast"),
             patch(
-                "src.api.persistent_app._update_thread_status",
+                "agent.api.persistent_app._update_thread_status",
                 AsyncMock(return_value=True),
             ),
-            patch("src.api.persistent_app._terminate_session", AsyncMock()),
-            patch("src.services.auxiliary.extract_and_store_memories", extraction),
+            patch("agent.api.persistent_app._terminate_session", AsyncMock()),
+            patch(
+                "shared.runtime.services.auxiliary.extract_and_store_memories",
+                extraction,
+            ),
         ):
             await _handle_idle_archive()
 
@@ -566,11 +574,14 @@ class TestTeardownExtraction:
         extraction = AsyncMock()
         ws = AsyncMock()
         with (
-            patch("src.api.persistent_app._session", session),
-            patch("src.api.persistent_app._thread_id", "tid"),
-            patch("src.api.persistent_app._broadcast"),
-            patch("src.api.persistent_app._terminate_session", AsyncMock()),
-            patch("src.services.auxiliary.extract_and_store_memories", extraction),
+            patch("agent.api.persistent_app._session", session),
+            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._broadcast"),
+            patch("agent.api.persistent_app._terminate_session", AsyncMock()),
+            patch(
+                "shared.runtime.services.auxiliary.extract_and_store_memories",
+                extraction,
+            ),
         ):
             if handler == "archive":
                 await _handle_archive(ws)
@@ -584,7 +595,7 @@ class TestTeardownExtraction:
     async def test_stateless_generic_terminate_skips_manager_extraction(
         self, monkeypatch
     ):
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         monkeypatch.setenv("STATELESS_EXECUTOR", "1")
         session = self._make_session()

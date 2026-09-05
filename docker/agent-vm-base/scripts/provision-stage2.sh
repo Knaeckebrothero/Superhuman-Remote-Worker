@@ -306,7 +306,7 @@ sudo -u agent-host git config --global core.pager cat
 # 7. browser-exec — workspace-side browser executor
 # -----------------------------------------------------------------------------
 #
-# The agent drives this over SSH (src/tools/context.py) so Chrome's CDP stays on
+# The agent drives this over SSH (src/agent/tools/context.py) so Chrome's CDP stays on
 # the workspace loopback and never crosses the network. It is the agent's ONLY
 # browser path — the in-pod fallback was removed deliberately
 # (knowledge-base/knowledge/issues/remove_local_browser_fallback.md) — so a workspace without

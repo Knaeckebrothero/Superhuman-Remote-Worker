@@ -3,16 +3,8 @@
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
 
-_ROOT = Path(__file__).resolve().parent.parent
-_ORCHESTRATOR = _ROOT / "orchestrator"
-for path in (_ROOT, _ORCHESTRATOR):
-    if str(path) not in sys.path:
-        sys.path.insert(0, str(path))
-
-from operator_cli.managed_repository_reconciliation import (  # noqa: E402
+from orchestrator.operator_cli.managed_repository_reconciliation import (
     _safe_inventory_counts,
     main,
 )

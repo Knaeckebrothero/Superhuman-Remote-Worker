@@ -17,7 +17,7 @@ from orchestrator.services.email_datasource import (
     validate_email_config,
     validate_email_credentials,
 )
-from src.core.datasource_setup import EMAIL_TIER_ORDER, EMAIL_TIER_TOOLS
+from agent.core.datasource_setup import EMAIL_TIER_ORDER, EMAIL_TIER_TOOLS
 
 
 def _creds(access_smtp: bool = False) -> dict:

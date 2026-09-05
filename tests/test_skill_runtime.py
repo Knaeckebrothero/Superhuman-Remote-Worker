@@ -8,7 +8,7 @@ tests/test_persona_fencing.py.
 """
 
 from orchestrator.services.config_resolver import resolve_config
-from src.core.loader import (
+from shared.runtime.core.loader import (
     get_phase_system_prompt,
     load_agent_config_from_dict,
     load_config_from_resolved,

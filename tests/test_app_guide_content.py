@@ -13,19 +13,19 @@ from typing import get_args
 
 import yaml
 
-from services.canvas import CanvasRenderer
-from services.cloud_staging import select_protected_mount
-from services.default_experts import MANAGED_SEEDS
-from services.project_loops import (
+from orchestrator.services.canvas import CanvasRenderer
+from orchestrator.services.cloud_staging import select_protected_mount
+from orchestrator.services.default_experts import MANAGED_SEEDS
+from orchestrator.services.project_loops import (
     LOOP_ANALYSIS_ROLES,
     LOOP_CAMPAIGN_BUDGET_RESERVE,
     LOOP_CAMPAIGN_DEFAULT_CAPS,
 )
-from services.shared_browser_canvas import BrowserCapabilityReason
-from src.core.capability_grants import CATALOG
-from src.core.session_tool_overrides import SESSION_TOOL_OVERRIDE_NAMES
-from src.tools.canvas import CANVAS_TOOLS_METADATA
-from src.tools.research.browser_direct import BROWSER_DIRECT_TOOLS_METADATA
+from orchestrator.services.shared_browser_canvas import BrowserCapabilityReason
+from shared.runtime.core.capability_grants import CATALOG
+from shared.runtime.core.session_tool_overrides import SESSION_TOOL_OVERRIDE_NAMES
+from agent.tools.canvas import CANVAS_TOOLS_METADATA
+from agent.tools.research.browser_direct import BROWSER_DIRECT_TOOLS_METADATA
 
 _ROOT = Path(__file__).resolve().parents[1]
 _GUIDE = _ROOT / "config" / "skills" / "app-guide"

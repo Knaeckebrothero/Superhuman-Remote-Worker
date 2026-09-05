@@ -5,16 +5,16 @@ from contextlib import asynccontextmanager
 
 import pytest
 
-import canvas_gateway as canvas_gateway_module
-from canvas_gateway import CanvasGatewayApp
-from services.canvas_session_notifications import CanvasConnectionRegistry
-from services.canvas_viewer_config import CanvasViewerConfig
-from services.canvas_viewer_database import (
+import orchestrator.canvas_gateway as canvas_gateway_module
+from orchestrator.canvas_gateway import CanvasGatewayApp
+from orchestrator.services.canvas_session_notifications import CanvasConnectionRegistry
+from orchestrator.services.canvas_viewer_config import CanvasViewerConfig
+from orchestrator.services.canvas_viewer_database import (
     CanvasViewerDatabaseConfigurationError,
     CanvasViewerDatabasePrivilegeError,
     attest_canvas_viewer_database_privileges,
 )
-import services.canvas_viewer_database as viewer_database_module
+import orchestrator.services.canvas_viewer_database as viewer_database_module
 
 
 _VIEWER_DATABASE_ENV = (

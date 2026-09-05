@@ -16,8 +16,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-import main
-from services.notification_service import RecordResult
+import orchestrator.main
+from orchestrator.services.notification_service import RecordResult
 
 JOB_ID = str(uuid.uuid4())
 USER_ID = str(uuid.uuid4())
@@ -27,7 +27,7 @@ SUDO_ID = str(uuid.uuid4())
 @pytest.fixture
 def record(monkeypatch):
     mock = AsyncMock(return_value=RecordResult("n-1", True, {"in_app": True}))
-    monkeypatch.setattr(main.notification_service, "record", mock)
+    monkeypatch.setattr(orchestrator.main.notification_service, "record", mock)
     return mock
 
 
@@ -45,7 +45,7 @@ def _job(**overrides):
 class TestNotifyOperatorFreeze:
     @pytest.mark.asyncio
     async def test_job_complete_is_a_review_queue_item(self, record):
-        result = await main._notify_operator_freeze(
+        result = await orchestrator.main._notify_operator_freeze(
             _job(),
             JOB_ID,
             "job_complete",
@@ -65,7 +65,7 @@ class TestNotifyOperatorFreeze:
 
     @pytest.mark.asyncio
     async def test_vm_upgrade_points_at_the_sudo_request(self, record):
-        await main._notify_operator_freeze(
+        await orchestrator.main._notify_operator_freeze(
             _job(),
             JOB_ID,
             "vm_upgrade_required",
@@ -80,7 +80,7 @@ class TestNotifyOperatorFreeze:
 
     @pytest.mark.asyncio
     async def test_vm_upgrade_without_request_falls_back_to_the_job(self, record):
-        await main._notify_operator_freeze(
+        await orchestrator.main._notify_operator_freeze(
             _job(), JOB_ID, "vm_upgrade_required", {}, dedup_key="k"
         )
         kwargs = record.call_args.kwargs
@@ -88,25 +88,25 @@ class TestNotifyOperatorFreeze:
 
     @pytest.mark.asyncio
     async def test_llm_unavailable_and_unknown_types_are_incidents(self, record):
-        await main._notify_operator_freeze(
+        await orchestrator.main._notify_operator_freeze(
             _job(), JOB_ID, "llm_unavailable", {"model": "m"}, dedup_key="a"
         )
         assert record.call_args.kwargs["category"] == "incident"
-        await main._notify_operator_freeze(
+        await orchestrator.main._notify_operator_freeze(
             _job(), JOB_ID, "something_new", {}, dedup_key="b"
         )
         assert record.call_args.kwargs["category"] == "incident"
 
     @pytest.mark.asyncio
     async def test_budget_exceeded(self, record):
-        await main._notify_operator_freeze(
+        await orchestrator.main._notify_operator_freeze(
             _job(), JOB_ID, "budget_exceeded", {"phase_number": 2}, dedup_key="c"
         )
         assert record.call_args.kwargs["category"] == "budget_exceeded"
 
     @pytest.mark.asyncio
     async def test_no_owner_records_nothing(self, record):
-        result = await main._notify_operator_freeze(
+        result = await orchestrator.main._notify_operator_freeze(
             _job(user_id=None), JOB_ID, "job_complete", {}, dedup_key="d"
         )
         assert result is None
@@ -115,29 +115,39 @@ class TestNotifyOperatorFreeze:
     @pytest.mark.asyncio
     async def test_dedup_key_is_required(self, record):
         with pytest.raises(TypeError):
-            await main._notify_operator_freeze(_job(), JOB_ID, "job_complete", {})
+            await orchestrator.main._notify_operator_freeze(
+                _job(), JOB_ID, "job_complete", {}
+            )
 
 
 class TestCompletionEffectDedupKey:
     def test_journalled_effect_uses_the_command_id(self):
         runner = SimpleNamespace(command_id="cmd-42")
-        key = main._completion_effect_dedup_key(runner, "freeze_notification", JOB_ID)
+        key = orchestrator.main._completion_effect_dedup_key(
+            runner, "freeze_notification", JOB_ID
+        )
         assert key == "freeze_notification:cmd-42"
         # Stable across retries and restarts of the same command.
-        assert key == main._completion_effect_dedup_key(
+        assert key == orchestrator.main._completion_effect_dedup_key(
             runner, "freeze_notification", JOB_ID
         )
 
     def test_runner_less_route_gets_a_fresh_key_each_time(self):
-        a = main._completion_effect_dedup_key(None, "freeze_notification", JOB_ID)
-        b = main._completion_effect_dedup_key(None, "freeze_notification", JOB_ID)
+        a = orchestrator.main._completion_effect_dedup_key(
+            None, "freeze_notification", JOB_ID
+        )
+        b = orchestrator.main._completion_effect_dedup_key(
+            None, "freeze_notification", JOB_ID
+        )
         assert a != b
         assert a.startswith(f"freeze_notification:{JOB_ID}:")
 
     def test_effect_names_are_still_the_versioned_vocabulary(self):
         # The journal vocabulary is a resumability contract; slice 1 must not
         # have renamed the notification effects (completion_effect_policy.py).
-        from services.completion_effect_policy import COMPLETION_EFFECT_INDEX
+        from orchestrator.services.completion_effect_policy import (
+            COMPLETION_EFFECT_INDEX,
+        )
 
         for pair in (
             ("freeze_notification", "freeze_notification"),

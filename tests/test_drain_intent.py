@@ -48,7 +48,7 @@ class TestPersistentDrainHandler:
     @pytest.fixture(autouse=True)
     def _isolate_module_state(self):
         """Snapshot + restore persistent_app globals around every test."""
-        from src.api import persistent_app
+        from agent.api import persistent_app
 
         saved = {name: getattr(persistent_app, name) for name in _PERSISTENT_GLOBALS}
         persistent_app._drain_intent_handled = False
@@ -88,7 +88,7 @@ class TestPersistentDrainHandler:
 
     @pytest.mark.asyncio
     async def test_no_session_exits_without_detach(self):
-        from src.api import persistent_app
+        from agent.api import persistent_app
 
         with (
             patch.object(
@@ -105,7 +105,7 @@ class TestPersistentDrainHandler:
 
     @pytest.mark.asyncio
     async def test_parked_session_drain_suspends(self):
-        from src.api import persistent_app
+        from agent.api import persistent_app
 
         client = self._attach_parked_session(persistent_app)
         runtime_generation = "55555555-5555-4555-8555-555555555555"
@@ -181,7 +181,7 @@ class TestPersistentDrainHandler:
 
     @pytest.mark.asyncio
     async def test_suspend_failure_falls_back_to_ended(self):
-        from src.api import persistent_app
+        from agent.api import persistent_app
 
         client = self._attach_parked_session(persistent_app)
         client.suspend_thread = AsyncMock(return_value=False)
@@ -212,7 +212,7 @@ class TestPersistentDrainHandler:
 
     @pytest.mark.asyncio
     async def test_exact_suspend_ambiguity_retries_in_background_without_ended(self):
-        from src.api import persistent_app
+        from agent.api import persistent_app
 
         client = self._attach_parked_session(persistent_app)
         generation = "55555555-5555-4555-8555-555555555555"
@@ -252,7 +252,7 @@ class TestPersistentDrainHandler:
 
     @pytest.mark.asyncio
     async def test_local_teardown_failure_never_settles_or_exits(self):
-        from src.api import persistent_app
+        from agent.api import persistent_app
 
         client = self._attach_parked_session(persistent_app)
         persistent_app._session_runtime_generation = (
@@ -289,7 +289,7 @@ class TestPersistentDrainHandler:
 
     @pytest.mark.asyncio
     async def test_retirement_begin_failure_preserves_session_for_retry(self):
-        from src.api import persistent_app
+        from agent.api import persistent_app
 
         client = self._attach_parked_session(persistent_app)
         original_session = persistent_app._session
@@ -318,7 +318,7 @@ class TestPersistentDrainHandler:
 
     @pytest.mark.asyncio
     async def test_turn_in_flight_defers(self):
-        from src.api import persistent_app
+        from agent.api import persistent_app
 
         self._attach_parked_session(persistent_app)
         persistent_app._awaiting_input = False  # loop not parked: mid-turn
@@ -340,7 +340,7 @@ class TestPersistentDrainHandler:
 
     @pytest.mark.asyncio
     async def test_tool_inflight_defers(self):
-        from src.api import persistent_app
+        from agent.api import persistent_app
 
         self._attach_parked_session(persistent_app)
         persistent_app._tool_inflight = True
@@ -354,7 +354,7 @@ class TestPersistentDrainHandler:
 
     @pytest.mark.asyncio
     async def test_queued_input_defers(self):
-        from src.api import persistent_app
+        from agent.api import persistent_app
 
         self._attach_parked_session(persistent_app)
         queue: asyncio.Queue = asyncio.Queue()
@@ -370,7 +370,7 @@ class TestPersistentDrainHandler:
 
     @pytest.mark.asyncio
     async def test_deferred_drain_fires_once_loop_parks(self):
-        from src.api import persistent_app
+        from agent.api import persistent_app
 
         client = self._attach_parked_session(persistent_app)
         persistent_app._awaiting_input = False  # busy on the first tick
@@ -401,7 +401,7 @@ class TestPersistentDrainHandler:
 
     @pytest.mark.asyncio
     async def test_subsequent_calls_are_idempotent(self):
-        from src.api import persistent_app
+        from agent.api import persistent_app
 
         client = self._attach_parked_session(persistent_app)
 
@@ -439,7 +439,7 @@ class TestPersistentDrainHandler:
         Without the _terminating guard the inner call writes 'ended' and
         defeats the orchestrator's 'suspended' transition.
         """
-        from src.api import persistent_app
+        from agent.api import persistent_app
 
         session = MagicMock()
         session.workspace_sync = None
@@ -484,7 +484,7 @@ class TestPersistentDrainHandler:
 
     @pytest.mark.asyncio
     async def test_no_intents_no_action(self):
-        from src.api import persistent_app
+        from agent.api import persistent_app
 
         with (
             patch.object(
@@ -845,11 +845,11 @@ class TestDualDrainHandler:
 
     @pytest.mark.asyncio
     async def test_idle_worker_exits_on_drain(self):
-        from src.api import dual_app
+        from agent.api import dual_app
 
         self._reset(dual_app)
 
-        with patch("src.api.dual_app.os._exit") as fake_exit:
+        with patch("agent.api.dual_app.os._exit") as fake_exit:
             await dual_app._handle_heartbeat_intents(
                 {"intents": {"should_drain": True, "drain_reason": "stale_image"}}
             )
@@ -862,14 +862,14 @@ class TestDualDrainHandler:
 
     @pytest.mark.asyncio
     async def test_idle_drain_exits_even_when_deregister_fails(self):
-        from src.api import dual_app
+        from agent.api import dual_app
 
         self._reset(dual_app)
         dual_app._orchestrator_client.deregister = AsyncMock(
             side_effect=RuntimeError("orchestrator 500")
         )
 
-        with patch("src.api.dual_app.os._exit") as fake_exit:
+        with patch("agent.api.dual_app.os._exit") as fake_exit:
             await dual_app._handle_heartbeat_intents(
                 {"intents": {"should_drain": True, "drain_reason": "stale_image"}}
             )
@@ -882,13 +882,13 @@ class TestDualDrainHandler:
         # os._exit and strand the pod forever.
         import asyncio
 
-        from src.api import dual_app
+        from agent.api import dual_app
 
         self._reset(dual_app)
         saved_task = dual_app._heartbeat_task
         dual_app._heartbeat_task = asyncio.current_task()
         try:
-            with patch("src.api.dual_app.os._exit") as fake_exit:
+            with patch("agent.api.dual_app.os._exit") as fake_exit:
                 await dual_app._handle_heartbeat_intents(
                     {"intents": {"should_drain": True}}
                 )
@@ -900,13 +900,13 @@ class TestDualDrainHandler:
 
     @pytest.mark.asyncio
     async def test_busy_worker_sets_flag_no_exit(self):
-        from src.api import dual_app
+        from agent.api import dual_app
 
         self._reset(dual_app)
         dual_app._current_job_id = "11111111-1111-1111-1111-111111111111"
         dual_app._pod_state = dual_app.PodState.WORKING
 
-        with patch("src.api.dual_app.os._exit") as fake_exit:
+        with patch("agent.api.dual_app.os._exit") as fake_exit:
             await dual_app._handle_heartbeat_intents(
                 {"intents": {"should_drain": True, "drain_reason": "stale_image"}}
             )
@@ -918,12 +918,12 @@ class TestDualDrainHandler:
 
     @pytest.mark.asyncio
     async def test_session_worker_sets_flag_no_exit(self):
-        from src.api import dual_app
+        from agent.api import dual_app
 
         self._reset(dual_app)
         dual_app._pod_state = dual_app.PodState.SESSION
 
-        with patch("src.api.dual_app.os._exit") as fake_exit:
+        with patch("agent.api.dual_app.os._exit") as fake_exit:
             await dual_app._handle_heartbeat_intents(
                 {"intents": {"should_drain": True}}
             )
@@ -932,11 +932,11 @@ class TestDualDrainHandler:
 
     @pytest.mark.asyncio
     async def test_no_drain_intent_no_state_change(self):
-        from src.api import dual_app
+        from agent.api import dual_app
 
         self._reset(dual_app)
 
-        with patch("src.api.dual_app.os._exit") as fake_exit:
+        with patch("agent.api.dual_app.os._exit") as fake_exit:
             await dual_app._handle_heartbeat_intents({"intents": {}})
             await dual_app._handle_heartbeat_intents({})
         fake_exit.assert_not_called()
@@ -1668,7 +1668,7 @@ class TestAutoContinueDrainBackstop:
 
 class TestAutoContinueFreezeTypeScope:
     def test_shared_registry_keeps_semantic_subsets_explicit(self):
-        from src.shared.job_freeze_types import (
+        from shared.job_freeze_types import (
             AUTO_REDISPATCH_FREEZE_TYPES,
             CONTINUE_AS_NEW_FREEZE_TYPES,
             ERROR_IMMUNE_FREEZE_TYPES,
@@ -1686,7 +1686,7 @@ class TestAutoContinueFreezeTypeScope:
             assert freeze_type not in ERROR_IMMUNE_FREEZE_TYPES
 
     def test_auto_continue_set_covers_redispatch_types_only(self):
-        from src.shared.job_freeze_types import AUTO_CONTINUE_FREEZE_TYPES
+        from shared.job_freeze_types import AUTO_CONTINUE_FREEZE_TYPES
 
         for ft in (
             "version_upgrade",

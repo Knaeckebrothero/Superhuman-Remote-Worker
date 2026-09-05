@@ -20,7 +20,7 @@ import pytest
 from fastapi import HTTPException
 from pydantic import ValidationError
 
-import security.access as access_module
+import orchestrator.security.access as access_module
 
 
 _PINNED_THREAD_ID = "11111111-1111-4111-8111-111111111111"
@@ -68,15 +68,15 @@ def _make_request(headers: dict[str, str] | None = None) -> MagicMock:
 def _patch_caller_and_db(user: dict, db):
     stack = ExitStack()
     stack.enter_context(
-        patch("main.require_approved_user", AsyncMock(return_value=user))
+        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user))
     )
     stack.enter_context(
         patch(
-            "security.access.require_approved_user",
+            "orchestrator.security.access.require_approved_user",
             AsyncMock(return_value=user),
         )
     )
-    stack.enter_context(patch("main.postgres_db", db))
+    stack.enter_context(patch("orchestrator.main.postgres_db", db))
     return stack
 
 
@@ -140,7 +140,7 @@ class TestRequireInternalOrJobAccess:
         with patch.object(access_module, "_INTERNAL_KEY", "secret"):
             req = _make_request({"X-Internal-Key": "secret"})
             with patch(
-                "security.access.require_approved_user",
+                "orchestrator.security.access.require_approved_user",
                 AsyncMock(side_effect=AssertionError("user auth called")),
             ):
                 caller, job = await access_module.require_internal_or_job_access(
@@ -166,7 +166,7 @@ class TestRequireInternalOrJobAccess:
         with patch.object(access_module, "_INTERNAL_KEY", "secret"):
             req = _make_request({})
             with patch(
-                "security.access.require_approved_user",
+                "orchestrator.security.access.require_approved_user",
                 AsyncMock(return_value=user_a),
             ):
                 caller, job = await access_module.require_internal_or_job_access(
@@ -181,7 +181,7 @@ class TestRequireInternalOrJobAccess:
         with patch.object(access_module, "_INTERNAL_KEY", "secret"):
             req = _make_request({})
             with patch(
-                "security.access.require_approved_user",
+                "orchestrator.security.access.require_approved_user",
                 AsyncMock(return_value=user_b),
             ):
                 with pytest.raises(HTTPException) as exc:
@@ -198,7 +198,7 @@ class TestRequireInternalOrJobAccess:
 
 class TestPureInternalEndpoints:
     def test_agent_registration_rejects_self_verified_provenance(self):
-        from main import AgentRegistration
+        from orchestrator.main import AgentRegistration
 
         with pytest.raises(ValidationError, match="self-assert verified"):
             AgentRegistration(
@@ -213,7 +213,7 @@ class TestPureInternalEndpoints:
 
     @pytest.mark.asyncio
     async def test_agent_register_without_key_401(self, fake_request):
-        from main import AgentRegistration, register_agent
+        from orchestrator.main import AgentRegistration, register_agent
 
         reg = AgentRegistration(
             config_name="scholar", pod_ip="10.0.0.1", hostname="agent-1"
@@ -234,7 +234,7 @@ class TestPureInternalEndpoints:
     )
     async def test_persistent_registration_refuses_non_pinned_thread(self, thread):
         """The lane fence runs before a hostname upsert can mutate any row."""
-        import main as orch_main
+        import orchestrator.main as orch_main
 
         reg = orch_main.AgentRegistration(
             config_name="session_base",
@@ -270,7 +270,7 @@ class TestPureInternalEndpoints:
 
     @pytest.mark.asyncio
     async def test_persistent_registration_still_binds_pinned_thread(self):
-        import main as orch_main
+        import orchestrator.main as orch_main
 
         reg = orch_main.AgentRegistration(
             config_name="session_base",
@@ -329,7 +329,7 @@ class TestPureInternalEndpoints:
 
     @pytest.mark.asyncio
     async def test_live_persistent_owner_rejects_other_hostname_before_upsert(self):
-        import main as orch_main
+        import orchestrator.main as orch_main
 
         reg = orch_main.AgentRegistration(
             config_name="session_base",
@@ -374,7 +374,7 @@ class TestPureInternalEndpoints:
 
     @pytest.mark.asyncio
     async def test_same_hostname_restart_targets_exact_live_owner(self):
-        import main as orch_main
+        import orchestrator.main as orch_main
 
         reg = orch_main.AgentRegistration(
             config_name="session_base",
@@ -442,7 +442,7 @@ class TestPureInternalEndpoints:
     async def test_same_hostname_stale_owner_still_targets_exact_row(
         self, owner_status
     ):
-        import main as orch_main
+        import orchestrator.main as orch_main
 
         reg = orch_main.AgentRegistration(
             config_name="session_base",
@@ -496,7 +496,7 @@ class TestPureInternalEndpoints:
 
     @pytest.mark.asyncio
     async def test_different_hostname_replacement_of_stale_owner_inserts_new_row(self):
-        import main as orch_main
+        import orchestrator.main as orch_main
 
         reg = orch_main.AgentRegistration(
             config_name="session_base",
@@ -556,7 +556,7 @@ class TestPureInternalEndpoints:
 
     @pytest.mark.asyncio
     async def test_missing_snapshotted_owner_refuses_before_upsert(self):
-        import main as orch_main
+        import orchestrator.main as orch_main
 
         reg = orch_main.AgentRegistration(
             config_name="session_base",
@@ -587,7 +587,7 @@ class TestPureInternalEndpoints:
 
     @pytest.mark.asyncio
     async def test_persistent_registration_refuses_a_lost_final_lane_bind(self):
-        import main as orch_main
+        import orchestrator.main as orch_main
 
         reg = orch_main.AgentRegistration(
             config_name="session_base",
@@ -625,7 +625,7 @@ class TestPureInternalEndpoints:
 
     @pytest.mark.asyncio
     async def test_final_persistent_bind_is_lane_qualified_and_clears_exact_agent(self):
-        import main as orch_main
+        import orchestrator.main as orch_main
 
         conn = AsyncMock()
         conn.execute = AsyncMock(return_value="UPDATE 0")
@@ -664,7 +664,7 @@ class TestPureInternalEndpoints:
 
     @pytest.mark.asyncio
     async def test_final_persistent_bind_cas_matches_the_snapshotted_owner(self):
-        import main as orch_main
+        import orchestrator.main as orch_main
 
         conn = AsyncMock()
         conn.execute = AsyncMock(return_value="UPDATE 1")
@@ -706,7 +706,7 @@ class TestPureInternalEndpoints:
 
     @pytest.mark.asyncio
     async def test_agent_heartbeat_without_key_401(self, fake_request):
-        from main import AgentHeartbeat, agent_heartbeat
+        from orchestrator.main import AgentHeartbeat, agent_heartbeat
 
         hb = AgentHeartbeat(status="ready", current_job_id=None, metrics=None)
         with patch.object(access_module, "_INTERNAL_KEY", "secret"):
@@ -718,7 +718,7 @@ class TestPureInternalEndpoints:
     async def test_agent_heartbeat_merges_graph_progress_into_metrics(
         self, fake_request
     ):
-        from main import AgentHeartbeat, agent_heartbeat
+        from orchestrator.main import AgentHeartbeat, agent_heartbeat
 
         hb = AgentHeartbeat(
             status="working",
@@ -734,7 +734,7 @@ class TestPureInternalEndpoints:
         fake_request.headers = {"X-Internal-Key": "secret"}
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
-            patch("main.postgres_db", fake_db),
+            patch("orchestrator.main.postgres_db", fake_db),
         ):
             result = await agent_heartbeat(fake_request, "agent-1", hb)
 
@@ -765,7 +765,7 @@ class TestPureInternalEndpoints:
         out-of-band because the heartbeat carried nothing back.
         knowledge-base/knowledge/issues/transient_db_error_hard_fails_job_and_destroys_vm.md (Defect 3)
         """
-        from main import AgentHeartbeat, agent_heartbeat
+        from orchestrator.main import AgentHeartbeat, agent_heartbeat
 
         job_id = "11111111-1111-1111-1111-111111111111"
         hb = AgentHeartbeat(status="working", current_job_id=job_id)
@@ -778,7 +778,7 @@ class TestPureInternalEndpoints:
         fake_request.headers = {"X-Internal-Key": "secret"}
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
-            patch("main.postgres_db", fake_db),
+            patch("orchestrator.main.postgres_db", fake_db),
         ):
             result = await agent_heartbeat(fake_request, "agent-1", hb)
 
@@ -788,7 +788,7 @@ class TestPureInternalEndpoints:
     async def test_agent_heartbeat_survives_a_job_lookup_failure(self, fake_request):
         """A heartbeat must never fail over the status lookup — it degrades to
         the previous push-only behaviour instead."""
-        from main import AgentHeartbeat, agent_heartbeat
+        from orchestrator.main import AgentHeartbeat, agent_heartbeat
 
         hb = AgentHeartbeat(
             status="working", current_job_id="11111111-1111-1111-1111-111111111111"
@@ -802,7 +802,7 @@ class TestPureInternalEndpoints:
         fake_request.headers = {"X-Internal-Key": "secret"}
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
-            patch("main.postgres_db", fake_db),
+            patch("orchestrator.main.postgres_db", fake_db),
         ):
             result = await agent_heartbeat(fake_request, "agent-1", hb)
 
@@ -813,7 +813,7 @@ class TestPureInternalEndpoints:
     async def test_agent_heartbeat_graph_progress_overrides_metric_field(
         self, fake_request
     ):
-        from main import AgentHeartbeat, agent_heartbeat
+        from orchestrator.main import AgentHeartbeat, agent_heartbeat
 
         hb = AgentHeartbeat(
             status="working",
@@ -829,7 +829,7 @@ class TestPureInternalEndpoints:
         fake_request.headers = {"X-Internal-Key": "secret"}
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
-            patch("main.postgres_db", fake_db),
+            patch("orchestrator.main.postgres_db", fake_db),
         ):
             await agent_heartbeat(fake_request, "agent-1", hb)
 
@@ -854,7 +854,7 @@ class TestPureInternalEndpoints:
 
     @pytest.mark.asyncio
     async def test_agent_heartbeat_slides_the_bound_threads_grant(self, fake_request):
-        from main import AgentHeartbeat, agent_heartbeat
+        from orchestrator.main import AgentHeartbeat, agent_heartbeat
 
         thread_id = "22222222-2222-2222-2222-222222222222"
         hb = AgentHeartbeat(status="ready")
@@ -871,8 +871,8 @@ class TestPureInternalEndpoints:
         fake_request.headers = {"X-Internal-Key": "secret"}
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
-            patch("main.postgres_db", fake_db),
-            patch("main.slide_thread_grant_on_liveness", slide),
+            patch("orchestrator.main.postgres_db", fake_db),
+            patch("orchestrator.main.slide_thread_grant_on_liveness", slide),
         ):
             result = await agent_heartbeat(fake_request, "agent-1", hb)
 
@@ -890,7 +890,7 @@ class TestPureInternalEndpoints:
         self, fake_request
     ):
         """A stateless worker agent has no thread and so no liveness claim."""
-        from main import AgentHeartbeat, agent_heartbeat
+        from orchestrator.main import AgentHeartbeat, agent_heartbeat
 
         hb = AgentHeartbeat(status="ready")
         fake_db = MagicMock()
@@ -906,8 +906,8 @@ class TestPureInternalEndpoints:
         fake_request.headers = {"X-Internal-Key": "secret"}
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
-            patch("main.postgres_db", fake_db),
-            patch("main.slide_thread_grant_on_liveness", slide),
+            patch("orchestrator.main.postgres_db", fake_db),
+            patch("orchestrator.main.slide_thread_grant_on_liveness", slide),
         ):
             result = await agent_heartbeat(fake_request, "agent-1", hb)
 
@@ -920,7 +920,7 @@ class TestPureInternalEndpoints:
     ):
         """Best-effort by construction: the credential window is never worth
         failing the liveness channel itself over."""
-        from main import AgentHeartbeat, agent_heartbeat
+        from orchestrator.main import AgentHeartbeat, agent_heartbeat
 
         hb = AgentHeartbeat(status="ready")
         fake_db = MagicMock()
@@ -936,8 +936,8 @@ class TestPureInternalEndpoints:
         fake_request.headers = {"X-Internal-Key": "secret"}
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
-            patch("main.postgres_db", fake_db),
-            patch("main.slide_thread_grant_on_liveness", slide),
+            patch("orchestrator.main.postgres_db", fake_db),
+            patch("orchestrator.main.slide_thread_grant_on_liveness", slide),
         ):
             result = await agent_heartbeat(fake_request, "agent-1", hb)
 
@@ -946,7 +946,7 @@ class TestPureInternalEndpoints:
 
     @pytest.mark.asyncio
     async def test_complete_job_without_key_401(self, fake_request, job_a):
-        from main import JobCompleteRequest, complete_job
+        from orchestrator.main import JobCompleteRequest, complete_job
 
         body = JobCompleteRequest(
             should_stop=True, goal_achieved=False, error=None, freeze_data=None
@@ -958,7 +958,7 @@ class TestPureInternalEndpoints:
 
     @pytest.mark.asyncio
     async def test_subjob_merge_without_key_401(self, fake_request, job_a):
-        from main import subjob_merge
+        from orchestrator.main import subjob_merge
 
         with patch.object(access_module, "_INTERNAL_KEY", "secret"):
             with pytest.raises(HTTPException) as exc:
@@ -967,7 +967,7 @@ class TestPureInternalEndpoints:
 
     @pytest.mark.asyncio
     async def test_agent_release_job_without_key_401(self, fake_request, job_a):
-        from main import agent_release_job
+        from orchestrator.main import agent_release_job
 
         with patch.object(access_module, "_INTERNAL_KEY", "secret"):
             with pytest.raises(HTTPException) as exc:
@@ -986,7 +986,7 @@ class TestDualCallableEndpoints:
         self, fake_request, job_a, fake_db
     ):
         """Agent path: valid X-Internal-Key + load job → skip user check."""
-        from main import cancel_job
+        from orchestrator.main import cancel_job
 
         fake_request.headers = {"X-Internal-Key": "secret"}
         # Job_a status is "created" — cancel handler will reach the next
@@ -994,12 +994,12 @@ class TestDualCallableEndpoints:
         fake_db.cancel_job = AsyncMock(return_value=True)
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
-            patch("main.postgres_db", fake_db),
+            patch("orchestrator.main.postgres_db", fake_db),
         ):
             # We patch require_approved_user to explode — if the gate ran
             # the user path, this would fire. It must not.
             with patch(
-                "security.access.require_approved_user",
+                "orchestrator.security.access.require_approved_user",
                 AsyncMock(side_effect=AssertionError("user auth ran for agent call")),
             ):
                 # The handler may still fail after the gate (DB shape) — what
@@ -1016,7 +1016,7 @@ class TestDualCallableEndpoints:
         self, user_b, job_a, fake_db, fake_request
     ):
         """Cockpit path: no key, cross-user → 403 from require_job_access."""
-        from main import pause_job
+        from orchestrator.main import pause_job
 
         fake_request.headers = {}
         with (
@@ -1036,7 +1036,7 @@ class TestDualCallableEndpoints:
         Agent jobs must bind identity through a thread/parent (or an
         authenticated MCP-forwarded user); a bare body user_id is rejected.
         """
-        from main import JobCreate, create_job
+        from orchestrator.main import JobCreate, create_job
 
         fake_request.headers = {"X-Internal-Key": "secret"}
         body = JobCreate(
@@ -1046,12 +1046,15 @@ class TestDualCallableEndpoints:
         )
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
-            patch("main.postgres_db", fake_db),
+            patch("orchestrator.main.postgres_db", fake_db),
             patch(
-                "main.require_approved_user",
+                "orchestrator.main.require_approved_user",
                 AsyncMock(side_effect=AssertionError("user auth ran")),
             ),
-            patch("main._enforce_readiness_gate", AsyncMock(return_value=None)),
+            patch(
+                "orchestrator.main._enforce_readiness_gate",
+                AsyncMock(return_value=None),
+            ),
             pytest.raises(HTTPException) as exc,
         ):
             await create_job(fake_request, body)
@@ -1066,15 +1069,18 @@ class TestDualCallableEndpoints:
     ):
         """The shared internal key is present in agent pods and therefore can
         never grant an originless HTTP "system job" bypass."""
-        from main import JobCreate, create_job
+        from orchestrator.main import JobCreate, create_job
 
         fake_request.headers = {"X-Internal-Key": "secret"}
         body = JobCreate(description="originless internal attempt")
 
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
-            patch("main.postgres_db", fake_db),
-            patch("main._enforce_readiness_gate", AsyncMock(return_value=None)),
+            patch("orchestrator.main.postgres_db", fake_db),
+            patch(
+                "orchestrator.main._enforce_readiness_gate",
+                AsyncMock(return_value=None),
+            ),
             pytest.raises(HTTPException) as exc,
         ):
             await create_job(fake_request, body)
@@ -1095,7 +1101,7 @@ class TestDualCallableEndpoints:
     ):
         """A session agent cannot point a child at another project's native KB
         or repositories by submitting a different project_id."""
-        from main import JobCreate, create_job
+        from orchestrator.main import JobCreate, create_job
 
         fake_request.headers = {"X-Internal-Key": "secret"}
         scoped_thread = {**thread_a, "project_id": project_a["id"]}
@@ -1109,12 +1115,15 @@ class TestDualCallableEndpoints:
 
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
-            patch("main.postgres_db", fake_db),
+            patch("orchestrator.main.postgres_db", fake_db),
             patch(
-                "main._thread_project_ids",
+                "orchestrator.main._thread_project_ids",
                 AsyncMock(return_value=[str(project_a["id"])]),
             ),
-            patch("main._enforce_readiness_gate", AsyncMock(return_value=None)),
+            patch(
+                "orchestrator.main._enforce_readiness_gate",
+                AsyncMock(return_value=None),
+            ),
             pytest.raises(HTTPException) as exc,
         ):
             await create_job(fake_request, body)
@@ -1135,7 +1144,7 @@ class TestDualCallableEndpoints:
     ):
         """A valid thread principal still cannot attach another user's private
         datasource (including an external OKF KB) by guessing its UUID."""
-        from main import JobCreate, create_job
+        from orchestrator.main import JobCreate, create_job
 
         fake_request.headers = {"X-Internal-Key": "secret"}
         scoped_thread = {**thread_a, "project_id": project_a["id"]}
@@ -1149,12 +1158,15 @@ class TestDualCallableEndpoints:
 
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
-            patch("main.postgres_db", fake_db),
+            patch("orchestrator.main.postgres_db", fake_db),
             patch(
-                "main._thread_project_ids",
+                "orchestrator.main._thread_project_ids",
                 AsyncMock(return_value=[str(project_a["id"])]),
             ),
-            patch("main._enforce_readiness_gate", AsyncMock(return_value=None)),
+            patch(
+                "orchestrator.main._enforce_readiness_gate",
+                AsyncMock(return_value=None),
+            ),
             pytest.raises(HTTPException) as exc,
         ):
             await create_job(fake_request, body)
@@ -1173,7 +1185,7 @@ class TestDualCallableEndpoints:
         fake_db,
     ):
         """Transport trust permits reuse, not ambient connector selection."""
-        from main import JobCreate, create_job
+        from orchestrator.main import JobCreate, create_job
 
         fake_request.headers = {"X-Internal-Key": "secret"}
         ownerless_thread = {
@@ -1191,9 +1203,12 @@ class TestDualCallableEndpoints:
 
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
-            patch("main.postgres_db", fake_db),
-            patch("main._thread_project_ids", AsyncMock(return_value=[])),
-            patch("main._enforce_readiness_gate", AsyncMock(return_value=None)),
+            patch("orchestrator.main.postgres_db", fake_db),
+            patch("orchestrator.main._thread_project_ids", AsyncMock(return_value=[])),
+            patch(
+                "orchestrator.main._enforce_readiness_gate",
+                AsyncMock(return_value=None),
+            ),
             pytest.raises(HTTPException) as exc,
         ):
             await create_job(fake_request, body)
@@ -1213,7 +1228,7 @@ class TestDualCallableEndpoints:
     ):
         """A child cannot retain a datasource after the parent's owner's
         current access was revoked; inheritance is selection, not authority."""
-        from main import JobCreate, create_job
+        from orchestrator.main import JobCreate, create_job
 
         fake_request.headers = {"X-Internal-Key": "secret"}
         fake_db.get_user = AsyncMock(return_value=user_a)
@@ -1228,10 +1243,13 @@ class TestDualCallableEndpoints:
 
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
-            patch("main.postgres_db", fake_db),
-            patch("main._enforce_readiness_gate", AsyncMock(return_value=None)),
+            patch("orchestrator.main.postgres_db", fake_db),
             patch(
-                "services.datasource_policy.default_datasource_selection",
+                "orchestrator.main._enforce_readiness_gate",
+                AsyncMock(return_value=None),
+            ),
+            patch(
+                "orchestrator.services.datasource_policy.default_datasource_selection",
                 AsyncMock(
                     side_effect=AssertionError(
                         "defaults must not override parent inheritance"
@@ -1252,7 +1270,7 @@ class TestDualCallableEndpoints:
     ):
         """Cockpit path: body.user_id is overwritten with caller.id (F2 pattern).
         A malicious body trying to attribute the job to user_b is sanitized."""
-        from main import JobCreate, create_job
+        from orchestrator.main import JobCreate, create_job
 
         fake_request.headers = {}
         body = JobCreate(
@@ -1263,7 +1281,10 @@ class TestDualCallableEndpoints:
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
             _patch_caller_and_db(user_a, fake_db),
-            patch("main._enforce_readiness_gate", AsyncMock(return_value=None)),
+            patch(
+                "orchestrator.main._enforce_readiness_gate",
+                AsyncMock(return_value=None),
+            ),
         ):
             try:
                 await create_job(fake_request, body)
@@ -1278,7 +1299,7 @@ class TestDualCallableEndpoints:
     ):
         """A stale users.default_project_id cannot restore native KB/project
         scope after the user loses editor access."""
-        from main import JobCreate, create_job
+        from orchestrator.main import JobCreate, create_job
 
         fake_request.headers = {}
         fake_db.get_user = AsyncMock(
@@ -1290,7 +1311,10 @@ class TestDualCallableEndpoints:
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
             _patch_caller_and_db(user_a, fake_db),
-            patch("main._enforce_readiness_gate", AsyncMock(return_value=None)),
+            patch(
+                "orchestrator.main._enforce_readiness_gate",
+                AsyncMock(return_value=None),
+            ),
             pytest.raises(HTTPException) as exc,
         ):
             await create_job(fake_request, body)
@@ -1304,7 +1328,7 @@ class TestDualCallableEndpoints:
         self, user_a, fake_db, fake_request
     ):
         """Public callers cannot self-declare subjobs or lifecycle runners."""
-        from main import JobCreate, create_job
+        from orchestrator.main import JobCreate, create_job
 
         fake_request.headers = {}
         fake_db.get_user = AsyncMock(
@@ -1345,12 +1369,20 @@ class TestDualCallableEndpoints:
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
             _patch_caller_and_db(user_a, fake_db),
-            patch("main._enforce_readiness_gate", AsyncMock(return_value=None)),
+            patch(
+                "orchestrator.main._enforce_readiness_gate",
+                AsyncMock(return_value=None),
+            ),
             # Orthogonal gate: this test is about marker stripping, and the
             # submit-time capability PEP would 422 on the `autonomy: full`
             # override for a mocked user with no grant rows.
-            patch("main._enforce_job_create_grants", AsyncMock(return_value=None)),
-            patch("services.job_provisioning.provision_job_repo", AsyncMock()),
+            patch(
+                "orchestrator.main._enforce_job_create_grants",
+                AsyncMock(return_value=None),
+            ),
+            patch(
+                "orchestrator.services.job_provisioning.provision_job_repo", AsyncMock()
+            ),
         ):
             await create_job(fake_request, body)
 
@@ -1375,7 +1407,7 @@ class TestDualCallableEndpoints:
 async def test_job_revalidation_scopes_legacy_policy_read_to_same_job(
     job_a, user_a, fake_db
 ):
-    from main import _revalidate_job_datasource_selection
+    from orchestrator.main import _revalidate_job_datasource_selection
 
     datasource_id = "99999999-9999-4999-8999-999999999999"
     fake_db.list_job_datasource_ids = AsyncMock(return_value=[datasource_id])
@@ -1389,8 +1421,8 @@ async def test_job_revalidation_scopes_legacy_policy_read_to_same_job(
     }
 
     with (
-        patch("main.postgres_db", fake_db),
-        patch("main._authorize_thread_datasource_selection", authorize),
+        patch("orchestrator.main.postgres_db", fake_db),
+        patch("orchestrator.main._authorize_thread_datasource_selection", authorize),
     ):
         selected, revisions = await _revalidate_job_datasource_selection(job_a)
 
@@ -1404,7 +1436,7 @@ async def test_job_revalidation_rejects_connector_deleted_from_live_junction(
     job_a, user_a, fake_db
 ):
     """The immutable context snapshot survives datasource FK cascade deletion."""
-    from main import _revalidate_job_datasource_selection
+    from orchestrator.main import _revalidate_job_datasource_selection
 
     datasource_id = "99999999-9999-4999-8999-999999999999"
     fake_db.list_job_datasource_ids = AsyncMock(return_value=[])
@@ -1418,8 +1450,8 @@ async def test_job_revalidation_rejects_connector_deleted_from_live_junction(
     }
 
     with (
-        patch("main.postgres_db", fake_db),
-        patch("main._authorize_thread_datasource_selection", authorize),
+        patch("orchestrator.main.postgres_db", fake_db),
+        patch("orchestrator.main._authorize_thread_datasource_selection", authorize),
     ):
         with pytest.raises(HTTPException) as exc:
             await _revalidate_job_datasource_selection(job_a)

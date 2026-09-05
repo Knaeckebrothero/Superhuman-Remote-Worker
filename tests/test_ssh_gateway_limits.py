@@ -16,7 +16,7 @@ attachments), plus three properties a review found broken in the first cut:
 
 from collections import OrderedDict
 
-from services.ssh_gateway_limits import GatewayLimiter
+from orchestrator.services.ssh_gateway_limits import GatewayLimiter
 
 
 class FakeClock:

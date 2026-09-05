@@ -422,7 +422,7 @@ cases:
 
   - id: near-miss-codebase-file
     prompt: >-
-      What responsibilities does orchestrator/main.py have, and which pieces
+      What responsibilities does src/orchestrator/main.py have, and which pieces
       would you extract first to reduce its size?
     category: near_miss
     tags: [repository_onboarding, application_code]

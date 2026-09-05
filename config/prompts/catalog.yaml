@@ -38,7 +38,7 @@
     and persistent modes.
 
 # --- Prompts · persistent (session) agents only -------------------------------
-# src/persistent_graph.py has no phases; this single prompt is the persistent-
+# src/agent/persistent_graph.py has no phases; this single prompt is the persistent-
 # mode counterpart to the worker's strategic/tactical directives.
 - kind: prompts
   name: systemprompt_interactive
@@ -63,7 +63,7 @@
 
 # --- Instructions · worker (job) agents only ----------------------------------
 # Workspace scaffolding + the strategic todo/phase system. Persistent sessions
-# use none of these (no phases, no todos); src/persistent_graph.py never loads
+# use none of these (no phases, no todos); src/agent/persistent_graph.py never loads
 # them. Resolved via InstructionMatrixResolver, so model-family variants apply
 # (e.g. instructions_minimax.md, strategic_todos_transition_gpt_oss.yaml). The vestigial
 # workspace_template.md is intentionally not exposed — workspace.md was removed.
@@ -140,7 +140,7 @@
   description: "Token count at which summarization / compaction is triggered."
 # limits.summarization_safe_limit was removed 2026-06-12: summarization
 # budgets are computed at call time from the auxiliary model's own window
-# (src/core/summarizer.py), not configured per main-model family.
+# (src/agent/core/summarizer.py), not configured per main-model family.
 
 # --- Guardrails (tool examples + nudges) --------------------------------------
 - kind: guardrails

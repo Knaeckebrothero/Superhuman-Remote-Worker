@@ -17,20 +17,20 @@ from langgraph.graph.message import add_messages
 import pytest
 from typing_extensions import TypedDict
 
-import src.api.persistent_app as pa
-import src.api.turn_executor as turn_executor
-from src.api.orchestrator_client import CompletionNonTerminalReportError
-from src.agent import UniversalAgent, _stateless_worker_remote_authority
-from src.core.workspace_backend import WorkspaceUnavailableError
-from src.core.backends.remote import RemoteBackend
-from src.graph import route_entry
-from src.shared.run_queue import ClaimedUnit, EnqueueResult
-from src.shared.subagent_lifecycle import (
+import agent.api.persistent_app as pa
+import agent.api.turn_executor as turn_executor
+from agent.api.orchestrator_client import CompletionNonTerminalReportError
+from agent.agent import UniversalAgent, _stateless_worker_remote_authority
+from shared.runtime.core.workspace_backend import WorkspaceUnavailableError
+from shared.runtime.core.backends.remote import RemoteBackend
+from agent.graph import route_entry
+from shared.run_queue import ClaimedUnit, EnqueueResult
+from shared.subagent_lifecycle import (
     SubagentLifecycleError,
     SubagentQuiescenceError,
 )
-from src.shared.job_steering import CheckpointSteeringAcker, context_delivery_key
-from src.shared.worker_queue import (
+from shared.job_steering import CheckpointSteeringAcker, context_delivery_key
+from shared.worker_queue import (
     WorkerClaim,
     WorkerCompletionAcceptance,
     WorkerRenewal,

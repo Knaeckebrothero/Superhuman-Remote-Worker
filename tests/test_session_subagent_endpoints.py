@@ -16,7 +16,7 @@ import pytest
 from pydantic import ValidationError
 
 import orchestrator.main as m
-from src.shared.persistent_input_delivery import InputDeliveryConflict
+from shared.persistent_input_delivery import InputDeliveryConflict
 
 
 PARENT = uuid.UUID("10000000-0000-4000-8000-000000000001")

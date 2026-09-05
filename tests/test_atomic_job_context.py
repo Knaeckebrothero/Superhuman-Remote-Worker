@@ -594,7 +594,7 @@ class TestConsumeJobGuidance:
     async def test_pinned_exact_subagent_key_preserves_a_newer_run_same_thread(
         self, db
     ):
-        from src.shared.job_steering import queued_reply_key
+        from shared.job_steering import queued_reply_key
 
         jid = str(uuid4())
         child_id = str(uuid4())
@@ -632,7 +632,7 @@ class TestConsumeJobGuidance:
 
     @pytest.mark.asyncio
     async def test_stateless_exact_reply_key_preserves_newer_same_thread(self, db):
-        from src.shared.job_steering import queued_reply_key
+        from shared.job_steering import queued_reply_key
 
         jid = str(uuid4())
         first = {
@@ -709,7 +709,7 @@ class TestConsumeJobGuidance:
 
     @pytest.mark.asyncio
     async def test_stateless_one_shot_ack_clears_only_exact_generation(self, db):
-        from src.shared.job_steering import context_delivery_key
+        from shared.job_steering import context_delivery_key
 
         jid = str(uuid4())
         context = {

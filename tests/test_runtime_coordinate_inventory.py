@@ -49,6 +49,13 @@ def test_runtime_coordinate_inventory_matches_manifest():
         )
 
 
+def test_empty_source_discovery_is_an_error(monkeypatch):
+    script = _load_script()
+    monkeypatch.setattr(script, "_roots", lambda: [])
+    with pytest.raises(RuntimeError, match="No Python sources"):
+        script.collect_sites()
+
+
 def test_every_runtime_coordinate_site_has_a_reviewed_classification():
     script = _load_script()
     sites = script.collect_sites()

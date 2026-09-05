@@ -13,8 +13,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-from src.agent import UniversalAgent
-from src.core.loader import load_agent_config
+from agent.agent import UniversalAgent
+from shared.runtime.core.loader import load_agent_config
 
 
 def _agent_with_worker_config():

@@ -31,32 +31,32 @@ from orchestrator.database.postgres import (
     PostgresDB as OrchestratorDB,
     SessionParentAuthorityRefused,
 )
-from src.api.turn_executor import _PENDING_INPUT_SQL
-from src.database.postgres_db import PostgresDB as AgentDB
-from src.shared.persistent_input_delivery import (
+from agent.api.turn_executor import _PENDING_INPUT_SQL
+from agent.database.postgres_db import PostgresDB as AgentDB
+from shared.persistent_input_delivery import (
     InputDeliveryConflict,
     claim_stateless_input_delivery,
     persist_input_delivery,
     transition_input_delivery,
     transition_stateless_input_delivery,
 )
-from src.shared.session_subagent_authority import session_subagent_delivery_id
-from src.shared.subagent_parent_authority import (
+from shared.session_subagent_authority import session_subagent_delivery_id
+from shared.subagent_parent_authority import (
     ParentExecutionAuthority,
     ParentExecutionAuthorityRefused,
     require_parent_execution_authority,
 )
-from src.shared.run_queue import (
+from shared.run_queue import (
     UNIT_KIND_SESSION_TURN,
     UNIT_KIND_WORKER_BATCH,
     claim_unit,
     reap_expired,
     record_input_seq,
 )
-from src.shared.worker_queue import claim_worker_batch, enqueue_worker_batch
+from shared.worker_queue import claim_worker_batch, enqueue_worker_batch
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-MIGRATIONS = ROOT / "orchestrator" / "database" / "migrations" / "app"
+MIGRATIONS = ROOT / "src" / "orchestrator" / "database" / "migrations" / "app"
 COLUMNS = "0206_threads_subagent_kind.sql"
 INDEX = "0207_threads_parent_job_idx.notx.sql"
 VALIDATE = "0208_threads_subagent_validate.sql"
@@ -329,7 +329,7 @@ class TestValidateMigration:
 
 class TestSchemaArtifact:
     def test_schema_current_carries_the_lane(self):
-        schema = (ROOT / "orchestrator/database/schema_current.sql").read_text()
+        schema = (ROOT / "src/orchestrator/database/schema_current.sql").read_text()
         start = schema.index("CREATE TABLE public.threads (")
         block = schema[start : schema.index(");", start)]
         assert "kind text DEFAULT 'session'::text NOT NULL" in block
@@ -383,7 +383,7 @@ class TestSchemaArtifact:
 
     def test_the_other_two_artifacts_are_not_involved(self):
         for name in ("vector_schema_current.sql", "audit_schema_current.sql"):
-            text = (ROOT / "orchestrator/database" / name).read_text()
+            text = (ROOT / "src/orchestrator/database" / name).read_text()
             assert "subagent_status" not in text
             assert "idx_threads_parent_job" not in text
 

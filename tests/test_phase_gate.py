@@ -22,9 +22,9 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 import pytest
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 
-from src.core.loader import LimitsConfig
-from src.graph import create_audited_tool_node
-from src.tools.registry import TOOL_REGISTRY
+from shared.runtime.core.loader import LimitsConfig
+from agent.graph import create_audited_tool_node
+from agent.tools.registry import TOOL_REGISTRY
 
 # The exact texts (config/guardrails/default.yaml, default family).
 STRATEGIC_IN_TACTICAL = (
@@ -98,7 +98,7 @@ def tool_context() -> MagicMock:
 def tool_node():
     """The patched LangGraph ToolNode (tests set ``ainvoke``); the patch is
     live while the test creates its audited node."""
-    with patch("src.graph.ToolNode") as MockToolNode:
+    with patch("agent.graph.ToolNode") as MockToolNode:
         mock_tn = AsyncMock()
         MockToolNode.return_value = mock_tn
         yield mock_tn
@@ -252,7 +252,7 @@ class TestAuditAndAccounting:
         audited = create_audited_tool_node(
             [tool("read_file"), tool("job_complete")], FakeConfig()
         )
-        with patch("src.graph.get_archiver", return_value=auditor):
+        with patch("agent.graph.get_archiver", return_value=auditor):
             await audited(
                 state(
                     [tc("read_file", "c1", {"path": "a"}), tc("job_complete", "c2")],
@@ -629,7 +629,7 @@ class TestDelegationBatch:
         that was in the batch — not the literal ``delegate_agent``. Pinned
         with a stand-in registry entry (delegate_agent is the only delegation
         tool since U3 WP4)."""
-        from src.tools.registry import TOOL_REGISTRY
+        from agent.tools.registry import TOOL_REGISTRY
 
         monkeypatch.setitem(
             TOOL_REGISTRY,

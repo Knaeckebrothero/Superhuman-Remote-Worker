@@ -16,28 +16,22 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 from contextlib import asynccontextmanager
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID
 
 import pytest
 
-_ORCH = Path(__file__).parent.parent / "orchestrator"
-if str(_ORCH) not in sys.path:
-    sys.path.insert(0, str(_ORCH))
-
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
-from main import (  # noqa: E402
+from orchestrator.main import (  # noqa: E402
     VALID_CATALOG_PROVIDER_KINDS,
     VALID_CATALOG_CAPABILITIES,
     CatalogModelCreate,
     CatalogModelUpdate,
     app,
 )
-import main  # noqa: E402
+import orchestrator.main  # noqa: E402
 from orchestrator.database.postgres import PostgresDB  # noqa: E402
 
 
@@ -395,14 +389,14 @@ class TestSerializeCatalogModelContextWindow:
     set, else the family default from the model config matrix."""
 
     def test_explicit_context_window_is_reported_as_explicit(self):
-        out = main._serialize_catalog_model(_row(context_window=262144))
+        out = orchestrator.main._serialize_catalog_model(_row(context_window=262144))
         assert out["context_window"] == 262144
         assert out["resolved_context_window"] == 262144
         assert out["context_window_source"] == "explicit"
 
     def test_unset_falls_back_to_family_default(self):
         # claude-opus family default is 1,000,000 (config/model_config_matrix.yaml).
-        out = main._serialize_catalog_model(
+        out = orchestrator.main._serialize_catalog_model(
             _row(context_window=None, family="claude-opus")
         )
         assert out["context_window"] is None
@@ -411,7 +405,7 @@ class TestSerializeCatalogModelContextWindow:
 
     def test_unknown_family_falls_back_to_default_128k(self):
         # Unknown family → the `default` block's model_max_context_tokens (128000).
-        out = main._serialize_catalog_model(
+        out = orchestrator.main._serialize_catalog_model(
             _row(context_window=None, family="totally-unknown-family")
         )
         assert out["resolved_context_window"] == 128000
@@ -584,7 +578,7 @@ class TestResolveCatalogModelTransportJoin:
 
     @pytest.mark.asyncio
     async def test_system_row_returns_decrypted_system_key(self):
-        from security.crypto import encrypt
+        from orchestrator.security.crypto import encrypt
 
         conn = _conn()
         conn.fetchrow = AsyncMock(
@@ -606,7 +600,7 @@ class TestResolveCatalogModelTransportJoin:
 
     @pytest.mark.asyncio
     async def test_endpoint_row_returns_decrypted_endpoint_key(self):
-        from security.crypto import encrypt
+        from orchestrator.security.crypto import encrypt
 
         conn = _conn()
         conn.fetchrow = AsyncMock(
@@ -671,7 +665,7 @@ class TestNormalizeCatalogModelId:
 
     def test_prepends_prefix_for_system_openrouter_row(self):
         assert (
-            main._normalize_catalog_model_id(
+            orchestrator.main._normalize_catalog_model_id(
                 "system", "openrouter", "minimax/minimax-m3"
             )
             == "openrouter/minimax/minimax-m3"
@@ -679,7 +673,7 @@ class TestNormalizeCatalogModelId:
 
     def test_idempotent_when_prefix_already_present(self):
         assert (
-            main._normalize_catalog_model_id(
+            orchestrator.main._normalize_catalog_model_id(
                 "system", "openrouter", "openrouter/minimax/minimax-m3"
             )
             == "openrouter/minimax/minimax-m3"
@@ -687,7 +681,7 @@ class TestNormalizeCatalogModelId:
 
     def test_idempotent_is_case_insensitive(self):
         assert (
-            main._normalize_catalog_model_id(
+            orchestrator.main._normalize_catalog_model_id(
                 "system", "openrouter", "OpenRouter/minimax/minimax-m3"
             )
             == "OpenRouter/minimax/minimax-m3"
@@ -696,10 +690,13 @@ class TestNormalizeCatalogModelId:
     def test_other_system_providers_untouched(self):
         # openai/anthropic/etc. resolve correctly without a routing prefix.
         assert (
-            main._normalize_catalog_model_id("system", "openai", "gpt-5.5") == "gpt-5.5"
+            orchestrator.main._normalize_catalog_model_id("system", "openai", "gpt-5.5")
+            == "gpt-5.5"
         )
         assert (
-            main._normalize_catalog_model_id("system", "anthropic", "claude-opus-4-7")
+            orchestrator.main._normalize_catalog_model_id(
+                "system", "anthropic", "claude-opus-4-7"
+            )
             == "claude-opus-4-7"
         )
 
@@ -707,7 +704,7 @@ class TestNormalizeCatalogModelId:
         # Endpoint rows route via the endpoint's inline base_url; prefixing
         # would be sent verbatim to the gateway and 404.
         assert (
-            main._normalize_catalog_model_id(
+            orchestrator.main._normalize_catalog_model_id(
                 "endpoint", "some-endpoint-uuid", "minimax/minimax-m3"
             )
             == "minimax/minimax-m3"

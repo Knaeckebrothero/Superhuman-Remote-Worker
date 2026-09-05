@@ -20,7 +20,7 @@
 # each subdirectory exactly once (the BFS's duplicate-subdir quirk — parent
 # listing + own self-entry — cannot occur with a single request).
 #
-# Run IN the orchestrator pod (code lives flattened at /app):
+# Run IN the orchestrator pod with its installed application packages:
 #   kubectl -n srw exec -i deploy/srw-orchestrator -- python3 -u - \
 #     < scripts/spike/etag_walk_bench.py <backend_id> <handle_db> [runs] [--depth-infinity]
 # The image does NOT contain scripts/ — to run by path instead of stdin you
@@ -31,22 +31,20 @@
 # ``handle_db`` is the projects.main_cloud_folder_handle column value, e.g.
 #   '{"backend": "nextcloud", "native_id": "1", "vendor_meta": {"mountpoint": "my-project"}}'
 #
-# NOTE: ``import main`` boots the FastAPI module (~20 s) but does NOT start
+# NOTE: ``import orchestrator.main`` boots the FastAPI module (~20 s) but does NOT start
 # background loops (those hang off the lifespan handler); router state still
 # needs an explicit ``ensure_initialized()``.
 import asyncio
 import sys
 import time
 
-sys.path.insert(0, "/app")
-
-import main  # noqa: E402  — module-level main_cloud_router lives here
-from services.cloud import ProjectFolderHandle  # noqa: E402
-from services.cloud._propfind import parse_propfind_entries  # noqa: E402
+import orchestrator.main  # module-level main_cloud_router lives here
+from orchestrator.services.cloud import ProjectFolderHandle
+from orchestrator.services.cloud._propfind import parse_propfind_entries
 
 
 async def _init_backend(backend_id: str, handle_db: str):
-    router = main.main_cloud_router
+    router = orchestrator.main.main_cloud_router
     ok = await router.ensure_initialized()
     if not ok:
         print("FATAL: main-cloud backend failed ensure_initialized()", flush=True)

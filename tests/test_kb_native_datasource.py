@@ -22,7 +22,7 @@ import pytest
 from fastapi import HTTPException
 from pydantic import ValidationError
 
-from main import (
+from orchestrator.main import (
     DatasourceUpdate,
     ExternalKnowledgeBase,
     ProjectCreate,
@@ -41,10 +41,10 @@ from orchestrator.services.kb_datasources import (
     reindex_kb_datasource,
 )
 from orchestrator.services.kb_reindex import kb_sweep_tick
-from src.core.datasource_setup import inject_workspace_facts
-from src.core.workspace import WorkspaceManager, WorkspaceManagerConfig
-from src.managers.git_manager import GitManager
-from src.services.knowledge.bindings import (
+from agent.core.datasource_setup import inject_workspace_facts
+from agent.core.workspace import WorkspaceManager, WorkspaceManagerConfig
+from agent.managers.git_manager import GitManager
+from agent.services.knowledge.bindings import (
     NATIVE_PROJECT_CONFIG_KEY as AGENT_NATIVE_KEY,
     build_knowledge_bindings,
 )
@@ -168,13 +168,13 @@ class TestProjectCreationProvisioning:
     async def _create(self, db, gitea, *, external_kb=None):
         with (
             patch(
-                "main.require_approved_user",
+                "orchestrator.main.require_approved_user",
                 AsyncMock(return_value={"id": OWNER_ID, "is_admin": False}),
             ),
-            patch("main.postgres_db", db),
-            patch("main.gitea_client", gitea),
+            patch("orchestrator.main.postgres_db", db),
+            patch("orchestrator.main.gitea_client", gitea),
             patch(
-                "main._ensure_project_cloud_resources",
+                "orchestrator.main._ensure_project_cloud_resources",
                 AsyncMock(side_effect=lambda project: project),
             ),
         ):
@@ -289,7 +289,10 @@ class TestProjectCreationProvisioning:
     @pytest.mark.asyncio
     async def test_helper_returns_the_created_row(self):
         db, gitea = self._db(), self._gitea()
-        with patch("main.postgres_db", db), patch("main.gitea_client", gitea):
+        with (
+            patch("orchestrator.main.postgres_db", db),
+            patch("orchestrator.main.gitea_client", gitea),
+        ):
             created = await _provision_project_knowledge_repo(
                 {"id": PROJECT_ID, "name": "Better Resavio"}, OWNER_ID
             )
@@ -369,7 +372,7 @@ class TestExternalProjectKnowledgeProvisioning(TestProjectCreationProvisioning):
         db.create_datasource.side_effect = RuntimeError("db failure")
         db.remove_project_repository = AsyncMock()
 
-        with patch("main.postgres_db", db), pytest.raises(RuntimeError):
+        with patch("orchestrator.main.postgres_db", db), pytest.raises(RuntimeError):
             await _provision_external_project_knowledge_repo(
                 {"id": PROJECT_ID, "name": "Better Resavio"},
                 OWNER_ID,
@@ -395,7 +398,7 @@ class TestAttachExternalProjectKnowledgeRepo(TestProjectCreationProvisioning):
 
         with (
             patch(
-                "main.require_project_owner",
+                "orchestrator.main.require_project_owner",
                 AsyncMock(
                     return_value=(
                         {"id": OWNER_ID, "is_admin": False},
@@ -403,8 +406,8 @@ class TestAttachExternalProjectKnowledgeRepo(TestProjectCreationProvisioning):
                     )
                 ),
             ),
-            patch("main.postgres_db", db),
-            patch("main.gitea_client", gitea),
+            patch("orchestrator.main.postgres_db", db),
+            patch("orchestrator.main.gitea_client", gitea),
         ):
             result = await attach_project_knowledge_repository(
                 request, PROJECT_ID, self.EXTERNAL
@@ -425,7 +428,7 @@ class TestAttachExternalProjectKnowledgeRepo(TestProjectCreationProvisioning):
 
         with (
             patch(
-                "main.require_project_owner",
+                "orchestrator.main.require_project_owner",
                 AsyncMock(
                     return_value=(
                         {"id": OWNER_ID, "is_admin": False},
@@ -433,8 +436,8 @@ class TestAttachExternalProjectKnowledgeRepo(TestProjectCreationProvisioning):
                     )
                 ),
             ),
-            patch("main.postgres_db", db),
-            patch("main.gitea_client", gitea),
+            patch("orchestrator.main.postgres_db", db),
+            patch("orchestrator.main.gitea_client", gitea),
             pytest.raises(HTTPException) as exc,
         ):
             await attach_project_knowledge_repository(
@@ -506,7 +509,7 @@ class TestAdoptConnectorAsProjectVault(TestProjectCreationProvisioning):
         return db
 
     async def _create_adopting(self, db, gitea, external_kb=None):
-        with patch("main._purge_kb_datasource_index", AsyncMock()):
+        with patch("orchestrator.main._purge_kb_datasource_index", AsyncMock()):
             return await self._create(db, gitea, external_kb=external_kb or self.ADOPT)
 
     @pytest.mark.asyncio
@@ -562,7 +565,9 @@ class TestAdoptConnectorAsProjectVault(TestProjectCreationProvisioning):
         accumulated under its own UUID would double every search hit."""
         db, gitea = self._db(), self._gitea()
 
-        with patch("main._purge_kb_datasource_index", AsyncMock()) as purge:
+        with patch(
+            "orchestrator.main._purge_kb_datasource_index", AsyncMock()
+        ) as purge:
             await self._create(db, gitea, external_kb=self.ADOPT)
 
         purge.assert_awaited_once_with(str(CONNECTOR_ID))
@@ -575,7 +580,7 @@ class TestAdoptConnectorAsProjectVault(TestProjectCreationProvisioning):
         db, gitea = self._db(), self._gitea()
 
         with patch(
-            "main._purge_kb_datasource_index",
+            "orchestrator.main._purge_kb_datasource_index",
             AsyncMock(side_effect=RuntimeError("vector db down")),
         ):
             project = await self._create(db, gitea, external_kb=self.ADOPT)
@@ -713,8 +718,8 @@ class TestAdoptConnectorAsProjectVault(TestProjectCreationProvisioning):
         db.remove_project_repository = AsyncMock()
 
         with (
-            patch("main.postgres_db", db),
-            patch("main._purge_kb_datasource_index", AsyncMock()) as purge,
+            patch("orchestrator.main.postgres_db", db),
+            patch("orchestrator.main._purge_kb_datasource_index", AsyncMock()) as purge,
             pytest.raises(RuntimeError),
         ):
             await _provision_external_project_knowledge_repo(
@@ -736,7 +741,7 @@ class TestAdoptConnectorAsProjectVault(TestProjectCreationProvisioning):
 
         with (
             patch(
-                "main.require_project_owner",
+                "orchestrator.main.require_project_owner",
                 AsyncMock(
                     return_value=(
                         {"id": OWNER_ID, "is_admin": False},
@@ -744,9 +749,9 @@ class TestAdoptConnectorAsProjectVault(TestProjectCreationProvisioning):
                     )
                 ),
             ),
-            patch("main.postgres_db", db),
-            patch("main.gitea_client", gitea),
-            patch("main._purge_kb_datasource_index", AsyncMock()),
+            patch("orchestrator.main.postgres_db", db),
+            patch("orchestrator.main.gitea_client", gitea),
+            patch("orchestrator.main._purge_kb_datasource_index", AsyncMock()),
         ):
             result = await attach_project_knowledge_repository(
                 object(), PROJECT_ID, self.ADOPT
@@ -768,7 +773,7 @@ class TestAdoptConnectorAsProjectVault(TestProjectCreationProvisioning):
 
         with (
             patch(
-                "main.require_project_owner",
+                "orchestrator.main.require_project_owner",
                 AsyncMock(
                     return_value=(
                         {"id": OWNER_ID, "is_admin": False},
@@ -776,8 +781,8 @@ class TestAdoptConnectorAsProjectVault(TestProjectCreationProvisioning):
                     )
                 ),
             ),
-            patch("main.postgres_db", db),
-            patch("main.gitea_client", gitea),
+            patch("orchestrator.main.postgres_db", db),
+            patch("orchestrator.main.gitea_client", gitea),
             pytest.raises(HTTPException) as exc,
         ):
             await attach_project_knowledge_repository(object(), PROJECT_ID, self.ADOPT)
@@ -796,7 +801,7 @@ class TestAdoptConnectorAsProjectVault(TestProjectCreationProvisioning):
 
         with (
             patch(
-                "main.require_project_owner",
+                "orchestrator.main.require_project_owner",
                 AsyncMock(
                     return_value=(
                         {"id": OWNER_ID, "is_admin": False},
@@ -804,9 +809,9 @@ class TestAdoptConnectorAsProjectVault(TestProjectCreationProvisioning):
                     )
                 ),
             ),
-            patch("main.postgres_db", db),
-            patch("main.gitea_client", gitea),
-            patch("main._purge_kb_datasource_index", AsyncMock()),
+            patch("orchestrator.main.postgres_db", db),
+            patch("orchestrator.main.gitea_client", gitea),
+            patch("orchestrator.main._purge_kb_datasource_index", AsyncMock()),
         ):
             result = await attach_project_knowledge_repository(
                 object(), PROJECT_ID, self.ADOPT
@@ -945,10 +950,10 @@ class TestExternalSweepSkipsNativeKb:
     async def test_manual_reindex_endpoint_refuses_a_native_row(self):
         with (
             patch(
-                "main.require_datasource_owner",
+                "orchestrator.main.require_datasource_owner",
                 AsyncMock(return_value=({}, native_kb_row())),
             ),
-            patch("main._reindex_kb_datasource_now", AsyncMock()) as now,
+            patch("orchestrator.main._reindex_kb_datasource_now", AsyncMock()) as now,
             pytest.raises(HTTPException) as exc,
         ):
             await reindex_datasource_knowledge(object(), str(DATASOURCE_ID))
@@ -1002,12 +1007,14 @@ class TestMarkerDurability:
 
         with (
             patch(
-                "main.require_datasource_owner",
+                "orchestrator.main.require_datasource_owner",
                 AsyncMock(return_value=({}, native_kb_row())),
             ),
-            patch("main.postgres_db", db),
-            patch("main._mark_kb_datasource_pending", AsyncMock()) as pending,
-            patch("main._schedule_kb_datasource_reindex", schedule),
+            patch("orchestrator.main.postgres_db", db),
+            patch(
+                "orchestrator.main._mark_kb_datasource_pending", AsyncMock()
+            ) as pending,
+            patch("orchestrator.main._schedule_kb_datasource_reindex", schedule),
         ):
             await update_datasource(
                 object(),
@@ -1033,11 +1040,11 @@ class TestMarkerDurability:
 
         with (
             patch(
-                "main.require_datasource_owner",
+                "orchestrator.main.require_datasource_owner",
                 AsyncMock(return_value=({}, native_kb_row())),
             ),
-            patch("main.postgres_db", db),
-            patch("main._schedule_kb_datasource_reindex", MagicMock()),
+            patch("orchestrator.main.postgres_db", db),
+            patch("orchestrator.main._schedule_kb_datasource_reindex", MagicMock()),
         ):
             result = await update_datasource(
                 object(), str(DATASOURCE_ID), DatasourceUpdate(name="Renamed")

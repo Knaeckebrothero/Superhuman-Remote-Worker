@@ -13,9 +13,9 @@ def test_catalog_policy_and_reporting_do_not_import_agent_execution():
     script = """
 import sys
 
-from src.shared import tool_catalog
-from src.core.tool_policy import config_tool_categories, expand_category_true
-from src.core.tool_report import (
+from shared import tool_catalog
+from shared.runtime.core.tool_policy import config_tool_categories, expand_category_true
+from shared.runtime.core.tool_report import (
     categorize_tool_names,
     code_granted_categories,
     code_granted_tools,
@@ -30,8 +30,8 @@ assert 'session_task' in code_granted_categories()
 assert 'srw_cloud_status' in code_granted_tools()
 
 for prefix in (
-    'src.tools', 'src.agent', 'src.api', 'src.graph',
-    'src.core.loader', 'src.core.context',
+    'agent.tools', 'agent.agent', 'agent.api', 'agent.graph',
+    'shared.runtime.core.loader', 'agent.core.context',
     'langchain', 'langchain_core', 'langgraph',
 ):
     loaded = [name for name in sys.modules if name == prefix or name.startswith(prefix + '.')]
@@ -50,8 +50,8 @@ for prefix in (
 @pytest.fixture
 def live_catalog():
     """Restore entries without replacing the shared dictionary identity."""
-    from src.shared import tool_catalog
-    from src.tools import registry
+    from shared import tool_catalog
+    from agent.tools import registry
 
     assert registry.TOOL_REGISTRY is tool_catalog.TOOL_REGISTRY
     original = tool_catalog.TOOL_REGISTRY.copy()
@@ -63,8 +63,8 @@ def live_catalog():
 
 
 def test_custom_registration_is_visible_to_shared_policy_and_reports(live_catalog):
-    from src.core.tool_policy import expand_category_true
-    from src.core.tool_report import categorize_tool_names
+    from shared.runtime.core.tool_policy import expand_category_true
+    from shared.runtime.core.tool_report import categorize_tool_names
 
     catalog, runtime = live_catalog
     runtime.register_tool(
@@ -88,8 +88,8 @@ def test_custom_registration_is_visible_to_shared_policy_and_reports(live_catalo
 
 
 def test_mcp_discovery_replacement_and_detach_share_the_same_catalog(live_catalog):
-    from src.core.tool_policy import expand_category_true
-    from src.core.tool_report import categorize_tool_names
+    from shared.runtime.core.tool_policy import expand_category_true
+    from shared.runtime.core.tool_report import categorize_tool_names
 
     catalog, runtime = live_catalog
     static_read_file = catalog.TOOL_REGISTRY["read_file"]

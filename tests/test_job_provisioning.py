@@ -16,7 +16,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from services.job_provisioning import JobProvisioningError, provision_job_repo
+from orchestrator.services.job_provisioning import (
+    JobProvisioningError,
+    provision_job_repo,
+)
 
 
 class _AsyncCtx:
@@ -148,7 +151,9 @@ def patched_seed(monkeypatch):
     """Patch the locally-imported ``fire_baseline_seed`` so the cloud-seed
     branch never schedules a real background task."""
     seed = MagicMock()
-    monkeypatch.setattr("services.job_cloud_baseline.fire_baseline_seed", seed)
+    monkeypatch.setattr(
+        "orchestrator.services.job_cloud_baseline.fire_baseline_seed", seed
+    )
     return seed
 
 
@@ -156,7 +161,7 @@ def patched_seed(monkeypatch):
 def patched_loop_seed(monkeypatch):
     seed = AsyncMock()
     monkeypatch.setattr(
-        "services.job_cloud_baseline.seed_project_folder_baseline", seed
+        "orchestrator.services.job_cloud_baseline.seed_project_folder_baseline", seed
     )
     return seed
 
@@ -717,7 +722,7 @@ class TestIsLoopExecutionRole:
     """Execution-ness controls expected project-cloud file production."""
 
     def test_analysis_roles_are_not_execution(self) -> None:
-        from services.project_loops import is_loop_execution_role
+        from orchestrator.services.project_loops import is_loop_execution_role
 
         assert is_loop_execution_role("scholar") is False
         assert is_loop_execution_role("critic") is False
@@ -726,19 +731,19 @@ class TestIsLoopExecutionRole:
         # product-qa audits the shipped product and writes KB findings only —
         # it never touches repo/, so an empty merge is normal, not F29 lost work.
         # knowledge-base/knowledge/features/loop_parallel_stages.md (Phase 0).
-        from services.project_loops import is_loop_execution_role
+        from orchestrator.services.project_loops import is_loop_execution_role
 
         assert is_loop_execution_role("product-qa") is False
 
     def test_execution_roles(self) -> None:
-        from services.project_loops import is_loop_execution_role
+        from orchestrator.services.project_loops import is_loop_execution_role
 
         assert is_loop_execution_role("developer") is True
         assert is_loop_execution_role("default") is True
         assert is_loop_execution_role("writer") is True
 
     def test_empty_or_none_is_not_execution(self) -> None:
-        from services.project_loops import is_loop_execution_role
+        from orchestrator.services.project_loops import is_loop_execution_role
 
         assert is_loop_execution_role(None) is False
         assert is_loop_execution_role("") is False

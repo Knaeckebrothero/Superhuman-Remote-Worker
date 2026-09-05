@@ -25,6 +25,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  PYTHONSAFEPATH: "1"
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
   # Lowercased repo path for GHCR cache refs. github.repository preserves
@@ -37,6 +38,26 @@ env:
   SRW_DOCUMENTATION_URL: https://github.com/knaeckebrothero/Superhuman-Remote-Worker
 
 jobs:
+  # Package boundaries are checked on the exact revision used by builds/tests.
+  architecture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install architecture tooling and editable packages
+        run: |
+          pip install import-linter==2.13
+          pip install --no-deps -e .
+      - name: Enforce application dependency boundaries
+        run: lint-imports --verbose
+
   # ---------------------------------------------------------------------------
   # Lint — blocking on main (code should already be formatted from develop)
   # ---------------------------------------------------------------------------
@@ -45,15 +66,17 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: Install ruff
         run: pip install ruff==0.14.10
       - name: Ruff lint
-        run: ruff check src/ orchestrator/ tests/
+        run: ruff check src/ tests/
       - name: Ruff format check
-        run: ruff format --check src/ orchestrator/ tests/
+        run: ruff format --check src/ tests/
       - name: Verify Playwright pin consistency
         run: |
           # The agent image has no Playwright; the pin only feeds the
@@ -96,6 +119,8 @@ jobs:
           - installer-production-vms
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
 
       - name: Install Helm
         uses: azure/setup-helm@v4
@@ -141,6 +166,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
 
       - name: Install Helm
         uses: azure/setup-helm@v4
@@ -178,6 +205,8 @@ jobs:
         language: [python, javascript-typescript]
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: github/codeql-action/init@v3
         with:
           languages: ${{ matrix.language }}
@@ -193,6 +222,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -371,8 +402,8 @@ jobs:
         run: >-
           uv pip install --system pip-licenses
           -r requirements.txt
-          -r orchestrator/requirements.txt
-          -r orchestrator/mcp/requirements.txt
+          -r src/orchestrator/requirements.txt
+          -r src/mcp_server/requirements.txt
       - name: Check third-party licenses
         # Python: installed metadata via pip-licenses. Frontend: read straight
         # from cockpit/package-lock.json (no npm install / node_modules needed).
@@ -393,6 +424,8 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -412,7 +445,9 @@ jobs:
           helm repo add collabora https://collaboraonline.github.io/online --force-update
           helm dependency build helm/
       - name: Install dependencies
-        run: uv pip install --system -r requirements.txt -r orchestrator/requirements.txt -r orchestrator/mcp/requirements.txt -r requirements-dev.txt pytest pytest-asyncio
+        run: uv pip install --system -r requirements.txt -r src/orchestrator/requirements.txt -r src/mcp_server/requirements.txt -r requirements-dev.txt pytest pytest-asyncio
+      - name: Install editable application packages
+        run: pip install --no-deps -e .
       # Keep tests from the same file on one worker so file-local fixture/order
       # assumptions remain intact. The runner caps worker count and also scales
       # down automatically on smaller GitHub-hosted runners.
@@ -449,6 +484,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       # The image ships Node 24; pin to 22 so unit tests, the production build,
       # and the conformance run all use the same Node as every other job.
       - uses: actions/setup-node@v4
@@ -524,6 +561,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
       - name: Compute next patch version
         id: bump
@@ -550,8 +588,9 @@ jobs:
   # All require lint + dep-audit + tests to pass.
   # ---------------------------------------------------------------------------
   build-agent:
-    needs: [lint, dependency-audit, test-python, test-cockpit, resolve-version]
+    needs: [architecture, lint, dependency-audit, test-python, test-cockpit, resolve-version]
     if: >-
+      needs.architecture.result == 'success' &&
       always() && !cancelled() &&
       needs.lint.result == 'success' &&
       needs.dependency-audit.result == 'success' &&
@@ -565,6 +604,8 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - name: Free disk space
         # Hosted runners have ~14 GiB free and these jobs need more. Self-hosted
         # runners do not need it, and the heavy variants below delete
@@ -621,8 +662,9 @@ jobs:
             SRW_DOCUMENTATION_URL=${{ env.SRW_DOCUMENTATION_URL }}
 
   build-orchestrator:
-    needs: [lint, dependency-audit, test-python, test-cockpit, resolve-version]
+    needs: [architecture, lint, dependency-audit, test-python, test-cockpit, resolve-version]
     if: >-
+      needs.architecture.result == 'success' &&
       always() && !cancelled() &&
       needs.lint.result == 'success' &&
       needs.dependency-audit.result == 'success' &&
@@ -636,6 +678,8 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: docker/setup-buildx-action@v3
         with:
           buildkitd-config-inline: |
@@ -680,8 +724,9 @@ jobs:
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-orchestrator:buildcache-main,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
   build-cockpit:
-    needs: [lint, dependency-audit, test-python, test-cockpit, resolve-version]
+    needs: [architecture, lint, dependency-audit, test-python, test-cockpit, resolve-version]
     if: >-
+      needs.architecture.result == 'success' &&
       always() && !cancelled() &&
       needs.lint.result == 'success' &&
       needs.dependency-audit.result == 'success' &&
@@ -695,6 +740,8 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: docker/setup-buildx-action@v3
         with:
           buildkitd-config-inline: |
@@ -739,8 +786,9 @@ jobs:
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-cockpit:buildcache-main,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
   build-mcp:
-    needs: [lint, dependency-audit, test-python, test-cockpit, resolve-version]
+    needs: [architecture, lint, dependency-audit, test-python, test-cockpit, resolve-version]
     if: >-
+      needs.architecture.result == 'success' &&
       always() && !cancelled() &&
       needs.lint.result == 'success' &&
       needs.dependency-audit.result == 'success' &&
@@ -754,6 +802,8 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: docker/setup-buildx-action@v3
         with:
           buildkitd-config-inline: |
@@ -798,8 +848,9 @@ jobs:
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-mcp:buildcache-main,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
   build-workspace:
-    needs: [lint, dependency-audit, test-python, test-cockpit, resolve-version]
+    needs: [architecture, lint, dependency-audit, test-python, test-cockpit, resolve-version]
     if: >-
+      needs.architecture.result == 'success' &&
       always() && !cancelled() &&
       needs.lint.result == 'success' &&
       needs.dependency-audit.result == 'success' &&
@@ -813,6 +864,8 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: docker/setup-buildx-action@v3
         with:
           buildkitd-config-inline: |
@@ -861,8 +914,9 @@ jobs:
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-workspace:buildcache-main,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
   build-sudo-gate:
-    needs: [lint, dependency-audit, test-python, test-cockpit, resolve-version]
+    needs: [architecture, lint, dependency-audit, test-python, test-cockpit, resolve-version]
     if: >-
+      needs.architecture.result == 'success' &&
       always() && !cancelled() &&
       needs.lint.result == 'success' &&
       needs.dependency-audit.result == 'success' &&
@@ -873,6 +927,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: actions/setup-go@v5
         with:
           go-version: '1.22'
@@ -909,8 +965,9 @@ jobs:
   # stage1-rebuild.yml so the baseline never drifts more than a week.
   # ---------------------------------------------------------------------------
   build-agent-vm-base-stage1:
-    needs: [lint, dependency-audit, test-python, test-cockpit, resolve-version]
+    needs: [architecture, lint, dependency-audit, test-python, test-cockpit, resolve-version]
     if: >-
+      needs.architecture.result == 'success' &&
       always() && !cancelled() &&
       github.event_name == 'push' &&
       needs.lint.result == 'success' &&
@@ -925,6 +982,8 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - name: Free disk space
         # Hosted runners have ~14 GiB free and these jobs need more. Self-hosted
         # runners do not need it, and the heavy variants below delete
@@ -1034,8 +1093,9 @@ jobs:
   # base so new stage1 dependencies can pass validation before main publishes them.
   # ---------------------------------------------------------------------------
   build-agent-vm-base:
-    needs: [lint, dependency-audit, test-python, test-cockpit, build-sudo-gate, resolve-version, build-agent-vm-base-stage1]
+    needs: [architecture, lint, dependency-audit, test-python, test-cockpit, build-sudo-gate, resolve-version, build-agent-vm-base-stage1]
     if: >-
+      needs.architecture.result == 'success' &&
       always() && !cancelled() &&
       needs.lint.result == 'success' &&
       needs.dependency-audit.result == 'success' &&
@@ -1056,6 +1116,8 @@ jobs:
           echo "::error::build-sudo-gate failed — refusing to build VM image without gate binaries"
           exit 1
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - name: Download sudo gate artifacts
         uses: actions/download-artifact@v4
         with:
@@ -1184,8 +1246,9 @@ jobs:
           fi
 
   build-vm-controller:
-    needs: [lint, dependency-audit, test-python, test-cockpit, resolve-version]
+    needs: [architecture, lint, dependency-audit, test-python, test-cockpit, resolve-version]
     if: >-
+      needs.architecture.result == 'success' &&
       always() && !cancelled() &&
       needs.lint.result == 'success' &&
       needs.dependency-audit.result == 'success' &&
@@ -1199,6 +1262,8 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: docker/setup-buildx-action@v3
         with:
           buildkitd-config-inline: |
@@ -1222,8 +1287,8 @@ jobs:
       - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
         uses: docker/build-push-action@v5
         with:
-          context: ./vm/controller
-          file: ./vm/controller/Dockerfile
+          context: .
+          file: ./docker/Dockerfile.vm-controller
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: |
@@ -1248,18 +1313,21 @@ jobs:
   # ---------------------------------------------------------------------------
   release-chart:
     name: Package and publish Helm chart
-    needs: [resolve-version, build-agent, build-orchestrator, build-cockpit, build-mcp, build-workspace, build-vm-controller, build-agent-vm-base, chart-test]
+    needs: [architecture, resolve-version, build-agent, build-orchestrator, build-cockpit, build-mcp, build-workspace, build-vm-controller, build-agent-vm-base, chart-test, chart-schema-negative]
     if: >-
       always() && !cancelled() &&
       github.event_name == 'push' &&
+      needs.architecture.result == 'success' &&
       needs.resolve-version.result == 'success' &&
       needs.build-agent.result == 'success' &&
       needs.build-orchestrator.result == 'success' &&
       needs.build-cockpit.result == 'success' &&
       needs.build-mcp.result == 'success' &&
       needs.build-agent-vm-base.result == 'success' &&
-      !contains(needs.build-workspace.result, 'failure') &&
-      needs.chart-test.result == 'success'
+      needs.build-workspace.result == 'success' &&
+      needs.build-vm-controller.result == 'success' &&
+      needs.chart-test.result == 'success' &&
+      needs.chart-schema-negative.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -1268,6 +1336,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
       - name: Install Helm
         uses: azure/setup-helm@v4
@@ -1277,14 +1346,36 @@ jobs:
         run: |
           sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
           sudo chmod +x /usr/local/bin/yq
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify every chart image before publication
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: >-
+          python3 scripts/verify_chart_images.py
+          --repository "${{ env.REGISTRY }}/${{ env.REPO_LOWER }}"
+          --release-sha "${{ github.sha }}"
+          --inventory /tmp/verified-chart-images.json
       - name: Stamp release component provenance
         env:
           RELEASE_VERSION: ${{ needs.resolve-version.outputs.version }}
         run: |
-          yq -i '.provenance.releaseVersion = strenv(RELEASE_VERSION)' helm/values.yaml
+          export IMAGE_TAG="sha-${GITHUB_SHA::7}"
+          yq -i '
+            .provenance.releaseVersion = strenv(RELEASE_VERSION) |
+            .image.mcp.digest = strenv(MCP_DIGEST) |
+            .vmController.image.tag = strenv(IMAGE_TAG) |
+            .provenance.components.vmController.sourceRevision = strenv(GITHUB_SHA) |
+            .provenance.components.vmController.releaseVersion = strenv(RELEASE_VERSION)
+          ' helm/values.yaml
           for component in orchestrator agent cockpit mcp workspace; do
             export component
             yq -i '
+              .image[strenv(component)].tag = strenv(IMAGE_TAG) |
               .provenance.components[strenv(component)].sourceRevision = strenv(GITHUB_SHA) |
               .provenance.components[strenv(component)].releaseVersion = strenv(RELEASE_VERSION)
             ' helm/values.yaml
@@ -1298,12 +1389,6 @@ jobs:
             --version "${{ needs.resolve-version.outputs.version }}" \
             --app-version "${{ needs.resolve-version.outputs.version }}" \
             --destination ./dist
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
       - name: Push chart to OCI registry
         run: |
           helm push "./dist/superhuman-remote-worker-${{ needs.resolve-version.outputs.version }}.tgz" \

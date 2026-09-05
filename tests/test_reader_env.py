@@ -13,8 +13,8 @@ import subprocess
 
 import pytest
 
-from src.tools.context import ToolContext
-from src.tools.delegation.reader_env import (
+from agent.tools.context import ToolContext
+from agent.tools.delegation.reader_env import (
     acquire_reader_env,
     release_reader_env,
 )
@@ -28,8 +28,8 @@ def _git(args, cwd):
 
 @pytest.fixture
 def parent_context(tmp_path):
-    from src.core.workspace import WorkspaceManager, WorkspaceManagerConfig
-    from src.managers.git_manager import GitManager
+    from agent.core.workspace import WorkspaceManager, WorkspaceManagerConfig
+    from agent.managers.git_manager import GitManager
 
     ws = tmp_path / "workspace"
     ws.mkdir()
@@ -138,7 +138,7 @@ class TestAcquireReaderEnv:
     @pytest.mark.asyncio
     async def test_no_git_falls_back_to_scratch_subdir(self, tmp_path):
         """When the parent has no active git, a scratch subdir is used instead."""
-        from src.core.workspace import WorkspaceManager, WorkspaceManagerConfig
+        from agent.core.workspace import WorkspaceManager, WorkspaceManagerConfig
 
         ws = tmp_path / "nogit"
         ws.mkdir()

@@ -13,7 +13,12 @@ from orchestrator.database.migrate import run_migrations
 
 
 VECTOR_MIGRATIONS = (
-    Path(__file__).resolve().parents[1] / "orchestrator/database/migrations/vector"
+    Path(__file__).resolve().parents[1]
+    / "src"
+    / "orchestrator"
+    / "database"
+    / "migrations"
+    / "vector"
 )
 
 

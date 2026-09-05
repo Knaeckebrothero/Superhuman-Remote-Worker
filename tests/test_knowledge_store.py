@@ -20,7 +20,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.services.knowledge_store import KnowledgeRecord, KnowledgeStore
+from shared.runtime.services.knowledge_store import KnowledgeRecord, KnowledgeStore
 
 
 # =============================================================================

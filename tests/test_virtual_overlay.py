@@ -1,7 +1,11 @@
 import pytest
 
-from src.core.backends.overlay import EntryMeta, VirtualOverlayBackend, VirtualPathError
-from src.core.workspace_backend import SEARCH_RESULT_HARD_CAP
+from agent.core.backends.overlay import (
+    EntryMeta,
+    VirtualOverlayBackend,
+    VirtualPathError,
+)
+from shared.runtime.core.workspace_backend import SEARCH_RESULT_HARD_CAP
 from tests._fs_backend import FilesystemTestBackend
 
 
@@ -312,7 +316,7 @@ class _CountingToolsProvider:
         return docs
 
     def entries(self):
-        from src.core.backends.overlay import EntryMeta
+        from agent.core.backends.overlay import EntryMeta
 
         return {
             name: EntryMeta(size=len(body.encode("utf-8")))
@@ -334,7 +338,7 @@ def test_root_search_renders_each_document_once(tmp_path):
     that is ~1,700 generate_tool_description invocations per root search, paid
     on the agent's request path.
     """
-    from src.core.backends.overlay import VirtualOverlayBackend
+    from agent.core.backends.overlay import VirtualOverlayBackend
     from tests._fs_backend import FilesystemTestBackend
 
     names = [f"tool_{i}" for i in range(10)]
@@ -351,7 +355,7 @@ def test_root_search_renders_each_document_once(tmp_path):
 
 def test_search_still_reflects_the_current_document_set(tmp_path):
     """Freshness must survive the optimization — no cross-call memoization."""
-    from src.core.backends.overlay import VirtualOverlayBackend
+    from agent.core.backends.overlay import VirtualOverlayBackend
     from tests._fs_backend import FilesystemTestBackend
 
     provider = _CountingToolsProvider(["tool_a"])
@@ -365,7 +369,7 @@ def test_search_still_reflects_the_current_document_set(tmp_path):
 
 def test_search_falls_back_when_a_provider_has_no_read_all(tmp_path):
     """read_all() is optional — providers without it must still be searchable."""
-    from src.core.backends.overlay import EntryMeta, VirtualOverlayBackend
+    from agent.core.backends.overlay import EntryMeta, VirtualOverlayBackend
     from tests._fs_backend import FilesystemTestBackend
 
     class Minimal:

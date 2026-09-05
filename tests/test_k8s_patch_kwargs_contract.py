@@ -16,7 +16,7 @@ import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-ORCHESTRATOR = REPO_ROOT / "orchestrator"
+ORCHESTRATOR = REPO_ROOT / "src" / "orchestrator"
 PATCH_PREFIX = "patch_namespaced_"
 
 

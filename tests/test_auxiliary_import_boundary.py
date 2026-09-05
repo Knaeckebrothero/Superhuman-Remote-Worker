@@ -19,11 +19,11 @@ def test_memory_and_remote_support_work_without_agent_runtime_imports():
                 import sys
 
                 forbidden = (
-                    "src.tools",
-                    "src.graph",
-                    "src.persistent_graph",
-                    "src.core.context",
-                    "src.core.archiver",
+                    "agent.tools",
+                    "agent.graph",
+                    "agent.persistent_graph",
+                    "agent.core.context",
+                    "agent.core.archiver",
                     "langgraph",
                 )
 
@@ -39,12 +39,12 @@ def test_memory_and_remote_support_work_without_agent_runtime_imports():
                 sys.meta_path.insert(0, AgentRuntimeBlocker())
 
                 from langchain_core.messages import HumanMessage, ToolMessage
-                from src.core.backends.remote import RemoteBackend
-                from src.services.auxiliary import (
+                from shared.runtime.core.backends.remote import RemoteBackend
+                from shared.runtime.services.auxiliary import (
                     SummarizeTask,
                     _format_messages_for_extraction,
                 )
-                from src.services.memory.extraction_engine import MemoryExtractionEngine
+                from agent.services.memory.extraction_engine import MemoryExtractionEngine
 
                 schema = SummarizeTask("conversation", "summarize").output_schema
                 summary = schema(

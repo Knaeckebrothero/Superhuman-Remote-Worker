@@ -116,7 +116,7 @@ class TestGitManagerWorktree:
 
     @pytest.fixture
     def git_manager(self, git_repo):
-        from src.managers.git_manager import GitManager
+        from agent.managers.git_manager import GitManager
 
         return GitManager(git_repo)
 
@@ -203,7 +203,7 @@ class TestDelegationTimeout:
         # so verify via source inspection
         import pathlib
 
-        main_src = pathlib.Path("orchestrator/main.py").read_text()
+        main_src = pathlib.Path("src/orchestrator/main.py").read_text()
         assert "async def _check_delegation_timeouts" in main_src
         assert "async def delegation_timeout_sweeper" in main_src
         assert "delegation_timeout_task" in main_src

@@ -58,8 +58,8 @@ class TestWritebackLoopStage:
     @pytest.mark.asyncio
     async def test_width1_writes_membership_and_display_mirror(self):
         db = AsyncMock()
-        with patch("main.postgres_db", db):
-            from main import _writeback_loop_stage
+        with patch("orchestrator.main.postgres_db", db):
+            from orchestrator.main import _writeback_loop_stage
 
             await _writeback_loop_stage(
                 LOOP_ID,
@@ -78,8 +78,8 @@ class TestWritebackLoopStage:
     @pytest.mark.asyncio
     async def test_fanout_writes_membership_with_null_mirror(self):
         db = AsyncMock()
-        with patch("main.postgres_db", db):
-            from main import _writeback_loop_stage
+        with patch("orchestrator.main.postgres_db", db):
+            from orchestrator.main import _writeback_loop_stage
 
             await _writeback_loop_stage(
                 LOOP_ID,
@@ -116,17 +116,23 @@ def _advance_patches(
     rotate: AsyncMock | None,
     notify: AsyncMock | None = None,
 ):
-    stack.enter_context(patch("main.postgres_db", db))
+    stack.enter_context(patch("orchestrator.main.postgres_db", db))
     stack.enter_context(
         patch(
-            "main._record_loop_job_outcome",
+            "orchestrator.main._record_loop_job_outcome",
             AsyncMock(return_value=("no-changes", None)),
         )
     )
-    stack.enter_context(patch("main._notify_loop_user_questions", AsyncMock()))
-    stack.enter_context(patch("main._notify_loop_event", notify or AsyncMock()))
+    stack.enter_context(
+        patch("orchestrator.main._notify_loop_user_questions", AsyncMock())
+    )
+    stack.enter_context(
+        patch("orchestrator.main._notify_loop_event", notify or AsyncMock())
+    )
     if rotate is not None:
-        stack.enter_context(patch("main._rotate_loop_to_next_stage", rotate))
+        stack.enter_context(
+            patch("orchestrator.main._rotate_loop_to_next_stage", rotate)
+        )
 
 
 class TestUnifiedAdvance:
@@ -138,7 +144,7 @@ class TestUnifiedAdvance:
         rotate = AsyncMock()
         with ExitStack() as stack:
             _advance_patches(stack, db, rotate=rotate)
-            from main import _advance_project_loop
+            from orchestrator.main import _advance_project_loop
 
             await _advance_project_loop(job, {}, [])
         db.claim_project_loop_stage_barrier.assert_awaited_once_with(LOOP_ID, job["id"])
@@ -157,7 +163,7 @@ class TestUnifiedAdvance:
         rotate = AsyncMock()
         with ExitStack() as stack:
             _advance_patches(stack, db, rotate=rotate)
-            from main import _advance_project_loop
+            from orchestrator.main import _advance_project_loop
 
             await _advance_project_loop(stray, {}, [])
         db.claim_project_loop_stage_barrier.assert_not_awaited()
@@ -173,7 +179,7 @@ class TestUnifiedAdvance:
         rotate = AsyncMock()
         with ExitStack() as stack:
             _advance_patches(stack, db, rotate=rotate)
-            from main import _advance_project_loop
+            from orchestrator.main import _advance_project_loop
 
             await _advance_project_loop(job, {}, [])
         db.claim_project_loop_stage_barrier.assert_not_awaited()
@@ -187,7 +193,7 @@ class TestUnifiedAdvance:
         rotate = AsyncMock()
         with ExitStack() as stack:
             _advance_patches(stack, db, rotate=rotate)
-            from main import _advance_project_loop
+            from orchestrator.main import _advance_project_loop
 
             await _advance_project_loop(job, {}, [])
         rotate.assert_not_awaited()
@@ -205,7 +211,7 @@ class TestUnifiedAdvance:
         rotate = AsyncMock()
         with ExitStack() as stack:
             _advance_patches(stack, db, rotate=rotate)
-            from main import _advance_project_loop
+            from orchestrator.main import _advance_project_loop
 
             await _advance_project_loop(job, {}, [])
         rotate.assert_not_awaited()
@@ -222,7 +228,7 @@ class TestUnifiedAdvance:
         rotate = AsyncMock()
         with ExitStack() as stack:
             _advance_patches(stack, db, rotate=rotate)
-            from main import _advance_project_loop
+            from orchestrator.main import _advance_project_loop
 
             await _advance_project_loop(job, {"error": "kaboom"}, [])
         kw = rotate.await_args.kwargs
@@ -243,7 +249,7 @@ class TestUnifiedAdvance:
         rotate = AsyncMock()
         with ExitStack() as stack:
             _advance_patches(stack, db, rotate=rotate)
-            from main import _advance_project_loop
+            from orchestrator.main import _advance_project_loop
 
             await _advance_project_loop(ok, {}, [])
         kw = rotate.await_args.kwargs
@@ -266,8 +272,10 @@ class TestUnifiedAdvance:
         planner = AsyncMock(return_value=(True, None))  # handled: member spawned
         with ExitStack() as stack:
             _advance_patches(stack, db, rotate=None)
-            stack.enter_context(patch("main._advance_planner_campaign", planner))
-            from main import _advance_project_loop
+            stack.enter_context(
+                patch("orchestrator.main._advance_planner_campaign", planner)
+            )
+            from orchestrator.main import _advance_project_loop
 
             await _advance_project_loop(job, {}, [])
         planner.assert_awaited_once()
@@ -290,9 +298,9 @@ class TestResume:
         db.get_job.side_effect = lambda jid: by_id.get(str(jid))
         adv = AsyncMock()
         with ExitStack() as stack:
-            stack.enter_context(patch("main.postgres_db", db))
-            stack.enter_context(patch("main._advance_project_loop", adv))
-            from main import _resume_project_loop
+            stack.enter_context(patch("orchestrator.main.postgres_db", db))
+            stack.enter_context(patch("orchestrator.main._advance_project_loop", adv))
+            from orchestrator.main import _resume_project_loop
 
             await _resume_project_loop(LOOP_ID)
         adv.assert_awaited_once_with(done, {}, [])
@@ -328,7 +336,7 @@ class TestCooldownPark:
         actions: list = []
         with ExitStack() as stack:
             _advance_patches(stack, db, rotate=rotate, notify=notify)
-            from main import _advance_project_loop
+            from orchestrator.main import _advance_project_loop
 
             await _advance_project_loop(
                 job, {"error": _cooldown_error(reset_at)}, actions
@@ -352,7 +360,7 @@ class TestCooldownPark:
         rotate, notify = AsyncMock(), AsyncMock()
         with ExitStack() as stack:
             _advance_patches(stack, db, rotate=rotate, notify=notify)
-            from main import _advance_project_loop
+            from orchestrator.main import _advance_project_loop
 
             await _advance_project_loop(
                 job, {"error": _cooldown_error(_time.time() - 60)}, []
@@ -368,7 +376,7 @@ class TestCooldownPark:
         rotate, notify = AsyncMock(), AsyncMock()
         with ExitStack() as stack:
             _advance_patches(stack, db, rotate=rotate, notify=notify)
-            from main import _advance_project_loop
+            from orchestrator.main import _advance_project_loop
 
             await _advance_project_loop(
                 job, {"error": {"message": "boom", "type": "llm_error"}}, []
@@ -394,7 +402,7 @@ class TestCooldownPark:
         rotate = AsyncMock()
         with ExitStack() as stack:
             _advance_patches(stack, db, rotate=rotate)
-            from main import _advance_project_loop
+            from orchestrator.main import _advance_project_loop
 
             await _advance_project_loop(job, {}, [])
         kw = rotate.await_args.kwargs
@@ -421,7 +429,7 @@ class TestCooldownPark:
         rotate = AsyncMock()
         with ExitStack() as stack:
             _advance_patches(stack, db, rotate=rotate)
-            from main import _advance_project_loop
+            from orchestrator.main import _advance_project_loop
 
             await _advance_project_loop(winner, {"error": _cooldown_error(t1)}, [])
         kw = rotate.await_args.kwargs
@@ -451,7 +459,7 @@ class TestCooldownPark:
         rotate = AsyncMock()
         with ExitStack() as stack:
             _advance_patches(stack, db, rotate=rotate)
-            from main import _advance_project_loop
+            from orchestrator.main import _advance_project_loop
 
             await _advance_project_loop(ok, {}, [])
         kw = rotate.await_args.kwargs
@@ -462,7 +470,7 @@ class TestCooldownPark:
     async def test_park_clamped_to_cap(self):
         import time as _time
 
-        from services.project_loops import LOOP_COOLDOWN_PARK_CAP_SECONDS
+        from orchestrator.services.project_loops import LOOP_COOLDOWN_PARK_CAP_SECONDS
 
         job = _job(status="failed")
         loop = _loop(current_stage_jobs=[job["id"]], current_job_id=job["id"])
@@ -470,7 +478,7 @@ class TestCooldownPark:
         rotate = AsyncMock()
         with ExitStack() as stack:
             _advance_patches(stack, db, rotate=rotate)
-            from main import _advance_project_loop
+            from orchestrator.main import _advance_project_loop
 
             await _advance_project_loop(
                 job, {"error": _cooldown_error(_time.time() + 365 * 24 * 3600)}, []
@@ -495,7 +503,7 @@ class TestCooldownPark:
         rotate, notify = AsyncMock(), AsyncMock()
         with ExitStack() as stack:
             _advance_patches(stack, db, rotate=rotate, notify=notify)
-            from main import _advance_project_loop
+            from orchestrator.main import _advance_project_loop
 
             await _advance_project_loop(
                 job, {"error": _cooldown_error(_time.time() + 7200)}, []
@@ -516,10 +524,12 @@ class TestParkThreading:
         db = AsyncMock()
         spawn = AsyncMock(return_value=([{"id": "j2"}], 2))
         with ExitStack() as stack:
-            stack.enter_context(patch("main.postgres_db", db))
-            stack.enter_context(patch("main._spawn_loop_stage", spawn))
-            stack.enter_context(patch("main._writeback_loop_stage", AsyncMock()))
-            from main import _rotate_loop_to_next_stage
+            stack.enter_context(patch("orchestrator.main.postgres_db", db))
+            stack.enter_context(patch("orchestrator.main._spawn_loop_stage", spawn))
+            stack.enter_context(
+                patch("orchestrator.main._writeback_loop_stage", AsyncMock())
+            )
+            from orchestrator.main import _rotate_loop_to_next_stage
 
             await _rotate_loop_to_next_stage(
                 loop,
@@ -542,9 +552,11 @@ class TestParkThreading:
         loop = _loop(scheduling="campaign")
         planner = AsyncMock(return_value=(True, None))
         with ExitStack() as stack:
-            stack.enter_context(patch("main.postgres_db", AsyncMock()))
-            stack.enter_context(patch("main._advance_planner_campaign", planner))
-            from main import _rotate_loop_to_next_stage
+            stack.enter_context(patch("orchestrator.main.postgres_db", AsyncMock()))
+            stack.enter_context(
+                patch("orchestrator.main._advance_planner_campaign", planner)
+            )
+            from orchestrator.main import _rotate_loop_to_next_stage
 
             await _rotate_loop_to_next_stage(
                 loop,
@@ -570,10 +582,12 @@ class TestParkThreading:
         campaign = {"id": "c1", "title": "t", "stages": ["developer"]}
         spawn = AsyncMock(return_value=([{"id": "j3"}], 2))
         with ExitStack() as stack:
-            stack.enter_context(patch("main.postgres_db", AsyncMock()))
-            stack.enter_context(patch("main._spawn_loop_stage", spawn))
-            stack.enter_context(patch("main._writeback_loop_stage", AsyncMock()))
-            from main import _spawn_campaign_member
+            stack.enter_context(patch("orchestrator.main.postgres_db", AsyncMock()))
+            stack.enter_context(patch("orchestrator.main._spawn_loop_stage", spawn))
+            stack.enter_context(
+                patch("orchestrator.main._writeback_loop_stage", AsyncMock())
+            )
+            from orchestrator.main import _spawn_campaign_member
 
             await _spawn_campaign_member(
                 loop,
@@ -597,13 +611,18 @@ class TestParkThreading:
         loop = _loop()
         create = AsyncMock(return_value={"id": "j4"})
         with ExitStack() as stack:
-            stack.enter_context(patch("main.postgres_db", AsyncMock()))
-            stack.enter_context(patch("main._trigger_dispatch"))
-            stack.enter_context(patch("services.project_loops.create_loop_job", create))
+            stack.enter_context(patch("orchestrator.main.postgres_db", AsyncMock()))
+            stack.enter_context(patch("orchestrator.main._trigger_dispatch"))
             stack.enter_context(
-                patch("services.job_provisioning.provision_job_repo", AsyncMock())
+                patch("orchestrator.services.project_loops.create_loop_job", create)
             )
-            from main import _spawn_loop_job
+            stack.enter_context(
+                patch(
+                    "orchestrator.services.job_provisioning.provision_job_repo",
+                    AsyncMock(),
+                )
+            )
+            from orchestrator.main import _spawn_loop_job
 
             await _spawn_loop_job(loop, role="critic", iteration=2, park_until=park)
         assert create.await_args.kwargs["park_until"] == park
@@ -632,9 +651,9 @@ class TestSpawnRequiresUnattendedOperationsGrant:
         job = AsyncMock()
         db = self._db(granted=False)
         with ExitStack() as stack:
-            stack.enter_context(patch("main.postgres_db", db))
-            stack.enter_context(patch("main._spawn_loop_job", job))
-            from main import _spawn_loop_stage
+            stack.enter_context(patch("orchestrator.main.postgres_db", db))
+            stack.enter_context(patch("orchestrator.main._spawn_loop_job", job))
+            from orchestrator.main import _spawn_loop_stage
 
             with pytest.raises(PermissionError) as exc:
                 await _spawn_loop_stage(
@@ -650,9 +669,9 @@ class TestSpawnRequiresUnattendedOperationsGrant:
         job = AsyncMock(return_value={"id": "j1"})
         db = self._db(granted=True)
         with ExitStack() as stack:
-            stack.enter_context(patch("main.postgres_db", db))
-            stack.enter_context(patch("main._spawn_loop_job", job))
-            from main import _spawn_loop_stage
+            stack.enter_context(patch("orchestrator.main.postgres_db", db))
+            stack.enter_context(patch("orchestrator.main._spawn_loop_job", job))
+            from orchestrator.main import _spawn_loop_stage
 
             jobs, total = await _spawn_loop_stage(
                 loop, stage="scholar", seq_index=0, base_total=0, remaining=5
@@ -668,9 +687,9 @@ class TestSpawnRequiresUnattendedOperationsGrant:
         loop = _loop(owner_id="u7", project_id="p9")
         db = self._db(granted=True, owner={"id": "u7"})
         with ExitStack() as stack:
-            stack.enter_context(patch("main.postgres_db", db))
-            stack.enter_context(patch("main._spawn_loop_job", AsyncMock()))
-            from main import _spawn_loop_stage
+            stack.enter_context(patch("orchestrator.main.postgres_db", db))
+            stack.enter_context(patch("orchestrator.main._spawn_loop_job", AsyncMock()))
+            from orchestrator.main import _spawn_loop_stage
 
             await _spawn_loop_stage(
                 loop, stage="scholar", seq_index=0, base_total=0, remaining=5
@@ -688,9 +707,9 @@ class TestSpawnRequiresUnattendedOperationsGrant:
         loop = _loop(project_id="p1")  # no owner_id
         db = self._db(granted=False)
         with ExitStack() as stack:
-            stack.enter_context(patch("main.postgres_db", db))
-            stack.enter_context(patch("main._spawn_loop_job", AsyncMock()))
-            from main import _spawn_loop_stage
+            stack.enter_context(patch("orchestrator.main.postgres_db", db))
+            stack.enter_context(patch("orchestrator.main._spawn_loop_job", AsyncMock()))
+            from orchestrator.main import _spawn_loop_stage
 
             await _spawn_loop_stage(
                 loop, stage="scholar", seq_index=0, base_total=0, remaining=5
@@ -716,7 +735,7 @@ class TestTurnOutcomeReachesRotation:
         rotate = AsyncMock()
         with ExitStack() as stack:
             _advance_patches(stack, db, rotate=rotate)
-            from main import _advance_project_loop
+            from orchestrator.main import _advance_project_loop
 
             await _advance_project_loop(job, {"error": "critic blew up"}, [])
         kw = rotate.await_args.kwargs
@@ -731,7 +750,7 @@ class TestTurnOutcomeReachesRotation:
         rotate = AsyncMock()
         with ExitStack() as stack:
             _advance_patches(stack, db, rotate=rotate)
-            from main import _advance_project_loop
+            from orchestrator.main import _advance_project_loop
 
             await _advance_project_loop(job, {}, [])
         assert rotate.await_args.kwargs["turn_all_failed"] is False
@@ -745,7 +764,7 @@ class TestTurnOutcomeReachesRotation:
         rotate = AsyncMock()
         with ExitStack() as stack:
             _advance_patches(stack, db, rotate=rotate)
-            from main import _advance_project_loop
+            from orchestrator.main import _advance_project_loop
 
             await _advance_project_loop(bad, {"error": "one leg died"}, [])
         kw = rotate.await_args.kwargs

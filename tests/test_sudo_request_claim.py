@@ -12,8 +12,8 @@ import pytest
 import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
-from database.postgres import PostgresDB
-from services.sudo_gate import SudoGateService
+from orchestrator.database.postgres import PostgresDB
+from orchestrator.services.sudo_gate import SudoGateService
 
 JOB = "11111111-1111-1111-1111-111111111111"
 REPLY = "_INBOX.aaaaaaaaaaaaaaaaaaaaaa"

@@ -172,7 +172,7 @@ class PinnedJobRecipient(BaseModel):
 
     This model is the wire contract between the orchestrator and a pinned
     worker process, so it lives beside the other shared identity types rather
-    than in ``src.api.models``: importing that package would drag the whole
+    than in ``agent.api.models``: importing that package would drag the whole
     agent runtime (and its agent-only dependencies) into the orchestrator.
     """
 

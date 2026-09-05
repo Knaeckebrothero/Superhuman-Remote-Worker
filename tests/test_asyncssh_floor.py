@@ -13,7 +13,10 @@ import pytest
 
 REQUIREMENTS = (
     pathlib.Path(__file__).resolve().parents[1] / "requirements.txt",
-    pathlib.Path(__file__).resolve().parents[1] / "orchestrator" / "requirements.txt",
+    pathlib.Path(__file__).resolve().parents[1]
+    / "src"
+    / "orchestrator"
+    / "requirements.txt",
 )
 MINIMUM = (2, 24, 0)
 

@@ -7,10 +7,11 @@ from uuid import UUID
 
 import pytest
 
-from database.postgres import PostgresDB
+from orchestrator.database.postgres import PostgresDB
 
 MIGRATIONS = (
     pathlib.Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "migrations"
@@ -387,7 +388,7 @@ async def test_prune_returns_zero_when_fetchval_is_none():
 async def test_sweeper_logs_default_interval_and_retention(caplog, monkeypatch):
     monkeypatch.delenv("SSH_ATTACHMENTS_PRUNE_INTERVAL_S", raising=False)
     monkeypatch.delenv("SSH_ATTACHMENTS_RETENTION_DAYS", raising=False)
-    from main import ssh_attachments_prune_sweeper
+    from orchestrator.main import ssh_attachments_prune_sweeper
 
     shutdown_event = asyncio.Event()
     shutdown_event.set()
@@ -401,7 +402,7 @@ async def test_sweeper_logs_default_interval_and_retention(caplog, monkeypatch):
 async def test_sweeper_honors_env_var_overrides(caplog, monkeypatch):
     monkeypatch.setenv("SSH_ATTACHMENTS_PRUNE_INTERVAL_S", "120")
     monkeypatch.setenv("SSH_ATTACHMENTS_RETENTION_DAYS", "14")
-    from main import ssh_attachments_prune_sweeper
+    from orchestrator.main import ssh_attachments_prune_sweeper
 
     shutdown_event = asyncio.Event()
     shutdown_event.set()

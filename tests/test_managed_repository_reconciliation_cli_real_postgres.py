@@ -19,6 +19,7 @@ from orchestrator.services.managed_repository_authority import _deploy_keypair
 
 SCHEMA_FILE = (
     Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "schema_current.sql"

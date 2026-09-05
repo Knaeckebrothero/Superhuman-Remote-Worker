@@ -6,7 +6,7 @@ a session/role that can never start must be caught before a pod spawns.
 
 import pytest
 
-from src.core.transport_resolution import (
+from shared.runtime.core.transport_resolution import (
     CitationTransportError,
     embedding_role_violation,
     is_openai_default_endpoint,

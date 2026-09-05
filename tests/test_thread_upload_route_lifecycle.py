@@ -131,7 +131,7 @@ class _DB:
 @pytest.mark.asyncio
 async def test_pinned_k8s_upload_requires_fresh_exact_attestation():
     from orchestrator import main
-    from services import thread_uploads
+    from orchestrator.services import thread_uploads
 
     thread = _pinned_thread()
     db = _PinnedDB(thread)
@@ -182,7 +182,7 @@ async def test_pinned_k8s_upload_requires_fresh_exact_attestation():
 @pytest.mark.parametrize("operation", ["upload", "delete"])
 async def test_pinned_k8s_same_ip_successor_gets_no_legacy_io(operation):
     from orchestrator import main
-    from services import thread_uploads
+    from orchestrator.services import thread_uploads
 
     thread = _pinned_thread()
     db = _PinnedDB(thread)
@@ -255,7 +255,7 @@ async def test_pinned_k8s_same_ip_successor_gets_no_legacy_io(operation):
 @pytest.mark.asyncio
 async def test_stateless_upload_holds_lifecycle_lock_through_final_write():
     from orchestrator import main
-    from services import thread_uploads
+    from orchestrator.services import thread_uploads
 
     order = []
     thread = _thread()
@@ -308,7 +308,7 @@ async def test_stateless_upload_holds_lifecycle_lock_through_final_write():
 @pytest.mark.asyncio
 async def test_retirement_marker_wins_before_upload_materialization():
     from orchestrator import main
-    from services import thread_uploads
+    from orchestrator.services import thread_uploads
 
     order = []
     initial = _thread()
@@ -346,7 +346,7 @@ async def test_retirement_marker_wins_before_upload_materialization():
 @pytest.mark.asyncio
 async def test_stateless_delete_holds_lifecycle_lock_through_exact_delete():
     from orchestrator import main
-    from services import thread_uploads
+    from orchestrator.services import thread_uploads
 
     order: list[str] = []
     thread = _thread()
@@ -408,7 +408,7 @@ async def test_present_falsey_stop_marker_refuses_delete_before_transport(
     marker_key, value
 ):
     from orchestrator import main
-    from services import thread_uploads
+    from orchestrator.services import thread_uploads
 
     order: list[str] = []
     initial = _thread()
@@ -454,7 +454,7 @@ async def test_present_falsey_stop_marker_refuses_delete_before_transport(
 @pytest.mark.parametrize("value", [None, False, 0, "", [], {}])
 async def test_present_falsey_stop_marker_refuses_upload_before_read(marker_key, value):
     from orchestrator import main
-    from services import thread_uploads
+    from orchestrator.services import thread_uploads
 
     order = []
     initial = _thread()
@@ -490,7 +490,7 @@ async def test_present_falsey_stop_marker_refuses_upload_before_read(marker_key,
 @pytest.mark.asyncio
 async def test_cancelled_virtual_upload_keeps_lifecycle_lock_until_writer_finishes():
     from orchestrator import main
-    from services import thread_uploads
+    from orchestrator.services import thread_uploads
 
     order: list[str] = []
     entered = threading.Event()
@@ -583,7 +583,7 @@ async def test_cancelled_virtual_upload_keeps_lifecycle_lock_until_writer_finish
 @pytest.mark.asyncio
 async def test_cancelled_virtual_delete_keeps_lifecycle_lock_until_worker_finishes():
     from orchestrator import main
-    from services import thread_uploads
+    from orchestrator.services import thread_uploads
 
     order: list[str] = []
     entered = threading.Event()

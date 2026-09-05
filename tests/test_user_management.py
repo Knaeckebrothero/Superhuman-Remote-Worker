@@ -8,17 +8,11 @@ Covers:
 """
 
 import os
-import sys
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import pytest
-
-# Add orchestrator to path so we can import its modules
-_orchestrator_dir = os.path.join(os.path.dirname(__file__), "..", "orchestrator")
-if _orchestrator_dir not in sys.path:
-    sys.path.insert(0, os.path.abspath(_orchestrator_dir))
 
 
 # ============================================================================
@@ -73,7 +67,7 @@ class TestPostgresDBUserOps:
     def _make_db(self):
         """Create a PostgresDB instance with a mocked pool."""
         with patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}):
-            from database import PostgresDB
+            from orchestrator.database import PostgresDB
 
             db = PostgresDB()
         db._pool = MagicMock()
@@ -347,7 +341,7 @@ class TestAppSideAdmission:
 
     @pytest.mark.asyncio
     async def test_write_through_migrates_legacy_role_holder(self):
-        from security.auth import _resolve_user_from_claims
+        from orchestrator.security.auth import _resolve_user_from_claims
 
         db, conn = self._db_with_user(self._user_row(is_approved=False))
         result = await _resolve_user_from_claims(self._claims(["user"]), db)
@@ -359,7 +353,7 @@ class TestAppSideAdmission:
 
     @pytest.mark.asyncio
     async def test_pending_when_no_role_and_db_false(self):
-        from security.auth import _resolve_user_from_claims
+        from orchestrator.security.auth import _resolve_user_from_claims
 
         db, _ = self._db_with_user(self._user_row(is_approved=False))
         result = await _resolve_user_from_claims(self._claims([]), db)
@@ -369,7 +363,7 @@ class TestAppSideAdmission:
 
     @pytest.mark.asyncio
     async def test_db_approved_survives_absent_role(self):
-        from security.auth import _resolve_user_from_claims
+        from orchestrator.security.auth import _resolve_user_from_claims
 
         db, _ = self._db_with_user(self._user_row(is_approved=True))
         result = await _resolve_user_from_claims(self._claims([]), db)
@@ -380,7 +374,7 @@ class TestAppSideAdmission:
 
     @pytest.mark.asyncio
     async def test_resolve_pat_no_longer_forces_approval(self):
-        from security.auth import _resolve_pat
+        from orchestrator.security.auth import _resolve_pat
 
         db = MagicMock()
         db.get_auth_token_by_hash = AsyncMock(
@@ -405,7 +399,7 @@ class TestAppSideAdmission:
 
     @pytest.mark.asyncio
     async def test_resolve_pat_approved_user_passes(self):
-        from security.auth import _resolve_pat
+        from orchestrator.security.auth import _resolve_pat
 
         db = MagicMock()
         db.get_auth_token_by_hash = AsyncMock(
@@ -431,7 +425,7 @@ class TestAppSideAdmission:
     async def test_ensure_user_provisioned_skips_without_sub(self):
         # Admin-created / pre-OIDC rows have no keycloak_sub → no provisioning
         # (they provision on their owner's first real OIDC login).
-        from security import auth
+        from orchestrator.security import auth
 
         with (
             patch.object(auth, "_ensure_cloud_user", new=AsyncMock()) as ec,
@@ -445,7 +439,7 @@ class TestAppSideAdmission:
     async def test_ensure_user_provisioned_fires_both_ensures(self):
         import asyncio
 
-        from security import auth
+        from orchestrator.security import auth
 
         with (
             patch.object(auth, "_ensure_cloud_user", new=AsyncMock()) as ec,
@@ -470,7 +464,10 @@ class TestAppSideAdmission:
         about the new user (one dedup key, so approving resolves them all),
         and the legacy `user_registered` SSE frame keeps flowing — it is the
         admin Users page's refresh signal, not a notification."""
-        from services.notification_service import NotificationService, RecordResult
+        from orchestrator.services.notification_service import (
+            NotificationService,
+            RecordResult,
+        )
 
         svc = NotificationService()
         feed = MagicMock()  # broadcast is sync
@@ -503,7 +500,7 @@ class TestAppSideAdmission:
     async def test_record_user_registered_skips_the_registrant_and_survives_a_bad_row(
         self,
     ):
-        from services.notification_service import NotificationService
+        from orchestrator.services.notification_service import NotificationService
 
         svc = NotificationService()
         feed = MagicMock()
@@ -532,7 +529,7 @@ class TestPostgresDBMcpTokens:
 
     def _make_db(self):
         with patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}):
-            from database import PostgresDB
+            from orchestrator.database import PostgresDB
 
             db = PostgresDB()
         db._pool = MagicMock()
@@ -772,7 +769,12 @@ class TestSchemaContainsIsAdmin:
 
     def test_schema_has_is_admin_migration(self):
         schema_path = os.path.join(
-            os.path.dirname(__file__), "..", "orchestrator", "database", "schema.sql"
+            os.path.dirname(__file__),
+            "..",
+            "src",
+            "orchestrator",
+            "database",
+            "schema.sql",
         )
         with open(schema_path) as f:
             content = f.read()
@@ -781,7 +783,12 @@ class TestSchemaContainsIsAdmin:
 
     def test_schema_has_mcp_tokens_table(self):
         schema_path = os.path.join(
-            os.path.dirname(__file__), "..", "orchestrator", "database", "schema.sql"
+            os.path.dirname(__file__),
+            "..",
+            "src",
+            "orchestrator",
+            "database",
+            "schema.sql",
         )
         with open(schema_path) as f:
             content = f.read()

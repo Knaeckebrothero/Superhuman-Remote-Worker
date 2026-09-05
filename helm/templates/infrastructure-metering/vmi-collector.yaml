@@ -84,7 +84,7 @@ spec:
         - name: collector
           image: {{ include "srw.imageRef" (dict "image" .Values.image.orchestrator) | quote }}
           imagePullPolicy: {{ .Values.image.orchestrator.pullPolicy }}
-          command: ["python", "-m", "services.infrastructure_metering.collector_runtime"]
+          command: ["python", "-m", "orchestrator.services.infrastructure_metering.collector_runtime"]
           env:
             - name: INFRASTRUCTURE_METERING_COLLECTOR_ENABLED
               value: "true"

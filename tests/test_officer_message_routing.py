@@ -18,9 +18,9 @@ import pytest
 from fastapi import HTTPException
 
 import orchestrator.main as main
-from services import message_routing as routing
-from services.notification_service import RecordResult
-from src.shared.runtime_actor import RuntimeActorContext
+from orchestrator.services import message_routing as routing
+from orchestrator.services.notification_service import RecordResult
+from shared.runtime_actor import RuntimeActorContext
 
 
 OFFICER_TID = str(uuid4())
@@ -788,7 +788,7 @@ class TestDrains:
             patch.object(main, "postgres_db", db),
             patch.object(main, "_inject_officer_notice", AsyncMock(return_value=True)),
             patch(
-                "services.message_routing.deliver_route_to_user",
+                "orchestrator.services.message_routing.deliver_route_to_user",
                 AsyncMock(return_value=True),
             ) as deliver,
         ):
@@ -1031,7 +1031,7 @@ class TestOfficerActionFlows:
         with (
             patch.object(main, "require_internal", AsyncMock()),
             patch.object(main, "postgres_db", db),
-            patch("services.message_routing.escalate_route", escalate),
+            patch("orchestrator.services.message_routing.escalate_route", escalate),
             _authorized_officer(),
         ):
             result = await main.officer_escalate_worker_message(
@@ -1064,7 +1064,7 @@ class TestOfficerActionFlows:
             patch.object(main, "require_internal", AsyncMock()),
             patch.object(main, "postgres_db", db),
             patch(
-                "services.message_routing.escalate_route",
+                "orchestrator.services.message_routing.escalate_route",
                 AsyncMock(return_value={"escalated": False, "delivered": False}),
             ),
             _authorized_officer(),
@@ -1198,7 +1198,7 @@ class TestInboundReplyRouteIntegration:
         with (
             patch.object(main, "COMPLETION_COMMANDS_ENABLED", False),
             patch.object(main, "postgres_db", db),
-            patch("services.session_wake.notify_officer", wake),
+            patch("orchestrator.services.session_wake.notify_officer", wake),
             patch.object(main, "_kick_officer_event_drain", MagicMock()),
         ):
             strategy, _seq = await main._route_inbound_reply(
@@ -1232,7 +1232,7 @@ class TestInboundReplyRouteIntegration:
 
 class TestWakeAndToolPlumbing:
     def test_worker_message_wake_bypasses_debounce(self):
-        from services import session_wake
+        from orchestrator.services import session_wake
 
         assert session_wake.OFFICER_DEBOUNCE_BY_SOURCE["worker_message"] == 0
 
@@ -1241,7 +1241,7 @@ class TestWakeAndToolPlumbing:
         five-argument call shape still binds."""
         import inspect
 
-        from src.tools.communication.messaging import create_communication_tools
+        from agent.tools.communication.messaging import create_communication_tools
 
         context = MagicMock()
         context.job_id = "j"
@@ -1256,7 +1256,7 @@ class TestWakeAndToolPlumbing:
 
     @pytest.mark.asyncio
     async def test_sitrep_worker_messages_section_lists_open_routes(self):
-        from services.sitrep import _worker_messages_section
+        from orchestrator.services.sitrep import _worker_messages_section
 
         now = datetime.now(timezone.utc)
         db = MagicMock()
@@ -1283,7 +1283,7 @@ class TestWakeAndToolPlumbing:
 
     @pytest.mark.asyncio
     async def test_sitrep_section_is_silent_when_empty(self):
-        from services.sitrep import _worker_messages_section
+        from orchestrator.services.sitrep import _worker_messages_section
 
         db = MagicMock()
         db.list_open_worker_message_routes = AsyncMock(return_value=[])
@@ -1359,7 +1359,7 @@ class TestDeliveryOutcomeClassification:
     and log decision now derives from one normalized outcome instead."""
 
     def test_provider_acceptance_is_accepted(self):
-        from services.message_routing import classify_dispatch
+        from orchestrator.services.message_routing import classify_dispatch
 
         assert classify_dispatch(
             {"email": True, "email_message_id": "<m@x>", "queued": False}
@@ -1368,29 +1368,29 @@ class TestDeliveryOutcomeClassification:
     def test_queued_for_digest_is_accepted(self):
         # Quiet-hours queueing is durable and genuinely accepted; retrying it
         # would double-send once the window closes.
-        from services.message_routing import classify_dispatch
+        from orchestrator.services.message_routing import classify_dispatch
 
         assert classify_dispatch({"queued": True}).accepted
 
     def test_an_uninitialized_service_is_retryable_not_delivered(self):
-        from services.message_routing import classify_dispatch
+        from orchestrator.services.message_routing import classify_dispatch
 
         out = classify_dispatch({"error": "NotificationService not initialized"})
         assert not out.accepted and "not initialized" in out.detail
 
     def test_empty_and_all_false_results_are_retryable(self):
-        from services.message_routing import classify_dispatch
+        from orchestrator.services.message_routing import classify_dispatch
 
         assert not classify_dispatch({}).accepted
         assert not classify_dispatch({"email": False, "ntfy": False}).accepted
 
     def test_a_non_dict_result_is_retryable_rather_than_crashing(self):
-        from services.message_routing import classify_dispatch
+        from orchestrator.services.message_routing import classify_dispatch
 
         assert not classify_dispatch(None).accepted
 
     def test_log_status_derives_from_the_same_outcome(self):
-        from services.message_routing import classify_dispatch
+        from orchestrator.services.message_routing import classify_dispatch
 
         assert classify_dispatch({"email": True}).log_status == "sent"
         assert classify_dispatch({"error": "x"}).log_status == "failed"
@@ -1403,7 +1403,7 @@ class TestFailedDeliveryStaysRetryable:
 
     @pytest.mark.asyncio
     async def test_a_failed_dispatch_does_not_stamp_delivery(self):
-        from services import message_routing
+        from orchestrator.services import message_routing
 
         db = _send_db(_job(), "user_direct")
         notifier = MagicMock()
@@ -1423,7 +1423,7 @@ class TestFailedDeliveryStaysRetryable:
 
     @pytest.mark.asyncio
     async def test_an_accepted_dispatch_stamps_exactly_once(self):
-        from services import message_routing
+        from orchestrator.services import message_routing
 
         job = _job()
         db = _send_db(job, "user_direct")
@@ -1468,7 +1468,7 @@ class TestRoutedWorkerTextIsSanitized:
 
     @pytest.mark.asyncio
     async def test_a_credential_in_worker_text_never_reaches_the_user(self):
-        from services import message_routing
+        from orchestrator.services import message_routing
 
         db = _send_db(_job(), "user_direct")
         db.get_thread_messages = AsyncMock(

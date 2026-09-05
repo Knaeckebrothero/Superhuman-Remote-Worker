@@ -10,8 +10,8 @@ import pytest
 
 import orchestrator.database.postgres as postgres_module
 from orchestrator.database.postgres import PostgresDB
-from src.shared.persistent_input_delivery import message_row_id
-from src.shared.session_subagent_authority import session_subagent_delivery_id
+from shared.persistent_input_delivery import message_row_id
+from shared.session_subagent_authority import session_subagent_delivery_id
 
 
 PARENT = UUID("aaaaaaaa-1111-4222-8333-444444444444")
@@ -292,7 +292,7 @@ async def test_pinned_soft_settlement_invokes_child_tombstone_in_same_transactio
         lambda *args, **kwargs: True,
     )
     append = AsyncMock()
-    monkeypatch.setattr("src.shared.event_journal.append_system_frame", append)
+    monkeypatch.setattr("shared.event_journal.append_system_frame", append)
 
     assert await db.settle_pinned_thread_retirement(
         str(PARENT),
@@ -330,7 +330,7 @@ async def test_stateless_soft_finish_invokes_child_tombstone_before_parent_updat
     tombstone = AsyncMock(return_value={"terminalized": 0, "deliveries": 0})
     db._terminalize_live_session_subagents_for_retirement = tombstone
     monkeypatch.setattr(
-        "src.shared.session_retirement.stateless_retirement_release_authorized",
+        "shared.session_retirement.stateless_retirement_release_authorized",
         lambda value: marker,
     )
 

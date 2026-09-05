@@ -33,15 +33,15 @@ from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
 from orchestrator.database.postgres import PostgresDB
-from src.api.lease_context import LeaseHandle, LeaseLostError, current_lease
-from src.core.fenced_checkpointer import FencedAsyncPostgresSaver
-from src.shared.run_queue import (
+from agent.api.lease_context import LeaseHandle, LeaseLostError, current_lease
+from agent.core.fenced_checkpointer import FencedAsyncPostgresSaver
+from shared.run_queue import (
     UNIT_KIND_WORKER_BATCH,
     reap_expired,
     release_unit,
     unpark_unit,
 )
-from src.shared.worker_queue import (
+from shared.worker_queue import (
     claim_worker_batch,
     enqueue_worker_batch,
     hold_worker_batch_for_preflight,
@@ -62,6 +62,7 @@ pytestmark = [
 
 _MIGRATIONS_DIR = (
     Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "migrations"

@@ -1,6 +1,6 @@
 """C2 — endpoint inventory snapshot test.
 
-Re-runs ``scripts/check_endpoint_auth.py`` against the live ``orchestrator/main.py``
+Re-runs ``scripts/check_endpoint_auth.py`` against the live ``src/orchestrator/main.py``
 and asserts the result matches the committed manifest at
 ``policy/endpoint_inventory.txt``.
 
@@ -36,6 +36,20 @@ def _load_script():
     sys.modules["check_endpoint_auth"] = module
     spec.loader.exec_module(module)
     return module
+
+
+def test_missing_source_is_an_error(tmp_path):
+    script = _load_script()
+    with pytest.raises(FileNotFoundError, match="route source is missing"):
+        script.collect_endpoints(tmp_path / "missing" / "main.py")
+
+
+def test_existing_source_may_have_no_endpoints(tmp_path, monkeypatch):
+    script = _load_script()
+    main = tmp_path / "main.py"
+    main.write_text("app = object()\n")
+    monkeypatch.setattr(script, "_router_modules", lambda: [])
+    assert script.collect_endpoints(main) == []
 
 
 def test_endpoint_inventory_matches_manifest():

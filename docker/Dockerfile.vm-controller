@@ -1,0 +1,29 @@
+FROM python:3.12-slim
+
+ARG SRW_SOURCE_REVISION=""
+ARG SRW_SOURCE_URL="https://github.com/knaeckebrothero/Superhuman-Remote-Worker"
+ARG SRW_RELEASE_VERSION=""
+ARG SRW_DOCUMENTATION_URL="https://github.com/knaeckebrothero/Superhuman-Remote-Worker"
+
+LABEL org.opencontainers.image.source="${SRW_SOURCE_URL}"
+LABEL org.opencontainers.image.revision="${SRW_SOURCE_REVISION}"
+LABEL org.opencontainers.image.version="${SRW_RELEASE_VERSION}"
+LABEL org.opencontainers.image.documentation="${SRW_DOCUMENTATION_URL}"
+LABEL io.srw.component="vm-controller"
+
+ENV PYTHONSAFEPATH=1
+
+WORKDIR /app
+
+COPY src/vm_controller/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY src/vm_controller/ ./src/vm_controller/
+COPY pyproject.toml ./
+RUN pip install --no-cache-dir --no-deps -e .
+
+# Non-root user — K8s RBAC handles authorization
+RUN useradd --create-home --no-log-init controller
+USER controller
+
+ENTRYPOINT ["python", "-u", "-m", "vm_controller"]

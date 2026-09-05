@@ -13,23 +13,17 @@ coverage of the submit/dispatch paths is verified manually per the plan.
 from __future__ import annotations
 
 import os
-import sys
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
 
-_ORCH = Path(__file__).parent.parent / "orchestrator"
-if str(_ORCH) not in sys.path:
-    sys.path.insert(0, str(_ORCH))
-
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
-import main as orch_main  # noqa: E402
-from main import AdminUserUpdate, app  # noqa: E402
+import orchestrator.main as orch_main  # noqa: E402
+from orchestrator.main import AdminUserUpdate, app  # noqa: E402
 
-MODULE = "main"
+MODULE = "orchestrator.main"
 
 
 # ---------------------------------------------------------------------------

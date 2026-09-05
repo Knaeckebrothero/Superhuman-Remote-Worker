@@ -8,17 +8,13 @@ under ``test_admin_models_api.py``.
 """
 
 import os
-import sys
-from pathlib import Path
 from unittest.mock import patch
-
-sys.path.insert(0, str(Path(__file__).parent.parent / "orchestrator"))
 
 # main.py validates VECTOR_DB_URL at module level; set a dummy value so the
 # import succeeds — tests here only exercise pure utility functions.
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
-from main import (  # noqa: E402
+from orchestrator.main import (  # noqa: E402
     _get_system_providers,
     _PROVIDER_ENV_KEYS,
 )

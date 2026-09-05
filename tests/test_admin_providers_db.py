@@ -19,7 +19,7 @@ from uuid import UUID
 import pytest
 
 from orchestrator.database.postgres import PostgresDB
-from security.crypto import decrypt, encrypt, is_encrypted
+from orchestrator.security.crypto import decrypt, encrypt, is_encrypted
 
 
 # ---------------------------------------------------------------------------

@@ -16,23 +16,16 @@ tool node:
 from __future__ import annotations
 
 import base64
-import sys
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-project_root = Path(__file__).parent.parent
-src_path = project_root / "src"
-if str(src_path) not in sys.path:
-    sys.path.insert(0, str(src_path))
-
-from src.core.loader import LimitsConfig  # noqa: E402
-from src.graph import create_audited_tool_node  # noqa: E402
-from src.services.image_content import IMAGE_DATA_TAG_TEMPLATE  # noqa: E402
+from shared.runtime.core.loader import LimitsConfig  # noqa: E402
+from agent.graph import create_audited_tool_node  # noqa: E402
+from agent.services.image_content import IMAGE_DATA_TAG_TEMPLATE  # noqa: E402
 
 
 # =============================================================================
@@ -116,7 +109,7 @@ class TestAuditedToolsImagePostProcessor:
         fake_tool = MagicMock()
         fake_tool.name = "read_file"
 
-        with patch("src.graph.ToolNode") as MockToolNode:
+        with patch("agent.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             mock_tn.ainvoke = AsyncMock(
                 return_value={
@@ -166,7 +159,7 @@ class TestAuditedToolsImagePostProcessor:
         fake_tool = MagicMock()
         fake_tool.name = "read_file"
 
-        with patch("src.graph.ToolNode") as MockToolNode:
+        with patch("agent.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             mock_tn.ainvoke = AsyncMock(
                 return_value={
@@ -193,7 +186,7 @@ class TestAuditedToolsImagePostProcessor:
         fake_tool = MagicMock()
         fake_tool.name = "search"
 
-        with patch("src.graph.ToolNode") as MockToolNode:
+        with patch("agent.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             mock_tn.ainvoke = AsyncMock(
                 return_value={
@@ -230,7 +223,7 @@ class TestAuditedToolsImagePostProcessor:
         fake_tool = MagicMock()
         fake_tool.name = "read_file"
 
-        with patch("src.graph.ToolNode") as MockToolNode:
+        with patch("agent.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             mock_tn.ainvoke = AsyncMock(
                 return_value={
@@ -279,7 +272,7 @@ class TestAuditedToolsImagePostProcessor:
         fake_tool = MagicMock()
         fake_tool.name = "read_file"
 
-        with patch("src.graph.ToolNode") as MockToolNode:
+        with patch("agent.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             mock_tn.ainvoke = AsyncMock(
                 return_value={

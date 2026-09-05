@@ -1,0 +1,128 @@
+"""Tools for Universal Agent.
+
+This package provides tools for the workspace-centric agent architecture:
+- Workspace tools: File operations (read, write, list, delete, search)
+- To do tools: Task management with archiving
+- Domain tools: Document processing, search, citation, cache, graph operations
+- Registry: Dynamic tool loading based on configuration
+
+Usage:
+    from agent.tools import (
+        ToolContext,
+        load_tools,
+        create_workspace_tools,
+        create_todo_tools,
+    )
+
+    # Create context with required dependencies
+    context = ToolContext(
+        workspace_manager=workspace_mgr,
+        todo_manager=todo_mgr,
+        postgres_db=pg_conn,
+    )
+
+    # Load tools by name
+    tools = load_tools(["read_file", "write_file", "add_todo", "complete_todo"], context)
+
+    # Or load all domain tools
+    tools = load_tools(["cypher_query"], context)
+
+    # Or create tool sets directly
+    workspace_tools = create_workspace_tools(context)
+    todo_tools = create_todo_tools(context)
+"""
+
+from agent.tools.citation import create_citation_tools, get_citation_metadata
+from agent.tools.context import ToolContext
+
+# Core toolkit exports (todo + job tools)
+from agent.tools.core import create_core_tools, get_core_metadata
+from agent.tools.core.job import (
+    create_job_tools,
+    get_final_phase_data,
+    clear_final_phase_data,
+)
+from agent.tools.core.todo import create_todo_tools
+from agent.tools.description_manager import (
+    DescriptionManager,
+    generate_tool_description,
+    generate_tool_index,
+    apply_description_overrides,
+    get_deferred_tools,
+    get_core_tools,
+)
+
+# Note: cache_tools removed (deprecated, not used in configs)
+from agent.tools.graph import create_graph_tools, get_graph_metadata
+from agent.tools.knowledge import create_knowledge_tools, get_knowledge_metadata
+from agent.tools.mongodb import create_mongodb_tools, get_mongodb_metadata
+from agent.tools.registry import (
+    TOOL_REGISTRY,
+    load_tools,
+    load_tools_for_phase,
+    get_available_tools,
+    get_tools_by_category,
+    load_tools_by_category,
+    filter_tools_by_phase,
+    get_tools_for_phase,
+    get_phase_tool_summary,
+    apply_instruction_enforcement,
+)
+
+# Domain tools
+from agent.tools.research import create_research_tools, get_research_metadata
+from agent.tools.sql import create_sql_tools, get_sql_metadata
+
+# Workspace toolkit (new package structure)
+from agent.tools.workspace import create_workspace_tools, get_workspace_metadata
+
+# Backward compatibility alias
+create_search_tools = create_research_tools
+
+__all__ = [
+    # Context
+    "ToolContext",
+    # Workspace toolkit
+    "create_workspace_tools",
+    "get_workspace_metadata",
+    # Core toolkit (todo + job)
+    "create_core_tools",
+    "get_core_metadata",
+    "create_todo_tools",
+    "create_job_tools",
+    "get_final_phase_data",
+    "clear_final_phase_data",
+    # Domain tools
+    "create_search_tools",
+    "create_research_tools",
+    "get_research_metadata",
+    "create_citation_tools",
+    "get_citation_metadata",
+    "create_graph_tools",
+    "get_graph_metadata",
+    "create_sql_tools",
+    "get_sql_metadata",
+    "create_mongodb_tools",
+    "get_mongodb_metadata",
+    "create_knowledge_tools",
+    "get_knowledge_metadata",
+    # Registry
+    "TOOL_REGISTRY",
+    "load_tools",
+    "load_tools_for_phase",
+    "get_available_tools",
+    "get_tools_by_category",
+    "load_tools_by_category",
+    # Phase-aware tool filtering
+    "filter_tools_by_phase",
+    "get_tools_for_phase",
+    "get_phase_tool_summary",
+    "apply_instruction_enforcement",
+    # Description manager
+    "DescriptionManager",
+    "generate_tool_description",
+    "generate_tool_index",
+    "apply_description_overrides",
+    "get_deferred_tools",
+    "get_core_tools",
+]

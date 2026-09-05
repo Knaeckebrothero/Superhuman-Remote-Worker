@@ -16,18 +16,18 @@ import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
 from orchestrator.database.postgres import PostgresDB
-from security import crypto
+from orchestrator.security import crypto
 from orchestrator.services import runtime_actor
 from orchestrator.services.agent_provisioner import AgentProvisioner
-from services.cloud.backend_instance_authority import (
+from orchestrator.services.cloud.backend_instance_authority import (
     MainCloudBackendInstanceAuthority,
     main_cloud_installation_proof_sha256,
 )
-from services.cloud.handles import ProjectFolderHandle
-from services.cloud.protected_reader_authority import (
+from orchestrator.services.cloud.handles import ProjectFolderHandle
+from orchestrator.services.cloud.protected_reader_authority import (
     ProtectedNextcloudReaderGrantPlan,
 )
-from services.cloud_staging.source_identity import (
+from orchestrator.services.cloud_staging.source_identity import (
     ProtectedMountSourceIdentity,
 )
 from orchestrator.services.persistent_provisioner import (
@@ -48,8 +48,8 @@ from orchestrator.services.persistent_recycler import (
     PersistentPodObservation,
     PersistentThreadRecycler,
 )
-from src.database.postgres_db import PostgresDB as AgentPostgresDB
-from src.shared.persistent_input_delivery import (
+from agent.database.postgres_db import PostgresDB as AgentPostgresDB
+from shared.persistent_input_delivery import (
     InputDeliveryAuthorityLost,
     claim_pending_input_deliveries,
     lock_runtime_authority,
@@ -57,16 +57,18 @@ from src.shared.persistent_input_delivery import (
     persist_input_delivery,
     transition_input_delivery,
 )
-from src.shared.runtime_actor import RUNTIME_ACTOR_BOOTSTRAP_HEADER
+from shared.runtime_actor import RUNTIME_ACTOR_BOOTSTRAP_HEADER
 
 SCHEMA_FILE = (
     Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "schema_current.sql"
 )
 PINNED_RECYCLE_MIGRATION = (
     Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "migrations"
@@ -2001,8 +2003,8 @@ async def test_soft_ended_generation_is_durable_quiescence_for_later_delete(db):
 async def test_permanent_delete_reclaims_same_generation_retained_k8s_pvc(db):
     """Actual soft cleanup leaves an exact PVC shell permanent End may reclaim."""
 
-    import main as orch_main
-    from services.container_provisioner import WorkspaceTeardownIdentity
+    import orchestrator.main as orch_main
+    from orchestrator.services.container_provisioner import WorkspaceTeardownIdentity
 
     ids = await _seed(db, protected_agent_pod=True, workspace_claim=False)
     thread = await db.get_thread(ids["thread"])
@@ -2143,7 +2145,7 @@ async def test_permanent_delete_reclaims_same_generation_retained_k8s_pvc(db):
 async def test_permanent_agent_ack_hands_off_mounted_claim_to_owner_cleanup(db):
     """The caller exits before an owner retry exact-deletes its Pod and PVC."""
 
-    import main as orch_main
+    import orchestrator.main as orch_main
 
     ids = await _seed(db, bind_agent=False, publish_agent_pod=False)
     generation = str((await db.get_thread(ids["thread"]))["runtime_generation"])
@@ -2829,7 +2831,7 @@ async def test_runtime_authority_outcomes_are_database_append_only(db, table):
             token = UUID(authority["token"])
             key_column = "retirement_token"
         else:
-            import main as orch_main
+            import orchestrator.main as orch_main
 
             token = UUID(ids["attach_token"])
             async with db.acquire() as setup_conn:
@@ -3134,7 +3136,7 @@ async def test_runtime_exposure_is_monotonic_within_generation(db):
 async def test_legacy_pre_registration_agent_pod_fails_closed_without_protocol(
     db, permanent
 ):
-    import main as orch_main
+    import orchestrator.main as orch_main
 
     ids = await _seed(db, bind_agent=False)
     async with db.acquire() as conn:
@@ -3192,7 +3194,7 @@ async def test_legacy_pre_registration_agent_pod_fails_closed_without_protocol(
 @pytest.mark.asyncio
 async def test_pre_registration_pod_recovery_refuses_a_late_agent_owner(db):
     """A direct/legacy registration race cannot be mistaken for an orphan Pod."""
-    import main as orch_main
+    import orchestrator.main as orch_main
 
     ids = await _seed(db, bind_agent=False)
     async with db.acquire() as conn:
@@ -3255,7 +3257,7 @@ async def test_pre_registration_pod_recovery_refuses_a_late_agent_owner(db):
 @pytest.mark.asyncio
 async def test_pre_registration_pod_recovery_reaps_exact_offline_orphan(db):
     """A failed registration row cannot wedge exact permanent retirement."""
-    import main as orch_main
+    import orchestrator.main as orch_main
 
     ids = await _seed(
         db,
@@ -3333,7 +3335,7 @@ async def test_pre_registration_pod_recovery_reaps_exact_offline_orphan(db):
 @pytest.mark.asyncio
 async def test_pre_registration_recovery_proves_physical_workspace_zero(db):
     """Agent-orphan zero alone cannot authorize a captured sandbox cleanup."""
-    import main as orch_main
+    import orchestrator.main as orch_main
 
     ids = await _seed(
         db,
@@ -3484,7 +3486,7 @@ async def test_response_lost_agent_create_uses_retained_pod_and_pvc_fences(
 ):
     """A 404 is never treated as zero; exact same-name fences own settlement."""
 
-    import main as orch_main
+    import orchestrator.main as orch_main
 
     ids = await _seed(
         db,
@@ -4237,7 +4239,7 @@ async def test_pinned_vm_permanent_clear_requires_process_zero_receipt(db):
 async def test_pinned_vm_retirement_uses_credential_process_zero_release(db):
     """The pinned End actuator must use release, never controller-only delete."""
 
-    import main as orch_main
+    import orchestrator.main as orch_main
     from orchestrator.services.vm_provisioner import VMTeardownResult
 
     ids = await _seed(db, bind_agent=False, publish_agent_pod=False)
@@ -4328,7 +4330,7 @@ async def test_pinned_vm_retirement_uses_credential_process_zero_release(db):
 @pytest.mark.asyncio
 async def test_failed_attach_abort_rotates_generation_and_stale_retry_preserves_b(db):
     """A proved pre-delivery A abort cannot clear the same agent rebound as B."""
-    import main as orch_main
+    import orchestrator.main as orch_main
 
     ids = await _seed(db, protected_agent_pod=True)
     async with db.acquire() as conn:
@@ -4405,7 +4407,7 @@ async def test_failed_attach_abort_rotates_generation_and_stale_retry_preserves_
 @pytest.mark.parametrize("permanent", [False, True])
 async def test_attach_abort_successor_can_end_before_reconcile(db, permanent):
     """G2 owns no stale G1 Pod marker even when End beats successor prepare."""
-    import main as orch_main
+    import orchestrator.main as orch_main
 
     ids = await _seed(db)
     async with db.acquire() as conn:
@@ -4474,7 +4476,7 @@ async def test_failed_attach_abort_fault_rolls_back_both_authority_rows(
     db, failure_target
 ):
     """Faults after either mutation cannot leave a half-rotated authority."""
-    import main as orch_main
+    import orchestrator.main as orch_main
 
     ids = await _seed(db)
     async with db.acquire() as conn:
@@ -4546,7 +4548,7 @@ async def test_failed_attach_abort_fault_rolls_back_both_authority_rows(
 @pytest.mark.asyncio
 async def test_failed_attach_abort_exact_outcome_survives_thread_deletion(db):
     """A dropped 200 can be proved after a concurrent permanent row delete."""
-    import main as orch_main
+    import orchestrator.main as orch_main
 
     ids = await _seed(db)
     async with db.acquire() as conn:
@@ -4603,7 +4605,7 @@ async def test_failed_attach_abort_exact_outcome_survives_thread_deletion(db):
 @pytest.mark.asyncio
 async def test_failed_attach_abort_outcome_is_restart_safe_successor_work(db):
     """A process restart can rediscover only the exact unbound G2."""
-    import main as orch_main
+    import orchestrator.main as orch_main
 
     ids = await _seed(db, protected_agent_pod=True)
     async with db.acquire() as conn:
@@ -4657,7 +4659,7 @@ async def test_failed_attach_abort_outcome_is_restart_safe_successor_work(db):
 async def test_workspace_zero_abort_clears_only_exact_g2_captured_endpoint(db):
     """The K8s delete's DB half preserves backing and rejects stale U1/G1."""
 
-    import main as orch_main
+    import orchestrator.main as orch_main
 
     ids = await _seed(db)
     workspace_generation = str(uuid4())
@@ -4772,7 +4774,7 @@ async def test_workspace_zero_abort_clears_only_exact_g2_captured_endpoint(db):
 
 @pytest.mark.asyncio
 async def test_failed_attach_abort_refuses_status_pod_and_protocol_mismatch(db):
-    import main as orch_main
+    import orchestrator.main as orch_main
 
     ids = await _seed(db)
     generation = str((await db.get_thread(ids["thread"]))["runtime_generation"])
@@ -4827,7 +4829,7 @@ async def test_failed_attach_abort_refuses_status_pod_and_protocol_mismatch(db):
 async def test_failed_attach_proof_joins_an_authorized_owner_retirement(db):
     """End beating attach cleanup receipts G1 and never creates successor G2."""
 
-    import main as orch_main
+    import orchestrator.main as orch_main
 
     ids = await _seed(db, protected_agent_pod=True, workspace_claim=False)
     async with db.acquire() as conn:
@@ -4894,7 +4896,7 @@ async def test_failed_attach_proof_joins_an_authorized_owner_retirement(db):
 
 @pytest.mark.asyncio
 async def test_retiring_failed_attach_lost_ack_has_exact_outcome_readback(db):
-    import main as orch_main
+    import orchestrator.main as orch_main
 
     ids = await _seed(db, protected_agent_pod=True, workspace_claim=False)
     async with db.acquire() as conn:
@@ -4950,7 +4952,7 @@ async def test_retiring_failed_attach_lost_ack_has_exact_outcome_readback(db):
 
 @pytest.mark.asyncio
 async def test_retiring_failed_attach_refuses_committed_input_admission(db):
-    import main as orch_main
+    import orchestrator.main as orch_main
 
     ids = await _seed(db, protected_agent_pod=True, workspace_claim=False)
     async with db.acquire() as conn:
@@ -5011,7 +5013,7 @@ async def test_retiring_failed_attach_refuses_committed_input_admission(db):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("admission_kind", ["input", "control"])
 async def test_failed_attach_abort_refuses_any_committed_admission(db, admission_kind):
-    import main as orch_main
+    import orchestrator.main as orch_main
 
     ids = await _seed(db)
     async with db.acquire() as conn:
@@ -5066,7 +5068,7 @@ async def test_failed_attach_abort_refuses_any_committed_admission(db, admission
 
 
 def _pinned_event_writer(db: PostgresDB, ids: dict[str, str], generation: str):
-    import src.api.persistent_app as agent_app
+    import agent.api.persistent_app as agent_app
 
     return agent_app._OrderedPersistentEventWriter(
         postgres_conn=db._pool,
@@ -5082,7 +5084,7 @@ def _pinned_event_writer(db: PostgresDB, ids: dict[str, str], generation: str):
 @pytest.mark.asyncio
 async def test_pinned_event_flush_after_settlement_cannot_append_after_terminal(db):
     """A delayed G1 flush observes terminal authority and appends nothing."""
-    import src.api.persistent_app as agent_app
+    import agent.api.persistent_app as agent_app
 
     ids = await _seed(db, protected_agent_pod=True)
     generation = str((await db.get_thread(ids["thread"]))["runtime_generation"])
@@ -5115,7 +5117,7 @@ async def test_pinned_event_flush_after_settlement_cannot_append_after_terminal(
 @pytest.mark.asyncio
 async def test_pinned_event_flush_winning_before_begin_serializes_before_terminal(db):
     """The converse ordering preserves a valid pre-Begin frame exactly once."""
-    import src.api.persistent_app as agent_app
+    import agent.api.persistent_app as agent_app
 
     ids = await _seed(db, protected_agent_pod=True)
     generation = str((await db.get_thread(ids["thread"]))["runtime_generation"])
@@ -5490,7 +5492,7 @@ async def test_never_engaged_receipt_rejects_preexisting_staged_overlay(db):
 async def test_soft_end_revokes_never_delivered_reader_before_zero_stage(
     db, reader_status
 ):
-    import main as orch_main
+    import orchestrator.main as orch_main
 
     ids = await _seed(db, bind_agent=False, publish_agent_pod=False)
     row_id, plan, _generation, _mount_id = await _seed_protected_ro_attempt(
@@ -5548,7 +5550,7 @@ async def test_soft_end_revokes_never_delivered_reader_before_zero_stage(
 async def test_soft_end_adopts_exact_review_after_reader_quiescence(db, manifest_blob):
     """An End retry preserves review bytes after the live reader is gone."""
 
-    import main as orch_main
+    import orchestrator.main as orch_main
 
     ids = await _seed(db, protected_agent_pod=True, workspace_claim=False)
     row_id, plan, generation, _mount_id = await _seed_protected_ro_attempt(
@@ -5653,7 +5655,7 @@ async def test_soft_end_adopts_exact_review_after_reader_quiescence(db, manifest
             orch_main, "_thread_turn_in_flight", AsyncMock(return_value=False)
         ),
         patch(
-            "services.cloud_staging.stage.stage_thread_cloud_diff",
+            "orchestrator.services.cloud_staging.stage.stage_thread_cloud_diff",
             AsyncMock(side_effect=AssertionError("quiesced retry must not re-stage")),
         ),
     ):
@@ -5845,7 +5847,7 @@ async def test_legacy_0185_planned_response_loss_is_adopted_by_leader(db, monkey
 async def test_legacy_0185_live_authority_is_adopted_before_first_end(db, monkeypatch):
     """A deployed pinned session reaches 0200 without freezing NULL authority."""
 
-    import main as orch_main
+    import orchestrator.main as orch_main
 
     ids = await _seed_legacy_0185_authority(db)
     before = await db.begin_pinned_thread_retirement(ids["thread"], permanent=False)
@@ -5965,7 +5967,7 @@ async def test_legacy_0185_live_authority_is_adopted_before_first_recycle(
 async def test_pre_0198_warm_binding_is_adopted_before_actual_end(db, monkeypatch):
     """A deployed pool-bound session gains exact authority before End freezes T."""
 
-    import main as orch_main
+    import orchestrator.main as orch_main
 
     ids = await _seed_warm_pool_binding(db, bound=True)
     assert await db.begin_pinned_thread_retirement(ids["thread"], permanent=False) == {
@@ -6061,7 +6063,7 @@ async def test_warm_attach_patch_response_loss_binds_exact_marker(db, monkeypatc
 async def test_never_delivered_warm_attach_soft_end_releases_exact_authority(
     db, monkeypatch
 ):
-    import main as orch_main
+    import orchestrator.main as orch_main
 
     ids = await _seed_warm_pool_binding(db, bound=False)
     api = StatefulPinnedK8sApi()
@@ -6506,7 +6508,7 @@ async def test_cancelled_warm_effect_stays_protecting_until_reconciled(db, monke
 async def test_end_does_not_reconcile_live_warm_patch_lease(db, monkeypatch):
     """End cannot abort a plan while its owner can still commit the patch."""
 
-    import main as orch_main
+    import orchestrator.main as orch_main
 
     ids = await _seed_warm_pool_binding(db, bound=False)
     api = StatefulPinnedK8sApi()
@@ -6563,7 +6565,7 @@ async def test_end_does_not_reconcile_live_warm_patch_lease(db, monkeypatch):
 async def test_bound_warm_attach_abort_releases_finalizer_before_pool_reuse(
     db, monkeypatch
 ):
-    import main as orch_main
+    import orchestrator.main as orch_main
 
     ids = await _seed_warm_pool_binding(db, bound=False)
     async with db.acquire() as conn:
@@ -6903,7 +6905,7 @@ async def test_production_recycler_recovers_lost_create_in_captured_namespace(db
 async def test_recycler_legacy_thread_recovers_through_registration_route(db, caplog):
     """0177 recovery uses the same adoption/bind/grant path as a real pod."""
 
-    import main as orch_main
+    import orchestrator.main as orch_main
 
     ids = await _seed(db, protected_agent_pod=True)
     message_id = await db.save_thread_message(

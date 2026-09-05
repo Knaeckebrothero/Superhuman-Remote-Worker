@@ -5,10 +5,10 @@ Angular dashboard for debugging and visualizing Superhuman Remote Worker agent e
 ## Quick Start
 
 ```bash
-# Terminal 1: Start Orchestrator backend
-cd orchestrator
-pip install -r requirements.txt
-uvicorn main:app --reload --port 8085
+# Terminal 1: Start Orchestrator backend from the repository root
+pip install -r src/orchestrator/requirements.txt
+pip install --no-deps -e .
+uvicorn orchestrator.main:app --reload --port 8085
 
 # Terminal 2: Start Angular frontend
 cd cockpit
@@ -135,9 +135,10 @@ The MCP (Model Context Protocol) server exposes cockpit metrics to LLMs like Cla
 
 **Local development:**
 ```bash
-cd orchestrator/mcp
-pip install -r requirements.txt
-python run.py
+# From the repository root
+pip install -r src/mcp_server/requirements.txt
+pip install --no-deps -e .
+python -m mcp_server
 ```
 
 **On the cluster (k3d):** the MCP server runs as its own Deployment. Reach it

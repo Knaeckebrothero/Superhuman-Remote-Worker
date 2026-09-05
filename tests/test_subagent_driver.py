@@ -27,11 +27,11 @@ from langchain_core.messages import (
 )
 from langchain_core.tools import tool
 
-from src.core.message_markers import PERSIST_ROLE_KEY
-from src.core.subagent_roster import resolve_subagent_roster
-from src.core.workspace import WorkspaceManager, WorkspaceManagerConfig
-from src.persistent_graph import PermissionOutcome
-from src.subagents import (
+from shared.runtime.core.message_markers import PERSIST_ROLE_KEY
+from shared.runtime.core.subagent_roster import resolve_subagent_roster
+from agent.core.workspace import WorkspaceManager, WorkspaceManagerConfig
+from agent.persistent_graph import PermissionOutcome
+from agent.subagents import (
     ChildBudgets,
     RecordingLedger,
     SimpleParentHost,
@@ -39,9 +39,9 @@ from src.subagents import (
     build_child,
     seed_fork_history,
 )
-from src.subagents.driver import PLACEHOLDER_PREFIX, SYNTH_PROMPT
-from src.subagents.driver import SubagentAuthorityLost
-from src.tools.context import ToolContext
+from agent.subagents.driver import PLACEHOLDER_PREFIX, SYNTH_PROMPT
+from agent.subagents.driver import SubagentAuthorityLost
+from agent.tools.context import ToolContext
 from tests._fake_chat_model import HANG, FakeChatModel, text_turn, tool_turn
 from tests._fs_backend import FilesystemTestBackend
 
@@ -346,7 +346,7 @@ class TestScenarioABF:
     ):
         """U0 #9/#3: only content/id/role on the items; no memory/KB stores."""
         parent_ctx, _ = parent
-        import src.subagents.driver as driver_module
+        import agent.subagents.driver as driver_module
 
         captured: Dict[str, Any] = {}
         real = driver_module.run_persistent_loop
@@ -849,7 +849,7 @@ class TestErrors:
     async def test_on_error_after_the_retry_ceiling_is_an_error(
         self, parent, monkeypatch
     ):
-        monkeypatch.setattr("src.persistent_graph._SESSION_LLM_RETRY_BASE_DELAY", 0.0)
+        monkeypatch.setattr("agent.persistent_graph._SESSION_LLM_RETRY_BASE_DELAY", 0.0)
         parent_ctx, _ = parent
         boom = [RuntimeError("connection reset") for _ in range(10)]
         entry = explorer_entry(limits={"llm_inproc_retries": 2})
@@ -869,7 +869,7 @@ class TestErrors:
     async def test_default_retry_ceiling_is_the_subagent_overlays_three(
         self, parent, monkeypatch
     ):
-        monkeypatch.setattr("src.persistent_graph._SESSION_LLM_RETRY_BASE_DELAY", 0.0)
+        monkeypatch.setattr("agent.persistent_graph._SESSION_LLM_RETRY_BASE_DELAY", 0.0)
         parent_ctx, _ = parent
         script = [
             RuntimeError("flap"),

@@ -141,7 +141,7 @@ A few things worth knowing about this block:
   which key's `last_used_at` gets bumped.
 - **`IdentityFile` assumes `~/.ssh/id_ed25519`.** That's the only path the config
   block generates, but the server accepts seven key types — Ed25519, ECDSA, RSA and
-  FIDO2 hardware-backed (`sk-*`) variants (`orchestrator/services/ssh_public_keys.py`).
+  FIDO2 hardware-backed (`sk-*`) variants (`src/orchestrator/services/ssh_public_keys.py`).
   If the key you registered lives somewhere else — a different filename, a different
   algorithm — edit `IdentityFile` in the block above to point at it before
   connecting. Combined with `IdentitiesOnly yes`, a wrong or missing path here means

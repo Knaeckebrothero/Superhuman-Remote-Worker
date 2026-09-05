@@ -8,8 +8,8 @@ import inspect
 import httpx
 import pytest
 
-from src.shared.orch_surface.client import AsyncCockpitClient, MutationOutcomeUnknown
-from src.shared.orch_surface.jobs import CallerCtx, get_descriptor, make_bound_handler
+from shared.orch_surface.client import AsyncCockpitClient, MutationOutcomeUnknown
+from shared.orch_surface.jobs import CallerCtx, get_descriptor, make_bound_handler
 
 
 @pytest.mark.asyncio

@@ -7,8 +7,8 @@ name: develop
 #   - Tests and builds are change-based (only run when relevant files change)
 #   - Images get SHA + :experimental tags (no version tags)
 #   - Helm chart published as "srw-dev" with monotonic 0.0.<run_number> versions
-#   - deploy-experimental prepares a reviewable Fleet update artifact; the
-#     protected develop branch is updated by an authorized administrator
+#   - Publishing the versioned dev chart deploys it through Fleet resolution;
+#     all required image builds and registry identities gate publication
 #   - Container image tags are per-component identities: sha of the newest
 #     commit that touched the component's build inputs (NOT the push HEAD),
 #     so a push that doesn't change a component never moves its tag and the
@@ -21,7 +21,7 @@ name: develop
 #     caught before merge instead of after. Docs-only PRs still pay nothing
 #     since change-detection skips the build jobs entirely.
 #   - Push to develop: same change-based builds, but `push: true` with
-#     SHA + :experimental tags, followed by a reviewable deployment update.
+#     SHA + :experimental tags, followed by verified chart publication.
 
 on:
   push:
@@ -35,6 +35,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  PYTHONSAFEPATH: "1"
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
   # Lowercased repo path for GHCR cache refs. github.repository preserves
@@ -48,6 +49,26 @@ env:
   SRW_RELEASE_VERSION: 0.0.0-dev.sha-${{ github.sha }}
 
 jobs:
+  # Package boundaries are checked on the exact revision used by builds/tests.
+  architecture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install architecture tooling and editable packages
+        run: |
+          pip install import-linter==2.13
+          pip install --no-deps -e .
+      - name: Enforce application dependency boundaries
+        run: lint-imports --verbose
+
   # ---------------------------------------------------------------------------
   # Auto-format + lint (non-blocking — failures don't gate builds)
   # On push: auto-commits ruff format fixes so develop stays clean.
@@ -60,7 +81,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: develop
+          ref: ${{ github.sha }}
 
       - uses: actions/setup-python@v5
         with:
@@ -69,24 +90,12 @@ jobs:
       - name: Install ruff
         run: pip install ruff==0.14.10
 
-      - name: Auto-format and commit
-        if: github.event_name == 'push'
-        run: |
-          ruff format src/ orchestrator/ tests/
-          if ! git diff --quiet; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add src/ orchestrator/ tests/
-            git commit -m "style: ruff auto-format"
-            git push
-          fi
-
       - name: Ruff lint check
-        run: ruff check src/ orchestrator/ tests/
+        run: ruff check src/ tests/
         continue-on-error: true
 
       - name: Ruff format check
-        run: ruff format --check src/ orchestrator/ tests/
+        run: ruff format --check src/ tests/
         continue-on-error: true
 
       - name: Verify Playwright pin consistency
@@ -101,6 +110,19 @@ jobs:
           grep -q "^PLAYWRIGHT_VERSION=${PIN}$" .env.example \
             || { echo "::error::PLAYWRIGHT_VERSION in .env.example does not match .playwright-version (${PIN})"; exit 1; }
         continue-on-error: true
+
+      - name: Auto-format and commit
+        if: github.event_name == 'push'
+        continue-on-error: true
+        run: |
+          ruff format src/ tests/
+          if ! git diff --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add src/ tests/
+            git commit -m "style: ruff auto-format"
+            git push origin HEAD:develop
+          fi
 
   # ---------------------------------------------------------------------------
   # Chart correctness gates (Phase 1) — render matrix + schema validation.
@@ -136,6 +158,8 @@ jobs:
           - installer-production-vms
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
 
       - name: Install Helm
         uses: azure/setup-helm@v4
@@ -184,6 +208,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
 
       - name: Install Helm
         uses: azure/setup-helm@v4
@@ -219,6 +245,8 @@ jobs:
         language: [python, javascript-typescript]
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: github/codeql-action/init@v3
         with:
           languages: ${{ matrix.language }}
@@ -233,6 +261,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -411,8 +441,8 @@ jobs:
         run: >-
           uv pip install --system pip-licenses
           -r requirements.txt
-          -r orchestrator/requirements.txt
-          -r orchestrator/mcp/requirements.txt
+          -r src/orchestrator/requirements.txt
+          -r src/mcp_server/requirements.txt
       - name: Check third-party licenses
         # Python: installed metadata via pip-licenses. Frontend: read straight
         # from cockpit/package-lock.json (no npm install / node_modules needed).
@@ -433,6 +463,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -452,8 +484,8 @@ jobs:
         run: >-
           uv pip install --system pip-licenses
           -r requirements.txt
-          -r orchestrator/requirements.txt
-          -r orchestrator/mcp/requirements.txt
+          -r src/orchestrator/requirements.txt
+          -r src/mcp_server/requirements.txt
       - name: Regenerate THIRD_PARTY_LICENSES.md
         # --write also runs the gate. A *policy* failure (exit 1, a denied
         # license) must not block the docs commit — the dependency-audit job is
@@ -499,7 +531,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     # packages: read — the rebuild predicate asks the registry whether a
-    # component's image already exists. Four of the five component packages are
+    # component's image already exists. The component packages may be
     # private, so this is not optional. On a fork PR where the token cannot read
     # them, the predicate fails open and everything builds (PRs never push).
     permissions:
@@ -534,6 +566,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
 
       - name: Detect test-relevant changes
@@ -623,10 +656,10 @@ jobs:
           echo "Test path detection: diffing $BASE..HEAD ($(git rev-list --count "$BASE..HEAD") commit(s))"
 
           if git diff --name-only "$BASE" HEAD -- \
-            'src/' 'orchestrator/' 'tests/' 'config/' 'agent.py' \
+            'src/' 'tests/' 'config/' 'init.py' 'scripts/' 'policy/' '.github/workflows/' \
             'cockpit/angular.json' 'docker/cockpit-nginx.conf' \
             'docker/Dockerfile.cockpit' \
-            'requirements.txt' 'orchestrator/requirements.txt' 'requirements-dev.txt' \
+            'requirements.txt' 'requirements-dev.txt' 'pyproject.toml' '.squawk.toml' \
             | grep -q .; then
             echo "python=true" >> "$GITHUB_OUTPUT"
           else
@@ -755,19 +788,16 @@ jobs:
           # Build-input path lists — single source for BOTH the rebuild
           # predicate (image_missing) and the image identity (last_input_sha),
           # so a component's tag can only ever move to a commit that touched
-          # its inputs. Lists mirror the Dockerfiles' COPY statements:
-          # Dockerfile.orchestrator copies src/, Dockerfile.cockpit copies
-          # docker/cockpit-canvas-env.sh, Dockerfile.mcp copies
-          # orchestrator/security/__init__.py — keep them in sync.
-          AGENT_PATHS=(src/ config/ agent.py requirements.txt
-            docker/Dockerfile.agent)
-          ORCHESTRATOR_PATHS=(orchestrator/ src/ config/
-            docker/Dockerfile.orchestrator)
-          COCKPIT_PATHS=(cockpit/ docker/Dockerfile.cockpit
+          # its inputs. Lists mirror each Dockerfile's COPY inputs, including
+          # packaging metadata and the context-wide .dockerignore filter.
+          AGENT_PATHS=(src/agent/ src/shared/ config/ requirements.txt pyproject.toml
+            .dockerignore docker/Dockerfile.agent)
+          ORCHESTRATOR_PATHS=(src/orchestrator/ src/shared/ config/ pyproject.toml
+            .dockerignore docker/Dockerfile.orchestrator)
+          COCKPIT_PATHS=(cockpit/ .dockerignore docker/Dockerfile.cockpit
             docker/cockpit-nginx.conf docker/cockpit-canvas-env.sh)
-          MCP_PATHS=(orchestrator/mcp/ src/shared/
-            orchestrator/security/__init__.py
-            orchestrator/security/anti_framing.py docker/Dockerfile.mcp)
+          MCP_PATHS=(src/mcp_server/ src/shared/ pyproject.toml
+            .dockerignore docker/Dockerfile.mcp)
           # docker/browser-exec is COPY'd into the workspace image at build time
           # (see Dockerfile.workspace §2c), so changes to it must rebuild the
           # workspace image. Missing this path caused a0ce92d2's browser-exec
@@ -777,7 +807,7 @@ jobs:
             docker/workspace-entrypoint.sh
             docker/browser-exec docker/check-browser-stream.py
             docker/assert-browser-stack.sh
-            .playwright-version)
+            .playwright-version .dockerignore)
 
           AGENT_SHA=$(last_input_sha "${AGENT_PATHS[@]}")
           AGENT=$(image_missing agent "$AGENT_SHA")
@@ -794,7 +824,7 @@ jobs:
           WORKSPACE_SHA=$(last_input_sha "${WORKSPACE_PATHS[@]}")
           WORKSPACE=$(image_missing workspace "$WORKSPACE_SHA")
 
-          VM_CONTROLLER_SHA=$(last_input_sha vm/controller/)
+          VM_CONTROLLER_SHA=$(last_input_sha src/vm_controller/ pyproject.toml .dockerignore docker/Dockerfile.vm-controller)
           VM_CONTROLLER=$(image_missing vm-controller "$VM_CONTROLLER_SHA")
 
           # Stage1 rebuilds on changes to the heavy provisioning script, the
@@ -910,6 +940,8 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -929,7 +961,9 @@ jobs:
           helm repo add collabora https://collaboraonline.github.io/online --force-update
           helm dependency build helm/
       - name: Install dependencies
-        run: uv pip install --system -r requirements.txt -r orchestrator/requirements.txt -r orchestrator/mcp/requirements.txt -r requirements-dev.txt pytest pytest-asyncio
+        run: uv pip install --system -r requirements.txt -r src/orchestrator/requirements.txt -r src/mcp_server/requirements.txt -r requirements-dev.txt pytest pytest-asyncio
+      - name: Install editable application packages
+        run: pip install --no-deps -e .
       # `changes` narrowed this to the test files the diff can reach; the fallback
       # covers a dispatch, where selection is skipped on purpose, and any path
       # where the output is unset. loadfile keeps each selected file on one worker.
@@ -967,6 +1001,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       # The image ships Node 24; pin to 22 so unit tests, the production build,
       # and the conformance run all use the same Node as every other job.
       - uses: actions/setup-node@v4
@@ -1027,8 +1063,9 @@ jobs:
   # Lint is NOT required (non-blocking on develop).
   # ---------------------------------------------------------------------------
   build-agent:
-    needs: [changes, dependency-audit, test-python, test-cockpit]
+    needs: [architecture, changes, dependency-audit, test-python, test-cockpit]
     if: >-
+      needs.architecture.result == 'success' &&
       always() && !cancelled() &&
       (needs.changes.outputs.agent == 'true' || github.event_name == 'workflow_dispatch') &&
       needs.dependency-audit.result == 'success' &&
@@ -1041,6 +1078,8 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - name: Free disk space
         # Hosted runners have ~14 GiB free and these jobs need more. Self-hosted
         # runners do not need it, and the heavy variants below delete
@@ -1071,7 +1110,7 @@ jobs:
         id: ident
         run: |
           FULL="${{ needs.changes.outputs.agent-sha }}"
-          : "${FULL:=$GITHUB_SHA}"
+          : "${FULL:?component identity is required}"
           {
             echo "full=$FULL"
             echo "short=${FULL::7}"
@@ -1110,8 +1149,9 @@ jobs:
             SRW_DOCUMENTATION_URL=${{ env.SRW_DOCUMENTATION_URL }}
 
   build-orchestrator:
-    needs: [changes, dependency-audit, test-python, test-cockpit]
+    needs: [architecture, changes, dependency-audit, test-python, test-cockpit]
     if: >-
+      needs.architecture.result == 'success' &&
       always() && !cancelled() &&
       (needs.changes.outputs.orchestrator == 'true' || github.event_name == 'workflow_dispatch') &&
       needs.dependency-audit.result == 'success' &&
@@ -1124,6 +1164,8 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: docker/setup-buildx-action@v3
         with:
           buildkitd-config-inline: |
@@ -1140,7 +1182,7 @@ jobs:
         id: ident
         run: |
           FULL="${{ needs.changes.outputs.orchestrator-sha }}"
-          : "${FULL:=$GITHUB_SHA}"
+          : "${FULL:?component identity is required}"
           {
             echo "full=$FULL"
             echo "short=${FULL::7}"
@@ -1178,8 +1220,9 @@ jobs:
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-orchestrator:buildcache-develop,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
   build-cockpit:
-    needs: [changes, dependency-audit, test-python, test-cockpit]
+    needs: [architecture, changes, dependency-audit, test-python, test-cockpit]
     if: >-
+      needs.architecture.result == 'success' &&
       always() && !cancelled() &&
       (needs.changes.outputs.cockpit == 'true' || github.event_name == 'workflow_dispatch') &&
       needs.dependency-audit.result == 'success' &&
@@ -1192,6 +1235,8 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: docker/setup-buildx-action@v3
         with:
           buildkitd-config-inline: |
@@ -1208,7 +1253,7 @@ jobs:
         id: ident
         run: |
           FULL="${{ needs.changes.outputs.cockpit-sha }}"
-          : "${FULL:=$GITHUB_SHA}"
+          : "${FULL:?component identity is required}"
           {
             echo "full=$FULL"
             echo "short=${FULL::7}"
@@ -1246,8 +1291,9 @@ jobs:
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-cockpit:buildcache-develop,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
   build-mcp:
-    needs: [changes, dependency-audit, test-python, test-cockpit]
+    needs: [architecture, changes, dependency-audit, test-python, test-cockpit]
     if: >-
+      needs.architecture.result == 'success' &&
       always() && !cancelled() &&
       (needs.changes.outputs.mcp == 'true' || github.event_name == 'workflow_dispatch') &&
       needs.dependency-audit.result == 'success' &&
@@ -1262,6 +1308,8 @@ jobs:
       digest: ${{ steps.build.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: docker/setup-buildx-action@v3
         with:
           buildkitd-config-inline: |
@@ -1278,7 +1326,7 @@ jobs:
         id: ident
         run: |
           FULL="${{ needs.changes.outputs.mcp-sha }}"
-          : "${FULL:=$GITHUB_SHA}"
+          : "${FULL:?component identity is required}"
           {
             echo "full=$FULL"
             echo "short=${FULL::7}"
@@ -1317,8 +1365,9 @@ jobs:
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-mcp:buildcache-develop,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
   build-workspace:
-    needs: [changes, dependency-audit, test-python, test-cockpit]
+    needs: [architecture, changes, dependency-audit, test-python, test-cockpit]
     if: >-
+      needs.architecture.result == 'success' &&
       always() && !cancelled() &&
       (needs.changes.outputs.workspace == 'true' || github.event_name == 'workflow_dispatch') &&
       needs.dependency-audit.result == 'success' &&
@@ -1331,6 +1380,8 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: docker/setup-buildx-action@v3
         with:
           buildkitd-config-inline: |
@@ -1347,7 +1398,7 @@ jobs:
         id: ident
         run: |
           FULL="${{ needs.changes.outputs.workspace-sha }}"
-          : "${FULL:=$GITHUB_SHA}"
+          : "${FULL:?component identity is required}"
           {
             echo "full=$FULL"
             echo "short=${FULL::7}"
@@ -1389,8 +1440,9 @@ jobs:
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-workspace:buildcache-develop,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
   build-sudo-gate:
-    needs: [changes, dependency-audit, test-python, test-cockpit]
+    needs: [architecture, changes, dependency-audit, test-python, test-cockpit]
     if: >-
+      needs.architecture.result == 'success' &&
       always() && !cancelled() &&
       (needs.changes.outputs.vm-base == 'true' || github.event_name == 'workflow_dispatch') &&
       needs.dependency-audit.result == 'success' &&
@@ -1400,6 +1452,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: actions/setup-go@v5
         with:
           go-version: '1.22'
@@ -1434,8 +1488,9 @@ jobs:
   # ghcr.io/<repo>-agent-vm-base-stage1; stage2 pulls and layers on top.
   # ---------------------------------------------------------------------------
   build-agent-vm-base-stage1:
-    needs: [changes, dependency-audit, test-python, test-cockpit]
+    needs: [architecture, changes, dependency-audit, test-python, test-cockpit]
     if: >-
+      needs.architecture.result == 'success' &&
       always() && !cancelled() &&
       (needs.changes.outputs.vm-base-stage1 == 'true' || github.event_name == 'workflow_dispatch') &&
       needs.dependency-audit.result == 'success' &&
@@ -1448,6 +1503,8 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - name: Free disk space
         # Hosted runners have ~14 GiB free and these jobs need more. Self-hosted
         # runners do not need it, and the heavy variants below delete
@@ -1574,8 +1631,9 @@ jobs:
   # stage2 on top via stage2.pkr.hcl. Should finish in ~5-10 min.
   # ---------------------------------------------------------------------------
   build-agent-vm-base:
-    needs: [changes, dependency-audit, test-python, test-cockpit, build-sudo-gate, build-agent-vm-base-stage1]
+    needs: [architecture, changes, dependency-audit, test-python, test-cockpit, build-sudo-gate, build-agent-vm-base-stage1]
     if: >-
+      needs.architecture.result == 'success' &&
       always() && !cancelled() &&
       (needs.changes.outputs.vm-base == 'true' || github.event_name == 'workflow_dispatch') &&
       needs.dependency-audit.result == 'success' &&
@@ -1595,6 +1653,8 @@ jobs:
           echo "::error::build-sudo-gate failed — refusing to build VM image without gate binaries"
           exit 1
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - name: Download sudo gate artifacts
         uses: actions/download-artifact@v4
         with:
@@ -1728,8 +1788,9 @@ jobs:
           fi
 
   build-vm-controller:
-    needs: [changes, dependency-audit, test-python, test-cockpit]
+    needs: [architecture, changes, dependency-audit, test-python, test-cockpit]
     if: >-
+      needs.architecture.result == 'success' &&
       always() && !cancelled() &&
       (needs.changes.outputs.vm-controller == 'true' || github.event_name == 'workflow_dispatch') &&
       needs.dependency-audit.result == 'success' &&
@@ -1742,6 +1803,8 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: docker/setup-buildx-action@v3
         with:
           buildkitd-config-inline: |
@@ -1758,7 +1821,7 @@ jobs:
         id: ident
         run: |
           FULL="${{ needs.changes.outputs.vm-controller-sha }}"
-          : "${FULL:=$GITHUB_SHA}"
+          : "${FULL:?component identity is required}"
           {
             echo "full=$FULL"
             echo "short=${FULL::7}"
@@ -1775,8 +1838,8 @@ jobs:
       - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
         uses: docker/build-push-action@v5
         with:
-          context: ./vm/controller
-          file: ./vm/controller/Dockerfile
+          context: .
+          file: ./docker/Dockerfile.vm-controller
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: |
@@ -1803,6 +1866,7 @@ jobs:
   # ---------------------------------------------------------------------------
   deploy-experimental:
     needs:
+      - architecture
       - changes
       - dependency-audit
       - test-python
@@ -1814,13 +1878,17 @@ jobs:
       - build-workspace
       - build-vm-controller
       - chart-test
+      - chart-schema-negative
     if: >-
       always() && !cancelled() &&
       github.event_name == 'push' &&
+      needs.architecture.result == 'success' &&
+      needs.changes.result == 'success' &&
       needs.dependency-audit.result == 'success' &&
       needs.test-python.result != 'failure' && needs.test-python.result != 'cancelled' &&
       needs.test-cockpit.result != 'failure' && needs.test-cockpit.result != 'cancelled' &&
-      needs.chart-test.result != 'failure' && needs.chart-test.result != 'cancelled'
+      needs.chart-test.result != 'failure' && needs.chart-test.result != 'cancelled' &&
+      needs.chart-schema-negative.result != 'failure' && needs.chart-schema-negative.result != 'cancelled'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -1830,7 +1898,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: develop
+          ref: ${{ github.sha }}
           # Full history: the staleness guard below compares commit ancestry.
           fetch-depth: 0
 
@@ -1850,6 +1918,14 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify every chart image before publication
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: >-
+          python3 scripts/verify_chart_images.py
+          --repository "${{ env.REGISTRY }}/${{ env.REPO_LOWER }}"
+          --inventory /tmp/verified-chart-images.json
 
       - name: Compute tags
         id: tag
@@ -1881,7 +1957,9 @@ jobs:
           needs.build-agent.result == 'success' ||
           needs.build-orchestrator.result == 'success' ||
           needs.build-cockpit.result == 'success' ||
-          needs.build-mcp.result == 'success'
+          needs.build-mcp.result == 'success' ||
+          needs.build-workspace.result == 'success' ||
+          needs.build-vm-controller.result == 'success'
         env:
           SHA_ORCHESTRATOR: ${{ needs.changes.outputs.orchestrator-sha }}
           SHA_AGENT: ${{ needs.changes.outputs.agent-sha }}
@@ -1906,14 +1984,14 @@ jobs:
           # never the push HEAD. So a component whose inputs did not change keeps
           # its existing tag across runs and does not provoke a needless rollout
           # (which for the agent means a fleet drain). The changes job emits all
-          # five unconditionally, so this is correct whether or not that
+          # six unconditionally, so this is correct whether or not that
           # component rebuilt in this run.
-          : "${SHA_ORCHESTRATOR:=$GITHUB_SHA}"
-          : "${SHA_AGENT:=$GITHUB_SHA}"
-          : "${SHA_COCKPIT:=$GITHUB_SHA}"
-          : "${SHA_MCP:=$GITHUB_SHA}"
-          : "${SHA_WORKSPACE:=$GITHUB_SHA}"
-          : "${SHA_VMCONTROLLER:=$GITHUB_SHA}"
+          : "${SHA_ORCHESTRATOR:?verified component identity is required}"
+          : "${SHA_AGENT:?verified component identity is required}"
+          : "${SHA_COCKPIT:?verified component identity is required}"
+          : "${SHA_MCP:?verified component identity is required}"
+          : "${SHA_WORKSPACE:?verified component identity is required}"
+          : "${SHA_VMCONTROLLER:?verified component identity is required}"
           export TAG_ORCHESTRATOR="sha-${SHA_ORCHESTRATOR::7}"
           export TAG_AGENT="sha-${SHA_AGENT::7}"
           export TAG_COCKPIT="sha-${SHA_COCKPIT::7}"
@@ -1928,21 +2006,8 @@ jobs:
           export REV_VMCONTROLLER="$SHA_VMCONTROLLER"
           export CHART_VERSION="${{ steps.tag.outputs.chart_version }}"
 
-          # mcp.requireImageDigest is true on the dev overlay, and the chart
-          # FAILS TO RENDER without image.mcp.digest (templates/mcp/deployment.yaml).
-          # So the digest has to travel inside the chart now that the values
-          # overlay no longer carries image data. Resolve it from the registry
-          # rather than from this run's build outputs: it must be correct on runs
-          # where mcp did NOT rebuild, and the registry answers for whatever the
-          # tag points at today. Fails closed — an unresolvable digest must stop
-          # the publish, not ship a chart that cannot render.
-          MCP_REF="ghcr.io/knaeckebrothero/superhuman-remote-worker-mcp:${TAG_MCP}"
-          MCP_DIGEST=$(docker buildx imagetools inspect "$MCP_REF" --format '{{.Manifest.Digest}}' || true)
-          case "$MCP_DIGEST" in
-            sha256:*) ;;
-            *) echo "::error::could not resolve a digest for ${MCP_REF} (got '${MCP_DIGEST}'); refusing to publish a chart that cannot render with mcp.requireImageDigest=true"; exit 1 ;;
-          esac
-          export MCP_DIGEST
+          # The prior gate verified every expected image, including reused ones.
+          : "${MCP_DIGEST:?verified MCP image digest is required}"
 
           yq -i '
             .image.orchestrator.tag = strenv(TAG_ORCHESTRATOR) |

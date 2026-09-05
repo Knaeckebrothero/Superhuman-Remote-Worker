@@ -29,42 +29,44 @@ REPO = Path(__file__).resolve().parents[1]
 # =============================================================================
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
-    """A miniature of this repo's shape: two import roots, data files, tests."""
-    (tmp_path / "src" / "core").mkdir(parents=True)
-    (tmp_path / "src" / "tools").mkdir(parents=True)
-    (tmp_path / "orchestrator" / "services").mkdir(parents=True)
+    """A miniature of this repo's shape: editable application packages, data files, and tests."""
+    (tmp_path / "src" / "agent" / "core").mkdir(parents=True)
+    (tmp_path / "src" / "agent" / "tools").mkdir(parents=True)
+    (tmp_path / "src" / "orchestrator" / "services").mkdir(parents=True)
     (tmp_path / "tests").mkdir()
     (tmp_path / "config").mkdir()
 
-    # leaf <- mid <- hub, plus an unrelated island
-    (tmp_path / "src" / "core" / "leaf.py").write_text("VALUE = 1\n")
-    (tmp_path / "src" / "core" / "mid.py").write_text(
-        "from src.core.leaf import VALUE\n"
-    )
-    (tmp_path / "src" / "tools" / "hub.py").write_text(
-        "from src.core.mid import VALUE\n"
-    )
-    (tmp_path / "src" / "core" / "island.py").write_text("OTHER = 2\n")
+    (tmp_path / "src" / "shared").mkdir()
 
-    # orchestrator/ is its own import root, so this is `services.thing`
-    (tmp_path / "orchestrator" / "services" / "thing.py").write_text(
-        "from src.core.leaf import VALUE\n"
+    # shared leaf <- agent mid <- agent hub, plus an unrelated island
+    (tmp_path / "src" / "shared" / "leaf.py").write_text("VALUE = 1\n")
+    (tmp_path / "src" / "agent" / "core" / "mid.py").write_text(
+        "from shared.leaf import VALUE\n"
     )
-    (tmp_path / "orchestrator" / "main.py").write_text(
-        "from services.thing import VALUE\n"
+    (tmp_path / "src" / "agent" / "tools" / "hub.py").write_text(
+        "from agent.core.mid import VALUE\n"
+    )
+    (tmp_path / "src" / "agent" / "core" / "island.py").write_text("OTHER = 2\n")
+
+    # Both applications consume the same shared leaf through qualified imports.
+    (tmp_path / "src" / "orchestrator" / "services" / "thing.py").write_text(
+        "from shared.leaf import VALUE\n"
+    )
+    (tmp_path / "src" / "orchestrator" / "main.py").write_text(
+        "from orchestrator.services.thing import VALUE\n"
     )
 
     (tmp_path / "tests" / "test_leaf.py").write_text(
-        "from src.core.leaf import VALUE\n\ndef test_x(): assert VALUE\n"
+        "from shared.leaf import VALUE\n\ndef test_x(): assert VALUE\n"
     )
     (tmp_path / "tests" / "test_hub.py").write_text(
-        "from src.tools.hub import VALUE\n\ndef test_x(): assert VALUE\n"
+        "from agent.tools.hub import VALUE\n\ndef test_x(): assert VALUE\n"
     )
     (tmp_path / "tests" / "test_island.py").write_text(
-        "from src.core.island import OTHER\n\ndef test_x(): assert OTHER\n"
+        "from agent.core.island import OTHER\n\ndef test_x(): assert OTHER\n"
     )
     (tmp_path / "tests" / "test_via_main.py").write_text(
-        "import main\n\ndef test_x(): assert main\n"
+        "import orchestrator.main as main\n\ndef test_x(): assert main\n"
     )
     # asserts on a data file, imports nothing interesting
     (tmp_path / "tests" / "test_data.py").write_text(
@@ -83,24 +85,24 @@ def sel(changed, repo: Path):
 
 class TestImportEdges:
     def test_a_leaf_selects_every_transitive_importer(self, repo: Path):
-        got = sel(["src/core/leaf.py"], repo)
+        got = sel(["src/shared/leaf.py"], repo)
         assert got == {
             "tests/test_leaf.py",
-            "tests/test_hub.py",  # via src.tools.hub -> src.core.mid
+            "tests/test_hub.py",  # via agent.tools.hub -> agent.core.mid
             "tests/test_via_main.py",  # via main -> services.thing
         }
 
     def test_an_island_selects_only_its_own_test(self, repo: Path):
-        assert sel(["src/core/island.py"], repo) == {"tests/test_island.py"}
+        assert sel(["src/agent/core/island.py"], repo) == {"tests/test_island.py"}
 
-    def test_the_second_import_root_resolves(self, repo: Path):
-        """`import main` must find orchestrator/main.py, as conftest arranges."""
-        assert sel(["orchestrator/main.py"], repo) == {"tests/test_via_main.py"}
+    def test_the_orchestrator_package_resolves(self, repo: Path):
+        """Qualified orchestrator imports resolve through the editable source root."""
+        assert sel(["src/orchestrator/main.py"], repo) == {"tests/test_via_main.py"}
 
     def test_an_intermediate_module_selects_its_dependents_not_its_deps(
         self, repo: Path
     ):
-        got = sel(["src/core/mid.py"], repo)
+        got = sel(["src/agent/core/mid.py"], repo)
         assert "tests/test_hub.py" in got
         # test_leaf imports leaf only; mid is downstream of it, not upstream.
         assert "tests/test_leaf.py" not in got
@@ -132,7 +134,7 @@ class TestFailOpen:
             "tests/conftest.py",
             "requirements.txt",
             "requirements-dev.txt",
-            "orchestrator/requirements.txt",
+            "src/orchestrator/requirements.txt",
             "pyproject.toml",
             "scripts/select_affected_tests.py",
         ],
@@ -143,8 +145,8 @@ class TestFailOpen:
         assert sel([changed], repo) == ALL
 
     def test_a_deleted_source_file_runs_everything(self, repo: Path):
-        (repo / "src" / "core" / "leaf.py").unlink()
-        assert sel(["src/core/leaf.py"], repo) == ALL
+        (repo / "src" / "shared" / "leaf.py").unlink()
+        assert sel(["src/shared/leaf.py"], repo) == ALL
 
     def test_a_python_file_outside_the_scanned_trees_runs_everything(self, repo: Path):
         (repo / "generator.py").write_text("x = 1\n")
@@ -154,8 +156,12 @@ class TestFailOpen:
         assert sel(["vm/helper.py"], repo) == ALL
 
     def test_an_unparseable_file_runs_everything(self, repo: Path):
-        (repo / "src" / "core" / "broken.py").write_text("def (\n")
-        assert sel(["src/core/leaf.py"], repo) == ALL
+        (repo / "src" / "agent" / "core" / "broken.py").write_text("def (\n")
+        assert sel(["src/shared/leaf.py"], repo) == ALL
+
+    def test_unobserved_application_source_runs_everything(self, repo: Path):
+        (repo / "src" / "agent" / "entry.py").write_text("VALUE = 1\n")
+        assert sel(["src/agent/entry.py"], repo) == ALL
 
     def test_no_changed_files_selects_nothing_rather_than_everything(self, repo: Path):
         """An empty diff is not an ambiguity — there is nothing to test."""
@@ -212,20 +218,44 @@ class TestNonTestFilesUnderTests:
         assert "tests/test_harness.py" in got
 
     def test_a_source_package_init_selects_its_dependents(self, repo: Path):
-        (repo / "src" / "core" / "__init__.py").write_text("")
-        got = sel(["src/core/__init__.py"], repo)
+        (repo / "src" / "shared" / "__init__.py").write_text("")
+        got = sel(["src/shared/__init__.py"], repo)
         assert "tests/test_leaf.py" in got
-        assert "tests/test_hub.py" in got  # via src.tools.hub -> src.core.mid
+        assert "tests/test_hub.py" in got  # via agent.tools.hub -> agent.core.mid
 
 
 class TestGraphInternals:
+    def test_shared_change_selects_all_application_consumers(self, repo: Path):
+        (repo / "src" / "mcp_server").mkdir()
+        (repo / "src" / "mcp_server" / "server.py").write_text(
+            "from shared.leaf import VALUE\n"
+        )
+        (repo / "tests" / "test_mcp.py").write_text(
+            "from mcp_server.server import VALUE\n"
+        )
+        assert {
+            "tests/test_leaf.py",
+            "tests/test_hub.py",
+            "tests/test_via_main.py",
+            "tests/test_mcp.py",
+        } <= sel(["src/shared/leaf.py"], repo)
+
+    def test_relative_initializer_exports_keep_leaf_dependencies(self, repo: Path):
+        (repo / "src" / "shared" / "__init__.py").write_text(
+            "from .leaf import VALUE\n"
+        )
+        (repo / "tests" / "test_package_api.py").write_text(
+            "from shared import VALUE\n"
+        )
+        assert "tests/test_package_api.py" in sel(["src/shared/leaf.py"], repo)
+
     def test_relative_imports_resolve_within_a_package(self, tmp_path: Path):
         (tmp_path / "src" / "pkg").mkdir(parents=True)
         (tmp_path / "tests").mkdir()
         (tmp_path / "src" / "pkg" / "__init__.py").write_text("")
         (tmp_path / "src" / "pkg" / "a.py").write_text("A = 1\n")
         (tmp_path / "src" / "pkg" / "b.py").write_text("from .a import A\n")
-        (tmp_path / "tests" / "test_b.py").write_text("from src.pkg.b import A\n")
+        (tmp_path / "tests" / "test_b.py").write_text("from pkg.b import A\n")
         graph = Graph(tmp_path)
         assert graph.reaches(
             tmp_path / "tests" / "test_b.py", tmp_path / "src" / "pkg" / "a.py"
@@ -234,7 +264,7 @@ class TestGraphInternals:
     def test_a_module_does_not_reach_itself(self, tmp_path: Path):
         (tmp_path / "src").mkdir()
         (tmp_path / "tests").mkdir()
-        (tmp_path / "src" / "solo.py").write_text("import src.solo\n")
+        (tmp_path / "src" / "solo.py").write_text("import solo\n")
         graph = Graph(tmp_path)
         assert (tmp_path / "src" / "solo.py") not in graph._closure(
             tmp_path / "src" / "solo.py"
@@ -247,20 +277,20 @@ class TestGraphInternals:
 class TestAgainstTheRealRepo:
     """One test, because building the real graph costs ~9s."""
 
-    #: Verbatim from commit a1d92680.
+    #: Commit a1d92680 paths mapped to the current application packages.
     CHANGED = [
         "config/schema.json",
         "config/session_base.yaml",
         "config/skills/app-guide/references/permissions-and-availability.md",
-        "orchestrator/main.py",
-        "src/core/capability_grants.py",
-        "src/core/loader.py",
-        "src/core/session_tool_overrides.py",
-        "src/core/tool_policy.py",
-        "src/core/tool_report.py",
-        "src/tools/orchestrator/catalog.py",
-        "src/tools/orchestrator/workflows.py",
-        "src/tools/registry.py",
+        "src/orchestrator/main.py",
+        "src/shared/runtime/core/capability_grants.py",
+        "src/shared/runtime/core/loader.py",
+        "src/shared/runtime/core/session_tool_overrides.py",
+        "src/shared/runtime/core/tool_policy.py",
+        "src/shared/runtime/core/tool_report.py",
+        "src/agent/tools/orchestrator/catalog.py",
+        "src/agent/tools/orchestrator/workflows.py",
+        "src/agent/tools/registry.py",
     ]
 
     #: Observed failures from the full-suite run on that change. The starred six
@@ -290,8 +320,11 @@ class TestAgainstTheRealRepo:
 
     def test_a_leaf_change_narrows_hard(self):
         """The saving has to be real, or selection is only added risk."""
-        got = select(["src/tools/workspace/files.py"], REPO)
+        # Workspace tools execute the eager tools/API package initializers;
+        # they are not leaves once those dependency edges are resolved correctly.
+        got = select(["src/vm_controller/lifecycle_auth.py"], REPO)
         assert got != ALL
+        assert "tests/test_vm_lifecycle_auth.py" in got
         total = len(list((REPO / "tests").glob("test_*.py")))
         assert len(got) < total * 0.25, (
             f"a leaf module selected {len(got)}/{total} test files; if even leaf "
@@ -325,7 +358,14 @@ class TestAgainstTheRealRepo:
         assert "tests/e2e/app/test_harness.py" in got
         assert "tests/e2e/app/deterministic_provider/test_provider.py" in got
 
-    def test_the_always_run_tripwires_are_always_present(self):
-        got = select(["src/tools/workspace/files.py"], REPO)
+    def test_workspace_change_keeps_eager_consumers_and_always_run_tripwires(self):
+        got = select(["src/agent/tools/workspace/files.py"], REPO)
+        # Importing a module executes its eager package initializers. Losing
+        # these edges made workspace tools look like a much narrower leaf.
+        assert "tests/citation_engine/test_integration_postgres.py" in got
+        assert "tests/cloud_mount/test_cloud_scan_guard.py" in got
         assert "tests/test_config_tool_grants_snapshot.py" in got
         assert "tests/test_tool_policy.py" in got
+        assert "tests/test_endpoint_inventory.py" in got
+        assert "tests/test_notification_producer_manifest.py" in got
+        assert "tests/test_runtime_coordinate_inventory.py" in got

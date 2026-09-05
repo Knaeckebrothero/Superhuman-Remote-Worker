@@ -6,7 +6,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from src.services.forge import (
+from shared.runtime.services.forge import (
     ForgeError,
     ForgeRepo,
     GitHubClient,
@@ -146,7 +146,9 @@ async def test_github_pr_status_distinguishes_merged_from_closed(monkeypatch):
             "base": {"ref": "develop"},
         }
     )
-    monkeypatch.setattr("src.services.forge._transport", transport, raising=False)
+    monkeypatch.setattr(
+        "shared.runtime.services.forge._transport", transport, raising=False
+    )
 
     target = ForgeRepo("github", "https://api.github.com", "acme", "widget", "tok")
     out = await get_pull_request_status(target, 7)
@@ -177,7 +179,9 @@ async def test_gitea_pr_status_normalizes_open(monkeypatch):
             "base": {"ref": "main"},
         }
     )
-    monkeypatch.setattr("src.services.forge._transport", transport, raising=False)
+    monkeypatch.setattr(
+        "shared.runtime.services.forge._transport", transport, raising=False
+    )
 
     target = ForgeRepo(
         "gitea", "https://git.example.test/api/v1", "acme", "widget", "tok"
@@ -203,7 +207,9 @@ async def test_gitlab_pr_status_uses_iid_and_normalizes_locked_as_closed(monkeyp
             "draft": True,
         }
     )
-    monkeypatch.setattr("src.services.forge._transport", transport, raising=False)
+    monkeypatch.setattr(
+        "shared.runtime.services.forge._transport", transport, raising=False
+    )
 
     target = ForgeRepo("gitlab", "https://gitlab.com/api/v4", "acme", "widget", "tok")
     out = await get_pull_request_status(target, 11)
@@ -226,7 +232,9 @@ async def test_gitlab_pr_status_uses_iid_and_normalizes_locked_as_closed(monkeyp
 @pytest.mark.asyncio
 async def test_pr_status_errors_do_not_leak_the_token(monkeypatch):
     transport, _ = _capture_get(status=403, payload={"message": "forbidden"})
-    monkeypatch.setattr("src.services.forge._transport", transport, raising=False)
+    monkeypatch.setattr(
+        "shared.runtime.services.forge._transport", transport, raising=False
+    )
 
     target = ForgeRepo("github", "https://api.github.com", "acme", "widget", "sekrit")
     with pytest.raises(ForgeError) as exc:
@@ -239,7 +247,9 @@ async def test_pr_status_errors_do_not_leak_the_token(monkeypatch):
 @pytest.mark.asyncio
 async def test_github_pr_shape(monkeypatch):
     transport, seen = _capture(payload={"number": 7, "html_url": "https://gh/pr/7"})
-    monkeypatch.setattr("src.services.forge._transport", transport, raising=False)
+    monkeypatch.setattr(
+        "shared.runtime.services.forge._transport", transport, raising=False
+    )
 
     target = ForgeRepo("github", "https://api.github.com", "acme", "widget", "tok")
     out = await open_pull_request(
@@ -260,7 +270,9 @@ async def test_github_pr_shape(monkeypatch):
 @pytest.mark.asyncio
 async def test_gitea_pr_shape_matches_github_body_but_differs_on_auth(monkeypatch):
     transport, seen = _capture(payload={"number": 3, "html_url": "https://gt/pr/3"})
-    monkeypatch.setattr("src.services.forge._transport", transport, raising=False)
+    monkeypatch.setattr(
+        "shared.runtime.services.forge._transport", transport, raising=False
+    )
 
     target = ForgeRepo(
         "gitea", "https://git.example.com/api/v1", "acme", "widget", "tok"
@@ -285,7 +297,9 @@ async def test_gitea_pr_shape_matches_github_body_but_differs_on_auth(monkeypatc
 @pytest.mark.asyncio
 async def test_gitlab_uses_encoded_project_path_and_its_own_field_names(monkeypatch):
     transport, seen = _capture(payload={"iid": 11, "web_url": "https://gl/mr/11"})
-    monkeypatch.setattr("src.services.forge._transport", transport, raising=False)
+    monkeypatch.setattr(
+        "shared.runtime.services.forge._transport", transport, raising=False
+    )
 
     target = ForgeRepo("gitlab", "https://gitlab.com/api/v4", "acme", "widget", "tok")
     out = await open_pull_request(
@@ -310,7 +324,9 @@ async def test_gitlab_uses_encoded_project_path_and_its_own_field_names(monkeypa
 @pytest.mark.asyncio
 async def test_error_response_raises_without_leaking_token(monkeypatch):
     transport, _ = _capture(status=422, payload={"message": "already exists"})
-    monkeypatch.setattr("src.services.forge._transport", transport, raising=False)
+    monkeypatch.setattr(
+        "shared.runtime.services.forge._transport", transport, raising=False
+    )
 
     target = ForgeRepo("github", "https://api.github.com", "acme", "widget", "sekrit")
     with pytest.raises(ForgeError) as exc:
@@ -336,7 +352,9 @@ async def test_github_validation_errors_detail_reaches_the_agent(monkeypatch):
             "errors": [{"message": "No commits between develop and job/abc"}],
         },
     )
-    monkeypatch.setattr("src.services.forge._transport", transport, raising=False)
+    monkeypatch.setattr(
+        "shared.runtime.services.forge._transport", transport, raising=False
+    )
 
     target = ForgeRepo("github", "https://api.github.com", "acme", "widget", "sekrit")
     with pytest.raises(ForgeError) as exc:
@@ -358,7 +376,9 @@ async def test_error_detail_tolerates_odd_errors_shapes(monkeypatch):
         {"message": "Validation Failed"},
     ):
         transport, _ = _capture(status=422, payload=payload)
-        monkeypatch.setattr("src.services.forge._transport", transport, raising=False)
+        monkeypatch.setattr(
+            "shared.runtime.services.forge._transport", transport, raising=False
+        )
         target = ForgeRepo("github", "https://api.github.com", "a", "b", "sekrit")
         with pytest.raises(ForgeError) as exc:
             await open_pull_request(target, title="T", head="h", base="b")
@@ -407,7 +427,9 @@ async def test_github_list_tree_uses_recursive_git_tree_api(monkeypatch):
         )
 
     monkeypatch.setattr(
-        "src.services.forge._transport", httpx.MockTransport(handler), raising=False
+        "shared.runtime.services.forge._transport",
+        httpx.MockTransport(handler),
+        raising=False,
     )
 
     tree = await _github_client().list_tree("vault", "feature/kb")
@@ -427,7 +449,9 @@ async def test_github_change_files_creates_one_file_with_contents_api(monkeypatc
     transport, seen = _capture(
         payload={"content": {"sha": "new"}, "commit": {"sha": "commit"}}
     )
-    monkeypatch.setattr("src.services.forge._transport", transport, raising=False)
+    monkeypatch.setattr(
+        "shared.runtime.services.forge._transport", transport, raising=False
+    )
 
     ok = await _github_client().change_files(
         "vault",
@@ -456,7 +480,9 @@ async def test_github_change_files_creates_one_file_with_contents_api(monkeypatc
 @pytest.mark.asyncio
 async def test_github_change_files_threads_blob_sha_for_update(monkeypatch):
     transport, seen = _capture(payload={"commit": {"sha": "commit"}})
-    monkeypatch.setattr("src.services.forge._transport", transport, raising=False)
+    monkeypatch.setattr(
+        "shared.runtime.services.forge._transport", transport, raising=False
+    )
 
     ok = await _github_client().change_files(
         "vault",
@@ -488,7 +514,9 @@ async def test_github_change_files_looks_up_missing_update_sha(monkeypatch):
         return httpx.Response(200, json={"commit": {"sha": "commit"}})
 
     monkeypatch.setattr(
-        "src.services.forge._transport", httpx.MockTransport(handler), raising=False
+        "shared.runtime.services.forge._transport",
+        httpx.MockTransport(handler),
+        raising=False,
     )
 
     ok = await _github_client().change_files(
@@ -532,7 +560,9 @@ async def test_github_change_files_rejects_multi_file_commit_without_network(
         raise AssertionError("multi-file GitHub write reached the network")
 
     monkeypatch.setattr(
-        "src.services.forge._transport", httpx.MockTransport(handler), raising=False
+        "shared.runtime.services.forge._transport",
+        httpx.MockTransport(handler),
+        raising=False,
     )
     one = {"path": "knowledge/a.md", "content_b64": "YQ=="}
     two = {"path": "knowledge/b.md", "content_b64": "Yg=="}
@@ -552,7 +582,9 @@ async def test_github_branch_head_encodes_slashes(monkeypatch):
         return httpx.Response(200, json={"commit": {"sha": "head-sha"}})
 
     monkeypatch.setattr(
-        "src.services.forge._transport", httpx.MockTransport(handler), raising=False
+        "shared.runtime.services.forge._transport",
+        httpx.MockTransport(handler),
+        raising=False,
     )
 
     head = await _github_client().get_branch_head_sha("vault", "feature/kb")
@@ -572,7 +604,9 @@ async def test_github_archive_download_writes_response_bytes(monkeypatch, tmp_pa
         return httpx.Response(200, content=b"tar-gz-bytes")
 
     monkeypatch.setattr(
-        "src.services.forge._transport", httpx.MockTransport(handler), raising=False
+        "shared.runtime.services.forge._transport",
+        httpx.MockTransport(handler),
+        raising=False,
     )
     destination = tmp_path / "vault.tar.gz"
 
@@ -590,7 +624,7 @@ async def test_github_archive_download_writes_response_bytes(monkeypatch, tmp_pa
 @pytest.mark.asyncio
 async def test_github_client_failures_do_not_expose_token(monkeypatch, caplog):
     monkeypatch.setattr(
-        "src.services.forge._transport",
+        "shared.runtime.services.forge._transport",
         httpx.MockTransport(
             lambda _request: httpx.Response(403, json={"message": "denied"})
         ),

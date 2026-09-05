@@ -28,20 +28,11 @@ import os
 import shlex
 import shutil
 import subprocess
-import sys
 import tempfile
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import paramiko
 import pytest
-
-project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-_orchestrator_dir = str(project_root / "orchestrator")
-if _orchestrator_dir not in sys.path:
-    sys.path.insert(0, _orchestrator_dir)
 
 from orchestrator.services.snapshot_service import SnapshotService  # noqa: E402
 from orchestrator.services.ssh_helpers import (  # noqa: E402

@@ -17,19 +17,12 @@ from __future__ import annotations
 
 import copy
 import os
-import sys
-from pathlib import Path
-
-# Add orchestrator/ to sys.path so its top-level modules import bare.
-_ORCH = Path(__file__).parent.parent / "orchestrator"
-if str(_ORCH) not in sys.path:
-    sys.path.insert(0, str(_ORCH))
 
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
-import main  # noqa: E402
+import orchestrator.main  # noqa: E402
 
-eff = main._effective_models_from_layers
+eff = orchestrator.main._effective_models_from_layers
 
 SLOTS = {"model", "subagent", "session"}
 

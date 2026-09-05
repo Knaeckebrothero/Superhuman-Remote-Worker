@@ -239,11 +239,13 @@ def _stub_post_commit_provisioning(monkeypatch):
     import sys
     import types
 
-    monkeypatch.setattr("services.job_provisioning.provision_job_repo", AsyncMock())
-    fake_main = types.ModuleType("main")
+    monkeypatch.setattr(
+        "orchestrator.services.job_provisioning.provision_job_repo", AsyncMock()
+    )
+    fake_main = types.ModuleType("orchestrator.main")
     fake_main.gitea_client = MagicMock()
     fake_main.main_cloud_router = MagicMock()
-    monkeypatch.setitem(sys.modules, "main", fake_main)
+    monkeypatch.setitem(sys.modules, "orchestrator.main", fake_main)
 
 
 class TestProcessOneDueAutomation:
@@ -496,7 +498,9 @@ class TestAutoDisableNotification:
 def _patch_provisioning(monkeypatch, *, side_effect=None) -> AsyncMock:
     """Re-patch the autouse provisioning stub with an assertable handle."""
     provision_mock = AsyncMock(side_effect=side_effect)
-    monkeypatch.setattr("services.job_provisioning.provision_job_repo", provision_mock)
+    monkeypatch.setattr(
+        "orchestrator.services.job_provisioning.provision_job_repo", provision_mock
+    )
     return provision_mock
 
 

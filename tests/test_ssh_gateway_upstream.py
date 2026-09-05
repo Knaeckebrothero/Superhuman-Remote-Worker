@@ -35,11 +35,15 @@ from dataclasses import dataclass
 import asyncssh
 import pytest
 
-import services.ssh_gateway_server as mod
-from services.ssh_gateway_ca import SshUserCa
-from services.ssh_gateway_client import REFUSAL_MESSAGES, SshTarget, TargetUnavailable
-from services.ssh_gateway_limits import GatewayLimiter
-from services.ssh_gateway_server import (
+import orchestrator.services.ssh_gateway_server as mod
+from orchestrator.services.ssh_gateway_ca import SshUserCa
+from orchestrator.services.ssh_gateway_client import (
+    REFUSAL_MESSAGES,
+    SshTarget,
+    TargetUnavailable,
+)
+from orchestrator.services.ssh_gateway_limits import GatewayLimiter
+from orchestrator.services.ssh_gateway_server import (
     GatewayContext,
     GatewaySSHServer,
     connect_upstream,
@@ -376,7 +380,9 @@ def test_a_malformed_pin_is_refused_and_named_as_our_own_data(malformed, caplog)
     """
     key = asyncssh.generate_private_key("ssh-ed25519").convert_to_public()
 
-    with caplog.at_level(logging.ERROR, logger="services.ssh_gateway_server"):
+    with caplog.at_level(
+        logging.ERROR, logger="orchestrator.services.ssh_gateway_server"
+    ):
         allowed = mod._PinnedClient(malformed).validate_host_public_key(
             "workspace", "127.0.0.1", 22, key
         )

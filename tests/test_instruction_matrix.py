@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
-from src.core.loader import (
+from shared.runtime.core.loader import (
     AgentConfig,
     FileResolver,
     InstructionMatrixResolver,
@@ -116,7 +116,7 @@ class TestMatrixResolver:
         """)
         )
 
-        from src.core import loader as _loader
+        from shared.runtime.core import loader as _loader
 
         _loader._model_config_matrix_cache.pop(matrix_path, None)
         result_prompt = PromptMatrixResolver._load_matrix_from_path(matrix_path)
@@ -259,7 +259,9 @@ class TestInstructionMatrixResolver:
         """)
         )
 
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+        with patch(
+            "shared.runtime.core.loader.get_project_root", return_value=tmp_path
+        ):
             # Also create framework files
             config_templates = tmp_path / "config" / "templates"
             config_templates.mkdir(parents=True)
@@ -279,7 +281,9 @@ class TestInstructionMatrixResolver:
         expert_dir = tmp_path / "expert"
         expert_dir.mkdir()
 
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+        with patch(
+            "shared.runtime.core.loader.get_project_root", return_value=tmp_path
+        ):
             config_templates = tmp_path / "config" / "templates"
             config_templates.mkdir(parents=True)
             (config_templates / "instructions.md").write_text("framework instructions")
@@ -304,7 +308,9 @@ class TestLoadInstructions:
         """load_instructions resolves via instruction matrix."""
         config = AgentConfig(agent_id="test", display_name="Test Agent")
 
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+        with patch(
+            "shared.runtime.core.loader.get_project_root", return_value=tmp_path
+        ):
             config_templates = tmp_path / "config" / "templates"
             config_templates.mkdir(parents=True)
             (config_templates / "instructions.md").write_text("framework instructions")
@@ -340,7 +346,9 @@ class TestResolvedConfigSerialization:
             _deployment_dir=str(tmp_path),
         )
 
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+        with patch(
+            "shared.runtime.core.loader.get_project_root", return_value=tmp_path
+        ):
             # Create prompt files
             config_prompts = tmp_path / "config" / "prompts"
             config_prompts.mkdir(parents=True)
@@ -403,7 +411,9 @@ class TestResolvedConfigSerialization:
             agent_id="x", display_name="X", _deployment_dir=str(expert_dir)
         )
 
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+        with patch(
+            "shared.runtime.core.loader.get_project_root", return_value=tmp_path
+        ):
             config_dir = tmp_path / "config"
             prompts = config_dir / "prompts"
             prompts.mkdir(parents=True)
@@ -433,7 +443,9 @@ class TestResolvedConfigSerialization:
         expert_dir.mkdir()
         (expert_dir / "strategic_todos_initial.yaml").write_text("expert todos")
 
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+        with patch(
+            "shared.runtime.core.loader.get_project_root", return_value=tmp_path
+        ):
             config_dir = tmp_path / "config"
             templates = config_dir / "templates"
             templates.mkdir(parents=True)
@@ -500,7 +512,9 @@ class TestResolvedConfigSerialization:
             _deployment_dir=str(tmp_path),
         )
 
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+        with patch(
+            "shared.runtime.core.loader.get_project_root", return_value=tmp_path
+        ):
             config_prompts = tmp_path / "config" / "prompts"
             config_prompts.mkdir(parents=True)
             (config_prompts / "systemprompt.txt").write_text("base phase model")

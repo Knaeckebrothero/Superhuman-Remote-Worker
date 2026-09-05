@@ -3,19 +3,13 @@
 from __future__ import annotations
 
 import json
-import sys
-from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
-project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-
-from src.tools.context import ToolContext  # noqa: E402
-from src.tools.orchestrator.workflows import create_workflow_tools  # noqa: E402
-from src.tools.registry import get_tools_by_category  # noqa: E402
+from agent.tools.context import ToolContext  # noqa: E402
+from agent.tools.orchestrator.workflows import create_workflow_tools  # noqa: E402
+from agent.tools.registry import get_tools_by_category  # noqa: E402
 
 
 def _tool_by_name(tools, name):
@@ -104,7 +98,7 @@ async def test_list_automations_formats_visible_rows(monkeypatch):
         }
     )
     monkeypatch.setattr(
-        "src.tools.orchestrator.workflows._get_client", lambda **kw: cap
+        "agent.tools.orchestrator.workflows._get_client", lambda **kw: cap
     )
 
     tools = create_workflow_tools(ToolContext(user_id="user-xyz"))
@@ -145,7 +139,7 @@ async def test_set_automation_bundle_create_forces_disabled_by_default(monkeypat
     url = "http://localhost:8085/api/automations"
     cap = _CapturingClient({url: {"id": "auto-2"}})
     monkeypatch.setattr(
-        "src.tools.orchestrator.workflows._get_client", lambda **kw: cap
+        "agent.tools.orchestrator.workflows._get_client", lambda **kw: cap
     )
 
     tools = create_workflow_tools(ToolContext(user_id="user-xyz"))
@@ -205,7 +199,7 @@ async def test_explain_project_loop_includes_current_jobs(monkeypatch):
         }
     )
     monkeypatch.setattr(
-        "src.tools.orchestrator.workflows._get_client", lambda **kw: cap
+        "agent.tools.orchestrator.workflows._get_client", lambda **kw: cap
     )
 
     tools = create_workflow_tools(ToolContext(user_id="user-xyz"))

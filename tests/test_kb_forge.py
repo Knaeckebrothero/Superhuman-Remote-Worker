@@ -6,7 +6,7 @@ import pytest
 
 from orchestrator.services.kb_forge import KbForgeConfigurationError, kb_client_for_repo
 from orchestrator.services.kb_reindex import KbRepoRef
-from src.services.forge import GitHubClient
+from shared.runtime.services.forge import GitHubClient
 
 
 def _ref(forge: str, credential_ref: str | None = None) -> KbRepoRef:

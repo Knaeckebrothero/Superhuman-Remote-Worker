@@ -38,7 +38,7 @@ import pytest
 from fastapi import HTTPException
 from pydantic import ValidationError
 
-import main
+import orchestrator.main
 from tests._route_inventory import mounted_routes
 
 USER = "00000000-0000-0000-0000-000000000001"
@@ -65,7 +65,7 @@ def internal(monkeypatch):
     async def _allow(request):
         return None
 
-    monkeypatch.setattr(main, "require_internal", _allow)
+    monkeypatch.setattr(orchestrator.main, "require_internal", _allow)
 
 
 _DEFAULT_USER = object()  # sentinel: "user" itself must be able to mean None
@@ -87,9 +87,13 @@ def _resolved(monkeypatch, *, thread_id=THREAD, user=_DEFAULT_USER, access=True)
     async def _access_fn(u, db, entity_id):
         return access
 
-    monkeypatch.setattr(main.postgres_db, "get_thread_id_by_ssh_handle", _thread_id_fn)
-    monkeypatch.setattr(main.postgres_db, "resolve_user_by_ssh_fingerprint", _user_fn)
-    monkeypatch.setattr(main, "user_can_access_ide_entity", _access_fn)
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db, "get_thread_id_by_ssh_handle", _thread_id_fn
+    )
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db, "resolve_user_by_ssh_fingerprint", _user_fn
+    )
+    monkeypatch.setattr(orchestrator.main, "user_can_access_ide_entity", _access_fn)
 
 
 def _close_resolved(monkeypatch, *, thread_id=THREAD, user=_DEFAULT_USER, access=True):
@@ -109,9 +113,13 @@ def _close_resolved(monkeypatch, *, thread_id=THREAD, user=_DEFAULT_USER, access
     async def _access_fn(u, db, entity_id):
         return access
 
-    monkeypatch.setattr(main.postgres_db, "get_ssh_attachment_thread_id", _thread_id_fn)
-    monkeypatch.setattr(main.postgres_db, "resolve_user_by_ssh_fingerprint", _user_fn)
-    monkeypatch.setattr(main, "user_can_access_ide_entity", _access_fn)
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db, "get_ssh_attachment_thread_id", _thread_id_fn
+    )
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db, "resolve_user_by_ssh_fingerprint", _user_fn
+    )
+    monkeypatch.setattr(orchestrator.main, "user_can_access_ide_entity", _access_fn)
 
 
 # =============================================================================
@@ -124,10 +132,11 @@ async def test_mark_used_requires_internal_key(monkeypatch):
     async def _deny(request):
         raise HTTPException(status_code=401, detail="Invalid internal key")
 
-    monkeypatch.setattr(main, "require_internal", _deny)
+    monkeypatch.setattr(orchestrator.main, "require_internal", _deny)
     with pytest.raises(HTTPException) as excinfo:
-        await main.internal_mark_ssh_key_used(
-            request=object(), body=main.SshKeyUsedRequest(fingerprint=FINGERPRINT)
+        await orchestrator.main.internal_mark_ssh_key_used(
+            request=object(),
+            body=orchestrator.main.SshKeyUsedRequest(fingerprint=FINGERPRINT),
         )
     assert excinfo.value.status_code == 401
 
@@ -137,11 +146,11 @@ async def test_create_attachment_requires_internal_key(monkeypatch):
     async def _deny(request):
         raise HTTPException(status_code=401, detail="Invalid internal key")
 
-    monkeypatch.setattr(main, "require_internal", _deny)
+    monkeypatch.setattr(orchestrator.main, "require_internal", _deny)
     with pytest.raises(HTTPException) as excinfo:
-        await main.internal_create_ssh_attachment(
+        await orchestrator.main.internal_create_ssh_attachment(
             request=object(),
-            body=main.SshAttachmentCreate(
+            body=orchestrator.main.SshAttachmentCreate(
                 fingerprint=FINGERPRINT,
                 client_ip="10.0.0.1",
                 handle="s-7f3a91c2",
@@ -155,12 +164,14 @@ async def test_close_attachment_requires_internal_key(monkeypatch):
     async def _deny(request):
         raise HTTPException(status_code=401, detail="Invalid internal key")
 
-    monkeypatch.setattr(main, "require_internal", _deny)
+    monkeypatch.setattr(orchestrator.main, "require_internal", _deny)
     with pytest.raises(HTTPException) as excinfo:
-        await main.internal_close_ssh_attachment(
+        await orchestrator.main.internal_close_ssh_attachment(
             request=object(),
             attachment_id=ATTACHMENT_ID,
-            body=main.SshAttachmentClose(fingerprint=FINGERPRINT, channels=["session"]),
+            body=orchestrator.main.SshAttachmentClose(
+                fingerprint=FINGERPRINT, channels=["session"]
+            ),
         )
     assert excinfo.value.status_code == 401
 
@@ -187,11 +198,14 @@ async def test_mark_used_happy_path_resolves_fingerprint_to_key_id(
     async def _mark_used(key_id, fingerprint_sha256):
         calls.append((key_id, fingerprint_sha256))
 
-    monkeypatch.setattr(main.postgres_db, "resolve_user_by_ssh_fingerprint", _user)
-    monkeypatch.setattr(main.postgres_db, "mark_ssh_key_used", _mark_used)
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db, "resolve_user_by_ssh_fingerprint", _user
+    )
+    monkeypatch.setattr(orchestrator.main.postgres_db, "mark_ssh_key_used", _mark_used)
 
-    result = await main.internal_mark_ssh_key_used(
-        request=object(), body=main.SshKeyUsedRequest(fingerprint=FINGERPRINT)
+    result = await orchestrator.main.internal_mark_ssh_key_used(
+        request=object(),
+        body=orchestrator.main.SshKeyUsedRequest(fingerprint=FINGERPRINT),
     )
     assert calls == [(KEY_ID, FINGERPRINT)]
     assert result == {"status": "ok"}
@@ -210,11 +224,14 @@ async def test_mark_used_unknown_fingerprint_is_silent_success_no_write(
     async def _tripwire(key_id, fingerprint_sha256):
         raise AssertionError("mark_ssh_key_used must not be called for an unknown key")
 
-    monkeypatch.setattr(main.postgres_db, "resolve_user_by_ssh_fingerprint", _no_user)
-    monkeypatch.setattr(main.postgres_db, "mark_ssh_key_used", _tripwire)
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db, "resolve_user_by_ssh_fingerprint", _no_user
+    )
+    monkeypatch.setattr(orchestrator.main.postgres_db, "mark_ssh_key_used", _tripwire)
 
-    result = await main.internal_mark_ssh_key_used(
-        request=object(), body=main.SshKeyUsedRequest(fingerprint=FINGERPRINT)
+    result = await orchestrator.main.internal_mark_ssh_key_used(
+        request=object(),
+        body=orchestrator.main.SshKeyUsedRequest(fingerprint=FINGERPRINT),
     )
     assert result == {"status": "ok"}
 
@@ -231,11 +248,14 @@ async def test_mark_used_db_hiccup_does_not_500(internal, monkeypatch):
     async def _boom(key_id, fingerprint_sha256):
         raise asyncpg.PostgresConnectionError("connection lost")
 
-    monkeypatch.setattr(main.postgres_db, "resolve_user_by_ssh_fingerprint", _user)
-    monkeypatch.setattr(main.postgres_db, "mark_ssh_key_used", _boom)
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db, "resolve_user_by_ssh_fingerprint", _user
+    )
+    monkeypatch.setattr(orchestrator.main.postgres_db, "mark_ssh_key_used", _boom)
 
-    result = await main.internal_mark_ssh_key_used(
-        request=object(), body=main.SshKeyUsedRequest(fingerprint=FINGERPRINT)
+    result = await orchestrator.main.internal_mark_ssh_key_used(
+        request=object(),
+        body=orchestrator.main.SshKeyUsedRequest(fingerprint=FINGERPRINT),
     )
     assert result == {"status": "ok"}
 
@@ -244,7 +264,7 @@ def test_mark_used_fingerprint_is_capped():
     """Fix round 1, Minor 4: an unbounded fingerprint reaches a SQL
     predicate verbatim. 500KB is comfortably past any real fingerprint."""
     with pytest.raises(ValidationError):
-        main.SshKeyUsedRequest(fingerprint="A" * (500 * 1024))
+        orchestrator.main.SshKeyUsedRequest(fingerprint="A" * (500 * 1024))
 
 
 # =============================================================================
@@ -270,11 +290,11 @@ async def test_create_attachment_happy_path(internal, monkeypatch):
         )
         return ATTACHMENT_ID
 
-    monkeypatch.setattr(main.postgres_db, "record_ssh_attachment", _record)
+    monkeypatch.setattr(orchestrator.main.postgres_db, "record_ssh_attachment", _record)
 
-    result = await main.internal_create_ssh_attachment(
+    result = await orchestrator.main.internal_create_ssh_attachment(
         request=object(),
-        body=main.SshAttachmentCreate(
+        body=orchestrator.main.SshAttachmentCreate(
             fingerprint=FINGERPRINT, client_ip="10.0.0.1", handle="s-7f3a91c2"
         ),
     )
@@ -298,11 +318,13 @@ async def test_create_attachment_ssh_key_id_absent_is_none(internal, monkeypatch
         assert ssh_key_id is None
         return ATTACHMENT_ID
 
-    monkeypatch.setattr(main.postgres_db, "record_ssh_attachment", _record)
+    monkeypatch.setattr(orchestrator.main.postgres_db, "record_ssh_attachment", _record)
 
-    result = await main.internal_create_ssh_attachment(
+    result = await orchestrator.main.internal_create_ssh_attachment(
         request=object(),
-        body=main.SshAttachmentCreate(fingerprint=FINGERPRINT, handle="s-7f3a91c2"),
+        body=orchestrator.main.SshAttachmentCreate(
+            fingerprint=FINGERPRINT, handle="s-7f3a91c2"
+        ),
     )
     assert result == {"attachment_id": ATTACHMENT_ID}
 
@@ -332,7 +354,7 @@ async def test_create_attachment_ignores_any_caller_supplied_identity(
         "user_id": ATTACKER_USER,
         "ssh_key_id": ATTACKER_KEY,
     }
-    body = main.SshAttachmentCreate.model_validate(raw_body)
+    body = orchestrator.main.SshAttachmentCreate.model_validate(raw_body)
     assert not hasattr(body, "thread_id")
     assert not hasattr(body, "user_id")
     assert not hasattr(body, "ssh_key_id")
@@ -344,9 +366,9 @@ async def test_create_attachment_ignores_any_caller_supplied_identity(
         captured.update(thread_id=thread_id, user_id=user_id, ssh_key_id=ssh_key_id)
         return ATTACHMENT_ID
 
-    monkeypatch.setattr(main.postgres_db, "record_ssh_attachment", _record)
+    monkeypatch.setattr(orchestrator.main.postgres_db, "record_ssh_attachment", _record)
 
-    await main.internal_create_ssh_attachment(request=object(), body=body)
+    await orchestrator.main.internal_create_ssh_attachment(request=object(), body=body)
 
     assert captured == {"thread_id": THREAD, "user_id": USER, "ssh_key_id": KEY_ID}
     assert ATTACKER_THREAD not in captured.values()
@@ -358,7 +380,7 @@ def test_attachment_create_body_has_no_identity_fields():
     """Structural half of the negative control above: the schema itself
     must not accept an asserted identity, under any field name this task's
     original (rejected) design used."""
-    fields = main.SshAttachmentCreate.model_fields
+    fields = orchestrator.main.SshAttachmentCreate.model_fields
     assert "thread_id" not in fields
     assert "user_id" not in fields
     assert "ssh_key_id" not in fields
@@ -369,9 +391,11 @@ async def test_create_attachment_unknown_handle_is_opaque_404(internal, monkeypa
     _resolved(monkeypatch, thread_id=None)
 
     with pytest.raises(HTTPException) as excinfo:
-        await main.internal_create_ssh_attachment(
+        await orchestrator.main.internal_create_ssh_attachment(
             request=object(),
-            body=main.SshAttachmentCreate(fingerprint=FINGERPRINT, handle="s-aaaaaaaa"),
+            body=orchestrator.main.SshAttachmentCreate(
+                fingerprint=FINGERPRINT, handle="s-aaaaaaaa"
+            ),
         )
     assert excinfo.value.status_code == 404
 
@@ -383,9 +407,11 @@ async def test_create_attachment_unknown_fingerprint_is_opaque_404(
     _resolved(monkeypatch, user=None)
 
     with pytest.raises(HTTPException) as excinfo:
-        await main.internal_create_ssh_attachment(
+        await orchestrator.main.internal_create_ssh_attachment(
             request=object(),
-            body=main.SshAttachmentCreate(fingerprint=FINGERPRINT, handle="s-7f3a91c2"),
+            body=orchestrator.main.SshAttachmentCreate(
+                fingerprint=FINGERPRINT, handle="s-7f3a91c2"
+            ),
         )
     assert excinfo.value.status_code == 404
 
@@ -397,16 +423,20 @@ async def test_create_attachment_not_authorized_is_opaque_404(internal, monkeypa
     _resolved(monkeypatch, access=False)
 
     with pytest.raises(HTTPException) as not_yours:
-        await main.internal_create_ssh_attachment(
+        await orchestrator.main.internal_create_ssh_attachment(
             request=object(),
-            body=main.SshAttachmentCreate(fingerprint=FINGERPRINT, handle="s-7f3a91c2"),
+            body=orchestrator.main.SshAttachmentCreate(
+                fingerprint=FINGERPRINT, handle="s-7f3a91c2"
+            ),
         )
 
     _resolved(monkeypatch, thread_id=None)
     with pytest.raises(HTTPException) as unknown:
-        await main.internal_create_ssh_attachment(
+        await orchestrator.main.internal_create_ssh_attachment(
             request=object(),
-            body=main.SshAttachmentCreate(fingerprint=FINGERPRINT, handle="s-aaaaaaaa"),
+            body=orchestrator.main.SshAttachmentCreate(
+                fingerprint=FINGERPRINT, handle="s-aaaaaaaa"
+            ),
         )
 
     assert not_yours.value.status_code == unknown.value.status_code == 404
@@ -424,12 +454,14 @@ async def test_create_attachment_malformed_handle_is_opaque_404_before_touching_
         called = True
         return None
 
-    monkeypatch.setattr(main.postgres_db, "get_thread_id_by_ssh_handle", _tripwire)
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db, "get_thread_id_by_ssh_handle", _tripwire
+    )
 
     with pytest.raises(HTTPException) as excinfo:
-        await main.internal_create_ssh_attachment(
+        await orchestrator.main.internal_create_ssh_attachment(
             request=object(),
-            body=main.SshAttachmentCreate(
+            body=orchestrator.main.SshAttachmentCreate(
                 fingerprint=FINGERPRINT, handle="s-abc\nProxyCommand x"
             ),
         )
@@ -450,12 +482,14 @@ async def test_create_attachment_value_error_maps_to_400(internal, monkeypatch):
     async def _record(*a, **kw):
         raise ValueError("invalid ssh handle: boom")
 
-    monkeypatch.setattr(main.postgres_db, "record_ssh_attachment", _record)
+    monkeypatch.setattr(orchestrator.main.postgres_db, "record_ssh_attachment", _record)
 
     with pytest.raises(HTTPException) as excinfo:
-        await main.internal_create_ssh_attachment(
+        await orchestrator.main.internal_create_ssh_attachment(
             request=object(),
-            body=main.SshAttachmentCreate(fingerprint=FINGERPRINT, handle="s-7f3a91c2"),
+            body=orchestrator.main.SshAttachmentCreate(
+                fingerprint=FINGERPRINT, handle="s-7f3a91c2"
+            ),
         )
     assert excinfo.value.status_code == 400
 
@@ -474,12 +508,14 @@ async def test_create_attachment_fk_violation_maps_to_400(internal, monkeypatch)
             "key constraint"
         )
 
-    monkeypatch.setattr(main.postgres_db, "record_ssh_attachment", _record)
+    monkeypatch.setattr(orchestrator.main.postgres_db, "record_ssh_attachment", _record)
 
     with pytest.raises(HTTPException) as excinfo:
-        await main.internal_create_ssh_attachment(
+        await orchestrator.main.internal_create_ssh_attachment(
             request=object(),
-            body=main.SshAttachmentCreate(fingerprint=FINGERPRINT, handle="s-7f3a91c2"),
+            body=orchestrator.main.SshAttachmentCreate(
+                fingerprint=FINGERPRINT, handle="s-7f3a91c2"
+            ),
         )
     assert excinfo.value.status_code < 500
     assert excinfo.value.status_code == 400
@@ -487,7 +523,9 @@ async def test_create_attachment_fk_violation_maps_to_400(internal, monkeypatch)
 
 def test_create_attachment_fingerprint_is_capped():
     with pytest.raises(ValidationError):
-        main.SshAttachmentCreate(fingerprint="A" * (500 * 1024), handle="s-7f3a91c2")
+        orchestrator.main.SshAttachmentCreate(
+            fingerprint="A" * (500 * 1024), handle="s-7f3a91c2"
+        )
 
 
 # =============================================================================
@@ -507,12 +545,12 @@ async def test_close_attachment_happy_path(internal, monkeypatch):
         captured["channels"] = channels
         return 1
 
-    monkeypatch.setattr(main.postgres_db, "close_ssh_attachment", _close)
+    monkeypatch.setattr(orchestrator.main.postgres_db, "close_ssh_attachment", _close)
 
-    result = await main.internal_close_ssh_attachment(
+    result = await orchestrator.main.internal_close_ssh_attachment(
         request=object(),
         attachment_id=ATTACHMENT_ID,
-        body=main.SshAttachmentClose(
+        body=orchestrator.main.SshAttachmentClose(
             fingerprint=FINGERPRINT, channels=["session", "sftp"]
         ),
     )
@@ -538,12 +576,14 @@ async def test_close_attachment_unknown_id_returns_zero_not_an_error(
     async def _tripwire(attachment_id, channels):
         raise AssertionError("close_ssh_attachment must not run for an unknown id")
 
-    monkeypatch.setattr(main.postgres_db, "close_ssh_attachment", _tripwire)
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db, "close_ssh_attachment", _tripwire
+    )
 
-    result = await main.internal_close_ssh_attachment(
+    result = await orchestrator.main.internal_close_ssh_attachment(
         request=object(),
         attachment_id=ATTACHMENT_ID,
-        body=main.SshAttachmentClose(fingerprint=FINGERPRINT, channels=[]),
+        body=orchestrator.main.SshAttachmentClose(fingerprint=FINGERPRINT, channels=[]),
     )
     assert result == {"closed": 0}
 
@@ -562,12 +602,14 @@ async def test_close_attachment_unknown_fingerprint_returns_zero_not_an_error(
             "close_ssh_attachment must not run for an unresolved caller"
         )
 
-    monkeypatch.setattr(main.postgres_db, "close_ssh_attachment", _tripwire)
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db, "close_ssh_attachment", _tripwire
+    )
 
-    result = await main.internal_close_ssh_attachment(
+    result = await orchestrator.main.internal_close_ssh_attachment(
         request=object(),
         attachment_id=ATTACHMENT_ID,
-        body=main.SshAttachmentClose(fingerprint=FINGERPRINT, channels=[]),
+        body=orchestrator.main.SshAttachmentClose(fingerprint=FINGERPRINT, channels=[]),
     )
     assert result == {"closed": 0}
 
@@ -585,12 +627,14 @@ async def test_close_attachment_not_authorized_is_refused(internal, monkeypatch)
             "close_ssh_attachment must not run for an unauthorized user"
         )
 
-    monkeypatch.setattr(main.postgres_db, "close_ssh_attachment", _tripwire)
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db, "close_ssh_attachment", _tripwire
+    )
 
-    result = await main.internal_close_ssh_attachment(
+    result = await orchestrator.main.internal_close_ssh_attachment(
         request=object(),
         attachment_id=ATTACHMENT_ID,
-        body=main.SshAttachmentClose(fingerprint=FINGERPRINT, channels=[]),
+        body=orchestrator.main.SshAttachmentClose(fingerprint=FINGERPRINT, channels=[]),
     )
     assert result == {"closed": 0}
 
@@ -607,20 +651,22 @@ async def test_close_attachment_unknown_and_unauthorized_are_indistinguishable(
     async def _tripwire(attachment_id, channels):
         raise AssertionError("close_ssh_attachment must not run for either case")
 
-    monkeypatch.setattr(main.postgres_db, "close_ssh_attachment", _tripwire)
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db, "close_ssh_attachment", _tripwire
+    )
 
     _close_resolved(monkeypatch, thread_id=None)
-    unknown = await main.internal_close_ssh_attachment(
+    unknown = await orchestrator.main.internal_close_ssh_attachment(
         request=object(),
         attachment_id=ATTACHMENT_ID,
-        body=main.SshAttachmentClose(fingerprint=FINGERPRINT, channels=[]),
+        body=orchestrator.main.SshAttachmentClose(fingerprint=FINGERPRINT, channels=[]),
     )
 
     _close_resolved(monkeypatch, access=False)
-    not_yours = await main.internal_close_ssh_attachment(
+    not_yours = await orchestrator.main.internal_close_ssh_attachment(
         request=object(),
         attachment_id=ATTACHMENT_ID,
-        body=main.SshAttachmentClose(fingerprint=FINGERPRINT, channels=[]),
+        body=orchestrator.main.SshAttachmentClose(fingerprint=FINGERPRINT, channels=[]),
     )
 
     assert unknown == not_yours == {"closed": 0}
@@ -638,12 +684,12 @@ async def test_close_attachment_already_closed_returns_zero_not_an_error(
     async def _close(attachment_id, channels):
         return 0
 
-    monkeypatch.setattr(main.postgres_db, "close_ssh_attachment", _close)
+    monkeypatch.setattr(orchestrator.main.postgres_db, "close_ssh_attachment", _close)
 
-    result = await main.internal_close_ssh_attachment(
+    result = await orchestrator.main.internal_close_ssh_attachment(
         request=object(),
         attachment_id=ATTACHMENT_ID,
-        body=main.SshAttachmentClose(fingerprint=FINGERPRINT, channels=[]),
+        body=orchestrator.main.SshAttachmentClose(fingerprint=FINGERPRINT, channels=[]),
     )
     assert result == {"closed": 0}
 
@@ -660,27 +706,35 @@ async def test_close_attachment_malformed_id_maps_to_400_not_500(internal):
     which fails this test.
     """
     with pytest.raises(HTTPException) as excinfo:
-        await main.internal_close_ssh_attachment(
+        await orchestrator.main.internal_close_ssh_attachment(
             request=object(),
             attachment_id="not-a-uuid",
-            body=main.SshAttachmentClose(fingerprint=FINGERPRINT, channels=[]),
+            body=orchestrator.main.SshAttachmentClose(
+                fingerprint=FINGERPRINT, channels=[]
+            ),
         )
     assert excinfo.value.status_code == 400
 
 
 def test_close_attachment_channels_count_is_capped():
     with pytest.raises(ValidationError):
-        main.SshAttachmentClose(fingerprint=FINGERPRINT, channels=["session"] * 9)
+        orchestrator.main.SshAttachmentClose(
+            fingerprint=FINGERPRINT, channels=["session"] * 9
+        )
 
 
 def test_close_attachment_channel_name_length_is_capped():
     with pytest.raises(ValidationError):
-        main.SshAttachmentClose(fingerprint=FINGERPRINT, channels=["x" * 33])
+        orchestrator.main.SshAttachmentClose(
+            fingerprint=FINGERPRINT, channels=["x" * 33]
+        )
 
 
 def test_close_attachment_fingerprint_is_capped():
     with pytest.raises(ValidationError):
-        main.SshAttachmentClose(fingerprint="A" * (500 * 1024), channels=[])
+        orchestrator.main.SshAttachmentClose(
+            fingerprint="A" * (500 * 1024), channels=[]
+        )
 
 
 # =============================================================================
@@ -714,13 +768,17 @@ async def test_ssh_key_id_appears_in_ssh_target_response(monkeypatch):
             status="active", metadata={"workspace_container": {"status": "suspended"}}
         )
 
-    monkeypatch.setattr(main, "require_internal", _allow)
-    monkeypatch.setattr(main.postgres_db, "get_thread_id_by_ssh_handle", _thread_id)
-    monkeypatch.setattr(main.postgres_db, "resolve_user_by_ssh_fingerprint", _user)
-    monkeypatch.setattr(main, "user_can_access_ide_entity", _access)
-    monkeypatch.setattr(main.postgres_db, "get_thread", _get_thread)
+    monkeypatch.setattr(orchestrator.main, "require_internal", _allow)
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db, "get_thread_id_by_ssh_handle", _thread_id
+    )
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db, "resolve_user_by_ssh_fingerprint", _user
+    )
+    monkeypatch.setattr(orchestrator.main, "user_can_access_ide_entity", _access)
+    monkeypatch.setattr(orchestrator.main.postgres_db, "get_thread", _get_thread)
 
-    result = await main.get_ssh_target(
+    result = await orchestrator.main.get_ssh_target(
         request=object(), handle="s-7f3a91c2", fingerprint=FINGERPRINT
     )
     assert result["ssh_key_id"] == KEY_ID
@@ -749,13 +807,17 @@ async def test_ssh_key_id_is_none_when_user_dict_carries_none(monkeypatch):
             status="active", metadata={"workspace_container": {"status": "suspended"}}
         )
 
-    monkeypatch.setattr(main, "require_internal", _allow)
-    monkeypatch.setattr(main.postgres_db, "get_thread_id_by_ssh_handle", _thread_id)
-    monkeypatch.setattr(main.postgres_db, "resolve_user_by_ssh_fingerprint", _user)
-    monkeypatch.setattr(main, "user_can_access_ide_entity", _access)
-    monkeypatch.setattr(main.postgres_db, "get_thread", _get_thread)
+    monkeypatch.setattr(orchestrator.main, "require_internal", _allow)
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db, "get_thread_id_by_ssh_handle", _thread_id
+    )
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db, "resolve_user_by_ssh_fingerprint", _user
+    )
+    monkeypatch.setattr(orchestrator.main, "user_can_access_ide_entity", _access)
+    monkeypatch.setattr(orchestrator.main.postgres_db, "get_thread", _get_thread)
 
-    result = await main.get_ssh_target(
+    result = await orchestrator.main.get_ssh_target(
         request=object(), handle="s-7f3a91c2", fingerprint=FINGERPRINT
     )
     assert result["ssh_key_id"] is None
@@ -769,7 +831,7 @@ async def test_ssh_key_id_is_none_when_user_dict_carries_none(monkeypatch):
 def test_ssh_audit_routes_are_mounted():
     """Every test above calls the handler directly, so none of them prove
     FastAPI actually serves these paths at these methods."""
-    routes = mounted_routes(main.app)
+    routes = mounted_routes(orchestrator.main.app)
     assert ("POST", "/api/internal/ssh-keys/used") in routes
     assert ("POST", "/api/internal/ssh-attachments") in routes
     assert (

@@ -9,7 +9,7 @@ import pytest
 from fastapi import HTTPException
 
 import orchestrator.main as main
-from services.completion_command_resolution import (
+from orchestrator.services.completion_command_resolution import (
     CompletionForceResolveResult,
     CompletionResolutionConflict,
     CompletionResolutionNotFound,

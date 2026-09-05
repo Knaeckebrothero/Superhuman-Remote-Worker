@@ -19,7 +19,7 @@ from uuid import uuid4
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
-from src.api.persistent_app import (
+from agent.api.persistent_app import (
     _app_guide_health,
     _auto_title_after_first_turn,
     _draft_title_from_prompt,
@@ -109,7 +109,7 @@ class TestGetAgentMetrics:
 
     def test_memory_health_included_when_counters_nonzero(self):
         """Contained memory-store failure counters ride the metrics dict."""
-        from src.services.recall_store import memory_health
+        from shared.runtime.services.recall_store import memory_health
 
         mock_psutil = MagicMock()
         mock_psutil.Process.return_value.memory_info.return_value.rss = 1_048_576
@@ -138,7 +138,7 @@ class TestInflightToolCall:
     persisted, so REST history can't show them mid-turn)."""
 
     def test_trailing_unanswered_tool_call_is_inflight(self):
-        from src.core.archiver import inflight_tool_call
+        from agent.core.archiver import inflight_tool_call
 
         messages = [
             HumanMessage(content="build it"),
@@ -160,7 +160,7 @@ class TestInflightToolCall:
         assert rt["args"]["command"] == "python ingest.py --reset"
 
     def test_answered_tool_call_is_not_inflight(self):
-        from src.core.archiver import inflight_tool_call
+        from agent.core.archiver import inflight_tool_call
 
         messages = [
             HumanMessage(content="build it"),
@@ -173,13 +173,13 @@ class TestInflightToolCall:
         assert inflight_tool_call(messages) is None
 
     def test_no_tool_calls_is_none(self):
-        from src.core.archiver import inflight_tool_call
+        from agent.core.archiver import inflight_tool_call
 
         messages = [HumanMessage(content="hi"), AIMessage(content="hello")]
         assert inflight_tool_call(messages) is None
 
     def test_only_last_tool_calling_turn_counts(self):
-        from src.core.archiver import inflight_tool_call
+        from agent.core.archiver import inflight_tool_call
 
         messages = [
             AIMessage(
@@ -291,7 +291,7 @@ class TestRestoreSessionMessageIds:
 
     @pytest.mark.asyncio
     async def test_all_restored_messages_have_ids(self):
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         mock_session = MagicMock()
         mock_session.messages = []
@@ -357,7 +357,7 @@ class TestRestoreSessionToolPairing:
     async def test_loads_newest_capped_tail(self):
         """Restore loads the NEWEST N (resume floor), not an oldest-N truncation
         — recent context is preserved while the load stays bounded."""
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         mock_session = MagicMock()
         mock_session.messages = []
@@ -396,7 +396,7 @@ class TestRestoreSessionToolPairing:
     @pytest.mark.asyncio
     async def test_orphaned_tool_calls_pruned_on_restore(self):
         """An assistant batch missing some results is repaired, not orphaned."""
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         # 5 parallel tool calls, only 3 results persisted (the b4478b88 shape).
         history = [
@@ -518,7 +518,7 @@ class TestRestoreFromCheckpoint:
     async def test_path_a_restores_summary_and_tail_only(self):
         """Checkpoint with ``boundary_turn`` → ``[SystemMessage(summary)] +
         tail rows``; the pre-boundary history is never re-loaded."""
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         mock_session = MagicMock()
         mock_session.messages = []
@@ -585,7 +585,7 @@ class TestRestoreFromCheckpoint:
     @pytest.mark.asyncio
     async def test_path_b_back_compat_when_no_checkpoint(self):
         """No summary row → Path B: bounded newest-N load, no ``since_turn``."""
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         mock_session = MagicMock()
         mock_session.messages = []
@@ -620,7 +620,7 @@ class TestRestoreFromCheckpoint:
     async def test_path_b_back_compat_when_boundary_turn_missing(self):
         """Phase-3 summary rows predate the boundary_turn metric — fall back to
         full load so existing threads stay correct."""
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         mock_session = MagicMock()
         mock_session.messages = []
@@ -654,7 +654,7 @@ class TestRestoreFromCheckpoint:
         """Path B that re-summarizes must persist a fresh checkpoint with
         ``trigger='resume'`` so subsequent resumes hit Path A and the banner
         appears (closes the resume-banner gap)."""
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         history = [
             {"role": "user", "content": f"q{i}", "tool_calls": None, "turn_number": i}
@@ -793,7 +793,7 @@ class TestRestoreFromCheckpoint:
         the persist, every resume re-runs the same blocking aux-LLM
         summarization and discards it (per-claim cost on the stateless
         lane)."""
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         mock_session, mock_agent = self._path_a_fixture(compaction_fires=True)
 
@@ -818,7 +818,7 @@ class TestRestoreFromCheckpoint:
         """A Path-A restore whose tail fits the budget must NOT rewrite the
         checkpoint — the existing summary row keeps driving the banner, and a
         rewrite would duplicate it on every reconnect."""
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         mock_session, mock_agent = self._path_a_fixture(compaction_fires=False)
 
@@ -1079,7 +1079,7 @@ class TestSaveTurnAiMessages:
         summary + the kept window. Membership stamps pick this turn's rows;
         the input (persisted at accept time) and other turns' rows are not
         rewritten; the DB still gets the exact input id for the boundary."""
-        from src.core.message_markers import stamp_turn_membership
+        from shared.runtime.core.message_markers import stamp_turn_membership
 
         client = AsyncMock()
         prior_turn = stamp_turn_membership(AIMessage(content="before", id="prev-ai"), 3)
@@ -1129,7 +1129,7 @@ class TestSaveTurnAiMessages:
     @pytest.mark.asyncio
     async def test_authoritative_membership_survives_evicted_input(self):
         """The exact input is gone from RAM entirely (summarised) — no crash."""
-        from src.core.message_markers import stamp_turn_membership
+        from shared.runtime.core.message_markers import stamp_turn_membership
 
         client = AsyncMock()
         messages = [
@@ -1189,7 +1189,7 @@ class TestReconcileTurnWithRetry:
 
     @staticmethod
     def _install(monkeypatch, save):
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         monkeypatch.setattr(pa, "_TURN_RECONCILE_RETRY_DELAY_S", 0.0)
         session = MagicMock()
@@ -1252,7 +1252,7 @@ class TestReconcileTurnWithRetry:
 
     @pytest.mark.asyncio
     async def test_lost_lease_is_not_retried(self, monkeypatch):
-        from src.api.lease_context import LeaseLostError
+        from agent.api.lease_context import LeaseLostError
 
         calls = []
 
@@ -1299,7 +1299,7 @@ class TestLoopCrashTerminalEdge:
 
     @pytest.mark.asyncio
     async def test_loop_crash_emits_turn_error_before_terminate(self, monkeypatch):
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         async def boom():
             raise RuntimeError("settlement failed")
@@ -1320,8 +1320,8 @@ class TestLoopCrashTerminalEdge:
 
     @pytest.mark.asyncio
     async def test_lost_lease_crash_emits_no_turn_error(self, monkeypatch):
-        from src.api import persistent_app as pa
-        from src.api.lease_context import LeaseLostError
+        from agent.api import persistent_app as pa
+        from agent.api.lease_context import LeaseLostError
 
         async def lost():
             raise LeaseLostError("fence lost")
@@ -1378,7 +1378,7 @@ class TestAuthoritativeTurnPersist:
 
     @pytest.mark.asyncio
     async def test_stateless_timeout_aborts_turn_settlement(self, monkeypatch):
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         monkeypatch.setenv("STATELESS_EXECUTOR", "1")
         session = self._session()
@@ -1404,7 +1404,7 @@ class TestAuthoritativeTurnPersist:
 
     @pytest.mark.asyncio
     async def test_pinned_timeout_remains_nonfatal(self, monkeypatch):
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         monkeypatch.delenv("STATELESS_EXECUTOR", raising=False)
         session = self._session()
@@ -1429,7 +1429,7 @@ class TestAuthoritativeTurnPersist:
     async def test_cancelled_turn_skips_reconcile_and_cannot_rewrite_prior_rows(
         self, monkeypatch
     ):
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         monkeypatch.delenv("STATELESS_EXECUTOR", raising=False)
         prior_human = HumanMessage(content="prior", id="prior-human")
@@ -1471,7 +1471,7 @@ class TestAuthoritativeTurnPersist:
     async def test_stateless_turn_cannot_skip_authoritative_reconcile(
         self, monkeypatch
     ):
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         monkeypatch.setenv("STATELESS_EXECUTOR", "1")
         session = self._session()
@@ -1491,7 +1491,7 @@ class TestAuthoritativeTurnPersist:
     async def test_stateless_completion_frame_follows_authoritative_persist(
         self, monkeypatch
     ):
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         monkeypatch.setenv("STATELESS_EXECUTOR", "1")
         session = self._session()
@@ -1517,7 +1517,7 @@ class TestAuthoritativeTurnPersist:
 
     @pytest.mark.asyncio
     async def test_stateless_missing_postgres_fails_closed(self, monkeypatch):
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         monkeypatch.setenv("STATELESS_EXECUTOR", "1")
         session = self._session()
@@ -1539,7 +1539,7 @@ class TestAuthoritativeTurnPersist:
 class TestPersistentLoopMemoryOutboxWiring:
     @pytest.mark.asyncio
     async def test_stateless_runtime_defers_turn_memory_to_outbox(self, monkeypatch):
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         monkeypatch.setenv("STATELESS_EXECUTOR", "1")
         captured = {}
@@ -1615,7 +1615,7 @@ class TestPersistOneMessage:
 class TestLoopPersistMessage:
     @pytest.mark.asyncio
     async def test_persists_via_session_pool_with_turn_count(self):
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         mock_session = MagicMock()
         mock_session.turn_count = 4
@@ -1636,7 +1636,7 @@ class TestLoopPersistMessage:
 
     @pytest.mark.asyncio
     async def test_noop_when_no_postgres_conn(self):
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         mock_session = MagicMock()
         mock_session.postgres_conn = None
@@ -1651,7 +1651,7 @@ class TestLoopPersistMessage:
 
     @pytest.mark.asyncio
     async def test_non_fatal_on_db_error(self):
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         mock_session = MagicMock()
         mock_session.turn_count = 1
@@ -1679,7 +1679,7 @@ class TestRecordCompactionBoundarySeq:
     async def test_resolves_boundary_id_to_seq_on_summary_row(self):
         """When the summarizer set a boundary id, _record_compaction resolves it
         to a seq and records boundary_seq alongside boundary_turn."""
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         mock_session = MagicMock()
         mock_session.turn_count = 5
@@ -1707,7 +1707,7 @@ class TestRecordCompactionBoundarySeq:
     async def test_boundary_seq_none_when_no_boundary_id(self):
         """No boundary id (no real compaction / restore-time fresh ids) → the
         seq lookup is skipped and boundary_seq is None (falls back to turn)."""
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         mock_session = MagicMock()
         mock_session.turn_count = 2
@@ -1732,7 +1732,7 @@ class TestRestorePathACursor:
     cursor only for old summary rows that predate boundary_seq."""
 
     def _restore_env(self, ckpt):
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         mock_session = MagicMock()
         mock_session.messages = []
@@ -1951,7 +1951,7 @@ class TestGenerateTitle:
     def _aux(title="Test Title", *, error=None):
         """AuxiliaryLLM stub whose structured chain() yields a ConversationTitle
         (or raises), mirroring the real structured-output path titling uses."""
-        from src.services.auxiliary import ConversationTitle
+        from shared.runtime.services.auxiliary import ConversationTitle
 
         aux = MagicMock()
         if error is not None:
@@ -2166,11 +2166,11 @@ class TestEarlyTitleFromPrompt:
         prompt = "why can't external clients reach my svc?"
         mock_session, mock_conn, mock_conn_ctx = self._mock_session()
         with (
-            patch("src.api.persistent_app._session", mock_session),
-            patch("src.api.persistent_app._thread_id", "tid"),
-            patch("src.api.persistent_app._draft_title_value", None),
-            patch("src.api.persistent_app._generate_title", AsyncMock()) as gen,
-            patch("src.api.persistent_app._broadcast") as bcast,
+            patch("agent.api.persistent_app._session", mock_session),
+            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._draft_title_value", None),
+            patch("agent.api.persistent_app._generate_title", AsyncMock()) as gen,
+            patch("agent.api.persistent_app._broadcast") as bcast,
         ):
             await _early_title_from_prompt(prompt)
 
@@ -2185,10 +2185,10 @@ class TestEarlyTitleFromPrompt:
         """A greeting is left to the after-turn pass — no draft, no write."""
         mock_session, mock_conn, mock_conn_ctx = self._mock_session()
         with (
-            patch("src.api.persistent_app._session", mock_session),
-            patch("src.api.persistent_app._thread_id", "tid"),
-            patch("src.api.persistent_app._draft_title_value", None),
-            patch("src.api.persistent_app._broadcast") as bcast,
+            patch("agent.api.persistent_app._session", mock_session),
+            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._draft_title_value", None),
+            patch("agent.api.persistent_app._broadcast") as bcast,
         ):
             await _early_title_from_prompt("hi")
 
@@ -2202,10 +2202,10 @@ class TestEarlyTitleFromPrompt:
             title="Existing real title"
         )
         with (
-            patch("src.api.persistent_app._session", mock_session),
-            patch("src.api.persistent_app._thread_id", "tid"),
-            patch("src.api.persistent_app._draft_title_value", None),
-            patch("src.api.persistent_app._broadcast") as bcast,
+            patch("agent.api.persistent_app._session", mock_session),
+            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._draft_title_value", None),
+            patch("agent.api.persistent_app._broadcast") as bcast,
         ):
             await _early_title_from_prompt("a perfectly good titleable prompt")
 
@@ -2219,9 +2219,9 @@ class TestEarlyTitleFromPrompt:
         mock_session, mock_conn, mock_conn_ctx = self._mock_session()
         mock_conn.get_thread = AsyncMock(side_effect=RuntimeError("db down"))
         with (
-            patch("src.api.persistent_app._session", mock_session),
-            patch("src.api.persistent_app._thread_id", "tid"),
-            patch("src.api.persistent_app._draft_title_value", None),
+            patch("agent.api.persistent_app._session", mock_session),
+            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._draft_title_value", None),
         ):
             await _early_title_from_prompt("a perfectly good titleable prompt")
 
@@ -2229,7 +2229,7 @@ class TestEarlyTitleFromPrompt:
 
     @pytest.mark.asyncio
     async def test_blocked_old_draft_cannot_write_or_broadcast_successor(self):
-        import src.api.persistent_app as papp
+        import agent.api.persistent_app as papp
 
         old_session, old_conn, old_conn_ctx = self._mock_session()
         new_session, _, _ = self._mock_session()
@@ -2312,18 +2312,18 @@ class TestAutoTitleAfterFirstTurn:
     @pytest.mark.asyncio
     async def test_overwrites_placeholder(self):
         """Mints the grounded LLM title over a still-placeholder thread."""
-        import src.api.persistent_app as papp
+        import agent.api.persistent_app as papp
 
         mock_session, _, mock_conn_ctx = self._mock_session("Untitled Session")
         with (
-            patch("src.api.persistent_app._session", mock_session),
-            patch("src.api.persistent_app._thread_id", "tid"),
-            patch("src.api.persistent_app._draft_title_value", None),
+            patch("agent.api.persistent_app._session", mock_session),
+            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._draft_title_value", None),
             patch(
-                "src.api.persistent_app._generate_title",
+                "agent.api.persistent_app._generate_title",
                 AsyncMock(return_value="Grounded LLM title"),
             ),
-            patch("src.api.persistent_app._broadcast") as bcast,
+            patch("agent.api.persistent_app._broadcast") as bcast,
         ):
             await _auto_title_after_first_turn()
             assert papp._draft_title_value is None  # nothing to clear
@@ -2335,18 +2335,18 @@ class TestAutoTitleAfterFirstTurn:
     async def test_overwrites_own_draft_and_clears_marker(self):
         """Replaces the submit-time draft with the grounded title and clears the
         outstanding-draft marker."""
-        import src.api.persistent_app as papp
+        import agent.api.persistent_app as papp
 
         mock_session, _, mock_conn_ctx = self._mock_session("why can't external")
         with (
-            patch("src.api.persistent_app._session", mock_session),
-            patch("src.api.persistent_app._thread_id", "tid"),
-            patch("src.api.persistent_app._draft_title_value", "why can't external"),
+            patch("agent.api.persistent_app._session", mock_session),
+            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._draft_title_value", "why can't external"),
             patch(
-                "src.api.persistent_app._generate_title",
+                "agent.api.persistent_app._generate_title",
                 AsyncMock(return_value="Grounded LLM title"),
             ),
-            patch("src.api.persistent_app._broadcast") as bcast,
+            patch("agent.api.persistent_app._broadcast") as bcast,
         ):
             await _auto_title_after_first_turn()
             assert papp._draft_title_value is None  # marker cleared after write
@@ -2360,11 +2360,11 @@ class TestAutoTitleAfterFirstTurn:
         is never overwritten — and the LLM isn't even invoked."""
         mock_session, _, mock_conn_ctx = self._mock_session("My hand-picked title")
         with (
-            patch("src.api.persistent_app._session", mock_session),
-            patch("src.api.persistent_app._thread_id", "tid"),
-            patch("src.api.persistent_app._draft_title_value", "some old draft"),
-            patch("src.api.persistent_app._generate_title", AsyncMock()) as gen,
-            patch("src.api.persistent_app._broadcast") as bcast,
+            patch("agent.api.persistent_app._session", mock_session),
+            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._draft_title_value", "some old draft"),
+            patch("agent.api.persistent_app._generate_title", AsyncMock()) as gen,
+            patch("agent.api.persistent_app._broadcast") as bcast,
         ):
             await _auto_title_after_first_turn()
 
@@ -2397,7 +2397,7 @@ class TestPollWorkspaceReady:
         get_thread_workspace. The attach lifespan catches it and exits with the
         real reason (Phase 4). docs: session_permission_mode_grant_denied_ready_timeout.md
         """
-        from src.api.orchestrator_client import SessionGrantDenied
+        from agent.api.orchestrator_client import SessionGrantDenied
 
         client = AsyncMock()
         client.get_thread_workspace = AsyncMock(
@@ -2526,7 +2526,7 @@ class TestPollWorkspaceReady:
         client = AsyncMock()
         client.get_thread_workspace = _get_workspace
 
-        with patch("src.api.persistent_app.asyncio.sleep", new_callable=AsyncMock):
+        with patch("agent.api.persistent_app.asyncio.sleep", new_callable=AsyncMock):
             result = await _poll_workspace_ready(
                 client, "tid", timeout=30, poll_interval=0.01
             )
@@ -2540,7 +2540,7 @@ class TestPollWorkspaceReady:
         client = AsyncMock()
         client.get_thread_workspace.return_value = {"status": "provisioning"}
 
-        with patch("src.api.persistent_app.asyncio.sleep", new_callable=AsyncMock):
+        with patch("agent.api.persistent_app.asyncio.sleep", new_callable=AsyncMock):
             # Use a very short timeout and mock time.monotonic to expire immediately
             with patch("time.monotonic", side_effect=[0, 100]):
                 result = await _poll_workspace_ready(
@@ -2582,7 +2582,7 @@ class TestPollWorkspaceReady:
         client = AsyncMock()
         client.get_thread_workspace = _get_workspace
 
-        with patch("src.api.persistent_app.asyncio.sleep", new_callable=AsyncMock):
+        with patch("agent.api.persistent_app.asyncio.sleep", new_callable=AsyncMock):
             # base timeout=1 would give up after the first poll (monotonic jumps
             # to 2, past the base deadline); the vm-detected extend to 1000 keeps
             # polling so the second poll returns the ready VM.
@@ -2611,7 +2611,7 @@ class TestPollWorkspaceReady:
             "pod_ip": "10.42.2.32",
         }
 
-        with patch("src.api.persistent_app.asyncio.sleep", new_callable=AsyncMock):
+        with patch("agent.api.persistent_app.asyncio.sleep", new_callable=AsyncMock):
             with patch("time.monotonic", side_effect=[0, 0.5, 2]):
                 result = await _poll_workspace_ready(
                     client,
@@ -2728,7 +2728,7 @@ class TestPollVmReady:
         client = AsyncMock()
         client.get_thread_workspace = _get_ws
 
-        with patch("src.api.persistent_app.asyncio.sleep", new_callable=AsyncMock):
+        with patch("agent.api.persistent_app.asyncio.sleep", new_callable=AsyncMock):
             result = await _poll_vm_ready(client, "tid", timeout=30, poll_interval=0.01)
 
         assert result is not None
@@ -2740,7 +2740,7 @@ class TestPollVmReady:
         client = AsyncMock()
         client.get_thread_workspace.return_value = {"vm_status": "provisioning"}
 
-        with patch("src.api.persistent_app.asyncio.sleep", new_callable=AsyncMock):
+        with patch("agent.api.persistent_app.asyncio.sleep", new_callable=AsyncMock):
             with patch("time.monotonic", side_effect=[0, 100]):
                 result = await _poll_vm_ready(
                     client, "tid", timeout=5, poll_interval=0.01
@@ -2774,7 +2774,7 @@ class TestHandleCompact:
     async def test_sends_error_when_session_none(self):
         """Sends error event when _session is None."""
         ws = AsyncMock()
-        with patch("src.api.persistent_app._session", None):
+        with patch("agent.api.persistent_app._session", None):
             await _handle_compact(ws, "")
         ws.send_json.assert_called()
         call_args = ws.send_json.call_args[0][0]
@@ -2786,7 +2786,7 @@ class TestHandleCompact:
         ws = AsyncMock()
         mock_session = MagicMock()
         mock_session.context_manager = None
-        with patch("src.api.persistent_app._session", mock_session):
+        with patch("agent.api.persistent_app._session", mock_session):
             await _handle_compact(ws, "")
         ws.send_json.assert_called()
 
@@ -2809,7 +2809,7 @@ class TestHandleCompact:
         mock_session.config.context_management.max_summary_length = 10000
         mock_session.workspace_manager = None
 
-        with patch("src.api.persistent_app._session", mock_session):
+        with patch("agent.api.persistent_app._session", mock_session):
             await _handle_compact(ws, "focus text")
 
         # Messages should be updated in-place
@@ -2830,7 +2830,7 @@ class TestHandleCompact:
         mock_session.config.context_management.max_summary_length = 10000
         mock_session.workspace_manager = None
 
-        with patch("src.api.persistent_app._session", mock_session):
+        with patch("agent.api.persistent_app._session", mock_session):
             await _handle_compact(ws, "my focus")
 
         # Find the context.compacted call
@@ -2869,8 +2869,8 @@ class TestHandleCompact:
         )
 
         with (
-            patch("src.api.persistent_app._session", mock_session),
-            patch("src.api.persistent_app._thread_id", "tid-1"),
+            patch("agent.api.persistent_app._session", mock_session),
+            patch("agent.api.persistent_app._thread_id", "tid-1"),
         ):
             await _handle_compact(ws, "")
 
@@ -2909,8 +2909,8 @@ class TestHandleCompact:
         )
 
         with (
-            patch("src.api.persistent_app._session", mock_session),
-            patch("src.api.persistent_app._thread_id", "tid-1"),
+            patch("agent.api.persistent_app._session", mock_session),
+            patch("agent.api.persistent_app._thread_id", "tid-1"),
         ):
             await _handle_compact(ws, "")
 
@@ -2940,8 +2940,8 @@ class TestHandleCompact:
         )
 
         with (
-            patch("src.api.persistent_app._session", mock_session),
-            patch("src.api.persistent_app._thread_id", "tid-1"),
+            patch("agent.api.persistent_app._session", mock_session),
+            patch("agent.api.persistent_app._thread_id", "tid-1"),
         ):
             await _handle_compact(ws, "")
 
@@ -2979,8 +2979,8 @@ class TestHandleCompact:
         )
 
         with (
-            patch("src.api.persistent_app._session", mock_session),
-            patch("src.api.persistent_app._thread_id", "tid-1"),
+            patch("agent.api.persistent_app._session", mock_session),
+            patch("agent.api.persistent_app._thread_id", "tid-1"),
         ):
             await _handle_compact(ws, "")
 
@@ -3014,8 +3014,8 @@ class TestHandleCompact:
         mock_session.postgres_conn.save_thread_message = AsyncMock()
 
         with (
-            patch("src.api.persistent_app._session", mock_session),
-            patch("src.api.persistent_app._thread_id", "tid-1"),
+            patch("agent.api.persistent_app._session", mock_session),
+            patch("agent.api.persistent_app._thread_id", "tid-1"),
         ):
             await _handle_compact(ws, "")
 
@@ -3043,7 +3043,7 @@ class TestHandleCompact:
         git_mgr.has_uncommitted_changes.return_value = True
         mock_session.workspace_manager.git_manager = git_mgr
 
-        with patch("src.api.persistent_app._session", mock_session):
+        with patch("agent.api.persistent_app._session", mock_session):
             await _handle_compact(ws, "")
 
         git_mgr.commit.assert_called_once()
@@ -3063,7 +3063,7 @@ class TestHandleCompact:
         git_mgr.commit.side_effect = RuntimeError("git broke")
         mock_session.workspace_manager.git_manager = git_mgr
 
-        with patch("src.api.persistent_app._session", mock_session):
+        with patch("agent.api.persistent_app._session", mock_session):
             await _handle_compact(ws, "")
 
 
@@ -3077,18 +3077,18 @@ class TestHandleArchive:
     def _common_teardown(self):
         with (
             patch(
-                "src.api.persistent_app._terminate_session", new=AsyncMock()
+                "agent.api.persistent_app._terminate_session", new=AsyncMock()
             ) as teardown,
             patch(
-                "src.api.persistent_app._update_thread_status",
+                "agent.api.persistent_app._update_thread_status",
                 new=AsyncMock(return_value=True),
             ) as status_update,
             patch(
-                "src.api.persistent_app._retirement_admission_identity",
+                "agent.api.persistent_app._retirement_admission_identity",
                 None,
             ),
             patch(
-                "src.api.persistent_app._retirement_admission_disposition",
+                "agent.api.persistent_app._retirement_admission_disposition",
                 None,
             ),
         ):
@@ -3099,7 +3099,7 @@ class TestHandleArchive:
     @pytest.mark.asyncio
     async def test_sends_error_when_session_none(self):
         ws = AsyncMock()
-        with patch("src.api.persistent_app._session", None):
+        with patch("agent.api.persistent_app._session", None):
             await _handle_archive(ws)
         ws.send_json.assert_called()
         call_args = ws.send_json.call_args[0][0]
@@ -3117,8 +3117,8 @@ class TestHandleArchive:
         mock_session.postgres_conn = None
 
         with (
-            patch("src.api.persistent_app._session", mock_session),
-            patch("src.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session", mock_session),
+            patch("agent.api.persistent_app._thread_id", "tid"),
         ):
             await _handle_archive(ws)
 
@@ -3144,8 +3144,8 @@ class TestHandleArchive:
         mock_session.memory_extraction_prompt = ""
 
         with (
-            patch("src.api.persistent_app._session", mock_session),
-            patch("src.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session", mock_session),
+            patch("agent.api.persistent_app._thread_id", "tid"),
         ):
             await _handle_archive(ws)
 
@@ -3164,10 +3164,10 @@ class TestHandleArchive:
         mock_session.memory_extraction_prompt = ""
 
         with (
-            patch("src.api.persistent_app._session", mock_session),
-            patch("src.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session", mock_session),
+            patch("agent.api.persistent_app._thread_id", "tid"),
             patch(
-                "src.api.persistent_app.extract_and_store_memories",
+                "agent.api.persistent_app.extract_and_store_memories",
                 side_effect=RuntimeError("extraction failed"),
                 create=True,
             ),
@@ -3202,10 +3202,11 @@ class TestHandleArchive:
         mock_session.postgres_conn = mock_conn
 
         with (
-            patch("src.api.persistent_app._session", mock_session),
-            patch("src.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session", mock_session),
+            patch("agent.api.persistent_app._thread_id", "tid"),
             patch(
-                "src.api.persistent_app._generate_title", return_value="Generated Title"
+                "agent.api.persistent_app._generate_title",
+                return_value="Generated Title",
             ),
         ):
             await _handle_archive(ws)
@@ -3225,8 +3226,8 @@ class TestHandleArchive:
         mock_session.postgres_conn = mock_conn
 
         with (
-            patch("src.api.persistent_app._session", mock_session),
-            patch("src.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session", mock_session),
+            patch("agent.api.persistent_app._thread_id", "tid"),
         ):
             await _handle_archive(ws)
 
@@ -3250,8 +3251,8 @@ class TestHandleArchive:
         mock_session.postgres_conn = None
 
         with (
-            patch("src.api.persistent_app._session", mock_session),
-            patch("src.api.persistent_app._thread_id", "test-thread-id"),
+            patch("agent.api.persistent_app._session", mock_session),
+            patch("agent.api.persistent_app._thread_id", "test-thread-id"),
         ):
             await _handle_archive(ws)
 
@@ -3283,10 +3284,10 @@ class TestHandleArchive:
         mock_session.postgres_conn = None
 
         with (
-            patch("src.api.persistent_app._session", mock_session),
-            patch("src.api.persistent_app._thread_id", "test-thread-id"),
+            patch("agent.api.persistent_app._session", mock_session),
+            patch("agent.api.persistent_app._thread_id", "test-thread-id"),
             patch(
-                "src.api.persistent_app._session_runtime_generation",
+                "agent.api.persistent_app._session_runtime_generation",
                 "55555555-5555-4555-8555-555555555555",
             ),
         ):
@@ -3316,10 +3317,10 @@ class TestHandleArchive:
         mock_session.postgres_conn = None
 
         with (
-            patch("src.api.persistent_app._session", mock_session),
-            patch("src.api.persistent_app._thread_id", "officer-thread"),
+            patch("agent.api.persistent_app._session", mock_session),
+            patch("agent.api.persistent_app._thread_id", "officer-thread"),
             patch(
-                "src.api.persistent_app._session_runtime_generation",
+                "agent.api.persistent_app._session_runtime_generation",
                 "55555555-5555-4555-8555-555555555555",
             ),
         ):
@@ -3354,8 +3355,8 @@ class TestHandleArchive:
         mock_session.postgres_conn = None
 
         with (
-            patch("src.api.persistent_app._session", mock_session),
-            patch("src.api.persistent_app._thread_id", "test-thread-id"),
+            patch("agent.api.persistent_app._session", mock_session),
+            patch("agent.api.persistent_app._thread_id", "test-thread-id"),
         ):
             await _handle_archive(ws)
 
@@ -3376,8 +3377,8 @@ class TestHandleArchive:
         session.postgres_conn = AsyncMock()
 
         with (
-            patch("src.api.persistent_app._session", session),
-            patch("src.api.persistent_app._thread_id", "test-thread-id"),
+            patch("agent.api.persistent_app._session", session),
+            patch("agent.api.persistent_app._thread_id", "test-thread-id"),
         ):
             await _handle_archive(ws)
 
@@ -3399,8 +3400,8 @@ class TestHandleArchive:
         mock_session.postgres_conn = None
 
         with (
-            patch("src.api.persistent_app._session", mock_session),
-            patch("src.api.persistent_app._thread_id", "test-thread-id"),
+            patch("agent.api.persistent_app._session", mock_session),
+            patch("agent.api.persistent_app._thread_id", "test-thread-id"),
         ):
             await _handle_archive(ws)
 
@@ -3413,11 +3414,11 @@ class TestHandleIdleArchive:
     def _clear_retirement_latch(self):
         with (
             patch(
-                "src.api.persistent_app._retirement_admission_identity",
+                "agent.api.persistent_app._retirement_admission_identity",
                 None,
             ),
             patch(
-                "src.api.persistent_app._retirement_admission_disposition",
+                "agent.api.persistent_app._retirement_admission_disposition",
                 None,
             ),
         ):
@@ -3436,7 +3437,7 @@ class TestHandleIdleArchive:
 
     @pytest.mark.asyncio
     async def test_settles_after_ending_without_preterminal_agent_frame(self):
-        from src.api import persistent_app as mod
+        from agent.api import persistent_app as mod
 
         order: list[str] = []
         update = AsyncMock(
@@ -3466,7 +3467,7 @@ class TestHandleIdleArchive:
 
     @pytest.mark.asyncio
     async def test_refused_ending_neither_settles_nor_publishes_terminal(self):
-        from src.api import persistent_app as mod
+        from agent.api import persistent_app as mod
 
         settle = AsyncMock()
         broadcast = MagicMock()
@@ -3490,7 +3491,7 @@ class TestHandleIdleArchive:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["ending", "ended"])
 async def test_pinned_terminal_status_never_uses_direct_db_fallback(status):
-    from src.api import persistent_app as mod
+    from agent.api import persistent_app as mod
 
     postgres = MagicMock()
     postgres.end_thread = AsyncMock()
@@ -3520,7 +3521,7 @@ async def test_pinned_terminal_status_never_uses_direct_db_fallback(status):
 
 @pytest.mark.asyncio
 async def test_begun_retirement_closes_local_input_and_readiness_before_finalization():
-    from src.api import persistent_app as mod
+    from agent.api import persistent_app as mod
 
     postgres = MagicMock()
     postgres.persist_pinned_input_delivery = AsyncMock()
@@ -3563,7 +3564,7 @@ async def test_begun_retirement_closes_local_input_and_readiness_before_finaliza
 
 @pytest.mark.asyncio
 async def test_child_quiescence_precedes_retirement_authority_revocation():
-    from src.api import persistent_app as mod
+    from agent.api import persistent_app as mod
 
     order: list[str] = []
     session = _retirement_session_mock()
@@ -3608,7 +3609,7 @@ async def test_child_quiescence_precedes_retirement_authority_revocation():
 
 @pytest.mark.asyncio
 async def test_child_quiescence_failure_refuses_retirement_begin():
-    from src.api import persistent_app as mod
+    from agent.api import persistent_app as mod
 
     session = _retirement_session_mock()
     session.quiesce_subagents.side_effect = RuntimeError("child still running")
@@ -3694,7 +3695,7 @@ class TestExactRetirementBeginReconciliation:
 
     @pytest.mark.asyncio
     async def test_drain_failure_before_begin_exactly_reopens_same_runtime(self):
-        from src.api import persistent_app as mod
+        from agent.api import persistent_app as mod
 
         client = SimpleNamespace(begin_thread_retirement=AsyncMock())
         reopen = AsyncMock(return_value=True)
@@ -3718,7 +3719,7 @@ class TestExactRetirementBeginReconciliation:
 
     @pytest.mark.asyncio
     async def test_missing_exact_owner_after_child_quiesce_fences_whole_runtime(self):
-        from src.api import persistent_app as mod
+        from agent.api import persistent_app as mod
 
         client = SimpleNamespace(begin_thread_retirement=AsyncMock())
         with (
@@ -3732,7 +3733,7 @@ class TestExactRetirementBeginReconciliation:
 
     @pytest.mark.asyncio
     async def test_no_commit_response_reopens_only_after_exact_lifecycle_proof(self):
-        from src.api import persistent_app as mod
+        from agent.api import persistent_app as mod
 
         client = SimpleNamespace(
             begin_thread_retirement=AsyncMock(return_value=None),
@@ -3757,7 +3758,7 @@ class TestExactRetirementBeginReconciliation:
 
     @pytest.mark.asyncio
     async def test_child_resume_failure_recloses_controls_and_latches_admission(self):
-        from src.api import persistent_app as mod
+        from agent.api import persistent_app as mod
 
         client = SimpleNamespace(
             begin_thread_retirement=AsyncMock(return_value=None),
@@ -3785,7 +3786,7 @@ class TestExactRetirementBeginReconciliation:
     async def test_malformed_commit_response_adopts_exact_authorized_permanent_intent(
         self,
     ):
-        from src.api import persistent_app as mod
+        from agent.api import persistent_app as mod
 
         client = SimpleNamespace(
             begin_thread_retirement=AsyncMock(return_value={"status": "ending"}),
@@ -3826,7 +3827,7 @@ class TestExactRetirementBeginReconciliation:
 
 @pytest.mark.asyncio
 async def test_loop_gone_terminal_begin_retries_without_reopening_controls():
-    from src.api import persistent_app as mod
+    from agent.api import persistent_app as mod
 
     generation = "88888888-8888-4888-8888-888888888888"
     attach_token = "99999999-9999-4999-8999-999999999999"
@@ -3915,7 +3916,7 @@ async def test_loop_gone_terminal_begin_retries_without_reopening_controls():
 
 @pytest.mark.asyncio
 async def test_authorized_retirement_transient_local_failure_keeps_exact_retry_owner():
-    from src.api import persistent_app as mod
+    from agent.api import persistent_app as mod
 
     generation = "88888888-8888-4888-8888-888888888888"
     attach_token = "99999999-9999-4999-8999-999999999999"
@@ -3944,7 +3945,7 @@ async def test_authorized_retirement_transient_local_failure_keeps_exact_retry_o
 
 @pytest.mark.asyncio
 async def test_authorized_retirement_retry_never_crosses_successor_identity():
-    from src.api import persistent_app as mod
+    from agent.api import persistent_app as mod
 
     generation = "88888888-8888-4888-8888-888888888888"
     attach_token = "99999999-9999-4999-8999-999999999999"
@@ -3980,7 +3981,7 @@ async def test_authorized_retirement_retry_never_crosses_successor_identity():
 
 @pytest.mark.asyncio
 async def test_hidden_preflight_ttl_abort_then_exact_reopen():
-    from src.api import persistent_app as mod
+    from agent.api import persistent_app as mod
 
     case = TestExactRetirementBeginReconciliation()
     client = SimpleNamespace(
@@ -4013,7 +4014,7 @@ async def test_hidden_preflight_ttl_abort_then_exact_reopen():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("lifecycle_mode", ["unavailable", "successor"])
 async def test_ambiguous_begin_never_reopens_without_exact_proof(lifecycle_mode):
-    from src.api import persistent_app as mod
+    from agent.api import persistent_app as mod
 
     case = TestExactRetirementBeginReconciliation()
     lifecycle = (
@@ -4228,7 +4229,7 @@ class TestHandleVmUpgrade:
     async def test_delegates_to_workspace_upgrade_vm(self):
         ws = AsyncMock()
         with patch(
-            "src.api.persistent_app._handle_workspace_upgrade",
+            "agent.api.persistent_app._handle_workspace_upgrade",
             new_callable=AsyncMock,
         ) as mock_handler:
             await _handle_vm_upgrade(ws)
@@ -4258,11 +4259,11 @@ class TestHandleWorkspaceUpgradeVm:
         backend = SimpleNamespace(supports_shell=True, sudo_action="allow")
         with (
             patch(
-                "src.api.persistent_app._session",
+                "agent.api.persistent_app._session",
                 self._session_with_backend(backend),
             ),
-            patch("src.api.persistent_app._orchestrator_client", client),
-            patch("src.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._orchestrator_client", client),
+            patch("agent.api.persistent_app._thread_id", "tid"),
         ):
             await _handle_workspace_upgrade(ws, target_tier="vm")
 
@@ -4285,13 +4286,13 @@ class TestHandleWorkspaceUpgradeVm:
         sandbox = SimpleNamespace(supports_shell=True, sudo_action="freeze")
         with (
             patch(
-                "src.api.persistent_app._session",
+                "agent.api.persistent_app._session",
                 self._session_with_backend(sandbox),
             ),
-            patch("src.api.persistent_app._orchestrator_client", client),
-            patch("src.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._orchestrator_client", client),
+            patch("agent.api.persistent_app._thread_id", "tid"),
             patch(
-                "src.api.persistent_app._poll_vm_ready",
+                "agent.api.persistent_app._poll_vm_ready",
                 new_callable=AsyncMock,
                 return_value=None,
             ),
@@ -4326,17 +4327,19 @@ class TestHandleWorkspaceUpgradeVm:
         mock_remote_mod.RemoteBackend.side_effect = RuntimeError("seed/swap boom")
         with (
             patch(
-                "src.api.persistent_app._session",
+                "agent.api.persistent_app._session",
                 self._session_with_backend(sandbox),
             ),
-            patch("src.api.persistent_app._orchestrator_client", client),
-            patch("src.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._orchestrator_client", client),
+            patch("agent.api.persistent_app._thread_id", "tid"),
             patch(
-                "src.api.persistent_app._poll_vm_ready",
+                "agent.api.persistent_app._poll_vm_ready",
                 new_callable=AsyncMock,
                 return_value={"ssh_host": "10.0.0.9", "ssh_port": 22},
             ),
-            patch.dict(sys.modules, {"src.core.backends.remote": mock_remote_mod}),
+            patch.dict(
+                sys.modules, {"shared.runtime.core.backends.remote": mock_remote_mod}
+            ),
         ):
             await _handle_workspace_upgrade(ws, target_tier="vm")
 
@@ -4383,16 +4386,18 @@ class TestHandleWorkspaceUpgradeVm:
 
         mock_remote_mod = MagicMock()  # RemoteBackend(...) → connectable stub
         with (
-            patch("src.api.persistent_app._session", sess),
-            patch("src.api.persistent_app._orchestrator_client", client),
-            patch("src.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session", sess),
+            patch("agent.api.persistent_app._orchestrator_client", client),
+            patch("agent.api.persistent_app._thread_id", "tid"),
             patch(
-                "src.api.persistent_app._poll_vm_ready",
+                "agent.api.persistent_app._poll_vm_ready",
                 new_callable=AsyncMock,
                 return_value={"ssh_host": "100.64.0.9", "ssh_port": 22},
             ),
-            patch.dict(sys.modules, {"src.core.backends.remote": mock_remote_mod}),
-            patch("src.core.backends.seed.seed_workspace", return_value=7),
+            patch.dict(
+                sys.modules, {"shared.runtime.core.backends.remote": mock_remote_mod}
+            ),
+            patch("agent.core.backends.seed.seed_workspace", return_value=7),
         ):
             await _handle_workspace_upgrade(ws, target_tier="vm")
 
@@ -4457,17 +4462,19 @@ class TestHandleWorkspaceUpgradeSandboxCanvasCapability:
         }
 
         with (
-            patch("src.api.persistent_app._session", session),
-            patch("src.api.persistent_app._orchestrator_client", client),
-            patch("src.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session", session),
+            patch("agent.api.persistent_app._orchestrator_client", client),
+            patch("agent.api.persistent_app._thread_id", "tid"),
             patch(
-                "src.api.persistent_app._poll_workspace_ready",
+                "agent.api.persistent_app._poll_workspace_ready",
                 new_callable=AsyncMock,
                 return_value=workspace,
             ),
-            patch.dict(sys.modules, {"src.core.backends.remote": remote_module}),
+            patch.dict(
+                sys.modules, {"shared.runtime.core.backends.remote": remote_module}
+            ),
             patch(
-                "src.core.backends.seed.seed_workspace", return_value=1
+                "agent.core.backends.seed.seed_workspace", return_value=1
             ) as seed_workspace,
         ):
             await _handle_workspace_upgrade(ws, target_tier="sandbox")
@@ -4513,16 +4520,18 @@ class TestHandleWorkspaceUpgradeSandboxCanvasCapability:
         remote_module = MagicMock()
         remote_module.RemoteBackend.return_value = new_backend
         with (
-            patch("src.api.persistent_app._session", session),
-            patch("src.api.persistent_app._orchestrator_client", client),
-            patch("src.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session", session),
+            patch("agent.api.persistent_app._orchestrator_client", client),
+            patch("agent.api.persistent_app._thread_id", "tid"),
             patch(
-                "src.api.persistent_app._poll_vm_ready",
+                "agent.api.persistent_app._poll_vm_ready",
                 new_callable=AsyncMock,
                 return_value={"ssh_host": "vm.test", "ssh_port": 22},
             ),
-            patch.dict(sys.modules, {"src.core.backends.remote": remote_module}),
-            patch("src.core.backends.seed.seed_workspace", return_value=1),
+            patch.dict(
+                sys.modules, {"shared.runtime.core.backends.remote": remote_module}
+            ),
+            patch("agent.core.backends.seed.seed_workspace", return_value=1),
         ):
             await _handle_workspace_upgrade(ws, target_tier="vm")
 
@@ -4559,17 +4568,19 @@ class TestHandleWorkspaceUpgradeSandboxCanvasCapability:
         }
 
         with (
-            patch("src.api.persistent_app._session", session),
-            patch("src.api.persistent_app._orchestrator_client", client),
-            patch("src.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session", session),
+            patch("agent.api.persistent_app._orchestrator_client", client),
+            patch("agent.api.persistent_app._thread_id", "tid"),
             patch(
-                "src.api.persistent_app._poll_workspace_ready",
+                "agent.api.persistent_app._poll_workspace_ready",
                 new_callable=AsyncMock,
                 return_value=workspace,
             ),
-            patch.dict(sys.modules, {"src.core.backends.remote": remote_module}),
+            patch.dict(
+                sys.modules, {"shared.runtime.core.backends.remote": remote_module}
+            ),
             patch(
-                "src.core.backends.seed.seed_workspace", return_value=1
+                "agent.core.backends.seed.seed_workspace", return_value=1
             ) as seed_workspace,
         ):
             await _handle_workspace_upgrade(ws, target_tier="sandbox")
@@ -4597,11 +4608,11 @@ class TestHandleWorkspaceUpgradeSandboxCanvasCapability:
         session.workspace_manager.backend = original_backend
 
         with (
-            patch("src.api.persistent_app._session", session),
-            patch("src.api.persistent_app._orchestrator_client", client),
-            patch("src.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session", session),
+            patch("agent.api.persistent_app._orchestrator_client", client),
+            patch("agent.api.persistent_app._thread_id", "tid"),
             patch(
-                "src.api.persistent_app._poll_workspace_ready",
+                "agent.api.persistent_app._poll_workspace_ready",
                 new_callable=AsyncMock,
             ) as poll,
         ):
@@ -4667,17 +4678,17 @@ class TestSubscriberFanout:
     from any single WebSocket. See knowledge-base/knowledge/features/headless_persistent_sessions.md."""
 
     def setup_method(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._subscribers.clear()
 
     def teardown_method(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._subscribers.clear()
 
     def test_subscribe_returns_fresh_queue(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         queue = mod._subscribe("client-A")
         assert "client-A" in mod._subscribers
@@ -4685,20 +4696,20 @@ class TestSubscriberFanout:
         assert queue.empty()
 
     def test_unsubscribe_removes_entry(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._subscribe("client-A")
         mod._unsubscribe("client-A")
         assert "client-A" not in mod._subscribers
 
     def test_unsubscribe_unknown_id_is_a_noop(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         # Should not raise.
         mod._unsubscribe("never-subscribed")
 
     def test_broadcast_enqueues_to_all_subscribers(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         # Reset event-log cursor so this test is deterministic.
         mod._next_seq = 0
@@ -4721,7 +4732,7 @@ class TestSubscriberFanout:
 
     def test_broadcast_no_subscribers_does_nothing(self):
         """Loop running with zero subscribers — the whole point of headless."""
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         # Should not raise.
         mod._broadcast("token", {"content": "into the void"})
@@ -4731,7 +4742,7 @@ class TestSubscriberFanout:
         """Slow consumer must not block the loop. Oldest frame is dropped."""
         import asyncio as _asyncio
 
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         small = _asyncio.Queue(maxsize=2)
         mod._subscribers["slow"] = small
@@ -4752,7 +4763,7 @@ class TestSubscriberFanout:
         """The keystone invariant — WS close must not cancel the loop."""
         import asyncio as _asyncio
 
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         async def _runit():
             async def _forever():
@@ -4790,7 +4801,7 @@ class TestTerminateSession:
 
     @pytest.mark.asyncio
     async def test_no_op_when_session_already_none(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._session = None
         # Should not raise.
@@ -4799,7 +4810,7 @@ class TestTerminateSession:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("reason", ["loop_crash", "shutdown"])
     async def test_every_terminal_reason_begins_retirement_before_cleanup(self, reason):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         order: list[str] = []
         loop_started = asyncio.Event()
@@ -4908,7 +4919,7 @@ class TestTerminateSession:
 
     @pytest.mark.asyncio
     async def test_officer_shutdown_begins_suspended_disposition(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         session = _retirement_session_mock()
         session.config = SimpleNamespace(officer=SimpleNamespace(enabled=True))
@@ -4956,7 +4967,7 @@ class TestTerminateSession:
 
     @pytest.mark.asyncio
     async def test_settlement_waits_for_late_side_task_quiescence(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         side_task_entered = asyncio.Event()
         release_side_task = asyncio.Event()
@@ -5010,7 +5021,7 @@ class TestTerminateSession:
 
     @pytest.mark.asyncio
     async def test_settlement_waits_for_watchdog_cancellation_finally(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         cancellation_seen = asyncio.Event()
         release_finally = asyncio.Event()
@@ -5066,7 +5077,7 @@ class TestTerminateSession:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("failure", ["background", "writer"])
     async def test_uncertain_pinned_quiescence_blocks_remote_settlement(self, failure):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         session = _retirement_session_mock()
         session.workspace_sync = None
@@ -5112,7 +5123,7 @@ class TestTerminateSession:
 
     @pytest.mark.asyncio
     async def test_failed_settlement_retains_exact_local_retirement_fence(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         session = _retirement_session_mock()
         session.workspace_sync = None
@@ -5160,7 +5171,7 @@ class TestTerminateSession:
     async def test_masked_final_response_uses_exact_outcome_without_cleanup_replay(
         self,
     ):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         generation = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         attach_token = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
@@ -5224,7 +5235,7 @@ class TestTerminateSession:
         """The race-fix from commit 3a1d265 must survive the rename."""
         import asyncio as _asyncio
 
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         # Track when the loop was cancelled vs when cleanup ran.
         order = []
@@ -5309,7 +5320,7 @@ class TestTerminateSession:
 
     @pytest.mark.asyncio
     async def test_mark_thread_false_preserves_shell_for_ownership_handoff(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._loop_task = None
         mod._thread_id = "t-handoff"
@@ -5341,7 +5352,7 @@ class TestTerminateSession:
 
     @pytest.mark.asyncio
     async def test_stateless_physical_handoff_preserves_workspace_daemons(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._loop_task = None
         mod._thread_id = "t-physical-handoff"
@@ -5372,7 +5383,7 @@ class TestTerminateSession:
     @pytest.mark.asyncio
     async def test_moved_pinned_binding_refuses_all_local_teardown(self):
         """A stale pinned pod must never destroy its successor's resources."""
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._loop_task = None
         mod._thread_id = "t-binding-moved"
@@ -5414,7 +5425,7 @@ class TestTerminateSession:
         """Subscriber registry and loop input queues must reset."""
         import asyncio as _asyncio
 
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._loop_task = None  # nothing to cancel
         mod._thread_id = "t2"
@@ -5457,7 +5468,7 @@ class TestTerminateSession:
 class TestAttachSessionEventJournalFailure:
     @pytest.mark.asyncio
     async def test_failed_stateless_physical_attach_preserves_resident_daemons(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         session = SimpleNamespace(
             shell_owner_token=61,
@@ -5485,7 +5496,7 @@ class TestAttachSessionEventJournalFailure:
 
     @pytest.mark.asyncio
     async def test_aborts_and_cleans_partial_session_before_any_broadcast(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         fake_db = MagicMock()
         instances = []
@@ -5567,7 +5578,7 @@ class TestAttachSessionCloudMount:
     @pytest.mark.asyncio
     async def test_active_cloud_mount_skips_legacy_nc_session_sync(self):
         """A mounted cloud workspace must not also start legacy WebDAV sync."""
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         recovery_queue_states = []
 
@@ -5683,7 +5694,7 @@ class TestAttachSessionProtectedCloudFailClose:
     async def test_protected_thread_skips_legacy_shim_despite_nc_folder(self):
         """protected_cloud=True + cloud_mount=None + nc_session_folder set
         must fail closed before building the legacy sync coordinator."""
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         workspace_override = {
             "remote": {"host": "10.42.0.10"},
@@ -5741,7 +5752,7 @@ class TestAttachSessionProtectedCloudFailClose:
         cloud_mount/cloud_sync but a live nc_session_folder still falls back
         to the legacy shim — the new protected-only gate must not swallow
         the existing back-compat path."""
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         workspace_override = {
             "remote": {"host": "10.42.0.10"},
@@ -5964,8 +5975,8 @@ class TestAttachSessionProtectedCloudSingletonIsolation:
     async def test_sequential_pool_reuse_does_not_leak_protected_flag(self):
         """Attach protected session A, then non-protected session B, through
         the same _agent: B and the singleton must never carry the flag."""
-        import src.api.persistent_app as mod
-        from src.core.loader import AgentConfig
+        import agent.api.persistent_app as mod
+        from shared.runtime.core.loader import AgentConfig
 
         singleton = AgentConfig(agent_id="pool-pod", display_name="Pool Pod")
         fake_agent = SimpleNamespace(
@@ -6030,14 +6041,14 @@ class TestHandlePersistentWebsocketReadiness:
     @pytest.mark.asyncio
     async def test_closes_with_4403_when_validated_session_disappeared(self):
         """A session lost after token routing is an identity change."""
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         ws = self._validated_websocket()
         with (
-            patch("src.api.persistent_app._session", None),
-            patch("src.api.persistent_app._loop_user_queue", None),
-            patch("src.api.persistent_app._loop_task", None),
-            patch("src.api.persistent_app._ws_connected_event", None),
+            patch("agent.api.persistent_app._session", None),
+            patch("agent.api.persistent_app._loop_user_queue", None),
+            patch("agent.api.persistent_app._loop_task", None),
+            patch("agent.api.persistent_app._ws_connected_event", None),
         ):
             await pa.handle_persistent_websocket(ws)
             assert pa._loop_task is None
@@ -6049,18 +6060,18 @@ class TestHandlePersistentWebsocketReadiness:
     @pytest.mark.asyncio
     async def test_closes_with_4503_when_llm_with_tools_missing(self):
         """Session exists but .setup() hasn't bound llm_with_tools yet."""
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         ws = self._validated_websocket()
         session = MagicMock()
         session.llm_with_tools = None
         with (
-            patch("src.api.persistent_app._session", session),
-            patch("src.api.persistent_app._loop_user_queue", None),
-            patch("src.api.persistent_app._loop_task", None),
-            patch("src.api.persistent_app._ws_connected_event", None),
+            patch("agent.api.persistent_app._session", session),
+            patch("agent.api.persistent_app._loop_user_queue", None),
+            patch("agent.api.persistent_app._loop_task", None),
+            patch("agent.api.persistent_app._ws_connected_event", None),
             patch(
-                "src.api.persistent_app._current_pinned_session_identity_fingerprint",
+                "agent.api.persistent_app._current_pinned_session_identity_fingerprint",
                 return_value=self.fingerprint,
             ),
         ):
@@ -6077,18 +6088,18 @@ class TestHandlePersistentWebsocketReadiness:
         _session and llm_with_tools), spawned the loop, and the loop's first
         get-user-input callback crashed on the None queue.
         """
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         ws = self._validated_websocket()
         session = MagicMock()
         session.llm_with_tools = MagicMock()  # truthy
         with (
-            patch("src.api.persistent_app._session", session),
-            patch("src.api.persistent_app._loop_user_queue", None),
-            patch("src.api.persistent_app._loop_task", None),
-            patch("src.api.persistent_app._ws_connected_event", None),
+            patch("agent.api.persistent_app._session", session),
+            patch("agent.api.persistent_app._loop_user_queue", None),
+            patch("agent.api.persistent_app._loop_task", None),
+            patch("agent.api.persistent_app._ws_connected_event", None),
             patch(
-                "src.api.persistent_app._current_pinned_session_identity_fingerprint",
+                "agent.api.persistent_app._current_pinned_session_identity_fingerprint",
                 return_value=self.fingerprint,
             ),
         ):
@@ -6102,18 +6113,18 @@ class TestHandlePersistentWebsocketReadiness:
     @pytest.mark.asyncio
     async def test_sends_error_frame_before_close(self):
         """Error frame must precede the close so clients see the reason."""
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         ws = self._validated_websocket()
         session = MagicMock()
         session.llm_with_tools = None
         with (
-            patch("src.api.persistent_app._session", session),
-            patch("src.api.persistent_app._loop_user_queue", None),
-            patch("src.api.persistent_app._loop_task", None),
-            patch("src.api.persistent_app._ws_connected_event", None),
+            patch("agent.api.persistent_app._session", session),
+            patch("agent.api.persistent_app._loop_user_queue", None),
+            patch("agent.api.persistent_app._loop_task", None),
+            patch("agent.api.persistent_app._ws_connected_event", None),
             patch(
-                "src.api.persistent_app._current_pinned_session_identity_fingerprint",
+                "agent.api.persistent_app._current_pinned_session_identity_fingerprint",
                 return_value=self.fingerprint,
             ),
         ):
@@ -6132,19 +6143,19 @@ class TestHandlePersistentWebsocketReadiness:
         """
         import asyncio
 
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         ws = self._validated_websocket()
         session = MagicMock()
         session.llm_with_tools = None
         connected = asyncio.Event()
         with (
-            patch("src.api.persistent_app._session", session),
-            patch("src.api.persistent_app._loop_user_queue", None),
-            patch("src.api.persistent_app._loop_task", None),
-            patch("src.api.persistent_app._ws_connected_event", connected),
+            patch("agent.api.persistent_app._session", session),
+            patch("agent.api.persistent_app._loop_user_queue", None),
+            patch("agent.api.persistent_app._loop_task", None),
+            patch("agent.api.persistent_app._ws_connected_event", connected),
             patch(
-                "src.api.persistent_app._current_pinned_session_identity_fingerprint",
+                "agent.api.persistent_app._current_pinned_session_identity_fingerprint",
                 return_value=self.fingerprint,
             ),
         ):
@@ -6160,7 +6171,7 @@ class TestHandlePersistentWebsocketReadiness:
         """
         from fastapi import WebSocketDisconnect
 
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         ws = self._validated_websocket()
         ws.receive_text.side_effect = WebSocketDisconnect()
@@ -6186,20 +6197,20 @@ class TestHandlePersistentWebsocketReadiness:
         ]
 
         with (
-            patch("src.api.persistent_app._session", session),
-            patch("src.api.persistent_app._thread_id", "thread-1"),
-            patch("src.api.persistent_app._loop_user_queue", asyncio.Queue()),
-            patch("src.api.persistent_app._session_ready", return_value=True),
-            patch("src.api.persistent_app._turn_event_open", True),
+            patch("agent.api.persistent_app._session", session),
+            patch("agent.api.persistent_app._thread_id", "thread-1"),
+            patch("agent.api.persistent_app._loop_user_queue", asyncio.Queue()),
+            patch("agent.api.persistent_app._session_ready", return_value=True),
+            patch("agent.api.persistent_app._turn_event_open", True),
             patch(
-                "src.api.persistent_app._pending_permission_requests",
+                "agent.api.persistent_app._pending_permission_requests",
                 AsyncMock(return_value=[]),
             ),
-            patch("src.api.persistent_app._ensure_persistent_loop_started"),
-            patch("src.api.persistent_app._orchestrator_client", None),
-            patch("src.api.persistent_app._ws_connected_event", None),
+            patch("agent.api.persistent_app._ensure_persistent_loop_started"),
+            patch("agent.api.persistent_app._orchestrator_client", None),
+            patch("agent.api.persistent_app._ws_connected_event", None),
             patch(
-                "src.api.persistent_app._current_pinned_session_identity_fingerprint",
+                "agent.api.persistent_app._current_pinned_session_identity_fingerprint",
                 return_value=self.fingerprint,
             ),
         ):
@@ -6229,7 +6240,7 @@ class TestHandlePersistentWebsocketReadiness:
     async def test_legacy_websocket_interrupt_targets_active_turn(self):
         from fastapi import WebSocketDisconnect
 
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         ws = self._validated_websocket()
         ws.receive_text.side_effect = [
@@ -6249,24 +6260,24 @@ class TestHandlePersistentWebsocketReadiness:
         hard_event = asyncio.Event()
 
         with (
-            patch("src.api.persistent_app._session", session),
-            patch("src.api.persistent_app._thread_id", "thread-1"),
-            patch("src.api.persistent_app._loop_user_queue", asyncio.Queue()),
-            patch("src.api.persistent_app._session_ready", return_value=True),
-            patch("src.api.persistent_app._turn_event_open", True),
-            patch("src.api.persistent_app._tool_inflight", False),
-            patch("src.api.persistent_app._loop_interrupt_flag", None),
-            patch("src.api.persistent_app._loop_interrupt_target_turn_id", None),
-            patch("src.api.persistent_app._hard_interrupt_event", hard_event),
+            patch("agent.api.persistent_app._session", session),
+            patch("agent.api.persistent_app._thread_id", "thread-1"),
+            patch("agent.api.persistent_app._loop_user_queue", asyncio.Queue()),
+            patch("agent.api.persistent_app._session_ready", return_value=True),
+            patch("agent.api.persistent_app._turn_event_open", True),
+            patch("agent.api.persistent_app._tool_inflight", False),
+            patch("agent.api.persistent_app._loop_interrupt_flag", None),
+            patch("agent.api.persistent_app._loop_interrupt_target_turn_id", None),
+            patch("agent.api.persistent_app._hard_interrupt_event", hard_event),
             patch(
-                "src.api.persistent_app._pending_permission_requests",
+                "agent.api.persistent_app._pending_permission_requests",
                 AsyncMock(return_value=[]),
             ),
-            patch("src.api.persistent_app._ensure_persistent_loop_started"),
-            patch("src.api.persistent_app._orchestrator_client", None),
-            patch("src.api.persistent_app._ws_connected_event", None),
+            patch("agent.api.persistent_app._ensure_persistent_loop_started"),
+            patch("agent.api.persistent_app._orchestrator_client", None),
+            patch("agent.api.persistent_app._ws_connected_event", None),
             patch(
-                "src.api.persistent_app._current_pinned_session_identity_fingerprint",
+                "agent.api.persistent_app._current_pinned_session_identity_fingerprint",
                 return_value=self.fingerprint,
             ),
         ):
@@ -6291,8 +6302,8 @@ class TestHandlePersistentWebsocketReadiness:
         """The UI flag must close before slower post-turn cleanup; the broader
         teardown-safety helper intentionally remains true in that window.
         """
-        from src.api import persistent_app as pa
-        from src.api.lease_context import LeaseHandle, current_lease
+        from agent.api import persistent_app as pa
+        from agent.api.lease_context import LeaseHandle, current_lease
 
         thread_id = str(uuid4())
         lease = LeaseHandle()
@@ -6302,21 +6313,21 @@ class TestHandlePersistentWebsocketReadiness:
         effect_hook = MagicMock()
         try:
             with (
-                patch("src.api.persistent_app._session", session),
-                patch("src.api.persistent_app._thread_id", thread_id),
-                patch("src.api.persistent_app._turn_event_open", False),
+                patch("agent.api.persistent_app._session", session),
+                patch("agent.api.persistent_app._thread_id", thread_id),
+                patch("agent.api.persistent_app._turn_event_open", False),
                 patch(
-                    "src.api.persistent_app._turn_tool_execution_identity",
+                    "agent.api.persistent_app._turn_tool_execution_identity",
                     ("stale-thread", 1, 1),
                 ),
                 patch(
-                    "src.api.persistent_app._turn_tool_execution_external_hook",
+                    "agent.api.persistent_app._turn_tool_execution_external_hook",
                     effect_hook,
                 ),
-                patch("src.api.persistent_app._cloud_sync_retry_pending", False),
-                patch("src.api.persistent_app._broadcast"),
+                patch("agent.api.persistent_app._cloud_sync_retry_pending", False),
+                patch("agent.api.persistent_app._broadcast"),
                 patch(
-                    "src.api.persistent_app._retire_announced_permission_rows",
+                    "agent.api.persistent_app._retire_announced_permission_rows",
                     AsyncMock(),
                 ),
             ):
@@ -6348,8 +6359,8 @@ class TestHandlePersistentWebsocketReadiness:
 
     @pytest.mark.asyncio
     async def test_stateless_tool_boundary_fails_closed_without_exact_identity(self):
-        from src.api import persistent_app as pa
-        from src.api.lease_context import LeaseHandle, current_lease
+        from agent.api import persistent_app as pa
+        from agent.api.lease_context import LeaseHandle, current_lease
 
         lease = LeaseHandle()
         lease.update("claimed-thread", 17)
@@ -6358,16 +6369,16 @@ class TestHandlePersistentWebsocketReadiness:
         try:
             with (
                 patch(
-                    "src.api.persistent_app._session",
+                    "agent.api.persistent_app._session",
                     SimpleNamespace(turn_count=4),
                 ),
-                patch("src.api.persistent_app._thread_id", "wrong-thread"),
+                patch("agent.api.persistent_app._thread_id", "wrong-thread"),
                 patch(
-                    "src.api.persistent_app._turn_tool_execution_identity",
+                    "agent.api.persistent_app._turn_tool_execution_identity",
                     None,
                 ),
                 patch(
-                    "src.api.persistent_app._turn_tool_execution_external_hook",
+                    "agent.api.persistent_app._turn_tool_execution_external_hook",
                     effect_hook,
                 ),
             ):
@@ -6382,23 +6393,23 @@ class TestHandlePersistentWebsocketReadiness:
 
     @pytest.mark.asyncio
     async def test_pinned_tool_boundary_needs_no_queue_identity(self):
-        from src.api import persistent_app as pa
-        from src.api.lease_context import current_lease
+        from agent.api import persistent_app as pa
+        from agent.api.lease_context import current_lease
 
         lease_context = current_lease.set(None)
         try:
             with (
                 patch(
-                    "src.api.persistent_app._session",
+                    "agent.api.persistent_app._session",
                     SimpleNamespace(turn_count=2),
                 ),
-                patch("src.api.persistent_app._thread_id", "pinned-thread"),
+                patch("agent.api.persistent_app._thread_id", "pinned-thread"),
                 patch(
-                    "src.api.persistent_app._turn_tool_execution_identity",
+                    "agent.api.persistent_app._turn_tool_execution_identity",
                     None,
                 ),
                 patch(
-                    "src.api.persistent_app._turn_tool_execution_external_hook",
+                    "agent.api.persistent_app._turn_tool_execution_external_hook",
                     None,
                 ),
             ):
@@ -6409,18 +6420,18 @@ class TestHandlePersistentWebsocketReadiness:
 
     @pytest.mark.asyncio
     async def test_error_keeps_tool_effect_identity_until_queue_disposition(self):
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         thread_id = str(uuid4())
         identity = (thread_id, 12, 5)
         session = SimpleNamespace(turn_count=5, postgres_conn=None)
         with (
-            patch("src.api.persistent_app._session", session),
-            patch("src.api.persistent_app._thread_id", thread_id),
-            patch("src.api.persistent_app._turn_event_open", True),
-            patch("src.api.persistent_app._turn_tool_execution_identity", identity),
-            patch("src.api.persistent_app._turn_complete_external_hook", None),
-            patch("src.api.persistent_app._broadcast"),
+            patch("agent.api.persistent_app._session", session),
+            patch("agent.api.persistent_app._thread_id", thread_id),
+            patch("agent.api.persistent_app._turn_event_open", True),
+            patch("agent.api.persistent_app._turn_tool_execution_identity", identity),
+            patch("agent.api.persistent_app._turn_complete_external_hook", None),
+            patch("agent.api.persistent_app._broadcast"),
         ):
             await pa._loop_on_error("provider failed after tool", turn_id=5)
             assert pa._turn_event_open is False
@@ -6436,7 +6447,7 @@ class TestHandlePersistentWebsocketReadiness:
 
     @pytest.mark.asyncio
     async def test_stateless_start_hook_finishes_before_turn_started(self):
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         order = []
         session = SimpleNamespace(turn_count=0, workspace_sync=None)
@@ -6448,11 +6459,11 @@ class TestHandlePersistentWebsocketReadiness:
             order.append((kind, payload["turn_id"], pa._turn_event_open))
 
         with (
-            patch("src.api.persistent_app._session", session),
-            patch("src.api.persistent_app._turn_event_open", False),
-            patch("src.api.persistent_app._turn_start_external_hook", hook),
-            patch("src.api.persistent_app._cloud_sync_retry_pending", False),
-            patch("src.api.persistent_app._broadcast", side_effect=broadcast),
+            patch("agent.api.persistent_app._session", session),
+            patch("agent.api.persistent_app._turn_event_open", False),
+            patch("agent.api.persistent_app._turn_start_external_hook", hook),
+            patch("agent.api.persistent_app._cloud_sync_retry_pending", False),
+            patch("agent.api.persistent_app._broadcast", side_effect=broadcast),
         ):
             await pa._loop_on_turn_start(4)
 
@@ -6471,46 +6482,46 @@ class TestSessionReadyHelper:
     """
 
     def test_false_when_session_missing(self):
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         with (
-            patch("src.api.persistent_app._session", None),
-            patch("src.api.persistent_app._loop_user_queue", MagicMock()),
+            patch("agent.api.persistent_app._session", None),
+            patch("agent.api.persistent_app._loop_user_queue", MagicMock()),
         ):
             assert pa._session_ready() is False
 
     def test_false_when_llm_with_tools_missing(self):
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         session = MagicMock()
         session.llm_with_tools = None
         with (
-            patch("src.api.persistent_app._session", session),
-            patch("src.api.persistent_app._loop_user_queue", MagicMock()),
+            patch("agent.api.persistent_app._session", session),
+            patch("agent.api.persistent_app._loop_user_queue", MagicMock()),
         ):
             assert pa._session_ready() is False
 
     def test_false_when_loop_user_queue_missing(self):
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         session = MagicMock()
         session.llm_with_tools = MagicMock()
         with (
-            patch("src.api.persistent_app._session", session),
-            patch("src.api.persistent_app._loop_user_queue", None),
+            patch("agent.api.persistent_app._session", session),
+            patch("agent.api.persistent_app._loop_user_queue", None),
         ):
             assert pa._session_ready() is False
 
     def test_true_when_all_three_set(self):
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         session = MagicMock()
         session.llm_with_tools = MagicMock()
         session.protected_cloud_required = False
         session.protected_cloud_ready.return_value = True
         with (
-            patch("src.api.persistent_app._session", session),
-            patch("src.api.persistent_app._loop_user_queue", MagicMock()),
+            patch("agent.api.persistent_app._session", session),
+            patch("agent.api.persistent_app._loop_user_queue", MagicMock()),
         ):
             assert pa._session_ready() is True
 
@@ -6524,7 +6535,7 @@ class TestLoopCheckInterrupt:
     """_loop_check_interrupt returns the tri-state mode and resets in one shot."""
 
     def setup_method(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._loop_interrupt_flag = None
         mod._loop_interrupt_target_turn_id = None
@@ -6533,12 +6544,12 @@ class TestLoopCheckInterrupt:
         mod._session = SimpleNamespace(turn_count=7)
 
     def test_returns_none_when_flag_not_set(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         assert mod._loop_check_interrupt() is None
 
     def test_returns_hard_mode_once_then_resets(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._loop_interrupt_flag = "hard"
         mod._loop_interrupt_target_turn_id = 7
@@ -6547,7 +6558,7 @@ class TestLoopCheckInterrupt:
         assert mod._loop_check_interrupt() is None
 
     def test_returns_graceful_mode_once_then_resets(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._loop_interrupt_flag = "graceful"
         mod._loop_interrupt_target_turn_id = 7
@@ -6559,7 +6570,7 @@ class TestLoopCheckInterrupt:
         it doesn't leak into the next turn's streaming/compaction race."""
         import asyncio as _asyncio
 
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._hard_interrupt_event = _asyncio.Event()
         mod._hard_interrupt_event.set()
@@ -6571,7 +6582,7 @@ class TestLoopCheckInterrupt:
         mod._hard_interrupt_event = None
 
     def test_unscoped_interrupt_is_discarded_instead_of_striking_current_turn(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._loop_interrupt_flag = "hard"
         mod._loop_interrupt_target_turn_id = None
@@ -6580,7 +6591,7 @@ class TestLoopCheckInterrupt:
         assert mod._loop_interrupt_flag is None
 
     def test_force_graceful_scoped_interrupt_never_sets_hard_event(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._turn_event_open = True
         mod._tool_inflight = False
@@ -6592,7 +6603,7 @@ class TestLoopCheckInterrupt:
 
     @pytest.mark.asyncio
     async def test_late_interrupt_is_cleared_at_exact_turn_terminal_edge(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._turn_event_open = True
         mod._hard_interrupt_event = asyncio.Event()
@@ -6628,7 +6639,7 @@ class TestHandleApiInterruptHardEvent:
         return request
 
     def setup_method(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._loop_interrupt_flag = None
         mod._loop_interrupt_target_turn_id = None
@@ -6636,7 +6647,7 @@ class TestHandleApiInterruptHardEvent:
         mod._hard_interrupt_event = None
 
     def teardown_method(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._session = None
         mod._tool_inflight = False
@@ -6649,7 +6660,7 @@ class TestHandleApiInterruptHardEvent:
     async def test_hard_mode_sets_event(self):
         import asyncio as _asyncio
 
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._session = SimpleNamespace(turn_count=7)
         mod._turn_event_open = True
@@ -6671,7 +6682,7 @@ class TestHandleApiInterruptHardEvent:
     async def test_graceful_mode_leaves_event_unset(self):
         import asyncio as _asyncio
 
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._session = SimpleNamespace(turn_count=7)
         mod._turn_event_open = True
@@ -6693,7 +6704,7 @@ class TestHandleApiInterruptHardEvent:
     async def test_correlated_body_applies_only_to_exact_active_turn(self, monkeypatch):
         import json
 
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         monkeypatch.delenv("STATELESS_EXECUTOR", raising=False)
         mod._session = SimpleNamespace(turn_count=7)
@@ -6725,7 +6736,7 @@ class TestHandleApiInterruptHardEvent:
     async def test_correlated_stale_turn_rejects_before_ram_mutation(self, monkeypatch):
         import json
 
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         monkeypatch.delenv("STATELESS_EXECUTOR", raising=False)
         mod._session = SimpleNamespace(turn_count=8)
@@ -6756,7 +6767,7 @@ class TestHandleApiInterruptHardEvent:
     ):
         import json
 
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         monkeypatch.delenv("STATELESS_EXECUTOR", raising=False)
         mod._session = SimpleNamespace(turn_count=7)
@@ -6779,7 +6790,7 @@ class TestHandleApiInterruptHardEvent:
     async def test_correlated_body_requires_positive_integer_target(self, monkeypatch):
         import json
 
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         monkeypatch.delenv("STATELESS_EXECUTOR", raising=False)
         mod._session = SimpleNamespace(turn_count=7)
@@ -6797,7 +6808,7 @@ class TestHandleApiInterruptHardEvent:
 
     @pytest.mark.asyncio
     async def test_wrong_identity_rejects_before_interrupt_ram_mutation(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._session = SimpleNamespace(turn_count=7)
         mod._turn_event_open = True
@@ -6828,7 +6839,7 @@ class TestHandleApiInterruptHardEvent:
 class TestCreatePersistentApp:
     def test_sets_module_globals(self):
         """create_persistent_app sets _config_path and _thread_id."""
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         create_persistent_app("my_config", "thread-123")
 
@@ -6843,7 +6854,7 @@ class TestCreatePersistentApp:
 
     def test_thread_id_optional(self):
         """thread_id can be None."""
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         create_persistent_app("config")
         assert mod._thread_id is None
@@ -6852,7 +6863,7 @@ class TestCreatePersistentApp:
     async def test_health_reports_ready_app_guide_without_changing_liveness(
         self, monkeypatch
     ):
-        from src.core.skill_resolution import APP_GUIDE_BREAK_GLASS_ENV
+        from shared.runtime.core.skill_resolution import APP_GUIDE_BREAK_GLASS_ENV
 
         monkeypatch.delenv(APP_GUIDE_BREAK_GLASS_ENV, raising=False)
         app = create_persistent_app("config", "tid")
@@ -6869,7 +6880,7 @@ class TestCreatePersistentApp:
     async def test_break_glass_health_is_bounded_degraded_and_still_live(
         self, monkeypatch
     ):
-        from src.core.skill_resolution import APP_GUIDE_BREAK_GLASS_ENV
+        from shared.runtime.core.skill_resolution import APP_GUIDE_BREAK_GLASS_ENV
 
         monkeypatch.setenv(APP_GUIDE_BREAK_GLASS_ENV, "true")
         app = create_persistent_app("config", "tid")
@@ -6888,8 +6899,8 @@ class TestCreatePersistentApp:
 
     @pytest.mark.asyncio
     async def test_break_glass_does_not_change_chat_readiness(self, monkeypatch):
-        import src.api.persistent_app as mod
-        from src.core.skill_resolution import APP_GUIDE_BREAK_GLASS_ENV
+        import agent.api.persistent_app as mod
+        from shared.runtime.core.skill_resolution import APP_GUIDE_BREAK_GLASS_ENV
 
         monkeypatch.setenv(APP_GUIDE_BREAK_GLASS_ENV, "true")
         monkeypatch.setattr(mod, "_session_ready", lambda: True)
@@ -6915,8 +6926,8 @@ class TestCreatePersistentApp:
 
     @pytest.mark.asyncio
     async def test_ready_reports_exact_non_secret_pinned_identity(self, monkeypatch):
-        import src.api.persistent_app as mod
-        from src.shared.pinned_session_identity import (
+        import agent.api.persistent_app as mod
+        from shared.pinned_session_identity import (
             pinned_session_ready_identity_fingerprint,
         )
 
@@ -6951,8 +6962,8 @@ class TestCreatePersistentApp:
         assert payload["capabilities"]["pinned_session_identity_contract"] == 1
 
     def test_app_guide_health_reports_reader_registration_loss(self, monkeypatch):
-        import src.api.persistent_app as mod
-        from src.core.skill_resolution import APP_GUIDE_BREAK_GLASS_ENV
+        import agent.api.persistent_app as mod
+        from shared.runtime.core.skill_resolution import APP_GUIDE_BREAK_GLASS_ENV
 
         monkeypatch.delenv(APP_GUIDE_BREAK_GLASS_ENV, raising=False)
         monkeypatch.delitem(
@@ -7001,7 +7012,7 @@ class TestCanvasControlMessages:
     async def test_source_updated_invalidates_read_and_uses_distinct_event(
         self, monkeypatch
     ):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._clear_all_canvas_awareness()
         tool_context = MagicMock()
@@ -7066,7 +7077,7 @@ class TestCanvasControlMessages:
     async def test_presentation_updated_reloads_authority_and_broadcasts_state(
         self, monkeypatch
     ):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._clear_all_canvas_awareness()
         tool_context = MagicMock()
@@ -7107,7 +7118,7 @@ class TestCanvasControlMessages:
 
     @pytest.mark.asyncio
     async def test_presentation_updated_rejects_extra_file_identity(self, monkeypatch):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         state_loader = AsyncMock()
         send = AsyncMock()
@@ -7132,7 +7143,7 @@ class TestCanvasControlMessages:
     async def test_malformed_source_update_is_rejected_before_validation(
         self, monkeypatch
     ):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         state_loader = AsyncMock()
         send = AsyncMock()
@@ -7158,7 +7169,7 @@ class TestCanvasControlMessages:
     async def test_awareness_is_one_live_only_lease_and_local_renew_idle(
         self, monkeypatch
     ):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._clear_all_canvas_awareness()
         state_loader = AsyncMock(return_value=self._state())
@@ -7246,7 +7257,7 @@ class TestHandleConfigUpdateEnrichmentGate:
 
     def test_gate_checks_auxiliary_model(self):
         from inspect import getsource
-        from src.api.persistent_app import _handle_config_update
+        from agent.api.persistent_app import _handle_config_update
 
         src = getsource(_handle_config_update)
         assert 'config_override.get("auxiliary", {}).get("model")' in src, (
@@ -7256,7 +7267,7 @@ class TestHandleConfigUpdateEnrichmentGate:
 
     def test_gate_checks_embedding_env_keys(self):
         from inspect import getsource
-        from src.api.persistent_app import _handle_config_update
+        from agent.api.persistent_app import _handle_config_update
 
         src = getsource(_handle_config_update)
         for key in (
@@ -7273,7 +7284,7 @@ class TestHandleConfigUpdateEnrichmentGate:
     def test_gate_checks_tool_updates_before_local_reload(self):
         from inspect import getsource
 
-        from src.api.persistent_app import _handle_config_update
+        from agent.api.persistent_app import _handle_config_update
 
         src = getsource(_handle_config_update)
         assert 'or config_override.get("tools")' in src
@@ -7286,7 +7297,7 @@ class TestHandleConfigUpdateEnrichmentGate:
         was the defect: a live "turn shell off" was acknowledged and discarded.
         Every category is validated against the registry now; the copy is what
         keeps the caller-owned WebSocket payload immutable."""
-        from src.api.persistent_app import _sanitize_live_session_config_override
+        from agent.api.persistent_app import _sanitize_live_session_config_override
 
         original = {
             "llm": {"temperature": 0.2},
@@ -7305,7 +7316,7 @@ class TestHandleConfigUpdateEnrichmentGate:
 
     @pytest.mark.parametrize("key", ["permission_mode", "narration_mode"])
     def test_live_config_update_rejects_ordered_control_scalars(self, key):
-        from src.api.persistent_app import _sanitize_live_session_config_override
+        from agent.api.persistent_app import _sanitize_live_session_config_override
 
         with pytest.raises(ValueError, match="session control endpoint"):
             _sanitize_live_session_config_override({"interactive": {key: "autonomous"}})
@@ -7314,7 +7325,7 @@ class TestHandleConfigUpdateEnrichmentGate:
     async def test_live_cross_category_tool_smuggling_never_reloads_tools(
         self, monkeypatch
     ):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         session = SimpleNamespace(resetup_tools_for_backend=MagicMock())
         orchestrator_client = SimpleNamespace(update_thread_config=AsyncMock())
@@ -7348,7 +7359,7 @@ class TestHandleConfigUpdateEnrichmentGate:
     async def test_protected_runtime_class_update_has_zero_local_or_remote_effect(
         self, monkeypatch, fragment
     ):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         config_sentinel = object()
         backend_sentinel = object()
@@ -7385,8 +7396,8 @@ class TestHandleConfigUpdateEnrichmentGate:
     async def test_ordinary_runtime_class_update_is_authorized_before_local_merge(
         self, monkeypatch
     ):
-        import src.api.persistent_app as mod
-        from src.api.orchestrator_client import ThreadConfigUpdateDenied
+        import agent.api.persistent_app as mod
+        from agent.api.orchestrator_client import ThreadConfigUpdateDenied
 
         config_sentinel = object()
         session = SimpleNamespace(
@@ -7419,7 +7430,7 @@ class TestHandleConfigUpdateEnrichmentGate:
         landmark `_session.auxiliary_llm = AuxiliaryLLM(` assignment so
         the rebuild path can't silently regress to the singleton."""
         from inspect import getsource
-        from src.api.persistent_app import _handle_config_update
+        from agent.api.persistent_app import _handle_config_update
 
         src = getsource(_handle_config_update)
         assert "_session.auxiliary_llm = AuxiliaryLLM(" in src
@@ -7430,7 +7441,7 @@ class TestHandleConfigUpdateEnrichmentGate:
         env. Without this the process-wide singleton sticks at the
         boot-time base_url and 401s on api.openai.com."""
         from inspect import getsource
-        from src.api.persistent_app import _handle_config_update
+        from agent.api.persistent_app import _handle_config_update
 
         src = getsource(_handle_config_update)
         assert "_embedding_module._embedding_service = None" in src
@@ -7447,8 +7458,8 @@ class TestHandleConfigUpdateAckProtocol:
         """A 4xx from the orchestrator (grant denial) must produce an error
         frame carrying the detail + request_id and must NOT fall back to
         applying the raw override locally (the old silent-escalation hole)."""
-        import src.api.persistent_app as mod
-        from src.api.orchestrator_client import ThreadConfigUpdateDenied
+        import agent.api.persistent_app as mod
+        from agent.api.orchestrator_client import ThreadConfigUpdateDenied
 
         session = SimpleNamespace(resetup_tools_for_backend=MagicMock())
         orchestrator_client = SimpleNamespace(
@@ -7479,7 +7490,7 @@ class TestHandleConfigUpdateAckProtocol:
     async def test_tools_rejection_echoes_request_id(self, monkeypatch):
         """The fail-loud tools gate (no orchestrator) keeps its semantics and
         now correlates: the error frame carries the caller's request_id."""
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         session = SimpleNamespace(resetup_tools_for_backend=MagicMock())
         send = AsyncMock()
@@ -7504,7 +7515,7 @@ class TestHandleConfigUpdateAckProtocol:
         the applied fragment + request_id. Source-shape pin, matching this
         file's convention for the deep post-rebuild path."""
         from inspect import getsource
-        from src.api.persistent_app import _handle_config_update
+        from agent.api.persistent_app import _handle_config_update
 
         src = getsource(_handle_config_update)
         assert '_broadcast("config.changed", ack)' in src
@@ -7517,7 +7528,7 @@ class TestHandleConfigUpdateAckProtocol:
         mode locally — otherwise a denied escalation still takes effect
         in-RAM until the next attach."""
         from inspect import getsource
-        from src.api.persistent_app import _handle_config_update
+        from agent.api.persistent_app import _handle_config_update
 
         src = getsource(_handle_config_update)
         assert src.index("not needs_enrichment") < src.index(
@@ -7525,7 +7536,7 @@ class TestHandleConfigUpdateAckProtocol:
         )
 
     def test_scrub_secret_values_drops_api_keys_recursively(self):
-        from src.api.persistent_app import _scrub_secret_values
+        from agent.api.persistent_app import _scrub_secret_values
 
         fragment = {
             "llm": {"model": "m", "api_key": "sk-secret", "base_url": "http://x"},
@@ -7551,7 +7562,7 @@ class TestHandleConfigUpdateDatasources:
     async def test_datasource_update_without_orchestrator_fails_loud(self, monkeypatch):
         """No orchestrator ⇒ no change: credentials only exist orchestrator-
         side and the grant flip can't be evaluated locally."""
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         session = SimpleNamespace(
             resetup_tools_for_backend=MagicMock(),
@@ -7579,8 +7590,8 @@ class TestHandleConfigUpdateDatasources:
         """A datasource-only change sends config={} — the 'no supported
         fields' guard must not reject it. (It then proceeds to the PATCH;
         a denial here proves the guard was passed.)"""
-        import src.api.persistent_app as mod
-        from src.api.orchestrator_client import ThreadConfigUpdateDenied
+        import agent.api.persistent_app as mod
+        from agent.api.orchestrator_client import ThreadConfigUpdateDenied
 
         session = SimpleNamespace(resetup_datasources=MagicMock())
         orchestrator_client = SimpleNamespace(
@@ -7614,7 +7625,7 @@ class TestHandleConfigUpdateDatasources:
         """PATCH succeeded (durable set updated) but the enriched payload
         fetch failed: surface the inconsistency and apply NOTHING locally —
         the next attach converges from metadata.datasource_ids."""
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         session = SimpleNamespace(resetup_datasources=MagicMock())
         orchestrator_client = SimpleNamespace(
@@ -7640,7 +7651,7 @@ class TestHandleConfigUpdateDatasources:
     def test_datasource_update_forces_enrichment_gate(self):
         from inspect import getsource
 
-        from src.api.persistent_app import _handle_config_update
+        from agent.api.persistent_app import _handle_config_update
 
         src = getsource(_handle_config_update)
         assert "or ds_update" in src
@@ -7656,7 +7667,7 @@ class TestHandleConfigUpdateDatasources:
         close."""
         from inspect import getsource
 
-        from src.api.persistent_app import _handle_config_update
+        from agent.api.persistent_app import _handle_config_update
 
         src = getsource(_handle_config_update)
         assert "_session.resetup_datasources(" in src
@@ -7667,7 +7678,7 @@ class TestHandleConfigUpdateDatasources:
     def test_turn_end_closer_waits_on_the_turn_flag(self):
         from inspect import getsource
 
-        from src.api.persistent_app import _close_datasources_after_turn
+        from agent.api.persistent_app import _close_datasources_after_turn
 
         src = getsource(_close_datasources_after_turn)
         assert "_turn_in_flight()" in src
@@ -7675,7 +7686,7 @@ class TestHandleConfigUpdateDatasources:
 
     @pytest.mark.asyncio
     async def test_close_after_turn_polls_until_turn_ends(self, monkeypatch):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         flags = iter([True, False])
         monkeypatch.setattr(mod, "_turn_in_flight", lambda: next(flags))
@@ -7704,7 +7715,7 @@ class TestAttachSessionRebinds:
 
     def test_attach_rebuilds_auxiliary_when_override_present(self):
         from inspect import getsource
-        from src.api.persistent_app import _attach_session_inner
+        from agent.api.persistent_app import _attach_session_inner
 
         src = getsource(_attach_session_inner)
         # Auxiliary rebuild branch
@@ -7719,7 +7730,7 @@ class TestAttachSessionRebinds:
         must still route through it, and the helper must reset the singleton
         and own all four memory-embedding keys."""
         from inspect import getsource
-        from src.api.persistent_app import (
+        from agent.api.persistent_app import (
             MEMORY_EMBEDDING_ENV_KEYS,
             _apply_session_embedding_env,
             _attach_session_inner,
@@ -7751,7 +7762,7 @@ class TestSignalWsConnected:
     def test_sets_event_when_present(self):
         import asyncio
 
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         event = asyncio.Event()
         with patch.object(pa, "_ws_connected_event", event):
@@ -7759,7 +7770,7 @@ class TestSignalWsConnected:
         assert event.is_set()
 
     def test_no_op_when_event_is_none(self):
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         with patch.object(pa, "_ws_connected_event", None):
             pa._signal_ws_connected()  # Should not raise
@@ -7770,7 +7781,7 @@ class TestBootWsWatchdog:
     async def test_returns_early_when_ws_connects(self):
         import asyncio
 
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         event = asyncio.Event()
         event.set()  # Pre-set so wait_for returns immediately
@@ -7785,7 +7796,7 @@ class TestBootWsWatchdog:
     async def test_triggers_detach_and_exit_on_timeout(self):
         import asyncio
 
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         event = asyncio.Event()  # Never set
         with patch.object(pa, "_ws_connected_event", event):
@@ -7801,7 +7812,7 @@ class TestBootWsWatchdog:
     async def test_boot_timeout_keeps_process_when_exact_cleanup_is_unproven(self):
         import asyncio
 
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         event = asyncio.Event()  # Never set
         with patch.object(pa, "_ws_connected_event", event):
@@ -7821,7 +7832,7 @@ class TestBootWsWatchdog:
 class TestThreadStatusWatchdog:
     @pytest.mark.asyncio
     async def test_exits_when_thread_status_is_ended(self):
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         client = AsyncMock()
         client.get_thread_lifecycle = AsyncMock(
@@ -7838,7 +7849,7 @@ class TestThreadStatusWatchdog:
 
     @pytest.mark.asyncio
     async def test_does_not_exit_when_out_of_band_cleanup_is_unproven(self):
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         client = AsyncMock()
         client.get_thread_lifecycle = AsyncMock(return_value={"status": "ended"})
@@ -7861,7 +7872,7 @@ class TestThreadStatusWatchdog:
     async def test_does_not_exit_when_thread_active(self):
         import asyncio
 
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         client = AsyncMock()
         client.get_thread_lifecycle = AsyncMock(
@@ -7885,7 +7896,7 @@ class TestThreadStatusWatchdog:
 
     @pytest.mark.asyncio
     async def test_exits_when_active_row_belongs_to_resumed_runtime_generation(self):
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         generation_a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         generation_b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
@@ -7915,7 +7926,7 @@ class TestThreadStatusWatchdog:
     async def test_exits_when_same_agent_generation_was_rebound_to_new_attach_token(
         self,
     ):
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         generation = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         token_a = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
@@ -7948,7 +7959,7 @@ class TestThreadStatusWatchdog:
     async def test_continues_when_lifecycle_fetch_fails(self):
         import asyncio
 
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         client = AsyncMock()
         client.get_thread_lifecycle = AsyncMock(side_effect=RuntimeError("network"))
@@ -7977,7 +7988,7 @@ class TestThreadStatusWatchdog:
         # See knowledge-base/knowledge/issues/persistent_session_watchdog_kills_awaiting_user.md.
         import asyncio
 
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         client = AsyncMock()
         client.get_thread_lifecycle = AsyncMock(
@@ -8006,7 +8017,7 @@ class TestThreadStatusWatchdog:
         # The orchestrator's attention-sleep watchdog owns the
         # awaiting_user → suspended transition. Once suspended, the
         # workspace pod is gone, so this agent is stranded and must exit.
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         client = AsyncMock()
         client.get_thread_lifecycle = AsyncMock(
@@ -8030,7 +8041,7 @@ class TestStartStopWatchdogs:
     async def test_start_creates_two_named_tasks(self):
         import asyncio
 
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         with patch.object(pa, "_watchdog_tasks", []):
             pa._start_watchdogs()
@@ -8049,7 +8060,7 @@ class TestStartStopWatchdogs:
     async def test_start_cancels_prior_tasks(self):
         import asyncio
 
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         async def _forever():
             await asyncio.sleep(60)
@@ -8073,7 +8084,7 @@ class TestStartStopWatchdogs:
         # raise CancelledError in the very watchdog that triggered detach.
         import asyncio
 
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         async def fake_watchdog():
             pa._stop_watchdogs()
@@ -8094,18 +8105,18 @@ class TestWorkspaceNotReadyException:
     """WorkspaceNotReady is a RuntimeError subclass."""
 
     def test_is_subclass_of_runtime_error(self):
-        from src.api.persistent_app import WorkspaceNotReady
+        from agent.api.persistent_app import WorkspaceNotReady
 
         assert issubclass(WorkspaceNotReady, RuntimeError)
 
     def test_can_be_caught_as_runtime_error(self):
-        from src.api.persistent_app import WorkspaceNotReady
+        from agent.api.persistent_app import WorkspaceNotReady
 
         with pytest.raises(RuntimeError):
             raise WorkspaceNotReady("test message")
 
     def test_message_is_preserved(self):
-        from src.api.persistent_app import WorkspaceNotReady
+        from agent.api.persistent_app import WorkspaceNotReady
 
         exc = WorkspaceNotReady("some message")
         assert "some message" in str(exc)
@@ -8116,8 +8127,8 @@ class TestAttachSessionRaisesWorkspaceNotReady:
 
     @pytest.mark.asyncio
     async def test_raises_workspace_not_ready_when_poll_returns_none(self):
-        from src.api import persistent_app as pa
-        from src.api.persistent_app import WorkspaceNotReady
+        from agent.api import persistent_app as pa
+        from agent.api.persistent_app import WorkspaceNotReady
 
         mock_client = AsyncMock()
 
@@ -8131,8 +8142,8 @@ class TestAttachSessionRaisesWorkspaceNotReady:
 
     @pytest.mark.asyncio
     async def test_raises_contains_descriptive_message(self):
-        from src.api import persistent_app as pa
-        from src.api.persistent_app import WorkspaceNotReady
+        from agent.api import persistent_app as pa
+        from agent.api.persistent_app import WorkspaceNotReady
 
         mock_client = AsyncMock()
 
@@ -8147,8 +8158,8 @@ class TestAttachSessionRaisesWorkspaceNotReady:
     @pytest.mark.asyncio
     async def test_double_attach_guard_still_raises_plain_runtime_error(self):
         """The :626 double-attach guard must remain a plain RuntimeError, not WorkspaceNotReady."""
-        from src.api import persistent_app as pa
-        from src.api.persistent_app import WorkspaceNotReady
+        from agent.api import persistent_app as pa
+        from agent.api.persistent_app import WorkspaceNotReady
 
         mock_session = MagicMock()
 
@@ -8172,7 +8183,7 @@ class TestExitDuplicateProvisionHelper:
     @pytest.mark.asyncio
     async def test_exit_duplicate_provision_calls_os_exit_zero(self):
         """The handler helper invokes os._exit(0) so the orphan pod completes."""
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         mock_client = MagicMock()
         mock_client.stop_heartbeat = MagicMock()
@@ -8190,7 +8201,7 @@ class TestExitDuplicateProvisionHelper:
     @pytest.mark.asyncio
     async def test_exit_duplicate_provision_best_effort_deregister(self):
         """Best-effort self-deregister + close are awaited before os._exit."""
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         mock_client = MagicMock()
         mock_client.stop_heartbeat = MagicMock()
@@ -8213,8 +8224,8 @@ class TestExitWorkspaceNotReadyHelper:
     @pytest.mark.asyncio
     async def test_exit_workspace_not_ready_calls_os_exit_zero(self):
         """The handler helper invokes os._exit(0)."""
-        from src.api import persistent_app as pa
-        from src.api.persistent_app import WorkspaceNotReady
+        from agent.api import persistent_app as pa
+        from agent.api.persistent_app import WorkspaceNotReady
 
         mock_client = MagicMock()
         mock_client.stop_heartbeat = MagicMock()
@@ -8234,8 +8245,8 @@ class TestExitWorkspaceNotReadyHelper:
     @pytest.mark.asyncio
     async def test_exit_workspace_not_ready_cancels_heartbeat_task(self):
         """When a heartbeat task exists, it is cancelled during clean exit."""
-        from src.api import persistent_app as pa
-        from src.api.persistent_app import WorkspaceNotReady
+        from agent.api import persistent_app as pa
+        from agent.api.persistent_app import WorkspaceNotReady
 
         mock_task = MagicMock()
         mock_client = MagicMock()
@@ -8257,8 +8268,8 @@ class TestExitWorkspaceNotReadyHelper:
     @pytest.mark.asyncio
     async def test_exit_workspace_not_ready_attempts_deregister(self):
         """Best-effort deregister is awaited before os._exit."""
-        from src.api import persistent_app as pa
-        from src.api.persistent_app import WorkspaceNotReady
+        from agent.api import persistent_app as pa
+        from agent.api.persistent_app import WorkspaceNotReady
 
         deregister = AsyncMock()
         close = AsyncMock()
@@ -8281,8 +8292,8 @@ class TestExitWorkspaceNotReadyHelper:
     @pytest.mark.asyncio
     async def test_exit_workspace_not_ready_no_client_still_exits(self):
         """Even without an orchestrator client, os._exit(0) is called."""
-        from src.api import persistent_app as pa
-        from src.api.persistent_app import WorkspaceNotReady
+        from agent.api import persistent_app as pa
+        from agent.api.persistent_app import WorkspaceNotReady
 
         exc = WorkspaceNotReady("no workspace")
 
@@ -8297,8 +8308,8 @@ class TestExitWorkspaceNotReadyHelper:
     @pytest.mark.asyncio
     async def test_exit_workspace_not_ready_deregister_failure_still_exits(self):
         """A deregister exception is swallowed; os._exit(0) is still called."""
-        from src.api import persistent_app as pa
-        from src.api.persistent_app import WorkspaceNotReady
+        from agent.api import persistent_app as pa
+        from agent.api.persistent_app import WorkspaceNotReady
 
         mock_client = MagicMock()
         mock_client.stop_heartbeat = MagicMock()
@@ -8343,7 +8354,7 @@ class TestScheduleExitDeregisters:
 
     @pytest.mark.asyncio
     async def test_scheduled_exit_deregisters_then_exits(self):
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         mock_client = self._client()
         with patch.object(pa, "_orchestrator_client", mock_client):
@@ -8356,7 +8367,7 @@ class TestScheduleExitDeregisters:
 
     @pytest.mark.asyncio
     async def test_scheduled_exit_proceeds_when_deregister_hangs(self):
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         mock_client = self._client()
 
@@ -8374,7 +8385,7 @@ class TestScheduleExitDeregisters:
 
     @pytest.mark.asyncio
     async def test_scheduled_exit_proceeds_when_deregister_errors(self):
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         mock_client = self._client()
         mock_client.deregister = AsyncMock(side_effect=RuntimeError("500"))
@@ -8387,7 +8398,7 @@ class TestScheduleExitDeregisters:
 
     @pytest.mark.asyncio
     async def test_scheduled_exit_without_client_still_exits(self):
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         with patch.object(pa, "_orchestrator_client", None):
             with patch.object(pa, "_heartbeat_task", None):
@@ -8484,7 +8495,7 @@ async def test_vm_tier_poll_rides_out_a_transient_workspace_failure():
     orchestrator restart, or a briefly unavailable repository authority)."""
     from unittest.mock import AsyncMock
 
-    from src.api.persistent_app import _poll_workspace_ready
+    from agent.api.persistent_app import _poll_workspace_ready
 
     client = AsyncMock()
     client.get_thread_workspace = AsyncMock(

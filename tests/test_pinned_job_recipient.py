@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from orchestrator import main
-from src.api.models import PinnedJobRecipient, pinned_job_recipient_matches
+from agent.api.models import PinnedJobRecipient, pinned_job_recipient_matches
 
 
 AGENT_ID = "11111111-1111-4111-8111-111111111111"

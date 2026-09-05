@@ -22,8 +22,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.api.orchestrator_client import CompletionDecisionError
-from src.tools.core.job import (
+from agent.api.orchestrator_client import CompletionDecisionError
+from agent.tools.core.job import (
     _final_phase_data,
     create_job_tools,
     get_final_phase_data,
@@ -196,12 +196,12 @@ class TestJobCompleteJournal:
 
 class TestDecisionStateMirror:
     def test_empty_when_no_decision(self):
-        from src.graph import _decision_state_mirror
+        from agent.graph import _decision_state_mirror
 
         assert _decision_state_mirror(JOB_ID) == {}
 
     def test_mirrors_completion_decision_and_sets_flag(self):
-        from src.graph import _decision_state_mirror
+        from agent.graph import _decision_state_mirror
 
         _final_phase_data[JOB_ID] = {"summary": "S", "tool_call_id": "t1"}
         updates = _decision_state_mirror(JOB_ID)
@@ -210,8 +210,8 @@ class TestDecisionStateMirror:
         assert "verdict_decision" not in updates
 
     def test_mirrors_verdict_decision(self):
-        from src.graph import _decision_state_mirror
-        from src.tools.evaluation.evaluation_tools import _verdict_data
+        from agent.graph import _decision_state_mirror
+        from agent.tools.evaluation.evaluation_tools import _verdict_data
 
         _verdict_data[JOB_ID] = {"_verdict": "returned", "_target_job_id": "t"}
         try:
@@ -234,7 +234,7 @@ def _finalize_fixtures():
 class TestFinalizeDurableFirst:
     def test_state_channel_fallback_when_cache_empty(self):
         """A restarted process finalizes from the checkpointed mirror."""
-        from src.core.phase import finalize_job
+        from agent.core.phase import finalize_job
 
         workspace, todo_manager = _finalize_fixtures()
         state = {
@@ -260,7 +260,7 @@ class TestFinalizeDurableFirst:
 
     def test_worker_without_decision_rejects_instead_of_fabricating(self):
         """The placeholder report ('Job completed', [], 1.0) must be dead."""
-        from src.core.phase import finalize_job
+        from agent.core.phase import finalize_job
 
         workspace, todo_manager = _finalize_fixtures()
         state = {
@@ -279,7 +279,7 @@ class TestFinalizeDurableFirst:
 
     def test_critic_without_verdict_completes_with_honest_report(self):
         """Fail-closed escalation path keeps working, without fabrication."""
-        from src.core.phase import finalize_job
+        from agent.core.phase import finalize_job
 
         workspace, todo_manager = _finalize_fixtures()
         state = {
@@ -301,7 +301,7 @@ class TestFinalizeDurableFirst:
 
     def test_verdict_recovered_from_state_channel(self):
         """A restarted critic's freeze carries the journaled verdict."""
-        from src.core.phase import finalize_job
+        from agent.core.phase import finalize_job
 
         workspace, todo_manager = _finalize_fixtures()
         state = {
@@ -324,7 +324,7 @@ class TestFinalizeDurableFirst:
 
     def test_trigger_fires_from_state_mirror_alone(self):
         """on_strategic_phase_complete finalizes off the checkpointed mirror."""
-        from src.core.phase import on_strategic_phase_complete
+        from agent.core.phase import on_strategic_phase_complete
 
         workspace, todo_manager = _finalize_fixtures()
         state = {

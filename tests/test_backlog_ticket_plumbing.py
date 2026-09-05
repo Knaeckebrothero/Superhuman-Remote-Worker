@@ -21,9 +21,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.tools.knowledge.knowledge_tools import create_kb_tools
-from src.services.knowledge.bindings import KnowledgeBinding
-from src.shared.runtime_actor import (
+from agent.tools.knowledge.knowledge_tools import create_kb_tools
+from agent.services.knowledge.bindings import KnowledgeBinding
+from shared.runtime_actor import (
     SENSITIVE_KNOWLEDGE_HUMAN_ROLE_POLICY,
     RuntimeActorContext,
     RuntimeAuthorizationResult,
@@ -164,11 +164,11 @@ def canonical_writes():
 
     with (
         patch(
-            "src.tools.knowledge.knowledge_tools._post_vault_file",
+            "agent.tools.knowledge.knowledge_tools._post_vault_file",
             side_effect=_record,
         ),
         patch(
-            "src.tools.knowledge.knowledge_tools._request_runtime_actor_authorization",
+            "agent.tools.knowledge.knowledge_tools._request_runtime_actor_authorization",
             side_effect=_authorize_from_test_actor,
         ),
     ):
@@ -189,7 +189,7 @@ def _capture_materialize():
 
     return (
         patch(
-            "src.tools.knowledge.knowledge_tools._post_vault_file",
+            "agent.tools.knowledge.knowledge_tools._post_vault_file",
             side_effect=_record,
         ),
         calls,
@@ -467,7 +467,7 @@ class TestOfficerOnlyTags:
         ctx.knowledge_graph = MagicMock()
         ctx.knowledge_graph.read_note.return_value = existing
         with patch(
-            "src.tools.knowledge.knowledge_tools._post_vault_file"
+            "agent.tools.knowledge.knowledge_tools._post_vault_file"
         ) as canonical_write:
             result = _tool(ctx, "kb_update").invoke(
                 {
@@ -646,7 +646,7 @@ class TestMachineTagsStayOutOfSearch:
     async def test_search_doc_excludes_the_machine_namespace(self):
         # A search for "researcher" that returns every ticket in the research
         # pool buries the notes that are actually about research.
-        from src.services.knowledge_store import KnowledgeStore
+        from shared.runtime.services.knowledge_store import KnowledgeStore
 
         db = AsyncMock()
         db.fetchval.side_effect = [None, uuid.uuid4()]  # no existing row -> INSERT
@@ -671,7 +671,7 @@ class TestMachineTagsStayOutOfSearch:
     @pytest.mark.asyncio
     async def test_the_note_still_stores_every_tag(self):
         # Exclusion is about the tsvector only — the tick reads tags off the row.
-        from src.services.knowledge_store import KnowledgeStore
+        from shared.runtime.services.knowledge_store import KnowledgeStore
 
         db = AsyncMock()
         db.fetchval.side_effect = [None, uuid.uuid4()]

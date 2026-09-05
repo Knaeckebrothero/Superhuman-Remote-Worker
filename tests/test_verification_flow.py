@@ -771,7 +771,7 @@ class TestLedgerIsNotPubliclySeedable:
     """
 
     def test_verification_rounds_is_stripped_from_a_public_payload(self):
-        from main import JobCreate, _strip_public_job_reserved_markers
+        from orchestrator.main import JobCreate, _strip_public_job_reserved_markers
 
         job = JobCreate(
             description="d",
@@ -790,7 +790,7 @@ class TestLedgerIsNotPubliclySeedable:
     def test_it_joins_the_other_verification_markers(self):
         """``verification_target`` was already stripped; the ledger the target
         side of that pair owns must be too."""
-        from main import _PUBLIC_JOB_CONTEXT_RESERVED_KEYS
+        from orchestrator.main import _PUBLIC_JOB_CONTEXT_RESERVED_KEYS
 
         assert "verification_target" in _PUBLIC_JOB_CONTEXT_RESERVED_KEYS
         assert "verification_rounds" in _PUBLIC_JOB_CONTEXT_RESERVED_KEYS

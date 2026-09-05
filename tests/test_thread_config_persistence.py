@@ -16,21 +16,15 @@ from __future__ import annotations
 
 import json
 import os
-import sys
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-_ORCH = Path(__file__).parent.parent / "orchestrator"
-if str(_ORCH) not in sys.path:
-    sys.path.insert(0, str(_ORCH))
-
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
-import main  # noqa: E402
-from security.access import redact_config_override  # noqa: E402
-from src.core.model_registry import ModelMeta  # noqa: E402
+import orchestrator.main  # noqa: E402
+from orchestrator.security.access import redact_config_override  # noqa: E402
+from shared.runtime.core.model_registry import ModelMeta  # noqa: E402
 
 
 ENDPOINT_ID = "11111111-1111-1111-1111-111111111111"
@@ -68,18 +62,23 @@ def patched_main(monkeypatch):
         return None
 
     monkeypatch.setattr(
-        main, "_resolve_model", AsyncMock(side_effect=fake_resolve), raising=True
+        orchestrator.main,
+        "_resolve_model",
+        AsyncMock(side_effect=fake_resolve),
+        raising=True,
     )
     monkeypatch.setattr(
-        main.postgres_db,
+        orchestrator.main.postgres_db,
         "get_user_llm_endpoint",
         AsyncMock(side_effect=fake_get_endpoint),
     )
     monkeypatch.setattr(
-        main.postgres_db, "resolve_api_keys_for_job", AsyncMock(return_value={})
+        orchestrator.main.postgres_db,
+        "resolve_api_keys_for_job",
+        AsyncMock(return_value={}),
     )
     monkeypatch.setattr(
-        main.postgres_db,
+        orchestrator.main.postgres_db,
         "resolve_default_for_capability",
         AsyncMock(return_value=None),
     )
@@ -89,7 +88,7 @@ class TestInjectThreadCredentials:
     @pytest.mark.asyncio
     async def test_fresh_injection(self, patched_main):
         co = {"llm": {"model": "custom-model"}}
-        out = await main._inject_thread_dispatch_credentials(
+        out = await orchestrator.main._inject_thread_dispatch_credentials(
             co, user_id="u", project_id="p"
         )
         assert out["llm"]["base_url"] == BASE_URL
@@ -102,7 +101,7 @@ class TestInjectThreadCredentials:
         stripped = {
             "llm": {"model": "custom-model", "provider": "openai", "base_url": BASE_URL}
         }
-        out = await main._inject_thread_dispatch_credentials(
+        out = await orchestrator.main._inject_thread_dispatch_credentials(
             stripped, user_id="u", project_id="p"
         )
         assert out["llm"]["api_key"] == API_KEY
@@ -113,7 +112,7 @@ class TestInjectThreadCredentials:
         """A prior hot-swap leaves provider/base_url=None sentinels in the stored
         copy; re-injection must treat them as absent and repopulate."""
         stored = {"llm": {"model": "custom-model", "provider": None, "base_url": None}}
-        out = await main._inject_thread_dispatch_credentials(
+        out = await orchestrator.main._inject_thread_dispatch_credentials(
             stored, user_id="u", project_id="p"
         )
         assert out["llm"]["base_url"] == BASE_URL
@@ -121,7 +120,7 @@ class TestInjectThreadCredentials:
 
     @pytest.mark.asyncio
     async def test_redact_then_reinject_round_trip(self, patched_main):
-        enriched = await main._inject_thread_dispatch_credentials(
+        enriched = await orchestrator.main._inject_thread_dispatch_credentials(
             {"llm": {"model": "custom-model"}}, user_id="u", project_id="p"
         )
         stripped = redact_config_override(enriched)
@@ -129,7 +128,7 @@ class TestInjectThreadCredentials:
         assert "api_key" not in stripped["llm"]
         assert stripped["llm"]["base_url"] == BASE_URL
         # Re-injection restores it.
-        restored = await main._inject_thread_dispatch_credentials(
+        restored = await orchestrator.main._inject_thread_dispatch_credentials(
             stripped, user_id="u", project_id="p"
         )
         assert restored["llm"]["api_key"] == API_KEY
@@ -157,17 +156,17 @@ class TestInjectThreadCredentials:
             return None
 
         monkeypatch.setattr(
-            main.postgres_db,
+            orchestrator.main.postgres_db,
             "resolve_default_for_capability",
             AsyncMock(side_effect=fake_default),
         )
         monkeypatch.setattr(
-            main.postgres_db,
+            orchestrator.main.postgres_db,
             "resolve_api_keys_for_job",
             AsyncMock(return_value={}),
         )
         monkeypatch.setattr(
-            main.postgres_db,
+            orchestrator.main.postgres_db,
             "get_user_llm_endpoint",
             AsyncMock(
                 return_value={
@@ -177,7 +176,7 @@ class TestInjectThreadCredentials:
             ),
         )
         monkeypatch.setattr(
-            main,
+            orchestrator.main,
             "_resolve_model",
             AsyncMock(side_effect=fake_resolve),
             raising=True,
@@ -191,7 +190,7 @@ class TestInjectThreadCredentials:
             }
         }
 
-        out = await main._inject_thread_dispatch_credentials(
+        out = await orchestrator.main._inject_thread_dispatch_credentials(
             co,
             user_id="u",
             project_id="p",
@@ -212,47 +211,67 @@ async def test_resolved_session_uses_canonical_mount_projects_for_kb_gate(monkey
     """A mount-only project thread still receives KB_* in the preferred blob."""
     thread_id = "aaaaaaaa-1111-2222-3333-444444444444"
     mounted_project = "bbbbbbbb-1111-2222-3333-444444444444"
-    monkeypatch.setattr(main, "_is_experts_db_enabled", lambda: True)
+    monkeypatch.setattr(orchestrator.main, "_is_experts_db_enabled", lambda: True)
     monkeypatch.setattr(
-        main, "_user_experts_enabled", AsyncMock(return_value=True), raising=True
+        orchestrator.main,
+        "_user_experts_enabled",
+        AsyncMock(return_value=True),
+        raising=True,
     )
     monkeypatch.setattr(
-        main, "_resolve_default_models", AsyncMock(return_value={}), raising=True
+        orchestrator.main,
+        "_resolve_default_models",
+        AsyncMock(return_value={}),
+        raising=True,
     )
     monkeypatch.setattr(
-        main, "_gather_in_scope_skills", AsyncMock(return_value=[]), raising=True
+        orchestrator.main,
+        "_gather_in_scope_skills",
+        AsyncMock(return_value=[]),
+        raising=True,
     )
     monkeypatch.setattr(
-        main,
+        orchestrator.main,
         "_seed_registry_model_overrides",
         AsyncMock(side_effect=lambda override, **_kwargs: override),
         raising=True,
     )
     project_lookup = AsyncMock(return_value=[mounted_project])
-    monkeypatch.setattr(main, "_thread_project_ids", project_lookup, raising=True)
     monkeypatch.setattr(
-        main, "_enforce_dispatch_grants", AsyncMock(return_value=None), raising=True
+        orchestrator.main, "_thread_project_ids", project_lookup, raising=True
+    )
+    monkeypatch.setattr(
+        orchestrator.main,
+        "_enforce_dispatch_grants",
+        AsyncMock(return_value=None),
+        raising=True,
     )
     injector = AsyncMock(side_effect=lambda co, **_kwargs: co)
     monkeypatch.setattr(
-        main, "_inject_thread_dispatch_credentials", injector, raising=True
+        orchestrator.main, "_inject_thread_dispatch_credentials", injector, raising=True
     )
 
     def fake_resolve_config(*, capture, **_kwargs):
         capture["merged_fragment"] = {}
         return {"agent": {}}
 
-    monkeypatch.setattr(main, "resolve_config", fake_resolve_config, raising=True)
+    monkeypatch.setattr(
+        orchestrator.main, "resolve_config", fake_resolve_config, raising=True
+    )
 
     async def fake_inject_blob(blob, callback):
         await callback({})
         return blob
 
-    monkeypatch.setattr(main, "inject_blob_credentials", fake_inject_blob, raising=True)
+    monkeypatch.setattr(
+        orchestrator.main, "inject_blob_credentials", fake_inject_blob, raising=True
+    )
     # The helper imports this function inside the call; patch the source module.
-    monkeypatch.setattr("src.core.skill_resolution.filter_bound_skills", MagicMock())
+    monkeypatch.setattr(
+        "shared.runtime.core.skill_resolution.filter_bound_skills", MagicMock()
+    )
 
-    result = await main._resolve_session_config(
+    result = await orchestrator.main._resolve_session_config(
         {"id": thread_id, "project_id": None, "config_name": "persistent_defaults"},
         {},
     )
@@ -295,18 +314,23 @@ def patched_main_codex_endpoint(monkeypatch):
         return None
 
     monkeypatch.setattr(
-        main, "_resolve_model", AsyncMock(side_effect=fake_resolve), raising=True
+        orchestrator.main,
+        "_resolve_model",
+        AsyncMock(side_effect=fake_resolve),
+        raising=True,
     )
     monkeypatch.setattr(
-        main.postgres_db,
+        orchestrator.main.postgres_db,
         "get_user_llm_endpoint",
         AsyncMock(side_effect=fake_get_endpoint),
     )
     monkeypatch.setattr(
-        main.postgres_db, "resolve_api_keys_for_job", AsyncMock(return_value={})
+        orchestrator.main.postgres_db,
+        "resolve_api_keys_for_job",
+        AsyncMock(return_value={}),
     )
     monkeypatch.setattr(
-        main.postgres_db,
+        orchestrator.main.postgres_db,
         "resolve_default_for_capability",
         AsyncMock(return_value=None),
     )
@@ -329,7 +353,7 @@ class TestCodexSessionStaleTransport:
                 "provider": "openai",  # stale factory
             }
         }
-        out = await main._inject_thread_dispatch_credentials(
+        out = await orchestrator.main._inject_thread_dispatch_credentials(
             stored,
             user_id="u",
         )
@@ -378,9 +402,13 @@ class TestStripBackfill:
             },
         ]
         conn = _FakeConn(rows)
-        monkeypatch.setattr(main.postgres_db, "acquire", lambda: _FakeAcquire(conn))
+        monkeypatch.setattr(
+            orchestrator.main.postgres_db, "acquire", lambda: _FakeAcquire(conn)
+        )
 
-        counts = await main.postgres_db.backfill_strip_thread_config_secrets()
+        counts = (
+            await orchestrator.main.postgres_db.backfill_strip_thread_config_secrets()
+        )
 
         assert counts == {"stripped": 1, "skipped": 1, "errors": 0}
         # Exactly one UPDATE, and its payload carries no secret.
@@ -398,9 +426,13 @@ class TestStripBackfill:
             }
         ]
         conn = _FakeConn(rows)
-        monkeypatch.setattr(main.postgres_db, "acquire", lambda: _FakeAcquire(conn))
+        monkeypatch.setattr(
+            orchestrator.main.postgres_db, "acquire", lambda: _FakeAcquire(conn)
+        )
 
-        counts = await main.postgres_db.backfill_strip_thread_config_secrets()
+        counts = (
+            await orchestrator.main.postgres_db.backfill_strip_thread_config_secrets()
+        )
 
         assert counts == {"stripped": 0, "skipped": 1, "errors": 0}
         assert conn.updates == []

@@ -67,14 +67,7 @@ def _get_knowledge_graph():
         return None
     _kg_cache["tried"] = True
     try:
-        import sys
-
-        from pathlib import Path
-
-        project_root = str(Path(__file__).parent.parent)
-        if project_root not in sys.path:
-            sys.path.insert(0, project_root)
-        from src.services.knowledge_graph import KnowledgeGraphDB
+        from shared.runtime.services.knowledge_graph import KnowledgeGraphDB
 
         kg = KnowledgeGraphDB()
         if not kg.connect():
@@ -469,7 +462,7 @@ class TestGetKnowledgeGraph:
     def teardown_method(self):
         _reset_kg_cache()
 
-    @patch("src.services.knowledge_graph.KnowledgeGraphDB")
+    @patch("shared.runtime.services.knowledge_graph.KnowledgeGraphDB")
     def test_returns_instance_on_successful_connect(self, MockKGDB):
         mock_kg = MagicMock()
         mock_kg.connect.return_value = True
@@ -477,7 +470,7 @@ class TestGetKnowledgeGraph:
         result = _get_knowledge_graph()
         assert result is mock_kg
 
-    @patch("src.services.knowledge_graph.KnowledgeGraphDB")
+    @patch("shared.runtime.services.knowledge_graph.KnowledgeGraphDB")
     def test_returns_cached_on_subsequent_calls(self, MockKGDB):
         mock_kg = MagicMock()
         mock_kg.connect.return_value = True
@@ -487,7 +480,7 @@ class TestGetKnowledgeGraph:
         assert first is second
         MockKGDB.assert_called_once()
 
-    @patch("src.services.knowledge_graph.KnowledgeGraphDB")
+    @patch("shared.runtime.services.knowledge_graph.KnowledgeGraphDB")
     def test_returns_none_on_connect_failure(self, MockKGDB):
         mock_kg = MagicMock()
         mock_kg.connect.return_value = False
@@ -496,13 +489,14 @@ class TestGetKnowledgeGraph:
         assert result is None
 
     @patch(
-        "src.services.knowledge_graph.KnowledgeGraphDB", side_effect=Exception("fail")
+        "shared.runtime.services.knowledge_graph.KnowledgeGraphDB",
+        side_effect=Exception("fail"),
     )
     def test_returns_none_on_exception(self, MockKGDB):
         result = _get_knowledge_graph()
         assert result is None
 
-    @patch.dict("sys.modules", {"src.services.knowledge_graph": None})
+    @patch.dict("sys.modules", {"shared.runtime.services.knowledge_graph": None})
     def test_returns_none_on_import_error(self):
         result = _get_knowledge_graph()
         assert result is None
@@ -1168,7 +1162,8 @@ class TestMaterializeEndpointIndexesInline:
                 main, "_build_kb_embedding_service", AsyncMock(return_value=svc)
             ),
             patch(
-                "services.kb_materialize.materialize_knowledge_note", _fake_materialize
+                "orchestrator.services.kb_materialize.materialize_knowledge_note",
+                _fake_materialize,
             ),
             patch.object(main, "require_internal", AsyncMock(return_value=None)),
         ):
@@ -1203,7 +1198,8 @@ class TestMaterializeEndpointIndexesInline:
                 main, "_build_kb_embedding_service", AsyncMock(return_value=None)
             ),
             patch(
-                "services.kb_materialize.materialize_knowledge_note", _fake_materialize
+                "orchestrator.services.kb_materialize.materialize_knowledge_note",
+                _fake_materialize,
             ),
             patch.object(main, "require_internal", AsyncMock(return_value=None)),
         ):
@@ -1241,7 +1237,8 @@ class TestMaterializeEndpointIndexesInline:
                 AsyncMock(side_effect=RuntimeError("catalog unavailable")),
             ),
             patch(
-                "services.kb_materialize.materialize_knowledge_note", _fake_materialize
+                "orchestrator.services.kb_materialize.materialize_knowledge_note",
+                _fake_materialize,
             ),
             patch.object(main, "require_internal", AsyncMock(return_value=None)),
         ):

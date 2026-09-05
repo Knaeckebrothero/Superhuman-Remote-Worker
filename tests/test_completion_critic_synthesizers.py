@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-import main
+import orchestrator.main
 
 
 @pytest.mark.asyncio
@@ -16,12 +16,12 @@ async def test_lost_s27_world_cas_has_no_external_followups(monkeypatch):
     wake = AsyncMock()
     dispatch = MagicMock()
     curation = AsyncMock()
-    monkeypatch.setattr(main, "postgres_db", database)
-    monkeypatch.setattr(main, "maybe_wake_session", wake)
-    monkeypatch.setattr(main, "_trigger_dispatch", dispatch)
-    monkeypatch.setattr(main, "_trigger_curation_final_pass", curation)
+    monkeypatch.setattr(orchestrator.main, "postgres_db", database)
+    monkeypatch.setattr(orchestrator.main, "maybe_wake_session", wake)
+    monkeypatch.setattr(orchestrator.main, "_trigger_dispatch", dispatch)
+    monkeypatch.setattr(orchestrator.main, "_trigger_curation_final_pass", curation)
 
-    result = await main._run_critic_verdict_followups(
+    result = await orchestrator.main._run_critic_verdict_followups(
         {
             "applicable": True,
             "world_cas_won": False,
@@ -45,12 +45,14 @@ async def test_lost_s30_world_cas_has_no_external_handoff(monkeypatch):
     workspace_handoff = AsyncMock()
     dispatch = MagicMock()
     wake = AsyncMock()
-    monkeypatch.setattr(main, "postgres_db", database)
-    monkeypatch.setattr(main, "_setup_verification_critic_workspace", workspace_handoff)
-    monkeypatch.setattr(main, "_trigger_dispatch", dispatch)
-    monkeypatch.setattr(main, "maybe_wake_session", wake)
+    monkeypatch.setattr(orchestrator.main, "postgres_db", database)
+    monkeypatch.setattr(
+        orchestrator.main, "_setup_verification_critic_workspace", workspace_handoff
+    )
+    monkeypatch.setattr(orchestrator.main, "_trigger_dispatch", dispatch)
+    monkeypatch.setattr(orchestrator.main, "maybe_wake_session", wake)
 
-    result = await main._run_verification_critic_handoff(
+    result = await orchestrator.main._run_verification_critic_handoff(
         {
             "applicable": True,
             "world_cas_won": False,
@@ -74,12 +76,12 @@ async def test_winning_s27_return_only_kicks_dispatch(monkeypatch):
     dispatch = MagicMock()
     wake = AsyncMock()
     curation = AsyncMock()
-    monkeypatch.setattr(main, "postgres_db", database)
-    monkeypatch.setattr(main, "_trigger_dispatch", dispatch)
-    monkeypatch.setattr(main, "maybe_wake_session", wake)
-    monkeypatch.setattr(main, "_trigger_curation_final_pass", curation)
+    monkeypatch.setattr(orchestrator.main, "postgres_db", database)
+    monkeypatch.setattr(orchestrator.main, "_trigger_dispatch", dispatch)
+    monkeypatch.setattr(orchestrator.main, "maybe_wake_session", wake)
+    monkeypatch.setattr(orchestrator.main, "_trigger_curation_final_pass", curation)
 
-    result = await main._run_critic_verdict_followups(
+    result = await orchestrator.main._run_critic_verdict_followups(
         {
             "applicable": True,
             "world_cas_won": True,
@@ -147,18 +149,18 @@ async def test_critic_escalation_followups_bound_multibyte_reason_and_action(
     notifier.record_review_returned = AsyncMock()
     wake = AsyncMock()
     wake_drain = MagicMock()
-    monkeypatch.setattr(main, "postgres_db", database)
-    monkeypatch.setattr(main, "notification_service", notifier)
-    monkeypatch.setattr(main, "maybe_wake_session", wake)
-    monkeypatch.setattr(main, "_kick_session_wake_drain", wake_drain)
+    monkeypatch.setattr(orchestrator.main, "postgres_db", database)
+    monkeypatch.setattr(orchestrator.main, "notification_service", notifier)
+    monkeypatch.setattr(orchestrator.main, "maybe_wake_session", wake)
+    monkeypatch.setattr(orchestrator.main, "_kick_session_wake_drain", wake_drain)
 
     if followup == "s27":
-        result = await main._run_critic_verdict_followups(
+        result = await orchestrator.main._run_critic_verdict_followups(
             plan,
             completion_command_id="command",
         )
     else:
-        result = await main._run_verification_critic_handoff(plan)
+        result = await orchestrator.main._run_verification_critic_handoff(plan)
 
     notified_reason = notifier.record_review_returned.await_args.kwargs["reason"]
     assert len(notified_reason.encode("utf-8")) <= 1024

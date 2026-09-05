@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from services.ide_credentials import (
+from orchestrator.services.ide_credentials import (
     IDE_CREDENTIAL_COOKIE,
     ide_credential,
     ide_credential_cookie_header,
@@ -113,7 +113,7 @@ class TestWorkspacePodInjection:
 
     def _provisioner(self):
         """A ContainerProvisioner with only what _build_pod_manifest reads."""
-        from services.container_provisioner import ContainerProvisioner
+        from orchestrator.services.container_provisioner import ContainerProvisioner
 
         provisioner = object.__new__(ContainerProvisioner)
         provisioner._namespace = ARGS["namespace"]
@@ -128,7 +128,7 @@ class TestWorkspacePodInjection:
         return {entry["name"]: entry.get("value") for entry in container["env"]}
 
     def _manifest(self, provisioner, pod_name):
-        from services.workspace_lifecycle import WorkspaceOwner
+        from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 
         return provisioner._build_pod_manifest(
             pod_name=pod_name,
@@ -148,7 +148,7 @@ class TestWorkspacePodInjection:
         vocabularies independently produced different credentials and 401'd
         every thread IDE.
         """
-        from services.workspace_lifecycle import WorkspaceOwner
+        from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 
         owner = WorkspaceOwner.session(ARGS["owner_id"])
         pod_name = owner.pod_name
@@ -197,8 +197,8 @@ class TestEnforcementIsReadBackNotAssumed:
         )
 
     def _check(self, pod):
-        from services.ide_proxy import IdeProxyService
-        from services.workspace_lifecycle import WorkspaceOwner
+        from orchestrator.services.ide_proxy import IdeProxyService
+        from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 
         owner = WorkspaceOwner.session(ARGS["owner_id"])
         return IdeProxyService._enforced_credential(
@@ -206,7 +206,7 @@ class TestEnforcementIsReadBackNotAssumed:
         )
 
     def _expected(self):
-        from services.workspace_lifecycle import WorkspaceOwner
+        from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 
         owner = WorkspaceOwner.session(ARGS["owner_id"])
         return ide_credential(

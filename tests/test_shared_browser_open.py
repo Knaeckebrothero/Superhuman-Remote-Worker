@@ -10,17 +10,17 @@ import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
-from routers import shared_browser as routes
-from services import shared_browser_canvas as browser_canvas
-from services.canvas import (
+from orchestrator.routers import shared_browser as routes
+from orchestrator.services import shared_browser_canvas as browser_canvas
+from orchestrator.services.canvas import (
     BrowserSource,
     CanvasCapabilities,
     CanvasMutation,
     CanvasRecord,
     build_public_canvas_representation,
 )
-from services.canvas_ssh import CanvasSSHError, RemoteWorkspaceTarget
-from services.shared_browser_canvas import (
+from orchestrator.services.canvas_ssh import CanvasSSHError, RemoteWorkspaceTarget
+from orchestrator.services.shared_browser_canvas import (
     BrowserCapabilityResponse,
     PreparedBrowser,
 )

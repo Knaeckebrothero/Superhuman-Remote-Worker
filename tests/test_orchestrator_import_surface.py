@@ -17,8 +17,8 @@ import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-ORCHESTRATOR = REPO_ROOT / "orchestrator"
-FORBIDDEN_ROOT = "src.api"
+ORCHESTRATOR = REPO_ROOT / "src" / "orchestrator"
+FORBIDDEN_ROOT = "agent.api"
 
 
 def _imported_modules(tree: ast.AST) -> set[str]:
@@ -65,7 +65,7 @@ def test_pinned_job_recipient_is_importable_without_the_agent_runtime():
     }
     assert heavy == set()
 
-    from src.shared.pinned_session_identity import (
+    from shared.pinned_session_identity import (
         PinnedJobRecipient,
         pinned_job_recipient_matches,
     )
@@ -86,6 +86,6 @@ def test_pinned_job_recipient_is_importable_without_the_agent_runtime():
 
 @pytest.mark.parametrize("name", ("PinnedJobRecipient", "pinned_job_recipient_matches"))
 def test_agent_api_models_still_re_export_the_recipient(name):
-    import src.api.models as models
+    import agent.api.models as models
 
     assert hasattr(models, name)

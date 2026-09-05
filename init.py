@@ -42,9 +42,6 @@ from pathlib import Path
 # Project root
 PROJECT_ROOT = Path(__file__).parent
 
-# Add project root to path for imports
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
 from dotenv import load_dotenv  # noqa: E402
 
@@ -61,7 +58,7 @@ def setup_logging(verbose: bool = False) -> None:
             format="%(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         )
-        for namespace in ("__main__", "src", "orchestrator"):
+        for namespace in ("__main__", "agent", "orchestrator", "shared"):
             logging.getLogger(namespace).setLevel(logging.DEBUG)
     else:
         level = logging.DEBUG if verbose else logging.INFO
@@ -191,7 +188,7 @@ async def init_all(
 
     # Initialize agent (workspace)
     if not only_orchestrator:
-        from src.init import init_workspace, cleanup_workspace
+        from agent.init import init_workspace, cleanup_workspace
 
         step += 1
         if force_reset:
@@ -288,7 +285,7 @@ async def verify_all(
                 )
 
     if not skip_agent:
-        from src.init import verify_workspace
+        from agent.init import verify_workspace
 
         ws_result = verify_workspace()
         if ws_result.get("exists"):
@@ -325,7 +322,7 @@ def create_backup(name: str | None = None) -> bool:
         True if successful, False otherwise.
     """
     from orchestrator.init import backup_postgres, backup_vector_db, backup_mongodb
-    from src.init import backup_workspace
+    from agent.init import backup_workspace
 
     backup_dir = generate_backup_dir_name(name)
     backup_dir.mkdir(parents=True, exist_ok=True)
@@ -378,7 +375,7 @@ def create_backup(name: str | None = None) -> bool:
     # 4. Backup workspace
     logger.info("[4/5] Backing up workspace...")
     if backup_workspace(backup_dir):
-        from src.init import verify_workspace
+        from agent.init import verify_workspace
 
         ws = verify_workspace()
         backup_info["components"]["workspace"] = {
@@ -425,7 +422,7 @@ def restore_backup(backup_path: str) -> bool:
         True if successful, False otherwise.
     """
     from orchestrator.init import restore_postgres, restore_vector_db, restore_mongodb
-    from src.init import restore_workspace
+    from agent.init import restore_workspace
 
     backup_dir = Path(backup_path)
     if not backup_dir.is_absolute():

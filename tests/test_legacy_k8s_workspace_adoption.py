@@ -10,7 +10,7 @@ from orchestrator.database.postgres import (
     _persisted_creation_marker,
     _stateless_runtime_creation_marker,
 )
-from services.session_workspace_adoption import (
+from orchestrator.services.session_workspace_adoption import (
     legacy_k8s_thread_runtime_adoption_candidate,
 )
 

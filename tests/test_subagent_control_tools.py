@@ -5,13 +5,13 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from src.tools.context import ToolContext
-from src.tools.delegation import create_delegation_tools, get_delegation_metadata
-from src.tools.delegation.control_plane import (
+from agent.tools.context import ToolContext
+from agent.tools.delegation import create_delegation_tools, get_delegation_metadata
+from agent.tools.delegation.control_plane import (
     CONTROL_PLANE_METADATA,
     CONTROL_TOOL_NAMES,
 )
-from src.tools.registry import TOOL_REGISTRY, load_tools
+from agent.tools.registry import TOOL_REGISTRY, load_tools
 
 
 ALL_DELEGATION_TOOLS = (

@@ -1,7 +1,7 @@
 """MCP routing through datasource setup and README.md facts rendering."""
 
-from src.core.datasource_setup import inject_workspace_facts, process_datasources
-from src.tools.mcp.manager import MCPManager
+from agent.core.datasource_setup import inject_workspace_facts, process_datasources
+from agent.tools.mcp.manager import MCPManager
 
 
 def _mcp_ds(name="GitHub", status=None, tools=None):

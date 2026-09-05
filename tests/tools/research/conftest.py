@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from src.tools.research.utils.paper_types import (
+from agent.tools.research.utils.paper_types import (
     AccessStatus,
     DownloadResult,
     Paper,
@@ -47,7 +47,7 @@ def mock_workspace_manager(temp_docs_dir, mock_filesystem_backend):
 @pytest.fixture
 def mock_tool_context(mock_workspace_manager):
     """Create a mock ToolContext with workspace support."""
-    from src.tools.context import ToolContext
+    from agent.tools.context import ToolContext
 
     ctx = MagicMock(spec=ToolContext)
     ctx.workspace_manager = mock_workspace_manager
@@ -80,7 +80,7 @@ def mock_remote_backend():
 @pytest.fixture
 def mock_remote_tool_context(mock_remote_backend):
     """Create a mock ToolContext with a remote workspace backend."""
-    from src.tools.context import ToolContext
+    from agent.tools.context import ToolContext
 
     manager = MagicMock()
     manager.is_initialized = True

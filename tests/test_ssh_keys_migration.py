@@ -4,6 +4,7 @@ import pathlib
 
 MIGRATIONS = (
     pathlib.Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "migrations"

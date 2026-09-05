@@ -22,21 +22,21 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from fastapi import HTTPException
 
-from database.postgres import JobQueryResult
+from orchestrator.database.postgres import JobQueryResult
 
 
 def _patch_caller_and_db(user: dict, db):
     stack = ExitStack()
     stack.enter_context(
-        patch("main.require_approved_user", AsyncMock(return_value=user))
+        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user))
     )
     stack.enter_context(
         patch(
-            "security.access.require_approved_user",
+            "orchestrator.security.access.require_approved_user",
             AsyncMock(return_value=user),
         )
     )
-    stack.enter_context(patch("main.postgres_db", db))
+    stack.enter_context(patch("orchestrator.main.postgres_db", db))
     return stack
 
 
@@ -55,7 +55,7 @@ def _scoped(user: dict, scope: str) -> dict:
 class TestAgentsAdminOnly:
     @pytest.mark.asyncio
     async def test_list_agents_non_admin_403(self, user_a, fake_db, fake_request):
-        from main import list_agents
+        from orchestrator.main import list_agents
 
         fake_db.list_agents = AsyncMock(
             side_effect=AssertionError("list_agents called past gate")
@@ -67,7 +67,7 @@ class TestAgentsAdminOnly:
 
     @pytest.mark.asyncio
     async def test_list_agents_admin_passes(self, user_admin, fake_db, fake_request):
-        from main import list_agents
+        from orchestrator.main import list_agents
 
         fake_db.list_agents = AsyncMock(
             return_value=[{"id": "a1", "pod_ip": "10.0.0.1"}]
@@ -78,7 +78,7 @@ class TestAgentsAdminOnly:
 
     @pytest.mark.asyncio
     async def test_get_agent_non_admin_403(self, user_a, fake_db, fake_request):
-        from main import get_agent
+        from orchestrator.main import get_agent
 
         fake_db.get_agent = AsyncMock(
             side_effect=AssertionError("get_agent called past gate")
@@ -90,7 +90,7 @@ class TestAgentsAdminOnly:
 
     @pytest.mark.asyncio
     async def test_get_agent_admin_passes(self, user_admin, fake_db, fake_request):
-        from main import get_agent
+        from orchestrator.main import get_agent
 
         fake_db.get_agent = AsyncMock(return_value={"id": "agent-1"})
         with _patch_caller_and_db(user_admin, fake_db):
@@ -101,7 +101,7 @@ class TestAgentsAdminOnly:
     async def test_get_agent_system_info_non_admin_403(
         self, user_a, fake_db, fake_request
     ):
-        from main import get_agent_system_info
+        from orchestrator.main import get_agent_system_info
 
         fake_db.get_agent = AsyncMock(
             side_effect=AssertionError("get_agent called past gate")
@@ -113,7 +113,7 @@ class TestAgentsAdminOnly:
 
     @pytest.mark.asyncio
     async def test_delete_agent_non_admin_403(self, user_a, fake_db, fake_request):
-        from main import delete_agent
+        from orchestrator.main import delete_agent
 
         fake_db.delete_agent = AsyncMock(
             side_effect=AssertionError("delete_agent called past gate")
@@ -125,7 +125,7 @@ class TestAgentsAdminOnly:
 
     @pytest.mark.asyncio
     async def test_delete_agent_admin_passes(self, user_admin, fake_db, fake_request):
-        from main import delete_agent
+        from orchestrator.main import delete_agent
 
         fake_db.delete_agent = AsyncMock(return_value=True)
         with _patch_caller_and_db(user_admin, fake_db):
@@ -138,18 +138,20 @@ class TestAgentsAdminOnly:
     ):
         """An agent deregistering itself on graceful exit carries only
         X-Internal-Key — no user resolves, so admin auth must not run."""
-        from main import delete_agent
+        from orchestrator.main import delete_agent
 
         fake_db.delete_agent = AsyncMock(return_value=True)
         with ExitStack() as stack:
-            stack.enter_context(patch("main.is_internal_call", lambda request: True))
+            stack.enter_context(
+                patch("orchestrator.main.is_internal_call", lambda request: True)
+            )
             stack.enter_context(
                 patch(
-                    "main.require_approved_user",
+                    "orchestrator.main.require_approved_user",
                     AsyncMock(side_effect=AssertionError("user auth consulted")),
                 )
             )
-            stack.enter_context(patch("main.postgres_db", fake_db))
+            stack.enter_context(patch("orchestrator.main.postgres_db", fake_db))
             result = await delete_agent(fake_request, "agent-1")
         assert result == {"status": "deleted"}
         fake_db.delete_agent.assert_awaited_once_with("agent-1")
@@ -165,7 +167,7 @@ class TestListMyActiveJobs:
     async def test_non_admin_filters_to_active_statuses(
         self, user_a, fake_db, fake_request
     ):
-        from main import list_my_active_jobs
+        from orchestrator.main import list_my_active_jobs
 
         # Mix of in-flight and terminal — gate should drop completed/failed.
         rows = [
@@ -186,7 +188,7 @@ class TestListMyActiveJobs:
     async def test_non_admin_uses_visibility_or_clause(
         self, user_a, fake_db, fake_request
     ):
-        from main import list_my_active_jobs
+        from orchestrator.main import list_my_active_jobs
 
         fake_db.query_jobs = AsyncMock(return_value=JobQueryResult(jobs=[]))
         with _patch_caller_and_db(user_a, fake_db):
@@ -202,7 +204,7 @@ class TestListMyActiveJobs:
         self, user_admin, fake_db, fake_request
     ):
         """Admin gets their personal active set (not the full fleet) — for that they use /api/agents."""
-        from main import list_my_active_jobs
+        from orchestrator.main import list_my_active_jobs
 
         fake_db.query_jobs = AsyncMock(return_value=JobQueryResult(jobs=[]))
         with _patch_caller_and_db(user_admin, fake_db):
@@ -215,14 +217,14 @@ class TestListMyActiveJobs:
 
     @pytest.mark.asyncio
     async def test_unauthenticated_baseline(self, fake_db, fake_request):
-        from main import list_my_active_jobs
+        from orchestrator.main import list_my_active_jobs
 
         with (
             patch(
-                "main.require_approved_user",
+                "orchestrator.main.require_approved_user",
                 AsyncMock(side_effect=HTTPException(status_code=401)),
             ),
-            patch("main.postgres_db", fake_db),
+            patch("orchestrator.main.postgres_db", fake_db),
         ):
             with pytest.raises(HTTPException) as exc:
                 await list_my_active_jobs(fake_request, limit=100)
@@ -232,7 +234,7 @@ class TestListMyActiveJobs:
     async def test_mcp_project_scope_narrows(
         self, user_a, project_a, fake_db, fake_request
     ):
-        from main import list_my_active_jobs
+        from orchestrator.main import list_my_active_jobs
 
         scoped = _scoped(user_a, f"project:{project_a['id']}")
         fake_db.query_jobs = AsyncMock(return_value=JobQueryResult(jobs=[]))
@@ -246,7 +248,7 @@ class TestListMyActiveJobs:
         self, user_admin, project_a, fake_db, fake_request
     ):
         """Admin with MCP scope keeps the admin path but gains scope_project_id."""
-        from main import list_my_active_jobs
+        from orchestrator.main import list_my_active_jobs
 
         scoped = _scoped(user_admin, f"project:{project_a['id']}")
         fake_db.query_jobs = AsyncMock(return_value=JobQueryResult(jobs=[]))

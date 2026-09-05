@@ -322,7 +322,7 @@
       ],
       "properties": {
         "agent_catalog": {
-          "description": "Agent catalog tools: manage experts and skills. Primarily for persistent agents (src/tools/orchestrator/catalog.py). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "Agent catalog tools: manage experts and skills. Primarily for persistent agents (src/agent/tools/orchestrator/catalog.py). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "examples": [
             [
               "list_experts",
@@ -380,7 +380,7 @@
           ]
         },
         "browser_direct": {
-          "description": "Direct browser-control tools (src/tools/research/browser_direct.py). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "Direct browser-control tools (src/agent/tools/research/browser_direct.py). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "oneOf": [
             {
               "type": "boolean"
@@ -429,7 +429,7 @@
           ]
         },
         "catalog_authoring": {
-          "description": "Catalogue-authoring tools: create or update experts, skills and automations from portable JSON bundles (src/tools/orchestrator/catalog.py, workflows.py). Split out of agent_catalog/workflows so those groups hold only reads and their `true` expansion is safe by construction. Gated by the catalog_authoring capability grant, deny-by-default, because these tools write rows the user's other agents then run. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "Catalogue-authoring tools: create or update experts, skills and automations from portable JSON bundles (src/agent/tools/orchestrator/catalog.py, workflows.py). Split out of agent_catalog/workflows so those groups hold only reads and their `true` expansion is safe by construction. Gated by the catalog_authoring capability grant, deny-by-default, because these tools write rows the user's other agents then run. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "examples": [
             [
               "get_expert_bundle",
@@ -488,7 +488,7 @@
           ]
         },
         "canvas": {
-          "description": "Dynamic Canvas presentation tools for persistent sessions (src/tools/canvas/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "Dynamic Canvas presentation tools for persistent sessions (src/agent/tools/canvas/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "examples": [
             [
               "get_canvas",
@@ -544,7 +544,7 @@
           ]
         },
         "citation": {
-          "description": "Citation management tools (src/tools/citation/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "Citation management tools (src/agent/tools/citation/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "examples": [
             [
               "cite_document",
@@ -600,7 +600,7 @@
           ]
         },
         "communication": {
-          "description": "Communication tools: agent-initiated messaging to humans via email (src/tools/communication/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "Communication tools: agent-initiated messaging to humans via email (src/agent/tools/communication/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "examples": [
             [
               "send_message"
@@ -654,7 +654,7 @@
           ]
         },
         "core": {
-          "description": "Core tools: todo management + job completion (src/tools/core/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "Core tools: todo management + job completion (src/agent/tools/core/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "examples": [
             [
               "next_phase_todos",
@@ -711,7 +711,7 @@
           ]
         },
         "delegation": {
-          "description": "Built-in subagent tools: `delegate_agent` plus `wait_agent`, `message_agent`, `stop_agent`, and `list_agents` (src/tools/delegation/). Every tool is explicit: it binds only when named here AND `delegation.enabled` is true. New configuration must use false, a bare list, or {only: [...]} — true and {except: [...]} are rejected so later control tools never appear without a reviewed grant. Stored legacy true and the deleted names `spawn_subagent` / `delegate_work` / `resume_delegation_child` normalize only to `delegate_agent`, with a deprecation warning.",
+          "description": "Built-in subagent tools: `delegate_agent` plus `wait_agent`, `message_agent`, `stop_agent`, and `list_agents` (src/agent/tools/delegation/). Every tool is explicit: it binds only when named here AND `delegation.enabled` is true. New configuration must use false, a bare list, or {only: [...]} — true and {except: [...]} are rejected so later control tools never appear without a reviewed grant. Stored legacy true and the deleted names `spawn_subagent` / `delegate_work` / `resume_delegation_child` normalize only to `delegate_agent`, with a deprecation warning.",
           "examples": [
             [
               "delegate_agent",
@@ -804,7 +804,7 @@
           ]
         },
         "evaluation": {
-          "description": "Evaluation/verdict tools for critic agents: approve or return jobs with feedback (src/tools/evaluation/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "Evaluation/verdict tools for critic agents: approve or return jobs with feedback (src/agent/tools/evaluation/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "examples": [
             [
               "approve_job_verdict",
@@ -859,7 +859,7 @@
           ]
         },
         "git": {
-          "description": "Git version control tools for workspace history (src/tools/git/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "Git version control tools for workspace history (src/agent/tools/git/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "examples": [
             [
               "git_log",
@@ -917,7 +917,7 @@
           ]
         },
         "graph": {
-          "description": "Neo4j graph tools (src/tools/graph/). Injected automatically when a Neo4j datasource is attached to the job. Usually left empty in config. Machine-owned: every tool here is code-granted (a neo4j datasource is attached), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "Neo4j graph tools (src/agent/tools/graph/). Injected automatically when a Neo4j datasource is attached to the job. Usually left empty in config. Machine-owned: every tool here is code-granted (a neo4j datasource is attached), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "examples": [
             [
               "cypher_query",
@@ -973,7 +973,7 @@
           ]
         },
         "knowledge": {
-          "description": "Knowledge base tools: project knowledge CRUD + search (src/tools/knowledge/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "Knowledge base tools: project knowledge CRUD + search (src/agent/tools/knowledge/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "examples": [
             [
               "kb_write",
@@ -1032,7 +1032,7 @@
           ]
         },
         "loop": {
-          "description": "Loop campaign tools (src/tools/loop/); injected per job via config_override for a planner loop's checkpoint critic, never listed in bundled configs. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "Loop campaign tools (src/agent/tools/loop/); injected per job via config_override for a planner loop's checkpoint critic, never listed in bundled configs. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "oneOf": [
             {
               "type": "boolean"
@@ -1130,7 +1130,7 @@
           ]
         },
         "mongodb": {
-          "description": "MongoDB query tools (src/tools/mongodb/). Injected automatically when a MongoDB datasource is attached to the job. Machine-owned: every tool here is code-granted (a mongodb datasource is attached), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "MongoDB query tools (src/agent/tools/mongodb/). Injected automatically when a MongoDB datasource is attached to the job. Machine-owned: every tool here is code-granted (a mongodb datasource is attached), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "examples": [
             [
               "mongo_query",
@@ -1359,7 +1359,7 @@
           ]
         },
         "product_help": {
-          "description": "Product-guide reader tools (src/tools/product_help.py, src/tools/product_capabilities.py). Machine-owned: every tool here is code-granted (persistent-session floor; see each tool's own gate), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "Product-guide reader tools (src/agent/tools/product_help.py, src/agent/tools/product_capabilities.py). Machine-owned: every tool here is code-granted (persistent-session floor; see each tool's own gate), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "oneOf": [
             {
               "type": "boolean"
@@ -1408,7 +1408,7 @@
           ]
         },
         "repo": {
-          "description": "Repository-datasource write tools (src/tools/repo/); distinct from `git`, which is the workspace's own version control. Machine-owned: every tool here is code-granted (a repository datasource is attached), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "Repository-datasource write tools (src/agent/tools/repo/); distinct from `git`, which is the workspace's own version control. Machine-owned: every tool here is code-granted (a repository datasource is attached), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "oneOf": [
             {
               "type": "boolean"
@@ -1457,7 +1457,7 @@
           ]
         },
         "research": {
-          "description": "Research/web search tools (src/tools/research/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "Research/web search tools (src/agent/tools/research/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "examples": [
             [
               "web_search"
@@ -1511,7 +1511,7 @@
           ]
         },
         "session_task": {
-          "description": "Lightweight session todo tools (src/tools/core/session_task_tools.py). Machine-owned: every tool here is code-granted (persistent session, unconditional (src/api/persistent_session.py:1415)), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "Lightweight session todo tools (src/agent/tools/core/session_task_tools.py). Machine-owned: every tool here is code-granted (persistent session, unconditional (src/agent/api/persistent_session.py:1415)), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "oneOf": [
             {
               "type": "boolean"
@@ -1560,7 +1560,7 @@
           ]
         },
         "shell": {
-          "description": "Shell tools: command execution (src/tools/shell/). shell must enumerate its tools: only `{only: [...]}` (or a bare list, the same thing) and `false` (or []) are accepted. `true` and `except` both auto-track the registry, so a tool added to the shell category later would land here with no diff to review; for a code-execution category that is the wrong default.",
+          "description": "Shell tools: command execution (src/agent/tools/shell/). shell must enumerate its tools: only `{only: [...]}` (or a bare list, the same thing) and `false` (or []) are accepted. `true` and `except` both auto-track the registry, so a tool added to the shell category later would land here with no diff to review; for a code-execution category that is the wrong default.",
           "examples": [
             [
               "run_command",
@@ -1605,7 +1605,7 @@
           ]
         },
         "sql": {
-          "description": "PostgreSQL query tools (src/tools/sql/). Injected automatically when a PostgreSQL datasource is attached to the job. Machine-owned: every tool here is code-granted (a postgresql datasource is attached), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "PostgreSQL query tools (src/agent/tools/sql/). Injected automatically when a PostgreSQL datasource is attached to the job. Machine-owned: every tool here is code-granted (a postgresql datasource is attached), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "examples": [
             [
               "sql_query",
@@ -1661,7 +1661,7 @@
           ]
         },
         "webdav": {
-          "description": "WebDAV / cloud-storage tools (src/tools/webdav/). Machine-owned: every tool here is code-granted (a webdav datasource is attached), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "WebDAV / cloud-storage tools (src/agent/tools/webdav/). Machine-owned: every tool here is code-granted (a webdav datasource is attached), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "oneOf": [
             {
               "type": "boolean"
@@ -1710,7 +1710,7 @@
           ]
         },
         "workflows": {
-          "description": "Workflow tools: inspect automations and project loops, and draft disabled automations. Primarily for persistent agents (src/tools/orchestrator/workflows.py). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "Workflow tools: inspect automations and project loops, and draft disabled automations. Primarily for persistent agents (src/agent/tools/orchestrator/workflows.py). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "examples": [
             [
               "list_automations",
@@ -1770,7 +1770,7 @@
           ]
         },
         "workspace": {
-          "description": "Workspace file operation tools (src/tools/workspace/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "Workspace file operation tools (src/agent/tools/workspace/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "examples": [
             [
               "read_file",
@@ -2284,7 +2284,7 @@
     },
     "delegation": {
       "type": "object",
-      "description": "The built-in subagents' settings (universal_experts_and_subagents.md §0 D7; runtime in src/subagents/). `enabled` gates `delegate_agent` and all four background controls; each tool exists only when also named in `tools.delegation`. Which children exist, their model, tools, write policy and budgets live in `subagents.roster`; a child never delegates or receives the control plane (depth 1). The pre-U3 keys (`max_depth`, `default_timeout`, `max_timeout`, `allowed_configs`, `mode`, `light`) are no longer accepted by this schema; the loader still drops them from any authored layer with a deprecation warning.",
+      "description": "The built-in subagents' settings (universal_experts_and_subagents.md §0 D7; runtime in src/agent/subagents/). `enabled` gates `delegate_agent` and all four background controls; each tool exists only when also named in `tools.delegation`. Which children exist, their model, tools, write policy and budgets live in `subagents.roster`; a child never delegates or receives the control plane (depth 1). The pre-U3 keys (`max_depth`, `default_timeout`, `max_timeout`, `allowed_configs`, `mode`, `light`) are no longer accepted by this schema; the loader still drops them from any authored layer with a deprecation warning.",
       "properties": {
         "enabled": {
           "type": "boolean",

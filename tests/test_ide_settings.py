@@ -1563,7 +1563,7 @@ class TestSweeperRegistrationShape:
     def test_settings_sweeper_is_leader_gated(self):
         import inspect
 
-        import main as orchestrator_main
+        import orchestrator.main as orchestrator_main
 
         source = inspect.getsource(orchestrator_main.lifespan)
         assert (
@@ -1575,7 +1575,7 @@ class TestSweeperRegistrationShape:
         # disabled sweeper every poll second for the whole leadership tenure.
         import inspect
 
-        import main as orchestrator_main
+        import orchestrator.main as orchestrator_main
 
         source = inspect.getsource(orchestrator_main.code_server_settings_sweeper)
         disabled_branch = source.split("from services.ide_settings import")[0]

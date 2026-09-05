@@ -191,7 +191,7 @@ def resolve_repo_clone_names(
     Shared by clone_repository_datasources() and inject_workspace_facts()
     so the README.md connector list always points at the real clone paths.
     """
-    from src.shared.git_url import repo_name_from_url
+    from shared.git_url import repo_name_from_url
 
     names: List[str] = []
     used: set[str] = set()

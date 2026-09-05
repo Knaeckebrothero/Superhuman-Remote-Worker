@@ -9,9 +9,9 @@ from uuid import UUID
 
 import pytest
 
-import src.database.postgres_db as agent_postgres
-from src.database.postgres_db import PostgresDB
-from src.shared.session_subagent_authority import SessionParentAuthority
+import agent.database.postgres_db as agent_postgres
+from agent.database.postgres_db import PostgresDB
+from shared.session_subagent_authority import SessionParentAuthority
 
 PARENT = UUID("aaaaaaaa-1111-4222-8333-444444444444")
 CHILD = UUID("bbbbbbbb-1111-4222-8333-444444444444")

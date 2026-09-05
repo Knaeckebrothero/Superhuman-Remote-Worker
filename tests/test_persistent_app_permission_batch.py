@@ -10,8 +10,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-import src.api.persistent_app as pa
-from src.persistent_graph import PermissionOutcome
+import agent.api.persistent_app as pa
+from agent.persistent_graph import PermissionOutcome
 
 
 PINNED_AGENT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"

@@ -23,7 +23,7 @@ import jinja2
 import pytest
 
 from orchestrator.services.config_resolver import resolve_config
-from src.core.loader import (
+from shared.runtime.core.loader import (
     LOADER_OWNED_KEY_PREFIX,
     PromptRenderSecurityError,
     _has_shell_tools,
@@ -345,7 +345,7 @@ def test_control_bare_agent_side_merge_is_the_bypass(form):
 
 
 def test_live_session_sanitizer_drops_loader_owned_keys():
-    from src.api.persistent_app import _sanitize_live_session_config_override
+    from agent.api.persistent_app import _sanitize_live_session_config_override
 
     sanitized = _sanitize_live_session_config_override(
         {
@@ -363,7 +363,7 @@ def test_live_session_sanitizer_drops_loader_owned_keys():
 def test_roster_entry_cannot_unmark_a_db_child():
     """A roster entry's sibling keys merge on top of the DB target AFTER the
     roster marks it; they are authored and must not carry the markers."""
-    from src.core.subagent_roster import resolve_subagent_roster
+    from shared.runtime.core.subagent_roster import resolve_subagent_roster
 
     child_id = "11111111-2222-4333-8444-555555555555"
     parent = {
@@ -401,11 +401,11 @@ def test_every_override_seam_calls_the_strip():
     """Source contract: the strip is wired at each caller-authored merge seam.
     (The functional tests above prove the helper; this pins where it runs.)"""
     expected = {
-        "src/agent.py": 1,
-        "src/api/persistent_app.py": 3,
-        "src/core/expert_resolution.py": 1,
-        "src/core/subagent_roster.py": 1,
-        "orchestrator/services/config_resolver.py": 2,
+        "src/agent/agent.py": 1,
+        "src/agent/api/persistent_app.py": 3,
+        "src/shared/runtime/core/expert_resolution.py": 1,
+        "src/shared/runtime/core/subagent_roster.py": 1,
+        "src/orchestrator/services/config_resolver.py": 2,
     }
     for rel, minimum in expected.items():
         src = (_REPO_ROOT / rel).read_text(encoding="utf-8")

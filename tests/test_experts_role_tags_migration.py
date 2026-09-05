@@ -18,10 +18,10 @@ import asyncpg
 import pytest
 
 from orchestrator.database.migrate import discover, run_migrations
-from src.core.expert_resolution import with_role_tag
+from shared.runtime.core.expert_resolution import with_role_tag
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-MIGRATIONS = ROOT / "orchestrator" / "database" / "migrations" / "app"
+MIGRATIONS = ROOT / "src" / "orchestrator" / "database" / "migrations" / "app"
 NAME = "0205_experts_role_tags_backfill.sql"
 SQL = MIGRATIONS / NAME
 PREDECESSOR = "0204_ssh_attachments.sql"
@@ -99,7 +99,7 @@ def test_premise_tags_is_not_null_with_an_empty_default():
     NULL tags would make ``= ANY (tags)`` NULL, ``NOT NULL`` NULL, and the
     row would be silently skipped. Assert on the replayed chain's artifact,
     not on 0028 alone, so a later relaxation would fail here."""
-    schema = (ROOT / "orchestrator/database/schema_current.sql").read_text()
+    schema = (ROOT / "src/orchestrator/database/schema_current.sql").read_text()
     start = schema.index("CREATE TABLE public.experts (")
     block = schema[start : schema.index(");", start)]
     assert "tags text[] DEFAULT '{}'::text[] NOT NULL" in block

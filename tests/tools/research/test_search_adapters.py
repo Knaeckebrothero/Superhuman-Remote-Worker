@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 
-from src.tools.research.search import (
+from agent.tools.research.search import (
     ADAPTER_NAMES,
     BraveAdapter,
     Crawl4AIAdapter,
@@ -274,7 +274,9 @@ def test_searxng_search_returns_normalized_results():
     manager, client = _http_client(response)
     adapter = SearxngAdapter(base_url="https://search.internal")
 
-    with patch("src.tools.research.search.searxng.httpx.Client", return_value=manager):
+    with patch(
+        "agent.tools.research.search.searxng.httpx.Client", return_value=manager
+    ):
         results = adapter.search("query", 5)
 
     assert results == [
@@ -306,7 +308,7 @@ def test_brave_search_returns_normalized_results():
     manager, client = _http_client(response)
     adapter = BraveAdapter(base_url="https://brave.internal", api_key="brave-key")
 
-    with patch("src.tools.research.search.brave.httpx.Client", return_value=manager):
+    with patch("agent.tools.research.search.brave.httpx.Client", return_value=manager):
         results = adapter.search("query", 5, time_range="week")
 
     assert results == [
@@ -341,11 +343,11 @@ def test_search_only_adapters_raise_for_undeclared_ops(adapter, op):
     [
         (
             SearxngAdapter(base_url="https://search.internal"),
-            "src.tools.research.search.searxng.httpx.Client",
+            "agent.tools.research.search.searxng.httpx.Client",
         ),
         (
             BraveAdapter(base_url="https://brave.internal", api_key="brave-key"),
-            "src.tools.research.search.brave.httpx.Client",
+            "agent.tools.research.search.brave.httpx.Client",
         ),
     ],
 )
@@ -368,12 +370,12 @@ def test_http_search_adapters_classify_rate_limits(adapter, module_path):
     [
         (
             SearxngAdapter(base_url="https://search.internal/root"),
-            "src.tools.research.search.searxng.httpx.Client",
+            "agent.tools.research.search.searxng.httpx.Client",
             "https://search.internal/root/search",
         ),
         (
             BraveAdapter(base_url="https://brave.internal/api", api_key="brave-key"),
-            "src.tools.research.search.brave.httpx.Client",
+            "agent.tools.research.search.brave.httpx.Client",
             "https://brave.internal/api/res/v1/web/search",
         ),
     ],
@@ -458,7 +460,7 @@ def test_firecrawl_declared_ops_return_normalized_shapes():
     )
 
     with patch(
-        "src.tools.research.search.firecrawl.httpx.Client", return_value=manager
+        "agent.tools.research.search.firecrawl.httpx.Client", return_value=manager
     ):
         assert adapter.search("query", 5, include_raw_content=True) == [
             Result(
@@ -509,7 +511,7 @@ def test_firecrawl_zero_results_is_an_answer():
     adapter = FirecrawlAdapter(base_url="https://firecrawl.internal/v2")
 
     with patch(
-        "src.tools.research.search.firecrawl.httpx.Client", return_value=manager
+        "agent.tools.research.search.firecrawl.httpx.Client", return_value=manager
     ):
         assert adapter.search("nothing", 5) == []
 
@@ -521,7 +523,9 @@ def test_firecrawl_classifies_rate_limit():
     adapter = FirecrawlAdapter(base_url="https://firecrawl.internal/v2")
 
     with (
-        patch("src.tools.research.search.firecrawl.httpx.Client", return_value=manager),
+        patch(
+            "agent.tools.research.search.firecrawl.httpx.Client", return_value=manager
+        ),
         pytest.raises(ProviderRateLimitError),
     ):
         adapter.search("query", 5)
@@ -536,7 +540,9 @@ def test_firecrawl_cloud_requires_a_key_and_timeout_can_fail_over():
     client.post.return_value = response
     adapter = FirecrawlAdapter(api_key="fc-test")
     with (
-        patch("src.tools.research.search.firecrawl.httpx.Client", return_value=manager),
+        patch(
+            "agent.tools.research.search.firecrawl.httpx.Client", return_value=manager
+        ),
         pytest.raises(ProviderUnavailableError) as raised,
     ):
         adapter.search("query", 5)
@@ -581,7 +587,7 @@ def test_firecrawl_target_url_never_changes_http_request_origin(
     adapter = FirecrawlAdapter(base_url="https://firecrawl.internal/v2")
 
     with patch(
-        "src.tools.research.search.firecrawl.httpx.Client", return_value=manager
+        "agent.tools.research.search.firecrawl.httpx.Client", return_value=manager
     ):
         if method == "extract":
             adapter.extract([influenced_url])
@@ -677,7 +683,9 @@ def test_crawl4ai_declared_ops_return_normalized_shapes():
         api_key="crawl4ai-test",
     )
 
-    with patch("src.tools.research.search.crawl4ai.httpx.Client", return_value=manager):
+    with patch(
+        "agent.tools.research.search.crawl4ai.httpx.Client", return_value=manager
+    ):
         assert adapter.extract(
             [
                 "https://result.example/extract",
@@ -755,7 +763,7 @@ def test_crawl4ai_empty_results_is_answer_and_target_stays_payload():
     )
 
     with patch(
-        "src.tools.research.search.crawl4ai.httpx.Client", return_value=manager
+        "agent.tools.research.search.crawl4ai.httpx.Client", return_value=manager
     ) as client_class:
         assert adapter.extract([influenced_url]) == []
 
@@ -790,7 +798,7 @@ def test_crawl4ai_classifies_provider_errors(status, expected):
     )
     with (
         patch(
-            "src.tools.research.search.crawl4ai.httpx.Client",
+            "agent.tools.research.search.crawl4ai.httpx.Client",
             return_value=manager,
         ),
         pytest.raises(expected),

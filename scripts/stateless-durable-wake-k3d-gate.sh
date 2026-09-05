@@ -114,16 +114,16 @@ for pod_ref in "${orchestrators[@]}"; do
     fi
     kubectl --context="$EXPECTED_CONTEXT" -n "$NAMESPACE" \
         exec "$pod_ref" -c orchestrator -- sh -ceu '
-            test -f /app/operator_cli/stateless_wake_acceptance.py
-            test -f /app/database/migrations/app/0191_stateless_input_deliveries.sql
-            test -f /app/database/migrations/app/0192_stateless_input_delivery_validate.sql
-            test -f /app/database/migrations/app/0197_non_pinned_workspace_process_zero.sql
-            test -f /app/database/migrations/app/0198_non_pinned_workspace_lifecycle_authority.sql
+            test -f /app/src/orchestrator/operator_cli/stateless_wake_acceptance.py
+            test -f /app/src/orchestrator/database/migrations/app/0191_stateless_input_deliveries.sql
+            test -f /app/src/orchestrator/database/migrations/app/0192_stateless_input_delivery_validate.sql
+            test -f /app/src/orchestrator/database/migrations/app/0197_non_pinned_workspace_process_zero.sql
+            test -f /app/src/orchestrator/database/migrations/app/0198_non_pinned_workspace_lifecycle_authority.sql
             test "$WORKSPACE_CLEANUP_RECONCILIATION_ENABLED" = false
             test "$WORKSPACE_REATTACH_FRESH_FALLBACK" = false
             test "$OFFICER_AUTO_PULL_RELEASE_ENABLED" = false
             grep -q "terminal_replay = await" /app/src/shared/persistent_input_delivery.py
-            grep -q "K8s Pod IPs are not recipient authority" /app/services/session_wake.py
+            grep -q "K8s Pod IPs are not recipient authority" /app/src/orchestrator/services/session_wake.py
         '
     image_id="$(
         kubectl --context="$EXPECTED_CONTEXT" -n "$NAMESPACE" get "$pod_ref" \
@@ -159,10 +159,10 @@ if [[ "$cleanup_only" != true ]]; then
         fi
         kubectl --context="$EXPECTED_CONTEXT" -n "$NAMESPACE" \
             exec "$pod_ref" -c agent -- sh -ceu '
-                grep -q "claim_stateless_input_delivery" /app/src/api/turn_executor.py
+                grep -q "claim_stateless_input_delivery" /app/src/agent/api/turn_executor.py
                 grep -q "input_delivery_capable_lease_token" /app/src/shared/persistent_input_delivery.py
                 grep -q "terminal_replay = await" /app/src/shared/persistent_input_delivery.py
-                grep -q "workspace_runtime_incarnation" /app/src/api/turn_executor.py
+                grep -q "workspace_runtime_incarnation" /app/src/agent/api/turn_executor.py
             '
         image_id="$(
             kubectl --context="$EXPECTED_CONTEXT" -n "$NAMESPACE" get "$pod_ref" \
@@ -184,4 +184,4 @@ operator_pod="${orchestrators[0]}"
 kubectl --context="$EXPECTED_CONTEXT" -n "$NAMESPACE" \
     exec "$operator_pod" -c orchestrator -- \
     env SRW_WAKE_GATE_CONTEXT="$EXPECTED_CONTEXT" \
-    python -m operator_cli.stateless_wake_acceptance "$@"
+    python -m orchestrator.operator_cli.stateless_wake_acceptance "$@"

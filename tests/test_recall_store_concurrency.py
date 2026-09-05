@@ -29,13 +29,14 @@ pytest.importorskip("testcontainers.postgres")
 pytest.importorskip("pgvector.asyncpg")
 
 from orchestrator.database.migrate import run_migrations  # noqa: E402
-from src.database.postgres_db import PostgresDB  # noqa: E402
-from src.services.recall_store import RecallStore, memory_health  # noqa: E402
+from agent.database.postgres_db import PostgresDB  # noqa: E402
+from shared.runtime.services.recall_store import RecallStore, memory_health  # noqa: E402
 
 # pgvector, not plain postgres: the vector migrations CREATE EXTENSION vector.
 PG_IMAGE = "pgvector/pgvector:pg15"
 VECTOR_MIGRATIONS = (
     Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "migrations"

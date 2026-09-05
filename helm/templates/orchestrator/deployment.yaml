@@ -127,7 +127,7 @@ spec:
                   name: {{ include "srw.secretName" . }}
                   key: APP_ENCRYPTION_KEY
             # Core databases — DSNs are composed at runtime from the parts
-            # below (orchestrator/utils/db_url.py). Storing a full URL in
+            # below (src/shared/db_url.py). Storing a full URL in
             # the Secret is no longer needed and was a footgun: passwords
             # with `/` truncated the netloc under urlsplit.
             - name: POSTGRES_USER
@@ -741,7 +741,7 @@ spec:
             # Name + key of the Secret holding the shared HS256 JWT key.
             # The orchestrator passes both through to dynamically-provisioned
             # agent pod manifests (services/agent_provisioner.py) so the
-            # pod's JWT validator (src/api/_session_auth.py) can resolve the
+            # pod's JWT validator (src/agent/api/_session_auth.py) can resolve the
             # same secret/key pair and verify handshake tokens.
             - name: SESSION_JWT_SECRET_NAME
               value: {{ .Values.sessionRouter.jwtSecretName | default (printf "%s-session-jwt" (include "srw.fullname" .)) | quote }}

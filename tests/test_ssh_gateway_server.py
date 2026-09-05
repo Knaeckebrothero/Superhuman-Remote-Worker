@@ -30,15 +30,15 @@ import pytest
 from asyncssh.constants import OPEN_ADMINISTRATIVELY_PROHIBITED
 from asyncssh.sftp import MIN_SFTP_VERSION
 
-import services.ssh_gateway_server as mod
-from services.ssh_gateway_client import (
+import orchestrator.services.ssh_gateway_server as mod
+from orchestrator.services.ssh_gateway_client import (
     REFUSAL_MESSAGES,
     SshTarget,
     TargetDenied,
     TargetUnavailable,
 )
-from services.ssh_gateway_limits import GatewayLimiter
-from services.ssh_gateway_server import (
+from orchestrator.services.ssh_gateway_limits import GatewayLimiter
+from orchestrator.services.ssh_gateway_server import (
     GatewayContext,
     GatewaySSHServer,
     clamp_direct_tcpip,

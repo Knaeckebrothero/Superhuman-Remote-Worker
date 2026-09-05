@@ -2,7 +2,7 @@
 # DO NOT EDIT BY HAND. Regenerate with `python scripts/check_endpoint_auth.py --write`.
 #
 # SCOPE: main.py `@app.METHOD(...)` /api/* routes, plus every APIRouter the
-# app mounts (orchestrator/routers/*, auth/bff.py, uploads.py, graph_routes.py)
+# app mounts (src/orchestrator/routers/*, auth/bff.py, uploads.py, graph_routes.py)
 # with its prefix folded in. Router /auth/* and /wopi/* are listed in full.
 #
 # Classifications:

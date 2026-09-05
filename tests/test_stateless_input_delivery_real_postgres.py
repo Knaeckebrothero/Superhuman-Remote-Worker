@@ -13,15 +13,15 @@ import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
 from orchestrator.database.postgres import PostgresDB
-from src.api.turn_executor import _PENDING_INPUT_SQL
-from src.shared.persistent_input_delivery import (
+from agent.api.turn_executor import _PENDING_INPUT_SQL
+from shared.persistent_input_delivery import (
     InputDeliveryAuthorityLost,
     claim_pending_input_deliveries,
     claim_stateless_input_delivery,
     transition_input_delivery,
     transition_stateless_input_delivery,
 )
-from src.shared.run_queue import (
+from shared.run_queue import (
     UNIT_KIND_SESSION_TURN,
     claim_unit,
     complete_unit,
@@ -32,6 +32,7 @@ from src.shared.run_queue import (
 
 SCHEMA_FILE = (
     Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "schema_current.sql"

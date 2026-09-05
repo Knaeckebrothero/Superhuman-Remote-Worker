@@ -48,7 +48,7 @@ tools:
 
 limits:
   # The persistent loop's in-process LLM attempt ceiling per turn (it used to
-  # be a hard-coded 3 in src/persistent_graph.py; U3 WP1 reads this key so a
+  # be a hard-coded 3 in src/agent/persistent_graph.py; U3 WP1 reads this key so a
   # subagent roster entry can lower it). A user is watching a session, so a
   # turn that cannot recover in a few seconds is surfaced, not retried for a
   # minute — the worker overlay's 5 is the worker's pause+backoff tier.

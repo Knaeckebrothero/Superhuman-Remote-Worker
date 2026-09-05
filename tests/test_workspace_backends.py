@@ -22,17 +22,12 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-# Add project root to path
-project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-
-from src.core.workspace_backend import (  # noqa: E402
+from shared.runtime.core.workspace_backend import (  # noqa: E402
     RemoteCommandTimeoutError,
     WorkspaceAuthenticationError,
     WorkspaceUnavailableError,
 )
-from src.core.backends.remote import WorkspaceHostIdentityMismatch  # noqa: E402
+from shared.runtime.core.backends.remote import WorkspaceHostIdentityMismatch  # noqa: E402
 
 
 # =============================================================================
@@ -290,7 +285,7 @@ class TestExecDrainLoopDeadline:
 # We mock at the paramiko SSHClient/SFTPClient level rather than patching
 # the module import.
 
-from src.core.backends.remote import (  # noqa: E402
+from shared.runtime.core.backends.remote import (  # noqa: E402
     RemoteBackend,
     _INHERITED_BUSY_SENTINEL,
     _PENDING_GUARD_STALE_SECONDS,
@@ -390,7 +385,7 @@ class TestRemoteShellCompletionRecords:
 def _valid_private_key_for_mocked_ssh():
     """Most tests exercise mocked transport behavior, not key parsing."""
     with patch(
-        "src.core.backends.remote._validate_private_key",
+        "shared.runtime.core.backends.remote._validate_private_key",
         return_value="SHA256:test-fingerprint",
     ):
         yield
@@ -460,7 +455,7 @@ class TestRemoteBackendInit:
 
     def test_init_without_paramiko_raises(self):
         """RemoteBackend.__init__ raises when paramiko is None at module level."""
-        import src.core.backends.remote as remote_mod
+        import shared.runtime.core.backends.remote as remote_mod
 
         original = remote_mod.paramiko
         try:
@@ -3291,7 +3286,9 @@ sys.exit(0)
         )
 
         with patch.object(backend, "_exec_with_status", side_effect=run_locally):
-            with caplog.at_level(logging.WARNING, logger="src.core.backends.remote"):
+            with caplog.at_level(
+                logging.WARNING, logger="shared.runtime.core.backends.remote"
+            ):
                 backend._reserve_and_send_shell_command(
                     "default",
                     expected=None,
@@ -3406,7 +3403,7 @@ class TestRemoteBackendCheckBlocked:
 
     def test_sudo_freeze_returns_sentinel(self):
         """sudo_action='freeze' (default) returns SUDO_FREEZE_SENTINEL."""
-        from src.tools.shell.shell_manager import SUDO_FREEZE_SENTINEL
+        from agent.tools.shell.shell_manager import SUDO_FREEZE_SENTINEL
 
         backend = RemoteBackend(host="host", workspace_path="/ws", sudo_action="freeze")
         result = backend._check_blocked("sudo apt-get install -y libxml2-dev")
@@ -3581,7 +3578,7 @@ class TestRemoteBackendShellOperations:
         backend, _, _ = remote_backend
         backend._tabs["default"] = _RemoteTab("default", pane_id="%1")
         with (
-            patch("src.core.backends.remote.uuid.uuid4") as uuid4,
+            patch("shared.runtime.core.backends.remote.uuid.uuid4") as uuid4,
             patch.object(backend, "_reserve_and_send_shell_command") as reserve,
             patch.object(
                 backend,
@@ -4134,8 +4131,8 @@ class TestRemoteBackendShellOperations:
 class TestRemoteBackendShellRun:
     """Sentinel output reports CWD and working_dir calls restore the tab."""
 
-    _SENTINEL = "__DONE_0123456789ab__"
     _ROOT = "/home/agent-host/workspace"
+    _SENTINEL = "__DONE_0123456789ab__"
 
     @staticmethod
     def _ready(backend):
@@ -4166,8 +4163,8 @@ class TestRemoteBackendShellRun:
             backend._tabs["default"].pending_sentinel = None
 
         with (
-            patch("src.core.backends.remote.uuid.uuid4") as uuid4,
-            patch("src.core.backends.remote.time.sleep"),
+            patch("shared.runtime.core.backends.remote.uuid.uuid4") as uuid4,
+            patch("shared.runtime.core.backends.remote.time.sleep"),
             patch.object(backend, "_tmux_capture", side_effect=captures),
             patch.object(
                 backend,
@@ -4236,7 +4233,7 @@ class TestRemoteBackendShellRun:
             git_finished.set()
 
         with (
-            patch("src.core.backends.remote.time.sleep"),
+            patch("shared.runtime.core.backends.remote.time.sleep"),
             patch.object(backend, "_tmux_capture", side_effect=capture),
             patch.object(
                 backend, "_reserve_and_send_shell_command", side_effect=reserve
@@ -4288,8 +4285,8 @@ class TestRemoteBackendShellRun:
             backend._tabs["default"].pending_sentinel = None
 
         with (
-            patch("src.core.backends.remote.uuid.uuid4") as uuid4,
-            patch("src.core.backends.remote.time.sleep"),
+            patch("shared.runtime.core.backends.remote.uuid.uuid4") as uuid4,
+            patch("shared.runtime.core.backends.remote.time.sleep"),
             patch.object(backend, "_tmux_exec_checked", side_effect=capture),
             patch.object(
                 backend, "_reserve_and_send_shell_command", side_effect=reserve
@@ -4311,8 +4308,8 @@ class TestRemoteBackendShellRun:
             backend._tabs["default"].pending_sentinel = sentinel
 
         with (
-            patch("src.core.backends.remote.uuid.uuid4") as uuid4,
-            patch("src.core.backends.remote.time.sleep"),
+            patch("shared.runtime.core.backends.remote.uuid.uuid4") as uuid4,
+            patch("shared.runtime.core.backends.remote.time.sleep"),
             patch.object(
                 backend,
                 "_tmux_capture",
@@ -4358,8 +4355,8 @@ class TestRemoteBackendShellRun:
         ]
 
         with (
-            patch("src.core.backends.remote.uuid.uuid4") as uuid4,
-            patch("src.core.backends.remote.time.sleep"),
+            patch("shared.runtime.core.backends.remote.uuid.uuid4") as uuid4,
+            patch("shared.runtime.core.backends.remote.time.sleep"),
             patch.object(backend, "_tmux_capture", side_effect=captures),
             patch.object(backend, "_reserve_and_send_shell_command") as reserve,
             patch.object(backend, "_tmux_send_keys") as send,
@@ -4389,8 +4386,8 @@ class TestRemoteBackendShellRun:
         ]
 
         with (
-            patch("src.core.backends.remote.uuid.uuid4") as uuid4,
-            patch("src.core.backends.remote.time.sleep"),
+            patch("shared.runtime.core.backends.remote.uuid.uuid4") as uuid4,
+            patch("shared.runtime.core.backends.remote.time.sleep"),
             patch.object(backend, "_tmux_capture", side_effect=captures),
             patch.object(backend, "_reserve_and_send_shell_command") as reserve,
             patch.object(backend, "_tmux_send_keys") as send,
@@ -4565,8 +4562,8 @@ class TestRemoteBackendShellCancel:
             tab.pending_sentinel = None
 
         with (
-            patch("src.core.backends.remote.time.sleep"),
-            patch("src.core.backends.remote.uuid.uuid4") as uuid4,
+            patch("shared.runtime.core.backends.remote.time.sleep"),
+            patch("shared.runtime.core.backends.remote.uuid.uuid4") as uuid4,
             patch.object(
                 backend,
                 "_cancel_and_probe_shell_command",
@@ -4610,8 +4607,8 @@ class TestRemoteBackendShellCancel:
             tab.pending_sentinel = None
 
         with (
-            patch("src.core.backends.remote.time.sleep"),
-            patch("src.core.backends.remote.uuid.uuid4") as uuid4,
+            patch("shared.runtime.core.backends.remote.time.sleep"),
+            patch("shared.runtime.core.backends.remote.uuid.uuid4") as uuid4,
             patch.object(
                 backend,
                 "_cancel_and_probe_shell_command",
@@ -4634,8 +4631,8 @@ class TestRemoteBackendShellCancel:
             tab.pending_sentinel = sentinel
 
         with (
-            patch("src.core.backends.remote.time.sleep"),
-            patch("src.core.backends.remote.uuid.uuid4") as uuid4,
+            patch("shared.runtime.core.backends.remote.time.sleep"),
+            patch("shared.runtime.core.backends.remote.uuid.uuid4") as uuid4,
             patch.object(
                 backend,
                 "_cancel_and_probe_shell_command",

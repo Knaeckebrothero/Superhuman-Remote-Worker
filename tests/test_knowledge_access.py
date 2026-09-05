@@ -27,15 +27,15 @@ def _patch_caller_and_db(user: dict, db):
     """Same patch stack used across F2/F3/F5 test files."""
     stack = ExitStack()
     stack.enter_context(
-        patch("main.require_approved_user", AsyncMock(return_value=user))
+        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user))
     )
     stack.enter_context(
         patch(
-            "security.access.require_approved_user",
+            "orchestrator.security.access.require_approved_user",
             AsyncMock(return_value=user),
         )
     )
-    stack.enter_context(patch("main.postgres_db", db))
+    stack.enter_context(patch("orchestrator.main.postgres_db", db))
     return stack
 
 
@@ -53,7 +53,7 @@ class TestKnowledgeGateNegativePaths:
     async def test_summary_cross_user_403(
         self, user_b, project_a, fake_db, fake_request
     ):
-        from main import get_knowledge_summary
+        from orchestrator.main import get_knowledge_summary
 
         with _patch_caller_and_db(user_b, fake_db):
             with pytest.raises(HTTPException) as exc:
@@ -62,7 +62,7 @@ class TestKnowledgeGateNegativePaths:
 
     @pytest.mark.asyncio
     async def test_list_cross_user_403(self, user_b, project_a, fake_db, fake_request):
-        from main import list_knowledge_notes
+        from orchestrator.main import list_knowledge_notes
 
         with _patch_caller_and_db(user_b, fake_db):
             with pytest.raises(HTTPException) as exc:
@@ -73,7 +73,7 @@ class TestKnowledgeGateNegativePaths:
     async def test_get_note_cross_user_403(
         self, user_b, project_a, fake_db, fake_request
     ):
-        from main import get_knowledge_note
+        from orchestrator.main import get_knowledge_note
 
         with _patch_caller_and_db(user_b, fake_db):
             with pytest.raises(HTTPException) as exc:
@@ -84,7 +84,7 @@ class TestKnowledgeGateNegativePaths:
     async def test_search_cross_user_403(
         self, user_b, project_a, fake_db, fake_request
     ):
-        from main import KnowledgeSearchRequest, search_knowledge
+        from orchestrator.main import KnowledgeSearchRequest, search_knowledge
 
         with _patch_caller_and_db(user_b, fake_db):
             with pytest.raises(HTTPException) as exc:
@@ -99,7 +99,7 @@ class TestKnowledgeGateNegativePaths:
     async def test_patch_note_cross_user_403(
         self, user_b, project_a, fake_db, fake_request
     ):
-        from main import KnowledgeNoteUpdate, update_knowledge_note
+        from orchestrator.main import KnowledgeNoteUpdate, update_knowledge_note
 
         with _patch_caller_and_db(user_b, fake_db):
             with pytest.raises(HTTPException) as exc:
@@ -115,7 +115,7 @@ class TestKnowledgeGateNegativePaths:
     async def test_delete_note_cross_user_403(
         self, user_b, project_a, fake_db, fake_request
     ):
-        from main import delete_knowledge_note
+        from orchestrator.main import delete_knowledge_note
 
         with _patch_caller_and_db(user_b, fake_db):
             with pytest.raises(HTTPException) as exc:
@@ -128,7 +128,7 @@ class TestKnowledgeGateNegativePaths:
     async def test_export_cross_user_403(
         self, user_b, project_a, fake_db, fake_request
     ):
-        from main import export_knowledge
+        from orchestrator.main import export_knowledge
 
         with _patch_caller_and_db(user_b, fake_db):
             with pytest.raises(HTTPException) as exc:
@@ -138,7 +138,7 @@ class TestKnowledgeGateNegativePaths:
     @pytest.mark.asyncio
     async def test_missing_project_404(self, user_a, fake_db, fake_request):
         """The gate raises 404 before any knowledge query runs."""
-        from main import get_knowledge_summary
+        from orchestrator.main import get_knowledge_summary
 
         with _patch_caller_and_db(user_a, fake_db):
             with pytest.raises(HTTPException) as exc:
@@ -171,10 +171,10 @@ class TestKnowledgeGatePositivePaths:
     async def test_summary_member_passes_gate(
         self, user_a, project_a, fake_db, fake_request
     ):
-        from main import get_knowledge_summary
+        from orchestrator.main import get_knowledge_summary
 
         with _patch_caller_and_db(user_a, fake_db):
-            with patch("main.vector_db", _make_dud_vector_db()):
+            with patch("orchestrator.main.vector_db", _make_dud_vector_db()):
                 with pytest.raises(HTTPException) as exc:
                     await get_knowledge_summary(fake_request, str(project_a["id"]))
         # 500 = gate passed, vector_db blew up as planned. NOT 403/404.
@@ -184,10 +184,10 @@ class TestKnowledgeGatePositivePaths:
     async def test_admin_bypasses_membership(
         self, user_admin, project_a, fake_db, fake_request
     ):
-        from main import list_knowledge_notes
+        from orchestrator.main import list_knowledge_notes
 
         with _patch_caller_and_db(user_admin, fake_db):
-            with patch("main.vector_db", _make_dud_vector_db()):
+            with patch("orchestrator.main.vector_db", _make_dud_vector_db()):
                 with pytest.raises(HTTPException) as exc:
                     await list_knowledge_notes(fake_request, str(project_a["id"]))
         # Same shape — admin made it past, inner code failed by design.
@@ -197,10 +197,10 @@ class TestKnowledgeGatePositivePaths:
     async def test_get_note_member_passes_gate(
         self, user_a, project_a, fake_db, fake_request
     ):
-        from main import get_knowledge_note
+        from orchestrator.main import get_knowledge_note
 
         with _patch_caller_and_db(user_a, fake_db):
-            with patch("main.vector_db", _make_dud_vector_db()):
+            with patch("orchestrator.main.vector_db", _make_dud_vector_db()):
                 with pytest.raises(HTTPException) as exc:
                     await get_knowledge_note(
                         fake_request, str(project_a["id"]), "note-1"
@@ -211,10 +211,10 @@ class TestKnowledgeGatePositivePaths:
     async def test_search_member_passes_gate(
         self, user_a, project_a, fake_db, fake_request
     ):
-        from main import KnowledgeSearchRequest, search_knowledge
+        from orchestrator.main import KnowledgeSearchRequest, search_knowledge
 
         with _patch_caller_and_db(user_a, fake_db):
-            with patch("main.vector_db", _make_dud_vector_db()):
+            with patch("orchestrator.main.vector_db", _make_dud_vector_db()):
                 with pytest.raises(HTTPException) as exc:
                     await search_knowledge(
                         fake_request,
@@ -227,10 +227,10 @@ class TestKnowledgeGatePositivePaths:
     async def test_patch_note_member_passes_gate(
         self, user_a, project_a, fake_db, fake_request
     ):
-        from main import KnowledgeNoteUpdate, update_knowledge_note
+        from orchestrator.main import KnowledgeNoteUpdate, update_knowledge_note
 
         with _patch_caller_and_db(user_a, fake_db):
-            with patch("main.vector_db", _make_dud_vector_db()):
+            with patch("orchestrator.main.vector_db", _make_dud_vector_db()):
                 with pytest.raises(HTTPException) as exc:
                     await update_knowledge_note(
                         fake_request,
@@ -244,10 +244,10 @@ class TestKnowledgeGatePositivePaths:
     async def test_delete_note_member_passes_gate(
         self, user_a, project_a, fake_db, fake_request
     ):
-        from main import delete_knowledge_note
+        from orchestrator.main import delete_knowledge_note
 
         with _patch_caller_and_db(user_a, fake_db):
-            with patch("main.vector_db", _make_dud_vector_db()):
+            with patch("orchestrator.main.vector_db", _make_dud_vector_db()):
                 with pytest.raises(HTTPException) as exc:
                     await delete_knowledge_note(
                         fake_request, str(project_a["id"]), "note-1"
@@ -264,10 +264,10 @@ class TestKnowledgeGatePositivePaths:
         """Export checks Neo4j availability *after* the gate. Without
         the graph attached it returns 503 — that confirms the gate let
         us through."""
-        from main import export_knowledge
+        from orchestrator.main import export_knowledge
 
         with _patch_caller_and_db(user_a, fake_db):
-            with patch("main._get_knowledge_graph", lambda: None):
+            with patch("orchestrator.main._get_knowledge_graph", lambda: None):
                 with pytest.raises(HTTPException) as exc:
                     await export_knowledge(fake_request, str(project_a["id"]))
         assert exc.value.status_code == 503

@@ -11,8 +11,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from src.services.auxiliary import KnowledgeVerdict, KnowledgeVerdictTask
-from src.services.knowledge.ingestion import (
+from shared.runtime.services.auxiliary import KnowledgeVerdict, KnowledgeVerdictTask
+from agent.services.knowledge.ingestion import (
     KnowledgeVerdictService,
     build_knowledge_verdict_service,
     gate_candidate,

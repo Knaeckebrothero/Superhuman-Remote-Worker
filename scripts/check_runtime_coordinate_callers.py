@@ -26,7 +26,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-ORCHESTRATOR = REPO_ROOT / "orchestrator"
+ORCHESTRATOR = REPO_ROOT / "src" / "orchestrator"
 MANIFEST = REPO_ROOT / "policy" / "runtime_coordinate_callers.txt"
 
 ALLOWED_CLASSIFICATIONS = frozenset(
@@ -141,10 +141,7 @@ def _skeleton(node: ast.AST | None, depth: int = 0) -> str:
     if isinstance(node, ast.JoinedStr):
         return "f'" + "".join(_skeleton(v, depth + 1) for v in node.values) + "'"
     if isinstance(node, ast.Subscript):
-        return (
-            f"{_skeleton(node.value, depth + 1)}"
-            f"[{_skeleton(node.slice, depth + 1)}]"
-        )
+        return f"{_skeleton(node.value, depth + 1)}[{_skeleton(node.slice, depth + 1)}]"
     if isinstance(node, ast.Dict):
         items = ", ".join(
             f"{_skeleton(k, depth + 1)}: {_skeleton(v, depth + 1)}"
@@ -157,11 +154,7 @@ def _skeleton(node: ast.AST | None, depth: int = 0) -> str:
             ast.Tuple: ("(", ")"),
             ast.Set: ("{", "}"),
         }[type(node)]
-        return (
-            open_
-            + ", ".join(_skeleton(e, depth + 1) for e in node.elts)
-            + close
-        )
+        return open_ + ", ".join(_skeleton(e, depth + 1) for e in node.elts) + close
     if isinstance(node, ast.BinOp):
         return (
             f"{_skeleton(node.left, depth + 1)} "
@@ -375,7 +368,10 @@ def sites_for_source(rel_path: str, source: str) -> list[Site]:
 
 def collect_sites() -> list[Site]:
     sites: list[Site] = []
-    for path in _roots():
+    paths = _roots()
+    if not paths:
+        raise RuntimeError("No Python sources discovered for the policy inventory")
+    for path in paths:
         sites.extend(
             sites_for_source(str(path.relative_to(REPO_ROOT)), path.read_text())
         )

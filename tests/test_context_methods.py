@@ -8,11 +8,11 @@ trim_messages, and sanitize_message_history.
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
-from src.core.loader import (
+from shared.runtime.core.loader import (
     CONTEXT_THRESHOLD_FRACTION,
     MESSAGE_COUNT_MIN_FRACTION,
 )
-from src.core.context import (
+from agent.core.context import (
     ContextManager,
     ContextConfig,
     repair_tool_call_arguments,
@@ -20,8 +20,8 @@ from src.core.context import (
     sanitize_message_history,
     scrub_history_tool_call_arguments,
 )
-from src.core.message_markers import PROTECTED_KEY, is_protected_message
-from src.core.workspace_injection import create_phase_instruction_message
+from shared.runtime.core.message_markers import PROTECTED_KEY, is_protected_message
+from shared.runtime.core.workspace_injection import create_phase_instruction_message
 
 
 # =============================================================================

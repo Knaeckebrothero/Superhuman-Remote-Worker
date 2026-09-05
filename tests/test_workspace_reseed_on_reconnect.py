@@ -14,15 +14,8 @@ Fix: (1) RemoteBackend fires an on_reconnect hook after a genuine reconnect;
 absent, without clobbering anything the agent has since produced.
 """
 
-import sys
-from pathlib import Path
-
-_ROOT = Path(__file__).parent.parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-
-from src.core.backends.remote import RemoteBackend  # noqa: E402
-from src.core.backends.seed import reseed_missing_files  # noqa: E402
+from shared.runtime.core.backends.remote import RemoteBackend  # noqa: E402
+from agent.core.backends.seed import reseed_missing_files  # noqa: E402
 from tests._fs_backend import FilesystemTestBackend  # noqa: E402
 
 

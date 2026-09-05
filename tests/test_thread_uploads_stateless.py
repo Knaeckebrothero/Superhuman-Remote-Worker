@@ -13,8 +13,8 @@ from uuid import UUID
 import pytest
 import asyncssh
 
-from services.canvas_ssh import CanvasSSHError
-from services.thread_uploads import (
+from orchestrator.services.canvas_ssh import CanvasSSHError
+from orchestrator.services.thread_uploads import (
     ThreadUploadError,
     _SshTarget,
     _VirtualTarget,
@@ -164,7 +164,7 @@ class _RejectingPinnedPool(_PinnedPool):
 
 @pytest.fixture
 def attested_upload(monkeypatch):
-    from services import thread_uploads
+    from orchestrator.services import thread_uploads
 
     monkeypatch.setattr(thread_uploads, "resolve_ssh_key_path", lambda: "/ssh/key")
     thread = _sandbox_thread()
@@ -511,7 +511,7 @@ async def test_runtime_replacement_after_write_removes_new_bytes(attested_upload
 async def test_pinned_transport_host_key_rejection_writes_no_bytes(
     attested_upload, monkeypatch
 ):
-    from services import thread_uploads
+    from orchestrator.services import thread_uploads
 
     rejecting = _RejectingPinnedPool(attested_upload.sftp)
     monkeypatch.setattr(thread_uploads, "_ATTESTED_SFTP_POOL", rejecting)
@@ -530,7 +530,7 @@ async def test_pinned_transport_host_key_rejection_writes_no_bytes(
 async def test_pinned_transport_host_key_rejection_deletes_no_bytes(
     attested_upload, monkeypatch
 ):
-    from services import thread_uploads
+    from orchestrator.services import thread_uploads
 
     attested_upload.sftp.dirs.add("/home/agent-host/workspace/uploads")
     attested_upload.sftp.files[UPLOAD_PATH] = b"hello"
@@ -557,7 +557,7 @@ async def test_pinned_transport_host_key_rejection_deletes_no_bytes(
 async def test_stateless_sandbox_cannot_fall_back_to_legacy_auto_add_path(
     attested_upload, monkeypatch
 ):
-    from services import thread_uploads
+    from orchestrator.services import thread_uploads
 
     legacy = AsyncMock(side_effect=AssertionError("legacy writer must not run"))
     monkeypatch.setattr(thread_uploads, "_sftp_write_files", legacy)
@@ -577,7 +577,7 @@ async def test_stateless_sandbox_cannot_fall_back_to_legacy_auto_add_path(
 async def test_stateless_sandbox_delete_cannot_fall_back_to_legacy_auto_add_path(
     attested_upload, monkeypatch
 ):
-    from services import thread_uploads
+    from orchestrator.services import thread_uploads
 
     legacy = MagicMock(side_effect=AssertionError("legacy delete must not run"))
     monkeypatch.setattr(thread_uploads, "_sftp_delete_file", legacy)
@@ -595,7 +595,7 @@ async def test_stateless_sandbox_delete_cannot_fall_back_to_legacy_auto_add_path
 
 @pytest.mark.asyncio
 async def test_pinned_legacy_upload_shape_is_unchanged(monkeypatch):
-    from services import thread_uploads
+    from orchestrator.services import thread_uploads
 
     thread = deepcopy(_sandbox_thread())
     thread["execution_lane"] = "pinned"
@@ -631,7 +631,7 @@ async def test_pinned_legacy_upload_shape_is_unchanged(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_stateless_virtual_upload_remains_on_object_store_path(monkeypatch):
-    from services import thread_uploads
+    from orchestrator.services import thread_uploads
 
     thread = {
         "id": THREAD_ID,
@@ -666,7 +666,7 @@ async def test_stateless_virtual_upload_remains_on_object_store_path(monkeypatch
 async def test_cancelled_stateless_virtual_upload_joins_blocking_writer(
     monkeypatch,
 ):
-    from services import thread_uploads
+    from orchestrator.services import thread_uploads
 
     entered = threading.Event()
     release = threading.Event()
@@ -774,7 +774,7 @@ def test_virtual_prefix_purge_fails_closed_on_partial_residue(failure) -> None:
 async def test_virtual_purge_refuses_backing_drift_before_blocking_effect(
     monkeypatch,
 ):
-    from services import thread_uploads, workspace_binding
+    from orchestrator.services import thread_uploads, workspace_binding
 
     spec = {"type": "s3", "root": "bucket", "config": {}}
     monkeypatch.setattr(

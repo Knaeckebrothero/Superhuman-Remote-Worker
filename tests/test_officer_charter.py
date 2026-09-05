@@ -25,28 +25,29 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from src.core.knowledge_injection import (
+from agent.core.knowledge_injection import (
     CHARTER_TOOL_CALL_ID_PREFIX,
     create_charter_injection_messages,
 )
-from src.core.loader import OfficerConfig, _parse_officer_config
-from src.core.workspace_injection import is_workspace_injection_message
-from src.persistent_graph import (
+from shared.runtime.core.loader import OfficerConfig, _parse_officer_config
+from shared.runtime.core.workspace_injection import is_workspace_injection_message
+from agent.persistent_graph import (
     _charter_injection_enabled,
     _inject_context_pairs,
 )
-from src.services.knowledge_graph import NOTE_TYPES
-from src.services.knowledge.bindings import KnowledgeBinding
-from src.services.knowledge_store import KB_TTL_BY_NOTE_TYPE, KnowledgeStore
-from src.shared.runtime_actor import (
+from shared.runtime.services.knowledge_graph import NOTE_TYPES
+from agent.services.knowledge.bindings import KnowledgeBinding
+from shared.runtime.services.knowledge_store import KB_TTL_BY_NOTE_TYPE, KnowledgeStore
+from shared.runtime_actor import (
     SENSITIVE_KNOWLEDGE_HUMAN_ROLE_POLICY,
     RuntimeActorContext,
     RuntimeAuthorizationResult,
 )
-from src.tools.knowledge.knowledge_tools import create_kb_tools
+from agent.tools.knowledge.knowledge_tools import create_kb_tools
 
 _MIGRATION = (
     Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "migrations"
@@ -160,11 +161,11 @@ def _runtime_actor_pep():
     """Stub the PEP and the server-side commit; yields the commit mock."""
     with (
         patch(
-            "src.tools.knowledge.knowledge_tools._request_runtime_actor_authorization",
+            "agent.tools.knowledge.knowledge_tools._request_runtime_actor_authorization",
             side_effect=_authorize_from_test_actor,
         ),
         patch(
-            "src.tools.knowledge.knowledge_tools._post_vault_file",
+            "agent.tools.knowledge.knowledge_tools._post_vault_file",
             return_value={
                 "status": "committed",
                 "canonical_state": "canonical",
@@ -384,7 +385,7 @@ class TestCharterWriteAuthority:
         ctx.knowledge_graph = MagicMock()
         ctx.knowledge_graph.read_note.return_value = existing
         with patch(
-            "src.tools.knowledge.knowledge_tools._post_vault_file"
+            "agent.tools.knowledge.knowledge_tools._post_vault_file"
         ) as canonical_write:
             result = _tool(ctx, "kb_update").func(
                 note="century-charter", content="editor's new orders"
@@ -577,9 +578,9 @@ class TestConferenceConfig:
         assert cfg.conference is False
 
     def test_sanitizer_admits_conference(self):
-        import main
+        import orchestrator.main
 
-        cleaned = main._validated_session_officer_override(
+        cleaned = orchestrator.main._validated_session_officer_override(
             {"officer": {"conference": True}}
         )
         assert cleaned == {"conference": True}
@@ -591,18 +592,20 @@ class TestConferenceConfig:
     def test_generic_sanitizer_rejects_post_owned_authority(self, field, value):
         from fastapi import HTTPException
 
-        import main
+        import orchestrator.main
 
         with pytest.raises(HTTPException, match="Unknown officer override"):
-            main._validated_session_officer_override({"officer": {field: value}})
+            orchestrator.main._validated_session_officer_override(
+                {"officer": {field: value}}
+            )
 
     def test_generic_sanitizer_rejects_slot_spend_authority(self):
         from fastapi import HTTPException
 
-        import main
+        import orchestrator.main
 
         with pytest.raises(HTTPException, match="owned by the Officer Post"):
-            main._validated_session_officer_override(
+            orchestrator.main._validated_session_officer_override(
                 {
                     "officer": {
                         "slots": {"line": {"count": 1, "spend_ceiling_daily": 4.5}}
@@ -611,9 +614,9 @@ class TestConferenceConfig:
             )
 
     def test_private_post_snapshot_materializes_safe_exact_authority(self):
-        import main
+        import orchestrator.main
 
-        cleaned = main._validated_post_owned_officer_create_fragment(
+        cleaned = orchestrator.main._validated_post_owned_officer_create_fragment(
             {
                 "officer": {
                     "auto_pull": True,
@@ -632,26 +635,30 @@ class TestConferenceConfig:
     def test_sanitizer_rejects_non_boolean_auto_pull(self, value):
         from fastapi import HTTPException
 
-        import main
+        import orchestrator.main
 
         with pytest.raises(HTTPException):
-            main._validated_session_officer_override({"officer": {"auto_pull": value}})
+            orchestrator.main._validated_session_officer_override(
+                {"officer": {"auto_pull": value}}
+            )
 
     @pytest.mark.parametrize("value", [0, -1, True, "nan", "inf"])
     def test_sanitizer_rejects_invalid_century_ceiling(self, value):
         from fastapi import HTTPException
 
-        import main
+        import orchestrator.main
 
         with pytest.raises(HTTPException):
-            main._validated_session_officer_override(
+            orchestrator.main._validated_session_officer_override(
                 {"officer": {"worker_spend_ceiling_daily": value}}
             )
 
     def test_sanitizer_still_rejects_unknown_keys(self):
         from fastapi import HTTPException
 
-        import main
+        import orchestrator.main
 
         with pytest.raises(HTTPException):
-            main._validated_session_officer_override({"officer": {"conferance": True}})
+            orchestrator.main._validated_session_officer_override(
+                {"officer": {"conferance": True}}
+            )

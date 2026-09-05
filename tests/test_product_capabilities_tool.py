@@ -14,9 +14,12 @@ from uuid import UUID
 import httpx
 import pytest
 
-from services.product_capabilities import ProductCapabilityService, ResolutionRequest
-from services.shared_browser_canvas import BrowserCapabilityResponse
-from src.core.product_capabilities import (
+from orchestrator.services.product_capabilities import (
+    ProductCapabilityService,
+    ResolutionRequest,
+)
+from orchestrator.services.shared_browser_canvas import BrowserCapabilityResponse
+from shared.runtime.core.product_capabilities import (
     AgentAction,
     ComponentProvenance,
     ProductComponent,
@@ -26,9 +29,9 @@ from src.core.product_capabilities import (
     SessionState,
     UserState,
 )
-from src.tools.context import SessionRuntimeFacts, ToolContext
-from src.tools.email.tools import create_email_tools
-from src.tools.product_capabilities import (
+from agent.tools.context import SessionRuntimeFacts, ToolContext
+from agent.tools.email.tools import create_email_tools
+from agent.tools.product_capabilities import (
     CapabilityToolErrorCode,
     CapabilityToolRequest,
     CapabilityToolStatus,
@@ -41,7 +44,7 @@ from src.tools.product_capabilities import (
     create_product_capability_tools,
     product_capabilities_tool_enabled,
 )
-from src.tools.registry import TOOL_REGISTRY, filter_tools_by_backend, load_tools
+from agent.tools.registry import TOOL_REGISTRY, filter_tools_by_backend, load_tools
 
 _USER_ID = "11111111-1111-1111-1111-111111111111"
 _THREAD_ID = "22222222-2222-2222-2222-222222222222"
@@ -337,7 +340,7 @@ async def test_fetcher_receives_bound_context_and_canonical_exact_filters():
 async def test_default_fetch_binds_internal_identity_thread_and_timeout(
     monkeypatch,
 ):
-    import src.tools.product_capabilities as capability_module
+    import agent.tools.product_capabilities as capability_module
 
     payload = await _server_payload("datasources.email")
     observed: dict[str, Any] = {}
@@ -876,7 +879,7 @@ async def test_server_cannot_claim_agent_component_or_actionability():
 
 @pytest.mark.asyncio
 async def test_output_is_deterministic_bounded_and_tail_truncated(monkeypatch):
-    import src.tools.product_capabilities as capability_module
+    import agent.tools.product_capabilities as capability_module
 
     monkeypatch.setattr(capability_module, "MAX_TOOL_OUTPUT_BYTES", 8_000)
     payload = await _server_payload()

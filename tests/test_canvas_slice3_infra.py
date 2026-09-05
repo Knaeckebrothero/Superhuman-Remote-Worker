@@ -102,8 +102,8 @@ def test_canvas_live_preview_gate_reaches_orchestrator_and_agent_config() -> Non
     # actual tool capability still comes only from the orchestrator's positive
     # attach bit and is covered by the callable/runtime tests.
     for relative_path in (
-        "orchestrator/services/agent_provisioner.py",
-        "orchestrator/services/persistent_provisioner.py",
+        "src/orchestrator/services/agent_provisioner.py",
+        "src/orchestrator/services/persistent_provisioner.py",
     ):
         source = (ROOT / relative_path).read_text()
         assert '"envFrom"' in source

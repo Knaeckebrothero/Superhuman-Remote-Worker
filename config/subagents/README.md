@@ -11,7 +11,7 @@ config/subagents/
 ```
 
 Design: `knowledge-base/knowledge/features/universal_experts_and_subagents.md`
-§0 D4/D7 and §1.1. Loader/resolver: `src/core/subagent_roster.py`.
+§0 D4/D7 and §1.1. Loader/resolver: `src/shared/runtime/core/subagent_roster.py`.
 
 ## Referencing an entry
 
@@ -101,7 +101,7 @@ Everything the expert schema allows (`config/schema.json`), plus, per entry:
 | `return`       | carried verbatim (`summary` \| `structured` \| `evidence` \| `diff`) | shapes the result |
 
 The resolved entry is data until a `delegate_agent` call names it: the roster
-runtime (`src/subagents/`) turns the entry into a running child. Foreground
+runtime (`src/agent/subagents/`) turns the entry into a running child. Foreground
 calls return the report directly; background calls return a durable receipt
 and push the completion automatically. `delegate_agent` and each control
 (`wait_agent`, `message_agent`, `stop_agent`, `list_agents`) are bound only
@@ -130,7 +130,7 @@ when the parent sets `delegation.enabled` AND explicitly names that tool in
    rejected on the DB write path — a persona is a substitution *value*, so a
    token inside it would never be expanded anyway. Write the display name
    literally. See `ASSEMBLER_OWNED_PROMPT_TOKENS` in
-   `src/core/expert_resolution.py`.
+   `src/shared/runtime/core/expert_resolution.py`.
 3. Run `UPDATE_TOOL_GRANTS_SNAPSHOT=1 pytest tests/test_config_tool_grants_snapshot.py`
    and review the added `subagents/<name>` entry, then
    `pytest tests/test_expert_roles_golden.py tests/test_subagent_roster.py tests/test_tool_policy.py`.

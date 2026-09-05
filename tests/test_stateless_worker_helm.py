@@ -198,7 +198,13 @@ def test_rendered_stateless_shell_delivers_sigterm_to_agent(
     command = _stateless_agent_container(deployment)["command"]
     ready_path = tmp_path / "ready"
     term_path = tmp_path / "term"
-    (tmp_path / "agent.py").write_text(
+    # Model the editable source root used by the image, including safe-path
+    # behavior; an adjacent agent.py is not the installed module entrypoint.
+    source_root = tmp_path / "application-source"
+    package = source_root / "agent"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "__main__.py").write_text(
         """\
 import os
 from pathlib import Path
@@ -219,6 +225,8 @@ signal.pause()
         **os.environ,
         "READY_PATH": str(ready_path),
         "TERM_PATH": str(term_path),
+        "PYTHONPATH": str(source_root),
+        "PYTHONSAFEPATH": "1",
     }
     process = subprocess.Popen(
         command,

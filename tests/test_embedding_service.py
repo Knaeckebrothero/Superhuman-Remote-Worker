@@ -29,7 +29,7 @@ def mock_env(monkeypatch):
 @pytest.fixture
 def mock_openai_client():
     """Mock AsyncOpenAI client."""
-    with patch("src.services.embedding_service.AsyncOpenAI") as mock_cls:
+    with patch("shared.runtime.services.embedding_service.AsyncOpenAI") as mock_cls:
         mock_client = MagicMock()
         mock_cls.return_value = mock_client
         yield mock_client, mock_cls
@@ -40,7 +40,7 @@ class TestEmbeddingServiceInit:
 
     def test_init_with_openai_key(self, mock_env, mock_openai_client):
         """Uses OPENAI_API_KEY when EMBEDDING_API_KEY not set."""
-        from src.services.embedding_service import EmbeddingService
+        from shared.runtime.services.embedding_service import EmbeddingService
 
         service = EmbeddingService()
         assert service.api_key == "test-key-123"
@@ -52,7 +52,7 @@ class TestEmbeddingServiceInit:
         monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
         monkeypatch.setenv("EMBEDDING_API_KEY", "embedding-key")
 
-        from src.services.embedding_service import EmbeddingService
+        from shared.runtime.services.embedding_service import EmbeddingService
 
         service = EmbeddingService()
         assert service.api_key == "embedding-key"
@@ -61,7 +61,7 @@ class TestEmbeddingServiceInit:
         """Respects EMBEDDING_MODEL env var."""
         monkeypatch.setenv("EMBEDDING_MODEL", "text-embedding-3-large")
 
-        from src.services.embedding_service import EmbeddingService
+        from shared.runtime.services.embedding_service import EmbeddingService
 
         service = EmbeddingService()
         assert service.model == "text-embedding-3-large"
@@ -70,7 +70,7 @@ class TestEmbeddingServiceInit:
         """Respects EMBEDDING_BASE_URL env var."""
         monkeypatch.setenv("EMBEDDING_BASE_URL", "http://localhost:11434/v1")
 
-        from src.services.embedding_service import EmbeddingService
+        from shared.runtime.services.embedding_service import EmbeddingService
 
         service = EmbeddingService()
         assert service.base_url == "http://localhost:11434/v1"
@@ -78,7 +78,7 @@ class TestEmbeddingServiceInit:
     def test_profile_fingerprint_is_normalized_and_never_depends_on_key(
         self, mock_env, mock_openai_client
     ):
-        from src.services.embedding_service import EmbeddingService
+        from shared.runtime.services.embedding_service import EmbeddingService
 
         first = EmbeddingService(
             provider="openai",
@@ -109,7 +109,7 @@ class TestEmbeddingServiceSingleton:
 
     def test_singleton_returns_same_instance(self, mock_env, mock_openai_client):
         """get_embedding_service returns the same instance on repeated calls."""
-        import src.services.embedding_service as mod
+        import shared.runtime.services.embedding_service as mod
 
         # Reset singleton
         mod._embedding_service = None
@@ -133,7 +133,7 @@ class TestKnowledgeEmbeddingService:
     def test_dedicated_profile_is_independent_of_user_memory(
         self, mock_env, monkeypatch, mock_openai_client
     ):
-        import src.services.embedding_service as mod
+        import shared.runtime.services.embedding_service as mod
 
         self._reset(mod)
         monkeypatch.setenv("EMBEDDING_MODEL", "user-memory-model")
@@ -162,7 +162,7 @@ class TestKnowledgeEmbeddingService:
     def test_legacy_deployment_falls_back_to_memory_profile(
         self, mock_env, mock_openai_client
     ):
-        import src.services.embedding_service as mod
+        import shared.runtime.services.embedding_service as mod
 
         self._reset(mod)
         assert mod.get_kb_embedding_service() is mod.get_embedding_service()
@@ -171,7 +171,7 @@ class TestKnowledgeEmbeddingService:
     def test_declared_profile_never_borrows_user_key(
         self, mock_env, monkeypatch, mock_openai_client
     ):
-        import src.services.embedding_service as mod
+        import shared.runtime.services.embedding_service as mod
 
         self._reset(mod)
         monkeypatch.setenv("EMBEDDING_API_KEY", "user-key")
@@ -187,7 +187,7 @@ class TestKnowledgeEmbeddingService:
     def test_profile_change_rebuilds_only_kb_singleton(
         self, mock_env, monkeypatch, mock_openai_client
     ):
-        import src.services.embedding_service as mod
+        import shared.runtime.services.embedding_service as mod
 
         self._reset(mod)
         monkeypatch.setenv("KB_EMBEDDING_MODEL", "kb-v1")
@@ -206,7 +206,7 @@ class TestKnowledgeEmbeddingService:
     def test_authoritative_apply_clears_stale_endpoint_and_profile_removal(
         self, mock_env, mock_openai_client
     ):
-        import src.services.embedding_service as mod
+        import shared.runtime.services.embedding_service as mod
 
         self._reset(mod)
         mod.apply_kb_embedding_env(
@@ -252,7 +252,7 @@ class TestEmbeddingServiceEmbed:
         """embed() returns a vector from the API response."""
         monkeypatch.setenv("EMBEDDING_DIMENSIONS", "3")
         mock_client, _ = mock_openai_client
-        from src.services.embedding_service import EmbeddingService
+        from shared.runtime.services.embedding_service import EmbeddingService
 
         # Mock the API response
         mock_embedding = MagicMock()
@@ -275,7 +275,7 @@ class TestEmbeddingServiceEmbed:
         """embed_batch() returns vectors in input order."""
         monkeypatch.setenv("EMBEDDING_DIMENSIONS", "1")
         mock_client, _ = mock_openai_client
-        from src.services.embedding_service import EmbeddingService
+        from shared.runtime.services.embedding_service import EmbeddingService
 
         # Mock response with out-of-order indices
         mock_e1 = MagicMock()
@@ -298,7 +298,7 @@ class TestEmbeddingServiceEmbed:
     @pytest.mark.asyncio
     async def test_embed_batch_empty(self, mock_env, mock_openai_client):
         """embed_batch() handles empty input."""
-        from src.services.embedding_service import EmbeddingService
+        from shared.runtime.services.embedding_service import EmbeddingService
 
         service = EmbeddingService()
         result = await service.embed_batch([])
@@ -318,7 +318,7 @@ class TestDimensionGuard:
 
     def test_default_expected_dimensions(self, mock_env, mock_openai_client):
         """Defaults to the schema's vector(4096)."""
-        from src.services.embedding_service import EmbeddingService
+        from shared.runtime.services.embedding_service import EmbeddingService
 
         assert EmbeddingService().expected_dimensions == 4096
 
@@ -326,7 +326,7 @@ class TestDimensionGuard:
     async def test_mismatch_raises_and_latches(self, mock_env, mock_openai_client):
         """Wrong dimensionality raises EmbeddingDimensionError and latches."""
         mock_client, _ = mock_openai_client
-        from src.services.embedding_service import (
+        from shared.runtime.services.embedding_service import (
             EmbeddingDimensionError,
             EmbeddingService,
         )
@@ -348,7 +348,7 @@ class TestDimensionGuard:
     async def test_batch_mismatch_raises(self, mock_env, mock_openai_client):
         """embed_batch() checks dimensions too."""
         mock_client, _ = mock_openai_client
-        from src.services.embedding_service import (
+        from shared.runtime.services.embedding_service import (
             EmbeddingDimensionError,
             EmbeddingService,
         )
@@ -367,7 +367,7 @@ class TestDimensionGuard:
         """Probe returns True when dimensions match."""
         monkeypatch.setenv("EMBEDDING_DIMENSIONS", "2")
         mock_client, _ = mock_openai_client
-        from src.services.embedding_service import EmbeddingService
+        from shared.runtime.services.embedding_service import EmbeddingService
 
         self._mock_response(mock_client, [0.1, 0.2])
         service = EmbeddingService()
@@ -379,7 +379,7 @@ class TestDimensionGuard:
     async def test_verify_dimensions_mismatch(self, mock_env, mock_openai_client):
         """Probe returns False on mismatch and latches degraded."""
         mock_client, _ = mock_openai_client
-        from src.services.embedding_service import EmbeddingService
+        from shared.runtime.services.embedding_service import EmbeddingService
 
         self._mock_response(mock_client, [0.1, 0.2])
         service = EmbeddingService()
@@ -391,7 +391,7 @@ class TestDimensionGuard:
     async def test_verify_dimensions_inconclusive(self, mock_env, mock_openai_client):
         """Connectivity failures must NOT latch degraded (transient)."""
         mock_client, _ = mock_openai_client
-        from src.services.embedding_service import EmbeddingService
+        from shared.runtime.services.embedding_service import EmbeddingService
 
         mock_client.embeddings.create = AsyncMock(side_effect=ConnectionError("down"))
         service = EmbeddingService()
@@ -401,7 +401,7 @@ class TestDimensionGuard:
 
     def test_health_snapshot(self, mock_env, mock_openai_client):
         """Snapshot carries the degraded flag for /status."""
-        from src.services.embedding_service import EmbeddingService
+        from shared.runtime.services.embedding_service import EmbeddingService
 
         service = EmbeddingService()
         snap = service.health_snapshot()
@@ -416,7 +416,7 @@ class TestDimensionGuard:
 
     def test_peek_does_not_construct(self, mock_env, mock_openai_client):
         """peek_embedding_service() never builds the singleton."""
-        import src.services.embedding_service as mod
+        import shared.runtime.services.embedding_service as mod
 
         mod._embedding_service = None
         assert mod.peek_embedding_service() is None
@@ -432,7 +432,7 @@ class TestEmbeddingProviders:
 
     def test_local_provider_default(self, mock_env, mock_openai_client):
         """Default provider is 'local'."""
-        from src.services.embedding_service import EmbeddingService
+        from shared.runtime.services.embedding_service import EmbeddingService
 
         service = EmbeddingService()
         assert service.provider == "local"
@@ -444,7 +444,7 @@ class TestEmbeddingProviders:
         monkeypatch.setenv("EMBEDDING_PROVIDER", "openrouter")
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key-123")
 
-        from src.services.embedding_service import EmbeddingService
+        from shared.runtime.services.embedding_service import EmbeddingService
 
         service = EmbeddingService()
         assert service.provider == "openrouter"
@@ -458,7 +458,7 @@ class TestEmbeddingProviders:
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key-123")
         monkeypatch.setenv("EMBEDDING_MODEL", "qwen3-embedding-0.6b")
 
-        from src.services.embedding_service import EmbeddingService
+        from shared.runtime.services.embedding_service import EmbeddingService
 
         service = EmbeddingService()
         assert service.model == "qwen/qwen3-embedding-0.6b"
@@ -469,7 +469,7 @@ class TestEmbeddingProviders:
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key-123")
         monkeypatch.setenv("EMBEDDING_MODEL", "openai/text-embedding-3-small")
 
-        from src.services.embedding_service import EmbeddingService
+        from shared.runtime.services.embedding_service import EmbeddingService
 
         service = EmbeddingService()
         assert service.model == "openai/text-embedding-3-small"
@@ -478,7 +478,7 @@ class TestEmbeddingProviders:
         """Explicit EMBEDDING_PROVIDER=local works."""
         monkeypatch.setenv("EMBEDDING_PROVIDER", "local")
 
-        from src.services.embedding_service import EmbeddingService
+        from shared.runtime.services.embedding_service import EmbeddingService
 
         service = EmbeddingService()
         assert service.provider == "local"
@@ -490,7 +490,7 @@ class TestEmbeddingProviders:
         """Unknown provider name falls back to local behavior."""
         monkeypatch.setenv("EMBEDDING_PROVIDER", "nonexistent")
 
-        from src.services.embedding_service import EmbeddingService
+        from shared.runtime.services.embedding_service import EmbeddingService
 
         service = EmbeddingService()
         # Unknown provider goes through the else (local) branch
@@ -507,7 +507,7 @@ class TestExplicitConfigOverrides:
         monkeypatch.setenv("EMBEDDING_MODEL", "env-model")
         monkeypatch.setenv("EMBEDDING_BASE_URL", "https://env.example/v1")
 
-        from src.services.embedding_service import EmbeddingService
+        from shared.runtime.services.embedding_service import EmbeddingService
 
         service = EmbeddingService(
             model="catalog-model",
@@ -523,7 +523,7 @@ class TestExplicitConfigOverrides:
     ):
         _, mock_cls = mock_openai_client
 
-        from src.services.embedding_service import EmbeddingService
+        from shared.runtime.services.embedding_service import EmbeddingService
 
         EmbeddingService(model="m", base_url="https://x.example/v1", api_key="k")
         kwargs = mock_cls.call_args[1]
@@ -535,7 +535,7 @@ class TestExplicitConfigOverrides:
     ):
         monkeypatch.setenv("EMBEDDING_BASE_URL", "https://env.example/v1")
 
-        from src.services.embedding_service import EmbeddingService
+        from shared.runtime.services.embedding_service import EmbeddingService
 
         service = EmbeddingService(model="only-model-given")
         assert service.model == "only-model-given"
@@ -543,7 +543,7 @@ class TestExplicitConfigOverrides:
         assert service.api_key == "test-key-123"  # OPENAI_API_KEY from mock_env
 
     def test_no_kwargs_is_pure_env_backward_compat(self, mock_env, mock_openai_client):
-        from src.services.embedding_service import EmbeddingService
+        from shared.runtime.services.embedding_service import EmbeddingService
 
         service = EmbeddingService()
         assert service.model == "qwen3-embedding-8b"

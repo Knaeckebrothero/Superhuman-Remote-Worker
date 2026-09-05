@@ -736,7 +736,7 @@ kubectl get pods -l app.kubernetes.io/component=vm-controller
 
 `sshGateway.enabled` adds a component that lets a user `ssh s-<handle>@<sshGateway.hostname>`
 straight into their session workspace. It runs the orchestrator image with a different command
-(`uvicorn ssh_gateway:create_app --factory`), authenticates the user's own public key, and mints
+(`uvicorn orchestrator.ssh_gateway:create_app --factory`), authenticates the user's own public key, and mints
 a short-lived certificate for the inner hop to the workspace. It is off by default.
 
 ### Three Secrets, three places

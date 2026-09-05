@@ -14,14 +14,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from services.kb_purge import (
+from orchestrator.services.kb_purge import (
     PURGE_EXCLUDED_TYPES,
     purge_enabled,
     purge_grace,
     purge_kb_tick,
     purge_max_per_tick,
 )
-from services.kb_reindex import kb_sweep_tick
+from orchestrator.services.kb_reindex import kb_sweep_tick
 
 KB = uuid.uuid4()
 
@@ -76,7 +76,9 @@ class TestPurgeTick:
     @pytest.mark.asyncio
     async def test_enumerates_with_the_three_signal_rule_and_the_cap(self):
         store = _store([])
-        with patch("services.kb_purge.materialize_knowledge_note_delete") as delete:
+        with patch(
+            "orchestrator.services.kb_purge.materialize_knowledge_note_delete"
+        ) as delete:
             counts = await purge_kb_tick(
                 postgres_db=MagicMock(),
                 store=store,
@@ -104,7 +106,9 @@ class TestPurgeTick:
     async def test_each_candidate_is_deleted_with_its_cas_token_and_a_reason(self):
         store = _store([_row("old-a", "1" * 40), _row("old-b", "2" * 40, "superseded")])
         delete = AsyncMock(return_value={"status": "committed", "reason": None})
-        with patch("services.kb_purge.materialize_knowledge_note_delete", delete):
+        with patch(
+            "orchestrator.services.kb_purge.materialize_knowledge_note_delete", delete
+        ):
             counts = await purge_kb_tick(
                 postgres_db="db",
                 store=store,
@@ -133,7 +137,9 @@ class TestPurgeTick:
             RuntimeError("boom"),
         ]
         delete = AsyncMock(side_effect=outcomes)
-        with patch("services.kb_purge.materialize_knowledge_note_delete", delete):
+        with patch(
+            "orchestrator.services.kb_purge.materialize_knowledge_note_delete", delete
+        ):
             counts = await purge_kb_tick(
                 postgres_db="db", store=store, gitea_client="g", kb_id=KB
             )
@@ -150,7 +156,7 @@ class TestPurgeTick:
         """timedelta(0) is falsy; it must still mean 'purge now' (E6 found
         the `grace or default` wart)."""
         store = _store([])
-        with patch("services.kb_purge.materialize_knowledge_note_delete"):
+        with patch("orchestrator.services.kb_purge.materialize_knowledge_note_delete"):
             await purge_kb_tick(
                 postgres_db="db",
                 store=store,
@@ -165,7 +171,9 @@ class TestPurgeTick:
         store = MagicMock()
         store.list_purge_candidates = AsyncMock(side_effect=RuntimeError("db down"))
         delete = AsyncMock()
-        with patch("services.kb_purge.materialize_knowledge_note_delete", delete):
+        with patch(
+            "orchestrator.services.kb_purge.materialize_knowledge_note_delete", delete
+        ):
             counts = await purge_kb_tick(
                 postgres_db="db", store=store, gitea_client="g", kb_id=KB
             )
@@ -200,7 +208,7 @@ class TestSweepIntegration:
             return {"purged": 1}
 
         with patch(
-            "services.kb_reindex.resolve_kb_repo",
+            "orchestrator.services.kb_reindex.resolve_kb_repo",
             AsyncMock(return_value=MagicMock(repo="r", branch="main", forge="gitea")),
         ):
             n = await kb_sweep_tick(
@@ -220,7 +228,7 @@ class TestSweepIntegration:
         project_id = uuid.uuid4()
         purge = AsyncMock(return_value={"purged": 0})
         with patch(
-            "services.kb_reindex.resolve_kb_repo",
+            "orchestrator.services.kb_reindex.resolve_kb_repo",
             AsyncMock(return_value=MagicMock(repo="r", branch="main", forge="gitea")),
         ):
             await kb_sweep_tick(
@@ -239,7 +247,7 @@ class TestSweepIntegration:
         project_id = uuid.uuid4()
         purge = AsyncMock(return_value={"purged": 0})
         with patch(
-            "services.kb_reindex.resolve_kb_repo",
+            "orchestrator.services.kb_reindex.resolve_kb_repo",
             AsyncMock(return_value=MagicMock(repo="r", branch="main", forge="gitea")),
         ):
             await kb_sweep_tick(
@@ -257,7 +265,7 @@ class TestSweepIntegration:
     async def test_a_purge_failure_does_not_fail_the_sweep(self):
         project_id = uuid.uuid4()
         with patch(
-            "services.kb_reindex.resolve_kb_repo",
+            "orchestrator.services.kb_reindex.resolve_kb_repo",
             AsyncMock(return_value=MagicMock(repo="r", branch="main", forge="gitea")),
         ):
             n = await kb_sweep_tick(

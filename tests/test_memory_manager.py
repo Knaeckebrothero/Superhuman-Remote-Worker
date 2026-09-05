@@ -16,11 +16,15 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
-import src.services.memory.registry as registry_module
-from src.core.loader import MemoryConfig, MemoryPipelineConfig, _parse_memory_config
-from src.services.knowledge_store import KnowledgeRecord
-from src.services.recall_store import MemoryRecord
-from src.services.memory import (
+import agent.services.memory.registry as registry_module
+from shared.runtime.core.loader import (
+    MemoryConfig,
+    MemoryPipelineConfig,
+    _parse_memory_config,
+)
+from shared.runtime.services.knowledge_store import KnowledgeRecord
+from shared.runtime.services.recall_store import MemoryRecord
+from agent.services.memory import (
     AssembleRequest,
     AssembleStats,
     Candidate,
@@ -330,7 +334,7 @@ class TestAssemble:
 
     @pytest.mark.asyncio
     async def test_scorer_failure_hard_fails(self):
-        from src.services.memory import MemoryPipelineError
+        from agent.services.memory import MemoryPipelineError
 
         manager = MemoryManager(
             MemoryRuntime(),
@@ -344,7 +348,7 @@ class TestAssemble:
 
     @pytest.mark.asyncio
     async def test_scorer_transient_exhaustion_degrades_turn(self):
-        from src.services.memory import TransientScorerError
+        from agent.services.memory import TransientScorerError
 
         first = make_candidate(kind="memory", record_id="m1")
         second = make_candidate(kind="memory", record_id="m2")
@@ -625,7 +629,7 @@ def make_scored(text, *, pinned=False, kind="memory", record_id="r"):
 
 class TestRerankerScorer:
     def _scorer(self, client, **kwargs):
-        from src.services.memory.plugins.reranker import RerankerScorer
+        from agent.services.memory.plugins.reranker import RerankerScorer
 
         defaults = dict(
             model="qwen3-reranker-8b",
@@ -718,7 +722,7 @@ class TestRerankerScorer:
     async def test_transient_exhaustion_raises_transient_scorer_error(self):
         import httpx
 
-        from src.services.memory import TransientScorerError
+        from agent.services.memory import TransientScorerError
 
         client = FakeRerankClient(error=httpx.ReadTimeout("still slow"))
         scorer = self._scorer(client, retries=2, retry_backoff=0)
@@ -789,8 +793,8 @@ class TestRerankerScorer:
         # MemoryPipelineError (fails the turn loud) rather than silently
         # degrading to legacy order. Regression for
         # knowledge-base/knowledge/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md.
-        from src.services.memory import MemoryPipelineError
-        from src.services.memory.plugins.reranker import RerankerScorer
+        from agent.services.memory import MemoryPipelineError
+        from agent.services.memory.plugins.reranker import RerankerScorer
 
         scorer = RerankerScorer(
             model="m",
@@ -830,8 +834,8 @@ class TestRerankerScorer:
         # The reranker rides the EMBEDDING endpoint, never the auxiliary — even
         # when the aux has a perfectly good base_url. Regression guard for
         # knowledge-base/knowledge/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md.
-        from src.services.memory.plugins.reranker import _build_reranker
-        from src.core.loader import RerankerConfig
+        from agent.services.memory.plugins.reranker import _build_reranker
+        from shared.runtime.core.loader import RerankerConfig
 
         monkeypatch.setenv("EMBEDDING_BASE_URL", "https://ai.h4ll.app/v1")
         monkeypatch.setenv("EMBEDDING_API_KEY", "embed-key")
@@ -848,8 +852,8 @@ class TestRerankerScorer:
         assert scorer.top_k == 64
 
     def test_factory_explicit_base_url_wins(self, monkeypatch):
-        from src.services.memory.plugins.reranker import _build_reranker
-        from src.core.loader import RerankerConfig
+        from agent.services.memory.plugins.reranker import _build_reranker
+        from shared.runtime.core.loader import RerankerConfig
 
         monkeypatch.setenv("EMBEDDING_BASE_URL", "https://ai.h4ll.app/v1")
         runtime = MemoryRuntime(
@@ -868,8 +872,8 @@ class TestRerankerScorer:
         # The original bug: aux = OpenRouter-direct (no base_url). Previously
         # this raised at construction and killed agent startup. With the
         # embedding fallback it builds cleanly and ignores the aux entirely.
-        from src.services.memory.plugins.reranker import _build_reranker
-        from src.core.loader import RerankerConfig
+        from agent.services.memory.plugins.reranker import _build_reranker
+        from shared.runtime.core.loader import RerankerConfig
 
         monkeypatch.setenv("EMBEDDING_BASE_URL", "https://ai.h4ll.app/v1")
         runtime = MemoryRuntime(
@@ -883,8 +887,8 @@ class TestRerankerScorer:
         # Genuinely unserviceable (no explicit base_url, no EMBEDDING_BASE_URL):
         # still a hard error at the plugin layer — the orchestrator pre-flight
         # (Part 3) catches this before a pod ever spawns.
-        from src.services.memory.plugins.reranker import _build_reranker
-        from src.core.loader import RerankerConfig
+        from agent.services.memory.plugins.reranker import _build_reranker
+        from shared.runtime.core.loader import RerankerConfig
 
         monkeypatch.delenv("EMBEDDING_BASE_URL", raising=False)
         runtime = MemoryRuntime(
@@ -924,7 +928,7 @@ class TestRerankerScorer:
 
 class TestBoundedPolicy:
     def _policy(self, **kwargs):
-        from src.services.memory.plugins.bounded import BoundedPolicy
+        from agent.services.memory.plugins.bounded import BoundedPolicy
 
         return BoundedPolicy(**kwargs)
 
@@ -987,7 +991,7 @@ class TestBoundedPolicy:
             self._policy(max_tokens=0)
 
     def test_factory_reads_bounded_config(self):
-        from src.services.memory.plugins.bounded import _build_bounded
+        from agent.services.memory.plugins.bounded import _build_bounded
 
         runtime = SimpleNamespace(
             memory_config=SimpleNamespace(
@@ -999,7 +1003,7 @@ class TestBoundedPolicy:
         assert policy.max_tokens is None
 
     def test_factory_missing_section_raises(self):
-        from src.services.memory.plugins.bounded import _build_bounded
+        from agent.services.memory.plugins.bounded import _build_bounded
 
         runtime = SimpleNamespace(memory_config=SimpleNamespace(bounded=None))
         with pytest.raises(ValueError, match="config section missing"):
@@ -1092,7 +1096,7 @@ class TestBoundedPolicy:
 
 class TestGatePolicy:
     def _policy(self, **kwargs):
-        from src.services.memory.plugins.gate import GatePolicy
+        from agent.services.memory.plugins.gate import GatePolicy
 
         defaults = dict(threshold=0.05)
         defaults.update(kwargs)
@@ -1207,7 +1211,7 @@ class TestGatePolicy:
             self._policy(mode="sigmoid")
 
     def test_factory_reads_gate_config(self):
-        from src.services.memory.plugins.gate import _build_gate
+        from agent.services.memory.plugins.gate import _build_gate
 
         runtime = SimpleNamespace(
             memory_config=SimpleNamespace(
@@ -1219,7 +1223,7 @@ class TestGatePolicy:
         assert policy.channel == "rerank"
 
     def test_factory_missing_threshold_or_section_raises(self):
-        from src.services.memory.plugins.gate import _build_gate
+        from agent.services.memory.plugins.gate import _build_gate
 
         with pytest.raises(ValueError, match="config section missing"):
             _build_gate(SimpleNamespace(memory_config=SimpleNamespace(gate=None)))
@@ -1251,7 +1255,7 @@ class TestGatePolicy:
 
 class TestDigestQueryText:
     def _build(self, messages, frame=None, **kwargs):
-        from src.services.memory.query import build_digest_query_text
+        from agent.services.memory.query import build_digest_query_text
 
         return build_digest_query_text(messages, frame, **kwargs)
 
@@ -1283,15 +1287,15 @@ class TestDigestQueryText:
         assert text == "x" * 100
 
     def test_frame_appended_as_focus(self):
-        from src.services.memory import TaskFrame
+        from agent.services.memory import TaskFrame
 
         frame = TaskFrame(top_todo="implement the parser", phase_number=2)
         text = self._build([HumanMessage(content="status?")], frame)
         assert text == "status?\nimplement the parser\nphase 2 tactical"
 
     def test_frame_only_matches_worker_legacy_shape(self):
-        from src.services.memory import TaskFrame
-        from src.services.memory.plugins.legacy import build_worker_query_text
+        from agent.services.memory import TaskFrame
+        from agent.services.memory.plugins.legacy import build_worker_query_text
 
         frame = TaskFrame(top_todo="write tests", phase_number=3, is_strategic=True)
         # With no conversation, the digest reduces to the legacy worker

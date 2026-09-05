@@ -1,22 +1,15 @@
 import asyncio
-import sys
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 import pytest
 
-project_root = Path(__file__).parent.parent
-for p in (str(project_root), str(project_root / "orchestrator")):
-    if p not in sys.path:
-        sys.path.insert(0, p)
-
 from unittest.mock import AsyncMock  # noqa: E402
 
-from services.session_provisioner import (  # noqa: E402
+from orchestrator.services.session_provisioner import (  # noqa: E402
     ensure_session_workspace,
     reconcile_session_workspaces,
 )
-from services.workspace_lifecycle import EnsureOutcome, WorkspaceOwner  # noqa: E402
+from orchestrator.services.workspace_lifecycle import EnsureOutcome, WorkspaceOwner  # noqa: E402
 
 
 PINNED_THREAD_ID = "11111111-1111-4111-8111-111111111111"

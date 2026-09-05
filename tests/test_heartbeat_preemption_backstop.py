@@ -25,9 +25,9 @@ from unittest.mock import patch
 
 import pytest
 
-import src.api.app as app_module
-import src.api.dual_app as dual_app
-from src.api.app import _clear_stop, _on_heartbeat_response
+import agent.api.app as app_module
+import agent.api.dual_app as dual_app
+from agent.api.app import _clear_stop, _on_heartbeat_response
 
 
 @pytest.fixture(autouse=True)
@@ -248,7 +248,7 @@ class TestDualAppPreemption:
         """A drain intent riding the same response must still be recorded —
         the preemption check runs first and must not short-circuit it."""
         self._working()
-        with patch("src.api.dual_app.os._exit") as fake_exit:
+        with patch("agent.api.dual_app.os._exit") as fake_exit:
             await dual_app._handle_heartbeat_intents(
                 {
                     "status": "ok",

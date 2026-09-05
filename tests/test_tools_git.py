@@ -4,19 +4,13 @@ Tests the git tools that wrap GitManager for LLM access.
 """
 
 import shutil
-import sys
 import tempfile
 from pathlib import Path
 
 import pytest
 
-# Add project root to path
-project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-
-from src.managers.git_manager import GitManager  # noqa: E402
-from src.tools.git.git_tools import create_git_tools, GIT_TOOLS_METADATA  # noqa: E402
+from agent.managers.git_manager import GitManager  # noqa: E402
+from agent.tools.git.git_tools import create_git_tools, GIT_TOOLS_METADATA  # noqa: E402
 
 
 def git_available():

@@ -18,8 +18,8 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-import src.api.dual_app as dual_app
-import src.api.persistent_app as pa
+import agent.api.dual_app as dual_app
+import agent.api.persistent_app as pa
 
 
 def _drain_response():
@@ -141,7 +141,7 @@ class TestOtherPodStatesUntouched:
     @pytest.mark.asyncio
     async def test_idle_worker_still_exits(self):
         dual_app._pod_state = dual_app.PodState.IDLE
-        with patch("src.api.dual_app.os._exit") as fake_exit:
+        with patch("agent.api.dual_app.os._exit") as fake_exit:
             await dual_app._handle_heartbeat_intents(_drain_response())
         fake_exit.assert_called_once_with(0)
 

@@ -11,19 +11,12 @@ the dual-callable paths that branch on ``user`` vs. internal.
 """
 
 from __future__ import annotations
-
-import sys
-from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
-project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-
-from src.tools.communication.messaging import create_communication_tools  # noqa: E402
-from src.tools.context import ToolContext  # noqa: E402
+from agent.tools.communication.messaging import create_communication_tools  # noqa: E402
+from agent.tools.context import ToolContext  # noqa: E402
 
 
 def _tool_by_name(tools, name):
@@ -75,7 +68,7 @@ async def test_send_message_forwards_user_id_from_context(monkeypatch):
     monkeypatch.setenv("MCP_INTERNAL_KEY", "test-internal-key")
     _CapturingAsyncClient.last_init_headers = None
     monkeypatch.setattr(
-        "src.tools.communication.messaging.httpx.AsyncClient",
+        "agent.tools.communication.messaging.httpx.AsyncClient",
         _CapturingAsyncClient,
     )
 
@@ -103,7 +96,7 @@ async def test_send_message_omits_user_id_header_when_context_lacks_user(monkeyp
     monkeypatch.setenv("MCP_INTERNAL_KEY", "test-internal-key")
     _CapturingAsyncClient.last_init_headers = None
     monkeypatch.setattr(
-        "src.tools.communication.messaging.httpx.AsyncClient",
+        "agent.tools.communication.messaging.httpx.AsyncClient",
         _CapturingAsyncClient,
     )
 
@@ -126,7 +119,7 @@ async def test_blocking_stateless_message_carries_exact_worker_token(monkeypatch
     monkeypatch.setenv("MCP_INTERNAL_KEY", "test-internal-key")
     _CapturingAsyncClient.last_post_json = None
     monkeypatch.setattr(
-        "src.tools.communication.messaging.httpx.AsyncClient",
+        "agent.tools.communication.messaging.httpx.AsyncClient",
         _CapturingAsyncClient,
     )
 
@@ -162,7 +155,7 @@ async def test_transport_retry_reuses_the_same_hidden_routing_generation(monkeyp
     _RetryClient.calls = 0
     _RetryClient.post_payloads = []
     monkeypatch.setattr(
-        "src.tools.communication.messaging.httpx.AsyncClient", _RetryClient
+        "agent.tools.communication.messaging.httpx.AsyncClient", _RetryClient
     )
     send = _tool_by_name(
         create_communication_tools(ToolContext(_job_id="job-1")), "send_message"

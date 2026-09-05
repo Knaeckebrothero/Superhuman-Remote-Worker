@@ -42,7 +42,7 @@ def _vector_url() -> str | None:
     url = os.getenv("CITATION_DB_URL")
     if url:
         return url
-    from src.utils.db_url import build_postgres_url
+    from shared.db_url import build_postgres_url
 
     return build_postgres_url("VECTOR_POSTGRES", fallback_env="VECTOR_DB_URL")
 
@@ -50,8 +50,8 @@ def _vector_url() -> str | None:
 @pytest_asyncio.fixture
 async def engine_ctx():
     """Yield (engine, db, job_id) bound to the vector store; clean up after."""
-    from src.citation_engine import CitationContext, CitationEngine
-    from src.database.postgres_db import PostgresDB
+    from agent.citation_engine import CitationContext, CitationEngine
+    from agent.database.postgres_db import PostgresDB
 
     url = _vector_url()
     if not url:
@@ -223,8 +223,8 @@ async def test_async_verification_writeback(engine_ctx):
     the real path: engine self-schedules ``verify_and_store_citation`` →
     ``AuxiliaryLLM.chain`` → ``_update_verification_status`` on the live schema.
     """
-    from src.citation_engine import CitationEngine
-    from src.services.auxiliary import CitationVerdict
+    from agent.citation_engine import CitationEngine
+    from shared.runtime.services.auxiliary import CitationVerdict
 
     engine, db, job_id = engine_ctx
     content = f"Companies must retain records for 10 years. marker={job_id}"
@@ -281,9 +281,9 @@ async def test_failed_verdict_surfaces_for_feedback(engine_ctx):
     citations back to the agent (``list_citations(verification_status='failed')``
     → ``format_failed_citations``).
     """
-    from src.citation_engine import CitationEngine
-    from src.core.citation_feedback_injection import format_failed_citations
-    from src.services.auxiliary import CitationVerdict
+    from agent.citation_engine import CitationEngine
+    from agent.core.citation_feedback_injection import format_failed_citations
+    from shared.runtime.services.auxiliary import CitationVerdict
 
     engine, db, job_id = engine_ctx
     content = f"Unrelated text about the weather. marker={job_id}"

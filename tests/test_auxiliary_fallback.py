@@ -20,14 +20,14 @@ import pytest
 from langchain_core.messages import AIMessage
 from pydantic import ValidationError
 
-from src.core.loader import (
+from shared.runtime.core.loader import (
     AuxiliaryConfig,
     LLMConfig,
     _parse_auxiliary_config,
     create_llm,
 )
-from src.core.llm_retry import NO_RETRY
-from src.services.auxiliary import (
+from shared.runtime.core.llm_retry import NO_RETRY
+from shared.runtime.services.auxiliary import (
     AuxiliaryLLM,
     AuxInputTooLarge,
     CurateKnowledgeTask,
@@ -38,7 +38,7 @@ from src.services.auxiliary import (
 @pytest.fixture(autouse=True)
 def _no_retry_backoff(monkeypatch):
     """Keep retry semantics under test without real one-second backoffs."""
-    from src.services import auxiliary
+    from shared.runtime.services import auxiliary
 
     fast_policy = replace(auxiliary._AUX_RETRY, base_delay=0.0, max_delay=0.0)
     monkeypatch.setattr(auxiliary, "_AUX_RETRY", fast_policy)
@@ -77,8 +77,8 @@ class TestCreateLLMProviderRouting:
             api_key=kw.get("api_key"),
         )
 
-    @patch("src.core.loader._create_openrouter_llm")
-    @patch("src.core.loader._create_openai_llm")
+    @patch("shared.runtime.core.loader._create_openrouter_llm")
+    @patch("shared.runtime.core.loader._create_openai_llm")
     def test_openrouter_prefix_autodetected_when_provider_none(
         self, mock_openai, mock_openrouter
     ):
@@ -88,8 +88,8 @@ class TestCreateLLMProviderRouting:
         mock_openrouter.assert_called_once()
         mock_openai.assert_not_called()
 
-    @patch("src.core.loader._create_openrouter_llm")
-    @patch("src.core.loader._create_openai_llm")
+    @patch("shared.runtime.core.loader._create_openrouter_llm")
+    @patch("shared.runtime.core.loader._create_openai_llm")
     def test_explicit_openrouter_provider_routes_to_openrouter(
         self, mock_openai, mock_openrouter
     ):
@@ -99,8 +99,8 @@ class TestCreateLLMProviderRouting:
         mock_openrouter.assert_called_once()
         mock_openai.assert_not_called()
 
-    @patch("src.core.loader._create_openrouter_llm")
-    @patch("src.core.loader._create_openai_llm")
+    @patch("shared.runtime.core.loader._create_openrouter_llm")
+    @patch("shared.runtime.core.loader._create_openai_llm")
     def test_plain_model_without_provider_still_openai(
         self, mock_openai, mock_openrouter
     ):
@@ -108,8 +108,8 @@ class TestCreateLLMProviderRouting:
         mock_openai.assert_called_once()
         mock_openrouter.assert_not_called()
 
-    @patch("src.core.loader._create_openrouter_llm")
-    @patch("src.core.loader._create_openai_llm")
+    @patch("shared.runtime.core.loader._create_openrouter_llm")
+    @patch("shared.runtime.core.loader._create_openai_llm")
     def test_explicit_provider_wins_over_prefix(self, mock_openai, mock_openrouter):
         # An explicit provider always beats the prefix heuristic.
         create_llm(self._cfg(model="openrouter/x/y", provider="openai"))
@@ -282,7 +282,7 @@ class TestAuxRetryBeforeFallback:
         # catch-all called them `transient` and the aux layer cheerfully re-sent
         # a 951k-token payload that cannot fit by construction. AuxInputTooLarge's
         # own docstring says callers must NOT retry these.
-        from src.llm.exceptions import ContextOverflowError
+        from shared.runtime.llm.exceptions import ContextOverflowError
 
         for exc in (
             ContextOverflowError(951682, 131072),

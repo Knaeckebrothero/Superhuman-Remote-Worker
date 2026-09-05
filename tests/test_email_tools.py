@@ -24,13 +24,13 @@ from types import SimpleNamespace
 
 import pytest
 
-import src.tools.email.tools as email_tools_mod
-from src.tools.context import ToolContext
-from src.tools.email.connection import (
+import agent.tools.email.tools as email_tools_mod
+from agent.tools.context import ToolContext
+from agent.tools.email.connection import (
     EmailConnection,
     folder_allowed,
 )
-from src.tools.email.tools import (
+from agent.tools.email.tools import (
     MAX_SNIPPET_CHARS,
     create_email_tools,
 )
@@ -1034,14 +1034,14 @@ class TestRegistryWiring:
     ]
 
     def test_all_email_tools_registered(self):
-        from src.tools.registry import TOOL_REGISTRY
+        from agent.tools.registry import TOOL_REGISTRY
 
         for name in self.ALL_TOOLS:
             assert name in TOOL_REGISTRY, name
             assert TOOL_REGISTRY[name]["category"] == "email"
 
     def test_phase_restrictions(self):
-        from src.tools.registry import filter_tools_by_phase
+        from agent.tools.registry import filter_tools_by_phase
 
         strategic = filter_tools_by_phase(self.ALL_TOOLS, "strategic")
         assert sorted(strategic) == [
@@ -1054,7 +1054,7 @@ class TestRegistryWiring:
         assert sorted(tactical) == sorted(self.ALL_TOOLS)
 
     def test_load_tools_gate_builds_requested_only(self):
-        from src.tools.registry import load_tools
+        from agent.tools.registry import load_tools
 
         conn = make_conn()
         conn._new_mailbox = lambda: make_mailbox()
@@ -1063,7 +1063,7 @@ class TestRegistryWiring:
         assert sorted(t.name for t in tools) == ["email_list", "email_move"]
 
     def test_load_tools_without_datasource_skips(self):
-        from src.tools.registry import load_tools
+        from agent.tools.registry import load_tools
 
         ctx = ToolContext()
         tools = load_tools(["email_list"], ctx)

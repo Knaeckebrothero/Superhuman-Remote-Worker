@@ -8,7 +8,7 @@ execution layer. Registration and tool construction remain agent-owned.
 
 from typing import Any, Dict, List
 
-from . import definitions as _definitions
+from shared.tool_catalog import definitions as _definitions
 
 
 TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {}

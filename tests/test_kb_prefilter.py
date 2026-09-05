@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from services.kb_prefilter import (
+from orchestrator.services.kb_prefilter import (
     NURSERY_TYPES,
     PROTECTED_TAGS,
     ROOT_TYPES,
@@ -21,7 +21,7 @@ from services.kb_prefilter import (
     prefilter_max_per_tick,
     prefilter_min_age,
 )
-from services.kb_reindex import kb_sweep_tick
+from orchestrator.services.kb_reindex import kb_sweep_tick
 
 KB = uuid.uuid4()
 
@@ -74,7 +74,9 @@ class TestPrefilterTick:
     @pytest.mark.asyncio
     async def test_enumerates_with_the_rule_vocabulary_and_cap(self):
         store = _store([])
-        with patch("services.kb_prefilter.materialize_knowledge_metadata_update") as m:
+        with patch(
+            "orchestrator.services.kb_prefilter.materialize_knowledge_metadata_update"
+        ) as m:
             counts = await prefilter_kb_tick(
                 postgres_db="db",
                 store=store,
@@ -100,7 +102,8 @@ class TestPrefilterTick:
             return_value={"status": "committed", "canonical_state": "canonical"}
         )
         with patch(
-            "services.kb_prefilter.materialize_knowledge_metadata_update", update
+            "orchestrator.services.kb_prefilter.materialize_knowledge_metadata_update",
+            update,
         ):
             counts = await prefilter_kb_tick(
                 postgres_db="db", store=store, gitea_client="g", kb_id=KB
@@ -132,7 +135,8 @@ class TestPrefilterTick:
             }
         )
         with patch(
-            "services.kb_prefilter.materialize_knowledge_metadata_update", update
+            "orchestrator.services.kb_prefilter.materialize_knowledge_metadata_update",
+            update,
         ):
             counts = await prefilter_kb_tick(
                 postgres_db="db", store=store, gitea_client="g", kb_id=KB
@@ -153,7 +157,8 @@ class TestPrefilterTick:
             }
         )
         with patch(
-            "services.kb_prefilter.materialize_knowledge_metadata_update", update
+            "orchestrator.services.kb_prefilter.materialize_knowledge_metadata_update",
+            update,
         ):
             counts = await prefilter_kb_tick(
                 postgres_db="db", store=store, gitea_client="g", kb_id=KB
@@ -166,7 +171,8 @@ class TestPrefilterTick:
         store = _store([_row("x"), _row("y")])
         update = AsyncMock(side_effect=[RuntimeError("boom"), {"status": "committed"}])
         with patch(
-            "services.kb_prefilter.materialize_knowledge_metadata_update", update
+            "orchestrator.services.kb_prefilter.materialize_knowledge_metadata_update",
+            update,
         ):
             counts = await prefilter_kb_tick(
                 postgres_db="db", store=store, gitea_client="g", kb_id=KB
@@ -179,7 +185,8 @@ class TestPrefilterTick:
         store.list_unreachable_nursery = AsyncMock(side_effect=RuntimeError("db"))
         update = AsyncMock()
         with patch(
-            "services.kb_prefilter.materialize_knowledge_metadata_update", update
+            "orchestrator.services.kb_prefilter.materialize_knowledge_metadata_update",
+            update,
         ):
             counts = await prefilter_kb_tick(
                 postgres_db="db", store=store, gitea_client="g", kb_id=KB
@@ -216,7 +223,7 @@ class TestSweepIntegration:
             return {"purged": 0}
 
         with patch(
-            "services.kb_reindex.resolve_kb_repo",
+            "orchestrator.services.kb_reindex.resolve_kb_repo",
             AsyncMock(return_value=MagicMock(repo="r", branch="main", forge="gitea")),
         ):
             n = await kb_sweep_tick(
@@ -238,7 +245,7 @@ class TestSweepIntegration:
         project_id = uuid.uuid4()
         prefilter = AsyncMock(return_value={"archived": 0})
         with patch(
-            "services.kb_reindex.resolve_kb_repo",
+            "orchestrator.services.kb_reindex.resolve_kb_repo",
             AsyncMock(return_value=MagicMock(repo="r", branch="main", forge="gitea")),
         ):
             await kb_sweep_tick(

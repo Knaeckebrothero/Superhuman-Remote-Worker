@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.api.orchestrator_client import (
+from agent.api.orchestrator_client import (
     OrchestratorClient,
     SessionGrantDenied,
     ThreadConfigUpdateDenied,
@@ -15,7 +15,7 @@ from src.api.orchestrator_client import (
     get_agent_ip,
     get_hostname,
 )
-from src.shared.subagent_parent_authority import (
+from shared.subagent_parent_authority import (
     ParentExecutionAuthority,
     ParentExecutionAuthorityRefused,
 )

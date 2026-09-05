@@ -7,20 +7,11 @@ Tests cover:
 4. Edge cases: S3 unavailable, capture failure, restore failure, double entry
 """
 
-import sys
 import asyncio
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from unittest.mock import ANY, AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
-
-project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-_orchestrator_dir = str(project_root / "orchestrator")
-if _orchestrator_dir not in sys.path:
-    sys.path.insert(0, _orchestrator_dir)
 
 from orchestrator.services.workspace_suspension import (  # noqa: E402
     WorkspaceSuspensionService,
@@ -30,13 +21,13 @@ from orchestrator.services.ssh_helpers import (  # noqa: E402
     EXTRACT_HOME_REMOTE_CMD,
     EXTRACT_REMOTE_CMD,
 )
-from services.container_provisioner import (  # noqa: E402
+from orchestrator.services.container_provisioner import (  # noqa: E402
     WorkspaceCleanupOutcome,
     WorkspaceRuntimeAttestation,
     WorkspaceTeardownIdentity,
 )
-from services.workspace_lifecycle import WorkspaceOwner  # noqa: E402
-from services.vm_provisioner import (  # noqa: E402
+from orchestrator.services.workspace_lifecycle import WorkspaceOwner  # noqa: E402
+from orchestrator.services.vm_provisioner import (  # noqa: E402
     VMTeardownIdentity,
     VMTeardownResult,
 )
@@ -303,8 +294,8 @@ class TestSuspendWorkspace:
         )
 
         with (
-            patch("services.ide_settings.pull_ide_config", pull),
-            patch("services.ide_settings.capture_ide_profile", profile),
+            patch("orchestrator.services.ide_settings.pull_ide_config", pull),
+            patch("orchestrator.services.ide_settings.capture_ide_profile", profile),
         ):
             result = await svc.suspend_workspace(job["id"])
 
@@ -1477,7 +1468,7 @@ class TestRestoreOwnerDispatch:
     @pytest.mark.asyncio
     async def test_restore_job_calls_restore_workspace(self):
         """restore(job owner) must delegate to restore_workspace(job_id)."""
-        from services.workspace_lifecycle import WorkspaceOwner as WO
+        from orchestrator.services.workspace_lifecycle import WorkspaceOwner as WO
 
         svc = make_service()
         svc.restore_workspace = AsyncMock(return_value=True)
@@ -1493,7 +1484,7 @@ class TestRestoreOwnerDispatch:
     @pytest.mark.asyncio
     async def test_restore_session_calls_restore_thread_workspace(self):
         """restore(session owner) must delegate to restore_thread_workspace(thread_id)."""
-        from services.workspace_lifecycle import WorkspaceOwner as WO
+        from orchestrator.services.workspace_lifecycle import WorkspaceOwner as WO
 
         svc = make_service()
         svc.restore_workspace = AsyncMock(return_value=True)
@@ -1508,7 +1499,7 @@ class TestRestoreOwnerDispatch:
 
     @pytest.mark.asyncio
     async def test_restore_session_forwards_exact_runtime_reuse_authority(self):
-        from services.workspace_lifecycle import WorkspaceOwner as WO
+        from orchestrator.services.workspace_lifecycle import WorkspaceOwner as WO
 
         svc = make_service()
         svc.restore_workspace = AsyncMock(return_value=True)
@@ -2216,7 +2207,7 @@ class TestVmJobSuspendRidesThePersistentRootdisk:
             remote_reads += 1
             raise AssertionError("foreign successor must not be read")
 
-        with patch("services.ide_settings.pull_ide_config", guarded_pull):
+        with patch("orchestrator.services.ide_settings.pull_ide_config", guarded_pull):
             assert await svc.suspend_workspace(job["id"]) is False
 
         assert remote_reads == 0

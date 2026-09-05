@@ -24,10 +24,10 @@ from uuid import UUID, uuid4
 import pytest
 
 import orchestrator.database.postgres as orchestrator_postgres
-import src.database.postgres_db as agent_postgres
+import agent.database.postgres_db as agent_postgres
 from orchestrator.database.postgres import PostgresDB as OrchestratorDB
-from src.database.postgres_db import PostgresDB as AgentDB
-from src.shared.subagent_parent_authority import ParentExecutionAuthority
+from agent.database.postgres_db import PostgresDB as AgentDB
+from shared.subagent_parent_authority import ParentExecutionAuthority
 
 JOB = UUID("aaaaaaaa-1111-4222-8333-444444444444")
 CHILD = UUID("bbbbbbbb-1111-4222-8333-444444444444")

@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
-from src.core.loader import (
+from shared.runtime.core.loader import (
     AgentConfig,
     LLMConfig,
     PhaseLLMOverride,
@@ -19,7 +19,7 @@ from src.core.loader import (
     load_agent_config_from_dict,
     serialize_resolved_config,
 )
-from src.core.model_registry import family_of
+from shared.runtime.core.model_registry import family_of
 
 
 # =============================================================================
@@ -330,7 +330,7 @@ class TestPromptMatrixResolver:
         matrix_path.write_text(":{invalid yaml")
 
         # Bypass the per-path cache so the malformed write is actually parsed.
-        from src.core import loader as _loader
+        from shared.runtime.core import loader as _loader
 
         _loader._model_config_matrix_cache.pop(matrix_path, None)
         result = PromptMatrixResolver._load_matrix_from_path(matrix_path)
@@ -341,7 +341,7 @@ class TestPromptMatrixResolver:
         matrix_path = tmp_path / "model_config_matrix.yaml"
         matrix_path.write_text("- just\n- a\n- list\n")
 
-        from src.core import loader as _loader
+        from shared.runtime.core import loader as _loader
 
         _loader._model_config_matrix_cache.pop(matrix_path, None)
         result = PromptMatrixResolver._load_matrix_from_path(matrix_path)
@@ -349,7 +349,7 @@ class TestPromptMatrixResolver:
 
     def test_load_matrix_nonexistent(self, tmp_path):
         """Non-existent matrix file returns empty dict."""
-        from src.core import loader as _loader
+        from shared.runtime.core import loader as _loader
 
         _loader._model_config_matrix_cache.pop(tmp_path / "nope.yaml", None)
         result = PromptMatrixResolver._load_matrix_from_path(tmp_path / "nope.yaml")
@@ -404,7 +404,9 @@ class TestDefaultResolution:
 
     def test_load_base_system_prompt_with_resolver(self, tmp_path):
         """load_base_system_prompt uses PromptMatrixResolver."""
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+        with patch(
+            "shared.runtime.core.loader.get_project_root", return_value=tmp_path
+        ):
             config_prompts = tmp_path / "config" / "prompts"
             config_prompts.mkdir(parents=True)
             (config_prompts / "systemprompt.txt").write_text(
@@ -422,7 +424,9 @@ class TestDefaultResolution:
             display_name="Test Agent",
         )
 
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+        with patch(
+            "shared.runtime.core.loader.get_project_root", return_value=tmp_path
+        ):
             config_prompts = tmp_path / "config" / "prompts"
             config_prompts.mkdir(parents=True)
             (config_prompts / "systemprompt.txt").write_text(
@@ -444,7 +448,9 @@ class TestDefaultResolution:
             display_name="Test Agent",
         )
 
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+        with patch(
+            "shared.runtime.core.loader.get_project_root", return_value=tmp_path
+        ):
             config_prompts = tmp_path / "config" / "prompts"
             config_prompts.mkdir(parents=True)
             (config_prompts / "systemprompt.txt").write_text(
@@ -554,7 +560,9 @@ class TestPromptMatrixResolverLoad:
         """)
         )
 
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+        with patch(
+            "shared.runtime.core.loader.get_project_root", return_value=tmp_path
+        ):
             # Also create base files
             config_prompts = tmp_path / "config" / "prompts"
             config_prompts.mkdir(parents=True)
@@ -573,7 +581,9 @@ class TestPromptMatrixResolverLoad:
         expert_dir.mkdir()
         # No systemprompt.txt in expert dir, but the framework provides it.
 
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+        with patch(
+            "shared.runtime.core.loader.get_project_root", return_value=tmp_path
+        ):
             config_prompts = tmp_path / "config" / "prompts"
             config_prompts.mkdir(parents=True)
             (config_prompts / "systemprompt.txt").write_text("framework systemprompt")
@@ -588,7 +598,9 @@ class TestPromptMatrixResolverLoad:
 
     def test_exists_returns_true_for_resolvable(self, tmp_path):
         """exists() returns True when the file can be found."""
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+        with patch(
+            "shared.runtime.core.loader.get_project_root", return_value=tmp_path
+        ):
             config_prompts = tmp_path / "config" / "prompts"
             config_prompts.mkdir(parents=True)
             (config_prompts / "systemprompt.txt").write_text("exists")
@@ -598,7 +610,9 @@ class TestPromptMatrixResolverLoad:
 
     def test_exists_returns_false_for_missing(self, tmp_path):
         """exists() returns False when file cannot be found."""
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+        with patch(
+            "shared.runtime.core.loader.get_project_root", return_value=tmp_path
+        ):
             config_prompts = tmp_path / "config" / "prompts"
             config_prompts.mkdir(parents=True)
 
@@ -633,7 +647,9 @@ class TestLocationPrimaryResolution:
         expert_dir.mkdir()
         (expert_dir / f"{entry_type}.txt").write_text(f"expert base {entry_type}")
 
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+        with patch(
+            "shared.runtime.core.loader.get_project_root", return_value=tmp_path
+        ):
             config_dir = tmp_path / "config"
             prompts = config_dir / "prompts"
             prompts.mkdir(parents=True)
@@ -655,7 +671,9 @@ class TestLocationPrimaryResolution:
         (expert_dir / "persona.txt").write_text("expert base")
         (expert_dir / "persona_gemma.txt").write_text("expert gemma")
 
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+        with patch(
+            "shared.runtime.core.loader.get_project_root", return_value=tmp_path
+        ):
             config_dir = tmp_path / "config"
             prompts = config_dir / "prompts"
             prompts.mkdir(parents=True)
@@ -672,7 +690,9 @@ class TestLocationPrimaryResolution:
         expert_dir = tmp_path / "expert"
         expert_dir.mkdir()
 
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+        with patch(
+            "shared.runtime.core.loader.get_project_root", return_value=tmp_path
+        ):
             config_dir = tmp_path / "config"
             prompts = config_dir / "prompts"
             prompts.mkdir(parents=True)
@@ -687,7 +707,9 @@ class TestLocationPrimaryResolution:
 
     def test_no_family_variant_uses_framework_base_rank4(self, tmp_path):
         """Family with no variant -> framework base (rank 4)."""
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+        with patch(
+            "shared.runtime.core.loader.get_project_root", return_value=tmp_path
+        ):
             prompts = tmp_path / "config" / "prompts"
             prompts.mkdir(parents=True)
             (prompts / "persona.txt").write_text("framework base")
@@ -709,7 +731,9 @@ class TestLocationPrimaryResolution:
         """)
         )
 
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+        with patch(
+            "shared.runtime.core.loader.get_project_root", return_value=tmp_path
+        ):
             config_dir = tmp_path / "config"
             prompts = config_dir / "prompts"
             prompts.mkdir(parents=True)
@@ -723,7 +747,9 @@ class TestLocationPrimaryResolution:
 
     def test_deployment_dir_none_is_framework_only(self, tmp_path):
         """deployment_dir=None (sessions/admin) -> framework chain, no crash."""
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+        with patch(
+            "shared.runtime.core.loader.get_project_root", return_value=tmp_path
+        ):
             config_dir = tmp_path / "config"
             prompts = config_dir / "prompts"
             prompts.mkdir(parents=True)
@@ -741,12 +767,16 @@ class TestLocationPrimaryResolution:
         expert_dir.mkdir()
         (expert_dir / "persona.txt").write_text("expert base persona")
 
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+        with patch(
+            "shared.runtime.core.loader.get_project_root", return_value=tmp_path
+        ):
             (tmp_path / "config" / "prompts").mkdir(parents=True)
             resolver = PromptMatrixResolver(
                 deployment_dir=str(expert_dir), model_family="default"
             )
-            with patch("src.core.loader._db_lookup", return_value="DB OVERRIDE"):
+            with patch(
+                "shared.runtime.core.loader._db_lookup", return_value="DB OVERRIDE"
+            ):
                 assert resolver.load("persona") == "DB OVERRIDE"
                 assert (
                     resolver.load("persona", bundled_only=True) == "expert base persona"
@@ -759,7 +789,9 @@ class TestLocationPrimaryResolution:
         expert_dir.mkdir()
         (expert_dir / "persona.txt").write_text("expert base")
 
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+        with patch(
+            "shared.runtime.core.loader.get_project_root", return_value=tmp_path
+        ):
             config_dir = tmp_path / "config"
             (config_dir / "prompts").mkdir(parents=True)
             (config_dir / "model_config_matrix.yaml").write_text(self.GEMMA_MATRIX)
@@ -915,10 +947,12 @@ class TestSingleWorkerPrompt:
         (config_prompts / "systemprompt.txt").write_text(self._TEMPLATE)
 
     def test_get_system_prompt_is_phase_agnostic(self, tmp_path):
-        from src.core.loader import get_system_prompt
+        from shared.runtime.core.loader import get_system_prompt
 
         config = AgentConfig(agent_id="test", display_name="Test Agent")
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+        with patch(
+            "shared.runtime.core.loader.get_project_root", return_value=tmp_path
+        ):
             self._write(tmp_path)
             one = get_system_prompt(config, tool_names=[])
             strategic = get_phase_system_prompt(

@@ -9,7 +9,7 @@ most coverage here.
 
 import pytest
 
-from src.core.progress_commit import ProgressCommitter, _subject
+from agent.core.progress_commit import ProgressCommitter, _subject
 
 
 class FakeClock:
@@ -306,14 +306,14 @@ class TestTodoToolWiring:
     """
 
     def _tool(self, context):
-        from src.tools.core.todo import create_todo_tools
+        from agent.tools.core.todo import create_todo_tools
 
         return next(t for t in create_todo_tools(context) if t.name == "todo_complete")
 
     def _context(self, todo_mgr, committer):
         from unittest.mock import MagicMock
 
-        from src.tools.context import ToolContext
+        from agent.tools.context import ToolContext
 
         ctx = ToolContext(workspace_manager=MagicMock(), todo_manager=todo_mgr)
         ctx.recall_store = None
@@ -323,7 +323,7 @@ class TestTodoToolWiring:
     def _todo_manager(self):
         from unittest.mock import MagicMock
 
-        from src.managers.todo import TodoManager
+        from agent.managers.todo import TodoManager
 
         mgr = TodoManager(workspace=MagicMock())
         # TodoManager enforces a min_todos floor (default 5).
@@ -383,7 +383,7 @@ class TestTodoToolWiring:
         assert first.notes == ["PASS: all requested outputs verified"]
 
     def test_oversized_completion_note_is_truncated_and_accepted(self, git, clock):
-        from src.tools.core.todo import MAX_COMPLETION_NOTE_CHARS
+        from agent.tools.core.todo import MAX_COMPLETION_NOTE_CHARS
 
         committer = make(git, clock)
         mgr = self._todo_manager()
@@ -406,7 +406,7 @@ class TestTodoToolWiring:
         assert git.commits == [f"{first.id}: {first.content}"]
 
     def test_completion_note_at_cap_is_stored_untouched(self, git, clock):
-        from src.tools.core.todo import MAX_COMPLETION_NOTE_CHARS
+        from agent.tools.core.todo import MAX_COMPLETION_NOTE_CHARS
 
         committer = make(git, clock)
         mgr = self._todo_manager()

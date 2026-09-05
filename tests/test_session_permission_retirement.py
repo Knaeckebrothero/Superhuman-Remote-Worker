@@ -8,19 +8,19 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.shared import session_permission_retirement as mod
+from shared import session_permission_retirement as mod
 
 
 def test_permission_migration_chain_is_expand_validate_and_snapshotted():
     root = Path(__file__).resolve().parents[1]
-    migrations = root / "orchestrator/database/migrations/app"
+    migrations = root / "src" / "orchestrator" / "database" / "migrations" / "app"
     add = (migrations / "0147_thread_permission_lease_receipts.sql").read_text()
     index = (migrations / "0148_thread_permission_receipt_idx.notx.sql").read_text()
     validate = (
         migrations / "0149_thread_permission_validate_constraints.sql"
     ).read_text()
     correction = (migrations / "0153_thread_permission_lease_comment.sql").read_text()
-    snapshot = (root / "orchestrator/database/schema_current.sql").read_text()
+    snapshot = (root / "src/orchestrator/database/schema_current.sql").read_text()
 
     assert "ADD COLUMN accepted_lease_token BIGINT" in add
     assert "thread_permission_accepted_lease_positive" in add

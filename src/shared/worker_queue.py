@@ -1,6 +1,6 @@
 """Worker-job composition over the shared :mod:`run_queue` substrate.
 
-``src.shared.run_queue`` deliberately touches only ``run_queue``.  Worker
+``shared.run_queue`` deliberately touches only ``run_queue``.  Worker
 claims need one additional invariant: the queue lease and the authoritative
 ``jobs`` row move together.  This module is the narrow composition layer used
 by both the orchestrator (admission/control/fence reads) and the stateless
@@ -24,7 +24,7 @@ from datetime import datetime
 from typing import Any, AsyncIterator
 from uuid import UUID
 
-from .run_queue import (
+from shared.run_queue import (
     AFFINITY_GRACE_SECONDS,
     LANE_STATELESS,
     LEASE_TTL_SECONDS,
@@ -36,7 +36,7 @@ from .run_queue import (
     complete_unit,
     enqueue_unit,
 )
-from .workspace_contract import (
+from shared.workspace_contract import (
     WORKSPACE_CONTRACT_CONTEXT_KEY,
     WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY,
     WorkspaceContractError,

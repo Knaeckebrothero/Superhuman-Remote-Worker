@@ -5,15 +5,15 @@ from __future__ import annotations
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from src.core.workspace import WorkspaceManager, WorkspaceManagerConfig
-from src.subagents import (
+from agent.core.workspace import WorkspaceManager, WorkspaceManagerConfig
+from agent.subagents import (
     ContextProbe,
     build_envelope,
     neutralise_control_markers,
     return_budget,
 )
-from src.subagents.driver import SubagentResult
-from src.subagents.envelope import (
+from agent.subagents.driver import SubagentResult
+from agent.subagents.envelope import (
     EVIDENCE_NOTE,
     MIN_RETURN_TOKENS,
     count_tokens,
@@ -217,7 +217,7 @@ class TestSpillAndEnvelope:
     def test_tool_output_is_never_promoted(self, workspace):
         """A child whose turn ended on a ToolMessage yields status error and the
         envelope carries only the last assistant text, marked partial."""
-        from src.subagents.driver import SubagentDriver
+        from agent.subagents.driver import SubagentDriver
 
         ws, _ = workspace
         driver = SubagentDriver.__new__(SubagentDriver)
@@ -254,7 +254,7 @@ class TestSpillAndEnvelope:
             "reader",
             "c",
         )
-        from src.subagents import SimpleParentHost
+        from agent.subagents import SimpleParentHost
 
         driver.host = SimpleParentHost(job_id="j")
         result = driver.classify()

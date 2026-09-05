@@ -23,6 +23,7 @@ from orchestrator.services.project_loop_atomic import (
 
 SCHEMA_FILE = (
     Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "schema_current.sql"
@@ -295,7 +296,7 @@ async def test_vector_ttl_turn_ledger_survives_response_loss(db, monkeypatch):
 
     migration = (
         Path(__file__).resolve().parents[1]
-        / "orchestrator/database/migrations/vector/0018_project_loop_ttl_effects.sql"
+        / "src/orchestrator/database/migrations/vector/0018_project_loop_ttl_effects.sql"
     ).read_text()
     project_id, loop_id, member_id = uuid4(), uuid4(), uuid4()
     async with db.acquire() as conn:
@@ -319,18 +320,18 @@ async def test_vector_ttl_turn_ledger_survives_response_loss(db, monkeypatch):
             project_id,
         )
 
-    import main
+    import orchestrator.main
 
-    monkeypatch.setattr(main, "vector_db", db)
+    monkeypatch.setattr(orchestrator.main, "vector_db", db)
     args = {
         "loop_id": str(loop_id),
         "project_id": str(project_id),
         "completed_member_id": str(member_id),
         "total_jobs_run": 4,
     }
-    assert await main._decrement_project_loop_kb_ttl_once(**args) is True
+    assert await orchestrator.main._decrement_project_loop_kb_ttl_once(**args) is True
     # Models a crash after vector COMMIT but before handoff/effect ack.
-    assert await main._decrement_project_loop_kb_ttl_once(**args) is False
+    assert await orchestrator.main._decrement_project_loop_kb_ttl_once(**args) is False
 
     async with db.acquire() as conn:
         assert (
@@ -350,7 +351,7 @@ async def test_vector_ttl_turn_ledger_survives_response_loss(db, monkeypatch):
         )
 
     with pytest.raises(RuntimeError, match="different turn"):
-        await main._decrement_project_loop_kb_ttl_once(
+        await orchestrator.main._decrement_project_loop_kb_ttl_once(
             **{**args, "completed_member_id": str(uuid4())}
         )
 
@@ -364,15 +365,15 @@ async def test_loop_notification_response_loss_dedups_bell_and_sse(db, monkeypat
             "INSERT INTO users (id,display_name) VALUES ($1,'Loop Owner')", user_id
         )
 
-    import main
-    from services.notification_feed import notification_feed
+    import orchestrator.main
+    from orchestrator.services.notification_feed import notification_feed
 
-    monkeypatch.setattr(main, "postgres_db", db)
+    monkeypatch.setattr(orchestrator.main, "postgres_db", db)
     broadcast = MagicMock()
     monkeypatch.setattr(notification_feed, "broadcast", broadcast)
     # The bell row is a feed row: wire the singleton to this DB + feed (attrs
     # only, so nothing leaks past the test).
-    from services.notification_service import notification_service
+    from orchestrator.services.notification_service import notification_service
 
     monkeypatch.setattr(notification_service, "_db", db)
     monkeypatch.setattr(notification_service, "_available", True)
@@ -387,9 +388,9 @@ async def test_loop_notification_response_loss_dedups_bell_and_sse(db, monkeypat
         "dedup_turn_identity": f"{member_id}:2",
         "note_id": "planned:0",
     }
-    await main._notify_loop_event(loop, **kwargs)
+    await orchestrator.main._notify_loop_event(loop, **kwargs)
     # Models a response loss after durable insert + SSE but before handoff ack.
-    await main._notify_loop_event(loop, **kwargs)
+    await orchestrator.main._notify_loop_event(loop, **kwargs)
 
     async with db.acquire() as conn:
         # The durable bell row is a feed row now (unified notification system):
@@ -406,7 +407,7 @@ async def test_loop_notification_response_loss_dedups_bell_and_sse(db, monkeypat
     broadcast.assert_called_once()
 
     with pytest.raises(RuntimeError, match="different payload"):
-        await main._notify_loop_event(
+        await orchestrator.main._notify_loop_event(
             loop,
             **{**kwargs, "message": "identity drift"},
         )

@@ -1814,17 +1814,26 @@ class TestKeptDiskSweep:
 
     @pytest.mark.asyncio
     async def test_control_marker_blocks_kept_disk_destructive_recheck(self):
+        job = {
+            "id": "job-1",
+            "status": "completed",
+            "execution_lane": "pinned",
+            "context": {"vm": {"rootdisk": "kept"}},
+        }
         mgr, provisioner, _, _, db = _make_manager(
+            job_rows=[job],
             completion_commands_enabled=True,
             completion_control_active=True,
         )
         conn = db.acquire.return_value.__aenter__.return_value
         conn.fetch.side_effect = None
-        conn.fetch.return_value = [{"id": "job-1", "execution_lane": "pinned"}]
+        conn.fetch.return_value = [{**job, "vm_context": job["context"]["vm"]}]
 
         assert await mgr.purge_kept_disks() == 0
 
+        provisioner.capture_vm_teardown_identity.assert_not_awaited()
         provisioner.release_vm_captured.assert_not_awaited()
+        db.merge_vm_context.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_purge_clears_the_marker(self):

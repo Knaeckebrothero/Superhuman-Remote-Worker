@@ -6,8 +6,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.tools.research.utils.network import ProxyConfig, ProxyType
-from src.tools.research.utils.paper_types import PaperSource
+from agent.tools.research.utils.network import ProxyConfig, ProxyType
+from agent.tools.research.utils.paper_types import PaperSource
 
 
 # ── ProxyConfig tests ──────────────────────────────────────────────
@@ -189,7 +189,7 @@ class TestNoLocalBrowserPath:
     """
 
     def test_browser_use_not_imported_under_src(self):
-        src_root = Path(__file__).resolve().parents[3] / "src"
+        src_root = Path(__file__).resolve().parents[3] / "src" / "agent"
         pattern = re.compile(r"^\s*(?:from|import)\s+browser_use", re.MULTILINE)
         offenders = sorted(
             str(path.relative_to(src_root))
@@ -208,12 +208,12 @@ class TestWorkflowToolsMetadata:
     """Tests for workflow tools metadata."""
 
     def test_metadata_has_research_topic(self):
-        from src.tools.research.workflow import WORKFLOW_TOOLS_METADATA
+        from agent.tools.research.workflow import WORKFLOW_TOOLS_METADATA
 
         assert "research_topic" in WORKFLOW_TOOLS_METADATA
 
     def test_metadata_category(self):
-        from src.tools.research.workflow import WORKFLOW_TOOLS_METADATA
+        from agent.tools.research.workflow import WORKFLOW_TOOLS_METADATA
 
         assert WORKFLOW_TOOLS_METADATA["research_topic"]["category"] == "research"
 
@@ -222,7 +222,7 @@ class TestDeduplicatePapers:
     """Tests for _deduplicate_papers function."""
 
     def test_deduplicates_by_doi(self, sample_paper, sample_paper_s2):
-        from src.tools.research.workflow import _deduplicate_papers
+        from agent.tools.research.workflow import _deduplicate_papers
 
         # Give them the same DOI
         sample_paper_s2.doi = sample_paper.doi
@@ -234,7 +234,7 @@ class TestDeduplicatePapers:
         assert result[0].source == PaperSource.SEMANTIC_SCHOLAR
 
     def test_deduplicates_by_arxiv_id(self, sample_paper, sample_paper_s2):
-        from src.tools.research.workflow import _deduplicate_papers
+        from agent.tools.research.workflow import _deduplicate_papers
 
         # Different DOIs but same arXiv ID
         sample_paper.doi = None
@@ -245,7 +245,7 @@ class TestDeduplicatePapers:
         assert len(result) == 1
 
     def test_keeps_unique_papers(self, sample_paper, sample_paper_s2):
-        from src.tools.research.workflow import _deduplicate_papers
+        from agent.tools.research.workflow import _deduplicate_papers
 
         # Different identifiers
         sample_paper.doi = "10.1/a"
@@ -257,13 +257,13 @@ class TestDeduplicatePapers:
         assert len(result) == 2
 
     def test_empty_inputs(self):
-        from src.tools.research.workflow import _deduplicate_papers
+        from agent.tools.research.workflow import _deduplicate_papers
 
         result = _deduplicate_papers([], [])
         assert result == []
 
     def test_prefers_semantic_scholar(self, sample_paper, sample_paper_s2):
-        from src.tools.research.workflow import _deduplicate_papers
+        from agent.tools.research.workflow import _deduplicate_papers
 
         # Same DOI - S2 should win since it's processed first
         sample_paper_s2.doi = sample_paper.doi
@@ -281,7 +281,7 @@ class TestResearchTopic:
     async def test_research_topic_combines_sources(
         self, mock_tool_context, sample_paper, sample_paper_s2
     ):
-        from src.tools.research.workflow import create_workflow_tools
+        from agent.tools.research.workflow import create_workflow_tools
 
         tools = create_workflow_tools(mock_tool_context)
         research_topic = tools[0]
@@ -294,12 +294,12 @@ class TestResearchTopic:
 
         with (
             patch(
-                "src.tools.research.workflow._search_arxiv_raw",
+                "agent.tools.research.workflow._search_arxiv_raw",
                 new_callable=AsyncMock,
                 return_value=[sample_paper],
             ),
             patch(
-                "src.tools.research.workflow._search_semantic_scholar_raw",
+                "agent.tools.research.workflow._search_semantic_scholar_raw",
                 new_callable=AsyncMock,
                 return_value=[sample_paper_s2],
             ),
@@ -316,19 +316,19 @@ class TestResearchTopic:
     async def test_research_topic_handles_search_failure(
         self, mock_tool_context, sample_paper
     ):
-        from src.tools.research.workflow import create_workflow_tools
+        from agent.tools.research.workflow import create_workflow_tools
 
         tools = create_workflow_tools(mock_tool_context)
         research_topic = tools[0]
 
         with (
             patch(
-                "src.tools.research.workflow._search_arxiv_raw",
+                "agent.tools.research.workflow._search_arxiv_raw",
                 new_callable=AsyncMock,
                 return_value=[sample_paper],
             ),
             patch(
-                "src.tools.research.workflow._search_semantic_scholar_raw",
+                "agent.tools.research.workflow._search_semantic_scholar_raw",
                 new_callable=AsyncMock,
                 side_effect=Exception("API error"),
             ),
@@ -344,19 +344,19 @@ class TestResearchTopic:
 
     @pytest.mark.asyncio
     async def test_research_topic_no_results(self, mock_tool_context):
-        from src.tools.research.workflow import create_workflow_tools
+        from agent.tools.research.workflow import create_workflow_tools
 
         tools = create_workflow_tools(mock_tool_context)
         research_topic = tools[0]
 
         with (
             patch(
-                "src.tools.research.workflow._search_arxiv_raw",
+                "agent.tools.research.workflow._search_arxiv_raw",
                 new_callable=AsyncMock,
                 return_value=[],
             ),
             patch(
-                "src.tools.research.workflow._search_semantic_scholar_raw",
+                "agent.tools.research.workflow._search_semantic_scholar_raw",
                 new_callable=AsyncMock,
                 return_value=[],
             ),
@@ -368,19 +368,19 @@ class TestResearchTopic:
 
     @pytest.mark.asyncio
     async def test_research_topic_both_fail(self, mock_tool_context):
-        from src.tools.research.workflow import create_workflow_tools
+        from agent.tools.research.workflow import create_workflow_tools
 
         tools = create_workflow_tools(mock_tool_context)
         research_topic = tools[0]
 
         with (
             patch(
-                "src.tools.research.workflow._search_arxiv_raw",
+                "agent.tools.research.workflow._search_arxiv_raw",
                 new_callable=AsyncMock,
                 side_effect=Exception("arXiv down"),
             ),
             patch(
-                "src.tools.research.workflow._search_semantic_scholar_raw",
+                "agent.tools.research.workflow._search_semantic_scholar_raw",
                 new_callable=AsyncMock,
                 side_effect=Exception("S2 down"),
             ),
@@ -394,19 +394,19 @@ class TestResearchTopic:
 
     @pytest.mark.asyncio
     async def test_research_topic_caps_num_papers(self, mock_tool_context):
-        from src.tools.research.workflow import create_workflow_tools
+        from agent.tools.research.workflow import create_workflow_tools
 
         tools = create_workflow_tools(mock_tool_context)
         research_topic = tools[0]
 
         with (
             patch(
-                "src.tools.research.workflow._search_arxiv_raw",
+                "agent.tools.research.workflow._search_arxiv_raw",
                 new_callable=AsyncMock,
                 return_value=[],
             ),
             patch(
-                "src.tools.research.workflow._search_semantic_scholar_raw",
+                "agent.tools.research.workflow._search_semantic_scholar_raw",
                 new_callable=AsyncMock,
                 return_value=[],
             ),
@@ -421,7 +421,7 @@ class TestFormatResearchReport:
     """Tests for _format_research_report function."""
 
     def test_format_basic_report(self, sample_paper):
-        from src.tools.research.workflow import _format_research_report
+        from agent.tools.research.workflow import _format_research_report
 
         report = _format_research_report(
             topic="test topic",
@@ -439,7 +439,7 @@ class TestFormatResearchReport:
         assert sample_paper.title in report
 
     def test_format_with_downloads(self, sample_paper):
-        from src.tools.research.workflow import _format_research_report
+        from agent.tools.research.workflow import _format_research_report
 
         report = _format_research_report(
             topic="test",
@@ -454,7 +454,7 @@ class TestFormatResearchReport:
         assert "Downloaded: paper.pdf" in report
 
     def test_format_truncates_abstracts(self, sample_paper):
-        from src.tools.research.workflow import _format_research_report
+        from agent.tools.research.workflow import _format_research_report
 
         sample_paper.abstract = "x" * 500
 
@@ -470,7 +470,7 @@ class TestFormatResearchReport:
         assert "..." in report
 
     def test_format_without_abstracts(self, sample_paper):
-        from src.tools.research.workflow import _format_research_report
+        from agent.tools.research.workflow import _format_research_report
 
         report = _format_research_report(
             topic="test",
@@ -491,7 +491,7 @@ class TestResearchToolsRegistry:
     """Tests for the research tools registry."""
 
     def test_get_research_metadata_includes_all_modules(self):
-        from src.tools.research import get_research_metadata
+        from agent.tools.research import get_research_metadata
 
         metadata = get_research_metadata()
 
@@ -514,7 +514,7 @@ class TestResearchToolsRegistry:
         assert "research_topic" in metadata
 
     def test_create_research_tools_returns_all(self, mock_tool_context):
-        from src.tools.research import create_research_tools
+        from agent.tools.research import create_research_tools
 
         tools = create_research_tools(mock_tool_context)
         names = {t.name for t in tools}
@@ -540,7 +540,7 @@ class TestToolContextBrowserExec:
 
     @pytest.mark.asyncio
     async def test_parses_json_stdout(self):
-        from src.tools.context import ToolContext
+        from agent.tools.context import ToolContext
 
         fake = MagicMock()
         backend = MagicMock(spec=["exec_command"])
@@ -555,7 +555,7 @@ class TestToolContextBrowserExec:
 
     @pytest.mark.asyncio
     async def test_stateless_backend_uses_claim_resource_fence(self):
-        from src.tools.context import ToolContext
+        from agent.tools.context import ToolContext
 
         fake = MagicMock()
         backend = MagicMock(spec=["exec_command", "exec_claim_resource"])
@@ -575,7 +575,7 @@ class TestToolContextBrowserExec:
 
     @pytest.mark.asyncio
     async def test_claim_fence_failure_never_falls_back_to_plain_exec(self):
-        from src.tools.context import ToolContext
+        from agent.tools.context import ToolContext
 
         fake = MagicMock()
         backend = MagicMock(spec=["exec_command", "exec_claim_resource"])
@@ -590,7 +590,7 @@ class TestToolContextBrowserExec:
 
     @pytest.mark.asyncio
     async def test_non_json_becomes_error(self):
-        from src.tools.context import ToolContext
+        from agent.tools.context import ToolContext
 
         fake = MagicMock()
         backend = MagicMock(spec=["exec_command"])
@@ -601,7 +601,7 @@ class TestToolContextBrowserExec:
 
     @pytest.mark.asyncio
     async def test_empty_output_becomes_error(self):
-        from src.tools.context import ToolContext
+        from agent.tools.context import ToolContext
 
         fake = MagicMock()
         backend = MagicMock(spec=["exec_command"])
@@ -612,7 +612,7 @@ class TestToolContextBrowserExec:
 
     @pytest.mark.asyncio
     async def test_parses_last_stdout_line(self):
-        from src.tools.context import ToolContext
+        from agent.tools.context import ToolContext
 
         fake = MagicMock()
         backend = MagicMock(spec=["exec_command"])
@@ -625,7 +625,7 @@ class TestToolContextBrowserExec:
 
     @pytest.mark.asyncio
     async def test_strict_close_requires_physical_shutdown_ack(self):
-        from src.tools.context import ToolContext
+        from agent.tools.context import ToolContext
 
         fake = MagicMock()
         fake.has_workspace.return_value = True
@@ -648,7 +648,7 @@ class TestToolContextBrowserExec:
         ],
     )
     async def test_strict_close_rejects_unacknowledged_shutdown(self, result):
-        from src.tools.context import ToolContext
+        from agent.tools.context import ToolContext
 
         fake = MagicMock()
         fake.has_workspace.return_value = True
@@ -670,7 +670,7 @@ class TestBrowserDirectDispatch:
 
     @pytest.mark.asyncio
     async def test_navigate_dispatches_and_wraps_nonce(self, mock_remote_tool_context):
-        from src.tools.research.browser_direct import create_browser_direct_tools
+        from agent.tools.research.browser_direct import create_browser_direct_tools
 
         ctx = self._ctx(
             mock_remote_tool_context,
@@ -690,7 +690,7 @@ class TestBrowserDirectDispatch:
 
     @pytest.mark.asyncio
     async def test_invalid_url_short_circuits(self, mock_remote_tool_context):
-        from src.tools.research.browser_direct import create_browser_direct_tools
+        from agent.tools.research.browser_direct import create_browser_direct_tools
 
         ctx = self._ctx(mock_remote_tool_context, {})
         tools = {t.name: t for t in create_browser_direct_tools(ctx)}
@@ -702,7 +702,7 @@ class TestBrowserDirectDispatch:
 
     @pytest.mark.asyncio
     async def test_click_passes_ref(self, mock_remote_tool_context):
-        from src.tools.research.browser_direct import create_browser_direct_tools
+        from agent.tools.research.browser_direct import create_browser_direct_tools
 
         ctx = self._ctx(
             mock_remote_tool_context, {"dom": "d", "url": "u", "title": "t"}
@@ -715,7 +715,7 @@ class TestBrowserDirectDispatch:
 
     @pytest.mark.asyncio
     async def test_exec_error_returned_unwrapped(self, mock_remote_tool_context):
-        from src.tools.research.browser_direct import create_browser_direct_tools
+        from agent.tools.research.browser_direct import create_browser_direct_tools
 
         ctx = self._ctx(mock_remote_tool_context, {"error": "navigate failed: boom"})
         tools = {t.name: t for t in create_browser_direct_tools(ctx)}
@@ -729,7 +729,7 @@ class TestBrowserDirectDispatch:
     async def test_snapshot_surfaces_known_browser_control_holder(
         self, mock_remote_tool_context
     ):
-        from src.tools.research.browser_direct import create_browser_direct_tools
+        from agent.tools.research.browser_direct import create_browser_direct_tools
 
         ctx = self._ctx(
             mock_remote_tool_context,
@@ -755,7 +755,7 @@ class TestBrowserDirectDispatch:
     async def test_user_driving_refusal_is_actionable_prompt_visible_prose(
         self, mock_remote_tool_context
     ):
-        from src.tools.research.browser_direct import create_browser_direct_tools
+        from agent.tools.research.browser_direct import create_browser_direct_tools
 
         daemon_message = "Interactive browser input is reserved for the user."
         ctx = self._ctx(
@@ -784,7 +784,7 @@ class TestBrowserDirectDispatch:
     async def test_snapshot_ignores_unknown_control_holder(
         self, mock_remote_tool_context, baton
     ):
-        from src.tools.research.browser_direct import create_browser_direct_tools
+        from agent.tools.research.browser_direct import create_browser_direct_tools
 
         ctx = self._ctx(
             mock_remote_tool_context,
@@ -801,8 +801,8 @@ class TestBrowserDirectDispatch:
         """A screenshot is surfaced as an <image_data> tag so the graph-side
         extract_image_tags post-processor lifts it into a real image block
         (and the base64 never reaches the token counter as text)."""
-        from src.tools.research.browser_direct import create_browser_direct_tools
-        from src.services.image_content import extract_image_tags
+        from agent.tools.research.browser_direct import create_browser_direct_tools
+        from agent.services.image_content import extract_image_tags
 
         ctx = self._ctx(
             mock_remote_tool_context,

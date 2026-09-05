@@ -27,7 +27,7 @@ from uuid import UUID
 import pytest
 from fastapi import HTTPException
 
-from security import access
+from orchestrator.security import access
 
 
 def _scoped(user: dict, scope: str | None) -> dict:
@@ -317,7 +317,7 @@ class TestRequireSudoRequestAuthorityScoped:
     ):
         scoped = _scoped(user_admin, f"project:{project_a['id']}")
         sudo_req = {"id": "req-1", "job_id": str(job_a["id"])}
-        with patch("services.sudo_gate.sudo_gate") as gate:
+        with patch("orchestrator.services.sudo_gate.sudo_gate") as gate:
             gate.get_request = AsyncMock(return_value=sudo_req)
             with _patch_caller(scoped):
                 result = await access.require_sudo_request_authority(
@@ -331,7 +331,7 @@ class TestRequireSudoRequestAuthorityScoped:
     ):
         scoped = _scoped(user_admin, f"project:{project_b['id']}")
         sudo_req = {"id": "req-1", "job_id": str(job_a["id"])}
-        with patch("services.sudo_gate.sudo_gate") as gate:
+        with patch("orchestrator.services.sudo_gate.sudo_gate") as gate:
             gate.get_request = AsyncMock(return_value=sudo_req)
             with _patch_caller(scoped):
                 with pytest.raises(HTTPException) as exc:
@@ -418,7 +418,7 @@ class TestMcpHeadersStashScope:
         """The auth path must read X-MCP-Scope and write it to user['scopes']."""
         from unittest.mock import MagicMock
 
-        from security.auth import _get_user_from_mcp_headers
+        from orchestrator.security.auth import _get_user_from_mcp_headers
 
         monkeypatch.setenv("MCP_INTERNAL_KEY", "shared-secret")
         request = MagicMock()
@@ -438,7 +438,7 @@ class TestMcpHeadersStashScope:
     async def test_missing_scope_header_yields_empty_list(self, user_a, monkeypatch):
         from unittest.mock import MagicMock
 
-        from security.auth import _get_user_from_mcp_headers
+        from orchestrator.security.auth import _get_user_from_mcp_headers
 
         monkeypatch.setenv("MCP_INTERNAL_KEY", "shared-secret")
         request = MagicMock()

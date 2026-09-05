@@ -1,24 +1,17 @@
 """Tests for the per-job repo model (resolve_job_repo, _graft_subjob_output, etc.)."""
 
 import os
-import sys
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
 
-# Add orchestrator/ to sys.path so its internal imports resolve
-_orch_dir = str(Path(__file__).parent.parent / "orchestrator")
-if _orch_dir not in sys.path:
-    sys.path.insert(0, _orch_dir)
-
 # main.py requires VECTOR_DB_URL at module level
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
-import main as orch_main  # noqa: E402
+import orchestrator.main as orch_main  # noqa: E402
 
-MODULE = "main"
+MODULE = "orchestrator.main"
 
 DELETE_RESULT = {
     "status": "deleted",
@@ -463,7 +456,7 @@ class TestDeleteJobGiteaCleanup:
         with (
             patch(f"{MODULE}.postgres_db") as mock_db,
             patch(
-                "security.access.require_approved_user",
+                "orchestrator.security.access.require_approved_user",
                 AsyncMock(
                     return_value={
                         "id": "00000000-0000-0000-0000-000000000099",
@@ -920,7 +913,7 @@ class TestGraftSubjobOutput:
 
     @pytest.mark.asyncio
     async def test_ambiguous_command_probe_refuses_to_repeat_graft(self):
-        from services.completion_effect_reconciliation import (
+        from orchestrator.services.completion_effect_reconciliation import (
             CompletionEffectProbeError,
         )
 

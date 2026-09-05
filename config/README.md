@@ -112,7 +112,7 @@ overlays declare none, so a re-rooted expert keeps everything it authored.
 
 Never read a base file directly — an overlay alone is only the role's residue.
 Use `load_role_base(role)` (the merged `expert_base` + overlay) from
-`src/core/loader.py`.
+`src/shared/runtime/core/loader.py`.
 
 ## Creating a Custom Agent Config
 
@@ -139,7 +139,7 @@ tools:
 Save as `config/my_agent.yaml` and run:
 
 ```bash
-python agent.py --config my_agent
+python -m agent --config my_agent
 ```
 
 Persistent/session experts use `$extends: session_base` instead; a shared
@@ -247,11 +247,11 @@ workspace:
 
 ### Tool Categories
 
-Tools are organized into categories. Each category maps to a module under `src/tools/`:
+Tools are organized into categories. Each category maps to a module under `src/agent/tools/`:
 
 ```yaml
 tools:
-  # File operations (src/tools/workspace/)
+  # File operations (src/agent/tools/workspace/)
   workspace:
     - read_file
     - write_file
@@ -268,7 +268,7 @@ tools:
     - create_directory
     - delete_directory
 
-  # Task management + completion (src/tools/core/)
+  # Task management + completion (src/agent/tools/core/)
   core:
     - next_phase_todos      # Stage todos for next tactical phase
     - todo_complete          # Mark current todo done
@@ -277,7 +277,7 @@ tools:
     - mark_complete          # Signal phase/task completion
     - job_complete           # Signal final completion (strategic only)
 
-  # Research: web, papers, browser, workflows (src/tools/research/)
+  # Research: web, papers, browser, workflows (src/agent/tools/research/)
   research:
     - web_search             # Tavily web search
     - extract_webpage        # Extract content from a URL
@@ -292,7 +292,7 @@ tools:
     # group below. Names listed here must exist in TOOL_REGISTRY; an unknown
     # name fails the whole batch load (tests/test_config_tool_names_are_registered.py).
 
-  # Citation management (src/tools/citation/)
+  # Citation management (src/agent/tools/citation/)
   citation:
     - cite_document
     - cite_web
@@ -306,29 +306,29 @@ tools:
     - search_library
     - generate_bibliography
 
-  # Database tool categories (src/tools/graph/, sql/, mongodb/)
+  # Database tool categories (src/agent/tools/graph/, sql/, mongodb/)
   # These are injected/stripped automatically by the orchestrator based on
   # which datasources are attached to the job. Usually left empty in config.
   graph: []      # Neo4j: execute_cypher_query, get_database_schema
   sql: []        # PostgreSQL: sql_query, sql_schema, sql_execute
   mongodb: []    # MongoDB: mongo_query, mongo_aggregate, mongo_schema, mongo_insert, mongo_update
 
-  # Shell command execution (src/tools/shell/)
+  # Shell command execution (src/agent/tools/shell/)
   # Mode controlled by shell.mode: "stateless" (default) or "persistent"
   shell:
     - run_command     # Execute commands, get output (stateless mode, default)
     - shell_read      # Read more output from scrollback
     # Alternative (persistent mode): shell_execute + shell_read
 
-  # Evaluation tools for critic agents (src/tools/evaluation/)
+  # Evaluation tools for critic agents (src/agent/tools/evaluation/)
   # Enable in critic config for approve/return capabilities.
   evaluation: []
 
-  # Version control (src/tools/git/) — reads the job's own repo by default and
+  # Version control (src/agent/tools/git/) — reads the job's own repo by default and
   # an attached repository datasource with repo="<clone-dir>".
   #
   # ONLY BOUND WHEN THE AGENT HAS NO SHELL TOOLS. If `shell` above is
-  # non-empty, ToolsConfig.__post_init__ (src/core/loader.py) drops this whole
+  # non-empty, ToolsConfig.__post_init__ (src/shared/runtime/core/loader.py) drops this whole
   # group: a shell can run git against any repository in the workspace, and
   # granting both gives the agent two ways to ask one question — the weaker of
   # which silently answers about a different repo. Shell-having agents should
@@ -410,7 +410,7 @@ Database tool categories (`graph`, `sql`, `mongodb`) are **not** controlled by t
 - If no datasource of a type is attached, the orchestrator **strips** the category (even if the config lists it).
 - The `read_only` flag on the datasource controls whether write tools are included.
 
-This means the agent config controls non-database tools, while the orchestrator controls database tools based on what's actually connected. See `_build_datasource_tool_override()` in `orchestrator/main.py`.
+This means the agent config controls non-database tools, while the orchestrator controls database tools based on what's actually connected. See `_build_datasource_tool_override()` in `src/orchestrator/main.py`.
 
 ### Context Management
 
@@ -423,7 +423,7 @@ limits:
   # context_threshold_tokens, model_max_context_tokens,
   # message_count_min_tokens
   # (summarization budgets are not config leaves — they are computed at call
-  # time from the auxiliary model's window, see src/core/summarizer.py)
+  # time from the auxiliary model's window, see src/agent/core/summarizer.py)
 
 context_management:
   compact_on_archive: true
@@ -433,7 +433,7 @@ context_management:
 
 ### Settings Matrix
 
-`settings_matrix.yaml` is the single source of truth for model-family-specific inference parameters and context limits. Keys match `detect_model_family()` output in `src/core/loader.py`.
+`settings_matrix.yaml` is the single source of truth for model-family-specific inference parameters and context limits. Keys match `detect_model_family()` output in `src/shared/runtime/core/loader.py`.
 
 ```yaml
 # Resolution: default → family-specific (deep_merge)
@@ -532,14 +532,14 @@ This works with VS Code + Red Hat YAML extension.
 
 ```bash
 # Use the worker framework base directly (normally a named expert is selected)
-python agent.py
+python -m agent
 
 # Use custom config
-python agent.py --config my_agent
+python -m agent --config my_agent
 
 # Use explicit path
-python agent.py --config /path/to/config.yaml
+python -m agent --config /path/to/config.yaml
 
 # As API server
-python agent.py --config my_agent --port 8001
+python -m agent --config my_agent --port 8001
 ```

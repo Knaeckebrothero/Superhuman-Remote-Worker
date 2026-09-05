@@ -21,8 +21,8 @@ import pytest
 
 from tests._tool_invoke import invoke_tool
 
-from src.core.workspace_backend import WorkspaceUnavailableError
-from src.tools.core.job import _final_phase_data, create_job_tools
+from shared.runtime.core.workspace_backend import WorkspaceUnavailableError
+from agent.tools.core.job import _final_phase_data, create_job_tools
 
 
 @pytest.fixture(autouse=True)

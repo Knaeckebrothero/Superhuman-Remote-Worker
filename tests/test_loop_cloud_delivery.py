@@ -7,12 +7,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from services.cloud import (
+from orchestrator.services.cloud import (
     CloudBackendError,
     CloudBackendErrorKind,
     ProjectFolderEntry,
 )
-from services.job_cloud_baseline import (
+from orchestrator.services.job_cloud_baseline import (
     apply_diff_to_cloud,
     deliver_loop_diff_to_cloud,
     detect_external_mods,
@@ -74,10 +74,12 @@ async def test_no_project_file_changes_advances_without_cloud_write():
     db = _db()
     with (
         patch(
-            "services.job_cloud_baseline.detect_external_mods", new_callable=AsyncMock
+            "orchestrator.services.job_cloud_baseline.detect_external_mods",
+            new_callable=AsyncMock,
         ) as detect,
         patch(
-            "services.job_cloud_baseline.apply_diff_to_cloud", new_callable=AsyncMock
+            "orchestrator.services.job_cloud_baseline.apply_diff_to_cloud",
+            new_callable=AsyncMock,
         ) as apply,
     ):
         outcome = await deliver_loop_diff_to_cloud(
@@ -108,11 +110,11 @@ async def test_non_project_repo_changes_are_not_reported_as_cloud_applied():
     db = _db()
     with (
         patch(
-            "services.job_cloud_baseline.detect_external_mods",
+            "orchestrator.services.job_cloud_baseline.detect_external_mods",
             new_callable=AsyncMock,
         ) as detect,
         patch(
-            "services.job_cloud_baseline.apply_diff_to_cloud",
+            "orchestrator.services.job_cloud_baseline.apply_diff_to_cloud",
             new_callable=AsyncMock,
         ) as apply,
     ):
@@ -137,11 +139,11 @@ async def test_clean_diff_is_applied_and_accepted():
     db = _db()
     with (
         patch(
-            "services.job_cloud_baseline.detect_external_mods",
+            "orchestrator.services.job_cloud_baseline.detect_external_mods",
             AsyncMock(return_value=[]),
         ) as detect,
         patch(
-            "services.job_cloud_baseline.apply_diff_to_cloud",
+            "orchestrator.services.job_cloud_baseline.apply_diff_to_cloud",
             AsyncMock(return_value={"applied": 1, "deleted": 0, "errors": []}),
         ) as apply,
     ):
@@ -194,8 +196,14 @@ async def test_completion_command_registers_bounded_intent_before_cloud_apply():
 
     db.merge_job_context.side_effect = register
     with (
-        patch("services.job_cloud_baseline.detect_external_mods", side_effect=clean),
-        patch("services.job_cloud_baseline.apply_diff_to_cloud", side_effect=apply),
+        patch(
+            "orchestrator.services.job_cloud_baseline.detect_external_mods",
+            side_effect=clean,
+        ),
+        patch(
+            "orchestrator.services.job_cloud_baseline.apply_diff_to_cloud",
+            side_effect=apply,
+        ),
     ):
         outcome = await deliver_loop_diff_to_cloud(
             job=job,
@@ -244,8 +252,8 @@ async def test_same_command_reapplies_after_cloud_apply_before_db_stamp():
     apply = AsyncMock(return_value={"applied": 1, "deleted": 0, "errors": []})
 
     with (
-        patch("services.job_cloud_baseline.detect_external_mods", detect),
-        patch("services.job_cloud_baseline.apply_diff_to_cloud", apply),
+        patch("orchestrator.services.job_cloud_baseline.detect_external_mods", detect),
+        patch("orchestrator.services.job_cloud_baseline.apply_diff_to_cloud", apply),
     ):
         with pytest.raises(RuntimeError, match="crash after WebDAV apply"):
             await deliver_loop_diff_to_cloud(
@@ -281,8 +289,8 @@ async def test_cloud_apply_does_not_start_when_command_intent_is_not_durable():
     apply = AsyncMock()
 
     with (
-        patch("services.job_cloud_baseline.detect_external_mods", detect),
-        patch("services.job_cloud_baseline.apply_diff_to_cloud", apply),
+        patch("orchestrator.services.job_cloud_baseline.detect_external_mods", detect),
+        patch("orchestrator.services.job_cloud_baseline.apply_diff_to_cloud", apply),
     ):
         with pytest.raises(RuntimeError, match="could not persist"):
             await deliver_loop_diff_to_cloud(
@@ -318,8 +326,8 @@ async def test_different_command_cannot_adopt_cloud_apply_intent():
     apply = AsyncMock()
 
     with (
-        patch("services.job_cloud_baseline.detect_external_mods", detect),
-        patch("services.job_cloud_baseline.apply_diff_to_cloud", apply),
+        patch("orchestrator.services.job_cloud_baseline.detect_external_mods", detect),
+        patch("orchestrator.services.job_cloud_baseline.apply_diff_to_cloud", apply),
     ):
         outcome = await deliver_loop_diff_to_cloud(
             job=job,
@@ -344,11 +352,12 @@ async def test_external_conflict_requires_review_and_does_not_apply():
     diverged = [{"path": "report.md", "kind": "etag_mismatch"}]
     with (
         patch(
-            "services.job_cloud_baseline.detect_external_mods",
+            "orchestrator.services.job_cloud_baseline.detect_external_mods",
             AsyncMock(return_value=diverged),
         ),
         patch(
-            "services.job_cloud_baseline.apply_diff_to_cloud", new_callable=AsyncMock
+            "orchestrator.services.job_cloud_baseline.apply_diff_to_cloud",
+            new_callable=AsyncMock,
         ) as apply,
     ):
         outcome = await deliver_loop_diff_to_cloud(
@@ -372,11 +381,11 @@ async def test_partial_cloud_write_requires_review():
     db = _db()
     with (
         patch(
-            "services.job_cloud_baseline.detect_external_mods",
+            "orchestrator.services.job_cloud_baseline.detect_external_mods",
             AsyncMock(return_value=[]),
         ),
         patch(
-            "services.job_cloud_baseline.apply_diff_to_cloud",
+            "orchestrator.services.job_cloud_baseline.apply_diff_to_cloud",
             AsyncMock(
                 return_value={
                     "applied": 1,

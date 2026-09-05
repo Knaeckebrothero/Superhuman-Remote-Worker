@@ -1,0 +1,65 @@
+"""Core toolkit - task management and job lifecycle.
+
+This toolkit is always loaded as it provides essential agent functionality.
+It includes:
+- Todo tools: Task tracking (next_phase_todos, todo_complete, todo_list, request_replan)
+- Job tools: Completion signaling (mark_complete, job_complete)
+"""
+
+from typing import Any, Dict, List
+
+from agent.tools.context import ToolContext
+
+
+def create_core_tools(context: ToolContext) -> List[Any]:
+    """Create all core tools with injected context.
+
+    Args:
+        context: ToolContext with dependencies
+
+    Returns:
+        List of LangChain tool functions
+    """
+    from agent.tools.core.todo import create_todo_tools
+    from agent.tools.core.job import create_job_tools
+    from agent.tools.core.upgrade import create_workspace_upgrade_tools
+    from agent.tools.core.officer import create_officer_tools
+
+    tools = []
+
+    if context.has_todo():
+        tools.extend(create_todo_tools(context))
+
+    if context.has_workspace():
+        tools.extend(create_job_tools(context))
+
+    # No workspace/todo dependency — loads on the lite tiers (todo_manager=None);
+    # only requested when exposed (lite sessions, workspace_tier_upgrade.md S5).
+    tools.extend(create_workspace_upgrade_tools(context))
+
+    # Officer sleep — flag-setter only; exposed solely when the session's
+    # config has officer.enabled (persistent_session tool assembly).
+    tools.extend(create_officer_tools(context))
+
+    return tools
+
+
+def get_core_metadata() -> Dict[str, Dict[str, Any]]:
+    """Get metadata for all core tools."""
+    from agent.tools.core.todo import TODO_TOOLS_METADATA
+    from agent.tools.core.job import JOB_TOOLS_METADATA
+    from agent.tools.core.upgrade import WORKSPACE_UPGRADE_TOOLS_METADATA
+    from agent.tools.core.officer import OFFICER_TOOLS_METADATA
+
+    return {
+        **TODO_TOOLS_METADATA,
+        **JOB_TOOLS_METADATA,
+        **WORKSPACE_UPGRADE_TOOLS_METADATA,
+        **OFFICER_TOOLS_METADATA,
+    }
+
+
+__all__ = [
+    "create_core_tools",
+    "get_core_metadata",
+]

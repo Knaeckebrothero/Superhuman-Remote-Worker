@@ -4,6 +4,7 @@ workspace/*
 ./workspace/*
 output/*
 orchestrator/workspace/*
+src/orchestrator/workspace/*
 project_documentation/*
 docker/certs/*
 

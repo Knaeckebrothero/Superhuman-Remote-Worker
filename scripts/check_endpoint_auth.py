@@ -19,7 +19,7 @@ fails the regression test and forces a manual review of any new endpoint.
 
 Two route sources are walked:
 
-  * `@app.METHOD(...)` in orchestrator/main.py — restricted to /api/* paths,
+  * `@app.METHOD(...)` in src/orchestrator/main.py — restricted to /api/* paths,
     which is every route main.py serves that this inventory cares about.
   * `@<router>.METHOD(...)` in any module that builds an `APIRouter`, with the
     router's `prefix=` folded into the path. These are mounted by main.py's
@@ -37,7 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-ORCHESTRATOR = REPO_ROOT / "orchestrator"
+ORCHESTRATOR = REPO_ROOT / "src" / "orchestrator"
 MAIN_PY = ORCHESTRATOR / "main.py"
 MANIFEST = REPO_ROOT / "policy" / "endpoint_inventory.txt"
 
@@ -389,6 +389,8 @@ def _router_modules() -> list[Path]:
 
 
 def collect_endpoints(main_path: Path = MAIN_PY) -> list[Endpoint]:
+    if not main_path.is_file():
+        raise FileNotFoundError(f"Orchestrator route source is missing: {main_path}")
     endpoints = _collect_module(main_path, app_var="app", api_only=True)
     for module in _router_modules():
         endpoints.extend(_collect_module(module))
@@ -402,7 +404,7 @@ def render_manifest(endpoints: list[Endpoint]) -> str:
         "# DO NOT EDIT BY HAND. Regenerate with `python scripts/check_endpoint_auth.py --write`.\n"
         "#\n"
         "# SCOPE: main.py `@app.METHOD(...)` /api/* routes, plus every APIRouter the\n"
-        "# app mounts (orchestrator/routers/*, auth/bff.py, uploads.py, graph_routes.py)\n"
+        "# app mounts (src/orchestrator/routers/*, auth/bff.py, uploads.py, graph_routes.py)\n"
         "# with its prefix folded in. Router /auth/* and /wopi/* are listed in full.\n"
         "#\n"
         "# Classifications:\n"

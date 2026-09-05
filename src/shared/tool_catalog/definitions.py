@@ -7,9 +7,12 @@ of truth instead of a copied snapshot.
 
 from typing import Any, Dict
 
-from src.shared.orch_surface.jobs import registry_metadata
+from shared.orch_surface.jobs import registry_metadata
 
-from .names import APP_GUIDE_LOADER_TOOL, PRODUCT_CAPABILITIES_TOOL_NAME
+from shared.tool_catalog.names import (
+    APP_GUIDE_LOADER_TOOL,
+    PRODUCT_CAPABILITIES_TOOL_NAME,
+)
 
 
 # canvas/__init__

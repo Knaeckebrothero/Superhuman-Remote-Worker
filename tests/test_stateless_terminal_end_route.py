@@ -370,8 +370,8 @@ def test_process_zero_without_pending_retirement_stays_fail_closed() -> None:
 async def test_process_zero_retry_retires_exact_live_residents_and_shell(
     monkeypatch,
 ) -> None:
-    from services import stateless_session_retirement as retirement_service
-    from services.cloud import RcloneMountSpec
+    from orchestrator.services import stateless_session_retirement as retirement_service
+    from orchestrator.services.cloud import RcloneMountSpec
 
     settled = _retiring_process_zero_thread()
     settled.update(
@@ -1223,7 +1223,7 @@ async def test_emptydir_permanent_requires_snapshot_prefix_cleanup_after_restore
 async def test_permanent_virtual_end_purges_exact_workspace_before_row_delete(
     purged,
 ) -> None:
-    from services import thread_uploads
+    from orchestrator.services import thread_uploads
 
     thread = _settled_virtual_thread()
     authority = _lifecycle_authority()

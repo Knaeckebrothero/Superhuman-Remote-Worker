@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from starlette.datastructures import Headers
 
-from security.csrf import allowed_browser_origins, websocket_origin_allowed
+from orchestrator.security.csrf import allowed_browser_origins, websocket_origin_allowed
 
 
 def _headers(*origins: str) -> Headers:

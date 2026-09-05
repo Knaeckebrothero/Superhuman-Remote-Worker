@@ -23,10 +23,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-import src.api.persistent_app as pa
-from src.persistent_graph import PermissionOutcome
-from src.shared.run_queue import heartbeat_unit
-from src.shared.thread_presence import PermissionExpiryResult
+import agent.api.persistent_app as pa
+from agent.persistent_graph import PermissionOutcome
+from shared.run_queue import heartbeat_unit
+from shared.thread_presence import PermissionExpiryResult
 
 
 # =============================================================================

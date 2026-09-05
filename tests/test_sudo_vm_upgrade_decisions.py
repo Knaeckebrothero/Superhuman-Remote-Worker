@@ -22,24 +22,18 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID
 
 import pytest
 from fastapi import HTTPException
 
-_ORCH = Path(__file__).parent.parent / "orchestrator"
-if str(_ORCH) not in sys.path:
-    sys.path.insert(0, str(_ORCH))
-
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
-import main as orch_main  # noqa: E402
+import orchestrator.main as orch_main  # noqa: E402
 
-MODULE = "main"
+MODULE = "orchestrator.main"
 
 JOB_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 REQ_ID = "11111111-2222-3333-4444-555555555555"
@@ -513,14 +507,14 @@ class TestApplyStickySudoDenial:
 class TestUserCanUseVmAdminGuard:
     @pytest.mark.asyncio
     async def test_admin_short_circuits_before_any_db_access(self):
-        from database.postgres import PostgresDB
+        from orchestrator.database.postgres import PostgresDB
 
         db = PostgresDB.__new__(PostgresDB)  # no pool — DB access would raise
         assert await db.user_can_use_vm({"is_admin": True, "can_use_vm": False})
 
     @pytest.mark.asyncio
     async def test_non_admin_falls_back_to_column(self):
-        from database.postgres import PostgresDB
+        from orchestrator.database.postgres import PostgresDB
 
         db = PostgresDB.__new__(PostgresDB)
         db.list_grants_for_scopes = AsyncMock(side_effect=RuntimeError("no db"))

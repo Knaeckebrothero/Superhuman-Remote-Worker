@@ -17,9 +17,6 @@ import os
 import sys
 import uuid
 
-# Add project root to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 
 # Test memories spanning different types and topics
 FAKE_MEMORIES = [
@@ -182,9 +179,9 @@ async def main():
         print("\nERROR: OPENAI_API_KEY or EMBEDDING_API_KEY not set.")
         sys.exit(1)
 
-    from src.database.postgres_db import PostgresDB
-    from src.services.embedding_service import get_embedding_service
-    from src.services.recall_store import RecallStore
+    from agent.database.postgres_db import PostgresDB
+    from shared.runtime.services.embedding_service import get_embedding_service
+    from shared.runtime.services.recall_store import RecallStore
 
     # Connect to database
     db = PostgresDB()
@@ -198,6 +195,7 @@ async def main():
         schema_path = (
             Path(__file__).parent.parent
             / "src"
+            / "agent"
             / "database"
             / "queries"
             / "postgres"

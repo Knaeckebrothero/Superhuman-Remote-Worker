@@ -940,7 +940,7 @@ class TestCreateIdePod:
     def test_ide_pod_name_format(self):
         """IDE pod uses 'ide-' prefix with truncated job_id."""
         from orchestrator.services.container_provisioner import ContainerProvisioner
-        from services.workspace_lifecycle import WorkspaceOwner
+        from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 
         provisioner = ContainerProvisioner()
         manifest = provisioner._build_pod_manifest(
@@ -958,7 +958,7 @@ class TestCreateIdePod:
     def test_ide_pod_label_override(self):
         """create_ide_pod overrides the component label to 'ide-session'."""
         from orchestrator.services.container_provisioner import ContainerProvisioner
-        from services.workspace_lifecycle import WorkspaceOwner
+        from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 
         provisioner = ContainerProvisioner()
         manifest = provisioner._build_pod_manifest(
@@ -995,7 +995,7 @@ class TestDeleteIdePod:
     async def test_legacy_delete_refuses_without_cleanup_intent_or_process_zero(self):
         """A name and live Pod UID are not terminal deletion authority."""
         from orchestrator.services.container_provisioner import ContainerProvisioner
-        from services.workspace_lifecycle import WorkspaceOwner
+        from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 
         provisioner = ContainerProvisioner()
         provisioner._k8s_available = True
@@ -1157,7 +1157,10 @@ class TestIdeProxySecurityBoundary:
                 AsyncMock(return_value=True),
             ),
             patch.object(main, "_request_exact_ide_http", request_upstream),
-            patch("services.ssh_helpers.orchestrator_can_reach", return_value=True),
+            patch(
+                "orchestrator.services.ssh_helpers.orchestrator_can_reach",
+                return_value=True,
+            ),
         ):
             response = await main.ide_proxy_http(request, "job-a", "workspace")
 
@@ -1577,26 +1580,26 @@ class TestIsBrowserNavigation:
         return req
 
     def test_sec_fetch_mode_navigate(self):
-        from main import _is_browser_navigation
+        from orchestrator.main import _is_browser_navigation
 
         assert _is_browser_navigation(self._req({"sec-fetch-mode": "navigate"})) is True
 
     def test_sec_fetch_mode_cors_is_not_navigation(self):
-        from main import _is_browser_navigation
+        from orchestrator.main import _is_browser_navigation
 
         # code-server's own asset/XHR sub-requests — must NOT be treated as navs.
         req = self._req({"sec-fetch-mode": "cors", "accept": "application/json"})
         assert _is_browser_navigation(req) is False
 
     def test_accept_html_fallback(self):
-        from main import _is_browser_navigation
+        from orchestrator.main import _is_browser_navigation
 
         # Older browsers without Sec-Fetch-Mode: fall back to Accept: text/html.
         req = self._req({"accept": "text/html,application/xhtml+xml"})
         assert _is_browser_navigation(req) is True
 
     def test_no_signal_is_not_navigation(self):
-        from main import _is_browser_navigation
+        from orchestrator.main import _is_browser_navigation
 
         assert _is_browser_navigation(self._req({})) is False
 
@@ -1616,15 +1619,15 @@ class TestIdeProxyHttpAuthRedirect:
 
     @pytest.mark.asyncio
     async def test_navigation_401_redirects_to_login(self):
-        import main
+        import orchestrator.main
 
         with patch(
-            "main.require_approved_user",
+            "orchestrator.main.require_approved_user",
             AsyncMock(
                 side_effect=HTTPException(status_code=401, detail="Not authenticated")
             ),
         ):
-            resp = await main.ide_proxy_http(
+            resp = await orchestrator.main.ide_proxy_http(
                 self._req({"sec-fetch-mode": "navigate"}), "thread-123", ""
             )
 
@@ -1634,16 +1637,16 @@ class TestIdeProxyHttpAuthRedirect:
 
     @pytest.mark.asyncio
     async def test_xhr_401_is_not_redirected(self):
-        import main
+        import orchestrator.main
 
         with patch(
-            "main.require_approved_user",
+            "orchestrator.main.require_approved_user",
             AsyncMock(
                 side_effect=HTTPException(status_code=401, detail="Not authenticated")
             ),
         ):
             with pytest.raises(HTTPException) as exc_info:
-                await main.ide_proxy_http(
+                await orchestrator.main.ide_proxy_http(
                     self._req({"sec-fetch-mode": "cors", "accept": "application/json"}),
                     "thread-123",
                     "",
@@ -1653,10 +1656,10 @@ class TestIdeProxyHttpAuthRedirect:
 
     @pytest.mark.asyncio
     async def test_navigation_403_is_not_redirected(self):
-        import main
+        import orchestrator.main
 
         with patch(
-            "main.require_approved_user",
+            "orchestrator.main.require_approved_user",
             AsyncMock(
                 side_effect=HTTPException(
                     status_code=403, detail="Account pending approval."
@@ -1664,7 +1667,7 @@ class TestIdeProxyHttpAuthRedirect:
             ),
         ):
             with pytest.raises(HTTPException) as exc_info:
-                await main.ide_proxy_http(
+                await orchestrator.main.ide_proxy_http(
                     self._req({"sec-fetch-mode": "navigate"}), "thread-123", ""
                 )
 
@@ -1688,7 +1691,7 @@ class TestBrowserIdeAdvertisement:
 
     def test_deployment_without_a_root_key_advertises_nothing(self, monkeypatch):
         """No key means no workspace here can bind one — say so once, cheaply."""
-        from services.ide_proxy import contain_ide_status
+        from orchestrator.services.ide_proxy import contain_ide_status
 
         monkeypatch.delenv("IDE_CREDENTIAL_KEY", raising=False)
 
@@ -1704,7 +1707,7 @@ class TestBrowserIdeAdvertisement:
         assert result["source"] == "live_workspace"
 
     def test_payload_without_a_url_is_returned_untouched(self, monkeypatch):
-        from services.ide_proxy import contain_ide_status
+        from orchestrator.services.ide_proxy import contain_ide_status
 
         monkeypatch.delenv("IDE_CREDENTIAL_KEY", raising=False)
         payload = {"status": "restoring", "code_server_url": None, "gitea_url": None}
@@ -1713,7 +1716,7 @@ class TestBrowserIdeAdvertisement:
 
     def test_configured_deployment_defers_to_the_per_workspace_check(self, monkeypatch):
         """The cheap gate must not answer a question only the runtime can."""
-        import services.ide_proxy as ide_proxy
+        import orchestrator.services.ide_proxy as ide_proxy
 
         monkeypatch.setenv("IDE_CREDENTIAL_KEY", "k")
         payload = dict(self.ACTIVE)
@@ -1723,7 +1726,7 @@ class TestBrowserIdeAdvertisement:
 
     @pytest.mark.asyncio
     async def test_bound_workspace_keeps_its_url(self, monkeypatch):
-        import services.ide_proxy as ide_proxy
+        import orchestrator.services.ide_proxy as ide_proxy
 
         monkeypatch.setenv("IDE_CREDENTIAL_KEY", "k")
         target = SimpleNamespace(backend="k8s", credential="c0ffee")
@@ -1742,7 +1745,7 @@ class TestBrowserIdeAdvertisement:
         self, monkeypatch
     ):
         """The button must not appear for a Pod the proxy will refuse."""
-        import services.ide_proxy as ide_proxy
+        import orchestrator.services.ide_proxy as ide_proxy
 
         monkeypatch.setenv("IDE_CREDENTIAL_KEY", "k")
         target = SimpleNamespace(backend="k8s", credential=None)
@@ -1761,7 +1764,7 @@ class TestBrowserIdeAdvertisement:
 
     @pytest.mark.asyncio
     async def test_typed_backend_refusal_is_passed_through(self, monkeypatch):
-        import services.ide_proxy as ide_proxy
+        import orchestrator.services.ide_proxy as ide_proxy
 
         monkeypatch.setenv("IDE_CREDENTIAL_KEY", "k")
         with patch.object(
@@ -1843,7 +1846,10 @@ class TestIdeWebSocketTransport:
             patch.object(
                 main, "_require_stateless_ide_lifecycle", AsyncMock(return_value=None)
             ),
-            patch("services.ssh_helpers.orchestrator_can_reach", return_value=True),
+            patch(
+                "orchestrator.services.ssh_helpers.orchestrator_can_reach",
+                return_value=True,
+            ),
             patch("websockets.connect", side_effect=connect),
         ):
             await main.ide_proxy_ws(ws, "thread-a", "stable/connection")

@@ -3,7 +3,7 @@
 import re
 from pathlib import Path
 
-from src.tools.registry import TOOL_REGISTRY
+from agent.tools.registry import TOOL_REGISTRY
 
 
 QUERY = Path("bench/queries/phase_illegal_calls.sql")

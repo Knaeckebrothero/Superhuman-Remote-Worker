@@ -11,8 +11,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.api.orchestrator_client import OrchestratorClient
-from src.shared.runtime_actor import RUNTIME_ACTOR_BOOTSTRAP_HEADER
+from agent.api.orchestrator_client import OrchestratorClient
+from shared.runtime_actor import RUNTIME_ACTOR_BOOTSTRAP_HEADER
 
 
 @pytest.mark.asyncio
@@ -207,7 +207,7 @@ async def test_register_raises_on_409_for_thread_bound():
     cleanly — leaving the per-session Service endpoints instead of lingering as
     an orphan that black-holes connections. See
     knowledge-history/done/persistent_thread_double_provisioning_race.md."""
-    from src.api.orchestrator_client import DuplicateThreadBinding
+    from agent.api.orchestrator_client import DuplicateThreadBinding
 
     client = OrchestratorClient(
         orchestrator_url="http://test-orch:8085",

@@ -7,17 +7,10 @@ Tests cover:
 3. OrchestratorClient.approve_job: success/failure paths
 """
 
-import sys
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import asyncpg
 import pytest
-
-# Add project root to path
-project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
 
 from orchestrator.services.completion import (  # noqa: E402
     determine_job_status,
@@ -859,7 +852,7 @@ class TestOrchestratorClientApproveJob:
 
     @pytest.fixture
     def client(self):
-        from src.api.orchestrator_client import OrchestratorClient
+        from agent.api.orchestrator_client import OrchestratorClient
 
         return OrchestratorClient(
             orchestrator_url="http://localhost:8085",
@@ -957,7 +950,7 @@ class TestOrchestratorClientReportCompletion:
 
     @pytest.fixture
     def client(self):
-        from src.api.orchestrator_client import OrchestratorClient
+        from agent.api.orchestrator_client import OrchestratorClient
 
         return OrchestratorClient(
             orchestrator_url="http://localhost:8085",
@@ -1115,7 +1108,7 @@ class TestOrchestratorClientReportCompletion:
 
     @pytest.mark.asyncio
     async def test_machine_coded_nonterminal_422_is_definitive(self, client):
-        from src.api.orchestrator_client import CompletionNonTerminalReportError
+        from agent.api.orchestrator_client import CompletionNonTerminalReportError
 
         mock_response = MagicMock()
         mock_response.status_code = 422

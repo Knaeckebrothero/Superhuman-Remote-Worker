@@ -25,7 +25,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy and install requirements
-COPY orchestrator/requirements.txt .
+COPY src/orchestrator/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Production image
@@ -46,7 +46,7 @@ LABEL io.srw.component="orchestrator"
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONPATH=/app \
+    PYTHONSAFEPATH=1 \
     PORT=8085 \
     SRW_COMPONENT=orchestrator \
     SRW_SOURCE_REVISION=${SRW_SOURCE_REVISION} \
@@ -78,41 +78,32 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 
-# Copy orchestrator source code with correct ownership
-COPY --chown=srw:srw orchestrator/ ./
-
-# Copy agent src package (builder LLM factory, knowledge graph, embedding service)
-COPY --chown=srw:srw src/ ./src/
-
-# Copy agent config directory (expert definitions, defaults, prompts, templates)
+# Copy only this application and its shared runtime/contracts.
+COPY --chown=srw:srw src/orchestrator/ ./src/orchestrator/
+COPY --chown=srw:srw src/shared/ ./src/shared/
 COPY --chown=srw:srw config/ ./config/
+COPY --chown=srw:srw pyproject.toml ./
+RUN pip install --no-cache-dir --no-deps -e .
 
 # Keep the metering package and the main entrypoint image-atomic. This import
 # catches selective/stale build contexts before an image can be published.
-RUN python -c "import services.infrastructure_metering.compute_activation"
+RUN python -c "import orchestrator.services.infrastructure_metering.compute_activation"
 # Fail the image build if the always-on session-memory drain accidentally
 # regains an agent-only import dependency.
-RUN python -c "import services.session_memory_executor"
-# The COPY above flattens orchestrator/ into /app, so there is no `orchestrator`
-# package at runtime: a `from orchestrator.services.X import ...` inside these
-# modules crash-loops the pod on the very first import. tests/conftest.py puts
-# BOTH the repo root and orchestrator/ on sys.path, so pytest resolves either
-# spelling and cannot see it. This import runs against the real flattened layout.
-RUN python -c "import services.email, services.headless_notifications"
-# The legacy-authority operator must be executable in the same flattened
+RUN python -c "import orchestrator.services.session_memory_executor"
+# Exercise the installed image namespace and lean dependency set directly.
+RUN python -c "import orchestrator.services.email, orchestrator.services.headless_notifications"
+# The legacy-authority operator must be executable in the same installed
 # namespace operators get through ``kubectl exec``.  Keep this as ``--help``:
 # image construction must never connect to storage or initialize the forge.
-RUN python -m operator_cli.managed_repository_reconciliation --help >/dev/null
+RUN python -m orchestrator.operator_cli.managed_repository_reconciliation --help >/dev/null
 # Keep the bounded stateless-wake rollout gate executable through the same
-# flattened-image import path. ``--help`` is inert and never opens storage.
-RUN python -m operator_cli.stateless_wake_acceptance --help >/dev/null
+# installed-package import path. ``--help`` is inert and never opens storage.
+RUN python -m orchestrator.operator_cli.stateless_wake_acceptance --help >/dev/null
 # The Canvas role reconciliation Job runs this same runtime attestation before
-# a Helm revision becomes ready. ``--help`` proves the flattened image imports
+# a Helm revision becomes ready. ``--help`` proves the installed image imports
 # it without opening a database connection.
-RUN python -m operator_cli.canvas_viewer_database_attestation --help >/dev/null
-
-# Marker so get_project_root() finds /app (no .git in container)
-RUN touch /app/pyproject.toml && chown srw:srw /app/pyproject.toml
+RUN python -m orchestrator.operator_cli.canvas_viewer_database_attestation --help >/dev/null
 
 USER srw
 
@@ -127,4 +118,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
 # lifespan shutdown — and with it the M1 leader-election advisory-unlock — never
 # runs before the 60s SIGKILL, so leadership handoff takes the full grace period
 # instead of a clean step-down. 10s leaves ample headroom under the 60s grace.
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8085", "--timeout-graceful-shutdown", "10"]
+CMD ["uvicorn", "orchestrator.main:app", "--host", "0.0.0.0", "--port", "8085", "--timeout-graceful-shutdown", "10"]

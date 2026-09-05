@@ -7,7 +7,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
-from src.shared.pinned_session_identity import PinnedSessionBinding
+from shared.pinned_session_identity import PinnedSessionBinding
 
 
 CONNECTION_THREAD_ID = "11111111-1111-4111-8111-111111111111"
@@ -112,7 +112,7 @@ def _install_fake_auth(monkeypatch, user_id: str = "u1") -> None:
     # Every connection path now joins protected-reader readiness before lane
     # or transport discovery. Ordinary fixture rows take the immediate-ready
     # branch; individual protected tests override this explicitly.
-    import main as main_mod
+    import orchestrator.main as main_mod
 
     monkeypatch.setattr(
         main_mod,
@@ -338,7 +338,7 @@ async def test_do_prepare_refuses_stateless_lane_before_provisioning(monkeypatch
     monkeypatch.setattr(
         sessions_mod, "_provision_agent_for_thread", provision, raising=True
     )
-    monkeypatch.setitem(sys.modules, "main", _fake_main())
+    monkeypatch.setitem(sys.modules, "orchestrator.main", _fake_main())
     emitted: list[tuple[str, dict]] = []
     monkeypatch.setattr(
         sessions_mod,
@@ -429,7 +429,7 @@ async def test_provision_helper_suppresses_pod_fallback_after_lane_transition(
     )
     fake_main._send_session_attach = AsyncMock(return_value=False)
     fake_main.agent_provisioner.provision_agent = AsyncMock()
-    monkeypatch.setitem(sys.modules, "main", fake_main)
+    monkeypatch.setitem(sys.modules, "orchestrator.main", fake_main)
 
     with pytest.raises(RuntimeError, match="pinned provisioning"):
         await sessions_mod._provision_agent_for_thread(
@@ -480,7 +480,7 @@ async def test_do_prepare_emits_phases_for_warm_thread(monkeypatch):
     fake_main = _fake_main()
     fake_main.session_router = AsyncMock()
     fake_main.session_router.ensure_route = AsyncMock(return_value="/p/t1")
-    monkeypatch.setitem(sys.modules, "main", fake_main)
+    monkeypatch.setitem(sys.modules, "orchestrator.main", fake_main)
 
     # Capture lifecycle emits at the call site inside sessions.py — patching
     # the bound `lifecycle_emit` name avoids the dual-module-path problem
@@ -583,7 +583,7 @@ async def test_do_prepare_never_publishes_ready_for_a_changed_binding(
     fake_main.session_router = MagicMock()
     fake_main.session_router.ensure_route = AsyncMock(return_value="/p/t1")
     fake_main.session_router.teardown_route = AsyncMock(return_value=True)
-    monkeypatch.setitem(sys.modules, "main", fake_main)
+    monkeypatch.setitem(sys.modules, "orchestrator.main", fake_main)
     emitted: list[str] = []
     monkeypatch.setattr(
         sessions_mod,
@@ -659,7 +659,7 @@ async def test_do_prepare_cleans_partial_route_on_every_exception(
         )
     )
     fake_main.session_router.teardown_route = AsyncMock(return_value=True)
-    monkeypatch.setitem(sys.modules, "main", fake_main)
+    monkeypatch.setitem(sys.modules, "orchestrator.main", fake_main)
     emitted: list[dict] = []
     monkeypatch.setattr(
         sessions_mod,
@@ -718,7 +718,7 @@ async def test_do_prepare_reports_failed_when_exact_route_cleanup_is_incomplete(
         side_effect=RuntimeError("Ingress create failed")
     )
     fake_main.session_router.teardown_route = AsyncMock(return_value=False)
-    monkeypatch.setitem(sys.modules, "main", fake_main)
+    monkeypatch.setitem(sys.modules, "orchestrator.main", fake_main)
     emitted: list[dict] = []
     monkeypatch.setattr(
         sessions_mod,
@@ -769,7 +769,7 @@ async def test_do_prepare_emits_failed_when_pod_not_ready(monkeypatch):
     fake_main = _fake_main()
     fake_main.session_router = AsyncMock()
     fake_main.session_router.ensure_route = AsyncMock()
-    monkeypatch.setitem(sys.modules, "main", fake_main)
+    monkeypatch.setitem(sys.modules, "orchestrator.main", fake_main)
 
     emit_calls: list[dict] = []
 
@@ -849,7 +849,7 @@ async def test_do_prepare_waits_when_agent_pod_marker_in_flight(monkeypatch):
     fake_main.ensure_session_workspace = AsyncMock(return_value=None)
     fake_main._session_grant_violations = AsyncMock(return_value=[])
     fake_main._session_endpoint_violations = AsyncMock(return_value=[])
-    monkeypatch.setitem(sys.modules, "main", fake_main)
+    monkeypatch.setitem(sys.modules, "orchestrator.main", fake_main)
 
     emit_calls: list[dict] = []
 
@@ -931,7 +931,7 @@ async def test_do_prepare_reconciles_workspace_on_cold_start(monkeypatch):
     fake_main.ensure_session_workspace = AsyncMock(return_value=None)
     fake_main._session_grant_violations = AsyncMock(return_value=[])
     fake_main._session_endpoint_violations = AsyncMock(return_value=[])
-    monkeypatch.setitem(sys.modules, "main", fake_main)
+    monkeypatch.setitem(sys.modules, "orchestrator.main", fake_main)
 
     monkeypatch.setattr(
         sessions_mod, "lifecycle_emit", lambda *a, **k: None, raising=True
@@ -1018,7 +1018,7 @@ async def test_do_prepare_waits_for_cloud_folder_before_binding_an_agent(monkeyp
     fake_main.ensure_session_workspace = AsyncMock(return_value=None)
     fake_main._session_grant_violations = AsyncMock(return_value=[])
     fake_main._session_endpoint_violations = AsyncMock(return_value=[])
-    monkeypatch.setitem(sys.modules, "main", fake_main)
+    monkeypatch.setitem(sys.modules, "orchestrator.main", fake_main)
 
     monkeypatch.setattr(
         sessions_mod, "lifecycle_emit", lambda *a, **k: None, raising=True
@@ -1074,7 +1074,7 @@ async def test_do_prepare_grant_denied_fails_fast_without_provisioning(monkeypat
         lambda v: "config exceeds your capability grants: " + "; ".join(v)
     )
     fake_main.ensure_session_workspace = AsyncMock(return_value=None)
-    monkeypatch.setitem(sys.modules, "main", fake_main)
+    monkeypatch.setitem(sys.modules, "orchestrator.main", fake_main)
 
     emit_calls: list[dict] = []
 
@@ -1144,7 +1144,7 @@ def test_connection_returns_ws_url_and_token_when_ready(monkeypatch):
     fake_main.session_tokens = test_tokens
     fake_main.session_router = MagicMock()
     fake_main.session_router.ensure_route = AsyncMock(return_value="/p/t1")
-    monkeypatch.setitem(sys.modules, "main", fake_main)
+    monkeypatch.setitem(sys.modules, "orchestrator.main", fake_main)
     monkeypatch.setenv("SESSION_INGRESS_HOST", "api.test.example")
 
     app.include_router(sessions_router)
@@ -1226,7 +1226,7 @@ def test_connection_refuses_any_changed_physical_binding_after_await(
     fake_main.session_router = MagicMock()
     fake_main.session_router.ensure_route = AsyncMock(return_value="/p/t1")
     fake_main.session_router.teardown_route = AsyncMock(return_value=True)
-    monkeypatch.setitem(sys.modules, "main", fake_main)
+    monkeypatch.setitem(sys.modules, "orchestrator.main", fake_main)
     fastapi_app.include_router(sessions_mod.router)
 
     response = TestClient(fastapi_app).get(
@@ -1298,7 +1298,7 @@ def test_connection_cleans_partial_route_on_every_exception(
         )
     )
     fake_main.session_router.teardown_route = AsyncMock(return_value=True)
-    monkeypatch.setitem(sys.modules, "main", fake_main)
+    monkeypatch.setitem(sys.modules, "orchestrator.main", fake_main)
     fastapi_app.include_router(sessions_mod.router)
 
     response = TestClient(fastapi_app, raise_server_exceptions=False).get(
@@ -1357,7 +1357,7 @@ def test_connection_fails_when_exact_partial_route_cleanup_is_incomplete(
         fake_main.session_router.teardown_route = AsyncMock(
             return_value=cleanup_failure
         )
-    monkeypatch.setitem(sys.modules, "main", fake_main)
+    monkeypatch.setitem(sys.modules, "orchestrator.main", fake_main)
     fastapi_app.include_router(sessions_mod.router)
 
     with pytest.raises(RuntimeError, match=message):
@@ -1405,7 +1405,7 @@ def test_connection_regates_agent_status_after_readiness(
     fake_main.session_router = MagicMock()
     fake_main.session_router.ensure_route = AsyncMock(return_value="/p/t1")
     fake_main.session_router.teardown_route = AsyncMock(return_value=True)
-    monkeypatch.setitem(sys.modules, "main", fake_main)
+    monkeypatch.setitem(sys.modules, "orchestrator.main", fake_main)
     fastapi_app.include_router(sessions_mod.router)
 
     response = TestClient(fastapi_app).get(

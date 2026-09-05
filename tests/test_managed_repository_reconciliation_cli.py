@@ -584,7 +584,7 @@ def test_compatibility_script_is_a_thin_wrapper():
     wrapper = (
         ROOT / "scripts" / "inventory-managed-repository-authority.py"
     ).read_text()
-    assert "operator_cli.managed_repository_reconciliation" in wrapper
+    assert "orchestrator.operator_cli.managed_repository_reconciliation" in wrapper
     assert "SELECT " not in wrapper
     assert "GiteaClient" not in wrapper
     assert "PostgresDB" not in wrapper

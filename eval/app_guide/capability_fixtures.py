@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from src.core.product_capabilities import (
+from shared.runtime.core.product_capabilities import (
     AgentAction,
     BuildEvaluation,
     BuildState,
@@ -31,7 +31,7 @@ from src.core.product_capabilities import (
     UserEvaluation,
     UserState,
 )
-from src.tools.product_capabilities import (
+from agent.tools.product_capabilities import (
     ProductCapabilitiesToolOutput,
     _bounded_success_output,
 )

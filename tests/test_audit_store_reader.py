@@ -23,7 +23,7 @@ pytest.importorskip("testcontainers.postgres")
 from orchestrator.database.audit_store import AuditStore  # noqa: E402
 from orchestrator.database.migrate import run_migrations  # noqa: E402
 from orchestrator.database.postgres import MIGRATIONS_AUDIT_DIR  # noqa: E402
-from src.database.audit_writer import SyncAuditWriter  # noqa: E402
+from agent.database.audit_writer import SyncAuditWriter  # noqa: E402
 
 pytestmark = pytest.mark.asyncio
 AUDIT_IMAGE = "postgres:16"

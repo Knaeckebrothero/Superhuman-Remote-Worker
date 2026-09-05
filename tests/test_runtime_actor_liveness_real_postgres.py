@@ -17,11 +17,11 @@ from starlette.datastructures import Headers
 from testcontainers.postgres import PostgresContainer
 
 from orchestrator.database.postgres import PostgresDB
-from security import crypto
+from orchestrator.security import crypto
 from orchestrator.services import runtime_actor as service
 from orchestrator.services import runtime_actor_verification as verification
-from src.shared import persistent_input_delivery as input_delivery
-from src.shared.runtime_actor import (
+from shared import persistent_input_delivery as input_delivery
+from shared.runtime_actor import (
     RUNTIME_ACTOR_MAINTENANCE_PHASE_HEADER,
     RUNTIME_ACTOR_MAINTENANCE_PHASE_PRE_TURN,
     RUNTIME_ACTOR_REFRESH_HEADER,
@@ -34,6 +34,7 @@ from tests._previous_release_seed import (
 
 SCHEMA_FILE = (
     Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "schema_current.sql"

@@ -1,7 +1,7 @@
 import pytest
 from fastapi import HTTPException
 
-from routers import contacts as contacts_router
+from orchestrator.routers import contacts as contacts_router
 
 
 @pytest.mark.asyncio

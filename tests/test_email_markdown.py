@@ -14,8 +14,8 @@ import re
 
 import pytest
 
-from services import brand
-from services.email_markdown import render_markdown
+from orchestrator.services import brand
+from orchestrator.services.email_markdown import render_markdown
 
 
 class TestFormatting:
@@ -196,7 +196,7 @@ class TestStaysWithinTheEmailContract:
             assert tag in html, f"{tag!r} missing — style would have to be global"
 
     def test_survives_the_layouts_ascii_pass(self) -> None:
-        from services.email_layout import render_email
+        from orchestrator.services.email_layout import render_email
 
         html = render_email(
             title="t", body_html=render_markdown("em dash — and `café`")
@@ -207,7 +207,7 @@ class TestStaysWithinTheEmailContract:
 
 class TestServiceBodies:
     def test_agent_message_body_is_rendered_markdown(self) -> None:
-        from services.email import EmailService
+        from orchestrator.services.email import EmailService
 
         html = EmailService()._build_agent_message_html(
             message_md="**Done.**\n\n- `a.md`",
@@ -222,7 +222,7 @@ class TestServiceBodies:
         assert "<li" in html
 
     def test_system_notification_body_is_rendered_markdown(self) -> None:
-        from services.email import EmailService
+        from orchestrator.services.email import EmailService
 
         html = EmailService()._build_system_notification_html(
             to_name="Ada",

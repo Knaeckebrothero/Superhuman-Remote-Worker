@@ -12,9 +12,9 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
 import pytest
-import services.project_loops as project_loops_service
+import orchestrator.services.project_loops as project_loops_service
 
-from services.project_loops import (
+from orchestrator.services.project_loops import (
     extract_cooldown_reset_at,
     build_loop_description,
     build_loop_kickoff,

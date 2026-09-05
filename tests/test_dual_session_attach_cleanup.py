@@ -7,8 +7,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-import src.api.dual_app as dual_app
-import src.api.persistent_app as persistent_app
+import agent.api.dual_app as dual_app
+import agent.api.persistent_app as persistent_app
 
 
 GENERATION = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -123,7 +123,7 @@ def _client(*, bound: bool = True, release=True) -> MagicMock:
 
 @pytest.mark.asyncio
 async def test_dual_ready_reports_exact_non_secret_session_identity(monkeypatch):
-    from src.shared.pinned_session_identity import (
+    from shared.pinned_session_identity import (
         pinned_session_ready_identity_fingerprint,
     )
 

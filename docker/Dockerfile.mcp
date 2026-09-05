@@ -19,7 +19,7 @@
 #     -e MCP_TRANSPORT=stdio \
 #     -e COCKPIT_API_URL=http://orchestrator:8085 \
 #     srw-mcp sleep infinity
-#   docker exec -i mcp python run.py
+#   docker exec -i mcp python -m mcp_server
 # =============================================================================
 
 FROM python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de
@@ -38,6 +38,7 @@ LABEL org.opencontainers.image.documentation="${SRW_DOCUMENTATION_URL}"
 LABEL io.srw.component="mcp"
 
 ENV PYTHONUNBUFFERED=1 \
+    PYTHONSAFEPATH=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     SRW_COMPONENT=mcp \
     SRW_SOURCE_REVISION=${SRW_SOURCE_REVISION} \
@@ -55,22 +56,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl && \
     rm -rf /var/lib/apt/lists/*
 
 # Install dependencies
-COPY orchestrator/mcp/requirements.txt .
+COPY src/mcp_server/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy MCP server source code with correct ownership
-COPY --chown=srw:srw orchestrator/mcp/ ./
-# Shared orchestrator-surface package (REST client + formatters), imported by
-# server.py as src.shared.orch_surface — the same path the repo layout uses.
-# See knowledge-base/knowledge/features/unified_orchestrator_tool_surface.md.
+COPY --chown=srw:srw src/mcp_server/ ./src/mcp_server/
 COPY --chown=srw:srw src/shared/ ./src/shared/
-# Shared trusted-origin response boundary used by the optional OAuth pages.
-COPY --chown=srw:srw orchestrator/security/__init__.py ./security/__init__.py
-COPY --chown=srw:srw orchestrator/security/anti_framing.py ./security/anti_framing.py
+COPY --chown=srw:srw pyproject.toml ./
+RUN pip install --no-cache-dir --no-deps -e .
 
 # Bake the exact protocol schema into the image. The image smoke test compares
 # raw tools/list from two fresh clients against this artifact.
-RUN MCP_TRANSPORT=stdio python schema_artifact.py /app/tool-schema.json
+RUN MCP_TRANSPORT=stdio python -m mcp_server.schema_artifact /app/tool-schema.json
 
 USER srw
 
@@ -83,7 +80,7 @@ ENV MCP_TRANSPORT=http \
 
 # Validate the exact final filesystem, dependency set, schema artifact, and
 # non-root runtime before the image can be exported or pushed by CI.
-RUN python image_smoke.py
+RUN python -m mcp_server.image_smoke
 
 EXPOSE 8000
 
@@ -91,4 +88,4 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
-CMD ["python", "run.py"]
+CMD ["python", "-m", "mcp_server"]

@@ -14,7 +14,7 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CONTROLLER_SRC = ROOT / "vm/controller/controller.py"
+CONTROLLER_SRC = ROOT / "src/vm_controller/controller.py"
 DAEMON_SRC = ROOT / "docker/agent-vm-base/files/management-daemon.py"
 RELEASE_NAMESPACE = "lane-c-contract"
 GUEST_ENV_PATH = "/etc/default/srw-guest"

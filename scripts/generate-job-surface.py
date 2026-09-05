@@ -6,13 +6,10 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-import sys
+
+from shared.orch_surface.jobs import JOB_DESCRIPTORS
 
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-from src.shared.orch_surface.jobs import JOB_DESCRIPTORS  # noqa: E402
 
 TS_PATH = ROOT / "cockpit/src/app/core/tools/job-surface.generated.ts"
 

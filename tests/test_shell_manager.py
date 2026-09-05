@@ -14,7 +14,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from src.tools.shell.shell_manager import (
+from agent.tools.shell.shell_manager import (
     DEFAULT_BLOCKED_COMMANDS,
     SUDO_FREEZE_SENTINEL,
     ShellManager,
@@ -79,7 +79,7 @@ class TestNoLocalShellPath:
     """The agent runtime must not contain an in-pod shell execution path."""
 
     def test_libtmux_not_imported_under_src(self):
-        src_root = Path(__file__).resolve().parents[1] / "src"
+        src_root = Path(__file__).resolve().parents[1] / "src" / "agent"
         pattern = re.compile(r"^\s*(?:from|import)\s+libtmux", re.MULTILINE)
         offenders = sorted(
             str(path.relative_to(src_root))
@@ -302,7 +302,7 @@ class TestApplyTailTerminalState:
     """Tests for _apply_tail handling terminal state format."""
 
     def test_terminal_state_preserved_when_short(self):
-        from src.tools.shell.shell_tools import _apply_tail
+        from agent.tools.shell.shell_tools import _apply_tail
 
         output = (
             "Command timed out after 120s: ssh admin@host\n"
@@ -313,7 +313,7 @@ class TestApplyTailTerminalState:
         assert result == output  # Should not truncate
 
     def test_terminal_state_truncated_when_long(self):
-        from src.tools.shell.shell_tools import _apply_tail
+        from agent.tools.shell.shell_tools import _apply_tail
 
         body_lines = [f"line {i}" for i in range(50)]
         output = (
@@ -327,7 +327,7 @@ class TestApplyTailTerminalState:
         assert "line 49" in result  # Last line preserved
 
     def test_stdout_format_still_works(self):
-        from src.tools.shell.shell_tools import _apply_tail
+        from agent.tools.shell.shell_tools import _apply_tail
 
         body_lines = [f"line {i}" for i in range(50)]
         output = "Exit code: 0\n--- stdout ---\n" + "\n".join(body_lines)

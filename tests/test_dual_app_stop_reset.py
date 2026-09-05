@@ -54,7 +54,7 @@ class _TrackedStream:
 def _restore_dual_app_globals():
     """Snapshot and restore the dual_app module globals these tests mutate so
     they don't leak into other test files (the module keeps process-wide state)."""
-    from src.api import dual_app
+    from agent.api import dual_app
 
     names = (
         "_pod_state",
@@ -100,7 +100,7 @@ class TestCompleteStop:
 
     @pytest.mark.asyncio
     async def test_resets_to_idle_then_signals(self):
-        from src.api import dual_app
+        from agent.api import dual_app
 
         client = _reset_module(dual_app, pod_state=dual_app.PodState.WORKING)
         dual_app._current_job_id = "job-1"
@@ -131,7 +131,7 @@ class TestProcessJobCooperativeStop:
     async def test_cooperative_stop_resets_and_does_not_exit(
         self, tmp_path, monkeypatch
     ):
-        from src.api import dual_app
+        from agent.api import dual_app
 
         client = _reset_module(dual_app, pod_state=dual_app.PodState.WORKING)
         dual_app._current_job_id = "job-A"
@@ -150,7 +150,7 @@ class TestProcessJobCooperativeStop:
         dual_app._agent = agent
 
         # Keep per-job file logging inside tmp_path.
-        from src.core import workspace as ws_mod
+        from agent.core import workspace as ws_mod
 
         monkeypatch.setattr(ws_mod, "get_logs_path", lambda: tmp_path)
 
@@ -184,7 +184,7 @@ class TestProcessJobCompletionOrdering:
     async def test_reports_with_pinned_fence_before_ready_heartbeat(
         self, tmp_path, monkeypatch
     ):
-        from src.api import dual_app
+        from agent.api import dual_app
 
         client = _reset_module(dual_app, pod_state=dual_app.PodState.WORKING)
         dual_app._current_job_id = "job-complete"
@@ -215,7 +215,7 @@ class TestProcessJobCompletionOrdering:
         agent.process_job = AsyncMock(return_value=stream)
         dual_app._agent = agent
 
-        from src.core import workspace as ws_mod
+        from agent.core import workspace as ws_mod
 
         monkeypatch.setattr(ws_mod, "get_logs_path", lambda: tmp_path)
 
@@ -233,7 +233,7 @@ class TestProcessJobCompletionOrdering:
     async def test_stream_error_closes_before_error_report_and_reset(
         self, tmp_path, monkeypatch
     ):
-        from src.api import dual_app
+        from agent.api import dual_app
 
         client = _reset_module(dual_app, pod_state=dual_app.PodState.WORKING)
         dual_app._current_job_id = "job-error"
@@ -256,7 +256,7 @@ class TestProcessJobCompletionOrdering:
         dual_app._agent = agent
         monkeypatch.setattr(dual_app, "_reset_to_idle", _reset)
 
-        from src.core import workspace as ws_mod
+        from agent.core import workspace as ws_mod
 
         monkeypatch.setattr(ws_mod, "get_logs_path", lambda: tmp_path)
 
@@ -268,8 +268,8 @@ class TestProcessJobCompletionOrdering:
     async def test_lifecycle_failure_drains_without_report_or_idle_reset(
         self, tmp_path, monkeypatch
     ):
-        from src.api import dual_app
-        from src.shared.subagent_lifecycle import SubagentQuiescenceError
+        from agent.api import dual_app
+        from shared.subagent_lifecycle import SubagentQuiescenceError
 
         client = _reset_module(dual_app, pod_state=dual_app.PodState.WORKING)
         dual_app._current_job_id = "job-lifecycle"
@@ -290,7 +290,7 @@ class TestProcessJobCompletionOrdering:
         monkeypatch.setattr(dual_app, "_reset_to_idle", reset)
         monkeypatch.setattr(dual_app, "_schedule_exit", schedule_exit)
 
-        from src.core import workspace as ws_mod
+        from agent.core import workspace as ws_mod
 
         monkeypatch.setattr(ws_mod, "get_logs_path", lambda: tmp_path)
 
@@ -310,8 +310,8 @@ class TestProcessJobCompletionOrdering:
 class TestJobStreamCloseCancellation:
     @pytest.mark.asyncio
     async def test_close_timeout_is_a_typed_lifecycle_failure(self, monkeypatch):
-        from src.api import dual_app
-        from src.shared.subagent_lifecycle import SubagentQuiescenceError
+        from agent.api import dual_app
+        from shared.subagent_lifecycle import SubagentQuiescenceError
 
         class _HungStream:
             async def aclose(self):
@@ -324,7 +324,7 @@ class TestJobStreamCloseCancellation:
 
     @pytest.mark.asyncio
     async def test_caller_cancellation_waits_for_close_owner(self):
-        from src.api import dual_app
+        from agent.api import dual_app
 
         close_started = asyncio.Event()
         release_close = asyncio.Event()
@@ -357,8 +357,8 @@ class TestResumeJobStreamClose:
     async def test_normal_resume_closes_before_report_and_reset(
         self, tmp_path, monkeypatch
     ):
-        from src.api import dual_app
-        from src.api.models import JobResumeRequest, PinnedJobRecipient
+        from agent.api import dual_app
+        from agent.api.models import JobResumeRequest, PinnedJobRecipient
 
         client = _reset_module(dual_app)
         client.dispatch_process_generation = "process-resume"
@@ -381,7 +381,7 @@ class TestResumeJobStreamClose:
         monkeypatch.setattr(dual_app, "_reset_to_idle", _reset)
         monkeypatch.setattr(dual_app, "_should_loop", lambda: True)
 
-        from src.core import workspace as ws_mod
+        from agent.core import workspace as ws_mod
 
         monkeypatch.setattr(ws_mod, "get_logs_path", lambda: tmp_path)
         app = dual_app.create_dual_app()
@@ -422,9 +422,9 @@ class TestResumeJobStreamClose:
     async def test_lifecycle_failure_resume_drains_without_report_or_reset(
         self, tmp_path, monkeypatch
     ):
-        from src.api import dual_app
-        from src.api.models import JobResumeRequest, PinnedJobRecipient
-        from src.shared.subagent_lifecycle import SubagentRecoveryError
+        from agent.api import dual_app
+        from agent.api.models import JobResumeRequest, PinnedJobRecipient
+        from shared.subagent_lifecycle import SubagentRecoveryError
 
         client = _reset_module(dual_app)
         client.dispatch_process_generation = "process-lifecycle-resume"
@@ -446,7 +446,7 @@ class TestResumeJobStreamClose:
         monkeypatch.setattr(dual_app, "_reset_to_idle", reset)
         monkeypatch.setattr(dual_app, "_schedule_exit", schedule_exit)
 
-        from src.core import workspace as ws_mod
+        from agent.core import workspace as ws_mod
 
         monkeypatch.setattr(ws_mod, "get_logs_path", lambda: tmp_path)
         app = dual_app.create_dual_app()
@@ -496,8 +496,8 @@ class TestCancelHardKillResets:
 
     @pytest.mark.asyncio
     async def test_hard_kill_timeout_resets_to_idle(self, monkeypatch):
-        from src.api import dual_app
-        from src.api.models import JobCancelByOrchestratorRequest, PinnedJobRecipient
+        from agent.api import dual_app
+        from agent.api.models import JobCancelByOrchestratorRequest, PinnedJobRecipient
 
         client = _reset_module(dual_app, pod_state=dual_app.PodState.WORKING)
         client.dispatch_process_generation = "process-C"
@@ -553,7 +553,7 @@ class TestFinalIdleStatusOnExit:
 
     @pytest.mark.asyncio
     async def test_non_loop_reset_asserts_draining(self, monkeypatch):
-        from src.api import dual_app
+        from agent.api import dual_app
 
         client = _reset_module(dual_app)
         monkeypatch.delenv("AGENT_LOOP", raising=False)
@@ -567,7 +567,7 @@ class TestFinalIdleStatusOnExit:
 
     @pytest.mark.asyncio
     async def test_loop_mode_reset_asserts_ready(self, monkeypatch):
-        from src.api import dual_app
+        from agent.api import dual_app
 
         client = _reset_module(dual_app)
         monkeypatch.setenv("AGENT_LOOP", "1")
@@ -591,14 +591,14 @@ class TestScheduleExitDeregisters:
     """
 
     async def _run_scheduled_exit(self, dual_app):
-        with patch("src.api.dual_app.os._exit") as fake_exit:
+        with patch("agent.api.dual_app.os._exit") as fake_exit:
             dual_app._schedule_exit(delay=0)
             await asyncio.wait_for(dual_app._pending_exit_task, timeout=2.0)
         return fake_exit
 
     @pytest.mark.asyncio
     async def test_deregisters_then_exits(self):
-        from src.api import dual_app
+        from agent.api import dual_app
 
         client = _reset_module(dual_app)
 
@@ -610,7 +610,7 @@ class TestScheduleExitDeregisters:
 
     @pytest.mark.asyncio
     async def test_exit_proceeds_when_deregister_hangs(self, monkeypatch):
-        from src.api import dual_app
+        from agent.api import dual_app
 
         client = _reset_module(dual_app)
 
@@ -626,7 +626,7 @@ class TestScheduleExitDeregisters:
 
     @pytest.mark.asyncio
     async def test_exit_proceeds_when_deregister_errors(self):
-        from src.api import dual_app
+        from agent.api import dual_app
 
         client = _reset_module(dual_app)
         client.deregister = AsyncMock(side_effect=RuntimeError("orchestrator 500"))
@@ -638,7 +638,7 @@ class TestScheduleExitDeregisters:
 
     @pytest.mark.asyncio
     async def test_exit_proceeds_without_client(self):
-        from src.api import dual_app
+        from agent.api import dual_app
 
         _reset_module(dual_app)
         dual_app._orchestrator_client = None
@@ -651,7 +651,7 @@ class TestScheduleExitDeregisters:
     async def test_heartbeat_task_cancelled_before_deregister(self):
         # A heartbeat landing mid-deregister would 404 and re-register,
         # resurrecting the row the exit just deleted.
-        from src.api import dual_app
+        from agent.api import dual_app
 
         client = _reset_module(dual_app)
         hb = asyncio.create_task(asyncio.sleep(60))
@@ -672,7 +672,7 @@ class TestScheduleExitDeregisters:
         # Never registered (agent_id unset) → nothing to delete, but the
         # heartbeat loop must still be stopped so it can't register a row
         # for a dying pod.
-        from src.api import dual_app
+        from agent.api import dual_app
 
         client = _reset_module(dual_app)
         client.agent_id = None

@@ -30,9 +30,9 @@ import asyncssh
 import pytest
 from starlette.datastructures import Address, Headers
 
-import ssh_gateway
-from services.ssh_gateway_token import mint_attach_token
-from ssh_gateway import client_ip, origin_allowed
+import orchestrator.ssh_gateway
+from orchestrator.services.ssh_gateway_token import mint_attach_token
+from orchestrator.ssh_gateway import client_ip, origin_allowed
 
 SECRET = "test-only-session-secret"
 USER = "00000000-0000-0000-0000-000000000001"
@@ -158,13 +158,13 @@ def test_an_entirely_trusted_chain_falls_back_to_the_leftmost_entry():
 def test_a_minted_token_authenticates_and_names_its_user(config):
     token, _ = mint_attach_token(USER, SECRET)
     ws = _ws({"authorization": f"Bearer {token}"})
-    assert ssh_gateway.attach_principal(ws, config) == USER
+    assert orchestrator.ssh_gateway.attach_principal(ws, config) == USER
 
 
 def test_the_bearer_scheme_is_case_insensitive(config):
     token, _ = mint_attach_token(USER, SECRET)
     ws = _ws({"authorization": f"bearer {token}"})
-    assert ssh_gateway.attach_principal(ws, config) == USER
+    assert orchestrator.ssh_gateway.attach_principal(ws, config) == USER
 
 
 @pytest.mark.parametrize(
@@ -182,7 +182,7 @@ def test_the_bearer_scheme_is_case_insensitive(config):
 )
 def test_everything_that_is_not_a_minted_token_is_refused(config, header):
     headers = {} if header is None else {"authorization": header}
-    assert ssh_gateway.attach_principal(_ws(headers), config) is None
+    assert orchestrator.ssh_gateway.attach_principal(_ws(headers), config) is None
 
 
 def test_the_internal_key_is_not_a_valid_user_credential(config):
@@ -191,7 +191,7 @@ def test_the_internal_key_is_not_a_valid_user_credential(config):
     endpoints. The original `_token_valid` accepted exactly this."""
     ws = _ws({"authorization": f"Bearer {config.internal_key}"})
     assert config.internal_key
-    assert ssh_gateway.attach_principal(ws, config) is None
+    assert orchestrator.ssh_gateway.attach_principal(ws, config) is None
 
 
 # ---------------------------------------------------------------------------
@@ -202,8 +202,8 @@ def test_the_internal_key_is_not_a_valid_user_credential(config):
 @pytest.mark.asyncio
 async def test_a_bad_origin_is_closed_before_the_upgrade(app):
     ws = _ws({"origin": "https://evil.example"}, app=app)
-    await ssh_gateway.attach_endpoint(ws)
-    assert ws.closed_code == ssh_gateway.WS_ORIGIN_REFUSED
+    await orchestrator.ssh_gateway.attach_endpoint(ws)
+    assert ws.closed_code == orchestrator.ssh_gateway.WS_ORIGIN_REFUSED
     assert ws.accepted is False
     assert app.state.limiter.admits == []
 
@@ -211,8 +211,8 @@ async def test_a_bad_origin_is_closed_before_the_upgrade(app):
 @pytest.mark.asyncio
 async def test_a_missing_token_is_closed_before_the_upgrade(app):
     ws = _ws({"origin": "https://cockpit.srw.works"}, app=app)
-    await ssh_gateway.attach_endpoint(ws)
-    assert ws.closed_code == ssh_gateway.WS_TOKEN_REFUSED
+    await orchestrator.ssh_gateway.attach_endpoint(ws)
+    assert ws.closed_code == orchestrator.ssh_gateway.WS_TOKEN_REFUSED
     assert ws.accepted is False
     assert app.state.limiter.admits == []
 
@@ -226,16 +226,16 @@ async def test_the_origin_is_checked_before_the_token(app):
         {"origin": "https://evil.example", "authorization": f"Bearer {token}"},
         app=app,
     )
-    await ssh_gateway.attach_endpoint(ws)
-    assert ws.closed_code == ssh_gateway.WS_ORIGIN_REFUSED
+    await orchestrator.ssh_gateway.attach_endpoint(ws)
+    assert ws.closed_code == orchestrator.ssh_gateway.WS_ORIGIN_REFUSED
 
 
 @pytest.mark.asyncio
 async def test_a_refused_admission_closes_without_accepting_or_releasing(app):
     app.state.limiter.allow = False
     ws = _authorized_ws(app)
-    await ssh_gateway.attach_endpoint(ws)
-    assert ws.closed_code == ssh_gateway.WS_RATE_REFUSED
+    await orchestrator.ssh_gateway.attach_endpoint(ws)
+    assert ws.closed_code == orchestrator.ssh_gateway.WS_RATE_REFUSED
     assert ws.accepted is False
     # A release for a slot that was never granted would inflate the global
     # cap; GatewayLimiter guards it, but the gateway must not attempt it.
@@ -253,7 +253,7 @@ async def test_an_accept_that_raises_still_releases_its_preauth_slot(app):
     ws.accept_error = RuntimeError("client vanished mid-handshake")
 
     with pytest.raises(RuntimeError):
-        await ssh_gateway.attach_endpoint(ws)
+        await orchestrator.ssh_gateway.attach_endpoint(ws)
 
     assert app.state.limiter.admits == ["203.0.113.9"]
     assert app.state.limiter.releases == ["203.0.113.9"]
@@ -270,7 +270,7 @@ async def test_the_happy_path_speaks_ssh_and_releases_exactly_once(app):
     it does not return until authentication completes)."""
     client_sock, ws_sock = socket.socketpair()
     ws = _authorized_ws(app, transport=ws_sock)
-    endpoint = asyncio.create_task(ssh_gateway.attach_endpoint(ws))
+    endpoint = asyncio.create_task(orchestrator.ssh_gateway.attach_endpoint(ws))
 
     loop = asyncio.get_running_loop()
     client_sock.setblocking(False)
@@ -295,17 +295,17 @@ async def test_the_server_is_built_with_the_real_client_ip(app, monkeypatch):
     place the real client IP can come from is the factory closure. Without
     it every connection rate-limits and audits as the same empty string."""
     seen = []
-    real = ssh_gateway.GatewaySSHServer
+    real = orchestrator.ssh_gateway.GatewaySSHServer
 
     def _spy(context, client_ip_value):
         seen.append(client_ip_value)
         return real(context, client_ip_value)
 
-    monkeypatch.setattr(ssh_gateway, "GatewaySSHServer", _spy)
+    monkeypatch.setattr(orchestrator.ssh_gateway, "GatewaySSHServer", _spy)
 
     client_sock, ws_sock = socket.socketpair()
     ws = _authorized_ws(app, transport=ws_sock)
-    endpoint = asyncio.create_task(ssh_gateway.attach_endpoint(ws))
+    endpoint = asyncio.create_task(orchestrator.ssh_gateway.attach_endpoint(ws))
     loop = asyncio.get_running_loop()
     client_sock.setblocking(False)
     await loop.sock_sendall(client_sock, b"SSH-2.0-TestClient\r\n")
@@ -326,7 +326,7 @@ async def test_the_tcp_listener_answers_with_an_ssh_banner(app):
     """Nothing in this plan bound 2222 before this, yet Task 11 ships a
     containerPort and a LoadBalancer on it and every step of Task 12's live
     gate is an `ssh -p 2222`. Without this the chart fronts a dead port."""
-    async with ssh_gateway.lifespan(app):
+    async with orchestrator.ssh_gateway.lifespan(app):
         listener = app.state.ssh_listener
         assert listener is not None
         reader, writer = await asyncio.open_connection("127.0.0.1", listener.port)
@@ -341,7 +341,7 @@ async def test_the_tcp_listener_answers_with_an_ssh_banner(app):
 
 @pytest.mark.asyncio
 async def test_the_tcp_listener_charges_and_releases_the_same_limiter(app):
-    async with ssh_gateway.lifespan(app):
+    async with orchestrator.ssh_gateway.lifespan(app):
         listener = app.state.ssh_listener
         reader, writer = await asyncio.open_connection("127.0.0.1", listener.port)
         writer.write(b"SSH-2.0-TestClient\r\n")
@@ -362,7 +362,7 @@ async def test_a_tcp_connection_refused_by_the_limiter_never_speaks_ssh(app):
     charged — the pre-auth cap exists because asyncssh ships no MaxStartups
     (measured: 1000 silent pre-auth connections accepted in 0.3s)."""
     app.state.limiter.allow = False
-    async with ssh_gateway.lifespan(app):
+    async with orchestrator.ssh_gateway.lifespan(app):
         listener = app.state.ssh_listener
         reader, writer = await asyncio.open_connection("127.0.0.1", listener.port)
         try:
@@ -375,7 +375,7 @@ async def test_a_tcp_connection_refused_by_the_limiter_never_speaks_ssh(app):
 
 @pytest.mark.asyncio
 async def test_shutdown_closes_the_listening_socket(app):
-    async with ssh_gateway.lifespan(app):
+    async with orchestrator.ssh_gateway.lifespan(app):
         port = app.state.ssh_listener.port
     assert app.state.ssh_listener is None
     with pytest.raises(OSError):
@@ -394,8 +394,8 @@ async def test_shutdown_drains_the_audit_background_tasks(app, monkeypatch):
         drained.append(timeout)
         return 2
 
-    monkeypatch.setattr(ssh_gateway, "drain_background_tasks", _drain)
-    async with ssh_gateway.lifespan(app):
+    monkeypatch.setattr(orchestrator.ssh_gateway, "drain_background_tasks", _drain)
+    async with orchestrator.ssh_gateway.lifespan(app):
         pass
     assert len(drained) == 1
 
@@ -429,7 +429,7 @@ async def test_a_transient_accept_error_does_not_kill_the_listener(app, monkeypa
 
     monkeypatch.setattr(loop, "sock_accept", flaky)
 
-    async with ssh_gateway.lifespan(app):
+    async with orchestrator.ssh_gateway.lifespan(app):
         listener = app.state.ssh_listener
         reader, writer = await asyncio.open_connection("127.0.0.1", listener.port)
         try:
@@ -457,22 +457,22 @@ async def test_health_reports_down_once_the_accept_loop_dies(app, monkeypatch):
 
     monkeypatch.setattr(loop, "sock_accept", fatal)
 
-    async with ssh_gateway.lifespan(app):
+    async with orchestrator.ssh_gateway.lifespan(app):
         listener = app.state.ssh_listener
         for _ in range(100):
             if not listener.is_serving():
                 break
             await asyncio.sleep(0.01)
         assert listener.is_serving() is False
-        response = await ssh_gateway.healthz(_request(app))
+        response = await orchestrator.ssh_gateway.healthz(_request(app))
         assert response.status_code == 503
 
 
 @pytest.mark.asyncio
 async def test_health_is_ok_while_the_listener_serves(app):
     """The negative control for the test above: a healthy gateway says so."""
-    async with ssh_gateway.lifespan(app):
-        response = await ssh_gateway.healthz(_request(app))
+    async with orchestrator.ssh_gateway.lifespan(app):
+        response = await orchestrator.ssh_gateway.healthz(_request(app))
         assert response.status_code == 200
 
 
@@ -483,7 +483,7 @@ async def test_a_connection_task_cancelled_before_it_runs_still_releases(app):
     scheduling never executes a line of its body, so an inner ``finally``
     never runs and the slot leaks. Shutdown-only, but the seam stays uniform.
     """
-    async with ssh_gateway.lifespan(app):
+    async with orchestrator.ssh_gateway.lifespan(app):
         listener = app.state.ssh_listener
         left, right = socket.socketpair()
         try:
@@ -503,7 +503,7 @@ async def test_a_refused_origin_is_metered_against_the_source(app):
     concurrency slot for a handshake that never opened would never be
     released, and a bad-origin flood would lock out everyone."""
     ws = _ws({"origin": "https://evil.example"}, app=app)
-    await ssh_gateway.attach_endpoint(ws)
+    await orchestrator.ssh_gateway.attach_endpoint(ws)
     assert app.state.limiter.refusals == ["203.0.113.9"]
     assert app.state.limiter.admits == []
     assert app.state.limiter.releases == []
@@ -514,7 +514,7 @@ async def test_a_refused_token_is_metered_against_the_source(app):
     """The token path matters more than the Origin path: it is the one that
     runs an HMAC per attempt."""
     ws = _ws({"origin": "https://cockpit.srw.works"}, app=app)
-    await ssh_gateway.attach_endpoint(ws)
+    await orchestrator.ssh_gateway.attach_endpoint(ws)
     assert app.state.limiter.refusals == ["203.0.113.9"]
     assert app.state.limiter.admits == []
 
@@ -525,8 +525,8 @@ async def test_a_refusal_over_budget_is_still_refused_not_admitted(app):
     refused, and the meter must never turn into a second admission path."""
     app.state.limiter.note_handshake_refusal = lambda ip: False
     ws = _ws({"origin": "https://evil.example"}, app=app)
-    await ssh_gateway.attach_endpoint(ws)
-    assert ws.closed_code == ssh_gateway.WS_ORIGIN_REFUSED
+    await orchestrator.ssh_gateway.attach_endpoint(ws)
+    assert ws.closed_code == orchestrator.ssh_gateway.WS_ORIGIN_REFUSED
     assert ws.accepted is False
     assert app.state.limiter.admits == []
 
@@ -537,9 +537,9 @@ async def test_a_refused_handshake_closes_the_socket_without_metering_a_slot(app
     were already counted by ``try_admit``'s own window."""
     app.state.limiter.allow = False
     ws = _authorized_ws(app)
-    await ssh_gateway.attach_endpoint(ws)
+    await orchestrator.ssh_gateway.attach_endpoint(ws)
     assert app.state.limiter.refusals == []
-    assert ws.closed_code == ssh_gateway.WS_RATE_REFUSED
+    assert ws.closed_code == orchestrator.ssh_gateway.WS_RATE_REFUSED
 
 
 def _request(app):
@@ -555,7 +555,7 @@ def test_the_module_imports_without_any_environment():
     """No module-level ``app = _build_app()``: importing this module must not
     require host keys, a CA or a secret, or the tests above could not import
     it at all."""
-    assert not hasattr(ssh_gateway, "app")
+    assert not hasattr(orchestrator.ssh_gateway, "app")
 
 
 def test_create_app_binds_every_context_callable(app):
@@ -600,11 +600,11 @@ async def test_the_bound_callables_carry_the_config_and_the_right_arity(
         calls["resolve"] = (config, handle, fingerprint)
         return "target"
 
-    monkeypatch.setattr(ssh_gateway, "mark_key_used", _mark_key_used)
-    monkeypatch.setattr(ssh_gateway, "record_attachment", _record)
-    monkeypatch.setattr(ssh_gateway, "close_attachment", _close)
-    monkeypatch.setattr(ssh_gateway, "resolve_target", _resolve)
-    rebuilt = ssh_gateway.create_app()
+    monkeypatch.setattr(orchestrator.ssh_gateway, "mark_key_used", _mark_key_used)
+    monkeypatch.setattr(orchestrator.ssh_gateway, "record_attachment", _record)
+    monkeypatch.setattr(orchestrator.ssh_gateway, "close_attachment", _close)
+    monkeypatch.setattr(orchestrator.ssh_gateway, "resolve_target", _resolve)
+    rebuilt = orchestrator.ssh_gateway.create_app()
     context = rebuilt.state.context
 
     await context.mark_key_used("SHA256:fp")
@@ -760,14 +760,14 @@ def gateway_environment(gateway_env, monkeypatch):
 
 @pytest.fixture
 def config(gateway_environment):
-    from services.ssh_gateway_config import load_config
+    from orchestrator.services.ssh_gateway_config import load_config
 
     return load_config()
 
 
 @pytest.fixture
 def app(gateway_environment):
-    application = ssh_gateway.create_app()
+    application = orchestrator.ssh_gateway.create_app()
     application.state.limiter = RecordingLimiter()
     application.state.context.limiter = application.state.limiter
     return application
@@ -796,9 +796,9 @@ def test_info_records_survive_app_construction(gateway_environment):
         root.handlers.clear()
         root.setLevel(logging.WARNING)  # a fresh interpreter's default
 
-        ssh_gateway.create_app()
+        orchestrator.ssh_gateway.create_app()
 
-        gateway_logger = logging.getLogger(ssh_gateway.__name__)
+        gateway_logger = logging.getLogger(orchestrator.ssh_gateway.__name__)
         assert gateway_logger.isEnabledFor(logging.INFO), (
             "INFO is filtered, so every refusal reason is dropped: an operator "
             "sees a failed connection with no logged cause"
@@ -843,7 +843,7 @@ def test_outbound_ssh_survives_a_uid_with_no_passwd_entry(
     with pytest.raises((KeyError, OSError)):
         getpass.getuser()
 
-    ssh_gateway.create_app()
+    orchestrator.ssh_gateway.create_app()
 
     # The app must have supplied a name, so the exact call asyncssh makes works.
     assert getpass.getuser(), "getpass.getuser() still fails: outbound SSH cannot open"

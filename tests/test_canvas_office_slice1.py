@@ -13,13 +13,13 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from services.canvas import (
+from orchestrator.services.canvas import (
     CanvasRecord,
     WorkspaceFileSource,
     canonical_source_fingerprint,
 )
-from services.canvas_files import ValidatedCanvasFile
-from services.canvas_office import (
+from orchestrator.services.canvas_files import ValidatedCanvasFile
+from orchestrator.services.canvas_office import (
     CanvasOfficeError,
     CollaboraConfig,
     CollaboraDiscoveryService,
@@ -316,7 +316,7 @@ class _RouteGateway:
 
 
 def _wopi_client(monkeypatch):
-    from routers import wopi
+    from orchestrator.routers import wopi
 
     tokens = _RouteTokenService()
     gateway = _RouteGateway()
@@ -372,8 +372,8 @@ def test_wopi_router_rejects_non_put_override(monkeypatch) -> None:
 
 
 def test_office_session_payload_uses_discovery_and_epoch_milliseconds() -> None:
-    from routers.canvases import _build_office_session_payload
-    from services.canvas_office import WopiTokenGrant
+    from orchestrator.routers.canvases import _build_office_session_payload
+    from orchestrator.services.canvas_office import WopiTokenGrant
 
     grant = WopiTokenGrant(
         access_token="signed-token",

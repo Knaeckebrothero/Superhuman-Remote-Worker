@@ -13,15 +13,15 @@ from datetime import datetime, timedelta, timezone
 import httpx
 import pytest
 
-from src.shared.orch_surface.client import AsyncCockpitClient
-from src.shared.orch_surface.jobs import CallerCtx, get_descriptor, make_bound_handler
-from src.shared.orch_surface.jobs.envelope import (
+from shared.orch_surface.client import AsyncCockpitClient
+from shared.orch_surface.jobs import CallerCtx, get_descriptor, make_bound_handler
+from shared.orch_surface.jobs.envelope import (
     Source,
     build_envelope,
     friendly_reason,
     overall_status,
 )
-from src.shared.runtime_actor import RuntimeActorContext
+from shared.runtime_actor import RuntimeActorContext
 
 JOB_ID = "19707fa1-0000-4000-8000-000000000001"
 

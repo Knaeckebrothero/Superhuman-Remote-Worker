@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-import src.api.persistent_app as app
+import agent.api.persistent_app as app
 
 
 GENERATION = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -77,7 +77,7 @@ def _partial_cleanup_patchers(context):
         patch.object(app, "_clear_attached_runtime_identity", return_value=True),
         patch.object(app, "_clear_attached_runtime_actor"),
         patch.object(app, "_apply_session_embedding_env"),
-        patch("src.tools.registry.register_mcp_tools"),
+        patch("agent.tools.registry.register_mcp_tools"),
         patch.dict(app.os.environ, {"POD_UID": "pod-uid-a"}),
     ]
 
@@ -232,7 +232,9 @@ async def test_partial_sandbox_zero_uses_attested_remote_identity():
     )
     backend.disconnect = MagicMock()
 
-    with patch("src.core.backends.remote.RemoteBackend", return_value=backend) as cls:
+    with patch(
+        "shared.runtime.core.backends.remote.RemoteBackend", return_value=backend
+    ) as cls:
         assert (
             await app._strict_cleanup_partial_sandbox_workspace(context)
             == "workspace_process_zero_v1"
@@ -269,7 +271,7 @@ async def test_real_attach_crosses_one_way_setup_boundary_before_constructor():
     tests green.
     """
 
-    from src.core.loader import AgentConfig
+    from shared.runtime.core.loader import AgentConfig
 
     workspace = {
         "status": "ready",
@@ -317,7 +319,7 @@ async def test_real_attach_crosses_one_way_setup_boundary_before_constructor():
         patch.object(app, "_poll_workspace_ready", AsyncMock(return_value=workspace)),
         patch.object(app, "PersistentSession", side_effect=constructor_failure),
         patch.object(app, "_apply_session_embedding_env"),
-        patch("src.tools.registry.register_mcp_tools"),
+        patch("agent.tools.registry.register_mcp_tools"),
     ):
         with pytest.raises(RuntimeError, match="constructor refused"):
             await app._attach_session_inner(

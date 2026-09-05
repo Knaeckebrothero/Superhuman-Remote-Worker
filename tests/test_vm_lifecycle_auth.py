@@ -7,7 +7,7 @@ from uuid import uuid4
 import pytest
 
 from orchestrator.services import vm_lifecycle_auth as orchestrator_auth
-from vm.controller import lifecycle_auth as controller_auth
+from vm_controller import lifecycle_auth as controller_auth
 
 
 SECRET = b"a-dedicated-lifecycle-secret-at-least-32-bytes"

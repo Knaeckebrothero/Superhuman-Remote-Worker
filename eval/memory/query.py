@@ -10,11 +10,11 @@ import logging
 import uuid
 from typing import Any, Dict, List
 
-from .arms import ArmSpec
-from .datasets import LMEQuestion
-from .infra import project_uuid, session_uuid
-from .ingest import HarnessHandles, _form_query_text
-from .metrics import collapse_to_sessions, question_metrics
+from eval.memory.arms import ArmSpec
+from eval.memory.datasets import LMEQuestion
+from eval.memory.infra import project_uuid, session_uuid
+from eval.memory.ingest import HarnessHandles, _form_query_text
+from eval.memory.metrics import collapse_to_sessions, question_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +69,7 @@ async def answer_retrieval(
     """Run the question against the ingested store; return the result row."""
     from langchain_core.messages import HumanMessage
 
-    from src.services.memory import AssembleRequest
+    from agent.services.memory import AssembleRequest
 
     project = project_uuid(handles.run_id, question.question_id)
     reader_job = session_uuid(handles.run_id, question.question_id, READER_SESSION)

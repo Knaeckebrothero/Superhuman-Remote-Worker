@@ -13,13 +13,9 @@ import asyncio
 import hashlib
 import json
 import os
-import sys
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-
-sys.path.insert(0, "/app")
-os.environ.setdefault("PYTHONPATH", "/app")
 
 PROJECT = os.environ["PROJECT"]
 TS = int(time.time())
@@ -48,14 +44,14 @@ def note(slug, ntype, links=(), created_days_ago=30):
 
 
 async def main():
-    from database.postgres import PostgresDB
-    from services.gitea import GiteaClient
-    from services.kb_materialize import materialize_knowledge_note
-    from services.kb_prefilter import prefilter_kb_tick
-    from services.kb_purge import purge_kb_tick
-    from services.kb_reindex import resolve_kb_repo
-    from src.services.knowledge_store import KnowledgeStore
-    from utils.db_url import build_postgres_url
+    from orchestrator.database.postgres import PostgresDB
+    from orchestrator.services.gitea import GiteaClient
+    from orchestrator.services.kb_materialize import materialize_knowledge_note
+    from orchestrator.services.kb_prefilter import prefilter_kb_tick
+    from orchestrator.services.kb_purge import purge_kb_tick
+    from orchestrator.services.kb_reindex import resolve_kb_repo
+    from shared.runtime.services.knowledge_store import KnowledgeStore
+    from shared.db_url import build_postgres_url
 
     postgres_db = PostgresDB()
     await postgres_db.connect()
@@ -200,7 +196,7 @@ async def main():
     print("S5 purge:", purge, "->", after_purge, "files present:", present)
 
     # cleanup: remove the survivors' files + rows
-    from services.kb_materialize import materialize_knowledge_note_delete
+    from orchestrator.services.kb_materialize import materialize_knowledge_note_delete
 
     for key in ("root", "linked", "young"):
         await materialize_knowledge_note_delete(

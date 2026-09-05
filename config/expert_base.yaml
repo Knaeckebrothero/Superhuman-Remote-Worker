@@ -93,7 +93,7 @@ workspace:
   #   workspace_path: /home/agent-host/workspace     # Workspace root (subdirectory of home)
 
 tools:
-  # Workspace tools - file operations (src/tools/workspace/)
+  # Workspace tools - file operations (src/agent/tools/workspace/)
   workspace:
     - read_file
     - write_file
@@ -109,7 +109,7 @@ tools:
     - get_document_info
     - create_directory
     - delete_directory
-  # Research tools - web search, academic papers, browser & workflows (src/tools/research/)
+  # Research tools - web search, academic papers, browser & workflows (src/agent/tools/research/)
   research:
     - web_search
     - extract_webpage
@@ -119,7 +119,7 @@ tools:
     - download_paper
     - get_paper_info
     - research_topic
-  # Direct browser control - step-by-step page interaction (src/tools/research/browser_direct.py)
+  # Direct browser control - step-by-step page interaction (src/agent/tools/research/browser_direct.py)
   browser_direct:
     - browser_navigate
     - browser_snapshot
@@ -130,7 +130,7 @@ tools:
     - browser_screenshot
     - browser_back
     - browser_close
-  # Citation tools - citation management (src/tools/citation/)
+  # Citation tools - citation management (src/agent/tools/citation/)
   citation:
     - cite_document
     - cite_web
@@ -143,32 +143,32 @@ tools:
     - tag_source
     - search_library
     - generate_bibliography
-  # Graph tools - Neo4j operations (src/tools/graph/)
+  # Graph tools - Neo4j operations (src/agent/tools/graph/)
   # NOTE: Graph tools are no longer listed in defaults. They are injected
   # automatically when a Neo4j datasource is attached to the job.
   # See knowledge-base/knowledge/datasources.md for the datasource connector system.
   graph: []
-  # SQL tools - PostgreSQL operations (src/tools/sql/)
+  # SQL tools - PostgreSQL operations (src/agent/tools/sql/)
   # Injected automatically via datasource system
   sql: []
-  # MongoDB tools - MongoDB operations (src/tools/mongodb/)
+  # MongoDB tools - MongoDB operations (src/agent/tools/mongodb/)
   # Injected automatically via datasource system
   mongodb: []
   # Repo tools - write operations on cloned repository datasources
-  # (src/tools/repo/). Injected automatically via datasource system; distinct
+  # (src/agent/tools/repo/). Injected automatically via datasource system; distinct
   # from `git`, which covers the agent's own workspace history.
   repo: []
-  # Email tools - IMAP/SMTP mailbox operations (src/tools/email/)
+  # Email tools - IMAP/SMTP mailbox operations (src/agent/tools/email/)
   # Injected automatically via datasource system
   email: []
-  # Shell tools - shell command execution (src/tools/shell/)
+  # Shell tools - shell command execution (src/agent/tools/shell/)
   # Privileged and orchestration-oriented capabilities are opt-in at the expert
   # layer.  This base is a reliable fallback, not a maximal role profile.
   shell: []
-  # Evaluation tools - verdict tools for critic agents (src/tools/evaluation/)
+  # Evaluation tools - verdict tools for critic agents (src/agent/tools/evaluation/)
   # Enable in critic config to give reviewer agents approve/return capabilities.
   evaluation: []
-  # Knowledge tools — project knowledge base CRUD + search (src/tools/knowledge/)
+  # Knowledge tools — project knowledge base CRUD + search (src/agent/tools/knowledge/)
   # Available when Neo4j + pgvector are connected; silently skipped otherwise.
   knowledge:
     - kb_write
@@ -184,10 +184,10 @@ tools:
     - kb_unanswered
     - kb_export
   # Delegation tools - delegate_agent plus its background control plane
-  # (src/tools/delegation/); every name is bound only when the expert names it
+  # (src/agent/tools/delegation/); every name is bound only when the expert names it
   # here AND sets delegation.enabled. Children strip this whole category.
   delegation: []
-  # Orchestrator tools - job delegation for persistent agents (src/tools/orchestrator/)
+  # Orchestrator tools - job delegation for persistent agents (src/agent/tools/orchestrator/)
   # Empty by default; persistent agents auto-load these via PersistentSession
   orchestrator: [ ]
   # Agent catalog tools - expert/skill management
@@ -196,7 +196,7 @@ tools:
   # Workflow tools - automations and project loop inspection
   # Empty by default; session experts opt into this closed control group.
   workflows: [ ]
-  # Git tools - workspace version control (src/tools/git/)
+  # Git tools - workspace version control (src/agent/tools/git/)
   git:
     - git_log
     - git_show
@@ -262,7 +262,7 @@ memory:
   # cutover flag: true routes memory through the manager + the pipeline
   # below; false keeps the legacy direct-store paths in the graph. The
   # pipeline names resolve against MEMORY_PLUGIN_REGISTRY
-  # (src/services/memory/) — an unknown name fails loudly at setup.
+  # (src/agent/services/memory/) — an unknown name fails loudly at setup.
   manager:
     enabled: true
   pipeline:
@@ -325,7 +325,7 @@ auxiliary:
   # for long. Failures fall back / skip gracefully.
   timeout: 120             # Seconds per LLM call (quick interactive tasks)
   # Per fold-call budget for conversation summarization (each pass is one
-  # bounded call — src/core/summarizer.py)
+  # bounded call — src/agent/core/summarizer.py)
   summarization_call_timeout: 240
   tasks:
     extract_memories:

@@ -7,8 +7,8 @@ the orchestrator (rewind for detached threads today; the M4 reaper's
 ``turn.interrupted`` / ``turn.parked`` system frames next) must append frames
 and bump generations without an agent in the loop. This package is the single
 implementation of the two DB-side primitives both sides share, in the same
-spirit as ``src.shared.orch_surface``: stdlib-only, framework-free, no imports
-from ``src.api`` or ``orchestrator.*``.
+spirit as ``shared.orch_surface``: stdlib-only, framework-free, no imports
+from ``agent.api`` or ``orchestrator.*``.
 
 Both helpers take an already-acquired asyncpg-style connection (anything with
 ``fetchrow(sql, *args)``) — pool management, retries, and failure taxonomy

@@ -9,7 +9,7 @@ from orchestrator.services.session_router import (
     SessionRouteAuthorityError,
     SessionRouterService,
 )
-from src.shared.pinned_session_identity import PinnedSessionBinding
+from shared.pinned_session_identity import PinnedSessionBinding
 
 THREAD_ID = "00000000-0000-4000-8000-0000000000a1"
 OTHER_THREAD_ID = "00000000-0000-4000-8000-0000000000b1"
