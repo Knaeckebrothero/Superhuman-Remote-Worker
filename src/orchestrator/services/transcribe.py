@@ -16,13 +16,14 @@ rule; mirrors ``tts.TtsSynthesisError``). No caching: every recording is unique.
 from __future__ import annotations
 
 import io
-import json
 import logging
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
 from openai import AsyncOpenAI
+
+from shared.speech_transcript import extract_transcript as _extract_transcript
 
 from orchestrator.services.capability_credentials import resolve_capability_credentials
 from orchestrator.services.usage_ledger import UsageEvent, UsageLedger
@@ -47,36 +48,6 @@ def _stt_timeout(size_bytes: int) -> float:
     return max(
         _STT_TIMEOUT_MIN, min(_STT_TIMEOUT_MAX, size_bytes / _STT_TIMEOUT_BYTES_PER_SEC)
     )
-
-
-def _extract_transcript(result: object) -> str:
-    """Pull the transcript text out of whatever the STT endpoint returned.
-
-    Well-behaved endpoints (JSON response format) yield a ``Transcription``
-    object with a ``.text`` attribute. Some OpenAI-compatible servers instead
-    return a bare string or a ``{"text": "..."}`` JSON blob regardless of the
-    requested format — unwrap those so raw JSON never reaches the composer.
-    """
-    text = getattr(result, "text", None)
-    if text is None:
-        if isinstance(result, dict):
-            text = result.get("text", "")
-        elif isinstance(result, str):
-            stripped = result.strip()
-            if stripped.startswith("{") and '"text"' in stripped:
-                try:
-                    parsed = json.loads(stripped)
-                except (ValueError, TypeError):
-                    parsed = None
-                if isinstance(parsed, dict):
-                    text = parsed.get("text", stripped)
-                else:
-                    text = stripped
-            else:
-                text = stripped
-        else:
-            text = ""
-    return (text or "").strip()
 
 
 async def transcribe_thread_audio(

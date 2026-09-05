@@ -1109,10 +1109,11 @@ class TestBindingsDoNotDuplicateTheProjectKb:
         assert bindings[0].kb_id == uuid.UUID(PROJECT_ID)
         assert bindings[0].writable is False
 
-    def test_marker_constant_matches_the_orchestrator(self):
-        """The agent image cannot import orchestrator code, so the constant is
-        duplicated — a silent rename on one side is a silent double index."""
-        assert AGENT_NATIVE_KEY == NATIVE_PROJECT_CONFIG_KEY
+    def test_existing_modules_export_the_shared_marker(self):
+        """Existing callers retain their imports from both application modules."""
+        from shared.native_kb import NATIVE_PROJECT_CONFIG_KEY as SHARED_NATIVE_KEY
+
+        assert AGENT_NATIVE_KEY == NATIVE_PROJECT_CONFIG_KEY == SHARED_NATIVE_KEY
 
     def test_connector_index_does_not_advertise_the_project_kb_as_read_only(self):
         ws = MagicMock()

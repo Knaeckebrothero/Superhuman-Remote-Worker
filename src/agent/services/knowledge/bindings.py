@@ -7,26 +7,11 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Iterable, Literal, Optional
 
+from shared.native_kb import (
+    NATIVE_PROJECT_CONFIG_KEY as NATIVE_PROJECT_CONFIG_KEY,
+    native_kb_project_id as native_kb_project_id,
+)
 from shared.runtime_actor import RuntimeActorContext
-
-
-# Mirror of ``orchestrator.services.kb_datasources.NATIVE_PROJECT_CONFIG_KEY``
-# (the agent image has no orchestrator deps, so the constant is duplicated
-# rather than imported). A ``kb`` datasource carrying this key is the
-# management surface over a project's OWN knowledge base, not an external one:
-# its notes live under ``kb_id = project_id``, never under the datasource UUID.
-NATIVE_PROJECT_CONFIG_KEY = "native_project_id"
-
-
-def native_kb_project_id(datasource: dict[str, Any] | None) -> Optional[str]:
-    """Return the project whose native KB this ``kb`` datasource mirrors."""
-    if not datasource:
-        return None
-    config = datasource.get("config") or {}
-    if not isinstance(config, dict):
-        return None
-    value = config.get(NATIVE_PROJECT_CONFIG_KEY)
-    return str(value) if value else None
 
 
 @dataclass(frozen=True)

@@ -17,7 +17,6 @@ Follows the same pattern as VisionHelper:
 """
 
 import asyncio
-import json
 import logging
 import math
 import os
@@ -30,6 +29,8 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from openai import AsyncOpenAI
+
+from shared.speech_transcript import extract_transcript as _extract_transcript
 
 logger = logging.getLogger(__name__)
 
@@ -147,36 +148,6 @@ def _split_long_line(text: str, max_length: int, out: List[str]) -> None:
 
     if text:
         out.append(text)
-
-
-def _extract_transcript(result: object) -> str:
-    """Pull the transcript text out of whatever the STT endpoint returned.
-
-    Well-behaved endpoints (JSON response format) yield a ``Transcription``
-    object with a ``.text`` attribute. Some OpenAI-compatible servers instead
-    return a bare string or a ``{"text": "..."}`` JSON blob regardless of the
-    requested format — unwrap those so raw JSON never reaches the transcript.
-    """
-    text = getattr(result, "text", None)
-    if text is None:
-        if isinstance(result, dict):
-            text = result.get("text", "")
-        elif isinstance(result, str):
-            stripped = result.strip()
-            if stripped.startswith("{") and '"text"' in stripped:
-                try:
-                    parsed = json.loads(stripped)
-                except (ValueError, TypeError):
-                    parsed = None
-                if isinstance(parsed, dict):
-                    text = parsed.get("text", stripped)
-                else:
-                    text = stripped
-            else:
-                text = stripped
-        else:
-            text = ""
-    return (text or "").strip()
 
 
 class AudioHelper:
