@@ -657,6 +657,7 @@ jobs:
 
           if git diff --name-only "$BASE" HEAD -- \
             'src/' 'tests/' 'config/' 'init.py' 'scripts/' 'policy/' '.github/workflows/' \
+            'docker/prepare-tokenizer-cache.py' \
             'cockpit/angular.json' 'docker/cockpit-nginx.conf' \
             'docker/Dockerfile.cockpit' \
             'requirements.txt' 'requirements-dev.txt' 'pyproject.toml' '.squawk.toml' \
@@ -791,7 +792,7 @@ jobs:
           # its inputs. Lists mirror each Dockerfile's COPY inputs, including
           # packaging metadata and the context-wide .dockerignore filter.
           AGENT_PATHS=(src/agent/ src/shared/ config/ requirements.txt pyproject.toml
-            .dockerignore docker/Dockerfile.agent)
+            .dockerignore docker/Dockerfile.agent docker/prepare-tokenizer-cache.py)
           ORCHESTRATOR_PATHS=(src/orchestrator/ src/shared/ config/ pyproject.toml
             .dockerignore docker/Dockerfile.orchestrator)
           COCKPIT_PATHS=(cockpit/ .dockerignore docker/Dockerfile.cockpit

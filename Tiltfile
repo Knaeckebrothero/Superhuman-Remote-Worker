@@ -191,6 +191,7 @@ docker_build(
         'pyproject.toml',
         '.dockerignore',
         'docker/Dockerfile.agent.dev',
+        'docker/prepare-tokenizer-cache.py',
     ],
     ignore=[
         '**/__pycache__',
