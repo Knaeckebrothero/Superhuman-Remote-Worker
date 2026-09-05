@@ -185,6 +185,19 @@ from orchestrator.routers import shared_browser_router  # noqa: E402
 from orchestrator.routers import vm_guest_router  # noqa: E402
 from orchestrator.routers.sessions import router as sessions_router  # noqa: E402
 from orchestrator.routers.contacts import ContactsDependencies  # noqa: E402
+from orchestrator.routers.preferences import (  # noqa: E402
+    PreferencesDependencies,
+    UserSettingsUpdate as UserSettingsUpdate,
+    router as preferences_router,
+)
+from orchestrator.services.preference_defaults import (  # noqa: E402
+    resolve_preference_defaults as _resolve_app_preference_defaults,
+)
+from orchestrator.services.session_workspace_policy import (  # noqa: E402
+    SESSION_CREATE_WORKSPACE_BACKENDS,
+    SESSION_DEFAULT_WORKSPACE_BACKEND,
+    SESSION_WORKSPACE_BACKENDS,
+)
 from orchestrator.routers.tables import TablesDependencies  # noqa: E402
 from orchestrator.routers.tables import router as tables_router  # noqa: E402
 from orchestrator.routers.contacts import project_router as contacts_project_router  # noqa: E402
@@ -8616,24 +8629,6 @@ def _is_lite_config_override(config_override: Any) -> bool:
     return _backend_from_override(config_override) in LITE_BACKENDS
 
 
-# Session workspace tiers selectable at create time (vm is upgrade-only) and
-# the platform default applied when neither the request nor the owner's saved
-# settings.persistent_agent.workspace_backend pick one. An S3 object store is
-# an assumed platform prerequisite (knowledge-history/done/s3_object_store_bundled_fallback.md),
-# so the default is the instant lite tier — see
-# knowledge-base/knowledge/features/instant_landing_session.md.
-SESSION_WORKSPACE_BACKENDS = ("sandbox", "virtual", "none")
-SESSION_DEFAULT_WORKSPACE_BACKEND = "virtual"
-
-# Backends a caller may *explicitly* select at session creation. ``vm`` is
-# creatable (operator-gated + provisioned via KubeVirt, see create_thread) but
-# deliberately NOT in SESSION_WORKSPACE_BACKENDS: it must never be an implicit
-# or saved default (a KubeVirt VM per session is expensive), so it is a
-# per-session opt-in only and is excluded from the default chain
-# (_default_session_workspace_backend) and the settings-PATCH validator.
-SESSION_CREATE_WORKSPACE_BACKENDS = SESSION_WORKSPACE_BACKENDS + ("vm",)
-
-
 def _resolve_thread_execution_lane(
     *,
     workspace_backend: str | None,
@@ -16062,193 +16057,6 @@ VALID_SYSTEM_API_KEY_PROVIDERS = {
 }
 
 
-class UserSettingsUpdate(BaseModel):
-    """Request body for updating user preferences. Null values remove the key."""
-
-    default_model: str | None = None
-    default_autonomy: str | None = None
-    default_reasoning_level: str | None = None
-    default_auxiliary_model: str | None = None
-    default_vision_model: str | None = None
-    default_whisper_model: str | None = None
-    default_tts_model: str | None = None
-    default_search_model: str | None = None
-    default_fetch_model: str | None = None
-    default_search_fallback_model: str | None = None
-    default_tts_voice: str | None = None
-    # NOTE: per-phase model defaults (default_strategic_model /
-    # default_tactical_model) were removed — see Layer 1 in
-    # knowledge-base/knowledge/issues/loop_ran_codex_spark_not_selected_model_then_hung_on_cooldown.md.
-    # ``default_chat_model`` and ``default_session_model`` were removed for a
-    # duller reason: nothing ever read them. The account-level chat model is
-    # ``default_model``, and a session's is ``persistent_agent.model``.
-    # Old clients PATCHing any of them are ignored (BaseModel drops unknown
-    # fields) — but a PATCH carrying ONLY a dropped key now 400s as "No
-    # settings provided", which is the honest answer.
-    default_embedding_model: str | None = None
-    embedding_provider: str | None = None
-    # Admin "View as" preference: 'all' = fleet-wide visibility (default),
-    # 'me' = shadow regular-user visibility. Read by the cockpit's
-    # ViewModeService; the live request narrowing rides the X-Admin-View-As
-    # header (orchestrator/security/auth.py), this just persists the choice.
-    admin_view_mode: Literal["me", "all"] | None = None
-    # persistent_agent sub-object: model, permission_mode,
-    # idle_timeout_minutes, headless_mode, headless_attention_sleep_minutes,
-    # and workspace_backend (the user's default session workspace tier).
-    # Patch-replaces the whole sub-object. Free-form by design, so legacy keys
-    # from removed controls (greeting, command_allowlist,
-    # notification_channels) still round-trip harmlessly if a stored blob
-    # carries them — nothing reads them any more.
-    persistent_agent: dict[str, Any] | None = None
-    # Read-aloud rewrite preferences: {reasoning_level, custom_prompt}. Controls
-    # how the auxiliary LLM rewrites a message for speech — reasoning_level (off
-    # by default, keeps the fast path) and a free-text custom_prompt (the user's
-    # standing style/summarization instructions). Read by services/tts.py's
-    # rewrite path. Patch-replaces the whole sub-object.
-    read_aloud: dict[str, Any] | None = None
-    # Notification/communication preferences: {delivery, channels, quiet_hours}.
-    # Read by services/notification_service.py (_get_user_channels,
-    # _is_in_quiet_hours) and by the agent-message delivery path. This field was
-    # missing until 2026-08-23: the cockpit's Communication card PATCHed
-    # ``communication`` into a model that did not declare it, Pydantic dropped it
-    # (extra="ignore"), the request 400'd as "No settings provided", and no user
-    # ever had the key. Patch-replaces the whole sub-object.
-    communication: dict[str, Any] | None = None
-    # Cockpit UI locale (BCP-47, e.g. "en" / "de-DE"). Client-only — nothing
-    # server-side reads it; the cockpit stores it here and reads it back from
-    # GET /api/settings/preferences. Kept as a free string rather than an enum
-    # so shipping a new locale is a cockpit-only change; I18nService.toSupported
-    # already normalises unknown tags to its default on read. Undeclared until
-    # 2026-08-23, so language choice never persisted for anyone.
-    language: str | None = None
-
-    @field_validator("persistent_agent")
-    @classmethod
-    def _validate_persistent_agent(
-        cls, v: dict[str, Any] | None
-    ) -> dict[str, Any] | None:
-        """Guard the persistent_agent sub-object: workspace_backend must be a
-        create-time-selectable tier — a typo here would otherwise misconfigure
-        every future session created from the user's defaults. Other keys stay
-        free-form (Phase 6 contract)."""
-        if v is None:
-            return v
-        if not isinstance(v, dict):
-            raise ValueError("persistent_agent must be an object")
-        backend = v.get("workspace_backend")
-        if backend is not None and backend not in SESSION_WORKSPACE_BACKENDS:
-            raise ValueError(
-                f"workspace_backend must be one of {list(SESSION_WORKSPACE_BACKENDS)}"
-            )
-        return v
-
-    @field_validator("read_aloud")
-    @classmethod
-    def _validate_read_aloud(cls, v: dict[str, Any] | None) -> dict[str, Any] | None:
-        """Guard the read-aloud sub-object: reasoning_level must be one of the
-        allowed levels, and custom_prompt is length-capped (it rides on every aux
-        rewrite call). Mirrors the server-side constants in services/tts.py."""
-        if v is None:
-            return v
-        if not isinstance(v, dict):
-            raise ValueError("read_aloud must be an object")
-        from orchestrator.services.tts import (
-            READ_ALOUD_PROMPT_MAX,
-            READ_ALOUD_REASONING_LEVELS,
-        )
-
-        level = v.get("reasoning_level")
-        if level is not None:
-            if (
-                not isinstance(level, str)
-                or level.lower() not in READ_ALOUD_REASONING_LEVELS
-            ):
-                raise ValueError(
-                    f"reasoning_level must be one of {list(READ_ALOUD_REASONING_LEVELS)}"
-                )
-            v["reasoning_level"] = level.lower()
-        prompt = v.get("custom_prompt")
-        if prompt is not None:
-            if not isinstance(prompt, str):
-                raise ValueError("custom_prompt must be a string")
-            if len(prompt) > READ_ALOUD_PROMPT_MAX:
-                raise ValueError(
-                    f"custom_prompt must be at most {READ_ALOUD_PROMPT_MAX} characters"
-                )
-        return v
-
-    @field_validator("communication")
-    @classmethod
-    def _validate_communication(cls, v: dict[str, Any] | None) -> dict[str, Any] | None:
-        """Guard the communication sub-object. ``channels`` values must be real
-        booleans: every reader gates on ``channels.get(name, True)``, so a string
-        ``"false"`` would be truthy and silently leave a channel switched on —
-        the exact failure the user would be trying to fix. The three known
-        sub-objects must be objects; other keys stay free-form, matching the
-        persistent_agent contract."""
-        if v is None:
-            return v
-        if not isinstance(v, dict):
-            raise ValueError("communication must be an object")
-        for key in ("delivery", "channels", "quiet_hours"):
-            sub = v.get(key)
-            if sub is not None and not isinstance(sub, dict):
-                raise ValueError(f"communication.{key} must be an object")
-        for name, enabled in (v.get("channels") or {}).items():
-            if not isinstance(enabled, bool):
-                raise ValueError(
-                    f"communication.channels.{name} must be a boolean, "
-                    f"got {type(enabled).__name__}"
-                )
-        # D9 preference matrix: categories[category][channel] = bool overrides
-        # the channel-type default above. Same strict-bool rule, same reason.
-        categories = v.get("categories")
-        if categories is not None:
-            if not isinstance(categories, dict):
-                raise ValueError("communication.categories must be an object")
-            for category, cells in categories.items():
-                if not isinstance(cells, dict):
-                    raise ValueError(
-                        f"communication.categories.{category} must be an object"
-                    )
-                for channel, enabled in cells.items():
-                    if not isinstance(enabled, bool):
-                        raise ValueError(
-                            f"communication.categories.{category}.{channel} must be "
-                            f"a boolean, got {type(enabled).__name__}"
-                        )
-        # How long a `normal` notification waits for someone to look before it
-        # mails, when no project officer owns the wait. Minutes; bounded so a
-        # typo cannot mean "never" or "instantly".
-        minutes = v.get("escalation_minutes")
-        if minutes is not None:
-            from orchestrator.services.notification_catalog import (
-                ESCALATION_MINUTES_BOUNDS,
-            )
-
-            lo, hi = ESCALATION_MINUTES_BOUNDS
-            if isinstance(minutes, bool) or not isinstance(minutes, int):
-                raise ValueError("communication.escalation_minutes must be an integer")
-            if not lo <= minutes <= hi:
-                raise ValueError(
-                    f"communication.escalation_minutes must be between {lo} and {hi}"
-                )
-        return v
-
-    @field_validator("language")
-    @classmethod
-    def _validate_language(cls, v: str | None) -> str | None:
-        """Sanity-cap the locale tag. Deliberately not an enum — see the field
-        comment. Just enough to keep junk out of the settings JSONB."""
-        if v is None:
-            return v
-        if not isinstance(v, str) or not re.fullmatch(
-            r"[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8})*", v
-        ):
-            raise ValueError("language must be a BCP-47 tag such as 'en' or 'de-DE'")
-        return v
-
-
 class ExternalKnowledgeBase(BaseModel):
     """An existing private GitHub repo to use as a project's live vault.
 
@@ -18156,6 +17964,11 @@ app = FastAPI(
 )
 app.state.contacts_dependencies = ContactsDependencies(db=postgres_db)
 app.state.tables_dependencies = TablesDependencies(db=postgres_db)
+app.state.preferences_dependencies = PreferencesDependencies(
+    db=postgres_db,
+    role_base=lambda role: _role_base_or_empty(role),
+    environ=os.environ,
+)
 
 # CSRF defense for the cookie BFF. Middleware order matters: Starlette
 # runs the OUTERMOST `add_middleware` last, so we add CSRF first and CORS
@@ -18394,6 +18207,7 @@ app.include_router(sessions_router)
 app.include_router(contacts_router)
 app.include_router(contacts_project_router)
 app.include_router(tables_router)
+app.include_router(preferences_router)
 
 
 # nosec: public k8s-liveness-probe
@@ -66986,97 +66800,10 @@ async def _enforce_readiness_gate() -> None:
 
 
 async def _resolve_preference_defaults() -> dict[str, Any]:
-    """Compute resolved default values for all user preference fields.
-
-    The chat/auxiliary/session model defaults come from the DB model registry
-    (``resolve_default_for_capability`` — the SAME source dispatch uses), so the
-    UI shows the model the agent will actually run, not the worker base's
-    placeholder. Non-model fields (autonomy, reasoning, helper-model env
-    fallbacks) still read framework defaults / env vars. This lets the UI show
-    the actual effective value instead of "Not set" / "Server default".
-    """
-    # The two role bases, fully merged (expert_base + overlay): `autonomy`
-    # lives in the worker overlay and `llm.model` in expert_base, so neither
-    # file alone answers.
-    worker_cfg = _role_base_or_empty("worker")
-    persistent_cfg = _role_base_or_empty("session")
-
-    llm = worker_cfg.get("llm", {})
-    aux = worker_cfg.get("auxiliary", {})
-    p_llm = persistent_cfg.get("llm", {})
-
-    # System chat/auxiliary defaults come from the DB model registry — the same
-    # source dispatch resolves via resolve_default_for_capability — NOT the YAML
-    # placeholder, so the displayed "default" is the model the agent will run.
-    # Fall back to the YAML model only when the registry has no capability default.
-    registry_chat = await postgres_db.resolve_default_for_capability("chat")
-    registry_aux = await postgres_db.resolve_default_for_capability("auxiliary")
-    # TTS is orchestrator-only (the read-aloud feature), resolved from the model
-    # registry by resolve_capability_credentials — NOT an agent env-helper like
-    # vision/whisper/embedding below. Resolve it the same way here so the Settings
-    # voice picker shows the model actually in effect (and thus the right voice
-    # list); env TTS_MODEL is only a last-ditch fallback.
-    registry_tts = await postgres_db.resolve_default_for_capability("tts")
-
-    return {
-        "default_model": registry_chat or llm.get("model"),
-        "default_autonomy": worker_cfg.get("autonomy"),
-        "default_reasoning_level": llm.get("reasoning_level"),
-        "default_auxiliary_model": registry_aux or aux.get("model") or llm.get("model"),
-        # Helper-model defaults match the env-var fallbacks in the agent code
-        # (src/services/vision_helper.py, audio_helper.py, embedding_service.py)
-        "default_vision_model": os.environ.get("VISION_MODEL", "gpt-4o"),
-        "default_whisper_model": os.environ.get("WHISPER_MODEL", "whisper-1"),
-        "default_tts_model": registry_tts or os.environ.get("TTS_MODEL", "tts-1"),
-        "default_embedding_model": os.environ.get(
-            "EMBEDDING_MODEL", "qwen3-embedding-8b"
-        ),
-        "embedding_provider": os.environ.get("EMBEDDING_PROVIDER", "local"),
-        # Admin "View as" default — fleet-wide visibility unless the admin
-        # has explicitly narrowed to their own data.
-        "admin_view_mode": "all",
-        "persistent_agent": {
-            # Sessions resolve their base model via the same chat-capability
-            # default (base_defaults in _resolve_session_config), so surface that
-            # — not the session base's placeholder.
-            "model": registry_chat or p_llm.get("model"),
-            "permission_mode": "supervised",
-            "idle_timeout_minutes": 30,
-            "workspace_backend": SESSION_DEFAULT_WORKSPACE_BACKEND,
-        },
-    }
-
-
-@app.get("/api/settings/preferences")
-async def get_user_preferences(request: Request) -> dict[str, Any]:
-    """Get the current user's preference settings.
-
-    The response includes a ``_resolved`` key containing the effective
-    default for every preference field (derived from framework YAML configs
-    and environment variables). The UI uses this to display the actual
-    value behind "Server default" / "Not set".
-    """
-    user = await require_approved_user(request, postgres_db)
-    prefs = await postgres_db.get_user_settings(str(user["id"]))
-    prefs["_resolved"] = await _resolve_preference_defaults()
-    return prefs
-
-
-@app.patch("/api/settings/preferences")
-async def update_user_preferences(
-    request: Request, body: UserSettingsUpdate
-) -> dict[str, str]:
-    """Update the current user's preference settings (patch-merge)."""
-    user = await require_approved_user(request, postgres_db)
-    settings = {
-        k: v
-        for k, v in body.model_dump().items()
-        if v is not None or k in body.model_fields_set
-    }
-    if not settings:
-        raise HTTPException(status_code=400, detail="No settings provided")
-    await postgres_db.update_user_settings(str(user["id"]), settings)
-    return {"status": "updated"}
+    """Compatibility adapter for app-global callers of preference defaults."""
+    return await _resolve_app_preference_defaults(
+        postgres_db, role_base=_role_base_or_empty, environ=os.environ
+    )
 
 
 @app.post("/api/settings/tts/preview")

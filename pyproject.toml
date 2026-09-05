@@ -89,6 +89,18 @@ forbidden_modules = ["orchestrator.main"]
 allow_indirect_imports = true
 
 [[tool.importlinter.contracts]]
+name = "Preferences domain does not import application startup"
+type = "forbidden"
+source_modules = [
+    "orchestrator.routers.preferences",
+    "orchestrator.services.preference_defaults",
+    "orchestrator.services.session_workspace_policy",
+]
+forbidden_modules = ["orchestrator.main"]
+# Existing auth helpers retain indirect composition lookups, as for contacts.
+allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
 name = "Shared initializer stays lightweight"
 type = "forbidden"
 # Check the root initializer separately without including its child packages.
