@@ -81,6 +81,7 @@ GATE_NAMES = {
     "relay_browser_stream",
     "_dispatch_infrastructure_ingestion",
     "_require_admin",
+    "require_admin",
     "_require_infrastructure_fleet_admin",
     "is_internal_call",
     "require_approved_user",
@@ -782,6 +783,7 @@ def _classify(
         "user_can_access_datasource": 1,
         "user_can_access_ide_entity": 1,
         "_require_admin": 2,
+        "require_admin": 2,
         "_require_infrastructure_fleet_admin": 2,
         "_dispatch_infrastructure_ingestion": 2,
         "require_internal": 2,
@@ -790,6 +792,9 @@ def _classify(
         "require_approved_user": 3,
     }
     primary = sorted(gates, key=lambda g: priority.get(g, 99))[0]
+    if primary == "require_admin":
+        # The extracted gate preserves the existing audited policy identity.
+        return "admin:_require_admin"
     if primary in ("_require_admin", "_require_infrastructure_fleet_admin"):
         return f"admin:{primary}"
     if primary in (

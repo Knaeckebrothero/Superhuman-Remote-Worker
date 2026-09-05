@@ -34,7 +34,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-from typing import Any, Literal
+from typing import Any, Awaitable, Callable, Literal
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import UUID
 
@@ -172,6 +172,38 @@ async def log_security_event(
         )
     except Exception as exc:
         logger.error("security-event DB write failed (deny proceeds): %s", exc)
+
+
+async def require_admin(
+    request: Request,
+    db: Any,
+    *,
+    resolve_user: Callable[[Request, Any], Awaitable[dict[str, Any]]] | None = None,
+    audit: Callable[..., Awaitable[None]] | None = None,
+) -> dict[str, Any]:
+    """Require an approved admin against the caller's database.
+
+    Use the un-shadowed privilege flag so an admin keeps access while viewing
+    as a user. The optional collaborators preserve the existing composition
+    adapter's call-time bindings; ordinary callers use these module defaults.
+    """
+    if resolve_user is None:
+        resolve_user = require_approved_user
+    if audit is None:
+        audit = log_security_event
+    user = await resolve_user(request, db)
+    if not user.get("real_is_admin", False):
+        await audit(
+            db,
+            event_type="admin_denied",
+            user=user,
+            resource_type="admin_endpoint",
+            resource_id=getattr(getattr(request, "url", None), "path", None),
+            detail="Admin access required",
+            request=request,
+        )
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return user
 
 
 async def _denied(

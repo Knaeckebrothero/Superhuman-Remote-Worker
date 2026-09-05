@@ -101,7 +101,6 @@ from pydantic import (  # noqa: E402
 from orchestrator.database import (  # noqa: E402
     PostgresDB,
     AuditStore,
-    ALLOWED_TABLES,
     FilterCategory,
     MIGRATIONS_VECTOR_DIR,
     MIGRATIONS_AUDIT_DIR,
@@ -138,6 +137,7 @@ from orchestrator.security.access import (  # noqa: E402
     filter_visible_datasources,
     is_internal_call,
     log_security_event,
+    require_admin as require_admin_gate,
     mcp_scope_project_id,
     normalize_project_statuses,
     project_is_archived,
@@ -185,6 +185,8 @@ from orchestrator.routers import shared_browser_router  # noqa: E402
 from orchestrator.routers import vm_guest_router  # noqa: E402
 from orchestrator.routers.sessions import router as sessions_router  # noqa: E402
 from orchestrator.routers.contacts import ContactsDependencies  # noqa: E402
+from orchestrator.routers.tables import TablesDependencies  # noqa: E402
+from orchestrator.routers.tables import router as tables_router  # noqa: E402
 from orchestrator.routers.contacts import project_router as contacts_project_router  # noqa: E402
 from orchestrator.routers.contacts import router as contacts_router  # noqa: E402
 from orchestrator.services.cron_dispatcher import cron_dispatcher_loop  # noqa: E402
@@ -18153,6 +18155,7 @@ app = FastAPI(
     default_response_class=CustomJSONResponse,
 )
 app.state.contacts_dependencies = ContactsDependencies(db=postgres_db)
+app.state.tables_dependencies = TablesDependencies(db=postgres_db)
 
 # CSRF defense for the cookie BFF. Middleware order matters: Starlette
 # runs the OUTERMOST `add_middleware` last, so we add CSRF first and CORS
@@ -18390,46 +18393,7 @@ app.include_router(vm_guest_router)
 app.include_router(sessions_router)
 app.include_router(contacts_router)
 app.include_router(contacts_project_router)
-
-
-@app.get("/api/tables")
-async def list_tables(request: Request) -> list[dict[str, Any]]:
-    """List available tables with row counts. **Admin only** (P4d) —
-    raw postgres table dump."""
-    await _require_admin(request)
-    return await postgres_db.get_tables()
-
-
-@app.get("/api/tables/{table_name}")
-async def get_table_data(
-    request: Request,
-    table_name: str,
-    page: int = Query(default=1, ge=-1),
-    page_size: int = Query(default=50, ge=1, le=500, alias="pageSize"),
-) -> dict[str, Any]:
-    """Get paginated table data. Use page=-1 to request the last page.
-    **Admin only** (P4d) — raw postgres rows."""
-    await _require_admin(request)
-    if table_name not in ALLOWED_TABLES:
-        raise HTTPException(status_code=404, detail=f"Table '{table_name}' not found")
-
-    try:
-        return await postgres_db.get_table_data(table_name, page, page_size)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
-
-
-@app.get("/api/tables/{table_name}/schema")
-async def get_table_schema(request: Request, table_name: str) -> list[dict[str, Any]]:
-    """Get column definitions for a table. **Admin only** (P4d)."""
-    await _require_admin(request)
-    if table_name not in ALLOWED_TABLES:
-        raise HTTPException(status_code=404, detail=f"Table '{table_name}' not found")
-
-    try:
-        return await postgres_db.get_table_schema(table_name)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
+app.include_router(tables_router)
 
 
 # nosec: public k8s-liveness-probe
@@ -67551,29 +67515,13 @@ async def reload_model_catalog(request: Request) -> dict[str, str]:
 
 
 async def _require_admin(request: Request) -> dict[str, Any]:
-    """Require authenticated admin user.
-
-    Checks ``real_is_admin`` (the un-shadowed privilege flag set by
-    ``require_approved_user``) so admin-only endpoints stay reachable when
-    the caller is in "view as user" mode. ``is_admin`` on the returned
-    dict still reflects the shadow, so any downstream visibility check
-    on the returned user dict honours the toggle.
-    """
-    user = await require_approved_user(request, postgres_db)
-    if not user.get("real_is_admin", False):
-        # A non-admin reaching an admin endpoint is the strongest single
-        # probe signal we have — always leaves a security_events row.
-        await log_security_event(
-            postgres_db,
-            event_type="admin_denied",
-            user=user,
-            resource_type="admin_endpoint",
-            resource_id=getattr(getattr(request, "url", None), "path", None),
-            detail="Admin access required",
-            request=request,
-        )
-        raise HTTPException(status_code=403, detail="Admin access required")
-    return user
+    """Retain call-time composition bindings for remaining main-module routes."""
+    return await require_admin_gate(
+        request,
+        postgres_db,
+        resolve_user=require_approved_user,
+        audit=log_security_event,
+    )
 
 
 async def _codex_proxy_request(

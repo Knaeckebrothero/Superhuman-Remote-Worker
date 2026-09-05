@@ -50,38 +50,44 @@ class TestAdminInfraGates:
     # ----- /api/tables family -----
     @pytest.mark.asyncio
     async def test_list_tables_non_admin_403(self, user_a, fake_db, fake_request):
-        from orchestrator.main import list_tables
+        from orchestrator.routers.tables import TablesDependencies, list_tables
 
         fake_db.get_tables = AsyncMock(
             side_effect=AssertionError("get_tables called past gate")
         )
         with _patch_caller_and_db(user_a, fake_db):
             with pytest.raises(HTTPException) as exc:
-                await list_tables(fake_request)
+                await list_tables(
+                    fake_request, dependencies=TablesDependencies(db=fake_db)
+                )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
     async def test_get_table_data_non_admin_403(self, user_a, fake_db, fake_request):
-        from orchestrator.main import get_table_data
+        from orchestrator.routers.tables import TablesDependencies, get_table_data
 
         fake_db.get_table_data = AsyncMock(
             side_effect=AssertionError("get_table_data called past gate")
         )
         with _patch_caller_and_db(user_a, fake_db):
             with pytest.raises(HTTPException) as exc:
-                await get_table_data(fake_request, "users")
+                await get_table_data(
+                    fake_request, "users", dependencies=TablesDependencies(db=fake_db)
+                )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
     async def test_get_table_schema_non_admin_403(self, user_a, fake_db, fake_request):
-        from orchestrator.main import get_table_schema
+        from orchestrator.routers.tables import TablesDependencies, get_table_schema
 
         fake_db.get_table_schema = AsyncMock(
             side_effect=AssertionError("get_table_schema called past gate")
         )
         with _patch_caller_and_db(user_a, fake_db):
             with pytest.raises(HTTPException) as exc:
-                await get_table_schema(fake_request, "users")
+                await get_table_schema(
+                    fake_request, "users", dependencies=TablesDependencies(db=fake_db)
+                )
         assert exc.value.status_code == 403
 
     # ----- /api/sudo/rules family -----
@@ -154,9 +160,11 @@ class TestAdminInfraGates:
     async def test_list_tables_admin_passes_gate(
         self, user_admin, fake_db, fake_request
     ):
-        from orchestrator.main import list_tables
+        from orchestrator.routers.tables import TablesDependencies, list_tables
 
         fake_db.get_tables = AsyncMock(return_value=[{"name": "users", "rows": 0}])
         with _patch_caller_and_db(user_admin, fake_db):
-            result = await list_tables(fake_request)
+            result = await list_tables(
+                fake_request, dependencies=TablesDependencies(db=fake_db)
+            )
         assert result == [{"name": "users", "rows": 0}]

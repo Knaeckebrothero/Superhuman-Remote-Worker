@@ -35,6 +35,7 @@ def boundary_tree(tmp_path):
         "orchestrator/app.py": "from shared.runtime.provider import VALUE\n",
         "orchestrator/main.py": "from orchestrator.app import VALUE\n",
         "orchestrator/routers/contacts.py": "from shared.value import VALUE\n",
+        "orchestrator/routers/tables.py": "from shared.value import VALUE\n",
         "mcp_server/app.py": "from shared.contracts.item import VALUE\n",
         "vm_controller/app.py": "from shared.value import VALUE\n",
     }.items():
@@ -61,7 +62,7 @@ def lint_boundaries(root):
 def test_allowed_runtime_and_lightweight_dependencies_pass(boundary_tree):
     result = lint_boundaries(boundary_tree)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "Contracts: 7 kept, 0 broken" in result.stdout
+    assert "Contracts: 8 kept, 0 broken" in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -82,6 +83,7 @@ def test_allowed_runtime_and_lightweight_dependencies_pass(boundary_tree):
         ("orchestrator/app.py", "services.canvas"),
         ("orchestrator/app.py", "database.postgres"),
         ("orchestrator/routers/contacts.py", "orchestrator.main"),
+        ("orchestrator/routers/tables.py", "orchestrator.main"),
         ("vm_controller/app.py", "headscale_client"),
     ],
 )

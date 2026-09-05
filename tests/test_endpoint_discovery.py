@@ -490,3 +490,45 @@ def test_cli_reports_excluded_routes_and_refuses_unsupported_composition(
     assert script.main() == 2
     assert not manifest.exists()
     assert "fixture.py:9: dynamic prefix" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "gate_call", ["require_admin()", "dependencies.require_admin()"]
+)
+def test_extracted_admin_gate_retains_the_existing_inventory_label(
+    application_sources, gate_call
+):
+    before, _ = application_sources(
+        {
+            "main.py": """
+            from fastapi import FastAPI
+            app = FastAPI()
+            @app.get('/api/tables')
+            def list_tables():
+                _require_admin()
+        """
+        }
+    )
+    after, _ = application_sources(
+        {
+            "main.py": """
+                from fastapi import FastAPI
+                from .tables import router
+                app = FastAPI()
+                app.include_router(router)
+            """,
+            "tables.py": f"""
+                from fastapi import APIRouter
+                router = APIRouter(prefix='/api/tables')
+                @router.get('')
+                def list_tables():
+                    require_approved_user()
+                    {gate_call}
+            """,
+        }
+    )
+    script = _load_script()
+    before_manifest = script.render_manifest(script.collect_endpoints(before))
+    after_manifest = script.render_manifest(script.collect_endpoints(after))
+    assert "admin:_require_admin" in before_manifest
+    assert after_manifest == before_manifest

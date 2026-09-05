@@ -1,9 +1,9 @@
-"""Characterize table HTTP contracts before extracting the current main routes.
+"""Preserve table HTTP contracts across the main-to-router extraction.
 
 Identity resolution and database I/O are doubled; approval, the admin gate,
 audit enrichment, request parsing and response serialization remain real.
-The current app still supplies its DB through main's singleton. The extraction
-will replace that fixture seam with app-owned dependencies.
+The assembled application receives this router's app-owned database dependency;
+its real middleware still determines generic error responses.
 """
 
 from types import SimpleNamespace
@@ -32,6 +32,7 @@ _DENIED_PATHS = (
 @pytest.fixture
 def tables_api(monkeypatch, user_admin):
     from orchestrator import main
+    from orchestrator.routers.tables import TablesDependencies
 
     columns = [{"name": "id", "type": "string", "nullable": False}]
     db = SimpleNamespace(
@@ -49,7 +50,9 @@ def tables_api(monkeypatch, user_admin):
         record_security_event=AsyncMock(),
     )
     identity = AsyncMock(return_value=user_admin)
-    monkeypatch.setattr(main, "postgres_db", db)
+    monkeypatch.setattr(
+        main.app.state, "tables_dependencies", TablesDependencies(db=db)
+    )
     monkeypatch.setattr(auth, "get_current_user", identity)
     return SimpleNamespace(app=main.app, db=db, identity=identity)
 
