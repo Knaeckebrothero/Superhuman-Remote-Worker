@@ -493,6 +493,74 @@ def _install_streaming_reasoning_tap(response: httpx.Response) -> _SSEReasoningT
     return tap
 
 
+def _prepare_reasoning_request(
+    request: httpx.Request,
+    *,
+    model: str,
+    max_context_tokens: int,
+    key_ring: Optional["KeyRing"],
+) -> tuple[bool, bool, Optional[httpx.Response]]:
+    """Classify and validate one request before either client's transport.
+
+    Return the chat/Responses flags and any synthetic overflow response.
+    Keep key rotation, response lifetime and reasoning capture in each client.
+    """
+    url_str = str(request.url)
+    is_chat = "/chat/completions" in url_str
+    is_responses = (
+        url_str.rstrip("/").endswith("/responses") or "/responses/" in url_str
+    )
+    is_llm_request = is_chat or is_responses
+
+    # Inject current key from KeyRing into the request header
+    if key_ring and is_llm_request:
+        try:
+            current = key_ring.current_key
+            request.headers["authorization"] = f"Bearer {current}"
+        except RuntimeError:
+            # All keys exhausted — let the request go with whatever header it has
+            logger.error("KeyRing: all keys exhausted, sending with original header")
+
+    # Token validation for LLM requests (Layer 0 safety check)
+    if is_llm_request:
+        overflow: Optional[ContextOverflowError] = None
+        try:
+            body = json.loads(request.content)
+            token_count = count_request_tokens(body, model)
+
+            # Log warning if approaching limit (90% threshold)
+            if token_count > max_context_tokens * WARNING_THRESHOLD_RATIO:
+                logger.warning(
+                    f"Request approaching context limit: "
+                    f"{token_count:,}/{max_context_tokens:,} tokens "
+                    f"({token_count / max_context_tokens * 100:.1f}%)"
+                )
+
+            if token_count > max_context_tokens:
+                logger.error(
+                    f"Context overflow at HTTP layer: "
+                    f"{token_count:,} tokens exceeds limit of {max_context_tokens:,}"
+                )
+                overflow = ContextOverflowError(
+                    token_count=token_count,
+                    limit=max_context_tokens,
+                    request_size_bytes=len(request.content),
+                )
+
+        except json.JSONDecodeError:
+            # Non-JSON request body, skip validation
+            logger.debug("Skipping token count for non-JSON request")
+        except Exception as e:
+            # Log but don't fail on counting errors - let the request through
+            logger.warning(f"Token counting failed, allowing request: {e}")
+
+        if overflow is not None:
+            # Don't raise — return a synthetic 413 the SDK won't retry.
+            return is_chat, is_responses, _overflow_response_413(request, overflow)
+
+    return is_chat, is_responses, None
+
+
 class ReasoningCapturingClient(httpx.Client):
     """HTTP client that captures reasoning_content and validates context limits.
 
@@ -545,60 +613,15 @@ class ReasoningCapturingClient(httpx.Client):
         )
 
     def send(self, request, **kwargs):
-        url_str = str(request.url)
-        is_chat = "/chat/completions" in url_str
-        is_responses = (
-            url_str.rstrip("/").endswith("/responses") or "/responses/" in url_str
+        is_chat, is_responses, overflow_response = _prepare_reasoning_request(
+            request,
+            model=self._model,
+            max_context_tokens=self._max_context_tokens,
+            key_ring=self._key_ring,
         )
+        if overflow_response is not None:
+            return overflow_response
         is_llm_request = is_chat or is_responses
-
-        # Inject current key from KeyRing into the request header
-        if self._key_ring and is_llm_request:
-            try:
-                current = self._key_ring.current_key
-                request.headers["authorization"] = f"Bearer {current}"
-            except RuntimeError:
-                # All keys exhausted — let the request go with whatever header it has
-                logger.error(
-                    "KeyRing: all keys exhausted, sending with original header"
-                )
-
-        # Token validation for LLM requests (Layer 0 safety check)
-        if is_llm_request:
-            overflow: Optional[ContextOverflowError] = None
-            try:
-                body = json.loads(request.content)
-                token_count = count_request_tokens(body, self._model)
-
-                # Log warning if approaching limit (90% threshold)
-                if token_count > self._max_context_tokens * WARNING_THRESHOLD_RATIO:
-                    logger.warning(
-                        f"Request approaching context limit: "
-                        f"{token_count:,}/{self._max_context_tokens:,} tokens "
-                        f"({token_count / self._max_context_tokens * 100:.1f}%)"
-                    )
-
-                if token_count > self._max_context_tokens:
-                    logger.error(
-                        f"Context overflow at HTTP layer: "
-                        f"{token_count:,} tokens exceeds limit of {self._max_context_tokens:,}"
-                    )
-                    overflow = ContextOverflowError(
-                        token_count=token_count,
-                        limit=self._max_context_tokens,
-                        request_size_bytes=len(request.content),
-                    )
-
-            except json.JSONDecodeError:
-                # Non-JSON request body, skip validation
-                logger.debug("Skipping token count for non-JSON request")
-            except Exception as e:
-                # Log but don't fail on counting errors - let the request through
-                logger.warning(f"Token counting failed, allowing request: {e}")
-
-            if overflow is not None:
-                # Don't raise — return a synthetic 413 the SDK won't retry.
-                return _overflow_response_413(request, overflow)
 
         # Send the request
         response = super().send(request, **kwargs)
@@ -763,56 +786,15 @@ class AsyncReasoningCapturingClient(httpx.AsyncClient):
         )
 
     async def send(self, request, **kwargs):
-        url_str = str(request.url)
-        is_chat = "/chat/completions" in url_str
-        is_responses = (
-            url_str.rstrip("/").endswith("/responses") or "/responses/" in url_str
+        is_chat, is_responses, overflow_response = _prepare_reasoning_request(
+            request,
+            model=self._model,
+            max_context_tokens=self._max_context_tokens,
+            key_ring=self._key_ring,
         )
+        if overflow_response is not None:
+            return overflow_response
         is_llm_request = is_chat or is_responses
-
-        # Inject current key from KeyRing into the request header
-        if self._key_ring and is_llm_request:
-            try:
-                current = self._key_ring.current_key
-                request.headers["authorization"] = f"Bearer {current}"
-            except RuntimeError:
-                logger.error(
-                    "KeyRing: all keys exhausted, sending with original header"
-                )
-
-        # Token validation for LLM requests (Layer 0 safety check)
-        if is_llm_request:
-            overflow: Optional[ContextOverflowError] = None
-            try:
-                body = json.loads(request.content)
-                token_count = count_request_tokens(body, self._model)
-
-                if token_count > self._max_context_tokens * WARNING_THRESHOLD_RATIO:
-                    logger.warning(
-                        f"Request approaching context limit: "
-                        f"{token_count:,}/{self._max_context_tokens:,} tokens "
-                        f"({token_count / self._max_context_tokens * 100:.1f}%)"
-                    )
-
-                if token_count > self._max_context_tokens:
-                    logger.error(
-                        f"Context overflow at HTTP layer: "
-                        f"{token_count:,} tokens exceeds limit of {self._max_context_tokens:,}"
-                    )
-                    overflow = ContextOverflowError(
-                        token_count=token_count,
-                        limit=self._max_context_tokens,
-                        request_size_bytes=len(request.content),
-                    )
-
-            except json.JSONDecodeError:
-                logger.debug("Skipping token count for non-JSON request")
-            except Exception as e:
-                logger.warning(f"Token counting failed, allowing request: {e}")
-
-            if overflow is not None:
-                # Don't raise — return a synthetic 413 the SDK won't retry.
-                return _overflow_response_413(request, overflow)
 
         # Send the request (async)
         response = await super().send(request, **kwargs)
