@@ -11253,16 +11253,28 @@ async def _archive_and_cleanup_workspace(
                     )
                 actions.append("docker workspace authority retired")
             else:
-                teardown_identity = (
-                    await container_provisioner.capture_terminal_workspace_identity(
-                        WorkspaceOwner.job(entity_id)
+                owner = WorkspaceOwner.job(entity_id)
+                runtime = ws_ctx.get(WORKSPACE_RUNTIME_INCARNATION_KEY)
+                replay = (
+                    await container_provisioner.replay_terminal_workspace_cleanup(
+                        owner, expected_runtime_incarnation=str(runtime)
                     )
+                    if runtime is not None
+                    else None
                 )
-                released = await container_provisioner.release_workspace(
-                    WorkspaceOwner.job(entity_id),
-                    teardown_identity=teardown_identity,
-                    strict=True,
-                )
+                if replay is not None:
+                    released = replay.settled
+                else:
+                    teardown_identity = (
+                        await container_provisioner.capture_terminal_workspace_identity(
+                            owner
+                        )
+                    )
+                    released = await container_provisioner.release_workspace(
+                        owner,
+                        teardown_identity=teardown_identity,
+                        strict=True,
+                    )
                 if not released:
                     raise RuntimeError(
                         "Kubernetes workspace exact teardown is incomplete"

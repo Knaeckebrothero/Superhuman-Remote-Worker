@@ -17088,6 +17088,135 @@ class PostgresDB:
                     )
                 )
 
+    async def terminal_workspace_cleanup_process_zero_is_current(
+        self,
+        thread_id: str,
+        *,
+        runtime_incarnation: str,
+        intent_id: str,
+        claimant: str,
+        claim_token: int,
+    ) -> bool:
+        """Revalidate a soft-End receipt for one captured permanent reclaim.
+
+        Soft End clears the current Pod UID. Its immutable receipt remains
+        usable only through the settled preserve generation and an exact,
+        currently claimed terminal-reclaim intent. This grants no general
+        current/stale runtime authority and never treats Pod absence as proof.
+        """
+
+        try:
+            thread_uuid = UUID(str(thread_id))
+            intent_uuid = UUID(str(intent_id))
+            runtime = _canonical_uuid_text(
+                runtime_incarnation, label="terminal workspace cleanup runtime"
+            )
+        except (TypeError, ValueError, RuntimeError):
+            return False
+        if (
+            not isinstance(claimant, str)
+            or not claimant
+            or isinstance(claim_token, bool)
+            or not isinstance(claim_token, int)
+            or claim_token <= 0
+        ):
+            return False
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                # Match cleanup's existing owner -> queue -> intent lock order.
+                owner = await conn.fetchrow(
+                    "SELECT status::text AS status, execution_lane, "
+                    "runtime_generation, metadata FROM threads WHERE id=$1 FOR UPDATE",
+                    thread_uuid,
+                )
+                if owner is None or (
+                    owner["status"] != "ended"
+                    or owner["execution_lane"] != "stateless"
+                    or owner["runtime_generation"] is None
+                ):
+                    return False
+                try:
+                    state = _strict_json_object(owner["metadata"], label="metadata")
+                except RuntimeError:
+                    return False
+                workspace = state.get("workspace_container")
+                settled = state.get("_stateless_workspace_retirement_settled")
+                if (
+                    not isinstance(workspace, dict)
+                    or workspace.get("provisioner") != "k8s"
+                    or workspace.get("status") != "deleted"
+                    or workspace.get(_STATELESS_RUNTIME_INCARNATION_KEY) is not None
+                    or not isinstance(settled, dict)
+                    or settled.get("cleanup_complete") is not True
+                    or settled.get("permanent") is not True
+                    or settled.get("runtime_incarnation") != runtime
+                ):
+                    return False
+                terminal_token = await self._lock_terminal_workspace_reclaim_authority(
+                    conn,
+                    owner_kind="thread",
+                    owner_id=thread_uuid,
+                    owner_status=owner["status"],
+                    owner_state=state,
+                )
+                if (
+                    terminal_token is None
+                    or settled.get("terminal_token") != terminal_token
+                ):
+                    return False
+                intent = await conn.fetchrow(
+                    "SELECT * FROM managed_repository_workspace_cleanup_intents "
+                    "WHERE id=$1 AND owner_kind='thread' AND owner_id=$2 "
+                    "AND scope='workspace_container' AND runtime_incarnation=$3::uuid "
+                    "AND pod_uid=$3::uuid AND thread_runtime_generation=$4 "
+                    "AND target_disposition='deleted' AND resource_policy='terminal_reclaim' "
+                    "AND reclaim_shared_resources AND capture_complete "
+                    "AND resources_captured_at IS NOT NULL AND settled_at IS NULL "
+                    "AND result_kind IS NULL AND terminal_queue_token=$5 "
+                    "AND claimed_by=$6 AND claim_token=$7 AND claim_expires_at>now() "
+                    "FOR UPDATE",
+                    intent_uuid,
+                    thread_uuid,
+                    runtime,
+                    owner["runtime_generation"],
+                    terminal_token,
+                    claimant,
+                    claim_token,
+                )
+                if intent is None:
+                    return False
+                # Reclaim may have observed an already-absent shared resource;
+                # a present one must still be the prior preserve generation's
+                # captured UID, never a new object at the deterministic name.
+                return bool(
+                    await conn.fetchval(
+                        "SELECT EXISTS (SELECT 1 FROM managed_repository_workspace_cleanup_intents p "
+                        "WHERE p.owner_kind='thread' AND p.owner_id=$1 "
+                        "AND p.thread_runtime_generation=$3 AND p.scope='workspace_container' "
+                        "AND p.runtime_incarnation=$2::uuid AND p.pod_uid=$2::uuid "
+                        "AND p.target_disposition='deleted' AND p.resource_policy='preserve' "
+                        "AND NOT p.reclaim_shared_resources AND p.capture_complete "
+                        "AND p.resources_captured_at IS NOT NULL AND p.phase='settled' "
+                        "AND p.result_kind='settled' AND p.cleanup_completed_at IS NOT NULL "
+                        "AND p.settled_at IS NOT NULL AND p.projection_transaction_id IS NOT NULL "
+                        "AND ($4::uuid IS NULL OR p.pvc_uid=$4) "
+                        "AND ($5::uuid IS NULL OR p.service_uid=$5) "
+                        "AND ($6::uuid IS NULL OR p.seed_configmap_uid=$6) "
+                        "AND p.intent_generation<$7) "
+                        "AND EXISTS (SELECT 1 FROM managed_repository_process_zero_receipts r "
+                        "WHERE r.owner_kind='thread' AND r.owner_id=$1 "
+                        "AND r.scope='workspace_container' AND r.provisioner='k8s' "
+                        "AND r.runtime_incarnation=$2::text)",
+                        thread_uuid,
+                        runtime,
+                        owner["runtime_generation"],
+                        intent["pvc_uid"],
+                        intent["service_uid"],
+                        intent["seed_configmap_uid"],
+                        intent["intent_generation"],
+                    )
+                )
+
     async def defer_managed_repository_workspace_cleanup_intent(
         self,
         intent_id: str,

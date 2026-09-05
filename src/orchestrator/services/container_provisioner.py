@@ -5598,6 +5598,61 @@ class ContainerProvisioner:
             return getattr(error, "status", None) == 404
         return False
 
+    async def replay_terminal_workspace_cleanup(
+        self,
+        owner: WorkspaceOwner,
+        *,
+        expected_runtime_incarnation: str,
+    ) -> WorkspaceCleanupOutcome | None:
+        """Retry a captured job cleanup after its exact Pod has disappeared.
+
+        A fresh/live cleanup still uses terminal identity and SSH capture.
+        An absent Pod may instead replay the existing terminal-reclaim tuple,
+        but only with its exact current process-zero receipt. No new intent or
+        resource identity is admitted by this path.
+        """
+
+        read = getattr(
+            type(self._db), "get_managed_repository_workspace_cleanup_intent", None
+        )
+        if owner.kind != "job" or not callable(read) or not self._k8s_available:
+            return None
+        intent = await read(
+            self._db,
+            owner.id,
+            owner_kind="job",
+            scope="workspace_container",
+            runtime_incarnation=expected_runtime_incarnation,
+        )
+        if not isinstance(intent, dict) or (
+            intent.get("target_disposition") != "deleted"
+            or intent.get("resource_policy") != "terminal_reclaim"
+            or intent.get("reclaim_shared_resources") is not True
+            or intent.get("capture_complete") is not True
+            or intent.get("resources_captured_at") is None
+        ):
+            return None
+        authority = await self.workspace_pod_authority(
+            owner,
+            expected_runtime_incarnation=expected_runtime_incarnation,
+        )
+        if authority in {"exact_live", "exact_terminal"}:
+            return None
+        if authority != "exact_absent" or (
+            await self._managed_repository_process_zero_replay_authority(
+                owner,
+                scope="workspace_container",
+                runtime_incarnation=expected_runtime_incarnation,
+            )
+            != "current"
+        ):
+            return _WORKSPACE_CLEANUP_RETRYABLE
+        return await self.reconcile_workspace_cleanup_intent(
+            owner,
+            expected_runtime_incarnation=expected_runtime_incarnation,
+            intent_generation=int(intent["intent_generation"]),
+        )
+
     async def reconcile_workspace_cleanup_intent(
         self,
         owner: WorkspaceOwner,
@@ -6900,6 +6955,30 @@ class ContainerProvisioner:
                         )
                 if process_zero_uid is not None:
                     observed_runtime_uid = process_zero_uid
+                elif (
+                    owner.kind == "session"
+                    and expected_runtime_incarnation is not None
+                    and isinstance(cleanup_intent, dict)
+                    and callable(
+                        reclaim_receipt := getattr(
+                            type(self._db),
+                            "terminal_workspace_cleanup_process_zero_is_current",
+                            None,
+                        )
+                    )
+                    and await reclaim_receipt(
+                        self._db,
+                        owner.id,
+                        runtime_incarnation=str(expected_runtime_incarnation),
+                        intent_id=str(cleanup_intent["id"]),
+                        claimant=str(cleanup_intent["claimed_by"]),
+                        claim_token=int(cleanup_intent["claim_token"]),
+                    )
+                ):
+                    # Soft End cleared the live UID. Only the locked permanent
+                    # reclaim generation may consume its settled predecessor's
+                    # exact receipt; ordinary current/stale callers gain nothing.
+                    observed_runtime_uid = str(expected_runtime_incarnation)
                 elif expected_runtime_incarnation is not None and self._db:
                     replay_authority = (
                         await self._managed_repository_process_zero_replay_authority(
