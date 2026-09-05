@@ -1,6 +1,7 @@
 """Tests for POST /api/sessions/{tid}/prepare and GET /api/sessions/{tid}/connection."""
 
 from datetime import datetime, timezone
+import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -441,8 +442,9 @@ async def test_provision_helper_suppresses_pod_fallback_after_lane_transition(
     fake_main.agent_provisioner.provision_agent.assert_not_awaited()
 
 
+@pytest.mark.parametrize("metadata", [{}, "{}", '{"protected_cloud": false}'])
 @pytest.mark.asyncio
-async def test_do_prepare_emits_phases_for_warm_thread(monkeypatch):
+async def test_do_prepare_emits_phases_for_warm_thread(monkeypatch, metadata):
     """When the thread already has an agent_id and the pod is ready,
     _do_prepare skips the actual provision work, runs the readiness probe,
     calls session_router.ensure_route, and emits provisioning → booting →
@@ -453,7 +455,7 @@ async def test_do_prepare_emits_phases_for_warm_thread(monkeypatch):
 
     db = AsyncMock()
     # Already bound and ready.
-    db.get_thread.return_value = _connection_thread()
+    db.get_thread.return_value = {**_connection_thread(), "metadata": metadata}
     binding = _connection_binding(
         hostname="srw-agent-s-deadbeef",
         pod_uid="k8s-uid-1",
@@ -523,6 +525,7 @@ async def test_do_prepare_emits_phases_for_warm_thread(monkeypatch):
         observed_ready["expected_session_identity_fingerprint"]
         == binding.session_identity_fingerprint
     )
+    assert observed_ready["require_protected_cloud"] is False
 
 
 @pytest.mark.parametrize("mutation_phase", ["post_ready", "post_route"])
@@ -1107,6 +1110,87 @@ async def test_do_prepare_grant_denied_fails_fast_without_provisioning(monkeypat
 # --------------------------------------------------------------------------- #
 # GET /api/sessions/{tid}/connection
 # --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "metadata,expected_status",
+    [
+        ({}, 200),
+        ({"protected_cloud": False}, 200),
+        ({"protected_cloud": True}, 425),
+        ({"protected_cloud": "false"}, 425),
+        ({"protected_cloud": None}, 425),
+        ([], 425),
+        (None, 425),
+    ],
+)
+def test_connection_probes_persisted_metadata_with_the_correct_cloud_requirement(
+    monkeypatch, metadata, expected_status
+):
+    """An ordinary pinned /ready is sufficient only for ordinary stored rows."""
+    import sys
+
+    import httpx
+    from orchestrator.routers import sessions as sessions_mod
+    from orchestrator.services import session_lifecycle
+    from orchestrator.services.session_tokens import SessionTokenService
+
+    _install_fake_auth(monkeypatch)
+    db = AsyncMock()
+    # asyncpg returns JSONB as text; PostgresDB.get_thread returns dict(row).
+    db.get_thread.return_value = {
+        **_connection_thread(),
+        "metadata": json.dumps(metadata),
+    }
+    binding = _connection_binding()
+    db.get_pinned_session_binding.return_value = binding
+    monkeypatch.setattr(sessions_mod, "_get_db", lambda: db)
+
+    def ready_response(request):
+        assert request.url.path == "/ready"
+        return httpx.Response(
+            200,
+            json={
+                "ready": True,
+                "thread_id": CONNECTION_THREAD_ID,
+                "session_identity_fingerprint": binding.session_identity_fingerprint,
+                "capabilities": {
+                    "pinned_session_identity_contract": 1,
+                    "protected_cloud_contract": None,
+                    "protected_cloud_ready": False,
+                },
+            },
+        )
+
+    real_client = httpx.AsyncClient
+    transport = httpx.MockTransport(ready_response)
+    monkeypatch.setattr(
+        session_lifecycle.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=transport, **kwargs),
+    )
+    monkeypatch.setattr(sessions_mod, "probe_ready", session_lifecycle.probe_ready)
+    fake_main = _fake_main()
+    fake_main.session_router.ensure_route = AsyncMock(return_value="/p/t1")
+    fake_main.session_tokens = SessionTokenService(
+        secret="test-secret-do-not-use", ttl_seconds=60
+    )
+    monkeypatch.setitem(sys.modules, "orchestrator.main", fake_main)
+
+    app = FastAPI()
+    app.include_router(sessions_mod.router)
+    response = TestClient(app).get(f"/api/sessions/{CONNECTION_THREAD_ID}/connection")
+
+    assert response.status_code == expected_status
+    if expected_status == 200:
+        assert response.json()["state"] == "ready"
+        assert response.json()["session_runtime_generation"] == CONNECTION_GENERATION
+        claims = fake_main.session_tokens.validate(response.json()["token"])
+        assert claims["sif"] == binding.session_identity_fingerprint
+        fake_main.session_router.ensure_route.assert_awaited_once()
+    else:
+        assert response.json()["detail"] == "session not ready"
+        fake_main.session_router.ensure_route.assert_not_awaited()
 
 
 def test_connection_returns_ws_url_and_token_when_ready(monkeypatch):

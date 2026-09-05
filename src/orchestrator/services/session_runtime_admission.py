@@ -146,7 +146,17 @@ def thread_requests_protected_cloud(thread: Mapping[str, Any] | None) -> bool:
 
     if not thread:
         return False
-    metadata = thread.get("metadata") or {}
+    metadata = thread.get("metadata")
+    if metadata is None:
+        metadata = {}
+    # asyncpg returns JSONB as text, and PostgresDB.get_thread preserves that
+    # storage shape. Decode the object before classifying its strict marker;
+    # malformed JSON and non-object values must still require protected gates.
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except json.JSONDecodeError:
+            return True
     return protected_cloud_marker_state(metadata) != "off"
 
 

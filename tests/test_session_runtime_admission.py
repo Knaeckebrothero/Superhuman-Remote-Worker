@@ -1,11 +1,56 @@
+import json
+
+import pytest
+
 from orchestrator.services.session_runtime_admission import (
     ThreadRuntimeAuthority,
     pinned_binding_invalid_detail,
+    protected_cloud_marker_state,
+    thread_requests_protected_cloud,
     thread_runtime_refusal_detail,
 )
 
 
 RUNTIME_GENERATION = "55555555-5555-4555-8555-555555555555"
+
+
+@pytest.mark.parametrize(
+    "metadata,expected",
+    [
+        ({}, False),
+        ({"protected_cloud": False}, False),
+        ({"protected_cloud": True}, True),
+        ({"protected_cloud": "false"}, True),
+        ({"protected_cloud": "true"}, True),
+        ({"protected_cloud": 0}, True),
+        ({"protected_cloud": 1}, True),
+        ({"protected_cloud": None}, True),
+    ],
+)
+@pytest.mark.parametrize("encoded", [False, True], ids=["mapping", "postgres-json"])
+def test_protected_cloud_requirement_accepts_the_storage_encoding(
+    metadata, expected, encoded
+):
+    stored = json.dumps(metadata) if encoded else metadata
+
+    assert thread_requests_protected_cloud({"metadata": stored}) is expected
+
+
+@pytest.mark.parametrize(
+    "stored",
+    ["", False, 0, [], "{malformed", "null", "false", "0", "[]", '"ordinary"'],
+)
+def test_invalid_stored_metadata_cannot_bypass_protected_readiness(stored):
+    assert thread_requests_protected_cloud({"metadata": stored}) is True
+
+
+@pytest.mark.parametrize("thread", [{}, {"metadata": None}])
+def test_historical_missing_metadata_remains_an_ordinary_session(thread):
+    assert thread_requests_protected_cloud(thread) is False
+
+
+def test_marker_parser_remains_strict_about_its_decoded_object_contract():
+    assert protected_cloud_marker_state('{"protected_cloud": false}') == "malformed"
 
 
 def test_binding_refusal_is_scoped_to_the_exact_runtime_generation():
