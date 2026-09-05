@@ -368,6 +368,10 @@ k8s_custom_deploy(
         # reclaim that same object on reinstall so generated encryption/Garage
         # keys do not rotate.
         '--take-ownership',
+        # Tilt observes application Pods below; Helm still gates readiness of
+        # the complete release, including databases and immutable collectors.
+        '--wait',
+        '--timeout=14m',
         '--values=deployment/values-local.yaml',
         '--values=deployment/values-tilt.yaml',
     ],
@@ -387,6 +391,22 @@ k8s_custom_deploy(
         'deployment/values-tilt.yaml',
     ],
     image_deps=[img[0] for img in _srw_images],
+)
+
+# Collectors and seed Jobs also use the orchestrator image, but run with an
+# immutable filesystem. Image matching alone would copy application edits into
+# those containers. Restrict discovery to the chart's application components;
+# dependency/migration/collector changes still rebuild the shared image above.
+k8s_resource(
+    'srw',
+    discovery_strategy='selectors-only',
+    extra_pod_selectors=[
+        {
+            'app.kubernetes.io/instance': 'srw',
+            'app.kubernetes.io/component': component,
+        }
+        for component in ['orchestrator', 'cockpit', 'mcp', 'agent-stateless', 'vm-controller']
+    ],
 )
 
 # -----------------------------------------------------------------------------
