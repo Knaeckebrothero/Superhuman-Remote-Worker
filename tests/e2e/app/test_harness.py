@@ -1178,6 +1178,44 @@ def test_stateless_sandbox_profile_renders_current_executor_and_workspace_images
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+@pytest.mark.parametrize("profile_name", ["pinned-virtual", "stateless-sandbox"])
+def test_session_profiles_do_not_render_an_extra_catalog_provider(
+    profile_name: str,
+) -> None:
+    command = [
+        "helm",
+        "template",
+        "srw-e2e",
+        str(harness.REPO_ROOT / "helm"),
+        "-n",
+        harness.NAMESPACE,
+    ]
+    for values_file in harness.resolve_profile(profile_name).values_files:
+        command.extend(("-f", str(values_file)))
+    rendered = subprocess.run(
+        command, check=True, capture_output=True, text=True, timeout=120
+    ).stdout
+    documents = [document for document in yaml.safe_load_all(rendered) if document]
+    assert not any(
+        document.get("metadata", {})
+        .get("labels", {})
+        .get("app.kubernetes.io/component")
+        == "searxng"
+        for document in documents
+    )
+    research_seed = next(
+        document
+        for document in documents
+        if document.get("kind") == "Job"
+        and document.get("metadata", {}).get("name") == "srw-e2e-research-provider-seed"
+    )
+    # A seed-only provider is enough to violate the browser's strict two-model
+    # catalogue check, even if its service were omitted from the chart.
+    environment = research_seed["spec"]["template"]["spec"]["containers"][0]["env"]
+    assert "SEARXNG_BASE_URL" not in {item["name"] for item in environment}
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
 def test_generated_app_secret_covers_every_required_rendered_key() -> None:
     rendered = subprocess.run(
         [

@@ -147,6 +147,11 @@ dozzle:
 codexProxy:
   enabled: false
 
+# Keep the session journey's catalogue exclusive to its deterministic fixture.
+# The chart normally enables and registers SearXNG as a search provider.
+searxng:
+  enabled: false
+
 nats:
   internal: false
   url: ""
