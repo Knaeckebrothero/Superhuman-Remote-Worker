@@ -2045,9 +2045,9 @@
         },
         "tool_binding_mode": {
           "type": "string",
-          "enum": ["auto", "union"],
+          "enum": ["auto", "union", "filtered"],
           "default": "auto",
-          "description": "Temporary U2 WP5 attribution control. `auto` preserves shipped behavior (`skills` uses one stable union schema; `legacy` uses phase-filtered schemas). `union` permits the planned arm C—legacy phase prose with the skills arm's stable schema. Removed with the legacy path in WP6."
+          "description": "Temporary U2 WP5 attribution control. `auto` preserves shipped behavior (`skills` uses one stable union schema; `legacy` uses phase-filtered schemas). `union` permits arm C—legacy phase prose with the skills arm's stable schema. `filtered` permits arm D—skills prose with the legacy arm's phase-filtered schema pair. Removed with the legacy path in WP6."
         }
       },
       "additionalProperties": false

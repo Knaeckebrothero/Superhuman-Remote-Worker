@@ -986,6 +986,7 @@ class TestPromptMode:
     def test_prompt_mode_validates(self):
         from src.core.loader import (
             TOOL_BINDING_MODE_AUTO,
+            TOOL_BINDING_MODE_FILTERED,
             TOOL_BINDING_MODE_UNION,
             PhaseSettings,
         )
@@ -996,6 +997,10 @@ class TestPromptMode:
         assert (
             PhaseSettings(tool_binding_mode="union").tool_binding_mode
             == TOOL_BINDING_MODE_UNION
+        )
+        assert (
+            PhaseSettings(tool_binding_mode="filtered").tool_binding_mode
+            == TOOL_BINDING_MODE_FILTERED
         )
         with pytest.raises(ValueError, match="prompt_mode"):
             PhaseSettings(prompt_mode="bogus")
@@ -1051,7 +1056,13 @@ class TestPromptMode:
         config = AgentConfig(agent_id="test", display_name="Test Agent")
         assert uses_phase_filtered_tool_binding(config) is False
 
+        # Planned arm D: skills prose, phase-filtered bindings.
+        config.phase_settings.tool_binding_mode = "filtered"
+        assert uses_legacy_phase_prompt(config) is False
+        assert uses_phase_filtered_tool_binding(config) is True
+
         config.phase_settings.prompt_mode = "legacy"
+        config.phase_settings.tool_binding_mode = "auto"
         assert uses_legacy_phase_prompt(config) is True
         assert uses_phase_filtered_tool_binding(config) is True
 

@@ -236,6 +236,21 @@ class TestBindJobTools:
         assert bound.descriptions["job_complete"].startswith("[strategic-phase tool]")
         assert bound.descriptions["request_replan"].startswith("[tactical-phase tool]")
 
+    def test_skills_prompt_with_filtered_binding_is_the_attribution_arm(self):
+        config = _make_config({})
+        config.phase_settings.tool_binding_mode = "filtered"
+        tools = [_structured(n) for n in _BIND_TOOLS]
+        agent = _bind(config, tools)
+
+        strategic, tactical = agent._llm.calls
+        assert sorted(strategic.tool_names) == ["job_complete", "read_file"]
+        assert sorted(tactical.tool_names) == ["read_file", "request_replan"]
+        assert agent._strategic_llm_with_tools is strategic
+        assert agent._tactical_llm_with_tools is tactical
+        assert agent._llm_with_tools is strategic
+        for binding in (strategic, tactical):
+            assert not any("-phase tool]" in d for d in binding.descriptions.values())
+
     def test_unregistered_tools_are_bound_in_neither_mode(self):
         for config in (_make_config({}), _legacy_config()):
             agent = _bind(

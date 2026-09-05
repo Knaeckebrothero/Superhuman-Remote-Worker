@@ -4501,7 +4501,7 @@ class UniversalAgent:
         bench's "current" arm; deleted in WP6) keeps today's phase-filtered
         pair and untouched descriptions, so arm A is honest. The temporary
         WP5 ``tool_binding_mode`` can select either shape independently of the
-        prose mode for attribution arm C; ``auto`` preserves both defaults.
+        prose mode for attribution arms C/D; ``auto`` preserves both defaults.
         """
         # parallel_tool_calls is an OpenAI Chat Completions param — suppressed
         # for providers/models that reject it (Google GenAI's
@@ -4545,7 +4545,7 @@ class UniversalAgent:
             # Keep _llm_with_tools for backwards compatibility
             self._llm_with_tools = self._strategic_llm_with_tools
             logger.info(
-                f"Loaded {len(self._tools)} tools (legacy prompt mode — "
+                f"Loaded {len(self._tools)} tools (phase-filtered binding — "
                 f"strategic: {len(strategic_tools)}, tactical: {len(tactical_tools)})"
             )
             return

@@ -2357,15 +2357,18 @@ VALID_PROMPT_MODES = frozenset({PROMPT_MODE_SKILLS, PROMPT_MODE_LEGACY})
 
 # Temporary WP5 attribution control. ``auto`` preserves the shipped coupling
 # (skills -> one union binding, legacy -> a phase-filtered pair). ``union``
-# permits the planned arm C: legacy phase prose with the same stable union
-# schema as skills mode. Defaults never change; WP6 removes this switch with
-# the legacy path.
+# permits arm C: legacy phase prose with the same stable union schema as skills
+# mode. ``filtered`` permits arm D: skills prose with the legacy arm's
+# phase-filtered schema pair. Defaults never change; WP6 removes this switch
+# with the legacy path.
 TOOL_BINDING_MODE_AUTO = "auto"
 TOOL_BINDING_MODE_UNION = "union"
+TOOL_BINDING_MODE_FILTERED = "filtered"
 VALID_TOOL_BINDING_MODES = frozenset(
     {
         TOOL_BINDING_MODE_AUTO,
         TOOL_BINDING_MODE_UNION,
+        TOOL_BINDING_MODE_FILTERED,
     }
 )
 
@@ -2380,7 +2383,8 @@ class PhaseSettings:
     floor to 2. ``prompt_mode`` selects how the worker receives its phase
     guidance (see ``PROMPT_MODE_SKILLS`` / ``PROMPT_MODE_LEGACY``).
     ``tool_binding_mode`` is temporary WP5 measurement scaffolding that can
-    decouple schema shape from the prompt treatment. Both ride
+    decouple schema shape from the prompt treatment (``auto | union |
+    filtered``). Both ride
     ``config_override`` like every other key here and are frozen with the job.
     """
 
@@ -5101,12 +5105,15 @@ def uses_phase_filtered_tool_binding(config: Any) -> bool:
 
     ``auto`` preserves the pre-attribution behavior, including old frozen
     system-prompt templates. Explicit modes decouple tool schema shape from
-    phase prose solely so WP5 can attribute its A/B result.
+    phase prose solely so WP5 can attribute its A/B result: ``union`` forces
+    one stable schema and ``filtered`` forces the per-phase pair.
     """
 
     mode = tool_binding_mode_of(config)
     if mode == TOOL_BINDING_MODE_UNION:
         return False
+    if mode == TOOL_BINDING_MODE_FILTERED:
+        return True
     return uses_legacy_phase_prompt(config)
 
 

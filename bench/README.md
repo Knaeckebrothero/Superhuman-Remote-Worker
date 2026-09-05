@@ -70,6 +70,12 @@ the current block. The query's single-phase tool list has a test that compares
 it directly with `TOOL_REGISTRY`, so registry changes cannot silently stale the
 acceptance check.
 
+The temporary U2 attribution matrix also accepts
+`phase_settings.tool_binding_mode: filtered`: this keeps skills-mode phase
+instructions while binding the same strategic/tactical schema pair as legacy.
+Together with `legacy + union`, it completes the two-by-two prompt/schema
+attribution without changing the shipped `auto` default.
+
 ## Task families
 
 | prefix | family | config | what it exercises |

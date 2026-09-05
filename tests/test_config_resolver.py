@@ -690,6 +690,22 @@ def test_legacy_prompt_mode_flows_through_config_override_and_skips_the_floor():
     assert default["agent"]["phase_settings"]["tool_binding_mode"] == "auto"
 
 
+def test_filtered_tool_binding_mode_round_trips_with_skills_prompt():
+    from src.core.loader import load_config_from_resolved
+
+    blob = resolve_config(
+        base_config_name="assistant",
+        expert_type="worker",
+        request_override={"phase_settings": {"tool_binding_mode": "filtered"}},
+    )
+    assert blob["agent"]["phase_settings"]["prompt_mode"] == "skills"
+    assert blob["agent"]["phase_settings"]["tool_binding_mode"] == "filtered"
+    assert len(_phase_bindings(blob["agent"]["instruction_files"])) == 2
+    hydrated = load_config_from_resolved(blob)
+    assert hydrated.phase_settings.prompt_mode == "skills"
+    assert hydrated.phase_settings.tool_binding_mode == "filtered"
+
+
 def test_invalid_prompt_mode_is_refused_at_resolution():
     import pytest
 
