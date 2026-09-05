@@ -163,8 +163,9 @@ def client_ip(websocket, trusted_proxies: Sequence[str] = ()) -> str:
     """The source address this connection is rate-limited and audited as.
 
     ``X-Forwarded-For`` is believed only when the socket peer is one of
-    ``trusted_proxies``, and then only its RIGHTMOST entry. Both halves
-    matter:
+    ``trusted_proxies``, and then read RIGHT to LEFT, skipping entries that
+    are themselves trusted proxies; the first untrusted entry is the client.
+    Every clause matters:
 
     * Trusting it unconditionally (the plan's original ``_client_ip``) lets
       any client send a fresh header per connection and mint a fresh
@@ -172,10 +173,22 @@ def client_ip(websocket, trusted_proxies: Sequence[str] = ()) -> str:
       in ``GatewayLimiter`` — the module that exists precisely because
       asyncssh ships no MaxStartups or PerSourceMaxStartups.
     * Taking the FIRST entry (also the original) reads the attacker's half of
-      the header. ingress-nginx sets ``$proxy_add_x_forwarded_for``, which
-      APPENDS the real peer to whatever the client already sent, so with one
-      trusted hop the rightmost entry is the one the trusted hop wrote and
-      everything left of it is client-supplied fiction.
+      the header. Proxies APPEND the real peer to whatever the client already
+      sent, so everything left of the last untrusted entry is client-supplied
+      fiction.
+    * Taking the RIGHTMOST entry unconditionally (this function until
+      2026-09-05) is only correct behind exactly one trusted hop. Behind
+      cloudflared → Traefik the ingress appends the *tunnel connector's* pod
+      address, so the rightmost entry is the second proxy: every external
+      user collapsed into one per-source bucket keyed by cloudflared's pod
+      IP, and the audit trail recorded that constant instead of the client.
+      Skipping trusted entries handles any chain depth and degrades to the
+      old behaviour for the one-hop case.
+
+    When every entry is trusted, the leftmost is returned: the originator
+    itself lives inside the trusted range (an in-cluster caller through the
+    ingress), and falling back to the peer would collapse it into the
+    ingress hop's bucket — the defect this walk exists to fix.
 
     The TCP transport does not come through here at all: it has a real socket
     peer and no headers.
@@ -183,10 +196,12 @@ def client_ip(websocket, trusted_proxies: Sequence[str] = ()) -> str:
     peer = getattr(getattr(websocket, "client", None), "host", "") or ""
     if trusted_proxies and _address_matches(peer, trusted_proxies):
         forwarded = websocket.headers.get("x-forwarded-for", "")
-        if forwarded:
-            rightmost = forwarded.split(",")[-1].strip()
-            if rightmost:
-                return rightmost
+        entries = [e.strip() for e in forwarded.split(",") if e.strip()]
+        for entry in reversed(entries):
+            if not _address_matches(entry, trusted_proxies):
+                return entry
+        if entries:
+            return entries[0]
     return peer or "unknown"
 
 

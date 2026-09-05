@@ -120,6 +120,36 @@ def test_a_single_trusted_address_without_a_mask_works():
     assert client_ip(ws, ("10.42.3.9",)) == "198.51.100.7"
 
 
+def test_two_trusted_hops_yield_the_client_not_the_intermediate_proxy():
+    """cloudflared -> Traefik is TWO trusted hops: Traefik appends cloudflared's
+    pod address, so the rightmost entry is the second proxy, not the client.
+    Walk right to left past every trusted entry; the first untrusted one is
+    the client. Observed live on dev (2026-09-03): 12 tunnel attaches all
+    rate-limited and audited as cloudflared's pod IP ``10.42.2.111``."""
+    ws = _ws({"x-forwarded-for": "2a00:20:d000::9, 10.42.2.111"}, host="10.42.3.9")
+    assert client_ip(ws, ("10.42.0.0/16",)) == "2a00:20:d000::9"
+
+
+def test_a_spoofed_leading_entry_does_not_win_through_two_hops():
+    """The client-supplied fiction sits LEFT of the entry the edge wrote.
+    Skipping trusted entries must stop at the first untrusted one, not walk
+    all the way to the attacker's half."""
+    ws = _ws(
+        {"x-forwarded-for": "1.2.3.4, 198.51.100.7, 10.42.2.111"},
+        host="10.42.3.9",
+    )
+    assert client_ip(ws, ("10.42.0.0/16",)) == "198.51.100.7"
+
+
+def test_an_entirely_trusted_chain_falls_back_to_the_leftmost_entry():
+    """Every entry inside the trusted range means the originator itself lives
+    there (an in-cluster caller through the ingress). The leftmost entry is
+    the origin; falling back to the peer would collapse it into the ingress
+    hop's bucket -- the exact defect this walk exists to fix."""
+    ws = _ws({"x-forwarded-for": "10.42.5.5, 10.42.2.111"}, host="10.42.3.9")
+    assert client_ip(ws, ("10.42.0.0/16",)) == "10.42.5.5"
+
+
 # ---------------------------------------------------------------------------
 # the bearer token
 # ---------------------------------------------------------------------------

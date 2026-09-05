@@ -280,7 +280,7 @@ canvas:
 #   enabled: true
 #   hostname: "ssh.example.com"
 #   allowedOrigins: ["https://app.example.com"]
-#   trustedProxies: "10.42.0.0/16"     # your ingress hop, or the literal "none"
+#   trustedProxies: "10.42.0.0/16"     # every proxy hop (ingress + tunnel connector), or the literal "none"
 #   hostKeySecret: "srw-ssh-gateway-hostkey"
 #   userCaSecret: "srw-ssh-gateway-ca"
 #   tcp:
