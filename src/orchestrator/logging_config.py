@@ -8,26 +8,26 @@ index and query them — and so ``kubectl logs`` is greppable by ``job_id`` toda
 ``LOG_FORMAT=json`` selects structured output (set in the cluster ConfigMap);
 the default is ``text`` so local/dev terminals and tests stay readable.
 
-This module is intentionally self-contained — it shares no code with the
-agent's ``src/agent/core/logging_config.py`` because the orchestrator and agent ship
-as separate images with no common import path. The two ``redact()``
-implementations must stay in sync; both are covered by tests
-(``tests/test_logging_config.py``).
+Redaction and JSON formatting live in ``shared.logging_format``. This
+adapter owns application correlation state, text formatting and logging setup.
 """
 
 from __future__ import annotations
 
 import contextvars
-import json
 import logging
 import os
 import re
 from contextlib import contextmanager
-from datetime import datetime, timezone
 from typing import Any, Iterator
 from uuid import uuid4
 
+from shared.logging_format import REDACTED
+from shared.logging_format import JsonLogFormatter as _JsonLogFormatter
+from shared.logging_format import redact as redact
+
 COMPONENT = "orchestrator"
+_REDACTED = REDACTED
 
 # ---------------------------------------------------------------------------
 # Correlation context (propagates across await/tasks via contextvars)
@@ -36,9 +36,6 @@ COMPONENT = "orchestrator"
 _log_context: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar(
     "srw_log_context", default={}
 )
-
-# Promoted to stable top-level keys, in this order, when present.
-_CORRELATION_KEYS = ("request_id", "job_id", "thread_id", "agent_id", "phase")
 
 
 def bind_log_context(**fields: Any) -> contextvars.Token:
@@ -79,85 +76,15 @@ def log_context(**fields: Any) -> Iterator[None]:
 
 
 # ---------------------------------------------------------------------------
-# Secret redaction (defense-in-depth — code should never log raw secrets)
-# ---------------------------------------------------------------------------
-
-_REDACTED = "***REDACTED***"
-
-# key: <value> / key=<value> for secret-ish key names.
-_KV_SECRET = re.compile(
-    r"(?i)\b(authorization|api[_-]?key|secret|client[_-]?secret|password|passwd|"
-    r"token|access[_-]?key|private[_-]?key|refresh[_-]?token)"
-    r"(\"?\s*[:=]\s*\"?)"
-    r"([^\s\"',}{)]+)"
-)
-# Standalone secret-shaped tokens.
-_STANDALONE = [
-    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._\-]+"),  # bearer <opaque/jwt>
-    re.compile(r"\beyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"),  # JWT
-    re.compile(r"\bsk-[A-Za-z0-9_\-]{16,}"),  # OpenAI / Anthropic style
-    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{8,}"),  # Slack
-    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{16,}"),  # GitHub
-]
-
-
-def redact(text: str) -> str:
-    """Mask secret-shaped substrings. Introduces no quotes/newlines, so the
-    result stays valid inside a JSON string."""
-    if not text:
-        return text
-    text = _KV_SECRET.sub(lambda m: f"{m.group(1)}{m.group(2)}{_REDACTED}", text)
-    for pattern in _STANDALONE:
-        text = pattern.sub(_REDACTED, text)
-    return text
-
-
-# ---------------------------------------------------------------------------
 # Formatters
 # ---------------------------------------------------------------------------
 
-# Intrinsic LogRecord attributes; anything else on the record is treated as
-# structured ``extra=`` and included in the JSON output.
-_RESERVED = set(logging.makeLogRecord({}).__dict__.keys()) | {
-    "message",
-    "asctime",
-    "taskName",
-    "color_message",  # uvicorn passes an ANSI-laden duplicate of the message
-}
 
-
-class JsonLogFormatter(logging.Formatter):
-    """One JSON object per line, with correlation context and redaction."""
+class JsonLogFormatter(_JsonLogFormatter):
+    """One JSON object per line, with application-local correlation context."""
 
     def __init__(self, component: str = COMPONENT) -> None:
-        super().__init__()
-        self.component = component
-
-    def format(self, record: logging.LogRecord) -> str:
-        rec: dict[str, Any] = {
-            "ts": datetime.fromtimestamp(record.created, timezone.utc)
-            .isoformat()
-            .replace("+00:00", "Z"),
-            "level": record.levelname,
-            "logger": record.name,
-            "component": self.component,
-            "message": redact(record.getMessage()),
-            "file": f"{record.filename}:{record.lineno}",
-        }
-        ctx = _log_context.get()
-        for key in _CORRELATION_KEYS:
-            if key in ctx:
-                rec[key] = ctx[key]
-        for key, value in ctx.items():
-            rec.setdefault(key, value)
-        for key, value in record.__dict__.items():
-            if key not in _RESERVED and key not in rec:
-                rec[key] = value
-        if record.exc_info:
-            rec["exc"] = redact(self.formatException(record.exc_info))
-        if record.stack_info:
-            rec["stack"] = redact(self.formatStack(record.stack_info))
-        return json.dumps(rec, default=str, ensure_ascii=False)
+        super().__init__(component=component, context_getter=_log_context.get)
 
 
 class TextLogFormatter(logging.Formatter):
