@@ -23,6 +23,11 @@ COPY src/shared/__init__.py src/shared/vm_lifecycle_auth.py ./src/shared/
 COPY pyproject.toml ./
 RUN pip install --no-cache-dir --no-deps -e .
 
+# Check generated SDK auth and token refresh in this final installed environment.
+# The bind mount is build-only; the probe never reads credentials or uses a network.
+RUN --network=none --mount=type=bind,source=scripts/check_kubernetes_sdk_auth.py,target=/tmp/check_kubernetes_sdk_auth.py \
+    python -I /tmp/check_kubernetes_sdk_auth.py
+
 # Non-root user — K8s RBAC handles authorization
 RUN useradd --create-home --no-log-init controller
 USER controller

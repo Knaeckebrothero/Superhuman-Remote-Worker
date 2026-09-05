@@ -794,14 +794,16 @@ jobs:
           AGENT_PATHS=(src/agent/ src/shared/ config/ requirements.txt pyproject.toml
             .dockerignore docker/Dockerfile.agent docker/prepare-tokenizer-cache.py)
           ORCHESTRATOR_PATHS=(src/orchestrator/ src/shared/ config/ pyproject.toml
-            .dockerignore docker/Dockerfile.orchestrator)
+            .dockerignore docker/Dockerfile.orchestrator
+            scripts/check_kubernetes_sdk_auth.py)
           COCKPIT_PATHS=(cockpit/ .dockerignore docker/Dockerfile.cockpit
             docker/cockpit-nginx.conf docker/cockpit-canvas-env.sh)
           MCP_PATHS=(src/mcp_server/ src/shared/ pyproject.toml
             .dockerignore docker/Dockerfile.mcp)
           VM_CONTROLLER_PATHS=(src/vm_controller/ src/shared/__init__.py
             src/shared/vm_lifecycle_auth.py pyproject.toml
-            .dockerignore docker/Dockerfile.vm-controller)
+            .dockerignore docker/Dockerfile.vm-controller
+            scripts/check_kubernetes_sdk_auth.py)
           # docker/browser-exec is COPY'd into the workspace image at build time
           # (see Dockerfile.workspace §2c), so changes to it must rebuild the
           # workspace image. Missing this path caused a0ce92d2's browser-exec
