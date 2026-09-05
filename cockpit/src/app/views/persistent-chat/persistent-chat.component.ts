@@ -646,6 +646,22 @@ export function pickCodeServerUrlToOpen(status: IdeSessionStatus | null): string
 }
 
 /**
+ * Whether this session's workspace is something the SSH gateway can reach.
+ * The SSH button used to render off `capabilities.sshGateway()` alone and so
+ * appeared on sessions with no container-backed workspace at all (connecting
+ * answers `srw: this session has no workspace yet`). Reachability is the same
+ * signal the IDE button reads: `active` and `restoring` mean a pod exists or
+ * is being made, and a typed refusal `code` means the IDE advertisement was
+ * withheld from a pod that IS ready (contain_ide_status_for only downgrades
+ * payloads that were about to advertise a URL) — where SSH is exactly the
+ * working fallback.
+ */
+export function sshWorkspaceReachable(status: IdeSessionStatus | null): boolean {
+    if (!status) return false;
+    return status.status === 'active' || status.status === 'restoring' || !!status.code;
+}
+
+/**
  * Pull file payloads out of a paste's clipboard items (#11 paste-to-attach),
  * dropping the `kind: 'string'` entries (plain text / HTML) so a text paste
  * falls through to the textarea untouched. Clipboard images frequently arrive
@@ -960,7 +976,7 @@ export function clearDraft(threadId: string | null): void {
                     <app-menu-item [disabled]="true">{{ 'chat.header.ideLoadingTooltip' | transloco }}</app-menu-item>
                   }
                 }
-                @if (capabilities.sshGateway()) {
+                @if (sshButtonVisible()) {
                   <app-menu-item (activated)="showSshPanel.update(v => !v)">{{ 'chat.header.sshButton' | transloco }}</app-menu-item>
                 }
               </app-menu>
@@ -1019,7 +1035,7 @@ export function clearDraft(threadId: string | null): void {
                   </button>
                 }
               }
-              @if (capabilities.sshGateway()) {
+              @if (sshButtonVisible()) {
                 <button class="ide-btn" (click)="showSshPanel.update(v => !v)"
                         [title]="'chat.header.sshTooltip' | transloco">
                   <app-icon size="sm" class="ide-icon">terminal</app-icon>
@@ -2605,6 +2621,12 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         if (!gateway || gateway.host_keys.length === 0) return '';
         return gateway.host_keys[0]?.fingerprint ?? '';
     });
+
+    /** SSH button gate: a deployed gateway AND a workspace it can reach —
+     *  see {@link sshWorkspaceReachable} for what counts as reachable. */
+    readonly sshButtonVisible = computed(
+        () => !!this.capabilities.sshGateway() && sshWorkspaceReachable(this.ideStatus()),
+    );
 
     /**
      * Fold the header's secondary actions into the `⋮` overflow menu.
