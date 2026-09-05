@@ -15,7 +15,7 @@ uvicorn orchestrator.main:app --reload --port 8085
 ```
 
 The service uses the cluster's databases. See the root
-[development guide](../../docs/development.md) for local setup. `src/` is a
+[development guide](../../README.md) for local setup. `src/` is a
 source root; imports use `orchestrator`, with common support in `shared`.
 
 ## Architecture
@@ -34,9 +34,12 @@ src/orchestrator/
 
 src/mcp_server/
 ├── server.py            # MCP tools and server
-├── client.py            # Async HTTP client for orchestrator API
+├── job_adapter.py       # MCP adapter for shared job actions
 ├── __main__.py          # python -m mcp_server
 └── requirements.txt
+
+src/shared/orch_surface/
+└── client.py            # Shared authenticated HTTP client for orchestrator API
 ```
 
 ## API Endpoints

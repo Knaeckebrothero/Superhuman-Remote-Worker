@@ -74,17 +74,20 @@ python -m pytest tests/test_auxiliary.py tests/test_auxiliary_fallback.py \
 
 ## §1. Static check — the fix is in the deployed code
 
+Paths and fallback log markers below match the current source (2026-09-05).
+The original unit-test counts and pending live-test status remain historical.
+
 ```bash
 # Local repo
-grep -n "provider=aux" src/agent.py src/api/persistent_app.py          # 3 hits (threading)
-grep -n "elif config.model and config.model.lower().startswith(\"openrouter/\")" src/core/loader.py
-grep -n "AUXILIARY FALLING BACK TO MAIN MODEL" src/services/auxiliary.py
+rg -n "provider=aux" src/agent/agent.py src/agent/api/persistent_app.py
+rg -n -F 'elif config.model and config.model.lower().startswith("openrouter/")' src/shared/runtime/core/loader.py
+rg -n -F "AUXILIARY OUTPUT PARSE/transport failure" src/shared/runtime/services/auxiliary.py
 
-# In a running agent pod (Tilt syncs src/ on k3d; dev ships the image):
+# In a running agent pod (Tilt rebuilds agent images on source changes):
 CTX=k3d-srw NS=srw   # or CTX=main NS=superhuman-remote-worker
 AGENT=$(kubectl --context=$CTX -n $NS get pods -o name | grep -E 'agent-(s|j)-' | head -1)
 kubectl --context=$CTX -n $NS exec ${AGENT#pod/} -c agent -- \
-  grep -c "AUXILIARY FALLING BACK TO MAIN MODEL" /app/src/services/auxiliary.py
+  grep -c -F "AUXILIARY OUTPUT PARSE/transport failure" /app/src/shared/runtime/services/auxiliary.py
 # expect: 1  (fallback code present)
 ```
 
@@ -101,8 +104,8 @@ The exact incident session was `182a8fc1-625c-4112-a9cc-0c2439506f1e`
      and the agent log shows the aux call going to `openrouter.ai` — NOT a 401
      from `platform.openai.com`.
    - **Or graceful fallback:** if the OpenRouter key/model is itself bad, the
-     session still works and the log shows `AUXILIARY FALLING BACK TO MAIN
-     MODEL … retrying on main model 'gpt-5.5'`, and `aux_degraded=true` (§4).
+     session still works and the log shows `AUXILIARY OUTPUT PARSE/transport
+     failure … retrying on main model 'gpt-5.5'`, and `aux_degraded=true` (§4).
 4. **FAIL:** "Untitled Session" with a silent `AUXILIARY MODEL DEGRADED` /
    `platform.openai.com` 401 and no fallback line = fix not effective.
 
@@ -153,8 +156,8 @@ the main-model fallback must cover it.
    conversation triggers memory/compaction).
 4. **Expected — PASS:**
    - The session **responds** (main model unaffected).
-   - Agent log shows `AUXILIARY FALLING BACK TO MAIN MODEL: aux model 'gemma-4-moe'
-     failed on task '…' … retrying on main model '<main>'`.
+   - Agent log shows `AUXILIARY OUTPUT PARSE/transport failure on aux model
+     'gemma-4-moe' for task '…' … retrying on main model '<main>'`.
    - A title is still generated (via the main model).
    - `srw-agent-*` pod stays `Running`, 0 restarts (no crash).
 5. **FAIL:** session hangs / pod crashes / no fallback log / silent "Untitled".
