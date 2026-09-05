@@ -235,7 +235,10 @@ class TestBackendSelection:
 
 
 def test_connect_logs_mode(mock_db, caplog):
-    with patch.dict(os.environ, {"VM_MODE": "off"}):
+    with (
+        patch.dict(os.environ, {"VM_MODE": "off"}),
+        caplog.at_level("INFO", logger="orchestrator.services.vm_provisioner"),
+    ):
         from orchestrator.services.vm_provisioner import VMProvisioner
 
         provisioner = VMProvisioner()
