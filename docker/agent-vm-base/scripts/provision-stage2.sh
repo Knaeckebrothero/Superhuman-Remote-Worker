@@ -55,6 +55,10 @@ echo "agent-host ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/agent-host
 sudo chmod 0440 /etc/sudoers.d/agent-host
 # Allow agent-host to read systemd journal (for debugging daemon issues)
 sudo usermod -aG systemd-journal agent-host
+# Docker Engine (stage 1) is rootful; group membership is what lets agent-host
+# drive it without sudo — and it must be baked in here, because a group added
+# at job time only reaches NEW login shells (probe 1, 2026-09-04, obstacle 5).
+sudo usermod -aG docker agent-host
 
 # Workspace lives in a dedicated subdirectory of home — keeps dotfiles
 # separate and provides a clean target for git clone.
@@ -92,15 +96,14 @@ sudo -u agent-host mkdir -p /home/agent-host/.config/systemd/user/sockets.target
 sudo -u agent-host ln -sf /usr/lib/systemd/user/podman.socket \
     /home/agent-host/.config/systemd/user/sockets.target.wants/podman.socket
 
-# Point Docker-API clients at that socket for every shell agent-host opens.
-sudo tee /etc/profile.d/podman-docker-host.sh > /dev/null <<'PODMANEOF'
-# Rootless podman exposes a Docker-compatible API socket; DOCKER_HOST lets
-# compose v2, testcontainers and other Docker-API clients find it.
-if [ -z "${DOCKER_HOST:-}" ] && [ -S "/run/user/$(id -u)/podman/podman.sock" ]; then
-    export DOCKER_HOST="unix:///run/user/$(id -u)/podman/podman.sock"
-fi
-PODMANEOF
-sudo chmod 0644 /etc/profile.d/podman-docker-host.sh
+# DOCKER_HOST is deliberately NOT exported. /usr/bin/docker is Docker Engine's
+# own CLI and talks to /var/run/docker.sock (agent-host is in `docker`). The
+# rootless podman socket stays reachable for anything that asks for it
+# explicitly (CONTAINER_HOST / `podman --remote`); exporting it as DOCKER_HOST
+# silently redirected the Docker CLI to podman even after Docker Engine was
+# installed (probe 1, 2026-09-04, obstacle 5). Remove any snippet a previous
+# image revision left behind so a re-run of stage 2 converges.
+sudo rm -f /etc/profile.d/podman-docker-host.sh
 
 # Agent runtime directory
 sudo mkdir -p /run/agent

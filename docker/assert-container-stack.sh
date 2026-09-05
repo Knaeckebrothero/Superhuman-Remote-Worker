@@ -54,7 +54,10 @@ echo "=== container stack (rootless podman) ==="
 
 # --- engine + CLI surface ----------------------------------------------------
 if out=$(podman --version 2>&1); then _ok "$out"; else _bad "podman ($out)"; fi
-_need_bin docker         "Docker CLI shim (podman-docker); workers and compose files say 'docker'"
+_need_bin docker         "Docker Engine CLI (docker-ce-cli); workers and compose files say 'docker'"
+if docker --version 2>/dev/null | grep -qi podman; then _bad "docker is the podman shim, not Docker Engine's CLI"; else _ok "docker is Docker Engine's CLI"; fi
+for bin in dockerd containerd kubectl helm k3d tilt mkcert; do _need_bin "$bin" "local-Kubernetes tooling (stage 1 §2b)"; done
+if [ -f /etc/profile.d/podman-docker-host.sh ]; then _bad "/etc/profile.d/podman-docker-host.sh present — DOCKER_HOST would be redirected to podman"; else _ok "no DOCKER_HOST redirect snippet"; fi
 _need_bin podman-compose "compose stacks (a postgres beside the app is the common case)"
 
 # --- rootless prerequisites --------------------------------------------------
@@ -101,13 +104,8 @@ else
     _bad "unqualified-search-registries in /etc/containers/registries.conf"
 fi
 
-# podman-docker's banner goes to stderr on every docker invocation, and agents
-# read stderr as evidence.
-if [ -f /etc/containers/nodocker ]; then
-    _ok "/etc/containers/nodocker (docker shim stays quiet on stderr)"
-else
-    _bad "/etc/containers/nodocker — docker shim will print an emulation banner to stderr" warn
-fi
+# The podman-docker shim (and its /etc/containers/nodocker banner switch) is
+# gone: /usr/bin/docker is Docker Engine's CLI since stage 1 §2b.
 
 # --- live checks -------------------------------------------------------------
 # `podman info` needs a user runtime dir, which does not exist during an image
