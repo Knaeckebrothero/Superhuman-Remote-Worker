@@ -19,6 +19,7 @@ COPY src/vm_controller/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY src/vm_controller/ ./src/vm_controller/
+COPY src/shared/__init__.py src/shared/vm_lifecycle_auth.py ./src/shared/
 COPY pyproject.toml ./
 RUN pip install --no-cache-dir --no-deps -e .
 

@@ -798,6 +798,9 @@ jobs:
             docker/cockpit-nginx.conf docker/cockpit-canvas-env.sh)
           MCP_PATHS=(src/mcp_server/ src/shared/ pyproject.toml
             .dockerignore docker/Dockerfile.mcp)
+          VM_CONTROLLER_PATHS=(src/vm_controller/ src/shared/__init__.py
+            src/shared/vm_lifecycle_auth.py pyproject.toml
+            .dockerignore docker/Dockerfile.vm-controller)
           # docker/browser-exec is COPY'd into the workspace image at build time
           # (see Dockerfile.workspace §2c), so changes to it must rebuild the
           # workspace image. Missing this path caused a0ce92d2's browser-exec
@@ -824,7 +827,7 @@ jobs:
           WORKSPACE_SHA=$(last_input_sha "${WORKSPACE_PATHS[@]}")
           WORKSPACE=$(image_missing workspace "$WORKSPACE_SHA")
 
-          VM_CONTROLLER_SHA=$(last_input_sha src/vm_controller/ pyproject.toml .dockerignore docker/Dockerfile.vm-controller)
+          VM_CONTROLLER_SHA=$(last_input_sha "${VM_CONTROLLER_PATHS[@]}")
           VM_CONTROLLER=$(image_missing vm-controller "$VM_CONTROLLER_SHA")
 
           # Stage1 rebuilds on changes to the heavy provisioning script, the
