@@ -184,3 +184,32 @@ def test_agent_egress_policy_admits_only_fixed_provider_pods() -> None:
             }
 
     assert fixed_destinations == {"searxng": {8080}, "crawl4ai": {11235}}
+
+
+def _research_seed_wait(objects: list[dict]) -> tuple[int, int]:
+    """(attempt cap in the init-container wait loop, Job activeDeadlineSeconds)."""
+    seed = _one(objects, "research-provider-seed", "Job")
+    init = seed["spec"]["template"]["spec"]["initContainers"][0]
+    script = init["command"][-1]
+    import re
+
+    match = re.search(r'\[ "\$i" -ge (\d+) \]', script)
+    assert match, script
+    return int(match.group(1)), int(seed["spec"]["activeDeadlineSeconds"])
+
+
+def test_research_seed_hook_wait_defaults_to_five_minutes() -> None:
+    attempts, deadline = _research_seed_wait(_render())
+    assert attempts == 100  # 300 s / 3 s poll
+    assert deadline == 600  # wait + 300 s for the seed itself
+
+
+def test_research_seed_hook_wait_is_configurable_for_cold_local_installs() -> None:
+    """A fresh k3d install pulls every image and walks Keycloak → Gitea →
+    orchestrator before the hook can succeed; 300 s is not enough (probe 1,
+    2026-09-04). The wait and the Job deadline must scale together."""
+    attempts, deadline = _research_seed_wait(
+        _render("llm.seed.researchProviderWaitSeconds=900")
+    )
+    assert attempts == 300
+    assert deadline == 1200

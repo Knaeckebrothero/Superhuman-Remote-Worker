@@ -93,10 +93,15 @@ The local overlay deliberately selects:
 It does not require CloudNativePG. Install CNPG separately only when testing the
 HA database path from the [Helm guide](../helm/README.md).
 
-The source chart uses moving `latest` component tags for the development path.
-That is convenient for this disposable evaluation, but it is not reproducible.
-For a durable deployment, use a tagged OCI chart and override every component
-image with the matching release tag or a verified digest, as described in the
+The chart's default component tags are `latest`, which the `main` pipeline
+publishes. A `develop` checkout's chart can be ahead of those images (a hook
+or flag that only exists on `develop`), so the bootstrap script resolves, per
+component, the newest image built from your checkout's git history and writes
+the tags to `deployment/values-local-images.yaml`. Pass that file after
+`values-local.yaml` on every install and upgrade; re-run the bootstrap after
+pulling to refresh it. Set `SRW_IMAGE_PIN=0` to skip pinning. For a durable
+deployment, use a tagged OCI chart and override every component image with the
+matching release tag or a verified digest, as described in the
 [production install guide](../helm/README.md#production-install-bring-your-own).
 
 ## 2. Bootstrap the cluster
@@ -112,8 +117,10 @@ The script is idempotent. It:
 3. uploads the mkcert CA and creates a ClusterIssuer;
 4. creates the `srw` namespace;
 5. creates the session-router JWT and local VM SSH Secrets if absent;
-6. maps the local ingress hostnames through cluster DNS; and
-7. downloads the Helm dependencies pinned by `Chart.lock`.
+6. maps the local ingress hostnames through cluster DNS;
+7. downloads the Helm dependencies pinned by `Chart.lock`; and
+8. pins the component image tags to this checkout in
+   `deployment/values-local-images.yaml`.
 
 Re-running it preserves existing Secrets and persistent volumes.
 
@@ -123,8 +130,17 @@ Re-running it preserves existing Secrets and persistent volumes.
 helm install srw ./helm \
   --namespace srw \
   --kube-context k3d-srw \
-  --values deployment/values-local.yaml
+  --values deployment/values-local.yaml \
+  --values deployment/values-local-images.yaml
 ```
+
+The first install of a fresh cluster pulls every image and starts the
+databases, Keycloak, Gitea and the orchestrator in sequence; the post-install
+seed hook waits for the orchestrator's health endpoint for
+`llm.seed.researchProviderWaitSeconds` (the local values file sets 900 s). If
+the hook still times out, the workloads keep converging — check
+`kubectl get pods` and re-run the same command as `helm upgrade` once the
+orchestrator is `Running`.
 
 Watch startup:
 

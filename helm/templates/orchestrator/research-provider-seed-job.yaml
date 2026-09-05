@@ -20,9 +20,14 @@ metadata:
     "helm.sh/hook": post-install,post-upgrade
     "helm.sh/hook-weight": "10"
     "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+{{- $waitSeconds := int (default 300 .Values.llm.seed.researchProviderWaitSeconds) }}
+{{- $waitAttempts := div $waitSeconds 3 }}
 spec:
   backoffLimit: 2
-  activeDeadlineSeconds: 600
+  # The seed itself needs well under 300 s once the orchestrator answers; the
+  # deadline is the health wait plus that margin so a slow cold start cannot
+  # make the Job time out before its own wait loop gives up.
+  activeDeadlineSeconds: {{ add $waitSeconds 300 }}
   ttlSecondsAfterFinished: 600
   template:
     metadata:
@@ -45,8 +50,8 @@ spec:
               i=0
               until wget -q -O- http://{{ include "srw.fullname" . }}-orchestrator:8085/api/health >/dev/null; do
                 i=$((i+1))
-                [ "$i" -ge 100 ] && { echo "orchestrator not ready after 300s; failing the research seed hook"; exit 1; }
-                echo "waiting for orchestrator ($i/100)"; sleep 3
+                [ "$i" -ge {{ $waitAttempts }} ] && { echo "orchestrator not ready after {{ $waitSeconds }}s; failing the research seed hook"; exit 1; }
+                echo "waiting for orchestrator ($i/{{ $waitAttempts }})"; sleep 3
               done
       containers:
         - name: seed

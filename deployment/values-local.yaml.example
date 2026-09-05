@@ -31,22 +31,15 @@ global:
   # imagePullSecrets:
   #   - name: ghcr-pull-secret
 
-# Image override — use ONLY when GHCR `:latest` is older than the chart on
-# `develop` HEAD (rare; CI rebuilds on every push). The README troubleshooting
-# section has the docker build + k3d image import commands.
-# image:
-#   orchestrator:
-#     repository: docker.io/library/srw-orchestrator
-#     tag: local-fix
-#     pullPolicy: IfNotPresent
-#   cockpit:
-#     repository: docker.io/library/srw-cockpit
-#     tag: local-fix
-#     pullPolicy: IfNotPresent
-#   agent:
-#     repository: docker.io/library/srw-agent
-#     tag: local-fix
-#     pullPolicy: IfNotPresent
+# Component image tags: do NOT set them here. The chart defaults to `:latest`,
+# which is built from `main`; a `develop` checkout's chart can be ahead of it.
+# `scripts/local-dev-up.sh` writes `deployment/values-local-images.yaml` with
+# every component pinned to the newest image built from THIS checkout's
+# history — pass it after this file on every install/upgrade:
+#   helm install srw ./helm -n srw --kube-context k3d-srw \
+#     -f deployment/values-local.yaml -f deployment/values-local-images.yaml
+# To run locally built images instead, override `image.<component>` in that
+# generated file (it is gitignored and regenerated on every bootstrap run).
 
 # -----------------------------------------------------------------------------
 # Cockpit BFF — HTTPS via mkcert CAIssuer, cookies are Secure. Domain left
@@ -443,3 +436,12 @@ logFormat: "text"
 keycloak:
   devUsers:
     enabled: true
+
+# -----------------------------------------------------------------------------
+# Research-provider seed hook: a fresh single-node install pulls every image
+# and walks Keycloak -> Gitea -> orchestrator before the hook can succeed; the
+# chart default of 300 s failed revision 1 of a clean install on 2026-09-04.
+# -----------------------------------------------------------------------------
+llm:
+  seed:
+    researchProviderWaitSeconds: 900

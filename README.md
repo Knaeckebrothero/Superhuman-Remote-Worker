@@ -87,11 +87,14 @@ $EDITOR deployment/values-local.yaml
 # Create the cluster, local TLS/DNS, required Secrets, and chart dependencies.
 ./scripts/local-dev-up.sh
 
-# Install the application.
+# Install the application. The second values file is written by the bootstrap
+# and pins every component image to this checkout (the chart's default
+# `latest` tags are built from `main` and can be older than a `develop` chart).
 helm install srw ./helm \
   --namespace srw \
   --kube-context k3d-srw \
-  --values deployment/values-local.yaml
+  --values deployment/values-local.yaml \
+  --values deployment/values-local-images.yaml
 ```
 
 Wait for the workloads, then open the Cockpit:
@@ -105,8 +108,8 @@ kubectl --context k3d-srw --namespace srw get pods --watch
 | <https://localhost/> | `test` | `srw-k3d-dev-test` |
 
 The local values file contains published development credentials and must never
-be used on a reachable deployment. This source-based path also follows moving
-development image tags. Continue with the
+be used on a reachable deployment. This source-based path installs the component
+images built from your checkout's history, not a release. Continue with the
 [local installation and smoke-test guide](docs/local-kubernetes.md). For an
 existing cluster, production topology, HA databases, upgrades, and the OCI
 chart, use the [Helm chart guide](helm/README.md).

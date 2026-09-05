@@ -2879,6 +2879,15 @@ llm:
     # -- Enable the seed Job. Missing/false leaves system tables untouched.
     enabled: false
 
+    # -- How long the research-provider seed hook (post-install/post-upgrade,
+    # always rendered while the orchestrator has replicas) waits for the
+    # orchestrator's health endpoint before failing the release. 300 s suits a
+    # warm cluster; a fresh single-node install that pulls every image and
+    # walks Keycloak -> Gitea -> orchestrator needs 900+ (probe 1, 2026-09-04
+    # failed revision 1 on exactly this). The Job's activeDeadlineSeconds is
+    # this value plus 300.
+    researchProviderWaitSeconds: 300
+
     # -- Optional: system API keys keyed by provider. Each entry references
     # an existing Secret in the release namespace — plaintext keys must never
     # appear in values.yaml. In ESO mode the referenced Secret is populated by
