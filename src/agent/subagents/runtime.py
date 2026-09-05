@@ -1978,6 +1978,25 @@ class SubagentRuntime:
         except Exception:
             current = False
         if not current:
+            async with self._state_lock:
+                if (
+                    self._recovery_complete
+                    and not self._handles
+                    and not self._active
+                    and not self._inflight
+                    and not self._background
+                    and not self._background_reservations
+                    and not self._background_admissions
+                    and not self._background_tasks
+                    and not self._foreground_terminal_pending
+                    and not self._persistence_abandoned
+                ):
+                    # Public End can revoke parent effect authority before
+                    # the local watchdog runs. After orphan recovery, a life
+                    # that never reserved a child has no evidence to commit.
+                    # Close locally without ledger writes or notifications;
+                    # Resume still requires exact current parent authority.
+                    return
             # A failed proof is ambiguous: the exact owner may be gone, or
             # the authority store may be transiently unavailable before the
             # retirement Begin commits. Keep admission closed, but preserve

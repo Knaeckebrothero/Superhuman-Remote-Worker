@@ -145,6 +145,44 @@ class DurableStateLedger(StrictLedger):
 
 
 @pytest.mark.asyncio
+async def test_empty_recovered_runtime_quiesces_after_parent_end(tmp_path):
+    ctx, _ = make_parent(tmp_path)
+    ledger = StrictLedger()
+    runtime = runtime_for(ctx, ledger=ledger)
+    assert await runtime.recover_orphans() == []
+    runtime.host.settlement_authority_fn = AsyncMock(return_value=False)
+    runtime.host.effect_authority_fn = AsyncMock(return_value=False)
+    runtime._notify_changed = AsyncMock()
+
+    await runtime.quiesce("parent End already authorized")
+
+    assert runtime._accepting is False
+    assert not ledger.opened and not ledger.terminal_calls
+    runtime._notify_changed.assert_not_awaited()
+    with pytest.raises(RuntimeError, match="exact parent authority"):
+        await runtime.resume()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prior_state", ["unrecovered", "reserved_handle"])
+async def test_empty_quiescence_never_hides_unresolved_child_authority(
+    tmp_path, prior_state
+):
+    ctx, _ = make_parent(tmp_path)
+    runtime = runtime_for(ctx, ledger=StrictLedger())
+    if prior_state == "reserved_handle":
+        assert await runtime.recover_orphans() == []
+        # Handles are reserved before a foreground build or durable create can
+        # suspend, and remain recorded even after its active entry is removed.
+        runtime.mint_handle("explorer")
+    runtime.host.settlement_authority_fn = AsyncMock(return_value=False)
+
+    with pytest.raises(RuntimeError, match="exact settlement authority"):
+        await runtime.quiesce("parent End already authorized")
+    assert runtime._accepting is False
+
+
+@pytest.mark.asyncio
 async def test_quiesced_runtime_resumes_only_with_exact_authority(tmp_path):
     ctx, _ = make_parent(tmp_path)
     runtime = runtime_for(ctx)
