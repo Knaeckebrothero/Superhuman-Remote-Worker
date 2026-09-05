@@ -1582,6 +1582,7 @@
       "citationsTooltip": "Quellen dieser Sitzung anzeigen",
       "moreActions": "Weitere Aktionen",
       "disconnect": "Trennen",
+      "disconnecting": "Wird getrennt…",
       "projectFilesButton": "Projektdateien",
       "projectFilesTooltip": "Projektordner {{name}} in Ihrer Cloud öffnen",
       "sessionFilesButton": "Sitzungsdateien",

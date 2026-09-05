@@ -214,6 +214,14 @@
   &[data-loading] { visibility: hidden; }
 }
 
+// A loading button is busy, not unavailable. The generic :disabled dimming
+// would drop the spinner to 0.5 opacity too, which on the low-contrast variants
+// (ghost) leaves the one piece of feedback barely visible — hold it at full
+// strength; the spin already reads as "not clickable yet".
+.app-button__btn[data-loading]:disabled {
+  opacity: 1;
+}
+
 .app-button__spinner {
   position: absolute;
   width: 14px;

@@ -1027,7 +1027,10 @@ export function clearDraft(threadId: string | null): void {
                 </button>
               }
             }
-            <app-button variant="ghost" size="sm" (clicked)="disconnectAndLeave()">
+            <app-button variant="ghost" size="sm"
+                        [loading]="isDisconnecting()"
+                        [ariaLabel]="(isDisconnecting() ? 'chat.header.disconnecting' : 'chat.header.disconnect') | transloco"
+                        (clicked)="disconnectAndLeave()">
               {{ 'chat.header.disconnect' | transloco }}
             </app-button>
           } @else if (chat.cloudSessionUrl() || chat.ncSessionFolder() || chat.verifiedProjectFolder()) {
@@ -2567,6 +2570,11 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     readonly showCitations = signal(false);
     readonly showSshPanel = signal(false);
 
+    /** Disconnect is a ~5s round trip (DELETE + agent/workspace teardown). The
+     *  header button spins for it so the click reads as accepted; without it
+     *  the whole wait looks like a dead button. */
+    readonly isDisconnecting = signal(false);
+
     /** Bare hostname for `srw-ssh-proxy --stdio <apiHost>` (ssh-config.ts's
      *  HOST_PATTERN admits no scheme, path or port). `environment.apiUrl`
      *  carries the `/api` suffix and, in local/k3d dev, a scheme and port —
@@ -3971,12 +3979,18 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     }
 
     async disconnectAndLeave(): Promise<void> {
+        if (this.isDisconnecting()) return;
+        this.isDisconnecting.set(true);
         try {
             await this.chat.endSession();
         } catch (e: any) {
             this.toast.danger(this.errors.translate(e, 'errors.sessions.endFailed'));
         } finally {
-            this.router.navigate(['/sessions']);
+            // Leaving destroys this component, so clearing the flag is normally
+            // moot — but a guard can refuse the navigation, and then the header
+            // has to come back rather than spin forever.
+            const left = await this.router.navigate(['/sessions']);
+            if (!left) this.isDisconnecting.set(false);
         }
     }
 

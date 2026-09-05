@@ -1582,6 +1582,7 @@
       "citationsTooltip": "Show this session's citations",
       "moreActions": "More actions",
       "disconnect": "Disconnect",
+      "disconnecting": "Disconnecting…",
       "projectFilesButton": "Project files",
       "projectFilesTooltip": "Open the {{name}} project folder in your cloud",
       "sessionFilesButton": "Session files",
