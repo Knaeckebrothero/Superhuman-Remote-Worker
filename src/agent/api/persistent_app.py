@@ -37,6 +37,7 @@ import httpx
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
+from agent.api import session_transport as _session_transport
 from agent.api._session_auth import validate_session_token as _validate_session_token
 from agent.api.models import PinnedSessionRecipient, pinned_session_recipient_matches
 from agent.api.orchestrator_client import (
@@ -7835,16 +7836,8 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
 
 
 async def _ws_send(ws: WebSocket, method: str, params: Dict[str, Any]) -> None:
-    """Send a JSON message over WebSocket. Silently drops if connection is closed.
-
-    Used by WS-handler-direct sends (the receive-loop's acks, the welcome frame,
-    fire-and-forget handler tasks that hold a ws reference). Loop-driven sends
-    use _broadcast() instead, so a closed WS doesn't kill the loop's output.
-    """
-    try:
-        await ws.send_json({"method": method, "params": params})
-    except Exception:
-        pass  # Connection already closed
+    """Send a direct response without adding it to the event journal."""
+    await _session_transport.send_message(ws, method, params)
 
 
 def _subscribe(client_id: str) -> asyncio.Queue:
@@ -7860,8 +7853,9 @@ def _subscribe(client_id: str) -> asyncio.Queue:
     attach.
     """
     was_empty = not _subscribers
-    queue: asyncio.Queue = asyncio.Queue(maxsize=_SUBSCRIBER_QUEUE_MAXSIZE)
-    _subscribers[client_id] = queue
+    queue = _session_transport.subscribe(
+        _subscribers, client_id, maxsize=_SUBSCRIBER_QUEUE_MAXSIZE
+    )
     if was_empty and _orchestrator_client is not None and _thread_id is not None:
         _track_session_side_task(
             asyncio.create_task(
@@ -7876,7 +7870,7 @@ def _unsubscribe(client_id: str) -> None:
 
     This is what WS close calls. The loop keeps running with one fewer audience.
     """
-    _subscribers.pop(client_id, None)
+    _session_transport.unsubscribe(_subscribers, client_id)
 
 
 async def _file_officer_wake(minutes: int, reason: str) -> None:
@@ -8734,24 +8728,8 @@ class _OrderedPersistentEventWriter:
 
 
 def _fan_out_live_frame(frame: Dict[str, Any]) -> None:
-    """Enqueue one already-built frame for every live control subscriber."""
-
-    method = str(frame.get("method") or "unknown")
-    for client_id, queue in list(_subscribers.items()):
-        try:
-            queue.put_nowait(frame)
-        except asyncio.QueueFull:
-            # Drop oldest, retry. If the retry still fails (shouldn't -- we just
-            # made room), drop the new frame and move on.
-            try:
-                queue.get_nowait()
-                queue.put_nowait(frame)
-            except (asyncio.QueueEmpty, asyncio.QueueFull):
-                logger.warning(
-                    "Subscriber %s queue overflow -- dropping frame %s",
-                    client_id,
-                    method,
-                )
+    """Deliver an already-built frame through the current subscriber registry."""
+    _session_transport.fan_out_frame(_subscribers, frame, logger=logger)
 
 
 def _event_persistence_failed(
@@ -11029,32 +11007,10 @@ async def _handle_canvas_control(
 async def _run_subscriber_pump(
     ws: WebSocket, client_id: str, queue: asyncio.Queue
 ) -> None:
-    """Drain a subscriber's queue into its WebSocket. Exits on send failure.
-
-    One pump task per connected WebSocket. Cancelled by the ws_chat finally
-    block when the WS closes; the queue is then garbage-collected after
-    _unsubscribe removes the dict entry.
-
-    When the queue is idle, sends a ``ws.ping`` frame every
-    ``_WS_PING_INTERVAL_S`` — sent directly (never journaled to
-    thread_events) so the cockpit's control-WS watchdog can distinguish a
-    quiet-but-alive socket from a half-open one that an edge/tunnel idle
-    timeout silently killed (session_silent_failure_audit.md #9). The send
-    also makes the pump itself notice a dead socket within one interval.
-    """
-    try:
-        while True:
-            try:
-                frame = await asyncio.wait_for(queue.get(), timeout=_WS_PING_INTERVAL_S)
-            except asyncio.TimeoutError:
-                frame = {"method": "ws.ping", "params": {}}
-            try:
-                await ws.send_json(frame)
-            except Exception:
-                # WS is dead — let the receive loop's exception path clean up.
-                return
-    except asyncio.CancelledError:
-        raise
+    """Drain one socket's queue; the handler owns cancellation and unsubscribe."""
+    await _session_transport.run_subscriber_pump(
+        ws, queue, ping_interval=_WS_PING_INTERVAL_S
+    )
 
 
 # ---------------------------------------------------------------------------
