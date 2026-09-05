@@ -307,19 +307,20 @@ class TestProjectReadGates:
     async def test_list_contacts_blocked_cross_user(
         self, user_b, project_a, fake_db, fake_request
     ):
-        from orchestrator.routers.contacts import get_project_contacts
+        from orchestrator.routers.contacts import (
+            ContactsDependencies,
+            get_project_contacts,
+        )
 
         gate = AsyncMock(side_effect=HTTPException(status_code=403, detail="denied"))
         fake_db.get_project_contacts = AsyncMock(
             side_effect=AssertionError("get_project_contacts called past the gate")
         )
-        with (
-            _patch_caller_and_db(user_b, fake_db),
-            patch("orchestrator.routers.contacts.require_project_member", gate),
-            patch("orchestrator.routers.contacts._get_db", lambda: fake_db),
-        ):
-            with pytest.raises(HTTPException) as exc:
-                await get_project_contacts(fake_request, str(project_a["id"]))
+        dependencies = ContactsDependencies(db=fake_db, require_project_member=gate)
+        with pytest.raises(HTTPException) as exc:
+            await get_project_contacts(
+                fake_request, str(project_a["id"]), dependencies=dependencies
+            )
         assert exc.value.status_code == 403
         gate.assert_awaited_once_with(fake_request, fake_db, str(project_a["id"]))
 
@@ -440,7 +441,11 @@ class TestProjectMutationRoles:
     async def test_add_contact_viewer_403(
         self, user_b, project_a, fake_db, fake_request
     ):
-        from orchestrator.routers.contacts import ContactCreate, add_project_contact
+        from orchestrator.routers.contacts import (
+            ContactCreate,
+            ContactsDependencies,
+            add_project_contact,
+        )
 
         gate = AsyncMock(
             side_effect=HTTPException(
@@ -451,13 +456,11 @@ class TestProjectMutationRoles:
             side_effect=AssertionError("create_contact called past the gate")
         )
         body = ContactCreate(display_name="X", addresses=[])
-        with (
-            _patch_caller_and_db(user_b, fake_db),
-            patch("orchestrator.routers.contacts.require_project_member", gate),
-            patch("orchestrator.routers.contacts._get_db", lambda: fake_db),
-        ):
-            with pytest.raises(HTTPException) as exc:
-                await add_project_contact(fake_request, str(project_a["id"]), body)
+        dependencies = ContactsDependencies(db=fake_db, require_project_member=gate)
+        with pytest.raises(HTTPException) as exc:
+            await add_project_contact(
+                fake_request, str(project_a["id"]), body, dependencies=dependencies
+            )
         assert exc.value.status_code == 403
         gate.assert_awaited_once_with(
             fake_request,
@@ -471,7 +474,11 @@ class TestProjectMutationRoles:
     async def test_add_contact_editor_passes(
         self, user_b, project_a, fake_db, fake_request
     ):
-        from orchestrator.routers.contacts import ContactCreate, add_project_contact
+        from orchestrator.routers.contacts import (
+            ContactCreate,
+            ContactsDependencies,
+            add_project_contact,
+        )
 
         gate = AsyncMock(return_value=(user_b, project_a))
         fake_db.list_contacts_for_user = AsyncMock(return_value=[])
@@ -482,12 +489,10 @@ class TestProjectMutationRoles:
         )
         fake_db.link_contact_to_project = AsyncMock(return_value=True)
         body = ContactCreate(display_name="X", addresses=[])
-        with (
-            _patch_caller_and_db(user_b, fake_db),
-            patch("orchestrator.routers.contacts.require_project_member", gate),
-            patch("orchestrator.routers.contacts._get_db", lambda: fake_db),
-        ):
-            result = await add_project_contact(fake_request, str(project_a["id"]), body)
+        dependencies = ContactsDependencies(db=fake_db, require_project_member=gate)
+        result = await add_project_contact(
+            fake_request, str(project_a["id"]), body, dependencies=dependencies
+        )
         assert result["contact"]["id"] == "new-contact"
         fake_db.link_contact_to_project.assert_awaited_once_with(
             str(project_a["id"]), "new-contact", user_b["id"]

@@ -9,9 +9,10 @@ ever sees canonical values. project_router carries the two kept
 from __future__ import annotations
 
 import re
-from typing import Any, List, Optional
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable, List, Optional
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from orchestrator.security.auth import require_approved_user
@@ -23,10 +24,24 @@ project_router = APIRouter(prefix="/api/projects", tags=["Contacts"])
 _E164 = re.compile(r"^\+[1-9]\d{6,14}$")
 
 
-def _get_db() -> Any:
-    import orchestrator.main
+@dataclass
+class ContactsDependencies:
+    """App-owned collaborators for this router, with explicit authorization gates.
 
-    return orchestrator.main.postgres_db
+    The application owns the database lifecycle. Keeping the gates on the same
+    small dependency value lets independently composed apps override contacts
+    behavior without replacing module globals or importing application startup.
+    """
+
+    db: Any
+    require_approved_user: Callable[..., Awaitable[Any]] = require_approved_user
+    require_project_member: Callable[..., Awaitable[Any]] = require_project_member
+    require_internal: Callable[..., Awaitable[Any]] = require_internal
+
+
+def get_contacts_dependencies(request: Request) -> ContactsDependencies:
+    """Resolve the dependency value from the app handling this request."""
+    return request.app.state.contacts_dependencies
 
 
 def _normalize_address(channel: str, address: str) -> str:
@@ -69,9 +84,11 @@ class AddressPatch(BaseModel):
     is_primary: Optional[bool] = None
 
 
-async def _owned_contact(request: Request, contact_id: str) -> dict:
-    db = _get_db()
-    user = await require_approved_user(request, db)
+async def _owned_contact(
+    request: Request, contact_id: str, dependencies: ContactsDependencies
+) -> dict:
+    db = dependencies.db
+    user = await dependencies.require_approved_user(request, db)
     contact = await db.get_contact(contact_id)
     if contact is None:
         raise HTTPException(status_code=404, detail="Contact not found")
@@ -87,6 +104,8 @@ async def list_internal_contacts(
     request: Request,
     job_id: str | None = None,
     thread_id: str | None = None,
+    *,
+    dependencies: ContactsDependencies = Depends(get_contacts_dependencies),
 ) -> dict:
     """Contacts linked to the caller's project. Agent-internal.
 
@@ -94,12 +113,12 @@ async def list_internal_contacts(
     supplies a project_id, so it cannot read another project's contacts. Same
     trust posture as send_message recipient resolution.
     """
-    await require_internal(request)
+    await dependencies.require_internal(request)
     if bool(job_id) == bool(thread_id):
         raise HTTPException(
             status_code=400, detail="Provide exactly one of job_id or thread_id"
         )
-    db = _get_db()
+    db = dependencies.db
     project_id = await db.resolve_project_for_agent(job_id=job_id, thread_id=thread_id)
     if not project_id:
         return {"contacts": []}
@@ -112,9 +131,11 @@ async def list_contacts(
     project_id: Optional[str] = None,
     channel: Optional[str] = None,
     q: Optional[str] = None,
+    *,
+    dependencies: ContactsDependencies = Depends(get_contacts_dependencies),
 ) -> dict:
-    db = _get_db()
-    user = await require_approved_user(request, db)
+    db = dependencies.db
+    user = await dependencies.require_approved_user(request, db)
     rows = await db.list_contacts_for_user(
         user["id"], project_id=project_id, channel=channel, q=q
     )
@@ -122,9 +143,14 @@ async def list_contacts(
 
 
 @router.post("")
-async def create_contact(request: Request, body: ContactCreate) -> dict:
-    db = _get_db()
-    user = await require_approved_user(request, db)
+async def create_contact(
+    request: Request,
+    body: ContactCreate,
+    *,
+    dependencies: ContactsDependencies = Depends(get_contacts_dependencies),
+) -> dict:
+    db = dependencies.db
+    user = await dependencies.require_approved_user(request, db)
     if not body.display_name.strip():
         raise HTTPException(status_code=400, detail="display_name is required")
     normalized = [
@@ -152,31 +178,46 @@ async def create_contact(request: Request, body: ContactCreate) -> dict:
 
 
 @router.patch("/{contact_id}")
-async def patch_contact(request: Request, contact_id: str, body: ContactPatch) -> dict:
-    await _owned_contact(request, contact_id)
+async def patch_contact(
+    request: Request,
+    contact_id: str,
+    body: ContactPatch,
+    *,
+    dependencies: ContactsDependencies = Depends(get_contacts_dependencies),
+) -> dict:
+    await _owned_contact(request, contact_id, dependencies)
     display_name = body.display_name
     if display_name is not None:
         display_name = display_name.strip()
         if not display_name:
             raise HTTPException(status_code=400, detail="display_name cannot be empty")
-    updated = await _get_db().update_contact(contact_id, display_name, body.notes)
+    updated = await dependencies.db.update_contact(contact_id, display_name, body.notes)
     return {"contact": updated}
 
 
 @router.delete("/{contact_id}")
-async def delete_contact(request: Request, contact_id: str) -> dict:
-    await _owned_contact(request, contact_id)
-    await _get_db().delete_contact(contact_id)
+async def delete_contact(
+    request: Request,
+    contact_id: str,
+    *,
+    dependencies: ContactsDependencies = Depends(get_contacts_dependencies),
+) -> dict:
+    await _owned_contact(request, contact_id, dependencies)
+    await dependencies.db.delete_contact(contact_id)
     return {"status": "deleted"}
 
 
 @router.post("/{contact_id}/addresses")
 async def add_address(
-    request: Request, contact_id: str, body: ContactAddressIn
+    request: Request,
+    contact_id: str,
+    body: ContactAddressIn,
+    *,
+    dependencies: ContactsDependencies = Depends(get_contacts_dependencies),
 ) -> dict:
-    contact = await _owned_contact(request, contact_id)
+    contact = await _owned_contact(request, contact_id, dependencies)
     addr = _normalize_address(body.channel, body.address)
-    added = await _get_db().add_contact_address(
+    added = await dependencies.db.add_contact_address(
         contact["id"], contact["owner_user_id"], body.channel, addr, body.is_primary
     )
     if added is None:
@@ -191,9 +232,15 @@ async def add_address(
 
 
 @router.patch("/addresses/{address_id}")
-async def patch_address(request: Request, address_id: str, body: AddressPatch) -> dict:
-    db = _get_db()
-    user = await require_approved_user(request, db)
+async def patch_address(
+    request: Request,
+    address_id: str,
+    body: AddressPatch,
+    *,
+    dependencies: ContactsDependencies = Depends(get_contacts_dependencies),
+) -> dict:
+    db = dependencies.db
+    user = await dependencies.require_approved_user(request, db)
     existing = await db.get_contact_address(address_id)
     if existing is None:
         raise HTTPException(status_code=404, detail="Address not found")
@@ -217,9 +264,14 @@ async def patch_address(request: Request, address_id: str, body: AddressPatch) -
 
 
 @router.delete("/addresses/{address_id}")
-async def delete_address(request: Request, address_id: str) -> dict:
-    db = _get_db()
-    user = await require_approved_user(request, db)
+async def delete_address(
+    request: Request,
+    address_id: str,
+    *,
+    dependencies: ContactsDependencies = Depends(get_contacts_dependencies),
+) -> dict:
+    db = dependencies.db
+    user = await dependencies.require_approved_user(request, db)
     existing = await db.get_contact_address(address_id)
     if existing is None:
         raise HTTPException(status_code=404, detail="Address not found")
@@ -233,14 +285,18 @@ async def delete_address(request: Request, address_id: str) -> dict:
 
 @router.post("/{contact_id}/projects/{project_id}")
 async def link_contact_to_project(
-    request: Request, contact_id: str, project_id: str
+    request: Request,
+    contact_id: str,
+    project_id: str,
+    *,
+    dependencies: ContactsDependencies = Depends(get_contacts_dependencies),
 ) -> dict:
-    db = _get_db()
+    db = dependencies.db
     # require_project_member returns (user, project) — index instead of
     # unpacking so a test double that stands in for the whole gate (a bare
     # AsyncMock, not configured to return a 2-tuple) doesn't blow up on
     # `a, b = ...` unpacking. Real calls still get the real user dict.
-    member = await require_project_member(
+    member = await dependencies.require_project_member(
         request, db, project_id, min_role="editor", allow_archived=False
     )
     user = member[0]
@@ -252,10 +308,16 @@ async def link_contact_to_project(
 
 @router.delete("/{contact_id}/projects/{project_id}")
 async def unlink_contact_from_project(
-    request: Request, contact_id: str, project_id: str
+    request: Request,
+    contact_id: str,
+    project_id: str,
+    *,
+    dependencies: ContactsDependencies = Depends(get_contacts_dependencies),
 ) -> dict:
-    db = _get_db()
-    await require_project_member(request, db, project_id, min_role="editor")
+    db = dependencies.db
+    await dependencies.require_project_member(
+        request, db, project_id, min_role="editor"
+    )
     removed = await db.unlink_contact_from_project(project_id, contact_id)
     if not removed:
         raise HTTPException(
@@ -265,25 +327,34 @@ async def unlink_contact_from_project(
 
 
 @project_router.get("/{project_id}/contacts")
-async def get_project_contacts(request: Request, project_id: str) -> dict:
-    db = _get_db()
-    await require_project_member(request, db, project_id)
+async def get_project_contacts(
+    request: Request,
+    project_id: str,
+    *,
+    dependencies: ContactsDependencies = Depends(get_contacts_dependencies),
+) -> dict:
+    db = dependencies.db
+    await dependencies.require_project_member(request, db, project_id)
     return {"contacts": await db.get_project_contacts(project_id)}
 
 
 @project_router.post("/{project_id}/contacts")
 async def add_project_contact(
-    request: Request, project_id: str, body: ContactCreate
+    request: Request,
+    project_id: str,
+    body: ContactCreate,
+    *,
+    dependencies: ContactsDependencies = Depends(get_contacts_dependencies),
 ) -> dict:
     """Find-or-create-then-link (spec): match by supplied address among
     caller-visible contacts, else by exact display_name, else create owned
     by caller; then link."""
-    db = _get_db()
+    db = dependencies.db
     # require_project_member returns (user, project) — index instead of
     # unpacking so a test double that stands in for the whole gate (a bare
     # AsyncMock, not configured to return a 2-tuple) doesn't blow up on
     # `a, b = ...` unpacking. Real calls still get the real user dict.
-    member = await require_project_member(
+    member = await dependencies.require_project_member(
         request, db, project_id, min_role="editor", allow_archived=False
     )
     user = member[0]

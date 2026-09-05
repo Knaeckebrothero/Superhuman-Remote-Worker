@@ -184,6 +184,7 @@ from orchestrator.routers import product_capabilities_router  # noqa: E402
 from orchestrator.routers import shared_browser_router  # noqa: E402
 from orchestrator.routers import vm_guest_router  # noqa: E402
 from orchestrator.routers.sessions import router as sessions_router  # noqa: E402
+from orchestrator.routers.contacts import ContactsDependencies  # noqa: E402
 from orchestrator.routers.contacts import project_router as contacts_project_router  # noqa: E402
 from orchestrator.routers.contacts import router as contacts_router  # noqa: E402
 from orchestrator.services.cron_dispatcher import cron_dispatcher_loop  # noqa: E402
@@ -18151,6 +18152,7 @@ app = FastAPI(
     lifespan=lifespan,
     default_response_class=CustomJSONResponse,
 )
+app.state.contacts_dependencies = ContactsDependencies(db=postgres_db)
 
 # CSRF defense for the cookie BFF. Middleware order matters: Starlette
 # runs the OUTERMOST `add_middleware` last, so we add CSRF first and CORS
