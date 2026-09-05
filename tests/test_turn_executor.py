@@ -69,6 +69,9 @@ class FakeDB:
         self.pending_rows = list(pending_rows or [])
         self.fetch_calls: List[tuple] = []
         self.refreshed_consumed_seq: Optional[int] = None
+        # Transcript leg of skip-if-answered: the seq the transcript proves
+        # answered, or None (the ordinary claim path).
+        self.transcript_answered_seq: Optional[int] = None
 
     async def fetch(self, sql: str, *args):
         self.fetch_calls.append((sql, args))
@@ -88,6 +91,8 @@ class FakeDB:
             )
         if sql == te._PENDING_EVENT_EXISTS_SQL:
             return any(row.get("delivery_id") for row in self.pending_rows)
+        if sql == te._ANSWERED_BY_TRANSCRIPT_SQL:
+            return self.transcript_answered_seq
         return None
 
 
@@ -849,6 +854,61 @@ class TestSkipIfAnswered:
         assert not harness.consumed
         # There is no attached session to keep warm on this no-LLM path.
         assert harness.executor._prefer_unit_id is None
+
+    @pytest.mark.asyncio
+    async def test_transcript_final_answer_completes_without_reanswering(self, harness):
+        """consumed_seq < input_seq, but the transcript already holds the
+        final answer for the pending input (a predecessor died in its
+        turn-complete hook — the compaction crash): advance the watermark to
+        that input and complete. No bundle, no attach, no LLM."""
+        unit = uuid4()
+        harness.db.transcript_answered_seq = 72204
+        claim = make_claim(unit_id=unit, token=4, input_seq=72204, consumed_seq=72200)
+
+        await harness.executor._serve_claim(claim)
+        await _finish(harness)
+
+        assert harness.calls["complete"] == [
+            {"unit_id": unit, "lease_token": 4, "consumed_seq": 72204}
+        ]
+        assert not harness.calls["bundle"]
+        assert not harness.calls["attach"]
+        assert not harness.consumed
+
+    @pytest.mark.asyncio
+    async def test_transcript_unanswered_keeps_the_ordinary_claim_path(self, harness):
+        unit = uuid4()
+        harness.db.transcript_answered_seq = None
+        claim = make_claim(unit_id=unit, token=4, input_seq=72204, consumed_seq=72200)
+
+        await harness.executor._serve_claim(claim)
+        await _finish(harness)
+
+        assert harness.calls["bundle"]
+        assert harness.calls["attach"]
+
+    @pytest.mark.asyncio
+    async def test_transcript_answer_with_pending_event_keeps_the_claim(self, harness):
+        """A pending event delivery must still run: the transcript leg never
+        completes a unit that has one waiting."""
+        unit = uuid4()
+        harness.db.transcript_answered_seq = 72204
+        harness.db.pending_rows = [
+            {
+                "id": "evt-1",
+                "seq": 72205,
+                "content": "notice",
+                "role": "event",
+                "delivery_id": "d-1",
+            }
+        ]
+        claim = make_claim(unit_id=unit, token=4, input_seq=72205, consumed_seq=72200)
+
+        await harness.executor._serve_claim(claim)
+        await _finish(harness)
+
+        assert harness.calls["bundle"]
+        assert harness.calls["attach"]
 
     @pytest.mark.asyncio
     async def test_pending_control_bypasses_skip_and_claims_without_human_input(

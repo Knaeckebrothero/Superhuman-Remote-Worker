@@ -2411,6 +2411,42 @@ def _make_compacting_ctx_mgr(result_fn):
 
 class TestContextCompaction:
     @pytest.mark.asyncio
+    async def test_turn_messages_are_stamped_and_survive_input_eviction(self):
+        """Every message the turn appends carries its membership stamp, so a
+        compaction that summarises the turn's own input away still leaves the
+        turn's rows selectable for the turn-end reconcile (the crash in
+        stateless_turn_settlement_crashes_after_midturn_compaction.md)."""
+        from src.core.message_markers import turn_membership
+
+        def _drop_input(msgs):
+            return [msgs[0], SystemMessage(content="[Summary of prior work]\nrecap")]
+
+        ctx_mgr = _make_compacting_ctx_mgr(_drop_input)
+        messages = [
+            SystemMessage(content="sys"),
+            HumanMessage(content="question", id="input-4"),
+        ]
+        callbacks = _make_callbacks()
+
+        result = await _execute_turn(
+            llm_with_tools=_make_streaming_llm(_make_llm_response("ok")),
+            tool_map={},
+            context_manager=ctx_mgr,
+            messages=messages,
+            callbacks=callbacks,
+            llm_timeout=600,
+            auxiliary_llm=None,
+            config=_make_config(),
+            turn_id=4,
+        )
+
+        assert result.error is None
+        assert not any(getattr(m, "id", None) == "input-4" for m in messages)
+        ai = [m for m in messages if isinstance(m, AIMessage)]
+        assert ai and all(turn_membership(m) == 4 for m in ai)
+        assert turn_membership(messages[0]) is None  # system prompt is not a turn row
+
+    @pytest.mark.asyncio
     async def test_compaction_triggers_git_commit_and_push(self):
         """When compaction actually ran (run counter), git commit + push fires."""
 

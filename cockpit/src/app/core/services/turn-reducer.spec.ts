@@ -171,15 +171,23 @@ describe('turn-reducer — turn lifecycle', () => {
         expect(state.activeAssistantTurnId).toBe('t1');
     });
 
-    it('turn_started is idempotent — replayed event keeps the same turn', () => {
+    it('replayed turn_started rebuilds the live turn from the re-delivered frames', () => {
+        // A stream that re-anchors before the turn began (stale/horizon-lost
+        // cursor) replays turn.started AND every frame after it. Keeping the
+        // old events would double the text ("hihi") and stack a second copy
+        // of the thoughts/tool calls behind the answer.
         const state = play([
             {type: 'turn_started', turnId: 't1', startedAt: 1000},
             {type: 'token', content: 'hi', timestamp: 1100},
             {type: 'turn_started', turnId: 't1', startedAt: 1000}, // replay
+            {type: 'token', content: 'hi', timestamp: 1100}, // re-delivered
         ]);
         expect(state.turns.filter(isAssistantTurn)).toHaveLength(1);
         const turn = activeTurn(state);
+        expect(turn.status).toBe('streaming');
+        expect(turn.events).toHaveLength(1);
         expect((turn.events[0] as TextEvent).content).toBe('hi');
+        expect(state.activeAssistantTurnId).toBe('t1');
     });
 
     it('reattach_turn joins a historical prefix and recovered suffix into one live turn', () => {

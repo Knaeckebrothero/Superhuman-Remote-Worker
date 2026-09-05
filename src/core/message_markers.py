@@ -54,6 +54,22 @@ PROTECTED_KEY = "srw_protected"
 PHASE_KEY = "srw_phase_key"
 INSTRUCTION_PATH_KEY = "srw_instruction_path"
 
+# Turn-membership stamp (sessions). The persistent loop stamps every message
+# it appends during a turn with that turn's id, so the turn-end reconcile
+# selects "this turn's rows" by membership instead of walking back to an
+# anchor message that a mid-turn compaction may have summarised away
+# (knowledge-base/knowledge/issues/stateless_turn_settlement_crashes_after_midturn_compaction.md).
+# In-memory only: ``_serialize_message_row`` does not persist
+# ``additional_kwargs``, and the stamp is never sent to a provider.
+TURN_MEMBERSHIP_KEY = "_srw_turn_id"
+
+# ``PROTECTED_KEY`` value the persistent loop pins the active turn's input
+# with: the user's live request survives a mid-turn summary verbatim (generic
+# pin, re-seated right after the summary) and is unpinned when the turn ends.
+# Distinct from ``True`` so unpinning never strips a marker some other
+# producer set on the same message (an injected event notice, say).
+PROTECTED_TURN_INPUT = "turn_input"
+
 
 def phase_key_for(phase_number: Any, phase_name: str) -> str:
     """The ``srw_phase_key`` of a concrete phase instance: ``"<n>:<phase>"``."""
@@ -109,16 +125,61 @@ def is_pinned_for_phase(message: Any, current_phase_key: Optional[str]) -> bool:
     return key is None or key == current_phase_key
 
 
+def stamp_turn_membership(message: Any, turn_id: int) -> Any:
+    """Mark ``message`` as produced in turn ``turn_id``; returns the message."""
+    kwargs = getattr(message, "additional_kwargs", None)
+    if isinstance(kwargs, dict):
+        kwargs[TURN_MEMBERSHIP_KEY] = int(turn_id)
+    return message
+
+
+def turn_membership(message: Any) -> Optional[int]:
+    """The turn id a message was stamped with, or None (unstamped)."""
+    value = _kwargs(message).get(TURN_MEMBERSHIP_KEY)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def pin_turn_input(message: Any) -> Any:
+    """Pin the active turn's input so a mid-turn summary re-seats it verbatim.
+
+    A no-op on a message some other producer already protects (its marker
+    and phase binding stay authoritative).
+    """
+    kwargs = getattr(message, "additional_kwargs", None)
+    if isinstance(kwargs, dict) and not kwargs.get(PROTECTED_KEY):
+        kwargs[PROTECTED_KEY] = PROTECTED_TURN_INPUT
+    return message
+
+
+def unpin_turn_input(message: Any) -> Any:
+    """Remove the pin :func:`pin_turn_input` set; leaves other pins alone."""
+    kwargs = getattr(message, "additional_kwargs", None)
+    if isinstance(kwargs, dict) and kwargs.get(PROTECTED_KEY) == PROTECTED_TURN_INPUT:
+        kwargs.pop(PROTECTED_KEY, None)
+    return message
+
+
 __all__ = [
     "INSTRUCTION_PATH_KEY",
     "PERSIST_ROLE_EVENT",
     "PERSIST_ROLE_KEY",
     "PHASE_KEY",
     "PROTECTED_KEY",
+    "PROTECTED_TURN_INPUT",
+    "TURN_MEMBERSHIP_KEY",
     "is_pinned_for_phase",
     "is_protected_message",
     "phase_key_for",
+    "pin_turn_input",
     "protected_identity",
     "protected_path",
     "protected_phase_key",
+    "stamp_turn_membership",
+    "turn_membership",
+    "unpin_turn_input",
 ]

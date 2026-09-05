@@ -2643,7 +2643,12 @@ export class PersistentChatService {
   private _startSseWatchdog(threadId: string): void {
     this._stopSseWatchdog();
     this.sseLastEventAt = Date.now();
-    this.agentLastEventAt = Date.now();
+    // The agent clock measures agent output, not stream health: a stream
+    // reopen (mobile background/foreground, a dropped socket) must not make
+    // a silent agent look freshly active. Seed it only on the first open.
+    if (this.agentLastEventAt <= 0) {
+      this.agentLastEventAt = Date.now();
+    }
     this.sseWatchdogTimer = setInterval(() => {
       // Piggyback the agent-quiet signal on this 5s tick (audit #8):
       // only meaningful while a turn is open — an idle agent being
@@ -5372,8 +5377,12 @@ export class PersistentChatService {
     // "Connected" only proves the orchestrator SSE is up. Every frame
     // reaching this dispatcher is agent-origin (orchestrator pings and
     // ws.ping never get here), so its age is a fair proxy for "is the
-    // agent producing anything".
-    this.agentLastEventAt = now;
+    // agent producing anything" — except the REST snapshot, which this
+    // service injects as a frame itself: counting it made every reconnect
+    // restart the silence clock while the agent had been quiet for minutes.
+    if (data.method !== 'session.state') {
+      this.agentLastEventAt = now;
+    }
 
     switch (data.method) {
       case 'session.state': {
@@ -5414,6 +5423,22 @@ export class PersistentChatService {
         ) {
           const turnId = String(params['turn_count']);
           this.dispatch({ type: 'reattach_turn', turnId, timestamp: now });
+        }
+        // The durable snapshot is the authority on whether a turn is open.
+        // A retained tab whose turn never got its terminal frame (the loop
+        // died in settlement; the journal has turn.started with no
+        // turn.completed/turn.error) would otherwise spin forever — the
+        // handler above only ever *reopens*. Close it now: the replay floor
+        // sits at the journal's tail, so nothing that follows reopens it,
+        // and a genuinely new turn arrives as a fresh turn.started.
+        if (
+          durableSnapshot &&
+          params['turn_in_flight'] === false &&
+          this.conversation().activeAssistantTurnId != null
+        ) {
+          this._closeActiveTurnIfAny('turn_interrupted');
+          this.runningTool.set(null);
+          this.compaction.set(null);
         }
         if (params['model']) {
           this.modelName.set(params['model'] as string);

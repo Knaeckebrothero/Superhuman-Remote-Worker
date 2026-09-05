@@ -56,6 +56,7 @@ from .persistent_session import (
 from ..tools.registry import TOOL_REGISTRY
 from ..core.archiver import inflight_tool_call
 from ..core.context import extract_summary_text, repair_tool_pairing
+from ..core.message_markers import turn_membership
 from ..core.skill_resolution import (
     APP_GUIDE_LOADER_TOOL,
     app_guide_health_snapshot,
@@ -13258,6 +13259,102 @@ async def _loop_on_turn_settled(turn_id: int) -> None:
     # complete/park/release CAS.
 
 
+# Turn-complete reconcile: bounded attempts + per-attempt timeout. The
+# reconcile is an idempotent upsert transaction (ON CONFLICT (id); the memory
+# effect is minted-or-reused), so a retry after a timeout or a dropped
+# connection is safe — and on the stateless lane a settlement that gives up
+# parks the whole thread, so one transient DB hiccup must not do that.
+_TURN_RECONCILE_ATTEMPTS = 3
+_TURN_RECONCILE_TIMEOUT_S = 5.0
+_TURN_RECONCILE_RETRY_DELAY_S = 0.5
+
+
+def _is_transient_db_error(exc: BaseException) -> bool:
+    """Connection-level / timeout failures a settlement retry can recover from.
+
+    Contract failures (``ValueError``/``RuntimeError`` from the reconcile
+    itself, a lost lease) are deterministic and never retried.
+    """
+    if isinstance(exc, LeaseLostError):
+        return False
+    if isinstance(exc, (asyncio.TimeoutError, ConnectionError)):
+        return True
+    try:
+        import asyncpg
+    except ImportError:  # pragma: no cover
+        return False
+    transient = (
+        asyncpg.PostgresConnectionError,
+        asyncpg.InterfaceError,
+        asyncpg.exceptions.DeadlockDetectedError,
+        asyncpg.exceptions.SerializationError,
+    )
+    return isinstance(exc, transient)
+
+
+async def _reconcile_turn_with_retry(
+    turn_id: int,
+    *,
+    metrics: Optional[dict],
+    authoritative_turn_boundary: bool,
+    turn_input_message_id: Optional[str],
+    memory_scope_kind: Optional[str],
+    memory_scope_id: Optional[str],
+) -> None:
+    """Run ``_save_turn_ai_messages`` with bounded retries on transient errors.
+
+    Pinned keeps its historical best-effort shape (a timeout is logged and
+    the turn proceeds). Stateless: the final failure propagates so the
+    caller refuses settlement — the queue generation stays retryable — but
+    only after every attempt is spent.
+    """
+    if _session is None:
+        return
+    for attempt in range(1, _TURN_RECONCILE_ATTEMPTS + 1):
+        try:
+            await asyncio.wait_for(
+                _save_turn_ai_messages(
+                    _session.postgres_conn,
+                    _thread_id,
+                    _session.messages,
+                    turn_id,
+                    metrics=metrics,
+                    tool_decisions=dict(_session.tool_decisions),
+                    authoritative_turn_boundary=authoritative_turn_boundary,
+                    turn_input_message_id=turn_input_message_id,
+                    memory_scope_kind=memory_scope_kind,
+                    memory_scope_id=memory_scope_id,
+                ),
+                timeout=_TURN_RECONCILE_TIMEOUT_S,
+            )
+            return
+        except Exception as exc:
+            if not _is_transient_db_error(exc):
+                raise
+            if not authoritative_turn_boundary:
+                logger.warning(
+                    "AI message save failed transiently (%s) — proceeding",
+                    exc if not isinstance(exc, asyncio.TimeoutError) else "timeout",
+                )
+                return
+            if attempt >= _TURN_RECONCILE_ATTEMPTS:
+                logger.error(
+                    "Authoritative stateless turn persist failed after %d "
+                    "attempts (%s); refusing turn settlement",
+                    attempt,
+                    exc if not isinstance(exc, asyncio.TimeoutError) else "timeout",
+                )
+                raise
+            logger.warning(
+                "Authoritative stateless turn persist attempt %d/%d failed "
+                "transiently (%s); retrying",
+                attempt,
+                _TURN_RECONCILE_ATTEMPTS,
+                exc if not isinstance(exc, asyncio.TimeoutError) else "timeout",
+            )
+            await asyncio.sleep(_TURN_RECONCILE_RETRY_DELAY_S * attempt)
+
+
 async def _loop_on_turn_complete_body(
     turn_id: int,
     metrics: Optional[dict] = None,
@@ -13299,30 +13396,14 @@ async def _loop_on_turn_complete_body(
     # effect, so failure must abort settlement and leave the queue generation
     # retryable. Pinned sessions retain the historical best-effort behavior.
     if _session.postgres_conn:
-        try:
-            await asyncio.wait_for(
-                _save_turn_ai_messages(
-                    _session.postgres_conn,
-                    _thread_id,
-                    _session.messages,
-                    turn_id,
-                    metrics=metrics,
-                    tool_decisions=dict(_session.tool_decisions),
-                    authoritative_turn_boundary=authoritative_turn_boundary,
-                    turn_input_message_id=turn_input_message_id,
-                    memory_scope_kind=memory_scope_kind,
-                    memory_scope_id=memory_scope_id,
-                ),
-                timeout=5.0,
-            )
-        except asyncio.TimeoutError:
-            if authoritative_turn_boundary:
-                logger.error(
-                    "Authoritative stateless turn persist timed out (5s); "
-                    "refusing turn settlement"
-                )
-                raise
-            logger.warning("AI message save timed out (5s) — proceeding")
+        await _reconcile_turn_with_retry(
+            turn_id,
+            metrics=metrics,
+            authoritative_turn_boundary=authoritative_turn_boundary,
+            turn_input_message_id=turn_input_message_id,
+            memory_scope_kind=memory_scope_kind,
+            memory_scope_id=memory_scope_id,
+        )
     elif authoritative_turn_boundary:
         raise RuntimeError(
             "authoritative stateless turn persist requires a Postgres connection"
@@ -13716,6 +13797,23 @@ async def _loop_completion_handler(loop_task: asyncio.Task) -> None:
         raise
     except Exception as e:
         logger.warning(f"Persistent loop crashed: {e}", exc_info=True)
+        # Every opened turn gets a terminal edge, on this path too: without a
+        # turn.error the journal keeps turn.started open, every attached
+        # client spins on a turn that ended, and every reload that replays
+        # the journal reopens it. Persisted as a role='error' row so the
+        # line survives reload. Not on a lost lease — that turn belongs to
+        # a successor claim now, which closes it itself.
+        if not isinstance(e, LeaseLostError):
+            try:
+                await _loop_on_error(
+                    "The session loop stopped before this turn could be "
+                    f"settled: {e}. The transcript is preserved — send a "
+                    "message to continue."
+                )
+            except Exception:
+                logger.debug(
+                    "turn.error on loop crash failed (non-fatal)", exc_info=True
+                )
         await _terminate_session("loop_crash", mark_thread=not _stateless_mode())
     else:
         logger.info("Persistent loop completed cleanly")
@@ -14129,6 +14227,69 @@ async def _save_message(
         logger.warning(f"Failed to save message (non-fatal): {e}")
 
 
+def _select_turn_messages(
+    messages: List[Any],
+    turn_number: int,
+    *,
+    authoritative_turn_boundary: bool,
+    turn_input_message_id: Optional[str],
+) -> List[Any]:
+    """The messages the turn-complete reconcile re-upserts for ``turn_number``.
+
+    Membership, not position: the loop stamps every message it appends
+    during a turn (``message_markers.stamp_turn_membership``), so the turn's
+    rows are selected by stamp regardless of what a mid-turn compaction did
+    to the working set. The transcript in ``thread_messages`` is the source
+    of truth for the turn boundary — ``save_thread_messages`` looks the
+    accepted input row up there — so the exact input message need not be
+    resident in RAM, and it is never rewritten here (persisted at accept
+    time). See
+    knowledge-base/knowledge/issues/stateless_turn_settlement_crashes_after_midturn_compaction.md.
+
+    Unstamped history keeps the historical walk from the tail: back to the
+    exact input id (stateless) or the latest HumanMessage (pinned). A
+    stateless walk that finds no anchor reconciles zero rows — the
+    incremental writes already hold the turn's content and the DB still
+    mints the boundary — rather than failing the settlement.
+    """
+    input_id = str(turn_input_message_id) if turn_input_message_id else None
+    if authoritative_turn_boundary and any(
+        turn_membership(msg) is not None for msg in messages
+    ):
+        wanted = int(turn_number)
+        return [
+            msg
+            for msg in messages
+            if turn_membership(msg) == wanted
+            and str(getattr(msg, "id", "")) != input_id
+        ]
+    to_save: List[Any] = []
+    boundary_found = False
+    for msg in reversed(messages):
+        if authoritative_turn_boundary:
+            if str(getattr(msg, "id", "")) == input_id:
+                boundary_found = True
+                break
+        elif hasattr(msg, "type") and msg.type in (
+            "human",
+            "HumanMessageChunk",
+        ):
+            boundary_found = True
+            break
+        to_save.append(msg)
+    to_save.reverse()
+    if authoritative_turn_boundary and not boundary_found:
+        logger.warning(
+            "turn %s reconcile: input message %s is not resident and the "
+            "history carries no membership stamps; reconciling zero rows "
+            "(incremental rows stand, the DB mints the boundary)",
+            turn_number,
+            input_id,
+        )
+        return []
+    return to_save
+
+
 async def _save_turn_ai_messages(
     client: Any,
     thread_id: str,
@@ -14161,30 +14322,16 @@ async def _save_turn_ai_messages(
     fatal; pinned callers keep the historical empty/no-error behavior.
     """
     try:
-        # Walk backwards from the end to find messages from this turn. The
-        # stateless lane stops at the exact accepted input id; pinned preserves
-        # its historical "latest HumanMessage" boundary.
-        to_save = []
-        boundary_found = False
-        for msg in reversed(messages):
-            if authoritative_turn_boundary:
-                if str(getattr(msg, "id", "")) == str(turn_input_message_id):
-                    boundary_found = True
-                    break
-            elif hasattr(msg, "type") and msg.type in (
-                "human",
-                "HumanMessageChunk",
-            ):
-                boundary_found = True
-                break
-            to_save.append(msg)
-        to_save.reverse()
-        if authoritative_turn_boundary and (
-            not turn_input_message_id or not boundary_found
-        ):
+        if authoritative_turn_boundary and not turn_input_message_id:
             raise ValueError(
                 "authoritative stateless turn lacks an exact input message id"
             )
+        to_save = _select_turn_messages(
+            messages,
+            turn_number,
+            authoritative_turn_boundary=authoritative_turn_boundary,
+            turn_input_message_id=turn_input_message_id,
+        )
         if authoritative_turn_boundary and (
             memory_scope_kind not in {"thread", "project"} or not memory_scope_id
         ):

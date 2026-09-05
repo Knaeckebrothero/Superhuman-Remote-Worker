@@ -3002,6 +3002,10 @@ class PersistentSession:
             summarization_call_timeout=(
                 self.config.auxiliary.summarization_call_timeout
             ),
+            # The loop adopts a compaction wholesale (no reducer): the kept
+            # window must keep its ids and turn stamps, or the turn-end
+            # reconcile cannot find this turn's rows after a mid-turn summary.
+            preserve_message_identity=True,
         )
 
     def refresh_context_limits(self) -> None:

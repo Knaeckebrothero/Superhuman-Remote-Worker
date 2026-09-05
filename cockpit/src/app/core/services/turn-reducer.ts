@@ -270,7 +270,11 @@ export function reduce(state: ConversationState, action: ReducerAction): Convers
                 };
             }
 
-            // Idempotent: replayed turn_started just re-activates the existing turn.
+            // A replayed turn_started for a turn this tab already holds live
+            // means the stream re-anchored before the turn began (a stale or
+            // horizon-lost cursor) and is about to re-deliver every frame of
+            // it. Rebuild the turn from that replay rather than appending a
+            // second copy of its thoughts and tool calls behind the answer.
             const existing = turns.find(
                 (t): t is AssistantTurn => t.kind === 'assistant' && t.id === action.turnId,
             );
@@ -281,6 +285,7 @@ export function reduce(state: ConversationState, action: ReducerAction): Convers
                         turn === existing
                             ? {
                                   ...existing,
+                                  events: [],
                                   status: 'streaming',
                                   finishedAt: undefined,
                                   model: action.model ?? existing.model,

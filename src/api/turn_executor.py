@@ -212,6 +212,52 @@ SELECT EXISTS (
 )
 """
 
+# Transcript-truth answered check (skip-if-answered's second leg). The
+# watermark leg catches a predecessor that persisted AND completed; this one
+# catches a predecessor whose turn ran to its final answer but whose
+# settlement never advanced ``consumed_seq`` (the loop died in the
+# turn-complete hook — e.g. the pre-fix compaction crash in
+# knowledge-base/knowledge/issues/stateless_turn_settlement_crashes_after_midturn_compaction.md).
+# Without it, an operator unpark re-injects the already-answered human row
+# and the thread answers it twice. Returns the seq of the oldest pending
+# human row that is followed by a final assistant answer — content, no tool
+# calls (the loop ends a turn exactly there) — with no newer human input in
+# between; NULL when the oldest pending input is genuinely unanswered.
+_ANSWERED_BY_TRANSCRIPT_SQL = """
+SELECT input.seq
+  FROM thread_messages AS input
+ WHERE input.thread_id = $1
+   AND input.role = 'human'
+   AND input.rewound_at IS NULL
+   AND input.seq > $2::bigint
+   AND input.seq <= $3::bigint
+   AND EXISTS (
+       SELECT 1
+         FROM thread_messages AS answer
+        WHERE answer.thread_id = input.thread_id
+          AND answer.role = 'ai'
+          AND answer.rewound_at IS NULL
+          AND answer.seq > input.seq
+          AND COALESCE(answer.content, '') <> ''
+          AND (
+              answer.tool_calls IS NULL
+              OR jsonb_typeof(answer.tool_calls) <> 'array'
+              OR jsonb_array_length(answer.tool_calls) = 0
+          )
+          AND NOT EXISTS (
+              SELECT 1
+                FROM thread_messages AS later_input
+               WHERE later_input.thread_id = input.thread_id
+                 AND later_input.role = 'human'
+                 AND later_input.rewound_at IS NULL
+                 AND later_input.seq > input.seq
+                 AND later_input.seq < answer.seq
+          )
+   )
+ ORDER BY input.seq ASC
+ LIMIT 1
+"""
+
 
 def _pa():
     """The persistent_app module, imported lazily (import-cycle guard)."""
@@ -2333,6 +2379,59 @@ class StatelessTurnExecutor:
             self._mark_warm(claim)
             return
 
+        # (b) Skip-if-answered, transcript leg: the oldest pending input
+        # already has its final answer in thread_messages (a predecessor's
+        # settlement died after the answer landed). Advance the watermark to
+        # that input instead of answering it again; complete_unit re-queues
+        # the unit when newer input is waiting behind it. A pending event
+        # delivery keeps the ordinary path (the claim must run it).
+        if (
+            not watermarks_answered
+            and claim.input_seq is not None
+            and claim.control_consumed_seq >= claim.control_input_seq
+        ):
+            answered_seq = await self._transcript_answered_seq(claim)
+            if answered_seq is not None:
+                try:
+                    fetchval = getattr(self._db, "fetchval", None)
+                    pending_event = bool(
+                        fetchval is not None
+                        and await fetchval(_PENDING_EVENT_EXISTS_SQL, claim.unit_id)
+                    )
+                except Exception:
+                    logger.warning(
+                        "pending-event authority query failed for unit %s; "
+                        "releasing instead of skipping (transcript leg)",
+                        unit_id,
+                        exc_info=True,
+                    )
+                    await self._release(claim, reason="pending_event_query_failed")
+                    return
+                if not pending_event:
+                    await self._detach_physical_before_transition(
+                        "skip_if_answered_by_transcript"
+                    )
+                    state = await complete_unit(
+                        self._db,
+                        unit_id=claim.unit_id,
+                        lease_token=token,
+                        consumed_seq=answered_seq,
+                    )
+                    logger.info(
+                        "run_queue complete: unit=%s consumed_seq=%s state=%s "
+                        "(skip-if-answered: transcript holds the final answer "
+                        "for input seq %s; watermark was %s)",
+                        unit_id,
+                        answered_seq,
+                        state,
+                        answered_seq,
+                        claim.consumed_seq,
+                    )
+                    if state is None:
+                        await self._ack_terminal_claim_loss(claim)
+                    self._mark_warm(claim)
+                    return
+
         # (c) Independent heartbeat — spawned BEFORE the bundle fetch/attach,
         # which can themselves outlast the 60s lease TTL (MCP connect_all,
         # message-tail restore). Never an astream hook.
@@ -3312,6 +3411,37 @@ class StatelessTurnExecutor:
             self._lease.mark_lost()
             raise
         return True
+
+    async def _transcript_answered_seq(self, claim: ClaimedUnit) -> Optional[int]:
+        """Seq of the oldest pending input the transcript already answers, or None.
+
+        Read-only and fail-open to None: a query failure means "not proven
+        answered", and the ordinary claim path decides. See
+        ``_ANSWERED_BY_TRANSCRIPT_SQL``.
+        """
+        fetchval = getattr(self._db, "fetchval", None)
+        if fetchval is None or claim.input_seq is None:
+            return None
+        try:
+            value = await fetchval(
+                _ANSWERED_BY_TRANSCRIPT_SQL,
+                claim.unit_id,
+                claim.consumed_seq if claim.consumed_seq is not None else -1,
+                int(claim.input_seq),
+            )
+        except Exception:
+            logger.warning(
+                "transcript answered-check failed for unit %s; treating as unanswered",
+                claim.unit_id,
+                exc_info=True,
+            )
+            return None
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
 
     async def _fetch_bundle(self, unit_id: str, token: int) -> Dict[str, Any]:
         client = _pa()._orchestrator_client

@@ -71,14 +71,23 @@ def extract_summary_text(messages: List[BaseMessage]) -> Optional[str]:
     return None
 
 
-def fresh_protected_copy(message: BaseMessage) -> BaseMessage:
+def fresh_protected_copy(
+    message: BaseMessage, *, preserve_identity: bool = False
+) -> BaseMessage:
     """Copy of a protected message without an id, markers intact.
 
     A copy without an id is *appended* by LangGraph's ``add_messages``
     reducer (the original is evicted by its ``RemoveMessage`` marker), which
     is how a re-seated block moves from the summarised region to its new
     position right after the summary.
+
+    ``preserve_identity`` returns the original object instead: a caller that
+    replaces its history wholesale (the persistent loop) has no reducer to
+    satisfy, and a re-seated message must keep the id its persisted row and
+    its turn stamp are keyed by.
     """
+    if preserve_identity:
+        return message
     if isinstance(message, HumanMessage):
         return HumanMessage(
             content=message.content,
@@ -91,6 +100,8 @@ def select_pinned_for_reseat(
     summarized: List[BaseMessage],
     kept: List[BaseMessage],
     current_phase_key: Optional[str],
+    *,
+    preserve_identity: bool = False,
 ) -> List[BaseMessage]:
     """Fresh copies of the protected messages in ``summarized`` that must survive.
 
@@ -98,7 +109,8 @@ def select_pinned_for_reseat(
     phase key) or bound to ``current_phase_key``; earlier phases' blocks are
     summarised away with their region. Copies are de-duplicated by
     ``protected_identity`` against ``kept`` (the window that follows the
-    summary) and against each other, in original order.
+    summary) and against each other, in original order. With
+    ``preserve_identity`` the originals are re-seated instead of copies.
     """
     present = {protected_identity(m) for m in kept if is_protected_message(m)}
     pinned: List[BaseMessage] = []
@@ -109,7 +121,7 @@ def select_pinned_for_reseat(
         if identity in present:
             continue
         present.add(identity)
-        pinned.append(fresh_protected_copy(msg))
+        pinned.append(fresh_protected_copy(msg, preserve_identity=preserve_identity))
     return pinned
 
 
@@ -118,6 +130,8 @@ def place_pinned_after_summary(
     summarized: List[BaseMessage],
     kept: List[BaseMessage],
     current_phase_key: Optional[str],
+    *,
+    preserve_identity: bool = False,
 ) -> List[BaseMessage]:
     """``[summary, *re-seated protected blocks, *kept]`` — the compacted tail.
 
@@ -126,7 +140,9 @@ def place_pinned_after_summary(
     model reads "what happened" and then "how this phase works" ahead of
     the live turns. See :func:`select_pinned_for_reseat` for the rule.
     """
-    pinned = select_pinned_for_reseat(summarized, kept, current_phase_key)
+    pinned = select_pinned_for_reseat(
+        summarized, kept, current_phase_key, preserve_identity=preserve_identity
+    )
     if pinned:
         logger.info(
             f"Re-seated {len(pinned)} protected message(s) after the summary "
@@ -1059,6 +1075,7 @@ class ContextManager:
         strategic_model: Optional[str] = None,
         tactical_model: Optional[str] = None,
         summarization_call_timeout: float = 240.0,
+        preserve_message_identity: bool = False,
     ):
         """Initialize context manager.
 
@@ -1070,8 +1087,19 @@ class ContextManager:
             summarization_call_timeout: Per fold-call timeout in seconds for
                 summarization LLM calls (N passes get N bounded calls, not
                 one shared blob — see src/core/summarizer.py)
+            preserve_message_identity: Keep the kept window's message
+                objects (ids, ``additional_kwargs``) through a summary
+                instead of re-creating them as id-less fresh copies. The
+                fresh copies exist for LangGraph's ``add_messages`` reducer
+                (evict by ``RemoveMessage``, append the copy after the
+                summary); a caller that replaces its history wholesale — the
+                persistent session loop — has no reducer and needs the ids
+                so its per-row upsert (``ON CONFLICT (id)``) and its turn
+                stamps survive compaction. See
+                knowledge-base/knowledge/issues/stateless_turn_settlement_crashes_after_midturn_compaction.md.
         """
         self.config = config or ContextConfig()
+        self.preserve_message_identity = bool(preserve_message_identity)
         # getattr-guarded: some callers pass a non-ContextConfig (e.g. tests
         # hand the whole AgentConfig). image_tokens is an optional new field —
         # absent -> flat estimation, never a constructor crash.
@@ -2283,6 +2311,13 @@ class ContextManager:
                         ),
                         tool_call_id=msg.tool_call_id,
                         name=getattr(msg, "name", None),
+                        # Identity rides along: the worker path re-copies this
+                        # id-less below anyway, the identity-preserving path
+                        # needs the capped copy to stay the same row.
+                        id=getattr(msg, "id", None),
+                        additional_kwargs=dict(
+                            getattr(msg, "additional_kwargs", None) or {}
+                        ),
                     )
                 )
 
@@ -2427,8 +2462,16 @@ class ContextManager:
 
         # Remove conversation messages (recent ones will be re-added as fresh copies).
         # Iterate the ORIGINAL conversation so we evict the right state IDs even
-        # when oversized messages were substituted with stubs above.
-        for msg in original_conversation:
+        # when oversized messages were substituted with stubs above. When the
+        # kept window keeps its identity it is not re-added, so only the
+        # summarised region is evicted (a marker for a surviving id would
+        # delete the message it means to keep).
+        evicted_conversation = (
+            original_conversation[:safe_start]
+            if self.preserve_message_identity
+            else original_conversation
+        )
+        for msg in evicted_conversation:
             if hasattr(msg, "id") and msg.id:
                 removal_markers.append(RemoveMessage(id=msg.id))
             else:
@@ -2440,10 +2483,14 @@ class ContextManager:
             )
 
         # Create fresh copies of recent messages without IDs so they get appended
-        # after the summary instead of staying in their original positions
+        # after the summary instead of staying in their original positions.
+        # preserve_message_identity keeps the objects themselves (no reducer
+        # to satisfy; ids + turn stamps must survive — see __init__).
         fresh_recent = []
         for msg in capped_recent_messages:
-            if isinstance(msg, AIMessage):
+            if self.preserve_message_identity:
+                fresh_recent.append(msg)
+            elif isinstance(msg, AIMessage):
                 fresh_recent.append(
                     AIMessage(
                         content=msg.content,
@@ -2481,6 +2528,7 @@ class ContextManager:
             messages_to_summarize,
             fresh_recent,
             self._current_phase_key,
+            preserve_identity=self.preserve_message_identity,
         )
 
         merged_summaries_info = (

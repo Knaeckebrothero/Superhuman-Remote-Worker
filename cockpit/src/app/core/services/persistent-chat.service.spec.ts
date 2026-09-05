@@ -1080,6 +1080,66 @@ describe('PersistentChatService — connect()', () => {
     expect((service.turns().find(isAssistantTurn) as AssistantTurn).status).toBe('done');
   });
 
+  it('closes a retained open turn when the durable snapshot proves the runtime idle', async () => {
+    // A turn whose terminal frame never arrived (the loop died in
+    // settlement; the journal holds turn.started with no turn.completed)
+    // stayed "generating" forever: the snapshot handler only ever reopened.
+    const { service, sseInstances } = createService();
+    await service.connect('thread-stranded');
+    fireSseOpen(sseInstances[0]);
+    fireSseMessage(sseInstances[0], { method: 'turn.started', params: { turn_id: 4 } }, '0:4303');
+    fireSseMessage(sseInstances[0], { method: 'token', params: { content: 'Completed.' } }, '0:5519');
+    (service as any)._flushDeltas();
+    expect(service.isStreaming()).toBe(true);
+    service.runningTool.set({ id: 'c1', tool: 'shell_execute', args: {} });
+
+    (service as any)._handleEvent({
+      method: 'session.state',
+      params: {
+        turn_count: 4,
+        turn_in_flight: false,
+        snapshot_source: 'durable_journal',
+        event_cursor: { epoch: 0, seq: 5520 },
+        replay_cursor: { epoch: 0, seq: 5520 },
+      },
+    });
+
+    expect(service.isStreaming()).toBe(false);
+    const turn = service.turns().find(isAssistantTurn) as AssistantTurn;
+    expect(turn.status).toBe('interrupted');
+    expect((turn.events[0] as TextEvent).content).toBe('Completed.');
+    expect(service.runningTool()).toBeNull();
+    // A pinned welcome frame (no durable source) keeps the historical
+    // reopen-only behaviour: it is followed by the exact WS state.
+    fireSseMessage(sseInstances[0], { method: 'turn.started', params: { turn_id: 5 } }, '0:5521');
+    (service as any)._handleEvent({
+      method: 'session.state',
+      params: { turn_count: 5, turn_in_flight: false },
+    });
+    expect(service.isStreaming()).toBe(true);
+  });
+
+  it('measures agent silence from agent-origin frames, not snapshots or stream reopens', async () => {
+    const { service, sseInstances } = createService();
+    await service.connect('thread-quiet');
+    fireSseOpen(sseInstances[0]);
+    (service as any).agentLastEventAt = 1000;
+
+    (service as any)._handleEvent({
+      method: 'session.state',
+      params: { turn_count: 4, turn_in_flight: false, snapshot_source: 'durable_journal' },
+    });
+    expect((service as any).agentLastEventAt).toBe(1000);
+
+    // A stream reopen must not make a silent agent look freshly active.
+    (service as any)._startSseWatchdog('thread-quiet');
+    expect((service as any).agentLastEventAt).toBe(1000);
+    (service as any)._stopSseWatchdog();
+
+    (service as any)._handleEvent({ method: 'usage.updated', params: { turn: 4 } });
+    expect((service as any).agentLastEventAt).toBeGreaterThan(1000);
+  });
+
   it('passes the cached cursor as ?last_event_id=<epoch>:<seq> on initial open', async () => {
     const { service, mockHttp, sseInstances } = createService({
       cursor: { epoch: 7, seq: 42, threadId: 'thread-B', updatedAt: '' } as any,

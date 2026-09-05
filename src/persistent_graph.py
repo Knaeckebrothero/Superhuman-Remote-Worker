@@ -40,6 +40,11 @@ from .core.context import (
 from .core.llm_retry import _classify_llm_error, _extract_rate_limit_delay
 from .core.loader import with_current_date
 from .core.message_markers import PERSIST_ROLE_KEY as _PERSIST_ROLE_KEY
+from .core.message_markers import (
+    pin_turn_input,
+    stamp_turn_membership,
+    unpin_turn_input,
+)
 from .core.summarizer import count_text_tokens
 from .core.workspace_backend import WorkspaceUnavailableError
 from .shared.tool_arg_coercion import coerce_tool_args
@@ -1194,6 +1199,15 @@ async def run_persistent_loop(
             # walk in _save_turn_ai_messages (backwards until the first
             # HumanMessage) keeps finding the turn boundary.
             user_msg.additional_kwargs[PERSIST_ROLE_KEY] = input_persist_role
+        # Turn membership is stamped on every message this turn appends (the
+        # input here, the rest via _execute_turn's _adopt) so the turn-end
+        # reconcile selects this turn's rows by stamp — a mid-turn compaction
+        # may summarise the input away, and walking back to it then crashed
+        # the settlement. The input is also pinned for the turn's duration:
+        # a summary re-seats it verbatim right after the recap, so the model
+        # keeps the live request while the rest of the turn is condensed.
+        stamp_turn_membership(user_msg, turn_id)
+        pin_turn_input(user_msg)
         messages.append(_ensure_msg_id(user_msg))
         # Capture the destination now, alongside the accepted input identity.
         # Config can hot-swap between turns, while tools can append synthetic
@@ -1462,6 +1476,7 @@ async def run_persistent_loop(
                     memory_service=memory_service,
                     defer_memory_capture_to_outbox=(defer_memory_extraction_to_outbox),
                     before_first_provider_admission=_admit_current_delivery,
+                    turn_id=turn_id,
                 )
             finally:
                 if tool_context is not None:
@@ -1664,6 +1679,9 @@ async def run_persistent_loop(
                 except Exception as e:
                     logger.warning(f"Memory extraction failed (non-fatal): {e}")
 
+        # The turn's provider work is over: the input no longer needs to
+        # survive a summary verbatim (the next turn pins its own).
+        unpin_turn_input(user_msg)
         turn_metrics = result.metrics if result else None
         if input_delivery_removed_from_context:
             await callbacks.on_turn_complete(
@@ -1877,15 +1895,24 @@ async def _execute_turn(
     memory_service: Optional[Any] = None,
     defer_memory_capture_to_outbox: bool = False,
     before_first_provider_admission: Optional[Callable[[], Awaitable[bool]]] = None,
+    turn_id: int = 0,
 ) -> TurnResult:
     """Execute a single turn: LLM call -> tool calls -> repeat until done.
 
     A turn ends when the LLM produces a response with no tool calls,
     or when the user interrupts.
+
+    ``turn_id`` (> 0) stamps every message this turn appends with its
+    membership (``message_markers.stamp_turn_membership``); the turn-end
+    reconcile selects the turn's rows by that stamp.
     """
     tool_calls_made = 0
     messages_added = 0
     first_provider_admitted = False
+
+    def _adopt(msg: Any) -> Any:
+        """Stamp a message this turn appends with the turn's membership."""
+        return stamp_turn_membership(msg, turn_id) if turn_id > 0 else msg
 
     def _provider_admission_closed() -> bool:
         gate = callbacks.before_provider_admission
@@ -1964,7 +1991,7 @@ async def _execute_turn(
             ),
             additional_kwargs={PERSIST_ROLE_KEY: "event"},
         )
-        messages.append(_ensure_msg_id(event))
+        messages.append(_adopt(_ensure_msg_id(event)))
         await _persist(event)
 
     # --- Memory retrieval (once per turn, before the inner loop) ---
@@ -2897,7 +2924,7 @@ async def _execute_turn(
                             response.invalid_tool_calls = []
                         final = finalize_streamed_response(response)
                         if final is not None:
-                            messages.append(final)
+                            messages.append(_adopt(final))
                             messages_added += 1
                     return TurnResult(
                         turn_id=0,
@@ -3243,7 +3270,7 @@ async def _execute_turn(
         response = repair_tool_call_arguments(response)
 
         # Add AI response to message history
-        messages.append(response)
+        messages.append(_adopt(response))
         messages_added += 1
         # Persist the LLM step immediately — it carries the reasoning + tool
         # calls and is the expensive bit to lose on a mid-turn crash.
@@ -3331,7 +3358,7 @@ async def _execute_turn(
                         name=str(tool_call.get("name") or "unknown"),
                     )
                 )
-                messages.append(rejected)
+                messages.append(_adopt(rejected))
                 messages_added += 1
                 await _persist(rejected)
             continue
@@ -3524,7 +3551,7 @@ async def _execute_turn(
                             tool_call_id=tool_call_id,
                         )
                     )
-                    messages.append(declined)
+                    messages.append(_adopt(declined))
                     messages_added += 1
                     await _persist(declined)
                     continue
@@ -3537,7 +3564,7 @@ async def _execute_turn(
                         tool_call_id=tool_call_id,
                     )
                 )
-                messages.append(tool_message)
+                messages.append(_adopt(tool_message))
                 messages_added += 1
                 tool_calls_made += 1
                 if officer_max_actions:
@@ -3558,7 +3585,7 @@ async def _execute_turn(
                             max_edge=resolve_image_max_edge(config),
                         )
                     )
-                    messages.append(image_message)
+                    messages.append(_adopt(image_message))
                     messages_added += 1
                     await _persist(image_message)
 
@@ -3641,8 +3668,10 @@ async def _execute_turn(
                 )
                 await callbacks.on_tool_start(tool_name, tool_args, tool_call_id)
                 messages.append(
-                    _ensure_msg_id(
-                        ToolMessage(content=error_result, tool_call_id=tool_call_id)
+                    _adopt(
+                        _ensure_msg_id(
+                            ToolMessage(content=error_result, tool_call_id=tool_call_id)
+                        )
                     )
                 )
                 await callbacks.on_tool_result(
@@ -3662,10 +3691,12 @@ async def _execute_turn(
 
             if outcome is PermissionOutcome.DECLINED:
                 messages.append(
-                    _ensure_msg_id(
-                        ToolMessage(
-                            content="User declined this tool call.",
-                            tool_call_id=tool_call_id,
+                    _adopt(
+                        _ensure_msg_id(
+                            ToolMessage(
+                                content="User declined this tool call.",
+                                tool_call_id=tool_call_id,
+                            )
                         )
                     )
                 )
@@ -3725,8 +3756,10 @@ async def _execute_turn(
             cleaned_str, extracted_images = extract_image_tags(result_str)
 
             messages.append(
-                _ensure_msg_id(
-                    ToolMessage(content=cleaned_str, tool_call_id=tool_call_id)
+                _adopt(
+                    _ensure_msg_id(
+                        ToolMessage(content=cleaned_str, tool_call_id=tool_call_id)
+                    )
                 )
             )
             messages_added += 1
@@ -3746,11 +3779,13 @@ async def _execute_turn(
 
             if extracted_images:
                 messages.append(
-                    _ensure_msg_id(
-                        make_multimodal_user_message(
-                            text=(f"Image content from tool call {tool_call_id}:"),
-                            images=extracted_images,
-                            max_edge=resolve_image_max_edge(config),
+                    _adopt(
+                        _ensure_msg_id(
+                            make_multimodal_user_message(
+                                text=(f"Image content from tool call {tool_call_id}:"),
+                                images=extracted_images,
+                                max_edge=resolve_image_max_edge(config),
+                            )
                         )
                     )
                 )
@@ -3807,7 +3842,7 @@ async def _execute_turn(
                     ),
                     additional_kwargs={PERSIST_ROLE_KEY: "event"},
                 )
-                messages.append(_ensure_msg_id(guard_note))
+                messages.append(_adopt(_ensure_msg_id(guard_note)))
                 messages_added += 1
                 await _persist(messages[-1])
                 logger.warning(
@@ -3825,7 +3860,7 @@ async def _execute_turn(
                     ),
                     additional_kwargs={PERSIST_ROLE_KEY: "event"},
                 )
-                messages.append(_ensure_msg_id(warn_note))
+                messages.append(_adopt(_ensure_msg_id(warn_note)))
                 messages_added += 1
                 await _persist(messages[-1])
 

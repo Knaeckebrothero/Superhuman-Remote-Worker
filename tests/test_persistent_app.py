@@ -1074,6 +1074,272 @@ class TestSaveTurnAiMessages:
         assert kwargs["memory_scope_id"] == "project-12"
 
     @pytest.mark.asyncio
+    async def test_authoritative_selects_by_membership_after_compaction(self):
+        """A mid-turn compaction summarised the accepted input away and left a
+        summary + the kept window. Membership stamps pick this turn's rows;
+        the input (persisted at accept time) and other turns' rows are not
+        rewritten; the DB still gets the exact input id for the boundary."""
+        from src.core.message_markers import stamp_turn_membership
+
+        client = AsyncMock()
+        prior_turn = stamp_turn_membership(AIMessage(content="before", id="prev-ai"), 3)
+        stamped_input = stamp_turn_membership(
+            HumanMessage(content="question", id="input-4"), 4
+        )
+        summary = SystemMessage(content="[Summary of prior work]\nrecap")
+        call = stamp_turn_membership(
+            AIMessage(
+                content="",
+                id="ai-call",
+                tool_calls=[{"name": "search", "args": {}, "id": "c1"}],
+            ),
+            4,
+        )
+        result = stamp_turn_membership(
+            ToolMessage(content="found", tool_call_id="c1", id="tool-1"), 4
+        )
+        final = stamp_turn_membership(AIMessage(content="done", id="final-4"), 4)
+        messages = [
+            SystemMessage(content="sys"),
+            prior_turn,
+            summary,
+            stamped_input,
+            call,
+            result,
+            final,
+        ]
+
+        await _save_turn_ai_messages(
+            client,
+            "tid",
+            messages,
+            4,
+            authoritative_turn_boundary=True,
+            turn_input_message_id="input-4",
+            memory_scope_kind="thread",
+            memory_scope_id="tid",
+        )
+
+        args = client.save_thread_messages.call_args.args
+        kwargs = client.save_thread_messages.call_args.kwargs
+        assert [row["id"] for row in args[1]] == ["ai-call", "tool-1", "final-4"]
+        assert kwargs["turn_input_message_id"] == "input-4"
+        assert kwargs["turn_number"] == 4
+
+    @pytest.mark.asyncio
+    async def test_authoritative_membership_survives_evicted_input(self):
+        """The exact input is gone from RAM entirely (summarised) — no crash."""
+        from src.core.message_markers import stamp_turn_membership
+
+        client = AsyncMock()
+        messages = [
+            SystemMessage(content="[Summary of prior work]\nrecap"),
+            stamp_turn_membership(AIMessage(content="done", id="final-5"), 5),
+        ]
+
+        await _save_turn_ai_messages(
+            client,
+            "tid",
+            messages,
+            5,
+            authoritative_turn_boundary=True,
+            turn_input_message_id="input-5",
+            memory_scope_kind="thread",
+            memory_scope_id="tid",
+        )
+
+        args = client.save_thread_messages.call_args.args
+        assert [row["id"] for row in args[1]] == ["final-5"]
+
+    @pytest.mark.asyncio
+    async def test_authoritative_unstamped_history_without_anchor_saves_nothing(self):
+        """Unstamped history whose input is not resident reconciles zero rows
+        (incremental rows stand, the DB mints the boundary) — never a crash."""
+        client = AsyncMock()
+        messages = [
+            SystemMessage(content="[Summary of prior work]\nrecap"),
+            AIMessage(content="done"),
+        ]
+
+        await _save_turn_ai_messages(
+            client,
+            "tid",
+            messages,
+            9,
+            authoritative_turn_boundary=True,
+            turn_input_message_id="input-9",
+            memory_scope_kind="thread",
+            memory_scope_id="tid",
+        )
+
+        client.save_thread_messages.assert_awaited_once_with(
+            "tid",
+            [],
+            turn_input_message_id="input-9",
+            turn_number=9,
+            memory_scope_kind="thread",
+            memory_scope_id="tid",
+        )
+
+
+class TestReconcileTurnWithRetry:
+    """Settlement is an idempotent upsert: transient DB failures are retried
+    (bounded), contract failures are not, and the pinned lane keeps its
+    best-effort shape."""
+
+    @staticmethod
+    def _install(monkeypatch, save):
+        from src.api import persistent_app as pa
+
+        monkeypatch.setattr(pa, "_TURN_RECONCILE_RETRY_DELAY_S", 0.0)
+        session = MagicMock()
+        session.postgres_conn = object()
+        session.messages = []
+        session.tool_decisions = {}
+        monkeypatch.setattr(pa, "_session", session)
+        monkeypatch.setattr(pa, "_thread_id", "tid")
+        monkeypatch.setattr(pa, "_save_turn_ai_messages", save)
+        return pa
+
+    @staticmethod
+    def _kwargs(authoritative: bool = True):
+        return {
+            "metrics": None,
+            "authoritative_turn_boundary": authoritative,
+            "turn_input_message_id": "input-4",
+            "memory_scope_kind": "thread",
+            "memory_scope_id": "tid",
+        }
+
+    @pytest.mark.asyncio
+    async def test_transient_failure_then_success(self, monkeypatch):
+        calls = []
+
+        async def save(*_a, **_k):
+            calls.append(1)
+            if len(calls) == 1:
+                raise ConnectionError("pool reset")
+
+        pa = self._install(monkeypatch, save)
+        await pa._reconcile_turn_with_retry(4, **self._kwargs())
+        assert len(calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_timeout_is_retried_then_succeeds(self, monkeypatch):
+        calls = []
+
+        async def save(*_a, **_k):
+            calls.append(1)
+            if len(calls) < 3:
+                raise asyncio.TimeoutError()
+
+        pa = self._install(monkeypatch, save)
+        await pa._reconcile_turn_with_retry(4, **self._kwargs())
+        assert len(calls) == 3
+
+    @pytest.mark.asyncio
+    async def test_contract_failure_is_not_retried(self, monkeypatch):
+        calls = []
+
+        async def save(*_a, **_k):
+            calls.append(1)
+            raise ValueError("lacks an immutable memory destination")
+
+        pa = self._install(monkeypatch, save)
+        with pytest.raises(ValueError):
+            await pa._reconcile_turn_with_retry(4, **self._kwargs())
+        assert len(calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_lost_lease_is_not_retried(self, monkeypatch):
+        from src.api.lease_context import LeaseLostError
+
+        calls = []
+
+        async def save(*_a, **_k):
+            calls.append(1)
+            raise LeaseLostError("fence lost")
+
+        pa = self._install(monkeypatch, save)
+        with pytest.raises(LeaseLostError):
+            await pa._reconcile_turn_with_retry(4, **self._kwargs())
+        assert len(calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_exhausted_transient_failures_propagate(self, monkeypatch):
+        calls = []
+
+        async def save(*_a, **_k):
+            calls.append(1)
+            raise ConnectionError("still down")
+
+        pa = self._install(monkeypatch, save)
+        with pytest.raises(ConnectionError):
+            await pa._reconcile_turn_with_retry(4, **self._kwargs())
+        assert len(calls) == pa._TURN_RECONCILE_ATTEMPTS
+
+    @pytest.mark.asyncio
+    async def test_pinned_lane_swallows_transient_failure(self, monkeypatch):
+        calls = []
+
+        async def save(*_a, **_k):
+            calls.append(1)
+            raise asyncio.TimeoutError()
+
+        pa = self._install(monkeypatch, save)
+        await pa._reconcile_turn_with_retry(4, **self._kwargs(authoritative=False))
+        assert len(calls) == 1
+
+
+class TestLoopCrashTerminalEdge:
+    """A loop that dies outside a turn's own error path still closes the open
+    turn: turn.error (+ durable error row) goes out before termination, so
+    no client — live or replaying the journal — spins on a turn that ended.
+    A lost lease is the successor claim's turn to close, not ours."""
+
+    @pytest.mark.asyncio
+    async def test_loop_crash_emits_turn_error_before_terminate(self, monkeypatch):
+        from src.api import persistent_app as pa
+
+        async def boom():
+            raise RuntimeError("settlement failed")
+
+        task = asyncio.create_task(boom())
+        await asyncio.sleep(0)
+        on_error = AsyncMock()
+        terminate = AsyncMock()
+        monkeypatch.setattr(pa, "_loop_on_error", on_error)
+        monkeypatch.setattr(pa, "_terminate_session", terminate)
+        monkeypatch.setattr(pa, "_stateless_mode", lambda: True)
+
+        await pa._loop_completion_handler(task)
+
+        on_error.assert_awaited_once()
+        assert "settlement failed" in on_error.await_args.args[0]
+        terminate.assert_awaited_once_with("loop_crash", mark_thread=False)
+
+    @pytest.mark.asyncio
+    async def test_lost_lease_crash_emits_no_turn_error(self, monkeypatch):
+        from src.api import persistent_app as pa
+        from src.api.lease_context import LeaseLostError
+
+        async def lost():
+            raise LeaseLostError("fence lost")
+
+        task = asyncio.create_task(lost())
+        await asyncio.sleep(0)
+        on_error = AsyncMock()
+        terminate = AsyncMock()
+        monkeypatch.setattr(pa, "_loop_on_error", on_error)
+        monkeypatch.setattr(pa, "_terminate_session", terminate)
+        monkeypatch.setattr(pa, "_stateless_mode", lambda: True)
+
+        await pa._loop_completion_handler(task)
+
+        on_error.assert_not_awaited()
+        terminate.assert_awaited_once_with("loop_crash", mark_thread=False)
+
+    @pytest.mark.asyncio
     async def test_pinned_keeps_historical_latest_human_boundary(self):
         """The new callback metadata must not change pinned reconciliation."""
         client = AsyncMock()

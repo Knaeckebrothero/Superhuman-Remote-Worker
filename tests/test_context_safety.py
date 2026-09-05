@@ -1811,3 +1811,112 @@ class TestPinnedAfterSummary:
         assert out[1].id is None
         assert protected_phase_key(out[1]) == "2:tactical"
         assert out[1].content == current.content
+
+
+# =============================================================================
+# preserve_message_identity — the persistent loop's compaction contract
+# =============================================================================
+
+
+class TestPreserveMessageIdentity:
+    """``preserve_message_identity``: the persistent loop replaces its history
+    wholesale (no ``add_messages`` reducer), so the kept window must keep its
+    objects — ids and ``additional_kwargs`` such as the turn stamp — and a
+    pinned message is re-seated as the original. The default mode keeps the
+    id-less fresh copies the worker graph's reducer relies on.
+    knowledge-base/knowledge/issues/stateless_turn_settlement_crashes_after_midturn_compaction.md
+    """
+
+    @staticmethod
+    def _manager(context_config, preserve: bool) -> ContextManager:
+        return ContextManager(
+            config=context_config,
+            model="gpt-4",
+            preserve_message_identity=preserve,
+        )
+
+    @staticmethod
+    def _history(n: int = 12):
+        from src.core.message_markers import stamp_turn_membership
+
+        body = "The quick brown fox jumps over the lazy dog. " * 8
+        messages = []
+        for i in range(n):
+            msg = (
+                HumanMessage(content=f"question {i}: {body}", id=f"msg-{i}")
+                if i % 2 == 0
+                else AIMessage(content=f"answer {i}: {body}", id=f"msg-{i}")
+            )
+            messages.append(stamp_turn_membership(msg, 4))
+        return messages
+
+    @pytest.mark.asyncio
+    async def test_kept_window_keeps_objects_ids_and_stamps(
+        self, context_config, mock_llm
+    ):
+        from langchain_core.messages import RemoveMessage
+        from src.core.message_markers import turn_membership
+
+        manager = self._manager(context_config, preserve=True)
+        messages = self._history()
+        result = await manager.summarize_and_compact(messages, mock_llm)
+
+        assert manager.compaction_runs == 1
+        tail = [m for m in result if not isinstance(m, (SystemMessage, RemoveMessage))]
+        assert tail
+        assert all(any(m is original for original in messages) for m in tail)
+        assert all(m.id and turn_membership(m) == 4 for m in tail)
+        # A marker for a surviving id would delete the message it means to keep.
+        evicted = {m.id for m in result if isinstance(m, RemoveMessage)}
+        assert not evicted & {m.id for m in tail}
+        assert evicted  # the summarised region is still evicted
+
+    @pytest.mark.asyncio
+    async def test_default_mode_recreates_idless_fresh_copies(
+        self, context_config, mock_llm
+    ):
+        from langchain_core.messages import RemoveMessage
+
+        manager = self._manager(context_config, preserve=False)
+        messages = self._history()
+        result = await manager.summarize_and_compact(messages, mock_llm)
+
+        tail = [m for m in result if not isinstance(m, (SystemMessage, RemoveMessage))]
+        assert tail
+        assert all(m.id is None for m in tail)
+        assert not any(any(m is original for original in messages) for m in tail)
+
+    @pytest.mark.asyncio
+    async def test_pinned_turn_input_is_reseated_as_the_original(
+        self, context_config, mock_llm
+    ):
+        from langchain_core.messages import RemoveMessage
+        from src.core.message_markers import (
+            PROTECTED_KEY,
+            pin_turn_input,
+            unpin_turn_input,
+        )
+
+        manager = self._manager(context_config, preserve=True)
+        messages = self._history()
+        turn_input = messages[0]
+        pin_turn_input(turn_input)
+
+        result = await manager.summarize_and_compact(messages, mock_llm)
+
+        kept = [m for m in result if not isinstance(m, RemoveMessage)]
+        summary_at = next(
+            i
+            for i, m in enumerate(kept)
+            if isinstance(m, SystemMessage) and "[Summary of prior work]" in m.content
+        )
+        assert kept[summary_at + 1] is turn_input
+        assert turn_input.id == "msg-0"
+        # The pin is the loop's, removed when the turn ends; other pins stay.
+        unpin_turn_input(turn_input)
+        assert PROTECTED_KEY not in turn_input.additional_kwargs
+        other = HumanMessage(
+            content="phase block", additional_kwargs={PROTECTED_KEY: True}
+        )
+        unpin_turn_input(other)
+        assert other.additional_kwargs[PROTECTED_KEY] is True
