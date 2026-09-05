@@ -19,9 +19,10 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 
 import httpx
+
+from shared.runtime.llm.structured_recovery import extract_json_candidate
 
 logger = logging.getLogger(__name__)
 
@@ -56,57 +57,8 @@ _PROVIDER_FOR_MODEL = {
 }
 
 
-def _strip_think_blocks(text: str) -> str:
-    return re.sub(r"(?is)<think>.*?</think>\s*", "", text)
-
-
-def _strip_code_fence(text: str) -> str:
-    match = re.search(
-        r"(?is)^\s*```(?:json)?\s*\n(.*)\n\s*```\s*$",
-        text,
-        flags=re.DOTALL,
-    )
-    if match:
-        return match.group(1)
-    return text
-
-
-def _first_json_span(text: str) -> str | None:
-    in_string = False
-    escape = False
-    depth = 0
-    start = None
-    for idx, char in enumerate(text):
-        if escape:
-            escape = False
-            continue
-        if char == "\\":
-            escape = True
-            continue
-        if char == '"':
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if char in "{[":
-            if depth == 0:
-                start = idx
-            depth += 1
-            continue
-        if char in "}]":
-            if depth:
-                depth -= 1
-                if depth == 0 and start is not None:
-                    return text[start : idx + 1].strip()
-    return None
-
-
 def _recover_structured_json(raw_text: str | None) -> dict | None:
-    if not raw_text:
-        return None
-    cleaned = _strip_think_blocks(raw_text)
-    cleaned = _strip_code_fence(cleaned)
-    candidate = _first_json_span(cleaned)
+    candidate = extract_json_candidate(raw_text)
     if candidate is None:
         return None
     try:

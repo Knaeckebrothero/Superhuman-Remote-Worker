@@ -51,6 +51,20 @@ def _first_json_span(text: str) -> Optional[str]:
     return None
 
 
+def extract_json_candidate(raw_text: str | None) -> Optional[str]:
+    """Return the first balanced object/array span, without validating JSON.
+
+    Preserve the established think-block, fence and escaped-string handling.
+    Callers own JSON/schema validation, defaults and error policy. A malformed
+    first candidate is not skipped in favor of a later candidate.
+    """
+    if not raw_text:
+        return None
+    cleaned = _remove_think_blocks(raw_text)
+    cleaned = _strip_code_fence(cleaned)
+    return _first_json_span(cleaned)
+
+
 def recover_structured(
     raw_text: str | None, schema: Type[BaseModel]
 ) -> Optional[BaseModel]:
@@ -60,12 +74,7 @@ def recover_structured(
     fenced JSON blocks), extracts the first balanced JSON object/array, then
     validates it against the pydantic schema.
     """
-    if not raw_text:
-        return None
-
-    cleaned = _remove_think_blocks(raw_text)
-    cleaned = _strip_code_fence(cleaned)
-    candidate = _first_json_span(cleaned)
+    candidate = extract_json_candidate(raw_text)
     if candidate is None:
         return None
 
