@@ -3,20 +3,13 @@
 # Files referenced here resolve via expert directory → config/{prompts,templates}/.
 
 default:
-  prompts:
-    strategic: strategic.txt
-    tactical: tactical.txt
   instructions:
     instructions: instructions.md
 
 minimax:
   prompts:
     persona: persona_minimax.txt
-    strategic: strategic_minimax.txt
-    tactical: tactical_minimax.txt
 
 minimax-m3:
   prompts:
     persona: persona_minimax_m3.txt
-    strategic: strategic_minimax_m3.txt
-    tactical: tactical_minimax_m3.txt

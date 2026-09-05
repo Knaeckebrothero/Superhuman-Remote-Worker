@@ -37,23 +37,6 @@
     Used when the conversation is compacted to free context. Runs in both worker
     and persistent modes.
 
-# --- Prompts · worker (job) agents only ---------------------------------------
-# Legacy phase swap only (phase_settings.prompt_mode: legacy, the U2 bench arm).
-# In the default skills mode the phase guidance is the bundled strategic-phase /
-# tactical-phase skills (config/skills/, expert-local overrides under
-# config/experts/<x>/skills/), delivered once per phase — these two keys are
-# not read then. Removed with the family variants (U2 WP6).
-- kind: prompts
-  name: strategic
-  group: "Prompts · worker (jobs)"
-  title: "Strategic-phase directive (legacy prompt mode)"
-  description: "Rendered into the system prompt during strategic (planning / reflection) phases — only when phase_settings.prompt_mode is legacy."
-- kind: prompts
-  name: tactical
-  group: "Prompts · worker (jobs)"
-  title: "Tactical-phase directive (legacy prompt mode)"
-  description: "Rendered into the system prompt during tactical (execution) phases — only when phase_settings.prompt_mode is legacy."
-
 # --- Prompts · persistent (session) agents only -------------------------------
 # src/persistent_graph.py has no phases; this single prompt is the persistent-
 # mode counterpart to the worker's strategic/tactical directives.

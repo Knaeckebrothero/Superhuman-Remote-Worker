@@ -653,7 +653,7 @@ class TestExecuteRendersGuidance:
 
         with (
             patch("src.graph.get_phase_system_prompt", return_value="SYS"),
-            patch("src.graph.get_system_prompt", return_value="SYS"),
+            patch("src.graph.get_phase_system_prompt", return_value="SYS"),
             patch("src.graph.get_archiver", return_value=None),
             patch.object(dual_app, "ack_guidance", ack),
         ):
@@ -688,7 +688,7 @@ class TestExecuteRendersGuidance:
 
         with (
             patch("src.graph.get_phase_system_prompt", return_value="SYS"),
-            patch("src.graph.get_system_prompt", return_value="SYS"),
+            patch("src.graph.get_phase_system_prompt", return_value="SYS"),
             patch("src.graph.get_archiver", return_value=None),
             patch.object(dual_app, "ack_guidance", ack),
         ):
@@ -725,7 +725,7 @@ class TestExecuteRendersGuidance:
 
         with (
             patch("src.graph.get_phase_system_prompt", return_value="SYS"),
-            patch("src.graph.get_system_prompt", return_value="SYS"),
+            patch("src.graph.get_phase_system_prompt", return_value="SYS"),
             patch("src.graph.get_archiver", return_value=None),
             patch.object(dual_app, "ack_guidance", ack),
         ):
@@ -758,7 +758,7 @@ class TestExecuteRendersGuidance:
 
         with (
             patch("src.graph.get_phase_system_prompt", return_value="SYS"),
-            patch("src.graph.get_system_prompt", return_value="SYS"),
+            patch("src.graph.get_phase_system_prompt", return_value="SYS"),
             patch("src.graph.get_archiver", return_value=None),
         ):
             await execute(state)

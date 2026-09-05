@@ -21,7 +21,6 @@ import yaml
 
 from src.core.loader import (
     INHERIT_MODEL,
-    PROMPT_MODE_LEGACY,
     ROLE_ROOTS,
     ROOT_NAMES,
     _apply_settings_matrix,
@@ -272,7 +271,7 @@ def resolve_config(
     # what the role does not read (e.g. `workspace.backend` for a subagent).
     data = prune_ignored_keys(data)
 
-    # Phase-skill floor (U2, worker role, skills mode): the strategic-phase /
+    # Phase-skill floor (U2, worker role): the strategic-phase /
     # tactical-phase bindings replaced an unconditional system-prompt swap, so
     # a worker must always carry them. `deep_merge` replaces lists wholesale —
     # an expert that authors its own `instruction_files` (a DB expert forked
@@ -340,15 +339,8 @@ def resolve_config(
 
 def ensure_worker_phase_skill_bindings(data: dict) -> dict:
     """Return ``data`` with the two phase-skill bindings present in
-    ``instruction_files`` (prepended when missing). A no-op in legacy prompt
-    mode — the swap carries the phase text there and the runtime skips the
-    phase-skill blocks anyway."""
-    phase_settings = data.get("phase_settings")
-    mode = (
-        phase_settings.get("prompt_mode") if isinstance(phase_settings, dict) else None
-    )
-    if mode == PROMPT_MODE_LEGACY:
-        return data
+    ``instruction_files`` (prepended when missing). Phase skills are the
+    only live source of worker phase guidance after U2 WP6."""
     entries = data.get("instruction_files")
     entries, restored = ensure_phase_skill_bindings(
         entries if isinstance(entries, list) else []

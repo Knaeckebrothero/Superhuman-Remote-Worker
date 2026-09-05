@@ -1,13 +1,12 @@
 """The per-call phase gate in ``create_audited_tool_node`` (U2 WP3).
 
-With one tool binding for every phase (``phase_settings.prompt_mode: skills``,
-the default) the LLM schema no longer filters tools by phase, so the runtime
+With one tool binding for every phase the LLM schema no longer filters tools
+by phase, so the runtime
 gate is the enforcement — and it decides per call: the batch's phase-legal
 calls execute through the ToolNode exactly as before (same batch timeout and
 watchdog), every phase-illegal call gets an error ToolMessage in its original
 position, both sets are audited (the rejection shows in the audit trail), and
-rejected calls count in the tool-call budget but never as progress. Legacy
-prompt mode keeps the pre-U2 whole-batch rejection (bench arm A).
+rejected calls count in the tool-call budget but never as progress.
 
 Design: knowledge-base/knowledge/features/universal_experts_and_subagents.md
 §1.2 — acceptance (c): no phase-illegal tool executes, the gate returns an
@@ -23,7 +22,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 import pytest
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 
-from src.core.loader import PROMPT_MODE_LEGACY, LimitsConfig
+from src.core.loader import LimitsConfig
 from src.graph import create_audited_tool_node
 from src.tools.registry import TOOL_REGISTRY
 
@@ -43,22 +42,11 @@ BATCH_NOTE = "Other calls in this batch were executed normally."
 
 @dataclass
 class FakeConfig:
-    """What create_audited_tool_node reads; phase_settings selects the mode."""
+    """What ``create_audited_tool_node`` reads."""
 
     agent_id: str = "gate-agent"
     limits: LimitsConfig = field(default_factory=LimitsConfig)
     llm: Any = field(default_factory=lambda: SimpleNamespace(model=None))
-    phase_settings: Optional[Any] = None
-
-
-def legacy_config(*, tool_binding_mode="auto", **limits) -> FakeConfig:
-    return FakeConfig(
-        limits=LimitsConfig(**limits),
-        phase_settings=SimpleNamespace(
-            prompt_mode=PROMPT_MODE_LEGACY,
-            tool_binding_mode=tool_binding_mode,
-        ),
-    )
 
 
 def tool(name: str) -> MagicMock:
@@ -246,31 +234,6 @@ class TestPerCallGate:
             # one tool that stages the work for the next tactical phase.
             assert named <= {own, "next_phase_todos"}, named
         assert "next_phase_todos" not in STRATEGIC_IN_TACTICAL
-
-    @pytest.mark.asyncio
-    async def test_legacy_prose_union_binding_uses_the_per_call_gate(self, tool_node):
-        tool_node.ainvoke = AsyncMock(
-            return_value={"messages": [result_for("read_file", "c1", "body")]}
-        )
-        audited = create_audited_tool_node(
-            [tool("read_file"), tool("job_complete")],
-            legacy_config(tool_binding_mode="union"),
-        )
-        result = await audited(
-            state(
-                [tc("read_file", "c1"), tc("job_complete", "c2")],
-                is_strategic=False,
-                phase_number=4,
-            )
-        )
-
-        tool_node.ainvoke.assert_awaited_once()
-        assert [
-            (message.tool_call_id, message.name) for message in tool_messages(result)
-        ] == [("c1", "read_file"), ("c2", "job_complete")]
-        assert tool_messages(result)[1].content == (
-            f"{STRATEGIC_IN_TACTICAL} {BATCH_NOTE}"
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -468,48 +431,6 @@ class TestBatchSemantics:
         )
         assert tool_messages(rejected)[0].content == STRATEGIC_IN_TACTICAL
         assert tool_node.ainvoke.await_count == 1
-
-
-# ---------------------------------------------------------------------------
-# Legacy prompt mode: the pre-U2 batch gate, byte for byte
-# ---------------------------------------------------------------------------
-
-
-class TestLegacyPromptMode:
-    @pytest.mark.asyncio
-    async def test_the_whole_batch_is_rejected_as_before(self, tool_node):
-        audited = create_audited_tool_node(
-            [tool("read_file"), tool("job_complete")], legacy_config()
-        )
-        result = await audited(
-            state(
-                [tc("read_file", "c1", {"path": "x"}), tc("job_complete", "c2")],
-                is_strategic=False,
-                phase_number=4,
-            )
-        )
-        by_id = {m.tool_call_id: m.content for m in tool_messages(result)}
-        assert by_id["c2"] == (
-            "Error: 'job_complete' is not available in the tactical phase. "
-            "Use tools appropriate for this phase."
-        )
-        assert by_id["c1"].startswith(
-            "Not executed: 'read_file' IS available in the tactical phase"
-        )
-        assert "Re-issue 'read_file'" in by_id["c1"]
-        tool_node.ainvoke.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_a_legal_batch_executes_as_before(self, tool_node):
-        tool_node.ainvoke = AsyncMock(
-            return_value={"messages": [result_for("job_complete", "c1", "done")]}
-        )
-        audited = create_audited_tool_node([tool("job_complete")], legacy_config())
-        result = await audited(
-            state([tc("job_complete", "c1")], is_strategic=True, phase_number=3)
-        )
-        assert tool_messages(result)[0].content == "done"
-        tool_node.ainvoke.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

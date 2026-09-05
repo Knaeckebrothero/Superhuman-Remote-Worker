@@ -589,7 +589,7 @@ def test_unresolvable_ref_dropped_with_warning(caplog):
     assert cfg.extra["_roster_warnings"] == warnings
 
 
-# --- U2 WP2: the phase-skill floor for the worker role + prompt_mode ---------
+# --- U2 WP2/WP6: the phase-skill floor and single worker path ----------------
 
 
 def _phase_bindings(entries):
@@ -664,7 +664,7 @@ def test_a_db_expert_forked_before_u2_gets_the_phase_bindings_back():
     assert blob["agent"]["_db_prompt_keys"] == ["strategic"]
 
 
-def test_legacy_prompt_mode_flows_through_config_override_and_skips_the_floor():
+def test_retired_phase_mode_override_keys_are_ignored_and_floor_is_kept():
     from src.core.loader import load_config_from_resolved
 
     blob = resolve_config(
@@ -677,48 +677,17 @@ def test_legacy_prompt_mode_flows_through_config_override_and_skips_the_floor():
             }
         },
     )
-    assert blob["agent"]["phase_settings"]["prompt_mode"] == "legacy"
-    assert blob["agent"]["phase_settings"]["tool_binding_mode"] == "union"
-    assert blob["agent"]["phase_settings"]["min_todos"] == 2  # merged, not replaced
-    assert _phase_bindings(blob["agent"]["instruction_files"]) == []
-    hydrated = load_config_from_resolved(blob)
-    assert hydrated.phase_settings.prompt_mode == "legacy"
-    assert hydrated.phase_settings.tool_binding_mode == "union"
-    # Default is skills, and it is frozen explicitly.
-    default = resolve_config(base_config_name="developer", expert_type="worker")
-    assert default["agent"]["phase_settings"]["prompt_mode"] == "skills"
-    assert default["agent"]["phase_settings"]["tool_binding_mode"] == "auto"
-
-
-def test_filtered_tool_binding_mode_round_trips_with_skills_prompt():
-    from src.core.loader import load_config_from_resolved
-
-    blob = resolve_config(
-        base_config_name="assistant",
-        expert_type="worker",
-        request_override={"phase_settings": {"tool_binding_mode": "filtered"}},
-    )
-    assert blob["agent"]["phase_settings"]["prompt_mode"] == "skills"
-    assert blob["agent"]["phase_settings"]["tool_binding_mode"] == "filtered"
+    assert set(blob["agent"]["phase_settings"]) == {"min_todos", "max_todos"}
+    assert blob["agent"]["phase_settings"]["min_todos"] == 2
     assert len(_phase_bindings(blob["agent"]["instruction_files"])) == 2
     hydrated = load_config_from_resolved(blob)
-    assert hydrated.phase_settings.prompt_mode == "skills"
-    assert hydrated.phase_settings.tool_binding_mode == "filtered"
+    assert not hasattr(hydrated.phase_settings, "prompt_mode")
+    assert not hasattr(hydrated.phase_settings, "tool_binding_mode")
 
 
-def test_invalid_prompt_mode_is_refused_at_resolution():
-    import pytest
-
-    with pytest.raises(ValueError, match="prompt_mode"):
-        resolve_config(
-            base_config_name="developer",
-            expert_type="worker",
-            request_override={"phase_settings": {"prompt_mode": "bogus"}},
-        )
-
-    with pytest.raises(ValueError, match="tool_binding_mode"):
-        resolve_config(
-            base_config_name="developer",
-            expert_type="worker",
-            request_override={"phase_settings": {"tool_binding_mode": "bogus"}},
-        )
+def test_new_worker_blob_has_no_phase_prompt_segments_or_mode_keys():
+    blob = resolve_config(base_config_name="developer", expert_type="worker")
+    assert set(blob["agent"]["phase_settings"]) == {"min_todos", "max_todos"}
+    assert "strategic" not in blob["prompts"]
+    assert "tactical" not in blob["prompts"]
+    assert len(_phase_bindings(blob["agent"]["instruction_files"])) == 2

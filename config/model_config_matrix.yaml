@@ -36,8 +36,6 @@ default:
     systemprompt: systemprompt.txt
     systemprompt_interactive: systemprompt_interactive.txt
     persona: persona.txt
-    strategic: strategic.txt
-    tactical: tactical.txt
     summarization: summarization_prompt.txt
     memory_extraction: memory_extraction_prompt.txt
     memory_assembler: memory_assembler_prompt.txt
@@ -71,8 +69,6 @@ minimax:
   prompts:
     systemprompt: systemprompt_minimax.txt
     persona: persona_minimax.txt
-    strategic: strategic_minimax.txt
-    tactical: tactical_minimax.txt
     summarization: summarization_prompt_minimax.txt
   instructions:
     instructions: instructions_minimax.md
@@ -121,8 +117,6 @@ minimax-m3:
   prompts:
     systemprompt: systemprompt_minimax_m3.txt
     persona: persona_minimax_m3.txt
-    strategic: strategic_minimax_m3.txt
-    tactical: tactical_minimax_m3.txt
     summarization: summarization_prompt_minimax_m3.txt
   instructions:
     instructions: instructions_minimax_m3.md
@@ -317,8 +311,6 @@ gpt-5:
     systemprompt: systemprompt_gpt_5.txt
     systemprompt_interactive: systemprompt_interactive_gpt_5.txt
     persona: persona_gpt_5.txt
-    strategic: strategic_gpt_5.txt
-    tactical: tactical_gpt_5.txt
     summarization: summarization_prompt_gpt_5.txt
     # Auxiliary task prompts — tuned for the gpt-5 family wire format
     # (XML-tagged, structured-output aware). Loaded when an aux model in this
@@ -360,8 +352,6 @@ gpt-5.6:
     systemprompt: systemprompt_gpt_5.txt
     systemprompt_interactive: systemprompt_interactive_gpt_5.txt
     persona: persona_gpt_5.txt
-    strategic: strategic_gpt_5.txt
-    tactical: tactical_gpt_5.txt
     summarization: summarization_prompt_gpt_5.txt
     memory_extraction: memory_extraction_prompt_gpt_5.txt
     memory_assembler: memory_assembler_prompt_gpt_5.txt
@@ -387,8 +377,6 @@ codex:
     systemprompt: systemprompt_gpt_5.txt
     systemprompt_interactive: systemprompt_interactive_gpt_5.txt
     persona: persona_gpt_5.txt
-    strategic: strategic_gpt_5.txt
-    tactical: tactical_gpt_5.txt
     summarization: summarization_prompt_gpt_5.txt
     # Shared with the gpt-5 family — codex aliases gpt-5 for prompts.
     memory_extraction: memory_extraction_prompt_gpt_5.txt
@@ -414,8 +402,6 @@ codex-spark:
     systemprompt: systemprompt_codex_spark.txt
     systemprompt_interactive: systemprompt_interactive_gpt_5.txt
     persona: persona_codex_spark.txt
-    strategic: strategic_codex_spark.txt
-    tactical: tactical_codex_spark.txt
     summarization: summarization_prompt_gpt_5.txt
   guardrails:
     file: codex_spark.yaml
@@ -435,8 +421,6 @@ gpt-oss:
   prompts:
     systemprompt: systemprompt_gpt_oss.txt
     persona: persona_gpt_oss.txt
-    strategic: strategic_gpt_oss.txt
-    tactical: tactical_gpt_oss.txt
     summarization: summarization_prompt_gpt_oss.txt
     memory_extraction: memory_extraction_prompt_gpt_oss.txt
     memory_assembler: memory_assembler_prompt_gpt_oss.txt
@@ -490,8 +474,6 @@ gemma:
     # Worker-path variants
     systemprompt: systemprompt_gemma.txt
     persona: persona_gemma.txt
-    strategic: strategic_gemma.txt
-    tactical: tactical_gemma.txt
     summarization: summarization_prompt_gemma.txt
     # Auxiliary-path variants (anti-repetition; mitigate vllm#40080)
     memory_extraction: memory_extraction_prompt_gemma.txt

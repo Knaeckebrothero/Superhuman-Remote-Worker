@@ -14,7 +14,6 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import MagicMock, AsyncMock, call, patch
 
@@ -71,9 +70,6 @@ class FakeConfig:
     limits: LimitsConfig = field(default_factory=LimitsConfig)
     tools: FakeToolsConfig = field(default_factory=FakeToolsConfig)
     llm: FakeLLMConfig = field(default_factory=FakeLLMConfig)
-    # ``phase_settings.prompt_mode`` selects the gate: skills (default, one
-    # binding, per-call gate) or legacy (phase-filtered pair, batch gate).
-    phase_settings: Optional[object] = None
 
 
 def make_tool_call(name: str, args: dict = None, call_id: str = None):
@@ -188,8 +184,8 @@ async def test_pending_tools_resume_restores_phase_before_instruction_gate(confi
     )
     context = ToolContext()
     context._instruction_files = [entry]
-    # A fresh successor context has no phase, so phase-filtered bindings are
-    # intentionally not evaluated until the resumed graph node supplies it.
+    # A fresh successor context has no phase, so phase-scoped instruction
+    # bindings are not evaluated until the resumed graph node supplies it.
     assert context.check_tool_enforcement("todo_complete") is None
     fake_read = MagicMock()
     fake_read.name = "read_file"
@@ -1360,11 +1356,9 @@ class TestRequestReplanReset:
 class TestPhaseGate:
     """The runtime phase gate in audited_tools.
 
-    With one tool binding for every phase (U2 skills mode, the default) the
-    gate IS the enforcement and decides per call: the batch's phase-legal
-    calls execute, each illegal one gets an error ToolMessage naming its
-    phase. Legacy prompt mode (phase-filtered bindings) keeps the pre-U2
-    whole-batch rejection as its backup layer. The full per-call contract
+    With one tool binding for every phase, the gate IS the enforcement and
+    decides per call: the batch's phase-legal calls execute, each illegal one
+    gets an error ToolMessage naming its phase. The full per-call contract
     (audit, budget, progress, order, timeout) is in tests/test_phase_gate.py.
     """
 
@@ -1550,52 +1544,6 @@ class TestPhaseGate:
             mock_tn.ainvoke.assert_awaited_once()
             seen = mock_tn.ainvoke.await_args.args[0]["messages"][-1]
             assert [c["name"] for c in seen.tool_calls] == ["read_file"]
-
-    @pytest.mark.asyncio
-    async def test_legacy_prompt_mode_rejects_the_whole_batch(self):
-        """Legacy prompt mode (phase-filtered bindings): the batch-level gate is
-        unchanged — the violating call gets the "not available" error and the
-        co-batched legal call an honest "not executed, re-issue" message."""
-        config = FakeConfig(phase_settings=SimpleNamespace(prompt_mode="legacy"))
-        fake_read = MagicMock()
-        fake_read.name = "read_file"
-        fake_jc = MagicMock()
-        fake_jc.name = "job_complete"
-
-        with patch("src.graph.ToolNode") as MockToolNode:
-            mock_tn = AsyncMock()
-            MockToolNode.return_value = mock_tn
-
-            audited = create_audited_tool_node([fake_read, fake_jc], config)
-
-            state = make_state(
-                [
-                    make_tool_call("read_file", {"path": "x"}, "call_rf"),
-                    make_tool_call("job_complete", {}, "call_jc"),
-                ],
-                is_strategic=False,
-            )
-            result = await audited(state)
-            msgs = result.get("messages", [])
-            tool_msgs = [m for m in msgs if isinstance(m, ToolMessage)]
-
-            # Both calls get responses (entire batch rejected)
-            assert len(tool_msgs) == 2
-            by_id = {m.tool_call_id: m for m in tool_msgs}
-
-            # Violating call: the real phase error
-            assert (
-                "'job_complete' is not available in the tactical phase"
-                in by_id["call_jc"].content
-            )
-            # Legal call: must NOT be told it is phase-illegal
-            assert "'read_file' is not available" not in by_id["call_rf"].content
-            assert "Not executed" in by_id["call_rf"].content
-            assert "IS available" in by_id["call_rf"].content
-            assert "'job_complete'" in by_id["call_rf"].content
-            assert "Re-issue" in by_id["call_rf"].content
-
-            mock_tn.ainvoke.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_both_phase_tool_passes_in_either(self, config):

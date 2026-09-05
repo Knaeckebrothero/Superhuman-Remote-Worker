@@ -6,10 +6,11 @@
 --
 -- The first result must report zero unsafe calls. A mismatched attempt is safe
 -- only when the runtime phase gate recorded the expected failed ToolMessage.
--- The second result describes persistent phase-block delivery. Skills-mode
+-- The second result describes persistent phase-block delivery. Current worker
 -- jobs should have zero zero_block_requests and normally advance 1->2->3...
--- by one block per phase. Compaction may remove superseded blocks; legacy-mode
--- jobs intentionally report only zero blocks.
+-- by one block per phase. Compaction may remove superseded blocks. Historical
+-- legacy benchmark jobs intentionally report only zero blocks; that live
+-- configuration switch was retired after WP5.
 
 \if :{?job_ids}
 \else

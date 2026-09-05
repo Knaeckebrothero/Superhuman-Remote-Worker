@@ -38,7 +38,6 @@ from .core.loader import (
     resolve_config_path,
     resolve_model_settings,
     supports_parallel_tool_calls,
-    uses_phase_filtered_tool_binding,
 )
 from .core.loader import get_project_root
 from .core.phase_snapshot import PhaseSnapshotManager
@@ -1062,7 +1061,7 @@ class UniversalAgent:
 
             # Build graph for this job
             self._graph = build_phase_alternation_graph(
-                **self._graph_llm_bindings(),
+                llm_with_tools=self._llm_with_tools,
                 tools=self._tools,
                 config=self.config,
                 workspace=self._workspace_manager,
@@ -2683,7 +2682,7 @@ class UniversalAgent:
         #    checkpointer, so the re-invoke resumes from the local checkpoint.
         snapshot_manager = PhaseSnapshotManager(job_id, workspace_backend=new_backend)
         self._graph = build_phase_alternation_graph(
-            **self._graph_llm_bindings(),
+            llm_with_tools=self._llm_with_tools,
             tools=self._tools,
             config=self.config,
             workspace=self._workspace_manager,
@@ -4381,8 +4380,7 @@ class UniversalAgent:
         # Apply instruction file enforcement wrappers (before_tool triggers)
         self._tools = apply_instruction_enforcement(self._tools, context)
 
-        # Bind the tools to the job's LLM (one binding for every phase in
-        # skills mode; the legacy phase-filtered pair in legacy prompt mode).
+        # Bind one stable union of the tools to the job's LLM for every phase.
         self._bind_job_tools()
 
         # Auto-register input documents as CitationEngine sources (background)
@@ -4490,18 +4488,13 @@ class UniversalAgent:
     def _bind_job_tools(self) -> None:
         """Bind the loaded tools to the job's LLM.
 
-        Skills mode (U2, the default): ONE binding carries the union of both
-        phases' tools — ``_llm_with_tools`` — and the two phase attributes
-        alias it (their readers keep working for one release). The phase is
-        enforced per call by the runtime gate in the graph, and single-phase
-        tools state their phase in the bound description
-        (``apply_phase_description_prefixes``, applied to the bound copies
-        like the guardrail Examples — the ToolNode's tool objects and the
-        full-description originals stay untouched). Legacy prompt mode (the
-        bench's "current" arm; deleted in WP6) keeps today's phase-filtered
-        pair and untouched descriptions, so arm A is honest. The temporary
-        WP5 ``tool_binding_mode`` can select either shape independently of the
-        prose mode for attribution arms C/D; ``auto`` preserves both defaults.
+        ONE binding carries the union of both phases' tools —
+        ``_llm_with_tools``. The phase is enforced per call by the runtime
+        gate in the graph, and single-phase tools state their phase in the
+        bound description (``apply_phase_description_prefixes``, applied to
+        the bound copies like the guardrail Examples — the ToolNode's tool
+        objects and full-description originals stay untouched). The two old
+        phase attributes remain aliases for one release.
         """
         # parallel_tool_calls is an OpenAI Chat Completions param — suppressed
         # for providers/models that reject it (Google GenAI's
@@ -4523,33 +4516,6 @@ class UniversalAgent:
         strategic_names = set(filter_tools_by_phase(all_names, "strategic"))
         tactical_names = set(filter_tools_by_phase(all_names, "tactical"))
 
-        if uses_phase_filtered_tool_binding(self.config):
-            # Phase-filter tools: each binding only sees tools declared for
-            # its phase; the ToolNode keeps the full list and its batch-level
-            # gate is the backup. This is automatic for legacy prompt mode or
-            # explicit in the temporary WP5 measurement control.
-            strategic_tools = apply_guardrails_to_tools(
-                [t for t in self._tools if t.name in strategic_names],
-                model=llm_cfg.model,
-            )
-            tactical_tools = apply_guardrails_to_tools(
-                [t for t in self._tools if t.name in tactical_names],
-                model=llm_cfg.model,
-            )
-            self._strategic_llm_with_tools = self._strategic_llm.bind_tools(
-                strategic_tools, **bind_kwargs
-            )
-            self._tactical_llm_with_tools = self._tactical_llm.bind_tools(
-                tactical_tools, **bind_kwargs
-            )
-            # Keep _llm_with_tools for backwards compatibility
-            self._llm_with_tools = self._strategic_llm_with_tools
-            logger.info(
-                f"Loaded {len(self._tools)} tools (phase-filtered binding — "
-                f"strategic: {len(strategic_tools)}, tactical: {len(tactical_tools)})"
-            )
-            return
-
         union = strategic_names | tactical_names
         dropped = [n for n in all_names if n not in union]
         if dropped:
@@ -4569,20 +4535,6 @@ class UniversalAgent:
             f"{len(tactical_names - strategic_names)} tactical-only, "
             f"{len(strategic_names & tactical_names)} both)"
         )
-
-    def _graph_llm_bindings(self) -> Dict[str, Any]:
-        """The tool binding(s) handed to ``build_phase_alternation_graph``.
-
-        One binding for every phase in skills mode; legacy prompt mode's
-        phase-filtered pair goes through the factory's deprecated aliases
-        (deleted together in WP6).
-        """
-        if self._strategic_llm_with_tools is self._tactical_llm_with_tools:
-            return {"llm_with_tools": self._llm_with_tools}
-        return {
-            "strategic_llm_with_tools": self._strategic_llm_with_tools,
-            "tactical_llm_with_tools": self._tactical_llm_with_tools,
-        }
 
     def _setup_job_knowledge(
         self, context: ToolContext, project_id: Optional[str]

@@ -345,8 +345,6 @@ class TestResolvedConfigSerialization:
             config_prompts = tmp_path / "config" / "prompts"
             config_prompts.mkdir(parents=True)
             (config_prompts / "systemprompt.txt").write_text("system prompt content")
-            (config_prompts / "strategic.txt").write_text("strategic content")
-            (config_prompts / "tactical.txt").write_text("tactical content")
             (config_prompts / "summarization_prompt.txt").write_text(
                 "summarization content"
             )
@@ -379,8 +377,8 @@ class TestResolvedConfigSerialization:
 
         # Check prompts captured
         assert result["prompts"]["systemprompt"] == "system prompt content"
-        assert result["prompts"]["strategic"] == "strategic content"
-        assert result["prompts"]["tactical"] == "tactical content"
+        assert "strategic" not in result["prompts"]
+        assert "tactical" not in result["prompts"]
         assert result["prompts"]["summarization"] == "summarization content"
 
         # Check instructions captured
@@ -505,9 +503,7 @@ class TestResolvedConfigSerialization:
         with patch("src.core.loader.get_project_root", return_value=tmp_path):
             config_prompts = tmp_path / "config" / "prompts"
             config_prompts.mkdir(parents=True)
-            (config_prompts / "systemprompt.txt").write_text("base {prompt_content}")
-            (config_prompts / "strategic.txt").write_text("strategic {phase_number}")
-            (config_prompts / "tactical.txt").write_text("tactical {phase_number}")
+            (config_prompts / "systemprompt.txt").write_text("base phase model")
             (config_prompts / "summarization_prompt.txt").write_text("summarize")
 
             config_templates = tmp_path / "config" / "templates"

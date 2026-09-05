@@ -1,4 +1,4 @@
-"""U2 acceptance (d): every bundled worker expert renders cleanly in skills mode.
+"""U2 acceptance (d): every bundled worker expert renders cleanly.
 
 For each bundled worker expert, on every model family that ships its own
 worker system-prompt template, render the ONE phase-agnostic system prompt
@@ -14,9 +14,8 @@ expert actually grants, and pin:
   and every ``has_tool("delegate_agent")`` block follows the grant;
 - a DB expert's phase prompt rides INSIDE the phase block as the fenced
   ``<expert_workflow>`` addendum (one protected identity per path);
-- the legacy switch: ``prompt_mode: legacy`` renders today's swap, a frozen
-  pre-U2 template keeps it, and the shipped templates are never mistaken for
-  one.
+- a frozen pre-U2 template keeps its phase swap for resume compatibility, while
+  every newly resolved template is phase-agnostic.
 
 Design: knowledge-base/knowledge/features/universal_experts_and_subagents.md §1.2.
 """
@@ -29,10 +28,7 @@ from pathlib import Path
 import pytest
 
 from src.core.loader import (
-    LEGACY_PHASE_PROMPT_FLAG,
     PHASE_SKILLS,
-    PROMPT_MODE_LEGACY,
-    PROMPT_MODE_SKILLS,
     PromptMatrixResolver,
     _has_shell_tools,
     append_expert_workflow_addendum,
@@ -48,7 +44,6 @@ from src.core.loader import (
     load_strategic_todos_template,
     render_instruction_content,
     resolve_bound_skill_dir,
-    uses_legacy_phase_prompt,
 )
 from src.core.message_markers import protected_path
 from src.core.model_registry import family_of
@@ -119,7 +114,7 @@ def _assert_clean(text: str, label: str) -> None:
     assert text.strip(), f"{label}: rendered empty"
     assert "{%" not in text, f"{label}: unrendered Jinja block"
     assert "{prompt_content}" not in text, f"{label}: {{prompt_content}} leaked"
-    assert LEGACY_PHASE_PROMPT_FLAG not in text, f"{label}: legacy scaffolding leaked"
+    assert "legacy_phase_prompt" not in text, f"{label}: legacy scaffolding leaked"
 
 
 def _strip_raw(text: str) -> str:
@@ -137,7 +132,7 @@ def test_family_models_still_map_to_their_family(family):
     assert family_of(_FAMILY_MODELS[family]) == family
 
 
-def test_every_shipped_worker_template_carries_the_guarded_slot_not_a_legacy_one():
+def test_every_shipped_worker_template_is_phase_agnostic():
     templates = sorted(
         p
         for p in (_CONFIG / "prompts").glob("systemprompt*.txt")
@@ -147,7 +142,8 @@ def test_every_shipped_worker_template_carries_the_guarded_slot_not_a_legacy_one
     for path in templates:
         raw = path.read_text(encoding="utf-8")
         assert not is_legacy_phase_template(raw), path.name
-        assert LEGACY_PHASE_PROMPT_FLAG in raw and "{prompt_content}" in raw, path.name
+        assert "legacy_phase_prompt" not in raw, path.name
+        assert "{prompt_content}" not in raw, path.name
         assert any(m in raw for m in _PHASE_MODEL_MARKERS), path.name
         assert "phase instructions" in raw and "phase directive" not in raw, path.name
 
@@ -187,7 +183,7 @@ def test_system_prompt_renders_phase_agnostic(name, leaf, family):
     with_ds = get_system_prompt(cfg, model=model, tool_names=tools)
     assert ("datasource_access" in with_ds) is False  # no cli datasources bound here
 
-    # Delegation: in skills mode the phase-aware entry point is the same prompt
+    # The phase-aware entry point is the same prompt
     # for both phases (the swap is gone), so the cached prefix is stable.
     strategic = get_phase_system_prompt(
         cfg, is_strategic=True, phase_number=1, model=model, tool_names=tools
@@ -196,7 +192,6 @@ def test_system_prompt_renders_phase_agnostic(name, leaf, family):
         cfg, is_strategic=False, phase_number=2, model=model, tool_names=tools
     )
     assert strategic == prompt == tactical, label
-    assert uses_legacy_phase_prompt(cfg) is False
 
 
 # ---------------------------------------------------------------------------
@@ -320,37 +315,8 @@ def test_addendum_needs_both_the_marker_and_the_text():
 
 
 # ---------------------------------------------------------------------------
-# The legacy switch on the shipped templates
+# Frozen pre-U2 resume compatibility
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("family", sorted(_FAMILY_MODELS))
-def test_legacy_prompt_mode_renders_the_swap_on_the_shipped_templates(family):
-    leaf = _CONFIG / "experts" / "developer" / "config.yaml"
-    cfg = _config(leaf)
-    cfg.phase_settings.prompt_mode = PROMPT_MODE_LEGACY
-    tools = _granted_tools(leaf)
-    model = _FAMILY_MODELS[family]
-    assert uses_legacy_phase_prompt(cfg) is True
-
-    strategic = get_phase_system_prompt(
-        cfg, is_strategic=True, phase_number=1, model=model, tool_names=tools
-    )
-    tactical = get_phase_system_prompt(
-        cfg, is_strategic=False, phase_number=2, model=model, tool_names=tools
-    )
-    for label, prompt in (("strategic", strategic), ("tactical", tactical)):
-        _assert_clean(prompt, f"legacy {family} {label}")
-        assert not any(m in prompt for m in _PHASE_MODEL_MARKERS), label
-        assert _PER_CALL_GATE_SENTENCE not in prompt, label  # batch gate in arm A
-        assert "<phase_directive>" in prompt or "# Phase Directive" in prompt, label
-    assert "You are in STRATEGIC mode." in strategic
-    assert "You are in TACTICAL mode." in tactical
-    assert strategic != tactical
-    # The family variant of the developer's phase prompt (matrix) still resolves
-    # in legacy mode — that is what makes the bench's "current" arm honest.
-    resolver = PromptMatrixResolver(str(leaf.parent), family)
-    assert resolver.load("strategic").strip()
 
 
 def test_frozen_pre_u2_template_keeps_the_swap_for_an_in_flight_job():
@@ -365,8 +331,7 @@ def test_frozen_pre_u2_template_keeps_the_swap_for_an_in_flight_job():
             },
         }
     )
-    assert cfg.phase_settings.prompt_mode == PROMPT_MODE_SKILLS
-    assert uses_legacy_phase_prompt(cfg) is True  # the frozen template decides
+    assert is_legacy_phase_template(cfg.extra["_resolved_prompts"]["systemprompt"])
     out = get_phase_system_prompt(
         cfg, is_strategic=False, phase_number=4, tool_names=[]
     )
@@ -377,8 +342,7 @@ def test_frozen_pre_u2_template_keeps_the_swap_for_an_in_flight_job():
 
 
 def test_every_worker_template_states_the_per_call_gate_once():
-    """All nine worker templates carry the WP3 sentence exactly once, inside
-    the skills branch (the legacy branch has no such sentence)."""
+    """All nine worker templates carry the WP3 sentence exactly once."""
     templates = [
         f
         for f in sorted(_CONFIG.glob("prompts/systemprompt*.txt"))
@@ -388,10 +352,6 @@ def test_every_worker_template_states_the_per_call_gate_once():
     for template in templates:
         text = template.read_text(encoding="utf-8")
         assert text.count(_PER_CALL_GATE_SENTENCE) == 1, template.name
-        legacy_branch = text[
-            text.index("{% if legacy_phase_prompt") : text.index("{% else")
-        ]
-        assert _PER_CALL_GATE_SENTENCE not in legacy_branch, template.name
 
 
 # ---------------------------------------------------------------------------
@@ -468,11 +428,9 @@ _STANCE_SENTENCES = {
 
 
 @pytest.mark.parametrize("name", sorted(_STANCE_SENTENCES))
-def test_expert_delegation_stance_follows_the_grant_in_skills_and_legacy(name):
+def test_expert_delegation_stance_follows_the_grant(name):
     root = _CONFIG / "experts" / name
     files = sorted((root / "skills").glob("*-phase/SKILL.md"))
-    files.extend(sorted(root.glob("strategic*.txt")))
-    files.extend(sorted(root.glob("tactical*.txt")))
     assert files, name
     stance = _STANCE_SENTENCES[name]
     for path in files:

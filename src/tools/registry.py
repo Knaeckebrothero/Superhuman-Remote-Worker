@@ -301,7 +301,7 @@ def expand_tool_wildcards(tool_names: List[str]) -> List[str]:
 
 
 #: Prefix a single-phase tool's description carries when every tool is bound
-#: at once (U2 skills mode): the bound schema no longer filters by phase, so
+#: at once: the bound schema no longer filters by phase, so
 #: the description states the phase generically — never a list of the other
 #: tools (models read such lists as exhaustive; see the todo_list_footer
 #: comment in config/guardrails/default.yaml). Both-phase tools carry none.

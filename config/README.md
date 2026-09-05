@@ -17,26 +17,26 @@ config/
 ├── experts/                     # Bundled roles and application-default seed bundles
 │   └── <expert>/
 │       ├── config.yaml              # Expert overlay (`$extends: worker_base` or `session_base`)
-│       └── model_config_matrix.yaml # Expert-level matrix override (optional)
+│       ├── model_config_matrix.yaml # Expert-level matrix override (optional)
+│       └── skills/                  # Expert-local skill overrides (optional)
+│           ├── strategic-phase/SKILL.md
+│           └── tactical-phase/SKILL.md
 ├── subagents/                   # Subagent library — small experts a roster references by name (see subagents/README.md)
 │   └── <name>/
 │       ├── config.yaml              # `$extends: expert_base`, `tags: [subagent]`, read-only tools, `llm: {model: inherit}`
 │       └── persona.txt              # Prompt files next to the config, like an expert's
-├── prompts/                     # Prompt templates (system prompt, phase prompts)
+├── skills/                      # Bundled skills, including the two hidden worker phase skills
+│   ├── strategic-phase/SKILL.md
+│   └── tactical-phase/SKILL.md
+├── prompts/                     # System, persona, and auxiliary prompt templates
 │   ├── systemprompt.txt         # Main system prompt
 │   ├── persona.txt              # Agent persona/identity prompt
-│   ├── strategic.txt            # Strategic phase prompt — legacy prompt_mode only; the live
-│   ├── tactical.txt             # Tactical phase prompt      guidance is skills/{strategic,tactical}-phase/SKILL.md
 │   ├── summarization_prompt.txt # Context compaction prompt
 │   ├── systemprompt_minimax.txt # MiniMax M2.7-optimized system prompt
 │   ├── persona_minimax.txt      # MiniMax M2.7-optimized persona
-│   ├── strategic_minimax.txt    # MiniMax M2.7-optimized strategic prompt
-│   ├── tactical_minimax.txt     # MiniMax M2.7-optimized tactical prompt
 │   ├── summarization_prompt_minimax.txt  # MiniMax M2.7-optimized summarization
 │   ├── systemprompt_minimax_m3.txt        # MiniMax M3 system prompt (1M ctx, multimodal)
 │   ├── persona_minimax_m3.txt             # MiniMax M3 persona
-│   ├── strategic_minimax_m3.txt           # MiniMax M3 strategic prompt
-│   ├── tactical_minimax_m3.txt            # MiniMax M3 tactical prompt
 │   ├── summarization_prompt_minimax_m3.txt # MiniMax M3 summarization
 │   ├── systemprompt_glm.txt                # GLM-5.2 worker system prompt
 │   ├── systemprompt_interactive_glm.txt    # GLM-5.2 persistent-chat system prompt
@@ -157,10 +157,11 @@ For configs that need custom prompts or instructions, create a directory:
 config/
 └── my_agent/
     ├── config.yaml              # Expert overlay (extends a mode base)
-    ├── prompt_matrix.yaml       # Expert-level prompt matrix (optional)
-    ├── instruction_matrix.yaml  # Expert-level instruction matrix (optional)
+    ├── model_config_matrix.yaml # Expert-level matrix overrides (optional)
     ├── instructions.md          # Custom instructions (optional)
-    └── strategic.txt            # Custom strategic prompt (optional)
+    └── skills/
+        ├── strategic-phase/SKILL.md # Custom planning/review guidance (optional)
+        └── tactical-phase/SKILL.md  # Custom execution guidance (optional)
 ```
 
 ### Two Matrix Systems
@@ -168,7 +169,7 @@ config/
 The agent uses two parallel matrix systems with the same 4-level fallback chain:
 
 **Prompt Matrix** (`prompt_matrix.yaml`) — resolves system prompts:
-- Entries: `systemprompt`, `persona`, `strategic`, `tactical`, `summarization`
+- Entries include `systemprompt`, `persona`, and `summarization`
 - File search: expert directory → `config/prompts/`
 
 **Instruction Matrix** (`instruction_matrix.yaml`) — resolves non-prompt templates:

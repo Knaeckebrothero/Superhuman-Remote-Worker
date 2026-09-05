@@ -15,7 +15,6 @@ from src.core.loader import (
     detect_reasoning_method,
     get_phase_system_prompt,
     load_base_system_prompt,
-    load_phase_component,
     render_placeholders,
     load_agent_config_from_dict,
     serialize_resolved_config,
@@ -156,9 +155,9 @@ class TestPromptMatrixResolver:
             model_family="claude-opus",
         )
         assert resolver.resolve_filename("systemprompt") == "systemprompt.txt"
-        assert resolver.resolve_filename("strategic") == "strategic.txt"
-        assert resolver.resolve_filename("tactical") == "tactical.txt"
         assert resolver.resolve_filename("summarization") == "summarization_prompt.txt"
+        assert "strategic" not in PromptMatrixResolver.HARDCODED_DEFAULTS
+        assert "tactical" not in PromptMatrixResolver.HARDCODED_DEFAULTS
         # Note: "instructions" moved to InstructionMatrixResolver
 
     def test_base_matrix_default_resolution(self, tmp_path):
@@ -171,7 +170,7 @@ class TestPromptMatrixResolver:
             default:
               prompts:
                 systemprompt: custom_systemprompt.txt
-                strategic: custom_strategic.txt
+                persona: custom_persona.txt
         """)
         )
 
@@ -188,9 +187,8 @@ class TestPromptMatrixResolver:
             )
 
         assert resolver.resolve_filename("systemprompt") == "custom_systemprompt.txt"
-        assert resolver.resolve_filename("strategic") == "custom_strategic.txt"
-        # Tactical not in matrix, falls to hardcoded default
-        assert resolver.resolve_filename("tactical") == "tactical.txt"
+        assert resolver.resolve_filename("persona") == "custom_persona.txt"
+        assert resolver.resolve_filename("summarization") == "summarization_prompt.txt"
 
     def test_expert_override(self, tmp_path):
         """Expert matrix entries override base matrix entries."""
@@ -201,7 +199,7 @@ class TestPromptMatrixResolver:
             default:
               prompts:
                 systemprompt: base_system.txt
-                strategic: base_strategic.txt
+                persona: base_persona.txt
         """)
         )
 
@@ -211,7 +209,7 @@ class TestPromptMatrixResolver:
             textwrap.dedent("""\
             default:
               prompts:
-                strategic: expert_strategic.txt
+                persona: expert_persona.txt
         """)
         )
 
@@ -229,8 +227,8 @@ class TestPromptMatrixResolver:
                 base_matrix_path
             )
 
-        # Expert overrides strategic
-        assert resolver.resolve_filename("strategic") == "expert_strategic.txt"
+        # Expert overrides persona
+        assert resolver.resolve_filename("persona") == "expert_persona.txt"
         # Base provides systemprompt (expert doesn't override it)
         assert resolver.resolve_filename("systemprompt") == "base_system.txt"
 
@@ -242,7 +240,7 @@ class TestPromptMatrixResolver:
             default:
               prompts:
                 systemprompt: systemprompt.txt
-                strategic: strategic.txt
+                persona: persona.txt
             claude-opus:
               prompts:
                 systemprompt: systemprompt_claude_opus.txt
@@ -265,8 +263,8 @@ class TestPromptMatrixResolver:
         assert (
             resolver.resolve_filename("systemprompt") == "systemprompt_claude_opus.txt"
         )
-        # Falls back to default for strategic (no model-specific entry)
-        assert resolver.resolve_filename("strategic") == "strategic.txt"
+        # Falls back to default for persona (no model-specific entry)
+        assert resolver.resolve_filename("persona") == "persona.txt"
 
     def test_full_chain_4_levels(self, tmp_path):
         """Exercise the full 4-level fallback chain."""
@@ -276,12 +274,12 @@ class TestPromptMatrixResolver:
             default:
               prompts:
                 systemprompt: base_default_system.txt
-                strategic: base_default_strategic.txt
-                tactical: base_default_tactical.txt
+                persona: base_default_persona.txt
                 summarization: base_default_summarization.txt
+                citation_verification: base_default_citation.txt
             claude-opus:
               prompts:
-                tactical: base_claude_tactical.txt
+                summarization: base_claude_summarization.txt
         """)
         )
 
@@ -290,7 +288,7 @@ class TestPromptMatrixResolver:
             textwrap.dedent("""\
             default:
               prompts:
-                strategic: expert_default_strategic.txt
+                persona: expert_default_persona.txt
             claude-opus:
               prompts:
                 systemprompt: expert_claude_system.txt
@@ -314,13 +312,16 @@ class TestPromptMatrixResolver:
         # Level 1: Expert model-specific
         assert resolver.resolve_filename("systemprompt") == "expert_claude_system.txt"
         # Level 2: Expert default
-        assert resolver.resolve_filename("strategic") == "expert_default_strategic.txt"
+        assert resolver.resolve_filename("persona") == "expert_default_persona.txt"
         # Level 3: Base model-specific
-        assert resolver.resolve_filename("tactical") == "base_claude_tactical.txt"
-        # Level 4: Base default
         assert (
             resolver.resolve_filename("summarization")
-            == "base_default_summarization.txt"
+            == "base_claude_summarization.txt"
+        )
+        # Level 4: Base default
+        assert (
+            resolver.resolve_filename("citation_verification")
+            == "base_default_citation.txt"
         )
 
     def test_load_matrix_invalid_yaml(self, tmp_path):
@@ -414,19 +415,6 @@ class TestDefaultResolution:
             result = load_base_system_prompt(resolver)
             assert "base template" in result
 
-    def test_load_phase_component_with_resolver(self, tmp_path):
-        """load_phase_component uses PromptMatrixResolver."""
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
-            config_prompts = tmp_path / "config" / "prompts"
-            config_prompts.mkdir(parents=True)
-            (config_prompts / "strategic.txt").write_text(
-                "strategic phase {phase_number}"
-            )
-
-            resolver = PromptMatrixResolver(model_family="default")
-            result = load_phase_component(is_strategic=True, matrix_resolver=resolver)
-            assert "strategic phase" in result
-
     def test_get_phase_system_prompt_no_model(self, tmp_path):
         """Without model param, default model family is used."""
         config = AgentConfig(
@@ -438,9 +426,8 @@ class TestDefaultResolution:
             config_prompts = tmp_path / "config" / "prompts"
             config_prompts.mkdir(parents=True)
             (config_prompts / "systemprompt.txt").write_text(
-                "{agent_display_name} {prompt_content}"
+                "{agent_display_name} phase-agnostic"
             )
-            (config_prompts / "strategic.txt").write_text("phase {phase_number}")
 
             result = get_phase_system_prompt(
                 config=config,
@@ -448,7 +435,7 @@ class TestDefaultResolution:
                 phase_number=1,
             )
             assert "Test Agent" in result
-            assert "phase 1" in result
+            assert "phase-agnostic" in result
 
     def test_get_phase_system_prompt_with_model(self, tmp_path):
         """With model param, model family is detected and used."""
@@ -461,9 +448,8 @@ class TestDefaultResolution:
             config_prompts = tmp_path / "config" / "prompts"
             config_prompts.mkdir(parents=True)
             (config_prompts / "systemprompt.txt").write_text(
-                "{agent_display_name} {prompt_content}"
+                "{agent_display_name} phase-agnostic"
             )
-            (config_prompts / "strategic.txt").write_text("phase {phase_number}")
 
             result = get_phase_system_prompt(
                 config=config,
@@ -472,14 +458,14 @@ class TestDefaultResolution:
                 model="claude-opus-4-6",
             )
             assert "Test Agent" in result
-            assert "phase 1" in result
+            assert "phase-agnostic" in result
             # Claude models should not have reasoning directive injected
             assert "Reasoning:" not in result
 
 
 # =============================================================================
 # render_placeholders: literal braces in trusted prose must survive render
-# (regression: product-qa tactical.txt `{py,sh,md}` hard-failed jobs via
+# (regression: the former product-qa tactical prompt's `{py,sh,md}` hard-failed via
 #  str.format KeyError at phase render — vault issues/ brace-format crash)
 # =============================================================================
 
@@ -524,30 +510,26 @@ class TestRenderPlaceholders:
     def test_non_allowlisted_token_always_literal(self):
         assert render_placeholders("{tool_name} x", phase_number="1") == "{tool_name} x"
 
-    def test_end_to_end_tactical_prompt_with_literal_braces(self, tmp_path):
-        """get_phase_system_prompt renders a tactical prompt whose prose holds a
-        literal `{py,sh,md}` AND a guardrail-style `{phase_number}` — the token
-        substitutes, the literal brace survives, and nothing raises."""
+    def test_frozen_legacy_prompt_with_literal_braces(self):
+        """The one-release frozen-config compatibility render remains
+        brace-safe while substituting its old phase placeholders."""
         config = AgentConfig(agent_id="test", display_name="QA Agent")
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
-            config_prompts = tmp_path / "config" / "prompts"
-            config_prompts.mkdir(parents=True)
-            (config_prompts / "systemprompt.txt").write_text(
-                "{agent_display_name}\n{prompt_content}"
-            )
-            (config_prompts / "tactical.txt").write_text(
+        config.extra["_resolved_prompts"] = {
+            "systemprompt": "{agent_display_name}\n{prompt_content}",
+            "tactical": (
                 "Tactical phase {phase_number}. "
                 "Save a repro under output/repros/NNN_slug.{py,sh,md}."
-            )
+            ),
+        }
 
-            result = get_phase_system_prompt(
-                config=config,
-                is_strategic=False,
-                phase_number=2,
-            )
-            assert "QA Agent" in result
-            assert "Tactical phase 2." in result  # {phase_number} substituted
-            assert "{py,sh,md}" in result  # literal brace survived
+        result = get_phase_system_prompt(
+            config=config,
+            is_strategic=False,
+            phase_number=2,
+        )
+        assert "QA Agent" in result
+        assert "Tactical phase 2." in result  # {phase_number} substituted
+        assert "{py,sh,md}" in result  # literal brace survived
 
 
 # =============================================================================
@@ -563,12 +545,12 @@ class TestPromptMatrixResolverLoad:
         # Create expert directory with custom file
         expert_dir = tmp_path / "expert"
         expert_dir.mkdir()
-        (expert_dir / "strategic.txt").write_text("expert strategic content")
+        (expert_dir / "persona.txt").write_text("expert persona content")
         (expert_dir / "model_config_matrix.yaml").write_text(
             textwrap.dedent("""\
             default:
               prompts:
-                strategic: strategic.txt
+                persona: persona.txt
         """)
         )
 
@@ -576,20 +558,20 @@ class TestPromptMatrixResolverLoad:
             # Also create base files
             config_prompts = tmp_path / "config" / "prompts"
             config_prompts.mkdir(parents=True)
-            (config_prompts / "strategic.txt").write_text("base strategic content")
+            (config_prompts / "persona.txt").write_text("base persona content")
 
             resolver = PromptMatrixResolver(
                 deployment_dir=str(expert_dir),
                 model_family="default",
             )
-            result = resolver.load("strategic")
-            assert result == "expert strategic content"
+            result = resolver.load("persona")
+            assert result == "expert persona content"
 
     def test_load_falls_through_to_framework(self, tmp_path):
         """When expert dir doesn't have the file, framework dir is used."""
         expert_dir = tmp_path / "expert"
         expert_dir.mkdir()
-        # No strategic.txt in expert dir, but matrix references it
+        # No systemprompt.txt in expert dir, but the framework provides it.
 
         with patch("src.core.loader.get_project_root", return_value=tmp_path):
             config_prompts = tmp_path / "config" / "prompts"
@@ -640,11 +622,9 @@ class TestLocationPrimaryResolution:
         gemma:
           prompts:
             persona: persona_gemma.txt
-            strategic: strategic_gemma.txt
-            tactical: tactical_gemma.txt
     """)
 
-    @pytest.mark.parametrize("entry_type", ["persona", "strategic", "tactical"])
+    @pytest.mark.parametrize("entry_type", ["persona"])
     def test_expert_base_beats_framework_family_variant(self, tmp_path, entry_type):
         """THE bug: expert ships only <type>.txt; base matrix maps the family to
         <type>_gemma.txt which exists in the framework dir. The expert's base
@@ -916,34 +896,26 @@ class TestLLMReuseEquality:
 
 
 # =============================================================================
-# U2: phase_settings.prompt_mode — one phase-agnostic prompt vs the legacy swap
+# U2 WP6: one phase-agnostic prompt, with frozen pre-U2 resume compatibility
 # =============================================================================
 
 
-class TestPromptMode:
+class TestSingleWorkerPrompt:
     """``get_system_prompt`` is the worker's one prompt; ``get_phase_system_prompt``
-    delegates to it unless ``prompt_mode == "legacy"`` or the template is a
-    pre-U2 one (bare ``{prompt_content}`` slot, no ``legacy_phase_prompt``)."""
+    delegates to it unless the frozen template is a pre-U2 one with the bare
+    ``{prompt_content}`` slot."""
 
     _TEMPLATE = (
-        "{agent_display_name}\n"
-        "{% if legacy_phase_prompt -%}\n"
-        "<phase_directive>\n{prompt_content}\n</phase_directive>\n"
-        "{% else -%}\n"
-        "<phase_model>alternating phases</phase_model>\n"
-        "{% endif -%}\n"
-        "END"
+        "{agent_display_name}\n<phase_model>alternating phases</phase_model>\nEND"
     )
 
     def _write(self, tmp_path):
         config_prompts = tmp_path / "config" / "prompts"
         config_prompts.mkdir(parents=True)
         (config_prompts / "systemprompt.txt").write_text(self._TEMPLATE)
-        (config_prompts / "strategic.txt").write_text("strategic phase {phase_number}")
-        (config_prompts / "tactical.txt").write_text("tactical phase {phase_number}")
 
     def test_get_system_prompt_is_phase_agnostic(self, tmp_path):
-        from src.core.loader import get_system_prompt, uses_legacy_phase_prompt
+        from src.core.loader import get_system_prompt
 
         config = AgentConfig(agent_id="test", display_name="Test Agent")
         with patch("src.core.loader.get_project_root", return_value=tmp_path):
@@ -955,7 +927,6 @@ class TestPromptMode:
             tactical = get_phase_system_prompt(
                 config, is_strategic=False, phase_number=2, tool_names=[]
             )
-        assert uses_legacy_phase_prompt(config) is False
         assert "Test Agent" in one
         assert "<phase_model>alternating phases</phase_model>" in one
         assert "phase_directive" not in one and "{prompt_content}" not in one
@@ -963,110 +934,49 @@ class TestPromptMode:
         assert "{%" not in one and "legacy_phase_prompt" not in one
         assert one == strategic == tactical  # the swap is gone
 
-    def test_legacy_mode_renders_phase_component(self, tmp_path):
-        from src.core.loader import PROMPT_MODE_LEGACY, uses_legacy_phase_prompt
-
+    def test_frozen_legacy_config_still_renders(self):
         config = AgentConfig(agent_id="test", display_name="Test Agent")
-        config.phase_settings.prompt_mode = PROMPT_MODE_LEGACY
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
-            self._write(tmp_path)
-            strategic = get_phase_system_prompt(
-                config, is_strategic=True, phase_number=1, tool_names=[]
-            )
-            tactical = get_phase_system_prompt(
-                config, is_strategic=False, phase_number=2, tool_names=[]
-            )
-        assert uses_legacy_phase_prompt(config) is True
-        assert "<phase_directive>\nstrategic phase 1\n</phase_directive>" in strategic
-        assert "<phase_directive>\ntactical phase 2\n</phase_directive>" in tactical
-        for out in (strategic, tactical):
-            assert "phase_model" not in out and "{%" not in out
-            assert "{prompt_content}" not in out and "END" in out
-
-    def test_prompt_mode_validates(self):
-        from src.core.loader import (
-            TOOL_BINDING_MODE_AUTO,
-            TOOL_BINDING_MODE_FILTERED,
-            TOOL_BINDING_MODE_UNION,
-            PhaseSettings,
+        config.extra["_resolved_prompts"] = {
+            "systemprompt": (
+                "OLD {agent_display_name}\n"
+                "<phase_directive>{prompt_content}</phase_directive>"
+            ),
+            "strategic": "strategic phase {phase_number}",
+            "tactical": "tactical phase {phase_number}",
+        }
+        strategic = get_phase_system_prompt(
+            config, is_strategic=True, phase_number=1, tool_names=[]
         )
-
-        assert PhaseSettings().prompt_mode == "skills"
-        assert PhaseSettings().tool_binding_mode == TOOL_BINDING_MODE_AUTO
-        assert PhaseSettings(prompt_mode="legacy").prompt_mode == "legacy"
-        assert (
-            PhaseSettings(tool_binding_mode="union").tool_binding_mode
-            == TOOL_BINDING_MODE_UNION
+        tactical = get_phase_system_prompt(
+            config, is_strategic=False, phase_number=2, tool_names=[]
         )
-        assert (
-            PhaseSettings(tool_binding_mode="filtered").tool_binding_mode
-            == TOOL_BINDING_MODE_FILTERED
-        )
-        with pytest.raises(ValueError, match="prompt_mode"):
-            PhaseSettings(prompt_mode="bogus")
-        with pytest.raises(ValueError, match="tool_binding_mode"):
-            PhaseSettings(tool_binding_mode="bogus")
-        with pytest.raises(ValueError, match="prompt_mode"):
-            load_agent_config_from_dict(
-                {
-                    "agent_id": "t",
-                    "display_name": "T",
-                    "phase_settings": {"prompt_mode": "bogus"},
-                }
-            )
+        assert "<phase_directive>strategic phase 1</phase_directive>" in strategic
+        assert "<phase_directive>tactical phase 2</phase_directive>" in tactical
+        assert all("{prompt_content}" not in out for out in (strategic, tactical))
 
-    def test_prompt_mode_rides_config_override_and_the_frozen_blob(self, tmp_path):
-        from src.core.loader import (
-            deep_merge,
-            load_config_from_resolved,
-            load_role_base,
-        )
-
-        data = deep_merge(
-            load_role_base("worker"),
+    def test_removed_mode_keys_in_old_snapshots_are_ignored(self):
+        config = load_agent_config_from_dict(
             {
+                "agent_id": "test",
+                "display_name": "Test Agent",
                 "phase_settings": {
+                    "min_todos": 2,
+                    "max_todos": 7,
                     "prompt_mode": "legacy",
-                    "tool_binding_mode": "union",
-                }
-            },
+                    "tool_binding_mode": "filtered",
+                },
+            }
         )
-        cfg = load_agent_config_from_dict(data)
-        assert cfg.phase_settings.prompt_mode == "legacy"
-        assert cfg.phase_settings.tool_binding_mode == "union"
-        assert cfg.phase_settings.min_todos == 2  # the override merged, not replaced
-        cfg._deployment_dir = str(tmp_path)
-        blob = serialize_resolved_config(cfg)
-        assert blob["agent"]["phase_settings"]["prompt_mode"] == "legacy"
-        assert blob["agent"]["phase_settings"]["tool_binding_mode"] == "union"
-        hydrated = load_config_from_resolved(blob)
-        assert hydrated.phase_settings.prompt_mode == "legacy"
-        assert hydrated.phase_settings.tool_binding_mode == "union"
-        # Default: skills, in the blob too.
-        default = load_agent_config_from_dict(load_role_base("worker"))
-        assert default.phase_settings.prompt_mode == "skills"
-        assert default.phase_settings.tool_binding_mode == "auto"
+        assert config.phase_settings.min_todos == 2
+        assert config.phase_settings.max_todos == 7
+        assert not hasattr(config.phase_settings, "prompt_mode")
+        assert not hasattr(config.phase_settings, "tool_binding_mode")
 
-    def test_tool_binding_mode_decouples_the_wp5_attribution_arms(self):
-        from src.core.loader import (
-            uses_legacy_phase_prompt,
-            uses_phase_filtered_tool_binding,
+    def test_new_frozen_blob_has_no_phase_prompt_or_mode_keys(self):
+        config = load_agent_config_from_dict(
+            {"agent_id": "test", "display_name": "Test Agent"}
         )
-
-        config = AgentConfig(agent_id="test", display_name="Test Agent")
-        assert uses_phase_filtered_tool_binding(config) is False
-
-        # Planned arm D: skills prose, phase-filtered bindings.
-        config.phase_settings.tool_binding_mode = "filtered"
-        assert uses_legacy_phase_prompt(config) is False
-        assert uses_phase_filtered_tool_binding(config) is True
-
-        config.phase_settings.prompt_mode = "legacy"
-        config.phase_settings.tool_binding_mode = "auto"
-        assert uses_legacy_phase_prompt(config) is True
-        assert uses_phase_filtered_tool_binding(config) is True
-
-        # Planned arm C: legacy phase prose, stable union binding.
-        config.phase_settings.tool_binding_mode = "union"
-        assert uses_legacy_phase_prompt(config) is True
-        assert uses_phase_filtered_tool_binding(config) is False
+        blob = serialize_resolved_config(config)
+        assert "strategic" not in blob["prompts"]
+        assert "tactical" not in blob["prompts"]
+        assert set(blob["agent"]["phase_settings"]) == {"min_todos", "max_todos"}

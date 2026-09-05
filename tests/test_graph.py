@@ -5,7 +5,6 @@ LLM-dependent nodes are tested with mocks or integration tests.
 """
 
 import inspect
-import warnings
 
 import pytest
 import tempfile
@@ -2344,13 +2343,11 @@ class TestEnsureWithinLimits:
 
 
 def _gate_config(**limits):
-    """What create_audited_tool_node reads; skills mode unless phase_settings
-    says legacy."""
+    """The config surface ``create_audited_tool_node`` reads."""
     return SimpleNamespace(
         agent_id="gate-agent",
         limits=LimitsConfig(**limits),
         llm=SimpleNamespace(model=None),
-        phase_settings=None,
     )
 
 
@@ -2372,8 +2369,7 @@ def _gate_state(calls, is_strategic=False, phase_number=4):
 
 
 class TestPerCallPhaseGate:
-    """One tool binding for every phase (skills mode): the audited tool node
-    decides per call. Legacy prompt mode keeps the batch-level gate."""
+    """With one binding for every phase, the audited tool node decides per call."""
 
     @pytest.mark.asyncio
     async def test_mixed_batch_runs_the_legal_call_and_rejects_the_illegal_one(
@@ -2498,38 +2494,9 @@ class TestPerCallPhaseGate:
             )
             assert not nudges(result)  # one call since the write, below 2
 
-    @pytest.mark.asyncio
-    async def test_legacy_prompt_mode_keeps_the_batch_level_gate(self):
-        cfg = _gate_config()
-        cfg.phase_settings = SimpleNamespace(prompt_mode="legacy")
-        with patch("src.graph.ToolNode") as MockToolNode:
-            mock_tn = AsyncMock()
-            MockToolNode.return_value = mock_tn
-            audited = create_audited_tool_node(
-                [_named_tool("read_file"), _named_tool("job_complete")], cfg
-            )
-            result = await audited(
-                _gate_state(
-                    [
-                        {"name": "read_file", "id": "c1", "args": {"path": "a"}},
-                        {"name": "job_complete", "id": "c2", "args": {}},
-                    ]
-                )
-            )
-            by_id = {m.tool_call_id: m.content for m in result["messages"]}
-            assert by_id["c2"] == (
-                "Error: 'job_complete' is not available in the tactical phase. "
-                "Use tools appropriate for this phase."
-            )
-            assert by_id["c1"].startswith(
-                "Not executed: 'read_file' IS available in the tactical phase"
-            )
-            mock_tn.ainvoke.assert_not_called()
-
 
 class TestExecuteNodeBindings:
-    """``create_execute_node(llm_with_tools=...)`` is the primary shape; the
-    strategic/tactical pair is a deprecated alias (legacy prompt mode)."""
+    """The execute node has exactly one bound-LLM input."""
 
     @staticmethod
     def _kwargs():
@@ -2547,32 +2514,12 @@ class TestExecuteNodeBindings:
     def test_one_binding_is_the_primary_argument(self):
         from src.graph import create_execute_node
 
-        with warnings.catch_warnings(record=True) as seen:
-            warnings.simplefilter("always")
-            node = create_execute_node(llm_with_tools=MagicMock(), **self._kwargs())
-        assert callable(node)
-        assert not [w for w in seen if "llm_with_tools" in str(w.message)]
-
-    def test_two_binding_kwargs_still_accepted_with_deprecation(self):
-        from src.graph import create_execute_node
-
-        with pytest.warns(DeprecationWarning, match="pass llm_with_tools="):
-            node = create_execute_node(
-                strategic_llm_with_tools=MagicMock(),
-                tactical_llm_with_tools=MagicMock(),
-                **self._kwargs(),
-            )
+        node = create_execute_node(llm_with_tools=MagicMock(), **self._kwargs())
         assert callable(node)
 
-    def test_both_shapes_at_once_or_neither_is_a_type_error(self):
+    def test_binding_is_required(self):
         from src.graph import create_execute_node
 
-        with pytest.raises(TypeError, match="not both"):
-            create_execute_node(
-                llm_with_tools=MagicMock(),
-                strategic_llm_with_tools=MagicMock(),
-                **self._kwargs(),
-            )
         with pytest.raises(TypeError, match="llm_with_tools"):
             create_execute_node(**self._kwargs())
 

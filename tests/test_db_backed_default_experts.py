@@ -281,9 +281,10 @@ def test_seed_bundles_carry_the_role_tag():
 
 def test_seed_bundle_reads_expert_local_phase_skill_bodies(tmp_path):
     """U2: the managed seed's prompts.strategic/tactical come from the
-    expert-local phase skills (body only), falling back to the legacy .txt."""
+    expert-local phase skills (body only)."""
     expert_dir = tmp_path / "experts" / "seeded"
     (expert_dir / "skills" / "strategic-phase").mkdir(parents=True)
+    (expert_dir / "skills" / "tactical-phase").mkdir(parents=True)
     (expert_dir / "config.yaml").write_text(
         "$extends: worker_base\nagent_id: seeded\ndisplay_name: Seeded\n"
     )
@@ -292,8 +293,9 @@ def test_seed_bundle_reads_expert_local_phase_skill_bodies(tmp_path):
         "---\nname: strategic-phase\ndescription: d\ncatalog: hidden\n---\n\n"
         "# Strategic phase\n\nSEEDED STRATEGIC BODY\n"
     )
-    (expert_dir / "tactical.txt").write_text(
-        "<tactical_phase>\nLEGACY TXT\n</tactical_phase>\n"
+    (expert_dir / "skills" / "tactical-phase" / "SKILL.md").write_text(
+        "---\nname: tactical-phase\ndescription: d\ncatalog: hidden\n---\n\n"
+        "# Tactical phase\n\nSEEDED TACTICAL BODY\n"
     )
 
     bundle = load_seed_bundle(tmp_path, directory="seeded", expert_type="worker")
@@ -303,7 +305,7 @@ def test_seed_bundle_reads_expert_local_phase_skill_bodies(tmp_path):
         bundle["prompts"]["strategic"] == "# Strategic phase\n\nSEEDED STRATEGIC BODY\n"
     )
     assert "catalog: hidden" not in bundle["prompts"]["strategic"]
-    assert bundle["prompts"]["tactical"].startswith("<tactical_phase>")
+    assert bundle["prompts"]["tactical"] == "# Tactical phase\n\nSEEDED TACTICAL BODY\n"
     # The bundled worker seed itself ships no phase prompt of its own.
     seed = load_seed_bundle(
         ROOT / "config", directory="general-worker", expert_type="worker"

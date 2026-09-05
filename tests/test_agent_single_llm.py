@@ -108,13 +108,12 @@ class TestCreatePhaseLLMsSingleModel:
 
 
 # ---------------------------------------------------------------------------
-# ``_bind_job_tools`` (U2 WP3): one binding for every phase, or the legacy pair
+# ``_bind_job_tools`` (U2): one stable union binding for every phase
 # ---------------------------------------------------------------------------
 
 from langchain_core.tools import StructuredTool  # noqa: E402
 
 from src.core.loader import (  # noqa: E402
-    PROMPT_MODE_LEGACY,
     InstructionFileEntry,
     supports_parallel_tool_calls,
 )
@@ -148,7 +147,7 @@ class _RecordingLLM:
 
 
 class _BindAgent:
-    """Only what _bind_job_tools / _graph_llm_bindings touch."""
+    """Only what ``_bind_job_tools`` touches."""
 
     def __init__(self, config, tools):
         self.config = config
@@ -167,15 +166,8 @@ def _bind(config, tools) -> _BindAgent:
     return agent
 
 
-def _legacy_config(*, tool_binding_mode="auto"):
-    config = _make_config({})
-    config.phase_settings.prompt_mode = PROMPT_MODE_LEGACY
-    config.phase_settings.tool_binding_mode = tool_binding_mode
-    return config
-
-
 class TestBindJobTools:
-    def test_skills_mode_binds_the_union_once(self):
+    def test_binds_the_union_once(self):
         config = _make_config({})
         tools = [_structured(n) for n in _BIND_TOOLS]
         agent = _bind(config, tools)
@@ -211,90 +203,36 @@ class TestBindJobTools:
         )
         assert bound.kwargs == expected
 
-    def test_legacy_prompt_mode_binds_the_filtered_pair(self):
-        tools = [_structured(n) for n in _BIND_TOOLS]
-        agent = _bind(_legacy_config(), tools)
-
-        strategic, tactical = agent._llm.calls
-        assert sorted(strategic.tool_names) == ["job_complete", "read_file"]
-        assert sorted(tactical.tool_names) == ["read_file", "request_replan"]
-        assert agent._strategic_llm_with_tools is strategic
-        assert agent._tactical_llm_with_tools is tactical
-        assert agent._llm_with_tools is strategic  # the old compat alias
-        for binding in (strategic, tactical):  # arm A: descriptions as before
-            assert not any("-phase tool]" in d for d in binding.descriptions.values())
-
-    def test_legacy_prompt_with_union_binding_is_the_attribution_arm(self):
-        tools = [_structured(n) for n in _BIND_TOOLS]
-        agent = _bind(_legacy_config(tool_binding_mode="union"), tools)
-
-        (bound,) = agent._llm.calls
-        assert sorted(bound.tool_names) == sorted(_BIND_TOOLS)
-        assert (
-            agent._strategic_llm_with_tools is agent._tactical_llm_with_tools is bound
+    def test_unregistered_tools_are_not_bound(self):
+        agent = _bind(
+            _make_config({}),
+            [_structured("read_file"), _structured("custom_unregistered")],
         )
-        assert bound.descriptions["job_complete"].startswith("[strategic-phase tool]")
-        assert bound.descriptions["request_replan"].startswith("[tactical-phase tool]")
+        (binding,) = agent._llm.calls
+        assert "custom_unregistered" not in binding.tool_names
+        assert "read_file" in binding.tool_names
 
-    def test_skills_prompt_with_filtered_binding_is_the_attribution_arm(self):
-        config = _make_config({})
-        config.phase_settings.tool_binding_mode = "filtered"
-        tools = [_structured(n) for n in _BIND_TOOLS]
-        agent = _bind(config, tools)
-
-        strategic, tactical = agent._llm.calls
-        assert sorted(strategic.tool_names) == ["job_complete", "read_file"]
-        assert sorted(tactical.tool_names) == ["read_file", "request_replan"]
-        assert agent._strategic_llm_with_tools is strategic
-        assert agent._tactical_llm_with_tools is tactical
-        assert agent._llm_with_tools is strategic
-        for binding in (strategic, tactical):
-            assert not any("-phase tool]" in d for d in binding.descriptions.values())
-
-    def test_unregistered_tools_are_bound_in_neither_mode(self):
-        for config in (_make_config({}), _legacy_config()):
-            agent = _bind(
-                config, [_structured("read_file"), _structured("custom_unregistered")]
-            )
-            for binding in agent._llm.calls:
-                assert "custom_unregistered" not in binding.tool_names
-                assert "read_file" in binding.tool_names
-
-    def test_graph_bindings_follow_the_binding_shape(self):
-        from src.agent import UniversalAgent
-
-        skills = _bind(_make_config({}), [_structured("read_file")])
-        assert UniversalAgent._graph_llm_bindings(skills) == {
-            "llm_with_tools": skills._llm_with_tools
-        }
-        legacy = _bind(_legacy_config(), [_structured("read_file")])
-        assert UniversalAgent._graph_llm_bindings(legacy) == {
-            "strategic_llm_with_tools": legacy._strategic_llm_with_tools,
-            "tactical_llm_with_tools": legacy._tactical_llm_with_tools,
-        }
-
-    def test_before_tool_enforcement_survives_binding_in_both_modes(self):
+    def test_before_tool_enforcement_survives_binding(self):
         """The todo-guide gate wraps the ToolNode's tool objects in place;
-        binding (copies for the schema) never undoes it, whichever mode."""
-        for config in (_make_config({}), _legacy_config()):
-            ctx = ToolContext()
-            ctx._instruction_files = [
-                InstructionFileEntry(
-                    trigger="before_tool:next_phase_todos",
-                    skill="todo-guide",
-                    enforce=True,
-                )
-            ]
-            tools = apply_instruction_enforcement(
-                [_structured("next_phase_todos"), _structured("read_file")], ctx
+        binding copies for the schema never undo it."""
+        ctx = ToolContext()
+        ctx._instruction_files = [
+            InstructionFileEntry(
+                trigger="before_tool:next_phase_todos",
+                skill="todo-guide",
+                enforce=True,
             )
-            gate = tools[0].func
-            ctx.set_current_phase("strategic", phase_number=1, turn_count=1)
-            assert "skills/todo-guide/SKILL.md" in gate()  # closed: guide unread
+        ]
+        tools = apply_instruction_enforcement(
+            [_structured("next_phase_todos"), _structured("read_file")], ctx
+        )
+        gate = tools[0].func
+        ctx.set_current_phase("strategic", phase_number=1, turn_count=1)
+        assert "skills/todo-guide/SKILL.md" in gate()  # closed: guide unread
 
-            agent = _bind(config, tools)
-            assert agent._tools[0].func is gate  # what the ToolNode executes
-            assert all("next_phase_todos" in b.tool_names for b in agent._llm.calls[:1])
+        agent = _bind(_make_config({}), tools)
+        assert agent._tools[0].func is gate  # what the ToolNode executes
+        assert "next_phase_todos" in agent._llm.calls[0].tool_names
 
 
 # ---------------------------------------------------------------------------

@@ -64,17 +64,11 @@ Its first result separates correctly rejected phase-mismatched attempts from
 unsafe or unclassified calls. The latter must be zero. Its second result checks
 the persistent `[phase: ...]` blocks: skills-mode jobs must have no requests
 without a block, and new phases normally increase the count one at a time;
-legacy-mode jobs intentionally have zero blocks. A compaction may drop older,
-superseded blocks, which is reported separately rather than treated as loss of
-the current block. The query's single-phase tool list has a test that compares
-it directly with `TOOL_REGISTRY`, so registry changes cannot silently stale the
-acceptance check.
-
-The temporary U2 attribution matrix also accepts
-`phase_settings.tool_binding_mode: filtered`: this keeps skills-mode phase
-instructions while binding the same strategic/tactical schema pair as legacy.
-Together with `legacy + union`, it completes the two-by-two prompt/schema
-attribution without changing the shipped `auto` default.
+historical legacy-mode jobs intentionally have zero blocks. A compaction may
+drop older, superseded blocks, which is reported separately rather than treated
+as loss of the current block. The query's single-phase tool list has a test that
+compares it directly with `TOOL_REGISTRY`, so registry changes cannot silently
+stale the acceptance check.
 
 ## Task families
 
@@ -96,13 +90,21 @@ absent from v1 — they change as the repo changes, which breaks pinning.
   Memory-Light recall, so replicate 3 can recall replicate 1's memories.
   v1 accepts this (it matches production behaviour); pass `--project-id`
   to scope a run to a dedicated project, and interleaved submission order
-  spreads any order effect across tasks. Per-arm projects are the plan for
-  real A/Bs.
+  spreads any order effect across tasks. For real A/Bs, use a distinct
+  `project_id` on each arm to prevent cross-arm contamination.
 - **Scholar tasks are high-variance** (subjob fan-out). One task in the
   set on purpose; don't let R* dominate group medians.
 - **Cost attribution is main-loop only.** The reporter counts
   `call_type=main` requests; auxiliary calls (memory extraction, curation)
   are not in the ceremony numbers, matching the §10 methodology.
+- **Raw and uncached input are different metrics.** Uncached input is reported
+  input minus reported cache-read tokens. Report both: a larger stable prefix
+  can increase total input while reducing uncached input. This is not an
+  invoice calculation or a claim about how a subscription counts tokens.
+- **Pin auxiliary inference when isolating a provider.** Setting an arm's
+  `model` pins its main loop only. Also set `config_override.auxiliary.model`
+  when background tasks must use that provider; otherwise deployment defaults
+  still apply. Check actual model usage across all archived call types.
 
 ## Operating notes (from `baseline-02`, the first live server-side run)
 
@@ -142,12 +144,10 @@ absent from v1 — they change as the repo changes, which breaks pinning.
   schedules arms adjacent within each replicate's shuffled wave — that
   adjacency is what neutralizes time-varying confounds (pool growth,
   contention), so never split arms across runs or clusters.
-- **U2 attribution arm C:** if the skills arm regresses, distinguish phase prose
-  from schema shape with `phase_settings: {prompt_mode: legacy,
-  tool_binding_mode: union}`. This keeps legacy phase text but binds the same
-  stable union schema as skills. The default `tool_binding_mode: auto` leaves
-  both primary arms unchanged; the switch is measurement scaffolding removed
-  with the legacy path in U2 WP6.
+- **U2 attribution controls are retired:** WP5 used temporary legacy/union and
+  skills/filtered arms to isolate phase prose from schema shape. WP6 removed
+  those live configuration switches after the MiniMax verdict; use the recorded
+  run IDs in the design note for historical comparisons.
 - **Running on k3d:** mint the test id_token per the auth memo (admin-cli
   password grant, use `id_token` not `access_token`); `POST /api/projects`
   requires `user_id` in the body. Give memory-sensitive experiments a

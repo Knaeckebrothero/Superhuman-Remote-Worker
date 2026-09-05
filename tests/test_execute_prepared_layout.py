@@ -3,7 +3,7 @@
 Acceptance for "cache prefix = system + tool schemas + history": every request
 the execute node (src/graph.py) sends is laid out as
 
-    [0]   SystemMessage — the ONE phase-agnostic system prompt (skills mode)
+    [0]   SystemMessage — the ONE phase-agnostic system prompt
     [1..] summary SystemMessages ("[Summary of prior work]") from state, in
           state order; any other SystemMessage in state is never sent
     [..]  history — every non-System message of state, in state order,
@@ -18,7 +18,7 @@ followed by turn N's new state messages, byte for byte, so provider prompt
 caches reuse it and only the tail is re-billed. Nothing in the tail reaches
 state.
 
-WP3's corollary is pinned here as well: in skills mode there is ONE tool
+WP3's corollary is pinned here as well: there is ONE tool
 schema per job (``phase_tool_schemas["strategic"] is
 phase_tool_schemas["tactical"]``) and the bound description set does not
 change between turns — the "tool schemas" half of the cache-prefix claim.
@@ -79,7 +79,7 @@ from src.core.workspace_injection import (
     TODOS_INJECTION_CONTENT_PREFIX,
     is_workspace_injection_message,
 )
-from src.graph import _per_binding, _resolve_phase_bindings, create_execute_node
+from src.graph import create_execute_node
 from src.managers import TodoManager
 from src.services.memory import AssembleStats, InjectionBlock, MemoryPayload
 from src.tools.context import ToolContext
@@ -90,7 +90,6 @@ WORKER_CONFIG_PATH = str(REPO_ROOT / "config" / "worker_base.yaml")
 
 JOB_ID = "layout-job-1"
 SYSTEM_PROMPT = "ONE-SYS"
-LEGACY_SYSTEM_PROMPT = "LEGACY-SYS"
 PHASE_SKILL_MD = (
     "---\n"
     "name: tactical-phase\n"
@@ -120,8 +119,7 @@ TOOL_SCHEMAS = [
 ]
 
 _EXECUTE_PATCHES = {
-    "src.graph.get_phase_system_prompt": LEGACY_SYSTEM_PROMPT,
-    "src.graph.get_system_prompt": SYSTEM_PROMPT,
+    "src.graph.get_phase_system_prompt": SYSTEM_PROMPT,
 }
 
 
@@ -513,12 +511,11 @@ class TestPreparedLayout:
             "todos",
         ]
 
-        # [0] is the ONE phase-agnostic prompt (skills mode), rebuilt per turn;
+        # [0] is the ONE phase-agnostic prompt, rebuilt per turn;
         # a SystemMessage that sits in state is never forwarded unless it is a
         # summary — the stale one is dropped.
         assert isinstance(request[0], SystemMessage)
         assert request[0].content == SYSTEM_PROMPT
-        assert LEGACY_SYSTEM_PROMPT not in [m.content for m in request]
         assert [m for m in request if isinstance(m, SystemMessage)] == [
             request[0],
             state["messages"][0],
@@ -738,26 +735,6 @@ class TestPreparedLayout:
 
 
 class TestOneSchemaPerJob:
-    def test_skills_mode_resolves_one_binding_and_extracts_once(self):
-        """``llm_with_tools=`` binds both phases to the SAME object, and the
-        per-binding extraction runs once — phase_tool_schemas["strategic"] is
-        phase_tool_schemas["tactical"]."""
-        llm = CapturingLLM()
-        phase_llms = _resolve_phase_bindings(llm, None, None, caller="test")
-        assert phase_llms == {"strategic": llm, "tactical": llm}
-        assert phase_llms["strategic"] is phase_llms["tactical"]
-
-        calls: List[Any] = []
-
-        def extract(bound):
-            calls.append(bound)
-            return bound.kwargs.get("tools")
-
-        schemas = _per_binding(phase_llms, extract)
-        assert calls == [llm]
-        assert schemas["strategic"] is schemas["tactical"]
-        assert schemas["strategic"] is llm.kwargs["tools"]
-
     @pytest.mark.asyncio
     async def test_archived_tool_schemas_are_one_object_across_phases_and_turns(
         self, env

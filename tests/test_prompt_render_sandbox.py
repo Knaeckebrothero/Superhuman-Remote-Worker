@@ -131,7 +131,7 @@ def test_render_has_no_unsandboxed_environment_left_under_src(tree):
 _BUNDLED = [
     "config/prompts/systemprompt.txt",
     "config/prompts/systemprompt_interactive.txt",
-    "config/experts/developer/tactical.txt",
+    "config/experts/developer/skills/tactical-phase/SKILL.md",
     "config/templates/strategic_todos_resume.yaml",
 ]
 
@@ -167,8 +167,8 @@ def test_bundled_prompt_renders_byte_identically_in_the_sandbox(rel, tools_on):
     for kw in (
         {},
         {"cli_datasources": ["postgresql"], "protected_cloud": True},
-        {"extra_context": {"legacy_phase_prompt": True}},
-        {"extra_context": {"legacy_phase_prompt": False}},
+        {"extra_context": {"caller_flag": True}},
+        {"extra_context": {"caller_flag": False}},
     ):
         assert render_instruction_content(content, tools, **kw) == _reference_render(
             content, tools, **kw

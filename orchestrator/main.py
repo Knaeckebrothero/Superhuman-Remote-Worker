@@ -63495,10 +63495,7 @@ def _bundled_expert_bundle(expert_id: str) -> dict[str, Any] | None:
     raw = yaml.safe_load(config_path.read_text()) or {}
     extends = canonical_config_name(str(raw.pop("$extends", "worker_base")))
     raw.pop("connections", None)
-    # Part 2: capture all prompt segments a fork should round-trip — base
-    # (family-agnostic) files only. Disk family variants (strategic_gpt_5.txt …)
-    # stay a bundled/framework concern; the fork keeps the base, which is strictly
-    # better than the old persona+instructions-only bundle that dropped the rest.
+    # Part 2: capture all prompt segments a fork should round-trip.
     # strategic/tactical come from the expert-local phase skills (U2: the
     # bodies of skills/<phase>-phase/SKILL.md), keeping the DB shape — at
     # delivery they are the fenced <expert_workflow> addendum of the phase block.

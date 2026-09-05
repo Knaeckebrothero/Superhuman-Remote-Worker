@@ -2,19 +2,17 @@
 # Only list entries that differ from the base matrix. Base entries fall through.
 # Files referenced here resolve via expert directory → config/{prompts,templates}/.
 #
-# Why every prompt is listed under `default` even when the filename matches the
+# Why the persona is listed under `default` even when the filename matches the
 # global hardcoded default: the resolver's level-1/2 lookup is on the expert
 # matrix; without an explicit `default` entry here, gemma/gpt-5/codex/etc.
 # resolve via base.<family>.prompts and pick up the global generalist prompts
 # (persona_gemma.txt, persona_gpt_5.txt, ...) instead of the developer's
-# TDD-specific files. Listing them under `default` here pins the TDD prompts
+# TDD-specific file. Listing it under `default` here pins the TDD persona
 # for every model family that does not have its own developer variant.
 
 default:
   prompts:
     persona: persona.txt
-    strategic: strategic.txt
-    tactical: tactical.txt
   instructions:
     instructions: instructions.md
     strategic_todos_initial: strategic_todos_initial.yaml
@@ -23,14 +21,10 @@ default:
 minimax:
   prompts:
     persona: persona_minimax.txt
-    strategic: strategic_minimax.txt
-    tactical: tactical_minimax.txt
 
 minimax-m3:
   prompts:
     persona: persona_minimax_m3.txt
-    strategic: strategic_minimax_m3.txt
-    tactical: tactical_minimax_m3.txt
 
 # gpt-5 and codex share the same prompt variant — codex aliases to gpt-5
 # in the global matrix (config/model_config_matrix.yaml) and the family
@@ -38,17 +32,11 @@ minimax-m3:
 gpt-5:
   prompts:
     persona: persona_gpt_5.txt
-    strategic: strategic_gpt_5.txt
-    tactical: tactical_gpt_5.txt
 
 codex:
   prompts:
     persona: persona_gpt_5.txt
-    strategic: strategic_gpt_5.txt
-    tactical: tactical_gpt_5.txt
 
 codex-spark:
   prompts:
     persona: persona_codex_spark.txt
-    strategic: strategic_codex_spark.txt
-    tactical: tactical_codex_spark.txt

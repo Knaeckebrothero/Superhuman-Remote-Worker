@@ -15,7 +15,6 @@ the *wiring* that slice 5 added to production code:
   compaction keeps stripping injected pairs after the cutover.
 """
 
-import warnings
 import asyncio
 import uuid
 from pathlib import Path
@@ -281,42 +280,9 @@ class TestWorkerConstruction:
             tool_context=tool_context,
         )
 
-    def test_one_binding_builds_without_a_deprecation_warning(
-        self, worker_config, workspace_manager
-    ):
+    def test_one_binding_builds(self, worker_config, workspace_manager):
         worker_config.memory.manager_enabled = False
-        with warnings.catch_warnings(record=True) as seen:
-            warnings.simplefilter("always")
-            self._build(worker_config, workspace_manager, None)
-        assert not [w for w in seen if "llm_with_tools" in str(w.message)]
-
-    def test_deprecated_binding_pair_still_builds_with_one_warning(
-        self, worker_config, workspace_manager
-    ):
-        """Legacy prompt mode hands the phase-filtered pair through the
-        deprecated aliases; the graph factory warns once (not again from the
-        execute node it builds)."""
-        from src.graph import build_phase_alternation_graph
-
-        worker_config.memory.manager_enabled = False
-        with warnings.catch_warnings(record=True) as seen:
-            warnings.simplefilter("always")
-            build_phase_alternation_graph(
-                strategic_llm_with_tools=MagicMock(),
-                tactical_llm_with_tools=MagicMock(),
-                tools=[],
-                config=worker_config,
-                workspace=workspace_manager,
-                todo_manager=TodoManager(workspace_manager),
-            )
-        ours = [
-            w
-            for w in seen
-            if issubclass(w.category, DeprecationWarning)
-            and "pass llm_with_tools=" in str(w.message)
-        ]
-        assert len(ours) == 1
-        assert "build_phase_alternation_graph(" in str(ours[0].message)
+        self._build(worker_config, workspace_manager, None)
 
     def test_flag_on_constructs_with_worker_runtime(
         self, worker_config, workspace_manager
@@ -576,7 +542,6 @@ def _mock_aux():
 _EXECUTE_PATCHES = (
     ("src.graph.get_archiver", None),
     ("src.graph.get_phase_system_prompt", "SYS"),
-    ("src.graph.get_system_prompt", "SYS"),
 )
 
 
@@ -607,7 +572,6 @@ class TestWorkerExecuteWiring:
         with (
             patch("src.graph.get_archiver", return_value=None),
             patch("src.graph.get_phase_system_prompt", return_value="SYS"),
-            patch("src.graph.get_system_prompt", return_value="SYS"),
         ):
             first = await node(state)
             _apply_turn(state, first)
@@ -676,7 +640,6 @@ class TestWorkerExecuteWiring:
         with (
             patch("src.graph.get_archiver", return_value=None),
             patch("src.graph.get_phase_system_prompt", return_value="SYS"),
-            patch("src.graph.get_system_prompt", return_value="SYS"),
         ):
             first = await node(state)
             _apply_turn(state, first)
@@ -717,7 +680,6 @@ class TestWorkerExecuteWiring:
         with (
             patch("src.graph.get_archiver", return_value=None),
             patch("src.graph.get_phase_system_prompt", return_value="SYS"),
-            patch("src.graph.get_system_prompt", return_value="SYS"),
         ):
             first = await node(state)
             _apply_turn(state, first)
@@ -769,7 +731,6 @@ class TestWorkerExecuteWiring:
         with (
             patch("src.graph.get_archiver", return_value=None),
             patch("src.graph.get_phase_system_prompt", return_value="SYS"),
-            patch("src.graph.get_system_prompt", return_value="SYS"),
         ):
             first = await node(_worker_state())
         block = first["messages"][0]
@@ -867,7 +828,6 @@ class TestWorkerExecuteWiring:
         with (
             patch("src.graph.get_archiver", return_value=None),
             patch("src.graph.get_phase_system_prompt", return_value="SYS"),
-            patch("src.graph.get_system_prompt", return_value="SYS"),
         ):
             result = await node(_worker_state())
 
@@ -898,7 +858,6 @@ class TestWorkerExecuteWiring:
             # blocks trip get_phase_system_prompt's .format with the
             # bare default model) — the wiring is.
             patch("src.graph.get_phase_system_prompt", return_value="SYS"),
-            patch("src.graph.get_system_prompt", return_value="SYS"),
         ):
             result = await node(_worker_state())
         await asyncio.sleep(0)  # let the fire-and-forget capture task run
@@ -977,7 +936,6 @@ class TestWorkerExecuteWiring:
         with (
             patch("src.graph.get_archiver", return_value=None),
             patch("src.graph.get_phase_system_prompt", return_value="SYS"),
-            patch("src.graph.get_system_prompt", return_value="SYS"),
         ):
             await node(_worker_state())
         await asyncio.sleep(0)
@@ -1493,7 +1451,7 @@ def _make_kb_retriever(runtime):
 
 
 # ---------------------------------------------------------------------------
-# U2 WP2: the phase skills as phase_start blocks, the DB addendum, legacy mode
+# U2 WP2: phase skills as phase_start blocks and the DB addendum
 # ---------------------------------------------------------------------------
 
 _TACTICAL_SKILL_MD = (
@@ -1547,8 +1505,7 @@ class TestPhaseSkillBlocks:
         state = _worker_state()
         with (
             patch("src.graph.get_archiver", return_value=None),
-            patch("src.graph.get_phase_system_prompt", return_value="LEGACY-SYS"),
-            patch("src.graph.get_system_prompt", return_value="ONE-SYS"),
+            patch("src.graph.get_phase_system_prompt", return_value="ONE-SYS"),
         ):
             first = await node(state)
 
@@ -1589,8 +1546,7 @@ class TestPhaseSkillBlocks:
         state = _worker_state()
         with (
             patch("src.graph.get_archiver", return_value=None),
-            patch("src.graph.get_phase_system_prompt", return_value="LEGACY-SYS"),
-            patch("src.graph.get_system_prompt", return_value="ONE-SYS"),
+            patch("src.graph.get_phase_system_prompt", return_value="ONE-SYS"),
         ):
             first = await node(state)
             _apply_turn(state, first)
@@ -1617,41 +1573,3 @@ class TestPhaseSkillBlocks:
         for request in requests:
             assert _count_text(request, "FORK TACTICAL RULE") == 1
             assert _count_text(request, "<expert_workflow") == 1
-
-    @pytest.mark.asyncio
-    async def test_legacy_prompt_mode_skips_phase_skill_blocks_and_renders_the_swap(
-        self, execute_env
-    ):
-        """phase_settings.prompt_mode == "legacy" (the bench's "current" arm):
-        the per-phase system-prompt swap is rendered and the phase-skill
-        bindings are NOT delivered; other phase_start bindings still are."""
-        env = execute_env
-        _bind_tactical_phase_skill(env, also_research_guide=True)
-        env["config"].phase_settings.prompt_mode = "legacy"
-        node = _make_execute_node(
-            env["config"],
-            env["workspace"],
-            env["todo"],
-            env["ctx"],
-            env["service"],
-            {"llm": env["llm"], "context": env["context"]},
-        )
-        state = _worker_state()
-        with (
-            patch("src.graph.get_archiver", return_value=None),
-            patch("src.graph.get_phase_system_prompt", return_value="LEGACY-SYS"),
-            patch("src.graph.get_system_prompt", return_value="ONE-SYS"),
-        ):
-            first = await node(state)
-
-        request = env["llm"].ainvoke.call_args_list[0].args[0]
-        assert request[0].content == "LEGACY-SYS"
-        blocks = [m for m in first["messages"] if is_protected_message(m)]
-        assert [m.additional_kwargs["srw_instruction_path"] for m in blocks] == [
-            "skills/research-guide/SKILL.md"
-        ]
-        assert _count_text(request, "UNIQUE TACTICAL SKILL BODY") == 0
-        assert _count_text(request, "RESEARCH GUIDE BODY") == 1
-        assert first["phase_instruction_injections"] == [
-            "2:tactical:skills/research-guide/SKILL.md"
-        ]

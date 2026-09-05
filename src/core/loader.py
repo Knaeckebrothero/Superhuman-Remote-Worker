@@ -1490,8 +1490,8 @@ def render_instruction_content(
     ``{% if protected_cloud %}`` for the protected-cloud honesty block, and
     ``{{ tools }}`` variable access.  Non-templated content (no ``{%``
     or ``{{`` markers) passes through unchanged with zero overhead.
-    ``extra_context`` adds caller-owned variables (the worker system prompt
-    passes ``legacy_phase_prompt``); it can never shadow the built-ins.
+    ``extra_context`` adds caller-owned variables; it can never shadow the
+    built-ins.
 
     Rendering is sandboxed (see ``_prompt_template_environment``) AND bounded.
     A template that reaches for Python internals raises
@@ -1810,8 +1810,6 @@ class PromptMatrixResolver(MatrixResolver):
         # file: a roster entry supplies the identity, never a prompt variant.
         "systemprompt_subagent": "systemprompt_subagent.txt",
         "persona": "persona.txt",
-        "strategic": "strategic.txt",
-        "tactical": "tactical.txt",
         "summarization": "summarization_prompt.txt",
         "memory_extraction": "memory_extraction_prompt.txt",
         "curation": "curation_prompt.txt",
@@ -2343,68 +2341,19 @@ class ContextManagementConfig:
     max_summary_length: int = 10000
 
 
-#: ``phase_settings.prompt_mode`` values (U2). ``skills``: one phase-agnostic
-#: system prompt, the phase guidance delivered once per concrete phase as the
-#: ``strategic-phase`` / ``tactical-phase`` skills (persistent, protected
-#: messages). ``legacy``: the pre-U2 swap — strategic/tactical prompt files
-#: rendered into the system prompt every turn, phase-filtered tool bindings,
-#: no phase-skill blocks. ``legacy`` exists only so the U2 bench can run both
-#: arms on one image (universal_experts_and_subagents.md §1.2); U2 WP6
-#: deletes it together with the family variants.
-PROMPT_MODE_SKILLS = "skills"
-PROMPT_MODE_LEGACY = "legacy"
-VALID_PROMPT_MODES = frozenset({PROMPT_MODE_SKILLS, PROMPT_MODE_LEGACY})
-
-# Temporary WP5 attribution control. ``auto`` preserves the shipped coupling
-# (skills -> one union binding, legacy -> a phase-filtered pair). ``union``
-# permits arm C: legacy phase prose with the same stable union schema as skills
-# mode. ``filtered`` permits arm D: skills prose with the legacy arm's
-# phase-filtered schema pair. Defaults never change; WP6 removes this switch
-# with the legacy path.
-TOOL_BINDING_MODE_AUTO = "auto"
-TOOL_BINDING_MODE_UNION = "union"
-TOOL_BINDING_MODE_FILTERED = "filtered"
-VALID_TOOL_BINDING_MODES = frozenset(
-    {
-        TOOL_BINDING_MODE_AUTO,
-        TOOL_BINDING_MODE_UNION,
-        TOOL_BINDING_MODE_FILTERED,
-    }
-)
-
-
 @dataclass
 class PhaseSettings:
     """Phase alternation settings.
 
     Controls the strategic/tactical phase transitions. min/max_todos are
     the LIVE bounds: agent.py passes them into TodoManager at construction,
-    where stage_tactical_todos enforces them. The worker overlay (worker_base) lowers the
-    floor to 2. ``prompt_mode`` selects how the worker receives its phase
-    guidance (see ``PROMPT_MODE_SKILLS`` / ``PROMPT_MODE_LEGACY``).
-    ``tool_binding_mode`` is temporary WP5 measurement scaffolding that can
-    decouple schema shape from the prompt treatment (``auto | union |
-    filtered``). Both ride
-    ``config_override`` like every other key here and are frozen with the job.
+    where stage_tactical_todos enforces them. The worker overlay (worker_base)
+    lowers the floor to 2. Phase guidance is always delivered by the bundled
+    phase skills, and every phase uses one stable union tool binding.
     """
 
     min_todos: int = 5  # Minimum todos required for strategic->tactical transition
     max_todos: int = 20  # Maximum todos allowed for strategic->tactical transition
-    prompt_mode: str = PROMPT_MODE_SKILLS  # skills | legacy (U2)
-    tool_binding_mode: str = TOOL_BINDING_MODE_AUTO  # temporary WP5 attribution
-
-    def __post_init__(self) -> None:
-        if self.prompt_mode not in VALID_PROMPT_MODES:
-            raise ValueError(
-                "phase_settings.prompt_mode must be one of "
-                f"{sorted(VALID_PROMPT_MODES)} (got {self.prompt_mode!r})"
-            )
-        if self.tool_binding_mode not in VALID_TOOL_BINDING_MODES:
-            raise ValueError(
-                "phase_settings.tool_binding_mode must be one of "
-                f"{sorted(VALID_TOOL_BINDING_MODES)} "
-                f"(got {self.tool_binding_mode!r})"
-            )
 
 
 @dataclass
@@ -3354,8 +3303,6 @@ def load_agent_config(
     phase_config = PhaseSettings(
         min_todos=phase_data.get("min_todos", 5),
         max_todos=phase_data.get("max_todos", 20),
-        prompt_mode=phase_data.get("prompt_mode", PROMPT_MODE_SKILLS),
-        tool_binding_mode=phase_data.get("tool_binding_mode", TOOL_BINDING_MODE_AUTO),
     )
 
     memory_data = data.get("memory", {})
@@ -3626,8 +3573,6 @@ def load_agent_config_from_dict(
     phase_config = PhaseSettings(
         min_todos=phase_data.get("min_todos", 5),
         max_todos=phase_data.get("max_todos", 20),
-        prompt_mode=phase_data.get("prompt_mode", PROMPT_MODE_SKILLS),
-        tool_binding_mode=phase_data.get("tool_binding_mode", TOOL_BINDING_MODE_AUTO),
     )
 
     memory_data = data.get("memory", {})
@@ -4966,26 +4911,6 @@ def load_base_system_prompt(matrix_resolver: PromptMatrixResolver) -> str:
     return matrix_resolver.load("systemprompt")
 
 
-def load_phase_component(
-    is_strategic: bool,
-    matrix_resolver: PromptMatrixResolver,
-) -> str:
-    """Load the phase-specific component (strategic.txt or tactical.txt).
-
-    Args:
-        is_strategic: True for strategic phase, False for tactical
-        matrix_resolver: PromptMatrixResolver for model-aware filename resolution.
-
-    Returns:
-        Raw template string with {phase_number} placeholder
-
-    Raises:
-        FileNotFoundError: If template not found
-    """
-    prompt_type = "strategic" if is_strategic else "tactical"
-    return matrix_resolver.load(prompt_type)
-
-
 # Placeholders the prompt assembler owns and substitutes. Everything else that
 # looks like a brace — CSS in a designer mockup, ``{py,sh,md}`` in a repro-path
 # hint, a JSON example — is literal prose and must survive untouched. We render
@@ -5040,81 +4965,15 @@ PHASE_SKILLS: Dict[str, str] = {
 }
 PHASE_SKILL_NAMES = frozenset(PHASE_SKILLS.values())
 
-#: Jinja variable the worker system-prompt templates branch on: True renders
-#: the pre-U2 ``<phase_directive>{prompt_content}</phase_directive>`` slot,
-#: False the phase-agnostic ``<phase_model>`` block. Present in every current
-#: template, absent from every pre-U2 one — which is what
-#: :func:`is_legacy_phase_template` keys on.
-LEGACY_PHASE_PROMPT_FLAG = "legacy_phase_prompt"
-
 
 def is_legacy_phase_template(template: str) -> bool:
-    """A pre-U2 worker system-prompt template: it still has the bare
-    ``{prompt_content}`` slot and knows nothing of the guarded legacy branch.
+    """A pre-U2 worker system-prompt template with the old phase slot.
 
     Such a template only exists frozen in a job dispatched before U2 (or as a
     synthetic test template); rendering it phase-agnostic would drop the
     phase guidance the job was dispatched with, so it keeps the swap.
     """
-    return "{prompt_content}" in template and LEGACY_PHASE_PROMPT_FLAG not in template
-
-
-def prompt_mode_of(config: Any) -> str:
-    """``config.phase_settings.prompt_mode`` with the skills default for
-    anything that is not a real config (tests hand the execute node a
-    MagicMock; the comparison must stay ``== "legacy"``, never truthiness)."""
-    settings = getattr(config, "phase_settings", None)
-    mode = getattr(settings, "prompt_mode", PROMPT_MODE_SKILLS)
-    return mode if isinstance(mode, str) else PROMPT_MODE_SKILLS
-
-
-def uses_legacy_phase_prompt(config: Any) -> bool:
-    """Whether the worker renders the pre-U2 phase swap for this job.
-
-    True when ``phase_settings.prompt_mode == "legacy"`` (the bench's
-    "current" arm) OR the frozen system-prompt template is a pre-U2 one (a
-    job dispatched before U2, resumed under it). The frozen blob is what a
-    dispatched job has; a disk template is judged inside
-    :func:`get_phase_system_prompt` when it is loaded. One decision drives the
-    system prompt, whether the phase-skill blocks are delivered, and where a
-    DB expert's phase addendum goes.
-    """
-    if prompt_mode_of(config) == PROMPT_MODE_LEGACY:
-        return True
-    extra = getattr(config, "extra", None)
-    resolved = extra.get("_resolved_prompts") if isinstance(extra, dict) else None
-    template = resolved.get("systemprompt") if isinstance(resolved, dict) else None
-    return isinstance(template, str) and is_legacy_phase_template(template)
-
-
-def tool_binding_mode_of(config: Any) -> str:
-    """Resolved WP5 measurement mode, defaulting to ``auto``.
-
-    Lightweight test configs often expose only ``prompt_mode`` on a
-    ``SimpleNamespace``; treating a missing or mocked value as ``auto`` keeps
-    shipped behavior and makes the diagnostic opt-in.
-    """
-
-    settings = getattr(config, "phase_settings", None)
-    mode = getattr(settings, "tool_binding_mode", TOOL_BINDING_MODE_AUTO)
-    return mode if mode in VALID_TOOL_BINDING_MODES else TOOL_BINDING_MODE_AUTO
-
-
-def uses_phase_filtered_tool_binding(config: Any) -> bool:
-    """Whether this worker binds a strategic/tactical schema pair.
-
-    ``auto`` preserves the pre-attribution behavior, including old frozen
-    system-prompt templates. Explicit modes decouple tool schema shape from
-    phase prose solely so WP5 can attribute its A/B result: ``union`` forces
-    one stable schema and ``filtered`` forces the per-phase pair.
-    """
-
-    mode = tool_binding_mode_of(config)
-    if mode == TOOL_BINDING_MODE_UNION:
-        return False
-    if mode == TOOL_BINDING_MODE_FILTERED:
-        return True
-    return uses_legacy_phase_prompt(config)
+    return "{prompt_content}" in template
 
 
 def phase_skill_bindings() -> List[Dict[str, Any]]:
@@ -5162,8 +5021,7 @@ def resolve_bound_skill_dir(skill: str, deployment_dir: Optional[str]) -> Path:
 
 def expert_phase_prompt_bodies(expert_dir: Union[str, Path]) -> Dict[str, str]:
     """``{"strategic": body, "tactical": body}`` of an expert directory —
-    the expert-local phase skill bodies (frontmatter stripped), falling back
-    to the legacy ``strategic.txt`` / ``tactical.txt`` while those exist.
+    the expert-local phase skill bodies with frontmatter stripped.
 
     Managed-expert seeding and the fork bundle write these into the DB row's
     ``prompts.strategic`` / ``prompts.tactical`` (shape unchanged); at
@@ -5178,10 +5036,6 @@ def expert_phase_prompt_bodies(expert_dir: Union[str, Path]) -> Dict[str, str]:
         skill_md = expert_dir / "skills" / skill / "SKILL.md"
         if skill_md.is_file():
             out[phase] = skill_body(skill_md.read_text(encoding="utf-8"))
-            continue
-        legacy = expert_dir / f"{phase}.txt"
-        if legacy.is_file():
-            out[phase] = legacy.read_text(encoding="utf-8")
     return out
 
 
@@ -5378,12 +5232,11 @@ def get_phase_system_prompt(
 ) -> str:
     """Get the complete system prompt for the current phase.
 
-    Since U2 the worker path is phase-agnostic by default — this delegates to
-    :func:`get_system_prompt` — and only renders the legacy swap when
-    ``phase_settings.prompt_mode == "legacy"`` or the (frozen) base template
-    is a pre-U2 one (``is_legacy_phase_template``). The legacy swap:
-    1. Load base template (systemprompt.txt)
-    2. Load phase component (strategic.txt or tactical.txt)
+    Since U2 the worker path is phase-agnostic. The only legacy branch retained
+    here is resume compatibility for a pre-U2 frozen base template carrying a
+    bare ``{prompt_content}`` slot. That frozen swap:
+    1. Read the frozen base template
+    2. Read the frozen strategic or tactical component
     3. Render phase component's {phase_number} placeholder
     4. Inject rendered component into base template's {prompt_content}
     5. Render remaining placeholders ({agent_display_name}, etc.)
@@ -5511,29 +5364,24 @@ def get_phase_system_prompt(
 
         return rendered
 
-    # Worker mode. The base template (frozen at dispatch, else disk) decides
-    # the render path: a pre-U2 template still carries the bare
-    # ``<phase_directive>{prompt_content}</phase_directive>`` slot, so an
-    # in-flight job keeps the swap it was dispatched with; the current
-    # templates guard that slot behind ``legacy_phase_prompt`` and render
-    # phase-agnostic unless ``phase_settings.prompt_mode == "legacy"``.
+    # Worker mode. Current templates are phase-agnostic. A pre-U2 template
+    # frozen into a dispatched job still carries the bare
+    # ``<phase_directive>{prompt_content}</phase_directive>`` slot, so that
+    # job alone keeps the phase component it was dispatched with.
     base_template = resolved_prompts.get("systemprompt") or load_base_system_prompt(
         resolver
     )
     expert_identity = _worker_expert_identity(config, resolver, resolved_prompts)
-    if not (
-        prompt_mode_of(config) == PROMPT_MODE_LEGACY
-        or is_legacy_phase_template(base_template)
-    ):
+    if not is_legacy_phase_template(base_template):
         return _render_worker_prompt(
             config, model, tool_names, base_template, expert_identity
         )
 
-    # Legacy swap (deleted in U2 WP6): phase component into {prompt_content}.
+    # Frozen pre-U2 compatibility: its resolved blob contains both components.
+    # New dispatches no longer resolve phase prompt files, so there is no disk
+    # fallback and no way to opt into this branch through live configuration.
     prompt_type_key = prompt_type or ("strategic" if is_strategic else "tactical")
-    phase_component = resolved_prompts.get(prompt_type_key) or load_phase_component(
-        is_strategic, resolver
-    )
+    phase_component = resolved_prompts.get(prompt_type_key) or ""
 
     # Part 2: fence a DB-authored (untrusted) phase directive — brace-safe +
     # subordinate to system/safety. Only when this segment came from a DB expert
@@ -5590,10 +5438,8 @@ def _render_worker_prompt(
 ) -> str:
     """Render the worker system prompt from its parts.
 
-    ``phase_component`` is None on the phase-agnostic path (the template's
-    ``legacy_phase_prompt`` branch renders False and a bare ``{prompt_content}``
-    of a pre-U2 template renders empty) and the loaded strategic/tactical
-    component on the legacy swap. ``phase_key`` names that component
+    ``phase_component`` is None on the phase-agnostic path and the frozen
+    strategic/tactical component on a pre-U2 resume. ``phase_key`` names that component
     (``strategic`` / ``tactical``) for the sandbox refusal log only.
     """
     legacy = phase_component is not None
@@ -5612,7 +5458,6 @@ def _render_worker_prompt(
             base_template,
             tool_names,
             cli_datasources=cli_ds,
-            extra_context={LEGACY_PHASE_PROMPT_FLAG: legacy},
             origin=_prompt_origin(config, "systemprompt"),
         )
 
@@ -6683,8 +6528,6 @@ def serialize_resolved_config(config: AgentConfig, model: str = "") -> dict:
         "systemprompt_interactive",
         "systemprompt_subagent",
         "persona",
-        "strategic",
-        "tactical",
         "summarization",
     ]:
         try:
