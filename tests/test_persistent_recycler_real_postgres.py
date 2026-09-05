@@ -6060,8 +6060,9 @@ async def test_warm_attach_patch_response_loss_binds_exact_marker(db, monkeypatc
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("pod_already_absent", [False, True])
 async def test_never_delivered_warm_attach_soft_end_releases_exact_authority(
-    db, monkeypatch
+    db, monkeypatch, pod_already_absent
 ):
     import orchestrator.main as orch_main
 
@@ -6120,6 +6121,30 @@ async def test_never_delivered_warm_attach_soft_end_releases_exact_authority(
         "permanent": False,
         "context": retirement["context"],
     }
+    if pod_already_absent:
+        # A previous attempt completed the exact Kubernetes effect but died
+        # before it appended the local-quiescence receipt.
+        assert await provisioner.delete_agent_pod_exact(
+            ids["pod_name"], expected_pod_uid=ids["pod_uid"], namespace="agents-a"
+        )
+        assert await provisioner.release_agent_pod_finalizer_exact(
+            ids["pod_name"], expected_pod_uid=ids["pod_uid"], namespace="agents-a"
+        )
+        assert (
+            await provisioner.agent_pod_authority(
+                ids["pod_name"], expected_pod_uid=ids["pod_uid"], namespace="agents-a"
+            )
+            == "exact_absent"
+        )
+        provisioner.delete_agent_pod_exact = delete_exact
+        original_wait = orch_main._wait_for_captured_agent_pod_retired
+
+        async def immediate_observation(*args, **kwargs):
+            return await original_wait(*args, **kwargs, timeout_s=0)
+
+        monkeypatch.setattr(
+            orch_main, "_wait_for_captured_agent_pod_retired", immediate_observation
+        )
     with (
         patch.object(orch_main, "postgres_db", db),
         patch.object(orch_main, "agent_provisioner", provisioner),

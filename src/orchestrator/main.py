@@ -12045,15 +12045,20 @@ async def _stop_captured_retirement_agent(
             pod_name,
             pod_uid,
             namespace=namespace,
-            allowed={"exact_terminal"},
+            allowed={"exact_terminal", "exact_absent"},
         )
-        if terminal != "exact_terminal":
+        if terminal not in {"exact_terminal", "exact_absent"}:
             raise RuntimeError("exact agent Pod termination is retryable")
-        if not await agent_provisioner.release_agent_pod_finalizer_exact(
-            pod_name,
-            expected_pod_uid=pod_uid,
-            namespace=namespace,
-            terminal_required=True,
+        # A prior attempt may have released the exact terminal Pod's finalizer
+        # before it could append the durable local-quiescence receipt.
+        if (
+            terminal == "exact_terminal"
+            and not await agent_provisioner.release_agent_pod_finalizer_exact(
+                pod_name,
+                expected_pod_uid=pod_uid,
+                namespace=namespace,
+                terminal_required=True,
+            )
         ):
             raise RuntimeError("exact agent Pod finalizer release is retryable")
         absent = await _wait_for_captured_agent_pod_retired(
