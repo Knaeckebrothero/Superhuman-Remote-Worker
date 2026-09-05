@@ -204,6 +204,127 @@ def _statements(nodes: list[ast.stmt]) -> list[ast.stmt]:
     return result
 
 
+def _binding_statements(source: _Source) -> list[ast.stmt]:
+    """Include explicitly declared lazy package exports as import bindings.
+
+    A package with module __getattr__ may declare its public export targets
+    under TYPE_CHECKING. Only literal __all__ names in an import-only block
+    participate; conditional route registrations remain unsupported. Runtime
+    identity tests must keep these declarations aligned with the lazy exports.
+    A present _EXPORTS table must be a literal mapping of public names to
+    (relative submodule, attribute) pairs matching those declarations. Other
+    dynamic __getattr__ implementations are not evaluated by this scanner.
+    """
+    statements = source.statements
+    if source.path.name != "__init__.py" or not any(
+        isinstance(node, ast.FunctionDef) and node.name == "__getattr__"
+        for node in statements
+    ):
+        return statements
+    exports = [
+        node.value
+        for node in statements
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id == "__all__"
+    ]
+    if len(exports) != 1 or not isinstance(exports[0], (ast.List, ast.Tuple)):
+        return statements
+    if not all(
+        isinstance(item, ast.Constant) and isinstance(item.value, str)
+        for item in exports[0].elts
+    ):
+        return statements
+    public = {item.value for item in exports[0].elts}
+    type_checking = {
+        alias.asname or alias.name
+        for node in statements
+        if isinstance(node, ast.ImportFrom)
+        and node.module == "typing"
+        and node.level == 0
+        for alias in node.names
+        if alias.name == "TYPE_CHECKING"
+    }
+    for node in statements:
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            type_checking.difference_update(
+                target.id for target in targets if isinstance(target, ast.Name)
+            )
+    extra = []
+    for node in statements:
+        if not (
+            isinstance(node, ast.If)
+            and isinstance(node.test, ast.Name)
+            and node.test.id in type_checking
+            and not node.orelse
+            and all(isinstance(item, ast.ImportFrom) for item in node.body)
+        ):
+            continue
+        for imported in node.body:
+            names = [
+                alias
+                for alias in imported.names
+                if alias.name != "*" and (alias.asname or alias.name) in public
+            ]
+            if names:
+                extra.append(
+                    ast.copy_location(
+                        ast.ImportFrom(
+                            module=imported.module, names=names, level=imported.level
+                        ),
+                        imported,
+                    )
+                )
+    maps = [
+        node.value
+        for node in statements
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "_EXPORTS"
+            for target in node.targets
+        )
+    ]
+    if maps and extra:
+        error = f"{source.path}:1: lazy _EXPORTS must be a literal mapping matching TYPE_CHECKING exports"
+        if len(maps) != 1 or not isinstance(maps[0], ast.Dict):
+            raise UnsupportedRouteError(error)
+        try:
+            mapping = ast.literal_eval(maps[0])
+        except (ValueError, TypeError, SyntaxError):
+            raise UnsupportedRouteError(error) from None
+        if len(mapping) != len(maps[0].keys) or set(mapping) != public:
+            raise UnsupportedRouteError(error)
+        declared = {}
+        for imported in extra:
+            module = imported.module or ""
+            if imported.level:
+                parents = source.name.split(".")
+                if imported.level > len(parents):
+                    raise UnsupportedRouteError(error)
+                module = ".".join(
+                    parents[: len(parents) - imported.level + 1]
+                    + ([module] if module else [])
+                )
+            for alias in imported.names:
+                name = alias.asname or alias.name
+                target = f"{module}.{alias.name}"
+                if name in declared and declared[name] != target:
+                    raise UnsupportedRouteError(error)
+                declared[name] = target
+        for name, target in mapping.items():
+            if (
+                not isinstance(target, tuple)
+                or len(target) != 2
+                or not all(isinstance(item, str) and item for item in target)
+            ):
+                raise UnsupportedRouteError(error)
+            if declared.get(name) != f"{source.name}.{target[0]}.{target[1]}":
+                raise UnsupportedRouteError(error)
+    return [*statements, *extra]
+
+
 class _RouteDiscovery:
     """Resolve named, declarative routers and their include graph, without imports.
 
@@ -243,7 +364,7 @@ class _RouteDiscovery:
         )
         self.sources[path] = source
         package = name if path.name == "__init__.py" else name.rpartition(".")[0]
-        for node in source.statements:
+        for node in _binding_statements(source):
             entries = []
             if isinstance(node, ast.ImportFrom):
                 module = node.module or ""
