@@ -32,6 +32,7 @@ from typing import Any, AsyncIterator, Dict, List, Literal, Optional, Sequence
 import asyncpg
 
 from shared.db_url import build_postgres_url
+from shared.runtime_actor import audit_metadata_payload
 
 logger = logging.getLogger(__name__)
 
@@ -183,6 +184,9 @@ def _audit_row_to_doc(r: asyncpg.Record) -> Dict[str, Any]:
     payload = r["payload"]
     if isinstance(payload, dict):
         doc.update(payload)
+    # Keep payload-shadow precedence, then redact the final metadata projection.
+    if "metadata" in doc:
+        doc["metadata"] = audit_metadata_payload(doc["metadata"])
     return doc
 
 
@@ -699,9 +703,11 @@ class AuditStore:
             if r["iteration"] is not None:
                 doc["iteration"] = r["iteration"]
             if r["metadata"] is not None:
-                doc["metadata"] = r["metadata"]
+                doc["metadata"] = audit_metadata_payload(r["metadata"])
             if r["auxiliary_metadata"] is not None:
-                doc["auxiliary_metadata"] = r["auxiliary_metadata"]
+                doc["auxiliary_metadata"] = audit_metadata_payload(
+                    r["auxiliary_metadata"]
+                )
             return doc
         except Exception as e:
             logger.warning(f"get_request failed: {e}")

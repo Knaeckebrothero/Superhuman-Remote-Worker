@@ -50,6 +50,8 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
+from shared.runtime_actor import audit_metadata_payload, redact_audit_payload_metadata
+
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -99,14 +101,15 @@ _HEAVY_JOB_METADATA_KEYS = (
 def _lean_job_metadata(
     metadata: Optional[Dict[str, Any]],
 ) -> Optional[Dict[str, Any]]:
-    """Drop heavy boot-only job blobs before persisting per-row audit/LLM metadata.
+    """Project safe actor identity and omit per-row copies of heavy boot blobs.
 
-    Returns ``metadata`` unchanged (same object) when it carries none of the heavy
-    keys — the common case — otherwise a shallow copy without them. The agent boots
+    Returns ``metadata`` unchanged (same object) when no projection is needed
+    — the common case — otherwise a shallow copy of the retained fields. The agent boots
     from these keys via ``self._job_metadata`` / the dispatch ``metadata`` dict,
     never from the persisted rows, so stripping here is invisible to execution and
     only shrinks what hits the DB.
     """
+    metadata = audit_metadata_payload(metadata)
     if not metadata or not any(k in metadata for k in _HEAVY_JOB_METADATA_KEYS):
         return metadata
     return {k: v for k, v in metadata.items() if k not in _HEAVY_JOB_METADATA_KEYS}
@@ -366,7 +369,9 @@ class LLMArchiver:
                 "metadata": _serialize_payload(_lean_job_metadata(metadata))
                 if metadata
                 else None,
-                "auxiliary_metadata": _serialize_payload(auxiliary_metadata)
+                "auxiliary_metadata": _serialize_payload(
+                    audit_metadata_payload(auxiliary_metadata)
+                )
                 if auxiliary_metadata
                 else None,
                 "metrics": metrics,
@@ -456,7 +461,9 @@ class LLMArchiver:
                     "status": "error",
                     "error": {"type": error_type, "message": error[:2000]},
                 },
-                "auxiliary_metadata": _serialize_payload(auxiliary_metadata)
+                "auxiliary_metadata": _serialize_payload(
+                    audit_metadata_payload(auxiliary_metadata)
+                )
                 if auxiliary_metadata
                 else None,
                 "metrics": metrics,
@@ -770,7 +777,9 @@ class LLMArchiver:
                 "phase_number": phase_number,
                 "timestamp": datetime.now(timezone.utc),
                 "latency_ms": latency_ms,
-                "payload": _serialize_payload(data) if data else {},
+                "payload": _serialize_payload(redact_audit_payload_metadata(data))
+                if data
+                else {},
                 "metadata": _serialize_payload(_lean_job_metadata(metadata))
                 if metadata
                 else None,

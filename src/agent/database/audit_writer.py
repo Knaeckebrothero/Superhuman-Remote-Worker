@@ -42,6 +42,8 @@ from urllib.parse import quote
 
 import asyncpg
 
+from shared.runtime_actor import audit_metadata_payload, redact_audit_payload_metadata
+
 logger = logging.getLogger(__name__)
 
 # Pool/loop startup must not hang the first write indefinitely; a bounded
@@ -277,8 +279,8 @@ class SyncAuditWriter:
                 row.get("latency_ms"),
                 row["request"],
                 row["response"],
-                row.get("metadata"),
-                row.get("auxiliary_metadata"),
+                audit_metadata_payload(row.get("metadata")),
+                audit_metadata_payload(row.get("auxiliary_metadata")),
                 row.get("metrics") or {},
             )
 
@@ -304,8 +306,8 @@ class SyncAuditWriter:
                 row.get("phase_number"),
                 row["timestamp"],
                 row.get("latency_ms"),
-                row.get("payload") or {},
-                row.get("metadata"),
+                redact_audit_payload_metadata(row.get("payload")) or {},
+                audit_metadata_payload(row.get("metadata")),
             )
 
     def insert_audit_post(
@@ -334,7 +336,11 @@ class SyncAuditWriter:
     ) -> bool:
         async with self._pool.acquire() as conn:
             status = await conn.execute(
-                _SQL_INSERT_AUDIT_POST, pre_id, request_id, latency_ms, payload or {}
+                _SQL_INSERT_AUDIT_POST,
+                pre_id,
+                request_id,
+                latency_ms,
+                redact_audit_payload_metadata(payload) or {},
             )
         # "INSERT 0 1" on success, "INSERT 0 0" when the pre row was missing.
         return status.rsplit(" ", 1)[-1] == "1"
