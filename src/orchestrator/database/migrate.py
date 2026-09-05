@@ -1,7 +1,14 @@
 """SQL migration runner.
 
-Apply versioned SQL files from ``orchestrator/database/migrations/{app,vector}/``
+Apply versioned SQL files from ``src/orchestrator/database/migrations/{app,audit,vector}/``
 in lexicographic order, tracked in a ``schema_migrations`` table on each DB.
+
+Applied files are immutable. The one reviewed historical exception is vector
+0025's published pgvector-preload variant: migration_recovery pins its exact
+filename, canonical on-disk checksum, and alternate successful-ledger checksum.
+Acceptance preserves the complete successful ledger row and never replays its
+SQL. Dirty rows and all unreviewed checksum drift still fail closed.
+
 Design rationale and operational runbook live in ``knowledge-base/knowledge/db_migration.md``.
 """
 
@@ -21,6 +28,7 @@ from pathlib import Path
 import asyncpg
 
 from orchestrator.database.migration_recovery import (
+    APPLIED_CHECKSUM_COMPATIBILITIES,
     NOTX_RECOVERIES,
     ConcurrentIndexRecovery,
 )
@@ -831,12 +839,25 @@ async def run_migrations(
 
                 for path in files:
                     if path.name in applied:
-                        if applied[path.name] != _checksum(path.read_text()):
+                        disk_checksum = _checksum(path.read_text())
+                        if applied[path.name] == disk_checksum:
+                            continue
+                        compatibility = APPLIED_CHECKSUM_COMPATIBILITIES.get(path.name)
+                        if (
+                            compatibility is None
+                            or disk_checksum != compatibility.canonical_checksum
+                            or applied[path.name] != compatibility.historical_checksum
+                        ):
                             raise RuntimeError(
                                 f"checksum changed: {path.name} "
                                 f"(applied migrations are immutable; "
                                 f"write a superseding migration instead)"
                             )
+                        log.warning(
+                            "accepted reviewed historical checksum for %s; "
+                            "successful ledger row retained unchanged",
+                            path.name,
+                        )
 
                 stray = set(applied) - {p.name for p in files}
                 if stray:

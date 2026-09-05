@@ -1,4 +1,9 @@
-"""Explicit recovery contracts for replay-safe non-transactional migrations.
+"""Explicit compatibility and recovery contracts for historical migrations.
+
+Successful migration history normally requires a byte-exact file checksum.
+A published edit can exceptionally have the same durable effects as the
+original file. Such compatibility must pin the filename and both exact hashes;
+it never rewrites the ledger, replays applied SQL, or accepts a failed row.
 
 Non-transactional DDL can commit its physical side effect before the migration
 ledger is updated, or leave an unusable catalog object behind when it fails.
@@ -14,6 +19,33 @@ trying to infer safety by parsing arbitrary SQL.
 from __future__ import annotations
 
 from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class AppliedChecksumCompatibility:
+    """One reviewed historical checksum for an exact canonical SQL file."""
+
+    canonical_checksum: str
+    historical_checksum: str
+
+
+# 097b414f2 inserted only comments and a session-local pgvector input cast into
+# already-applied vector 0025. Its CREATE FUNCTION bytes and durable effects are
+# identical to the original from 734250425 (also shipped in 99169725a). Restore
+# the original file; migrate._load_installed_pgvector already loads the library
+# on cold upgrade connections. Databases that successfully applied the edited
+# artifact retain their actual historical checksum, timestamps, and attribution.
+# This exception is directional: only the original exact bytes are canonical.
+APPLIED_CHECKSUM_COMPATIBILITIES: dict[str, AppliedChecksumCompatibility] = {
+    "0025_knowledge_multi_angle_search.sql": AppliedChecksumCompatibility(
+        canonical_checksum=(
+            "fc9395f5ca2fd60a48932d8038e92238124ae23d7174d558d22a89a83d791ab8"
+        ),
+        historical_checksum=(
+            "915246808c5714610aeb98faac61d96b5a2a72a81cba26677ba2d9b636325424"
+        ),
+    )
+}
 
 
 @dataclass(frozen=True)
