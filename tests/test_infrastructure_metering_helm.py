@@ -12,9 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_orchestrator_images_bake_slice3_metering_package_atomically():
-    import_check = (
-        'RUN python -c "import services.infrastructure_metering.compute_activation"'
-    )
+    import_check = 'RUN python -c "import orchestrator.services.infrastructure_metering.compute_activation"'
     for relative_path in (
         "docker/Dockerfile.orchestrator",
         "docker/Dockerfile.orchestrator.dev",
@@ -30,7 +28,7 @@ def test_orchestrator_images_bake_slice3_metering_package_atomically():
         1,
     )[0]
     fallback_paths = orchestrator_build.split("fall_back_on([", 1)[1].split("]),", 1)[0]
-    assert "'orchestrator/services/infrastructure_metering/'" in fallback_paths
+    assert "'src/orchestrator/services/infrastructure_metering/'" in fallback_paths
 
 
 def _render_remote_vmi_ingress(*extra: str) -> list[dict]:
@@ -355,7 +353,7 @@ def test_dedicated_metering_collector_renders_only_with_scoped_pod_reads():
     assert container["command"] == [
         "python",
         "-m",
-        "services.infrastructure_metering.collector_runtime",
+        "orchestrator.services.infrastructure_metering.collector_runtime",
     ]
     env_names = {entry["name"] for entry in container["env"]}
     assert "INFRASTRUCTURE_METERING_INGESTION_KEY" in env_names

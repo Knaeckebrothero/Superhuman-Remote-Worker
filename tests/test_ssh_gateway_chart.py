@@ -212,7 +212,7 @@ def test_reuses_the_orchestrator_image(gateway: dict) -> None:
     container = _container(gateway, "ssh-gateway")
     assert "orchestrator" in container["image"]
     assert container["command"][0] == "uvicorn"
-    assert "ssh_gateway:create_app" in container["command"]
+    assert "orchestrator.ssh_gateway:create_app" in container["command"]
     assert "--factory" in container["command"]
 
 

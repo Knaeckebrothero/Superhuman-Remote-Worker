@@ -461,7 +461,7 @@ def test_all_release_dockerfiles_carry_standard_declared_oci_metadata():
         "docker/Dockerfile.cockpit",
         "docker/Dockerfile.mcp",
         "docker/Dockerfile.workspace",
-        "vm/controller/Dockerfile",
+        "docker/Dockerfile.vm-controller",
         "docker/agent-vm-base/Dockerfile.containerDisk",
         "docker/agent-vm-base/Dockerfile.containerDisk-stage1",
     )

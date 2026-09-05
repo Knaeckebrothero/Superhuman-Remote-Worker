@@ -332,7 +332,4 @@ def test_optional_mcp_documents_use_the_same_response_boundary() -> None:
 
     for relative_path in ("docker/Dockerfile.mcp", "docker/Dockerfile.mcp.dev"):
         dockerfile = (ROOT / relative_path).read_text()
-        assert (
-            "orchestrator/security/anti_framing.py ./security/anti_framing.py"
-            in dockerfile
-        )
+        assert "COPY --chown=srw:srw src/shared/ ./src/shared/" in dockerfile

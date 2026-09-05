@@ -67,9 +67,11 @@ EXISTING_HOST_KEY_FINGERPRINT = "SHA256:" + ("B" * 43)
 
 
 def test_controller_dockerfile_packages_lifecycle_auth_module() -> None:
-    dockerfile = (project_root / "vm/controller/Dockerfile").read_text(encoding="utf-8")
+    dockerfile = (project_root / "docker/Dockerfile.vm-controller").read_text(
+        encoding="utf-8"
+    )
 
-    assert "COPY controller.py headscale_client.py lifecycle_auth.py ./" in dockerfile
+    assert "COPY src/vm_controller/ ./src/vm_controller/" in dockerfile
 
 
 class _FakeApiException(Exception):

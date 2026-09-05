@@ -49,7 +49,9 @@ import orchestrator.services.session_memory_executor
 
 def test_orchestrator_images_smoke_import_always_on_drain() -> None:
     root = Path(__file__).parent.parent
-    import_probe = 'RUN python -c "import services.session_memory_executor"'
+    import_probe = (
+        'RUN python -c "import orchestrator.services.session_memory_executor"'
+    )
     for relative in (
         "docker/Dockerfile.orchestrator",
         "docker/Dockerfile.orchestrator.dev",

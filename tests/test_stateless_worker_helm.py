@@ -143,7 +143,7 @@ def test_generic_pool_opens_sessions_without_opening_worker_admission() -> None:
     assert len(stateless_deployments) == 1
     assert _stateless_agent_container(stateless_deployments[0])["command"][
         -1
-    ].startswith("exec python agent.py --mode stateless")
+    ].startswith("exec python -m agent --mode stateless")
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
@@ -178,7 +178,7 @@ def test_stateless_executor_execs_python_as_pid1() -> None:
         "sh",
         "-c",
         (
-            "exec python agent.py --mode stateless --config worker_base "
+            "exec python -m agent --mode stateless --config worker_base "
             "--port 8001 --host 0.0.0.0 --loop"
         ),
     ]

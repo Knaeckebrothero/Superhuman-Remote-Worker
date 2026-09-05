@@ -40,12 +40,12 @@ def test_permission_migration_chain_is_expand_validate_and_snapshotted():
 
 
 def test_shared_helper_is_agent_image_import_safe():
-    """The agent Dockerfile copies src/ but no orchestrator/ package."""
+    """The agent image includes shared contracts and excludes the orchestrator."""
 
     root = Path(__file__).resolve().parents[1]
     dockerfile = (root / "docker/Dockerfile.agent").read_text()
-    assert "COPY --chown=srw:srw src/ ./src/" in dockerfile
-    assert "COPY --chown=srw:srw orchestrator/" not in dockerfile
+    assert "COPY --chown=srw:srw src/shared/ ./src/shared/" in dockerfile
+    assert "COPY --chown=srw:srw src/orchestrator/" not in dockerfile
 
     tree = ast.parse((root / "src/shared/session_permission_retirement.py").read_text())
     imported_roots = {

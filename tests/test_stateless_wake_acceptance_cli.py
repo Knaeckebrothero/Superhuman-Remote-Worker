@@ -22,7 +22,7 @@ from orchestrator.operator_cli.stateless_wake_acceptance import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
-MODULE = "operator_cli.stateless_wake_acceptance"
+MODULE = "orchestrator.operator_cli.stateless_wake_acceptance"
 
 
 def test_default_mode_is_read_only_inspection():
@@ -146,10 +146,17 @@ def test_top_level_unexpected_failure_is_redacted(monkeypatch, capsys):
     assert secret_shaped_error not in json.dumps(payload)
 
 
-def test_operator_module_runs_from_flattened_image_layout(tmp_path):
-    shutil.copytree(ROOT / "orchestrator" / "operator_cli", tmp_path / "operator_cli")
+def test_operator_module_runs_from_installed_package_layout(tmp_path):
+    source_root = tmp_path / "src"
+    package_root = source_root / "orchestrator"
+    package_root.mkdir(parents=True)
+    shutil.copy2(ROOT / "src/orchestrator/__init__.py", package_root / "__init__.py")
+    shutil.copytree(
+        ROOT / "src/orchestrator/operator_cli", package_root / "operator_cli"
+    )
     environment = os.environ.copy()
-    environment["PYTHONPATH"] = str(tmp_path)
+    environment["PYTHONPATH"] = str(source_root)
+    environment["PYTHONSAFEPATH"] = "1"
     result = subprocess.run(
         [sys.executable, "-m", MODULE, "--help"],
         cwd=tmp_path,
