@@ -41,6 +41,7 @@ from agent.api.models import (
     pinned_session_recipient_matches,
 )
 from agent.api._session_auth import validate_session_token as _validate_session_token
+from agent.api.job_stream import close_job_stream as _close_stream
 from agent.api.orchestrator_client import (
     OrchestratorClient,
     create_orchestrator_client_from_env,
@@ -55,7 +56,6 @@ from shared.workspace_contract import (
 )
 from shared.subagent_lifecycle import (
     SubagentLifecycleError,
-    SubagentQuiescenceError,
 )
 from shared.pinned_session_identity import (
     PINNED_SESSION_READY_IDENTITY_CONTRACT,
@@ -106,54 +106,13 @@ _JOB_STREAM_CLOSE_TIMEOUT_SECONDS = 60.0
 
 
 async def _close_job_stream(streaming_gen: Any, *, job_id: str) -> None:
-    """Bound and shield generator finalization before releasing a pinned job.
-
-    Closing the graph stream flushes its pending asynchronous checkpoint writes
-    and runs the agent's job-scoped cleanup. A caller cancellation must still
-    propagate, but only after the bounded close owner has reached a terminal
-    outcome; otherwise the app can report/reset while cleanup is still running.
-    """
-
-    async def _bounded_close() -> None:
-        try:
-            await asyncio.wait_for(
-                streaming_gen.aclose(), timeout=_JOB_STREAM_CLOSE_TIMEOUT_SECONDS
-            )
-        except asyncio.TimeoutError as exc:
-            logger.error(
-                "Job %s stream close timed out after %.0fs",
-                job_id,
-                _JOB_STREAM_CLOSE_TIMEOUT_SECONDS,
-            )
-            raise SubagentQuiescenceError(
-                f"job {job_id} stream cleanup timed out"
-            ) from exc
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("Job %s stream close failed", job_id)
-            raise
-
-    close_task = asyncio.create_task(
-        _bounded_close(), name=f"job-stream-close-{job_id[:12]}"
+    """Finalize through one close owner with this app's timeout and logger."""
+    await _close_stream(
+        streaming_gen,
+        job_id=job_id,
+        timeout_seconds=_JOB_STREAM_CLOSE_TIMEOUT_SECONDS,
+        logger=logger,
     )
-    cancellation: asyncio.CancelledError | None = None
-    while not close_task.done():
-        try:
-            await asyncio.shield(close_task)
-        except asyncio.CancelledError as exc:
-            # Keep the close task as the sole finalizer and restore caller
-            # cancellation once it is terminal. Repeated cancellation remains
-            # harmless and cannot start a second aclose().
-            cancellation = exc
-
-    try:
-        close_task.result()
-    except asyncio.CancelledError:
-        if cancellation is None:
-            raise
-    if cancellation is not None:
-        raise cancellation
 
 
 def _require_pinned_job_recipient(
