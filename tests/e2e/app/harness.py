@@ -3021,76 +3021,49 @@ class ApplicationE2EHarness:
             }
             for thread_id in reversed(thread_ids):
                 path = f"/api/persistent/threads/{urllib.parse.quote(thread_id)}"
-                deadline = time.monotonic() + timeout_seconds
                 status = 0
-                while True:
-                    now = time.monotonic()
-                    if now >= deadline:
-                        break
-                    status, _body = _http_request(
-                        f"{root}{path}?permanent=true",
-                        method="DELETE",
-                        headers=headers,
-                        expected=(200, 202, 204, 404, 409, 503),
-                        # Stateless End synchronously drains residents, retires
-                        # the shell, and proves exact Kubernetes cleanup. Give
-                        # that request the phase's remaining bounded budget;
-                        # 20 seconds can abandon a healthy lifecycle operation.
-                        timeout=max(0.1, deadline - now),
-                    )
-                    if status not in {409, 503}:
-                        break
-                    time.sleep(min(2, max(0.1, deadline - time.monotonic())))
+                deleted = False
                 forced = False
-                if status in {409, 503}:
-                    # Force escalation is legal only because thread_id came
-                    # from the validated, exact resource ledger above. A
-                    # stateless force may durably close admission and still
-                    # return 409/503 while its final-memory/runtime obligations
-                    # converge, so retry that same exact authority separately.
-                    forced = True
-                    force_deadline = time.monotonic() + force_timeout_seconds
+                for forced, phase_budget in (
+                    (False, timeout_seconds),
+                    (True, force_timeout_seconds),
+                ):
+                    # Force remains legal only after the whole graceful budget
+                    # for this exact validated ledger ID. A 2xx can acknowledge
+                    # asynchronous pinned retirement without deleting the row.
+                    deadline = time.monotonic() + phase_budget
+                    query = "?permanent=true" + ("&force=true" if forced else "")
                     while True:
                         now = time.monotonic()
-                        if now >= force_deadline:
+                        if now >= deadline:
                             break
                         status, _body = _http_request(
-                            f"{root}{path}?permanent=true&force=true",
+                            f"{root}{path}{query}",
                             method="DELETE",
                             headers=headers,
                             expected=(200, 202, 204, 404, 409, 503),
-                            timeout=max(0.1, force_deadline - now),
+                            # Synchronous stateless retirement retains this
+                            # phase's full remaining lifecycle request budget.
+                            timeout=max(0.1, deadline - now),
                         )
-                        if status not in {409, 503}:
+                        if status == 404:
+                            deleted = True
                             break
-                        time.sleep(min(2, max(0.1, force_deadline - time.monotonic())))
-                    if status in {409, 503}:
-                        raise HarnessError(
-                            "bounded exact-id force cleanup did not settle"
-                        )
-                verify_status, _body = _http_request(
-                    f"{root}{path}",
-                    headers=headers,
-                    expected=(200, 404),
-                    timeout=20,
-                )
-                if verify_status != 404:
-                    _status, listing_body = _http_request(
-                        f"{root}/api/persistent/threads", headers=headers
-                    )
-                    listing = _json_body(
-                        listing_body, label="thread cleanup verification"
-                    )
-                    rows = (
-                        listing.get("threads", []) if isinstance(listing, dict) else []
-                    )
-                    if any(
-                        isinstance(row, dict) and row.get("id") == thread_id
-                        for row in rows
-                    ):
-                        raise HarnessError(
-                            "exact thread remained after permanent cleanup"
-                        )
+                        if status not in {409, 503}:
+                            verify_status, _body = _http_request(
+                                f"{root}{path}",
+                                headers=headers,
+                                expected=(200, 404),
+                                timeout=min(20, max(0.1, deadline - time.monotonic())),
+                            )
+                            if verify_status == 404:
+                                deleted = True
+                                break
+                        time.sleep(min(2, max(0.0, deadline - time.monotonic())))
+                    if deleted:
+                        break
+                if not deleted:
+                    raise HarnessError("bounded exact-id force cleanup did not settle")
                 results.append(
                     {
                         "kind": "thread",

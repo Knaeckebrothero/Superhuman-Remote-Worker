@@ -914,9 +914,8 @@ def test_resource_ledger_is_replaceable_only_after_matching_exact_cleanup() -> N
     assert document["resources"][0]["cleaned_at"] == document["cleanup_completed_at"]
 
 
-def test_exact_cleanup_retries_retryable_force_until_it_converges(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+@pytest.fixture
+def cleanup_clock(monkeypatch: pytest.MonkeyPatch):
     class FakePortForward:
         def __init__(self, **_kwargs):
             self.local_port = 43123
@@ -927,6 +926,22 @@ def test_exact_cleanup_retries_retryable_force_until_it_converges(
         def __exit__(self, *_args):
             return False
 
+    class Clock:
+        now = 0.0
+
+        def sleep(self, seconds):
+            self.now += seconds
+
+    clock = Clock()
+    monkeypatch.setattr(harness, "PortForward", FakePortForward)
+    monkeypatch.setattr(harness.time, "monotonic", lambda: clock.now)
+    monkeypatch.setattr(harness.time, "sleep", clock.sleep)
+    return clock
+
+
+def test_exact_cleanup_retries_retryable_force_until_it_converges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cleanup_clock
+) -> None:
     responses = iter(
         [
             (409, b""),  # graceful retirement remains busy
@@ -943,13 +958,9 @@ def test_exact_cleanup_retries_retryable_force_until_it_converges(
         request_timeouts.append(kwargs.get("timeout", 20))
         return next(responses)
 
-    monotonic_values = iter([0.0, 0.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0])
     monkeypatch.setenv("APP_E2E_CLEANUP_TIMEOUT_SECONDS", "1")
-    monkeypatch.setenv("APP_E2E_FORCE_CLEANUP_TIMEOUT_SECONDS", "1")
-    monkeypatch.setattr(harness, "PortForward", FakePortForward)
+    monkeypatch.setenv("APP_E2E_FORCE_CLEANUP_TIMEOUT_SECONDS", "3")
     monkeypatch.setattr(harness, "_http_request", fake_request)
-    monkeypatch.setattr(harness.time, "monotonic", lambda: next(monotonic_values))
-    monkeypatch.setattr(harness.time, "sleep", lambda _seconds: None)
 
     application = harness.ApplicationE2EHarness(tmp_path / "state")
     thread_id = "123e4567-e89b-42d3-a456-426614174000"
@@ -971,7 +982,114 @@ def test_exact_cleanup_retries_retryable_force_until_it_converges(
     assert calls[1].endswith(f"/{thread_id}?permanent=true&force=true")
     assert calls[2] == calls[1]
     assert calls[3].endswith(f"/{thread_id}")
-    assert request_timeouts[:3] == [1, 1, 1]
+    assert request_timeouts[:3] == [1, 3, 1]
+    assert cleanup_clock.now == 3
+
+
+@pytest.mark.parametrize("accepted_status", [200, 202, 204])
+def test_exact_cleanup_waits_for_absence_after_accepted_retirement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cleanup_clock, accepted_status
+) -> None:
+    responses = iter(
+        [
+            (accepted_status, b'{"status":"ending"}'),
+            (200, b'{"status":"ending"}'),
+            (accepted_status, b'{"status":"ending"}'),
+            (404, b""),
+        ]
+    )
+    calls = []
+
+    def fake_request(url: str, **kwargs):
+        calls.append((kwargs.get("method", "GET"), url, cleanup_clock.now))
+        return next(responses)
+
+    monkeypatch.setattr(harness, "_http_request", fake_request)
+    application = harness.ApplicationE2EHarness(tmp_path / "state")
+    thread_id = "123e4567-e89b-42d3-a456-426614174000"
+    results = application._cleanup_threads(
+        {"kubeconfig": str(tmp_path / "kubeconfig.yaml")}, [thread_id], "session=owned"
+    )
+
+    path = f"http://127.0.0.1:43123/api/persistent/threads/{thread_id}"
+    assert calls == [
+        ("DELETE", f"{path}?permanent=true", 0),
+        ("GET", path, 0),
+        ("DELETE", f"{path}?permanent=true", 2),
+        ("GET", path, 2),
+    ]
+    assert results == [
+        {
+            "kind": "thread",
+            "id": thread_id,
+            "status": str(accepted_status),
+            "forced": "false",
+        }
+    ]
+
+
+def test_exact_cleanup_bounds_pending_retirement_and_fences_force_by_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cleanup_clock
+) -> None:
+    calls = []
+
+    def fake_request(url: str, **kwargs):
+        calls.append((kwargs.get("method", "GET"), url, cleanup_clock.now))
+        return 200, b'{"status":"ending"}'
+
+    monkeypatch.setenv("APP_E2E_CLEANUP_TIMEOUT_SECONDS", "3")
+    monkeypatch.setenv("APP_E2E_FORCE_CLEANUP_TIMEOUT_SECONDS", "3")
+    monkeypatch.setattr(harness, "_http_request", fake_request)
+    application = harness.ApplicationE2EHarness(tmp_path / "state")
+    thread_id = "123e4567-e89b-42d3-a456-426614174000"
+    with pytest.raises(
+        harness.HarnessError, match="bounded exact-id force cleanup did not settle"
+    ):
+        application._cleanup_threads(
+            {"kubeconfig": str(tmp_path / "kubeconfig.yaml")},
+            [thread_id],
+            "session=owned",
+        )
+
+    path = f"http://127.0.0.1:43123/api/persistent/threads/{thread_id}"
+    assert calls == [
+        ("DELETE", f"{path}?permanent=true", 0),
+        ("GET", path, 0),
+        ("DELETE", f"{path}?permanent=true", 2),
+        ("GET", path, 2),
+        ("DELETE", f"{path}?permanent=true&force=true", 3),
+        ("GET", path, 3),
+        ("DELETE", f"{path}?permanent=true&force=true", 5),
+        ("GET", path, 5),
+    ]
+    assert cleanup_clock.now == 6
+
+
+@pytest.mark.parametrize(
+    "thread_id", ["all", "../threads", "123e4567-e89b-42d3-a456-426614174000/other"]
+)
+def test_cleanup_rejects_nonexact_ledger_ids_before_any_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, thread_id: str
+) -> None:
+    store = harness.StateStore(tmp_path / "state")
+    ledger = store.initialize("20260824-123456-ab12cd34")
+    harness.write_private_json(
+        Path(ledger["run_dir"]) / "browser/browser-resources.json",
+        {
+            "schema": 1,
+            "run_id": "cleanup-unit-run",
+            "resources": [{"kind": "thread", "id": thread_id}],
+        },
+    )
+    application = harness.ApplicationE2EHarness(tmp_path / "state")
+    monkeypatch.setattr(application, "_assert_owned_cluster", lambda _ledger: None)
+
+    def forbidden_request(*_args, **_kwargs):
+        pytest.fail("an invalid resource ledger must never issue a cleanup request")
+
+    monkeypatch.setattr(harness, "_http_request", forbidden_request)
+    with pytest.raises(harness.SafetyError, match="invalid thread id"):
+        application.cleanup(ledger)
 
 
 def test_exact_cleanup_request_receives_the_full_remaining_lifecycle_budget(
