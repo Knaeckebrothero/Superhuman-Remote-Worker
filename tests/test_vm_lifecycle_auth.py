@@ -371,6 +371,10 @@ def test_response_must_correlate_to_the_exact_request() -> None:
 def _controller_source_copies():
     dockerfile = (REPO / "docker/Dockerfile.vm-controller").read_text()
     for line in dockerfile.splitlines():
+        # This guard owns COPY inputs, not shell parsing of unrelated RUN
+        # instructions, which may span multiple physical Dockerfile lines.
+        if not line.lstrip().startswith("COPY "):
+            continue
         parts = shlex.split(line)
         if parts and parts[0] == "COPY":
             for source in parts[1:-1]:
