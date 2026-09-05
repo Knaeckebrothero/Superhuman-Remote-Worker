@@ -1570,13 +1570,54 @@ class TestSweeperRegistrationShape:
             "run_when_leader(code_server_settings_sweeper, _shutdown_event)" in source
         )
 
-    def test_disabled_sweeper_parks_instead_of_returning(self):
+    @pytest.mark.asyncio
+    async def test_disabled_sweeper_parks_instead_of_returning(self, monkeypatch):
         # A bare return would make run_when_leader respawn (and log) the
         # disabled sweeper every poll second for the whole leadership tenure.
-        import inspect
-
         import orchestrator.main as orchestrator_main
+        from orchestrator.services import ide_settings
 
-        source = inspect.getsource(orchestrator_main.code_server_settings_sweeper)
-        disabled_branch = source.split("from services.ide_settings import")[0]
-        assert "await shutdown_event.wait()" in disabled_branch
+        monkeypatch.setenv("IDE_SETTINGS_SYNC_ENABLED", "false")
+        db = MagicMock()
+        db.list_active_ide_workspaces = AsyncMock(return_value=[])
+        provisioner = MagicMock()
+        store_factory = MagicMock()
+        classifier_factory = MagicMock()
+        monkeypatch.setattr(orchestrator_main, "postgres_db", db)
+        monkeypatch.setattr(orchestrator_main, "container_provisioner", provisioner)
+        monkeypatch.setattr(ide_settings, "IdeSettingsStore", store_factory)
+        monkeypatch.setattr(ide_settings, "OpenVsxClassifier", classifier_factory)
+
+        shutdown = asyncio.Event()
+        waiting = asyncio.Event()
+        wait_for_shutdown = shutdown.wait
+
+        async def observed_wait():
+            waiting.set()
+            return await wait_for_shutdown()
+
+        wait = AsyncMock(side_effect=observed_wait)
+        monkeypatch.setattr(shutdown, "wait", wait)
+        task = asyncio.create_task(
+            orchestrator_main.code_server_settings_sweeper(shutdown)
+        )
+        try:
+            await asyncio.wait_for(waiting.wait(), timeout=1)
+            assert not task.done(), "disabled sweeper must stay parked until shutdown"
+            wait.assert_awaited_once()
+            store_factory.assert_not_called()
+            classifier_factory.assert_not_called()
+            assert db.mock_calls == []
+            assert provisioner.mock_calls == []
+
+            shutdown.set()
+            await asyncio.wait_for(task, timeout=1)
+            wait.assert_awaited_once()
+            store_factory.assert_not_called()
+            classifier_factory.assert_not_called()
+            assert db.mock_calls == []
+            assert provisioner.mock_calls == []
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
