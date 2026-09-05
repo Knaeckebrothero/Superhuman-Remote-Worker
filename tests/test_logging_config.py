@@ -194,7 +194,10 @@ def isolated_logging(monkeypatch):
     monkeypatch.setattr(root, "handlers", root.handlers[:])
     monkeypatch.setattr(root, "level", root.level)
     monkeypatch.setattr(warnings, "showwarning", warnings.showwarning)
-    monkeypatch.setattr(logging, "_warnings_showwarning", logging._warnings_showwarning)
+    # An earlier app import can enable capture before pytest replaces showwarning.
+    # Reset the latch so configure_logging captures this test's current hook;
+    # monkeypatch restores both the inherited latch and hook after the test.
+    monkeypatch.setattr(logging, "_warnings_showwarning", None)
     for name in ("logging-test.application", "logging-test.library", "uvicorn.access"):
         logger = logging.getLogger(name)
         monkeypatch.setattr(logger, "level", logging.NOTSET)
