@@ -18,93 +18,10 @@ from src.shared.orch_surface.formatters import (
 
 from .jobs import _get_client, _get_orchestrator_url
 
-WORKFLOW_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
-    "list_automations": {
-        "module": "orchestrator.workflows",
-        "function": "list_automations",
-        "description": "List visible cron automations for the user or a project.",
-        "category": "workflows",
-        "short_description": "List automations.",
-        "phases": ["strategic", "tactical"],
-    },
-    "get_automation": {
-        "module": "orchestrator.workflows",
-        "function": "get_automation",
-        "description": "Inspect one visible automation.",
-        "category": "workflows",
-        "short_description": "Inspect an automation.",
-        "phases": ["strategic", "tactical"],
-    },
-    "list_automation_runs": {
-        "module": "orchestrator.workflows",
-        "function": "list_automation_runs",
-        "description": "List jobs spawned by an automation.",
-        "category": "workflows",
-        "short_description": "List automation runs.",
-        "phases": ["strategic", "tactical"],
-    },
-    "propose_automation": {
-        "module": "orchestrator.workflows",
-        "function": "propose_automation",
-        "description": (
-            "Draft a disabled automation JSON bundle without writing it. Use "
-            "set_automation_bundle with dry_run=false only after user approval."
-        ),
-        "category": "workflows",
-        "short_description": "Draft a disabled automation.",
-        "phases": ["strategic", "tactical"],
-    },
-    "get_automation_bundle": {
-        "module": "orchestrator.workflows",
-        "function": "get_automation_bundle",
-        "description": (
-            "Get a portable JSON automation bundle for editing. Authoring "
-            "support; not injected by default."
-        ),
-        "category": "catalog_authoring",
-        "short_description": "Get editable automation JSON.",
-        "phases": ["strategic", "tactical"],
-    },
-    "set_automation_bundle": {
-        "module": "orchestrator.workflows",
-        "function": "set_automation_bundle",
-        "description": (
-            "Create or update an automation from JSON. dry_run defaults true; "
-            "creation writes disabled automations unless allow_enabled=true. "
-            "Authoring support; not injected by default."
-        ),
-        "category": "catalog_authoring",
-        "short_description": "Create or update an automation from JSON.",
-        "phases": ["strategic", "tactical"],
-    },
-    "get_project_loop": {
-        "module": "orchestrator.workflows",
-        "function": "get_project_loop",
-        "description": "Inspect the current or most recent project loop.",
-        "category": "workflows",
-        "short_description": "Inspect the project loop.",
-        "phases": ["strategic", "tactical"],
-    },
-    "list_project_loop_jobs": {
-        "module": "orchestrator.workflows",
-        "function": "list_project_loop_jobs",
-        "description": "List jobs spawned by the active project loop.",
-        "category": "workflows",
-        "short_description": "List project loop jobs.",
-        "phases": ["strategic", "tactical"],
-    },
-    "explain_project_loop": {
-        "module": "orchestrator.workflows",
-        "function": "explain_project_loop",
-        "description": (
-            "Explain the project loop state, active stage, remaining budget, "
-            "last error, and likely next actions."
-        ),
-        "category": "workflows",
-        "short_description": "Explain project loop state.",
-        "phases": ["strategic", "tactical"],
-    },
-}
+from src.shared.tool_catalog.definitions import (
+    WORKFLOW_TOOLS_METADATA as WORKFLOW_TOOLS_METADATA,
+)
+
 
 _AUTOMATION_CREATE_FIELDS = {
     "name",

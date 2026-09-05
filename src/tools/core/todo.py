@@ -11,11 +11,15 @@ In the phase alternation architecture:
 """
 
 import logging
-from typing import Any, Dict, List
+from typing import Any, List
 
 from langchain_core.tools import tool
 
 from ..context import ToolContext
+
+from src.shared.tool_catalog.definitions import (
+    TODO_TOOLS_METADATA as TODO_TOOLS_METADATA,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,36 +30,6 @@ MAX_COMPLETION_NOTE_CHARS = 1000
 #   - "strategic": Available only in strategic mode (planning)
 #   - "tactical": Available only in tactical mode (execution)
 #   - Both: Available in both modes
-TODO_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
-    "next_phase_todos": {
-        "module": "core.todo",
-        "function": "next_phase_todos",
-        "description": "Stage todos for the next tactical phase",
-        "category": "core",
-        "phases": ["strategic"],  # Strategic-only: creates work for tactical phase
-    },
-    "todo_complete": {
-        "module": "core.todo",
-        "function": "todo_complete",
-        "description": "Mark a single task as complete (one at a time)",
-        "category": "core",
-        "phases": ["strategic", "tactical"],  # Both: used in all phases
-    },
-    "todo_list": {
-        "module": "core.todo",
-        "function": "todo_list",
-        "description": "List all todos with IDs and status",
-        "category": "core",
-        "phases": ["strategic", "tactical"],  # Both: helps see current state
-    },
-    "request_replan": {
-        "module": "core.todo",
-        "function": "request_replan",
-        "description": "End this phase early and return to planning, keeping all work and todo state",
-        "category": "core",
-        "phases": ["tactical"],  # Tactical-only: the in-flight adaptation path
-    },
-}
 
 
 def create_todo_tools(context: ToolContext) -> List[Any]:

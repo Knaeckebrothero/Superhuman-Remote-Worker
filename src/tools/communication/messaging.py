@@ -13,30 +13,18 @@ import logging
 import os
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional
 
 import httpx
 from langchain_core.tools import tool
 
 from ..context import ToolContext
 
+from src.shared.tool_catalog.definitions import (
+    COMMUNICATION_TOOLS_METADATA as COMMUNICATION_TOOLS_METADATA,
+)
+
 logger = logging.getLogger(__name__)
-
-
-COMMUNICATION_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
-    "send_message": {
-        "module": "communication.messaging",
-        "function": "send_message",
-        "description": (
-            "Send a message to a human via email. Use mode='async' to continue "
-            "working, or mode='blocking' to pause execution until a reply arrives. "
-            "Use sparingly — the recipient receives this as an email."
-        ),
-        "category": "communication",
-        "short_description": "Email the job owner. Supports async and blocking modes.",
-        "phases": ["strategic", "tactical"],
-    },
-}
 
 
 def _mask_email(email: str) -> str:

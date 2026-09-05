@@ -19,32 +19,12 @@ from typing import Any
 
 from ..workspace_backend import WorkspaceBackend
 
-# Backends that run with no workspace container/VM (the agent pod is the only
-# pod). Shell-less by construction; the seams branch on this set.
-LITE_BACKENDS = frozenset({"virtual", "none"})
-
-# Backends whose workspace is a KubeVirt VM (``threads.metadata.vm``, owned by
-# vm_provisioner) rather than a sandbox container
-# (``threads.metadata.workspace_container``). ``remote`` is the legacy alias for
-# ``vm`` — kept in the set so old stored overrides resolve identically (see the
-# inline ``("vm", "remote")`` checks in orchestrator/main.py).
-VM_BACKENDS = frozenset({"vm", "remote"})
-
-
-def is_lite_backend(backend: str) -> bool:
-    """True if ``backend`` is a no-workspace-pod tier (``virtual``/``none``)."""
-    return backend in LITE_BACKENDS
-
-
-def is_vm_backend(backend: str) -> bool:
-    """True if ``backend`` is VM-tier (``vm``, or its legacy ``remote`` alias).
-
-    Callers use this to keep container-provisioning paths off a VM-tier session:
-    its workspace already exists as a VM, and provisioning a sandbox alongside it
-    makes the session silently attach to the wrong tier
-    (knowledge-base/knowledge/issues/session_vm_backend_never_attaches.md).
-    """
-    return backend in VM_BACKENDS
+from src.shared.backend_kinds import (
+    LITE_BACKENDS as LITE_BACKENDS,
+    VM_BACKENDS as VM_BACKENDS,
+    is_lite_backend as is_lite_backend,
+    is_vm_backend as is_vm_backend,
+)
 
 
 def create_lite_backend(workspace_config: Any, *, job_id: str) -> WorkspaceBackend:

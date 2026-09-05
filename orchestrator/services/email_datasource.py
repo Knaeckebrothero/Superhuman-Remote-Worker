@@ -19,7 +19,7 @@ import imaplib
 import smtplib
 from typing import Any
 
-from src.core.datasource_setup import (
+from src.shared.datasource_policy import (
     EMAIL_TIER_ORDER,
     email_effective_access,
 )

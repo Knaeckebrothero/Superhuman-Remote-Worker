@@ -8,25 +8,17 @@ import asyncio
 import logging
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, List, Optional, Set
 
 from langchain_core.tools import tool
 
 from ..context import ToolContext
 
+from src.shared.tool_catalog.definitions import (
+    RESEARCH_WORKFLOW_TOOLS_METADATA as WORKFLOW_TOOLS_METADATA,  # noqa: F401
+)
+
 logger = logging.getLogger(__name__)
-
-
-WORKFLOW_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
-    "research_topic": {
-        "module": "research.workflow",
-        "function": "research_topic",
-        "description": "Comprehensive literature search across multiple databases",
-        "category": "research",
-        "short_description": "Search arXiv + Semantic Scholar, deduplicate, download OA papers.",
-        "phases": ["tactical"],
-    },
-}
 
 
 def create_workflow_tools(context: ToolContext) -> List[Any]:

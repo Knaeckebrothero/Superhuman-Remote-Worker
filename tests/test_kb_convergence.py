@@ -18,10 +18,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from src.services.knowledge_auxiliary import assemble_and_converge_knowledge  # noqa: E402
 from src.services.auxiliary import (
     AssembleKnowledgeTask,
     KnowledgeAssemblyResult,
-    assemble_and_converge_knowledge,
 )
 from src.services.knowledge_store import KnowledgeRecord, KnowledgeStore
 

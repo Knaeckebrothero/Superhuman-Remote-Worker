@@ -63,9 +63,16 @@ from src.core.runtime_provenance import merge_product_provenance
 
 from .context import SessionRuntimeFacts, ToolContext
 
+from src.shared.tool_catalog.definitions import (
+    PRODUCT_CAPABILITY_TOOLS_METADATA as PRODUCT_CAPABILITY_TOOLS_METADATA,
+)
+
+from src.shared.tool_catalog.names import (
+    PRODUCT_CAPABILITIES_TOOL_NAME as PRODUCT_CAPABILITIES_TOOL_NAME,
+)
+
 logger = logging.getLogger(__name__)
 
-PRODUCT_CAPABILITIES_TOOL_NAME = "get_product_capabilities"
 PRODUCT_CAPABILITIES_TOOL_ENABLED_ENV = "PRODUCT_CAPABILITIES_TOOL_ENABLED"
 MAX_TOOL_CAPABILITY_IDS = 12
 MAX_SERVER_RESPONSE_BYTES = 64 * 1024
@@ -170,29 +177,6 @@ class ProductCapabilitiesToolOutput(BaseModel):
         ):
             raise ValueError("ready output requires a complete response")
         return self
-
-
-PRODUCT_CAPABILITY_TOOLS_METADATA: dict[str, dict[str, Any]] = {
-    PRODUCT_CAPABILITIES_TOOL_NAME: {
-        "module": "product_capabilities",
-        "function": PRODUCT_CAPABILITIES_TOOL_NAME,
-        "description": (
-            "Check the current SRW build, deployment, permission, attachment, "
-            "workspace, loaded-tool, and actionability state for exact product "
-            "topics or capability IDs. The current user and thread are bound by "
-            "the runtime and cannot be supplied by the model. This snapshot is "
-            "advisory; an operation must still enforce current policy."
-        ),
-        "category": "product_help",
-        "short_description": "Check current SRW capability and session state.",
-        "phases": ["strategic", "tactical"],
-        # Persistent-session floor appended at persistent_session.py:1442-1448
-        # behind an operator-owned env canary, independent of every
-        # user-selectable tool group.
-        "grant": "code",
-        "gate": "PRODUCT_CAPABILITIES_TOOL_ENABLED env canary",
-    }
-}
 
 
 def get_product_capabilities_metadata() -> dict[str, dict[str, Any]]:

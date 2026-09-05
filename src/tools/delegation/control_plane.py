@@ -14,6 +14,10 @@ from typing import Any, Dict, List, Optional
 
 from ..context import ToolContext
 
+from src.shared.tool_catalog.definitions import (
+    CONTROL_PLANE_METADATA as CONTROL_PLANE_METADATA,
+)
+
 
 CONTROL_TOOL_NAMES = (
     "wait_agent",
@@ -21,72 +25,6 @@ CONTROL_TOOL_NAMES = (
     "stop_agent",
     "list_agents",
 )
-
-
-def _metadata(
-    description: str,
-    short_description: str,
-) -> Dict[str, Any]:
-    return {
-        "module": "delegation.control_plane",
-        "description": description,
-        "short_description": short_description,
-        "category": "delegation",
-        "phases": ["strategic", "tactical"],
-        "grant": "explicit",
-        "gate": (
-            "named outright in a tools.delegation list AND "
-            "delegation.enabled is true; children never receive delegation "
-            "or its control plane"
-        ),
-    }
-
-
-CONTROL_PLANE_METADATA: Dict[str, Dict[str, Any]] = {
-    "wait_agent": {
-        **_metadata(
-            "Wait for one background subagent, or for any background "
-            "subagent when handle is omitted. Use this only when its next "
-            "update is immediately blocking your work. Completion reports "
-            "are pushed into your next turn automatically, so do not poll "
-            "with wait_agent or list_agents. Timeout is 10-3600 seconds.",
-            "Wait once for a blocking subagent update; never poll.",
-        ),
-        "function": "wait_agent",
-    },
-    "message_agent": {
-        **_metadata(
-            "Send a concise steering message to an addressable background "
-            "subagent by handle. A queued or running child accepts steering. "
-            "A terminal child is durably revived on its existing transcript "
-            "and worktree with a new fenced generation. Consume its prior "
-            "report first. The next report is pushed automatically; do not "
-            "poll after messaging.",
-            "Steer a live child or durably revive a terminal one.",
-        ),
-        "function": "message_agent",
-    },
-    "stop_agent": {
-        **_metadata(
-            "Ask a background subagent to stop by handle. It gets a bounded "
-            "grace window for a tool-less partial synthesis before a hard "
-            "stop. The terminal report is pushed automatically; do not poll "
-            "for it.",
-            "Stop a background subagent after a bounded synthesis grace.",
-        ),
-        "function": "stop_agent",
-    },
-    "list_agents": {
-        **_metadata(
-            "List this parent's addressable background subagents as a "
-            "bounded status view. It never returns transcripts or full "
-            "reports. Completions are pushed automatically; use this for an "
-            "occasional roster check, never as a polling loop.",
-            "List bounded background-subagent statuses; never transcripts.",
-        ),
-        "function": "list_agents",
-    },
-}
 
 
 def create_control_plane_tools(context: ToolContext) -> List[Any]:

@@ -17,11 +17,11 @@ if str(src_path) not in sys.path:
     sys.path.insert(0, str(src_path))
 
 from src.core.loader import load_agent_config, resolve_config_path  # noqa: E402
+from src.services.knowledge_auxiliary import curate_and_store_knowledge  # noqa: E402
 from src.services.auxiliary import (  # noqa: E402
     AuxiliaryLLM,
     CurateKnowledgeTask,
     CurationResult,
-    curate_and_store_knowledge,
 )
 from src.tools.context import ToolContext  # noqa: E402
 
@@ -399,7 +399,8 @@ class TestInlineCurationWiring:
         }
 
         with patch(
-            "src.services.auxiliary.curate_and_store_knowledge", new_callable=AsyncMock
+            "src.services.knowledge_auxiliary.curate_and_store_knowledge",
+            new_callable=AsyncMock,
         ) as mock_curate:
             await archive_fn(state)
             # Allow async task to run

@@ -7,7 +7,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
-from src.core.datasource_setup import resolve_repo_clone_names
+from src.shared.datasource_policy import resolve_repo_clone_names
 from src.services.forge import ForgeError, parse_owner_repo
 from src.shared.deliverable_contract import (
     DeliverableContractError,

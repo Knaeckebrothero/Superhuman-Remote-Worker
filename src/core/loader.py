@@ -1277,7 +1277,7 @@ def _has_shell_tools(tool_set: Set[str]) -> bool:
     as proof of a shell would re-open these blocks on precisely the lite-tier
     sessions they exist to protect.
     """
-    from src.tools.registry import TOOL_REGISTRY
+    from src.shared.tool_catalog import TOOL_REGISTRY
 
     for name in tool_set:
         meta = TOOL_REGISTRY.get(name)

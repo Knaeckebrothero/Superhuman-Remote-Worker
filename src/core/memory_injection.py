@@ -12,11 +12,10 @@ from typing import Tuple
 
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 
+from src.core.injection_markers import (
+    MEMORY_TOOL_CALL_ID_PREFIX as MEMORY_TOOL_CALL_ID_PREFIX,
+)
 from src.core.workspace_injection import content_hash_id
-
-# Prefix for identifying synthetic memory injection tool calls
-# Used to exclude these messages from summarization
-MEMORY_TOOL_CALL_ID_PREFIX = "memory_inject_"
 
 
 def create_memory_injection_messages(

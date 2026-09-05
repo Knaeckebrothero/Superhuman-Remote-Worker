@@ -18,28 +18,11 @@ from langchain_core.tools import tool
 
 from ..context import ToolContext
 
+from src.shared.tool_catalog.definitions import (
+    LOOP_PLAN_TOOLS_METADATA as LOOP_PLAN_TOOLS_METADATA,
+)
+
 logger = logging.getLogger(__name__)
-
-
-LOOP_PLAN_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
-    "loop_plan": {
-        "module": "loop.plan",
-        "function": "loop_plan",
-        "description": (
-            "File the loop's next campaign plan: pick ONE initiative (an "
-            "existing KB note), schedule 1..K execution stages toward it, "
-            "pre-register the acceptance evidence the closing critic will "
-            "check, and dispose the previous campaign (ship/extend/kill) if "
-            "one awaits review. To close a reviewed campaign WITHOUT opening "
-            "a new one, call with only disposition_outcome=ship|kill (no "
-            "initiative, no stages). The plan is applied when this job "
-            "completes; re-filing replaces the previous plan."
-        ),
-        "category": "loop",
-        "short_description": "File the next campaign plan (checkpoint critic only).",
-        "phases": ["strategic", "tactical"],
-    },
-}
 
 
 def create_loop_plan_tools(context: ToolContext) -> List[Any]:

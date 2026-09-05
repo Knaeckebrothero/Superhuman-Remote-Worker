@@ -41,7 +41,7 @@ from src.core.chunk_planner import (
     SummarizationFailed,
     count_text_tokens,
 )
-from src.core.context import IdentityAnchor
+from src.core.summary_models import IdentityAnchor
 from src.core.llm_retry import NO_RETRY
 
 logger = logging.getLogger(__name__)

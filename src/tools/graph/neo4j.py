@@ -16,6 +16,10 @@ from langchain_core.tools import tool
 
 from ..context import ToolContext
 
+from src.shared.tool_catalog.definitions import (
+    GRAPH_TOOLS_METADATA as GRAPH_TOOLS_METADATA,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -34,35 +38,6 @@ _WRITE_KEYWORDS = (
 
 # Tool metadata for registry
 # Phase availability: domain tools are tactical-only
-GRAPH_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
-    "cypher_query": {
-        "module": "graph.neo4j",
-        "function": "cypher_query",
-        "description": "Execute a read-only Cypher query against Neo4j",
-        "category": "graph",
-        "defer_to_workspace": True,
-        "short_description": "Execute read-only Cypher query against Neo4j.",
-        "phases": ["tactical"],
-    },
-    "cypher_execute": {
-        "module": "graph.neo4j",
-        "function": "cypher_execute",
-        "description": "Execute a write Cypher statement (CREATE, MERGE, DELETE, SET) against Neo4j",
-        "category": "graph",
-        "defer_to_workspace": True,
-        "short_description": "Execute write Cypher (CREATE/MERGE/DELETE/SET) against Neo4j.",
-        "phases": ["tactical"],
-    },
-    "get_database_schema": {
-        "module": "graph.neo4j",
-        "function": "get_database_schema",
-        "description": "Get Neo4j database schema (labels, relationships, properties)",
-        "category": "graph",
-        "defer_to_workspace": True,
-        "short_description": "Get Neo4j schema (labels, relationships, properties).",
-        "phases": ["tactical"],
-    },
-}
 
 
 def create_neo4j_tools(context: ToolContext) -> List[Any]:

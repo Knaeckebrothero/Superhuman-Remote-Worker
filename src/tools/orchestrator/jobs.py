@@ -22,30 +22,16 @@ from src.shared.orch_surface.jobs import (
     JOB_DESCRIPTORS,
     JobToolResult,
     make_bound_handler,
-    registry_metadata,
 )
 from src.services.image_content import IMAGE_DATA_TAG_TEMPLATE
 
 from ..context import ToolContext
 
-logger = logging.getLogger(__name__)
+from src.shared.tool_catalog.definitions import (
+    ORCHESTRATOR_TOOLS_METADATA as ORCHESTRATOR_TOOLS_METADATA,
+)
 
-ORCHESTRATOR_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
-    "get_session_context": {
-        "module": "orchestrator.jobs",
-        "function": "get_session_context",
-        "description": (
-            "Summarize the current persistent session context: thread ID, user "
-            "ID, project scope, workspace availability, backend capabilities, "
-            "cloud mount status, knowledge/connector availability, the chat "
-            "models this deployment routes, and the caller's effective grants."
-        ),
-        "category": "orchestrator",
-        "short_description": "Show current session/project/workspace context.",
-        "phases": ["strategic", "tactical"],
-    },
-    **registry_metadata(),
-}
+logger = logging.getLogger(__name__)
 
 
 def _get_orchestrator_url() -> str:

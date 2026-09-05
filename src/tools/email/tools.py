@@ -32,6 +32,10 @@ from .connection import (
     folder_name_eq,
 )
 
+from src.shared.tool_catalog.definitions import (
+    EMAIL_TOOLS_METADATA as EMAIL_TOOLS_METADATA,
+)
+
 logger = logging.getLogger(__name__)
 
 # Snippet/inline bounds — compaction only runs at phase boundaries, so the
@@ -70,75 +74,6 @@ _HTML_TAG_HINT_RE = re.compile(
     r"<\s*(?:html|head|body|div|span|p|br|table|tr|td|img|a|style|script|font)\b",
     re.IGNORECASE,
 )
-
-
-EMAIL_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
-    "email_list_folders": {
-        "module": "email.tools",
-        "function": "email_list_folders",
-        "category": "email",
-        "phases": ["strategic", "tactical"],
-        "description": "List accessible mailbox folders with message/unseen counts",
-    },
-    "email_list": {
-        "module": "email.tools",
-        "function": "email_list",
-        "category": "email",
-        "phases": ["strategic", "tactical"],
-        "description": "List message envelopes in a folder (UIDs, newest first)",
-    },
-    "email_search": {
-        "module": "email.tools",
-        "function": "email_search",
-        "category": "email",
-        "phases": ["strategic", "tactical"],
-        "description": (
-            "Search messages by text/sender/subject/date across allowed folders"
-        ),
-    },
-    "email_read": {
-        "module": "email.tools",
-        "function": "email_read",
-        "category": "email",
-        "phases": ["strategic", "tactical"],
-        "description": (
-            "Read one message: headers + bounded snippet; body saved to workspace"
-        ),
-    },
-    "email_move": {
-        "module": "email.tools",
-        "function": "email_move",
-        "category": "email",
-        "phases": ["tactical"],
-        "description": "Move messages to another folder (archive/trash are moves)",
-    },
-    "email_flag": {
-        "module": "email.tools",
-        "function": "email_flag",
-        "category": "email",
-        "phases": ["tactical"],
-        "description": "Mark messages read/unread, or star/unstar them",
-    },
-    "email_draft": {
-        "module": "email.tools",
-        "function": "email_draft",
-        "category": "email",
-        "phases": ["tactical"],
-        "description": (
-            "Compose a plain-text draft into the Drafts folder "
-            "(reply in-thread or to allowlisted recipients)"
-        ),
-    },
-    "email_send": {
-        "module": "email.tools",
-        "function": "email_send",
-        "category": "email",
-        "phases": ["tactical"],
-        "description": (
-            "Send mail as the user via SMTP (gated unless unattended send is enabled)"
-        ),
-    },
-}
 
 
 # ---------------------------------------------------------------------------

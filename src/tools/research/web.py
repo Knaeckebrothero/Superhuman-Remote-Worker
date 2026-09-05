@@ -9,6 +9,10 @@ from langchain_core.tools import tool
 from ..context import ToolContext
 from .search import ProviderError, SearchAdapter, create_search_adapter
 
+from src.shared.tool_catalog.definitions import (
+    RESEARCH_TOOLS_METADATA as RESEARCH_TOOLS_METADATA,
+)
+
 logger = logging.getLogger(__name__)
 
 # Maximum words per result/page to protect LLM context window
@@ -19,55 +23,6 @@ NO_WORKSPACE_MAX_WORDS = 1500
 
 # Tool metadata for registry
 # Phase availability: domain tools are tactical-only
-RESEARCH_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
-    "web_search": {
-        "module": "research.web",
-        "function": "web_search",
-        "description": (
-            "Search the web. Results are returned as bounded "
-            "snippets; raw page content can be fetched and archived to the "
-            "workspace for later reading/citation."
-        ),
-        "category": "research",
-        "defer_to_workspace": True,
-        "short_description": (
-            "Search the web; archive full text and return compact snippets."
-        ),
-        "phases": ["tactical"],
-    },
-    "extract_webpage": {
-        "module": "research.web",
-        "function": "extract_webpage",
-        "description": (
-            "Extract full content from web pages. Content is archived when "
-            "possible and inline output is bounded per call."
-        ),
-        "category": "research",
-        "short_description": (
-            "Extract and archive page content from URLs with bounded inline output."
-        ),
-        "phases": ["tactical"],
-    },
-    "crawl_website": {
-        "module": "research.web",
-        "function": "crawl_website",
-        "description": (
-            "Crawl a website from a URL. Page content is archived when possible "
-            "and returned as snippets with saved-file pointers."
-        ),
-        "category": "research",
-        "short_description": "Crawl and archive website pages with compact snippets.",
-        "phases": ["tactical"],
-    },
-    "map_website": {
-        "module": "research.web",
-        "function": "map_website",
-        "description": "Map website structure to discover URLs",
-        "category": "research",
-        "short_description": "Discover URLs in a website's structure.",
-        "phases": ["tactical"],
-    },
-}
 
 
 def _parse_comma_list(value: Optional[str]) -> Optional[List[str]]:

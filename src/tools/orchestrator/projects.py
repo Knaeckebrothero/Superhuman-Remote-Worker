@@ -18,32 +18,11 @@ from src.shared.orch_surface.formatters import (
 
 from .jobs import _get_client, _get_orchestrator_url
 
-logger = logging.getLogger(__name__)
+from src.shared.tool_catalog.definitions import (
+    PROJECT_TOOLS_METADATA as PROJECT_TOOLS_METADATA,
+)
 
-PROJECT_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
-    "get_current_project": {
-        "module": "orchestrator.projects",
-        "function": "get_current_project",
-        "description": (
-            "Get details for the project associated with this persistent "
-            "session. Uses the session's project scope from the thread context."
-        ),
-        "category": "orchestrator",
-        "short_description": "Get the current session project.",
-        "phases": ["strategic", "tactical"],
-    },
-    "list_project_jobs": {
-        "module": "orchestrator.projects",
-        "function": "list_project_jobs",
-        "description": (
-            "List jobs in the current project, or in a specified project when "
-            "the caller has access. Returns full job IDs and useful summaries."
-        ),
-        "category": "orchestrator",
-        "short_description": "List jobs for the current or selected project.",
-        "phases": ["strategic", "tactical"],
-    },
-}
+logger = logging.getLogger(__name__)
 
 
 def _current_project_id(context: ToolContext) -> Optional[str]:

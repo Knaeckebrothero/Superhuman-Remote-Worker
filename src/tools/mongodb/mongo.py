@@ -19,6 +19,10 @@ from langchain_core.tools import tool
 
 from ..context import ToolContext
 
+from src.shared.tool_catalog.definitions import (
+    MONGODB_TOOLS_METADATA as MONGODB_TOOLS_METADATA,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -44,53 +48,6 @@ def _parse_json(s: str, label: str = "input") -> Any:
 
 # Tool metadata for registry
 # Phase availability: domain tools are tactical-only
-MONGODB_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
-    "mongo_query": {
-        "module": "mongodb.mongo",
-        "function": "mongo_query",
-        "description": "Query documents from a MongoDB collection with optional filters",
-        "category": "mongodb",
-        "defer_to_workspace": True,
-        "short_description": "Query documents from a MongoDB collection.",
-        "phases": ["tactical"],
-    },
-    "mongo_aggregate": {
-        "module": "mongodb.mongo",
-        "function": "mongo_aggregate",
-        "description": "Run an aggregation pipeline on a MongoDB collection",
-        "category": "mongodb",
-        "defer_to_workspace": True,
-        "short_description": "Run aggregation pipeline on a MongoDB collection.",
-        "phases": ["tactical"],
-    },
-    "mongo_schema": {
-        "module": "mongodb.mongo",
-        "function": "mongo_schema",
-        "description": "Inspect MongoDB database schema (collections, sample fields, indexes)",
-        "category": "mongodb",
-        "defer_to_workspace": True,
-        "short_description": "Inspect MongoDB schema (collections, fields, indexes).",
-        "phases": ["tactical"],
-    },
-    "mongo_insert": {
-        "module": "mongodb.mongo",
-        "function": "mongo_insert",
-        "description": "Insert one or more documents into a MongoDB collection",
-        "category": "mongodb",
-        "defer_to_workspace": True,
-        "short_description": "Insert documents into a MongoDB collection.",
-        "phases": ["tactical"],
-    },
-    "mongo_update": {
-        "module": "mongodb.mongo",
-        "function": "mongo_update",
-        "description": "Update documents in a MongoDB collection",
-        "category": "mongodb",
-        "defer_to_workspace": True,
-        "short_description": "Update documents in a MongoDB collection.",
-        "phases": ["tactical"],
-    },
-}
 
 
 def create_mongo_tools(context: ToolContext) -> List[Any]:

@@ -17,11 +17,10 @@ from typing import Any, List, Tuple
 
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 
+from src.core.injection_markers import (
+    CITATION_FEEDBACK_TOOL_CALL_ID_PREFIX as CITATION_FEEDBACK_TOOL_CALL_ID_PREFIX,
+)
 from src.core.workspace_injection import content_hash_id
-
-# Prefix for identifying synthetic citation-feedback tool calls.
-# Used to exclude these messages from summarization (re-injected fresh).
-CITATION_FEEDBACK_TOOL_CALL_ID_PREFIX = "citation_feedback_inject_"
 
 #: Cap how many failed citations are listed in one injection (the rest are
 #: summarized as a count) to bound the injected token cost.

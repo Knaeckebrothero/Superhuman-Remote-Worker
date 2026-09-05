@@ -23,53 +23,15 @@ from langchain_core.tools import tool
 
 from ..context import ToolContext
 
+from src.shared.tool_catalog.definitions import (
+    GIT_TOOLS_METADATA as GIT_TOOLS_METADATA,
+)
+
 logger = logging.getLogger(__name__)
 
 
 # Tool metadata for registry
 # Phase availability: git tools are available in BOTH phases (read-only)
-GIT_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
-    "git_log": {
-        "module": "git.git_tools",
-        "function": "git_log",
-        "description": "View commit history with filtering",
-        "category": "git",
-        "short_description": "View commit history (default: last 10 commits). Pass repo='<name>' for an attached repository.",
-        "phases": ["strategic", "tactical"],
-    },
-    "git_show": {
-        "module": "git.git_tools",
-        "function": "git_show",
-        "description": "Inspect a specific commit's changes",
-        "category": "git",
-        "short_description": "Show commit details and diff (use stat_only=true for summary). Pass repo='<name>' for an attached repository.",
-        "phases": ["strategic", "tactical"],
-    },
-    "git_diff": {
-        "module": "git.git_tools",
-        "function": "git_diff",
-        "description": "Compare current state to previous commits",
-        "category": "git",
-        "short_description": "Show differences (uncommitted changes or between refs). Pass repo='<name>' for an attached repository.",
-        "phases": ["strategic", "tactical"],
-    },
-    "git_status": {
-        "module": "git.git_tools",
-        "function": "git_status",
-        "description": "See uncommitted changes and workspace state",
-        "category": "git",
-        "short_description": "Show current branch and uncommitted changes. Pass repo='<name>' for an attached repository.",
-        "phases": ["strategic", "tactical"],
-    },
-    "git_tags": {
-        "module": "git.git_tools",
-        "function": "git_tags",
-        "description": "List phase milestone tags",
-        "category": "git",
-        "short_description": "List git tags for this job (use all_jobs=True for all). Pass repo='<name>' for an attached repository.",
-        "phases": ["strategic", "tactical"],
-    },
-}
 
 
 def create_git_tools(context: ToolContext) -> List[Any]:

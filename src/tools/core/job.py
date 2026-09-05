@@ -29,6 +29,10 @@ from langchain_core.tools import InjectedToolCallId, tool
 from ...core.workspace_backend import WorkspaceUnavailableError
 from ..context import ToolContext
 
+from src.shared.tool_catalog.definitions import (
+    JOB_TOOLS_METADATA as JOB_TOOLS_METADATA,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -45,22 +49,6 @@ _final_phase_data: Dict[str, Dict[str, Any]] = {}
 #   - "strategic": Only in strategic mode (planning)
 #   - "tactical": Only in tactical mode (execution)
 #   - Both: Available in both modes (default if not specified)
-JOB_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
-    "mark_complete": {
-        "module": "core.job",
-        "function": "mark_complete",
-        "description": "Signal task/phase completion with structured report",
-        "category": "core",
-        "phases": ["strategic", "tactical"],  # Both modes
-    },
-    "job_complete": {
-        "module": "core.job",
-        "function": "job_complete",
-        "description": "Signal FINAL job completion - call when all phases are done",
-        "category": "core",
-        "phases": ["strategic"],  # Strategic-only: prevents premature termination
-    },
-}
 
 
 def create_job_tools(context: ToolContext) -> List[Any]:

@@ -229,14 +229,12 @@ class ToolPolicyError(ValueError):
 
 
 def _registry():
-    """Import the registry lazily.
+    """Read the common catalog without importing live tool factories.
 
-    ``src/tools/registry`` imports ``src/core/loader`` (through the tool
-    packages), and ``src/core/loader`` imports this module — so a
-    module-level import here would close a cycle.  The list forms, which are
-    the overwhelming majority, never reach this.
+    The agent runtime updates this same process-local metadata object when
+    MCP tools are discovered. The list forms never need to import it.
     """
-    from src.tools import registry
+    from src.shared import tool_catalog as registry
 
     return registry
 

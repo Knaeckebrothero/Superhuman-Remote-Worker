@@ -12,31 +12,11 @@ from langchain_core.tools import tool
 
 from ..context import ToolContext
 
-logger = logging.getLogger(__name__)
+from src.shared.tool_catalog.definitions import (
+    SESSION_TASK_METADATA as SESSION_TASK_METADATA,
+)
 
-SESSION_TASK_METADATA: Dict[str, Dict[str, Any]] = {
-    "task_add": {
-        "module": "core.session_task_tools",
-        "function": "task_add",
-        "description": "Add a task to the session task list",
-        "category": "session_task",
-        "phases": ["strategic", "tactical"],
-    },
-    "task_complete": {
-        "module": "core.session_task_tools",
-        "function": "task_complete",
-        "description": "Mark a session task as completed",
-        "category": "session_task",
-        "phases": ["strategic", "tactical"],
-    },
-    "task_list": {
-        "module": "core.session_task_tools",
-        "function": "task_list",
-        "description": "List all session tasks with status",
-        "category": "session_task",
-        "phases": ["strategic", "tactical"],
-    },
-}
+logger = logging.getLogger(__name__)
 
 
 def get_session_task_metadata() -> Dict[str, Dict[str, Any]]:

@@ -16,6 +16,10 @@ from langchain_core.tools import tool
 
 from ..context import ToolContext
 
+from src.shared.tool_catalog.definitions import (
+    CITATION_TOOLS_METADATA as CITATION_TOOLS_METADATA,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -49,107 +53,6 @@ TagActionValue = Literal["add", "remove"]
 
 # Tool metadata for registry
 # Phase availability: domain tools are tactical-only
-CITATION_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
-    "cite_document": {
-        "module": "citation.sources",
-        "function": "cite_document",
-        "description": "Create a verified citation for document content",
-        "category": "citation",
-        "defer_to_workspace": True,
-        "short_description": "Create verified citation for document content.",
-        "phases": ["strategic", "tactical"],
-    },
-    "cite_web": {
-        "module": "citation.sources",
-        "function": "cite_web",
-        "description": "Create a verified citation for web content",
-        "category": "citation",
-        "defer_to_workspace": True,
-        "short_description": "Create verified citation for web content.",
-        "phases": ["strategic", "tactical"],
-    },
-    "list_sources": {
-        "module": "citation.sources",
-        "function": "list_sources",
-        "description": "List all registered citation sources",
-        "category": "citation",
-        "defer_to_workspace": True,
-        "short_description": "List all registered citation sources.",
-        "phases": ["strategic", "tactical"],
-    },
-    "get_citation": {
-        "module": "citation.sources",
-        "function": "get_citation",
-        "description": "Get details about a specific citation",
-        "category": "citation",
-        "defer_to_workspace": True,
-        "short_description": "Get details about a specific citation by ID.",
-        "phases": ["strategic", "tactical"],
-    },
-    "list_citations": {
-        "module": "citation.sources",
-        "function": "list_citations",
-        "description": "List all citations created in this session",
-        "category": "citation",
-        "defer_to_workspace": True,
-        "short_description": "List all citations with status and source info.",
-        "phases": ["strategic", "tactical"],
-    },
-    "edit_citation": {
-        "module": "citation.sources",
-        "function": "edit_citation",
-        "description": "Edit fields of an existing citation",
-        "category": "citation",
-        "defer_to_workspace": True,
-        "short_description": "Edit citation fields (claim, quote, confidence, etc.).",
-        "phases": ["strategic", "tactical"],
-    },
-    "annotate_source": {
-        "module": "citation.sources",
-        "function": "annotate_source",
-        "description": "Add a note, highlight, summary, question, or critique to a source",
-        "category": "citation",
-        "defer_to_workspace": True,
-        "short_description": "Add annotation to a citation source.",
-        "phases": ["strategic", "tactical"],
-    },
-    "get_annotations": {
-        "module": "citation.sources",
-        "function": "get_annotations",
-        "description": "Get annotations for a source",
-        "category": "citation",
-        "defer_to_workspace": True,
-        "short_description": "Get annotations for a citation source.",
-        "phases": ["strategic", "tactical"],
-    },
-    "tag_source": {
-        "module": "citation.sources",
-        "function": "tag_source",
-        "description": "Add or remove tags on a citation source",
-        "category": "citation",
-        "defer_to_workspace": True,
-        "short_description": "Add or remove tags on a citation source.",
-        "phases": ["strategic", "tactical"],
-    },
-    "search_library": {
-        "module": "citation.sources",
-        "function": "search_library",
-        "description": "Search the source library using keyword, semantic, or hybrid search",
-        "category": "citation",
-        "defer_to_workspace": True,
-        "short_description": "Search source library with hybrid retrieval and evidence labels.",
-        "phases": ["strategic", "tactical"],
-    },
-    "generate_bibliography": {
-        "module": "citation.sources",
-        "function": "generate_bibliography",
-        "description": "Generate a formatted bibliography/references file from citations",
-        "category": "citation",
-        "defer_to_workspace": True,
-        "short_description": "Generate formatted bibliography file from citations.",
-        "phases": ["strategic", "tactical"],
-    },
-}
 
 
 def _format_stub_document_citation(

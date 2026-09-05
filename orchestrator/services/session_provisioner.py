@@ -31,7 +31,7 @@ from services.workspace_lifecycle import (
     ensure_workspace,
 )
 from services.workspace_suspension import WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY
-from src.core.backends.factory import LITE_BACKENDS, VM_BACKENDS
+from src.shared.backend_kinds import LITE_BACKENDS, VM_BACKENDS
 
 logger = logging.getLogger(__name__)
 

@@ -25,6 +25,10 @@ from langchain_core.tools import tool
 
 from ..context import ToolContext
 
+from src.shared.tool_catalog.definitions import (
+    EVALUATION_TOOLS_METADATA as EVALUATION_TOOLS_METADATA,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -60,24 +64,6 @@ def clear_verdict_data(job_id: str) -> None:
 
 
 # Tool metadata for registry
-EVALUATION_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
-    "approve_job_verdict": {
-        "module": "evaluation.evaluation_tools",
-        "function": "approve_job_verdict",
-        "description": "Approve a target job that is pending review",
-        "category": "evaluation",
-        "short_description": "Approve a pending_review job (transitions to completed).",
-        "phases": ["strategic"],
-    },
-    "return_job_with_feedback": {
-        "module": "evaluation.evaluation_tools",
-        "function": "return_job_with_feedback",
-        "description": "Resume a target job with feedback for the original agent to address",
-        "category": "evaluation",
-        "short_description": "Return a job to the original agent with issues to fix.",
-        "phases": ["strategic"],
-    },
-}
 
 
 def create_evaluation_tools(context: ToolContext) -> List[Any]:

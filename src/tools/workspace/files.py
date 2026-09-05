@@ -14,7 +14,7 @@ import logging
 import mimetypes
 import zipfile
 from pathlib import Path, PurePosixPath
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, List, Literal, Optional
 
 from langchain_core.tools import tool
 from src.core.workspace_backend import WorkspaceUnavailableError
@@ -26,6 +26,10 @@ from src.services.image_content import (
 from src.services.cloud_mount.guardrails import workspace_path_touches_cloud
 from src.utils.pdf import PDFReader, format_read_info
 from ..context import ToolContext
+
+from src.shared.tool_catalog.definitions import (
+    FILE_TOOLS_METADATA as FILE_TOOLS_METADATA,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -73,29 +77,6 @@ ZIP_REFUSAL_NOTE_SUFFIX = ".extraction-refused.txt"
 
 # Tool metadata for registry
 # Phase availability: file tools are available in both strategic and tactical modes
-FILE_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
-    "read_file": {
-        "module": "workspace.files",
-        "function": "read_file",
-        "description": "Read content from a file in the workspace",
-        "category": "workspace",
-        "phases": ["strategic", "tactical"],
-    },
-    "write_file": {
-        "module": "workspace.files",
-        "function": "write_file",
-        "description": "Write content to a file (requires read_file first for existing files)",
-        "category": "workspace",
-        "phases": ["strategic", "tactical"],
-    },
-    "edit_file": {
-        "module": "workspace.files",
-        "function": "edit_file",
-        "description": "Edit a file: replace text, or use position='end'/'start' to append/prepend (requires read_file first)",
-        "category": "workspace",
-        "phases": ["strategic", "tactical"],
-    },
-}
 
 
 def _cloud_cache_guard_for_path(context: ToolContext, path: str) -> Optional[str]:

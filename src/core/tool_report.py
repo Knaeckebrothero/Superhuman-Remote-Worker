@@ -162,7 +162,7 @@ def categorize_tool_names(names: Iterable[str]) -> dict[str, list[str]]:
     reads a list of names that already are.  Names the local registry does not
     know land in :data:`UNCLASSIFIED_CATEGORY`.
     """
-    from src.tools.registry import TOOL_REGISTRY
+    from src.shared.tool_catalog import TOOL_REGISTRY
 
     out: dict[str, list[str]] = {}
     for name in names:
@@ -198,7 +198,7 @@ def backend_blocked_categories(caps: Optional[Mapping[str, Any]]) -> dict[str, s
     """
     if not caps:
         return {}
-    from src.tools.registry import _EXECUTION_CATEGORIES
+    from src.shared.tool_catalog import _EXECUTION_CATEGORIES
 
     blocked: dict[str, str] = {}
     if not caps.get("supports_shell", False):
@@ -240,7 +240,7 @@ def grant_blocked_categories(grants: Optional[Mapping[str, Any]]) -> dict[str, s
 
 def code_granted_categories() -> dict[str, str]:
     """Category -> the gate that grants it, for categories config cannot set."""
-    from src.tools.registry import CODE_GRANTED_CATEGORIES
+    from src.shared.tool_catalog import CODE_GRANTED_CATEGORIES
 
     return {
         category: f"granted by the runtime, not by config ({gate})"
@@ -265,7 +265,7 @@ def code_granted_tools() -> dict[str, str]:
     not carry the mark is a registry omission, which is the right place to fix
     it.
     """
-    from src.tools.registry import TOOL_REGISTRY
+    from src.shared.tool_catalog import TOOL_REGISTRY
 
     return {
         name: str(meta.get("gate") or "runtime code")

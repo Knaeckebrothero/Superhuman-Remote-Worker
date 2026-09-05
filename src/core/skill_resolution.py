@@ -22,10 +22,11 @@ from typing import Any
 
 from src.core.expert_resolution import expert_precedence_key
 
+from src.shared.tool_catalog.names import APP_GUIDE_LOADER_TOOL as APP_GUIDE_LOADER_TOOL
+
 logger = logging.getLogger(__name__)
 
 APP_GUIDE_SKILL = "app-guide"
-APP_GUIDE_LOADER_TOOL = "read_product_guide"
 APP_GUIDE_BREAK_GLASS_ENV = "APP_GUIDE_BREAK_GLASS_DISABLED"
 PRESENT_WITH_CANVAS_SKILL = "present-with-canvas"
 RESERVED_SYSTEM_SKILL_NAMES = frozenset({APP_GUIDE_SKILL})

@@ -9,7 +9,10 @@ tmux-backed terminal tabs.
 """
 
 import logging
-from typing import Any, Dict
+
+from src.shared.tool_catalog.definitions import (
+    CODING_TOOLS_METADATA as CODING_TOOLS_METADATA,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +20,6 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_OUTPUT_CHARS = 50000
 
 # Tool metadata for registry (empty — run_command removed)
-CODING_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {}
 
 
 def _truncate_output(text: str, max_chars: int, label: str = "output") -> str:

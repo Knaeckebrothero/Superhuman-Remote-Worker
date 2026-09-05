@@ -37,7 +37,7 @@ from services.canvas_ssh import (
 )
 from services.ssh_helpers import orchestrator_can_reach
 from services.workspace_binding import remote_canvas_presentation_available
-from src.core.backends.factory import LITE_BACKENDS
+from src.shared.backend_kinds import LITE_BACKENDS
 
 BrowserCapabilityReason = Literal[
     "feature_disabled",

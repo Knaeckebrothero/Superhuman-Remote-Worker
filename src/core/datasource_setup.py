@@ -21,6 +21,14 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from src.services.knowledge.bindings import native_kb_project_id
+from src.shared.datasource_policy import (
+    EMAIL_TIER_ORDER as EMAIL_TIER_ORDER,
+    EMAIL_TIER_TOOLS as EMAIL_TIER_TOOLS,
+    DATASOURCE_TOOL_MAP as DATASOURCE_TOOL_MAP,
+    email_effective_access as email_effective_access,
+    datasource_tool_categories as datasource_tool_categories,
+    resolve_repo_clone_names as resolve_repo_clone_names,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,180 +52,6 @@ def _ds_slug_hyphen(name: str) -> str:
     """
     s = re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-")
     return s or "unnamed"
-
-
-# Cumulative email access tiers (``config.access``): each tier includes every
-# tool of the tiers below it (knowledge-base/knowledge/features/email_datasource.md). Order in
-# EMAIL_TIER_ORDER is the escalation order used for clamping/maxing.
-EMAIL_TIER_ORDER: Tuple[str, ...] = ("read", "read_write", "draft", "send")
-EMAIL_TIER_TOOLS: Dict[str, List[str]] = {
-    "read": [
-        "email_list_folders",
-        "email_list",
-        "email_search",
-        "email_read",
-    ],
-    "read_write": [
-        "email_list_folders",
-        "email_list",
-        "email_search",
-        "email_read",
-        "email_move",
-        "email_flag",
-    ],
-    "draft": [
-        "email_list_folders",
-        "email_list",
-        "email_search",
-        "email_read",
-        "email_move",
-        "email_flag",
-        "email_draft",
-    ],
-    "send": [
-        "email_list_folders",
-        "email_list",
-        "email_search",
-        "email_read",
-        "email_move",
-        "email_flag",
-        "email_draft",
-        "email_send",
-    ],
-}
-
-# Datasource type → tool category + read/write tool sets. Single source of
-# truth for BOTH trust boundaries: the orchestrator's
-# _build_datasource_tool_override (job dispatch, thread create/resume) and the
-# agent's session attach path delegate to datasource_tool_categories() below.
-# These were previously two hand-maintained copies that disagreed on
-# read-write managed connectors (agent: write tools; orchestrator: CLI-only).
-DATASOURCE_TOOL_MAP: Dict[str, Dict[str, Any]] = {
-    "neo4j": {
-        "category": "graph",
-        "read": ["cypher_query", "get_database_schema"],
-        "write": ["cypher_query", "cypher_execute", "get_database_schema"],
-    },
-    "postgresql": {
-        "category": "sql",
-        "read": ["sql_query", "sql_schema"],
-        "write": ["sql_query", "sql_schema", "sql_execute"],
-    },
-    "mongodb": {
-        "category": "mongodb",
-        "read": ["mongo_query", "mongo_aggregate", "mongo_schema"],
-        "write": [
-            "mongo_query",
-            "mongo_aggregate",
-            "mongo_schema",
-            "mongo_insert",
-            "mongo_update",
-        ],
-    },
-    "webdav": {
-        "category": "webdav",
-        "read": ["webdav_list", "webdav_read", "webdav_info"],
-        "write": [
-            "webdav_list",
-            "webdav_read",
-            "webdav_info",
-            "webdav_write",
-            "webdav_delete",
-        ],
-    },
-    "repository": {
-        "category": "repo",
-        "read": ["repo_pull", "repo_pr_status"],
-        "write": [
-            "repo_checkout",
-            "repo_commit",
-            "repo_push",
-            "repo_pull",
-            "repo_open_pr",
-            "repo_pr_status",
-        ],
-    },
-    # Email is tier-keyed (config.access), not binary read/write — see
-    # EMAIL_TIER_TOOLS and knowledge-base/knowledge/features/email_datasource.md.
-    "email": {
-        "category": "email",
-        "tiers": EMAIL_TIER_TOOLS,
-    },
-    # MCP tool names are discovered only after the agent connects. The
-    # wildcard is expanded against the runtime registry before tool loading.
-    "mcp": {
-        "category": "mcp",
-        "dynamic": True,
-    },
-}
-
-
-def email_effective_access(ds: Dict[str, Any]) -> str:
-    """Effective email tier: ``config.access`` (default ``draft``), clamped
-    to ``read`` by a read-only project link.
-
-    Unknown values fail closed to ``read``. The clamp never empties
-    credentials — email needs a live IMAP login at every tier
-    (knowledge-base/knowledge/features/email_datasource.md, Touchpoints).
-    """
-    if ds.get("project_read_only", False):
-        return "read"
-    access = (ds.get("config") or {}).get("access", "draft")
-    return access if access in EMAIL_TIER_TOOLS else "read"
-
-
-def datasource_tool_categories(
-    datasources: List[Dict[str, Any]],
-) -> Dict[str, List[str]]:
-    """Map attached datasources to tool-category overrides.
-
-    Semantics:
-
-    - type not attached → category stripped (``[]``) so stale tools from a
-      previously attached datasource never survive,
-    - ALL datasources of a type read-only → read tools,
-    - any read-write → write tools, backed by the real connection
-      process_datasources() now creates for read-write connectors too,
-    - tier-keyed types (email): highest effective tier across attached
-      datasources of the type (the "any read-write → write" analog);
-      per-datasource tiers come from ``config.access`` clamped by
-      ``project_read_only`` (email_effective_access), and the tool layer's
-      per-call tier check is the backup gate.
-    - dynamic types (MCP): ``["*"]`` while attached; the agent expands this
-      sentinel after runtime discovery. Project read-only does not alter MCP
-      tools because the server and its credentials are the access boundary.
-
-    History: read-write managed connectors (postgresql/neo4j/mongodb) used
-    to map to ``[]`` — "CLI mode" — which was dead on remote workspace
-    backends and left them with no access path at all
-    (knowledge-base/knowledge/issues/datasource_cli_mode_dead_on_remote.md, fixed via
-    direction 1: connection-backed write tools).
-    """
-    by_type: Dict[str, List[Dict[str, Any]]] = {}
-    for ds in datasources:
-        ds_type = ds.get("type")
-        if ds_type:
-            by_type.setdefault(ds_type, []).append(ds)
-
-    categories: Dict[str, List[str]] = {}
-    for ds_type, tool_info in DATASOURCE_TOOL_MAP.items():
-        category = tool_info["category"]
-        ds_list = by_type.get(ds_type, [])
-        if not ds_list:
-            categories[category] = []
-        elif tool_info.get("dynamic"):
-            categories[category] = ["*"]
-        elif "tiers" in tool_info:
-            tier = max(
-                (email_effective_access(ds) for ds in ds_list),
-                key=EMAIL_TIER_ORDER.index,
-            )
-            categories[category] = list(tool_info["tiers"][tier])
-        elif all(ds.get("project_read_only", False) for ds in ds_list):
-            categories[category] = list(tool_info["read"])
-        else:
-            categories[category] = list(tool_info["write"])
-    return categories
 
 
 def process_datasources(
@@ -823,41 +657,6 @@ def create_datasource_connection(
 # ---------------------------------------------------------------------------
 # Repository setup
 # ---------------------------------------------------------------------------
-
-
-def resolve_repo_clone_names(
-    repo_datasources: List[Dict[str, Any]],
-) -> List[str]:
-    """Return the clone-directory name for each repository datasource, in order.
-
-    The directory under ``repos/`` uses the upstream repo name from the URL
-    (falling back to the datasource-label slug), with a numeric suffix when
-    two datasources resolve to the same name (e.g. forks of one upstream).
-    Shared by clone_repository_datasources() and inject_workspace_facts()
-    so the README.md connector list always points at the real clone paths.
-    """
-    from ..utils.git_url import repo_name_from_url
-
-    names: List[str] = []
-    used: set[str] = set()
-    for ds in repo_datasources:
-        ds_slug = (
-            re.sub(r"[^a-z0-9]+", "-", ds.get("name", "repo").lower()).strip("-")
-            or "repo"
-        )
-        base = repo_name_from_url(ds.get("connection_url", ""), fallback=ds_slug)
-        name = base
-        suffix = 2
-        while name in used:
-            name = f"{base}-{suffix}"
-            suffix += 1
-        if name != base:
-            logger.info(
-                "Repo name collision for %s; cloning into %s instead", base, name
-            )
-        used.add(name)
-        names.append(name)
-    return names
 
 
 def clone_repository_datasources(

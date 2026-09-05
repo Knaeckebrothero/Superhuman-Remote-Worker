@@ -25,34 +25,16 @@ from src.core.skill_resolution import (
 
 from .context import ToolContext
 
+from src.shared.tool_catalog.definitions import (
+    PRODUCT_HELP_TOOLS_METADATA as PRODUCT_HELP_TOOLS_METADATA,
+)
+
 logger = logging.getLogger(__name__)
 
 _TOPIC_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,79}$")
 _MAX_TOPICS = 64
 _MAX_PROCEDURE_CHARS = 30_000
 _MAX_REFERENCE_CHARS = 50_000
-
-PRODUCT_HELP_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
-    APP_GUIDE_LOADER_TOOL: {
-        "module": "product_help",
-        "function": APP_GUIDE_LOADER_TOOL,
-        "description": (
-            "Read the current SRW product guide without relying on workspace "
-            "files. Pass topic_id='index' to load its procedure and current "
-            "topic IDs, then read the one topic that explicitly covers the "
-            "user's requested outcome. If no index row covers an exact combined "
-            "workflow, stop after index and report the guide gap instead of "
-            "composing adjacent features."
-        ),
-        "category": "product_help",
-        "phases": ["strategic", "tactical"],
-        # Persistent-session floor appended at persistent_session.py:1427-1432
-        # and removed again by the operator break-glass. `product_help` has no
-        # ToolsConfig field at all, so a config naming it is discarded today.
-        "grant": "code",
-        "gate": "app-guide break-glass off (app_guide_break_glass_disabled)",
-    },
-}
 
 
 def get_product_help_metadata() -> Dict[str, Dict[str, Any]]:

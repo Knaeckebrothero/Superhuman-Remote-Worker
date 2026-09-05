@@ -12,23 +12,17 @@ Design: knowledge-base/knowledge/features/agent_skills.md (Slice 2).
 """
 
 import logging
-from typing import Any, Dict, List
+from typing import Any, List
 
 from langchain_core.tools import tool
 
 from ..context import ToolContext
 
-logger = logging.getLogger(__name__)
+from src.shared.tool_catalog.definitions import (
+    SKILL_TOOLS_METADATA as SKILL_TOOLS_METADATA,
+)
 
-SKILL_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
-    "use_skill": {
-        "module": "workspace.skills",
-        "function": "use_skill",
-        "description": "Load a skill's SKILL.md guidance into context for the current task",
-        "category": "workspace",
-        "phases": ["strategic", "tactical"],
-    },
-}
+logger = logging.getLogger(__name__)
 
 
 def create_skill_tools(context: ToolContext) -> List[Any]:

@@ -18,15 +18,15 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 
+from src.core.injection_markers import (
+    KNOWLEDGE_TOOL_CALL_ID_PREFIX as KNOWLEDGE_TOOL_CALL_ID_PREFIX,
+    CHARTER_TOOL_CALL_ID_PREFIX as CHARTER_TOOL_CALL_ID_PREFIX,
+)
 from src.core.workspace_injection import content_hash_id
 from src.services.knowledge.bindings import KnowledgeBinding
 from src.tools.knowledge.chunker import embedding_version_for_service
 
 logger = logging.getLogger(__name__)
-
-# Prefix for identifying synthetic knowledge injection tool calls
-KNOWLEDGE_TOOL_CALL_ID_PREFIX = "knowledge_inject_"
-CHARTER_TOOL_CALL_ID_PREFIX = "charter_inject_"
 
 
 @dataclass

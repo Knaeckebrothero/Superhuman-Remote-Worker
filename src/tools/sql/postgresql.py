@@ -11,46 +11,21 @@ attached to a job. See knowledge-base/knowledge/datasources.md.
 
 import json
 import logging
-from typing import Any, Dict, List
+from typing import Any, List
 
 from langchain_core.tools import tool
 
 from ..context import ToolContext
+
+from src.shared.tool_catalog.definitions import (
+    SQL_TOOLS_METADATA as SQL_TOOLS_METADATA,
+)
 
 logger = logging.getLogger(__name__)
 
 
 # Tool metadata for registry
 # Phase availability: domain tools are tactical-only
-SQL_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
-    "sql_query": {
-        "module": "sql.postgresql",
-        "function": "sql_query",
-        "description": "Execute a read-only SQL query against the PostgreSQL connector",
-        "category": "sql",
-        "defer_to_workspace": True,
-        "short_description": "Execute a read-only SQL query against PostgreSQL.",
-        "phases": ["tactical"],
-    },
-    "sql_schema": {
-        "module": "sql.postgresql",
-        "function": "sql_schema",
-        "description": "Inspect the PostgreSQL connector schema (tables, columns, types)",
-        "category": "sql",
-        "defer_to_workspace": True,
-        "short_description": "Inspect the PostgreSQL schema (tables, columns, types).",
-        "phases": ["tactical"],
-    },
-    "sql_execute": {
-        "module": "sql.postgresql",
-        "function": "sql_execute",
-        "description": "Execute a write SQL statement (INSERT, UPDATE, DELETE, DDL) against the PostgreSQL connector",
-        "category": "sql",
-        "defer_to_workspace": True,
-        "short_description": "Execute write SQL (INSERT/UPDATE/DELETE/DDL) against PostgreSQL.",
-        "phases": ["tactical"],
-    },
-}
 
 
 def create_postgresql_tools(context: ToolContext) -> List[Any]:

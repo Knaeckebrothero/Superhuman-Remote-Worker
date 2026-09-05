@@ -22,47 +22,11 @@ from ...services.forge import (
 )
 from ..context import ToolContext
 
-logger = logging.getLogger(__name__)
+from src.shared.tool_catalog.definitions import (
+    REPO_TOOLS_METADATA as REPO_TOOLS_METADATA,
+)
 
-REPO_TOOLS_METADATA = {
-    "repo_checkout": {
-        "category": "repo",
-        "description": (
-            "Switch an attached repository to a branch, optionally creating it."
-        ),
-        "short_description": "Switch (or create) a branch in an attached repository.",
-    },
-    "repo_commit": {
-        "category": "repo",
-        "description": "Stage all changes and commit them in an attached repository.",
-        "short_description": "Stage and commit changes in an attached repository.",
-    },
-    "repo_push": {
-        "category": "repo",
-        "description": "Push a branch of an attached repository to its remote.",
-        "short_description": "Push the current branch of an attached repository.",
-    },
-    "repo_pull": {
-        "category": "repo",
-        "description": "Fast-forward pull in an attached repository.",
-        "short_description": "Fast-forward pull in an attached repository.",
-    },
-    "repo_open_pr": {
-        "category": "repo",
-        "description": (
-            "Open a pull request (merge request on GitLab) for an attached repository."
-        ),
-        "short_description": "Open a pull/merge request for an attached repository.",
-    },
-    "repo_pr_status": {
-        "category": "repo",
-        "description": (
-            "Read the live open, merged, or closed state of a pull request "
-            "(merge request on GitLab) in an attached repository."
-        ),
-        "short_description": "Read live pull/merge request status.",
-    },
-}
+logger = logging.getLogger(__name__)
 
 
 def create_repo_tools(context: ToolContext) -> List[Any]:

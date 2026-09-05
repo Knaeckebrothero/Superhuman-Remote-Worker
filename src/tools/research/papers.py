@@ -10,7 +10,11 @@ import logging
 import re
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, List, Optional, TYPE_CHECKING
+
+from src.shared.tool_catalog.definitions import (
+    PAPER_TOOLS_METADATA as PAPER_TOOLS_METADATA,
+)
 
 if TYPE_CHECKING:
     from .utils.paper_types import DownloadResult
@@ -20,33 +24,6 @@ from langchain_core.tools import tool
 from ..context import ToolContext
 
 logger = logging.getLogger(__name__)
-
-PAPER_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
-    "search_papers": {
-        "module": "research.papers",
-        "function": "search_papers",
-        "description": "Search academic databases for papers",
-        "category": "research",
-        "short_description": "Search arXiv or Semantic Scholar for academic papers.",
-        "phases": ["tactical"],
-    },
-    "download_paper": {
-        "module": "research.papers",
-        "function": "download_paper",
-        "description": "Download paper PDF to workspace",
-        "category": "research",
-        "short_description": "Download paper PDF using arXiv/Unpaywall/browser fallback chain.",
-        "phases": ["tactical"],
-    },
-    "get_paper_info": {
-        "module": "research.papers",
-        "function": "get_paper_info",
-        "description": "Get metadata and citation info for a paper",
-        "category": "research",
-        "short_description": "Get paper metadata, abstract, and citations via Semantic Scholar.",
-        "phases": ["tactical"],
-    },
-}
 
 
 # DOI pattern: 10.XXXX/...

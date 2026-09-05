@@ -8,7 +8,7 @@ Provides filesystem operations within the workspace including:
 """
 
 import logging
-from typing import Any, Dict, List
+from typing import Any, List
 
 from langchain_core.tools import tool
 from src.core.workspace_backend import SEARCH_RESULT_HARD_CAP, WorkspaceUnavailableError
@@ -19,6 +19,10 @@ from ...services.cloud_mount.guardrails import (
     workspace_search_touches_cloud,
 )
 from src.utils.pdf import PDFReader, format_document_info
+
+from src.shared.tool_catalog.definitions import (
+    FILESYSTEM_TOOLS_METADATA as FILESYSTEM_TOOLS_METADATA,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -73,80 +77,6 @@ def _infer_file_purpose(filename: str) -> str:
 
 # Tool metadata for registry
 # Phase availability: filesystem tools are available in both strategic and tactical modes
-FILESYSTEM_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
-    "list_files": {
-        "module": "workspace.filesystem",
-        "function": "list_files",
-        "description": "List files and directories in the workspace",
-        "category": "workspace",
-        "phases": ["strategic", "tactical"],
-    },
-    "delete_file": {
-        "module": "workspace.filesystem",
-        "function": "delete_file",
-        "description": "Delete a file or empty directory",
-        "category": "workspace",
-        "phases": ["strategic", "tactical"],
-    },
-    "search_files": {
-        "module": "workspace.filesystem",
-        "function": "search_files",
-        "description": "Search for text content in workspace files",
-        "category": "workspace",
-        "phases": ["strategic", "tactical"],
-    },
-    "file_exists": {
-        "module": "workspace.filesystem",
-        "function": "file_exists",
-        "description": "Check if a file or directory exists",
-        "category": "workspace",
-        "phases": ["strategic", "tactical"],
-    },
-    "move_file": {
-        "module": "workspace.filesystem",
-        "function": "move_file",
-        "description": "Move or rename a file/directory in the workspace",
-        "category": "workspace",
-        "phases": ["strategic", "tactical"],
-    },
-    "rename_file": {
-        "module": "workspace.filesystem",
-        "function": "rename_file",
-        "description": "Rename a file or directory (keeps it in the same location)",
-        "category": "workspace",
-        "phases": ["strategic", "tactical"],
-    },
-    "copy_file": {
-        "module": "workspace.filesystem",
-        "function": "copy_file",
-        "description": "Copy a file within the workspace",
-        "category": "workspace",
-        "phases": ["strategic", "tactical"],
-    },
-    "get_document_info": {
-        "module": "workspace.filesystem",
-        "function": "get_document_info",
-        "description": "Get document metadata (page count, size) for planning access",
-        "category": "workspace",
-        "defer_to_workspace": True,
-        "short_description": "Get PDF/document metadata (pages, size) for planning access.",
-        "phases": ["strategic", "tactical"],
-    },
-    "create_directory": {
-        "module": "workspace.filesystem",
-        "function": "create_directory",
-        "description": "Create a directory (and parents) in the workspace",
-        "category": "workspace",
-        "phases": ["strategic", "tactical"],
-    },
-    "delete_directory": {
-        "module": "workspace.filesystem",
-        "function": "delete_directory",
-        "description": "Delete a directory and all its contents",
-        "category": "workspace",
-        "phases": ["strategic", "tactical"],
-    },
-}
 
 
 def create_filesystem_tools(context: ToolContext) -> List[Any]:

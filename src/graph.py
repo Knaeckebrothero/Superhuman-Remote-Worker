@@ -3248,7 +3248,7 @@ def create_archive_phase_node(
             and config.auxiliary.enabled
         ):
             try:
-                from src.services.auxiliary import curate_and_store_knowledge
+                from src.services.knowledge_auxiliary import curate_and_store_knowledge
 
                 try:
                     ws_md = (
@@ -3312,7 +3312,9 @@ def create_archive_phase_node(
             and config.auxiliary.enabled
         ):
             try:
-                from src.services.auxiliary import assemble_and_converge_knowledge
+                from src.services.knowledge_auxiliary import (
+                    assemble_and_converge_knowledge,
+                )
 
                 asyncio.create_task(
                     assemble_and_converge_knowledge(

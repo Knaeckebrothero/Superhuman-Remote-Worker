@@ -636,7 +636,7 @@ def _coerce_context(context: Any) -> dict:
 def is_kubernetes_capture_context(context: Any) -> bool:
     """Return whether a capture row names an unfenced Kubernetes runtime."""
 
-    from src.core.backends.factory import is_vm_backend
+    from src.shared.backend_kinds import is_vm_backend
 
     parsed = _coerce_context(context)
     backend = ((parsed.get("config_override") or {}).get("workspace") or {}).get(

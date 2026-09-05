@@ -34,7 +34,7 @@ try:
 except ImportError:
     paramiko = None  # Deferred — only needed when backend: remote is used
 
-from ...tools.shell.shell_manager import (
+from ..shell_protocol import (
     COLLIDING_COMMAND_TEMPLATE,
     HARD_TIMEOUT_CAP_SECONDS,
     INTERACTIVE_PROMPT_PATTERNS,
@@ -59,7 +59,7 @@ from ..workspace_backend import (
 logger = logging.getLogger(__name__)
 
 # Stall/timeout constants, interactive-prompt patterns and message templates
-# are shared from shell_manager (imported above) to keep the local and remote
+# are shared from shell_protocol (imported above) to keep the local and remote
 # shell backends in lock-step.
 
 # Connect-failure buckets → how many attempts each is worth.
@@ -4462,7 +4462,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         if tab_type is None:
             tab_type = "shell"
             if command:
-                from src.tools.shell.shell_manager import COMMAND_TYPE_MAP
+                from src.core.shell_protocol import COMMAND_TYPE_MAP
 
                 first_word = command.strip().split()[0]
                 base_cmd = first_word.rsplit("/", 1)[-1]

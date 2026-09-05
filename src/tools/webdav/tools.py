@@ -22,46 +22,11 @@ from langchain_core.tools import tool
 
 from ..context import ToolContext
 
+from src.shared.tool_catalog.definitions import (
+    WEBDAV_TOOLS_METADATA as WEBDAV_TOOLS_METADATA,
+)
+
 logger = logging.getLogger(__name__)
-
-
-WEBDAV_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
-    "webdav_list": {
-        "module": "webdav.tools",
-        "function": "webdav_list",
-        "category": "webdav",
-        "phases": ["strategic", "tactical"],
-        "description": "List files and folders in WebDAV",
-    },
-    "webdav_read": {
-        "module": "webdav.tools",
-        "function": "webdav_read",
-        "category": "webdav",
-        "phases": ["strategic", "tactical"],
-        "description": "Download a file from WebDAV into the workspace",
-    },
-    "webdav_info": {
-        "module": "webdav.tools",
-        "function": "webdav_info",
-        "category": "webdav",
-        "phases": ["strategic", "tactical"],
-        "description": "Get metadata about a file or folder in WebDAV",
-    },
-    "webdav_write": {
-        "module": "webdav.tools",
-        "function": "webdav_write",
-        "category": "webdav",
-        "phases": ["tactical"],
-        "description": "Upload a file from the workspace to WebDAV",
-    },
-    "webdav_delete": {
-        "module": "webdav.tools",
-        "function": "webdav_delete",
-        "category": "webdav",
-        "phases": ["tactical"],
-        "description": "Delete a file or folder from WebDAV",
-    },
-}
 
 
 def create_webdav_tools(context: ToolContext) -> List[Any]:

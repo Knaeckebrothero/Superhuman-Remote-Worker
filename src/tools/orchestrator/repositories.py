@@ -15,49 +15,11 @@ from src.shared.orch_surface.formatters import truncate_text as _truncate
 
 from .jobs import _get_client, _get_orchestrator_url
 
-logger = logging.getLogger(__name__)
+from src.shared.tool_catalog.definitions import (
+    REPOSITORY_TOOLS_METADATA as REPOSITORY_TOOLS_METADATA,
+)
 
-REPOSITORY_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
-    "list_project_repositories": {
-        "module": "orchestrator.repositories",
-        "function": "list_project_repositories",
-        "description": (
-            "List repositories attached to the current or selected project. "
-            "Returned URLs are safe/redacted display URLs."
-        ),
-        "category": "orchestrator",
-        "short_description": "List project repositories.",
-        "phases": ["strategic", "tactical"],
-    },
-    "get_default_project_repository": {
-        "module": "orchestrator.repositories",
-        "function": "get_default_project_repository",
-        "description": (
-            "Show the project's preferred writable source repository metadata. "
-            "Project cloud files and job history are not repository roles."
-        ),
-        "category": "orchestrator",
-        "short_description": "Show the default project repository.",
-        "phases": ["strategic", "tactical"],
-    },
-    "checkout_project_repository": {
-        "module": "orchestrator.repositories",
-        "function": "checkout_project_repository",
-        "description": (
-            "Clone a project repository into the current session workspace. "
-            "Requires a shell-capable sandbox or VM workspace."
-        ),
-        "category": "orchestrator",
-        "short_description": "Clone a project repository into the session workspace.",
-        "phases": ["strategic", "tactical"],
-        # No config lists this; persistent_session.py:1540 appends it. It is
-        # also one of the three `orchestrator` entries absent from
-        # SESSION_TOOL_OVERRIDE_NAMES, so the code grant is what keeps a
-        # category-level `orchestrator: true` from widening onto it.
-        "grant": "code",
-        "gate": "fleet management enabled AND backend.supports_shell",
-    },
-}
+logger = logging.getLogger(__name__)
 
 
 def _current_project_id(context: ToolContext) -> Optional[str]:

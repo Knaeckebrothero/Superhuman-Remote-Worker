@@ -19,7 +19,7 @@ from typing import Any
 from uuid import UUID
 
 from services.workspace_binding import remote_canvas_presentation_available
-from src.core.backends.factory import LITE_BACKENDS
+from src.shared.backend_kinds import LITE_BACKENDS
 
 # Gitea setup writes these two keys for every tier, including virtual/none.
 # They describe a repository, not a provisioned SSH workspace. Every other

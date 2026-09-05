@@ -21,49 +21,17 @@ exposed when ``officer.enabled`` (persistent_session tool assembly).
 
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, List
 
 from langchain_core.tools import tool
 
 from ..context import ToolContext
 
+from src.shared.tool_catalog.definitions import (
+    OFFICER_TOOLS_METADATA as OFFICER_TOOLS_METADATA,
+)
+
 logger = logging.getLogger(__name__)
-
-
-OFFICER_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
-    "sleep": {
-        "module": "core.officer",
-        "function": "sleep",
-        "description": (
-            "End this wake and sleep for a number of minutes. Any event "
-            "(job transition, user message) wakes you earlier; the timer is "
-            "durable and survives restarts. Officer sessions only."
-        ),
-        "category": "core",
-        "short_description": "End the wake; sleep until the timer or an event.",
-        "phases": ["strategic", "tactical"],  # phase-free in sessions
-        # No config lists this; persistent_session.py:1554-1557 appends it.
-        "grant": "code",
-        "gate": "officer.enabled is True",
-    },
-    "notify_user": {
-        "module": "core.officer",
-        "function": "notify_user",
-        "description": (
-            "Message your Legate (the user) out-of-band. urgency='log' for "
-            "the record only, 'digest' for their next look at the "
-            "notification center, 'page' for an immediate notification. "
-            "Also how you answer a Legate note when they are not live in "
-            "your session. Officer sessions only."
-        ),
-        "category": "core",
-        "short_description": "Message the user: log, digest, or page.",
-        "phases": ["strategic", "tactical"],
-        # No config lists this; persistent_session.py:1554-1557 appends it.
-        "grant": "code",
-        "gate": "officer.enabled is True",
-    },
-}
 
 
 def create_officer_tools(context: ToolContext) -> List[Any]:

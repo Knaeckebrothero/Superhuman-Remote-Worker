@@ -21,6 +21,10 @@ from typing import List, Tuple
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 
+from src.core.injection_markers import (
+    INSTRUCTION_TOOL_CALL_ID_PREFIX as INSTRUCTION_TOOL_CALL_ID_PREFIX,
+    TODOS_INJECTION_CONTENT_PREFIX as TODOS_INJECTION_CONTENT_PREFIX,
+)
 from src.core.message_markers import (
     INSTRUCTION_PATH_KEY,
     PERSIST_ROLE_EVENT,
@@ -28,13 +32,6 @@ from src.core.message_markers import (
     PHASE_KEY,
     PROTECTED_KEY,
 )
-
-# Prefix for identifying synthetic instruction tool calls
-# Used to exclude these messages from summarization
-INSTRUCTION_TOOL_CALL_ID_PREFIX = "instruction_inject_"
-
-# Prefix for identifying transient todo injection messages
-TODOS_INJECTION_CONTENT_PREFIX = "<active_tasks>\n"
 
 
 def content_hash_id(content: str) -> str:
@@ -208,12 +205,10 @@ def is_workspace_injection_message(message: BaseMessage) -> bool:
             if content.startswith(TODOS_INJECTION_CONTENT_PREFIX):
                 return True
 
-    from src.core.memory_injection import MEMORY_TOOL_CALL_ID_PREFIX
-    from src.core.knowledge_injection import (
+    from src.core.injection_markers import (
+        MEMORY_TOOL_CALL_ID_PREFIX,
         CHARTER_TOOL_CALL_ID_PREFIX,
         KNOWLEDGE_TOOL_CALL_ID_PREFIX,
-    )
-    from src.core.citation_feedback_injection import (
         CITATION_FEEDBACK_TOOL_CALL_ID_PREFIX,
     )
 

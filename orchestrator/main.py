@@ -528,7 +528,7 @@ from src.shared.session_subagent_authority import (  # noqa: E402
 # branches here can't drift from what the agent actually constructs.
 # (no_workspace_agent_mode.md §4) — importing the frozenset is cheap; the heavy
 # backend modules are lazy-imported inside the factory's functions.
-from src.core.backends.factory import LITE_BACKENDS  # noqa: E402
+from src.shared.backend_kinds import LITE_BACKENDS  # noqa: E402
 from src.shared.workspace_contract import (  # noqa: E402
     WORKSPACE_CONTRACT_CONTEXT_KEY,
     WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY,
@@ -547,7 +547,7 @@ from src.core.datasource_catalog import (  # noqa: E402
     DATASOURCE_TYPE_IDS,
     DATASOURCE_TYPES,
 )
-from src.core.datasource_setup import datasource_tool_categories  # noqa: E402
+from src.shared.datasource_policy import datasource_tool_categories  # noqa: E402
 from src.core.session_tool_overrides import (  # noqa: E402
     LEGACY_APPENDED_GROUPS,
     SESSION_TOOL_OVERRIDE_NAMES,
@@ -572,7 +572,7 @@ from src.core.tool_report import (  # noqa: E402
 
 # Tool -> category, for annotating replayed history (_stamp_tool_categories).
 # Same registry the agent's live SSE frames read, so the two can't disagree.
-from src.tools.registry import TOOL_REGISTRY  # noqa: E402
+from src.shared.tool_catalog import TOOL_REGISTRY  # noqa: E402
 from src.utils.ssh_key import (  # noqa: E402
     InvalidSSHKeyError,
     generate_ed25519_keypair as _generate_ed25519_keypair,
@@ -58190,7 +58190,7 @@ async def _thread_input_stateless(thread: dict, content: str) -> dict[str, Any]:
     separate ``enqueue_unit`` call is needed: every branch leaves the unit
     queued, leased-with-watermark, or deliberately parked.
     """
-    from src.database.postgres_db import _coerce_row_id
+    from src.shared.row_identity import _coerce_row_id
     from src.shared.run_queue import (
         LANE_STATELESS,
         UNIT_KIND_SESSION_TURN,

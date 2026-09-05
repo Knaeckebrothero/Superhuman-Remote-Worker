@@ -32,93 +32,14 @@ from .browser_security import validate_url_with_config, wrap_with_nonce
 from ..context import ToolContext
 from ...services.image_content import IMAGE_DATA_TAG_TEMPLATE
 
+from src.shared.tool_catalog.definitions import (
+    BROWSER_DIRECT_TOOLS_METADATA as BROWSER_DIRECT_TOOLS_METADATA,
+)
+
 logger = logging.getLogger(__name__)
 
 
 # ── Tool metadata for registry ───────────────────────────────────────
-
-BROWSER_DIRECT_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
-    "browser_navigate": {
-        "module": "research.browser_direct",
-        "function": "browser_navigate",
-        "description": (
-            "Open a URL in the browser and see the page. Use when you need "
-            "to inspect, interact with, or visually verify a specific page."
-        ),
-        "category": "browser_direct",
-        "short_description": "Navigate to URL and return page DOM + screenshot.",
-        "phases": ["tactical"],
-    },
-    "browser_snapshot": {
-        "module": "research.browser_direct",
-        "function": "browser_snapshot",
-        "description": (
-            "Get the current page state — DOM accessibility tree and optional "
-            "screenshot. Use after actions to see what changed."
-        ),
-        "category": "browser_direct",
-        "short_description": "Return current page DOM snapshot + screenshot.",
-        "phases": ["tactical"],
-    },
-    "browser_click": {
-        "module": "research.browser_direct",
-        "function": "browser_click",
-        "description": "Click an element on the page by its reference number from the DOM snapshot.",
-        "category": "browser_direct",
-        "short_description": "Click element by DOM reference number.",
-        "phases": ["tactical"],
-    },
-    "browser_type": {
-        "module": "research.browser_direct",
-        "function": "browser_type",
-        "description": "Type text into an input field identified by its reference number.",
-        "category": "browser_direct",
-        "short_description": "Type text into input field by reference number.",
-        "phases": ["tactical"],
-    },
-    "browser_select": {
-        "module": "research.browser_direct",
-        "function": "browser_select",
-        "description": "Select an option from a dropdown by its reference number.",
-        "category": "browser_direct",
-        "short_description": "Select dropdown option by reference number.",
-        "phases": ["tactical"],
-    },
-    "browser_scroll": {
-        "module": "research.browser_direct",
-        "function": "browser_scroll",
-        "description": (
-            "Scroll the page or a specific element. Direction: up, down, left, right."
-        ),
-        "category": "browser_direct",
-        "short_description": "Scroll page or element in a direction.",
-        "phases": ["tactical"],
-    },
-    "browser_screenshot": {
-        "module": "research.browser_direct",
-        "function": "browser_screenshot",
-        "description": "Take a screenshot of the current page. Always returns an image regardless of multimodal setting.",
-        "category": "browser_direct",
-        "short_description": "Take full screenshot of current page.",
-        "phases": ["tactical"],
-    },
-    "browser_back": {
-        "module": "research.browser_direct",
-        "function": "browser_back",
-        "description": "Navigate back to the previous page in browser history.",
-        "category": "browser_direct",
-        "short_description": "Go back one page in browser history.",
-        "phases": ["tactical"],
-    },
-    "browser_close": {
-        "module": "research.browser_direct",
-        "function": "browser_close",
-        "description": "Close the browser and free resources. The browser will restart on next use.",
-        "category": "browser_direct",
-        "short_description": "Close the browser session.",
-        "phases": ["tactical"],
-    },
-}
 
 
 async def _run_action(context: ToolContext, action: str, **args: Any) -> Dict[str, Any]:

@@ -61,6 +61,10 @@ from .gardener import (
     render_index_md,
 )
 
+from src.shared.tool_catalog.definitions import (
+    KNOWLEDGE_TOOLS_METADATA as KNOWLEDGE_TOOLS_METADATA,
+)
+
 logger = logging.getLogger(__name__)
 
 # Closed vocabularies for the kb tool schemas, mirroring the frozensets in
@@ -600,128 +604,6 @@ def _check_external_url(url: str, timeout: float = 5.0) -> Optional[str]:
 
 
 # Tool metadata for registry
-KNOWLEDGE_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
-    # Write tools
-    "kb_write": {
-        "module": "knowledge.knowledge_tools",
-        "function": "kb_write",
-        "description": "Create a new knowledge note (Neo4j + pgvector write-through)",
-        "category": "knowledge",
-        "short_description": "Create a knowledge note in the project knowledge base.",
-        "phases": ["strategic", "tactical"],
-    },
-    "kb_update": {
-        "module": "knowledge.knowledge_tools",
-        "function": "kb_update",
-        "description": "Update an existing knowledge note",
-        "category": "knowledge",
-        "short_description": "Update a knowledge note (append, status, tags, links).",
-        "phases": ["strategic", "tactical"],
-    },
-    "kb_delete": {
-        "module": "knowledge.knowledge_tools",
-        "function": "kb_delete",
-        "description": (
-            "Retire a knowledge note (archive with a reason; reversible, "
-            "hidden from search, purged later by the grace-period lane)"
-        ),
-        "category": "knowledge",
-        "short_description": "Retire a knowledge note with a reason (archive, reversible).",
-        "phases": ["strategic", "tactical"],
-    },
-    # Read tools
-    "kb_read": {
-        "module": "knowledge.knowledge_tools",
-        "function": "kb_read",
-        "description": "Read a full knowledge note with metadata and relationships",
-        "category": "knowledge",
-        "short_description": "Read a knowledge note by slug ID.",
-        "phases": ["strategic", "tactical"],
-    },
-    "kb_list": {
-        "module": "knowledge.knowledge_tools",
-        "function": "kb_list",
-        "description": "List knowledge notes with optional filters",
-        "category": "knowledge",
-        "short_description": "List knowledge notes (filter by type, tag, status).",
-        "phases": ["strategic", "tactical"],
-    },
-    "kb_search": {
-        "module": "knowledge.knowledge_tools",
-        "function": "kb_search",
-        "description": "Hybrid search over knowledge base (semantic + keyword + recency)",
-        "category": "knowledge",
-        "short_description": "Search knowledge base with hybrid ranking.",
-        "phases": ["strategic", "tactical"],
-    },
-    "kb_grep": {
-        "module": "knowledge.knowledge_tools",
-        "function": "kb_grep",
-        "description": "Enumerate every matching line in the knowledge base (substring or regex, with context)",
-        "category": "knowledge",
-        "short_description": "Grep the knowledge base for a literal or regex.",
-        "phases": ["strategic", "tactical"],
-    },
-    # Graph query tools
-    "kb_related": {
-        "module": "knowledge.knowledge_tools",
-        "function": "kb_related",
-        "description": "Find notes related to a given note (graph traversal)",
-        "category": "knowledge",
-        "short_description": "Find related notes within N hops.",
-        "phases": ["strategic", "tactical"],
-    },
-    "kb_contradictions": {
-        "module": "knowledge.knowledge_tools",
-        "function": "kb_contradictions",
-        "description": "Find contradicting notes in the knowledge base",
-        "category": "knowledge",
-        "short_description": "List notes connected by CONTRADICTS edges.",
-        "phases": ["strategic", "tactical"],
-    },
-    "kb_provenance": {
-        "module": "knowledge.knowledge_tools",
-        "function": "kb_provenance",
-        "description": "Trace a note's derivation chain (DERIVED_FROM)",
-        "category": "knowledge",
-        "short_description": "Trace DERIVED_FROM chain for a note.",
-        "phases": ["strategic", "tactical"],
-    },
-    "kb_unanswered": {
-        "module": "knowledge.knowledge_tools",
-        "function": "kb_unanswered",
-        "description": "List open questions with no answers",
-        "category": "knowledge",
-        "short_description": "List question notes without ANSWERS edges.",
-        "phases": ["strategic", "tactical"],
-    },
-    # Export
-    "kb_export": {
-        "module": "knowledge.knowledge_tools",
-        "function": "kb_export",
-        "description": "Export knowledge base as OKF/markdown files",
-        "category": "knowledge",
-        "short_description": "Export knowledge base to OKF .md files.",
-        "phases": ["strategic", "tactical"],
-    },
-    # Maintenance / gardener (slice 2)
-    "kb_lint": {
-        "module": "knowledge.knowledge_tools",
-        "function": "kb_lint",
-        "description": "Lint an OKF knowledge base for structural/link/id issues",
-        "category": "knowledge",
-        "short_description": "Lint the knowledge base (frontmatter, links, ids).",
-        "phases": ["strategic", "tactical"],
-    },
-    "kb_index": {
-        "module": "knowledge.knowledge_tools",
-        "function": "kb_index",
-        "description": "Regenerate the OKF index.md for a knowledge base",
-        "category": "knowledge",
-        "short_description": "Regenerate index.md (grouped links by type).",
-        "phases": ["strategic", "tactical"],
-    },
-}
 
 
 #: Fail-closed message every degraded KB tool returns during a vector/KB

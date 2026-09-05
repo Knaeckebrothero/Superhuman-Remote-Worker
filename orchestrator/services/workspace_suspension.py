@@ -276,7 +276,7 @@ def _thread_is_vm_tier(metadata: dict, ws_ctx: dict, vm_ctx: dict) -> bool:
     (its git_remote_url lives at the context root), so presence really does imply
     pod-tier there and the job paths keep their existing checks.
     """
-    from src.core.backends.factory import is_vm_backend
+    from src.shared.backend_kinds import is_vm_backend
 
     # A materialized VM beats the declared backend, because upgrade-to-VM
     # provisions metadata.vm WITHOUT rewriting config_override.workspace.backend

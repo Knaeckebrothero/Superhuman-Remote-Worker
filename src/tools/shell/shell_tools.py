@@ -17,7 +17,7 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional
 
 from langchain_core.tools import tool
 
@@ -31,6 +31,10 @@ from ...services.cloud_mount.guardrails import (
     detect_cloud_scan_risk,
     format_cloud_delete_guard_message,
     format_cloud_scan_guard_message,
+)
+
+from src.shared.tool_catalog.definitions import (
+    SHELL_TOOLS_METADATA as SHELL_TOOLS_METADATA,
 )
 
 logger = logging.getLogger(__name__)
@@ -211,55 +215,6 @@ _CANCEL_HINT = (
     "\n\nNote: if this command is stuck or you did not expect it to run this "
     "long, call cancel_command to abort it and free the tab."
 )
-
-SHELL_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
-    "run_command": {
-        "module": "shell.shell_tools",
-        "function": "run_command",
-        "description": "Execute a shell command and return its output",
-        "category": "shell",
-        "short_description": "Run a shell command and get output.",
-        "phases": ["strategic", "tactical"],
-    },
-    "cancel_command": {
-        "module": "shell.shell_tools",
-        "function": "cancel_command",
-        "description": "Abort a stuck/hung command by sending Ctrl+C to the shell tab",
-        "category": "shell",
-        "short_description": "Cancel a stuck shell command (Ctrl+C).",
-        "phases": ["strategic", "tactical"],
-    },
-    "shell_execute": {
-        "module": "shell.shell_tools",
-        "function": "shell_execute",
-        "description": "Execute a command or send keystrokes in an independent persistent terminal tab",
-        "category": "shell",
-        "short_description": "Run commands in a persistent terminal tab.",
-        "phases": ["strategic", "tactical"],
-    },
-    "shell_read": {
-        "module": "shell.shell_tools",
-        "function": "shell_read",
-        "description": "Read scrollback output from a persistent terminal tab",
-        "category": "shell",
-        "short_description": "Read output from a terminal tab.",
-        "phases": ["strategic", "tactical"],
-    },
-    "srw_cloud_status": {
-        "module": "shell.shell_tools",
-        "function": "srw_cloud_status",
-        "description": "Show rclone cloud mount status, cache usage, and rclone RC stats",
-        "category": "shell",
-        "short_description": "Show cloud mount/cache status.",
-        "phases": ["strategic", "tactical"],
-        # No config lists this; persistent_session.py:1526 appends it. Keeping
-        # it out of a category-level `shell: true` also stops an operator who
-        # wanted "shell commands on" from silently acquiring a cloud-mount
-        # reporter that happens to share the category.
-        "grant": "code",
-        "gate": "cloud_mount_manager.active",
-    },
-}
 
 
 def _check_sudo_freeze(

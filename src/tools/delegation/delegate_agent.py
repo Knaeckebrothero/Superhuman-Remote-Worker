@@ -25,6 +25,10 @@ from typing import Any, Dict, List, Literal, Mapping, Optional
 
 from ..context import ToolContext
 
+from src.shared.tool_catalog.definitions import (
+    DELEGATE_AGENT_METADATA as DELEGATE_AGENT_METADATA,
+)
+
 logger = logging.getLogger(__name__)
 
 #: The registry entry. ``grant: explicit`` — a config must NAME the tool in
@@ -32,32 +36,6 @@ logger = logging.getLogger(__name__)
 #: ``delegation.enabled``; the factory returns nothing otherwise, so the
 #: binding follows both (B.12). Both phases: a strategic parent fans reads
 #: out while planning, a tactical one delegates bounded implementation.
-DELEGATE_AGENT_METADATA: Dict[str, Dict[str, Any]] = {
-    "delegate_agent": {
-        "module": "delegation.delegate_agent",
-        "function": "delegate_agent",
-        "description": (
-            "Delegate ONE bounded brief to a built-in subagent of the given "
-            "type. Foreground calls return its report as this tool's result. "
-            "Background calls return an immediate durable receipt and push "
-            "the completion into a later parent turn automatically; never "
-            "poll for it. Subagents run in-process on the parent's workspace "
-            "with a fresh context and their own turn/token budgets; they "
-            "cannot delegate further."
-        ),
-        "category": "delegation",
-        "short_description": (
-            "Delegate a bounded brief in the foreground or durable background."
-        ),
-        "phases": ["strategic", "tactical"],
-        "grant": "explicit",
-        "gate": (
-            "named outright in a tools.delegation list AND delegation.enabled "
-            "is true — the factory creates the tool only when both hold; "
-            "children never receive it (depth 1, D7)"
-        ),
-    },
-}
 
 MAX_TYPE_DESCRIPTION_CHARS = 320
 

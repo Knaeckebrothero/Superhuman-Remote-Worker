@@ -23,34 +23,17 @@ session only exposes it while the backend has no shell.
 
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, List
 
 from langchain_core.tools import tool
 
 from ..context import ToolContext
 
+from src.shared.tool_catalog.definitions import (
+    WORKSPACE_UPGRADE_TOOLS_METADATA as WORKSPACE_UPGRADE_TOOLS_METADATA,
+)
+
 logger = logging.getLogger(__name__)
-
-
-WORKSPACE_UPGRADE_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
-    "request_workspace_upgrade": {
-        "module": "core.upgrade",
-        "function": "request_workspace_upgrade",
-        "description": (
-            "Request an upgrade from the lite workspace to a real sandbox "
-            "container (shell, git, file tools). A human decides before "
-            "anything is provisioned; you only request, and you may not be "
-            "resumed afterwards."
-        ),
-        "category": "core",
-        "short_description": "Ask to upgrade to a real sandbox workspace.",
-        "phases": ["strategic", "tactical"],  # Available in both modes
-        # No config lists this; persistent_session.py:1547 and agent.py:3078
-        # append it, and only where there is something to upgrade to.
-        "grant": "code",
-        "gate": "lite tier — backend.supports_shell is False",
-    },
-}
 
 
 def create_workspace_upgrade_tools(context: ToolContext) -> List[Any]:

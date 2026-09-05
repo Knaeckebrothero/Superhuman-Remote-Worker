@@ -18,238 +18,49 @@ import functools
 import logging
 from typing import Any, Dict, List, Optional
 
-from .canvas import create_canvas_tools, get_canvas_metadata
-from .citation import create_citation_tools, get_citation_metadata
-from .webdav import create_webdav_tools, get_webdav_metadata
-from .repo import create_repo_tools, get_repo_metadata
-from .communication import create_communication_tools, get_communication_metadata
+from .canvas import create_canvas_tools
+from .citation import create_citation_tools
+from .webdav import create_webdav_tools
+from .repo import create_repo_tools
+from .communication import create_communication_tools
 from .context import ToolContext
 
 # Import from core toolkit package
-from .core import create_core_tools, get_core_metadata
-from .core.session_task_tools import (
-    create_session_task_tools,
-    get_session_task_metadata,
-)
-from .delegation import create_delegation_tools, get_delegation_metadata
-from .email import create_email_tools, get_email_metadata
+from .core import create_core_tools
+from .core.session_task_tools import create_session_task_tools
+from .delegation import create_delegation_tools
+from .email import create_email_tools
 
 # Import domain tools
-from .evaluation import create_evaluation_tools, get_evaluation_metadata
-from .git import create_git_tools, get_git_metadata
-from .graph import create_graph_tools, get_graph_metadata
-from .knowledge import create_knowledge_tools, get_knowledge_metadata
-from .loop import create_loop_tools, get_loop_metadata
-from .mongodb import create_mongodb_tools, get_mongodb_metadata
-from .orchestrator import create_orchestrator_tools, get_orchestrator_metadata
+from .evaluation import create_evaluation_tools
+from .git import create_git_tools
+from .graph import create_graph_tools
+from .knowledge import create_knowledge_tools
+from .loop import create_loop_tools
+from .mongodb import create_mongodb_tools
+from .orchestrator import create_orchestrator_tools
 from .orchestrator.catalog import create_catalog_tools
 from .orchestrator.workflows import create_workflow_tools
-from .product_capabilities import (
-    create_product_capability_tools,
-    get_product_capabilities_metadata,
-)
-from .product_help import create_product_help_tools, get_product_help_metadata
-from .research import (
-    create_browser_direct_tools,
-    create_research_tools,
-    get_browser_direct_metadata,
-    get_research_metadata,
-)
-from .shell import create_shell_tools, get_shell_metadata
-from .sql import create_sql_tools, get_sql_metadata
+from .product_capabilities import create_product_capability_tools
+from .product_help import create_product_help_tools
+from .research import create_browser_direct_tools, create_research_tools
+from .shell import create_shell_tools
+from .sql import create_sql_tools
 
 # Import workspace tools from new package
-from .workspace import create_workspace_tools, get_workspace_metadata
+from .workspace import create_workspace_tools
+
+from src.shared.tool_catalog import (
+    CODE_GRANTED_CATEGORIES as CODE_GRANTED_CATEGORIES,
+    TOOL_REGISTRY as TOOL_REGISTRY,
+    _EXECUTION_CATEGORIES as _EXECUTION_CATEGORIES,
+    _classify_code_granted_categories as _classify_code_granted_categories,
+    get_available_tools as get_available_tools,
+    get_categories as get_categories,
+    get_tools_by_category as get_tools_by_category,
+)
 
 logger = logging.getLogger(__name__)
-
-
-# Master registry mapping tool names to their metadata
-# This is populated from individual tool modules
-TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {}
-
-# Register workspace tools
-TOOL_REGISTRY.update(get_workspace_metadata())
-
-# Register core toolkit (todo + job/completion tools)
-TOOL_REGISTRY.update(get_core_metadata())
-
-# Register domain tools
-TOOL_REGISTRY.update(get_research_metadata())
-TOOL_REGISTRY.update(get_browser_direct_metadata())
-TOOL_REGISTRY.update(get_citation_metadata())
-TOOL_REGISTRY.update(get_canvas_metadata())
-TOOL_REGISTRY.update(get_graph_metadata())
-TOOL_REGISTRY.update(get_sql_metadata())
-TOOL_REGISTRY.update(get_mongodb_metadata())
-TOOL_REGISTRY.update(get_webdav_metadata())
-TOOL_REGISTRY.update(get_repo_metadata())
-TOOL_REGISTRY.update(get_email_metadata())
-TOOL_REGISTRY.update(get_git_metadata())
-TOOL_REGISTRY.update(get_shell_metadata())
-TOOL_REGISTRY.update(get_evaluation_metadata())
-TOOL_REGISTRY.update(get_knowledge_metadata())
-TOOL_REGISTRY.update(get_communication_metadata())
-TOOL_REGISTRY.update(get_orchestrator_metadata())
-TOOL_REGISTRY.update(get_product_help_metadata())
-TOOL_REGISTRY.update(get_product_capabilities_metadata())
-# Loop campaign tools — never in bundled configs; injected per-job via
-# config_override.tools.loop for planner-loop checkpoint critics only.
-TOOL_REGISTRY.update(get_loop_metadata())
-
-# Register session task tools (lightweight todos for persistent sessions)
-TOOL_REGISTRY.update(get_session_task_metadata())
-
-# Register delegation tools (subagent spawning)
-TOOL_REGISTRY.update(get_delegation_metadata())
-
-
-# ---------------------------------------------------------------------------
-# Grant classification
-# ---------------------------------------------------------------------------
-# Two optional metadata keys answer one question: *who is allowed to put this
-# tool's name into the list passed to* ``load_tools``?  They are METADATA ONLY
-# — nothing reads them yet.  The category-level ``true`` expansion that will
-# consume them is a separate change
-# (knowledge-base/knowledge/features/tool_config_policy_vs_membership.md, "Step A: classify
-# code-only tools in the registry").
-#
-# ``grant``
-#   absent       Config may grant it, including through a category-level
-#                ``true`` / ``except`` policy.  The default, and the case for
-#                103 of the 151 registered tools.
-#   ``"code"``   Runtime code binds it *instead of* config.  No shipped config
-#                should name one, and a category-level ``true`` must not
-#                expand to it — otherwise ``core: true`` and ``shell: true``
-#                would read as granting tools whose real switch is somewhere
-#                else entirely (``officer.enabled``, ``cloud_mount.active``, an
-#                attached datasource).  Excluding them is what makes ``true``
-#                behaviour-preserving for ``core`` and ``shell``.
-#   ``"explicit"``
-#                Config may grant it, but only by writing its name.  A
-#                category-level ``true`` / ``except`` must not reach it.
-#
-#                This mark used to carry the safety judgement for the six
-#                ``*_bundle`` control-plane writes, which sat inside
-#                ``agent_catalog`` / ``workflows`` yet were absent from
-#                ``SESSION_TOOL_OVERRIDE_NAMES``.  On 2026-08-03 they moved to
-#                their own ``catalog_authoring`` category behind a capability
-#                grant, so those two groups now contain only reads and their
-#                ``true`` expansion equals the session vocabulary *by
-#                construction* — no mark required.  Prefer that fix: a category
-#                whose name matches its blast radius needs no exception list.
-#                What remains marked is the residue where a category genuinely
-#                mixes tiers (``delegate_agent``, ``steer_job``).
-#
-# ``gate``
-#   A short string, present on every classified entry: what actually decides
-#   whether the tool gets bound.  For ``"code"`` that is the runtime fact or
-#   config key that controls the injection; for ``"explicit"`` it is the naming
-#   requirement and the reason for it.  Without this field the rule is folklore
-#   — see the design doc's "code floors" note.
-#
-# The expansion contract a consumer must implement:
-#
-#     expand(True, cat)            -> [n for n in get_tools_by_category(cat)
-#                                      if "grant" not in TOOL_REGISTRY[n]]
-#     expand({"except": xs}, cat)  -> expand(True, cat) minus xs
-#     expand({"only": xs}, cat)    -> xs as written (an explicit name is an
-#     expand([...], cat)              explicit name; ``"code"`` entries stay
-#                                     nameable so nothing that works today
-#                                     stops working)
-#
-# Deliberately NOT classified, and why:
-#   * the 26 legacy experts-off shim names appended at
-#     ``src/api/persistent_session.py:1470-1520`` — the runtime re-adds those
-#     canonical ``orchestrator`` / ``agent_catalog`` / ``workflows`` lists only
-#     when no disable marker is present.  On the resolved path config still
-#     decides, so marking them would make those groups permanently
-#     un-enableable: the current bug, re-introduced by its own fix.
-#   * ``approve_job_verdict`` / ``return_job_with_feedback`` (stamped as
-#     ``tools.evaluation`` by ``_critic_config_override``) and ``loop_plan``
-#     (stamped as ``tools.loop`` by the planner loops).  Those are code writing
-#     a *config fragment*, which is a config grant; ``evaluation: true`` and
-#     ``loop: true`` must keep resolving to them.
-#   * ``mcp``.  ``ToolsConfig`` has the field, the registry has no static
-#     members, and ``register_mcp_tools`` populates the category per
-#     job/session at runtime.  ``mcp: true`` normalises to the existing ``"*"``
-#     sentinel rather than expanding against the registry, so there is nothing
-#     here to mark.
-
-#: Categories whose every tool is bound by runtime code rather than by a
-#: config's tool list.  Expressed per category because that is the truth: a new
-#: tool added to any of these is code-granted by construction.  Per-tool
-#: ``gate`` strings win over the category default (``setdefault`` below), which
-#: is how ``product_help``'s two differently-gated floors stay accurate.
-CODE_GRANTED_CATEGORIES: Dict[str, str] = {
-    # Datasource-derived.  ``DATASOURCE_TOOL_MAP``
-    # (src/core/datasource_setup.py) maps an attached datasource type to a
-    # whole category list, and the result is written straight onto
-    # ``config.tools.<category>`` at attach/dispatch time.  The bases ship
-    # these keys as ``[]`` with a comment saying config does not manage them.
-    "graph": "a neo4j datasource is attached",
-    "sql": "a postgresql datasource is attached",
-    "mongodb": "a mongodb datasource is attached",
-    "webdav": "a webdav datasource is attached",
-    "repo": "a repository datasource is attached",
-    "email": "an email datasource is attached (tier from its config.access)",
-    # Persistent-session floors.  Neither category has a ``ToolsConfig`` field,
-    # so ``tools.product_help: [...]`` in a YAML file is silently discarded
-    # today (src/core/loader.py).  Recording it as a code grant makes that a
-    # stated rule instead of an accident of a missing dataclass field.
-    "product_help": "persistent-session floor; see each tool's own gate",
-    "session_task": "persistent session, unconditional "
-    "(src/api/persistent_session.py:1415)",
-}
-
-
-def _classify_code_granted_categories() -> None:
-    """Stamp the category-level grant classification onto ``TOOL_REGISTRY``.
-
-    Runs once at import, after every ``get_*_metadata()`` merge above.  Uses
-    ``setdefault`` so a per-tool classification declared next to the tool
-    always wins over the category default.
-    """
-    for category, gate in CODE_GRANTED_CATEGORIES.items():
-        for meta in TOOL_REGISTRY.values():
-            if meta.get("category") == category:
-                meta.setdefault("grant", "code")
-                meta.setdefault("gate", gate)
-
-
-_classify_code_granted_categories()
-
-
-def get_available_tools() -> Dict[str, Dict[str, Any]]:
-    """Get all registered tools with their metadata.
-
-    Returns:
-        Dictionary mapping tool names to metadata
-    """
-    return TOOL_REGISTRY.copy()
-
-
-def get_tools_by_category(category: str) -> List[str]:
-    """Get tool names in a specific category.
-
-    Args:
-        category: Category name (workspace, core, research, citation, graph)
-
-    Returns:
-        List of tool names in the category
-    """
-    return [
-        name for name, meta in TOOL_REGISTRY.items() if meta.get("category") == category
-    ]
-
-
-def get_categories() -> set[str]:
-    """Get all available tool categories.
-
-    Returns:
-        Set of category names
-    """
-    return {meta.get("category", "unknown") for meta in TOOL_REGISTRY.values()}
 
 
 def register_mcp_tools(manager: Any | None) -> None:
@@ -348,12 +159,6 @@ def filter_tools_by_phase(tool_names: List[str], phase: str) -> List[str]:
         if phase in phases:
             filtered.append(name)
     return filtered
-
-
-# Tool categories that need a workspace-backed execution environment. The lite
-# tiers (virtual/none) declare supports_shell=False — there is no workspace
-# pod — so none of these can run there.
-_EXECUTION_CATEGORIES = ("shell", "browser_direct", "git")
 
 
 def filter_tools_by_backend(tool_names: List[str], backend: Any) -> List[str]:

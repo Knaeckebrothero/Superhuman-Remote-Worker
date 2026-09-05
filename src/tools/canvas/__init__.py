@@ -17,6 +17,10 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ..context import ToolContext
 
+from src.shared.tool_catalog.definitions import (
+    CANVAS_TOOLS_METADATA as CANVAS_TOOLS_METADATA,
+)
+
 logger = logging.getLogger(__name__)
 
 _LOGICAL_STATE_FIELDS = (
@@ -30,49 +34,6 @@ _LOGICAL_STATE_FIELDS = (
     "status",
     "updated_at",
 )
-
-
-CANVAS_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
-    "get_canvas": {
-        "module": "canvas",
-        "function": "get_canvas",
-        "description": (
-            "Inspect the persistent thread's shared Canvas before replacing its "
-            "stage or changing a file the user may be viewing. Returns logical "
-            "presentation metadata, not source bytes or credentials."
-        ),
-        "category": "canvas",
-        "short_description": "Inspect the current shared Canvas presentation.",
-        "phases": ["strategic", "tactical"],
-    },
-    "set_canvas": {
-        "module": "canvas",
-        "function": "set_canvas",
-        "description": (
-            "Present or refresh a validated workspace file, an attested loopback "
-            "workspace port, or the current shared browser when the matching "
-            "workspace capability is advertised. browser_id='current' resolves "
-            "the agent's current browser at call time; control may remain with "
-            "the user. Never supply a hostname or URL. Re-read files the user "
-            "may have changed before overwriting them, and call set_canvas again "
-            "after updating a presented source."
-        ),
-        "category": "canvas",
-        "short_description": "Present or refresh a workspace source on Canvas.",
-        "phases": ["strategic", "tactical"],
-    },
-    "clear_canvas": {
-        "module": "canvas",
-        "function": "clear_canvas",
-        "description": (
-            "Clear the persistent thread's shared Canvas presentation. This does "
-            "not delete its source file or stop any workspace process."
-        ),
-        "category": "canvas",
-        "short_description": "Clear the shared Canvas without deleting its source.",
-        "phases": ["strategic", "tactical"],
-    },
-}
 
 
 class _NoCanvasArguments(BaseModel):
