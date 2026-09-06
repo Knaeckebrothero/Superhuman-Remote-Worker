@@ -179,6 +179,14 @@ def _stage_vector_migrations(tmp_path, name, variant):
     return staged
 
 
+def _pending_probe_name(migrations_dir):
+    # Keep the synthetic pending migration after the current production head.
+    prefix = max(
+        int(path.name.split("_", 1)[0]) for path in migrations_dir.glob("*.sql")
+    )
+    return f"{prefix + 1:04d}_checksum_compatibility_probe.sql"
+
+
 def test_vector_0025_is_restored_and_published_variant_is_exact():
     # Neither fixture relies on git being installed or historical objects being
     # present in a CI shallow checkout. The fragment reconstructs the exact
@@ -210,7 +218,7 @@ async def test_successful_vector_histories_keep_exact_ledger_rows(
 ):
     history = _stage_vector_migrations(tmp_path, "history", variant)
     target = _stage_vector_migrations(tmp_path, "target", "original")
-    probe = "0026_checksum_compatibility_probe.sql"
+    probe = _pending_probe_name(target)
     if pending:
         (target / probe).write_text(
             "CREATE TABLE checksum_compatibility_probe(id int);\n"
@@ -290,7 +298,7 @@ async def test_vector_checksum_compatibility_rejects_unreviewed_drift(
         path.write_text(path.read_text() + "\n-- unrelated unreviewed edit\n")
     else:
         raise AssertionError(mutation)
-    (target / "0026_checksum_compatibility_probe.sql").write_text(
+    (target / _pending_probe_name(target)).write_text(
         "CREATE TABLE checksum_compatibility_probe(id int);\n"
     )
 

@@ -324,7 +324,7 @@ def test_vector_idempotency_ledgers_are_current_and_in_generated_snapshot():
             REPO_ROOT / "src" / "orchestrator" / "database" / "migrations" / "vector"
         ).glob("*.sql")
     )
-    assert migrations[-1].name == "0025_knowledge_multi_angle_search.sql"
+    assert migrations[-1].name == "0026_job_vector_retirement.sql"
     snapshot = (
         REPO_ROOT / "src/orchestrator/database/vector_schema_current.sql"
     ).read_text()
