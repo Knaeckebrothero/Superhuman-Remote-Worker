@@ -44683,7 +44683,11 @@ async def _agent_get_thread_workspace_locked(
                         "ssh_host_key_fingerprint"
                     ]
     if pinned_k8s_attestation is not None:
-        workspace_generation = pinned_k8s_attestation.workspace_generation
+        # The attestation identifies physical backing by PVC/Pod UID. Pinned
+        # session consumers (shell ownership, cloud staging and retirement)
+        # use the separately stored binding generation, already paired with
+        # this exact attested backing and rechecked at the response boundary.
+        workspace_generation = str(UUID(str(binding["generation"])))
         workspace_runtime_incarnation = pinned_k8s_attestation.runtime_incarnation
         workspace_ssh_host_key_fingerprint = (
             pinned_k8s_attestation.ssh_host_key_fingerprint

@@ -13,6 +13,7 @@ from kubernetes.client.exceptions import ApiException
 from orchestrator import main
 from orchestrator.services.container_provisioner import (
     STATELESS_WORKSPACE_PROCESS_ZERO_FINALIZER,
+    WorkspaceRuntimeAttestation,
 )
 from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 from tests import test_persistent_recycler_real_postgres as authority
@@ -163,6 +164,60 @@ async def _begin(db, ids, permanent):
     )
     await authority._authorize_and_ack(db, ids, retirement)
     return retirement
+
+
+@pytest.mark.asyncio
+async def test_delivered_pinned_workspace_generation_can_ack_retirement(
+    db, monkeypatch
+):
+    """Kubernetes backing UID and the durable session binding are distinct UUIDs."""
+    ids, owner, p, resources, _ = await _scenario(db, monkeypatch)
+    thread = await db.get_thread(owner.id)
+    metadata = authority._json(thread["metadata"])
+    binding = metadata["_workspace_binding"]
+    backing_uid = resources["pvc"].metadata.uid
+    assert backing_uid != binding["generation"]
+    monkeypatch.setattr(
+        p,
+        "attest_workspace_runtime",
+        AsyncMock(
+            return_value=WorkspaceRuntimeAttestation(
+                backing_id=binding["backing_id"],
+                workspace_generation=backing_uid,
+                runtime_incarnation=resources["pod"].metadata.uid,
+                ssh_host_key_fingerprint=binding["ssh_host_key_fingerprint"],
+                host=p._workspace_dns(owner),
+                pod_ip="10.0.0.8",
+            )
+        ),
+    )
+    payload = await main._agent_get_thread_workspace_locked(
+        owner.id,
+        presented_agent_id=ids["agent"],
+        presented_runtime_generation=str(thread["runtime_generation"]),
+        presented_attach_token=ids["attach_token"],
+    )
+    retirement = await db.begin_pinned_thread_retirement(owner.id, permanent=False)
+    assert await db.authorize_pinned_thread_retirement(
+        owner.id,
+        token=retirement["token"],
+        generation=retirement["generation"],
+        settle_status="ended",
+    )
+    receipt = await db.acknowledge_pinned_thread_local_quiescence(
+        owner.id,
+        expected_runtime_generation=retirement["generation"],
+        expected_retirement_token=retirement["token"],
+        expected_agent_id=ids["agent"],
+        expected_attach_token=ids["attach_token"],
+        expected_settle_status="ended",
+        expected_quiescence_protocol="workspace_process_zero_v1",
+        expected_workspace_generation=payload["workspace_generation"],
+        expected_workspace_runtime_incarnation=payload["workspace_runtime_incarnation"],
+    )
+    assert receipt is not None
+    assert payload["workspace_generation"] == binding["generation"]
+    assert payload["workspace_runtime_incarnation"] == resources["pod"].metadata.uid
 
 
 @pytest.mark.asyncio
