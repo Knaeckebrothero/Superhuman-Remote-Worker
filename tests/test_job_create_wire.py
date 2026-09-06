@@ -334,6 +334,96 @@ async def test_project_denial_precedes_creation(wire):
 
 
 @pytest.mark.asyncio
+async def test_readiness_precedes_internal_authority_and_upload_checks(
+    wire, monkeypatch
+):
+    main._enforce_readiness_gate.side_effect = HTTPException(503, "Not ready")
+    upload = Mock()
+    monkeypatch.setattr(main, "authorize_upload_reference", upload)
+    response = await submit(
+        wire,
+        body(parent_job_id=PARENT, upload_id="unread"),
+        **{"x-test-internal": "1"},
+    )
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Not ready"}
+    wire.db.get_job.assert_not_awaited()
+    wire.db.get_user.assert_not_awaited()
+    upload.assert_not_called()
+    wire.db.create_job.assert_not_awaited()
+    wire.provision.assert_not_awaited()
+    wire.dispatch.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_upload_refusal_precedes_project_expert_insert_and_provision(
+    wire, monkeypatch
+):
+    upload = Mock(side_effect=HTTPException(403, "Upload belongs to another user"))
+    monkeypatch.setattr(main, "authorize_upload_reference", upload)
+    response = await submit(
+        wire,
+        body(parent_job_id=PARENT, upload_id="foreign"),
+        **{"x-test-internal": "1"},
+    )
+    assert response.status_code == 403
+    assert response.json() == {"detail": "Upload belongs to another user"}
+    wire.db.get_job.assert_awaited_once_with(PARENT)
+    wire.db.get_user.assert_awaited_once_with(USER)
+    assert upload.call_args.args[0]["id"] == USER
+    wire.db.get_user_role_in_project.assert_not_awaited()
+    wire.db.get_project.assert_not_awaited()
+    wire.expert.assert_not_awaited()
+    wire.db.create_job.assert_not_awaited()
+    wire.provision.assert_not_awaited()
+    wire.dispatch.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_bench_adapter_revalidates_creator_and_preserves_provenance(
+    wire, monkeypatch
+):
+    from orchestrator.routers import bench
+    from orchestrator.security import access, auth
+
+    # Exercise the retained real bench Request bridge and real MCP auth, with
+    # a test-only transport key and external storage/provisioning controlled.
+    monkeypatch.setenv("MCP_INTERNAL_KEY", "bench-fixture-key")
+    monkeypatch.setattr(access, "_INTERNAL_KEY", "bench-fixture-key")
+    monkeypatch.setattr(main, "is_internal_call", access.is_internal_call)
+    monkeypatch.setattr(main, "require_approved_user", auth.require_approved_user)
+    run = {"id": JOB, "created_by": USER, "spec": {"project_id": PROJECT}}
+    task = {"id": "scope-test", "description": "bench admission"}
+    arm = {"name": "baseline", "model": "fixture-model"}
+    result = await bench._create_job_through_main(run, task, arm, 1)
+    assert str(result["id"]) == JOB
+    args = wire.db.create_job.await_args.kwargs
+    assert args["user_id"] == USER and args["project_id"] == PROJECT
+    assert args["datasource_ids"] == []
+    assert args["context"]["bench"] == {
+        "run_id": JOB,
+        "task": "scope-test",
+        "arm": "baseline",
+        "replicate": 1,
+    }
+    assert args["datasource_selection_provenance"]["creation_path"] == "internal_rest"
+    wire.db.create_job.reset_mock()
+    wire.provision.reset_mock()
+    wire.dispatch.reset_mock()
+    wire.db.get_user.return_value["is_approved"] = False
+    with pytest.raises(HTTPException) as exc:
+        await bench._create_job_through_main(run, task, arm, 2)
+    assert exc.value.status_code == 403
+    wire.db.get_user.return_value = None
+    with pytest.raises(HTTPException) as exc:
+        await bench._create_job_through_main(run, task, arm, 3)
+    assert exc.value.status_code == 401
+    wire.db.create_job.assert_not_awaited()
+    wire.provision.assert_not_awaited()
+    wire.dispatch.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_deliverable_contract_survives_http_validation_and_is_bound_before_insert(
     wire,
 ):

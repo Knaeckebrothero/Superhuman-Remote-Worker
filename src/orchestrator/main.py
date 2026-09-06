@@ -10566,6 +10566,12 @@ _PUBLIC_JOB_CONTEXT_RESERVED_KEYS = {
     "vm",
     "workspace_container",
 }
+from orchestrator.services.job_admission_scope import (  # noqa: E402
+    JobAdmissionActor,
+    JobAdmissionScopeDependencies,
+    _INTERNAL_JOB_SCOPE_DENIED,
+    prepare_job_admission_scope,
+)
 from orchestrator.services.job_create_ingress import (  # noqa: E402
     _SERVER_OWNED_OFFICER_CONTEXT_KEYS as _SERVER_OWNED_OFFICER_CONTEXT_KEYS,
     _SERVER_OWNED_RAW_CREATE_CONTEXT_KEYS,
@@ -10589,7 +10595,7 @@ def _strip_public_job_reserved_markers(job: "JobCreate") -> None:
     job.worktree_path = None
     job.delegation_context = None
     # thread_id is derived, never submitted. Only the internal path may set it,
-    # and there it is authenticated: _resolve_internal_job_creation_scope
+    # and there it is authenticated: prepare_job_admission_scope
     # fetches the thread and 403s when it is missing or owned by someone else.
     # The public path never validated it — harmless while the value was merely
     # a datasource-inheritance hint whose lookup failures are swallowed, but
@@ -18643,145 +18649,25 @@ def _with_cloud_review_mode(job: dict[str, Any]) -> dict[str, Any]:
     return job
 
 
-_INTERNAL_JOB_SCOPE_DENIED = "Internal job origin scope is unavailable"
+def _job_admission_scope_dependencies(
+    request: Request,
+) -> JobAdmissionScopeDependencies:
+    """Bind the existing application collaborators without moving their lifecycle."""
+    db = postgres_db
+    authenticate = require_approved_user
 
-
-async def _resolve_internal_job_creation_scope(
-    request: Request, job: JobCreate
-) -> tuple[dict[str, Any] | None, str | None, str | None, bool]:
-    """Derive an internal job's user/project scope from authoritative context.
-
-    ``X-Internal-Key`` authenticates the transport, not the user/project values
-    in a request body. Agent-created jobs therefore inherit identity and allowed
-    projects from ``thread_id`` and/or ``parent_job_id``. A valid MCP forwarded
-    user header is the remaining user-authenticated internal path. Originless
-    internal HTTP calls are rejected: the shared key reaches agent pods, so it
-    cannot establish a privileged "system job" identity. A userless child is
-    valid only when derived from an authoritative userless parent/thread.
-
-    Returns ``(principal, user_id, project_id, origin_bound)``. ``origin_bound``
-    suppresses the normal user-default-project fallback: an unscoped parent or
-    thread must not silently widen into its owner's unrelated default project.
-    """
-
-    def denied() -> HTTPException:
-        return HTTPException(status_code=403, detail=_INTERNAL_JOB_SCOPE_DENIED)
-
-    thread: dict[str, Any] | None = None
-    parent: dict[str, Any] | None = None
-    thread_projects: list[str] = []
-
-    if job.thread_id:
-        try:
-            thread = await postgres_db.get_thread(str(job.thread_id))
-        except Exception as exc:
-            raise denied() from exc
-        if thread is None:
-            raise denied()
-        try:
-            thread_projects = await _thread_project_ids(str(job.thread_id))
-            column_project = thread.get("project_id")
-            if column_project and str(column_project) not in thread_projects:
-                thread_projects.insert(0, str(column_project))
-            # Acknowledged-but-still-unavailable project drift is narrowed
-            # out INSIDE _revalidate_thread_project_ids now, same as the
-            # warm-attach and cold-workspace call sites, so an
-            # already-acknowledged revoked/deleted project does not
-            # spuriously 403 an internal job scoped off this thread — while a
-            # RECOVERED acknowledged project returns automatically.
-            thread_projects = await _revalidate_thread_project_ids(
-                thread, thread_projects
-            )
-        except HTTPException as exc:
-            # An archived project is the one refusal worth naming here. The
-            # generic ``denied()`` exists so a caller cannot learn WHY internal
-            # scope resolution failed, but the archived 409 only ever reaches a
-            # caller who is already a member of that project, so it discloses
-            # nothing — and the agent on the other end can act on "unarchive
-            # it" where "scope is unavailable" leaves it guessing.
-            if exc.status_code == 409:
-                raise
-            raise denied() from exc
-        except Exception as exc:
-            raise denied() from exc
-
-    if job.parent_job_id:
-        try:
-            parent = await postgres_db.get_job(str(job.parent_job_id))
-        except Exception as exc:
-            raise denied() from exc
-        if parent is None:
-            raise denied()
-
-    if thread is not None or parent is not None:
-        thread_user_id = (
-            str(thread["user_id"]) if thread and thread.get("user_id") else None
-        )
-        parent_user_id = (
-            str(parent["user_id"]) if parent and parent.get("user_id") else None
-        )
-        if thread is not None and parent is not None:
-            if thread_user_id != parent_user_id:
-                raise denied()
-        origin_user_id = parent_user_id if parent is not None else thread_user_id
-
-        forwarded_user_id = request.headers.get("X-MCP-User-Id")
-        if forwarded_user_id and str(forwarded_user_id) != str(origin_user_id or ""):
-            raise denied()
-        if job.user_id and str(job.user_id) != str(origin_user_id or ""):
-            raise denied()
-
-        if parent is not None:
-            parent_project = (
-                str(parent["project_id"]) if parent.get("project_id") else None
-            )
-            allowed_projects = {parent_project} if parent_project else set()
-            if thread is not None and parent_project not in set(thread_projects):
-                # Includes an unscoped parent paired with a project-scoped
-                # thread: the parent remains the stricter authority.
-                if parent_project is not None or thread_projects:
-                    raise denied()
-            default_project = parent_project
-        else:
-            allowed_projects = set(thread_projects)
-            column_project = thread.get("project_id") if thread else None
-            default_project = (
-                str(column_project)
-                if column_project and str(column_project) in allowed_projects
-                else (thread_projects[0] if thread_projects else None)
-            )
-
-        requested_project = str(job.project_id) if job.project_id else None
-        if requested_project and requested_project not in allowed_projects:
-            raise denied()
-        effective_project = requested_project or default_project
-
-        principal = None
-        if origin_user_id:
-            principal = await postgres_db.get_user(origin_user_id)
-            if principal is None:
-                raise denied()
-        return principal, origin_user_id, effective_project, True
-
-    # MCP forwards a separately authenticated user identity. Resolve it through
-    # the normal admission path; a bare internal key plus a body user_id is not
-    # equivalent and is rejected below.
-    forwarded_user_id = request.headers.get("X-MCP-User-Id")
-    if forwarded_user_id:
-        principal = await require_approved_user(request, postgres_db)
-        principal_id = str(principal["id"])
-        if job.user_id and str(job.user_id) != principal_id:
-            raise denied()
-        requested_project = str(job.project_id) if job.project_id else None
+    async def authenticate_forwarded_user() -> tuple[dict[str, Any], str | None]:
+        principal = await authenticate(request, db)
         scoped_project = mcp_scope_project_id(principal)
-        if scoped_project is not None:
-            scoped_project_id = str(scoped_project)
-            if requested_project and requested_project != scoped_project_id:
-                raise denied()
-            requested_project = requested_project or scoped_project_id
-        return principal, principal_id, requested_project, False
+        return principal, str(scoped_project) if scoped_project is not None else None
 
-    raise denied()
+    return JobAdmissionScopeDependencies(
+        store=db,
+        thread_project_ids=_thread_project_ids,
+        revalidate_thread_project_ids=_revalidate_thread_project_ids,
+        authenticate_forwarded_user=authenticate_forwarded_user,
+        authorize_upload_reference=authorize_upload_reference,
+    )
 
 
 async def _require_job_project_access(
@@ -18946,69 +18832,20 @@ async def create_job(request: Request, job: PublicJobCreateBody) -> dict[str, An
     job.config_override = _with_validated_tool_overrides(job.config_override)
     await _enforce_readiness_gate()
     try:
-        # Merge upload IDs into context
-        context = dict(job.context) if job.context else {}
-        if job.upload_id:
-            context["upload_id"] = job.upload_id
-        if job.config_upload_id:
-            context["config_upload_id"] = job.config_upload_id
-        if job.instructions_upload_id:
-            context["instructions_upload_id"] = job.instructions_upload_id
-        if job.instructions:
-            context["instructions"] = job.instructions
-        if job.kickoff_message:
-            context["kickoff_message"] = job.kickoff_message
-        if job.required_deliverables:
-            # Deliverable contract (P1-C): normalize + dedupe into context.
-            # The dispatcher forwards context to the agent's task brief and the
-            # completion gate validates the seal against committed Gitea state.
-            from shared.deliverable_contract import parse_required_deliverables
-
-            manifest = parse_required_deliverables(
-                job.required_deliverables, strict=True
-            )
-            if manifest:
-                context["required_deliverables"] = manifest
-
-        # Internal transport authentication is not user authorization. Derive
-        # agent-created job identity/scope from the originating thread/parent
-        # (or an authenticated MCP-forwarded user), never from body user/project
-        # fields. Even userless system children must have a server-resolved
-        # parent/thread; a bare shared-key HTTP request is never a principal.
-        internal_origin_bound = False
-        internal_principal: dict[str, Any] | None = None
-        if internal_call:
-            (
-                internal_principal,
-                effective_user_id,
-                scoped_project_id,
-                internal_origin_bound,
-            ) = await _resolve_internal_job_creation_scope(request, job)
-        else:
-            internal_principal = caller
-            effective_user_id = job.user_id
-            scoped_project_id = str(job.project_id) if job.project_id else None
-
-        # Uploads are bound to their creator (uploads.py). Every upload this
-        # job references — the three body fields merged above, or the same
-        # keys arriving through ``context`` — must belong to the principal
-        # the job runs as, checked here before anything is persisted or
-        # dispatched: the agent later loads ``config_upload_id`` as its own
-        # config, so a foreign id would run someone else's YAML under this
-        # user. Admins reach any upload; legacy uploads with no recorded
-        # owner are admin-only. Only a userless system child (internal
-        # origin that resolved to no user at all) is exempt — there is no
-        # identity to check against, and the runtime's own download path is
-        # internal-key-only for the same reason.
-        upload_principal = internal_principal if internal_call else caller
-        for upload_key in ("upload_id", "config_upload_id", "instructions_upload_id"):
-            referenced_upload = context.get(upload_key)
-            if referenced_upload:
-                authorize_upload_reference(
-                    upload_principal,
-                    str(referenced_upload),
-                    internal=internal_call and upload_principal is None,
-                )
+        scope = await prepare_job_admission_scope(
+            command=job,
+            actor=JobAdmissionActor(
+                principal=caller,
+                forwarded_user_id=request.headers.get("X-MCP-User-Id"),
+            ),
+            origin="internal_rest" if internal_call else "user_rest",
+            dependencies=_job_admission_scope_dependencies(request),
+        )
+        context = scope.context
+        internal_principal = scope.principal
+        effective_user_id = scope.user_id
+        scoped_project_id = scope.project_id
+        internal_origin_bound = scope.origin_bound
 
         # Resolve project_id: authoritative internal origin / public request,
         # then the user's default only when no thread/parent constrained scope.
@@ -19662,7 +19499,7 @@ async def create_job(request: Request, job: PublicJobCreateBody) -> dict[str, An
             delivery_contract_record = None
 
         # Session ↔ job backref. `job.thread_id` is authenticated on the
-        # internal path (_resolve_internal_job_creation_scope 403s on a thread
+        # internal path (prepare_job_admission_scope 403s on a thread
         # that is missing or owned by someone else) and forced to None on the
         # public path by _strip_public_job_reserved_markers — so persisting it
         # here cannot be steered from a request body.
@@ -50728,7 +50565,7 @@ async def _classify_thread_project_ids(
     ``archived`` is the lifecycle verdict (§4.3 of
     knowledge-base/knowledge/features/project_and_job_list_filtering.md). This
     funnel is the only path thread creation takes, and — for free — the one
-    ``_resolve_internal_job_creation_scope`` takes for agent-spawned subjobs,
+    ``prepare_job_admission_scope`` takes for agent-spawned subjobs,
     so extending it here covers both rather than inventing a parallel check.
     It ranks BELOW authorization: a caller with no membership still learns
     only ``revoked``, never that the project happens to be archived. The
