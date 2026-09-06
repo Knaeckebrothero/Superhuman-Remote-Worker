@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace as NS
+from unittest.mock import MagicMock
 from uuid import uuid4
 
 import asyncpg
@@ -12,6 +13,7 @@ import pytest
 from orchestrator import main
 from orchestrator.services.agent_provisioner import AgentProvisioner
 from orchestrator.services.pinned_k8s_effect import PINNED_AUTHORITY_FINALIZER
+from orchestrator.services.session_router import SessionRouterService
 from shared.persistent_input_delivery import (
     mark_input_delivery_queued,
     persist_input_delivery,
@@ -234,6 +236,24 @@ async def _scenario(
     provider._core_api = k8s
     monkeypatch.setattr(main, "postgres_db", db)
     monkeypatch.setattr(main, "agent_provisioner", provider)
+    # The stopped actor's route is already absent. Keep route teardown on
+    # injected APIs so this SQL/Kubernetes model never reads ambient kubeconfig.
+    core_api = MagicMock()
+    networking_api = MagicMock()
+    core_api.read_namespaced_service.side_effect = authority_fixtures._K8sError(404)
+    networking_api.read_namespaced_ingress.side_effect = authority_fixtures._K8sError(
+        404
+    )
+    monkeypatch.setattr(
+        main,
+        "session_router",
+        SessionRouterService(
+            namespace="agents-a",
+            ingress_host="unused.example",
+            core_api=core_api,
+            networking_api=networking_api,
+        ),
+    )
 
     soft = await db.begin_pinned_thread_retirement(ids["thread"], permanent=False)
     await _authorize_and_ack(db, old, soft)

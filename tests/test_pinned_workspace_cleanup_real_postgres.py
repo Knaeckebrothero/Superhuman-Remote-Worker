@@ -191,12 +191,17 @@ async def test_delivered_pinned_workspace_generation_can_ack_retirement(
             )
         ),
     )
+    # Credential resolution is independent of the workspace-generation wire
+    # contract. Preserve the config without constructing live provider clients.
+    inject_credentials = AsyncMock(side_effect=lambda config, **_kwargs: config)
+    monkeypatch.setattr(main, "_inject_thread_dispatch_credentials", inject_credentials)
     payload = await main._agent_get_thread_workspace_locked(
         owner.id,
         presented_agent_id=ids["agent"],
         presented_runtime_generation=str(thread["runtime_generation"]),
         presented_attach_token=ids["attach_token"],
     )
+    inject_credentials.assert_awaited_once()
     retirement = await db.begin_pinned_thread_retirement(owner.id, permanent=False)
     assert await db.authorize_pinned_thread_retirement(
         owner.id,
