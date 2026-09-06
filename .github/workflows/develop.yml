@@ -49,8 +49,45 @@ env:
   SRW_RELEASE_VERSION: 0.0.0-dev.sha-${{ github.sha }}
 
 jobs:
+  # These are separate runtime environments; the combined unit environment below
+  # cannot validate either image's dependency closure/Python target.
+  dependency-locks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - role: orchestrator
+            python: "3.11"
+            lock: requirements/locks/orchestrator-py311.txt
+          - role: vm-controller
+            python: "3.12"
+            lock: requirements/locks/vm-controller-py312.txt
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Check dependency input and lock drift
+        run: python scripts/lock_dependencies.py check
+      - name: Install the role in a clean environment
+        run: |
+          python -m venv .role-venv
+          .role-venv/bin/python -m pip install --require-hashes -r ${{ matrix.lock }}
+          .role-venv/bin/python -m pip check
+      - name: Verify installed pins and SDK authentication
+        run: |
+          .role-venv/bin/python scripts/lock_dependencies.py check ${{ matrix.role }} --installed
+          .role-venv/bin/python -I scripts/check_kubernetes_sdk_auth.py
+
   # Package boundaries are checked on the exact revision used by builds/tests.
   architecture:
+    needs: [dependency-locks]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -660,7 +697,7 @@ jobs:
             'docker/prepare-tokenizer-cache.py' \
             'cockpit/angular.json' 'docker/cockpit-nginx.conf' \
             'docker/Dockerfile.cockpit' \
-            'requirements.txt' 'requirements-dev.txt' 'pyproject.toml' '.squawk.toml' \
+            'requirements.txt' 'requirements-dev.txt' 'requirements/' 'pyproject.toml' '.squawk.toml' \
             | grep -q .; then
             echo "python=true" >> "$GITHUB_OUTPUT"
           else
@@ -795,7 +832,7 @@ jobs:
             .dockerignore docker/Dockerfile.agent docker/prepare-tokenizer-cache.py)
           ORCHESTRATOR_PATHS=(src/orchestrator/ src/shared/ config/ pyproject.toml
             .dockerignore docker/Dockerfile.orchestrator
-            scripts/check_kubernetes_sdk_auth.py)
+            scripts/check_kubernetes_sdk_auth.py requirements/ scripts/lock_dependencies.py)
           COCKPIT_PATHS=(cockpit/ .dockerignore docker/Dockerfile.cockpit
             docker/cockpit-nginx.conf docker/cockpit-canvas-env.sh)
           MCP_PATHS=(src/mcp_server/ src/shared/ pyproject.toml
@@ -803,7 +840,7 @@ jobs:
           VM_CONTROLLER_PATHS=(src/vm_controller/ src/shared/__init__.py
             src/shared/vm_lifecycle_auth.py pyproject.toml
             .dockerignore docker/Dockerfile.vm-controller
-            scripts/check_kubernetes_sdk_auth.py)
+            scripts/check_kubernetes_sdk_auth.py requirements/ scripts/lock_dependencies.py)
           # docker/browser-exec is COPY'd into the workspace image at build time
           # (see Dockerfile.workspace §2c), so changes to it must rebuild the
           # workspace image. Missing this path caused a0ce92d2's browser-exec
@@ -970,6 +1007,8 @@ jobs:
         run: uv pip install --system -r requirements.txt -r src/orchestrator/requirements.txt -r src/mcp_server/requirements.txt -r requirements-dev.txt pytest pytest-asyncio
       - name: Install editable application packages
         run: pip install --no-deps -e .
+      - name: Check combined test environment compatibility
+        run: python -m pip check
       # `changes` narrowed this to the test files the diff can reach; the fallback
       # covers a dispatch, where selection is skipped on purpose, and any path
       # where the output is unset. loadfile keeps each selected file on one worker.

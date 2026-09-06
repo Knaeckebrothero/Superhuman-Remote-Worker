@@ -15,13 +15,18 @@ ENV PYTHONSAFEPATH=1
 
 WORKDIR /app
 
-COPY src/vm_controller/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements/ ./requirements/
+COPY scripts/lock_dependencies.py ./scripts/
+COPY src/vm_controller/requirements.txt ./src/vm_controller/requirements.txt
+RUN python scripts/lock_dependencies.py check vm-controller \
+    && pip install --no-cache-dir --require-hashes -r requirements/locks/vm-controller-py312.txt
 
 COPY src/vm_controller/ ./src/vm_controller/
 COPY src/shared/__init__.py src/shared/vm_lifecycle_auth.py ./src/shared/
 COPY pyproject.toml ./
 RUN pip install --no-cache-dir --no-deps -e .
+RUN --network=none python -I scripts/lock_dependencies.py check vm-controller --installed \
+    && python -m pip check
 
 # Check generated SDK auth and token refresh in this final installed environment.
 # The bind mount is build-only; the probe never reads credentials or uses a network.

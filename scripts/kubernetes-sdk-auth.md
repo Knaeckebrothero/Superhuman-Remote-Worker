@@ -51,5 +51,6 @@ suppress publication, break copying, drop copied auth or refresh, and share a
 mutable auth mapping. Restoration is checked after success and failures. The
 check verifies header
 construction and refresh; it does not verify cluster connectivity, TLS, RBAC or
-server API compatibility. Dependency version policy remains in each role's
-requirements file.
+server API compatibility. Both roles consume the shared SDK constraint and
+separate hashed dependency locks described in
+[the dependency update workflow](../requirements/README.md).

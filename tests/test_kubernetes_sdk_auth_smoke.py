@@ -114,8 +114,8 @@ def test_negative_control_rejects_auth_that_bypasses_the_configuration(tmp_path)
         tmp_path,
         """
 original_auth = client.ApiClient.update_params_for_auth
-def retain_header(self, headers, queries, auth_settings):
-    original_auth(self, headers, queries, auth_settings)
+def retain_header(self, headers, queries, auth_settings, *args, **kwargs):
+    original_auth(self, headers, queries, auth_settings, *args, **kwargs)
     if "authorization" in headers:
         self.fixture_retained_auth = headers["authorization"]
     else:
@@ -186,8 +186,8 @@ def retain_default_header(self, *args, **kwargs):
         return
     instance = self.api_client
     original_auth = instance.update_params_for_auth
-    def retain_header(headers, queries, auth_settings):
-        original_auth(headers, queries, auth_settings)
+    def retain_header(headers, queries, auth_settings, *args, **kwargs):
+        original_auth(headers, queries, auth_settings, *args, **kwargs)
         if "authorization" in headers:
             instance.fixture_retained_auth = headers["authorization"]
         else:

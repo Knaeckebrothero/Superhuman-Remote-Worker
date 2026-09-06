@@ -23,8 +23,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-COPY src/orchestrator/requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt
+COPY requirements/ ./requirements/
+COPY scripts/lock_dependencies.py ./scripts/
+COPY src/orchestrator/requirements.txt ./src/orchestrator/requirements.txt
+RUN python scripts/lock_dependencies.py check orchestrator \
+    && pip install --no-cache-dir --require-hashes -r requirements/locks/orchestrator-py311.txt
 
 # -----------------------------------------------------------------------------
 # Dev runtime
@@ -60,6 +63,12 @@ COPY src/shared/ /app/src/shared/
 COPY config/ /app/config/
 COPY pyproject.toml /app/
 RUN pip install --no-cache-dir --no-deps -e .
+
+RUN --network=none \
+    --mount=type=bind,source=requirements,target=/app/requirements \
+    --mount=type=bind,source=scripts/lock_dependencies.py,target=/app/scripts/lock_dependencies.py \
+    python -I /app/scripts/lock_dependencies.py check orchestrator --installed \
+    && python -m pip check
 
 # Check generated SDK auth and token refresh in this final installed environment.
 # The bind mount is build-only; the probe never reads credentials or uses a network.

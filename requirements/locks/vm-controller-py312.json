@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "role": "vm-controller",
+  "python": "3.12",
+  "platform": "linux/amd64",
+  "inputs": {
+    "requirements/constraints.txt": "4743d447d0a6fbceec4c8edef0409c3bd8d38e7337fbbf9d1a3b1ed7a4b12135",
+    "requirements/lock-tools.txt": "9219192bf61e8af976d040e208d364dbfa6cf2758d8724ff9fe02672e9c4d7d7",
+    "scripts/lock_dependencies.py": "7056c7d9add464d8e8004f2436b38aa882ded8da212a574c120d8bcfb352a4ca",
+    "src/vm_controller/requirements.txt": "685e36be6d864031dfa058a10b56bbef27fbe68a93cb31e03933a0a8ed6bb278"
+  },
+  "lock_sha256": "cc6e7291f23d599c559e1a957497d377d2c7980381aa15f9c2a28f6b31ecb66a"
+}

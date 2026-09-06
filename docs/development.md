@@ -53,6 +53,11 @@ application packages are present in the checkout or image. `src/` is a source
 root, not an import package; imports use `agent`, `orchestrator`, `mcp_server`,
 `vm_controller`, or `shared` without adding `PYTHONPATH` entries.
 
+For an environment matching the deployed orchestrator or controller, use the
+[role dependency locks](../requirements/README.md), including their Python and
+platform targets. The combined Python 3.12 developer/test environment above uses
+the declarations and shared constraints; it does not combine the role locks.
+
 PDF processing also needs Poppler:
 
 ```bash

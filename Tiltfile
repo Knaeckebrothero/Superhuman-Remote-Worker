@@ -75,11 +75,15 @@ docker_build(
         '.dockerignore',
         'docker/Dockerfile.orchestrator.dev',
         'scripts/check_kubernetes_sdk_auth.py',
+        'requirements/',
+        'scripts/lock_dependencies.py',
     ],
     live_update=[
         fall_back_on([
             'docker/Dockerfile.orchestrator.dev',
             'scripts/check_kubernetes_sdk_auth.py',
+            'requirements/',
+            'scripts/lock_dependencies.py',
             'src/orchestrator/requirements.txt',
             'pyproject.toml',
             '.dockerignore',
@@ -339,6 +343,8 @@ docker_build(
         '.dockerignore',
         'docker/Dockerfile.vm-controller',
         'scripts/check_kubernetes_sdk_auth.py',
+        'requirements/',
+        'scripts/lock_dependencies.py',
     ],
     ignore=['**/__pycache__', '**/*.pyc'],
 )

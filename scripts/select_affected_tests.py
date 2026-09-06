@@ -76,6 +76,8 @@ FULL_SUITE_TRIGGERS = (
     "tox.ini",
     "requirements.txt",
     "requirements-dev.txt",
+    "requirements/",
+    "scripts/lock_dependencies.py",
     "src/orchestrator/requirements.txt",
     "src/mcp_server/requirements.txt",
     "src/vm_controller/requirements.txt",
