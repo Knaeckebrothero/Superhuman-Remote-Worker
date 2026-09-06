@@ -2123,6 +2123,7 @@ async def test_permanent_delete_reclaims_same_generation_retained_k8s_pvc(db):
         capture_snapshot=True,
         strict=True,
         teardown_identity=identity,
+        pinned_retirement=permanent,
     )
     await db.delete_thread(
         ids["thread"],

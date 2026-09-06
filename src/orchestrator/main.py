@@ -13268,12 +13268,13 @@ async def _cleanup_pinned_thread_retirement(
     elif backend == "sandbox" and sandbox_identity_present:
         if not container_provisioner.is_available:
             raise RuntimeError("Kubernetes workspace cleanup is unavailable")
+        captured_runtime = str(ws.get(WORKSPACE_RUNTIME_INCARNATION_KEY) or "")
         workspace_identity = (
             await container_provisioner.capture_workspace_teardown_identity(
-                WorkspaceOwner.session(thread_id)
+                WorkspaceOwner.session(thread_id),
+                expected_runtime_incarnation=captured_runtime or None,
             )
         )
-        captured_runtime = str(ws.get(WORKSPACE_RUNTIME_INCARNATION_KEY) or "")
         captured_generation = str(binding.get("generation") or "")
         captured_backing = str(binding.get("backing_id") or "")
         retained_pvc_uid = str(retained_soft_workspace.get("pvc_uid") or "")
@@ -13334,7 +13335,7 @@ async def _cleanup_pinned_thread_retirement(
                 or captured_runtime
                 or workspace_identity.pod_uid is not None
                 or workspace_identity.service_uid is not None
-                or workspace_identity.pvc_uid != retained_pvc_uid
+                or workspace_identity.pvc_uid not in (None, retained_pvc_uid)
             ):
                 raise RuntimeError(
                     "retained Kubernetes workspace authority changed before deletion"
@@ -13363,7 +13364,7 @@ async def _cleanup_pinned_thread_retirement(
             # A present same-name PVC must still be the exact captured UID.
             # Absence is an idempotent replay after an earlier exact release
             # deleted the volume but a later retirement obligation remained
-            # retryable; _release_captured_workspace rechecks Pod absence and
+            # retryable; pinned release rechecks Pod absence and
             # never adopts a deterministic-name successor.
             raise RuntimeError("workspace PVC identity changed before retirement")
         released = await container_provisioner.release_workspace(
@@ -13372,6 +13373,7 @@ async def _cleanup_pinned_thread_retirement(
             capture_snapshot=True,
             strict=True,
             teardown_identity=workspace_identity,
+            pinned_retirement=retirement,
         )
         if not released:
             raise RuntimeError("exact Kubernetes workspace cleanup is retryable")

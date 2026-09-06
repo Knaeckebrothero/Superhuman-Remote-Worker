@@ -12420,6 +12420,83 @@ class PostgresDB:
                 )
                 return result == "UPDATE 1"
 
+    async def get_pinned_workspace_cleanup_authority(
+        self,
+        thread_id: str,
+        *,
+        runtime_generation: str,
+        retirement_token: str,
+    ) -> dict[str, Any] | None:
+        """Read exact authorized pinned cleanup, including its genuine zero receipt.
+
+        The caller holds the thread advisory lock across external cleanup and
+        settlement. Pinned G/T closes admission; the non-pinned cleanup ledger
+        deliberately cannot grant this authority. A saved repository-process
+        receipt remains replayable under this same G/T after endpoint clearing.
+        """
+
+        try:
+            thread_uuid = UUID(str(thread_id))
+            generation_uuid = UUID(str(runtime_generation))
+            token_uuid = UUID(str(retirement_token))
+        except (TypeError, ValueError):
+            return None
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT metadata, runtime_retirement_context AS context,
+                       runtime_retirement_local_quiescence AS local_quiescence,
+                       runtime_retirement_permanent AS permanent,
+                       EXISTS (
+                           SELECT 1 FROM managed_repository_process_zero_receipts r
+                            WHERE r.owner_kind='thread' AND r.owner_id=threads.id
+                              AND r.scope='workspace_container' AND r.provisioner='k8s'
+                              AND r.runtime_incarnation=runtime_retirement_context
+                                  #>>'{workspace_container,_runtime_incarnation}'
+                       ) AS process_zero
+                  FROM threads
+                 WHERE id=$1 AND execution_lane='pinned'
+                   AND runtime_generation=$2 AND runtime_retirement_token=$3
+                   AND runtime_retirement_authorized_at IS NOT NULL
+                """,
+                thread_uuid,
+                generation_uuid,
+                token_uuid,
+            )
+        if row is None:
+            return None
+        result = dict(row)
+        try:
+            for key in ("metadata", "context", "local_quiescence"):
+                result[key] = _strict_json_object(
+                    {} if result[key] is None else result[key], label=key
+                )
+        except RuntimeError:
+            return None
+        context = result["context"]
+        local_zero = _pinned_retirement_local_quiescence_matches(
+            context,
+            result["local_quiescence"],
+            runtime_generation=generation_uuid,
+            retirement_token=token_uuid,
+            final_status=str(context.get("settle_status") or ""),
+            permanent=result["permanent"],
+        )
+        prior_zero = bool(
+            not local_zero
+            and result["permanent"]
+            and await self.pinned_thread_has_prior_soft_settlement(
+                thread_id,
+                runtime_generation=runtime_generation,
+                retirement_token=retirement_token,
+            )
+        )
+        if context.get("workspace_backend") != "sandbox" or not (
+            local_zero or prior_zero
+        ):
+            return None
+        return result
+
     async def pinned_retirement_external_cleanup_complete(
         self,
         thread_id: str,

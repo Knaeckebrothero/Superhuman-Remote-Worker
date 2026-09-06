@@ -7884,6 +7884,7 @@ class ContainerProvisioner:
         strict: bool = False,
         teardown_identity: WorkspaceTeardownIdentity | None = None,
         exact_absence_timeout_seconds: float = 30.0,
+        pinned_retirement: Mapping[str, Any] | None = None,
     ) -> bool:
         """Snapshot a workspace to S3, then delete the pod (and, by default, its PVC).
 
@@ -7903,6 +7904,9 @@ class ContainerProvisioner:
                 UID absent after Kubernetes accepts a strict delete. Existing
                 callers retain the historical 30-second bound; captured S36
                 supplies 45 seconds around its explicit 10-second grace.
+            pinned_retirement: Exact Begin context and G/T for the pinned End
+                flow, which holds the thread advisory lock through settlement.
+                Uses pinned process-zero cleanup and best-effort snapshots.
 
         The headless Service is dropped either way: it is 409-idempotent to
         recreate on the next ``create_workspace``, so unlike the volume it costs
@@ -7913,6 +7917,18 @@ class ContainerProvisioner:
         """
         if not self._k8s_available:
             return False
+
+        if pinned_retirement is not None:
+            if teardown_identity is None or not strict or require_snapshot:
+                return False
+            return await self._release_pinned_retirement_workspace(
+                owner,
+                teardown_identity,
+                retirement=pinned_retirement,
+                reclaim_volume=reclaim_volume,
+                capture_snapshot=capture_snapshot,
+                exact_absence_timeout_seconds=exact_absence_timeout_seconds,
+            )
 
         if teardown_identity is not None:
             return await self._release_captured_workspace(
@@ -8067,6 +8083,161 @@ class ContainerProvisioner:
             expected_runtime_incarnation=effective_runtime_incarnation,
             strict=strict,
         )
+
+    async def _release_pinned_retirement_workspace(
+        self,
+        owner: WorkspaceOwner,
+        identity: WorkspaceTeardownIdentity,
+        *,
+        retirement: Mapping[str, Any],
+        reclaim_volume: bool,
+        capture_snapshot: bool,
+        exact_absence_timeout_seconds: float,
+    ) -> bool:
+        """Release a pinned sandbox under its existing immutable G/T authority.
+
+        The End flow holds the thread advisory lock, validates the captured
+        backing, and settles only after this grouped release. Keep the pinned
+        Pod finalizer/process-zero actuator; S36 intents serve non-pinned work.
+        """
+
+        if owner.kind != "session" or self._db is None:
+            return False
+
+        async def current() -> dict[str, Any] | None:
+            authority = await self._db.get_pinned_workspace_cleanup_authority(
+                owner.id,
+                runtime_generation=str(retirement.get("generation") or ""),
+                retirement_token=str(retirement.get("token") or ""),
+            )
+            if (
+                authority is None
+                or authority["context"] != retirement.get("context")
+                or authority["permanent"] != reclaim_volume
+                or bool(retirement.get("permanent")) != reclaim_volume
+            ):
+                return None
+            return authority
+
+        authority = await current()
+        if authority is None:
+            return False
+        context = authority["context"]
+        workspace = context.get("workspace_container") or {}
+        binding = context.get("workspace_binding") or {}
+        runtime = workspace.get(WORKSPACE_RUNTIME_INCARNATION_KEY)
+        retained = context.get("retained_soft_workspace") or {}
+        if (
+            workspace.get("provisioner") != "k8s"
+            or workspace.get("namespace") != self._namespace
+        ):
+            return False
+        if identity.pod_uid not in (None, runtime):
+            return False
+        if identity.pvc_uid is not None and binding.get("backing_id") != (
+            f"k8s-pvc:{self._namespace}:{identity.pvc_uid}"
+        ):
+            return False
+        if runtime is None:
+            # A same-generation soft outcome is the only authority for a
+            # Pod-less retained PVC. Never infer process zero from Pod 404.
+            if (
+                not reclaim_volume
+                or not retained
+                or context.get("entry_status") != "ended"
+                or retained.get("pvc_uid")
+                != binding.get("backing_id", "").rsplit(":", 1)[-1]
+                or identity.service_uid is not None
+                or not await self._captured_teardown_pod_is_absent(owner)
+            ):
+                return False
+        else:
+            pod_authority = await self.workspace_pod_authority(
+                owner, expected_runtime_incarnation=runtime
+            )
+            if pod_authority in {"unknown", "replacement"}:
+                return False
+            if pod_authority == "exact_absent":
+                if not authority["process_zero"]:
+                    return False
+                if not await self._delete_seed_configmap(
+                    owner.pod_name, expected_owner=owner, expected_pod_uid=runtime
+                ):
+                    return False
+            else:
+                if (
+                    capture_snapshot
+                    and self._snapshot_service
+                    and self._snapshot_service.is_available
+                    and pod_authority == "exact_live"
+                    and binding.get("ssh_host_key_fingerprint")
+                ):
+                    status = await self.get_workspace_status(owner)
+                    if not status or status.get("runtime_incarnation") != runtime:
+                        return False
+                    if status.get("ready") and status.get("pod_ip"):
+                        try:
+                            await self._snapshot_service.capture_vm_snapshot(
+                                job_id=owner.id,
+                                ssh_host=status["pod_ip"],
+                                ssh_port=30022,
+                                source_type="pod",
+                                entity_type="threads",
+                                expected_host_key_fingerprint=binding.get(
+                                    "ssh_host_key_fingerprint"
+                                ),
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Pinned workspace snapshot failed for %s", owner.id
+                            )
+                if (
+                    not await current()
+                    or not await self._delete_pinned_workspace_legacy(
+                        owner,
+                        expected_runtime_incarnation=runtime,
+                        captured_teardown_uid=runtime,
+                        wait_for_exact_absence=True,
+                        exact_absence_timeout_seconds=exact_absence_timeout_seconds,
+                        defer_context_clear=True,
+                    )
+                ):
+                    return False
+
+        # Recheck the whole group after Pod deletion and before each shared
+        # effect. Same-name successors and a changed G/T always retain it.
+        if not await current() or not await self._captured_teardown_pod_is_absent(
+            owner
+        ):
+            return False
+        if reclaim_volume and identity.pvc_uid is not None:
+            if not await self.delete_workspace_pvc(
+                owner, require_exact_owner=True, expected_uid=identity.pvc_uid
+            ):
+                return False
+        if not await current() or not await self._captured_teardown_pod_is_absent(
+            owner
+        ):
+            return False
+        if identity.service_uid is not None:
+            if not await self._delete_service(
+                owner, require_exact_owner=True, expected_uid=identity.service_uid
+            ):
+                return False
+        if not await current():
+            return False
+        # Leave the original endpoint durable on every partial failure. This
+        # last projection is retryable from the same G/T and saved zero receipt.
+        cleared = await self._set_context(
+            owner,
+            {
+                "status": "deleted",
+                "pod_ip": None,
+                WORKSPACE_RUNTIME_INCARNATION_KEY: None,
+            },
+        )
+        await workspace_metering.close_interval(self._db, owner)
+        return cleared
 
     async def _release_captured_workspace(
         self,
