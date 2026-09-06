@@ -208,7 +208,7 @@ async function openFileCanvas(
   outerSelector: string,
   markerSelector: string,
 ): Promise<void> {
-  await page.goto(WRAPPER_PATH, {waitUntil: 'domcontentloaded'});
+  await page.goto(WRAPPER_PATH, {waitUntil: 'load'});
   await expect(page.locator(outerSelector)).toBeVisible();
   await expect(
     page.frameLocator(outerSelector).frameLocator('iframe').locator(markerSelector),

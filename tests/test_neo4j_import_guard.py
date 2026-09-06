@@ -33,9 +33,10 @@ _BLOCK_NEO4J = (
 )
 
 
-def _run(code: str, extra_path: str = "") -> subprocess.CompletedProcess:
+def _run(code: str) -> subprocess.CompletedProcess:
     env = dict(os.environ)
-    env["PYTHONPATH"] = REPO_ROOT + (os.pathsep + extra_path if extra_path else "")
+    env.pop("PYTHONPATH", None)
+    env["PYTHONSAFEPATH"] = "1"
     return subprocess.run(
         [sys.executable, "-c", code],
         capture_output=True,
@@ -49,21 +50,23 @@ def _run(code: str, extra_path: str = "") -> subprocess.CompletedProcess:
 class TestImportChainWithoutNeo4j:
     def test_chunker_imports_without_neo4j(self):
         """The PR2 chunker (under src.tools) must import on a neo4j-less image."""
-        proc = _run(_BLOCK_NEO4J + "import src.tools.knowledge.chunker; print('OK')")
+        proc = _run(
+            _BLOCK_NEO4J + "import shared.runtime.knowledge.chunker; print('OK')"
+        )
         assert proc.returncode == 0, proc.stderr
         assert "OK" in proc.stdout
 
     def test_tools_package_imports_without_neo4j(self):
         """The eager registry chain in src/tools/__init__ must survive."""
-        proc = _run(_BLOCK_NEO4J + "import src.tools; print('OK')")
+        proc = _run(_BLOCK_NEO4J + "import agent.tools; print('OK')")
         assert proc.returncode == 0, proc.stderr
         assert "OK" in proc.stdout
 
     def test_kb_reindex_imports_without_neo4j(self):
         """services.kb_reindex (the sweeper's import) must be deterministic."""
         proc = _run(
-            _BLOCK_NEO4J + "from services.kb_reindex import reindex_kb; print('OK')",
-            extra_path=os.path.join(REPO_ROOT, "orchestrator"),
+            _BLOCK_NEO4J
+            + "from orchestrator.services.kb_reindex import reindex_kb; print('OK')",
         )
         assert proc.returncode == 0, proc.stderr
         assert "OK" in proc.stdout
@@ -73,14 +76,15 @@ class TestImportChainWithoutNeo4j:
         proc = _run(
             _BLOCK_NEO4J
             + (
-                "first = None\n"
-                "try:\n"
-                "    import src.tools.knowledge.chunker\n"
-                "    first = 'ok'\n"
-                "except Exception as e:\n"
-                "    first = type(e).__name__\n"
-                "import src.tools.knowledge.chunker\n"
-                "print('first=' + first + ' retry=ok')\n"
+                """first = None
+try:
+    import shared.runtime.knowledge.chunker
+    first = 'ok'
+except Exception as e:
+    first = type(e).__name__
+import shared.runtime.knowledge.chunker
+print('first=' + first + ' retry=ok')
+"""
             )
         )
         assert proc.returncode == 0, proc.stderr
@@ -90,7 +94,7 @@ class TestImportChainWithoutNeo4j:
 class TestNeo4jDbConstructionGuard:
     def test_construction_raises_without_driver(self, monkeypatch):
         """With the package absent the failure moves to Neo4jDB(...) — loudly."""
-        import src.database.neo4j_db as neo4j_db
+        import shared.runtime.database.neo4j_db as neo4j_db
 
         monkeypatch.setattr(neo4j_db, "GraphDatabase", None)
         with pytest.raises(RuntimeError, match="neo4j"):
@@ -99,7 +103,7 @@ class TestNeo4jDbConstructionGuard:
 
 class TestWorkerKnowledgeSetupWithoutNeo4j:
     def test_external_only_scope_initializes_store_without_graph(self):
-        from src.agent import UniversalAgent
+        from agent.agent import UniversalAgent
 
         agent = UniversalAgent.__new__(UniversalAgent)
         agent.vector_conn = MagicMock(name="vector_conn")
@@ -117,12 +121,14 @@ class TestWorkerKnowledgeSetupWithoutNeo4j:
         knowledge_store = MagicMock(name="knowledge_store")
 
         with (
-            patch("src.services.embedding_service.get_kb_embedding_service"),
+            patch("shared.runtime.services.embedding_service.get_kb_embedding_service"),
             patch(
-                "src.services.knowledge_store.KnowledgeStore",
+                "shared.runtime.services.knowledge_store.KnowledgeStore",
                 return_value=knowledge_store,
             ),
-            patch("src.services.knowledge_graph.KnowledgeGraphDB") as graph_cls,
+            patch(
+                "shared.runtime.services.knowledge_graph.KnowledgeGraphDB"
+            ) as graph_cls,
         ):
             agent._setup_job_knowledge(context, None)
 
@@ -131,7 +137,7 @@ class TestWorkerKnowledgeSetupWithoutNeo4j:
 
     def test_vector_store_is_available_when_graph_connection_fails(self):
         """Neo4j failure disables graph features, not pgvector KB tools."""
-        from src.agent import UniversalAgent
+        from agent.agent import UniversalAgent
 
         agent = UniversalAgent.__new__(UniversalAgent)
         agent.vector_conn = MagicMock(name="vector_conn")
@@ -152,15 +158,15 @@ class TestWorkerKnowledgeSetupWithoutNeo4j:
 
         with (
             patch(
-                "src.services.embedding_service.get_kb_embedding_service",
+                "shared.runtime.services.embedding_service.get_kb_embedding_service",
                 return_value=embedding_service,
             ),
             patch(
-                "src.services.knowledge_store.KnowledgeStore",
+                "shared.runtime.services.knowledge_store.KnowledgeStore",
                 return_value=knowledge_store,
             ) as store_cls,
             patch(
-                "src.services.knowledge_graph.KnowledgeGraphDB",
+                "shared.runtime.services.knowledge_graph.KnowledgeGraphDB",
                 return_value=knowledge_graph,
             ),
         ):
@@ -178,7 +184,7 @@ class TestWorkerKnowledgeSetupWithoutNeo4j:
 
     def test_missing_vector_connection_marks_store_degraded(self):
         """A genuinely unavailable retrieval store still fails honestly."""
-        from src.agent import UniversalAgent
+        from agent.agent import UniversalAgent
 
         agent = UniversalAgent.__new__(UniversalAgent)
         agent.vector_conn = None
@@ -195,9 +201,9 @@ class TestWorkerKnowledgeSetupWithoutNeo4j:
         knowledge_graph.connect.return_value = False
 
         with (
-            patch("src.core.archiver.audit_unavailable") as audit_unavailable,
+            patch("agent.core.archiver.audit_unavailable") as audit_unavailable,
             patch(
-                "src.services.knowledge_graph.KnowledgeGraphDB",
+                "shared.runtime.services.knowledge_graph.KnowledgeGraphDB",
                 return_value=knowledge_graph,
             ),
         ):

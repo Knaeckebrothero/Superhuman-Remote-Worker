@@ -3,20 +3,24 @@
 Unit tests inject fake API objects, which accept any keyword, so a kwarg the
 real generated client rejects survives every green suite and only fails when a
 deployed orchestrator issues the call. ``_content_type`` was exactly that: the
-client dropped it, and each remaining site raised ``ApiTypeError`` at runtime
+35.0.0 client rejected it, and each remaining site raised ``ApiTypeError`` at runtime
 instead of publishing a session route or releasing a finalizer.
 """
 
 from __future__ import annotations
 
 import ast
+import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-ORCHESTRATOR = REPO_ROOT / "orchestrator"
+ORCHESTRATOR = REPO_ROOT / "src" / "orchestrator"
 PATCH_PREFIX = "patch_namespaced_"
 
 
@@ -64,25 +68,61 @@ def test_no_patch_site_passes_a_client_private_kwarg():
         if kwarg.startswith("_")
     ]
     assert offenders == [], (
-        "The generated Kubernetes client rejects its former private kwargs "
-        "(ApiTypeError) and a mocked API in unit tests cannot catch it:\n"
+        "Keep patch calls compatible with SDK/image generations that reject "
+        "private kwargs (ApiTypeError); mocked APIs cannot catch this:\n"
         + "\n".join(offenders)
     )
 
 
-def test_installed_client_rejects_the_removed_content_type_kwarg():
-    """Pin the reason the kwarg is gone, so a revert fails loudly here."""
+def test_installed_client_sends_json_patch_without_private_kwargs(tmp_path):
+    """Protect the wire contract rather than a particular SDK's kwarg rejection.
 
+    36.0.3 accepts the former override. Both generations must encode the public
+    list-body call correctly. A fresh process avoids suite-wide SDK mocks.
+    """
     pytest.importorskip("kubernetes")
-    from kubernetes.client.api.core_v1_api import CoreV1Api
-
-    api = CoreV1Api.__new__(CoreV1Api)
-    with pytest.raises(Exception) as rejected:
-        CoreV1Api.patch_namespaced_pod(
-            api,
-            name="p",
-            namespace="n",
-            body=[],
-            _content_type="application/json-patch+json",
-        )
-    assert "_content_type" in str(rejected.value)
+    code = """
+import json, sys
+def no_network(event, args):
+    if event in {'socket.connect', 'socket.getaddrinfo'}:
+        raise AssertionError('patch probe attempted network access')
+sys.addaudithook(no_network)
+from kubernetes.client import ApiClient, Configuration, CoreV1Api, NetworkingV1Api
+body = [{'op': 'test', 'path': '/metadata/uid', 'value': 'fixture-uid'},
+        {'op': 'remove', 'path': '/metadata/finalizers'}]
+class Captured(Exception): pass
+receipts = []
+def request(method, url, **kwargs):
+    assert method == 'PATCH'
+    assert url.startswith('https://srw-patch-smoke.invalid/')
+    assert kwargs['headers']['Content-Type'] == 'application/json-patch+json'
+    assert kwargs['body'] == body
+    receipts.append(url)
+    raise Captured
+with ApiClient(Configuration(host='https://srw-patch-smoke.invalid')) as client:
+    client.request = request
+    for api_type, resources in (
+        (CoreV1Api, ('pod', 'persistent_volume_claim', 'config_map', 'service')),
+        (NetworkingV1Api, ('ingress',)),
+    ):
+        api = api_type(client)
+        for resource in resources:
+            try:
+                getattr(api, 'patch_namespaced_' + resource)(name='p', namespace='n', body=body)
+            except Captured:
+                pass
+            else:
+                raise AssertionError('generated patch did not reach request boundary')
+print(json.dumps(receipts))
+"""
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", code],
+        cwd=tmp_path,
+        env={"PATH": os.defpath},
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert len(json.loads(result.stdout)) == 5

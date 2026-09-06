@@ -14,8 +14,8 @@ from typing import Any
 import httpx
 import pytest
 
-from src.shared.orch_surface.client import AsyncCockpitClient
-from src.shared.orch_surface.formatters import (
+from shared.orch_surface.client import AsyncCockpitClient
+from shared.orch_surface.formatters import (
     format_officer_note_result,
     format_officer_post,
     format_officer_roster,
@@ -299,7 +299,7 @@ def test_a_live_note_says_it_reached_him():
 
 def test_a_tail_render_does_not_advertise_offset_paging():
     """The tail window is the END of the log; 'use offset=1' would walk backwards."""
-    from src.shared.orch_surface.formatters import format_persistent_thread_messages
+    from shared.orch_surface.formatters import format_persistent_thread_messages
 
     text = format_persistent_thread_messages(
         {

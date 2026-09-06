@@ -1,0 +1,536 @@
+"""Workspace service for accessing job workspace files.
+
+Provides access to:
+- Current todos (todos.yaml)
+- Archived todos (archive/todos_*.md)
+- Workspace metadata
+
+Configuration:
+    Set WORKSPACE_PATH environment variable to override the default workspace location.
+    This is useful when running the API in a container with a mounted workspace volume.
+"""
+
+import logging
+import os
+import re
+import subprocess
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+logger = logging.getLogger(__name__)
+
+
+_BLOCKED_PATHS = {"todos.yaml", ".gitignore"}
+_BLOCKED_PREFIXES = (".git/", "tools/")
+
+
+class WorkspaceService:
+    """Service for reading and writing job workspace files."""
+
+    def __init__(self, workspace_base: str | None = None):
+        """Initialize workspace service.
+
+        Args:
+            workspace_base: Base path for workspaces. Priority:
+                1. Explicit workspace_base argument
+                2. WORKSPACE_PATH environment variable
+                3. Default: ../../../workspace relative to this file
+        """
+        # Project root: three levels up from this file
+        # (workspace.py -> services/ -> orchestrator/ -> project root)
+        project_root = Path(__file__).resolve().parents[3]
+
+        if workspace_base:
+            raw = Path(workspace_base)
+        elif os.environ.get("WORKSPACE_PATH"):
+            raw = Path(os.environ["WORKSPACE_PATH"])
+        else:
+            raw = project_root / "workspace"
+
+        # Resolve relative paths against the project root, not the cwd
+        self._base = raw if raw.is_absolute() else project_root / raw
+
+    @property
+    def base_path(self) -> Path:
+        """Get the configured workspace base path."""
+        return self._base
+
+    @property
+    def is_available(self) -> bool:
+        """Check if workspace directory exists and is accessible."""
+        return self._base.exists() and self._base.is_dir()
+
+    def _get_job_path(self, job_id: str) -> Path | None:
+        """Get the workspace path for a job.
+
+        In the simplified workspace model, the base path IS the workspace
+        (no job_{id} subdirectories). This is dev-only — in production the
+        orchestrator reads workspace files via API, not local filesystem.
+
+        Args:
+            job_id: Job UUID (unused — kept for interface compatibility)
+
+        Returns:
+            Base path if it exists, None otherwise
+        """
+        if self._base.exists() and self._base.is_dir():
+            return self._base
+        return None
+
+    def get_current_todos(self, job_id: str) -> dict[str, Any] | None:
+        """Get current todos from todos.yaml.
+
+        Args:
+            job_id: Job UUID
+
+        Returns:
+            Dict with todos list and metadata, or None if not found
+        """
+        job_path = self._get_job_path(job_id)
+        if not job_path:
+            return None
+
+        todos_file = job_path / "todos.yaml"
+        if not todos_file.exists():
+            return None
+
+        try:
+            with open(todos_file) as f:
+                data = yaml.safe_load(f)
+
+            if not data:
+                return {"todos": [], "source": "todos.yaml"}
+
+            # Handle both list and dict formats
+            if isinstance(data, list):
+                todos = data
+            elif isinstance(data, dict):
+                todos = data.get("todos", [])
+            else:
+                todos = []
+
+            return {
+                "todos": todos,
+                "source": "todos.yaml",
+                "is_current": True,
+            }
+        except Exception:
+            return None
+
+    def list_archived_todos(self, job_id: str) -> list[dict[str, Any]]:
+        """List all archived todo files for a job.
+
+        Args:
+            job_id: Job UUID
+
+        Returns:
+            List of archive metadata (name, path, timestamp)
+        """
+        job_path = self._get_job_path(job_id)
+        if not job_path:
+            return []
+
+        archive_dir = job_path / "archive"
+        if not archive_dir.exists():
+            return []
+
+        archives = []
+        for f in archive_dir.glob("todos_*.md"):
+            # Extract phase name and timestamp from filename
+            # Format: todos_{phase_name}_{YYYYMMDD_HHMMSS}.md
+            name = f.stem  # todos_phase_name_20260124_183618
+            parts = name.split("_")
+
+            # Try to extract timestamp (last 2 parts should be date and time)
+            timestamp = None
+            phase_name = None
+            if len(parts) >= 3:
+                try:
+                    date_part = parts[-2]  # YYYYMMDD
+                    time_part = parts[-1]  # HHMMSS
+                    if len(date_part) == 8 and len(time_part) == 6:
+                        timestamp = f"{date_part[:4]}-{date_part[4:6]}-{date_part[6:8]}T{time_part[:2]}:{time_part[2:4]}:{time_part[4:6]}"
+                        # Phase name is everything between "todos_" and the timestamp
+                        phase_name = "_".join(parts[1:-2]) if len(parts) > 3 else None
+                except (ValueError, IndexError):
+                    pass
+
+            archives.append(
+                {
+                    "filename": f.name,
+                    "phase_name": phase_name or name.replace("todos_", ""),
+                    "timestamp": timestamp,
+                    "path": str(f.relative_to(job_path)),
+                }
+            )
+
+        # Sort by timestamp (newest first)
+        archives.sort(key=lambda x: x.get("timestamp") or "", reverse=True)
+        return archives
+
+    def get_archived_todos(self, job_id: str, filename: str) -> dict[str, Any] | None:
+        """Get parsed content of an archived todo file.
+
+        Args:
+            job_id: Job UUID
+            filename: Archive filename (e.g., "todos_phase1_20260124_183618.md")
+
+        Returns:
+            Dict with parsed todos and metadata, or None if not found
+        """
+        job_path = self._get_job_path(job_id)
+        if not job_path:
+            return None
+
+        # Security: ensure filename is safe
+        if ".." in filename or "/" in filename or "\\" in filename:
+            return None
+
+        archive_file = job_path / "archive" / filename
+        if not archive_file.exists():
+            return None
+
+        try:
+            content = archive_file.read_text()
+            return self._parse_archived_todos(content, filename)
+        except Exception:
+            return None
+
+    def _parse_archived_todos(self, content: str, filename: str) -> dict[str, Any]:
+        """Parse archived todo markdown into structured data.
+
+        Args:
+            content: Markdown content
+            filename: Source filename
+
+        Returns:
+            Dict with todos, summary, and metadata
+        """
+        result = {
+            "source": filename,
+            "is_current": False,
+            "todos": [],
+            "summary": {},
+            "phase_name": None,
+            "archived_at": None,
+            "failure_note": None,
+        }
+
+        lines = content.split("\n")
+        current_section = None
+        current_todo = None
+
+        for line in lines:
+            line_stripped = line.strip()
+
+            # Parse header for phase name
+            if line_stripped.startswith("# Archived Todos:"):
+                result["phase_name"] = line_stripped.replace(
+                    "# Archived Todos:", ""
+                ).strip()
+            elif line_stripped.startswith("Archived:"):
+                result["archived_at"] = line_stripped.replace("Archived:", "").strip()
+
+            # Section headers
+            elif line_stripped.startswith("## Completed"):
+                current_section = "completed"
+                # Extract count from "## Completed (N)"
+                match = re.search(r"\((\d+)\)", line_stripped)
+                if match:
+                    result["summary"]["completed"] = int(match.group(1))
+            elif line_stripped.startswith("## Not Completed"):
+                current_section = "not_completed"
+                match = re.search(r"\((\d+)\)", line_stripped)
+                if match:
+                    result["summary"]["not_completed"] = int(match.group(1))
+            elif line_stripped.startswith("## Summary"):
+                current_section = "summary"
+            elif line_stripped.startswith("## Failure Note"):
+                current_section = "failure_note"
+
+            # Parse todos
+            elif current_section in (
+                "completed",
+                "not_completed",
+            ) and line_stripped.startswith("- ["):
+                # Parse todo line: - [x] Content or - [ ] Content or - [~] Content
+                match = re.match(r"- \[([x ~])\] (.+)", line_stripped)
+                if match:
+                    status_char = match.group(1)
+                    content = match.group(2)
+
+                    status = (
+                        "completed"
+                        if status_char == "x"
+                        else ("in_progress" if status_char == "~" else "pending")
+                    )
+
+                    current_todo = {
+                        "content": content,
+                        "status": status,
+                        "notes": [],
+                    }
+                    result["todos"].append(current_todo)
+
+            # Parse todo notes (indented under todo)
+            elif (
+                current_todo
+                and line.startswith("  - ")
+                and current_section in ("completed", "not_completed")
+            ):
+                note = line.strip()[2:]  # Remove "- " prefix
+                current_todo["notes"].append(note)
+
+            # Parse summary lines
+            elif current_section == "summary" and line_stripped.startswith("- "):
+                match = re.match(r"- (\w+): (\d+)", line_stripped)
+                if match:
+                    key = match.group(1).lower()
+                    value = int(match.group(2))
+                    result["summary"][key] = value
+
+            # Parse failure note
+            elif (
+                current_section == "failure_note"
+                and line_stripped
+                and not line_stripped.startswith("#")
+            ):
+                if result["failure_note"]:
+                    result["failure_note"] += "\n" + line_stripped
+                else:
+                    result["failure_note"] = line_stripped
+
+        return result
+
+    def get_all_todos(self, job_id: str) -> dict[str, Any]:
+        """Get all todos for a job (current + archives).
+
+        Args:
+            job_id: Job UUID
+
+        Returns:
+            Dict with current todos and list of archives
+        """
+        current = self.get_current_todos(job_id)
+        archives = self.list_archived_todos(job_id)
+
+        return {
+            "job_id": job_id,
+            "current": current,
+            "archives": archives,
+            "has_workspace": self._get_job_path(job_id) is not None,
+        }
+
+    def get_workspace_file(self, job_id: str, filename: str) -> str | None:
+        """Get content of a workspace file by relative path.
+
+        Supports any file within the job workspace directory, including
+        subdirectories (e.g., "archive/phase_1_retrospective.md").
+        Path is sandboxed — directory traversal is blocked.
+
+        Args:
+            job_id: Job UUID
+            filename: Relative path within workspace (e.g., "workspace.md",
+                      "plan.md", "archive/todos_phase_2.yaml")
+
+        Returns:
+            File content as string, or None if not found or access denied
+        """
+        job_path = self._get_job_path(job_id)
+        if not job_path:
+            return None
+
+        # Security: resolve the path and verify it stays within the workspace
+        try:
+            file_path = (job_path / filename).resolve()
+            if not str(file_path).startswith(str(job_path.resolve())):
+                return None  # Directory traversal attempt
+        except (ValueError, OSError):
+            return None
+
+        if not file_path.exists() or not file_path.is_file():
+            return None
+
+        try:
+            return file_path.read_text()
+        except Exception:
+            return None
+
+    def list_workspace_files(self, job_id: str) -> list[dict[str, Any]]:
+        """List available files in a job workspace.
+
+        Args:
+            job_id: Job UUID
+
+        Returns:
+            List of file metadata (name, size, modified)
+        """
+        job_path = self._get_job_path(job_id)
+        if not job_path:
+            return []
+
+        # Only list main workspace files
+        files_to_check = ["workspace.md", "plan.md", "todos.yaml"]
+        files = []
+
+        for filename in files_to_check:
+            file_path = job_path / filename
+            if file_path.exists():
+                stat = file_path.stat()
+                files.append(
+                    {
+                        "name": filename,
+                        "size": stat.st_size,
+                        "modified": stat.st_mtime,
+                    }
+                )
+
+        return files
+
+    @staticmethod
+    def is_path_blocked(path: str) -> str | None:
+        """Check if a path is blocked from editing.
+
+        Returns:
+            Error message if blocked, None if allowed.
+        """
+        normalized = path.replace("\\", "/").strip("/")
+        if normalized in _BLOCKED_PATHS:
+            return f"Path '{normalized}' is managed internally and cannot be edited"
+        for prefix in _BLOCKED_PREFIXES:
+            if normalized.startswith(prefix):
+                return f"Paths under '{prefix}' are internal and cannot be edited"
+        return None
+
+    def write_workspace_file(
+        self,
+        job_id: str,
+        path: str,
+        content: str,
+        commit_message: str | None = None,
+    ) -> dict[str, Any]:
+        """Write content to a workspace file (sandboxed).
+
+        Creates parent directories if needed. Optionally commits
+        the change to the workspace git repo.
+
+        Args:
+            job_id: Job UUID
+            path: Relative path within workspace
+            content: File content to write
+            commit_message: If provided, git-commit after writing
+
+        Returns:
+            Dict with path, size, committed status, or error key.
+        """
+        blocked = self.is_path_blocked(path)
+        if blocked:
+            return {"error": blocked}
+
+        job_path = self._get_job_path(job_id)
+        if not job_path:
+            return {"error": f"No workspace found for job '{job_id}'"}
+
+        try:
+            file_path = (job_path / path).resolve()
+            if not str(file_path).startswith(str(job_path.resolve())):
+                return {"error": "Directory traversal is not allowed"}
+        except (ValueError, OSError):
+            return {"error": "Invalid path"}
+
+        try:
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.write_text(content)
+        except Exception as e:
+            return {"error": f"Write failed: {e}"}
+
+        committed = False
+        if commit_message:
+            committed = self._git_commit(job_path, commit_message)
+
+        return {
+            "path": path,
+            "size": len(content),
+            "committed": committed,
+        }
+
+    @staticmethod
+    def _git_commit(job_path: Path, message: str) -> bool:
+        """Stage all changes and commit in the workspace git repo."""
+        git_dir = job_path / ".git"
+        if not git_dir.exists():
+            return False
+        try:
+            subprocess.run(
+                ["git", "add", "-A"],
+                cwd=str(job_path),
+                capture_output=True,
+                timeout=10,
+            )
+            result = subprocess.run(
+                ["git", "commit", "-m", message],
+                cwd=str(job_path),
+                capture_output=True,
+                timeout=10,
+            )
+            return result.returncode == 0
+        except Exception as e:
+            logger.warning(f"Git commit failed in {job_path}: {e}")
+            return False
+
+    def get_workspace_overview(self, job_id: str) -> dict[str, Any]:
+        """Get an overview of the job workspace.
+
+        Args:
+            job_id: Job UUID
+
+        Returns:
+            Dict with workspace files, todos summary, and metadata
+        """
+        job_path = self._get_job_path(job_id)
+        has_workspace = job_path is not None
+
+        result = {
+            "job_id": job_id,
+            "has_workspace": has_workspace,
+            "files": [],
+            "workspace_md": None,
+            "plan_md": None,
+            "todos": None,
+            "archive_count": 0,
+        }
+
+        if not has_workspace:
+            return result
+
+        # List files
+        result["files"] = self.list_workspace_files(job_id)
+
+        # Get workspace.md content (truncated for overview)
+        workspace_content = self.get_workspace_file(job_id, "workspace.md")
+        if workspace_content:
+            # Truncate to first 2000 chars for overview
+            result["workspace_md"] = workspace_content[:2000]
+            if len(workspace_content) > 2000:
+                result["workspace_md"] += "\n\n... (truncated)"
+
+        # Get plan.md content (truncated)
+        plan_content = self.get_workspace_file(job_id, "plan.md")
+        if plan_content:
+            result["plan_md"] = plan_content[:2000]
+            if len(plan_content) > 2000:
+                result["plan_md"] += "\n\n... (truncated)"
+
+        # Get current todos
+        result["todos"] = self.get_current_todos(job_id)
+
+        # Count archives
+        result["archive_count"] = len(self.list_archived_todos(job_id))
+
+        return result
+
+
+# Global service instance
+workspace_service = WorkspaceService()

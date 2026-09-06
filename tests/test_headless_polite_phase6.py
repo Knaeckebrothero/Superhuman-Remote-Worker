@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.core.loader import (
+from shared.runtime.core.loader import (
     AgentConfig,
     HeadlessConfig,
     load_agent_config_from_dict,
@@ -83,7 +83,7 @@ class TestHeadlessConfigParsing:
 
 
 def _reset_agent_globals():
-    import src.api.persistent_app as mod
+    import agent.api.persistent_app as mod
 
     mod._session = None
     mod._thread_id = None
@@ -98,7 +98,7 @@ def _reset_agent_globals():
 
 def _install_session(*, turn_count: int, headless_mode: str = "eager"):
     """Install a fake _session with a HeadlessConfig-shaped config.headless."""
-    import src.api.persistent_app as mod
+    import agent.api.persistent_app as mod
 
     session = MagicMock()
     session.turn_count = turn_count
@@ -118,7 +118,7 @@ def _install_session(*, turn_count: int, headless_mode: str = "eager"):
 
 
 def test_reset_agent_globals_clears_pinned_identity_protocol() -> None:
-    import src.api.persistent_app as mod
+    import agent.api.persistent_app as mod
 
     mod._pinned_status_identity_enabled = True
     mod._pinned_runtime_generation_enabled = True
@@ -144,7 +144,7 @@ class TestPoliteModeFlip:
     async def test_polite_flips_with_subscribers_attached(self):
         """Polite mode flips awaiting_user even when a subscriber is present —
         this is the core Phase 6 behavioral change."""
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         _, client = _install_session(turn_count=2, headless_mode="polite")
         mod._subscribers["ws-1"] = asyncio.Queue()
@@ -163,7 +163,7 @@ class TestPoliteModeFlip:
     async def test_polite_still_skips_when_turn_count_is_zero(self):
         """Polite still respects the first-boot guard — flipping on the boot
         wait would email the user before they've sent a single message."""
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         _, client = _install_session(turn_count=0, headless_mode="polite")
         mod._loop_user_queue.put_nowait("hi")
@@ -176,7 +176,7 @@ class TestPoliteModeFlip:
     @pytest.mark.asyncio
     async def test_eager_with_subscribers_does_not_flip(self):
         """Phase 5 regression: eager mode + subscribers attached → no flip."""
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         _, client = _install_session(turn_count=2, headless_mode="eager")
         mod._subscribers["ws-1"] = asyncio.Queue()
@@ -193,7 +193,7 @@ class TestPoliteModeFlip:
     @pytest.mark.asyncio
     async def test_eager_untethered_still_flips(self):
         """Phase 5 regression: eager + no subs → flip awaiting_user."""
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         _, client = _install_session(turn_count=2, headless_mode="eager")
         mod._loop_user_queue.put_nowait("hi")
@@ -209,7 +209,7 @@ class TestPoliteModeFlip:
     async def test_missing_headless_attr_defaults_to_eager(self):
         """Defensive: a session whose config has no headless attribute (legacy
         config or test mock) must not crash the loop — fall back to eager."""
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         _, client = _install_session(turn_count=2, headless_mode="eager")
         # Strip only the headless attribute; keep interactive intact so

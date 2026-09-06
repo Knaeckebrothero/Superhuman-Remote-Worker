@@ -16,8 +16,8 @@ import pytest
 import yaml
 from langchain_core.tools import tool
 
-from src.core.loader import resolve_guardrails
-from src.services.guardrails import (
+from shared.runtime.core.loader import resolve_guardrails
+from shared.runtime.services.guardrails import (
     GuardrailFormatError,
     KNOWN_NUDGES,
     _replace_examples_block,
@@ -298,7 +298,7 @@ class TestTodoListFooter:
     """
 
     def test_no_family_enumerates_tool_surface(self):
-        from src.core.loader import _load_guardrails_matrix
+        from shared.runtime.core.loader import _load_guardrails_matrix
 
         matrix = _load_guardrails_matrix(None)
         assert "default" in matrix
@@ -325,7 +325,7 @@ class TestPhaseGateNudges:
     (same rule as the todo-list footer, same failure mode if broken)."""
 
     def test_no_family_enumerates_tool_surface(self):
-        from src.core.loader import _load_guardrails_matrix
+        from shared.runtime.core.loader import _load_guardrails_matrix
 
         matrix = _load_guardrails_matrix(None)
         for family in sorted(matrix):

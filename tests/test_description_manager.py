@@ -9,12 +9,12 @@ is served live from tools/ as a virtual directory
 import pytest
 from unittest.mock import MagicMock
 
-from src.tools.description_manager import (
+from agent.tools.description_manager import (
     DescriptionManager,
     get_deferred_tools,
     get_core_tools,
 )
-from src.tools.registry import TOOL_REGISTRY
+from agent.tools.registry import TOOL_REGISTRY
 
 
 # =============================================================================

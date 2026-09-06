@@ -36,7 +36,7 @@ from pathlib import Path
 
 import pytest
 
-from src.core.loader import (
+from shared.runtime.core.loader import (
     MAX_RENDERED_PROMPT_CHARS,
     PROMPT_RENDER_TIME_BUDGET_SECONDS,
     PromptRenderBudgetError,
@@ -81,11 +81,10 @@ _BOMBS = {
 # virtual-memory reservation during import can never make this flaky. Each
 # result is printed and flushed on its own line, so a hang (the pre-fix
 # behaviour of ``nested_for``) still leaves the completed cases readable.
-_BOMB_RUNNER = r"""
+_BOMB_RUNNER = """
 import json, os, resource, sys, time
 
-sys.path.insert(0, os.environ["SRW_REPO_ROOT"])
-from src.core.loader import render_instruction_content  # noqa: E402
+from shared.runtime.core.loader import render_instruction_content  # noqa: E402
 
 with open("/proc/self/status") as status:
     held = next(
@@ -120,7 +119,6 @@ def bomb_results() -> dict:
     """Render every bomb in one child process under ``RLIMIT_AS``."""
     env = {
         **os.environ,
-        "SRW_REPO_ROOT": str(_REPO_ROOT),
         "SRW_AS_HEADROOM": str(_AS_HEADROOM_BYTES),
         "SRW_BOMBS": json.dumps(_BOMBS),
     }
@@ -248,7 +246,7 @@ def test_bound_skill_bodies_are_disk_provenance_only():
     nothing, and ``filter_bound_skills`` then removes it from the catalog too,
     so a user-authored body reaches neither delivery channel.
     """
-    from src.core.skill_resolution import filter_bound_skills
+    from shared.runtime.core.skill_resolution import filter_bound_skills
 
     config = load_agent_config_from_dict(
         {
@@ -284,7 +282,7 @@ def test_bound_skill_bodies_are_disk_provenance_only():
 def test_catalog_skill_files_are_delivered_verbatim_never_rendered():
     """The other half of the same argument: DB catalog skills are written to the
     workspace as-is, so their bodies never reach the renderer at all."""
-    from src.core.skill_resolution import skill_files_to_workspace
+    from shared.runtime.core.skill_resolution import skill_files_to_workspace
 
     bomb = _BOMBS["multiplication"]
     mapped = skill_files_to_workspace({"user-skill": {"SKILL.md": bomb}})

@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-import main as orchestrator_main
+import orchestrator.main as orchestrator_main
 from orchestrator.services.kb_reindex import kb_index_lock, reindex_kb
 
 
@@ -87,9 +87,11 @@ async def test_delete_waits_for_writer_then_stale_reindex_cannot_resurrect_index
 
     cancel_local = AsyncMock()
     with (
-        patch("main.postgres_db", db),
-        patch("src.services.knowledge_store.KnowledgeStore", return_value=store),
-        patch("main._cancel_kb_datasource_reindexes", cancel_local),
+        patch("orchestrator.main.postgres_db", db),
+        patch(
+            "shared.runtime.services.knowledge_store.KnowledgeStore", return_value=store
+        ),
+        patch("orchestrator.main._cancel_kb_datasource_reindexes", cancel_local),
     ):
         deletion = asyncio.create_task(
             orchestrator_main._delete_kb_datasource_with_index(datasource_id)
@@ -146,7 +148,7 @@ async def test_cancel_datasource_reindexes_drains_and_forgets_owned_task():
         finally:
             cleaned.set()
 
-    with patch("main._run_scheduled_kb_datasource_reindex", scheduled):
+    with patch("orchestrator.main._run_scheduled_kb_datasource_reindex", scheduled):
         orchestrator_main._schedule_kb_datasource_reindex(
             datasource_id, force_full=True
         )

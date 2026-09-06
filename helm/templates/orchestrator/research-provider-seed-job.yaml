@@ -57,7 +57,7 @@ spec:
         - name: seed
           image: {{ include "srw.imageRef" (dict "image" .Values.image.orchestrator) | quote }}
           imagePullPolicy: {{ .Values.image.orchestrator.pullPolicy }}
-          command: ["python", "-m", "seed.llm_config"]
+          command: ["python", "-m", "orchestrator.seed.llm_config"]
           args: ["--research-providers-only"]
           env:
             - name: POSTGRES_USER

@@ -28,7 +28,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from src.core.loader import (
+from shared.runtime.core.loader import (
     load_and_merge_config,
     render_instruction_content,
     resolve_config_path,

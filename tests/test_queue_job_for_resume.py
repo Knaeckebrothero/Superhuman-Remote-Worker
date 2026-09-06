@@ -23,7 +23,7 @@ import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
 from orchestrator.database.postgres import CompletionDecisionBlocked, PostgresDB
-from src.shared.subagent_parent_authority import (
+from shared.subagent_parent_authority import (
     ParentExecutionAuthority,
     ParentExecutionAuthorityRefused,
 )

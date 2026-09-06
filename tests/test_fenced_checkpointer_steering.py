@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
-from src.core.fenced_checkpointer import FencedAsyncPostgresSaver
+from agent.core.fenced_checkpointer import FencedAsyncPostgresSaver
 
 
 def _saver(post_commit: AsyncMock) -> FencedAsyncPostgresSaver:

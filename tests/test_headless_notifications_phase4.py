@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-import services.headless_notifications as hn
+import orchestrator.services.headless_notifications as hn
 
 
 # ---------------------------------------------------------------------------

@@ -3,7 +3,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from src.database.postgres_db import PostgresDB
+from agent.database.postgres_db import PostgresDB
 
 
 @pytest.mark.asyncio
@@ -236,7 +236,7 @@ async def test_history_without_seq_gt_keeps_turn_ordering():
 async def test_get_seq_for_message_id_coerces_and_returns_seq():
     import uuid
 
-    from src.database.postgres_db import _THREAD_MSG_ID_NS
+    from agent.database.postgres_db import _THREAD_MSG_ID_NS
 
     db = PostgresDB.__new__(PostgresDB)
     db.fetchrow = AsyncMock(return_value={"seq": 99})

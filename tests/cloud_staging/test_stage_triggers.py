@@ -22,11 +22,11 @@ from uuid import uuid4
 import pytest
 from fastapi import HTTPException
 
-import main
-import security.access as access_module
-from services.container_provisioner import WorkspaceRuntimeAttestation
-from services.vm_provisioner import VMTeardownIdentity, VMTeardownResult
-from services.workspace_suspension import WorkspaceSuspensionService
+import orchestrator.main
+import orchestrator.security.access as access_module
+from orchestrator.services.container_provisioner import WorkspaceRuntimeAttestation
+from orchestrator.services.vm_provisioner import VMTeardownIdentity, VMTeardownResult
+from orchestrator.services.workspace_suspension import WorkspaceSuspensionService
 
 
 # =============================================================================
@@ -52,21 +52,27 @@ class TestCloudStageEndpoint:
         """No/garbage X-Internal-Key -> 401, before the flag or task logic runs."""
         with patch.object(access_module, "_INTERNAL_KEY", "secret"):
             with pytest.raises(HTTPException) as exc:
-                await main.agent_trigger_cloud_stage(fake_request, "thread-1")
+                await orchestrator.main.agent_trigger_cloud_stage(
+                    fake_request, "thread-1"
+                )
         assert exc.value.status_code == 401
 
     @pytest.mark.asyncio
     async def test_cloud_stage_flag_off_skips(self, fake_request):
         """Flag off -> {"skipped": "flag_off"}; no task is ever scheduled."""
         fake_request.headers = {"X-Internal-Key": "secret"}
-        main._cloud_stage_tasks.clear()
+        orchestrator.main._cloud_stage_tasks.clear()
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
-            patch("main._is_protected_cloud_mode_enabled", return_value=False),
+            patch(
+                "orchestrator.main._is_protected_cloud_mode_enabled", return_value=False
+            ),
         ):
-            result = await main.agent_trigger_cloud_stage(fake_request, "thread-1")
+            result = await orchestrator.main.agent_trigger_cloud_stage(
+                fake_request, "thread-1"
+            )
         assert result == {"skipped": "flag_off"}
-        assert main._cloud_stage_tasks == {}
+        assert orchestrator.main._cloud_stage_tasks == {}
 
     @pytest.mark.asyncio
     async def test_cloud_stage_schedules_task(self, fake_request):
@@ -74,91 +80,108 @@ class TestCloudStageEndpoint:
         the task calls stage_thread_cloud_diff and self-evicts from the
         registry when done."""
         fake_request.headers = {"X-Internal-Key": "secret"}
-        main._cloud_stage_tasks.clear()
+        orchestrator.main._cloud_stage_tasks.clear()
         stage_mock = AsyncMock(return_value={"epoch": 1, "counts": {}})
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
-            patch("main._is_protected_cloud_mode_enabled", return_value=True),
-            patch("services.cloud_staging.stage.stage_thread_cloud_diff", stage_mock),
+            patch(
+                "orchestrator.main._is_protected_cloud_mode_enabled", return_value=True
+            ),
+            patch(
+                "orchestrator.services.cloud_staging.stage.stage_thread_cloud_diff",
+                stage_mock,
+            ),
             patch.object(
-                main.postgres_db,
+                orchestrator.main.postgres_db,
                 "get_thread",
                 AsyncMock(return_value={"id": "thread-1"}),
             ),
             patch.object(
-                main.postgres_db,
+                orchestrator.main.postgres_db,
                 "get_ro_mount_by_thread",
                 AsyncMock(return_value={"id": "mount-1"}),
             ),
             patch.object(
-                main.postgres_db,
+                orchestrator.main.postgres_db,
                 "thread_advisory_lock",
                 side_effect=_owned_lock,
             ),
             patch.object(
-                main, "_require_pinned_workspace_credential_owner", AsyncMock()
+                orchestrator.main,
+                "_require_pinned_workspace_credential_owner",
+                AsyncMock(),
             ),
             patch.object(
-                main,
+                orchestrator.main,
                 "_capture_cloud_stage_authority",
                 return_value=dict(_STAGE_AUTHORITY),
             ),
         ):
-            result = await main.agent_trigger_cloud_stage(fake_request, "thread-1")
+            result = await orchestrator.main.agent_trigger_cloud_stage(
+                fake_request, "thread-1"
+            )
             assert result == {"scheduled": True}
             # Task is registered synchronously (create_task schedules but does
             # not run until the event loop gets control back).
-            task_key = main._cloud_stage_task_key("thread-1", _STAGE_AUTHORITY)
-            assert task_key in main._cloud_stage_tasks
-            task = main._cloud_stage_tasks[task_key]
+            task_key = orchestrator.main._cloud_stage_task_key(
+                "thread-1", _STAGE_AUTHORITY
+            )
+            assert task_key in orchestrator.main._cloud_stage_tasks
+            task = orchestrator.main._cloud_stage_tasks[task_key]
             await task
 
         stage_mock.assert_awaited_once_with(
             thread_id="thread-1",
-            postgres_db=main.postgres_db,
-            snapshot_service=main.snapshot_service,
+            postgres_db=orchestrator.main.postgres_db,
+            snapshot_service=orchestrator.main.snapshot_service,
             authority=_STAGE_AUTHORITY,
-            vm_provisioner=main.vm_provisioner,
+            vm_provisioner=orchestrator.main.vm_provisioner,
         )
         # Self-evicts once the task completes.
-        assert task_key not in main._cloud_stage_tasks
+        assert task_key not in orchestrator.main._cloud_stage_tasks
 
     @pytest.mark.asyncio
     async def test_cloud_stage_dedupes_inflight_thread(self, fake_request):
         """A second ping for the same thread while one is still in flight
         must not spawn a duplicate task."""
         fake_request.headers = {"X-Internal-Key": "secret"}
-        main._cloud_stage_tasks.clear()
+        orchestrator.main._cloud_stage_tasks.clear()
         sentinel_task = MagicMock()
-        task_key = main._cloud_stage_task_key("thread-1", _STAGE_AUTHORITY)
-        main._cloud_stage_tasks[task_key] = sentinel_task
+        task_key = orchestrator.main._cloud_stage_task_key("thread-1", _STAGE_AUTHORITY)
+        orchestrator.main._cloud_stage_tasks[task_key] = sentinel_task
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
-            patch("main._is_protected_cloud_mode_enabled", return_value=True),
+            patch(
+                "orchestrator.main._is_protected_cloud_mode_enabled", return_value=True
+            ),
             patch.object(
-                main.postgres_db,
+                orchestrator.main.postgres_db,
                 "get_thread",
                 AsyncMock(return_value={"id": "thread-1"}),
             ),
             patch.object(
-                main.postgres_db,
+                orchestrator.main.postgres_db,
                 "get_ro_mount_by_thread",
                 AsyncMock(return_value={"id": "mount-1"}),
             ),
             patch.object(
-                main, "_require_pinned_workspace_credential_owner", AsyncMock()
+                orchestrator.main,
+                "_require_pinned_workspace_credential_owner",
+                AsyncMock(),
             ),
             patch.object(
-                main,
+                orchestrator.main,
                 "_capture_cloud_stage_authority",
                 return_value=dict(_STAGE_AUTHORITY),
             ),
         ):
-            result = await main.agent_trigger_cloud_stage(fake_request, "thread-1")
+            result = await orchestrator.main.agent_trigger_cloud_stage(
+                fake_request, "thread-1"
+            )
         assert result == {"scheduled": True}
         # Registry slot untouched — still the sentinel, no new task created.
-        assert main._cloud_stage_tasks[task_key] is sentinel_task
-        main._cloud_stage_tasks.clear()
+        assert orchestrator.main._cloud_stage_tasks[task_key] is sentinel_task
+        orchestrator.main._cloud_stage_tasks.clear()
 
 
 # =============================================================================
@@ -286,7 +309,10 @@ class TestTeardownStageHook:
             side_effect=AssertionError("foreign successor must not be read")
         )
 
-        with patch("services.cloud_staging.stage.stage_thread_cloud_diff", stage_mock):
+        with patch(
+            "orchestrator.services.cloud_staging.stage.stage_thread_cloud_diff",
+            stage_mock,
+        ):
             assert await svc.suspend_thread_workspace("thread-1") is False
 
         stage_mock.assert_not_awaited()
@@ -317,7 +343,7 @@ class TestTeardownStageHook:
         snapshot_service.capture_vm_snapshot = AsyncMock(side_effect=fake_capture)
 
         with patch(
-            "services.cloud_staging.stage.stage_thread_cloud_diff",
+            "orchestrator.services.cloud_staging.stage.stage_thread_cloud_diff",
             AsyncMock(side_effect=fake_stage),
         ):
             result = await svc.suspend_thread_workspace("thread-1")
@@ -333,7 +359,10 @@ class TestTeardownStageHook:
         svc, snapshot_service, _ = _make_suspension_service(db)
 
         stage_mock = AsyncMock(side_effect=RuntimeError("ssh capture failed"))
-        with patch("services.cloud_staging.stage.stage_thread_cloud_diff", stage_mock):
+        with patch(
+            "orchestrator.services.cloud_staging.stage.stage_thread_cloud_diff",
+            stage_mock,
+        ):
             result = await svc.suspend_thread_workspace("thread-1")
 
         assert result is True
@@ -350,7 +379,10 @@ class TestTeardownStageHook:
         svc, snapshot_service, _ = _make_suspension_service(db)
 
         stage_mock = AsyncMock(return_value={"epoch": 1})
-        with patch("services.cloud_staging.stage.stage_thread_cloud_diff", stage_mock):
+        with patch(
+            "orchestrator.services.cloud_staging.stage.stage_thread_cloud_diff",
+            stage_mock,
+        ):
             result = await svc.suspend_thread_workspace("thread-1")
 
         assert result is True

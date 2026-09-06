@@ -204,7 +204,9 @@ class TestContainerInheritance:
     async def test_exact_legacy_parent_runtime_is_adopted_under_parent_owner(
         self, monkeypatch
     ):
-        from services.container_provisioner import WorkspaceRuntimeAttestation
+        from orchestrator.services.container_provisioner import (
+            WorkspaceRuntimeAttestation,
+        )
 
         parent_id = "11111111-1111-4111-8111-111111111111"
         old_runtime = {
@@ -582,8 +584,10 @@ class TestFailSubjobUnblocksParent:
 class TestScholarMaterializationFailure:
     @pytest.mark.asyncio
     async def test_policy_failure_releases_waiting_parent(self, monkeypatch):
-        from database.postgres import DatasourceMaterializationAuthorizationError
-        from services import completion
+        from orchestrator.database.postgres import (
+            DatasourceMaterializationAuthorizationError,
+        )
+        from orchestrator.services import completion
 
         parent_id = "11111111-1111-4111-8111-111111111111"
         owner_id = "22222222-2222-4222-8222-222222222222"

@@ -10,7 +10,7 @@ from fastapi import HTTPException
 
 import orchestrator.main as main
 from orchestrator.services.runtime_actor import RuntimeActorRefreshExchange
-from src.shared.runtime_actor import RuntimeActorContext
+from shared.runtime_actor import RuntimeActorContext
 
 
 PROJECT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"

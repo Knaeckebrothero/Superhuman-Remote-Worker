@@ -179,6 +179,67 @@ class RuntimeActorContext:
         return bool(self.access_credential and self.access_expires_at)
 
 
+def _audit_actor_identity(actor: Any) -> dict[str, Any] | None:
+    if isinstance(actor, RuntimeActorContext):
+        actor = actor.audit_payload()
+    if not isinstance(actor, dict):
+        return None
+    # Validate identity leaves before construction: the transport parser's
+    # permissive str()/int() coercion can serialize nested opaque values. Do
+    # not parse credentials or expiry fields merely to discard them afterward.
+    identity = {
+        name: actor.get(name)
+        for name in (
+            "caller_kind",
+            "project_id",
+            "project_role",
+            "thread_id",
+            "user_id",
+        )
+    }
+    if any(
+        value is not None and not isinstance(value, str) for value in identity.values()
+    ):
+        return None
+    incarnation = actor.get("officer_incarnation")
+    if incarnation is not None and (type(incarnation) is not int or incarnation < 0):
+        return None
+    identity["officer_incarnation"] = incarnation
+    try:
+        return RuntimeActorContext(**identity).audit_payload()
+    except (TypeError, ValueError):
+        return None
+
+
+def audit_metadata_payload(metadata: Any) -> dict[str, Any] | None:
+    """Project structured audit metadata without runtime bearer credentials.
+
+    Reuse the actor's existing identity-only audit contract. Unsupported actor
+    shapes become null; unsupported metadata shapes are omitted. No recursive
+    payload/text scrubbing occurs, and live metadata/actor objects are untouched.
+    """
+    if metadata is None:
+        return None
+    if not isinstance(metadata, dict):
+        return None
+    if "runtime_actor" not in metadata or metadata["runtime_actor"] is None:
+        return metadata
+    identity = _audit_actor_identity(metadata["runtime_actor"])
+    if metadata["runtime_actor"] == identity:
+        return metadata
+    return {**metadata, "runtime_actor": identity}
+
+
+def redact_audit_payload_metadata(payload: Any) -> Any:
+    """Project only the top-level metadata slot that shadows audit columns."""
+    if not isinstance(payload, dict) or "metadata" not in payload:
+        return payload
+    metadata = audit_metadata_payload(payload["metadata"])
+    if payload["metadata"] is metadata:
+        return payload
+    return {**payload, "metadata": metadata}
+
+
 @dataclass(frozen=True, slots=True)
 class RuntimeAuthorizationResult:
     """Explicit authorization outcome returned before any sensitive mutation."""

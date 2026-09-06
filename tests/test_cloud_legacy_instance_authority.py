@@ -26,8 +26,8 @@ from uuid import uuid4
 import pytest
 from fastapi import HTTPException
 
-from services.cloud import MainCloudRouter
-from services.cloud.errors import FeatureNotAvailable
+from orchestrator.services.cloud import MainCloudRouter
+from orchestrator.services.cloud.errors import FeatureNotAvailable
 
 
 INSTANCE_ID = "4e72e665-1f70-4b69-9804-d981b51416e6"
@@ -112,21 +112,24 @@ class TestGetProjectOnLegacyRow:
         project_a["main_cloud_backend_instance_id"] = None
         project_a["main_cloud_folder_handle"] = "nextcloud:12345"
 
-        from main import get_project
+        from orchestrator.main import get_project
 
         real_router = _router()
         with (
-            patch("main.require_approved_user", AsyncMock(return_value=user_a)),
             patch(
-                "security.access.require_approved_user",
+                "orchestrator.main.require_approved_user",
                 AsyncMock(return_value=user_a),
             ),
-            patch("main.postgres_db", fake_db),
             patch(
-                "main._ensure_project_cloud_resources",
+                "orchestrator.security.access.require_approved_user",
+                AsyncMock(return_value=user_a),
+            ),
+            patch("orchestrator.main.postgres_db", fake_db),
+            patch(
+                "orchestrator.main._ensure_project_cloud_resources",
                 AsyncMock(side_effect=lambda p: p),
             ),
-            patch("main.main_cloud_router", real_router),
+            patch("orchestrator.main.main_cloud_router", real_router),
         ):
             result = await get_project(fake_request, str(project_a["id"]))
 
@@ -155,18 +158,18 @@ class TestAddMemberOnLegacyRow:
         project_a["main_cloud_backend"] = "nextcloud"
         project_a["main_cloud_backend_instance_id"] = None
 
-        from main import ProjectMemberAdd, add_project_member
+        from orchestrator.main import ProjectMemberAdd, add_project_member
 
         fake_db.add_project_member = AsyncMock(
             side_effect=AssertionError("member row written despite refusal")
         )
         with (
             patch(
-                "main.require_project_owner",
+                "orchestrator.main.require_project_owner",
                 AsyncMock(return_value=(user_a, project_a)),
             ),
-            patch("main.postgres_db", fake_db),
-            patch("main.main_cloud_router", _router()),
+            patch("orchestrator.main.postgres_db", fake_db),
+            patch("orchestrator.main.main_cloud_router", _router()),
         ):
             with pytest.raises(HTTPException) as exc:
                 await add_project_member(

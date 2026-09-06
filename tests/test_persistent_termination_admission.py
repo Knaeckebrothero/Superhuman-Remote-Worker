@@ -12,22 +12,22 @@ import pytest
 from fastapi import WebSocketDisconnect
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from services import session_lifecycle, session_wake, sitrep
-from src.api import persistent_app, persistent_termination
-from src.api.persistent_session import PersistentSession
-from src.persistent_graph import (
+from orchestrator.services import session_lifecycle, session_wake, sitrep
+from agent.api import persistent_app, persistent_termination
+from agent.api.persistent_session import PersistentSession
+from agent.persistent_graph import (
     PersistentLoopCallbacks,
     _execute_turn,
     run_persistent_loop,
 )
-from src.services.auxiliary import (
+from shared.runtime.services.auxiliary import (
     AuxiliaryLLM,
     AuxiliaryProviderAdmissionClosed,
 )
-from src.services.memory import CaptureEvent
-from src.services.memory.manager import MemoryManager
-from src.core.workspace_backend import WorkspaceUnavailableError
-from src.shared.pinned_session_identity import PinnedSessionBinding
+from agent.services.memory import CaptureEvent
+from agent.services.memory.manager import MemoryManager
+from shared.runtime.core.workspace_backend import WorkspaceUnavailableError
+from shared.pinned_session_identity import PinnedSessionBinding
 
 
 def _config() -> MagicMock:
@@ -926,7 +926,7 @@ async def test_authorized_retirement_fences_provider_and_tool_before_effect(
 
 @pytest.mark.asyncio
 async def test_stateless_effect_boundary_awaits_exact_queue_lease(monkeypatch):
-    from src.api.lease_context import LeaseHandle, current_lease
+    from agent.api.lease_context import LeaseHandle, current_lease
 
     thread_id = str(uuid4())
     lease = LeaseHandle()
@@ -973,7 +973,7 @@ async def test_stateless_effect_boundary_awaits_exact_queue_lease(monkeypatch):
 async def test_stateless_effect_boundary_rechecks_local_life_after_db_await(
     monkeypatch,
 ):
-    from src.api.lease_context import LeaseHandle, current_lease
+    from agent.api.lease_context import LeaseHandle, current_lease
 
     thread_id = str(uuid4())
     lease = LeaseHandle()
@@ -1604,7 +1604,7 @@ async def test_stateless_event_without_delivery_metadata_keeps_legacy_stop_bound
 @pytest.mark.asyncio
 async def test_late_turn_n_interrupt_clears_before_durable_a_and_b_execute(monkeypatch):
     """Terminal-edge Stop cannot jump from completed N onto queued A."""
-    from src.api import persistent_app as pa
+    from agent.api import persistent_app as pa
 
     a_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
     b_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"

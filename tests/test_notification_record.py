@@ -20,8 +20,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from services import notification_catalog as cat
-from services.notification_service import (
+from orchestrator.services import notification_catalog as cat
+from orchestrator.services.notification_service import (
     ActionNotDeclared,
     ActionUnregistered,
     NotificationNotFound,

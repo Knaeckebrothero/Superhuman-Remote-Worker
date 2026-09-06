@@ -52,85 +52,89 @@ from orchestrator.services.infrastructure_metering.sealer import (
     InfrastructureUsageDaySealer,
 )
 from orchestrator.services.usage_ledger import StrictUsagePublishResult
-from src.shared.persistent_input_delivery import message_row_id, persist_input_delivery
+from shared.persistent_input_delivery import message_row_id, persist_input_delivery
 
 
 ROOT = Path(__file__).parents[1]
 APP_MIGRATION = (
     ROOT
-    / "orchestrator/database/migrations/app/0086_infrastructure_metering_foundations.sql"
+    / "src/orchestrator/database/migrations/app/0086_infrastructure_metering_foundations.sql"
 )
 APP_INGESTION_MIGRATION = (
     ROOT
-    / "orchestrator/database/migrations/app/0087_inventory_ingestion_foundations.sql"
+    / "src/orchestrator/database/migrations/app/0087_inventory_ingestion_foundations.sql"
 )
 APP_INGESTION_SIZE_FIX = (
     ROOT
-    / "orchestrator/database/migrations/app/0088_inventory_ingestion_logical_size.sql"
+    / "src/orchestrator/database/migrations/app/0088_inventory_ingestion_logical_size.sql"
 )
 APP_PLAN_PERIOD_INDEX = (
     ROOT
-    / "orchestrator/database/migrations/app/0089_infrastructure_plan_period_idx.notx.sql"
+    / "src/orchestrator/database/migrations/app/0089_infrastructure_plan_period_idx.notx.sql"
 )
 APP_INTERVAL_OVERLAP_INDEX = (
     ROOT
-    / "orchestrator/database/migrations/app/0090_infrastructure_interval_overlap_idx.notx.sql"
+    / "src/orchestrator/database/migrations/app/0090_infrastructure_interval_overlap_idx.notx.sql"
 )
 APP_COMPLETE_SNAPSHOT_RECEIVED_INDEX = (
     ROOT
-    / "orchestrator/database/migrations/app/0091_inventory_complete_received_idx.notx.sql"
+    / "src/orchestrator/database/migrations/app/0091_inventory_complete_received_idx.notx.sql"
 )
 APP_INVALID_WATCH_RECEIVED_INDEX = (
     ROOT
-    / "orchestrator/database/migrations/app/0092_inventory_invalid_watch_received_idx.notx.sql"
+    / "src/orchestrator/database/migrations/app/0092_inventory_invalid_watch_received_idx.notx.sql"
 )
 APP_DAY_SEQUENCE_BACKFILL_PREP = (
     ROOT
-    / "orchestrator/database/migrations/app/0092z_infrastructure_day_sequence_backfill_prep.sql"
+    / "src/orchestrator/database/migrations/app/0092z_infrastructure_day_sequence_backfill_prep.sql"
 )
 APP_TERMINAL_EVIDENCE_MIGRATION = (
     ROOT
-    / "orchestrator/database/migrations/app/0100_infrastructure_terminal_evidence_single_boundary.sql"
+    / "src/orchestrator/database/migrations/app/0100_infrastructure_terminal_evidence_single_boundary.sql"
 )
 APP_REFERENCED_RATE_GUARD_MIGRATION = (
     ROOT
-    / "orchestrator/database/migrations/app/0101_usage_rates_v2_referenced_range_guard.sql"
+    / "src/orchestrator/database/migrations/app/0101_usage_rates_v2_referenced_range_guard.sql"
 )
 APP_STORAGE_FOUNDATION_MIGRATION = (
-    ROOT / "orchestrator/database/migrations/app/0102_storage_asset_foundations.sql"
+    ROOT / "src/orchestrator/database/migrations/app/0102_storage_asset_foundations.sql"
 )
 APP_COMPUTE_FOUNDATION_MIGRATION = (
-    ROOT / "orchestrator/database/migrations/app/0103_compute_metering_foundations.sql"
+    ROOT
+    / "src/orchestrator/database/migrations/app/0103_compute_metering_foundations.sql"
 )
 APP_AGENT_METERING_LOCK_ORDER_MIGRATION = (
-    ROOT / "orchestrator/database/migrations/app/0104_agent_metering_lock_order.sql"
+    ROOT / "src/orchestrator/database/migrations/app/0104_agent_metering_lock_order.sql"
 )
 APP_STORAGE_SOURCE_ACTIVATION_MIGRATION = (
-    ROOT / "orchestrator/database/migrations/app/0105_storage_source_activation.sql"
+    ROOT / "src/orchestrator/database/migrations/app/0105_storage_source_activation.sql"
 )
 APP_COMPUTE_SCOPE_EPOCH_GUARD_MIGRATION = (
-    ROOT / "orchestrator/database/migrations/app/0106_compute_scope_epoch_guard.sql"
+    ROOT / "src/orchestrator/database/migrations/app/0106_compute_scope_epoch_guard.sql"
 )
 APP_COMPUTE_SCOPE_AUTHORIZATION_MIGRATION = (
-    ROOT / "orchestrator/database/migrations/app/0107_compute_scope_authorization.sql"
+    ROOT
+    / "src/orchestrator/database/migrations/app/0107_compute_scope_authorization.sql"
 )
 APP_COMPUTE_EXACT_EPOCH_AUTHORITY_MIGRATION = (
-    ROOT / "orchestrator/database/migrations/app/0108_compute_exact_epoch_authority.sql"
+    ROOT
+    / "src/orchestrator/database/migrations/app/0108_compute_exact_epoch_authority.sql"
 )
 APP_COMPUTE_EXACT_EPOCH_LIFECYCLE_MIGRATION = (
-    ROOT / "orchestrator/database/migrations/app/0109_compute_exact_epoch_lifecycle.sql"
+    ROOT
+    / "src/orchestrator/database/migrations/app/0109_compute_exact_epoch_lifecycle.sql"
 )
 APP_COMPUTE_EPOCH_ROLLOVER_MIGRATION = (
     ROOT
-    / "orchestrator/database/migrations/app/0112_compute_epoch_rollover_authority.sql"
+    / "src/orchestrator/database/migrations/app/0112_compute_epoch_rollover_authority.sql"
 )
 APP_COMPUTE_AUTHORITY_CONFIRMATION_GAP_MIGRATION = (
     ROOT
-    / "orchestrator/database/migrations/app/0113_compute_authority_confirmation_gap.sql"
+    / "src/orchestrator/database/migrations/app/0113_compute_authority_confirmation_gap.sql"
 )
 APP_COMPUTE_INTERVAL_EPOCH_SHAPE_REPAIR_MIGRATION = (
     ROOT
-    / "orchestrator/database/migrations/app/0114_compute_interval_epoch_shape_repair.sql"
+    / "src/orchestrator/database/migrations/app/0114_compute_interval_epoch_shape_repair.sql"
 )
 # Bump this whenever a new app migration lands — the assertion below is the
 # tripwire that says "a migration was added; check the snapshot was regenerated
@@ -144,197 +148,215 @@ APP_COMPUTE_INTERVAL_EPOCH_SHAPE_REPAIR_MIGRATION = (
 # completion command substrate (0140; 0134-0139 are reserved), and the routed
 # completion-sweep substrate (0141).
 APP_DATASOURCE_TOMBSTONES_MIGRATION = (
-    ROOT / "orchestrator/database/migrations/app/0115_datasource_tombstones.sql"
+    ROOT / "src/orchestrator/database/migrations/app/0115_datasource_tombstones.sql"
 )
 APP_JOBS_EXECUTION_LANE_MIGRATION = (
-    ROOT / "orchestrator/database/migrations/app/0118_jobs_execution_lane.sql"
+    ROOT / "src/orchestrator/database/migrations/app/0118_jobs_execution_lane.sql"
 )
 APP_THREAD_CONTROL_INBOX_MIGRATION = (
-    ROOT / "orchestrator/database/migrations/app/0119_thread_control_inbox.sql"
+    ROOT / "src/orchestrator/database/migrations/app/0119_thread_control_inbox.sql"
 )
 APP_THREAD_CONTROL_RECEIPT_INDEX = (
     ROOT
-    / "orchestrator/database/migrations/app/0120_thread_control_receipt_idx.notx.sql"
+    / "src/orchestrator/database/migrations/app/0120_thread_control_receipt_idx.notx.sql"
 )
 APP_THREAD_CONTROL_VALIDATION = (
     ROOT
-    / "orchestrator/database/migrations/app/0121_thread_control_validate_constraints.sql"
+    / "src/orchestrator/database/migrations/app/0121_thread_control_validate_constraints.sql"
 )
 APP_THREAD_CLOUD_SYNC_GENERATIONS = (
-    ROOT / "orchestrator/database/migrations/app/0122_thread_cloud_sync_generations.sql"
+    ROOT
+    / "src/orchestrator/database/migrations/app/0122_thread_cloud_sync_generations.sql"
 )
 APP_THREAD_CLOUD_SYNC_BASELINES = (
-    ROOT / "orchestrator/database/migrations/app/0123_thread_cloud_sync_baselines.sql"
+    ROOT
+    / "src/orchestrator/database/migrations/app/0123_thread_cloud_sync_baselines.sql"
 )
 APP_CLOUD_SYNC_MARKER_COMMENT = (
-    ROOT / "orchestrator/database/migrations/app/0124_cloud_sync_marker_comment.sql"
+    ROOT / "src/orchestrator/database/migrations/app/0124_cloud_sync_marker_comment.sql"
 )
 APP_THREAD_CLIENT_PRESENCE = (
-    ROOT / "orchestrator/database/migrations/app/0125_thread_client_presence.sql"
+    ROOT / "src/orchestrator/database/migrations/app/0125_thread_client_presence.sql"
 )
 APP_CANVAS_EDITOR_AWARENESS = (
-    ROOT / "orchestrator/database/migrations/app/0126_canvas_editor_awareness.sql"
+    ROOT / "src/orchestrator/database/migrations/app/0126_canvas_editor_awareness.sql"
 )
 APP_THREAD_INTERRUPT_INBOX = (
-    ROOT / "orchestrator/database/migrations/app/0127_thread_interrupt_inbox.sql"
+    ROOT / "src/orchestrator/database/migrations/app/0127_thread_interrupt_inbox.sql"
 )
 APP_THREAD_INTERRUPT_RECEIPT_INDEX = (
     ROOT
-    / "orchestrator/database/migrations/app/0128_thread_interrupt_receipt_idx.notx.sql"
+    / "src/orchestrator/database/migrations/app/0128_thread_interrupt_receipt_idx.notx.sql"
 )
 APP_THREAD_INTERRUPT_VALIDATION = (
     ROOT
-    / "orchestrator/database/migrations/app/0129_thread_interrupt_validate_constraints.sql"
+    / "src/orchestrator/database/migrations/app/0129_thread_interrupt_validate_constraints.sql"
 )
 APP_JOBS_VERIFICATION_DEDUPE = (
-    ROOT / "orchestrator/database/migrations/app/0130_jobs_verification_dedupe.sql"
+    ROOT / "src/orchestrator/database/migrations/app/0130_jobs_verification_dedupe.sql"
 )
 APP_JOBS_VERIFICATION_DROP_INDEX = (
     ROOT
-    / "orchestrator/database/migrations/app/0131_drop_jobs_verification_uniq.notx.sql"
+    / "src/orchestrator/database/migrations/app/0131_drop_jobs_verification_uniq.notx.sql"
 )
 APP_JOBS_VERIFICATION_INDEX = (
-    ROOT / "orchestrator/database/migrations/app/0132_jobs_verification_uniq.notx.sql"
+    ROOT
+    / "src/orchestrator/database/migrations/app/0132_jobs_verification_uniq.notx.sql"
 )
 APP_THREAD_SESSION_DURABLE_STATE = (
-    ROOT / "orchestrator/database/migrations/app/0133_thread_session_durable_state.sql"
+    ROOT
+    / "src/orchestrator/database/migrations/app/0133_thread_session_durable_state.sql"
 )
 APP_JOB_COMPLETION_COMMANDS = (
-    ROOT / "orchestrator/database/migrations/app/0140_job_completion_commands.sql"
+    ROOT / "src/orchestrator/database/migrations/app/0140_job_completion_commands.sql"
 )
 APP_JOB_COMPLETION_SWEEP_ROUTING = (
-    ROOT / "orchestrator/database/migrations/app/0141_job_completion_sweep_routing.sql"
+    ROOT
+    / "src/orchestrator/database/migrations/app/0141_job_completion_sweep_routing.sql"
 )
 APP_JOB_COMPLETION_SWEEP_ROUTE_PRECEDENCE = (
     ROOT
-    / "orchestrator/database/migrations/app/0142_job_completion_sweep_route_precedence.sql"
+    / "src/orchestrator/database/migrations/app/0142_job_completion_sweep_route_precedence.sql"
 )
 APP_JOB_COMPLETION_ACCEPT_STATUS = (
-    ROOT / "orchestrator/database/migrations/app/0143_job_completion_accept_status.sql"
+    ROOT
+    / "src/orchestrator/database/migrations/app/0143_job_completion_accept_status.sql"
 )
 APP_JOB_COMPLETION_STATUS_REORDER = (
-    ROOT / "orchestrator/database/migrations/app/0144_job_completion_status_reorder.sql"
+    ROOT
+    / "src/orchestrator/database/migrations/app/0144_job_completion_status_reorder.sql"
 )
 APP_MANAGED_REPOSITORY_AUTHORITIES = (
     ROOT
-    / "orchestrator/database/migrations/app/0176_managed_repository_authorities.sql"
+    / "src/orchestrator/database/migrations/app/0176_managed_repository_authorities.sql"
 )
 APP_MANAGED_REPOSITORY_THREAD_DETACH = (
     ROOT
-    / "orchestrator/database/migrations/app/0177_managed_repository_thread_detach.sql"
+    / "src/orchestrator/database/migrations/app/0177_managed_repository_thread_detach.sql"
 )
 APP_SUDO_REQUESTS_THREAD_SCOPE = (
-    ROOT / "orchestrator/database/migrations/app/0178_sudo_requests_thread_scope.sql"
+    ROOT
+    / "src/orchestrator/database/migrations/app/0178_sudo_requests_thread_scope.sql"
 )
 APP_SUDO_REQUESTS_ENTITY_CHECK = (
-    ROOT / "orchestrator/database/migrations/app/0179_sudo_requests_entity_check.sql"
+    ROOT
+    / "src/orchestrator/database/migrations/app/0179_sudo_requests_entity_check.sql"
 )
 APP_SUDO_REQUESTS_THREAD_INDEX = (
-    ROOT / "orchestrator/database/migrations/app/0180_sudo_requests_thread_idx.notx.sql"
+    ROOT
+    / "src/orchestrator/database/migrations/app/0180_sudo_requests_thread_idx.notx.sql"
 )
 APP_SUDO_REQUESTS_VALIDATE_CONSTRAINTS = (
     ROOT
-    / "orchestrator/database/migrations/app/0181_sudo_requests_validate_constraints.sql"
+    / "src/orchestrator/database/migrations/app/0181_sudo_requests_validate_constraints.sql"
 )
 APP_DELIVERABLE_CONTRACT_AUTHORITY = (
     ROOT
-    / "orchestrator/database/migrations/app/0182_deliverable_contract_authority.sql"
+    / "src/orchestrator/database/migrations/app/0182_deliverable_contract_authority.sql"
 )
 APP_PERSISTENT_INPUT_DELIVERY_CANCELLATION = (
     ROOT
-    / "orchestrator/database/migrations/app/0183_persistent_input_delivery_cancellation.sql"
+    / "src/orchestrator/database/migrations/app/0183_persistent_input_delivery_cancellation.sql"
 )
 APP_THREAD_ENDED_TRANSITION_FENCE = (
-    ROOT / "orchestrator/database/migrations/app/0184_thread_ended_transition_fence.sql"
+    ROOT
+    / "src/orchestrator/database/migrations/app/0184_thread_ended_transition_fence.sql"
 )
 APP_THREAD_RUNTIME_GENERATION_RETIREMENT = (
     ROOT
-    / "orchestrator/database/migrations/app/0185_thread_runtime_generation_retirement.sql"
+    / "src/orchestrator/database/migrations/app/0185_thread_runtime_generation_retirement.sql"
 )
 APP_PROTECTED_CLOUD_INSTANCE_AUTHORITY = (
     ROOT
-    / "orchestrator/database/migrations/app/0186_protected_cloud_instance_authority.sql"
+    / "src/orchestrator/database/migrations/app/0186_protected_cloud_instance_authority.sql"
 )
 APP_DEPLOYED_PRE_REGISTRATION_SANDBOX_ZERO = (
-    ROOT / "orchestrator/database/migrations/app/0187_pre_registration_sandbox_zero.sql"
+    ROOT
+    / "src/orchestrator/database/migrations/app/0187_pre_registration_sandbox_zero.sql"
 )
 APP_DEPLOYED_PRE_REGISTRATION_DELETE_SANDBOX_ZERO = (
     ROOT
-    / "orchestrator/database/migrations/app/0188_pre_registration_delete_sandbox_zero.sql"
+    / "src/orchestrator/database/migrations/app/0188_pre_registration_delete_sandbox_zero.sql"
 )
 APP_COMPUTE_INITIAL_RECOVERY_AUTHORITY = (
     ROOT
-    / "orchestrator/database/migrations/app/0189_compute_initial_recovery_epoch_authority.sql"
+    / "src/orchestrator/database/migrations/app/0189_compute_initial_recovery_epoch_authority.sql"
 )
 APP_MANAGED_REPOSITORY_LEGACY_RECONCILIATION = (
     ROOT
-    / "orchestrator/database/migrations/app/0190_managed_repository_legacy_reconciliation.sql"
+    / "src/orchestrator/database/migrations/app/0190_managed_repository_legacy_reconciliation.sql"
 )
 APP_STATELESS_INPUT_DELIVERIES = (
-    ROOT / "orchestrator/database/migrations/app/0191_stateless_input_deliveries.sql"
+    ROOT
+    / "src/orchestrator/database/migrations/app/0191_stateless_input_deliveries.sql"
 )
 APP_STATELESS_INPUT_DELIVERY_VALIDATION = (
     ROOT
-    / "orchestrator/database/migrations/app/0192_stateless_input_delivery_validate.sql"
+    / "src/orchestrator/database/migrations/app/0192_stateless_input_delivery_validate.sql"
 )
 APP_MANAGED_REPOSITORY_PROCESS_ZERO_AUTHORITY = (
     ROOT
-    / "orchestrator/database/migrations/app/0193_managed_repository_process_zero_authority.sql"
+    / "src/orchestrator/database/migrations/app/0193_managed_repository_process_zero_authority.sql"
 )
 APP_NOTIFICATIONS_MIGRATION = (
-    ROOT / "orchestrator/database/migrations/app/0194_notifications.sql"
+    ROOT / "src/orchestrator/database/migrations/app/0194_notifications.sql"
 )
 APP_NOTIFICATION_STEPS_MIGRATION = (
-    ROOT / "orchestrator/database/migrations/app/0195_notification_steps.sql"
+    ROOT / "src/orchestrator/database/migrations/app/0195_notification_steps.sql"
 )
 APP_NOTIFICATIONS_CUTOVER_MIGRATION = (
-    ROOT / "orchestrator/database/migrations/app/0196_notifications_cutover.sql"
+    ROOT / "src/orchestrator/database/migrations/app/0196_notifications_cutover.sql"
 )
 # Unified notification feed (slice 3: the cutover backfill) — the head after
 # the 0184-0192 managed-repository / stateless-input lane and the slice-1/2
 # feed tables; bump when the next lands.
 APP_PINNED_RECYCLE_AUTHORITY_MIGRATION = (
     ROOT
-    / "orchestrator/database/migrations/app/0200_pinned_agent_recycle_authority.sql"
+    / "src/orchestrator/database/migrations/app/0200_pinned_agent_recycle_authority.sql"
 )
-APP_USER_SSH_KEYS = ROOT / "orchestrator/database/migrations/app/0201_user_ssh_keys.sql"
+APP_USER_SSH_KEYS = (
+    ROOT / "src/orchestrator/database/migrations/app/0201_user_ssh_keys.sql"
+)
 APP_THREADS_SSH_HANDLE = (
-    ROOT / "orchestrator/database/migrations/app/0202_threads_ssh_handle.sql"
+    ROOT / "src/orchestrator/database/migrations/app/0202_threads_ssh_handle.sql"
 )
 APP_THREADS_SSH_HANDLE_IDX = (
-    ROOT / "orchestrator/database/migrations/app/0203_threads_ssh_handle_idx.notx.sql"
+    ROOT
+    / "src/orchestrator/database/migrations/app/0203_threads_ssh_handle_idx.notx.sql"
 )
 APP_SSH_ATTACHMENTS = (
-    ROOT / "orchestrator/database/migrations/app/0204_ssh_attachments.sql"
+    ROOT / "src/orchestrator/database/migrations/app/0204_ssh_attachments.sql"
 )
 # U1 config unification: the experts.tags role backfill (data only) — the head
 # after the 0201-0204 SSH lane; bump when the next lands.
 APP_EXPERTS_ROLE_TAGS_BACKFILL = (
-    ROOT / "orchestrator/database/migrations/app/0205_experts_role_tags_backfill.sql"
+    ROOT
+    / "src/orchestrator/database/migrations/app/0205_experts_role_tags_backfill.sql"
 )
 # U3 subagents (WP3): the threads kind / parent / subagent columns, their
 # partial parent-job index and the validation of the NOT VALID constraints —
 # the head after the 0205 role-tag backfill; bump when the next lands.
 APP_THREADS_SUBAGENT_KIND = (
-    ROOT / "orchestrator/database/migrations/app/0206_threads_subagent_kind.sql"
+    ROOT / "src/orchestrator/database/migrations/app/0206_threads_subagent_kind.sql"
 )
 APP_THREADS_PARENT_JOB_IDX = (
-    ROOT / "orchestrator/database/migrations/app/0207_threads_parent_job_idx.notx.sql"
+    ROOT
+    / "src/orchestrator/database/migrations/app/0207_threads_parent_job_idx.notx.sql"
 )
 APP_THREADS_SUBAGENT_VALIDATE = (
-    ROOT / "orchestrator/database/migrations/app/0208_threads_subagent_validate.sql"
+    ROOT / "src/orchestrator/database/migrations/app/0208_threads_subagent_validate.sql"
 )
 APP_EXPERT_PERSONA_IDENTITY_BACKFILL = (
     ROOT
-    / "orchestrator/database/migrations/app/0209_expert_persona_identity_backfill.sql"
+    / "src/orchestrator/database/migrations/app/0209_expert_persona_identity_backfill.sql"
 )
 APP_THREAD_TERMINAL_RECLAIM_PROJECTION = (
     ROOT
-    / "orchestrator/database/migrations/app/0210_thread_terminal_reclaim_projection.sql"
+    / "src/orchestrator/database/migrations/app/0210_thread_terminal_reclaim_projection.sql"
 )
 APP_IMAGE_DELIVERY_ROWS_EVENT_ROLE = (
     ROOT
-    / "orchestrator/database/migrations/app/0211_image_delivery_rows_event_role.sql"
+    / "src/orchestrator/database/migrations/app/0211_image_delivery_rows_event_role.sql"
 )
 # Research search/fetch capability resolution. Renumbered twice: 0205 -> 0210 during
 # the 2026-08-30 rebase (0205 was taken by 0205_experts_role_tags_backfill.sql), then
@@ -342,7 +364,7 @@ APP_IMAGE_DELIVERY_ROWS_EVENT_ROLE = (
 # 0211 had both been taken upstream. Two migrations sharing a prefix hard-fails the
 # duplicate-prefix check and the runner.
 APP_SEARCH_FETCH_CAPABILITIES = (
-    ROOT / "orchestrator/database/migrations/app/0212_search_fetch_capabilities.sql"
+    ROOT / "src/orchestrator/database/migrations/app/0212_search_fetch_capabilities.sql"
 )
 # Supersedes 0183's constraint shape without editing 0183. Renumbered 0206 -> 0211
 # during the 2026-08-30 rebase onto develop: 0206 was already taken by
@@ -351,21 +373,23 @@ APP_SEARCH_FETCH_CAPABILITIES = (
 # 0211 was taken upstream by 0211_image_delivery_rows_event_role.sql.
 APP_INPUT_DELIVERY_CONSTRAINTS_NOT_VALID = (
     ROOT
-    / "orchestrator/database/migrations/app/0213_input_delivery_constraints_not_valid.sql"
+    / "src/orchestrator/database/migrations/app/0213_input_delivery_constraints_not_valid.sql"
 )
 APP_CURRENT_MIGRATION_HEAD = (
-    ROOT / "orchestrator/database/migrations/app/0222_main_cloud_instance_pairing.sql"
+    ROOT
+    / "src/orchestrator/database/migrations/app/0225_settled_virtual_actor_exit.sql"
 )
 AUDIT_EXPANSION = (
     ROOT
-    / "orchestrator/database/migrations/audit/0003_infrastructure_usage_events_v2.sql"
+    / "src/orchestrator/database/migrations/audit/0003_infrastructure_usage_events_v2.sql"
 )
 AUDIT_VALIDATION = (
     ROOT
-    / "orchestrator/database/migrations/audit/0004_validate_and_seed_infrastructure_usage_v2.sql"
+    / "src/orchestrator/database/migrations/audit/0004_validate_and_seed_infrastructure_usage_v2.sql"
 )
 AUDIT_PROJECT_INDEX = (
-    ROOT / "orchestrator/database/migrations/audit/0005_usage_events_project_ts_idx.sql"
+    ROOT
+    / "src/orchestrator/database/migrations/audit/0005_usage_events_project_ts_idx.sql"
 )
 
 
@@ -868,8 +892,12 @@ def test_audit_project_window_index_documents_partitioned_build() -> None:
 
 
 def test_migration_heads_are_unique_and_snapshots_are_not_the_contract() -> None:
-    app_files = discover(ROOT / "orchestrator/database/migrations/app")
-    audit_files = discover(ROOT / "orchestrator/database/migrations/audit")
+    app_files = discover(
+        ROOT / "src" / "orchestrator" / "database" / "migrations" / "app"
+    )
+    audit_files = discover(
+        ROOT / "src" / "orchestrator" / "database" / "migrations" / "audit"
+    )
 
     for files in (app_files, audit_files):
         prefixes = [path.name.split("_", 1)[0] for path in files]
@@ -950,7 +978,7 @@ def test_0184_ended_transition_fence_is_mixed_version_compatible() -> None:
     assert "BEFORE UPDATE OF status ON public.threads" in sql
     assert "srw.explicit_thread_resume" not in raw
 
-    snapshot = (ROOT / "orchestrator/database/schema_current.sql").read_text()
+    snapshot = (ROOT / "src/orchestrator/database/schema_current.sql").read_text()
     assert "CREATE FUNCTION public.enforce_thread_ended_transition()" in snapshot
     assert "CREATE TRIGGER threads_ended_transition_fence BEFORE UPDATE OF" in snapshot
 
@@ -1027,7 +1055,7 @@ def test_0185_runtime_generation_and_retirement_authority_contract() -> None:
     assert "agent_runtime_zero_v1" in sql
     assert "workspace_actuator_zero_v1" in sql
 
-    snapshot = (ROOT / "orchestrator/database/schema_current.sql").read_text()
+    snapshot = (ROOT / "src/orchestrator/database/schema_current.sql").read_text()
     assert "runtime_generation uuid" in snapshot
     assert "runtime_retirement_token uuid" in snapshot
     assert "runtime_retirement_authorized_at timestamp with time zone" in snapshot
@@ -1148,7 +1176,9 @@ async def test_0185_serializes_real_predecessor_rows_with_lane_changes(
     blocker = updater = observer = None
     migration_task = update_task = None
     try:
-        for path in discover(ROOT / "orchestrator/database/migrations/app"):
+        for path in discover(
+            ROOT / "src" / "orchestrator" / "database" / "migrations" / "app"
+        ):
             if path.name >= APP_STATELESS_INPUT_DELIVERIES.name:
                 break
             (through_0184 / path.name).write_bytes(path.read_bytes())
@@ -1239,7 +1269,9 @@ async def test_0185_serializes_real_predecessor_rows_with_lane_changes(
         # hard-fail had this replay been narrowed to dodge it. Narrowing it
         # again removes the coverage; fix the migration instead.
         migration_task = asyncio.create_task(
-            run_migrations(pool, ROOT / "orchestrator/database/migrations/app")
+            run_migrations(
+                pool, ROOT / "src" / "orchestrator" / "database" / "migrations" / "app"
+            )
         )
 
         for _ in range(100):
@@ -1387,7 +1419,9 @@ async def test_0185_refuses_claimed_pending_history_on_stateless_thread(
     through_0184 = tmp_path / "ambiguous-through-0184"
     through_0184.mkdir()
     try:
-        for path in discover(ROOT / "orchestrator/database/migrations/app"):
+        for path in discover(
+            ROOT / "src" / "orchestrator" / "database" / "migrations" / "app"
+        ):
             if path.name >= APP_STATELESS_INPUT_DELIVERIES.name:
                 break
             (through_0184 / path.name).write_bytes(path.read_bytes())
@@ -1424,7 +1458,9 @@ async def test_0185_refuses_claimed_pending_history_on_stateless_thread(
             asyncpg.CheckViolationError,
             match="Pre-0191 stateless input history is ambiguous",
         ):
-            await run_migrations(pool, ROOT / "orchestrator/database/migrations/app")
+            await run_migrations(
+                pool, ROOT / "src" / "orchestrator" / "database" / "migrations" / "app"
+            )
 
         async with pool.acquire() as conn:
             # Transactional failure rolls every 0185 catalog mutation back.
@@ -1475,7 +1511,9 @@ async def test_0185_refuses_numbered_pending_history_on_stateless_thread(
     through_0184 = tmp_path / "numbered-through-0184"
     through_0184.mkdir()
     try:
-        for path in discover(ROOT / "orchestrator/database/migrations/app"):
+        for path in discover(
+            ROOT / "src" / "orchestrator" / "database" / "migrations" / "app"
+        ):
             if path.name >= APP_STATELESS_INPUT_DELIVERIES.name:
                 break
             (through_0184 / path.name).write_bytes(path.read_bytes())
@@ -1510,7 +1548,9 @@ async def test_0185_refuses_numbered_pending_history_on_stateless_thread(
             asyncpg.CheckViolationError,
             match="Pre-0191 stateless input history is ambiguous",
         ):
-            await run_migrations(pool, ROOT / "orchestrator/database/migrations/app")
+            await run_migrations(
+                pool, ROOT / "src" / "orchestrator" / "database" / "migrations" / "app"
+            )
 
         async with pool.acquire() as conn:
             assert not await conn.fetchval(
@@ -1568,7 +1608,9 @@ async def test_deployed_0188_history_upgrades_to_current_head(
     deployed = tmp_path / "deployed-through-0188"
     deployed.mkdir()
     try:
-        for path in discover(ROOT / "orchestrator/database/migrations/app"):
+        for path in discover(
+            ROOT / "src" / "orchestrator" / "database" / "migrations" / "app"
+        ):
             if path.name > APP_DEPLOYED_PRE_REGISTRATION_DELETE_SANDBOX_ZERO.name:
                 break
             (deployed / path.name).write_bytes(path.read_bytes())
@@ -1592,7 +1634,9 @@ async def test_deployed_0188_history_upgrades_to_current_head(
                 ),
             ]
 
-        await run_migrations(pool, ROOT / "orchestrator/database/migrations/app")
+        await run_migrations(
+            pool, ROOT / "src" / "orchestrator" / "database" / "migrations" / "app"
+        )
         async with pool.acquire() as conn:
             assert await conn.fetchval(
                 "SELECT success FROM schema_migrations WHERE filename=$1",
@@ -1669,7 +1713,9 @@ async def test_0177_repairs_deployed_legacy_thread_detach_without_opening_attach
     through_0176.mkdir()
     through_0177.mkdir()
     try:
-        for path in discover(ROOT / "orchestrator/database/migrations/app"):
+        for path in discover(
+            ROOT / "src" / "orchestrator" / "database" / "migrations" / "app"
+        ):
             if path.name < APP_MANAGED_REPOSITORY_AUTHORITIES.name:
                 (through_0175 / path.name).write_bytes(path.read_bytes())
             if path.name <= APP_MANAGED_REPOSITORY_AUTHORITIES.name:
@@ -2064,7 +2110,9 @@ async def test_compute_shape_repair_upgrades_deployed_0112_and_0113_checksums(
     staged_dir.mkdir()
     repaired_dir.mkdir()
     try:
-        for path in discover(ROOT / "orchestrator/database/migrations/app"):
+        for path in discover(
+            ROOT / "src" / "orchestrator" / "database" / "migrations" / "app"
+        ):
             if path.name <= APP_COMPUTE_AUTHORITY_CONFIRMATION_GAP_MIGRATION.name:
                 (staged_dir / path.name).write_bytes(path.read_bytes())
             if path.name <= APP_COMPUTE_INTERVAL_EPOCH_SHAPE_REPAIR_MIGRATION.name:

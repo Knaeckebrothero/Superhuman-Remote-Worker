@@ -67,56 +67,44 @@ docker_build(
     'srw-orchestrator',
     context='.',
     dockerfile='docker/Dockerfile.orchestrator.dev',
+    only=[
+        'src/orchestrator/',
+        'src/shared/',
+        'config/',
+        'pyproject.toml',
+        '.dockerignore',
+        'docker/Dockerfile.orchestrator.dev',
+        'scripts/check_kubernetes_sdk_auth.py',
+        'requirements/',
+        'scripts/lock_dependencies.py',
+    ],
     live_update=[
         fall_back_on([
             'docker/Dockerfile.orchestrator.dev',
-            'orchestrator/requirements.txt',
-            # Migrations must be BAKED, never just live-synced: a synced
-            # migration gets applied to the DB by the reloaded app, but the
-            # image still lacks the file — the next pod from that image (e.g.
-            # a Reloader bounce) fails startup with "applied but missing on
-            # disk" and crash-loops (2026-06-11, 0025_security_events).
-            'orchestrator/database/migrations/',
-            # A package change can add a module imported by main.py. Live sync
-            # targets the currently selected Pod, so during a rolling update an
-            # older baked image can receive main.py without receiving the new
-            # module. Bake this package atomically into a new image instead.
-            'orchestrator/services/infrastructure_metering/',
+            'scripts/check_kubernetes_sdk_auth.py',
+            'requirements/',
+            'scripts/lock_dependencies.py',
+            'src/orchestrator/requirements.txt',
+            'pyproject.toml',
+            '.dockerignore',
+            # Applied migrations must remain present in every new replica.
+            'src/orchestrator/database/migrations/',
+            # main.py and new metering modules must be baked together, even
+            # when live sync currently targets only one rolling-update Pod.
+            'src/orchestrator/services/infrastructure_metering/',
         ]),
-        # orchestrator/ contents are flattened into /app/ to match the prod
-        # Dockerfile's layout (so `from services.foo import bar` resolves).
-        sync('orchestrator/', '/app/'),
-        sync('src/', '/app/src/'),
+        sync('src/orchestrator/', '/app/src/orchestrator/'),
+        sync('src/shared/', '/app/src/shared/'),
         sync('config/', '/app/config/'),
     ],
     ignore=[
         '**/__pycache__',
         '**/*.pyc',
         '**/*.pyo',
-        '.pytest_cache',
-        '.mypy_cache',
-        '.ruff_cache',
-        '.venv',
-        '*.egg-info',
-        '.coverage',
-        'htmlcov',
-        'tests/',
-        'workspace/',
-        '.tilt-state/',
-        # Cross-component dirs the orchestrator build doesn't care about — any
-        # file change here would otherwise force a fall_back full rebuild.
-        'cockpit/',
-        'helm/',
-        'knowledge-base/',
-        'knowledge-history/',
-        'deployment/',
-        'scripts/',
-        'docker/Dockerfile.cockpit*',
-        'docker/Dockerfile.agent*',
-        'docker/Dockerfile.mcp*',
-        '*.md',
-        '.git/',
-        '.playwright-mcp/',
+        '**/.pytest_cache',
+        '**/.mypy_cache',
+        '**/.ruff_cache',
+        '**/*.egg-info',
     ],
 )
 
@@ -157,10 +145,9 @@ docker_build(
         # Monaco assets are built once into the image; don't sync over them.
         'cockpit/public/monaco/',
         # Cross-component dirs the cockpit build doesn't care about.
-        'orchestrator/',
         'src/',
         'config/',
-        'agent.py',
+        'pyproject.toml',
         'init.py',
         'helm/',
         'knowledge-base/',
@@ -182,7 +169,7 @@ docker_build(
 # spawned by AgentProvisioner; see Non-goals in tilt_inner_loop_dev.md). What
 # Tilt CAN do is automate the rebuild loop end-to-end:
 #
-#   1. file save under src/, config/, agent.py, or requirements.txt
+#   1. file save under src/agent/, src/shared/, config/, or packaging inputs
 #   2. docker_build rebuilds srw-agent:tilt-<hash>
 #   3. push to localhost:5005 (k3d pulls via srw-registry:5000)
 #   4. the `srw` custom deploy re-renders the srw-config ConfigMap with the
@@ -194,8 +181,8 @@ docker_build(
 #      provisions the next agent pod with the new tag
 #
 # The `only=` list pins the file watcher to exactly the paths that go into
-# the final image's source layers — pyproject changes don't rebuild, doc
-# edits don't rebuild, test files don't rebuild. Cold rebuild is ~30-60 s;
+# the final image's source and packaging layers. Unrelated application,
+# documentation and test edits do not rebuild this image. Cold rebuild is ~30-60 s;
 # warm cache (only src/ changed) is ~10-15 s.
 # -----------------------------------------------------------------------------
 docker_build(
@@ -203,19 +190,23 @@ docker_build(
     context='.',
     dockerfile='docker/Dockerfile.agent.dev',
     only=[
-        'src/',
+        'src/agent/',
+        'src/shared/',
         'config/',
-        'agent.py',
         'requirements.txt',
+        'pyproject.toml',
+        '.dockerignore',
         'docker/Dockerfile.agent.dev',
+        'docker/prepare-tokenizer-cache.py',
     ],
     ignore=[
         '**/__pycache__',
         '**/*.pyc',
         '**/*.pyo',
-        'src/**/.pytest_cache',
-        'src/**/.mypy_cache',
-        'src/**/.ruff_cache',
+        '**/.pytest_cache',
+        '**/.mypy_cache',
+        '**/.ruff_cache',
+        '**/*.egg-info',
     ],
 )
 
@@ -226,67 +217,39 @@ docker_build(
 # trigger a process restart without rebuilding the image. ~3-5 s loop.
 #
 # fall_back_on covers the cases where live_update can't help (requirements
-# bump, Dockerfile change, formatters touch from outside mcp/).
+# bump, Dockerfile change, or package/build-context metadata changes).
 # -----------------------------------------------------------------------------
 docker_build(
     'srw-mcp',
     context='.',
     dockerfile='docker/Dockerfile.mcp.dev',
+    only=[
+        'src/mcp_server/',
+        'src/shared/',
+        'pyproject.toml',
+        '.dockerignore',
+        'docker/Dockerfile.mcp.dev',
+    ],
     live_update=[
         fall_back_on([
             'docker/Dockerfile.mcp.dev',
-            'orchestrator/mcp/requirements.txt',
+            'src/mcp_server/requirements.txt',
+            'pyproject.toml',
+            '.dockerignore',
         ]),
-        # Layout matches the Dockerfile's COPYs:
-        #   orchestrator/mcp/   → /app/
-        #   src/shared/         → /app/src/shared/   (client + formatters)
-        #   orchestrator/security/anti_framing.py → /app/security/anti_framing.py
-        # The watchfiles CMD watches /app recursively, so synced shared-package
-        # edits restart the server like any mcp/ edit.
-        sync('orchestrator/mcp/', '/app/'),
+        # Both namespaces match the editable installation. The recursive
+        # watchfiles process restarts for either application or shared edits.
+        sync('src/mcp_server/', '/app/src/mcp_server/'),
         sync('src/shared/', '/app/src/shared/'),
-        sync('orchestrator/security/anti_framing.py', '/app/security/anti_framing.py'),
     ],
     ignore=[
         '**/__pycache__',
         '**/*.pyc',
         '**/*.pyo',
-        # Cross-component dirs the mcp build doesn't care about. `src` uses
-        # `*` (not trailing `/`) so the `!` negation below can re-include the
-        # shared package the image ships.
-        'src/*',
-        '!src/shared',
-        'config/',
-        'cockpit/',
-        'helm/',
-        'knowledge-base/',
-        'knowledge-history/',
-        'deployment/',
-        'scripts/',
-        'tests/',
-        'workspace/',
-        'agent.py',
-        'init.py',
-        # Other orchestrator code outside of mcp/ + the two synced files
-        # would otherwise trigger fall_back via context-content hash.
-        # `!` negation re-includes the two files the Dockerfile COPYs
-        # from orchestrator/services/.
-        'orchestrator/api/',
-        'orchestrator/auth/',
-        'orchestrator/database/',
-        'orchestrator/dispatch/',
-        'orchestrator/routers/',
-        'orchestrator/services/',
-        'orchestrator/main.py',
-        'orchestrator/requirements.txt',
-        'docker/Dockerfile.orchestrator*',
-        'docker/Dockerfile.agent*',
-        'docker/Dockerfile.cockpit*',
-        'docker/Dockerfile.workspace*',
-        '*.md',
-        '.git/',
-        '.playwright-mcp/',
-        '.tilt-state/',
+        '**/.pytest_cache',
+        '**/.mypy_cache',
+        '**/.ruff_cache',
+        '**/*.egg-info',
     ],
 )
 
@@ -370,8 +333,19 @@ local(
 # -----------------------------------------------------------------------------
 docker_build(
     'srw-vm-controller',
-    context='vm/controller',
-    dockerfile='vm/controller/Dockerfile',
+    context='.',
+    dockerfile='docker/Dockerfile.vm-controller',
+    only=[
+        'src/vm_controller/',
+        'src/shared/__init__.py',
+        'src/shared/vm_lifecycle_auth.py',
+        'pyproject.toml',
+        '.dockerignore',
+        'docker/Dockerfile.vm-controller',
+        'scripts/check_kubernetes_sdk_auth.py',
+        'requirements/',
+        'scripts/lock_dependencies.py',
+    ],
     ignore=['**/__pycache__', '**/*.pyc'],
 )
 
@@ -406,6 +380,10 @@ k8s_custom_deploy(
         # reclaim that same object on reinstall so generated encryption/Garage
         # keys do not rotate.
         '--take-ownership',
+        # Tilt observes application Pods below; Helm still gates readiness of
+        # the complete release, including databases and immutable collectors.
+        '--wait',
+        '--timeout=14m',
         '--values=deployment/values-local.yaml',
         '--values=deployment/values-tilt.yaml',
     ],
@@ -425,6 +403,22 @@ k8s_custom_deploy(
         'deployment/values-tilt.yaml',
     ],
     image_deps=[img[0] for img in _srw_images],
+)
+
+# Collectors and seed Jobs also use the orchestrator image, but run with an
+# immutable filesystem. Image matching alone would copy application edits into
+# those containers. Restrict discovery to the chart's application components;
+# dependency/migration/collector changes still rebuild the shared image above.
+k8s_resource(
+    'srw',
+    discovery_strategy='selectors-only',
+    extra_pod_selectors=[
+        {
+            'app.kubernetes.io/instance': 'srw',
+            'app.kubernetes.io/component': component,
+        }
+        for component in ['orchestrator', 'cockpit', 'mcp', 'agent-stateless', 'vm-controller']
+    ],
 )
 
 # -----------------------------------------------------------------------------

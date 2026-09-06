@@ -18,7 +18,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from src.services.knowledge_store import KnowledgeRecord, KnowledgeStore
+from shared.runtime.services.knowledge_store import KnowledgeRecord, KnowledgeStore
 
 
 def _store(embedding_service: bool = True):

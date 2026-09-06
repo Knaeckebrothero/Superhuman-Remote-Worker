@@ -279,7 +279,7 @@ spec:
           command:
             - python
             - -m
-            - operator_cli.canvas_viewer_database_attestation
+            - orchestrator.operator_cli.canvas_viewer_database_attestation
           envFrom:
             - configMapRef:
                 name: {{ include "srw.fullname" . }}-canvas-gateway-config

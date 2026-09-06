@@ -16,7 +16,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from src.graph import create_archive_phase_node
+from agent.graph import create_archive_phase_node
 
 
 def _config():

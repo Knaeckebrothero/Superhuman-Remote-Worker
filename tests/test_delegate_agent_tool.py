@@ -26,25 +26,25 @@ from langchain_core.messages import (
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
 
-from src.core.loader import LLMConfig
-from src.core.subagent_roster import resolve_subagent_roster
-from src.core.workspace import WorkspaceManager, WorkspaceManagerConfig
-from src.subagents import (
+from shared.runtime.core.loader import LLMConfig
+from shared.runtime.core.subagent_roster import resolve_subagent_roster
+from agent.core.workspace import WorkspaceManager, WorkspaceManagerConfig
+from agent.subagents import (
     SUBAGENT_STATUSES,
     RecordingLedger,
     SubagentRuntime,
     WorkerHost,
 )
-from src.subagents.child import WRITE_POLICIES
-from src.subagents.fork import FORK_NOTICE
-from src.tools.context import ToolContext
-from src.tools.delegation import create_delegation_tools, get_delegation_metadata
-from src.tools.delegation.delegate_agent import (
+from agent.subagents.child import WRITE_POLICIES
+from agent.subagents.fork import FORK_NOTICE
+from agent.tools.context import ToolContext
+from agent.tools.delegation import create_delegation_tools, get_delegation_metadata
+from agent.tools.delegation.delegate_agent import (
     DELEGATE_AGENT_METADATA,
     build_description,
     create_delegate_agent_tools,
 )
-from src.tools.registry import TOOL_REGISTRY, load_tools
+from agent.tools.registry import TOOL_REGISTRY, load_tools
 from tests._fake_chat_model import FakeChatModel, text_turn, tool_turn
 from tests._fs_backend import FilesystemTestBackend
 

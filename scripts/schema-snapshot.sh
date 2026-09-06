@@ -46,22 +46,19 @@
 #   CONTAINER_ENGINE=podman scripts/schema-snapshot.sh   # force engine
 #   PYTHON=./venv/bin/python scripts/schema-snapshot.sh  # runner interpreter
 #
-# Requires: docker or podman, and a Python with asyncpg + cryptography (the
-# migration runner's deps) reachable as $PYTHON.
+# Requires: docker or podman, asyncpg, and an editable application install
+# (pip install --no-deps -e .) reachable as $PYTHON.
 # =============================================================================
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-OUT_DIR="orchestrator/database"
+OUT_DIR="src/orchestrator/database"
 
 # --- interpreter for the migration runner ----------------------------------
-# The runner imports `security.crypto` / `utils.db_url` assuming orchestrator/
-# is sys.path[0], so we always invoke it as `-m database.migrate` from inside
-# orchestrator/ (mirrors the CI dry-run job's working-directory). Database
-# modules also import shared packages from the repository-root `src/` tree, so
-# the migration invocation explicitly carries REPO_ROOT in PYTHONPATH.
+# The standalone module is installed from the source layout with --no-deps -e .
+# Its lazy package initializer keeps this path independent of application deps.
 if [[ -z "${PYTHON:-}" ]]; then
   if [[ -x "$REPO_ROOT/venv/bin/python" ]]; then
     PYTHON="$REPO_ROOT/venv/bin/python"
@@ -138,13 +135,13 @@ emit_header() {
 -- GENERATED FILE — DO NOT EDIT BY HAND.
 --
 -- Canonical current schema for the '$fam' database, produced by replaying every
--- migration under orchestrator/database/migrations/$fam/ from zero into a
+-- migration under src/orchestrator/database/migrations/$fam/ from zero into a
 -- throwaway container and dumping the result.
 --
--- Source of truth : orchestrator/database/migrations/$fam/*.sql
+-- Source of truth : src/orchestrator/database/migrations/$fam/*.sql
 -- Regenerate      : scripts/schema-snapshot.sh $fam
 -- CI enforces that this file matches a fresh regeneration (db-migrations.yml).
--- The frozen orchestrator/database/{schema,vector_schema}.sql snapshots are a
+-- The frozen src/orchestrator/database/{schema,vector_schema}.sql snapshots are a
 -- separate, historical concern; THIS file tracks the live migration chain.
 --
 EOF
@@ -264,10 +261,9 @@ generate_one() {
   fi
 
   # Migrate from zero (real apply — runs .notx.sql CONCURRENTLY files too).
-  ( cd orchestrator && \
-    PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-    DATABASE_URL="postgresql://postgres:$PGPASS@localhost:$port/$db" \
-    "$PYTHON" -m database.migrate --dir "database/migrations/$subdir" ) >&2
+  DATABASE_URL="postgresql://postgres:$PGPASS@localhost:$port/$db" \
+    "$PYTHON" -m orchestrator.database.migrate \
+      --dir "src/orchestrator/database/migrations/$subdir" >&2
 
   # Dump INSIDE the container (client == server by construction). Pin the
   # random \restrict token (CVE-2025-8714) with --restrict-key when the build
@@ -344,7 +340,7 @@ if [[ "$CHECK" -eq 1 ]]; then
   done < <(select_families)
   if [[ "$drift" -eq 1 ]]; then
     echo "" >&2
-    echo "Schema artifacts are out of date. Run: scripts/schema-snapshot.sh && git add -A orchestrator/database/*_current.sql" >&2
+    echo "Schema artifacts are out of date. Run: scripts/schema-snapshot.sh && git add -A src/orchestrator/database/*_current.sql" >&2
     exit 1
   fi
   echo "OK: schema artifacts are up to date." >&2

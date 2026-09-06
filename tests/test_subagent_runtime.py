@@ -11,11 +11,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-import src.subagents.runtime as runtime_mod
-from src.core.loader import LLMConfig
-from src.core.subagent_roster import resolve_subagent_roster
-from src.core.workspace import WorkspaceManager, WorkspaceManagerConfig
-from src.subagents import (
+import agent.subagents.runtime as runtime_mod
+from shared.runtime.core.loader import LLMConfig
+from shared.runtime.core.subagent_roster import resolve_subagent_roster
+from agent.core.workspace import WorkspaceManager, WorkspaceManagerConfig
+from agent.subagents import (
     SUBAGENT_STATUSES,
     ChildBudgets,
     ContextProbe,
@@ -25,7 +25,7 @@ from src.subagents import (
     SubagentRuntime,
     WorkerHost,
 )
-from src.tools.context import ToolContext
+from agent.tools.context import ToolContext
 from tests._fake_chat_model import HANG, FakeChatModel, text_turn
 from tests._fs_backend import FilesystemTestBackend
 

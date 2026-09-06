@@ -7,22 +7,16 @@ import logging
 import pytest
 import shutil
 import tempfile
-import sys
 from pathlib import Path
 from unittest.mock import MagicMock
 
-# Add project root to path
-project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-
-from src.core.workspace import WorkspaceManager, WorkspaceManagerConfig  # noqa: E402
-from src.core.phase import (  # noqa: E402
+from agent.core.workspace import WorkspaceManager, WorkspaceManagerConfig  # noqa: E402
+from agent.core.phase import (  # noqa: E402
     _complete_phase_with_git,
     on_strategic_phase_complete,
     on_tactical_phase_complete,
 )
-from src.managers.todo import TodoManager  # noqa: E402
+from agent.managers.todo import TodoManager  # noqa: E402
 from tests._fs_backend import FilesystemTestBackend  # noqa: E402
 
 
@@ -143,7 +137,7 @@ class TestCompletePhaseWithGit:
         first_commit = gm.resolve_tag_commit(tag_name)
         assert first_commit is not None
 
-        with caplog.at_level(logging.ERROR, logger="src.managers.git_manager"):
+        with caplog.at_level(logging.ERROR, logger="agent.managers.git_manager"):
             _complete_phase_with_git(
                 workspace=workspace_with_git,
                 phase_number=1,

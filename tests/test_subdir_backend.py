@@ -8,7 +8,7 @@ the parent root). Uses FilesystemTestBackend as the parent.
 
 from pathlib import Path
 
-from src.core.backends.subdir import SubdirBackend
+from agent.core.backends.subdir import SubdirBackend
 
 from tests._fs_backend import FilesystemTestBackend
 

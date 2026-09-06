@@ -189,14 +189,14 @@ def _calls(conn: _ControlConn, operation: str, contains: str):
     ],
 )
 def test_public_control_envelope_rejects_invalid_method_mode_or_request_id(payload):
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
 
     with pytest.raises(ValidationError):
         orchestrator_main.ThreadControlRequest.model_validate(payload)
 
 
 def test_public_workspace_undo_envelope_has_empty_canonical_payload():
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
 
     body = orchestrator_main.ThreadControlRequest(
         client_request_id=CLIENT_REQUEST_ID,
@@ -216,7 +216,7 @@ def test_public_workspace_undo_envelope_has_empty_canonical_payload():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("key", ["permission_mode", "narration_mode"])
 async def test_generic_orchestrator_config_update_cannot_bypass_inbox(key):
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
 
     with pytest.raises(HTTPException) as exc:
         await orchestrator_main._apply_thread_config_update(
@@ -234,7 +234,7 @@ async def test_generic_orchestrator_config_update_cannot_bypass_inbox(key):
 
 @pytest.mark.asyncio
 async def test_control_endpoint_stops_at_exact_owner_gate():
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
 
     denial = HTTPException(status_code=403, detail="Not thread owner")
     owner = AsyncMock(side_effect=denial)
@@ -262,7 +262,7 @@ async def test_control_endpoint_stops_at_exact_owner_gate():
 
 @pytest.mark.asyncio
 async def test_control_endpoint_admits_owner_request_without_exposing_lane():
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
 
     user = {"id": OWNER_ID}
     thread = {
@@ -342,7 +342,7 @@ async def test_control_endpoint_admits_owner_request_without_exposing_lane():
 
 @pytest.mark.asyncio
 async def test_control_endpoint_refuses_unattested_stateless_sandbox_request():
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
 
     thread = {
         "id": THREAD_ID,
@@ -383,7 +383,7 @@ async def test_control_endpoint_refuses_unattested_stateless_sandbox_request():
 
 @pytest.mark.asyncio
 async def test_control_endpoint_admits_lane_free_workspace_undo_payload():
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
 
     thread = {
         "id": THREAD_ID,
@@ -439,7 +439,7 @@ async def test_control_endpoint_admits_lane_free_workspace_undo_payload():
 async def test_admin_can_control_ownerless_legacy_thread_without_fake_uuid():
     """Admin-only ownerless threads retain their pre-REST control surface."""
 
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
 
     admin_id = UUID("77777777-7777-4777-8777-777777777777")
     thread = {
@@ -496,7 +496,7 @@ async def test_admin_can_control_ownerless_legacy_thread_without_fake_uuid():
 
 @pytest.mark.asyncio
 async def test_control_endpoint_maps_admission_conflict_to_409():
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
 
     body = orchestrator_main.ThreadControlRequest(
         client_request_id=CLIENT_REQUEST_ID,
@@ -536,7 +536,7 @@ async def test_control_endpoint_maps_admission_conflict_to_409():
 
 @pytest.mark.asyncio
 async def test_control_endpoint_maps_transient_owner_readiness_to_425():
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
 
     body = orchestrator_main.ThreadControlRequest(
         client_request_id=CLIENT_REQUEST_ID,
@@ -576,7 +576,7 @@ async def test_control_endpoint_maps_transient_owner_readiness_to_425():
 
 @pytest.mark.asyncio
 async def test_exact_pinned_ended_status_refuses_successor_binding():
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
 
     successor = UUID("88888888-8888-4888-8888-888888888888")
     conn = MagicMock()
@@ -621,7 +621,7 @@ async def test_exact_pinned_ended_status_refuses_successor_binding():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["active", "awaiting_user"])
 async def test_exact_pinned_live_status_refuses_stale_pre_resume_agent(status):
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
 
     successor = UUID("88888888-8888-4888-8888-888888888888")
     conn = MagicMock()
@@ -668,7 +668,7 @@ async def test_exact_pinned_live_status_refuses_stale_pre_resume_agent(status):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["active", "awaiting_user"])
 async def test_exact_pinned_live_status_preserves_runtime_resources(status):
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
 
     thread = {
         "id": THREAD_ID,
@@ -730,7 +730,7 @@ async def test_exact_pinned_live_status_preserves_runtime_resources(status):
 
 @pytest.mark.asyncio
 async def test_strict_pinned_status_phase_rejects_missing_identity(monkeypatch):
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
 
     db = MagicMock()
     db.get_thread = AsyncMock(
@@ -754,7 +754,7 @@ async def test_strict_pinned_status_phase_rejects_missing_identity(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_committed_retry_bypasses_mutable_grant_policy():
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
 
     thread = {"id": THREAD_ID, "user_id": OWNER_ID, "project_id": PROJECT_ID}
     duplicate = AdmittedControl(

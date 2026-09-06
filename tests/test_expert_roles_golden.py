@@ -35,7 +35,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from src.core.loader import (
+from shared.runtime.core.loader import (
     EXPERT_BASE,
     IGNORE_KEYS_DIRECTIVE,
     ROLE_ROOTS,
@@ -765,8 +765,8 @@ def test_library_entry_is_read_only_when_loaded_standalone(name):
     subagent floor. Implementer is the sole workspace writer; probe and reader
     never acquire a workspace file mutator.
     """
-    from src.subagents.child import WRITE_TOOLS
-    from src.tools.registry import TOOL_REGISTRY
+    from agent.subagents.child import WRITE_TOOLS
+    from agent.tools.registry import TOOL_REGISTRY
 
     leaf = next(p for p in _LIBRARY if p.parent.name == name)
     own = yaml.safe_load(leaf.read_text(encoding="utf-8"))

@@ -1,0 +1,2 @@
+# Temporary migration tooling; keep out of runtime dependency sets.
+libcst==1.8.6

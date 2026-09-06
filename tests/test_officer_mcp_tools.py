@@ -8,23 +8,13 @@ from turn one.
 """
 
 import os
-import sys
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
-_orchestrator_dir = os.path.join(os.path.dirname(__file__), "..", "orchestrator")
-if _orchestrator_dir not in sys.path:
-    sys.path.insert(0, os.path.abspath(_orchestrator_dir))
-
-_mock_mcp_instance = MagicMock()
-_mock_mcp_instance.tool = lambda fn, **_kwargs: fn
-_mock_fastmcp = MagicMock()
-_mock_fastmcp.FastMCP.return_value = _mock_mcp_instance
-sys.modules.setdefault("fastmcp", _mock_fastmcp)
 os.environ.setdefault("MCP_TRANSPORT", "stdio")
 
-from mcp import server as _mcp_server_mod  # noqa: E402
+from mcp_server import server as _mcp_server_mod  # noqa: E402
 
 PROJECT_ID = "a572e4a0-d97a-4103-91fd-92a980d6717d"
 THREAD_ID = "6ce5bc4c-b773-4027-b47f-55d5308c92bb"

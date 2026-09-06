@@ -20,8 +20,8 @@ from pathlib import Path
 
 import pytest
 
-from src.core.expert_resolution import ASSEMBLER_OWNED_PROMPT_TOKENS
-from src.core.loader import render_instruction_content, render_placeholders
+from shared.runtime.core.expert_resolution import ASSEMBLER_OWNED_PROMPT_TOKENS
+from shared.runtime.core.loader import render_instruction_content, render_placeholders
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 

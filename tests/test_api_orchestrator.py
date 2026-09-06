@@ -96,7 +96,7 @@ class TestJobStartEndpoint:
     @pytest.fixture
     def test_client(self, mock_agent):
         """Create a test client with mocked agent."""
-        import src.api.app as app_module
+        import agent.api.app as app_module
 
         # Save original state
         original_agent = app_module._agent
@@ -109,7 +109,7 @@ class TestJobStartEndpoint:
         app_module._orchestrator_client = _runtime_client()
 
         # Create app without lifespan (we're mocking the agent)
-        from src.api.app import create_app
+        from agent.api.app import create_app
 
         # We need to create a fresh app instance
         test_app = create_app()
@@ -128,7 +128,7 @@ class TestJobStartEndpoint:
 
     def test_job_start_accepts_and_returns_202(self, test_client, mock_agent):
         """Test that /job/start accepts a job and returns 202."""
-        import src.api.app as app_module
+        import agent.api.app as app_module
 
         # Ensure no job is running
         app_module._current_job_id = None
@@ -150,7 +150,7 @@ class TestJobStartEndpoint:
         assert data["status"] == "accepted"
 
     def test_pre_contract_job_start_is_refused(self, test_client, mock_agent):
-        import src.api.app as app_module
+        import agent.api.app as app_module
 
         app_module._current_job_id = None
         app_module._agent = mock_agent
@@ -170,7 +170,7 @@ class TestJobStartEndpoint:
 
     def test_job_start_rejects_when_busy(self, test_client, mock_agent):
         """Test that /job/start returns 409 when agent is busy."""
-        import src.api.app as app_module
+        import agent.api.app as app_module
 
         # Simulate a job already running
         app_module._current_job_id = "existing-job-456"
@@ -218,7 +218,7 @@ class TestJobCancelEndpoint:
     @pytest.fixture
     def test_client(self, mock_agent):
         """Create a test client with mocked agent."""
-        import src.api.app as app_module
+        import agent.api.app as app_module
 
         original_agent = app_module._agent
         original_job_id = app_module._current_job_id
@@ -242,7 +242,7 @@ class TestJobCancelEndpoint:
 
     def test_job_cancel_no_job_returns_404(self, test_client, mock_agent):
         """Test that /job/cancel returns 404 when no job is running."""
-        import src.api.app as app_module
+        import agent.api.app as app_module
 
         app_module._current_job_id = None
         app_module._agent = mock_agent
@@ -281,7 +281,7 @@ class TestJobResumeEndpoint:
     @pytest.fixture
     def test_client(self, mock_agent):
         """Create a test client with mocked agent."""
-        import src.api.app as app_module
+        import agent.api.app as app_module
 
         original_agent = app_module._agent
         original_job_id = app_module._current_job_id
@@ -305,7 +305,7 @@ class TestJobResumeEndpoint:
 
     def test_job_resume_works(self, test_client, mock_agent):
         """Test that /job/resume accepts a resume request."""
-        import src.api.app as app_module
+        import agent.api.app as app_module
 
         app_module._current_job_id = None
         app_module._agent = mock_agent
@@ -351,7 +351,7 @@ class TestGetCurrentJobEndpoint:
     @pytest.fixture
     def test_client(self, mock_agent):
         """Create a test client with mocked agent."""
-        import src.api.app as app_module
+        import agent.api.app as app_module
 
         original_agent = app_module._agent
         original_job_id = app_module._current_job_id
@@ -369,7 +369,7 @@ class TestGetCurrentJobEndpoint:
 
     def test_get_current_job_when_idle(self, test_client, mock_agent):
         """Test /job/current returns no job when idle."""
-        import src.api.app as app_module
+        import agent.api.app as app_module
 
         app_module._current_job_id = None
         app_module._agent = mock_agent
@@ -383,7 +383,7 @@ class TestGetCurrentJobEndpoint:
 
     def test_get_current_job_when_busy(self, test_client, mock_agent):
         """Test /job/current returns job info when busy."""
-        import src.api.app as app_module
+        import agent.api.app as app_module
 
         app_module._current_job_id = "active-job-123"
         app_module._agent = mock_agent
@@ -404,8 +404,8 @@ class TestPinnedJobStreamClose:
     async def test_close_timeout_is_a_typed_lifecycle_failure(self, monkeypatch):
         import asyncio
 
-        import src.api.app as app_module
-        from src.shared.subagent_lifecycle import SubagentQuiescenceError
+        import agent.api.app as app_module
+        from shared.subagent_lifecycle import SubagentQuiescenceError
 
         class _HungStream:
             async def aclose(self):
@@ -420,7 +420,7 @@ class TestPinnedJobStreamClose:
     async def test_fresh_job_closes_before_completion_report_and_cleanup(
         self, monkeypatch
     ):
-        import src.api.app as app_module
+        import agent.api.app as app_module
 
         events: list[str] = []
         final = {"should_stop": True, "error": None}
@@ -456,8 +456,8 @@ class TestPinnedJobStreamClose:
     async def test_resumed_job_error_closes_before_error_report_and_cleanup(
         self, monkeypatch
     ):
-        import src.api.app as app_module
-        from src.api.models import JobResumeRequest
+        import agent.api.app as app_module
+        from agent.api.models import JobResumeRequest
 
         events: list[str] = []
 
@@ -514,8 +514,8 @@ class TestPinnedJobStreamClose:
     async def test_fresh_job_lifecycle_failure_drains_without_completion_report(
         self, monkeypatch
     ):
-        import src.api.app as app_module
-        from src.shared.subagent_lifecycle import SubagentQuiescenceError
+        import agent.api.app as app_module
+        from shared.subagent_lifecycle import SubagentQuiescenceError
 
         events: list[str] = []
         client = MagicMock()
@@ -555,9 +555,9 @@ class TestPinnedJobStreamClose:
     async def test_resumed_job_lifecycle_failure_drains_without_completion_report(
         self, monkeypatch
     ):
-        import src.api.app as app_module
-        from src.api.models import JobResumeRequest
-        from src.shared.subagent_lifecycle import SubagentRecoveryError
+        import agent.api.app as app_module
+        from agent.api.models import JobResumeRequest
+        from shared.subagent_lifecycle import SubagentRecoveryError
 
         events: list[str] = []
         client = MagicMock()
@@ -613,6 +613,6 @@ class TestPinnedJobStreamClose:
 
 def create_app_for_testing():
     """Create app instance for testing without lifespan management."""
-    from src.api.app import create_app
+    from agent.api.app import create_app
 
     return create_app()

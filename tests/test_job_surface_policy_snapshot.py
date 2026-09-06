@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from src.shared.orch_surface.jobs import JOB_DESCRIPTORS, caller_default_names
+from shared.orch_surface.jobs import JOB_DESCRIPTORS, caller_default_names
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SNAPSHOT = Path(__file__).parent / "fixtures" / "job_surface_caller_defaults.json"

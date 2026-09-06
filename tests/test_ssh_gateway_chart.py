@@ -212,7 +212,7 @@ def test_reuses_the_orchestrator_image(gateway: dict) -> None:
     container = _container(gateway, "ssh-gateway")
     assert "orchestrator" in container["image"]
     assert container["command"][0] == "uvicorn"
-    assert "ssh_gateway:create_app" in container["command"]
+    assert "orchestrator.ssh_gateway:create_app" in container["command"]
     assert "--factory" in container["command"]
 
 
@@ -327,7 +327,7 @@ def test_configmap_carries_no_setting_the_gateway_never_reads(
     (This is also why there is no `sshGateway.limits` block: `load_config`
     reads none of the five caps -- see the task report.)
     """
-    source = (ROOT / "orchestrator/services/ssh_gateway_config.py").read_text()
+    source = (ROOT / "src/orchestrator/services/ssh_gateway_config.py").read_text()
     read_by_load_config = set(re.findall(r'src\.get\(\s*"([A-Z_0-9]+)"', source))
     assert "SSH_GATEWAY_HOST_KEYS" in read_by_load_config  # regex sanity
     assert "ORCHESTRATOR_URL" in read_by_load_config

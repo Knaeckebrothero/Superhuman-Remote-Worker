@@ -71,31 +71,46 @@ def db():
 def _patched(db, *, inherited, defaults):
     """Stub the collaborators around the connector branch, not the branch."""
     return [
-        patch("main.postgres_db", db),
-        patch("main._enforce_readiness_gate", AsyncMock(return_value=None)),
-        patch("main._thread_project_ids", AsyncMock(return_value=[PROJECT_ID])),
+        patch("orchestrator.main.postgres_db", db),
         patch(
-            "main._revalidate_thread_project_ids",
+            "orchestrator.main._enforce_readiness_gate", AsyncMock(return_value=None)
+        ),
+        patch(
+            "orchestrator.main._thread_project_ids",
+            AsyncMock(return_value=[PROJECT_ID]),
+        ),
+        patch(
+            "orchestrator.main._revalidate_thread_project_ids",
             AsyncMock(side_effect=lambda _thread, project_ids: project_ids),
         ),
-        patch("main._require_job_project_access", AsyncMock(return_value=None)),
-        patch("main._is_experts_db_enabled", MagicMock(return_value=False)),
-        patch("main._inherit_parent_datasource_ids", inherited),
         patch(
-            "main._authorize_thread_datasource_selection",
+            "orchestrator.main._require_job_project_access",
+            AsyncMock(return_value=None),
+        ),
+        patch(
+            "orchestrator.main._is_experts_db_enabled", MagicMock(return_value=False)
+        ),
+        patch("orchestrator.main._inherit_parent_datasource_ids", inherited),
+        patch(
+            "orchestrator.main._authorize_thread_datasource_selection",
             AsyncMock(side_effect=lambda _actor, ids, **_kw: (list(ids), {})),
         ),
-        patch("services.datasource_policy.default_datasource_selection", defaults),
-        patch("main._enforce_job_create_grants", AsyncMock(return_value=None)),
-        patch("services.job_provisioning.provision_job_repo", AsyncMock()),
-        patch("main._spawn_scholar_subjob", AsyncMock(return_value=None)),
-        patch("main._trigger_dispatch", MagicMock()),
+        patch(
+            "orchestrator.services.datasource_policy.default_datasource_selection",
+            defaults,
+        ),
+        patch(
+            "orchestrator.main._enforce_job_create_grants", AsyncMock(return_value=None)
+        ),
+        patch("orchestrator.services.job_provisioning.provision_job_repo", AsyncMock()),
+        patch("orchestrator.main._spawn_scholar_subjob", AsyncMock(return_value=None)),
+        patch("orchestrator.main._trigger_dispatch", MagicMock()),
     ]
 
 
 async def _create(db, fake_request, body, *, inherited, defaults):
-    import security.access as access_module
-    from main import create_job
+    import orchestrator.security.access as access_module
+    from orchestrator.main import create_job
 
     with ExitStack() as stack:
         stack.enter_context(patch.object(access_module, "_INTERNAL_KEY", "secret"))
@@ -123,7 +138,7 @@ class TestDispatchResolvesProjectDefaults:
         come up with the project's repository attached — not with the empty
         list his own post happens to carry.
         """
-        from main import JobCreate
+        from orchestrator.main import JobCreate
 
         inherited, defaults = _stubs()
         selection = await _create(
@@ -148,7 +163,7 @@ class TestDispatchResolvesProjectDefaults:
         self, db, fake_request
     ):
         """The flag is the opt-in, so silence keeps the old contract."""
-        from main import JobCreate
+        from orchestrator.main import JobCreate
 
         inherited, defaults = _stubs()
         selection = await _create(
@@ -180,7 +195,7 @@ class TestDelegationStillInherits:
         "attach whatever the project offers" applied to work that was scoped
         deliberately narrower.
         """
-        from main import JobCreate
+        from orchestrator.main import JobCreate
 
         inherited, defaults = _stubs()
         selection = await _create(
@@ -210,7 +225,7 @@ class TestDelegationStillInherits:
         A reviewed array from the cockpit, including a deliberate ``[]``, is an
         instruction. Nothing here may quietly re-attach connectors underneath it.
         """
-        from main import JobCreate
+        from orchestrator.main import JobCreate
 
         inherited, defaults = _stubs()
         selection = await _create(

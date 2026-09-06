@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CHART = ROOT / "helm"
 RUNTIME_AUTHORITY_MIGRATION = (
     ROOT
-    / "orchestrator/database/migrations/app/0185_thread_runtime_generation_retirement.sql"
+    / "src/orchestrator/database/migrations/app/0185_thread_runtime_generation_retirement.sql"
 )
 
 

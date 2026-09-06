@@ -788,7 +788,7 @@ async def test_config_resolver_receives_the_row_captured_with_the_event_cursor()
 
 @pytest.mark.asyncio
 async def test_owner_gated_route_resolves_only_safe_display_config():
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
 
     thread = _thread(
         id="thread-1",
@@ -845,7 +845,7 @@ async def test_owner_gated_route_resolves_only_safe_display_config():
 
 @pytest.mark.asyncio
 async def test_owner_gated_route_returns_404_if_thread_vanishes_after_auth():
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
 
     with (
         patch.object(

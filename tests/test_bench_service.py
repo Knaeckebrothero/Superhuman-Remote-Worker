@@ -12,8 +12,8 @@ import pytest
 from fastapi import HTTPException
 from starlette.requests import Request
 
-from routers import bench as bench_router
-from services.bench import (
+from orchestrator.routers import bench as bench_router
+from orchestrator.services.bench import (
     BenchStore,
     build_bench_job_payload,
     build_submission_queue,
@@ -332,7 +332,7 @@ def test_arm_project_is_frozen_and_overrides_the_run_project():
 
 @pytest.mark.asyncio
 async def test_create_run_validates_and_persists_each_arm_project(monkeypatch):
-    import main
+    import orchestrator.main
 
     legacy_project = "44444444-4444-4444-4444-444444444444"
     skills_project = "55555555-5555-5555-5555-555555555555"
@@ -344,8 +344,10 @@ async def test_create_run_validates_and_persists_each_arm_project(monkeypatch):
     )
     monkeypatch.setattr(bench_router, "require_project_member", require_member)
     monkeypatch.setattr(bench_router, "create_bench_run", create)
-    monkeypatch.setattr(main, "postgres_db", MagicMock())
-    monkeypatch.setattr(main, "_with_validated_tool_overrides", lambda value: value)
+    monkeypatch.setattr(orchestrator.main, "postgres_db", MagicMock())
+    monkeypatch.setattr(
+        orchestrator.main, "_with_validated_tool_overrides", lambda value: value
+    )
 
     body = bench_router.BenchRunCreate(
         name="paired",
@@ -372,7 +374,7 @@ async def test_create_run_validates_and_persists_each_arm_project(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_create_run_rejects_arm_outside_token_project_scope(monkeypatch):
-    import main
+    import orchestrator.main
 
     allowed_project = "33333333-3333-3333-3333-333333333333"
     other_project = "44444444-4444-4444-4444-444444444444"
@@ -399,7 +401,10 @@ async def test_create_run_rejects_arm_outside_token_project_scope(monkeypatch):
 
     assert exc.value.status_code == 403
     assert require_member.await_count == 1
-    assert require_member.await_args.args[1:] == (main.postgres_db, allowed_project)
+    assert require_member.await_args.args[1:] == (
+        orchestrator.main.postgres_db,
+        allowed_project,
+    )
     assert require_member.await_args.kwargs == {
         "min_role": "editor",
         "allow_archived": False,

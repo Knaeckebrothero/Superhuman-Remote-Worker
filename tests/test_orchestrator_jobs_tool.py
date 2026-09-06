@@ -9,11 +9,11 @@ from typing import Any
 import httpx
 import pytest
 
-from src.shared.orch_surface.client import AsyncCockpitClient
-from src.shared.runtime_actor import RUNTIME_ACTOR_HEADER, RuntimeActorContext
-from src.tools.context import ToolContext
-from src.tools.orchestrator import jobs as jobs_module
-from src.tools.orchestrator.jobs import create_orchestrator_tools
+from shared.orch_surface.client import AsyncCockpitClient
+from shared.runtime_actor import RUNTIME_ACTOR_HEADER, RuntimeActorContext
+from agent.tools.context import ToolContext
+from agent.tools.orchestrator import jobs as jobs_module
+from agent.tools.orchestrator.jobs import create_orchestrator_tools
 
 
 JOB_ID = "19707fa1-0000-4000-8000-000000000001"

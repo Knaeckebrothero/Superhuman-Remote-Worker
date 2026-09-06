@@ -6,8 +6,8 @@ from unittest.mock import patch
 import pytest
 import yaml
 
-import src.core.loader as loader
-from src.core.loader import (
+import shared.runtime.core.loader as loader
+from shared.runtime.core.loader import (
     CONTEXT_THRESHOLD_FRACTION,
     MESSAGE_COUNT_MIN_FRACTION,
     LLMConfig,
@@ -19,7 +19,7 @@ from src.core.loader import (
     detect_reasoning_method,
     load_uploaded_config,
 )
-from src.core.model_registry import family_of
+from shared.runtime.core.model_registry import family_of
 
 # Limit-leaf fractions are IMPORTED from src/core/loader.py rather than
 # re-pinned here, so this table can never drift from the derivation it checks.

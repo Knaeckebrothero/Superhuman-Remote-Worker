@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.core.workspace import WorkspaceManager
+from agent.core.workspace import WorkspaceManager
 from tests._fs_backend import FilesystemTestBackend
 
 
@@ -33,7 +33,7 @@ class RemoteLikeBackend(FilesystemTestBackend):
 
 def _bare_agent(workspace_manager, config=None):
     """UniversalAgent shell (no __init__) for unit-testing instance methods."""
-    from src.agent import UniversalAgent
+    from agent.agent import UniversalAgent
 
     agent = UniversalAgent.__new__(UniversalAgent)
     agent._workspace_manager = workspace_manager
@@ -70,7 +70,7 @@ class TestInstructionsClobber:
         assert ws.read_file("instructions.md") == "CUSTOM USER BRIEF"
 
     def test_template_deployed_when_instructions_missing(self, tmp_path, monkeypatch):
-        import src.core.loader as loader
+        import shared.runtime.core.loader as loader
 
         monkeypatch.setattr(loader, "load_instructions", lambda *a, **k: "TEMPLATE")
         monkeypatch.setattr(
@@ -103,7 +103,7 @@ class TestBoundSkillCapabilityRendering:
     ):
         from pathlib import Path
 
-        from src.core.loader import InstructionFileEntry
+        from shared.runtime.core.loader import InstructionFileEntry
 
         raw_skill = Path("config/skills/verify-before-done/SKILL.md").read_text(
             encoding="utf-8"
@@ -213,7 +213,7 @@ class TestResolveUploadedInstructions:
     async def test_falls_back_to_local_uploads_dir_when_http_fails(
         self, tmp_path, monkeypatch
     ):
-        import src.core.workspace as workspace_module
+        import agent.core.workspace as workspace_module
 
         monkeypatch.setattr(
             workspace_module, "get_workspace_base_path", lambda: tmp_path
@@ -235,7 +235,7 @@ class TestResolveUploadedInstructions:
     async def test_returns_none_when_upload_id_resolves_to_nothing(
         self, tmp_path, monkeypatch
     ):
-        import src.core.workspace as workspace_module
+        import agent.core.workspace as workspace_module
 
         monkeypatch.setattr(
             workspace_module, "get_workspace_base_path", lambda: tmp_path
@@ -265,7 +265,7 @@ class TestWorkspaceFactsReadme:
         return WorkspaceManager(job_id="t", backend=FilesystemTestBackend(tmp_path))
 
     def _inject(self, ws, ds_configs=None, **kwargs):
-        from src.core.datasource_setup import inject_workspace_facts
+        from agent.core.datasource_setup import inject_workspace_facts
 
         return inject_workspace_facts(ds_configs or [], ws, **kwargs)
 
@@ -314,7 +314,7 @@ class TestWorkspaceFactsReadme:
         """The orchestrator's current auto-init README ("SRW managed repository;
         creation-intent=<uuid>", orchestrator/services/gitea.py) is a stub too —
         it must be replaced, not appended to (seen live on k3d job 2e6a4518)."""
-        from src.core.datasource_setup import merge_workspace_facts
+        from agent.core.datasource_setup import merge_workspace_facts
 
         stub = (
             "# job-2e6a4518\n\n"
@@ -343,7 +343,7 @@ class TestWorkspaceFactsReadme:
     def test_facts_only_never_the_job_id_description_or_kickoff(self, tmp_path):
         import inspect
 
-        from src.core.datasource_setup import (
+        from agent.core.datasource_setup import (
             inject_workspace_facts,
             render_workspace_facts,
         )
@@ -499,7 +499,7 @@ class TestPersistentSessionSkillGuard:
 
     def test_bound_skill_not_overwritten_on_remote_backend(self, tmp_path):
         pytest.importorskip("langgraph")
-        from src.core.loader import InstructionFileEntry
+        from shared.runtime.core.loader import InstructionFileEntry
         from tests.test_persistent_session import _make_config, _make_session
 
         cfg = _make_config(
@@ -558,7 +558,7 @@ class TestReseedFromSnapshotIfFresh:
     def test_seeded_workspace_does_not_rewind_to_the_last_snapshot(
         self, tmp_path, monkeypatch
     ):
-        from src.core.backends.seed import mark_workspace_seeded
+        from agent.core.backends.seed import mark_workspace_seeded
 
         backend = FilesystemTestBackend(tmp_path)
         agent = self._agent(tmp_path, backend)
@@ -567,7 +567,7 @@ class TestReseedFromSnapshotIfFresh:
 
         snapshot_mgr = MagicMock()
         monkeypatch.setattr(
-            "src.core.phase_snapshot.PhaseSnapshotManager",
+            "agent.core.phase_snapshot.PhaseSnapshotManager",
             MagicMock(return_value=snapshot_mgr),
         )
 
@@ -585,7 +585,7 @@ class TestReseedFromSnapshotIfFresh:
 
         snapshot_mgr = MagicMock()
         monkeypatch.setattr(
-            "src.core.phase_snapshot.PhaseSnapshotManager",
+            "agent.core.phase_snapshot.PhaseSnapshotManager",
             MagicMock(return_value=snapshot_mgr),
         )
 
@@ -602,7 +602,7 @@ class TestReseedFromSnapshotIfFresh:
         snapshot_mgr = MagicMock()
         snapshot_mgr.get_latest_snapshot.return_value = SimpleNamespace(phase_number=3)
         monkeypatch.setattr(
-            "src.core.phase_snapshot.PhaseSnapshotManager",
+            "agent.core.phase_snapshot.PhaseSnapshotManager",
             MagicMock(return_value=snapshot_mgr),
         )
 
@@ -614,7 +614,7 @@ class TestReseedFromSnapshotIfFresh:
         self, tmp_path, monkeypatch
     ):
         """The original hazard, inverted: virtual files must not read as seeded."""
-        from src.core.virtual_dirs import SingleFileProvider
+        from agent.core.virtual_dirs import SingleFileProvider
 
         backend = FilesystemTestBackend(tmp_path)
         agent = self._agent(tmp_path, backend)
@@ -626,7 +626,7 @@ class TestReseedFromSnapshotIfFresh:
         snapshot_mgr = MagicMock()
         snapshot_mgr.get_latest_snapshot.return_value = SimpleNamespace(phase_number=1)
         monkeypatch.setattr(
-            "src.core.phase_snapshot.PhaseSnapshotManager",
+            "agent.core.phase_snapshot.PhaseSnapshotManager",
             MagicMock(return_value=snapshot_mgr),
         )
 

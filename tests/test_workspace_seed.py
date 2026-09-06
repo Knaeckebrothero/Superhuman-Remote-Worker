@@ -11,18 +11,11 @@ object-store prefix down into the freshly provisioned backend via
   * ``seed_workspace`` — recursive copy + verify-before-return.
 """
 
-import sys
-from pathlib import Path
-
 import pytest
 
-_ROOT = Path(__file__).parent.parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-
-from src.core.backends.object_store import InMemoryObjectStore  # noqa: E402
-from src.core.backends.seed import seed_workspace  # noqa: E402
-from src.core.backends.virtual import VirtualWorkspaceBackend  # noqa: E402
+from shared.runtime.core.backends.object_store import InMemoryObjectStore  # noqa: E402
+from agent.core.backends.seed import seed_workspace  # noqa: E402
+from agent.core.backends.virtual import VirtualWorkspaceBackend  # noqa: E402
 from tests._fs_backend import FilesystemTestBackend  # noqa: E402
 
 

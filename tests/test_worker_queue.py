@@ -7,8 +7,8 @@ from uuid import uuid4
 
 import pytest
 
-import src.shared.worker_queue as worker_queue
-from src.shared.run_queue import ClaimedUnit, EnqueueResult
+import shared.worker_queue as worker_queue
+from shared.run_queue import ClaimedUnit, EnqueueResult
 
 
 class _Connection:
@@ -575,14 +575,14 @@ class TestStatelessWorkerBackendAdmissible:
     """One predicate for both admission twins (claim CAS + agent guard)."""
 
     def test_sandbox_always_admissible(self, monkeypatch):
-        from src.shared.workspace_contract import stateless_worker_backend_admissible
+        from shared.workspace_contract import stateless_worker_backend_admissible
 
         for mode in ("off", "same-cluster", "external"):
             assert stateless_worker_backend_admissible("sandbox", vm_mode=mode)
         assert stateless_worker_backend_admissible("container", vm_mode="off")
 
     def test_vm_admissible_only_on_pod_network(self):
-        from src.shared.workspace_contract import stateless_worker_backend_admissible
+        from shared.workspace_contract import stateless_worker_backend_admissible
 
         assert stateless_worker_backend_admissible("vm", vm_mode="same-cluster")
         assert stateless_worker_backend_admissible("remote", vm_mode="same-cluster")
@@ -590,7 +590,7 @@ class TestStatelessWorkerBackendAdmissible:
         assert not stateless_worker_backend_admissible("vm", vm_mode="off")
 
     def test_lite_and_junk_never_admissible(self):
-        from src.shared.workspace_contract import stateless_worker_backend_admissible
+        from shared.workspace_contract import stateless_worker_backend_admissible
 
         for backend in ("virtual", "none", "", None, 7, "desktop"):
             assert not stateless_worker_backend_admissible(
@@ -598,7 +598,7 @@ class TestStatelessWorkerBackendAdmissible:
             )
 
     def test_job_requests_vm_follows_topology(self, monkeypatch):
-        from src.shared.worker_queue import _job_requests_vm
+        from shared.worker_queue import _job_requests_vm
 
         vm_job = {
             "config_override": {"workspace": {"backend": "vm"}},

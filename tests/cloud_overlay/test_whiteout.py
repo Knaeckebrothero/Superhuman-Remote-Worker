@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from src.services.cloud_overlay.whiteout import enumerate_diff, DiffEntry, is_whiteout
+from agent.services.cloud_overlay.whiteout import enumerate_diff, DiffEntry, is_whiteout
 
 
 def _mkchardev_or_skip(p: Path):

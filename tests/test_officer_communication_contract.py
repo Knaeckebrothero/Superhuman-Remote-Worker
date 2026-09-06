@@ -5,7 +5,7 @@ context, and answering it is part of the wake's work."""
 import re
 from pathlib import Path
 
-from src.tools.core.officer import OFFICER_TOOLS_METADATA
+from agent.tools.core.officer import OFFICER_TOOLS_METADATA
 
 PERSONA = Path("config/experts/centurion/persona.txt")
 

@@ -42,18 +42,18 @@ from orchestrator.services.infrastructure_metering.inventory import (
 from orchestrator.services.infrastructure_metering.vmi_intervals import (
     VMIIntervalReconciler,
 )
-from src.shared.workspace_contract import (
+from shared.workspace_contract import (
     WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY,
     pinned_dispatch_authority_jsonb_sql,
 )
 
 
 ROOT = Path(__file__).parents[1]
-APP_MIGRATIONS = ROOT / "orchestrator/database/migrations/app"
+APP_MIGRATIONS = ROOT / "src" / "orchestrator" / "database" / "migrations" / "app"
 COMPUTE_MIGRATION = APP_MIGRATIONS / "0103_compute_metering_foundations.sql"
 COMPUTE_SCOPE_GUARD_MIGRATION = APP_MIGRATIONS / "0106_compute_scope_epoch_guard.sql"
 COMPUTE_ACTIVATION_SERVICE = (
-    ROOT / "orchestrator/services/infrastructure_metering/compute_activation.py"
+    ROOT / "src/orchestrator/services/infrastructure_metering/compute_activation.py"
 )
 
 

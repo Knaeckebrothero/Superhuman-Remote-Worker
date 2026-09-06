@@ -10,24 +10,24 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from src.services.cloud_sync import base as cloud_sync_base
-from src.services.cloud_sync.base import (
+from agent.services.cloud_sync import base as cloud_sync_base
+from agent.services.cloud_sync.base import (
     CloudSyncMarker,
     CloudSyncMarkerError,
 )
-from src.services.cloud_sync.coordinator import (
+from agent.services.cloud_sync.coordinator import (
     CloudSyncError,
     CloudSyncGenerationError,
     MountSync,
     WorkspaceSyncCoordinator,
 )
-from src.shared.cloud_sync_generations import (
+from shared.cloud_sync_generations import (
     CloudSyncRequirement,
     encode_cloud_sync_baseline,
 )
 from tests._fs_backend import FilesystemTestBackend
 
-from ._local_fs import LocalFsWorkspaceSync
+from tests.cloud_sync._local_fs import LocalFsWorkspaceSync
 
 
 THREAD_A = "11111111-1111-4111-8111-111111111111"

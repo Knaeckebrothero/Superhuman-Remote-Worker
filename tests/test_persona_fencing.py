@@ -9,7 +9,7 @@ in the orchestrator-resolved shape (the marker rides in the resolved blob).
 
 import pytest
 
-from src.core.loader import (
+from shared.runtime.core.loader import (
     get_phase_system_prompt,
     get_subagent_system_prompt,
     get_system_prompt,
@@ -160,7 +160,7 @@ def test_db_summarization_braces_survive_format_map():
     format_map(defaultdict(str)) without raising (auxiliary.py contract)."""
     from collections import defaultdict
 
-    from src.core.loader import load_summarization_prompt
+    from shared.runtime.core.loader import load_summarization_prompt
 
     config = _config(
         _db_prompt_keys=["summarization"],

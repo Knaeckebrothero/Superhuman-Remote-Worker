@@ -17,7 +17,7 @@ import shutil
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
-from src.services.cloud_sync.base import WorkspaceSyncBase
+from agent.services.cloud_sync.base import WorkspaceSyncBase
 
 
 class LocalFsWorkspaceSync(WorkspaceSyncBase):

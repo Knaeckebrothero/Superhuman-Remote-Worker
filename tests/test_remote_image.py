@@ -10,7 +10,7 @@ import pytest
 from fastapi import HTTPException
 from PIL import Image
 
-from services import remote_image as subject
+from orchestrator.services import remote_image as subject
 
 
 def _png(width: int = 2, height: int = 3) -> bytes:
@@ -275,13 +275,13 @@ async def test_fetch_rejects_oversized_declared_body_without_reading_it():
 
 @pytest.mark.asyncio
 async def test_endpoint_authenticates_before_fetch(fake_request):
-    from main import RemoteImageRequest, load_remote_image
+    from orchestrator.main import RemoteImageRequest, load_remote_image
 
     denied = HTTPException(status_code=401, detail="signed out")
     fetch = AsyncMock()
     with (
-        patch("main.require_approved_user", AsyncMock(side_effect=denied)),
-        patch("main.fetch_remote_image", fetch),
+        patch("orchestrator.main.require_approved_user", AsyncMock(side_effect=denied)),
+        patch("orchestrator.main.fetch_remote_image", fetch),
     ):
         with pytest.raises(HTTPException) as exc:
             await load_remote_image(
@@ -294,7 +294,7 @@ async def test_endpoint_authenticates_before_fetch(fake_request):
 
 @pytest.mark.asyncio
 async def test_endpoint_returns_no_store_nosniff_image(fake_request, user_a):
-    from main import RemoteImageRequest, load_remote_image
+    from orchestrator.main import RemoteImageRequest, load_remote_image
 
     image = subject.RemoteImage(
         content=_png(),
@@ -303,8 +303,10 @@ async def test_endpoint_returns_no_store_nosniff_image(fake_request, user_a):
         height=3,
     )
     with (
-        patch("main.require_approved_user", AsyncMock(return_value=user_a)),
-        patch("main.fetch_remote_image", AsyncMock(return_value=image)),
+        patch(
+            "orchestrator.main.require_approved_user", AsyncMock(return_value=user_a)
+        ),
+        patch("orchestrator.main.fetch_remote_image", AsyncMock(return_value=image)),
     ):
         response = await load_remote_image(
             fake_request,

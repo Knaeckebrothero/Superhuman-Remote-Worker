@@ -48,41 +48,41 @@ from langchain_core.messages import (
     message_to_dict,
 )
 
-import src.api.dual_app as dual_app
-from src.citation_engine.models import Citation, VerificationStatus
-from src.core.citation_feedback_injection import (
+import agent.api.dual_app as dual_app
+from shared.runtime.citation_engine.models import Citation, VerificationStatus
+from agent.core.citation_feedback_injection import (
     CITATION_FEEDBACK_TOOL_CALL_ID_PREFIX,
     format_failed_citations,
     is_citation_feedback_injection_message,
 )
-from src.core.guidance_injection import (
+from agent.core.guidance_injection import (
     GUIDANCE_TOOL_CALL_ID_PREFIX,
     is_guidance_injection_message,
 )
-from src.core.knowledge_injection import (
+from agent.core.knowledge_injection import (
     create_knowledge_injection_messages,
     is_knowledge_injection_message,
 )
-from src.core.loader import InstructionFileEntry, load_agent_config
-from src.core.memory_injection import (
+from shared.runtime.core.loader import InstructionFileEntry, load_agent_config
+from agent.core.memory_injection import (
     create_memory_injection_messages,
     is_memory_injection_message,
 )
-from src.core.message_markers import (
+from shared.runtime.core.message_markers import (
     PERSIST_ROLE_EVENT,
     PERSIST_ROLE_KEY,
     is_protected_message,
     protected_phase_key,
 )
-from src.core.workspace import WorkspaceManager
-from src.core.workspace_injection import (
+from agent.core.workspace import WorkspaceManager
+from shared.runtime.core.workspace_injection import (
     TODOS_INJECTION_CONTENT_PREFIX,
     is_workspace_injection_message,
 )
-from src.graph import create_execute_node
-from src.managers import TodoManager
-from src.services.memory import AssembleStats, InjectionBlock, MemoryPayload
-from src.tools.context import ToolContext
+from agent.graph import create_execute_node
+from agent.managers import TodoManager
+from agent.services.memory import AssembleStats, InjectionBlock, MemoryPayload
+from agent.tools.context import ToolContext
 from tests._fs_backend import FilesystemTestBackend
 
 REPO_ROOT = Path(__file__).parent.parent
@@ -119,7 +119,7 @@ TOOL_SCHEMAS = [
 ]
 
 _EXECUTE_PATCHES = {
-    "src.graph.get_phase_system_prompt": SYSTEM_PROMPT,
+    "agent.graph.get_phase_system_prompt": SYSTEM_PROMPT,
 }
 
 
@@ -343,7 +343,7 @@ def _patches():
 
 async def _run(node, state):
     """One execute turn under the harness patches (no archiver)."""
-    with patch("src.graph.get_archiver", return_value=None):
+    with patch("agent.graph.get_archiver", return_value=None):
         patches = _patches()
         for p in patches:
             p.start()
@@ -750,7 +750,7 @@ class TestOneSchemaPerJob:
         auditor = MagicMock()
 
         state = _state(is_strategic_phase=True, phase_number=1)
-        with patch("src.graph.get_archiver", return_value=auditor):
+        with patch("agent.graph.get_archiver", return_value=auditor):
             patches = _patches()
             for p in patches:
                 p.start()

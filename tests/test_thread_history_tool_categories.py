@@ -13,15 +13,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from main import _stamp_tool_categories, get_thread_messages_history
+from orchestrator.main import _stamp_tool_categories, get_thread_messages_history
 
 
 def _patched(db):
     """Patch the endpoint's module-level deps: auth + the db singleton."""
     owner = AsyncMock(return_value=({"id": "u1"}, {"id": "t1", "user_id": "u1"}))
     return (
-        patch("main.require_thread_owner", owner),
-        patch("main.postgres_db", db),
+        patch("orchestrator.main.require_thread_owner", owner),
+        patch("orchestrator.main.postgres_db", db),
     )
 
 
@@ -42,7 +42,7 @@ class TestStampToolCategories:
     def test_categories_match_the_live_paths_source(self):
         # These are the buckets the chip renders; if the registry moves, this
         # test moves with it rather than silently drifting from the SSE frame.
-        from src.tools.registry import TOOL_REGISTRY
+        from agent.tools.registry import TOOL_REGISTRY
 
         messages = [
             _msg(

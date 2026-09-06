@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 from typing import List, Optional, Sequence
 
-from .metrics import aggregate
+from eval.memory.metrics import aggregate
 
 #: Headline columns for the markdown tables (others stay in summary.json).
 HEADLINE = ("recall@5", "ndcg@5", "coverage@5", "recall@10", "first_hit_rank")

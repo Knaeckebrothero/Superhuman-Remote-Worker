@@ -36,6 +36,7 @@ pytestmark = pytest.mark.skipif(
 
 SCHEMA_FILE = (
     Path(__file__).resolve().parent.parent
+    / "src"
     / "orchestrator"
     / "database"
     / "schema_current.sql"

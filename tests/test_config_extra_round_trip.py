@@ -14,7 +14,7 @@ and the shell tool group bound only ``shell_read``.
 
 import dataclasses
 
-from src.core.loader import (
+from shared.runtime.core.loader import (
     SubagentsConfig,
     get_all_tool_names,
     load_agent_config,

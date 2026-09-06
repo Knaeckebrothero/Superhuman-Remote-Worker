@@ -7,7 +7,7 @@ double-nesting into extra["extra"].
 
 from unittest.mock import patch
 
-from src.core.loader import (
+from shared.runtime.core.loader import (
     AgentConfig,
     load_config_from_resolved,
     serialize_resolved_config,
@@ -20,8 +20,8 @@ class TestExtraSerializationRoundTrip:
     def _mock_serialize(self, config: AgentConfig) -> dict:
         """Serialize config with mocked prompt/instruction resolvers."""
         with (
-            patch("src.core.loader.PromptMatrixResolver") as mock_prompt,
-            patch("src.core.loader.InstructionMatrixResolver") as mock_instr,
+            patch("shared.runtime.core.loader.PromptMatrixResolver") as mock_prompt,
+            patch("shared.runtime.core.loader.InstructionMatrixResolver") as mock_instr,
         ):
             mock_prompt.return_value.load.return_value = "dummy prompt"
             mock_instr.return_value.load.return_value = "dummy instruction"

@@ -8,7 +8,7 @@ from uuid import UUID
 import pytest
 from fastapi import HTTPException
 
-from main import (
+from orchestrator.main import (
     DatasourceCreate,
     DatasourceUpdate,
     _build_datasource_tool_override,
@@ -101,7 +101,7 @@ async def test_mcp_create_rejected_before_auth_when_gate_off(monkeypatch):
 
     with (
         patch(
-            "main.require_approved_user",
+            "orchestrator.main.require_approved_user",
             AsyncMock(side_effect=AssertionError("auth ran before feature gate")),
         ),
         pytest.raises(HTTPException) as exc,
@@ -132,10 +132,10 @@ async def test_remote_mcp_create_passes_credentials_to_encrypted_db_path(monkeyp
 
     with (
         patch(
-            "main.require_approved_user",
+            "orchestrator.main.require_approved_user",
             AsyncMock(return_value={"id": UUID(int=1)}),
         ),
-        patch("main.postgres_db", db),
+        patch("orchestrator.main.postgres_db", db),
     ):
         result = await create_datasource(
             DatasourceCreate(
@@ -162,10 +162,10 @@ async def test_stdio_create_normalizes_connection_url_to_none(monkeypatch):
 
     with (
         patch(
-            "main.require_approved_user",
+            "orchestrator.main.require_approved_user",
             AsyncMock(return_value={"id": UUID(int=1)}),
         ),
-        patch("main.postgres_db", db),
+        patch("orchestrator.main.postgres_db", db),
     ):
         await create_datasource(
             DatasourceCreate(
@@ -204,10 +204,10 @@ async def test_update_validates_merged_shape_and_can_clear_url(monkeypatch):
 
     with (
         patch(
-            "main.require_datasource_owner",
+            "orchestrator.main.require_datasource_owner",
             AsyncMock(return_value=({}, existing)),
         ),
-        patch("main.postgres_db", db),
+        patch("orchestrator.main.postgres_db", db),
     ):
         result = await update_datasource(
             object(),
@@ -297,7 +297,7 @@ class TestMcpConnectionTest:
         }
 
         with patch(
-            "main.require_datasource_owner",
+            "orchestrator.main.require_datasource_owner",
             AsyncMock(return_value=({}, datasource)),
         ):
             result = await probe_datasource_endpoint(object(), datasource_id)
@@ -317,7 +317,7 @@ class TestMcpConnectionTest:
         }
 
         with patch(
-            "main.require_datasource_owner",
+            "orchestrator.main.require_datasource_owner",
             AsyncMock(return_value=({}, datasource)),
         ):
             result = await probe_datasource_endpoint(object(), datasource_id)
@@ -342,7 +342,7 @@ class TestMcpConnectionTest:
         }
 
         with patch(
-            "main.require_datasource_owner",
+            "orchestrator.main.require_datasource_owner",
             AsyncMock(return_value=({}, datasource)),
         ):
             result = await probe_datasource_endpoint(object(), datasource_id)

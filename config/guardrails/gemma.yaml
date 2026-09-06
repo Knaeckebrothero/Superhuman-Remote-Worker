@@ -16,7 +16,7 @@
 
 tool_examples:
 
-  # ----- src/tools/core/todo.py -----
+  # ----- src/agent/tools/core/todo.py -----
   next_phase_todos: |-
     Examples:
         <|tool_call>call:next_phase_todos{todos:[<|"|>Extract document text from uploaded PDF<|"|>,<|"|>Chunk document into processable segments<|"|>,<|"|>Identify requirements in each chunk<|"|>,<|"|>Validate extracted requirements<|"|>,<|"|>Write requirements to database<|"|>],phase_name:<|"|>Phase 1: Document Processing<|"|>}<tool_call|>
@@ -26,7 +26,7 @@ tool_examples:
         <|tool_call>call:todo_complete{}<tool_call|>                              # complete the first pending task
         <|tool_call>call:todo_complete{todo_id:<|"|>todo_3<|"|>}<tool_call|>      # complete a specific task by id
 
-  # ----- src/tools/git/git_tools.py -----
+  # ----- src/agent/tools/git/git_tools.py -----
   git_log: |-
     Examples:
         <|tool_call>call:git_log{}<tool_call|>                       # last 10 commits, compact one-line format
@@ -81,7 +81,7 @@ tool_examples:
         <|tool_call>call:git_worktree_cleanup{branch:<|"|>subagent/0<|"|>}<tool_call|>
         <|tool_call>call:git_worktree_cleanup{branch:<|"|>subagent/2<|"|>,force:true}<tool_call|>
 
-  # ----- src/tools/shell/shell_tools.py -----
+  # ----- src/agent/tools/shell/shell_tools.py -----
   run_command: |-
     Examples:
         <|tool_call>call:run_command{command:<|"|>pytest tests/ -x<|"|>,working_dir:<|"|>.<|"|>}<tool_call|>
@@ -100,7 +100,7 @@ tool_examples:
         <|tool_call>call:shell_read{name:<|"|>build<|"|>,lines:100}<tool_call|>                    # last 100 lines of build tab
         <|tool_call>call:shell_read{name:<|"|>srv<|"|>,offset:0,lines:50}<tool_call|>              # first 50 lines
 
-  # ----- src/tools/workspace/files.py and filesystem.py -----
+  # ----- src/agent/tools/workspace/files.py and filesystem.py -----
   edit_file: |-
     Examples:
         # Replace mode (default)
@@ -132,7 +132,7 @@ tool_examples:
     Examples:
         <|tool_call>call:get_document_info{path:<|"|>documents/report.pdf<|"|>}<tool_call|>                                          # page count + structure preview
 
-  # ----- src/tools/knowledge/knowledge_tools.py -----
+  # ----- src/agent/tools/knowledge/knowledge_tools.py -----
   kb_write: |-
     Examples:
         <|tool_call>call:kb_write{title:<|"|>Chose JWT over OAuth<|"|>,type:<|"|>decision<|"|>,content:<|"|>...<|"|>,tags:[<|"|>authentication<|"|>,<|"|>security<|"|>]}<tool_call|>
@@ -153,7 +153,7 @@ tool_examples:
         <|tool_call>call:kb_update{note:<|"|>chose-jwt-over-oauth<|"|>,append:<|"|>Update: also adopted refresh-token rotation.<|"|>}<tool_call|>
         <|tool_call>call:kb_update{note:<|"|>api-rate-limit-experiment<|"|>,status:<|"|>resolved<|"|>,confidence:<|"|>high<|"|>}<tool_call|>
 
-  # ----- src/tools/citation/sources.py -----
+  # ----- src/agent/tools/citation/sources.py -----
   cite_web: |-
     Examples:
         <|tool_call>call:cite_web{text:<|"|>LLMs hallucinate at higher rates on out-of-distribution prompts.<|"|>,url:<|"|>https://example.com/llm-hallucinations<|"|>,claim:<|"|>Out-of-distribution prompts increase hallucination risk.<|"|>}<tool_call|>
@@ -162,7 +162,7 @@ tool_examples:
     Examples:
         <|tool_call>call:cite_document{text:<|"|>Total revenue rose 12% YoY.<|"|>,document_path:<|"|>documents/q3_report.pdf<|"|>,page:12,claim:<|"|>Q3 revenue grew 12% year-over-year.<|"|>}<tool_call|>
 
-  # ----- src/tools/delegation/delegate_agent.py -----
+  # ----- src/agent/tools/delegation/delegate_agent.py -----
   delegate_agent: |-
     Examples:
         <|tool_call>call:delegate_agent{description:<|"|>Map the rate limiter module<|"|>,prompt:<|"|>Objective: explain how src/ratelimit/ enforces per-user quotas. Expected output: at most 10 evidence bullets. Context: this maps the module before implementation. Read src/ratelimit/*.py and tests/test_ratelimit.py. Report entry points, the data model, the quota check (file:line), and gaps. Scope: no changes.<|"|>,subagent_type:<|"|>explorer<|"|>}<tool_call|>
@@ -184,7 +184,7 @@ tool_examples:
     Examples:
         <|tool_call>call:list_agents{}<tool_call|>
 
-  # ----- src/tools/research/web.py -----
+  # ----- src/agent/tools/research/web.py -----
   web_search: |-
     Examples:
         <|tool_call>call:web_search{query:<|"|>vLLM gemma4 tool-call parser regex<|"|>}<tool_call|>
@@ -196,7 +196,7 @@ tool_examples:
         <|tool_call>call:extract_webpage{urls:<|"|>https://docs.vllm.ai/en/latest/models/supported_models.html<|"|>}<tool_call|>
         <|tool_call>call:extract_webpage{urls:<|"|>https://example.com/a, https://example.com/b<|"|>,query:<|"|>rate limiting strategies<|"|>}<tool_call|>
 
-  # ----- src/tools/research/papers.py -----
+  # ----- src/agent/tools/research/papers.py -----
   search_papers: |-
     Examples:
         <|tool_call>call:search_papers{query:<|"|>speculative decoding<|"|>}<tool_call|>                      # arxiv default

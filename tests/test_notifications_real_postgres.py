@@ -22,11 +22,12 @@ from testcontainers.postgres import PostgresContainer
 
 from orchestrator.database.postgres import PostgresDB
 from orchestrator.security import crypto
-from services.notification_catalog import notification_id
-from services.notification_service import NotificationService
+from orchestrator.services.notification_catalog import notification_id
+from orchestrator.services.notification_service import NotificationService
 
 SCHEMA_FILE = (
     Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "schema_current.sql"
@@ -671,14 +672,14 @@ class TestStepsEndToEnd:
             == 0
         )
         # Not due: the sweeper has nothing.
-        from services.notification_steps import process_due_steps
+        from orchestrator.services.notification_steps import process_due_steps
 
         stats = await process_due_steps(db=db, service=svc, worker_id="w")
         assert stats == {"claimed": 0}
 
     @pytest.mark.asyncio
     async def test_due_steps_seen_skip_resolved_cancel_rest_digest(self, db):
-        from services.notification_steps import process_due_steps
+        from orchestrator.services.notification_steps import process_due_steps
 
         svc = self._service(db)
         results = [await self._record(svc, n) for n in range(1, 5)]
@@ -735,7 +736,7 @@ class TestStepsEndToEnd:
     async def test_provider_failure_retries_then_the_claim_ledger_stops_a_double(
         self, db
     ):
-        from services.notification_steps import process_due_steps
+        from orchestrator.services.notification_steps import process_due_steps
 
         svc = self._service(db)
         svc._email_service.send_notification_email = AsyncMock(
@@ -777,7 +778,7 @@ class TestCutoverBackfill:
 
     MIGRATION = (
         Path(__file__).resolve().parents[1]
-        / "orchestrator/database/migrations/app/0196_notifications_cutover.sql"
+        / "src/orchestrator/database/migrations/app/0196_notifications_cutover.sql"
     )
 
     async def _seed(self, db):

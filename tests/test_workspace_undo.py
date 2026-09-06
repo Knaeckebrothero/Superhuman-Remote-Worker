@@ -9,8 +9,8 @@ from uuid import UUID
 
 import pytest
 
-from src.managers.git_manager import GitManager
-from src.services.workspace_undo import (
+from agent.managers.git_manager import GitManager
+from agent.services.workspace_undo import (
     WorkspaceUndoRetryable,
     WorkspaceUndoUnavailable,
     apply_workspace_undo,

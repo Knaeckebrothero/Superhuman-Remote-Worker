@@ -12,12 +12,12 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
-from src.core.message_markers import (
+from shared.runtime.core.message_markers import (
     PROTECTED_KEY,
     PROTECTED_TURN_INPUT,
     turn_membership,
 )
-from src.persistent_graph import PersistentLoopCallbacks, run_persistent_loop
+from agent.persistent_graph import PersistentLoopCallbacks, run_persistent_loop
 
 
 def _config() -> MagicMock:

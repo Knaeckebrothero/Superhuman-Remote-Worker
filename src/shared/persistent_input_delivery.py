@@ -129,7 +129,7 @@ async def _lock_stateless_runtime_authority(
     # additionally stamps the immutable Kubernetes UID in thread metadata;
     # require the exact three-part claim so a restarted pod with the same name
     # cannot inherit another incarnation's DB mutation authority.
-    from .session_retirement import active_claim_authority
+    from shared.session_retirement import active_claim_authority
 
     try:
         active_claim = active_claim_authority(thread["metadata"])
@@ -430,7 +430,7 @@ async def persist_input_delivery(
             ):
                 queue_deferred_reason = "rolling_old_executor"
             else:
-                from src.shared.run_queue import (
+                from shared.run_queue import (
                     UNIT_KIND_SESSION_TURN,
                     record_input_seq,
                 )

@@ -6,7 +6,7 @@ Offline evaluation of the agent memory subsystem against
 Research grounding: `knowledge-base/knowledge/research/ai_memory/results/05_lifecycle_eval_report.md`.
 
 The harness drives the production seam directly — `MemoryManager.assemble()`
-and `capture()` from `src/services/memory/` — with the production loader,
+and `capture()` from `src/agent/services/memory/` — with the production loader,
 stores, embedding service, and prompts. No graph spin-up, no orchestrator.
 What an arm measures is what a real session with that YAML would do.
 

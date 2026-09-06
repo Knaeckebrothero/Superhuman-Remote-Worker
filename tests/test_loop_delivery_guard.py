@@ -54,12 +54,15 @@ def _ctx(role: str = "developer") -> dict:
 
 async def _run(job: dict, *, role: str = "developer") -> list[str]:
     """Invoke the real hook and return the loop-visible action lines."""
-    from main import _record_loop_job_outcome
+    from orchestrator.main import _record_loop_job_outcome
 
     db = MagicMock()
     db.create_job_change_record = AsyncMock(return_value=True)
     actions: list[str] = []
-    with patch("main.postgres_db", db), patch("main.vector_db", None):
+    with (
+        patch("orchestrator.main.postgres_db", db),
+        patch("orchestrator.main.vector_db", None),
+    ):
         await _record_loop_job_outcome(
             job,
             ctx=_ctx(role),

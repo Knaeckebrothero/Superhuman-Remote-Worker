@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from services.completion_effect_policy import (
+from orchestrator.services.completion_effect_policy import (
     COMPLETION_EFFECT_GROUPS,
     COMPLETION_EFFECT_INDEX,
     COMPLETION_EFFECT_PLAN,

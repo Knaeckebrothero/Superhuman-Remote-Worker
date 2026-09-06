@@ -60,13 +60,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.core.session_tool_overrides import SESSION_TOOL_OVERRIDE_NAMES
-from src.core.tool_policy import (
+from shared.runtime.core.session_tool_overrides import SESSION_TOOL_OVERRIDE_NAMES
+from shared.runtime.core.tool_policy import (
     MCP_WILDCARD,
     ToolPolicyError,
     validate_tool_override_fragment,
 )
-from src.tools.registry import TOOL_REGISTRY, get_tools_by_category
+from agent.tools.registry import TOOL_REGISTRY, get_tools_by_category
 
 #: The categories the cockpit's New Session form renders as checkboxes, in
 #: order. Mirror of SESSION_TOOL_CATEGORIES in
@@ -139,7 +139,10 @@ class TestEveryRenderedCategoryIsHonoured:
         they are in-category, so assert it against the registry rather than
         trusting it.
         """
-        from src.core.loader import load_and_merge_config, resolve_config_path
+        from shared.runtime.core.loader import (
+            load_and_merge_config,
+            resolve_config_path,
+        )
 
         for base in ("session_base", "worker_base"):
             path, _ = resolve_config_path(base)
@@ -382,7 +385,7 @@ class TestTheGateIsNotThePDP:
         ) == {"shell": ["run_command"], "browser_direct": ["browser_click"]}
 
     def test_the_pdp_still_sees_what_this_lets_through(self):
-        from src.core.capability_grants import evaluate
+        from shared.runtime.core.capability_grants import evaluate
 
         fragment = {
             "tools": validate_tool_override_fragment(
@@ -464,26 +467,47 @@ def job_db():
 
 
 async def _create_job(db, request, body):
-    import security.access as access_module
-    from main import create_job
+    import orchestrator.security.access as access_module
+    from orchestrator.main import create_job
 
     user = {"id": USER_ID, "is_admin": False}
     patches = [
         patch.object(access_module, "_INTERNAL_KEY", "secret"),
-        patch("main.require_approved_user", AsyncMock(return_value=user)),
-        patch("security.access.require_approved_user", AsyncMock(return_value=user)),
-        patch("main.postgres_db", db),
-        patch("main._enforce_readiness_gate", AsyncMock(return_value=None)),
-        patch("main._thread_project_ids", AsyncMock(return_value=[])),
-        patch("main._revalidate_thread_project_ids", AsyncMock(return_value=[])),
-        patch("main._require_job_project_access", AsyncMock(return_value=None)),
-        patch("main._is_experts_db_enabled", MagicMock(return_value=False)),
-        patch("main._inherit_parent_datasource_ids", AsyncMock(return_value=[])),
-        patch("main._authorize_thread_datasource_ids", AsyncMock(return_value=[])),
-        patch("main._enforce_job_create_grants", AsyncMock(return_value=None)),
-        patch("services.job_provisioning.provision_job_repo", AsyncMock()),
-        patch("main._spawn_scholar_subjob", AsyncMock(return_value=None)),
-        patch("main._trigger_dispatch", MagicMock()),
+        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user)),
+        patch(
+            "orchestrator.security.access.require_approved_user",
+            AsyncMock(return_value=user),
+        ),
+        patch("orchestrator.main.postgres_db", db),
+        patch(
+            "orchestrator.main._enforce_readiness_gate", AsyncMock(return_value=None)
+        ),
+        patch("orchestrator.main._thread_project_ids", AsyncMock(return_value=[])),
+        patch(
+            "orchestrator.main._revalidate_thread_project_ids",
+            AsyncMock(return_value=[]),
+        ),
+        patch(
+            "orchestrator.main._require_job_project_access",
+            AsyncMock(return_value=None),
+        ),
+        patch(
+            "orchestrator.main._is_experts_db_enabled", MagicMock(return_value=False)
+        ),
+        patch(
+            "orchestrator.main._inherit_parent_datasource_ids",
+            AsyncMock(return_value=[]),
+        ),
+        patch(
+            "orchestrator.main._authorize_thread_datasource_ids",
+            AsyncMock(return_value=[]),
+        ),
+        patch(
+            "orchestrator.main._enforce_job_create_grants", AsyncMock(return_value=None)
+        ),
+        patch("orchestrator.services.job_provisioning.provision_job_repo", AsyncMock()),
+        patch("orchestrator.main._spawn_scholar_subjob", AsyncMock(return_value=None)),
+        patch("orchestrator.main._trigger_dispatch", MagicMock()),
     ]
     with ExitStack() as stack:
         for p in patches:
@@ -500,7 +524,7 @@ class TestJobCreateBoundary:
         ``tools.<anything>: [<any registered name>]`` straight through, with
         only a dispatch PDP that keys off the CATEGORY behind it."""
         from fastapi import HTTPException
-        from main import JobCreate
+        from orchestrator.main import JobCreate
 
         with pytest.raises(HTTPException) as exc:
             await _create_job(
@@ -521,7 +545,7 @@ class TestJobCreateBoundary:
         and ``create_job`` forwards a MODEL-AUTHORED config_override
         verbatim — which is precisely a caller that can write this fragment."""
         from fastapi import HTTPException
-        from main import JobCreate
+        from orchestrator.main import JobCreate
 
         parent = str(uuid.uuid4())
         job_db.get_job = AsyncMock(
@@ -548,7 +572,7 @@ class TestJobCreateBoundary:
     async def test_a_legitimate_fragment_is_persisted_normalised(
         self, job_db, job_request
     ):
-        from main import JobCreate
+        from orchestrator.main import JobCreate
 
         await _create_job(
             job_db,
@@ -572,7 +596,7 @@ class TestJobCreateBoundary:
         """``src/api/orchestrator_client.py`` POSTs this exact fragment for
         every self-verifying job — the one real internal caller with a
         ``tools`` block on this endpoint."""
-        from main import JobCreate
+        from orchestrator.main import JobCreate
 
         await _create_job(
             job_db,
@@ -594,7 +618,7 @@ class TestJobCreateBoundary:
 
     @pytest.mark.asyncio
     async def test_a_job_without_tools_is_untouched(self, job_db, job_request):
-        from main import JobCreate
+        from orchestrator.main import JobCreate
 
         await _create_job(
             job_db,
@@ -612,7 +636,7 @@ class TestJobCreateBoundary:
 
 class TestLiveSessionSanitiser:
     def test_every_category_survives_the_agent_side_sanitiser(self):
-        from src.api.persistent_app import _sanitize_live_session_config_override
+        from agent.api.persistent_app import _sanitize_live_session_config_override
 
         result = _sanitize_live_session_config_override(
             {"tools": {"canvas": [], "research": [], "shell": ["run_command"]}}
@@ -624,7 +648,7 @@ class TestLiveSessionSanitiser:
         }
 
     def test_a_smuggle_raises_rather_than_being_filtered_out(self):
-        from src.api.persistent_app import _sanitize_live_session_config_override
+        from agent.api.persistent_app import _sanitize_live_session_config_override
 
         with pytest.raises(ValueError, match="run_command"):
             _sanitize_live_session_config_override(
@@ -632,7 +656,7 @@ class TestLiveSessionSanitiser:
             )
 
     def test_the_caller_owned_payload_is_not_mutated(self):
-        from src.api.persistent_app import _sanitize_live_session_config_override
+        from agent.api.persistent_app import _sanitize_live_session_config_override
 
         payload = {"tools": {"canvas": True}}
         _sanitize_live_session_config_override(payload)
@@ -937,7 +961,8 @@ class TestSessionCreateBoundary:
         pinned_provision = AsyncMock()
 
         with patch(
-            "services.provision_or_assign.provision_or_assign", pinned_provision
+            "orchestrator.services.provision_or_assign.provision_or_assign",
+            pinned_provision,
         ):
             result = await main.create_thread(
                 main.ThreadCreateRequest(
@@ -1028,7 +1053,8 @@ class TestSessionCreateBoundary:
         pinned_provision = AsyncMock()
 
         with patch(
-            "services.provision_or_assign.provision_or_assign", pinned_provision
+            "orchestrator.services.provision_or_assign.provision_or_assign",
+            pinned_provision,
         ):
             await main.create_thread(
                 main.ThreadCreateRequest(
@@ -1098,7 +1124,8 @@ class TestSessionCreateBoundary:
 
         pinned_provision = AsyncMock()
         with patch(
-            "services.provision_or_assign.provision_or_assign", pinned_provision
+            "orchestrator.services.provision_or_assign.provision_or_assign",
+            pinned_provision,
         ):
             await main.create_thread(
                 main.ThreadCreateRequest(title=f"{class_source} officer"),
@@ -1181,7 +1208,10 @@ class TestSessionCreateBoundary:
             "workspace": {"backend": "virtual"},
         }
 
-        with patch("services.provision_or_assign.provision_or_assign", warm_provision):
+        with patch(
+            "orchestrator.services.provision_or_assign.provision_or_assign",
+            warm_provision,
+        ):
             await main.create_thread(request, MagicMock())
             await asyncio.sleep(0)
 
@@ -1204,7 +1234,10 @@ class TestSessionCreateBoundary:
             )
         )
 
-        with patch("services.datasource_policy.default_datasource_selection", resolver):
+        with patch(
+            "orchestrator.services.datasource_policy.default_datasource_selection",
+            resolver,
+        ):
             await main.create_thread(
                 main.ThreadCreateRequest(
                     title="t",
@@ -1509,7 +1542,7 @@ class TestAutomationBoundary:
         )
         # The router late-imports `from main import postgres_db`, which
         # resolves sys.modules["main"] — patching orchestrator.main misses it.
-        monkeypatch.setattr("main.postgres_db", db)
+        monkeypatch.setattr("orchestrator.main.postgres_db", db)
         monkeypatch.setattr(
             mod, "require_approved_user", AsyncMock(return_value=caller)
         )
@@ -1751,7 +1784,7 @@ class TestNoModelAuthoredPathReachesSessionCreate:
         import ast
         from pathlib import Path
 
-        tree = ast.parse(Path("orchestrator/mcp/server.py").read_text())
+        tree = ast.parse(Path("src/mcp_server/server.py").read_text())
         fns = [
             n
             for n in ast.walk(tree)
@@ -2063,7 +2096,7 @@ class TestExpertWriteBoundary:
         `enumerate_only` enumeration for a category that refuses `true`. All
         three have to survive this gate."""
         main, db = expert_env
-        from src.core.tool_policy import enumerate_only_members
+        from shared.runtime.core.tool_policy import enumerate_only_members
 
         payload = {
             "tools": {

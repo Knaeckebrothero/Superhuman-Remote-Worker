@@ -51,29 +51,39 @@ def _discard_background_task(coroutine):
 def _patch_caller_and_db(user: dict, db):
     stack = ExitStack()
     stack.enter_context(
-        patch("main.require_approved_user", AsyncMock(return_value=user))
+        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user))
     )
     stack.enter_context(
         patch(
-            "security.access.require_approved_user",
+            "orchestrator.security.access.require_approved_user",
             AsyncMock(return_value=user),
         )
     )
-    stack.enter_context(patch("main.postgres_db", db))
+    stack.enter_context(patch("orchestrator.main.postgres_db", db))
     # Past the drift gate, resume_thread reprovisions an agent and
     # provisions/reuses the session's cloud folder — machinery this file has
     # no interest in exercising. Keep it inert and deterministic rather than
     # depending on whatever services.agent_provisioner detects (or not) about
     # the box the tests happen to run on.
     stack.enter_context(
-        patch("main.agent_provisioner", SimpleNamespace(is_available=False))
+        patch(
+            "orchestrator.main.agent_provisioner", SimpleNamespace(is_available=False)
+        )
     )
     stack.enter_context(
-        patch("main.persistent_provisioner", SimpleNamespace(is_available=False))
+        patch(
+            "orchestrator.main.persistent_provisioner",
+            SimpleNamespace(is_available=False),
+        )
     )
-    stack.enter_context(patch("main.ensure_session_workspace", AsyncMock()))
     stack.enter_context(
-        patch("main.asyncio.create_task", side_effect=_discard_background_task)
+        patch("orchestrator.main.ensure_session_workspace", AsyncMock())
+    )
+    stack.enter_context(
+        patch(
+            "orchestrator.main.asyncio.create_task",
+            side_effect=_discard_background_task,
+        )
     )
     db.list_thread_mounts = AsyncMock(return_value=[])
 
@@ -121,7 +131,7 @@ class TestResumeConfigDrift:
     async def test_drift_returns_428_and_does_not_mutate(
         self, user_a, thread_a, fake_db, fake_request
     ):
-        from main import resume_thread
+        from orchestrator.main import resume_thread
 
         thread = _ended_thread(thread_a)
         drift = [
@@ -129,7 +139,7 @@ class TestResumeConfigDrift:
         ]
 
         with _patch_caller_and_db(user_a, fake_db):
-            with patch("main._thread_config_drift", _fake_drift(drift)):
+            with patch("orchestrator.main._thread_config_drift", _fake_drift(drift)):
                 with pytest.raises(HTTPException) as exc:
                     await resume_thread(str(thread["id"]), fake_request)
 
@@ -155,7 +165,7 @@ class TestResumeConfigDrift:
     async def test_full_acknowledgment_resumes(
         self, user_a, thread_a, fake_db, fake_request
     ):
-        from main import ThreadResumeRequest, resume_thread
+        from orchestrator.main import ThreadResumeRequest, resume_thread
 
         thread = _ended_thread(thread_a)
         thread_id = str(thread["id"])
@@ -164,7 +174,7 @@ class TestResumeConfigDrift:
         ]
 
         with _patch_caller_and_db(user_a, fake_db):
-            with patch("main._thread_config_drift", _fake_drift(drift)):
+            with patch("orchestrator.main._thread_config_drift", _fake_drift(drift)):
                 result = await resume_thread(
                     thread_id,
                     fake_request,
@@ -181,7 +191,7 @@ class TestResumeConfigDrift:
     async def test_partial_acknowledgment_is_rejected(
         self, user_a, thread_a, fake_db, fake_request
     ):
-        from main import ThreadResumeRequest, resume_thread
+        from orchestrator.main import ThreadResumeRequest, resume_thread
 
         thread = _ended_thread(thread_a)
         drift = [
@@ -190,7 +200,7 @@ class TestResumeConfigDrift:
         ]
 
         with _patch_caller_and_db(user_a, fake_db):
-            with patch("main._thread_config_drift", _fake_drift(drift)):
+            with patch("orchestrator.main._thread_config_drift", _fake_drift(drift)):
                 with pytest.raises(HTTPException) as exc:
                     await resume_thread(
                         str(thread["id"]),
@@ -224,14 +234,14 @@ class TestResumeConfigDrift:
         """An item that recovered between prompt and confirm must not force a
         pointless re-prompt: acknowledging it anyway is harmless — the subset
         rule, not equality."""
-        from main import ThreadResumeRequest, resume_thread
+        from orchestrator.main import ThreadResumeRequest, resume_thread
 
         thread = _ended_thread(thread_a)
         thread_id = str(thread["id"])
         drift = [DriftItem("grant:shell_tools", "grant", "revoked", "shell")]
 
         with _patch_caller_and_db(user_a, fake_db):
-            with patch("main._thread_config_drift", _fake_drift(drift)):
+            with patch("orchestrator.main._thread_config_drift", _fake_drift(drift)):
                 result = await resume_thread(
                     thread_id,
                     fake_request,
@@ -260,7 +270,7 @@ class TestResumeConfigDrift:
         with no body still 428'd. The stored ack must be honored on its own,
         with no ``acknowledge`` in this request at all.
         """
-        from main import resume_thread
+        from orchestrator.main import resume_thread
 
         thread = _ended_thread(thread_a)
         thread_id = str(thread["id"])
@@ -270,7 +280,7 @@ class TestResumeConfigDrift:
         ]
 
         with _patch_caller_and_db(user_a, fake_db):
-            with patch("main._thread_config_drift", _fake_drift(drift)):
+            with patch("orchestrator.main._thread_config_drift", _fake_drift(drift)):
                 result = await resume_thread(thread_id, fake_request)
 
         assert result == {"status": "created", "thread_id": thread_id}
@@ -284,7 +294,7 @@ class TestResumeConfigDrift:
         that drifts for the FIRST time is in neither the request body nor
         the stored ack, so it must still block with a 428 naming it — the
         union must never let brand-new drift through."""
-        from main import resume_thread
+        from orchestrator.main import resume_thread
 
         thread = _ended_thread(thread_a)
         thread_id = str(thread["id"])
@@ -295,7 +305,7 @@ class TestResumeConfigDrift:
         ]
 
         with _patch_caller_and_db(user_a, fake_db):
-            with patch("main._thread_config_drift", _fake_drift(drift)):
+            with patch("orchestrator.main._thread_config_drift", _fake_drift(drift)):
                 with pytest.raises(HTTPException) as exc:
                     await resume_thread(thread_id, fake_request)
 
@@ -315,13 +325,13 @@ class TestResumeConfigDrift:
     async def test_no_drift_resumes_exactly_as_before(
         self, user_a, thread_a, fake_db, fake_request
     ):
-        from main import resume_thread
+        from orchestrator.main import resume_thread
 
         thread = _ended_thread(thread_a)
         thread_id = str(thread["id"])
 
         with _patch_caller_and_db(user_a, fake_db):
-            with patch("main._thread_config_drift", _fake_drift([])):
+            with patch("orchestrator.main._thread_config_drift", _fake_drift([])):
                 result = await resume_thread(thread_id, fake_request)
 
         assert result == {"status": "created", "thread_id": thread_id}
@@ -335,13 +345,13 @@ class TestResumeConfigDrift:
     ):
         """Pre-existing behaviour, unchanged: a double-click / already-active
         thread still 409s, and now does so BEFORE drift is even computed."""
-        from main import resume_thread
+        from orchestrator.main import resume_thread
 
         thread_a["status"] = "created"
         drift_probe = _fake_drift([])
 
         with _patch_caller_and_db(user_a, fake_db):
-            with patch("main._thread_config_drift", drift_probe):
+            with patch("orchestrator.main._thread_config_drift", drift_probe):
                 with pytest.raises(HTTPException) as exc:
                     await resume_thread(str(thread_a["id"]), fake_request)
 
@@ -368,14 +378,14 @@ class TestResumeConfigDrift:
         by the patched ``_resolve_session_config`` is the only thing that can
         reach the handler.
         """
-        from main import resume_thread
+        from orchestrator.main import resume_thread
 
         thread = _ended_thread(thread_a)
         thread_id = str(thread["id"])
 
         with _patch_caller_and_db(user_a, fake_db):
             with patch(
-                "main._resolve_session_config",
+                "orchestrator.main._resolve_session_config",
                 AsyncMock(side_effect=RuntimeError("boom")),
             ):
                 with pytest.raises(HTTPException) as exc:
@@ -411,7 +421,7 @@ class TestResumeConfigDrift:
         while an admin passes ``_classify_thread_project_ids``'s is_admin
         bypass and sees nothing wrong.
         """
-        from main import resume_thread
+        from orchestrator.main import resume_thread
 
         thread = _ended_thread(thread_a)
         thread_id = str(thread["id"])
@@ -425,10 +435,13 @@ class TestResumeConfigDrift:
         with _patch_caller_and_db(user_admin, fake_db):
             with (
                 patch(
-                    "main._thread_project_ids",
+                    "orchestrator.main._thread_project_ids",
                     AsyncMock(return_value=[project_id]),
                 ),
-                patch("main._resolve_session_config", AsyncMock(return_value=None)),
+                patch(
+                    "orchestrator.main._resolve_session_config",
+                    AsyncMock(return_value=None),
+                ),
             ):
                 with pytest.raises(HTTPException) as exc:
                     await resume_thread(thread_id, fake_request)
@@ -458,7 +471,7 @@ class TestResumeConfigDrift:
         (only the grant probe is stubbed inert) so the blocking check is
         genuinely exercised, not assumed away by a mock.
         """
-        from main import resume_thread
+        from orchestrator.main import resume_thread
 
         thread = _ended_thread(thread_a)
         thread_id = str(thread["id"])
@@ -480,7 +493,10 @@ class TestResumeConfigDrift:
         )
 
         with _patch_caller_and_db(user_a, fake_db):
-            with patch("main._resolve_session_config", AsyncMock(return_value=None)):
+            with patch(
+                "orchestrator.main._resolve_session_config",
+                AsyncMock(return_value=None),
+            ):
                 with pytest.raises(HTTPException) as exc:
                     await resume_thread(thread_id, fake_request)
 

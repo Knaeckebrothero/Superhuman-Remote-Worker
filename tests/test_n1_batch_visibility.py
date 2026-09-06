@@ -124,7 +124,7 @@ class TestFilterVisibleDatasources:
 
 def _db_with_conn(fetch_rows):
     with patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}):
-        from database import PostgresDB
+        from orchestrator.database import PostgresDB
 
         db = PostgresDB()
     db._pool = MagicMock()

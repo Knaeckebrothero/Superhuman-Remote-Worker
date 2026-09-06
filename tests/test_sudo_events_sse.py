@@ -23,15 +23,15 @@ def _patch_caller_and_db(user: dict, db):
     """Same patch stack used across F2/F3/F5/F6 test files."""
     stack = ExitStack()
     stack.enter_context(
-        patch("main.require_approved_user", AsyncMock(return_value=user))
+        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user))
     )
     stack.enter_context(
         patch(
-            "security.access.require_approved_user",
+            "orchestrator.security.access.require_approved_user",
             AsyncMock(return_value=user),
         )
     )
-    stack.enter_context(patch("main.postgres_db", db))
+    stack.enter_context(patch("orchestrator.main.postgres_db", db))
     return stack
 
 
@@ -79,7 +79,7 @@ class TestSudoSseFilter:
     async def test_thread_owner_sees_thread_event(
         self, user_a, thread_a, thread_b, fake_db
     ):
-        from main import sudo_sse_events
+        from orchestrator.main import sudo_sse_events
 
         queue: asyncio.Queue = asyncio.Queue()
         await queue.put(
@@ -92,8 +92,10 @@ class TestSudoSseFilter:
         request.is_disconnected = AsyncMock(side_effect=lambda: queue.empty())
 
         with _patch_caller_and_db(user_a, fake_db):
-            with patch("main.sudo_gate.subscribe_sse", lambda: queue):
-                with patch("main.sudo_gate.unsubscribe_sse", lambda q: None):
+            with patch("orchestrator.main.sudo_gate.subscribe_sse", lambda: queue):
+                with patch(
+                    "orchestrator.main.sudo_gate.unsubscribe_sse", lambda q: None
+                ):
                     response = await sudo_sse_events(request)
                     chunks = [chunk async for chunk in response.body_iterator]
 
@@ -107,7 +109,7 @@ class TestSudoSseFilter:
     async def test_thread_owner_can_list_and_get_thread_sudo_request(
         self, user_a, thread_a, fake_db
     ):
-        from main import get_sudo_request, list_sudo_requests
+        from orchestrator.main import get_sudo_request, list_sudo_requests
 
         row = {
             "id": "thread-sudo",
@@ -116,7 +118,10 @@ class TestSudoSseFilter:
         }
         request = MagicMock(cookies={}, headers={})
         with _patch_caller_and_db(user_a, fake_db):
-            with patch("main.sudo_gate.list_requests", AsyncMock(return_value=[row])):
+            with patch(
+                "orchestrator.main.sudo_gate.list_requests",
+                AsyncMock(return_value=[row]),
+            ):
                 listed = await list_sudo_requests(
                     request,
                     job_id=None,
@@ -124,7 +129,9 @@ class TestSudoSseFilter:
                     request_type=None,
                     limit=50,
                 )
-            with patch("main.sudo_gate.get_request", AsyncMock(return_value=row)):
+            with patch(
+                "orchestrator.main.sudo_gate.get_request", AsyncMock(return_value=row)
+            ):
                 fetched = await get_sudo_request(request, "thread-sudo")
 
         assert listed == [row]
@@ -133,7 +140,7 @@ class TestSudoSseFilter:
     @pytest.mark.asyncio
     async def test_user_sees_only_own_jobs_events(self, user_a, job_a, job_b, fake_db):
         """user_a should see events for job_a (owned), not for job_b."""
-        from main import sudo_sse_events
+        from orchestrator.main import sudo_sse_events
 
         queue: asyncio.Queue = asyncio.Queue()
         await queue.put(("new_request", {"id": "r1", "job_id": str(job_a["id"])}))
@@ -152,8 +159,10 @@ class TestSudoSseFilter:
         request.is_disconnected = _is_disconnected
 
         with _patch_caller_and_db(user_a, fake_db):
-            with patch("main.sudo_gate.subscribe_sse", lambda: queue):
-                with patch("main.sudo_gate.unsubscribe_sse", lambda q: None):
+            with patch("orchestrator.main.sudo_gate.subscribe_sse", lambda: queue):
+                with patch(
+                    "orchestrator.main.sudo_gate.unsubscribe_sse", lambda q: None
+                ):
                     response = await sudo_sse_events(request)
                     out = bytearray()
                     async for chunk in response.body_iterator:
@@ -172,7 +181,7 @@ class TestSudoSseFilter:
     async def test_admin_sees_all_events_including_orphans(
         self, user_admin, job_a, job_b, fake_db
     ):
-        from main import sudo_sse_events
+        from orchestrator.main import sudo_sse_events
 
         queue: asyncio.Queue = asyncio.Queue()
         await queue.put(("new_request", {"id": "r1", "job_id": str(job_a["id"])}))
@@ -189,8 +198,10 @@ class TestSudoSseFilter:
         request.is_disconnected = _is_disconnected
 
         with _patch_caller_and_db(user_admin, fake_db):
-            with patch("main.sudo_gate.subscribe_sse", lambda: queue):
-                with patch("main.sudo_gate.unsubscribe_sse", lambda q: None):
+            with patch("orchestrator.main.sudo_gate.subscribe_sse", lambda: queue):
+                with patch(
+                    "orchestrator.main.sudo_gate.unsubscribe_sse", lambda q: None
+                ):
                     response = await sudo_sse_events(request)
                     out = bytearray()
                     async for chunk in response.body_iterator:
@@ -208,7 +219,7 @@ class TestSudoSseFilter:
         self, user_a, job_a, job_b, fake_db
     ):
         """`request_decided` events now carry job_id (F6 fix to sudo_gate)."""
-        from main import sudo_sse_events
+        from orchestrator.main import sudo_sse_events
 
         queue: asyncio.Queue = asyncio.Queue()
         await queue.put(
@@ -245,8 +256,10 @@ class TestSudoSseFilter:
         request.is_disconnected = _is_disconnected
 
         with _patch_caller_and_db(user_a, fake_db):
-            with patch("main.sudo_gate.subscribe_sse", lambda: queue):
-                with patch("main.sudo_gate.unsubscribe_sse", lambda q: None):
+            with patch("orchestrator.main.sudo_gate.subscribe_sse", lambda: queue):
+                with patch(
+                    "orchestrator.main.sudo_gate.unsubscribe_sse", lambda q: None
+                ):
                     response = await sudo_sse_events(request)
                     out = bytearray()
                     async for chunk in response.body_iterator:
@@ -276,7 +289,7 @@ class TestSudoGateEventsCarryJobId:
 
     @pytest.mark.asyncio
     async def test_approve_request_event_has_job_id(self):
-        from services.sudo_gate import SudoGateService
+        from orchestrator.services.sudo_gate import SudoGateService
 
         gate = SudoGateService()
         gate._db = AsyncMock()

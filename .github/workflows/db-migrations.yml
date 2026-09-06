@@ -1,10 +1,10 @@
 name: db-migrations
 
-# Gate for changes under orchestrator/database/migrations/** (plus the schema
+# Gate for changes under src/orchestrator/database/migrations/** (plus the schema
 # artifacts, the runner and its import surface, and the squawk config).
 #
 # The trigger list carries database/__init__.py even though it is not a
-# migration: `python -m database.migrate` loads the package initializer first.
+# migration: `python -m orchestrator.database.migrate` loads the package initializer first.
 # That initializer deliberately keeps application exports lazy so the runner
 # needs only asyncpg; changing the import boundary must exercise this workflow.
 # postgres.py remains listed because it owns the application-side schema
@@ -35,13 +35,17 @@ on:
   push:
     branches: [develop, main]
     paths:
-      - 'orchestrator/database/migrations/**.sql'
-      - 'orchestrator/database/migrate.py'
+      - 'src/orchestrator/database/migrations/**.sql'
+      - 'src/orchestrator/database/migrate.py'
+      - 'src/orchestrator/database/migration_recovery.py'
+      - 'src/orchestrator/__init__.py'
+      - 'src/shared/**'
+      - 'pyproject.toml'
       # Runner import surface, not migrations — see the header note.
-      - 'orchestrator/database/__init__.py'
-      - 'orchestrator/database/postgres.py'
-      - 'orchestrator/database/*_current.sql'
-      - 'orchestrator/services/canvas*.py'
+      - 'src/orchestrator/database/__init__.py'
+      - 'src/orchestrator/database/postgres.py'
+      - 'src/orchestrator/database/*_current.sql'
+      - 'src/orchestrator/services/canvas*.py'
       - 'helm/files/canvas-viewer-role.sql'
       - 'scripts/provision-canvas-gateway-database.sh'
       - 'tests/test_canvas_gateway_operator_provision.py'
@@ -52,13 +56,17 @@ on:
       - '.squawk.toml'
   pull_request:
     paths:
-      - 'orchestrator/database/migrations/**.sql'
-      - 'orchestrator/database/migrate.py'
+      - 'src/orchestrator/database/migrations/**.sql'
+      - 'src/orchestrator/database/migrate.py'
+      - 'src/orchestrator/database/migration_recovery.py'
+      - 'src/orchestrator/__init__.py'
+      - 'src/shared/**'
+      - 'pyproject.toml'
       # Runner import surface, not migrations — see the header note.
-      - 'orchestrator/database/__init__.py'
-      - 'orchestrator/database/postgres.py'
-      - 'orchestrator/database/*_current.sql'
-      - 'orchestrator/services/canvas*.py'
+      - 'src/orchestrator/database/__init__.py'
+      - 'src/orchestrator/database/postgres.py'
+      - 'src/orchestrator/database/*_current.sql'
+      - 'src/orchestrator/services/canvas*.py'
       - 'helm/files/canvas-viewer-role.sql'
       - 'scripts/provision-canvas-gateway-database.sh'
       - 'tests/test_canvas_gateway_operator_provision.py'
@@ -79,6 +87,9 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  PYTHONSAFEPATH: "1"
+
 jobs:
   squawk:
     name: lint (squawk)
@@ -87,6 +98,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
       # Lint ONLY the migrations this push/PR adds or modifies — never the
       # whole frozen history. Applied migrations can't be edited (the runner's
@@ -129,9 +141,13 @@ jobs:
           # Added/Modified migration files only, minus the 0001 bootstrap
           # snapshots (they lint like ALTERs on a hot table but are empty-DB
           # bootstraps; also pinned in .squawk.toml's excluded_paths).
+          # Detect exact renames before filtering paths: limiting the diff to
+          # the new directory hides the removed source and turns a pure move
+          # of immutable SQL into an addition. A failed diff must fail the gate.
+          changed_paths=$(git diff --find-renames=100% --name-only --diff-filter=AM "$base" "${{ github.sha }}")
           mapfile -t files < <(
-            git diff --name-only --diff-filter=AM "$base" "${{ github.sha }}" \
-              -- 'orchestrator/database/migrations/**/*.sql' \
+            printf '%s\n' "$changed_paths" \
+              | grep '^src/orchestrator/database/migrations/.*\.sql$' \
               | grep -v '/0001_initial\.sql$' || true
           )
           if [ "${#files[@]}" -eq 0 ]; then
@@ -198,6 +214,8 @@ jobs:
           --health-retries=10
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -207,6 +225,7 @@ jobs:
       - run: >-
           pip install --quiet asyncpg cryptography httpx tenacity
           'pydantic>=2.10' pytest pytest-asyncio
+      - run: pip install --quiet --no-deps -e .
       - name: Create the vector database
         env:
           PGPASSWORD: ci
@@ -215,43 +234,28 @@ jobs:
           # (uuid-ossp on both DBs, vector on the vector DB), so we only
           # need to ensure the second database exists.
           psql -h localhost -U ci -d ci_app -c "CREATE DATABASE ci_vector;"
-      # Mirror production's import root: Dockerfile.orchestrator copies the
-      # contents of orchestrator/ into /app/, so the package treats orchestrator/
-      # as the top of sys.path (e.g. `from security.crypto import ...`,
-      # `from utils.db_url import ...`). Run the migration runner the same way.
-      #
-      # That same /app also holds the repository-root `src/` tree (the
-      # Dockerfile copies it to /app/src/), so in production ONE sys.path entry
-      # resolves both roots. Here they are two directories, so carry the
-      # workspace in PYTHONPATH to match production's import root.
+      # Resolve the same editable packages as production, from the repository root.
       - name: Dry-run app migrations
-        working-directory: orchestrator
         env:
           DATABASE_URL: postgresql://ci:ci@localhost:5432/ci_app
-          PYTHONPATH: ${{ github.workspace }}
         run: |
-          python -m database.migrate \
-            --dir database/migrations/app \
+          python -m orchestrator.database.migrate \
+            --dir src/orchestrator/database/migrations/app \
             --dry-run
       - name: Dry-run vector migrations
-        working-directory: orchestrator
         env:
           DATABASE_URL: postgresql://ci:ci@localhost:5432/ci_vector
-          PYTHONPATH: ${{ github.workspace }}
         run: |
-          python -m database.migrate \
-            --dir database/migrations/vector \
+          python -m orchestrator.database.migrate \
+            --dir src/orchestrator/database/migrations/vector \
             --dry-run
       - name: Apply app migrations for Canvas viewer lifecycle test
-        working-directory: orchestrator
         env:
           DATABASE_URL: postgresql://ci:ci@localhost:5432/ci_app
-          PYTHONPATH: ${{ github.workspace }}
-        run: python -m database.migrate --dir database/migrations/app
+        run: python -m orchestrator.database.migrate --dir src/orchestrator/database/migrations/app
       - name: Exercise Canvas viewer lifecycle against PostgreSQL
         env:
           CANVAS_TEST_DATABASE_URL: postgresql://ci:ci@localhost:5432/ci_app
-          PYTHONPATH: orchestrator:.
         run: >-
           pytest -q
           tests/test_canvas_viewer_postgres_integration.py
@@ -270,12 +274,17 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       # The migration runner is intentionally independent of the application
       # database layer and needs only asyncpg.
       - run: pip install --quiet asyncpg
+      - run: pip install --quiet --no-deps -e .
+      - name: Prove the standalone migration import needs only asyncpg
+        run: python -m orchestrator.database.migrate --help
       # Docker is preinstalled on ubuntu-latest; the script auto-detects it and
       # spins up one throwaway container per family (pgvector:pg15 x2,
       # postgres:16), migrates from zero, and dumps inside the container.
@@ -287,12 +296,12 @@ jobs:
       # first so a brand-new artifact (untracked) is caught too, not just edits.
       - name: Fail on stale or hand-edited artifacts
         run: |
-          git add -A orchestrator/database/*_current.sql
-          if git diff --cached --quiet -- orchestrator/database/*_current.sql; then
+          git add -A src/orchestrator/database/*_current.sql
+          if git diff --cached --quiet -- src/orchestrator/database/*_current.sql; then
             echo "Schema artifacts are up to date."
           else
-            echo "::error::Schema artifacts are stale or hand-edited. Regenerate with: scripts/schema-snapshot.sh && git add -A orchestrator/database/*_current.sql, then commit."
-            git --no-pager diff --cached -- orchestrator/database/*_current.sql
+            echo "::error::Schema artifacts are stale or hand-edited. Regenerate with: scripts/schema-snapshot.sh && git add -A src/orchestrator/database/*_current.sql, then commit."
+            git --no-pager diff --cached -- src/orchestrator/database/*_current.sql
             exit 1
           fi
 
@@ -302,17 +311,24 @@ jobs:
     timeout-minutes: 2
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - name: No duplicate migration prefixes
         run: |
           set -euo pipefail
           fail=0
-          for d in orchestrator/database/migrations/*/; do
-            if ls "$d"*.sql >/dev/null 2>&1; then
-              dupes=$(ls "$d"*.sql | xargs -n1 basename | awk -F_ '{print $1}' | sort | uniq -d)
-              if [ -n "$dupes" ]; then
-                echo "ERROR: duplicate prefix(es) in $d: $dupes"
-                fail=1
-              fi
+          test -d src/orchestrator/database/migrations/app
+          test -d src/orchestrator/database/migrations/vector
+          test -d src/orchestrator/database/migrations/audit
+          for d in src/orchestrator/database/migrations/*/; do
+            if ! ls "$d"*.sql >/dev/null 2>&1; then
+              echo "ERROR: no migrations discovered in $d"
+              exit 1
+            fi
+            dupes=$(ls "$d"*.sql | xargs -n1 basename | awk -F_ '{print $1}' | sort | uniq -d)
+            if [ -n "$dupes" ]; then
+              echo "ERROR: duplicate prefix(es) in $d: $dupes"
+              fail=1
             fi
           done
           exit $fail

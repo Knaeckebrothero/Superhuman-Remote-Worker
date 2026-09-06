@@ -22,6 +22,7 @@ from orchestrator.database.postgres import PostgresDB
 
 SCHEMA_FILE = (
     Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "schema_current.sql"

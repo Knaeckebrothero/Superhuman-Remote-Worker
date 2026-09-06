@@ -4,10 +4,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.api import app as worker_app
-from src.api import dual_app
-from src.services.recall_store import memory_health
-from src.tools.context import ToolContext
+from agent.api import app as worker_app
+from agent.api import dual_app
+from shared.runtime.services.recall_store import memory_health
+from agent.tools.context import ToolContext
 
 
 def _build_agent_with_graph_progress(value: int) -> object:

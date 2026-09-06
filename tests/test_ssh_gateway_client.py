@@ -24,8 +24,8 @@ import json
 
 import pytest
 
-from services import ssh_gateway_targets
-from services.ssh_gateway_client import (
+from orchestrator.services import ssh_gateway_targets
+from orchestrator.services.ssh_gateway_client import (
     KEY_USE_BUMP_TIMEOUT_SECONDS,
     REFUSAL_MESSAGES,
     SshTarget,
@@ -33,7 +33,7 @@ from services.ssh_gateway_client import (
     TargetUnavailable,
     resolve_target,
 )
-from services.ssh_gateway_config import GatewayConfig
+from orchestrator.services.ssh_gateway_config import GatewayConfig
 
 _UNSET = object()
 
@@ -104,7 +104,7 @@ async def test_live_target_is_returned(monkeypatch):
         )
         return FakeResponse(200, _live_payload())
 
-    import services.ssh_gateway_client as mod
+    import orchestrator.services.ssh_gateway_client as mod
 
     monkeypatch.setattr(mod, "_http_get", _get)
     target = await resolve_target(_config(), "s-7f3a91c2", "SHA256:abc")
@@ -136,7 +136,7 @@ async def test_orchestrator_request_timeout_is_configurable(monkeypatch):
         calls.append(timeout)
         return FakeResponse(200, _live_payload())
 
-    import services.ssh_gateway_client as mod
+    import orchestrator.services.ssh_gateway_client as mod
 
     monkeypatch.setattr(mod, "_http_get", _get)
     await resolve_target(
@@ -152,7 +152,7 @@ async def test_404_is_denial_not_unavailability(monkeypatch):
     async def _get(url, headers=None, params=None, timeout=None):
         return FakeResponse(404, {"detail": "No such workspace"})
 
-    import services.ssh_gateway_client as mod
+    import orchestrator.services.ssh_gateway_client as mod
 
     monkeypatch.setattr(mod, "_http_get", _get)
     with pytest.raises(TargetDenied):
@@ -172,7 +172,7 @@ async def test_non_live_state_raises_with_the_state(monkeypatch):
             ),
         )
 
-    import services.ssh_gateway_client as mod
+    import orchestrator.services.ssh_gateway_client as mod
 
     monkeypatch.setattr(mod, "_http_get", _get)
     with pytest.raises(TargetUnavailable) as excinfo:
@@ -185,7 +185,7 @@ async def test_orchestrator_failure_fails_closed(monkeypatch):
     async def _get(url, headers=None, params=None, timeout=None):
         raise OSError("connection refused")
 
-    import services.ssh_gateway_client as mod
+    import orchestrator.services.ssh_gateway_client as mod
 
     monkeypatch.setattr(mod, "_http_get", _get)
     with pytest.raises(TargetUnavailable) as excinfo:
@@ -227,7 +227,7 @@ async def test_handle_path_traversal_is_denied_without_an_http_call(monkeypatch)
         calls.append(url)
         return FakeResponse(200, _live_payload())
 
-    import services.ssh_gateway_client as mod
+    import orchestrator.services.ssh_gateway_client as mod
 
     monkeypatch.setattr(mod, "_http_get", _get)
     with pytest.raises(TargetDenied):
@@ -246,7 +246,7 @@ async def test_ordinary_handle_still_reaches_the_http_call(monkeypatch):
         calls.append(url)
         return FakeResponse(200, _live_payload())
 
-    import services.ssh_gateway_client as mod
+    import orchestrator.services.ssh_gateway_client as mod
 
     monkeypatch.setattr(mod, "_http_get", _get)
     target = await resolve_target(_config(), "s-7f3a91c2", "SHA256:abc")
@@ -267,7 +267,7 @@ async def test_non_json_response_body_refuses_instead_of_crashing(monkeypatch):
     async def _get(url, headers=None, params=None, timeout=None):
         return NonJsonResponse()
 
-    import services.ssh_gateway_client as mod
+    import orchestrator.services.ssh_gateway_client as mod
 
     monkeypatch.setattr(mod, "_http_get", _get)
     with pytest.raises(TargetUnavailable) as excinfo:
@@ -281,7 +281,7 @@ async def test_non_dict_payload_refuses_instead_of_crashing(monkeypatch, payload
     async def _get(url, headers=None, params=None, timeout=None):
         return FakeResponse(200, payload)
 
-    import services.ssh_gateway_client as mod
+    import orchestrator.services.ssh_gateway_client as mod
 
     monkeypatch.setattr(mod, "_http_get", _get)
     with pytest.raises(TargetUnavailable) as excinfo:
@@ -300,7 +300,7 @@ async def test_unhashable_state_refuses_instead_of_crashing(monkeypatch, state):
     async def _get(url, headers=None, params=None, timeout=None):
         return FakeResponse(200, {"state": state})
 
-    import services.ssh_gateway_client as mod
+    import orchestrator.services.ssh_gateway_client as mod
 
     monkeypatch.setattr(mod, "_http_get", _get)
     with pytest.raises(TargetUnavailable) as excinfo:
@@ -318,7 +318,7 @@ async def test_live_payload_with_null_port_refuses_instead_of_crashing(monkeypat
     async def _get(url, headers=None, params=None, timeout=None):
         return FakeResponse(200, _live_payload(pod_port=None))
 
-    import services.ssh_gateway_client as mod
+    import orchestrator.services.ssh_gateway_client as mod
 
     monkeypatch.setattr(mod, "_http_get", _get)
     with pytest.raises(TargetUnavailable) as excinfo:
@@ -336,7 +336,7 @@ async def test_live_payload_missing_a_field_refuses_instead_of_crashing(monkeypa
         del payload["host_key_fingerprint"]
         return FakeResponse(200, payload)
 
-    import services.ssh_gateway_client as mod
+    import orchestrator.services.ssh_gateway_client as mod
 
     monkeypatch.setattr(mod, "_http_get", _get)
     with pytest.raises(TargetUnavailable) as excinfo:
@@ -394,7 +394,7 @@ async def test_live_payload_with_an_invalid_field_refuses_instead_of_returning_a
     async def _get(url, headers=None, params=None, timeout=None):
         return FakeResponse(200, _live_payload(**overrides))
 
-    import services.ssh_gateway_client as mod
+    import orchestrator.services.ssh_gateway_client as mod
 
     monkeypatch.setattr(mod, "_http_get", _get)
     with pytest.raises(TargetUnavailable) as excinfo:
@@ -410,7 +410,7 @@ async def test_live_payload_with_valid_fields_is_still_accepted(monkeypatch):
     async def _get(url, headers=None, params=None, timeout=None):
         return FakeResponse(200, _live_payload())
 
-    import services.ssh_gateway_client as mod
+    import orchestrator.services.ssh_gateway_client as mod
 
     monkeypatch.setattr(mod, "_http_get", _get)
     target = await resolve_target(_config(), "s-7f3a91c2", "SHA256:abc")
@@ -440,7 +440,7 @@ async def test_the_three_added_states_are_not_collapsed_to_unreachable(
             ),
         )
 
-    import services.ssh_gateway_client as mod
+    import orchestrator.services.ssh_gateway_client as mod
 
     monkeypatch.setattr(mod, "_http_get", _get)
     with pytest.raises(TargetUnavailable) as excinfo:
@@ -591,7 +591,7 @@ class _PostRecorder:
 
 
 def _patch_post(monkeypatch, recorder):
-    import services.ssh_gateway_client as mod
+    import orchestrator.services.ssh_gateway_client as mod
 
     monkeypatch.setattr(mod, "_http_post", recorder)
     return recorder
@@ -603,7 +603,7 @@ async def test_mark_key_used_posts_only_the_fingerprint(monkeypatch):
     resolution is lazy -- so this endpoint is keyed by fingerprint. Sending
     anything more would also be asserting an identity, which this module's
     docstring rules out."""
-    from services.ssh_gateway_client import mark_key_used
+    from orchestrator.services.ssh_gateway_client import mark_key_used
 
     post = _patch_post(monkeypatch, _PostRecorder(FakeResponse(200, {"status": "ok"})))
     await mark_key_used(_config(), "SHA256:abc")
@@ -623,7 +623,7 @@ async def test_the_bump_gets_a_shorter_budget_than_the_other_audit_calls(monkeyp
     (connection.py:1719-1725), so a slow bump hangs the user's first channel
     open. The other two audit calls run off the packet path and keep the
     full budget."""
-    from services.ssh_gateway_client import record_attachment
+    from orchestrator.services.ssh_gateway_client import record_attachment
 
     post = _patch_post(
         monkeypatch, _PostRecorder(FakeResponse(200, {"attachment_id": "att-1"}))
@@ -639,7 +639,7 @@ async def test_a_tightened_global_budget_is_never_widened_by_the_override(monkey
     """An operator who lowers orchestrator_request_timeout is stating a
     ceiling. A per-call override takes the SHORTER of the two, so the bump's
     own constant can only ever tighten, never relax, that ceiling."""
-    from services.ssh_gateway_client import mark_key_used
+    from orchestrator.services.ssh_gateway_client import mark_key_used
 
     post = _patch_post(monkeypatch, _PostRecorder(FakeResponse(200, {"status": "ok"})))
     await mark_key_used(_config(orchestrator_request_timeout=0.5), "SHA256:abc")
@@ -653,7 +653,7 @@ async def test_an_audit_write_never_raises_a_refusal(monkeypatch):
     two are authorization outcomes the gateway turns into a readable
     refusal, and a control-plane hiccup on a bookkeeping write must never be
     able to manufacture one."""
-    from services.ssh_gateway_client import AuditWriteFailed, mark_key_used
+    from orchestrator.services.ssh_gateway_client import AuditWriteFailed, mark_key_used
 
     _patch_post(monkeypatch, _PostRecorder(raises=RuntimeError("connection reset")))
 
@@ -667,7 +667,7 @@ async def test_an_audit_write_never_raises_a_refusal(monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", [400, 404, 422, 500, 503])
 async def test_a_non_200_audit_response_is_a_failure(monkeypatch, status):
-    from services.ssh_gateway_client import AuditWriteFailed, mark_key_used
+    from orchestrator.services.ssh_gateway_client import AuditWriteFailed, mark_key_used
 
     _patch_post(monkeypatch, _PostRecorder(FakeResponse(status, {"status": "ok"})))
 
@@ -680,7 +680,7 @@ async def test_record_attachment_asserts_no_identity(monkeypatch):
     """thread_id/user_id/ssh_key_id are resolved server-side. An earlier
     draft of the endpoint took them as asserted fields, which let any
     internal-key holder attribute an SSH attach to any user."""
-    from services.ssh_gateway_client import record_attachment
+    from orchestrator.services.ssh_gateway_client import record_attachment
 
     post = _patch_post(
         monkeypatch, _PostRecorder(FakeResponse(200, {"attachment_id": "att-1"}))
@@ -707,7 +707,10 @@ async def test_record_attachment_refuses_an_invalid_handle_before_the_request(
     """The handle is the SSH username and is fully attacker-controlled. A
     handle this module would refuse to resolve has no business riding along
     with config.internal_key to open an audit row either."""
-    from services.ssh_gateway_client import AuditWriteFailed, record_attachment
+    from orchestrator.services.ssh_gateway_client import (
+        AuditWriteFailed,
+        record_attachment,
+    )
 
     post = _patch_post(
         monkeypatch, _PostRecorder(FakeResponse(200, {"attachment_id": "att-1"}))
@@ -727,7 +730,10 @@ async def test_record_attachment_refuses_an_invalid_handle_before_the_request(
 async def test_record_attachment_rejects_an_unusable_id(monkeypatch, payload):
     """Without this the gateway would hold a None/int "id" and later POST it
     into a URL path, turning one bad response into a second bad request."""
-    from services.ssh_gateway_client import AuditWriteFailed, record_attachment
+    from orchestrator.services.ssh_gateway_client import (
+        AuditWriteFailed,
+        record_attachment,
+    )
 
     _patch_post(monkeypatch, _PostRecorder(FakeResponse(200, payload)))
 
@@ -741,7 +747,7 @@ async def test_close_attachment_sends_the_fingerprint_and_channels(monkeypatch):
     thread, so the fingerprint is not optional decoration -- without it any
     internal-key holder could close (and fabricate channels on) an audit row
     belonging to someone else."""
-    from services.ssh_gateway_client import close_attachment
+    from orchestrator.services.ssh_gateway_client import close_attachment
 
     post = _patch_post(monkeypatch, _PostRecorder(FakeResponse(200, {"closed": 1})))
     closed = await close_attachment(
@@ -763,7 +769,7 @@ async def test_close_attachment_percent_encodes_the_id(monkeypatch):
     """The one value here that lands in a URL path. resolve_target encodes
     its handle at the point the path is built rather than trusting where it
     came from; this follows that precedent."""
-    from services.ssh_gateway_client import close_attachment
+    from orchestrator.services.ssh_gateway_client import close_attachment
 
     post = _patch_post(monkeypatch, _PostRecorder(FakeResponse(200, {"closed": 0})))
     await close_attachment(_config(), "../../admin", "SHA256:abc")
@@ -778,7 +784,7 @@ async def test_close_attachment_treats_zero_as_a_normal_outcome(monkeypatch):
     """{"closed": 0} is the endpoint's opaque answer for unknown, already
     closed, and not-yours alike. The gateway's close is best effort and must
     not log a failure for the ordinary already-closed case."""
-    from services.ssh_gateway_client import close_attachment
+    from orchestrator.services.ssh_gateway_client import close_attachment
 
     _patch_post(monkeypatch, _PostRecorder(FakeResponse(200, {"closed": 0})))
     assert await close_attachment(_config(), "att-1", "SHA256:abc") == 0
@@ -792,7 +798,10 @@ async def test_close_attachment_rejects_an_unusable_count(monkeypatch, payload):
     """`isinstance(True, int)` is True, so a JSON boolean would otherwise
     read back as "1 row closed" -- the same bool-is-an-int trap _is_valid_port
     guards against one field over."""
-    from services.ssh_gateway_client import AuditWriteFailed, close_attachment
+    from orchestrator.services.ssh_gateway_client import (
+        AuditWriteFailed,
+        close_attachment,
+    )
 
     _patch_post(monkeypatch, _PostRecorder(FakeResponse(200, payload)))
 
@@ -802,7 +811,7 @@ async def test_close_attachment_rejects_an_unusable_count(monkeypatch, payload):
 
 @pytest.mark.asyncio
 async def test_a_non_json_audit_body_is_a_failure(monkeypatch):
-    from services.ssh_gateway_client import AuditWriteFailed, mark_key_used
+    from orchestrator.services.ssh_gateway_client import AuditWriteFailed, mark_key_used
 
     _patch_post(monkeypatch, _PostRecorder(NonJsonResponse()))
 
@@ -816,7 +825,7 @@ async def test_client_ip_is_omitted_rather_than_sent_as_null(monkeypatch):
     bridge behind a proxy that strips it). Omitting the optional field is
     the documented shape; sending an explicit null is the same to Pydantic
     but reads in a request log as "we knew it was nothing"."""
-    from services.ssh_gateway_client import record_attachment
+    from orchestrator.services.ssh_gateway_client import record_attachment
 
     post = _patch_post(
         monkeypatch, _PostRecorder(FakeResponse(200, {"attachment_id": "att-1"}))

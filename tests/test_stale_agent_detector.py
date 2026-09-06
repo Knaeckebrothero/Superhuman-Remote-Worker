@@ -281,6 +281,86 @@ def test_virtual_binding_agent_zero_accepts_exact_project_cloud_shape():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("first_authority", ["exact_terminal", "exact_absent"])
+async def test_captured_agent_stop_retries_after_exact_pod_disappeared(
+    monkeypatch, first_authority
+):
+    retirement = {
+        "context": {
+            "agent_pod": {
+                "pod_name": "captured-agent",
+                "pod_uid": "captured-uid",
+                "namespace": "captured-namespace",
+                "protection_protocol": "finalizer_v1",
+            }
+        }
+    }
+    provisioner = MagicMock(is_available=True)
+    provisioner.delete_agent_pod_exact = AsyncMock(return_value=True)
+    provisioner.agent_pod_authority = AsyncMock(
+        side_effect=[first_authority, "exact_absent"]
+    )
+    provisioner.release_agent_pod_finalizer_exact = AsyncMock(return_value=True)
+    original_wait = main._wait_for_captured_agent_pod_retired
+
+    async def immediate_observation(*args, **kwargs):
+        return await original_wait(*args, **kwargs, timeout_s=0)
+
+    monkeypatch.setattr(main, "agent_provisioner", provisioner)
+    monkeypatch.setattr(
+        main, "_wait_for_captured_agent_pod_retired", immediate_observation
+    )
+    await main._stop_captured_retirement_agent(retirement)
+    provisioner.delete_agent_pod_exact.assert_awaited_once_with(
+        "captured-agent",
+        expected_pod_uid="captured-uid",
+        namespace="captured-namespace",
+    )
+    if first_authority == "exact_terminal":
+        provisioner.release_agent_pod_finalizer_exact.assert_awaited_once_with(
+            "captured-agent",
+            expected_pod_uid="captured-uid",
+            namespace="captured-namespace",
+            terminal_required=True,
+        )
+    else:
+        provisioner.release_agent_pod_finalizer_exact.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authority", ["exact_live", "unknown", "replacement"])
+async def test_captured_agent_stop_refuses_unproven_initial_absence(
+    monkeypatch, authority
+):
+    retirement = {
+        "context": {
+            "agent_pod": {
+                "pod_name": "captured-agent",
+                "pod_uid": "captured-uid",
+                "namespace": "captured-namespace",
+                "protection_protocol": "finalizer_v1",
+            }
+        }
+    }
+    provisioner = MagicMock(is_available=True)
+    provisioner.delete_agent_pod_exact = AsyncMock(return_value=True)
+    provisioner.agent_pod_authority = AsyncMock(return_value=authority)
+    provisioner.release_agent_pod_finalizer_exact = AsyncMock(return_value=True)
+    original_wait = main._wait_for_captured_agent_pod_retired
+
+    async def immediate_observation(*args, **kwargs):
+        return await original_wait(*args, **kwargs, timeout_s=0)
+
+    monkeypatch.setattr(main, "agent_provisioner", provisioner)
+    monkeypatch.setattr(
+        main, "_wait_for_captured_agent_pod_retired", immediate_observation
+    )
+    with pytest.raises(RuntimeError, match="exact agent Pod termination is retryable"):
+        await main._stop_captured_retirement_agent(retirement)
+    provisioner.release_agent_pod_finalizer_exact.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_detector_retries_durable_attach_abort_after_request_task_failure():
     """The leader/startup sweep owns G2 even if the request-local task dies."""
 

@@ -5,7 +5,7 @@ from pathlib import Path
 
 MIGRATION = (
     Path(__file__).parent.parent
-    / "orchestrator/database/migrations/app/0212_search_fetch_capabilities.sql"
+    / "src/orchestrator/database/migrations/app/0212_search_fetch_capabilities.sql"
 )
 
 

@@ -29,8 +29,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from services import session_wake
-from src.shared.pinned_session_identity import PinnedSessionBinding
+from orchestrator.services import session_wake
+from shared.pinned_session_identity import PinnedSessionBinding
 
 # Captured at import, before the autouse fixture replaces it with a mock — the
 # two tests below need the REAL implementation.
@@ -50,8 +50,8 @@ def test_wake_service_has_no_direct_pod_ip_injection() -> None:
     repository = Path(__file__).resolve().parents[1]
     calls: list[tuple[str, int]] = []
     for relative in (
-        "orchestrator/services/session_wake.py",
-        "orchestrator/main.py",
+        "src/orchestrator/services/session_wake.py",
+        "src/orchestrator/main.py",
     ):
         tree = ast.parse((repository / relative).read_text())
         for node in ast.walk(tree):
@@ -72,7 +72,7 @@ def test_wake_service_has_no_direct_pod_ip_injection() -> None:
                 f"{relative}:{node.lineno} bypasses the exact DB recheck"
             )
     assert all(
-        relative != "orchestrator/services/session_wake.py" for relative, _ in calls
+        relative != "src/orchestrator/services/session_wake.py" for relative, _ in calls
     )
     assert len(calls) == 2
 
@@ -605,7 +605,7 @@ async def test_owner_notification_records_a_session_wake_row(monkeypatch):
 
     monkeypatch.setitem(
         __import__("sys").modules,
-        "services.notification_service",
+        "orchestrator.services.notification_service",
         type("M", (), {"notification_service": _Svc()}),
     )
     db = _db(claimed=[_claim_row()], thread=_thread(agent_id=None))
@@ -640,7 +640,7 @@ async def test_owner_without_an_email_still_gets_the_row(monkeypatch):
 
     monkeypatch.setitem(
         __import__("sys").modules,
-        "services.notification_service",
+        "orchestrator.services.notification_service",
         type("M", (), {"notification_service": _Svc()}),
     )
     db = _db(claimed=[_claim_row()], thread=_thread(agent_id=None))

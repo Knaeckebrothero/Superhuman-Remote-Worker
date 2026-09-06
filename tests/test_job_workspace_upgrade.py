@@ -23,9 +23,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from services.workspace_lifecycle import WorkspaceOwner
-from src.core.capability_grants import CATALOG, evaluate
-from src.shared.workspace_contract import resolve_workspace_contract
+from orchestrator.services.workspace_lifecycle import WorkspaceOwner
+from shared.runtime.core.capability_grants import CATALOG, evaluate
+from shared.workspace_contract import resolve_workspace_contract
 
 DEFAULTS = {k: v["default"] for k, v in CATALOG.items()}
 
@@ -396,7 +396,7 @@ class TestJobGrantExtraction:
 
 def _bare_agent():
     """A UniversalAgent shell (no __init__) for unit-testing instance methods."""
-    from src.agent import UniversalAgent
+    from agent.agent import UniversalAgent
 
     agent = UniversalAgent.__new__(UniversalAgent)
     agent._current_job_id = "job-1"
@@ -466,13 +466,13 @@ class TestW1TriggerExposure:
     inline decision against the real registry + filter."""
 
     def test_tool_is_registered_core(self):
-        from src.tools.registry import TOOL_REGISTRY
+        from agent.tools.registry import TOOL_REGISTRY
 
         assert "request_workspace_upgrade" in TOOL_REGISTRY
         assert TOOL_REGISTRY["request_workspace_upgrade"]["category"] == "core"
 
     def test_injected_on_lite_kept_through_filter(self):
-        from src.tools.registry import filter_tools_by_backend
+        from agent.tools.registry import filter_tools_by_backend
 
         class _Lite:
             supports_shell = False
@@ -574,7 +574,7 @@ class TestStreamingInterception:
         agent = self._agent_for_stream()
         agent._perform_inprocess_workspace_upgrade = AsyncMock(return_value=True)
         states = [{"iteration": 1}, {"should_stop": True, "goal_achieved": True}]
-        with patch("src.agent.run_graph_with_streaming", _async_gen_from(states)):
+        with patch("agent.agent.run_graph_with_streaming", _async_gen_from(states)):
             out = [s async for s in agent._process_job_streaming(None, {})]
         assert out == states
         agent._perform_inprocess_workspace_upgrade.assert_not_called()
@@ -587,7 +587,7 @@ class TestStreamingInterception:
         states = [
             {"should_stop": True, "freeze_data": {"freeze_type": "budget_exceeded"}}
         ]
-        with patch("src.agent.run_graph_with_streaming", _async_gen_from(states)):
+        with patch("agent.agent.run_graph_with_streaming", _async_gen_from(states)):
             out = [s async for s in agent._process_job_streaming(None, {})]
         assert out == states
         agent._perform_inprocess_workspace_upgrade.assert_not_called()
@@ -611,7 +611,7 @@ class TestStreamingInterception:
         def _runner(*_a, **_k):
             return _async_gen_from(next(runs))()
 
-        with patch("src.agent.run_graph_with_streaming", _runner):
+        with patch("agent.agent.run_graph_with_streaming", _runner):
             out = [s async for s in agent._process_job_streaming(None, {})]
         # Both streams' states surfaced; upgrade ran exactly once; resume primed.
         assert out == first + second
@@ -636,7 +636,7 @@ class TestStreamingInterception:
             }
         ]
         with patch(
-            "src.agent.run_graph_with_streaming", _async_gen_from(freeze_states)
+            "agent.agent.run_graph_with_streaming", _async_gen_from(freeze_states)
         ):
             out = [s async for s in agent._process_job_streaming(None, {})]
         # Upgrade attempted once; failed → freeze surfaced unchanged, no resume.

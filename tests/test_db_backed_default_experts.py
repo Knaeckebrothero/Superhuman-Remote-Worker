@@ -10,7 +10,7 @@ from orchestrator.services.default_experts import (
     resolve_root_expert,
     seed_managed_default_experts,
 )
-from src.core.loader import canonical_config_name, resolve_config_path
+from shared.runtime.core.loader import canonical_config_name, resolve_config_path
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -145,7 +145,7 @@ async def test_managed_seed_is_idempotent_and_insert_only():
 
 
 def test_default_expert_migration_shape():
-    migration_dir = ROOT / "orchestrator/database/migrations/app"
+    migration_dir = ROOT / "src" / "orchestrator" / "database" / "migrations" / "app"
     sql = "\n".join(
         path.read_text() for path in sorted(migration_dir.glob("006[4-8]_*.sql"))
     )
@@ -162,13 +162,13 @@ def test_default_assistant_runtime_control_groups_are_really_off():
     """The resolved policy must reach the runtime gates, not stop at YAML."""
     from orchestrator import main as orchestrator_main
     from orchestrator.services.config_resolver import resolve_config
-    from src.api.persistent_session import (
+    from agent.api.persistent_session import (
         _agent_catalog_enabled,
         _canvas_enabled,
         _fleet_management_enabled,
         _workflows_enabled,
     )
-    from src.core.loader import load_config_from_resolved
+    from shared.runtime.core.loader import load_config_from_resolved
 
     assistant = load_seed_bundle(
         ROOT / "config", directory="assistant", expert_type="session"

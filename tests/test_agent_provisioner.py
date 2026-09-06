@@ -18,7 +18,7 @@ import pytest
 
 from orchestrator.services.agent_pod_entrypoint import InvalidConfigNameError
 from orchestrator.services.agent_provisioner import AgentProvisioner
-from src.core.loader import canonical_config_name
+from shared.runtime.core.loader import canonical_config_name
 from orchestrator.services.pinned_k8s_effect import (
     K8S_MUTATION_REQUEST_TIMEOUT,
     PINNED_AUTHORITY_FINALIZER,

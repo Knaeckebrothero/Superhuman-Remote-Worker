@@ -1,4 +1,4 @@
-# Squawk linter config for orchestrator/database/migrations/**.sql.
+# Squawk linter config for src/orchestrator/database/migrations/**.sql.
 # Wired into CI by .github/workflows/db-migrations.yml; design rationale
 # and the rule list this complements live in knowledge-base/knowledge/db_migration.md
 # §Testing & CI.
@@ -155,20 +155,20 @@ excluded_rules = [
 #                no row can be written between the DROP and the ADD — and a
 #                NOT VALID split would reopen exactly that window.
 excluded_paths = [
-    "orchestrator/database/migrations/app/0001_initial.sql",
-    "orchestrator/database/migrations/vector/0001_initial.sql",
-    "orchestrator/database/migrations/app/0004_thread_events.sql",
-    "orchestrator/database/migrations/app/0006_headless_notifications.sql",
-    "orchestrator/database/migrations/app/0008_thread_awaiting_user.sql",
-    "orchestrator/database/migrations/app/0058_canvases.sql",
-    "orchestrator/database/migrations/app/0117_run_queue_affinity.sql",
-    "orchestrator/database/migrations/app/0122_thread_cloud_sync_generations.sql",
-    "orchestrator/database/migrations/app/0123_thread_cloud_sync_baselines.sql",
-    "orchestrator/database/migrations/app/0132_jobs_verification_uniq.notx.sql",
-    "orchestrator/database/migrations/app/0143_job_completion_accept_status.sql",
-    "orchestrator/database/migrations/app/0147_thread_permission_lease_receipts.sql",
-    "orchestrator/database/migrations/app/0171_officer_runtime_grant_liveness.sql",
-    "orchestrator/database/migrations/app/0183_persistent_input_delivery_cancellation.sql",
-    "orchestrator/database/migrations/app/0212_search_fetch_capabilities.sql",
-    "orchestrator/database/migrations/vector/0008_kb_index_chunking.sql",
+    "src/orchestrator/database/migrations/app/0001_initial.sql",
+    "src/orchestrator/database/migrations/vector/0001_initial.sql",
+    "src/orchestrator/database/migrations/app/0004_thread_events.sql",
+    "src/orchestrator/database/migrations/app/0006_headless_notifications.sql",
+    "src/orchestrator/database/migrations/app/0008_thread_awaiting_user.sql",
+    "src/orchestrator/database/migrations/app/0058_canvases.sql",
+    "src/orchestrator/database/migrations/app/0117_run_queue_affinity.sql",
+    "src/orchestrator/database/migrations/app/0122_thread_cloud_sync_generations.sql",
+    "src/orchestrator/database/migrations/app/0123_thread_cloud_sync_baselines.sql",
+    "src/orchestrator/database/migrations/app/0132_jobs_verification_uniq.notx.sql",
+    "src/orchestrator/database/migrations/app/0143_job_completion_accept_status.sql",
+    "src/orchestrator/database/migrations/app/0147_thread_permission_lease_receipts.sql",
+    "src/orchestrator/database/migrations/app/0171_officer_runtime_grant_liveness.sql",
+    "src/orchestrator/database/migrations/app/0183_persistent_input_delivery_cancellation.sql",
+    "src/orchestrator/database/migrations/app/0212_search_fetch_capabilities.sql",
+    "src/orchestrator/database/migrations/vector/0008_kb_index_chunking.sql",
 ]

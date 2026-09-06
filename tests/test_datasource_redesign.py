@@ -587,7 +587,7 @@ class TestInjectTypedEnvVars:
                 os.environ[k] = saved[k]
 
     def _get_inject_fn(self):
-        from src.agent import UniversalAgent
+        from agent.agent import UniversalAgent
 
         agent = UniversalAgent.__new__(UniversalAgent)
         return agent._inject_typed_env_vars
@@ -650,7 +650,7 @@ class TestRenderInstructionContentCLI:
     """Tests for cli_datasources support in render_instruction_content."""
 
     def test_cli_datasources_conditional(self):
-        from src.core.loader import render_instruction_content
+        from shared.runtime.core.loader import render_instruction_content
 
         template = "{% if cli_datasources %}HAS_CLI{% endif %}"
         result = render_instruction_content(
@@ -659,14 +659,14 @@ class TestRenderInstructionContentCLI:
         assert "HAS_CLI" in result
 
     def test_no_cli_datasources_omits_block(self):
-        from src.core.loader import render_instruction_content
+        from shared.runtime.core.loader import render_instruction_content
 
         template = "{% if cli_datasources %}HAS_CLI{% endif %}"
         result = render_instruction_content(template, [], cli_datasources=[])
         assert "HAS_CLI" not in result
 
     def test_has_cli_datasource_check(self):
-        from src.core.loader import render_instruction_content
+        from shared.runtime.core.loader import render_instruction_content
 
         template = (
             '{% if has_cli_datasource("postgresql") %}PG{% endif %}'
@@ -679,7 +679,7 @@ class TestRenderInstructionContentCLI:
         assert "NEO" not in result
 
     def test_default_none_cli_datasources(self):
-        from src.core.loader import render_instruction_content
+        from shared.runtime.core.loader import render_instruction_content
 
         template = "{% if cli_datasources %}HAS_CLI{% endif %}"
         result = render_instruction_content(template, [])
@@ -707,7 +707,7 @@ class TestRenderInstructionContentProtectedCloud:
     )
 
     def test_protected_block_rendered_when_flag_true(self):
-        from src.core.loader import render_instruction_content
+        from shared.runtime.core.loader import render_instruction_content
 
         result = render_instruction_content(
             self.PROTECTED_BLOCK_TEMPLATE, [], protected_cloud=True
@@ -717,7 +717,7 @@ class TestRenderInstructionContentProtectedCloud:
         assert "{}" not in result
 
     def test_protected_block_absent_when_flag_false(self):
-        from src.core.loader import render_instruction_content
+        from shared.runtime.core.loader import render_instruction_content
 
         result = render_instruction_content(
             self.PROTECTED_BLOCK_TEMPLATE, [], protected_cloud=False
@@ -726,7 +726,7 @@ class TestRenderInstructionContentProtectedCloud:
         assert "{%" not in result
 
     def test_protected_block_absent_by_default(self):
-        from src.core.loader import render_instruction_content
+        from shared.runtime.core.loader import render_instruction_content
 
         result = render_instruction_content(self.PROTECTED_BLOCK_TEMPLATE, [])
         assert "staged for your review" not in result

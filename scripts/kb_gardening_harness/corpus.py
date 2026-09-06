@@ -5,12 +5,10 @@ what the reindexer would see.
 """
 
 from __future__ import annotations
-import sys
 import collections
 import pathlib
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
-from src.tools.knowledge.gardener import (
+from shared.runtime.knowledge.gardener import (
     parse_note_md,
     _internal_link_targets,
     frontmatter_link_targets,

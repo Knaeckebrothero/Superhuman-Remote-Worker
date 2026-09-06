@@ -26,11 +26,12 @@ from orchestrator.services.deliverable_contracts import (
     DeliveryContractConflict,
     prepare_delivery_contract,
 )
-from src.database.postgres_db import PostgresDB as AgentPostgresDB
+from agent.database.postgres_db import PostgresDB as AgentPostgresDB
 
 
 SCHEMA_FILE = (
     Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "schema_current.sql"

@@ -8,11 +8,11 @@ from typing import AsyncIterator
 
 import pytest
 
-from services.canvas_http import (
+from orchestrator.services.canvas_http import (
     open_canvas_http_exchange,
     spool_canvas_request_body,
 )
-from services.canvas_proxy_policy import (
+from orchestrator.services.canvas_proxy_policy import (
     CanvasProxyError,
     CanvasProxyLimits,
     CanvasPublicOrigin,

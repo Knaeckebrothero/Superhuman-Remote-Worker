@@ -14,7 +14,7 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi import HTTPException
 
-from src.api.models import (
+from agent.api.models import (
     JobCancelByOrchestratorRequest,
     JobResumeRequest,
     JobStartRequest,
@@ -41,11 +41,11 @@ def worker_runtime(request):
     """A registered worker process that already owns ``JOB_ID``."""
 
     if request.param == "app":
-        from src.api import app as module
+        from agent.api import app as module
 
         application = module.create_app()
     else:
-        from src.api import dual_app as module
+        from agent.api import dual_app as module
 
         application = module.create_dual_app()
 

@@ -26,15 +26,20 @@ import pytest
 import pytest_asyncio
 
 from orchestrator.database.postgres import PostgresDB
-from services import sitrep
-from services.officer_admission import count_in_flight_by_slot
-from services.officer_slots import SlotAdmissionError, admit, capacity_lines
-from src.shared.orch_surface.formatters import format_officer_post
+from orchestrator.services import sitrep
+from orchestrator.services.officer_admission import count_in_flight_by_slot
+from orchestrator.services.officer_slots import (
+    SlotAdmissionError,
+    admit,
+    capacity_lines,
+)
+from shared.orch_surface.formatters import format_officer_post
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SCHEMA_FILE = REPO_ROOT / "orchestrator" / "database" / "schema_current.sql"
+SCHEMA_FILE = REPO_ROOT / "src" / "orchestrator" / "database" / "schema_current.sql"
 MIGRATION_FILE = (
     REPO_ROOT
+    / "src"
     / "orchestrator"
     / "database"
     / "migrations"

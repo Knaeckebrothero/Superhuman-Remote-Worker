@@ -7,23 +7,17 @@ inline curation wiring in archive_phase, and CurateKnowledgeTask.
 import asyncio
 import pytest
 import tempfile
-import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-project_root = Path(__file__).parent.parent
-src_path = project_root / "src"
-if str(src_path) not in sys.path:
-    sys.path.insert(0, str(src_path))
-
-from src.core.loader import load_agent_config, resolve_config_path  # noqa: E402
-from src.services.auxiliary import (  # noqa: E402
+from shared.runtime.core.loader import load_agent_config, resolve_config_path  # noqa: E402
+from agent.services.knowledge_auxiliary import curate_and_store_knowledge  # noqa: E402
+from shared.runtime.services.auxiliary import (  # noqa: E402
     AuxiliaryLLM,
     CurateKnowledgeTask,
     CurationResult,
-    curate_and_store_knowledge,
 )
-from src.tools.context import ToolContext  # noqa: E402
+from agent.tools.context import ToolContext  # noqa: E402
 
 
 def _load_config(name: str):
@@ -101,7 +95,7 @@ class TestCurateAndStoreKnowledge:
             aux, "agent", new_callable=AsyncMock, return_value=curation_result
         ):
             with patch(
-                "src.tools.knowledge.knowledge_tools.create_kb_tools",
+                "agent.tools.knowledge.knowledge_tools.create_kb_tools",
                 return_value=[MagicMock()],
             ):
                 result = await curate_and_store_knowledge(
@@ -133,7 +127,7 @@ class TestCurateAndStoreKnowledge:
             aux, "agent", new_callable=AsyncMock, side_effect=RuntimeError("LLM down")
         ):
             with patch(
-                "src.tools.knowledge.knowledge_tools.create_kb_tools",
+                "agent.tools.knowledge.knowledge_tools.create_kb_tools",
                 return_value=[MagicMock()],
             ):
                 result = await curate_and_store_knowledge(
@@ -243,7 +237,7 @@ class TestInlineCurationWiring:
 
     @pytest.fixture
     def workspace_manager(self, temp_workspace):
-        from src.core.workspace import WorkspaceManager
+        from agent.core.workspace import WorkspaceManager
         from tests._fs_backend import FilesystemTestBackend
 
         ws = WorkspaceManager(
@@ -257,9 +251,9 @@ class TestInlineCurationWiring:
     @pytest.mark.asyncio
     async def test_no_curation_when_no_kb(self, workspace_manager):
         """Verify no curation when tool_context has no knowledge base."""
-        from src.graph import create_archive_phase_node
-        from src.managers import TodoManager, PlanManager
-        from src.core.context import ContextManager
+        from agent.graph import create_archive_phase_node
+        from agent.managers import TodoManager, PlanManager
+        from agent.core.context import ContextManager
 
         config = _load_config("defaults")
         config.context_management.compact_on_archive = False
@@ -303,9 +297,9 @@ class TestInlineCurationWiring:
     @pytest.mark.asyncio
     async def test_no_curation_when_disabled(self, workspace_manager):
         """Verify no curation when curator.enabled is False."""
-        from src.graph import create_archive_phase_node
-        from src.managers import TodoManager, PlanManager
-        from src.core.context import ContextManager
+        from agent.graph import create_archive_phase_node
+        from agent.managers import TodoManager, PlanManager
+        from agent.core.context import ContextManager
 
         config = _load_config("defaults")
         config.context_management.compact_on_archive = False
@@ -349,9 +343,9 @@ class TestInlineCurationWiring:
     @pytest.mark.asyncio
     async def test_curation_triggered_when_enabled(self, workspace_manager):
         """Verify inline curation fires when KB available and curator enabled."""
-        from src.graph import create_archive_phase_node
-        from src.managers import TodoManager, PlanManager
-        from src.core.context import ContextManager
+        from agent.graph import create_archive_phase_node
+        from agent.managers import TodoManager, PlanManager
+        from agent.core.context import ContextManager
 
         config = _load_config("defaults")
         config.context_management.compact_on_archive = False
@@ -399,7 +393,8 @@ class TestInlineCurationWiring:
         }
 
         with patch(
-            "src.services.auxiliary.curate_and_store_knowledge", new_callable=AsyncMock
+            "agent.services.knowledge_auxiliary.curate_and_store_knowledge",
+            new_callable=AsyncMock,
         ) as mock_curate:
             await archive_fn(state)
             # Allow async task to run
@@ -423,7 +418,7 @@ class TestAgentNoCurationCallback:
 
     def test_agent_has_no_curation_callback(self):
         """Verify curation_callback was removed from UniversalAgent."""
-        from src.agent import UniversalAgent
+        from agent.agent import UniversalAgent
 
         config = _load_config("defaults")
         agent = UniversalAgent(config)
@@ -431,7 +426,7 @@ class TestAgentNoCurationCallback:
 
     def test_agent_has_knowledge_graph_attr(self):
         """Verify UniversalAgent tracks knowledge_graph for cleanup."""
-        from src.agent import UniversalAgent
+        from agent.agent import UniversalAgent
 
         config = _load_config("defaults")
         agent = UniversalAgent(config)

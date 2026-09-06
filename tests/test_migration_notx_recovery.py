@@ -27,9 +27,9 @@ from orchestrator.database.migration_recovery import NOTX_RECOVERIES
 
 
 ROOT = Path(__file__).resolve().parents[1]
-APP_MIGRATIONS = ROOT / "orchestrator/database/migrations/app"
-VECTOR_MIGRATIONS = ROOT / "orchestrator/database/migrations/vector"
-AUDIT_MIGRATIONS = ROOT / "orchestrator/database/migrations/audit"
+APP_MIGRATIONS = ROOT / "src" / "orchestrator" / "database" / "migrations" / "app"
+VECTOR_MIGRATIONS = ROOT / "src" / "orchestrator" / "database" / "migrations" / "vector"
+AUDIT_MIGRATIONS = ROOT / "src" / "orchestrator" / "database" / "migrations" / "audit"
 DEDUPE = APP_MIGRATIONS / "0130_jobs_verification_dedupe.sql"
 DROP_INDEX = APP_MIGRATIONS / "0131_drop_jobs_verification_uniq.notx.sql"
 CREATE_INDEX = APP_MIGRATIONS / "0132_jobs_verification_uniq.notx.sql"

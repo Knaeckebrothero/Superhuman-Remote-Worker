@@ -238,6 +238,9 @@ def test_exact_terminal_classifier_is_narrow() -> None:
 
 def test_controller_fixture_has_no_post_or_auto_pull_mutation() -> None:
     program = gate.controller_program()
+    assert "from orchestrator.database.postgres import PostgresDB" in program
+    assert "from orchestrator.services.container_provisioner import" in program
+    assert "sys.path" not in program
     assert "managed_repository_process_zero_receipts" in program
     assert "_release_process_zero_finalizer" in program
     assert "0193_managed_repository_process_zero_authority.sql" in program
@@ -583,7 +586,14 @@ def test_artifact_preflight_checks_agent_code_and_workspace_binaries() -> None:
     for agent in calls[2:4]:
         assert agent[0][2:4] == ["-c", "agent"]
         assert b"9>&-" in (agent[1] or b"")
-    assert b"/app/database/migrations/app/0197_" in (calls[0][1] or b"")
+    assert b"/app/src/orchestrator/database/migrations/app/0197_" in (
+        calls[0][1] or b""
+    )
+    assert b"from orchestrator.database.postgres import PostgresDB" in (
+        calls[0][1] or b""
+    )
+    assert b"from shared.runtime.core.managed_repository import" in (calls[2][1] or b"")
+    assert b"from shared.runtime.services.cloud_mount import" in (calls[2][1] or b"")
     assert b"record_managed_repository_workspace_creation_resource" in (
         calls[0][1] or b""
     )

@@ -21,8 +21,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-import main
-from services.notification_service import RecordResult
+import orchestrator.main
+from orchestrator.services.notification_service import RecordResult
 
 THREAD_ID = str(uuid.uuid4())
 PROJECT_ID = str(uuid.uuid4())
@@ -32,19 +32,25 @@ BASE = "https://cockpit.example.com"
 class TestOfficerSessionLink:
     def test_env_set_builds_link(self, monkeypatch):
         monkeypatch.setenv("COCKPIT_EXTERNAL_URL", BASE)
-        assert main._officer_session_link(THREAD_ID) == f"{BASE}/sessions/{THREAD_ID}"
+        assert (
+            orchestrator.main._officer_session_link(THREAD_ID)
+            == f"{BASE}/sessions/{THREAD_ID}"
+        )
 
     def test_trailing_slash_stripped(self, monkeypatch):
         monkeypatch.setenv("COCKPIT_EXTERNAL_URL", f"{BASE}/")
-        assert main._officer_session_link(THREAD_ID) == f"{BASE}/sessions/{THREAD_ID}"
+        assert (
+            orchestrator.main._officer_session_link(THREAD_ID)
+            == f"{BASE}/sessions/{THREAD_ID}"
+        )
 
     def test_env_unset_returns_none(self, monkeypatch):
         monkeypatch.delenv("COCKPIT_EXTERNAL_URL", raising=False)
-        assert main._officer_session_link(THREAD_ID) is None
+        assert orchestrator.main._officer_session_link(THREAD_ID) is None
 
     def test_env_blank_returns_none(self, monkeypatch):
         monkeypatch.setenv("COCKPIT_EXTERNAL_URL", "   ")
-        assert main._officer_session_link(THREAD_ID) is None
+        assert orchestrator.main._officer_session_link(THREAD_ID) is None
 
 
 @pytest.fixture
@@ -62,7 +68,7 @@ def record(monkeypatch):
     mock = AsyncMock(
         return_value=RecordResult("n-1", True, {"in_app": True, "email": True})
     )
-    monkeypatch.setattr(main.notification_service, "record", mock)
+    monkeypatch.setattr(orchestrator.main.notification_service, "record", mock)
     return mock
 
 
@@ -70,7 +76,7 @@ class TestDispatchOfficerPageLink:
     @pytest.mark.asyncio
     async def test_appends_link_when_base_url_set(self, thread, record, monkeypatch):
         monkeypatch.setenv("COCKPIT_EXTERNAL_URL", BASE)
-        notification_id = await main._dispatch_officer_page(
+        notification_id = await orchestrator.main._dispatch_officer_page(
             thread, THREAD_ID, "Centurion needs you", "He fell asleep on watch."
         )
         assert notification_id == "n-1"
@@ -83,7 +89,7 @@ class TestDispatchOfficerPageLink:
         self, thread, record, monkeypatch
     ):
         monkeypatch.delenv("COCKPIT_EXTERNAL_URL", raising=False)
-        notification_id = await main._dispatch_officer_page(
+        notification_id = await orchestrator.main._dispatch_officer_page(
             thread, THREAD_ID, "Centurion needs you", "He fell asleep on watch."
         )
         assert notification_id == "n-1"
@@ -96,7 +102,7 @@ class TestDispatchOfficerPageRecords:
         self, thread, record, monkeypatch
     ):
         monkeypatch.setenv("COCKPIT_EXTERNAL_URL", BASE)
-        notification_id = await main._dispatch_officer_page(
+        notification_id = await orchestrator.main._dispatch_officer_page(
             thread, THREAD_ID, "Centurion needs you", "He fell asleep on watch."
         )
         assert notification_id == "n-1"
@@ -118,7 +124,7 @@ class TestDispatchOfficerPageRecords:
 
     @pytest.mark.asyncio
     async def test_default_subject(self, thread, record):
-        notification_id = await main._dispatch_officer_page(
+        notification_id = await orchestrator.main._dispatch_officer_page(
             thread, THREAD_ID, "", "Wake up."
         )
         assert notification_id == "n-1"
@@ -126,9 +132,15 @@ class TestDispatchOfficerPageRecords:
 
     @pytest.mark.asyncio
     async def test_dedup_key_collapses_identical_text_on_one_day(self, thread, record):
-        await main._dispatch_officer_page(thread, THREAD_ID, "S", "Same text")
-        await main._dispatch_officer_page(thread, THREAD_ID, "S", "Same text")
-        await main._dispatch_officer_page(thread, THREAD_ID, "S", "Other text")
+        await orchestrator.main._dispatch_officer_page(
+            thread, THREAD_ID, "S", "Same text"
+        )
+        await orchestrator.main._dispatch_officer_page(
+            thread, THREAD_ID, "S", "Same text"
+        )
+        await orchestrator.main._dispatch_officer_page(
+            thread, THREAD_ID, "S", "Other text"
+        )
         keys = [c.kwargs["dedup_key"] for c in record.call_args_list]
         assert keys[0] == keys[1]
         assert keys[0] != keys[2]
@@ -136,7 +148,7 @@ class TestDispatchOfficerPageRecords:
 
     @pytest.mark.asyncio
     async def test_explicit_category_and_key_are_passed_through(self, thread, record):
-        notification_id = await main._dispatch_officer_page(
+        notification_id = await orchestrator.main._dispatch_officer_page(
             thread,
             THREAD_ID,
             "Officer authorization unavailable",
@@ -150,12 +162,14 @@ class TestDispatchOfficerPageRecords:
 
     @pytest.mark.asyncio
     async def test_low_severity_for_digest(self, thread, record):
-        await main._dispatch_officer_page(thread, THREAD_ID, "S", "M", severity="low")
+        await orchestrator.main._dispatch_officer_page(
+            thread, THREAD_ID, "S", "M", severity="low"
+        )
         assert record.call_args.kwargs["severity"] == "low"
 
     @pytest.mark.asyncio
     async def test_no_owner_means_nobody_to_notify(self, record):
-        notification_id = await main._dispatch_officer_page(
+        notification_id = await orchestrator.main._dispatch_officer_page(
             {"user_id": None}, THREAD_ID, "S", "M"
         )
         assert notification_id is None
@@ -164,5 +178,7 @@ class TestDispatchOfficerPageRecords:
     @pytest.mark.asyncio
     async def test_feed_write_failure_is_reported_not_raised(self, thread, record):
         record.side_effect = RuntimeError("pool down")
-        notification_id = await main._dispatch_officer_page(thread, THREAD_ID, "S", "M")
+        notification_id = await orchestrator.main._dispatch_officer_page(
+            thread, THREAD_ID, "S", "M"
+        )
         assert notification_id is None

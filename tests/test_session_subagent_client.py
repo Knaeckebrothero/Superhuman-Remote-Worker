@@ -6,11 +6,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.api.orchestrator_client import (
+from agent.api.orchestrator_client import (
     OrchestratorClient,
     SubagentPersistenceError,
 )
-from src.shared.session_subagent_authority import (
+from shared.session_subagent_authority import (
     SessionParentAuthority,
     SessionParentAuthorityRefused,
     session_subagent_delivery_id,

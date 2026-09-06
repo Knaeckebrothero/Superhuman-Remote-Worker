@@ -14,20 +14,13 @@ vm_ssh_readiness_probe_unroutable_from_orchestrator.md:
 """
 
 import os
-import sys
-from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
-# Add orchestrator/ to sys.path so its top-level modules import bare.
-_ORCH = Path(__file__).parent.parent / "orchestrator"
-if str(_ORCH) not in sys.path:
-    sys.path.insert(0, str(_ORCH))
-
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
-from services.ssh_helpers import (  # noqa: E402
+from orchestrator.services.ssh_helpers import (  # noqa: E402
     is_tailnet_addr,
     orchestrator_can_reach,
     stream_extract_snapshot,
@@ -99,7 +92,7 @@ class TestStreamExtractTailnetGuard:
 class TestSnapshotCaptureTailnetGuard:
     @pytest.mark.asyncio
     async def test_tailnet_target_skipped(self):
-        from services.snapshot_service import SnapshotService
+        from orchestrator.services.snapshot_service import SnapshotService
 
         svc = SnapshotService()
         svc._available = True
@@ -119,14 +112,14 @@ class TestSnapshotCaptureTailnetGuard:
     async def test_routable_target_proceeds_to_capture(self):
         """A pod-network host passes the guard (and proceeds into the normal
         capture path — here it goes on to 'capturing')."""
-        from services.snapshot_service import SnapshotService
+        from orchestrator.services.snapshot_service import SnapshotService
 
         svc = SnapshotService()
         svc._available = True
         svc._set_snapshot_context = AsyncMock()
 
         with patch(
-            "services.snapshot_service.resolve_ssh_key_path",
+            "orchestrator.services.snapshot_service.resolve_ssh_key_path",
             side_effect=RuntimeError("stop here"),
         ):
             await svc.capture_vm_snapshot(
@@ -145,8 +138,8 @@ class TestSnapshotCaptureTailnetGuard:
 class TestIdeSeedTailnetGuard:
     @pytest.mark.asyncio
     async def test_tailnet_target_skipped_before_db_access(self):
-        from services.nats_bridge import NatsBridge
-        from security.vm_guest import VmGuestIdentity
+        from orchestrator.services.nats_bridge import NatsBridge
+        from orchestrator.security.vm_guest import VmGuestIdentity
 
         bridge = NatsBridge()
         bridge._db = AsyncMock()
@@ -169,12 +162,12 @@ class TestIdeSeedTailnetGuard:
 class TestFailVmParkedJob:
     @pytest.mark.asyncio
     async def test_fails_job_with_visible_error(self, monkeypatch):
-        import main
+        import orchestrator.main
 
         update = AsyncMock()
-        monkeypatch.setattr(main.postgres_db, "update_job_status", update)
+        monkeypatch.setattr(orchestrator.main.postgres_db, "update_job_status", update)
 
-        await main._fail_vm_parked_job(
+        await orchestrator.main._fail_vm_parked_job(
             "job-parked",
             "provisioning exhausted after 3 attempts (never reached 'ready')",
         )

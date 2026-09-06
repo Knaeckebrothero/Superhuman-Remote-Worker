@@ -22,11 +22,11 @@ from orchestrator.services.managed_repository_authority import (
     revoke_and_delete_managed_repository,
     runtime_credential,
 )
-from src.core.managed_repository import (
+from shared.runtime.core.managed_repository import (
     ManagedRepositoryMaterializationError,
     materialize_managed_repository_credentials,
 )
-from src.core.backends.remote import RemoteBackend
+from shared.runtime.core.backends.remote import RemoteBackend
 
 
 def _authority(*, repo_name: str = "job-12345678") -> dict:
@@ -697,7 +697,7 @@ def test_workspace_materialization_never_places_private_key_in_command_or_file()
 def test_workspace_materialization_wipes_untransferred_keys_on_early_failure(
     monkeypatch,
 ) -> None:
-    from src.core import managed_repository as managed_repository_module
+    from shared.runtime.core import managed_repository as managed_repository_module
 
     private_key = bytearray(b"untransferred-private-material")
     payload = {"private_key": "caller-copy-is-removed"}

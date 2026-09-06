@@ -19,9 +19,9 @@ from unittest.mock import AsyncMock, MagicMock, call
 import pytest
 
 from orchestrator.services import run_queue_reaper as mod
-from src.shared import session_permission_retirement as permission_retirement
-from src.shared.run_queue import StolenUnit
-from src.shared.run_queue import queries as queue_queries
+from shared import session_permission_retirement as permission_retirement
+from shared.run_queue import StolenUnit
+from shared.run_queue import queries as queue_queries
 
 UNIT_A = uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
 UNIT_B = uuid.UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
@@ -308,8 +308,8 @@ async def test_atomic_session_steal_parks_exact_uid_debt_after_settlement(monkey
 
 @pytest.mark.asyncio
 async def test_post_eviction_404_does_not_settle_claimant_debt(monkeypatch):
-    import services.agent_provisioner as provisioner_module
-    import src.shared.session_retirement as retirement
+    import orchestrator.services.agent_provisioner as provisioner_module
+    import shared.session_retirement as retirement
 
     conn = _conn()
     conn.claim_loss_candidates = [

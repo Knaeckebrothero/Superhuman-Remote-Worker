@@ -13,19 +13,12 @@ heavy module-level init (Keycloak, DBs, etc.). Instead, we:
 from __future__ import annotations
 
 import os
-import sys
-from pathlib import Path
 
 import pytest
 
-# Allow importing the orchestrator main module (matches test_models_api.py).
-_ORCH = Path(__file__).parent.parent / "orchestrator"
-if str(_ORCH) not in sys.path:
-    sys.path.insert(0, str(_ORCH))
-
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
-from main import (  # noqa: E402
+from orchestrator.main import (  # noqa: E402
     VALID_DEFAULT_MODEL_KINDS,
     VALID_SYSTEM_API_KEY_PROVIDERS,
     AdminDefaultModelSet,

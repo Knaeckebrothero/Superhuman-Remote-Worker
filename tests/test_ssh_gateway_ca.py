@@ -6,7 +6,7 @@ import asyncssh
 import pytest
 from asyncssh.public_key import CERT_TYPE_USER
 
-from services.ssh_gateway_ca import (
+from orchestrator.services.ssh_gateway_ca import (
     CERT_BACKDATE_SECONDS,
     DEFAULT_CERT_LIFETIME_SECONDS,
     MAX_CERT_LIFETIME_SECONDS,

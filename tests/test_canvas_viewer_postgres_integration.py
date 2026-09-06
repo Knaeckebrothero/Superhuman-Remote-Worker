@@ -18,19 +18,19 @@ from uuid import UUID, uuid4
 import asyncpg
 import pytest
 
-from services.canvas import CanvasService, WorkspaceAppSource
-from services.canvas_ssh import RemoteWorkspaceTarget
-from services.canvas_viewer_config import CanvasViewerConfig
-from services.canvas_viewer_database import (
+from orchestrator.services.canvas import CanvasService, WorkspaceAppSource
+from orchestrator.services.canvas_ssh import RemoteWorkspaceTarget
+from orchestrator.services.canvas_viewer_config import CanvasViewerConfig
+from orchestrator.services.canvas_viewer_database import (
     CanvasViewerDatabasePrivilegeError,
     attest_canvas_viewer_database_privileges,
 )
-from services.canvas_viewer_sessions import (
+from orchestrator.services.canvas_viewer_sessions import (
     CanvasBootstrapExchange,
     CanvasViewerError,
     CanvasViewerSessionService,
 )
-import services.canvas_viewer_sessions as viewer_sessions_module
+import orchestrator.services.canvas_viewer_sessions as viewer_sessions_module
 
 
 _DATABASE_URL = os.getenv("CANVAS_TEST_DATABASE_URL", "").strip()

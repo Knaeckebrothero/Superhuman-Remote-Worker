@@ -18,8 +18,8 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from database.postgres import PostgresDB
-from services.canvas import (
+from orchestrator.database.postgres import PostgresDB
+from orchestrator.services.canvas import (
     CanvasMutation,
     CanvasPreconditionFailed,
     CanvasRecord,
@@ -27,7 +27,7 @@ from services.canvas import (
     build_public_canvas_representation,
     canonical_source_fingerprint,
 )
-from services.canvas_files import (
+from orchestrator.services.canvas_files import (
     CanvasFileError,
     RawWorkspaceFile,
     ThreadWorkspaceFileGateway,
@@ -170,7 +170,7 @@ while True:
 
 
 def test_path_and_byte_validation_fail_closed(monkeypatch) -> None:
-    from services import canvas_files
+    from orchestrator.services import canvas_files
 
     monkeypatch.setattr(canvas_files, "magic", _Magic)
     assert canonical_workspace_path("output/report.md") == "output/report.md"
@@ -233,7 +233,7 @@ def test_path_and_byte_validation_fail_closed(monkeypatch) -> None:
 def test_office_detection_requires_matching_extension_and_magic(
     monkeypatch, path: str, detected: str, media_type: str
 ) -> None:
-    from services import canvas_files
+    from orchestrator.services import canvas_files
 
     class OfficeMagic:
         @staticmethod
@@ -264,7 +264,7 @@ def test_office_detection_requires_matching_extension_and_magic(
 def test_office_detection_rejects_ambiguous_or_mismatched_bytes(
     monkeypatch, path: str, detected: str
 ) -> None:
-    from services import canvas_files
+    from orchestrator.services import canvas_files
 
     class OfficeMagic:
         @staticmethod
@@ -279,7 +279,7 @@ def test_office_detection_rejects_ambiguous_or_mismatched_bytes(
 
 
 def test_office_renderer_is_closed_and_office_size_is_independent(monkeypatch) -> None:
-    from services import canvas_files
+    from orchestrator.services import canvas_files
 
     class OfficeMagic:
         @staticmethod
@@ -315,7 +315,7 @@ def test_office_renderer_is_closed_and_office_size_is_independent(monkeypatch) -
 
 
 def test_interactive_html_renderer_is_explicit_and_html_only(monkeypatch) -> None:
-    from services import canvas_files
+    from orchestrator.services import canvas_files
 
     monkeypatch.setattr(canvas_files, "magic", _Magic)
     data = b"<!doctype html><style>.card{color:green}</style><div class=card>Safe</div>"
@@ -337,7 +337,7 @@ def test_interactive_html_renderer_is_explicit_and_html_only(monkeypatch) -> Non
 
 
 def test_javascript_mime_is_narrowly_treated_as_text(monkeypatch) -> None:
-    from services import canvas_files
+    from orchestrator.services import canvas_files
 
     class JavaScriptMagic:
         @staticmethod
@@ -372,7 +372,7 @@ def test_javascript_mime_is_narrowly_treated_as_text(monkeypatch) -> None:
 async def test_sftp_reader_rejects_root_and_source_symlinks(symlink_path) -> None:
     from types import SimpleNamespace
 
-    from services.canvas_files import _read_sftp_workspace_file
+    from orchestrator.services.canvas_files import _read_sftp_workspace_file
 
     class FakeSFTP:
         async def lstat(self, path):
@@ -412,7 +412,7 @@ async def test_sftp_transport_uses_renderer_specific_read_ceiling(
 ) -> None:
     from types import SimpleNamespace
 
-    from services import canvas_files
+    from orchestrator.services import canvas_files
 
     monkeypatch.setattr(canvas_files, "MAX_TEXT_BYTES", 11)
     monkeypatch.setattr(canvas_files, "MAX_OFFICE_BYTES", 23)
@@ -455,7 +455,7 @@ async def test_sftp_transport_uses_renderer_specific_read_ceiling(
 async def test_sftp_rejects_known_text_size_before_open(monkeypatch) -> None:
     from types import SimpleNamespace
 
-    from services import canvas_files
+    from orchestrator.services import canvas_files
 
     monkeypatch.setattr(canvas_files, "MAX_TEXT_BYTES", 11)
     monkeypatch.setattr(canvas_files, "MAX_FILE_BYTES", 100)
@@ -486,7 +486,7 @@ async def test_sftp_rejects_known_text_size_before_open(monkeypatch) -> None:
 
 
 def test_remote_endpoint_must_match_binding_and_uses_fixed_root() -> None:
-    from services.canvas_files import (
+    from orchestrator.services.canvas_files import (
         REMOTE_WORKSPACE_ROOT,
         _remote_workspace_target,
         _require_same_remote_workspace,
@@ -523,7 +523,7 @@ async def test_pinned_sftp_options_keep_callback_validation_enabled(
 ) -> None:
     from types import SimpleNamespace
 
-    from services import canvas_files
+    from orchestrator.services import canvas_files
 
     if canvas_files.asyncssh is None:
         pytest.skip("asyncssh is not installed in this unit-test environment")
@@ -589,7 +589,7 @@ async def test_pinned_sftp_options_keep_callback_validation_enabled(
 
 @pytest.mark.asyncio
 async def test_sftp_start_failure_closes_new_ssh_connection(monkeypatch) -> None:
-    from services import canvas_files
+    from orchestrator.services import canvas_files
 
     if canvas_files.asyncssh is None:
         pytest.skip("asyncssh is not installed in this unit-test environment")
@@ -635,12 +635,12 @@ async def test_queued_remote_read_aborts_after_release_and_reassignment(
 ) -> None:
     from contextlib import asynccontextmanager
 
-    from services import canvas_files
+    from orchestrator.services import canvas_files
 
     if canvas_files.asyncssh is None:
         pytest.skip("asyncssh is not installed in this unit-test environment")
 
-    from services.docker_provisioner import DockerProvisioner
+    from orchestrator.services.docker_provisioner import DockerProvisioner
 
     next_generation = UUID("22222222-bbbb-4bbb-8bbb-222222222222")
     initial = _thread()
@@ -785,7 +785,7 @@ async def test_queued_remote_read_aborts_after_release_and_reassignment(
 
 @pytest.mark.asyncio
 async def test_gateway_checks_generation_and_source_version(monkeypatch) -> None:
-    from services import canvas_files
+    from orchestrator.services import canvas_files
 
     monkeypatch.setattr(canvas_files, "magic", _Magic)
     reads: list[str] = []
@@ -821,7 +821,7 @@ async def test_gateway_checks_generation_and_source_version(monkeypatch) -> None
 async def test_validation_runs_off_loop_and_has_bounded_capacity(monkeypatch) -> None:
     import threading
 
-    from services import canvas_files
+    from orchestrator.services import canvas_files
 
     main_thread = threading.get_ident()
     validation_threads: list[int] = []
@@ -859,7 +859,7 @@ async def test_full_gate_bounds_buffers_and_survives_worker_cancellation(
 ) -> None:
     import threading
 
-    from services import canvas_files
+    from orchestrator.services import canvas_files
 
     worker_started = threading.Event()
     worker_exit = threading.Event()
@@ -913,8 +913,8 @@ async def test_full_gate_bounds_buffers_and_survives_worker_cancellation(
 
 @pytest.mark.asyncio
 async def test_virtual_materialization_saturation_fails_boundedly(monkeypatch) -> None:
-    from services import canvas_files
-    from services.workspace_binding import virtual_thread_backing_id
+    from orchestrator.services import canvas_files
+    from orchestrator.services.workspace_binding import virtual_thread_backing_id
 
     spec = {
         "type": "s3",
@@ -946,9 +946,9 @@ async def test_virtual_materialization_saturation_fails_boundedly(monkeypatch) -
 async def test_virtual_rclone_growth_is_bounded_and_children_are_reaped(
     monkeypatch, tmp_path
 ) -> None:
-    from services import canvas_files
-    from services.workspace_binding import virtual_thread_backing_id
-    from src.core.backends.rclone import (
+    from orchestrator.services import canvas_files
+    from orchestrator.services.workspace_binding import virtual_thread_backing_id
+    from shared.runtime.core.backends.rclone import (
         RcloneObjectStore,
         RcloneSizeLimitExceeded,
     )
@@ -1006,8 +1006,8 @@ async def test_virtual_rclone_growth_is_bounded_and_children_are_reaped(
 async def test_virtual_rclone_cancellation_terminates_and_reaps_child(
     monkeypatch, tmp_path
 ) -> None:
-    from services import canvas_files
-    from services.workspace_binding import virtual_thread_backing_id
+    from orchestrator.services import canvas_files
+    from orchestrator.services.workspace_binding import virtual_thread_backing_id
 
     _write_streaming_rclone(tmp_path)
     monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ.get('PATH', '')}")
@@ -1046,7 +1046,7 @@ async def test_virtual_rclone_cancellation_terminates_and_reaps_child(
 
 @pytest.mark.asyncio
 async def test_remote_materialization_queue_is_bounded(monkeypatch) -> None:
-    from services import canvas_files
+    from orchestrator.services import canvas_files
 
     saturated = asyncio.Semaphore(1)
     await saturated.acquire()
@@ -1246,7 +1246,7 @@ def _route_client(
     record: CanvasRecord | None = None,
     file: ValidatedCanvasFile | None = None,
 ):
-    from routers import canvases
+    from orchestrator.routers import canvases
 
     db = _RouteDB(_thread())
     service = _RouteService(record)
@@ -1386,8 +1386,8 @@ def test_delegated_state_rechecks_owner_after_remote_representation(
 async def test_response_capacity_is_held_through_final_asgi_body_send(
     monkeypatch,
 ) -> None:
-    from routers import canvases
-    from services import canvas_files
+    from orchestrator.routers import canvases
+    from orchestrator.services import canvas_files
 
     semaphore = asyncio.Semaphore(1)
     await semaphore.acquire()
@@ -1427,8 +1427,8 @@ async def test_response_capacity_is_held_through_final_asgi_body_send(
 
 @pytest.mark.asyncio
 async def test_response_cancellation_releases_buffer_lease_exactly_once() -> None:
-    from routers import canvases
-    from services.canvas_files import CanvasResponseLease
+    from orchestrator.routers import canvases
+    from orchestrator.services.canvas_files import CanvasResponseLease
 
     class CountingSemaphore:
         releases = 0
@@ -1504,8 +1504,8 @@ def test_internal_file_set_contract_and_serializer_boundary(monkeypatch) -> None
 def test_internal_office_set_is_enabled_only_with_live_collabora(
     monkeypatch,
 ) -> None:
-    from routers import canvases
-    from services.canvas_office import CollaboraConfig
+    from orchestrator.routers import canvases
+    from orchestrator.services.canvas_office import CollaboraConfig
 
     office = _office_file()
     client, service, gateway, _ = _route_client(monkeypatch, file=office)
@@ -1649,8 +1649,8 @@ def test_office_bytes_never_use_the_generic_canvas_content_route(monkeypatch) ->
 def test_office_session_mint_requires_bff_cookie_and_returns_form_contract(
     monkeypatch,
 ) -> None:
-    from routers import canvases
-    from services.canvas_office import CollaboraConfig, WopiTokenGrant
+    from orchestrator.routers import canvases
+    from orchestrator.services.canvas_office import CollaboraConfig, WopiTokenGrant
 
     office = _office_file()
     source = WorkspaceFileSource(path=office.path, workspace_generation=GENERATION)
@@ -1742,8 +1742,8 @@ def test_office_session_accepts_the_weakened_form_of_its_own_state_etag(
 ) -> None:
     """The Office pane holds whatever ETag the CDN handed the browser."""
 
-    from routers import canvases
-    from services.canvas_office import CollaboraConfig, WopiTokenGrant
+    from orchestrator.routers import canvases
+    from orchestrator.services.canvas_office import CollaboraConfig, WopiTokenGrant
 
     office = _office_file()
     source = WorkspaceFileSource(path=office.path, workspace_generation=GENERATION)
@@ -1822,8 +1822,8 @@ def test_office_session_accepts_the_weakened_form_of_its_own_state_etag(
 
 
 def test_editable_office_session_mints_write_scope_and_capability(monkeypatch) -> None:
-    from routers import canvases
-    from services.canvas_office import CollaboraConfig, WopiTokenGrant
+    from orchestrator.routers import canvases
+    from orchestrator.services.canvas_office import CollaboraConfig, WopiTokenGrant
 
     office = _office_file()
     source = WorkspaceFileSource(path=office.path, workspace_generation=GENERATION)
@@ -2592,7 +2592,7 @@ async def test_workspace_binding_is_idempotent_and_status_merges_do_not_rotate()
 
 
 def test_private_workspace_binding_is_removed_from_public_thread_shapes() -> None:
-    import main
+    import orchestrator.main
 
     private = _thread()["metadata"]["_workspace_binding"]
     for metadata in (
@@ -2622,7 +2622,9 @@ def test_private_workspace_binding_is_removed_from_public_thread_shapes() -> Non
             }
         ),
     ):
-        redacted = main._redact_thread_metadata({"id": THREAD_ID, "metadata": metadata})
+        redacted = orchestrator.main._redact_thread_metadata(
+            {"id": THREAD_ID, "metadata": metadata}
+        )
         serialized = json.dumps(redacted)
         assert "_workspace_binding" not in serialized
         assert "SHA256:test" not in serialized
@@ -2635,7 +2637,7 @@ def test_private_workspace_binding_is_removed_from_public_thread_shapes() -> Non
 
 
 def test_private_workspace_lease_is_removed_from_public_job_shapes() -> None:
-    import main
+    import orchestrator.main
 
     context = json.dumps(
         {
@@ -2654,7 +2656,7 @@ def test_private_workspace_lease_is_removed_from_public_job_shapes() -> None:
             },
         }
     )
-    redacted = main._redact_job_config_override(
+    redacted = orchestrator.main._redact_job_config_override(
         {"id": "job", "context": context, "config_override": None}
     )
     assert isinstance(redacted["context"], str)
@@ -2676,7 +2678,9 @@ def test_private_workspace_lease_is_removed_from_public_job_shapes() -> None:
 def test_workspace_host_key_material_is_root_only_and_pod_persistent() -> None:
     entrypoint = Path("docker/workspace-entrypoint.sh").read_text()
     dockerfile = Path("docker/Dockerfile.workspace").read_text()
-    manifest_source = Path("orchestrator/services/container_provisioner.py").read_text()
+    manifest_source = Path(
+        "src/orchestrator/services/container_provisioner.py"
+    ).read_text()
     assert "HOST_KEY_DIR=/var/lib/srw-system/ssh" in entrypoint
     assert "chown -R agent-host:agent-host /home/agent-host" not in entrypoint
     assert "chown -R" not in entrypoint
@@ -2699,7 +2703,9 @@ def test_workspace_host_key_material_is_root_only_and_pod_persistent() -> None:
 
 
 def test_remote_canvas_capability_requires_exact_trusted_generation_pair() -> None:
-    from services.workspace_binding import remote_canvas_presentation_available
+    from orchestrator.services.workspace_binding import (
+        remote_canvas_presentation_available,
+    )
 
     thread = _thread()
     metadata = thread["metadata"]
@@ -2730,7 +2736,7 @@ def test_remote_canvas_capability_requires_exact_trusted_generation_pair() -> No
 async def test_k8s_trusted_identity_tracks_pvc_not_replacement_pod(monkeypatch) -> None:
     from types import SimpleNamespace
 
-    from services import container_provisioner as module
+    from orchestrator.services import container_provisioner as module
 
     pod_uid = ["11111111-1111-4111-8111-111111111111"]
     pvc_uid = ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"]
@@ -2799,7 +2805,7 @@ async def test_k8s_ready_context_pairs_backing_generation_with_pod_uid(
     from types import SimpleNamespace
     from unittest.mock import AsyncMock, MagicMock
 
-    from services import container_provisioner as module
+    from orchestrator.services import container_provisioner as module
 
     runtime_generation = "33333333-3333-4333-8333-333333333333"
     runtime_incarnation = "22222222-2222-4222-8222-222222222222"
@@ -2942,7 +2948,7 @@ async def test_k8s_ready_context_pairs_backing_generation_with_pod_uid(
 def test_vm_host_key_ownership_modes_leave_canvas_fail_closed() -> None:
     cleanup = Path("docker/agent-vm-base/scripts/cleanup.sh").read_text()
     primary_template = Path("helm/templates/vm-controller/configmap.yaml").read_text()
-    nats_source = Path("orchestrator/services/nats_bridge.py").read_text()
+    nats_source = Path("src/orchestrator/services/nats_bridge.py").read_text()
     assert "rm -f /etc/ssh/ssh_host_*" in cleanup
     # Same-cluster host identity is injected into the per-VM Secret by the
     # controller — the template must never regenerate one guest-side.
@@ -2952,7 +2958,7 @@ def test_vm_host_key_ownership_modes_leave_canvas_fail_closed() -> None:
 
 
 def test_docker_fingerprint_inventory_parser(monkeypatch) -> None:
-    from services.docker_provisioner import DockerProvisioner
+    from orchestrator.services.docker_provisioner import DockerProvisioner
 
     monkeypatch.setenv(
         "WORKSPACE_HOST_KEY_FINGERPRINTS",
@@ -2979,7 +2985,7 @@ async def test_unattested_docker_thread_still_assigns_but_disables_canvas(
 ) -> None:
     from unittest.mock import AsyncMock
 
-    from services.docker_provisioner import DockerProvisioner
+    from orchestrator.services.docker_provisioner import DockerProvisioner
 
     monkeypatch.setenv("WORKSPACE_HOSTS", "workspace-1")
     monkeypatch.setenv("WORKSPACE_HOST_KEY_FINGERPRINTS", fingerprint_inventory)
@@ -3023,7 +3029,7 @@ async def test_unattested_docker_thread_still_assigns_but_disables_canvas(
 async def test_default_docker_job_release_retires_agents_then_quarantines() -> None:
     from unittest.mock import AsyncMock
 
-    from services.docker_provisioner import DockerProvisioner
+    from orchestrator.services.docker_provisioner import DockerProvisioner
 
     provisioner = DockerProvisioner()
     db = AsyncMock()
@@ -3070,7 +3076,7 @@ async def test_default_docker_job_release_retires_agents_then_quarantines() -> N
 async def test_default_docker_thread_release_retires_then_quarantines() -> None:
     from unittest.mock import AsyncMock
 
-    from services.docker_provisioner import DockerProvisioner
+    from orchestrator.services.docker_provisioner import DockerProvisioner
 
     provisioner = DockerProvisioner()
     db = AsyncMock()
@@ -3127,7 +3133,7 @@ async def test_default_docker_release_fails_closed_when_process_zero_is_unknown(
 
     from unittest.mock import AsyncMock
 
-    from services.docker_provisioner import DockerProvisioner
+    from orchestrator.services.docker_provisioner import DockerProvisioner
 
     provisioner = DockerProvisioner()
     lease = {
@@ -3173,7 +3179,7 @@ async def test_default_docker_release_reclaims_exact_failed_quarantine_once() ->
 
     from unittest.mock import AsyncMock
 
-    from services.docker_provisioner import DockerProvisioner
+    from orchestrator.services.docker_provisioner import DockerProvisioner
 
     provisioner = DockerProvisioner()
     lease = {
@@ -3217,7 +3223,7 @@ async def test_default_docker_release_replays_proven_process_zero(
 
     from unittest.mock import AsyncMock
 
-    from services.docker_provisioner import DockerProvisioner
+    from orchestrator.services.docker_provisioner import DockerProvisioner
 
     provisioner = DockerProvisioner()
     lease = {
@@ -3260,7 +3266,7 @@ async def test_default_docker_release_replays_proven_process_zero(
 async def test_default_docker_retirement_uses_all_then_independent_zero_proof() -> None:
     from unittest.mock import AsyncMock
 
-    from services.docker_provisioner import DockerProvisioner
+    from orchestrator.services.docker_provisioner import DockerProvisioner
 
     provisioner = DockerProvisioner()
     provisioner._run_pinned_workspace_command = AsyncMock(return_value=True)
@@ -3283,7 +3289,7 @@ async def test_default_docker_retirement_uses_all_then_independent_zero_proof() 
 async def test_trusted_dev_cleanup_failure_quarantines(raises) -> None:
     from unittest.mock import AsyncMock
 
-    from services.docker_provisioner import DockerProvisioner
+    from orchestrator.services.docker_provisioner import DockerProvisioner
 
     provisioner = DockerProvisioner()
     provisioner._trusted_dev_reuse = True
@@ -3324,7 +3330,7 @@ async def test_trusted_dev_cleanup_requires_and_pins_inventory_identity(
 ) -> None:
     from types import SimpleNamespace
 
-    from services import docker_provisioner as module
+    from orchestrator.services import docker_provisioner as module
 
     if module.asyncssh is None:
         pytest.skip("asyncssh is not installed in this unit-test environment")
@@ -3399,7 +3405,7 @@ async def test_docker_endpoint_is_paired_after_binding_and_fails_closed(
 ) -> None:
     from unittest.mock import AsyncMock
 
-    from services.docker_provisioner import DockerProvisioner
+    from orchestrator.services.docker_provisioner import DockerProvisioner
 
     monkeypatch.setenv("WORKSPACE_HOSTS", "workspace-1")
     monkeypatch.setenv(
@@ -3456,7 +3462,7 @@ async def test_docker_binding_failure_quarantines_concrete_lease(
 ) -> None:
     from unittest.mock import AsyncMock
 
-    from services.docker_provisioner import DockerProvisioner
+    from orchestrator.services.docker_provisioner import DockerProvisioner
 
     monkeypatch.setenv("WORKSPACE_HOSTS", "workspace-1")
     monkeypatch.setenv(
@@ -3505,7 +3511,7 @@ async def test_docker_canvas_pairing_loses_to_concurrent_release_cas(
 ) -> None:
     from unittest.mock import AsyncMock
 
-    from services.docker_provisioner import DockerProvisioner
+    from orchestrator.services.docker_provisioner import DockerProvisioner
 
     monkeypatch.setenv("WORKSPACE_HOSTS", "workspace-1")
     monkeypatch.setenv(
@@ -3556,7 +3562,7 @@ async def test_docker_release_revokes_canvas_before_static_host_reset(
 ) -> None:
     from unittest.mock import AsyncMock
 
-    from services.docker_provisioner import DockerProvisioner
+    from orchestrator.services.docker_provisioner import DockerProvisioner
 
     provisioner = DockerProvisioner()
     db = AsyncMock()
@@ -3625,22 +3631,24 @@ async def test_docker_release_revokes_canvas_before_static_host_reset(
 
 
 def test_canvas_session_create_override_is_closed() -> None:
-    import main
+    import orchestrator.main
 
-    with pytest.raises(main.HTTPException) as exc:
-        main._validated_tool_overrides({"tools": {"canvas": ["run_command"]}})
+    with pytest.raises(orchestrator.main.HTTPException) as exc:
+        orchestrator.main._validated_tool_overrides(
+            {"tools": {"canvas": ["run_command"]}}
+        )
     assert exc.value.status_code == 400
 
     # ``shell`` is no longer discarded — every category the request names is
     # honoured now (Defect 2). The canvas group is still closed against a
     # foreign name, which is the part this test exists for.
-    accepted = main._validated_tool_overrides(
+    accepted = orchestrator.main._validated_tool_overrides(
         {"tools": {"canvas": [], "shell": ["shell_execute"]}}
     )
     assert accepted == {"canvas": [], "shell": ["shell_execute"]}
-    assert main._session_tool_group_disabled_markers({"tools": {"canvas": []}}) == {
-        "_canvas_disabled": True
-    }
+    assert orchestrator.main._session_tool_group_disabled_markers(
+        {"tools": {"canvas": []}}
+    ) == {"_canvas_disabled": True}
 
 
 def test_chart_internal_key_is_generated_and_reaches_agents() -> None:

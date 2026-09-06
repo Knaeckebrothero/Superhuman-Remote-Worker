@@ -20,22 +20,16 @@ agent produced nothing".
 """
 
 import logging
-import sys
-from pathlib import Path
 from unittest.mock import MagicMock
 
-project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-
-from src.core.loader import AgentConfig  # noqa: E402
-from src.core.phase import (  # noqa: E402
+from shared.runtime.core.loader import AgentConfig  # noqa: E402
+from agent.core.phase import (  # noqa: E402
     DELIVERY_ERROR_KEY,
     DELIVERY_FAILED_KEY,
     finalize_job,
     freeze_for_review,
 )
-from src.tools.core.job import (  # noqa: E402
+from agent.tools.core.job import (  # noqa: E402
     clear_final_phase_data,
     seed_final_phase_data,
 )

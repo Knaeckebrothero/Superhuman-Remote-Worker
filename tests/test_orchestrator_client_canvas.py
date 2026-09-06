@@ -5,7 +5,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from src.api.orchestrator_client import (
+from agent.api.orchestrator_client import (
     CANVAS_REQUEST_TIMEOUT_SECONDS,
     CanvasClearResult,
     CanvasClientError,

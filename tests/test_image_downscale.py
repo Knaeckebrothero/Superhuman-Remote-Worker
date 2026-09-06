@@ -9,7 +9,7 @@ import os
 import pytest
 from PIL import Image
 
-from src.services.image_downscale import (
+from agent.services.image_downscale import (
     DEFAULT_FAMILY_MAX_EDGE_FALLBACK,
     downscale_image_b64,
     downscale_image_bytes,
@@ -163,7 +163,7 @@ class TestSeamIntegration:
         return base64.b64encode(_solid_jpeg(3000, 2000)).decode()
 
     def test_block_downscales_when_max_edge_set(self):
-        from src.services.image_content import make_image_content_block_from_b64
+        from agent.services.image_content import make_image_content_block_from_b64
 
         block = make_image_content_block_from_b64(
             self._big_b64(), "image/jpeg", max_edge=1568
@@ -174,14 +174,14 @@ class TestSeamIntegration:
         assert max(_dims(payload)) == 1568
 
     def test_block_untouched_when_no_max_edge(self):
-        from src.services.image_content import make_image_content_block_from_b64
+        from agent.services.image_content import make_image_content_block_from_b64
 
         b64 = self._big_b64()
         block = make_image_content_block_from_b64(b64, "image/jpeg")
         assert block["image_url"]["url"].split(",", 1)[1] == b64  # unchanged
 
     def test_multimodal_message_downscales_each_image(self):
-        from src.services.image_content import (
+        from agent.services.image_content import (
             ExtractedImage,
             make_multimodal_user_message,
         )
@@ -208,23 +208,23 @@ class _FakeConfig:
 
 class TestResolveImageMaxEdgeFromConfig:
     def test_high_uses_family_cap(self):
-        from src.services.image_content import resolve_image_max_edge
+        from agent.services.image_content import resolve_image_max_edge
 
         assert resolve_image_max_edge(_FakeConfig("high", 2576)) == 2576
 
     def test_standard_plateaus(self):
-        from src.services.image_content import resolve_image_max_edge
+        from agent.services.image_content import resolve_image_max_edge
 
         assert resolve_image_max_edge(_FakeConfig("standard", 2576)) == 1568
 
     def test_none_config_is_noop(self):
-        from src.services.image_content import resolve_image_max_edge
+        from agent.services.image_content import resolve_image_max_edge
 
         assert resolve_image_max_edge(None) is None
 
     def test_missing_family_cap_falls_back(self):
-        from src.services.image_content import resolve_image_max_edge
-        from src.services.image_downscale import DEFAULT_FAMILY_MAX_EDGE_FALLBACK
+        from agent.services.image_content import resolve_image_max_edge
+        from agent.services.image_downscale import DEFAULT_FAMILY_MAX_EDGE_FALLBACK
 
         # family declares no image_tokens.max_edge -> universal default
         assert (

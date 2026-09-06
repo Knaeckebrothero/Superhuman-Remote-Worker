@@ -63,7 +63,7 @@ spec:
           # keys, a CA and a secret before uvicorn is even listening.
           command:
             - uvicorn
-            - ssh_gateway:create_app
+            - orchestrator.ssh_gateway:create_app
             - --factory
             - --host
             - 0.0.0.0

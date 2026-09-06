@@ -8,7 +8,7 @@ import copy
 
 import pytest
 
-from src.core.capability_grants import (
+from shared.runtime.core.capability_grants import (
     CATALOG,
     evaluate,
     meet,
@@ -216,20 +216,20 @@ def test_admin_short_circuits_and_empty_is_clean():
 
 
 def test_rejects_duplicate_keys():
-    from src.core.expert_resolution import scan_fragment_text
+    from shared.runtime.core.expert_resolution import scan_fragment_text
 
     assert scan_fragment_text('{"llm": {"api_key": null, "api_key": "x"}}')
 
 
 def test_rejects_non_ascii_key():
     # fullwidth 'api_key' — reject the non-ASCII key outright, don't try to normalize.
-    from src.core.expert_resolution import scan_fragment_text
+    from shared.runtime.core.expert_resolution import scan_fragment_text
 
     assert scan_fragment_text('{"llm": {"ａｐｉ＿ｋｅｙ": "x"}}')
 
 
 def test_allows_clean_fragment_text():
-    from src.core.expert_resolution import scan_fragment_text
+    from shared.runtime.core.expert_resolution import scan_fragment_text
 
     assert (
         scan_fragment_text('{"llm": {"model": "gemma-4-moe"}, "tools": {"shell": []}}')
@@ -269,7 +269,7 @@ def test_null_deletion_of_guardrail_caught_in_merged():
 
 
 def test_cross_layer_credential_assembly_denied():
-    from src.core.expert_resolution import hard_deny_scan
+    from shared.runtime.core.expert_resolution import hard_deny_scan
 
     assert hard_deny_scan({"llm": {"model": "x", "api_key": "leaked"}})
 
@@ -708,7 +708,7 @@ def test_strip_map_covers_every_catalog_key_or_is_explicitly_excluded(monkeypatc
     (like the reviewer's `network_egress`) is automatically in-scope with no
     edit to this test.
     """
-    import src.core.capability_grants as capability_grants
+    import shared.runtime.core.capability_grants as capability_grants
 
     for key in CATALOG:
         if key in _NOT_ENFORCED_BY_EVALUATE_FRAGMENT_PDP:

@@ -27,7 +27,7 @@ from pathlib import Path
 
 import pytest
 
-from src.core.loader import (
+from shared.runtime.core.loader import (
     PHASE_SKILLS,
     PromptMatrixResolver,
     _has_shell_tools,
@@ -45,11 +45,11 @@ from src.core.loader import (
     render_instruction_content,
     resolve_bound_skill_dir,
 )
-from src.core.message_markers import protected_path
-from src.core.model_registry import family_of
-from src.core.skill_format import parse_skill_md
-from src.core.workspace_injection import create_phase_instruction_message
-from src.tools.registry import TOOL_REGISTRY
+from shared.runtime.core.message_markers import protected_path
+from shared.runtime.core.model_registry import family_of
+from shared.runtime.core.skill_format import parse_skill_md
+from shared.runtime.core.workspace_injection import create_phase_instruction_message
+from agent.tools.registry import TOOL_REGISTRY
 
 _REPO = Path(__file__).resolve().parents[1]
 _CONFIG = _REPO / "config"

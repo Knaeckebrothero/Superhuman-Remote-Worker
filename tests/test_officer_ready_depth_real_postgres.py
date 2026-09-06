@@ -24,8 +24,8 @@ from orchestrator.services.officer_backlog import ready_depth_by_pool  # noqa: E
 
 PG_IMAGE = "pgvector/pgvector:pg15"
 ROOT = Path(__file__).resolve().parents[1]
-APP_SCHEMA = ROOT / "orchestrator" / "database" / "schema_current.sql"
-VECTOR_MIGRATIONS = ROOT / "orchestrator" / "database" / "migrations" / "vector"
+APP_SCHEMA = ROOT / "src" / "orchestrator" / "database" / "schema_current.sql"
+VECTOR_MIGRATIONS = ROOT / "src" / "orchestrator" / "database" / "migrations" / "vector"
 
 
 def _database_dsn(dsn: str, database: str) -> str:

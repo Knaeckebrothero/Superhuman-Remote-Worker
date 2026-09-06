@@ -1,8 +1,8 @@
 import asyncpg
 import pytest
 
-from database.postgres import PostgresDB
-from services.ssh_handles import (
+from orchestrator.database.postgres import PostgresDB
+from orchestrator.services.ssh_handles import (
     _ALPHABET,
     HANDLE_PATTERN,
     is_valid_handle,

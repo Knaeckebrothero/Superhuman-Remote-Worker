@@ -8,17 +8,18 @@ from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
-from src.managers.session_tasks import SessionTaskManager
-from src.api.persistent_session import PersistentSession
-from src.api.lease_context import LeaseLostError
-from src.services.memory import CaptureEvent, MemoryRuntime
-from src.services.memory.plugins.legacy_writers import PersistentIntervalExtractor
-from src.tools.core.session_task_tools import create_session_task_tools
+from agent.managers.session_tasks import SessionTaskManager
+from agent.api.persistent_session import PersistentSession
+from agent.api.lease_context import LeaseLostError
+from agent.services.memory import CaptureEvent, MemoryRuntime
+from agent.services.memory.plugins.legacy_writers import PersistentIntervalExtractor
+from agent.tools.core.session_task_tools import create_session_task_tools
 
 
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATION = (
-    ROOT / "orchestrator/database/migrations/app/0133_thread_session_durable_state.sql"
+    ROOT
+    / "src/orchestrator/database/migrations/app/0133_thread_session_durable_state.sql"
 )
 
 
@@ -203,7 +204,7 @@ async def test_memory_interval_writer_uses_durable_claim_before_extraction(monke
     claim = AsyncMock(return_value=False)
     extract = AsyncMock()
     monkeypatch.setattr(
-        "src.services.auxiliary.extract_and_store_memories",
+        "shared.runtime.services.auxiliary.extract_and_store_memories",
         extract,
     )
     memory_config = MagicMock(observer_interval=5)
@@ -226,7 +227,7 @@ async def test_memory_interval_writer_extracts_after_durable_claim(monkeypatch):
     claim = AsyncMock(return_value=True)
     extract = AsyncMock()
     monkeypatch.setattr(
-        "src.services.auxiliary.extract_and_store_memories",
+        "shared.runtime.services.auxiliary.extract_and_store_memories",
         extract,
     )
     memory_config = MagicMock(observer_interval=5)

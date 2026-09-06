@@ -16,7 +16,7 @@ from orchestrator.services.config_resolver import (
     inject_blob_credentials,
     resolve_config,
 )
-from src.core.loader import (
+from shared.runtime.core.loader import (
     load_agent_config,
     load_config_from_resolved,
     resolve_config_path,
@@ -554,7 +554,7 @@ def test_unresolvable_ref_dropped_with_warning(caplog):
     `agent._roster_warnings`; the rest of the roster and the blob survive."""
     import logging
 
-    from src.core.loader import load_config_from_resolved
+    from shared.runtime.core.loader import load_config_from_resolved
 
     parent = {
         "expert_type": "worker",
@@ -571,7 +571,7 @@ def test_unresolvable_ref_dropped_with_warning(caplog):
         },
         "prompts": {},
     }
-    with caplog.at_level(logging.WARNING, logger="src.core.subagent_roster"):
+    with caplog.at_level(logging.WARNING, logger="shared.runtime.core.subagent_roster"):
         blob = resolve_config(
             base_config_name="worker_base",
             expert_row=parent,
@@ -603,7 +603,7 @@ def test_worker_resolution_restores_the_phase_skill_bindings_an_expert_replaced(
     session expert) authors its own list. Dispatched as a worker it must still
     carry the two phase bindings — they replaced the unconditional system-prompt
     swap — restored at the front, frozen in the blob, visible to the PDP."""
-    from src.core.loader import load_config_from_resolved
+    from shared.runtime.core.loader import load_config_from_resolved
 
     cap: dict = {}
     blob = resolve_config(
@@ -665,7 +665,7 @@ def test_a_db_expert_forked_before_u2_gets_the_phase_bindings_back():
 
 
 def test_retired_phase_mode_override_keys_are_ignored_and_floor_is_kept():
-    from src.core.loader import load_config_from_resolved
+    from shared.runtime.core.loader import load_config_from_resolved
 
     blob = resolve_config(
         base_config_name="assistant",

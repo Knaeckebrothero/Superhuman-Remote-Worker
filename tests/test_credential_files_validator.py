@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import pytest
 
-from security.credential_files import (
+from orchestrator.security.credential_files import (
     AGENT_HOME,
     CREDENTIAL_FILE_TYPES,
     CredentialFileValidationError,

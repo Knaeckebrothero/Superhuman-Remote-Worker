@@ -12,7 +12,7 @@ async def test_emit_publishes_permission_request_to_scoped_subject(monkeypatch):
     monkeypatch.setenv("SESSION_BOUND_THREAD_ID", "t1")
     monkeypatch.setenv("ORCHESTRATOR_ID", "srw-test")
 
-    from src.api import persistent_app
+    from agent.api import persistent_app
 
     nc = AsyncMock()
     monkeypatch.setattr(persistent_app, "_nats_client", nc, raising=False)
@@ -39,7 +39,7 @@ async def test_emit_skips_unmapped_method(monkeypatch):
     monkeypatch.setenv("SESSION_BOUND_THREAD_ID", "t1")
     monkeypatch.setenv("ORCHESTRATOR_ID", "srw-test")
 
-    from src.api import persistent_app
+    from agent.api import persistent_app
 
     nc = AsyncMock()
     monkeypatch.setattr(persistent_app, "_nats_client", nc, raising=False)
@@ -58,7 +58,7 @@ async def test_emit_skips_when_thread_id_unset(monkeypatch):
     monkeypatch.delenv("SESSION_BOUND_THREAD_ID", raising=False)
     monkeypatch.setenv("ORCHESTRATOR_ID", "srw-test")
 
-    from src.api import persistent_app
+    from agent.api import persistent_app
 
     nc = AsyncMock()
     monkeypatch.setattr(persistent_app, "_nats_client", nc, raising=False)
@@ -78,7 +78,7 @@ async def test_emit_refused_when_orchestrator_id_unset(monkeypatch):
     monkeypatch.setenv("SESSION_BOUND_THREAD_ID", "t1")
     monkeypatch.delenv("ORCHESTRATOR_ID", raising=False)
 
-    from src.api import persistent_app
+    from agent.api import persistent_app
 
     nc = AsyncMock()
     monkeypatch.setattr(persistent_app, "_nats_client", nc, raising=False)
@@ -97,7 +97,7 @@ async def test_emit_silent_on_publish_failure(monkeypatch):
     monkeypatch.setenv("SESSION_BOUND_THREAD_ID", "t1")
     monkeypatch.setenv("ORCHESTRATOR_ID", "srw-test")
 
-    from src.api import persistent_app
+    from agent.api import persistent_app
 
     nc = AsyncMock()
     nc.publish.side_effect = RuntimeError("NATS down")

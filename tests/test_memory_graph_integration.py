@@ -12,14 +12,14 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
-from src.services.auxiliary import (
+from shared.runtime.services.auxiliary import (
     AuxiliaryLLM,
     ExtractedMemories,
     ExtractedMemory,
     _should_extract_memories,
     extract_and_store_memories,
 )
-from src.tools.context import ToolContext
+from agent.tools.context import ToolContext
 
 
 # =============================================================================

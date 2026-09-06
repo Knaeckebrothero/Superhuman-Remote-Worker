@@ -19,13 +19,13 @@ from __future__ import annotations
 import pytest
 from langchain_core.messages import HumanMessage
 
-from src.api.persistent_app import (
+from agent.api.persistent_app import (
     _ACCEPTED_INPUT_ROLES,
     _db_rows_to_lc_messages,
     _serialize_message_row,
 )
-from src.core.loader import scheduled_work_system_floor
-from src.persistent_graph import PERSIST_ROLE_KEY
+from shared.runtime.core.loader import scheduled_work_system_floor
+from agent.persistent_graph import PERSIST_ROLE_KEY
 
 NOTICE = "[JOB_FINISHED] A worker job you created has reached a terminal state."
 

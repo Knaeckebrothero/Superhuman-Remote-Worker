@@ -27,11 +27,12 @@ import asyncpg  # noqa: E402
 import pytest_asyncio  # noqa: E402
 
 from orchestrator.database.migrate import run_migrations  # noqa: E402
-from src.services.knowledge_store import KnowledgeStore  # noqa: E402
+from shared.runtime.services.knowledge_store import KnowledgeStore  # noqa: E402
 
 PG_IMAGE = "pgvector/pgvector:pg15"
 VECTOR_MIGRATIONS = (
     Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "migrations"

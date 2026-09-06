@@ -9,7 +9,7 @@ database fails closed.
 Only the database half is enforced. These statements combine the mutation
 with a live ``run_queue`` lease check, so a stale cooperative executor cannot
 reserve or acknowledge state. The resource marker is intentionally classified
-separately in ``src.services.cloud_sync``: it is stored in user-writable cloud
+separately in ``agent.services.cloud_sync``: it is stored in user-writable cloud
 space and is therefore cooperative (though deletion/rollback is detected), not
 a security boundary.
 """

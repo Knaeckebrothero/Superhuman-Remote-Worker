@@ -4,10 +4,10 @@ Regression guard for knowledge-base/knowledge/issues/agent_fast_freeze_on_dead_w
 
 import pytest
 
-from src.core.workspace_backend import WorkspaceUnavailableError
-from src.tools.context import ToolContext
-from src.tools.workspace.filesystem import create_filesystem_tools
-from src.tools.workspace.files import create_file_tools
+from shared.runtime.core.workspace_backend import WorkspaceUnavailableError
+from agent.tools.context import ToolContext
+from agent.tools.workspace.filesystem import create_filesystem_tools
+from agent.tools.workspace.files import create_file_tools
 
 
 class _DeadWorkspace:

@@ -1,6 +1,6 @@
 """The canonical, framework-independent SRW job-management surface."""
 
-from .descriptors import (
+from shared.orch_surface.jobs.descriptors import (
     AUTH_CONTEXT_FAILURE_NOTICE,
     CallerCtx,
     JobDescriptor,
@@ -14,8 +14,8 @@ from .descriptors import (
 )
 
 # Importing operation modules is the single registration side effect.
-from . import control as _control  # noqa: F401,E402
-from . import inspection as _inspection  # noqa: F401,E402
+from shared.orch_surface.jobs import control as _control  # noqa: F401,E402
+from shared.orch_surface.jobs import inspection as _inspection  # noqa: F401,E402
 
 JOB_DESCRIPTORS = get_descriptors()
 

@@ -24,19 +24,20 @@ import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
 from orchestrator.database.postgres import PostgresDB
-from services.session_workspace_adoption import (
+from orchestrator.services.session_workspace_adoption import (
     LEGACY_CREATION_MARKER_KEY,
     ensure_legacy_k8s_thread_runtime_authority,
 )
-from services.job_workspace_adoption import (
+from orchestrator.services.job_workspace_adoption import (
     LegacyK8sAdoptionOutcome,
     ensure_legacy_k8s_job_runtime_authority,
 )
-from src.shared.workspace_contract import LEGACY_K8S_RUNTIME_ADOPTION_KEY
+from shared.workspace_contract import LEGACY_K8S_RUNTIME_ADOPTION_KEY
 from tests._previous_release_seed import seed_previous_release_row
 
 SCHEMA_FILE = (
     Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "schema_current.sql"
@@ -86,7 +87,7 @@ async def db(pg_dsn, _schema_applied):
 
 
 def _attestation(*, runtime_incarnation=None, host=None, pod_ip=None):
-    from services.container_provisioner import WorkspaceRuntimeAttestation
+    from orchestrator.services.container_provisioner import WorkspaceRuntimeAttestation
 
     backing = str(uuid4())
     return WorkspaceRuntimeAttestation(

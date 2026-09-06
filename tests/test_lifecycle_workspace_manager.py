@@ -19,12 +19,12 @@ from orchestrator.services.lifecycle import (
     WorkspaceInstanceManager,
     expected_workspace_shas,
 )
-from services.container_provisioner import (
+from orchestrator.services.container_provisioner import (
     WorkspaceCleanupOutcome,
     WorkspaceRuntimeAttestation,
     WorkspaceTeardownIdentity,
 )
-from services.workspace_lifecycle import WorkspaceOwner
+from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 
 
 # =============================================================================

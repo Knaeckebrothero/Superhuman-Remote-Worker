@@ -11,7 +11,6 @@ Covered here:
     and still reject genuinely nonexistent files
 """
 
-import sys
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -20,23 +19,18 @@ import pytest
 
 from tests._tool_invoke import invoke_tool
 
-project_root = Path(__file__).parent.parent
-src_path = project_root / "src"
-if str(src_path) not in sys.path:
-    sys.path.insert(0, str(src_path))
-
-from src.core.deliverables import (  # noqa: E402
+from agent.core.deliverables import (  # noqa: E402
     format_deliverable_contract_block,
     parse_required_deliverables,
     resolve_workspace_deliverable,
 )
-from src.shared.deliverable_contract import (  # noqa: E402
+from shared.deliverable_contract import (  # noqa: E402
     DeliverableContractError,
     cloned_repo_deliverables,
     parse_required_deliverables as parse_contract,
 )
-from src.core.workspace import WorkspaceManager  # noqa: E402
-from src.tools.core.job import _final_phase_data, create_job_tools  # noqa: E402
+from agent.core.workspace import WorkspaceManager  # noqa: E402
+from agent.tools.core.job import _final_phase_data, create_job_tools  # noqa: E402
 from tests._fs_backend import FilesystemTestBackend  # noqa: E402
 
 

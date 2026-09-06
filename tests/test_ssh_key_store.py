@@ -7,7 +7,7 @@ where the bugs live. Real SQL execution is covered by the k3d gate in plan 3.
 
 import pytest
 
-from database.postgres import (
+from orchestrator.database.postgres import (
     MAX_SSH_KEYS_PER_USER,
     PostgresDB,
     SshKeyAlreadyRegistered,

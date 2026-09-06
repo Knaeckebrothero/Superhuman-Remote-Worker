@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from src.services.cloud_overlay.overlay_mount import (
+from shared.runtime.services.cloud_overlay.overlay_mount import (
     OverlayMountError,
     OverlayMountManager,
 )
@@ -196,7 +196,7 @@ def _stub_session(overlay, rclone):
     """A minimal object carrying the REAL PersistentSession.reset_cloud_overlay
     (bound), so route tests exercise the genuine session→overlay→refresh chain
     without constructing a full PersistentSession."""
-    from src.api.persistent_session import PersistentSession
+    from agent.api.persistent_session import PersistentSession
 
     class _StubSession:
         reset_cloud_overlay = PersistentSession.reset_cloud_overlay
@@ -214,7 +214,7 @@ def _stub_session(overlay, rclone):
 @pytest.fixture
 def post_reset(monkeypatch):
     """Install a session stub on the persistent_app module and POST the route."""
-    import src.api.persistent_app as app_mod
+    import agent.api.persistent_app as app_mod
     from fastapi.testclient import TestClient
 
     app = app_mod.create_persistent_app("dummy_config", _RESET_THREAD_ID)
@@ -237,7 +237,7 @@ def post_reset(monkeypatch):
 
 
 def test_reset_cloud_overlay_raises_unavailable_when_missing_or_inactive():
-    from src.api.persistent_session import CloudOverlayUnavailable
+    from agent.api.persistent_session import CloudOverlayUnavailable
 
     # overlay manager present but never mounted -> inactive
     with pytest.raises(CloudOverlayUnavailable):
@@ -273,7 +273,7 @@ def test_route_500_on_rclone_refresh_error(post_reset):
     """THE reviewer Critical: RcloneMountError subclasses RuntimeError — a
     failed lower vfs/refresh must surface as 500 (retry/alert), never be
     misreported as the 404 give-up branch."""
-    from src.services.cloud_mount import RcloneMountError
+    from shared.runtime.services.cloud_mount import RcloneMountError
 
     backend = FakeRemoteBackend()
     mgr = _manager(backend)

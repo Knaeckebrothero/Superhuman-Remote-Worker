@@ -19,8 +19,8 @@ from uuid import uuid4
 
 import pytest
 
-import main as orch_main
-from main import list_officers
+import orchestrator.main as orch_main
+from orchestrator.main import list_officers
 
 PROJECT_A = str(uuid4())
 PROJECT_B = str(uuid4())

@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 import pytest
 
-from src.services.cloud_sync.nextcloud_sync import NextcloudWorkspaceSync
+from agent.services.cloud_sync.nextcloud_sync import NextcloudWorkspaceSync
 
 
 class _FakeWebDavClient:

@@ -1,10 +1,12 @@
-"""Shared packages — code imported by two or more SRW applications.
+"""Contracts and support code shared by SRW applications.
 
-Modules here ship in every image (agent, orchestrator, MCP), so the bar for
-entry is: used by >=2 apps, framework-free (no langchain/langgraph, no
-imports from ``src.core``/``src.tools``/``orchestrator.*``), and dependencies
-limited to stdlib + the small common set every image already installs
-(httpx, tenacity). This is also the shared-code location the source-tree
-flattening targets (knowledge-base/knowledge/features/source_tree_unification.md), so packages
-born here do not move when the tree flattens.
+The root and all children except ``shared.runtime`` stay lightweight: no
+LangChain/LangGraph and no application imports. Their dependencies are limited
+to the small common set used by the agent, orchestrator and MCP images.
+
+``shared.runtime`` holds reusable configuration, model, memory, storage and
+workspace implementations used by the agent and orchestrator. It may use their
+runtime dependencies, but cannot depend on any application package. Lightweight
+shared code, MCP and the VM controller must not import that subtree. Import
+Linter enforces these boundaries in ``pyproject.toml``.
 """

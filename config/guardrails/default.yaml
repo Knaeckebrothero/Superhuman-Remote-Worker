@@ -10,14 +10,14 @@
 #                  block already in the docstring).
 #   nudges:        keyed runtime strings used by graph/manager/service
 #                  injection sites. Placeholder contracts are validated
-#                  against KNOWN_NUDGES in src/services/guardrails.py.
+#                  against KNOWN_NUDGES in src/shared/runtime/services/guardrails.py.
 #
 # When adding a new tool, drop its name here. When adding a new nudge
 # call site, add the key here AND in KNOWN_NUDGES.
 
 tool_examples:
 
-  # ----- src/tools/core/todo.py -----
+  # ----- src/agent/tools/core/todo.py -----
   next_phase_todos: |-
     Examples:
         next_phase_todos(
@@ -36,7 +36,7 @@ tool_examples:
         todo_complete()                       # complete the first pending task
         todo_complete(todo_id="todo_3")       # complete a specific task by id
 
-  # ----- src/tools/git/git_tools.py -----
+  # ----- src/agent/tools/git/git_tools.py -----
   git_log: |-
     Examples:
         git_log()                  # last 10 commits, compact one-line format
@@ -98,7 +98,7 @@ tool_examples:
         git_worktree_cleanup(branch="subagent/0")
         git_worktree_cleanup(branch="subagent/2", force=True)
 
-  # ----- src/tools/shell/shell_tools.py -----
+  # ----- src/agent/tools/shell/shell_tools.py -----
   run_command: |-
     Examples:
         run_command(command="pytest tests/ -x", working_dir=".")
@@ -118,7 +118,7 @@ tool_examples:
         shell_read(name="build", lines=100)                # last 100 lines of build tab
         shell_read(name="srv", offset=0, lines=50)         # first 50 lines
 
-  # ----- src/tools/workspace/files.py and filesystem.py -----
+  # ----- src/agent/tools/workspace/files.py and filesystem.py -----
   edit_file: |-
     Examples:
         # Replace mode (default)
@@ -150,7 +150,7 @@ tool_examples:
     Examples:
         get_document_info(path="documents/report.pdf")                          # page count + structure preview
 
-  # ----- src/tools/knowledge/knowledge_tools.py -----
+  # ----- src/agent/tools/knowledge/knowledge_tools.py -----
   kb_write: |-
     Examples:
         kb_write(
@@ -181,7 +181,7 @@ tool_examples:
         kb_update(note="chose-jwt-over-oauth", append="Update: also adopted refresh-token rotation.")
         kb_update(note="api-rate-limit-experiment", status="resolved", confidence="high")
 
-  # ----- src/tools/citation/sources.py -----
+  # ----- src/agent/tools/citation/sources.py -----
   cite_web: |-
     Examples:
         cite_web(
@@ -199,7 +199,7 @@ tool_examples:
             claim="Q3 revenue grew 12% year-over-year.",
         )
 
-  # ----- src/tools/delegation/delegate_agent.py -----
+  # ----- src/agent/tools/delegation/delegate_agent.py -----
   delegate_agent: |-
     Examples:
         delegate_agent(
@@ -230,7 +230,7 @@ tool_examples:
     Examples:
         list_agents()
 
-  # ----- src/tools/research/web.py -----
+  # ----- src/agent/tools/research/web.py -----
   web_search: |-
     Examples:
         web_search(query="vLLM gemma4 tool-call parser regex")
@@ -242,7 +242,7 @@ tool_examples:
         extract_webpage(urls="https://docs.vllm.ai/en/latest/models/supported_models.html")
         extract_webpage(urls="https://example.com/a, https://example.com/b", query="rate limiting strategies")
 
-  # ----- src/tools/research/papers.py -----
+  # ----- src/agent/tools/research/papers.py -----
   search_papers: |-
     Examples:
         search_papers(query="speculative decoding")                      # arxiv default
@@ -257,15 +257,15 @@ tool_examples:
 
 nudges:
 
-  # ----- src/graph.py recovery + phase nudges -----
+  # ----- src/agent/graph.py recovery + phase nudges -----
 
-  # Sites: src/graph.py:1371-1380 (todo-action recovery nudge)
+  # Sites: src/agent/graph.py:1371-1380 (todo-action recovery nudge)
   # Placeholders: {todo_id}
   todo_action: |-
     Action required: complete the current todo `{todo_id}` now by invoking the `todo_complete` tool.
     Use the tool-call format defined in your system prompt — do not type the call as plain text.
 
-  # Sites: src/graph.py:1193-1208 (degenerate-response recovery)
+  # Sites: src/agent/graph.py:1193-1208 (degenerate-response recovery)
   degenerate_recovery_assistant: |-
     My previous response was degenerate — it contained repetitive or malformed output. I need to retry with a shorter, well-formed response.
 
@@ -273,31 +273,31 @@ nudges:
     Your last response was detected as degenerate and has been discarded. Issues found: {pattern_detail}.
     If you were trying to call a tool, retry with smaller arguments or a different approach.
 
-  # Sites: src/graph.py audited_tools (act-ratio tripwire)
+  # Sites: src/agent/graph.py audited_tools (act-ratio tripwire)
   # Placeholders: {count}
   act_ratio_nudge: |-
     You've spent {count} steps on planning artifacts. Stop planning; take the next concrete action toward the current todo.
 
-  # Sites: src/graph.py:3020-3023 (loop-warning suffix appended to ToolMessage)
+  # Sites: src/agent/graph.py:3020-3023 (loop-warning suffix appended to ToolMessage)
   loop_warning_suffix: |-
     [LOOP WARNING] You have called this tool with the same arguments multiple times. You may be stuck in a loop.
     Consider a different approach: try different arguments, use a different tool, or mark the current todo as blocked and move on.
 
-  # Sites: src/graph.py tool-not-found recovery suffix
+  # Sites: src/agent/graph.py tool-not-found recovery suffix
   tool_not_found_suffix: |-
     If your current todo requires this tool, mark it as blocked using the `todo_complete` tool with a note explaining which tool is needed, and proceed with the next todo.
 
-  # Sites: src/core/phase.py on_strategic_phase_complete()
+  # Sites: src/agent/core/phase.py on_strategic_phase_complete()
   # Placeholders: {phase_number}, {phase_name}, {todo_count}
   phase_transition_strategic_to_tactical: |-
     [PHASE_TRANSITION] Strategic phase complete. Entering tactical phase {phase_number}: {phase_name} ({todo_count} todos). Work through the todos using your tools.
 
-  # Sites: src/core/phase.py on_tactical_phase_complete()
+  # Sites: src/agent/core/phase.py on_tactical_phase_complete()
   # Placeholders: {phase_number}
   phase_transition_tactical_to_strategic: |-
     [PHASE_TRANSITION] Tactical phase complete. Entering strategic phase {phase_number}. Review what was accomplished, update plan.md and record key learnings, then either stage todos for the next tactical phase using the `next_phase_todos` tool or invoke the `job_complete` tool.
 
-  # Sites: src/graph.py audited_tools — the per-call phase gate (U2). One tool
+  # Sites: src/agent/graph.py audited_tools — the per-call phase gate (U2). One tool
   # binding serves every phase, so this is what a phase-illegal call gets
   # back while the batch's legal calls run. Name the tool's phase, the
   # current phase and what advances the job; NEVER enumerate the tool
@@ -312,9 +312,9 @@ nudges:
   # Appended to the rejection when the batch also carried phase-legal calls.
   phase_gate_batch_note: "Other calls in this batch were executed normally."
 
-  # ----- src/managers/todo.py -----
+  # ----- src/agent/managers/todo.py -----
 
-  # Sites: src/managers/todo.py:416 (todo-list footer)
+  # Sites: src/agent/managers/todo.py:416 (todo-list footer)
   # NEVER enumerate the tool surface here ("Tools available: ..."). Models read
   # such lists as exhaustive and conclude their other bound tools are gone —
   # proven rewind-loop root cause (job 1cab4b88, 9 tactical phases burned;
@@ -324,7 +324,7 @@ nudges:
     Mark each finished task by invoking the `todo_complete` tool with its todo id. This task list is a status reminder, not a tool list — it does not limit which tools you can call; every tool bound in this request stays available.
     Invoke tools via the tool-call format defined in your system prompt.
 
-  # ----- src/services/recall_store.py -----
+  # ----- src/shared/runtime/services/recall_store.py -----
 
   memory_block_header_pinned: "--- Pinned Memories (TTL-active) ---"
   memory_block_header_retrieved: "--- Retrieved Memories (relevance-ranked) ---"
@@ -332,17 +332,17 @@ nudges:
   # {tokens} (already-formatted, e.g. "150")
   memory_block_footer: "--- End Memories ({count}, ~{tokens} tokens) ---"
 
-  # ----- src/services/knowledge_store.py -----
+  # ----- src/shared/runtime/services/knowledge_store.py -----
 
   knowledge_block_header: "--- Project Knowledge ---"
   # Placeholders: {count} (number of notes), {tokens} (already-formatted)
   knowledge_block_footer: "--- End Knowledge ({count} notes, ~{tokens} tokens) ---"
 
-  # ----- src/persistent_graph.py -----
+  # ----- src/agent/persistent_graph.py -----
 
   empty_response_recovery: "⚠ The model returned an empty response. Please try again or switch models."
 
-  # ----- src/tools/context.py, src/tools/registry.py, src/tools/workspace/files.py -----
+  # ----- src/agent/tools/context.py, src/agent/tools/registry.py, src/agent/tools/workspace/files.py -----
 
   # Placeholders: {file_path}, {tool_name}
   read_file_required_error: |-

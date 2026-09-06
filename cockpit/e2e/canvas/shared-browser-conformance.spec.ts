@@ -181,7 +181,7 @@ test.describe('Shared browser Cockpit handoff', () => {
     const harness = new BrowserSocketHarness();
     await harness.install(context, page);
 
-    await page.goto(SESSION_PATH, {waitUntil: 'domcontentloaded'});
+    await page.goto(SESSION_PATH, {waitUntil: 'load'});
     const openBrowser = page.getByRole('button', {name: 'Open browser', exact: true}).first();
     await expect(openBrowser).toBeVisible();
     expect(await fixtureState(request)).toMatchObject({

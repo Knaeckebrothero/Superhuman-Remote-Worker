@@ -20,8 +20,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.agent import UniversalAgent
-from src.core.loader import LimitsConfig, load_agent_config
+from agent.agent import UniversalAgent
+from shared.runtime.core.loader import LimitsConfig, load_agent_config
 
 CITATION_ENV = (
     "CITATION_LLM_MODEL",
@@ -61,7 +61,7 @@ def _init_with_captured_create_llm(agent: UniversalAgent):
         created.append(cfg)
         return SimpleNamespace(model=cfg.model, cfg=cfg)
 
-    with patch("src.agent.create_llm", side_effect=fake_create_llm):
+    with patch("agent.agent.create_llm", side_effect=fake_create_llm):
         agent._initialize_citation_verifier(LimitsConfig())
     return created
 
@@ -109,7 +109,7 @@ class TestNoLeakToCustomEndpoint:
         monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
         agent = _agent()
 
-        with caplog.at_level(logging.ERROR, logger="src.agent"):
+        with caplog.at_level(logging.ERROR, logger="agent.agent"):
             created = _init_with_captured_create_llm(agent)
 
         # No client was constructed for the custom endpoint, so OPENAI_API_KEY

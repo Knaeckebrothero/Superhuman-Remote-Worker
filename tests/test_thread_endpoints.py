@@ -28,7 +28,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from services.workspace_lifecycle import WorkspaceOwner
+from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 
 
 # =============================================================================

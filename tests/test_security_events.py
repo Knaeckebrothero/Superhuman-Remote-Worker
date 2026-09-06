@@ -27,7 +27,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import HTTPException
 
-from security.access import (
+from orchestrator.security.access import (
     _request_meta,
     log_security_event,
     require_job_access,
@@ -38,7 +38,7 @@ from security.access import (
 def _patch_auth(user: dict):
     """Route ``require_approved_user`` inside security.access to ``user``."""
     return patch(
-        "security.access.require_approved_user",
+        "orchestrator.security.access.require_approved_user",
         AsyncMock(return_value=user),
     )
 
@@ -132,7 +132,10 @@ class TestDenyWritesEvent:
         self, user_a, job_b, fake_db, fake_request, caplog
     ):
         """The structured log line fires (it's the DB-outage fallback)."""
-        with _patch_auth(user_a), caplog.at_level("WARNING", logger="security.access"):
+        with (
+            _patch_auth(user_a),
+            caplog.at_level("WARNING", logger="orchestrator.security.access"),
+        ):
             with pytest.raises(HTTPException):
                 await require_job_access(fake_request, fake_db, str(job_b["id"]))
         assert any("security-event access_denied" in r.message for r in caplog.records)
@@ -178,7 +181,10 @@ class TestWriteFailureContainment:
         self, user_a, job_b, fake_db, fake_request, caplog
     ):
         fake_db.record_security_event = AsyncMock(side_effect=RuntimeError("pool down"))
-        with _patch_auth(user_a), caplog.at_level("ERROR", logger="security.access"):
+        with (
+            _patch_auth(user_a),
+            caplog.at_level("ERROR", logger="orchestrator.security.access"),
+        ):
             with pytest.raises(HTTPException) as exc:
                 await require_job_access(fake_request, fake_db, str(job_b["id"]))
         assert exc.value.status_code == 403
@@ -225,16 +231,16 @@ def _patch_main(user: dict, db):
 
     stack = ExitStack()
     stack.enter_context(
-        patch("main.require_approved_user", AsyncMock(return_value=user))
+        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user))
     )
-    stack.enter_context(patch("main.postgres_db", db))
+    stack.enter_context(patch("orchestrator.main.postgres_db", db))
     return stack
 
 
 class TestAdminEndpoint:
     @pytest.mark.asyncio
     async def test_admin_lists_events(self, user_admin, fake_db, fake_request):
-        from main import admin_list_security_events
+        from orchestrator.main import admin_list_security_events
 
         fake_db.list_security_events = AsyncMock(
             return_value=[{"event_type": "access_denied"}]
@@ -249,7 +255,7 @@ class TestAdminEndpoint:
     @pytest.mark.asyncio
     async def test_non_admin_denied_and_audited(self, user_a, fake_db, fake_request):
         """The gate guarding the audit log itself writes an admin_denied event."""
-        from main import admin_list_security_events
+        from orchestrator.main import admin_list_security_events
 
         with _patch_main(user_a, fake_db):
             with pytest.raises(HTTPException) as exc:
@@ -261,7 +267,7 @@ class TestAdminEndpoint:
 
     @pytest.mark.asyncio
     async def test_bad_since_is_400(self, user_admin, fake_db, fake_request):
-        from main import admin_list_security_events
+        from orchestrator.main import admin_list_security_events
 
         with _patch_main(user_admin, fake_db):
             with pytest.raises(HTTPException) as exc:

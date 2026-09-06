@@ -21,7 +21,7 @@ from orchestrator.services.stateless_session_retirement import (
     retire_stateless_workspace_residents,
     verify_stateless_workspace_residents_retired,
 )
-from src.core.managed_repository import (
+from shared.runtime.core.managed_repository import (
     _SSH_AGENT_RETIRE_PROGRAM,
     managed_repository_agent_launch_command,
     managed_repository_agent_retirement_command,

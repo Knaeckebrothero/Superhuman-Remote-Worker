@@ -11,8 +11,11 @@ For contribution scope and pull-request expectations, read
 
 | Path | Responsibility |
 |---|---|
-| `orchestrator/` | FastAPI API, authentication, dispatch, provisioning, persistence, migrations, and MCP |
-| `agent.py`, `src/` | LangGraph worker and persistent-session runtime, tools, workspace backends, and memory |
+| `src/orchestrator/` | FastAPI API, authentication, dispatch, provisioning, persistence, and migrations |
+| `src/agent/` | LangGraph worker and persistent-session runtime, tools, and graph execution |
+| `src/mcp_server/` | MCP API client and service |
+| `src/vm_controller/` | Workspace VM lifecycle controller |
+| `src/shared/` | Framework-free contracts and helpers; `runtime/` holds common configuration, LLM, memory, and transport support for agent and orchestrator |
 | `cockpit/` | Angular web application |
 | `config/` | Expert, role, prompt, tool, and skill configuration |
 | `helm/` | Kubernetes deployment artifact and values schema |
@@ -37,9 +40,23 @@ python -m venv venv
 source venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
+python -m pip install -r src/orchestrator/requirements.txt
 python -m pip install -r requirements-dev.txt
+python -m pip install --no-deps -e .
 playwright install chromium
 ```
+
+Dependency sets remain separate. For MCP development, install
+`src/mcp_server/requirements.txt`; for the VM controller, install
+`src/vm_controller/requirements.txt`. The editable install exposes whichever
+application packages are present in the checkout or image. `src/` is a source
+root, not an import package; imports use `agent`, `orchestrator`, `mcp_server`,
+`vm_controller`, or `shared` without adding `PYTHONPATH` entries.
+
+For an environment matching the deployed orchestrator or controller, use the
+[role dependency locks](../requirements/README.md), including their Python and
+platform targets. The combined Python 3.12 developer/test environment above uses
+the declarations and shared constraints; it does not combine the role locks.
 
 PDF processing also needs Poppler:
 
@@ -108,19 +125,19 @@ feedback are not command-line inputs.
 
 ```bash
 # Jobs and persistent sessions (default)
-python agent.py --port 8001 --loop
+python -m agent --port 8001 --loop
 
 # Jobs only
-python agent.py --mode worker --port 8001 --loop
+python -m agent --mode worker --port 8001 --loop
 
 # Interactive sessions only
-python agent.py --mode persistent --port 8002 --loop
+python -m agent --mode persistent --port 8002 --loop
 
 # Resolve a different expert configuration
-python agent.py --config scholar --port 8001 --loop
+python -m agent --config scholar --port 8001 --loop
 
 # Verbose logs
-LOG_LEVEL=DEBUG python agent.py --port 8001 --loop
+LOG_LEVEL=DEBUG python -m agent --port 8001 --loop
 ```
 
 `--loop` keeps the manually started process alive after one job. In Kubernetes,
@@ -185,8 +202,9 @@ k3d cluster start srw
 tilt up
 ```
 
-The Tilt UI is served at <https://localhost:10350>. Stopping Tilt does not stop
-the cluster.
+The Tilt UI is served at <https://localhost:10350>. Ctrl-C stops its watcher
+and leaves the deployed release and cluster running. Use `tilt ci` for a
+single apply without a persistent watcher.
 
 ### Edit-to-effect behavior
 
@@ -210,8 +228,9 @@ tilt args -- --port 10351
 tilt down
 ```
 
-`tilt down` removes the Helm release managed by Tilt. It does not delete the
-k3d cluster or every retained PVC.
+`tilt down` removes the Helm release managed by Tilt. Disabling the `srw`
+resource also runs its Helm delete command; it does not merely pause source
+sync. These actions do not delete the k3d cluster or every retained PVC.
 
 ## Develop and verify
 
@@ -222,12 +241,36 @@ implementation grows. Keep pull requests narrowly scoped.
 Use the smallest relevant checks during iteration, then broaden them in
 proportion to risk.
 
+### Job HTTP contracts
+
+The public create request is described in
+[`schemas/job_create.py`](../src/orchestrator/schemas/job_create.py); the job-list
+envelope and its rows are described in
+[`schemas/job_list.py`](../src/orchestrator/schemas/job_list.py). List response
+models are documentation only: the route retains its dictionary serializer and
+existing redaction. Do not install a filtering response model as a schema cleanup.
+
+Cockpit's `JobListPage`/`JobSummary` projections live in `core/models/audit.model.ts`;
+`Job` lives in `core/models/api.model.ts`. The shared synthetic
+[`job-list-page.json`](../cockpit/src/app/core/models/fixtures/job-list-page.json)
+is checked against the mounted ASGI route and the real Cockpit HTTP service.
+Schema tests guard field names and nullable values. Current server responses
+always include `as_of` and `filters`; Cockpit retains optional metadata for
+compatibility and its synthetic empty result on errors.
+
+List counts and offsets refer to display roots, with matching child rows riding
+along. `total=null` means counting was skipped; `total_is_capped=true` marks a
+numeric lower bound. Carry `as_of` between pages to exclude newer inserts; it
+does not freeze status changes or deletions. Real PostgreSQL pagination coverage
+lives in `tests/test_job_subjob_roster_real_postgres.py`. Keep the existing
+agent/MCP bare-array compatibility adapter when extending this contract.
+
 ### Python
 
 ```bash
 pytest tests/test_<area>.py -x -q --tb=short
-ruff check src/ orchestrator/ tests/
-ruff format --check src/ orchestrator/ tests/
+ruff check src/ tests/
+ruff format --check src/ tests/
 
 # Full bounded runner used by CI
 ./scripts/pytest-fast.sh

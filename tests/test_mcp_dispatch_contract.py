@@ -3,11 +3,11 @@
 import ast
 from pathlib import Path
 
-from src.shared.orch_surface.formatters import format_created_job
-from src.shared.orch_surface.jobs import get_descriptor
+from shared.orch_surface.formatters import format_created_job
+from shared.orch_surface.jobs import get_descriptor
 
 
-SERVER_PATH = Path(__file__).parent.parent / "orchestrator" / "mcp" / "server.py"
+SERVER_PATH = Path(__file__).parent.parent / "src" / "mcp_server" / "server.py"
 
 
 def _async_function(tree: ast.AST, name: str) -> ast.AsyncFunctionDef:

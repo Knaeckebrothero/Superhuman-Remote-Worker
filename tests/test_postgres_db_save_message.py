@@ -16,7 +16,7 @@ import uuid
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
-from src.database.postgres_db import (
+from agent.database.postgres_db import (
     PostgresDB,
     _coerce_row_id,
     _THREAD_MSG_ID_NS,

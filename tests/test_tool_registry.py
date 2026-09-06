@@ -9,17 +9,17 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from src.core.loader import InstructionFileEntry
-from src.tools.context import ToolContext
+from shared.runtime.core.loader import InstructionFileEntry
+from agent.tools.context import ToolContext
 from langchain_core.tools import StructuredTool
 
-from src.core.workspace import WorkspaceManager
-from src.services.guardrails import apply_guardrails_to_tools
-from src.tools.description_manager import (
+from agent.core.workspace import WorkspaceManager
+from shared.runtime.services.guardrails import apply_guardrails_to_tools
+from agent.tools.description_manager import (
     apply_description_overrides,
     apply_phase_description_prefixes,
 )
-from src.tools.registry import (
+from agent.tools.registry import (
     PHASE_DESCRIPTION_PREFIXES,
     TOOL_REGISTRY,
     single_phase_of,
@@ -345,7 +345,7 @@ class TestLoadToolsValidation:
         every such name — not one line per name, and not silence.
         """
         ctx = ToolContext()  # no neo4j datasource -> graph tools cannot bind
-        with caplog.at_level("WARNING", logger="src.tools.registry"):
+        with caplog.at_level("WARNING", logger="agent.tools.registry"):
             result = load_tools(["cypher_query", "cypher_execute"], ctx)
 
         assert result == []
@@ -364,7 +364,7 @@ class TestLoadToolsValidation:
         ws = MagicMock()
         ws.is_initialized = True
         ctx = ToolContext(workspace_manager=ws)
-        with caplog.at_level("WARNING", logger="src.tools.registry"):
+        with caplog.at_level("WARNING", logger="agent.tools.registry"):
             result = load_tools(["read_file"], ctx)
 
         assert [tool.name for tool in result] == ["read_file"]
@@ -811,7 +811,7 @@ class TestPhaseDescriptionPrefixes:
             "todo_complete",
             "read_file",
         ]
-        from src.managers import TodoManager
+        from agent.managers import TodoManager
 
         tools = load_tools(
             names, ToolContext(workspace_manager=ws, todo_manager=TodoManager(ws))

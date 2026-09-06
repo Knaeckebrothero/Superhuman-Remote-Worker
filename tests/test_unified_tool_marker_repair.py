@@ -22,7 +22,7 @@ import pytest_asyncio
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATION = (
     ROOT
-    / "orchestrator/database/migrations/app/0158_repair_unified_tool_group_markers.sql"
+    / "src/orchestrator/database/migrations/app/0158_repair_unified_tool_group_markers.sql"
 )
 
 

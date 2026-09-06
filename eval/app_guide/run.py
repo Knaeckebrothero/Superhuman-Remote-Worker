@@ -35,21 +35,21 @@ from eval.app_guide.capability_fixtures import (
     CAPABILITY_FIXTURE_NAMES,
     capability_fixture_json,
 )
-from src.core.expert_resolution import fence_skills_menu
-from src.core.product_capabilities import CAPABILITY_REGISTRY
-from src.core.skill_resolution import (
+from shared.runtime.core.expert_resolution import fence_skills_menu
+from shared.runtime.core.product_capabilities import CAPABILITY_REGISTRY
+from shared.runtime.core.skill_resolution import (
     APP_GUIDE_LOADER_TOOL,
     APP_GUIDE_SKILL,
     add_persistent_system_skills,
     managed_product_guide_system_floor,
     managed_product_guide_turn_boundary,
 )
-from src.tools.context import ToolContext
-from src.tools.product_capabilities import (
+from agent.tools.context import ToolContext
+from agent.tools.product_capabilities import (
     PRODUCT_CAPABILITIES_TOOL_NAME,
     CapabilityToolRequest,
 )
-from src.tools.product_help import create_product_help_tools
+from agent.tools.product_help import create_product_help_tools
 
 SCHEMA_VERSION = 1
 DEFAULT_CASES_PATH = Path(__file__).with_name("cases.yaml")

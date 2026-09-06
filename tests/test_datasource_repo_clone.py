@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.core.datasource_setup import (
+from agent.core.datasource_setup import (
     clone_repository_datasources,
     inject_workspace_facts,
     process_datasources,
@@ -68,7 +68,7 @@ class TestCapabilityGate:
 
     def test_no_backend_skips_without_clone(self, caplog):
         ws = make_workspace_manager(with_backend=False)
-        with patch("src.managers.git_manager.GitManager.clone") as mock_clone:
+        with patch("agent.managers.git_manager.GitManager.clone") as mock_clone:
             clone_repository_datasources([token_ds()], ws)
         mock_clone.assert_not_called()
         assert ws.source_repos == {}
@@ -76,7 +76,7 @@ class TestCapabilityGate:
 
     def test_backend_without_shell_skips(self, caplog):
         ws = make_workspace_manager(supports_shell=False)
-        with patch("src.managers.git_manager.GitManager.clone") as mock_clone:
+        with patch("agent.managers.git_manager.GitManager.clone") as mock_clone:
             clone_repository_datasources([token_ds()], ws)
         mock_clone.assert_not_called()
         assert any("shell support" in r.message for r in caplog.records)
@@ -86,7 +86,7 @@ class TestCapabilityGate:
         clone_repository_datasources([], ws)  # must not raise or log errors
 
     def test_local_clone_function_removed(self):
-        from src.core import datasource_setup
+        from agent.core import datasource_setup
 
         assert not hasattr(datasource_setup, "setup_repository_datasource")
 
@@ -98,7 +98,7 @@ class TestBackendClone:
         ws = make_workspace_manager()
         git_mgr = MagicMock()
         with patch(
-            "src.managers.git_manager.GitManager.clone", return_value=git_mgr
+            "agent.managers.git_manager.GitManager.clone", return_value=git_mgr
         ) as mock_clone:
             clone_repository_datasources(
                 [token_ds(default_branch="dev")],
@@ -122,7 +122,7 @@ class TestBackendClone:
             "credentials": {"auth_method": "ssh", "ssh_key": "KEYMATERIAL"},
         }
         with patch(
-            "src.managers.git_manager.GitManager.clone", return_value=MagicMock()
+            "agent.managers.git_manager.GitManager.clone", return_value=MagicMock()
         ) as mock_clone:
             clone_repository_datasources([ds], ws)
 
@@ -141,7 +141,7 @@ class TestBackendClone:
     def test_name_collision_gets_suffix(self):
         ws = make_workspace_manager()
         with patch(
-            "src.managers.git_manager.GitManager.clone", return_value=MagicMock()
+            "agent.managers.git_manager.GitManager.clone", return_value=MagicMock()
         ) as mock_clone:
             clone_repository_datasources(
                 [token_ds(name="upstream"), token_ds(name="fork")],
@@ -154,7 +154,7 @@ class TestBackendClone:
 
     def test_failed_clone_not_registered(self, caplog):
         ws = make_workspace_manager()
-        with patch("src.managers.git_manager.GitManager.clone", return_value=None):
+        with patch("agent.managers.git_manager.GitManager.clone", return_value=None):
             clone_repository_datasources([token_ds()], ws)
         assert ws.source_repos == {}
         assert any("Failed to clone" in r.message for r in caplog.records)
@@ -163,7 +163,7 @@ class TestBackendClone:
         ws = make_workspace_manager()
         git_mgr = MagicMock()
         git_mgr.checkout_branch.return_value = False
-        with patch("src.managers.git_manager.GitManager.clone", return_value=git_mgr):
+        with patch("agent.managers.git_manager.GitManager.clone", return_value=git_mgr):
             clone_repository_datasources(
                 [
                     token_ds(
@@ -188,7 +188,7 @@ class TestBackendClone:
         existing = MagicMock()
         existing.checkout_branch.return_value = True
 
-        with patch("src.managers.git_manager.GitManager") as git_manager:
+        with patch("agent.managers.git_manager.GitManager") as git_manager:
             git_manager.return_value = existing
             clone_repository_datasources(
                 [
@@ -220,9 +220,9 @@ class TestBackendClone:
         existing = MagicMock()
         existing.current_branch.return_value = "job/fix-thing"
 
-        with patch("src.managers.git_manager.GitManager") as git_manager:
+        with patch("agent.managers.git_manager.GitManager") as git_manager:
             git_manager.return_value = existing
-            with caplog.at_level(logging.DEBUG, logger="src.core.datasource_setup"):
+            with caplog.at_level(logging.DEBUG, logger="agent.core.datasource_setup"):
                 clone_repository_datasources([token_ds(default_branch="dev")], ws)
 
         existing.checkout_branch.assert_not_called()
@@ -242,7 +242,7 @@ class TestBackendClone:
         existing = MagicMock()
         existing.checkout_branch.return_value = False
 
-        with patch("src.managers.git_manager.GitManager") as git_manager:
+        with patch("agent.managers.git_manager.GitManager") as git_manager:
             git_manager.return_value = existing
             clone_repository_datasources(
                 [token_ds(default_branch="gone", require_default_branch=True)],
@@ -258,7 +258,7 @@ class TestBackendClone:
         ws = make_workspace_manager()
 
         with patch(
-            "src.managers.git_manager.GitManager.clone", return_value=MagicMock()
+            "agent.managers.git_manager.GitManager.clone", return_value=MagicMock()
         ):
             clone_repository_datasources([token_ds()], ws)
 
@@ -277,7 +277,7 @@ class TestBackendClone:
             read_only=False,
         )
         with patch(
-            "src.managers.git_manager.GitManager.clone", return_value=MagicMock()
+            "agent.managers.git_manager.GitManager.clone", return_value=MagicMock()
         ):
             clone_repository_datasources([ds], ws)
 
@@ -294,7 +294,7 @@ class TestBackendClone:
         ws = make_workspace_manager()
         ds = token_ds(config={"forge": "github"}, read_only=True)
         with patch(
-            "src.managers.git_manager.GitManager.clone", return_value=MagicMock()
+            "agent.managers.git_manager.GitManager.clone", return_value=MagicMock()
         ):
             clone_repository_datasources([ds], ws)
         assert ws.source_repo_meta["repo"]["read_only"] is True
@@ -336,7 +336,7 @@ class TestRealAgentPayloadCarriesForgeMetadata:
             )
         )
         with patch(
-            "src.managers.git_manager.GitManager.clone", return_value=MagicMock()
+            "agent.managers.git_manager.GitManager.clone", return_value=MagicMock()
         ):
             clone_repository_datasources(payload, ws)
 
@@ -363,7 +363,7 @@ class TestRealAgentPayloadCarriesForgeMetadata:
 
         ws = make_workspace_manager()
         with patch(
-            "src.managers.git_manager.GitManager.clone", return_value=MagicMock()
+            "agent.managers.git_manager.GitManager.clone", return_value=MagicMock()
         ):
             clone_repository_datasources(payload, ws)
 
@@ -373,8 +373,8 @@ class TestRealAgentPayloadCarriesForgeMetadata:
     async def test_resolved_row_reaches_the_pr_authority_writer(self):
         """Resolved DB row -> payload -> clone -> tool retains one exact UUID."""
 
-        from src.tools.context import ToolContext
-        from src.tools.repo import create_repo_tools
+        from agent.tools.context import ToolContext
+        from agent.tools.repo import create_repo_tools
 
         datasource_id = "22222222-2222-4222-8222-222222222222"
         payload = agent_payload(
@@ -390,7 +390,7 @@ class TestRealAgentPayloadCarriesForgeMetadata:
         git_mgr = MagicMock()
         git_mgr.current_branch.return_value = "job/exact-authority"
         git_mgr.rev_parse.return_value = "a" * 40
-        with patch("src.managers.git_manager.GitManager.clone", return_value=git_mgr):
+        with patch("agent.managers.git_manager.GitManager.clone", return_value=git_mgr):
             clone_repository_datasources(payload, ws)
 
         context = ToolContext(workspace_manager=ws)
@@ -405,11 +405,11 @@ class TestRealAgentPayloadCarriesForgeMetadata:
 
         with (
             patch(
-                "src.tools.repo.repo_tools.open_pull_request",
+                "agent.tools.repo.repo_tools.open_pull_request",
                 return_value={"number": 7, "url": "https://github.test/pr/7"},
             ),
             patch(
-                "src.tools.repo.repo_tools.get_pull_request_status",
+                "agent.tools.repo.repo_tools.get_pull_request_status",
                 return_value={
                     "number": 7,
                     "url": "https://github.test/pr/7",
@@ -439,7 +439,7 @@ class TestRealAgentPayloadCarriesForgeMetadata:
             token_ds(config={"forge": "github"}, project_read_only=True)
         )
         with patch(
-            "src.managers.git_manager.GitManager.clone", return_value=MagicMock()
+            "agent.managers.git_manager.GitManager.clone", return_value=MagicMock()
         ):
             clone_repository_datasources(payload, ws)
 
@@ -465,7 +465,7 @@ class TestRealAgentPayloadCarriesForgeMetadata:
             ),
         )
         with patch(
-            "src.managers.git_manager.GitManager.clone", return_value=MagicMock()
+            "agent.managers.git_manager.GitManager.clone", return_value=MagicMock()
         ):
             clone_repository_datasources(payload, ws)
 
@@ -479,7 +479,7 @@ class TestRealAgentPayloadCarriesForgeMetadata:
         ds = token_ds(config={"forge": "github"})
         ds["read_only"] = True
         with patch(
-            "src.managers.git_manager.GitManager.clone", return_value=MagicMock()
+            "agent.managers.git_manager.GitManager.clone", return_value=MagicMock()
         ):
             clone_repository_datasources([ds], ws)
 
@@ -495,9 +495,12 @@ class TestRealAgentPayloadCarriesForgeMetadata:
         ``repo_*`` tools come out the far end. Every unit test in this branch
         passed while this chain produced nothing.
         """
-        from src.core.loader import get_all_tool_names, load_config_from_resolved
-        from src.tools.context import ToolContext
-        from src.tools.registry import load_tools
+        from shared.runtime.core.loader import (
+            get_all_tool_names,
+            load_config_from_resolved,
+        )
+        from agent.tools.context import ToolContext
+        from agent.tools.registry import load_tools
 
         payload = agent_payload(
             token_ds(
@@ -510,7 +513,7 @@ class TestRealAgentPayloadCarriesForgeMetadata:
         )
         ws = make_workspace_manager()
         with patch(
-            "src.managers.git_manager.GitManager.clone", return_value=MagicMock()
+            "agent.managers.git_manager.GitManager.clone", return_value=MagicMock()
         ):
             clone_repository_datasources(payload, ws)
         assert ws.source_repo_meta["Superhuman-Remote-Worker"]["forge"] == "github"
@@ -545,7 +548,7 @@ class TestRealAgentPayloadCarriesForgeMetadata:
         ws = make_workspace_manager()
         ds = token_ds(url="git@github.com:org/repo.git", config={"forge": "github"})
         with patch(
-            "src.managers.git_manager.GitManager.clone", return_value=MagicMock()
+            "agent.managers.git_manager.GitManager.clone", return_value=MagicMock()
         ):
             clone_repository_datasources([ds], ws)
 
@@ -568,7 +571,7 @@ class TestRealAgentPayloadCarriesForgeMetadata:
             config={"forge": "github"},
         )
         with patch(
-            "src.managers.git_manager.GitManager.clone", return_value=MagicMock()
+            "agent.managers.git_manager.GitManager.clone", return_value=MagicMock()
         ):
             clone_repository_datasources([ds], ws)
 
@@ -665,7 +668,7 @@ class TestProcessDatasourcesRepoGuard:
     """process_datasources never clones — repository entries are skipped."""
 
     def test_repository_ds_ignored_with_warning(self, caplog):
-        with patch("src.core.datasource_setup.subprocess.run") as mock_run:
+        with patch("agent.core.datasource_setup.subprocess.run") as mock_run:
             connections, clients, cli_types = process_datasources([token_ds()])
         mock_run.assert_not_called()
         assert connections == {}

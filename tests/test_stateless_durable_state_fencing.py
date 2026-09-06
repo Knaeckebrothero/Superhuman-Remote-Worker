@@ -7,8 +7,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.api.lease_context import LeaseLostError
-from src.database.postgres_db import PostgresDB
+from agent.api.lease_context import LeaseLostError
+from agent.database.postgres_db import PostgresDB
 
 
 THREAD_ID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
@@ -195,14 +195,14 @@ async def test_repointed_lease_rejects_every_durable_operation_before_sql(
 
     with (
         patch(
-            "src.database.postgres_db._active_run_queue_lease",
+            "agent.database.postgres_db._active_run_queue_lease",
             return_value=(OTHER_THREAD_ID, LEASE[1]),
         ),
         patch(
-            "src.database.postgres_db._require_run_queue_fence",
+            "agent.database.postgres_db._require_run_queue_fence",
             new=AsyncMock(),
         ) as fence,
-        patch("src.api.lease_context.mark_current_lease_lost") as mark_lost,
+        patch("agent.api.lease_context.mark_current_lease_lost") as mark_lost,
         pytest.raises(LeaseLostError, match="cannot access thread"),
     ):
         await operation(db, THREAD_ID)
@@ -236,11 +236,11 @@ async def test_stale_lease_rejection_performs_no_durable_write(operation: Operat
 
     with (
         patch(
-            "src.database.postgres_db._active_run_queue_lease",
+            "agent.database.postgres_db._active_run_queue_lease",
             return_value=LEASE,
         ),
         patch(
-            "src.database.postgres_db._require_run_queue_fence",
+            "agent.database.postgres_db._require_run_queue_fence",
             new=AsyncMock(side_effect=LeaseLostError("stale")),
         ),
         pytest.raises(LeaseLostError, match="stale"),
@@ -285,11 +285,11 @@ async def test_fk_insert_uses_threads_then_queue_then_write_lock_order(
 
     with (
         patch(
-            "src.database.postgres_db._active_run_queue_lease",
+            "agent.database.postgres_db._active_run_queue_lease",
             return_value=LEASE,
         ),
         patch(
-            "src.database.postgres_db._require_run_queue_fence",
+            "agent.database.postgres_db._require_run_queue_fence",
             side_effect=fence,
         ),
     ):
@@ -341,11 +341,11 @@ async def test_message_write_uses_threads_then_queue_then_mutations(
 
     with (
         patch(
-            "src.database.postgres_db._active_run_queue_lease",
+            "agent.database.postgres_db._active_run_queue_lease",
             return_value=LEASE,
         ),
         patch(
-            "src.database.postgres_db._require_run_queue_fence",
+            "agent.database.postgres_db._require_run_queue_fence",
             side_effect=fence,
         ),
     ):
@@ -374,11 +374,11 @@ async def test_workspace_baseline_is_fenced_then_inserted_once_at_seq_zero():
 
     with (
         patch(
-            "src.database.postgres_db._active_run_queue_lease",
+            "agent.database.postgres_db._active_run_queue_lease",
             return_value=LEASE,
         ),
         patch(
-            "src.database.postgres_db._require_run_queue_fence",
+            "agent.database.postgres_db._require_run_queue_fence",
             side_effect=fence,
         ),
     ):

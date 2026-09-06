@@ -3,7 +3,7 @@ import subprocess
 import asyncssh
 import pytest
 
-from services.ssh_gateway_config import (
+from orchestrator.services.ssh_gateway_config import (
     ENCRYPTION_ALGS,
     KEX_ALGS,
     MAC_ALGS,

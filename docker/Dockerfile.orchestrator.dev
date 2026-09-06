@@ -23,8 +23,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-COPY orchestrator/requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt
+COPY requirements/ ./requirements/
+COPY scripts/lock_dependencies.py ./scripts/
+COPY src/orchestrator/requirements.txt ./src/orchestrator/requirements.txt
+RUN python scripts/lock_dependencies.py check orchestrator \
+    && pip install --no-cache-dir --require-hashes -r requirements/locks/orchestrator-py311.txt
 
 # -----------------------------------------------------------------------------
 # Dev runtime
@@ -36,7 +39,7 @@ LABEL description="Orchestrator API — dev image with uvicorn --reload"
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONPATH=/app \
+    PYTHONSAFEPATH=1 \
     PORT=8085
 
 WORKDIR /app
@@ -54,23 +57,31 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 
-# Layout matches the prod image: orchestrator content goes directly under /app
-# (so `from services.foo import bar` resolves), src and config keep their
-# package names.
-COPY orchestrator/ /app/
-COPY src/ /app/src/
+# Preserve the same installed package layout as the production image.
+COPY src/orchestrator/ /app/src/orchestrator/
+COPY src/shared/ /app/src/shared/
 COPY config/ /app/config/
+COPY pyproject.toml /app/
+RUN pip install --no-cache-dir --no-deps -e .
+
+RUN --network=none \
+    --mount=type=bind,source=requirements,target=/app/requirements \
+    --mount=type=bind,source=scripts/lock_dependencies.py,target=/app/scripts/lock_dependencies.py \
+    python -I /app/scripts/lock_dependencies.py check orchestrator --installed \
+    && python -m pip check
+
+# Check generated SDK auth and token refresh in this final installed environment.
+# The bind mount is build-only; the probe never reads credentials or uses a network.
+RUN --network=none --mount=type=bind,source=scripts/check_kubernetes_sdk_auth.py,target=/tmp/check_kubernetes_sdk_auth.py \
+    python -I /tmp/check_kubernetes_sdk_auth.py
 
 # Keep the metering package and the main entrypoint image-atomic. This import
 # catches selective/stale build contexts before Kubernetes sees the image.
-RUN python -c "import services.infrastructure_metering.compute_activation"
+RUN python -c "import orchestrator.services.infrastructure_metering.compute_activation"
 # The always-on session-memory drain must remain importable from the lean
-# orchestrator dependency set; importing through src.api would pull agent-only
+# orchestrator dependency set; importing through agent.api would pull agent-only
 # checkpoint dependencies and fail only after the Pod starts.
-RUN python -c "import services.session_memory_executor"
-
-# Marker so get_project_root() finds /app (no .git in container)
-RUN touch /app/pyproject.toml
+RUN python -c "import orchestrator.services.session_memory_executor"
 
 EXPOSE 8085
 
@@ -79,11 +90,10 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
 
 # uvicorn --reload re-imports changed modules without restarting the container.
 # --reload-dir keeps the watcher off bytecode caches and tests/.
-CMD ["uvicorn", "main:app", \
+CMD ["uvicorn", "orchestrator.main:app", \
      "--host", "0.0.0.0", \
      "--port", "8085", \
      "--timeout-graceful-shutdown", "10", \
      "--reload", \
-     "--reload-dir", "/app", \
      "--reload-dir", "/app/src", \
      "--reload-dir", "/app/config"]

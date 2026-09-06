@@ -20,8 +20,8 @@ from pathlib import Path
 
 import pytest
 
-from src.core.loader import load_and_merge_config, resolve_config_path
-from src.tools.registry import TOOL_REGISTRY
+from shared.runtime.core.loader import load_and_merge_config, resolve_config_path
+from agent.tools.registry import TOOL_REGISTRY
 
 # Wildcards are expanded at load time against the live registry, not looked up.
 _WILDCARDS = {"*"}

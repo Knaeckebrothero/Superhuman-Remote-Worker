@@ -85,15 +85,9 @@ async def test_upsert_settings_override_persists_value_json():
 
 
 def _import_main():
-    import sys
-    from pathlib import Path
+    import orchestrator.main  # noqa: E402
 
-    _orch = Path(__file__).parent.parent / "orchestrator"
-    if str(_orch) not in sys.path:
-        sys.path.insert(0, str(_orch))
-    import main  # noqa: E402
-
-    return main
+    return orchestrator.main
 
 
 def _registered_routes(app) -> set:

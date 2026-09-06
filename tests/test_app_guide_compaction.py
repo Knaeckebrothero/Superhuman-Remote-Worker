@@ -2,18 +2,18 @@
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
-from src.core.context import ContextConfig, ContextManager
-from src.core.expert_resolution import fence_skills_menu
-from src.core.skill_resolution import (
+from agent.core.context import ContextConfig, ContextManager
+from shared.runtime.core.expert_resolution import fence_skills_menu
+from shared.runtime.core.skill_resolution import (
     APP_GUIDE_LOADER_TOOL,
     add_persistent_system_skills,
     managed_product_guide_system_floor,
     managed_product_guide_turn_boundary,
 )
-from src.core.memory_injection import create_memory_injection_messages
-from src.persistent_graph import _inject_context_pairs
-from src.tools.context import ToolContext
-from src.tools.product_help import create_product_help_tools
+from agent.core.memory_injection import create_memory_injection_messages
+from agent.persistent_graph import _inject_context_pairs
+from agent.tools.context import ToolContext
+from agent.tools.product_help import create_product_help_tools
 
 
 def test_app_guide_can_be_loaded_again_after_old_result_is_compacted(monkeypatch):

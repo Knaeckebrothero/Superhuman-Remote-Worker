@@ -7,7 +7,7 @@ collision appends a deterministic 4-char hash.
 
 import re
 
-from src.tools.mcp.naming import mcp_server_slug, namespace_mcp_tool
+from agent.tools.mcp.naming import mcp_server_slug, namespace_mcp_tool
 
 
 class TestServerSlug:

@@ -19,7 +19,7 @@ Each tactical phase ends with a strategic review where you assess coverage:
 - Are you going deep on one thing instead of scanning broadly?
 
 A phase should represent one coherent exploration sweep — "scan web for caching patterns,"
-"audit error handling in src/tools/," "run latency benchmark" — not an entire research program.
+"audit error handling in src/agent/tools/," "run latency benchmark" — not an entire research program.
 
 ---
 
@@ -32,7 +32,7 @@ Every todo must be specific enough that you know *exactly* when it's done.
 | Vague (fails) | Specific (works) |
 |---|---|
 | "Research caching" | "Web search for 'Redis vs in-memory caching Python LangGraph', summarize top 5 approaches to notes/caching_research.md" |
-| "Look at the codebase" | "Read src/tools/research/ and search_files for 'retry' to find error handling patterns. Write idea if gaps found." |
+| "Look at the codebase" | "Read src/agent/tools/research/ and search_files for 'retry' to find error handling patterns. Write idea if gaps found." |
 | "Check performance" | "Run shell benchmark: time python -c 'from src.core.loader import load_config; load_config(\"defaults\")' — record result in output/experiments/003_config_load/" |
 | "Explore logging" | "Query job audit trail via curl to orchestrator API for jobs with status=failed, look for common error patterns" |
 | "Write up findings" | "Write output/ideas/007_retry_backoff.md with Problem, Proposal, Evidence, Effort from retry pattern analysis" |
@@ -54,9 +54,9 @@ Every todo must be specific enough that you know *exactly* when it's done.
 Before finalizing each todo, ask: "What artifact does this produce?"
 - "Research error handling" → No artifact named. Too vague.
 {% if has_tool("kb_write") -%}
-- "Search for error handling patterns in src/tools/, write idea to output/ideas/005_error_patterns.md if gaps found, or record dead end via the kb_write tool (type=learning, tag=dead-end)" → Clear artifact. Specific.
+- "Search for error handling patterns in src/agent/tools/, write idea to output/ideas/005_error_patterns.md if gaps found, or record dead end via the kb_write tool (type=learning, tag=dead-end)" → Clear artifact. Specific.
 {% else -%}
-- "Search for error handling patterns in src/tools/, write idea to output/ideas/005_error_patterns.md if gaps found, or record dead end to notes/dead_ends.md" → Clear artifact. Specific.
+- "Search for error handling patterns in src/agent/tools/, write idea to output/ideas/005_error_patterns.md if gaps found, or record dead end to notes/dead_ends.md" → Clear artifact. Specific.
 {% endif -%}
 
 ---
@@ -84,9 +84,9 @@ Example todos:
 Purpose: Dig through the repository for patterns, gaps, and improvement opportunities.
 
 Example todos:
-- "Map directory structure of src/tools/ — read each __init__.py to understand tool categories"
+- "Map directory structure of src/agent/tools/ — read each __init__.py to understand tool categories"
 - "Search for 'except Exception' across src/ — catalog overly broad exception handling"
-- "Read src/core/context.py and src/core/workspace_injection.py — look for optimization opportunities"
+- "Read src/agent/core/context.py and src/shared/runtime/core/workspace_injection.py — look for optimization opportunities"
 - "Run `git log -n 30` via run_command to identify most frequently changed files — check for code churn patterns"
 - "Run shell: ruff check src/ 2>&1 | head -50 — catalog lint issues by category"
 - "Write idea artifacts for each finding with specific file:line references"

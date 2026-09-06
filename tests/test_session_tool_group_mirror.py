@@ -76,7 +76,10 @@ def test_the_tool_name_lists_are_gone_from_the_types_module():
 
 def test_the_write_vocabulary_is_served_not_transcribed():
     """`shell` is the one category a client must enumerate — from the server."""
-    from src.core.tool_policy import ENUMERATE_ONLY_CATEGORIES, enumerate_only_members
+    from shared.runtime.core.tool_policy import (
+        ENUMERATE_ONLY_CATEGORIES,
+        enumerate_only_members,
+    )
 
     served = enumerate_only_members()
     assert set(served) == set(ENUMERATE_ONLY_CATEGORIES)

@@ -37,7 +37,7 @@ from orchestrator.services.infrastructure_metering.inventory import (
 
 ROOT = Path(__file__).parents[1]
 APP_MIGRATIONS = tuple(
-    ROOT / "orchestrator/database/migrations/app" / name
+    ROOT / "src/orchestrator/database/migrations/app" / name
     for name in (
         "0034_workspace_intervals.sql",
         "0086_infrastructure_metering_foundations.sql",
@@ -85,7 +85,7 @@ def test_applied_cutover_migration_checksums_are_frozen() -> None:
     }
 
     for filename, checksum in expected.items():
-        migration = ROOT / "orchestrator/database/migrations/app" / filename
+        migration = ROOT / "src/orchestrator/database/migrations/app" / filename
         assert hashlib.sha256(migration.read_bytes()).hexdigest() == checksum
 
 

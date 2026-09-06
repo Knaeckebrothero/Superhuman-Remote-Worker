@@ -12,7 +12,7 @@ from uuid import UUID
 
 import pytest
 
-from database.postgres import PostgresDB
+from orchestrator.database.postgres import PostgresDB
 
 
 JOB_A = "11111111-1111-4111-8111-111111111111"
@@ -940,7 +940,7 @@ async def test_transition_rejects_cleanup_bypassing_lifecycle_edges() -> None:
 
 def test_inventory_migration_is_owner_independent_and_conservative() -> None:
     migration = Path(
-        "orchestrator/database/migrations/app/0059_docker_workspace_leases.sql"
+        "src/orchestrator/database/migrations/app/0059_docker_workspace_leases.sql"
     ).read_text()
 
     assert "PRIMARY KEY (host, port)" in migration

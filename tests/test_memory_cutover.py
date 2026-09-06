@@ -31,16 +31,23 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
-from src.core.loader import InstructionFileEntry, QueryConfig, load_agent_config
-from src.core.message_markers import is_protected_message, protected_phase_key
-from src.core.workspace import WorkspaceManager
-from src.core.workspace_injection import (
+from shared.runtime.core.loader import (
+    InstructionFileEntry,
+    QueryConfig,
+    load_agent_config,
+)
+from shared.runtime.core.message_markers import (
+    is_protected_message,
+    protected_phase_key,
+)
+from agent.core.workspace import WorkspaceManager
+from shared.runtime.core.workspace_injection import (
     TODOS_INJECTION_CONTENT_PREFIX,
     is_workspace_injection_message,
 )
-from src.llm.exceptions import ContextOverflowError
-from src.managers import TodoManager, PlanManager
-from src.services.memory import (
+from shared.runtime.llm.exceptions import ContextOverflowError
+from agent.managers import TodoManager, PlanManager
+from agent.services.memory import (
     AssembleStats,
     Candidate,
     InjectionBlock,
@@ -48,7 +55,7 @@ from src.services.memory import (
     MemoryPayload,
     MemoryRuntime,
 )
-from src.tools.context import ToolContext
+from agent.tools.context import ToolContext
 from tests._fs_backend import FilesystemTestBackend
 from tests._memory_fixtures import (
     PROJECT_ID,
@@ -92,8 +99,8 @@ def make_payload(
     memory_text: str = "MEMBLOCK", knowledge_text: str = "KBBLOCK"
 ) -> MemoryPayload:
     """A payload with real injection pairs (the production message shapes)."""
-    from src.core.knowledge_injection import create_knowledge_injection_messages
-    from src.core.memory_injection import create_memory_injection_messages
+    from agent.core.knowledge_injection import create_knowledge_injection_messages
+    from agent.core.memory_injection import create_memory_injection_messages
 
     blocks: List[InjectionBlock] = []
     if memory_text:
@@ -246,7 +253,7 @@ class TestPipelineDefaults:
         """
         import dataclasses
 
-        from src.core.loader import deep_merge, load_agent_config_from_dict
+        from shared.runtime.core.loader import deep_merge, load_agent_config_from_dict
 
         worker_config.memory.manager_enabled = True
         base = dataclasses.asdict(worker_config)
@@ -269,7 +276,7 @@ class TestWorkerConstruction:
     """build_phase_alternation_graph builds the manager behind the flag."""
 
     def _build(self, config, workspace_manager, tool_context):
-        from src.graph import build_phase_alternation_graph
+        from agent.graph import build_phase_alternation_graph
 
         return build_phase_alternation_graph(
             llm_with_tools=MagicMock(),
@@ -296,7 +303,7 @@ class TestWorkerConstruction:
         ctx.recall_store = marker_store
 
         with patch(
-            "src.services.memory.MemoryManager.from_config",
+            "agent.services.memory.MemoryManager.from_config",
             return_value=RecordingManager(),
         ) as from_config:
             self._build(worker_config, workspace_manager, ctx)
@@ -327,7 +334,7 @@ class TestWorkerConstruction:
         ctx = ToolContext(workspace_manager=workspace_manager)
         ctx.recall_store = SimpleNamespace()
         mgr = RecordingManager()
-        with patch("src.services.memory.MemoryManager.from_config", return_value=mgr):
+        with patch("agent.services.memory.MemoryManager.from_config", return_value=mgr):
             graph = self._build(worker_config, workspace_manager, ctx)
         assert getattr(graph, "_srw_memory_service", None) is mgr
 
@@ -344,7 +351,7 @@ class TestWorkerConstruction:
         ctx = ToolContext(workspace_manager=workspace_manager)
 
         with patch(
-            "src.services.memory.MemoryManager.from_config",
+            "agent.services.memory.MemoryManager.from_config",
             return_value=RecordingManager(),
         ) as from_config:
             self._build(worker_config, workspace_manager, ctx)
@@ -356,7 +363,7 @@ class TestPersistentConstruction:
     """PersistentSession._setup_memory builds the manager behind the flag."""
 
     def _make_session(self, persistent_config):
-        from src.api.persistent_session import PersistentSession
+        from agent.api.persistent_session import PersistentSession
 
         return PersistentSession(thread_id=str(uuid.uuid4()), config=persistent_config)
 
@@ -371,11 +378,11 @@ class TestPersistentConstruction:
         recorder = RecordingManager()
         with (
             patch(
-                "src.services.embedding_service.get_embedding_service",
+                "shared.runtime.services.embedding_service.get_embedding_service",
                 return_value=MagicMock(verify_dimensions=AsyncMock()),
             ),
             patch(
-                "src.services.memory.MemoryManager.from_config",
+                "agent.services.memory.MemoryManager.from_config",
                 return_value=recorder,
             ) as from_config,
         ):
@@ -401,10 +408,10 @@ class TestPersistentConstruction:
 
         with (
             patch(
-                "src.services.embedding_service.get_embedding_service",
+                "shared.runtime.services.embedding_service.get_embedding_service",
                 return_value=MagicMock(verify_dimensions=AsyncMock()),
             ),
-            patch("src.services.memory.MemoryManager.from_config") as from_config,
+            patch("agent.services.memory.MemoryManager.from_config") as from_config,
         ):
             session._setup_memory(None, vector_conn=MagicMock())
 
@@ -418,7 +425,7 @@ class TestPersistentConstruction:
 
 
 def _make_execute_node(config, workspace_manager, todo_manager, ctx, service, mgr):
-    from src.graph import create_execute_node
+    from agent.graph import create_execute_node
 
     return create_execute_node(
         llm_with_tools=mgr["llm"],
@@ -516,8 +523,8 @@ def _count_text(request, text: str) -> int:
 
 def _mock_aux():
     """AuxiliaryLLM whose structured summariser returns a fixed short summary."""
-    from src.core.context import ConversationSummary
-    from src.services.auxiliary import AuxiliaryLLM
+    from agent.core.context import ConversationSummary
+    from shared.runtime.services.auxiliary import AuxiliaryLLM
 
     parsed = ConversationSummary(
         summary="Summary of the work so far.",
@@ -540,8 +547,8 @@ def _mock_aux():
 
 
 _EXECUTE_PATCHES = (
-    ("src.graph.get_archiver", None),
-    ("src.graph.get_phase_system_prompt", "SYS"),
+    ("agent.graph.get_archiver", None),
+    ("agent.graph.get_phase_system_prompt", "SYS"),
 )
 
 
@@ -570,8 +577,8 @@ class TestWorkerExecuteWiring:
         state = _worker_state()
 
         with (
-            patch("src.graph.get_archiver", return_value=None),
-            patch("src.graph.get_phase_system_prompt", return_value="SYS"),
+            patch("agent.graph.get_archiver", return_value=None),
+            patch("agent.graph.get_phase_system_prompt", return_value="SYS"),
         ):
             first = await node(state)
             _apply_turn(state, first)
@@ -638,8 +645,8 @@ class TestWorkerExecuteWiring:
         state["phase_instruction_injections"] = [key]
 
         with (
-            patch("src.graph.get_archiver", return_value=None),
-            patch("src.graph.get_phase_system_prompt", return_value="SYS"),
+            patch("agent.graph.get_archiver", return_value=None),
+            patch("agent.graph.get_phase_system_prompt", return_value="SYS"),
         ):
             first = await node(state)
             _apply_turn(state, first)
@@ -678,8 +685,8 @@ class TestWorkerExecuteWiring:
         state = _worker_state()
 
         with (
-            patch("src.graph.get_archiver", return_value=None),
-            patch("src.graph.get_phase_system_prompt", return_value="SYS"),
+            patch("agent.graph.get_archiver", return_value=None),
+            patch("agent.graph.get_phase_system_prompt", return_value="SYS"),
         ):
             first = await node(state)
             _apply_turn(state, first)
@@ -715,7 +722,7 @@ class TestWorkerExecuteWiring:
         trimming and summarisation each leave exactly one phase block —
         and summarisation seats it right after the summary, before the
         kept window."""
-        from src.core.context import ContextConfig, ContextManager
+        from agent.core.context import ContextConfig, ContextManager
 
         env = execute_env
         body = "RESEARCH PROCEDURE " * 40
@@ -729,8 +736,8 @@ class TestWorkerExecuteWiring:
             {"llm": env["llm"], "context": env["context"]},
         )
         with (
-            patch("src.graph.get_archiver", return_value=None),
-            patch("src.graph.get_phase_system_prompt", return_value="SYS"),
+            patch("agent.graph.get_archiver", return_value=None),
+            patch("agent.graph.get_phase_system_prompt", return_value="SYS"),
         ):
             first = await node(_worker_state())
         block = first["messages"][0]
@@ -826,8 +833,8 @@ class TestWorkerExecuteWiring:
         )
 
         with (
-            patch("src.graph.get_archiver", return_value=None),
-            patch("src.graph.get_phase_system_prompt", return_value="SYS"),
+            patch("agent.graph.get_archiver", return_value=None),
+            patch("agent.graph.get_phase_system_prompt", return_value="SYS"),
         ):
             result = await node(_worker_state())
 
@@ -853,11 +860,11 @@ class TestWorkerExecuteWiring:
         )
 
         with (
-            patch("src.graph.get_archiver", return_value=auditor),
+            patch("agent.graph.get_archiver", return_value=auditor),
             # The real prompt templates aren't under test (their Jinja
             # blocks trip get_phase_system_prompt's .format with the
             # bare default model) — the wiring is.
-            patch("src.graph.get_phase_system_prompt", return_value="SYS"),
+            patch("agent.graph.get_phase_system_prompt", return_value="SYS"),
         ):
             result = await node(_worker_state())
         await asyncio.sleep(0)  # let the fire-and-forget capture task run
@@ -934,8 +941,8 @@ class TestWorkerExecuteWiring:
         )
 
         with (
-            patch("src.graph.get_archiver", return_value=None),
-            patch("src.graph.get_phase_system_prompt", return_value="SYS"),
+            patch("agent.graph.get_archiver", return_value=None),
+            patch("agent.graph.get_phase_system_prompt", return_value="SYS"),
         ):
             await node(_worker_state())
         await asyncio.sleep(0)
@@ -957,7 +964,7 @@ class TestWorkerExecuteWiring:
 class TestArchiveNodeWiring:
     @pytest.mark.asyncio
     async def test_phase_boundary_capture(self, workspace_manager):
-        from src.graph import create_archive_phase_node
+        from agent.graph import create_archive_phase_node
 
         todo_manager = TodoManager(workspace_manager)
         plan_manager = PlanManager(workspace_manager)
@@ -1005,7 +1012,7 @@ class TestAuditedToolsWiring:
     async def test_todo_complete_capture_drains_queue(
         self, worker_config, workspace_manager
     ):
-        from src.graph import create_audited_tool_node
+        from agent.graph import create_audited_tool_node
 
         ctx = ToolContext(workspace_manager=workspace_manager)
         ctx.queue_memory(content="Queued insight", importance=0.7, source="todo")
@@ -1015,7 +1022,7 @@ class TestAuditedToolsWiring:
         fake_tool = MagicMock()
         fake_tool.name = "fake_tool"
 
-        with patch("src.graph.ToolNode") as MockToolNode:
+        with patch("agent.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             mock_tn.ainvoke = AsyncMock(
                 return_value={
@@ -1046,7 +1053,7 @@ class TestAuditedToolsWiring:
                 "phase_number": 2,
                 "metadata": {},
             }
-            with patch("src.graph.get_archiver", return_value=None):
+            with patch("agent.graph.get_archiver", return_value=None):
                 await node(state)
 
         assert [e.kind for e in service.captures] == ["todo_complete"]
@@ -1059,14 +1066,14 @@ class TestAuditedToolsWiring:
 
     @pytest.mark.asyncio
     async def test_empty_queue_emits_nothing(self, worker_config, workspace_manager):
-        from src.graph import create_audited_tool_node
+        from agent.graph import create_audited_tool_node
 
         ctx = ToolContext(workspace_manager=workspace_manager)
         service = RecordingManager()
         fake_tool = MagicMock()
         fake_tool.name = "fake_tool"
 
-        with patch("src.graph.ToolNode") as MockToolNode:
+        with patch("agent.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             mock_tn.ainvoke = AsyncMock(
                 return_value={
@@ -1097,7 +1104,7 @@ class TestAuditedToolsWiring:
                 "phase_number": 2,
                 "metadata": {},
             }
-            with patch("src.graph.get_archiver", return_value=None):
+            with patch("agent.graph.get_archiver", return_value=None):
                 await node(state)
 
         assert service.captures == []
@@ -1109,7 +1116,7 @@ class TestAuditedToolsWiring:
 
 
 def _persistent_callbacks():
-    from src.persistent_graph import PersistentLoopCallbacks
+    from agent.persistent_graph import PersistentLoopCallbacks
 
     return PersistentLoopCallbacks(
         get_user_input=AsyncMock(return_value="hello"),
@@ -1128,7 +1135,7 @@ def _persistent_callbacks():
 class TestPersistentTurnWiring:
     @pytest.mark.asyncio
     async def test_flag_on_assemble_and_insertion(self):
-        from src.persistent_graph import _execute_turn
+        from agent.persistent_graph import _execute_turn
 
         captured_prepared: List[List[Any]] = []
 
@@ -1195,7 +1202,7 @@ class TestPersistentTurnWiring:
 
     @pytest.mark.asyncio
     async def test_digest_flag_switches_query_formation(self):
-        from src.persistent_graph import _execute_turn
+        from agent.persistent_graph import _execute_turn
 
         async def _astream(msgs, **kwargs):
             yield AIMessage(content="ok")
@@ -1263,21 +1270,21 @@ def _archive_session(service: RecordingManager) -> MagicMock:
 class TestTeardownWiring:
     @pytest.mark.asyncio
     async def test_archive_captures_session_end(self):
-        from src.api.persistent_app import _handle_archive
+        from agent.api.persistent_app import _handle_archive
 
         service = RecordingManager()
         session = _archive_session(service)
         ws = AsyncMock()
 
         with (
-            patch("src.api.persistent_app._session", session),
-            patch("src.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session", session),
+            patch("agent.api.persistent_app._thread_id", "tid"),
             patch(
-                "src.api.persistent_app._update_thread_status",
+                "agent.api.persistent_app._update_thread_status",
                 new=AsyncMock(return_value=True),
             ),
             patch(
-                "src.api.persistent_app._terminate_session",
+                "agent.api.persistent_app._terminate_session",
                 new=AsyncMock(),
             ),
         ):
@@ -1295,21 +1302,21 @@ class TestTeardownWiring:
 
     @pytest.mark.asyncio
     async def test_idle_archive_captures_idle_kind(self):
-        from src.api.persistent_app import _handle_idle_archive
+        from agent.api.persistent_app import _handle_idle_archive
 
         service = RecordingManager()
         session = _archive_session(service)
         session.workspace_manager = None
 
         with (
-            patch("src.api.persistent_app._session", session),
-            patch("src.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session", session),
+            patch("agent.api.persistent_app._thread_id", "tid"),
             patch(
-                "src.api.persistent_app._update_thread_status",
+                "agent.api.persistent_app._update_thread_status",
                 new=AsyncMock(return_value=True),
             ),
             patch(
-                "src.api.persistent_app._terminate_session",
+                "agent.api.persistent_app._terminate_session",
                 new=AsyncMock(),
             ),
         ):
@@ -1321,7 +1328,7 @@ class TestTeardownWiring:
     @pytest.mark.asyncio
     async def test_terminate_captures_session_end_once(self):
         """B11: detach-style endings now capture — exactly once."""
-        from src.api import persistent_app
+        from agent.api import persistent_app
 
         service = RecordingManager()
         session = MagicMock()
@@ -1351,8 +1358,8 @@ class TestTeardownWiring:
     @pytest.mark.asyncio
     async def test_terminate_skips_when_archive_already_captured(self):
         """B11 guard: archive → terminate must not double-extract."""
-        from src.api import persistent_app
-        from src.api.persistent_app import _handle_archive
+        from agent.api import persistent_app
+        from agent.api.persistent_app import _handle_archive
 
         service = RecordingManager()
         session = _archive_session(service)
@@ -1371,7 +1378,7 @@ class TestTeardownWiring:
             patch.object(persistent_app, "_stop_watchdogs"),
         ):
             # _handle_archive reads the patched-in module globals directly
-            with patch("src.api.persistent_app._thread_id", "tid-b11-2"):
+            with patch("agent.api.persistent_app._thread_id", "tid-b11-2"):
                 await _handle_archive(ws)
             await persistent_app._terminate_session("loop_complete")
 
@@ -1411,7 +1418,7 @@ class TestStripRecognitionB10:
                 ("kb_notes", _make_kb_retriever(runtime)),
             ],
         )
-        from src.services.memory import AssembleRequest
+        from agent.services.memory import AssembleRequest
 
         payload = await manager.assemble(
             AssembleRequest(query_text="anything", model=None)
@@ -1431,7 +1438,7 @@ class TestStripRecognitionB10:
         manager = MemoryManager(
             MemoryRuntime(), retrievers=[("exotic", _ExoticRetriever())]
         )
-        from src.services.memory import AssembleRequest
+        from agent.services.memory import AssembleRequest
 
         payload = await manager.assemble(AssembleRequest(query_text="q"))
         assert payload.stats.candidates_total == 1
@@ -1439,13 +1446,13 @@ class TestStripRecognitionB10:
 
 
 def _make_recall_retriever(runtime):
-    from src.services.memory.plugins.legacy import RecallTwoTierRetriever
+    from agent.services.memory.plugins.legacy import RecallTwoTierRetriever
 
     return RecallTwoTierRetriever(runtime.recall_store)
 
 
 def _make_kb_retriever(runtime):
-    from src.services.memory.plugins.legacy import KbNotesRetriever
+    from agent.services.memory.plugins.legacy import KbNotesRetriever
 
     return KbNotesRetriever(runtime.knowledge_store, project_id=runtime.project_id)
 
@@ -1490,7 +1497,7 @@ class TestPhaseSkillBlocks:
     ):
         """A bound skill delivers its instructions, not its catalog frontmatter;
         the factory's [phase: ...] header is the only header."""
-        from src.core.message_markers import protected_path
+        from shared.runtime.core.message_markers import protected_path
 
         env = execute_env
         _bind_tactical_phase_skill(env)
@@ -1504,8 +1511,8 @@ class TestPhaseSkillBlocks:
         )
         state = _worker_state()
         with (
-            patch("src.graph.get_archiver", return_value=None),
-            patch("src.graph.get_phase_system_prompt", return_value="ONE-SYS"),
+            patch("agent.graph.get_archiver", return_value=None),
+            patch("agent.graph.get_phase_system_prompt", return_value="ONE-SYS"),
         ):
             first = await node(state)
 
@@ -1545,8 +1552,8 @@ class TestPhaseSkillBlocks:
         )
         state = _worker_state()
         with (
-            patch("src.graph.get_archiver", return_value=None),
-            patch("src.graph.get_phase_system_prompt", return_value="ONE-SYS"),
+            patch("agent.graph.get_archiver", return_value=None),
+            patch("agent.graph.get_phase_system_prompt", return_value="ONE-SYS"),
         ):
             first = await node(state)
             _apply_turn(state, first)

@@ -18,7 +18,7 @@ import pytest
 from fastapi import HTTPException
 from PIL import Image
 
-from services.job_evidence import (
+from orchestrator.services.job_evidence import (
     DIFF_LINE_LIMIT,
     MAX_IMAGES_PER_JOB,
     READ_PAGE_CHARS,
@@ -349,7 +349,7 @@ class TestManifestBuild:
     @pytest.mark.asyncio
     async def test_decompression_bomb_error_is_a_safe_manifest_rejection(self):
         with patch(
-            "services.job_evidence.Image.open",
+            "orchestrator.services.job_evidence.Image.open",
             side_effect=Image.DecompressionBombError("private/path.png"),
         ):
             manifest = await build_evidence_manifest(
@@ -420,7 +420,7 @@ def _available_entry(content: bytes, *, kind="test_report", media="text/plain") 
 class TestEvidenceRead:
     @pytest.mark.asyncio
     async def test_private_gitea_failure_logs_hide_repository_and_path(self, caplog):
-        from services.gitea import GiteaClient
+        from orchestrator.services.gitea import GiteaClient
 
         client = GiteaClient()
         client._initialized = True
@@ -740,7 +740,7 @@ class TestEvidenceRead:
         content = _png_bytes()
         entry = _available_entry(content, kind="screenshot", media="image/png")
         with patch(
-            "services.job_evidence.Image.open",
+            "orchestrator.services.job_evidence.Image.open",
             side_effect=Image.DecompressionBombError("private/path.png"),
         ):
             result = await read_evidence_entry(
@@ -848,12 +848,15 @@ class TestEvidenceRead:
 def _patch_caller_and_db(user: dict, db):
     stack = ExitStack()
     stack.enter_context(
-        patch("main.require_approved_user", AsyncMock(return_value=user))
+        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user))
     )
     stack.enter_context(
-        patch("security.access.require_approved_user", AsyncMock(return_value=user))
+        patch(
+            "orchestrator.security.access.require_approved_user",
+            AsyncMock(return_value=user),
+        )
     )
-    stack.enter_context(patch("main.postgres_db", db))
+    stack.enter_context(patch("orchestrator.main.postgres_db", db))
     return stack
 
 
@@ -871,7 +874,7 @@ class TestEvidenceRouteAuthorization:
     ):
         """A guessed/leaked evidence ID from another project is denied by the
         server scope gate before the manifest is even parsed."""
-        from main import read_job_evidence_route
+        from orchestrator.main import read_job_evidence_route
 
         job_a["context"] = {
             "evidence_manifest": {"recorded_at": "t", "entries": [{"id": "ev_1"}]}
@@ -888,7 +891,7 @@ class TestEvidenceRouteAuthorization:
     async def test_non_member_denied_listing(
         self, user_b, fake_db, fake_request, job_a
     ):
-        from main import list_job_evidence_route
+        from orchestrator.main import list_job_evidence_route
 
         with _patch_caller_and_db(user_b, fake_db):
             with pytest.raises(HTTPException) as excinfo:
@@ -899,7 +902,7 @@ class TestEvidenceRouteAuthorization:
     async def test_owner_reads_manifest_and_unknown_id_404s(
         self, user_a, fake_db, fake_request, job_a
     ):
-        from main import list_job_evidence_route, read_job_evidence_route
+        from orchestrator.main import list_job_evidence_route, read_job_evidence_route
 
         job_a["context"] = {
             "evidence_manifest": {
@@ -930,7 +933,7 @@ class TestEvidenceRouteAuthorization:
     async def test_route_failure_never_exposes_private_coordinates(
         self, user_a, fake_db, fake_request, job_a, caplog
     ):
-        from main import read_job_evidence_route
+        from orchestrator.main import read_job_evidence_route
 
         job_a["context"] = {
             "evidence_manifest": {
@@ -943,7 +946,7 @@ class TestEvidenceRouteAuthorization:
         private_detail = "victim-private-repo/private/report.png"
         with _patch_caller_and_db(user_a, fake_db):
             with patch(
-                "services.job_evidence.read_evidence_entry",
+                "orchestrator.services.job_evidence.read_evidence_entry",
                 AsyncMock(side_effect=RuntimeError(private_detail)),
             ):
                 with pytest.raises(HTTPException) as excinfo:
@@ -958,7 +961,7 @@ class TestEvidenceRouteAuthorization:
     async def test_completion_report_route_404_when_absent(
         self, user_a, fake_db, fake_request, job_a
     ):
-        from main import get_job_completion_report_route
+        from orchestrator.main import get_job_completion_report_route
 
         with _patch_caller_and_db(user_a, fake_db):
             with pytest.raises(HTTPException) as excinfo:

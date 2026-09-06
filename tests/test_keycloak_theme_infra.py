@@ -162,7 +162,7 @@ def test_light_tokens_match_the_shared_brand_palette() -> None:
     ties the Keycloak CSS to brand.py, so all three move together or a test
     fails. Without it the login page is exactly the surface that silently rots.
     """
-    from services import brand
+    from orchestrator.services import brand
 
     css = LOGIN_CSS.read_text()
     rules = _css_rules(css)
@@ -198,7 +198,7 @@ def test_dark_tokens_match_the_shared_senate_palette() -> None:
     Scoped to the .pf-v5-theme-dark block: a whole-file search would match the
     :root declarations of the very same token names.
     """
-    from services import brand
+    from orchestrator.services import brand
 
     scss = (ROOT / brand.SCSS_TOKEN_SOURCE).read_text()
     start = scss.index("$senate-theme: (")
@@ -548,7 +548,7 @@ def test_email_wrapper_uses_no_unmanaged_colours() -> None:
     everywhere else. Judges directives, not raw text: the header comment must
     stay free to name a colour it explains (see _ftl_directives).
     """
-    from services import brand
+    from orchestrator.services import brand
 
     ftl = _ftl_directives((THEME / "email/html/template.ftl").read_text())
     managed = {brand.normalize_hex(v) for v in brand.TRAVERTINE.values()}
@@ -571,7 +571,7 @@ def test_email_wrapper_never_uses_text_muted() -> None:
     tests/test_email_layout.py::test_footer_note_uses_text_secondary for the
     same ban on the Python-rendered side.
     """
-    from services import brand
+    from orchestrator.services import brand
 
     ftl = _ftl_directives((THEME / "email/html/template.ftl").read_text())
     used = {brand.normalize_hex(h) for h in re.findall(r"#[0-9a-fA-F]{3,6}\b", ftl)}

@@ -19,7 +19,7 @@ from uuid import UUID
 
 import pytest
 
-from services import session_wake
+from orchestrator.services import session_wake
 
 THREAD_ID = "6ce5bc4c-0000-4000-8000-000000000001"
 AGENT_ID = "f898a7dd-0000-4000-8000-000000000002"
@@ -168,9 +168,9 @@ async def test_a_held_officer_with_no_live_pod_is_reported_held_not_queued():
 
 from unittest.mock import MagicMock  # noqa: E402
 
-import main as orch_main  # noqa: E402
+import orchestrator.main as orch_main  # noqa: E402
 from fastapi import HTTPException  # noqa: E402
-from main import OfficerNoteRequest, send_project_officer_note  # noqa: E402
+from orchestrator.main import OfficerNoteRequest, send_project_officer_note  # noqa: E402
 
 
 @pytest.fixture
@@ -279,7 +279,7 @@ async def test_a_queued_note_reports_when_he_will_read_it(
 
 
 def test_the_legate_routes_are_wired():
-    from main import app
+    from orchestrator.main import app
 
     registered = {
         (method, getattr(route, "path", ""))

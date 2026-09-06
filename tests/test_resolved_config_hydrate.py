@@ -13,9 +13,9 @@ from unittest.mock import AsyncMock
 import pytest
 
 from orchestrator.services.config_resolver import resolve_config
-from src.agent import UniversalAgent
-from src.api.models import JobResumeRequest, JobStartRequest
-from src.core.loader import (
+from agent.agent import UniversalAgent
+from agent.api.models import JobResumeRequest, JobStartRequest
+from shared.runtime.core.loader import (
     SubagentsConfig,
     get_all_tool_names,
     load_agent_config,
@@ -181,7 +181,7 @@ def test_from_resolved_hydrates_a_materialised_roster():
     assert subagents.roster["explorer"]["llm"]["model"] == "claude-opus-4-1"
     assert "subagents" not in agent.config.extra
     # And each entry is a config in its own right (what the roster runtime parses).
-    from src.core.loader import load_agent_config_from_dict
+    from shared.runtime.core.loader import load_agent_config_from_dict
 
     child = load_agent_config_from_dict(subagents.roster["implementer"])
     assert child.agent_id == "implementer"

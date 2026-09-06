@@ -10,23 +10,20 @@ Tests:
 
 import json
 import pytest
-import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 # Add project root to path
 project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
 
-from src.tools.evaluation.evaluation_tools import (  # noqa: E402
+from agent.tools.evaluation.evaluation_tools import (  # noqa: E402
     _verdict_data,
     get_verdict_data,
     clear_verdict_data,
     EVALUATION_TOOLS_METADATA,
     create_evaluation_tools,
 )
-from src.core.phase import (  # noqa: E402
+from agent.core.phase import (  # noqa: E402
     _finalize_with_verdict,
     TransitionResult,
 )
@@ -252,7 +249,7 @@ class TestFinalizeJobNoImplicitApproval:
     def test_critic_without_verdict_does_not_synthesize_approval(self, caplog):
         import logging
 
-        from src.core.phase import finalize_job
+        from agent.core.phase import finalize_job
 
         state = make_state()  # metadata.verification_target == "target-job-1"
         ws = make_workspace()
@@ -275,7 +272,7 @@ class TestFinalizeJobNoImplicitApproval:
     def test_critic_without_verdict_still_completes_its_own_job(self):
         """The critic's own job must still resolve (not hang) — only the
         TARGET's advancement is refused, not the critic's own completion."""
-        from src.core.phase import finalize_job
+        from agent.core.phase import finalize_job
 
         state = make_state()
         ws = make_workspace()
@@ -299,7 +296,7 @@ class TestHandleTransitionFreezeDataStatus:
     @pytest.mark.asyncio
     async def test_freeze_data_status_completed(self):
         """When freeze_data has status='completed', DB should get 'completed'."""
-        from src.core.phase import TransitionResult
+        from agent.core.phase import TransitionResult
 
         mock_db = MagicMock()
         mock_db.jobs = MagicMock()
@@ -691,7 +688,7 @@ class TestStrategicPhaseWithVerdict:
 
     def test_verdict_triggers_finalize(self):
         """When verdict data exists, on_strategic_phase_complete should finalize."""
-        from src.core.phase import on_strategic_phase_complete
+        from agent.core.phase import on_strategic_phase_complete
 
         state = make_state()
         ws = make_workspace()
@@ -732,8 +729,8 @@ class TestVerdictDurability:
         (`if client is None: return None`). For a verdict that is exactly
         backwards — a silently-unrecorded rejection becomes an approval.
         """
-        from src.tools.context import ToolContext
-        from src.tools.evaluation.evaluation_tools import create_evaluation_tools
+        from agent.tools.context import ToolContext
+        from agent.tools.evaluation.evaluation_tools import create_evaluation_tools
 
         ctx = ToolContext(_job_id="c1", config={})
         ctx.orchestrator_client = None
@@ -748,7 +745,7 @@ class TestVerdictDurability:
         )
 
         assert "error" in result.lower()
-        from src.tools.evaluation.evaluation_tools import get_verdict_data
+        from agent.tools.evaluation.evaluation_tools import get_verdict_data
 
         assert get_verdict_data("c1") is None
 
@@ -757,8 +754,8 @@ class TestVerdictDurability:
         """The server's computed verdict wins over what the model claimed."""
         from unittest.mock import AsyncMock
 
-        from src.tools.context import ToolContext
-        from src.tools.evaluation.evaluation_tools import (
+        from agent.tools.context import ToolContext
+        from agent.tools.evaluation.evaluation_tools import (
             create_evaluation_tools,
             get_verdict_data,
         )
@@ -797,8 +794,8 @@ class TestVerdictDurability:
         """
         from unittest.mock import AsyncMock, MagicMock
 
-        from src.tools.context import ToolContext
-        from src.tools.evaluation.evaluation_tools import (
+        from agent.tools.context import ToolContext
+        from agent.tools.evaluation.evaluation_tools import (
             create_evaluation_tools,
             get_verdict_data,
         )
@@ -843,9 +840,9 @@ class TestVerdictDurability:
         """
         from unittest.mock import AsyncMock
 
-        from src.api.orchestrator_client import VerdictRecordingError
-        from src.tools.context import ToolContext
-        from src.tools.evaluation.evaluation_tools import (
+        from agent.api.orchestrator_client import VerdictRecordingError
+        from agent.tools.context import ToolContext
+        from agent.tools.evaluation.evaluation_tools import (
             create_evaluation_tools,
             get_verdict_data,
         )
@@ -870,9 +867,9 @@ class TestVerdictDurability:
         """Round 1 fix — Finding 2 (return_job_with_feedback half)."""
         from unittest.mock import AsyncMock
 
-        from src.api.orchestrator_client import VerdictRecordingError
-        from src.tools.context import ToolContext
-        from src.tools.evaluation.evaluation_tools import (
+        from agent.api.orchestrator_client import VerdictRecordingError
+        from agent.tools.context import ToolContext
+        from agent.tools.evaluation.evaluation_tools import (
             create_evaluation_tools,
             get_verdict_data,
         )
@@ -908,9 +905,9 @@ class TestVerdictDurability:
         """
         from unittest.mock import AsyncMock
 
-        from src.api.orchestrator_client import VerdictRecordingError
-        from src.tools.context import ToolContext
-        from src.tools.evaluation.evaluation_tools import (
+        from agent.api.orchestrator_client import VerdictRecordingError
+        from agent.tools.context import ToolContext
+        from agent.tools.evaluation.evaluation_tools import (
             create_evaluation_tools,
             get_verdict_data,
         )

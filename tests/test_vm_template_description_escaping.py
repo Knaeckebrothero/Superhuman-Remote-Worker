@@ -41,8 +41,6 @@ import pytest
 import yaml
 
 PROJECT_ROOT = Path(__file__).parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
 # The same-cluster template mounts cloud-init from a Secret (no KubeVirt
 # 2048-byte inline cap), but the controller still truncates the description and
@@ -146,14 +144,9 @@ BASE_JOB_CONFIG = {
 def _install_controller_import_stubs() -> None:
     """Make `vm.controller.controller` importable outside its own image.
 
-    It does `from headscale_client import HeadscaleClient` (only resolvable
-    inside vm/controller/) and imports kubernetes + nats, none of which are
-    installed in the test environment. Mirrors test_vm_controller.py.
+    Kubernetes and NATS collaborators are stubbed as in test_vm_controller.py.
+    The Headscale client resolves through its installed canonical package.
     """
-    headscale = types.ModuleType("headscale_client")
-    headscale.HeadscaleClient = MagicMock()
-    sys.modules.setdefault("headscale_client", headscale)
-
     k8s = types.ModuleType("kubernetes")
     k8s_client = types.ModuleType("kubernetes.client")
     k8s_config = types.ModuleType("kubernetes.config")
@@ -190,7 +183,7 @@ def _controller_render(description: str) -> dict:
     rendered cloud-init back on the manifest as _srwCloudInitUserData.
     """
     _install_controller_import_stubs()
-    from vm.controller.controller import VMController
+    from vm_controller.controller import VMController
 
     ctrl = VMController()
     ctrl.template_text = _load_chart_vm_template(MAIN_CHART_CONFIGMAP)

@@ -8,8 +8,8 @@ import httpx
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from src.llm.exceptions import ContextOverflowError
-from src.llm.reasoning_chat import (
+from shared.runtime.llm.exceptions import ContextOverflowError
+from shared.runtime.llm.reasoning_chat import (
     AsyncReasoningCapturingClient,
     ReasoningCapturingClient,
     count_request_tokens,

@@ -39,8 +39,11 @@ import pytest
 from fastapi import HTTPException
 
 import orchestrator.main as orch_main
-from services.agent_pod_entrypoint import InvalidConfigNameError, validate_config_name
-from services.session_runtime_admission import ThreadRuntimeAuthority
+from orchestrator.services.agent_pod_entrypoint import (
+    InvalidConfigNameError,
+    validate_config_name,
+)
+from orchestrator.services.session_runtime_admission import ThreadRuntimeAuthority
 
 
 # Each of these breaks a different rule in the allow-list, and each is the
@@ -106,12 +109,15 @@ class TestValidatorVocabulary:
 def _patch_caller(user: dict, db) -> ExitStack:
     stack = ExitStack()
     stack.enter_context(
-        patch("main.require_approved_user", AsyncMock(return_value=user))
+        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user))
     )
     stack.enter_context(
-        patch("security.access.require_approved_user", AsyncMock(return_value=user))
+        patch(
+            "orchestrator.security.access.require_approved_user",
+            AsyncMock(return_value=user),
+        )
     )
-    stack.enter_context(patch("main.postgres_db", db))
+    stack.enter_context(patch("orchestrator.main.postgres_db", db))
     return stack
 
 
@@ -123,12 +129,12 @@ class TestThreadCreateWriteBoundary:
     async def test_hostile_name_is_refused_before_any_insert(
         self, name, user_a, fake_db, fake_request
     ):
-        from main import ThreadCreateRequest, create_thread
+        from orchestrator.main import ThreadCreateRequest, create_thread
 
         fake_db.create_thread = AsyncMock()
         fake_db.get_user_settings = AsyncMock(return_value={})
         with _patch_caller(user_a, fake_db):
-            with patch("main._enforce_readiness_gate", AsyncMock()):
+            with patch("orchestrator.main._enforce_readiness_gate", AsyncMock()):
                 with pytest.raises(HTTPException) as exc:
                     await create_thread(
                         ThreadCreateRequest(config_name=name), fake_request
@@ -149,11 +155,11 @@ class TestThreadCreateWriteBoundary:
         that it is no longer the config_name check that refuses, i.e. no 422
         naming the field.
         """
-        from main import ThreadCreateRequest, create_thread
+        from orchestrator.main import ThreadCreateRequest, create_thread
 
         fake_db.get_user_settings = AsyncMock(return_value={})
         with _patch_caller(user_a, fake_db):
-            with patch("main._enforce_readiness_gate", AsyncMock()):
+            with patch("orchestrator.main._enforce_readiness_gate", AsyncMock()):
                 try:
                     await create_thread(
                         ThreadCreateRequest(config_name=name), fake_request
@@ -172,11 +178,11 @@ class TestAgentThreadCreateWriteBoundary:
 
     @pytest.mark.asyncio
     async def test_hostile_name_is_refused_before_any_insert(self, fake_db):
-        from main import AgentThreadCreateRequest, agent_create_thread
+        from orchestrator.main import AgentThreadCreateRequest, agent_create_thread
 
         fake_db.create_thread = AsyncMock()
-        with patch("main.postgres_db", fake_db):
-            with patch("main.require_internal", AsyncMock()):
+        with patch("orchestrator.main.postgres_db", fake_db):
+            with patch("orchestrator.main.require_internal", AsyncMock()):
                 with pytest.raises(HTTPException) as exc:
                     await agent_create_thread(
                         MagicMock(),
@@ -196,14 +202,14 @@ class TestJobCreateWriteBoundary:
     async def test_hostile_name_is_refused_before_any_insert(
         self, name, user_a, fake_db, fake_request
     ):
-        from main import JobCreate, create_job
+        from orchestrator.main import JobCreate, create_job
 
         fake_db.create_job = AsyncMock()
         # No default project: the boundary under test must fire on a plain,
         # unscoped job create, not only inside a project.
         fake_db.get_user = AsyncMock(return_value=user_a)
         with _patch_caller(user_a, fake_db):
-            with patch("main._enforce_readiness_gate", AsyncMock()):
+            with patch("orchestrator.main._enforce_readiness_gate", AsyncMock()):
                 with pytest.raises(HTTPException) as exc:
                     await create_job(
                         fake_request,
@@ -223,7 +229,7 @@ class TestProjectDefaultConfigNameWriteBoundary:
     async def test_create_project_refuses_hostile_default(
         self, user_a, fake_db, fake_request
     ):
-        from main import ProjectCreate, create_project
+        from orchestrator.main import ProjectCreate, create_project
 
         fake_db.create_project = AsyncMock()
         with _patch_caller(user_a, fake_db):
@@ -244,12 +250,12 @@ class TestProjectDefaultConfigNameWriteBoundary:
     async def test_patch_project_refuses_hostile_default(
         self, user_a, project_a, fake_db, fake_request
     ):
-        from main import ProjectUpdate, update_project
+        from orchestrator.main import ProjectUpdate, update_project
 
         fake_db.update_project = AsyncMock(return_value=True)
         with _patch_caller(user_a, fake_db):
             with patch(
-                "main.require_project_owner",
+                "orchestrator.main.require_project_owner",
                 AsyncMock(return_value=(user_a, project_a)),
             ):
                 with pytest.raises(HTTPException) as exc:
@@ -312,8 +318,10 @@ class TestAutomationExpertWriteBoundary:
 
     @pytest.mark.asyncio
     async def test_hostile_expert_is_refused(self):
-        from services.automations import validate_automation_expert_selection
-        from services.default_experts import ExpertSelectionError
+        from orchestrator.services.automations import (
+            validate_automation_expert_selection,
+        )
+        from orchestrator.services.default_experts import ExpertSelectionError
 
         with pytest.raises(ExpertSelectionError) as exc:
             await validate_automation_expert_selection(
@@ -327,7 +335,9 @@ class TestAutomationExpertWriteBoundary:
 
     @pytest.mark.asyncio
     async def test_legitimate_expert_still_normalizes(self):
-        from services.automations import validate_automation_expert_selection
+        from orchestrator.services.automations import (
+            validate_automation_expert_selection,
+        )
 
         assert (
             await validate_automation_expert_selection(
@@ -435,7 +445,7 @@ class TestCommissionedOfficerProvisioningFailsLoudly:
         )
         recorder = _LifecycleRecorder()
 
-        with patch("services.session_lifecycle.emit", recorder):
+        with patch("orchestrator.services.session_lifecycle.emit", recorder):
             # Must not raise: in production this IS the task body, and a raise
             # here is dropped by asyncio with nothing else recording it.
             await orch_main._provision_commissioned_officer(
@@ -467,7 +477,7 @@ class TestCommissionedOfficerProvisioningFailsLoudly:
         monkeypatch.setattr(orch_main, "persistent_provisioner", prov)
         recorder = _LifecycleRecorder()
 
-        with patch("services.session_lifecycle.emit", recorder):
+        with patch("orchestrator.services.session_lifecycle.emit", recorder):
             await orch_main._provision_commissioned_officer(
                 THREAD_ID,
                 user_id=USER_ID,
@@ -492,7 +502,7 @@ class TestCommissionedOfficerProvisioningFailsLoudly:
         )
         recorder = _LifecycleRecorder()
 
-        with patch("services.session_lifecycle.emit", recorder):
+        with patch("orchestrator.services.session_lifecycle.emit", recorder):
             await orch_main._provision_commissioned_officer(
                 THREAD_ID,
                 user_id=USER_ID,
@@ -573,17 +583,30 @@ def _resume_db(user_a, thread_row: dict):
 def _resume_stack(user: dict, db, thread_row: dict) -> ExitStack:
     stack = ExitStack()
     stack.enter_context(
-        patch("main.require_thread_owner", AsyncMock(return_value=(user, thread_row)))
+        patch(
+            "orchestrator.main.require_thread_owner",
+            AsyncMock(return_value=(user, thread_row)),
+        )
     )
-    stack.enter_context(patch("main.postgres_db", db))
-    stack.enter_context(patch("main.ensure_session_workspace", AsyncMock()))
-    stack.enter_context(patch("main._thread_config_drift", AsyncMock(return_value=[])))
-    stack.enter_context(patch("main._await_late_cloud_setup", AsyncMock()))
+    stack.enter_context(patch("orchestrator.main.postgres_db", db))
     stack.enter_context(
-        patch("main._await_protected_cloud_runtime_ready", AsyncMock(return_value=True))
+        patch("orchestrator.main.ensure_session_workspace", AsyncMock())
     )
     stack.enter_context(
-        patch("main._find_idle_persistent_agent", AsyncMock(return_value=None))
+        patch("orchestrator.main._thread_config_drift", AsyncMock(return_value=[]))
+    )
+    stack.enter_context(patch("orchestrator.main._await_late_cloud_setup", AsyncMock()))
+    stack.enter_context(
+        patch(
+            "orchestrator.main._await_protected_cloud_runtime_ready",
+            AsyncMock(return_value=True),
+        )
+    )
+    stack.enter_context(
+        patch(
+            "orchestrator.main._find_idle_persistent_agent",
+            AsyncMock(return_value=None),
+        )
     )
     return stack
 
@@ -597,7 +620,7 @@ class TestResumeReprovisionFailsLoudly:
     async def test_refused_config_name_records_a_failed_state(
         self, user_a, fake_request
     ):
-        from main import resume_thread
+        from orchestrator.main import resume_thread
 
         thread_row = _preparable_thread(
             user_id=str(user_a["id"]),
@@ -618,9 +641,11 @@ class TestResumeReprovisionFailsLoudly:
         )
 
         with _resume_stack(user_a, db, thread_row):
-            with patch("main.agent_provisioner", provisioner):
-                with patch("main.asyncio.create_task", tasks):
-                    with patch("services.session_lifecycle.emit", recorder):
+            with patch("orchestrator.main.agent_provisioner", provisioner):
+                with patch("orchestrator.main.asyncio.create_task", tasks):
+                    with patch(
+                        "orchestrator.services.session_lifecycle.emit", recorder
+                    ):
                         await resume_thread(THREAD_ID, fake_request)
                         assert await tasks.drain("_reprovision") == 1
 
@@ -634,7 +659,7 @@ class TestResumeReprovisionFailsLoudly:
     async def test_legacy_path_refusal_records_a_failed_state(
         self, user_a, fake_request
     ):
-        from main import resume_thread
+        from orchestrator.main import resume_thread
 
         thread_row = _preparable_thread(
             user_id=str(user_a["id"]),
@@ -647,14 +672,17 @@ class TestResumeReprovisionFailsLoudly:
 
         with _resume_stack(user_a, db, thread_row):
             with patch(
-                "main.agent_provisioner",
+                "orchestrator.main.agent_provisioner",
                 SimpleNamespace(is_available=False, in_cluster=False),
             ):
                 with patch(
-                    "main.persistent_provisioner", _refusing_persistent_provisioner()
+                    "orchestrator.main.persistent_provisioner",
+                    _refusing_persistent_provisioner(),
                 ):
-                    with patch("main.asyncio.create_task", tasks):
-                        with patch("services.session_lifecycle.emit", recorder):
+                    with patch("orchestrator.main.asyncio.create_task", tasks):
+                        with patch(
+                            "orchestrator.services.session_lifecycle.emit", recorder
+                        ):
                             await resume_thread(THREAD_ID, fake_request)
                             assert await tasks.drain("_reprovision_legacy") == 1
 
@@ -698,8 +726,8 @@ class TestMagicLinkWakeProvisioningFailsLoudly:
 
         tasks = _CollectingCreateTask()
         recorder = _LifecycleRecorder()
-        with patch("main.asyncio.create_task", tasks):
-            with patch("services.session_lifecycle.emit", recorder):
+        with patch("orchestrator.main.asyncio.create_task", tasks):
+            with patch("orchestrator.services.session_lifecycle.emit", recorder):
                 await orch_main._phase5_wake_if_suspended(THREAD_ID)
                 assert await tasks.drain("_create_after_magic_link") == 1
 

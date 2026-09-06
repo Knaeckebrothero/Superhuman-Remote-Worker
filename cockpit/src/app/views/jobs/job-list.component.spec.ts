@@ -722,6 +722,25 @@ describe('JobListComponent — filters drive the URL', () => {
     component.goToPage(1);
     expect(navigate.mock.calls[0][1].queryParams.as_of).toBeNull();
   });
+
+  it('keeps a capped total when the next HTTP page skips counting', () => {
+    const params = new BehaviorSubject(paramMap({}));
+    const stamp = '2026-09-06T09:00:00Z';
+    const getJobsPage = vi.fn()
+      .mockReturnValueOnce(of(page([job('a')], {total: 10_000, total_is_capped: true, has_more: true, as_of: stamp})))
+      .mockReturnValueOnce(of(page([job('b')], {total: null, total_is_capped: false, has_more: false, offset: 25, as_of: stamp})));
+    const {fixture, component} = mountLogic({params, api: {getJobsPage} as Partial<ApiService>});
+    fixture.detectChanges();
+    params.next(paramMap({page: '2', as_of: stamp}));
+
+    const query = getJobsPage.mock.calls[1][0] as Record<string, unknown>;
+    expect(query['include_total']).toBe(false);
+    expect(query['as_of']).toBe(stamp);
+    expect(component.total()).toBe(10_000);
+    expect(component.totalIsCapped()).toBe(true);
+    expect(component.hasMore()).toBe(false);
+    expect(component.jobs().map((row) => row.id)).toEqual(['b']);
+  });
 });
 
 describe('JobListComponent — live refresh', () => {

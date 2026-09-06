@@ -16,7 +16,7 @@ import re
 
 import pytest
 
-from src.core.loader import _has_shell_tools, render_instruction_content
+from shared.runtime.core.loader import _has_shell_tools, render_instruction_content
 
 # summarization_* are rendered with .format_map (see services/auxiliary.py),
 # not Jinja — they are not part of this contract.

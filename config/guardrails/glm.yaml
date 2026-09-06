@@ -4,7 +4,7 @@
 # OpenAI-compatible API (LangChain ChatOpenAI over OpenRouter). Tool calls use
 # standard OpenAI parens-form serialization — everything in `default.yaml`
 # applies as-is. Reasoning is returned out-of-band (OpenRouter
-# `reasoning`/`reasoning_details`) and captured by src/llm/reasoning_chat.py,
+# `reasoning`/`reasoning_details`) and captured by src/shared/runtime/llm/reasoning_chat.py,
 # so it never needs to appear in tool examples.
 #
 # Starts empty; this file exists so the matrix has a guardrails entry for `glm`

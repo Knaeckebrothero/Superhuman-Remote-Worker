@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from fastapi import HTTPException
 
-import main
+import orchestrator.main
 
 THREAD_ID = str(uuid.uuid4())
 
@@ -32,20 +32,22 @@ def _thread(*, officer=True):
 
 @pytest.fixture
 def wired(monkeypatch):
-    monkeypatch.setattr(main, "require_internal", AsyncMock())
+    monkeypatch.setattr(orchestrator.main, "require_internal", AsyncMock())
     monkeypatch.setattr(
-        main.postgres_db, "get_thread", AsyncMock(return_value=_thread())
+        orchestrator.main.postgres_db, "get_thread", AsyncMock(return_value=_thread())
     )
     dispatch = AsyncMock(return_value="n-1")
-    monkeypatch.setattr(main, "_dispatch_officer_page", dispatch)
+    monkeypatch.setattr(orchestrator.main, "_dispatch_officer_page", dispatch)
     return dispatch
 
 
 async def _call(
     urgency, message="Capacity exhausted with work queued", subject="Capacity"
 ):
-    body = main.OfficerNotifyRequest(message=message, urgency=urgency, subject=subject)
-    return await main.agent_officer_notify(MagicMock(), THREAD_ID, body)
+    body = orchestrator.main.OfficerNotifyRequest(
+        message=message, urgency=urgency, subject=subject
+    )
+    return await orchestrator.main.agent_officer_notify(MagicMock(), THREAD_ID, body)
 
 
 class TestUrgencies:
@@ -100,7 +102,7 @@ class TestRejections:
     @pytest.mark.asyncio
     async def test_non_officer_thread_is_409(self, wired, monkeypatch):
         monkeypatch.setattr(
-            main.postgres_db,
+            orchestrator.main.postgres_db,
             "get_thread",
             AsyncMock(return_value=_thread(officer=False)),
         )
@@ -111,7 +113,7 @@ class TestRejections:
     @pytest.mark.asyncio
     async def test_missing_thread_is_404(self, wired, monkeypatch):
         monkeypatch.setattr(
-            main.postgres_db, "get_thread", AsyncMock(return_value=None)
+            orchestrator.main.postgres_db, "get_thread", AsyncMock(return_value=None)
         )
         with pytest.raises(HTTPException) as e:
             await _call("page")

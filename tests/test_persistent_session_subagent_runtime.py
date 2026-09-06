@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.subagents.host import SessionHost
+from agent.subagents.host import SessionHost
 from tests.test_persistent_session import _make_session
 
 
@@ -36,11 +36,11 @@ def test_delegation_tool_installs_a_true_thread_parent_runtime():
 
     with (
         patch(
-            "src.subagents.session_persistence.SessionSubagentLedger.from_context",
+            "agent.subagents.session_persistence.SessionSubagentLedger.from_context",
             return_value=ledger,
         ) as ledger_factory,
         patch(
-            "src.subagents.runtime.SubagentRuntime.from_context",
+            "agent.subagents.runtime.SubagentRuntime.from_context",
             return_value=runtime,
         ) as runtime_factory,
     ):
@@ -112,11 +112,11 @@ def test_fully_wired_session_installs_hidden_runtime_for_revoked_config_recovery
 
     with (
         patch(
-            "src.subagents.session_persistence.SessionSubagentLedger.from_context",
+            "agent.subagents.session_persistence.SessionSubagentLedger.from_context",
             return_value=ledger,
         ),
         patch(
-            "src.subagents.runtime.SubagentRuntime.from_context",
+            "agent.subagents.runtime.SubagentRuntime.from_context",
             return_value=runtime,
         ),
     ):

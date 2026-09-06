@@ -23,7 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from pydantic import ValidationError
 
-from src.tools.knowledge.knowledge_tools import (
+from agent.tools.knowledge.knowledge_tools import (
     KNOWLEDGE_TOOLS_METADATA,
     _post_vault_file,
     create_kb_tools,
@@ -50,7 +50,7 @@ def _make_context(project_id=None, project_ids=None, job_id=None):
 def _make_tools(context=None):
     """Create kb tools with mocked context, patching asyncio loop."""
     ctx = context or _make_context()
-    with patch("src.tools.knowledge.knowledge_tools.asyncio") as mock_asyncio:
+    with patch("agent.tools.knowledge.knowledge_tools.asyncio") as mock_asyncio:
         mock_asyncio.get_running_loop.side_effect = RuntimeError("no loop")
         tools = create_kb_tools(ctx)
     return tools, ctx
@@ -99,7 +99,7 @@ def _no_materialization_http():
     holds its own module-level reference and is unaffected.
     """
     with patch(
-        "src.tools.knowledge.knowledge_tools._post_vault_file",
+        "agent.tools.knowledge.knowledge_tools._post_vault_file",
         return_value={"status": "committed", "path": "knowledge/test.md"},
     ):
         yield
@@ -138,7 +138,7 @@ def _capture_materialize(result=None):
         return dict(result or {"status": "committed", "path": f"knowledge/{slug}.md"})
 
     patcher = patch(
-        "src.tools.knowledge.knowledge_tools._post_vault_file", side_effect=_fake
+        "agent.tools.knowledge.knowledge_tools._post_vault_file", side_effect=_fake
     )
     return patcher, calls
 
@@ -157,7 +157,11 @@ def _fake_http(status_code=200, body=None, raises=None):
         client.post.return_value = response
     ctor = MagicMock()
     ctor.return_value.__enter__.return_value = client
-    return patch("src.tools.knowledge.knowledge_tools.httpx.Client", ctor), ctor, client
+    return (
+        patch("agent.tools.knowledge.knowledge_tools.httpx.Client", ctor),
+        ctor,
+        client,
+    )
 
 
 def _store_row(note_id, note_type="learning", content="", **extra):
@@ -271,7 +275,7 @@ class TestCreateKbTools:
         # (the pgvector index is canonical for retrieval; files for content).
         ctx = _make_context()
         ctx.knowledge_graph = None
-        with patch("src.tools.knowledge.knowledge_tools.asyncio") as ma:
+        with patch("agent.tools.knowledge.knowledge_tools.asyncio") as ma:
             ma.get_running_loop.side_effect = RuntimeError
             tools = create_kb_tools(ctx)
         assert len(tools) == 14
@@ -280,7 +284,7 @@ class TestCreateKbTools:
         ctx = _make_context()
         ctx.knowledge_store = None
         with pytest.raises(ValueError, match="knowledge_store"):
-            with patch("src.tools.knowledge.knowledge_tools.asyncio") as ma:
+            with patch("agent.tools.knowledge.knowledge_tools.asyncio") as ma:
                 ma.get_running_loop.side_effect = RuntimeError
                 create_kb_tools(ctx)
 
@@ -317,7 +321,7 @@ class TestKbWrite:
         kg.create_note.return_value = "test-slug"
         ctx.knowledge_store.upsert_note = AsyncMock(return_value=uuid.uuid4())
 
-        with patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             _invoke(
                 _get_tool(tools, "kb_write"),
                 {
@@ -339,7 +343,7 @@ class TestKbWrite:
         ctx.knowledge_graph.create_note.return_value = "my-note"
         ctx.knowledge_store.upsert_note = AsyncMock(return_value=uuid.uuid4())
 
-        with patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             result = _invoke(
                 _get_tool(tools, "kb_write"),
                 {
@@ -416,7 +420,7 @@ class TestKbUpdate:
         ctx.knowledge_graph.update_note.return_value = True
         ctx.knowledge_graph.read_note.return_value = {"title": "T", "content": "x"}
 
-        with patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             _invoke(
                 _get_tool(tools, "kb_update"),
                 {
@@ -438,7 +442,7 @@ class TestKbUpdate:
         ctx.knowledge_graph.update_note.return_value = True
         ctx.knowledge_graph.read_note.return_value = {"title": "T", "content": "x"}
 
-        with patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             result = _invoke(
                 _get_tool(tools, "kb_update"),
                 {
@@ -939,7 +943,7 @@ class TestKbSearch:
 
 class TestKbGrep:
     def _ctx(self, matches, total):
-        from src.services.knowledge_store import GrepMatch
+        from shared.runtime.services.knowledge_store import GrepMatch
 
         ctx = _make_context()
         ctx.knowledge_store.grep_notes = AsyncMock(return_value=(matches, total))
@@ -984,7 +988,7 @@ class TestKbGrep:
         assert out.startswith("Error:") and "empty" in out
 
     def test_registered_in_metadata(self):
-        from src.tools.knowledge.knowledge_tools import KNOWLEDGE_TOOLS_METADATA
+        from agent.tools.knowledge.knowledge_tools import KNOWLEDGE_TOOLS_METADATA
 
         assert KNOWLEDGE_TOOLS_METADATA["kb_grep"]["category"] == "knowledge"
 
@@ -1805,7 +1809,7 @@ class TestRenderNoteMd:
     """Tests for the pure OKF markdown serializer (_render_note_md)."""
 
     def test_emits_frontmatter_fences_and_required_keys(self):
-        from src.tools.knowledge.knowledge_tools import _render_note_md
+        from agent.tools.knowledge.knowledge_tools import _render_note_md
 
         md = _render_note_md({"id": "chose-jwt", "type": "decision", "content": "body"})
         assert md.startswith("---\n")
@@ -1815,7 +1819,7 @@ class TestRenderNoteMd:
         assert "status: active" in md  # defaults to active
 
     def test_title_and_body(self):
-        from src.tools.knowledge.knowledge_tools import _render_note_md
+        from agent.tools.knowledge.knowledge_tools import _render_note_md
 
         md = _render_note_md(
             {
@@ -1829,7 +1833,7 @@ class TestRenderNoteMd:
         assert "The full body." in md
 
     def test_title_falls_back_to_id(self):
-        from src.tools.knowledge.knowledge_tools import _render_note_md
+        from agent.tools.knowledge.knowledge_tools import _render_note_md
 
         md = _render_note_md({"id": "abc-slug", "type": "learning", "content": "x"})
         assert "# abc-slug" in md
@@ -1837,7 +1841,7 @@ class TestRenderNoteMd:
     def test_no_double_h1_when_content_starts_with_same_h1(self):
         # Run-8 nit (docs §11.1): the serializer prepended `# {title}` even when
         # the body already opened with the same H1 → every note's title twice.
-        from src.tools.knowledge.knowledge_tools import _render_note_md
+        from agent.tools.knowledge.knowledge_tools import _render_note_md
 
         md = _render_note_md(
             {
@@ -1852,7 +1856,7 @@ class TestRenderNoteMd:
         assert "The body." in md
 
     def test_content_own_h1_suppresses_prepended_title(self):
-        from src.tools.knowledge.knowledge_tools import _render_note_md
+        from agent.tools.knowledge.knowledge_tools import _render_note_md
 
         md = _render_note_md(
             {
@@ -1868,7 +1872,7 @@ class TestRenderNoteMd:
 
     def test_h2_leading_content_still_gets_title(self):
         # An H2 opener is not a title — the H1 title should still be prepended.
-        from src.tools.knowledge.knowledge_tools import _render_note_md
+        from agent.tools.knowledge.knowledge_tools import _render_note_md
 
         md = _render_note_md(
             {
@@ -1882,7 +1886,7 @@ class TestRenderNoteMd:
         assert "# Real Title" in lines
 
     def test_derives_description_from_content_first_sentence(self):
-        from src.tools.knowledge.knowledge_tools import _render_note_md
+        from agent.tools.knowledge.knowledge_tools import _render_note_md
 
         md = _render_note_md(
             {
@@ -1894,7 +1898,7 @@ class TestRenderNoteMd:
         assert 'description: "We chose JWT because it is stateless."' in md
 
     def test_explicit_description_wins_and_is_quoted(self):
-        from src.tools.knowledge.knowledge_tools import _render_note_md
+        from agent.tools.knowledge.knowledge_tools import _render_note_md
 
         md = _render_note_md(
             {
@@ -1907,7 +1911,7 @@ class TestRenderNoteMd:
         assert 'description: "A one: liner"' in md
 
     def test_description_escapes_double_quotes(self):
-        from src.tools.knowledge.knowledge_tools import _render_note_md
+        from agent.tools.knowledge.knowledge_tools import _render_note_md
 
         md = _render_note_md(
             {
@@ -1920,7 +1924,7 @@ class TestRenderNoteMd:
         assert 'description: "has \\"quotes\\""' in md
 
     def test_emits_markdown_links_not_wikilinks(self):
-        from src.tools.knowledge.knowledge_tools import _render_note_md
+        from agent.tools.knowledge.knowledge_tools import _render_note_md
 
         md = _render_note_md(
             {
@@ -1942,7 +1946,7 @@ class TestRenderNoteMd:
         assert "**REFERENCES:** [rfc-7519](rfc-7519.md)" in md
 
     def test_emits_provenance_when_present(self):
-        from src.tools.knowledge.knowledge_tools import _render_note_md
+        from agent.tools.knowledge.knowledge_tools import _render_note_md
 
         md = _render_note_md(
             {
@@ -1959,7 +1963,7 @@ class TestRenderNoteMd:
         assert "branch: job/abc" in md
 
     def test_omits_optional_fields_when_absent(self):
-        from src.tools.knowledge.knowledge_tools import _render_note_md
+        from agent.tools.knowledge.knowledge_tools import _render_note_md
 
         md = _render_note_md({"id": "n1", "type": "decision", "content": "b"})
         assert "confidence:" not in md
@@ -1968,7 +1972,7 @@ class TestRenderNoteMd:
         assert "superseded_by:" not in md
 
     def test_emits_tags_keywords_confidence_and_superseded_by(self):
-        from src.tools.knowledge.knowledge_tools import _render_note_md
+        from agent.tools.knowledge.knowledge_tools import _render_note_md
 
         md = _render_note_md(
             {
@@ -2136,7 +2140,7 @@ class TestKbWriteMaterialization:
         tools, _ = _make_tools(ctx)
 
         patcher, calls = _capture_materialize()
-        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patcher, patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             _invoke(
                 _get_tool(tools, "kb_write"),
                 {"title": "Chose JWT", "type": "decision", "content": "We chose JWT."},
@@ -2159,7 +2163,7 @@ class TestKbWriteMaterialization:
         tools, _ = _make_tools(ctx)
 
         patcher, _ = _capture_materialize()
-        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patcher, patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             _invoke(
                 _get_tool(tools, "kb_write"),
                 {"title": "T", "type": "decision", "content": "x"},
@@ -2176,7 +2180,7 @@ class TestKbWriteMaterialization:
         tools, _ = _make_tools(ctx)
 
         patcher, calls = _capture_materialize()
-        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patcher, patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             result = _invoke(
                 _get_tool(tools, "kb_write"),
                 {"title": "From A Session", "type": "learning", "content": "x"},
@@ -2196,7 +2200,7 @@ class TestKbWriteMaterialization:
         patcher, calls = _capture_materialize(
             {"status": "failed", "reason": "commit-refused"}
         )
-        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patcher, patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             result = _invoke(
                 _get_tool(tools, "kb_write"),
                 {"title": "T", "type": "decision", "content": "x"},
@@ -2219,8 +2223,8 @@ class TestKbWriteMaterialization:
         patcher, _ = _capture_materialize(
             {"status": "failed", "reason": "resolve-error"}
         )
-        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
-            with patch("src.tools.knowledge.knowledge_tools.logger") as log:
+        with patcher, patch("agent.tools.knowledge.knowledge_tools.asyncio"):
+            with patch("agent.tools.knowledge.knowledge_tools.logger") as log:
                 _invoke(
                     _get_tool(tools, "kb_write"),
                     {"title": "T", "type": "decision", "content": "x"},
@@ -2237,7 +2241,7 @@ class TestKbWriteMaterialization:
         tools, _ = _make_tools(ctx)
 
         patcher, calls = _capture_materialize()
-        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patcher, patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             _invoke(
                 _get_tool(tools, "kb_write"),
                 {
@@ -2258,7 +2262,7 @@ class TestKbWriteMaterialization:
         tools, _ = _make_tools(ctx)
 
         patcher, calls = _capture_materialize()
-        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patcher, patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             _invoke(
                 _get_tool(tools, "kb_write"),
                 {
@@ -2286,7 +2290,7 @@ class TestKbWriteMaterialization:
         tools, _ = _make_tools(ctx)
 
         patcher, calls = _capture_materialize()
-        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patcher, patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             _invoke(
                 _get_tool(tools, "kb_write"),
                 {"title": "T", "type": "decision", "content": "x"},
@@ -2303,7 +2307,7 @@ class TestKbWriteMaterialization:
         tools, _ = _make_tools(ctx)
 
         patcher, calls = _capture_materialize()
-        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patcher, patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             _invoke(
                 _get_tool(tools, "kb_write"),
                 {"title": "T", "type": "decision", "content": "x"},
@@ -2322,14 +2326,14 @@ class TestKbWriteMaterialization:
         # repo has been bitten by loading orchestrator modules under two names.
         from orchestrator.services.kb_reindex import note_fields
 
-        from src.tools.knowledge.gardener import parse_note_md
+        from shared.runtime.knowledge.gardener import parse_note_md
 
         ctx = _make_git_context()
         ctx.knowledge_graph.create_note.return_value = "n1"
         tools, _ = _make_tools(ctx)
 
         patcher, calls = _capture_materialize()
-        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patcher, patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             _invoke(
                 _get_tool(tools, "kb_write"),
                 {"title": "Round Trip", "type": "decision", "content": "x"},
@@ -2365,7 +2369,7 @@ def materializer():
     its result dict is where ``indexed`` / ``index_reason`` come from.
     """
     with patch(
-        "src.tools.knowledge.knowledge_tools._materialize_note",
+        "agent.tools.knowledge.knowledge_tools._materialize_note",
         return_value={
             "status": "committed",
             "canonical_state": "canonical",
@@ -2549,7 +2553,7 @@ class TestKbUpdateForwardsRetrievalMessages:
         ctx.knowledge_graph.update_note.return_value = True
         tools, _ = _make_tools(ctx)
         patcher, calls = _capture_materialize()
-        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patcher, patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             _invoke(
                 _get_tool(tools, "kb_update"),
                 {"note": "an-existing-note", "append": "more text"},
@@ -2609,36 +2613,36 @@ class TestRetireDenied:
         return base
 
     def test_plain_old_nursery_note_may_be_retired(self):
-        from src.tools.knowledge.knowledge_tools import _retire_denied
+        from agent.tools.knowledge.knowledge_tools import _retire_denied
 
         assert _retire_denied(self._row(), []) is None
 
     def test_charter_is_never_retired(self):
-        from src.tools.knowledge.knowledge_tools import _retire_denied
+        from agent.tools.knowledge.knowledge_tools import _retire_denied
 
         assert "charter" in _retire_denied(self._row(type="charter"), [])
 
     @pytest.mark.parametrize("ticket", ["feature", "issue", "idea"])
     def test_tickets_are_closed_not_retired(self, ticket):
-        from src.tools.knowledge.knowledge_tools import _retire_denied
+        from agent.tools.knowledge.knowledge_tools import _retire_denied
 
         assert "ticket" in _retire_denied(self._row(type=ticket), [])
 
     @pytest.mark.parametrize("tag", ["pinned", "ready", "parallel-safe", "Pinned"])
     def test_protected_tags(self, tag):
-        from src.tools.knowledge.knowledge_tools import _retire_denied
+        from agent.tools.knowledge.knowledge_tools import _retire_denied
 
         assert "tagged" in _retire_denied(self._row(tags=[tag]), [])
 
     def test_dispatch_authorised_note(self):
-        from src.tools.knowledge.knowledge_tools import _retire_denied
+        from agent.tools.knowledge.knowledge_tools import _retire_denied
 
         assert "dispatch" in _retire_denied(
             self._row(ready_at="2026-09-01T00:00:00Z"), []
         )
 
     def test_evidence_of_an_active_durable_note(self):
-        from src.tools.knowledge.knowledge_tools import _retire_denied
+        from agent.tools.knowledge.knowledge_tools import _retire_denied
 
         denied = _retire_denied(
             self._row(),
@@ -2649,7 +2653,7 @@ class TestRetireDenied:
     def test_fresh_note_is_protected_from_a_racing_curator(self):
         from datetime import datetime, timezone
 
-        from src.tools.knowledge.knowledge_tools import _retire_denied
+        from agent.tools.knowledge.knowledge_tools import _retire_denied
 
         assert "24 hours" in _retire_denied(
             self._row(created=datetime.now(timezone.utc)), []
@@ -2658,7 +2662,7 @@ class TestRetireDenied:
     def test_naive_created_timestamp_is_treated_as_utc(self):
         from datetime import datetime
 
-        from src.tools.knowledge.knowledge_tools import _retire_denied
+        from agent.tools.knowledge.knowledge_tools import _retire_denied
 
         assert "24 hours" in _retire_denied(self._row(created=datetime.utcnow()), [])
 
@@ -2901,7 +2905,7 @@ class TestKbUpdateKeepsTheNotesTimestamps:
         ctx = self._graph_ctx()
         tools, _ = _make_tools(ctx)
         patcher, calls = _capture_materialize()
-        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patcher, patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             _invoke(
                 _get_tool(tools, "kb_update"),
                 {"note": "an-existing-note", "append": "more"},
@@ -2943,7 +2947,7 @@ class TestKbUpdateKeepsTheNotesTimestamps:
         ctx = self._graph_ctx(created=_dt(2025, 12, 31, 9, 0, tzinfo=_tz.utc))
         tools, _ = _make_tools(ctx)
         patcher, calls = _capture_materialize()
-        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patcher, patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             _invoke(
                 _get_tool(tools, "kb_update"),
                 {"note": "an-existing-note", "append": "more"},
@@ -2964,7 +2968,7 @@ class TestKbUpdateKeepsTheNotesTimestamps:
         ctx = self._graph_ctx(created=_GraphDateTime())
         tools, _ = _make_tools(ctx)
         patcher, calls = _capture_materialize()
-        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patcher, patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             _invoke(
                 _get_tool(tools, "kb_update"),
                 {"note": "an-existing-note", "append": "more"},
@@ -2984,7 +2988,7 @@ class TestKbUpdateKeepsTheNotesTimestamps:
         ctx = self._graph_ctx(created=None)
         tools, _ = _make_tools(ctx)
         patcher, calls = _capture_materialize()
-        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patcher, patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             _invoke(
                 _get_tool(tools, "kb_update"),
                 {"note": "an-existing-note", "append": "more"},
@@ -3000,7 +3004,7 @@ class TestKbUpdateKeepsTheNotesTimestamps:
         ctx = self._graph_ctx()
         tools, _ = _make_tools(ctx)
         patcher, calls = _capture_materialize()
-        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patcher, patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             _invoke(
                 _get_tool(tools, "kb_update"),
                 {"note": "an-existing-note", "append": "more"},
@@ -3024,7 +3028,7 @@ class TestKbUpdateErrorPathsDoNotOverclaim:
         ctx.knowledge_graph.update_note.side_effect = RuntimeError("neo4j down")
         tools, _ = _make_tools(ctx)
         with patch(
-            "src.tools.knowledge.knowledge_tools._materialize_note",
+            "agent.tools.knowledge.knowledge_tools._materialize_note",
             return_value=materialization,
         ):
             return _invoke(
@@ -3083,7 +3087,7 @@ class TestKbUpdateMaterialization:
         tools, _ = _make_tools(ctx)
 
         patcher, calls = _capture_materialize()
-        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patcher, patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             _invoke(
                 _get_tool(tools, "kb_update"),
                 {"note": "n1", "content": "updated body"},
@@ -3107,7 +3111,7 @@ class TestKbUpdateMaterialization:
         tools, _ = _make_tools(ctx)
 
         patcher, calls = _capture_materialize()
-        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patcher, patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             result = _invoke(
                 _get_tool(tools, "kb_update"),
                 {"note": "n1", "content": "x"},
@@ -3152,7 +3156,7 @@ class TestKbUpdateMaterialization:
         patcher, calls = _capture_materialize(
             {"status": "failed", "reason": "commit-error"}
         )
-        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patcher, patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             result = _invoke(
                 _get_tool(tools, "kb_update"),
                 {"note": "n1", "content": "x"},
@@ -3169,8 +3173,8 @@ class TestKbUpdateMaterialization:
 import hashlib as _hashlib  # noqa: E402
 from types import SimpleNamespace  # noqa: E402
 
-from src.services.auxiliary import KnowledgeVerdict  # noqa: E402
-from src.services.knowledge.ingestion import KnowledgeVerdictService  # noqa: E402
+from shared.runtime.services.auxiliary import KnowledgeVerdict  # noqa: E402
+from agent.services.knowledge.ingestion import KnowledgeVerdictService  # noqa: E402
 
 
 class _GateAux:
@@ -3335,7 +3339,7 @@ class TestKbWriteErrorPathsDoNotOverclaim:
         ctx.knowledge_graph.read_note.return_value = None
         ctx.knowledge_graph.create_note.side_effect = RuntimeError("neo4j down")
         with patch(
-            "src.tools.knowledge.knowledge_tools._materialize_note",
+            "agent.tools.knowledge.knowledge_tools._materialize_note",
             return_value={
                 "status": "committed",
                 "canonical_state": "canonical",
@@ -3369,7 +3373,7 @@ class TestKbWriteErrorPathsDoNotOverclaim:
             KnowledgeVerdict(action="SUPERSEDE", target_indices=[1], reason="replaced"),
         )
         with patch(
-            "src.tools.knowledge.knowledge_tools._materialize_note",
+            "agent.tools.knowledge.knowledge_tools._materialize_note",
             return_value={
                 "status": "committed",
                 "canonical_state": "canonical",
@@ -3399,7 +3403,7 @@ class TestKbWriteErrorPathsDoNotOverclaim:
         ctx.knowledge_graph.read_note.return_value = None
         ctx.knowledge_graph.create_note.side_effect = RuntimeError("neo4j down")
         with patch(
-            "src.tools.knowledge.knowledge_tools._materialize_note",
+            "agent.tools.knowledge.knowledge_tools._materialize_note",
             return_value={
                 "status": "committed",
                 "canonical_state": "canonical",
@@ -3430,7 +3434,7 @@ class TestKbWriteSlugDedup:
             "type": "decision",
             "title": "Test",
         }
-        with patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             result = _invoke(
                 _get_tool(tools, "kb_write"),
                 {"title": "Test", "type": "decision", "content": "body"},
@@ -3453,7 +3457,7 @@ class TestKbWriteSlugDedup:
         }
         kg.create_note.return_value = "test-abc123"
         ctx.knowledge_store.upsert_note = AsyncMock(return_value=uuid.uuid4())
-        with patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             _invoke(
                 _get_tool(tools, "kb_write"),
                 {"title": "Test", "type": "decision", "content": "NEW body"},
@@ -3466,7 +3470,7 @@ class TestKbWriteSlugDedup:
         kg.read_note.return_value = None
         kg.create_note.return_value = "fresh-slug"
         ctx.knowledge_store.upsert_note = AsyncMock(return_value=uuid.uuid4())
-        with patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             result = _invoke(
                 _get_tool(tools, "kb_write"),
                 {"title": "Fresh", "type": "learning", "content": "x"},
@@ -3559,7 +3563,7 @@ class TestKbLintUrlSweep:
         ctx = self._ctx(_KB_LINT_URL_ROWS)
         tools, _ = _make_tools(ctx)
         with patch(
-            "src.tools.knowledge.knowledge_tools._check_external_url"
+            "agent.tools.knowledge.knowledge_tools._check_external_url"
         ) as checker:
             result = _invoke(_get_tool(tools, "kb_lint"), {})
         checker.assert_not_called()
@@ -3569,7 +3573,7 @@ class TestKbLintUrlSweep:
         ctx = self._ctx(_KB_LINT_URL_ROWS)
         tools, _ = _make_tools(ctx)
         with patch(
-            "src.tools.knowledge.knowledge_tools._check_external_url",
+            "agent.tools.knowledge.knowledge_tools._check_external_url",
             return_value="HTTP 404",
         ):
             result = _invoke(_get_tool(tools, "kb_lint"), {"check_urls": True})
@@ -3580,7 +3584,7 @@ class TestKbLintUrlSweep:
         ctx = self._ctx(_KB_LINT_URL_ROWS)
         tools, _ = _make_tools(ctx)
         with patch(
-            "src.tools.knowledge.knowledge_tools._check_external_url",
+            "agent.tools.knowledge.knowledge_tools._check_external_url",
             return_value=None,
         ):
             result = _invoke(_get_tool(tools, "kb_lint"), {"check_urls": True})
@@ -3598,7 +3602,7 @@ class TestKbLintUrlSweep:
         ctx = self._ctx(rows)
         tools, _ = _make_tools(ctx)
         with patch(
-            "src.tools.knowledge.knowledge_tools._check_external_url",
+            "agent.tools.knowledge.knowledge_tools._check_external_url",
             return_value=None,
         ) as checker:
             result = _invoke(_get_tool(tools, "kb_lint"), {"check_urls": True})

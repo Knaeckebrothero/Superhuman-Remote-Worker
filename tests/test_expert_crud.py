@@ -416,7 +416,7 @@ async def test_list_type_filter_matches_tag(monkeypatch):
     assert "plain-session" not in worker and "subagents/explorer" not in worker
     authored = yaml.safe_load(
         (
-            Path(main_module.__file__).parent.parent
+            Path(main_module.__file__).resolve().parents[2]
             / "config/experts/developer/config.yaml"
         ).read_text(encoding="utf-8")
     )["tags"]
@@ -439,7 +439,7 @@ def test_bundled_expert_bundle_reads_the_phase_skill_bodies():
     what the phase block's <expert_workflow> addendum will carry."""
     from pathlib import Path
 
-    from src.core.skill_format import parse_skill_md
+    from shared.runtime.core.skill_format import parse_skill_md
 
     bundle = _bundled_expert_bundle("developer")
     if bundle is None:

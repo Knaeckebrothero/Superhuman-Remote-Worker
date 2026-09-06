@@ -40,7 +40,7 @@ workspace:
   initial_files: {}
 
 tools:
-  # Core tools - to-do + job management (src/tools/core/)
+  # Core tools - to-do + job management (src/agent/tools/core/)
   core:
     - next_phase_todos
     - todo_complete
@@ -48,10 +48,10 @@ tools:
     - request_replan
     - mark_complete
     - job_complete
-  # WebDAV tools - WebDAV file operations (src/tools/webdav/)
+  # WebDAV tools - WebDAV file operations (src/agent/tools/webdav/)
   # Injected automatically via datasource system
   webdav: []
-  # Communication tools - agent-human messaging via email (src/tools/communication/)
+  # Communication tools - agent-human messaging via email (src/agent/tools/communication/)
   communication:
     - send_message
   # Dynamic Canvas is persistent-session-only. Worker agents never receive it.
@@ -120,7 +120,7 @@ limits:
   # process artifacts (patterns below), inject a one-line "stop planning"
   # nudge. Any action on a non-process target resets the counter. 0 disables.
   act_ratio_nudge_threshold: 6
-  # Progress durability — see src/core/progress_commit.py. Commits land per
+  # Progress durability — see src/agent/core/progress_commit.py. Commits land per
   # completed todo (free, local); pushes are throttled to this interval so a
   # burst of quick todos doesn't hammer Gitea.
   progress_push_interval_seconds: 60
@@ -216,7 +216,7 @@ scholar:
   scholar_config: scholar   # Which expert config to use
 
 # Built-in subagents (universal_experts_and_subagents.md §0 D7; runtime in
-# src/subagents/). `enabled` gates `delegate_agent` and the four background
+# src/agent/subagents/). `enabled` gates `delegate_agent` and the four background
 # controls: true still binds nothing unless the expert explicitly names each
 # tool under tools.delegation. Which children exist, their model, tools and
 # budgets live in the expert's `subagents.roster` (see config/subagents/README.md).

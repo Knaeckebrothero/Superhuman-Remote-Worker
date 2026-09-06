@@ -56,7 +56,7 @@ def browser_ide_transport_available(monkeypatch):
     from types import SimpleNamespace
     from unittest.mock import AsyncMock as _AsyncMock
 
-    import services.ide_proxy as ide_proxy
+    import orchestrator.services.ide_proxy as ide_proxy
 
     monkeypatch.setenv("IDE_CREDENTIAL_KEY", "test-root-key")
     monkeypatch.setattr(
@@ -69,7 +69,7 @@ def browser_ide_transport_available(monkeypatch):
 @pytest.fixture
 def service_factory():
     from orchestrator.services.ide_session import IdeSessionService
-    from services.container_provisioner import WorkspaceRuntimeAttestation
+    from orchestrator.services.container_provisioner import WorkspaceRuntimeAttestation
 
     db = AsyncMock()
     db.merge_ide_session_context = AsyncMock()
@@ -468,7 +468,7 @@ async def test_ide_repository_key_rejects_reused_ip_host_key_before_stdin(
 
 @pytest.mark.asyncio
 async def test_ide_post_write_uid_replacement_cannot_settle_restore(service_factory):
-    from services.container_provisioner import WorkspaceRuntimeAttestation
+    from orchestrator.services.container_provisioner import WorkspaceRuntimeAttestation
 
     svc = service_factory
     exact_b = svc._container_provisioner.attest_ide_runtime.return_value
@@ -1343,7 +1343,7 @@ async def test_extract_snapshot_to_vm_reused_endpoint_successor_gets_no_bytes(
     service_factory,
 ):
     """A VM replacement at A's endpoint is rejected before SSH extraction."""
-    from services.container_provisioner import WorkspaceRuntimeAttestation
+    from orchestrator.services.container_provisioner import WorkspaceRuntimeAttestation
 
     svc = service_factory
     svc._snapshot_service.download_snapshot = AsyncMock(return_value=True)

@@ -464,7 +464,9 @@ async function fixtureState(request: APIRequestContext): Promise<FixtureState> {
 }
 
 async function openCanvas(page: Page) {
-  const response = await page.goto(WRAPPER_PATH, {waitUntil: 'domcontentloaded'});
+  // WebKit can defer rendering until the document's font resources finish.
+  // Start the Canvas readiness budget after navigation, including those loads.
+  const response = await page.goto(WRAPPER_PATH, {waitUntil: 'load'});
   await expect(page.locator(LIVE_FRAME)).toBeVisible();
   await expect(page.frameLocator(LIVE_FRAME).locator('#canvas-app-ready')).toBeVisible();
   return response;

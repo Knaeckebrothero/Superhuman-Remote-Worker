@@ -51,7 +51,7 @@ CI uses Python 3.12, Node.js 22, npm, and the versions pinned by the repository.
 - Never commit `.env`, copied local values, cluster Secrets, tokens, customer
   data, or private deployment details.
 - Put database changes in a new migration under
-  `orchestrator/database/migrations/app/` or `vector/`; do not edit schema
+  `src/orchestrator/database/migrations/app/` or `vector/`; do not edit schema
   snapshots as the implementation.
 - Keep final job-state authority in the orchestrator. Agent code reports
   completion data and control flags but does not persist its own terminal state.
@@ -67,8 +67,8 @@ Run checks proportional to the change. Common commands are:
 ```bash
 # Python
 pytest tests/test_<area>.py -x -q --tb=short
-ruff check src/ orchestrator/ tests/
-ruff format --check src/ orchestrator/ tests/
+ruff check src/ tests/
+ruff format --check src/ tests/
 
 # Cockpit
 cd cockpit

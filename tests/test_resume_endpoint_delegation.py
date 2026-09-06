@@ -18,24 +18,17 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 from contextlib import asynccontextmanager
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 from fastapi import HTTPException
 
-# Add orchestrator/ to sys.path so its top-level modules import bare.
-_ORCH = Path(__file__).parent.parent / "orchestrator"
-if str(_ORCH) not in sys.path:
-    sys.path.insert(0, str(_ORCH))
-
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
-import main  # noqa: E402
-from src.shared.runtime_actor import RuntimeActorContext  # noqa: E402
+import orchestrator.main  # noqa: E402
+from shared.runtime_actor import RuntimeActorContext  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +157,7 @@ def fake_conn(monkeypatch):
     async def _acquire():
         yield conn
 
-    monkeypatch.setattr(main.postgres_db, "acquire", _acquire)
+    monkeypatch.setattr(orchestrator.main.postgres_db, "acquire", _acquire)
     return conn
 
 
@@ -179,7 +172,7 @@ def injector(monkeypatch):
         return config_override
 
     mock = AsyncMock(side_effect=_fake)
-    monkeypatch.setattr(main, "_inject_dispatch_credentials", mock)
+    monkeypatch.setattr(orchestrator.main, "_inject_dispatch_credentials", mock)
     return mock
 
 
@@ -190,31 +183,41 @@ def resume_collaborators(monkeypatch, fake_conn, injector):
     _FakeAsyncClient.next_status = 202
     _FakeAsyncClient.next_text = ""
     _FakeAsyncClient.resolved_config_resume = True
-    monkeypatch.setattr(main.httpx, "AsyncClient", _FakeAsyncClient)
+    monkeypatch.setattr(orchestrator.main.httpx, "AsyncClient", _FakeAsyncClient)
 
     # Most tests in this fixture exercise the legacy flat-override fallback.
     # Resolved-config delivery gets a focused regression below.
-    monkeypatch.setattr(main, "_is_experts_db_enabled", lambda: False)
-    monkeypatch.setattr(main, "_user_experts_enabled", AsyncMock(return_value=False))
+    monkeypatch.setattr(orchestrator.main, "_is_experts_db_enabled", lambda: False)
     monkeypatch.setattr(
-        main, "_resolve_authorized_job_datasources", AsyncMock(return_value=[])
+        orchestrator.main, "_user_experts_enabled", AsyncMock(return_value=False)
     )
-    monkeypatch.setattr(main, "_job_project_repositories", AsyncMock(return_value=None))
-    monkeypatch.setattr(main, "_apply_cloud_storage_override", MagicMock())
-    monkeypatch.setattr(main, "_build_datasources_payload", MagicMock(return_value=[]))
     monkeypatch.setattr(
-        main,
+        orchestrator.main,
+        "_resolve_authorized_job_datasources",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        orchestrator.main, "_job_project_repositories", AsyncMock(return_value=None)
+    )
+    monkeypatch.setattr(orchestrator.main, "_apply_cloud_storage_override", MagicMock())
+    monkeypatch.setattr(
+        orchestrator.main, "_build_datasources_payload", MagicMock(return_value=[])
+    )
+    monkeypatch.setattr(
+        orchestrator.main,
         "_build_datasource_tool_override",
         MagicMock(side_effect=lambda ds, co: co),
     )
-    monkeypatch.setattr(main.postgres_db, "delete_job_context_keys", AsyncMock())
-    monkeypatch.setattr(main.postgres_db, "update_job_status", AsyncMock())
-    monkeypatch.setattr(main.postgres_db, "heartbeat", AsyncMock())
     monkeypatch.setattr(
-        main.container_provisioner,
+        orchestrator.main.postgres_db, "delete_job_context_keys", AsyncMock()
+    )
+    monkeypatch.setattr(orchestrator.main.postgres_db, "update_job_status", AsyncMock())
+    monkeypatch.setattr(orchestrator.main.postgres_db, "heartbeat", AsyncMock())
+    monkeypatch.setattr(
+        orchestrator.main.container_provisioner,
         "attest_workspace_runtime",
         AsyncMock(
-            return_value=main.WorkspaceRuntimeAttestation(
+            return_value=orchestrator.main.WorkspaceRuntimeAttestation(
                 backing_id="k8s-pvc:agent-workspaces:workspace-pvc",
                 workspace_generation="22222222-2222-4222-8222-222222222222",
                 runtime_incarnation=WORKSPACE_RUNTIME,
@@ -226,30 +229,32 @@ def resume_collaborators(monkeypatch, fake_conn, injector):
         ),
     )
     monkeypatch.setattr(
-        main,
+        orchestrator.main,
         "_pinned_k8s_job_workspace_authority_is_current",
         AsyncMock(return_value=True),
     )
-    recipient = main.PinnedJobRecipient(
+    recipient = orchestrator.main.PinnedJobRecipient(
         expected_agent_id=AGENT_ID,
         expected_pod_uid=None,
         expected_process_generation="55555555-5555-4555-8555-555555555555",
         expected_job_id=JOB_ID,
     )
     monkeypatch.setattr(
-        main,
+        orchestrator.main,
         "_prepare_pinned_job_mutation_target",
         AsyncMock(
-            return_value=main._PinnedJobMutationTarget(_agent(), recipient),
+            return_value=orchestrator.main._PinnedJobMutationTarget(
+                _agent(), recipient
+            ),
         ),
     )
     monkeypatch.setattr(
-        main.postgres_db,
+        orchestrator.main.postgres_db,
         "managed_repository_authorities_are_current",
         AsyncMock(return_value=True),
     )
     monkeypatch.setattr(
-        main,
+        orchestrator.main,
         "_workspace_runtime_unchanged_before_delivery",
         AsyncMock(return_value=True),
     )
@@ -264,7 +269,7 @@ def resume_collaborators(monkeypatch, fake_conn, injector):
         )
 
     monkeypatch.setattr(
-        main,
+        orchestrator.main,
         "mint_worker_runtime_actor",
         AsyncMock(side_effect=_mint_worker),
     )
@@ -300,7 +305,7 @@ class TestResumeJobOnAgentInjection:
             worktree_path="/home/agent-host/workspace/.worktrees/job-1",
         )
 
-        assert await main._resume_job_on_agent(job, _agent()) is True
+        assert await orchestrator.main._resume_job_on_agent(job, _agent()) is True
 
         remote = _posted_payload()["config_override"]["workspace"]["remote"]
         assert remote == {
@@ -333,7 +338,7 @@ class TestResumeJobOnAgentInjection:
             },
         )
 
-        assert await main._resume_job_on_agent(job, _agent()) is True
+        assert await orchestrator.main._resume_job_on_agent(job, _agent()) is True
         remote = _posted_payload()["config_override"]["workspace"]["remote"]
         assert remote["key_path"] == "/run/secrets/ssh/id_ed25519"
 
@@ -341,7 +346,9 @@ class TestResumeJobOnAgentInjection:
     async def test_injected_credentials_reach_the_posted_payload(
         self, resume_collaborators
     ):
-        ok = await main._resume_job_on_agent(_job(project_id=PROJECT_ID), _agent())
+        ok = await orchestrator.main._resume_job_on_agent(
+            _job(project_id=PROJECT_ID), _agent()
+        )
 
         assert ok is True
         payload = _posted_payload()
@@ -350,13 +357,15 @@ class TestResumeJobOnAgentInjection:
         assert payload["config_override"]["llm"]["api_key"] == "sk-llm"
         assert payload["runtime_actor"]["caller_kind"] == "worker"
         assert payload["runtime_actor"]["project_id"] == PROJECT_ID
-        main.postgres_db.update_job_status.assert_awaited_once_with(
+        orchestrator.main.postgres_db.update_job_status.assert_awaited_once_with(
             job_id=JOB_ID, status="processing", assigned_agent_id=AGENT_ID
         )
 
     @pytest.mark.asyncio
     async def test_kb_profile_follows_project_scope(self, resume_collaborators):
-        await main._resume_job_on_agent(_job(project_id=PROJECT_ID), _agent())
+        await orchestrator.main._resume_job_on_agent(
+            _job(project_id=PROJECT_ID), _agent()
+        )
         assert (
             resume_collaborators.injector.await_args.kwargs["include_kb_profile"]
             is True
@@ -372,18 +381,25 @@ class TestResumeJobOnAgentInjection:
         a wire field: the exact live defect was a syntactically successful
         resume whose effective tools still came from worker_base.
         """
-        from src.core.loader import get_all_tool_names, load_config_from_resolved
+        from shared.runtime.core.loader import (
+            get_all_tool_names,
+            load_config_from_resolved,
+        )
 
-        monkeypatch.setattr(main, "_is_experts_db_enabled", lambda: True)
-        monkeypatch.setattr(main, "_resolve_default_models", AsyncMock(return_value={}))
-        monkeypatch.setattr(main, "_gather_in_scope_skills", AsyncMock(return_value=[]))
+        monkeypatch.setattr(orchestrator.main, "_is_experts_db_enabled", lambda: True)
         monkeypatch.setattr(
-            main,
+            orchestrator.main, "_resolve_default_models", AsyncMock(return_value={})
+        )
+        monkeypatch.setattr(
+            orchestrator.main, "_gather_in_scope_skills", AsyncMock(return_value=[])
+        )
+        monkeypatch.setattr(
+            orchestrator.main,
             "_seed_registry_model_overrides",
             AsyncMock(side_effect=lambda config, **_kwargs: config),
         )
 
-        ok = await main._resume_job_on_agent(
+        ok = await orchestrator.main._resume_job_on_agent(
             _job(
                 config_name="developer",
                 config_override={
@@ -413,31 +429,39 @@ class TestResumeJobOnAgentInjection:
     async def test_resolved_resume_grant_denial_still_fails_closed(
         self, resume_collaborators, monkeypatch
     ):
-        monkeypatch.setattr(main, "_is_experts_db_enabled", lambda: True)
-        monkeypatch.setattr(main, "_user_experts_enabled", AsyncMock(return_value=True))
-        monkeypatch.setattr(main, "_resolve_default_models", AsyncMock(return_value={}))
-        monkeypatch.setattr(main, "_gather_in_scope_skills", AsyncMock(return_value=[]))
+        monkeypatch.setattr(orchestrator.main, "_is_experts_db_enabled", lambda: True)
         monkeypatch.setattr(
-            main,
+            orchestrator.main, "_user_experts_enabled", AsyncMock(return_value=True)
+        )
+        monkeypatch.setattr(
+            orchestrator.main, "_resolve_default_models", AsyncMock(return_value={})
+        )
+        monkeypatch.setattr(
+            orchestrator.main, "_gather_in_scope_skills", AsyncMock(return_value=[])
+        )
+        monkeypatch.setattr(
+            orchestrator.main,
             "_seed_registry_model_overrides",
             AsyncMock(side_effect=lambda config, **_kwargs: config),
         )
         monkeypatch.setattr(
-            main,
+            orchestrator.main,
             "_enforce_dispatch_grants",
             AsyncMock(
-                side_effect=main.GrantDenied(
+                side_effect=orchestrator.main.GrantDenied(
                     ["shell_tools: tools.shell requires the shell_tools grant"]
                 )
             ),
         )
 
-        ok = await main._resume_job_on_agent(_job(config_name="developer"), _agent())
+        ok = await orchestrator.main._resume_job_on_agent(
+            _job(config_name="developer"), _agent()
+        )
 
         assert ok is False
         assert _FakeAsyncClient.posts == []
         resume_collaborators.injector.assert_not_awaited()
-        main.postgres_db.update_job_status.assert_awaited_once_with(
+        orchestrator.main.postgres_db.update_job_status.assert_awaited_once_with(
             JOB_ID,
             status="failed",
             error_message=(
@@ -452,16 +476,22 @@ class TestResumeJobOnAgentInjection:
     ):
         """A mixed-version rollout must not send a blob the old agent ignores."""
         _FakeAsyncClient.resolved_config_resume = False
-        monkeypatch.setattr(main, "_is_experts_db_enabled", lambda: True)
-        monkeypatch.setattr(main, "_resolve_default_models", AsyncMock(return_value={}))
-        monkeypatch.setattr(main, "_gather_in_scope_skills", AsyncMock(return_value=[]))
+        monkeypatch.setattr(orchestrator.main, "_is_experts_db_enabled", lambda: True)
         monkeypatch.setattr(
-            main,
+            orchestrator.main, "_resolve_default_models", AsyncMock(return_value={})
+        )
+        monkeypatch.setattr(
+            orchestrator.main, "_gather_in_scope_skills", AsyncMock(return_value=[])
+        )
+        monkeypatch.setattr(
+            orchestrator.main,
             "_seed_registry_model_overrides",
             AsyncMock(side_effect=lambda config, **_kwargs: config),
         )
 
-        ok = await main._resume_job_on_agent(_job(config_name="developer"), _agent())
+        ok = await orchestrator.main._resume_job_on_agent(
+            _job(config_name="developer"), _agent()
+        )
 
         assert ok is True
         payload = _posted_payload()
@@ -474,7 +504,7 @@ class TestResumeJobOnAgentInjection:
     async def test_kb_profile_off_without_project_or_kb_datasource(
         self, resume_collaborators
     ):
-        await main._resume_job_on_agent(_job(), _agent())
+        await orchestrator.main._resume_job_on_agent(_job(), _agent())
         assert (
             resume_collaborators.injector.await_args.kwargs["include_kb_profile"]
             is False
@@ -485,11 +515,11 @@ class TestResumeJobOnAgentInjection:
         self, resume_collaborators, monkeypatch
     ):
         monkeypatch.setattr(
-            main,
+            orchestrator.main,
             "_resolve_authorized_job_datasources",
             AsyncMock(return_value=[{"type": "kb", "id": "ds-1"}]),
         )
-        await main._resume_job_on_agent(_job(), _agent())
+        await orchestrator.main._resume_job_on_agent(_job(), _agent())
         assert (
             resume_collaborators.injector.await_args.kwargs["include_kb_profile"]
             is True
@@ -497,7 +527,7 @@ class TestResumeJobOnAgentInjection:
 
     @pytest.mark.asyncio
     async def test_config_upload_id_passthrough(self, resume_collaborators):
-        await main._resume_job_on_agent(
+        await orchestrator.main._resume_job_on_agent(
             _job(context={"config_upload_id": "upload-7"}), _agent()
         )
         assert _posted_payload()["config_upload_id"] == "upload-7"
@@ -506,18 +536,18 @@ class TestResumeJobOnAgentInjection:
     async def test_config_upload_id_absent_stays_off_the_wire(
         self, resume_collaborators
     ):
-        await main._resume_job_on_agent(_job(), _agent())
+        await orchestrator.main._resume_job_on_agent(_job(), _agent())
         assert "config_upload_id" not in _posted_payload()
 
     @pytest.mark.asyncio
     async def test_queued_feedback_delivered_then_cleared(self, resume_collaborators):
-        ok = await main._resume_job_on_agent(
+        ok = await orchestrator.main._resume_job_on_agent(
             _job(context={"queued_feedback": "fix the tests"}), _agent()
         )
 
         assert ok is True
         assert _posted_payload()["feedback"] == "fix the tests"
-        main.postgres_db.delete_job_context_keys.assert_awaited_once_with(
+        orchestrator.main.postgres_db.delete_job_context_keys.assert_awaited_once_with(
             JOB_ID, ["queued_feedback"]
         )
 
@@ -531,7 +561,7 @@ class TestResumeJobOnAgentRejection:
         _FakeAsyncClient.next_status = 422
         _FakeAsyncClient.next_text = private_material
 
-        assert await main._resume_job_on_agent(_job(), _agent()) is False
+        assert await orchestrator.main._resume_job_on_agent(_job(), _agent()) is False
 
         assert private_material not in caplog.text
         assert "status=422" in caplog.text
@@ -540,18 +570,18 @@ class TestResumeJobOnAgentRejection:
     async def test_409_demotes_stale_ready_agent(self, resume_collaborators):
         _FakeAsyncClient.next_status = 409
 
-        ok = await main._resume_job_on_agent(_job(), _agent())
+        ok = await orchestrator.main._resume_job_on_agent(_job(), _agent())
 
         assert ok is False
         demote_sql = resume_collaborators.conn.execute.await_args.args[0]
         assert "UPDATE agents SET status = 'working'" in demote_sql
-        main.postgres_db.update_job_status.assert_not_awaited()
+        orchestrator.main.postgres_db.update_job_status.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_other_rejects_do_not_demote(self, resume_collaborators):
         _FakeAsyncClient.next_status = 500
 
-        ok = await main._resume_job_on_agent(_job(), _agent())
+        ok = await orchestrator.main._resume_job_on_agent(_job(), _agent())
 
         assert ok is False
         resume_collaborators.conn.execute.assert_not_awaited()
@@ -560,11 +590,11 @@ class TestResumeJobOnAgentRejection:
     async def test_rejected_resume_keeps_queued_feedback(self, resume_collaborators):
         _FakeAsyncClient.next_status = 409
 
-        await main._resume_job_on_agent(
+        await orchestrator.main._resume_job_on_agent(
             _job(context={"queued_feedback": "keep me"}), _agent()
         )
 
-        main.postgres_db.delete_job_context_keys.assert_not_awaited()
+        orchestrator.main.postgres_db.delete_job_context_keys.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -579,35 +609,45 @@ def endpoint_collaborators(monkeypatch, fake_conn):
     agent = _agent()
 
     monkeypatch.setattr(
-        main, "require_internal_or_job_access", AsyncMock(return_value=(None, job))
+        orchestrator.main,
+        "require_internal_or_job_access",
+        AsyncMock(return_value=(None, job)),
     )
-    monkeypatch.setattr(main, "_user_experts_enabled", AsyncMock(return_value=False))
-    monkeypatch.setattr(main.postgres_db, "get_agent", AsyncMock(return_value=agent))
-    monkeypatch.setattr(main.postgres_db, "merge_job_context", AsyncMock())
+    monkeypatch.setattr(
+        orchestrator.main, "_user_experts_enabled", AsyncMock(return_value=False)
+    )
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db, "get_agent", AsyncMock(return_value=agent)
+    )
+    monkeypatch.setattr(orchestrator.main.postgres_db, "merge_job_context", AsyncMock())
     claim_job = AsyncMock(return_value=True)
-    monkeypatch.setattr(main.postgres_db, "claim_job_for_agent", claim_job)
+    monkeypatch.setattr(orchestrator.main.postgres_db, "claim_job_for_agent", claim_job)
     queue_for_resume = AsyncMock(return_value=True)
-    monkeypatch.setattr(main.postgres_db, "queue_job_for_resume", queue_for_resume)
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db, "queue_job_for_resume", queue_for_resume
+    )
     acknowledge_circuit = AsyncMock(return_value=True)
     monkeypatch.setattr(
-        main.postgres_db,
+        orchestrator.main.postgres_db,
         "acknowledge_lease_recovery_circuit",
         acknowledge_circuit,
     )
     queue_stateless = AsyncMock(return_value=True)
     monkeypatch.setattr(
-        main.postgres_db, "queue_stateless_job_for_resume", queue_stateless
+        orchestrator.main.postgres_db, "queue_stateless_job_for_resume", queue_stateless
     )
     prepare_stateless = AsyncMock(return_value=True)
     monkeypatch.setattr(
-        main.postgres_db,
+        orchestrator.main.postgres_db,
         "prepare_stateless_job_for_workspace_resume",
         prepare_stateless,
     )
-    monkeypatch.setattr(main, "snapshot_service", SimpleNamespace(is_available=False))
-    monkeypatch.setattr(main, "_trigger_dispatch", MagicMock())
+    monkeypatch.setattr(
+        orchestrator.main, "snapshot_service", SimpleNamespace(is_available=False)
+    )
+    monkeypatch.setattr(orchestrator.main, "_trigger_dispatch", MagicMock())
     delegate = AsyncMock(return_value=True)
-    monkeypatch.setattr(main, "_resume_job_on_agent", delegate)
+    monkeypatch.setattr(orchestrator.main, "_resume_job_on_agent", delegate)
     return SimpleNamespace(
         job=job,
         agent=agent,
@@ -634,18 +674,24 @@ class TestResumeEndpointDelegation:
         prepare = AsyncMock(
             return_value=("wait", job, "kubernetes_attestation_unavailable")
         )
-        monkeypatch.setattr(main, "_prepare_job_workspace_runtime", prepare)
+        monkeypatch.setattr(
+            orchestrator.main, "_prepare_job_workspace_runtime", prepare
+        )
         shed = AsyncMock()
-        monkeypatch.setattr(main.postgres_db, "shed_workspace_context", shed)
+        monkeypatch.setattr(
+            orchestrator.main.postgres_db, "shed_workspace_context", shed
+        )
 
-        result = await main.resume_job(MagicMock(), JOB_ID, main.JobResumeRequest())
+        result = await orchestrator.main.resume_job(
+            MagicMock(), JOB_ID, orchestrator.main.JobResumeRequest()
+        )
 
         assert result["status"] == "queued"
         endpoint_collaborators.queue_for_resume.assert_awaited_once_with(
             JOB_ID, None, expected_status="paused"
         )
         endpoint_collaborators.delegate.assert_not_awaited()
-        main.postgres_db.get_agent.assert_not_awaited()
+        orchestrator.main.postgres_db.get_agent.assert_not_awaited()
         shed.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -668,7 +714,7 @@ class TestResumeEndpointDelegation:
         # This test owns the stateless queue transition, not the historical
         # Kubernetes adoption collaborator exercised in the dedicated cases.
         monkeypatch.setattr(
-            main,
+            orchestrator.main,
             "_prepare_job_workspace_runtime",
             AsyncMock(
                 return_value=(
@@ -679,10 +725,10 @@ class TestResumeEndpointDelegation:
             ),
         )
 
-        result = await main.resume_job(
+        result = await orchestrator.main.resume_job(
             MagicMock(),
             JOB_ID,
-            main.JobResumeRequest(feedback="reviewer correction"),
+            orchestrator.main.JobResumeRequest(feedback="reviewer correction"),
         )
 
         assert result["status"] == "queued"
@@ -700,12 +746,14 @@ class TestResumeEndpointDelegation:
             expected_status="pending_review",
         )
         endpoint_collaborators.delegate.assert_not_awaited()
-        main.postgres_db.get_agent.assert_not_awaited()
+        orchestrator.main.postgres_db.get_agent.assert_not_awaited()
         endpoint_collaborators.queue_for_resume.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_fast_path_delegates_to_shared_resume(self, endpoint_collaborators):
-        result = await main.resume_job(MagicMock(), JOB_ID, main.JobResumeRequest())
+        result = await orchestrator.main.resume_job(
+            MagicMock(), JOB_ID, orchestrator.main.JobResumeRequest()
+        )
 
         assert result == {
             "status": "resumed",
@@ -721,19 +769,21 @@ class TestResumeEndpointDelegation:
             AGENT_ID,
             allow_failed=True,
         )
-        main.postgres_db.merge_job_context.assert_not_awaited()
+        orchestrator.main.postgres_db.merge_job_context.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_feedback_is_merged_and_stamped_on_the_delegated_job(
         self, endpoint_collaborators
     ):
-        await main.resume_job(
-            MagicMock(), JOB_ID, main.JobResumeRequest(feedback="try again")
+        await orchestrator.main.resume_job(
+            MagicMock(),
+            JOB_ID,
+            orchestrator.main.JobResumeRequest(feedback="try again"),
         )
 
         # The explicit resume path also stamps the honest [FEEDBACK_RESUME]
         # banner cause (P1-A): a paused job -> the operator wording.
-        main.postgres_db.merge_job_context.assert_awaited_once_with(
+        orchestrator.main.postgres_db.merge_job_context.assert_awaited_once_with(
             JOB_ID,
             {
                 "queued_feedback": "try again",
@@ -750,7 +800,9 @@ class TestResumeEndpointDelegation:
     async def test_declined_resume_falls_back_to_queue(self, endpoint_collaborators):
         endpoint_collaborators.delegate.return_value = False
 
-        result = await main.resume_job(MagicMock(), JOB_ID, main.JobResumeRequest())
+        result = await orchestrator.main.resume_job(
+            MagicMock(), JOB_ID, orchestrator.main.JobResumeRequest()
+        )
 
         assert result["status"] == "queued"
         assert result["job_id"] == JOB_ID
@@ -783,13 +835,15 @@ class TestRedispatchCircuitAcknowledgement:
         self, endpoint_collaborators
     ):
         self._trip(endpoint_collaborators.job)
-        main.require_internal_or_job_access.return_value = (
+        orchestrator.main.require_internal_or_job_access.return_value = (
             {"id": "00000000-0000-0000-0000-0000000000cc"},
             endpoint_collaborators.job,
         )
 
-        result = await main.resume_job(
-            MagicMock(), JOB_ID, main.JobResumeRequest(feedback="retry deliberately")
+        result = await orchestrator.main.resume_job(
+            MagicMock(),
+            JOB_ID,
+            orchestrator.main.JobResumeRequest(feedback="retry deliberately"),
         )
 
         assert result["status"] == "acknowledged"
@@ -807,11 +861,11 @@ class TestRedispatchCircuitAcknowledgement:
                     "An operator explicitly resumed this job with the feedback below."
                 ),
             },
-            completion_commands_enabled=main.COMPLETION_COMMANDS_ENABLED,
+            completion_commands_enabled=orchestrator.main.COMPLETION_COMMANDS_ENABLED,
         )
         endpoint_collaborators.delegate.assert_not_awaited()
         endpoint_collaborators.queue_for_resume.assert_not_awaited()
-        main._trigger_dispatch.assert_called_once_with()
+        orchestrator.main._trigger_dispatch.assert_called_once_with()
 
     @pytest.mark.asyncio
     async def test_current_officer_may_acknowledge_own_project(
@@ -826,13 +880,17 @@ class TestRedispatchCircuitAcknowledgement:
             officer_incarnation=4,
         )
         authorize = AsyncMock(return_value=actor)
-        monkeypatch.setattr(main, "authorize_runtime_actor_request", authorize)
+        monkeypatch.setattr(
+            orchestrator.main, "authorize_runtime_actor_request", authorize
+        )
 
-        result = await main.resume_job(MagicMock(), JOB_ID, main.JobResumeRequest())
+        result = await orchestrator.main.resume_job(
+            MagicMock(), JOB_ID, orchestrator.main.JobResumeRequest()
+        )
 
         assert result["status"] == "acknowledged"
         authorize.assert_awaited_once_with(
-            main.postgres_db,
+            orchestrator.main.postgres_db,
             ANY,
             action="redispatch_livelock_ack",
             project_id=PROJECT_ID,
@@ -855,34 +913,40 @@ class TestRedispatchCircuitAcknowledgement:
                 detail={"code": "runtime_not_current"},
             )
         )
-        monkeypatch.setattr(main, "authorize_runtime_actor_request", authorize)
+        monkeypatch.setattr(
+            orchestrator.main, "authorize_runtime_actor_request", authorize
+        )
 
         with pytest.raises(HTTPException) as exc:
-            await main.resume_job(MagicMock(), JOB_ID, main.JobResumeRequest())
+            await orchestrator.main.resume_job(
+                MagicMock(), JOB_ID, orchestrator.main.JobResumeRequest()
+            )
 
         assert exc.value.status_code == 403
         endpoint_collaborators.acknowledge_circuit.assert_not_awaited()
         endpoint_collaborators.delegate.assert_not_awaited()
-        main._trigger_dispatch.assert_not_called()
+        orchestrator.main._trigger_dispatch.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_acknowledgement_race_reports_no_false_success(
         self, endpoint_collaborators
     ):
         self._trip(endpoint_collaborators.job)
-        main.require_internal_or_job_access.return_value = (
+        orchestrator.main.require_internal_or_job_access.return_value = (
             {"id": "00000000-0000-0000-0000-0000000000cc"},
             endpoint_collaborators.job,
         )
         endpoint_collaborators.acknowledge_circuit.return_value = False
 
         with pytest.raises(HTTPException) as exc:
-            await main.resume_job(MagicMock(), JOB_ID, main.JobResumeRequest())
+            await orchestrator.main.resume_job(
+                MagicMock(), JOB_ID, orchestrator.main.JobResumeRequest()
+            )
 
         assert exc.value.status_code == 409
         endpoint_collaborators.delegate.assert_not_awaited()
         endpoint_collaborators.queue_for_resume.assert_not_awaited()
-        main._trigger_dispatch.assert_not_called()
+        orchestrator.main._trigger_dispatch.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -909,13 +973,17 @@ class TestResumeEndpointWorkspacelessJob:
             "vm": {"status": "failed", "error": "while scanning a simple key"}
         }
         shed = AsyncMock(return_value=True)
-        monkeypatch.setattr(main.postgres_db, "shed_workspace_context", shed)
+        monkeypatch.setattr(
+            orchestrator.main.postgres_db, "shed_workspace_context", shed
+        )
         endpoint_collaborators.shed = shed
         return endpoint_collaborators
 
     @pytest.mark.asyncio
     async def test_queues_instead_of_resuming_onto_an_agent(self, workspaceless):
-        result = await main.resume_job(MagicMock(), JOB_ID, main.JobResumeRequest())
+        result = await orchestrator.main.resume_job(
+            MagicMock(), JOB_ID, orchestrator.main.JobResumeRequest()
+        )
 
         assert result["status"] == "queued"
         workspaceless.delegate.assert_not_awaited()
@@ -924,7 +992,9 @@ class TestResumeEndpointWorkspacelessJob:
     @pytest.mark.asyncio
     async def test_sheds_the_parked_vm_context(self, workspaceless):
         """Without this the dispatcher reads status='failed' and re-parks it."""
-        await main.resume_job(MagicMock(), JOB_ID, main.JobResumeRequest())
+        await orchestrator.main.resume_job(
+            MagicMock(), JOB_ID, orchestrator.main.JobResumeRequest()
+        )
 
         workspaceless.shed.assert_awaited_once_with(JOB_ID, "vm")
 
@@ -933,7 +1003,9 @@ class TestResumeEndpointWorkspacelessJob:
         workspaceless.job["config_override"] = {"workspace": {"backend": "sandbox"}}
         workspaceless.job["context"] = {"workspace_container": {"status": "deleted"}}
 
-        await main.resume_job(MagicMock(), JOB_ID, main.JobResumeRequest())
+        await orchestrator.main.resume_job(
+            MagicMock(), JOB_ID, orchestrator.main.JobResumeRequest()
+        )
 
         workspaceless.shed.assert_awaited_once_with(JOB_ID, "workspace_container")
 
@@ -944,8 +1016,10 @@ class TestResumeEndpointWorkspacelessJob:
         The pre-flight returns before the endpoint's own feedback merge, so the
         feedback rides along on the queue write instead.
         """
-        await main.resume_job(
-            MagicMock(), JOB_ID, main.JobResumeRequest(feedback="try again")
+        await orchestrator.main.resume_job(
+            MagicMock(),
+            JOB_ID,
+            orchestrator.main.JobResumeRequest(feedback="try again"),
         )
 
         workspaceless.queue_for_resume.assert_awaited_once_with(
@@ -972,10 +1046,10 @@ class TestResumeEndpointWorkspacelessJob:
             }
         )
 
-        result = await main.resume_job(
+        result = await orchestrator.main.resume_job(
             MagicMock(),
             JOB_ID,
-            main.JobResumeRequest(feedback="continue after rebuild"),
+            orchestrator.main.JobResumeRequest(feedback="continue after rebuild"),
         )
 
         assert result["status"] == "queued"
@@ -1013,7 +1087,9 @@ class TestResumeEndpointWorkspacelessJob:
             },
         }
 
-        result = await main.resume_job(MagicMock(), JOB_ID, main.JobResumeRequest())
+        result = await orchestrator.main.resume_job(
+            MagicMock(), JOB_ID, orchestrator.main.JobResumeRequest()
+        )
 
         assert result["status"] == "resumed"
         workspaceless.delegate.assert_awaited_once()
@@ -1060,15 +1136,21 @@ def grant_recheck_collaborators(monkeypatch, endpoint_collaborators):
     ``_enforce_dispatch_grants``, so each test below controls which one
     raises, and with what.
     """
-    monkeypatch.setattr(main, "_user_experts_enabled", AsyncMock(return_value=True))
-    monkeypatch.setattr(main, "_resolve_default_models", AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        orchestrator.main, "_user_experts_enabled", AsyncMock(return_value=True)
+    )
+    monkeypatch.setattr(
+        orchestrator.main, "_resolve_default_models", AsyncMock(return_value={})
+    )
     endpoint_collaborators.resolve_config = MagicMock(
         side_effect=_capturing_resolve_config
     )
-    monkeypatch.setattr(main, "resolve_config", endpoint_collaborators.resolve_config)
+    monkeypatch.setattr(
+        orchestrator.main, "resolve_config", endpoint_collaborators.resolve_config
+    )
     endpoint_collaborators.enforce_dispatch_grants = AsyncMock(return_value=None)
     monkeypatch.setattr(
-        main,
+        orchestrator.main,
         "_enforce_dispatch_grants",
         endpoint_collaborators.enforce_dispatch_grants,
     )
@@ -1084,12 +1166,16 @@ class TestResumeEndpointGrantRecheck:
         NOT put the job back on an agent. Asserting the status code alone
         would still pass a fix that resumed the job first and merely
         returned the right code afterwards."""
-        grant_recheck_collaborators.resolve_config.side_effect = main.ToolPolicyError(
-            "tools.core: unsupported value None (NoneType)."
+        grant_recheck_collaborators.resolve_config.side_effect = (
+            orchestrator.main.ToolPolicyError(
+                "tools.core: unsupported value None (NoneType)."
+            )
         )
 
         with pytest.raises(HTTPException) as ei:
-            await main.resume_job(MagicMock(), JOB_ID, main.JobResumeRequest())
+            await orchestrator.main.resume_job(
+                MagicMock(), JOB_ID, orchestrator.main.JobResumeRequest()
+            )
 
         assert ei.value.status_code == 409
         # Names the real cause (the stored config, not the caller's grants)
@@ -1110,7 +1196,9 @@ class TestResumeEndpointGrantRecheck:
             "connection reset by peer"
         )
 
-        result = await main.resume_job(MagicMock(), JOB_ID, main.JobResumeRequest())
+        result = await orchestrator.main.resume_job(
+            MagicMock(), JOB_ID, orchestrator.main.JobResumeRequest()
+        )
 
         assert result == {
             "status": "resumed",
@@ -1125,13 +1213,15 @@ class TestResumeEndpointGrantRecheck:
         level: an actual grant violation still fails closed with 403, not
         the new 409 this task adds for the unresolvable-config case."""
         grant_recheck_collaborators.enforce_dispatch_grants.side_effect = (
-            main.GrantDenied(
+            orchestrator.main.GrantDenied(
                 ["shell_tools: tools.shell requires the shell_tools grant"]
             )
         )
 
         with pytest.raises(HTTPException) as ei:
-            await main.resume_job(MagicMock(), JOB_ID, main.JobResumeRequest())
+            await orchestrator.main.resume_job(
+                MagicMock(), JOB_ID, orchestrator.main.JobResumeRequest()
+            )
 
         assert ei.value.status_code == 403
         assert "shell_tools" in ei.value.detail
@@ -1141,7 +1231,9 @@ class TestResumeEndpointGrantRecheck:
     async def test_happy_path_still_resumes(self, grant_recheck_collaborators):
         """Fixture sanity baseline: when both collaborators pass, the PEP
         block is a no-op and the job resumes normally."""
-        result = await main.resume_job(MagicMock(), JOB_ID, main.JobResumeRequest())
+        result = await orchestrator.main.resume_job(
+            MagicMock(), JOB_ID, orchestrator.main.JobResumeRequest()
+        )
 
         assert result["status"] == "resumed"
         grant_recheck_collaborators.delegate.assert_awaited_once()
@@ -1169,7 +1261,9 @@ class TestResumeEndpointGrantRecheck:
         grant_recheck_collaborators.job["config_override"] = "{not valid json"
 
         with pytest.raises(HTTPException) as ei:
-            await main.resume_job(MagicMock(), JOB_ID, main.JobResumeRequest())
+            await orchestrator.main.resume_job(
+                MagicMock(), JOB_ID, orchestrator.main.JobResumeRequest()
+            )
 
         assert ei.value.status_code == 409
         assert "cannot be resolved" in ei.value.detail
@@ -1191,15 +1285,19 @@ class TestResumeEndpointGrantRecheck:
         own internal $extends probe swallows the first attempt and retries
         against the same missing path) — not a mocked stand-in for it.
         """
-        from services.config_resolver import resolve_config as real_resolve_config
+        from orchestrator.services.config_resolver import (
+            resolve_config as real_resolve_config,
+        )
 
-        monkeypatch.setattr(main, "resolve_config", real_resolve_config)
+        monkeypatch.setattr(orchestrator.main, "resolve_config", real_resolve_config)
         grant_recheck_collaborators.job["config_name"] = (
             "this-config-name-does-not-exist-anywhere-2f9c1a"
         )
 
         with pytest.raises(HTTPException) as ei:
-            await main.resume_job(MagicMock(), JOB_ID, main.JobResumeRequest())
+            await orchestrator.main.resume_job(
+                MagicMock(), JOB_ID, orchestrator.main.JobResumeRequest()
+            )
 
         assert ei.value.status_code == 409
         assert "cannot be resolved" in ei.value.detail
@@ -1223,7 +1321,7 @@ class TestResumePayloadGitRemote:
     ):
         job = _job(context={"git_remote_url": "http://srw-gitea:3000/srw/job-1.git"})
 
-        assert await main._resume_job_on_agent(job, _agent()) is True
+        assert await orchestrator.main._resume_job_on_agent(job, _agent()) is True
 
         assert (
             _posted_payload()["git_remote_url"] == "http://srw-gitea:3000/srw/job-1.git"
@@ -1233,6 +1331,6 @@ class TestResumePayloadGitRemote:
     async def test_resume_payload_omits_git_remote_when_job_has_none(
         self, resume_collaborators
     ):
-        assert await main._resume_job_on_agent(_job(), _agent()) is True
+        assert await orchestrator.main._resume_job_on_agent(_job(), _agent()) is True
 
         assert "git_remote_url" not in _posted_payload()

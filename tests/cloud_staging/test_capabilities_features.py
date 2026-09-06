@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-import main
+import orchestrator.main
 
 
 def _patch_capabilities(
@@ -28,27 +28,31 @@ def _patch_capabilities(
 ) -> ExitStack:
     stack = ExitStack()
     stack.enter_context(
-        patch("main.require_approved_user", AsyncMock(return_value=user))
+        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user))
     )
-    stack.enter_context(patch("main._is_protected_cloud_mode_enabled", lambda: flag))
+    stack.enter_context(
+        patch("orchestrator.main._is_protected_cloud_mode_enabled", lambda: flag)
+    )
     stack.enter_context(
         patch(
-            "main._datasource_scope_auto_attach_v1_enabled",
+            "orchestrator.main._datasource_scope_auto_attach_v1_enabled",
             lambda: datasource_scope_flag,
         )
     )
     stack.enter_context(
         patch(
-            "main._datasource_defaults_on_omission",
+            "orchestrator.main._datasource_defaults_on_omission",
             lambda: datasource_defaults_flag,
         )
     )
     # _grant_project_ids -> user_visible_project_ids -> postgres_db; short-
     # circuit it so the non-admin branch doesn't need a real db.
-    stack.enter_context(patch("main._grant_project_ids", AsyncMock(return_value=[])))
+    stack.enter_context(
+        patch("orchestrator.main._grant_project_ids", AsyncMock(return_value=[]))
+    )
     stack.enter_context(
         patch(
-            "services.grants_service.resolve_grants_for",
+            "orchestrator.services.grants_service.resolve_grants_for",
             AsyncMock(return_value=grants or {}),
         )
     )
@@ -60,7 +64,7 @@ class TestCapabilitiesFeatures:
     async def test_admin_features_flag_on(self, user_admin, fake_request):
         stack = _patch_capabilities(user=user_admin, flag=True)
         with stack:
-            result = await main.my_capabilities(fake_request)
+            result = await orchestrator.main.my_capabilities(fake_request)
         assert result["is_admin"] is True
         assert result["features"] == {
             "protected_cloud": True,
@@ -72,7 +76,7 @@ class TestCapabilitiesFeatures:
     async def test_admin_features_flag_off(self, user_admin, fake_request):
         stack = _patch_capabilities(user=user_admin, flag=False)
         with stack:
-            result = await main.my_capabilities(fake_request)
+            result = await orchestrator.main.my_capabilities(fake_request)
         assert result["is_admin"] is True
         assert result["features"] == {
             "protected_cloud": False,
@@ -84,7 +88,7 @@ class TestCapabilitiesFeatures:
     async def test_non_admin_features_flag_on(self, user_a, fake_request):
         stack = _patch_capabilities(user=user_a, flag=True)
         with stack:
-            result = await main.my_capabilities(fake_request)
+            result = await orchestrator.main.my_capabilities(fake_request)
         assert result["is_admin"] is False
         assert result["features"] == {
             "protected_cloud": True,
@@ -96,7 +100,7 @@ class TestCapabilitiesFeatures:
     async def test_non_admin_features_flag_off(self, user_a, fake_request):
         stack = _patch_capabilities(user=user_a, flag=False)
         with stack:
-            result = await main.my_capabilities(fake_request)
+            result = await orchestrator.main.my_capabilities(fake_request)
         assert result["is_admin"] is False
         assert result["features"] == {
             "protected_cloud": False,
@@ -114,16 +118,16 @@ class TestCapabilitiesFeatures:
             datasource_scope_flag=True,
         )
         with stack:
-            result = await main.my_capabilities(fake_request)
+            result = await orchestrator.main.my_capabilities(fake_request)
 
         assert result["features"]["datasource_scope_auto_attach_v1"] is True
 
 
 def test_datasource_scope_feature_gate_defaults_off(monkeypatch):
     monkeypatch.delenv("DATASOURCE_SCOPE_AUTO_ATTACH_V1_ENABLED", raising=False)
-    assert main._datasource_scope_auto_attach_v1_enabled() is False
+    assert orchestrator.main._datasource_scope_auto_attach_v1_enabled() is False
 
 
 def test_datasource_scope_feature_gate_accepts_true(monkeypatch):
     monkeypatch.setenv("DATASOURCE_SCOPE_AUTO_ATTACH_V1_ENABLED", "true")
-    assert main._datasource_scope_auto_attach_v1_enabled() is True
+    assert orchestrator.main._datasource_scope_auto_attach_v1_enabled() is True

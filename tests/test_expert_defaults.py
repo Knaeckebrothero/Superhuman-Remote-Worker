@@ -7,7 +7,7 @@ import yaml
 
 import orchestrator.main as orchestrator_main
 from orchestrator.main import _load_expert_detail
-from src.core.tool_policy import enumerate_only_members
+from shared.runtime.core.tool_policy import enumerate_only_members
 
 
 @pytest.mark.asyncio
@@ -97,7 +97,7 @@ async def test_bundled_expert_detail_serves_the_write_vocabulary_too():
 @pytest.mark.asyncio
 async def test_the_served_vocabulary_is_what_the_write_boundary_accepts():
     """The round trip the forms actually perform."""
-    from src.core.tool_policy import validate_tool_override_fragment
+    from shared.runtime.core.tool_policy import validate_tool_override_fragment
 
     detail = await _load_expert_detail("worker_base")
     for category, names in detail["enumerate_only"].items():
@@ -257,7 +257,7 @@ class TestPublicBaseIdsAfterTheRootSplit:
     async def test_base_id_detail_is_the_merged_role_base(
         self, expert_id, defaults_type, role
     ):
-        from src.core.loader import ROLE_ROOTS, load_role_base
+        from shared.runtime.core.loader import ROLE_ROOTS, load_role_base
 
         detail = await _load_expert_detail(expert_id, defaults_type=defaults_type)
 
@@ -302,7 +302,10 @@ class TestPublicBaseIdsAfterTheRootSplit:
     async def test_bundled_expert_detail_matches_the_loader_chain(self, expert_id):
         """The served config equals the loader's merged chain for the expert's
         own role (base + leaf), minus the keys the API never serves."""
-        from src.core.loader import load_and_merge_config, resolve_config_path
+        from shared.runtime.core.loader import (
+            load_and_merge_config,
+            resolve_config_path,
+        )
 
         detail = await _load_expert_detail(expert_id)
 

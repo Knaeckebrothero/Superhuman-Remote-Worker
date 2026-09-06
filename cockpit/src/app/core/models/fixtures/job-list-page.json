@@ -1,0 +1,97 @@
+{
+  "jobs": [
+    {
+      "id": "33333333-3333-4333-8333-333333333333",
+      "description": "Job-list contract fixture",
+      "status": "completed",
+      "completion_outcome_kind": null,
+      "origin": "user",
+      "config_name": null,
+      "assigned_agent_id": null,
+      "user_id": "11111111-1111-4111-8111-111111111111",
+      "project_id": "22222222-2222-4222-8222-222222222222",
+      "parent_job_id": null,
+      "priority": 5,
+      "repo_name": null,
+      "branch_name": null,
+      "merge_status": null,
+      "diff_status": null,
+      "exported_at": null,
+      "exported_folder_handle": null,
+      "error_message": null,
+      "created_at": "2026-09-06T08:00:00Z",
+      "created_by_thread_id": null,
+      "snapshot_status": null,
+      "project_name": "Contract project",
+      "pending_approval": false,
+      "pending_approval_request_id": null,
+      "display_root_id": "33333333-3333-4333-8333-333333333333",
+      "is_display_root": true,
+      "subjob_count": 1,
+      "workspace_contract": {
+        "state": "waiting"
+      },
+      "audit_count": null,
+      "cloud_review_mode": "open_folder",
+      "exported_folder_url": null
+    },
+    {
+      "id": "33333333-3333-4333-8333-333333333334",
+      "description": "Matching child",
+      "status": "completed",
+      "completion_outcome_kind": null,
+      "origin": "subjob",
+      "config_name": "scholar",
+      "assigned_agent_id": null,
+      "user_id": "11111111-1111-4111-8111-111111111111",
+      "project_id": "22222222-2222-4222-8222-222222222222",
+      "parent_job_id": "33333333-3333-4333-8333-333333333333",
+      "priority": 5,
+      "repo_name": null,
+      "branch_name": null,
+      "merge_status": null,
+      "diff_status": null,
+      "exported_at": null,
+      "exported_folder_handle": null,
+      "error_message": null,
+      "created_at": "2026-09-06T08:00:00Z",
+      "created_by_thread_id": null,
+      "snapshot_status": null,
+      "project_name": "Contract project",
+      "pending_approval": false,
+      "pending_approval_request_id": null,
+      "display_root_id": "33333333-3333-4333-8333-333333333333",
+      "is_display_root": false,
+      "subjob_count": 0,
+      "workspace_contract": {
+        "state": "waiting"
+      },
+      "audit_count": null,
+      "cloud_review_mode": "open_folder",
+      "exported_folder_url": null
+    }
+  ],
+  "total": 10000,
+  "total_is_capped": true,
+  "has_more": true,
+  "limit": 1,
+  "offset": 2,
+  "as_of": "2026-09-06T09:00:00Z",
+  "filters": {
+    "status": [
+      "completed"
+    ],
+    "origin": [
+      "user",
+      "subjob"
+    ],
+    "project_id": [
+      "22222222-2222-4222-8222-222222222222",
+      "22222222-2222-4222-8222-222222222223"
+    ],
+    "has_project": null,
+    "include_archived_projects": false,
+    "search": null,
+    "user_id": null
+  }
+}

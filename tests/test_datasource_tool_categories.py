@@ -11,7 +11,7 @@ hand-maintained copies disagreed on read-write managed connectors
 
 import pytest
 
-from src.core.datasource_setup import (
+from agent.core.datasource_setup import (
     DATASOURCE_TOOL_MAP,
     datasource_tool_categories,
 )
@@ -117,7 +117,7 @@ class TestDatasourceToolCategories:
 
 def test_repository_maps_to_repo_category_not_git():
     """Reusing 'git' would strip the workspace git tools when no repo is attached."""
-    from src.core.datasource_setup import datasource_tool_categories
+    from agent.core.datasource_setup import datasource_tool_categories
 
     cats = datasource_tool_categories(
         [{"type": "repository", "name": "r", "project_read_only": False}]
@@ -127,7 +127,7 @@ def test_repository_maps_to_repo_category_not_git():
 
 
 def test_read_only_repository_gets_only_read_tools():
-    from src.core.datasource_setup import datasource_tool_categories
+    from agent.core.datasource_setup import datasource_tool_categories
 
     cats = datasource_tool_categories(
         [{"type": "repository", "name": "r", "project_read_only": True}]
@@ -150,7 +150,7 @@ class TestRepoCategorySurvivesTheRealFunnel:
 
     def _config_for(self, datasources):
         from orchestrator.main import _build_datasource_tool_override
-        from src.core.loader import load_config_from_resolved
+        from shared.runtime.core.loader import load_config_from_resolved
 
         override = _build_datasource_tool_override(datasources, None)
         resolved = {
@@ -166,7 +166,7 @@ class TestRepoCategorySurvivesTheRealFunnel:
 
     def test_tools_config_has_a_repo_field(self):
         """A dataclass without the field silently drops the category."""
-        from src.core.loader import ToolsConfig
+        from shared.runtime.core.loader import ToolsConfig
 
         assert "repo" in ToolsConfig.__dataclass_fields__
         assert ToolsConfig().repo == []
@@ -186,7 +186,7 @@ class TestRepoCategorySurvivesTheRealFunnel:
         """The guard for the whole feature: without ``"repo"`` in the
         ``get_all_tool_names`` category tuple, the agent never asks the
         registry for a single repo tool."""
-        from src.core.loader import get_all_tool_names
+        from shared.runtime.core.loader import get_all_tool_names
 
         names = get_all_tool_names(self._config_for([_ds("repository")]))
         assert "repo_checkout" in names
@@ -197,7 +197,7 @@ class TestRepoCategorySurvivesTheRealFunnel:
         assert "repo_pr_status" in names
 
     def test_read_only_repository_yields_only_repo_read_tools(self):
-        from src.core.loader import get_all_tool_names
+        from shared.runtime.core.loader import get_all_tool_names
 
         names = get_all_tool_names(
             self._config_for([_ds("repository", read_only=True)])
@@ -210,7 +210,7 @@ class TestRepoCategorySurvivesTheRealFunnel:
         assert "repo_open_pr" not in names
 
     def test_no_repository_attached_yields_no_repo_tools(self):
-        from src.core.loader import get_all_tool_names
+        from shared.runtime.core.loader import get_all_tool_names
 
         names = get_all_tool_names(self._config_for([_ds("postgresql")]))
         assert not [n for n in names if n.startswith("repo_")]
@@ -220,8 +220,8 @@ class TestRepoCategorySurvivesTheRealFunnel:
         group back into a ``repo`` bucket, which is what gates the wiring
         block in ``src/tools/registry.py`` (``if "repo" in
         tools_by_category``)."""
-        from src.core.loader import get_all_tool_names
-        from src.tools.registry import TOOL_REGISTRY
+        from shared.runtime.core.loader import get_all_tool_names
+        from agent.tools.registry import TOOL_REGISTRY
 
         names = get_all_tool_names(self._config_for([_ds("repository")]))
         # Same grouping load_tools() performs before dispatching by category.
@@ -308,7 +308,7 @@ class TestApplyDatasourceEnrichmentToResolved:
     (dedicated-pod parity with warm-pool, live_session_settings.md P0.2)."""
 
     def test_folds_categories_and_cli_types_into_agent_dict(self):
-        from src.api.persistent_app import _apply_datasource_enrichment_to_resolved
+        from agent.api.persistent_app import _apply_datasource_enrichment_to_resolved
 
         resolved = {
             "agent": {
@@ -337,8 +337,8 @@ class TestApplyDatasourceEnrichmentToResolved:
         _apply_datasource_enrichment_to_resolved must surface as
         config.extra['_cli_datasources'] and config.tools.sql after
         load_config_from_resolved."""
-        from src.api.persistent_app import _apply_datasource_enrichment_to_resolved
-        from src.core.loader import load_config_from_resolved
+        from agent.api.persistent_app import _apply_datasource_enrichment_to_resolved
+        from shared.runtime.core.loader import load_config_from_resolved
 
         resolved = {
             "agent": {"agent_id": "a", "display_name": "A", "tools": {}},
@@ -353,7 +353,7 @@ class TestApplyDatasourceEnrichmentToResolved:
         assert config.tools.sql == ["sql_query", "sql_schema"]
 
     def test_noop_on_missing_or_malformed_blob(self):
-        from src.api.persistent_app import _apply_datasource_enrichment_to_resolved
+        from agent.api.persistent_app import _apply_datasource_enrichment_to_resolved
 
         # None blob: nothing to do, must not raise.
         _apply_datasource_enrichment_to_resolved(None, {"sql": []}, ["postgresql"])
@@ -364,7 +364,7 @@ class TestApplyDatasourceEnrichmentToResolved:
         assert resolved == {"agent": "not-a-dict"}
 
     def test_no_cli_types_leaves_top_level_unset(self):
-        from src.api.persistent_app import _apply_datasource_enrichment_to_resolved
+        from agent.api.persistent_app import _apply_datasource_enrichment_to_resolved
 
         resolved = {"agent": {"agent_id": "a", "tools": {}}}
         _apply_datasource_enrichment_to_resolved(resolved, {"sql": []}, [])
@@ -379,7 +379,7 @@ class TestProcessDatasourcesConnectionRouting:
     @pytest.fixture
     def spies(self, monkeypatch):
         """Spy on connection creation + the retired CLI injectors."""
-        import src.core.datasource_setup as mod
+        import agent.core.datasource_setup as mod
         from unittest.mock import MagicMock
 
         created = []
@@ -403,7 +403,7 @@ class TestProcessDatasourcesConnectionRouting:
         return created, cli_spies
 
     def test_read_write_connector_gets_connection_not_cli(self, spies):
-        from src.core.datasource_setup import process_datasources
+        from agent.core.datasource_setup import process_datasources
 
         created, cli_spies = spies
         connections, clients, cli_types = process_datasources(
@@ -417,7 +417,7 @@ class TestProcessDatasourcesConnectionRouting:
             spy.assert_not_called()
 
     def test_read_only_connector_unchanged(self, spies):
-        from src.core.datasource_setup import process_datasources
+        from agent.core.datasource_setup import process_datasources
 
         created, _ = spies
         connections, clients, cli_types = process_datasources(
@@ -431,7 +431,7 @@ class TestProcessDatasourcesConnectionRouting:
         grants write tools when ANY of a type is RW — so the RW connection
         must win the slot regardless of input order (write tools must never
         bind to the read-only-linked connection)."""
-        from src.core.datasource_setup import process_datasources
+        from agent.core.datasource_setup import process_datasources
 
         for order in (["rw", "ro"], ["ro", "rw"]):
             connections, _, _ = process_datasources(
@@ -448,7 +448,7 @@ class TestDatasourceIndexNotes:
     RW CLI usage lines (PGSERVICE/cypher-shell/mongosh) advertised a dead path."""
 
     def _render_index(self, ds_configs):
-        from src.core.datasource_setup import inject_workspace_facts
+        from agent.core.datasource_setup import inject_workspace_facts
         from unittest.mock import MagicMock
 
         ws = MagicMock()

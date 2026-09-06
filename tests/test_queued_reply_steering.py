@@ -17,14 +17,14 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.graph import (
+from agent.graph import (
     _deliver_queued_replies,
     _reply_key,
     _replies_overdue,
     _write_reply_files,
 )
-from src.core.message_markers import PERSIST_ROLE_EVENT, PERSIST_ROLE_KEY
-from src.tools.context import ToolContext
+from shared.runtime.core.message_markers import PERSIST_ROLE_EVENT, PERSIST_ROLE_KEY
+from agent.tools.context import ToolContext
 
 
 def iso(seconds_ago: float) -> str:
@@ -63,7 +63,7 @@ def acks(monkeypatch):
         )
 
     monkeypatch.setattr(
-        "src.graph._ack_supervisor_guidance",
+        "agent.graph._ack_supervisor_guidance",
         record,
     )
     return recorded
@@ -73,14 +73,14 @@ def acks(monkeypatch):
 def written(monkeypatch):
     recorded = []
     monkeypatch.setattr(
-        "src.graph._write_reply_files",
+        "agent.graph._write_reply_files",
         lambda job_id, workspace, replies: recorded.append(list(replies)),
     )
     return recorded
 
 
 def set_inbox(monkeypatch, replies):
-    monkeypatch.setattr("src.graph._get_queued_replies", lambda job_id: list(replies))
+    monkeypatch.setattr("agent.graph._get_queued_replies", lambda job_id: list(replies))
 
 
 class TestRepliesOverdue:
@@ -396,7 +396,7 @@ class TestDelivery:
         def boom(job_id, workspace, replies):
             raise RuntimeError("workspace unreachable")
 
-        monkeypatch.setattr("src.graph._write_reply_files", boom)
+        monkeypatch.setattr("agent.graph._write_reply_files", boom)
         set_inbox(
             monkeypatch, [{"thread_id": "t1", "message": "m", "timestamp": iso(5)}]
         )
@@ -501,12 +501,12 @@ class TestSourceAwareArchive:
 
 class TestTodoCompleteSetsTheBreak:
     def _tool(self, context):
-        from src.tools.core.todo import create_todo_tools
+        from agent.tools.core.todo import create_todo_tools
 
         return next(t for t in create_todo_tools(context) if t.name == "todo_complete")
 
     def test_completing_a_todo_requests_a_drain(self):
-        from src.managers.todo import TodoManager
+        from agent.managers.todo import TodoManager
 
         mgr = TodoManager(workspace=MagicMock())
         mgr.stage_tactical_todos(
@@ -533,8 +533,8 @@ class TestBoundaryBackstop:
     def _node(self, tool_context, monkeypatch, returned):
         from unittest.mock import MagicMock
 
-        from src.graph import _reply_key, create_handle_transition_node
-        from src.managers.todo import TodoManager
+        from agent.graph import _reply_key, create_handle_transition_node
+        from agent.managers.todo import TodoManager
 
         async def fake_process(
             job_id,
@@ -550,7 +550,7 @@ class TestBoundaryBackstop:
                 or _reply_key(reply) not in delivered_reply_keys
             ]
 
-        monkeypatch.setattr("src.graph._process_queued_replies", fake_process)
+        monkeypatch.setattr("agent.graph._process_queued_replies", fake_process)
 
         config = MagicMock()
         config.phase_settings = SimpleNamespace(min_todos=5, max_todos=20)
@@ -647,7 +647,7 @@ class TestBoundaryBackstop:
 
     @pytest.mark.asyncio
     async def test_backstop_suppresses_already_delivered_mail(self, monkeypatch, acks):
-        from src.graph import _reply_key
+        from agent.graph import _reply_key
 
         reply = {"thread_id": "t1", "message": "already seen", "timestamp": iso(5)}
         ctx = make_context()
@@ -670,7 +670,7 @@ class TestBoundaryBackstop:
     async def test_checkpointed_reply_is_filtered_before_workspace_write(
         self, monkeypatch
     ):
-        from src.graph import _process_queued_replies, _reply_key
+        from agent.graph import _process_queued_replies, _reply_key
 
         reply = {
             "id": "reply-committed-before-ack",
@@ -682,7 +682,7 @@ class TestBoundaryBackstop:
             fetchrow=AsyncMock(return_value={"context": {"queued_replies": [reply]}})
         )
         write_files = MagicMock()
-        monkeypatch.setattr("src.graph._write_reply_files", write_files)
+        monkeypatch.setattr("agent.graph._write_reply_files", write_files)
 
         result = await _process_queued_replies(
             "job-1",
@@ -699,7 +699,7 @@ class TestInboxContract:
     """The heartbeat prune contract, shared by both lanes."""
 
     def test_list_overwrites_empty_clears_none_keeps(self):
-        from src.api.dual_app import _replace_inbox
+        from agent.api.dual_app import _replace_inbox
 
         inbox = {}
         _replace_inbox(inbox, "job-1", [{"thread_id": "t1"}], "Queued replies")
@@ -715,7 +715,7 @@ class TestInboxContract:
 
     @pytest.mark.asyncio
     async def test_dual_app_forwards_exact_reply_keys(self, monkeypatch):
-        from src.api import dual_app
+        from agent.api import dual_app
 
         client = MagicMock()
         client.ack_job_guidance = AsyncMock(return_value=True)

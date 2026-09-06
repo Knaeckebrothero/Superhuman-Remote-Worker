@@ -17,8 +17,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from src.api import persistent_session as ps_module
-from src.api.persistent_session import PersistentSession
+from agent.api import persistent_session as ps_module
+from agent.api.persistent_session import PersistentSession
 
 
 def _make_session(**overrides) -> PersistentSession:

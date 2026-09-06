@@ -37,7 +37,7 @@ def assert_schema_rejected(
 
 CANVAS_GATEWAY_COMMAND = [
     "uvicorn",
-    "canvas_gateway:app",
+    "orchestrator.canvas_gateway:app",
     "--host",
     "0.0.0.0",
     "--port",
@@ -102,8 +102,8 @@ def test_canvas_live_preview_gate_reaches_orchestrator_and_agent_config() -> Non
     # actual tool capability still comes only from the orchestrator's positive
     # attach bit and is covered by the callable/runtime tests.
     for relative_path in (
-        "orchestrator/services/agent_provisioner.py",
-        "orchestrator/services/persistent_provisioner.py",
+        "src/orchestrator/services/agent_provisioner.py",
+        "src/orchestrator/services/persistent_provisioner.py",
     ):
         source = (ROOT / relative_path).read_text()
         assert '"envFrom"' in source
@@ -209,7 +209,7 @@ def test_canvas_gateway_templates_default_dark_with_optional_ingress() -> None:
     assert "port: 8086" in templates["service.yaml"]
 
     deployment = templates["deployment.yaml"]
-    assert "canvas_gateway:app" in deployment
+    assert "orchestrator.canvas_gateway:app" in deployment
     assert "--http" in deployment
     assert "- h11" in deployment
     assert "--no-access-log" in deployment
@@ -247,7 +247,7 @@ def test_canvas_gateway_templates_default_dark_with_optional_ingress() -> None:
     assert "ttlSecondsAfterFinished:" not in role_job
     assert "helm.sh/hook" not in role_job
     assert ".Release.Revision" in role_job
-    assert "operator_cli.canvas_viewer_database_attestation" in role_job
+    assert "orchestrator.operator_cli.canvas_viewer_database_attestation" in role_job
 
     database_role = templates["database-role.yaml"]
     assert "kind: DatabaseRole" in database_role
@@ -924,7 +924,7 @@ def test_canvas_gateway_development_can_provision_restricted_internal_role() -> 
     assert attestation["command"] == [
         "python",
         "-m",
-        "operator_cli.canvas_viewer_database_attestation",
+        "orchestrator.operator_cli.canvas_viewer_database_attestation",
     ]
     assert {entry["name"] for entry in attestation["env"]} == {
         "CANVAS_VIEWER_POSTGRES_PASSWORD"

@@ -14,9 +14,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.services.knowledge_store import KbWatermark
-from src.tools.knowledge.chunker import CHUNKER_VERSION, note_centroid
-from src.tools.knowledge.gardener import parse_note_md
+from shared.runtime.services.knowledge_store import KbWatermark
+from shared.runtime.knowledge.chunker import CHUNKER_VERSION, note_centroid
+from shared.runtime.knowledge.gardener import parse_note_md
 
 from orchestrator.services.kb_reindex import (
     FIRST_SWEEP_DELAY_SECONDS,
@@ -860,7 +860,7 @@ class TestReindexKbIncremental:
 
         import httpx
 
-        from src.services.forge import ForgeRepo, GitHubClient
+        from shared.runtime.services.forge import ForgeRepo, GitHubClient
 
         note = (
             "---\nid: note\ntype: learning\nstatus: active\n---\n"
@@ -897,7 +897,7 @@ class TestReindexKbIncremental:
             raise AssertionError(f"unexpected GitHub request: {request.method} {path}")
 
         monkeypatch.setattr(
-            "src.services.forge._transport",
+            "shared.runtime.services.forge._transport",
             httpx.MockTransport(handler),
             raising=False,
         )
@@ -2732,7 +2732,10 @@ class TestPostJobReindexTriggerResolvesItsOwnRepo:
         import pathlib
 
         return (
-            pathlib.Path(__file__).resolve().parents[1] / "orchestrator" / "main.py"
+            pathlib.Path(__file__).resolve().parents[1]
+            / "src"
+            / "orchestrator"
+            / "main.py"
         ).read_text(encoding="utf-8")
 
     def test_trigger_does_not_pin_repo_name(self):
@@ -2769,20 +2772,20 @@ class TestManualReindexProjectionSettlement:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("status", ["completed", "up-to-date"])
     async def test_success_settles_latest_canonical_intents(self, status):
-        from main import _reindex_project_kb
+        from orchestrator.main import _reindex_project_kb
 
         project_id = str(uuid.uuid4())
         db = AsyncMock()
         db.mark_knowledge_projections_synced.return_value = 2
         reindex = AsyncMock(return_value={"status": status, "upserted": 1})
         with (
-            patch("main.postgres_db", db),
-            patch("main.vector_db", MagicMock()),
+            patch("orchestrator.main.postgres_db", db),
+            patch("orchestrator.main.vector_db", MagicMock()),
             patch(
-                "main._build_kb_embedding_service",
+                "orchestrator.main._build_kb_embedding_service",
                 AsyncMock(return_value=MagicMock()),
             ),
-            patch("services.kb_reindex.reindex_kb", reindex),
+            patch("orchestrator.services.kb_reindex.reindex_kb", reindex),
         ):
             result = await _reindex_project_kb(
                 project_id,
@@ -2796,19 +2799,19 @@ class TestManualReindexProjectionSettlement:
 
     @pytest.mark.asyncio
     async def test_partial_reindex_does_not_claim_projection_convergence(self):
-        from main import _reindex_project_kb
+        from orchestrator.main import _reindex_project_kb
 
         project_id = str(uuid.uuid4())
         db = AsyncMock()
         with (
-            patch("main.postgres_db", db),
-            patch("main.vector_db", MagicMock()),
+            patch("orchestrator.main.postgres_db", db),
+            patch("orchestrator.main.vector_db", MagicMock()),
             patch(
-                "main._build_kb_embedding_service",
+                "orchestrator.main._build_kb_embedding_service",
                 AsyncMock(return_value=MagicMock()),
             ),
             patch(
-                "services.kb_reindex.reindex_kb",
+                "orchestrator.services.kb_reindex.reindex_kb",
                 AsyncMock(return_value={"status": "partial", "errors": 1}),
             ),
         ):

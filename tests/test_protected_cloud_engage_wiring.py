@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-import main
+import orchestrator.main
 
 # NOTE: import via the bare ``services.cloud...`` path, matching main.py's own
 # import (``from services.cloud.ro_engage import ...`` — see main.py's cloud
@@ -27,11 +27,13 @@ import main
 # here made ``except RoEngageRefused`` in main.py never match the instance this
 # test's side_effect raises, silently mis-testing the refusal path (it fell
 # through to the generic ``except Exception`` branch instead).
-from services.cloud.ro_engage import RoEngageRefused
-from services.cloud.protected_reader_authority import (
+from orchestrator.services.cloud.ro_engage import RoEngageRefused
+from orchestrator.services.cloud.protected_reader_authority import (
     ProtectedNextcloudReaderGrantPlan,
 )
-from services.cloud_staging.source_identity import ProtectedMountSourceIdentity
+from orchestrator.services.cloud_staging.source_identity import (
+    ProtectedMountSourceIdentity,
+)
 
 
 @asynccontextmanager
@@ -139,7 +141,7 @@ def _active_ro_row(*, attempt: str = "44444444-4444-4444-8444-444444444444") -> 
 )
 def test_active_ro_match_requires_complete_deliverable_attempt(field, value):
     row = {**_active_ro_row(), field: value}
-    assert not main._ro_mount_matches_protected_selection(
+    assert not orchestrator.main._ro_mount_matches_protected_selection(
         row,
         _PROTECTED_MOUNT_ROWS,
         thread_id=_ENGAGE_THREAD_ID,
@@ -149,7 +151,7 @@ def test_active_ro_match_requires_complete_deliverable_attempt(field, value):
 
 
 def test_active_ro_match_accepts_complete_exact_attempt():
-    assert main._ro_mount_matches_protected_selection(
+    assert orchestrator.main._ro_mount_matches_protected_selection(
         _active_ro_row(),
         _PROTECTED_MOUNT_ROWS,
         thread_id=_ENGAGE_THREAD_ID,
@@ -182,15 +184,17 @@ async def test_runtime_ready_probe_rechecks_lifecycle_after_reader_await():
     # Entry capture, loop authority check, then the final post-reader check.
     get_thread = AsyncMock(side_effect=[live, live, ended])
     with (
-        patch.object(main.postgres_db, "get_thread", get_thread),
+        patch.object(orchestrator.main.postgres_db, "get_thread", get_thread),
         patch.object(
-            main,
+            orchestrator.main,
             "_protected_cloud_delivery_state",
             side_effect=delayed_delivery,
         ),
     ):
         probe = asyncio.create_task(
-            main._await_protected_cloud_runtime_ready(thread_id, timeout_s=1)
+            orchestrator.main._await_protected_cloud_runtime_ready(
+                thread_id, timeout_s=1
+            )
         )
         await delivery_started.wait()
         release_delivery.set()
@@ -219,17 +223,19 @@ async def test_attach_inner_reader_flip_fails_without_scheduling_engage():
     }
     reserve = AsyncMock()
     with (
-        patch.object(main.postgres_db, "get_thread", AsyncMock(return_value=thread)),
         patch.object(
-            main,
+            orchestrator.main.postgres_db, "get_thread", AsyncMock(return_value=thread)
+        ),
+        patch.object(
+            orchestrator.main,
             "_protected_cloud_delivery_state",
             AsyncMock(return_value=("engaging", None)),
         ),
-        patch.object(main, "_schedule_protected_engage") as schedule,
-        patch.object(main, "_reserve_session_attach_binding", reserve),
+        patch.object(orchestrator.main, "_schedule_protected_engage") as schedule,
+        patch.object(orchestrator.main, "_reserve_session_attach_binding", reserve),
     ):
         result = await asyncio.wait_for(
-            main._send_session_attach_locked(
+            orchestrator.main._send_session_attach_locked(
                 {"id": "33333333-3333-4333-8333-333333333333"},
                 str(thread["id"]),
                 expected_runtime_generation=generation,
@@ -254,24 +260,32 @@ async def test_engage_called_for_protected_thread_with_project_mount():
     mock_db_context.__aexit__ = AsyncMock(return_value=None)
 
     with (
-        patch.object(main, "_is_protected_cloud_mode_enabled", return_value=True),
-        patch.object(main.postgres_db, "get_thread", AsyncMock(return_value=thread)),
         patch.object(
-            main.postgres_db,
+            orchestrator.main, "_is_protected_cloud_mode_enabled", return_value=True
+        ),
+        patch.object(
+            orchestrator.main.postgres_db, "get_thread", AsyncMock(return_value=thread)
+        ),
+        patch.object(
+            orchestrator.main.postgres_db,
             "list_thread_mounts",
             AsyncMock(return_value=mount_rows),
         ),
         patch.object(
-            main.postgres_db,
+            orchestrator.main.postgres_db,
             "get_ro_mount_by_thread",
             AsyncMock(return_value=None),
         ),
-        patch.object(main, "engage_ro_mount", new=AsyncMock()) as engage,
-        patch.object(main.main_cloud_router, "for_backend_instance") as for_backend,
-        patch.object(main.postgres_db, "acquire", return_value=mock_db_context),
+        patch.object(orchestrator.main, "engage_ro_mount", new=AsyncMock()) as engage,
+        patch.object(
+            orchestrator.main.main_cloud_router, "for_backend_instance"
+        ) as for_backend,
+        patch.object(
+            orchestrator.main.postgres_db, "acquire", return_value=mock_db_context
+        ),
     ):
         for_backend.return_value = object()
-        await main._engage_protected_cloud_for_thread(
+        await orchestrator.main._engage_protected_cloud_for_thread(
             _ENGAGE_THREAD_ID,
             user_id="user-1",
             mount_rows=mount_rows,
@@ -296,24 +310,32 @@ async def test_engage_success_clears_stale_protected_cloud_error():
     mock_db_context.__aexit__ = AsyncMock(return_value=None)
 
     with (
-        patch.object(main, "_is_protected_cloud_mode_enabled", return_value=True),
-        patch.object(main.postgres_db, "get_thread", AsyncMock(return_value=thread)),
         patch.object(
-            main.postgres_db,
+            orchestrator.main, "_is_protected_cloud_mode_enabled", return_value=True
+        ),
+        patch.object(
+            orchestrator.main.postgres_db, "get_thread", AsyncMock(return_value=thread)
+        ),
+        patch.object(
+            orchestrator.main.postgres_db,
             "list_thread_mounts",
             AsyncMock(return_value=mount_rows),
         ),
         patch.object(
-            main.postgres_db,
+            orchestrator.main.postgres_db,
             "get_ro_mount_by_thread",
             AsyncMock(return_value=None),
         ),
-        patch.object(main, "engage_ro_mount", new=AsyncMock()),
-        patch.object(main.main_cloud_router, "for_backend_instance") as for_backend,
-        patch.object(main.postgres_db, "acquire", return_value=mock_db_context),
+        patch.object(orchestrator.main, "engage_ro_mount", new=AsyncMock()),
+        patch.object(
+            orchestrator.main.main_cloud_router, "for_backend_instance"
+        ) as for_backend,
+        patch.object(
+            orchestrator.main.postgres_db, "acquire", return_value=mock_db_context
+        ),
     ):
         for_backend.return_value = object()
-        await main._engage_protected_cloud_for_thread(
+        await orchestrator.main._engage_protected_cloud_for_thread(
             _ENGAGE_THREAD_ID,
             user_id="user-1",
             mount_rows=mount_rows,
@@ -335,32 +357,40 @@ async def test_engage_refusal_records_error_and_does_not_raise():
     recorded: list[str] = []
     thread = _engage_runtime_thread()
     with (
-        patch.object(main, "_is_protected_cloud_mode_enabled", return_value=True),
-        patch.object(main.postgres_db, "get_thread", AsyncMock(return_value=thread)),
         patch.object(
-            main.postgres_db,
+            orchestrator.main, "_is_protected_cloud_mode_enabled", return_value=True
+        ),
+        patch.object(
+            orchestrator.main.postgres_db, "get_thread", AsyncMock(return_value=thread)
+        ),
+        patch.object(
+            orchestrator.main.postgres_db,
             "list_thread_mounts",
             AsyncMock(return_value=mount_rows),
         ),
         patch.object(
-            main.postgres_db,
+            orchestrator.main.postgres_db,
             "get_ro_mount_by_thread",
             AsyncMock(return_value=None),
         ),
         patch.object(
-            main, "engage_ro_mount", new=AsyncMock(side_effect=RoEngageRefused("floor"))
+            orchestrator.main,
+            "engage_ro_mount",
+            new=AsyncMock(side_effect=RoEngageRefused("floor")),
         ),
         patch.object(
-            main.main_cloud_router, "for_backend_instance", return_value=object()
+            orchestrator.main.main_cloud_router,
+            "for_backend_instance",
+            return_value=object(),
         ),
         patch.object(
-            main,
+            orchestrator.main,
             "_record_protected_error",
             new=AsyncMock(side_effect=lambda tid, msg, **_kwargs: recorded.append(msg)),
         ),
     ):
         # must NOT raise — a refusal is recorded, the session boots with no mount
-        await main._engage_protected_cloud_for_thread(
+        await orchestrator.main._engage_protected_cloud_for_thread(
             _ENGAGE_THREAD_ID,
             user_id="user-1",
             mount_rows=mount_rows,
@@ -392,23 +422,23 @@ async def test_schedule_protected_engage_registers_and_clears_task():
     depends on."""
     with (
         patch.object(
-            main, "_engage_protected_cloud_for_thread", new=AsyncMock()
+            orchestrator.main, "_engage_protected_cloud_for_thread", new=AsyncMock()
         ) as engage,
         patch.object(
-            main.postgres_db,
+            orchestrator.main.postgres_db,
             "thread_advisory_lock",
             side_effect=_owned_workspace_lifecycle_lock,
         ),
     ):
-        task = main._schedule_protected_engage(
+        task = orchestrator.main._schedule_protected_engage(
             _ENGAGE_THREAD_ID,
             user_id="user-1",
             mount_rows=[],
             runtime_generation=_ENGAGE_GENERATION,
         )
-        assert main._protected_engage_tasks.get(_ENGAGE_TASK_KEY) is task
+        assert orchestrator.main._protected_engage_tasks.get(_ENGAGE_TASK_KEY) is task
         await task
-    assert _ENGAGE_TASK_KEY not in main._protected_engage_tasks
+    assert _ENGAGE_TASK_KEY not in orchestrator.main._protected_engage_tasks
     engage.assert_awaited_once()
 
 
@@ -444,34 +474,40 @@ async def test_cross_replica_same_generation_engage_mints_only_once():
     backend.revoke_protected_reader_attempt = AsyncMock()
 
     with (
-        patch.object(main, "_is_protected_cloud_mode_enabled", return_value=True),
         patch.object(
-            main.postgres_db,
+            orchestrator.main, "_is_protected_cloud_mode_enabled", return_value=True
+        ),
+        patch.object(
+            orchestrator.main.postgres_db,
             "thread_advisory_lock",
             side_effect=serialized_lifecycle,
         ),
         patch.object(
-            main.postgres_db,
+            orchestrator.main.postgres_db,
             "get_thread",
             AsyncMock(return_value=_engage_runtime_thread()),
         ),
         patch.object(
-            main.postgres_db,
+            orchestrator.main.postgres_db,
             "list_thread_mounts",
             AsyncMock(return_value=_PROTECTED_MOUNT_ROWS),
         ),
         patch.object(
-            main.postgres_db,
+            orchestrator.main.postgres_db,
             "get_ro_mount_by_thread",
             AsyncMock(side_effect=lambda _tid: state["row"]),
         ),
-        patch.object(main, "engage_ro_mount", engage),
+        patch.object(orchestrator.main, "engage_ro_mount", engage),
         patch.object(
-            main.main_cloud_router, "for_backend_instance", return_value=backend
+            orchestrator.main.main_cloud_router,
+            "for_backend_instance",
+            return_value=backend,
         ),
-        patch.object(main.postgres_db, "acquire", return_value=mock_db_context),
+        patch.object(
+            orchestrator.main.postgres_db, "acquire", return_value=mock_db_context
+        ),
     ):
-        first = main._schedule_protected_engage(
+        first = orchestrator.main._schedule_protected_engage(
             _ENGAGE_THREAD_ID,
             user_id="user-1",
             mount_rows=_PROTECTED_MOUNT_ROWS,
@@ -479,7 +515,7 @@ async def test_cross_replica_same_generation_engage_mints_only_once():
         )
         # A separate replica has a separate registry and can schedule the same
         # work. Calling the scheduler twice deliberately bypasses local dedupe.
-        second = main._schedule_protected_engage(
+        second = orchestrator.main._schedule_protected_engage(
             _ENGAGE_THREAD_ID,
             user_id="user-1",
             mount_rows=_PROTECTED_MOUNT_ROWS,
@@ -500,7 +536,7 @@ async def test_build_agent_cloud_mount_awaits_inflight_engage_task_then_returns_
     (create-time engage still in flight) when the attach path asks for the
     mount. The first lookup finds nothing; awaiting the registered task lets
     it finish, and the RE-lookup afterward finds the row it just wrote."""
-    from main import _build_agent_cloud_mount
+    from orchestrator.main import _build_agent_cloud_mount
 
     monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
     monkeypatch.delenv("CLOUD_RCLONE_ALLOW_CONTAINER", raising=False)
@@ -509,7 +545,7 @@ async def test_build_agent_cloud_mount_awaits_inflight_engage_task_then_returns_
         return None
 
     task = asyncio.create_task(_noop())
-    main._protected_engage_tasks[_ENGAGE_TASK_KEY] = task
+    orchestrator.main._protected_engage_tasks[_ENGAGE_TASK_KEY] = task
 
     calls = {"n": 0}
 
@@ -520,9 +556,11 @@ async def test_build_agent_cloud_mount_awaits_inflight_engage_task_then_returns_
 
     try:
         with (
-            patch("main._is_protected_cloud_mode_enabled", return_value=True),
             patch(
-                "main.postgres_db.get_ro_mount_by_thread",
+                "orchestrator.main._is_protected_cloud_mode_enabled", return_value=True
+            ),
+            patch(
+                "orchestrator.main.postgres_db.get_ro_mount_by_thread",
                 new=AsyncMock(side_effect=_get_row),
             ),
         ):
@@ -535,7 +573,7 @@ async def test_build_agent_cloud_mount_awaits_inflight_engage_task_then_returns_
                 },
             )
     finally:
-        main._protected_engage_tasks.pop(_ENGAGE_TASK_KEY, None)
+        orchestrator.main._protected_engage_tasks.pop(_ENGAGE_TASK_KEY, None)
         if not task.done():
             task.cancel()
 
@@ -551,7 +589,7 @@ async def test_build_agent_cloud_mount_inflight_task_timeout_still_fails_closed(
     """A registered task that never finishes in time must not hang the
     attach path forever, and must never surface a mount after the bounded
     wait — fail-closed even on a timeout, not just an outright refusal."""
-    from main import _build_agent_cloud_mount
+    from orchestrator.main import _build_agent_cloud_mount
 
     monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
     monkeypatch.delenv("CLOUD_RCLONE_ALLOW_CONTAINER", raising=False)
@@ -560,17 +598,19 @@ async def test_build_agent_cloud_mount_inflight_task_timeout_still_fails_closed(
         await asyncio.Event().wait()  # never completes on its own
 
     task = asyncio.create_task(_hang())
-    main._protected_engage_tasks[_ENGAGE_TASK_KEY] = task
+    orchestrator.main._protected_engage_tasks[_ENGAGE_TASK_KEY] = task
 
     try:
         with (
-            patch("main._is_protected_cloud_mode_enabled", return_value=True),
             patch(
-                "main.postgres_db.get_ro_mount_by_thread",
+                "orchestrator.main._is_protected_cloud_mode_enabled", return_value=True
+            ),
+            patch(
+                "orchestrator.main.postgres_db.get_ro_mount_by_thread",
                 new=AsyncMock(return_value=None),
             ),
             patch(
-                "main.asyncio.wait_for",
+                "orchestrator.main.asyncio.wait_for",
                 new=AsyncMock(side_effect=asyncio.TimeoutError()),
             ),
         ):
@@ -583,7 +623,7 @@ async def test_build_agent_cloud_mount_inflight_task_timeout_still_fails_closed(
                 },
             )
     finally:
-        main._protected_engage_tasks.pop(_ENGAGE_TASK_KEY, None)
+        orchestrator.main._protected_engage_tasks.pop(_ENGAGE_TASK_KEY, None)
         task.cancel()
 
     assert payload is None
@@ -598,19 +638,19 @@ async def test_build_agent_cloud_mount_skips_poll_when_error_already_recorded(
     already ran to completion with nothing to wait for, so the poll loop
     must be skipped entirely rather than burning ~9s to rediscover 'no
     row'."""
-    from main import _build_agent_cloud_mount
+    from orchestrator.main import _build_agent_cloud_mount
 
     monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
     monkeypatch.delenv("CLOUD_RCLONE_ALLOW_CONTAINER", raising=False)
-    main._protected_engage_tasks.pop(_ENGAGE_TASK_KEY, None)
+    orchestrator.main._protected_engage_tasks.pop(_ENGAGE_TASK_KEY, None)
 
     with (
-        patch("main._is_protected_cloud_mode_enabled", return_value=True),
+        patch("orchestrator.main._is_protected_cloud_mode_enabled", return_value=True),
         patch(
-            "main.postgres_db.get_ro_mount_by_thread",
+            "orchestrator.main.postgres_db.get_ro_mount_by_thread",
             new=AsyncMock(return_value=None),
         ) as get_row,
-        patch("main.asyncio.sleep", new=AsyncMock()) as sleep,
+        patch("orchestrator.main.asyncio.sleep", new=AsyncMock()) as sleep,
     ):
         payload = await _build_agent_cloud_mount(
             _engage_runtime_thread(),
@@ -632,11 +672,11 @@ async def test_build_agent_cloud_mount_poll_finds_row_before_cap(monkeypatch):
     """Poll path (no task, no recorded error): the row can land mid-poll —
     the loop must stop as soon as it does, not always exhaust all 3
     attempts."""
-    from main import _build_agent_cloud_mount
+    from orchestrator.main import _build_agent_cloud_mount
 
     monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
     monkeypatch.delenv("CLOUD_RCLONE_ALLOW_CONTAINER", raising=False)
-    main._protected_engage_tasks.pop(_ENGAGE_TASK_KEY, None)
+    orchestrator.main._protected_engage_tasks.pop(_ENGAGE_TASK_KEY, None)
 
     calls = {"n": 0}
 
@@ -645,12 +685,12 @@ async def test_build_agent_cloud_mount_poll_finds_row_before_cap(monkeypatch):
         return _ACTIVE_NC_ROW if calls["n"] >= 3 else None
 
     with (
-        patch("main._is_protected_cloud_mode_enabled", return_value=True),
+        patch("orchestrator.main._is_protected_cloud_mode_enabled", return_value=True),
         patch(
-            "main.postgres_db.get_ro_mount_by_thread",
+            "orchestrator.main.postgres_db.get_ro_mount_by_thread",
             new=AsyncMock(side_effect=_get_row),
         ),
-        patch("main.asyncio.sleep", new=AsyncMock()) as sleep,
+        patch("orchestrator.main.asyncio.sleep", new=AsyncMock()) as sleep,
     ):
         payload = await _build_agent_cloud_mount(
             _engage_runtime_thread(),
@@ -699,7 +739,7 @@ def _resume_thread_row(**overrides) -> dict:
 @pytest.mark.parametrize("execution_lane", ["stateless", "future-lane"])
 async def test_resume_refuses_unavailable_non_pinned_lane(execution_lane):
     """Malformed stateless and unknown lanes fail before lifecycle mutation."""
-    from main import resume_thread
+    from orchestrator.main import resume_thread
 
     thread = _resume_thread_row(execution_lane=execution_lane)
     db = AsyncMock()
@@ -707,11 +747,11 @@ async def test_resume_refuses_unavailable_non_pinned_lane(execution_lane):
 
     with (
         patch(
-            "main.require_thread_owner",
+            "orchestrator.main.require_thread_owner",
             AsyncMock(return_value=({"id": "user-1"}, thread)),
         ),
-        patch("main.postgres_db", db),
-        pytest.raises(main.HTTPException) as exc,
+        patch("orchestrator.main.postgres_db", db),
+        pytest.raises(orchestrator.main.HTTPException) as exc,
     ):
         await resume_thread(_RESUME_THREAD_ID, object())
 
@@ -722,7 +762,7 @@ async def test_resume_refuses_unavailable_non_pinned_lane(execution_lane):
 @pytest.mark.asyncio
 async def test_stateless_sandbox_resume_skips_registered_agent_and_ensures_workspace():
     """A valid queue-lane resume is topology-neutral and restores only state."""
-    from main import resume_thread
+    from orchestrator.main import resume_thread
 
     generation = "11111111-1111-4111-8111-111111111111"
     thread = _resume_thread_row(
@@ -794,16 +834,24 @@ async def test_stateless_sandbox_resume_skips_registered_agent_and_ensures_works
     ensure_workspace = AsyncMock()
 
     with (
-        patch("main.require_thread_owner", AsyncMock(return_value=(user, thread))),
-        patch("main.postgres_db", db),
-        patch("main._thread_project_ids", AsyncMock(return_value=[])),
-        patch("main._revalidate_thread_project_ids", AsyncMock(return_value=[])),
-        patch("main._thread_config_drift", AsyncMock(return_value=[])),
-        patch("main._require_supported_protected_session_class", AsyncMock()),
-        patch("main.agent_provisioner", agent_provisioner),
-        patch("main.persistent_provisioner", persistent_provisioner),
-        patch("main._find_idle_persistent_agent", find_idle),
-        patch("main.ensure_session_workspace", ensure_workspace),
+        patch(
+            "orchestrator.main.require_thread_owner",
+            AsyncMock(return_value=(user, thread)),
+        ),
+        patch("orchestrator.main.postgres_db", db),
+        patch("orchestrator.main._thread_project_ids", AsyncMock(return_value=[])),
+        patch(
+            "orchestrator.main._revalidate_thread_project_ids",
+            AsyncMock(return_value=[]),
+        ),
+        patch("orchestrator.main._thread_config_drift", AsyncMock(return_value=[])),
+        patch(
+            "orchestrator.main._require_supported_protected_session_class", AsyncMock()
+        ),
+        patch("orchestrator.main.agent_provisioner", agent_provisioner),
+        patch("orchestrator.main.persistent_provisioner", persistent_provisioner),
+        patch("orchestrator.main._find_idle_persistent_agent", find_idle),
+        patch("orchestrator.main.ensure_session_workspace", ensure_workspace),
     ):
         result = await resume_thread(_RESUME_THREAD_ID, object())
         await asyncio.sleep(0)
@@ -818,7 +866,7 @@ async def test_stateless_sandbox_resume_skips_registered_agent_and_ensures_works
 
 @pytest.mark.asyncio
 async def test_stateless_resume_refuses_retirement_marker_before_mutation():
-    from main import resume_thread
+    from orchestrator.main import resume_thread
 
     thread = _resume_thread_row(
         execution_lane="stateless",
@@ -854,12 +902,18 @@ async def test_stateless_resume_refuses_retirement_marker_before_mutation():
     )
 
     with (
-        patch("main.require_thread_owner", AsyncMock(return_value=({}, thread))),
-        patch("main.postgres_db", db),
-        patch("main._thread_project_ids", AsyncMock(return_value=[])),
-        patch("main._revalidate_thread_project_ids", AsyncMock(return_value=[])),
-        patch("main._thread_config_drift", AsyncMock(return_value=[])),
-        pytest.raises(main.HTTPException) as exc,
+        patch(
+            "orchestrator.main.require_thread_owner",
+            AsyncMock(return_value=({}, thread)),
+        ),
+        patch("orchestrator.main.postgres_db", db),
+        patch("orchestrator.main._thread_project_ids", AsyncMock(return_value=[])),
+        patch(
+            "orchestrator.main._revalidate_thread_project_ids",
+            AsyncMock(return_value=[]),
+        ),
+        patch("orchestrator.main._thread_config_drift", AsyncMock(return_value=[])),
+        pytest.raises(orchestrator.main.HTTPException) as exc,
     ):
         await resume_thread(_RESUME_THREAD_ID, object())
 
@@ -869,7 +923,7 @@ async def test_stateless_resume_refuses_retirement_marker_before_mutation():
 
 @pytest.mark.asyncio
 async def test_resume_cas_loss_to_retirement_fails_closed():
-    from main import resume_thread
+    from orchestrator.main import resume_thread
 
     thread = _resume_thread_row(metadata={})
     db = MagicMock()
@@ -878,12 +932,18 @@ async def test_resume_cas_loss_to_retirement_fails_closed():
     db.list_thread_mounts = AsyncMock(return_value=[])
 
     with (
-        patch("main.require_thread_owner", AsyncMock(return_value=({}, thread))),
-        patch("main.postgres_db", db),
-        patch("main._thread_project_ids", AsyncMock(return_value=[])),
-        patch("main._revalidate_thread_project_ids", AsyncMock(return_value=[])),
-        patch("main._thread_config_drift", AsyncMock(return_value=[])),
-        pytest.raises(main.HTTPException) as exc,
+        patch(
+            "orchestrator.main.require_thread_owner",
+            AsyncMock(return_value=({}, thread)),
+        ),
+        patch("orchestrator.main.postgres_db", db),
+        patch("orchestrator.main._thread_project_ids", AsyncMock(return_value=[])),
+        patch(
+            "orchestrator.main._revalidate_thread_project_ids",
+            AsyncMock(return_value=[]),
+        ),
+        patch("orchestrator.main._thread_config_drift", AsyncMock(return_value=[])),
+        pytest.raises(orchestrator.main.HTTPException) as exc,
     ):
         await resume_thread(_RESUME_THREAD_ID, object())
 
@@ -893,7 +953,7 @@ async def test_resume_cas_loss_to_retirement_fails_closed():
 @pytest.mark.asyncio
 async def test_resume_refetch_refuses_lane_changed_while_task_was_scheduled():
     """A pinned entry snapshot is not authority for the background bind."""
-    from main import resume_thread
+    from orchestrator.main import resume_thread
 
     thread = _resume_thread_row(
         metadata={},
@@ -925,18 +985,26 @@ async def test_resume_refetch_refuses_lane_changed_while_task_was_scheduled():
     ensure_workspace = AsyncMock()
 
     with (
-        patch("main.require_thread_owner", AsyncMock(return_value=(user, thread))),
-        patch("main.postgres_db", db),
-        patch("main._thread_project_ids", AsyncMock(return_value=[])),
-        patch("main._revalidate_thread_project_ids", AsyncMock(return_value=[])),
-        patch("main._thread_config_drift", AsyncMock(return_value=[])),
-        patch("main._is_protected_cloud_mode_enabled", return_value=False),
-        patch("main.agent_provisioner", provisioner),
-        patch("main.persistent_provisioner", MagicMock(is_available=False)),
-        patch("main._find_idle_persistent_agent", find_idle),
-        patch("main._send_session_attach", attach),
-        patch("main._await_late_cloud_setup", AsyncMock()),
-        patch("main.ensure_session_workspace", ensure_workspace),
+        patch(
+            "orchestrator.main.require_thread_owner",
+            AsyncMock(return_value=(user, thread)),
+        ),
+        patch("orchestrator.main.postgres_db", db),
+        patch("orchestrator.main._thread_project_ids", AsyncMock(return_value=[])),
+        patch(
+            "orchestrator.main._revalidate_thread_project_ids",
+            AsyncMock(return_value=[]),
+        ),
+        patch("orchestrator.main._thread_config_drift", AsyncMock(return_value=[])),
+        patch("orchestrator.main._is_protected_cloud_mode_enabled", return_value=False),
+        patch("orchestrator.main.agent_provisioner", provisioner),
+        patch(
+            "orchestrator.main.persistent_provisioner", MagicMock(is_available=False)
+        ),
+        patch("orchestrator.main._find_idle_persistent_agent", find_idle),
+        patch("orchestrator.main._send_session_attach", attach),
+        patch("orchestrator.main._await_late_cloud_setup", AsyncMock()),
+        patch("orchestrator.main.ensure_session_workspace", ensure_workspace),
     ):
         result = await resume_thread(_RESUME_THREAD_ID, object())
         await asyncio.sleep(0)
@@ -951,7 +1019,7 @@ async def test_resume_refetch_refuses_lane_changed_while_task_was_scheduled():
 @pytest.mark.asyncio
 async def test_resume_refetches_lane_after_failed_pool_reservation():
     """A warm-attach refusal cannot fall through after a concurrent flip."""
-    from main import resume_thread
+    from orchestrator.main import resume_thread
 
     thread = _resume_thread_row(
         metadata={},
@@ -992,21 +1060,40 @@ async def test_resume_refetches_lane_after_failed_pool_reservation():
     attach = AsyncMock(side_effect=lose_lane)
 
     with (
-        patch("main.require_thread_owner", AsyncMock(return_value=(user, thread))),
-        patch("main.postgres_db", db),
-        patch("main._thread_project_ids", AsyncMock(return_value=[])),
-        patch("main._revalidate_thread_project_ids", AsyncMock(return_value=[])),
-        patch("main._thread_config_drift", AsyncMock(return_value=[])),
-        patch("main._require_supported_protected_session_class", AsyncMock()),
-        patch("main._thread_has_knowledge_scope", AsyncMock(return_value=False)),
-        patch("main._inject_thread_dispatch_credentials", AsyncMock(return_value={})),
-        patch("main._is_protected_cloud_mode_enabled", return_value=False),
-        patch("main.agent_provisioner", provisioner),
-        patch("main.persistent_provisioner", MagicMock(is_available=False)),
-        patch("main._find_idle_persistent_agent", AsyncMock(return_value=idle)),
-        patch("main._send_session_attach", attach),
-        patch("main._await_late_cloud_setup", AsyncMock()),
-        patch("main.ensure_session_workspace", AsyncMock()),
+        patch(
+            "orchestrator.main.require_thread_owner",
+            AsyncMock(return_value=(user, thread)),
+        ),
+        patch("orchestrator.main.postgres_db", db),
+        patch("orchestrator.main._thread_project_ids", AsyncMock(return_value=[])),
+        patch(
+            "orchestrator.main._revalidate_thread_project_ids",
+            AsyncMock(return_value=[]),
+        ),
+        patch("orchestrator.main._thread_config_drift", AsyncMock(return_value=[])),
+        patch(
+            "orchestrator.main._require_supported_protected_session_class", AsyncMock()
+        ),
+        patch(
+            "orchestrator.main._thread_has_knowledge_scope",
+            AsyncMock(return_value=False),
+        ),
+        patch(
+            "orchestrator.main._inject_thread_dispatch_credentials",
+            AsyncMock(return_value={}),
+        ),
+        patch("orchestrator.main._is_protected_cloud_mode_enabled", return_value=False),
+        patch("orchestrator.main.agent_provisioner", provisioner),
+        patch(
+            "orchestrator.main.persistent_provisioner", MagicMock(is_available=False)
+        ),
+        patch(
+            "orchestrator.main._find_idle_persistent_agent",
+            AsyncMock(return_value=idle),
+        ),
+        patch("orchestrator.main._send_session_attach", attach),
+        patch("orchestrator.main._await_late_cloud_setup", AsyncMock()),
+        patch("orchestrator.main.ensure_session_workspace", AsyncMock()),
     ):
         result = await resume_thread(_RESUME_THREAD_ID, object())
         await asyncio.sleep(0)
@@ -1023,7 +1110,7 @@ async def test_resume_schedules_reengage_when_no_active_row():
     Slice A reconciler already revoked the grant (no active
     cloud_ro_mounts row) — otherwise a protected thread stays permanently
     mount-less after its first end/resume cycle."""
-    from main import resume_thread
+    from orchestrator.main import resume_thread
 
     thread = _resume_thread_row()
     user = {"id": "user-1"}
@@ -1040,18 +1127,28 @@ async def test_resume_schedules_reengage_when_no_active_row():
     spawned, create_task = _capture_background_tasks()
 
     with (
-        patch("main.require_thread_owner", AsyncMock(return_value=(user, thread))),
-        patch("main.postgres_db", db),
-        patch("main._thread_project_ids", AsyncMock(return_value=[])),
-        patch("main._revalidate_thread_project_ids", AsyncMock(return_value=[])),
-        patch("main._thread_config_drift", AsyncMock(return_value=[])),
-        patch("main._require_supported_protected_session_class", AsyncMock()),
-        patch("main._is_protected_cloud_mode_enabled", return_value=True),
-        patch("main._schedule_protected_engage") as schedule,
-        patch("main.agent_provisioner", MagicMock(is_available=False)),
-        patch("main.persistent_provisioner", MagicMock(is_available=False)),
-        patch("main.ensure_session_workspace", new=AsyncMock()),
-        patch("main.asyncio.create_task", side_effect=create_task),
+        patch(
+            "orchestrator.main.require_thread_owner",
+            AsyncMock(return_value=(user, thread)),
+        ),
+        patch("orchestrator.main.postgres_db", db),
+        patch("orchestrator.main._thread_project_ids", AsyncMock(return_value=[])),
+        patch(
+            "orchestrator.main._revalidate_thread_project_ids",
+            AsyncMock(return_value=[]),
+        ),
+        patch("orchestrator.main._thread_config_drift", AsyncMock(return_value=[])),
+        patch(
+            "orchestrator.main._require_supported_protected_session_class", AsyncMock()
+        ),
+        patch("orchestrator.main._is_protected_cloud_mode_enabled", return_value=True),
+        patch("orchestrator.main._schedule_protected_engage") as schedule,
+        patch("orchestrator.main.agent_provisioner", MagicMock(is_available=False)),
+        patch(
+            "orchestrator.main.persistent_provisioner", MagicMock(is_available=False)
+        ),
+        patch("orchestrator.main.ensure_session_workspace", new=AsyncMock()),
+        patch("orchestrator.main.asyncio.create_task", side_effect=create_task),
     ):
         result = await resume_thread(_RESUME_THREAD_ID, object())
         await asyncio.gather(*spawned)
@@ -1070,7 +1167,7 @@ async def test_resume_schedules_reengage_when_no_active_row():
 async def test_resume_skips_reengage_when_active_row_present():
     """No re-engage when a live grant already covers this thread — resume
     must not spam a fresh reader/grant on every reconnect."""
-    from main import resume_thread
+    from orchestrator.main import resume_thread
 
     thread = _resume_thread_row()
     user = {"id": "user-1"}
@@ -1087,18 +1184,28 @@ async def test_resume_skips_reengage_when_active_row_present():
     spawned, create_task = _capture_background_tasks()
 
     with (
-        patch("main.require_thread_owner", AsyncMock(return_value=(user, thread))),
-        patch("main.postgres_db", db),
-        patch("main._thread_project_ids", AsyncMock(return_value=[])),
-        patch("main._revalidate_thread_project_ids", AsyncMock(return_value=[])),
-        patch("main._thread_config_drift", AsyncMock(return_value=[])),
-        patch("main._require_supported_protected_session_class", AsyncMock()),
-        patch("main._is_protected_cloud_mode_enabled", return_value=True),
-        patch("main._schedule_protected_engage") as schedule,
-        patch("main.agent_provisioner", MagicMock(is_available=False)),
-        patch("main.persistent_provisioner", MagicMock(is_available=False)),
-        patch("main.ensure_session_workspace", new=AsyncMock()),
-        patch("main.asyncio.create_task", side_effect=create_task),
+        patch(
+            "orchestrator.main.require_thread_owner",
+            AsyncMock(return_value=(user, thread)),
+        ),
+        patch("orchestrator.main.postgres_db", db),
+        patch("orchestrator.main._thread_project_ids", AsyncMock(return_value=[])),
+        patch(
+            "orchestrator.main._revalidate_thread_project_ids",
+            AsyncMock(return_value=[]),
+        ),
+        patch("orchestrator.main._thread_config_drift", AsyncMock(return_value=[])),
+        patch(
+            "orchestrator.main._require_supported_protected_session_class", AsyncMock()
+        ),
+        patch("orchestrator.main._is_protected_cloud_mode_enabled", return_value=True),
+        patch("orchestrator.main._schedule_protected_engage") as schedule,
+        patch("orchestrator.main.agent_provisioner", MagicMock(is_available=False)),
+        patch(
+            "orchestrator.main.persistent_provisioner", MagicMock(is_available=False)
+        ),
+        patch("orchestrator.main.ensure_session_workspace", new=AsyncMock()),
+        patch("orchestrator.main.asyncio.create_task", side_effect=create_task),
     ):
         await resume_thread(_RESUME_THREAD_ID, object())
         await asyncio.gather(*spawned)
@@ -1111,7 +1218,7 @@ async def test_resume_skips_reengage_when_active_row_present():
 async def test_resume_skips_reengage_for_non_protected_thread():
     """Regression guard: an ordinary (non-protected) thread's resume must
     never touch the protected-engage registry."""
-    from main import resume_thread
+    from orchestrator.main import resume_thread
 
     thread = _resume_thread_row(metadata={})
     user = {"id": "user-1"}
@@ -1128,18 +1235,28 @@ async def test_resume_skips_reengage_for_non_protected_thread():
     spawned, create_task = _capture_background_tasks()
 
     with (
-        patch("main.require_thread_owner", AsyncMock(return_value=(user, thread))),
-        patch("main.postgres_db", db),
-        patch("main._thread_project_ids", AsyncMock(return_value=[])),
-        patch("main._revalidate_thread_project_ids", AsyncMock(return_value=[])),
-        patch("main._thread_config_drift", AsyncMock(return_value=[])),
-        patch("main._require_supported_protected_session_class", AsyncMock()),
-        patch("main._is_protected_cloud_mode_enabled", return_value=True),
-        patch("main._schedule_protected_engage") as schedule,
-        patch("main.agent_provisioner", MagicMock(is_available=False)),
-        patch("main.persistent_provisioner", MagicMock(is_available=False)),
-        patch("main.ensure_session_workspace", new=AsyncMock()),
-        patch("main.asyncio.create_task", side_effect=create_task),
+        patch(
+            "orchestrator.main.require_thread_owner",
+            AsyncMock(return_value=(user, thread)),
+        ),
+        patch("orchestrator.main.postgres_db", db),
+        patch("orchestrator.main._thread_project_ids", AsyncMock(return_value=[])),
+        patch(
+            "orchestrator.main._revalidate_thread_project_ids",
+            AsyncMock(return_value=[]),
+        ),
+        patch("orchestrator.main._thread_config_drift", AsyncMock(return_value=[])),
+        patch(
+            "orchestrator.main._require_supported_protected_session_class", AsyncMock()
+        ),
+        patch("orchestrator.main._is_protected_cloud_mode_enabled", return_value=True),
+        patch("orchestrator.main._schedule_protected_engage") as schedule,
+        patch("orchestrator.main.agent_provisioner", MagicMock(is_available=False)),
+        patch(
+            "orchestrator.main.persistent_provisioner", MagicMock(is_available=False)
+        ),
+        patch("orchestrator.main.ensure_session_workspace", new=AsyncMock()),
+        patch("orchestrator.main.asyncio.create_task", side_effect=create_task),
     ):
         await resume_thread(_RESUME_THREAD_ID, object())
         await asyncio.gather(*spawned)

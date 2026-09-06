@@ -24,8 +24,8 @@ import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
-import security.access as access_module
-import uploads
+import orchestrator.security.access as access_module
+import orchestrator.uploads
 
 INTERNAL_KEY = "test-internal-key"
 _SESSIONS = {"sess-a": "user_a", "sess-b": "user_b", "sess-admin": "user_admin"}
@@ -73,7 +73,7 @@ def _internal() -> dict[str, str]:
 @pytest.fixture
 def uploads_dir(tmp_path, monkeypatch):
     target = tmp_path / "uploads"
-    monkeypatch.setattr(uploads, "UPLOADS_DIR", target)
+    monkeypatch.setattr(orchestrator.uploads, "UPLOADS_DIR", target)
     return target
 
 
@@ -99,15 +99,15 @@ def cookie_users(user_a, user_b, user_admin, monkeypatch):
     async def _resolve(session_id, db):
         return sessions.get(session_id)
 
-    monkeypatch.setattr("security.auth._resolve_from_cookie", _resolve)
-    monkeypatch.setattr(uploads, "_get_db", lambda: MagicMock())
+    monkeypatch.setattr("orchestrator.security.auth._resolve_from_cookie", _resolve)
+    monkeypatch.setattr(orchestrator.uploads, "_get_db", lambda: MagicMock())
     return users
 
 
 @pytest.fixture
 def app(uploads_dir, internal_key, cookie_users):
     application = FastAPI()
-    application.include_router(uploads.router)
+    application.include_router(orchestrator.uploads.router)
     return application
 
 
@@ -120,7 +120,7 @@ def client(app):
 def rmtree_guard(monkeypatch):
     """Fail the test if anything reaches ``shutil.rmtree``."""
     guard = MagicMock(side_effect=AssertionError("rmtree reached the filesystem"))
-    monkeypatch.setattr(uploads.shutil, "rmtree", guard)
+    monkeypatch.setattr(orchestrator.uploads.shutil, "rmtree", guard)
     return guard
 
 
@@ -225,7 +225,7 @@ class TestCookieUser:
         )
         assert response.status_code == 201, response.text
         upload_id = response.json()["upload_id"]
-        assert uploads._UPLOAD_ID_RE.fullmatch(upload_id)
+        assert orchestrator.uploads._UPLOAD_ID_RE.fullmatch(upload_id)
         metadata = json.loads((uploads_dir / upload_id / "metadata.json").read_text())
         assert metadata["user_id"] == str(user_a["id"])
         assert metadata["files"] == [
@@ -342,7 +342,7 @@ class TestInternalCaller:
         assert response.status_code == 201, response.text
         upload_id = response.json()["upload_id"]
         metadata = json.loads((uploads_dir / upload_id / "metadata.json").read_text())
-        assert metadata["user_id"] == uploads.INTERNAL_UPLOADER
+        assert metadata["user_id"] == orchestrator.uploads.INTERNAL_UPLOADER
 
     def test_internal_key_reads_any_users_upload(self, client, uploads_dir, user_a):
         upload_id = _mint()
@@ -364,7 +364,7 @@ class TestInternalCaller:
         """The agent fetches job inputs through ``OrchestratorClient`` with
         ``MCP_INTERNAL_KEY`` and no ``user_id`` (``src/agent.py``); that exact
         header set has to keep working against the gated router."""
-        from src.api.orchestrator_client import OrchestratorClient
+        from agent.api.orchestrator_client import OrchestratorClient
 
         upload_id = _mint()
         _write_upload(uploads_dir, upload_id, owner=str(user_a["id"]))
@@ -470,7 +470,7 @@ class TestUploadIdValidation:
             headers=_internal(),
         )
         assert response.status_code == 201
-        assert uploads._validate_upload_id(response.json()["upload_id"])
+        assert orchestrator.uploads._validate_upload_id(response.json()["upload_id"])
 
     @pytest.mark.asyncio
     async def test_filename_traversal_still_guarded(
@@ -486,7 +486,9 @@ class TestUploadIdValidation:
         request = MagicMock()
         request.headers = _internal()
         with pytest.raises(HTTPException) as exc:
-            await uploads.get_uploaded_file(request, upload_id, "../secret.txt")
+            await orchestrator.uploads.get_uploaded_file(
+                request, upload_id, "../secret.txt"
+            )
         assert exc.value.status_code == 404
 
 
@@ -516,23 +518,25 @@ class _ChunkedUpload:
 
 class TestSizeLimit:
     def test_limit_value_unchanged_and_label_matches(self):
-        assert uploads.MAX_FILE_SIZE == 5 * 1024 * 1024 * 1024
-        assert uploads._MAX_FILE_SIZE_LABEL == "5120 MB"
-        assert "50MB" not in (uploads.upload_files.__doc__ or "")
+        assert orchestrator.uploads.MAX_FILE_SIZE == 5 * 1024 * 1024 * 1024
+        assert orchestrator.uploads._MAX_FILE_SIZE_LABEL == "5120 MB"
+        assert "50MB" not in (orchestrator.uploads.upload_files.__doc__ or "")
 
     @pytest.mark.asyncio
     async def test_oversized_upload_is_refused_mid_stream(
         self, uploads_dir, internal_key, monkeypatch
     ):
-        monkeypatch.setattr(uploads, "MAX_FILE_SIZE", 1_000)
-        monkeypatch.setattr(uploads, "UPLOAD_CHUNK_SIZE", 100)
+        monkeypatch.setattr(orchestrator.uploads, "MAX_FILE_SIZE", 1_000)
+        monkeypatch.setattr(orchestrator.uploads, "UPLOAD_CHUNK_SIZE", 100)
         upload = _ChunkedUpload(total=100_000)
         request = MagicMock()
         request.headers = _internal()
 
         with pytest.raises(HTTPException) as exc:
-            await uploads.upload_files(
-                request, files=[upload], upload_type=uploads.UploadType.DOCUMENTS
+            await orchestrator.uploads.upload_files(
+                request,
+                files=[upload],
+                upload_type=orchestrator.uploads.UploadType.DOCUMENTS,
             )
 
         assert exc.value.status_code == 413
@@ -546,8 +550,8 @@ class TestSizeLimit:
     def test_oversized_multipart_is_413_and_cleaned_up(
         self, client, uploads_dir, monkeypatch
     ):
-        monkeypatch.setattr(uploads, "MAX_FILE_SIZE", 1_000)
-        monkeypatch.setattr(uploads, "UPLOAD_CHUNK_SIZE", 100)
+        monkeypatch.setattr(orchestrator.uploads, "MAX_FILE_SIZE", 1_000)
+        monkeypatch.setattr(orchestrator.uploads, "UPLOAD_CHUNK_SIZE", 100)
         response = client.post(
             "/api/uploads",
             files=[("files", ("big.bin", b"x" * 5_000, "application/octet-stream"))],
@@ -568,12 +572,12 @@ def _create_job_as(fake_db, caller) -> ExitStack:
     uses for the same handler."""
     stack = ExitStack()
     stack.enter_context(patch.object(access_module, "_INTERNAL_KEY", INTERNAL_KEY))
-    stack.enter_context(patch("main.postgres_db", fake_db))
+    stack.enter_context(patch("orchestrator.main.postgres_db", fake_db))
     stack.enter_context(
-        patch("main.require_approved_user", AsyncMock(return_value=caller))
+        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=caller))
     )
     stack.enter_context(
-        patch("main._enforce_readiness_gate", AsyncMock(return_value=None))
+        patch("orchestrator.main._enforce_readiness_gate", AsyncMock(return_value=None))
     )
     return stack
 
@@ -583,7 +587,7 @@ class TestCreateJobUploadOwnership:
     async def test_another_users_upload_is_403(
         self, uploads_dir, user_a, user_b, fake_db, fake_request
     ):
-        from main import JobCreate, create_job
+        from orchestrator.main import JobCreate, create_job
 
         upload_id = _mint()
         _write_upload(uploads_dir, upload_id, owner=str(user_a["id"]))
@@ -606,7 +610,7 @@ class TestCreateJobUploadOwnership:
     ):
         """The dispatcher reads the ids from ``jobs.context``; a body that
         sets them there directly must meet the same check."""
-        from main import JobCreate, create_job
+        from orchestrator.main import JobCreate, create_job
 
         upload_id = _mint("config" if key == "config_upload_id" else "documents")
         _write_upload(uploads_dir, upload_id, owner=str(user_a["id"]))
@@ -624,7 +628,7 @@ class TestCreateJobUploadOwnership:
     async def test_malformed_and_missing_upload_ids_are_refused(
         self, uploads_dir, user_a, fake_db, fake_request
     ):
-        from main import JobCreate, create_job
+        from orchestrator.main import JobCreate, create_job
 
         fake_request.headers = {}
         fake_request.cookies = {}
@@ -642,7 +646,7 @@ class TestCreateJobUploadOwnership:
         """Sentinel on the step right after the ownership check: reaching it
         proves the owner's own upload was accepted. An HTTPException subclass
         so ``create_job``'s ``except Exception`` → 500 wrapper lets it out."""
-        from main import JobCreate, create_job
+        from orchestrator.main import JobCreate, create_job
 
         class _PastTheUploadCheck(HTTPException):
             pass
@@ -657,7 +661,7 @@ class TestCreateJobUploadOwnership:
         with (
             _create_job_as(fake_db, user_a),
             patch(
-                "main._require_job_project_access",
+                "orchestrator.main._require_job_project_access",
                 AsyncMock(
                     side_effect=_PastTheUploadCheck(status_code=599, detail="past")
                 ),
@@ -674,20 +678,22 @@ class TestAuthorizeUploadReference:
     def test_owner_admin_internal_pass(self, uploads_dir, user_a, user_admin):
         upload_id = _mint()
         _write_upload(uploads_dir, upload_id, owner=str(user_a["id"]))
-        assert uploads.authorize_upload_reference(user_a, upload_id)["upload_id"] == (
-            upload_id
+        assert orchestrator.uploads.authorize_upload_reference(user_a, upload_id)[
+            "upload_id"
+        ] == (upload_id)
+        assert orchestrator.uploads.authorize_upload_reference(user_admin, upload_id)
+        assert orchestrator.uploads.authorize_upload_reference(
+            None, upload_id, internal=True
         )
-        assert uploads.authorize_upload_reference(user_admin, upload_id)
-        assert uploads.authorize_upload_reference(None, upload_id, internal=True)
 
     def test_other_user_and_no_principal_are_403(self, uploads_dir, user_a, user_b):
         upload_id = _mint()
         _write_upload(uploads_dir, upload_id, owner=str(user_a["id"]))
         with pytest.raises(HTTPException) as exc:
-            uploads.authorize_upload_reference(user_b, upload_id)
+            orchestrator.uploads.authorize_upload_reference(user_b, upload_id)
         assert exc.value.status_code == 403
         with pytest.raises(HTTPException) as exc:
-            uploads.authorize_upload_reference(None, upload_id)
+            orchestrator.uploads.authorize_upload_reference(None, upload_id)
         assert exc.value.status_code == 403
 
     def test_legacy_ownerless_upload_is_admin_or_internal_only(
@@ -696,16 +702,20 @@ class TestAuthorizeUploadReference:
         upload_id = _mint()
         _write_upload(uploads_dir, upload_id, owner=None)
         with pytest.raises(HTTPException) as exc:
-            uploads.authorize_upload_reference(user_a, upload_id)
+            orchestrator.uploads.authorize_upload_reference(user_a, upload_id)
         assert exc.value.status_code == 403
-        assert uploads.authorize_upload_reference(user_admin, upload_id)
-        assert uploads.authorize_upload_reference(None, upload_id, internal=True)
+        assert orchestrator.uploads.authorize_upload_reference(user_admin, upload_id)
+        assert orchestrator.uploads.authorize_upload_reference(
+            None, upload_id, internal=True
+        )
 
     def test_internal_upload_is_not_a_users(self, uploads_dir, user_a):
         upload_id = _mint()
-        _write_upload(uploads_dir, upload_id, owner=uploads.INTERNAL_UPLOADER)
+        _write_upload(
+            uploads_dir, upload_id, owner=orchestrator.uploads.INTERNAL_UPLOADER
+        )
         with pytest.raises(HTTPException) as exc:
-            uploads.authorize_upload_reference(user_a, upload_id)
+            orchestrator.uploads.authorize_upload_reference(user_a, upload_id)
         assert exc.value.status_code == 403
 
     def test_view_as_user_shadow_narrows_admin(self, uploads_dir, user_a, user_admin):
@@ -715,5 +725,5 @@ class TestAuthorizeUploadReference:
         _write_upload(uploads_dir, upload_id, owner=str(user_a["id"]))
         shadowed = {**user_admin, "is_admin": False, "real_is_admin": True}
         with pytest.raises(HTTPException) as exc:
-            uploads.authorize_upload_reference(shadowed, upload_id)
+            orchestrator.uploads.authorize_upload_reference(shadowed, upload_id)
         assert exc.value.status_code == 403

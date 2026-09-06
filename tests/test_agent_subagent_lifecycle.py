@@ -8,12 +8,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-import src.agent as agent_module
-import src.api.persistent_app as persistent_app
-from src.agent import UniversalAgent
-from src.api.lease_context import LeaseHandle
-from src.api.turn_executor import StatelessTurnExecutor
-from src.shared.subagent_lifecycle import (
+import agent.agent as agent_module
+import agent.api.persistent_app as persistent_app
+from agent.agent import UniversalAgent
+from agent.api.lease_context import LeaseHandle
+from agent.api.turn_executor import StatelessTurnExecutor
+from shared.subagent_lifecycle import (
     SubagentAbandonError,
     SubagentQuiescenceError,
     SubagentRecoveryError,

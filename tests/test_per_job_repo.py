@@ -1,24 +1,17 @@
 """Tests for the per-job repo model (resolve_job_repo, _graft_subjob_output, etc.)."""
 
 import os
-import sys
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
 
-# Add orchestrator/ to sys.path so its internal imports resolve
-_orch_dir = str(Path(__file__).parent.parent / "orchestrator")
-if _orch_dir not in sys.path:
-    sys.path.insert(0, _orch_dir)
-
 # main.py requires VECTOR_DB_URL at module level
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
-import main as orch_main  # noqa: E402
+import orchestrator.main as orch_main  # noqa: E402
 
-MODULE = "main"
+MODULE = "orchestrator.main"
 
 DELETE_RESULT = {
     "status": "deleted",
@@ -169,6 +162,14 @@ class TestResolveJobRepo:
 class TestDeleteJobGiteaCleanup:
     """Tests for delete_job() Gitea branch/repo cleanup logic."""
 
+    @pytest.fixture(autouse=True)
+    def vector_retirement(self):
+        """Repository tests still complete the required vector retirement."""
+        with patch(f"{MODULE}.vector_db") as vector_db:
+            connection = AsyncMock()
+            vector_db.acquire.return_value.__aenter__.return_value = connection
+            yield connection
+
     @pytest.mark.asyncio
     async def test_root_job_deletes_repo(self):
         """Root job with repo_name: deletes the entire Gitea repo."""
@@ -199,7 +200,9 @@ class TestDeleteJobGiteaCleanup:
             mock_gitea.delete_repo = AsyncMock()
             mock_gitea.delete_branch = AsyncMock()
 
-            result = await orch_main.delete_job(_stub_request(), "abcd1234-xxxx")
+            result = await orch_main.delete_job(
+                _stub_request(), "abcd1234-1111-4111-8111-111111111111"
+            )
 
             assert result == DELETE_RESULT
             mock_gitea.delete_repo.assert_awaited_once_with(
@@ -230,7 +233,9 @@ class TestDeleteJobGiteaCleanup:
             mock_gitea.delete_branch = AsyncMock()
             mock_gitea.delete_repo = AsyncMock()
 
-            result = await orch_main.delete_job(_stub_request(), "abcd1234-xxxx")
+            result = await orch_main.delete_job(
+                _stub_request(), "abcd1234-1111-4111-8111-111111111111"
+            )
 
             assert result == DELETE_RESULT
             mock_gitea.delete_branch.assert_awaited_once_with(
@@ -264,7 +269,9 @@ class TestDeleteJobGiteaCleanup:
             mock_gitea.delete_branch = AsyncMock()
             mock_gitea.delete_repo = AsyncMock()
 
-            result = await orch_main.delete_job(_stub_request(), "legacy-id")
+            result = await orch_main.delete_job(
+                _stub_request(), "12345678-1111-4111-8111-111111111111"
+            )
 
             assert result == DELETE_RESULT
             mock_gitea.delete_branch.assert_awaited_once_with(
@@ -463,7 +470,7 @@ class TestDeleteJobGiteaCleanup:
         with (
             patch(f"{MODULE}.postgres_db") as mock_db,
             patch(
-                "security.access.require_approved_user",
+                "orchestrator.security.access.require_approved_user",
                 AsyncMock(
                     return_value={
                         "id": "00000000-0000-0000-0000-000000000099",
@@ -920,7 +927,7 @@ class TestGraftSubjobOutput:
 
     @pytest.mark.asyncio
     async def test_ambiguous_command_probe_refuses_to_repeat_graft(self):
-        from services.completion_effect_reconciliation import (
+        from orchestrator.services.completion_effect_reconciliation import (
             CompletionEffectProbeError,
         )
 

@@ -8,14 +8,14 @@ from unittest.mock import AsyncMock
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
-from src.shared.session_subagent_authority import (
+from shared.session_subagent_authority import (
     SessionParentAuthority,
     SessionParentAuthorityRefused,
     session_subagent_delivery_id,
 )
-from src.subagents.ledger import SubagentLedger
-from src.subagents.persistence import SubagentPersistenceRefused
-from src.subagents.session_persistence import SessionSubagentLedger
+from agent.subagents.ledger import SubagentLedger
+from agent.subagents.persistence import SubagentPersistenceRefused
+from agent.subagents.session_persistence import SessionSubagentLedger
 
 PARENT = "aaaaaaaa-1111-4222-8333-444444444444"
 OTHER_PARENT = "bbbbbbbb-1111-4222-8333-444444444444"

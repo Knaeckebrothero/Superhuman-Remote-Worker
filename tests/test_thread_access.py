@@ -26,7 +26,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import HTTPException
 
-from src.shared.pinned_session_identity import PinnedSessionBinding
+from shared.pinned_session_identity import PinnedSessionBinding
 
 
 FORWARD_THREAD_ID = "11111111-1111-4111-8111-111111111111"
@@ -83,15 +83,15 @@ def _forwarding_stateless_thread(*, ready: bool) -> dict:
 def _patch_caller_and_db(user: dict, db):
     stack = ExitStack()
     stack.enter_context(
-        patch("main.require_approved_user", AsyncMock(return_value=user))
+        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user))
     )
     stack.enter_context(
         patch(
-            "security.access.require_approved_user",
+            "orchestrator.security.access.require_approved_user",
             AsyncMock(return_value=user),
         )
     )
-    stack.enter_context(patch("main.postgres_db", db))
+    stack.enter_context(patch("orchestrator.main.postgres_db", db))
     return stack
 
 
@@ -110,7 +110,7 @@ def _scoped(user: dict, scope: str) -> dict:
 class TestRequireThreadOwner:
     @pytest.mark.asyncio
     async def test_owner_passes(self, user_a, thread_a, fake_db, fake_request):
-        from security.access import require_thread_owner
+        from orchestrator.security.access import require_thread_owner
 
         with _patch_caller_and_db(user_a, fake_db):
             user, thread = await require_thread_owner(
@@ -121,7 +121,7 @@ class TestRequireThreadOwner:
 
     @pytest.mark.asyncio
     async def test_cross_user_403(self, user_b, thread_a, fake_db, fake_request):
-        from security.access import require_thread_owner
+        from orchestrator.security.access import require_thread_owner
 
         with _patch_caller_and_db(user_b, fake_db):
             with pytest.raises(HTTPException) as exc:
@@ -299,7 +299,7 @@ class TestForwardingWorkspaceAuthority:
     @pytest.mark.asyncio
     async def test_orphan_thread_fail_closed(self, user_a, fake_db, fake_request):
         """G3 core fix: thread with user_id=NULL is no longer publicly readable."""
-        from security.access import require_thread_owner
+        from orchestrator.security.access import require_thread_owner
 
         orphan_id = "ccc55555-5555-5555-5555-555555555555"
         fake_db.get_thread = AsyncMock(
@@ -313,7 +313,7 @@ class TestForwardingWorkspaceAuthority:
     @pytest.mark.asyncio
     async def test_orphan_thread_admin_bypass(self, user_admin, fake_db, fake_request):
         """Admins still see orphans (they may need to clean them up)."""
-        from security.access import require_thread_owner
+        from orchestrator.security.access import require_thread_owner
 
         orphan_id = "ccc55555-5555-5555-5555-555555555555"
         orphan = {"id": orphan_id, "user_id": None, "title": "orphan"}
@@ -324,7 +324,7 @@ class TestForwardingWorkspaceAuthority:
 
     @pytest.mark.asyncio
     async def test_admin_bypass(self, user_admin, thread_a, fake_db, fake_request):
-        from security.access import require_thread_owner
+        from orchestrator.security.access import require_thread_owner
 
         with _patch_caller_and_db(user_admin, fake_db):
             user, thread = await require_thread_owner(
@@ -334,7 +334,7 @@ class TestForwardingWorkspaceAuthority:
 
     @pytest.mark.asyncio
     async def test_missing_404(self, user_a, fake_db, fake_request):
-        from security.access import require_thread_owner
+        from orchestrator.security.access import require_thread_owner
 
         with _patch_caller_and_db(user_a, fake_db):
             with pytest.raises(HTTPException) as exc:
@@ -348,7 +348,7 @@ class TestForwardingWorkspaceAuthority:
         self, user_a, thread_a, project_a, fake_db, fake_request
     ):
         """Threads have no project, so a project:<uuid> token can't read them."""
-        from security.access import require_thread_owner
+        from orchestrator.security.access import require_thread_owner
 
         scoped = _scoped(user_a, f"project:{project_a['id']}")
         with _patch_caller_and_db(scoped, fake_db):
@@ -365,7 +365,7 @@ class TestForwardingWorkspaceAuthority:
 class TestThreadEndpointGates:
     @pytest.mark.asyncio
     async def test_get_thread_orphan_blocked(self, user_a, fake_db, fake_request):
-        from main import get_thread
+        from orchestrator.main import get_thread
 
         orphan_id = "ccc55555-5555-5555-5555-555555555555"
         fake_db.get_thread = AsyncMock(
@@ -375,7 +375,7 @@ class TestThreadEndpointGates:
         sentinel = MagicMock(side_effect=AssertionError("called past gate"))
         with (
             _patch_caller_and_db(user_a, fake_db),
-            patch("main._resolve_cloud_session_url", sentinel),
+            patch("orchestrator.main._resolve_cloud_session_url", sentinel),
         ):
             with pytest.raises(HTTPException) as exc:
                 await get_thread(orphan_id, fake_request)
@@ -386,12 +386,12 @@ class TestThreadEndpointGates:
     async def test_get_thread_cross_user_blocked(
         self, user_b, thread_a, fake_db, fake_request
     ):
-        from main import get_thread
+        from orchestrator.main import get_thread
 
         sentinel = MagicMock(side_effect=AssertionError("called past gate"))
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("main._resolve_cloud_session_url", sentinel),
+            patch("orchestrator.main._resolve_cloud_session_url", sentinel),
         ):
             with pytest.raises(HTTPException) as exc:
                 await get_thread(str(thread_a["id"]), fake_request)
@@ -401,11 +401,14 @@ class TestThreadEndpointGates:
     async def test_get_thread_owner_passes(
         self, user_a, thread_a, fake_db, fake_request
     ):
-        from main import get_thread
+        from orchestrator.main import get_thread
 
         with (
             _patch_caller_and_db(user_a, fake_db),
-            patch("main._resolve_cloud_session_url", MagicMock(return_value=None)),
+            patch(
+                "orchestrator.main._resolve_cloud_session_url",
+                MagicMock(return_value=None),
+            ),
         ):
             result = await get_thread(str(thread_a["id"]), fake_request)
         assert result["id"] == thread_a["id"]
@@ -414,7 +417,7 @@ class TestThreadEndpointGates:
     async def test_get_thread_messages_history_cross_user_blocked(
         self, user_b, thread_a, fake_db, fake_request
     ):
-        from main import get_thread_messages_history
+        from orchestrator.main import get_thread_messages_history
 
         fake_db.get_thread_messages_history = AsyncMock(
             side_effect=AssertionError("called past gate")
@@ -430,7 +433,7 @@ class TestThreadEndpointGates:
     async def test_thread_event_stream_orphan_blocked(
         self, user_a, fake_db, fake_request
     ):
-        from main import thread_event_stream
+        from orchestrator.main import thread_event_stream
 
         orphan_id = "ccc55555-5555-5555-5555-555555555555"
         fake_db.get_thread = AsyncMock(

@@ -19,8 +19,8 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from services import canvas_snapshots
-from services.canvas import (
+from orchestrator.services import canvas_snapshots
+from orchestrator.services.canvas import (
     CanvasEditError,
     CanvasRecord,
     CanvasService,
@@ -28,8 +28,8 @@ from services.canvas import (
     WorkspaceFileSource,
     canonical_source_fingerprint,
 )
-from services.canvas_files import CanvasFileError, ValidatedCanvasFile
-from services.canvas_snapshots import CanvasSnapshotStore
+from orchestrator.services.canvas_files import CanvasFileError, ValidatedCanvasFile
+from orchestrator.services.canvas_snapshots import CanvasSnapshotStore
 
 THREAD_ID = "a3333333-3333-3333-3333-333333333333"
 USER_ID = "b4444444-4444-4444-8444-444444444444"
@@ -375,7 +375,7 @@ class _RouteService:
 
     async def repin_workspace_generation(self, thread_id, **kwargs):
         del thread_id, kwargs
-        from services.canvas import CanvasMutation
+        from orchestrator.services.canvas import CanvasMutation
 
         return CanvasMutation(changed=False, record=self.record)
 
@@ -398,7 +398,7 @@ class _OfflineGateway:
 
 
 def _route_client(monkeypatch, *, record, gateway, store):
-    from routers import canvases
+    from orchestrator.routers import canvases
 
     db = object()
     service = _RouteService(record)
@@ -795,7 +795,7 @@ class _RepinProbeService:
     async def repin_workspace_generation(
         self, thread_id, *, expected_source_version, verifier
     ):
-        from services.canvas import CanvasMutation
+        from orchestrator.services.canvas import CanvasMutation
 
         del thread_id, expected_source_version
         self.calls += 1
@@ -822,7 +822,7 @@ class _VerifyGateway:
 
 
 async def _run_maybe_repin(monkeypatch, *, outcome: str, times: int):
-    from routers import canvases
+    from orchestrator.routers import canvases
 
     canvases._REPIN_ATTEMPTED.clear()
     record = _record()
@@ -870,7 +870,7 @@ async def test_a_definitively_changed_file_is_attempted_once(monkeypatch) -> Non
 async def test_a_matching_file_is_verified_without_latching(monkeypatch) -> None:
     """A successful verification never records a suppressing attempt."""
 
-    from routers import canvases
+    from orchestrator.routers import canvases
 
     service, _ = await _run_maybe_repin(monkeypatch, outcome="match", times=1)
 
@@ -884,7 +884,7 @@ async def test_repin_is_skipped_entirely_when_the_generation_still_matches(
 ) -> None:
     """The staleness test is metadata-only: a healthy Canvas reads no files."""
 
-    from routers import canvases
+    from orchestrator.routers import canvases
 
     canvases._REPIN_ATTEMPTED.clear()
     record = _record()

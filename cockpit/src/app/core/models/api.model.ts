@@ -2027,10 +2027,11 @@ export interface WorkspaceContractProjection {
 export interface Job {
   id: string;
   description: string;
-  document_path?: string;
-  config_name: string;
-  config_override?: Record<string, unknown>;
-  assigned_agent_id?: string;
+  document_path?: string | null;
+  config_name: string | null;
+  /** JSONB can arrive as JSON text; normalize before reading its fields. */
+  config_override?: Record<string, unknown> | string | null;
+  assigned_agent_id?: string | null;
   user_id?: string | null;
   project_id?: string | null;
   parent_job_id?: string | null;
@@ -2048,10 +2049,10 @@ export interface Job {
   status: JobStatus;
   completion_outcome_kind?: 'blocked_undelivered' | null;
   created_at: string;
-  updated_at?: string;
-  completed_at?: string;
-  error_message?: string;
-  audit_count?: number;
+  updated_at?: string | null;
+  completed_at?: string | null;
+  error_message?: string | null;
+  audit_count?: number | null;
   /**
    * JSONB — **may arrive as a raw JSON STRING, not an object.** asyncpg hands
    * JSONB back as text and the orchestrator passes it through, so indexing
@@ -2102,7 +2103,8 @@ export interface Job {
 }
 
 /**
- * Request body for creating a new job.
+ * Public job-create projection owned by orchestrator.schemas.job_create.
+ * Keep view state and internal delegation/identity commands outside this type.
  */
 export interface JobCreateRequest {
   description: string;
@@ -2111,19 +2113,28 @@ export interface JobCreateRequest {
   instructions_upload_id?: string;
   document_path?: string;
   document_dir?: string;
+  /** Unified selector: bundled expert ID or DB expert UUID; omission uses the server default. */
+  expert?: string;
+  /** Legacy bundled/deployment-config alias. Conflicting expert selectors are refused. */
   config_name?: string;
-  /** DB-backed expert UUID. Preferred over config_name for expert selection;
-   *  the orchestrator resolves it into the job config. config_name stays base. */
+  /** Legacy DB-expert UUID alias; resolves over worker_base, not another bundled expert. */
   expert_id?: string;
   config_override?: Record<string, unknown>;
   context?: Record<string, unknown>;
   instructions?: string;
   kickoff_message?: string;
+  /** Immutable artifact/knowledge/PR contract, validated against authorized repositories. */
+  required_deliverables?: string[];
+  /** Explicit [] opts out; omission follows the deployment's defaults policy. Null is invalid. */
   datasource_ids?: string[];
-  builder_session_id?: string;
+  /** Mutually exclusive with datasource_ids, including an explicit empty array. */
+  use_datasource_defaults?: boolean;
+  /** Ignored compatibility input; the server derives ownership from the authenticated caller. */
   user_id?: string;
   project_id?: string;
   priority?: number;
+  /** Deployment-gated execution selection; stateless requires a supported workspace. */
+  execution_lane?: 'pinned' | 'stateless';
 }
 
 /**

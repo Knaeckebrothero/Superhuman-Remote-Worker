@@ -12,13 +12,13 @@ from pathlib import Path
 
 import pytest
 
-from src.services.cloud_sync import (
+from agent.services.cloud_sync import (
     CloudSyncError,
     MountSync,
     WorkspaceSyncCoordinator,
 )
 
-from ._local_fs import FailingLocalFsWorkspaceSync, LocalFsWorkspaceSync
+from tests.cloud_sync._local_fs import FailingLocalFsWorkspaceSync, LocalFsWorkspaceSync
 
 
 def _make_mount(

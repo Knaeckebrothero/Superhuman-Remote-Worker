@@ -5,8 +5,8 @@ from pathlib import Path
 
 import yaml
 
-from src.core.loader import render_instruction_content
-from src.core.skill_format import parse_skill_md, skill_identity
+from shared.runtime.core.loader import render_instruction_content
+from shared.runtime.core.skill_format import parse_skill_md, skill_identity
 
 _SKILLS = Path(__file__).resolve().parents[1] / "config" / "skills"
 
@@ -182,8 +182,8 @@ def test_phase_skills_are_catalog_hidden_and_bound():
     """U2: the worker's phase guidance is two bundled skills that never enter a
     catalog (``catalog: hidden``) and reach the worker only through the
     ``phase_start`` bindings of the worker overlay."""
-    from src.core.loader import PHASE_SKILLS, load_role_base
-    from src.core.skill_format import is_catalog_hidden
+    from shared.runtime.core.loader import PHASE_SKILLS, load_role_base
+    from shared.runtime.core.skill_format import is_catalog_hidden
 
     bindings = {
         e["skill"]: e

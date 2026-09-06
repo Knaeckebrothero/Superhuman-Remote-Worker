@@ -1,7 +1,7 @@
 """The two EmailService bodies render through the shared layout, escaped."""
 
-from services import brand
-from services.email import EmailService
+from orchestrator.services import brand
+from orchestrator.services.email import EmailService
 
 
 def test_system_notification_escapes_recipient_name() -> None:

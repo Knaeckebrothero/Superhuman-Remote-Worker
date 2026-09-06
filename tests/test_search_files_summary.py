@@ -7,9 +7,9 @@ say so honestly instead of reporting a plain count that understates how many
 matches actually exist.
 """
 
-from src.core.workspace_backend import SEARCH_RESULT_HARD_CAP
-from src.tools.context import ToolContext
-from src.tools.workspace.filesystem import create_filesystem_tools
+from shared.runtime.core.workspace_backend import SEARCH_RESULT_HARD_CAP
+from agent.tools.context import ToolContext
+from agent.tools.workspace.filesystem import create_filesystem_tools
 
 
 class _StubWorkspace:

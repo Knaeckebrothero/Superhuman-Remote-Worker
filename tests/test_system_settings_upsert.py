@@ -12,18 +12,12 @@ fake connection that records the query args.
 """
 
 import json
-import sys
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID
 
 import pytest
 
-_ORCH = Path(__file__).parent.parent / "orchestrator"
-if str(_ORCH) not in sys.path:
-    sys.path.insert(0, str(_ORCH))
-
-from database.postgres import PostgresDB  # noqa: E402
+from orchestrator.database.postgres import PostgresDB  # noqa: E402
 
 
 class _FakeAcquire:

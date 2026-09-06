@@ -22,16 +22,16 @@ from uuid import uuid4
 
 import pytest
 
-import src.api.persistent_app as pa
-import src.api.turn_executor as te
-from src.api.lease_context import (
+import agent.api.persistent_app as pa
+import agent.api.turn_executor as te
+from agent.api.lease_context import (
     LeaseHandle,
     LeaseLostError,
     current_lease,
     get_current_lease,
 )
-from src.api.orchestrator_client import ClaimBundleError
-from src.shared.run_queue import ClaimedUnit
+from agent.api.orchestrator_client import ClaimBundleError
+from shared.run_queue import ClaimedUnit
 
 
 # ---------------------------------------------------------------------------
@@ -2175,7 +2175,7 @@ class TestStripRestoredPending:
 
 class TestScrubOnClaim:
     def test_tenant_a_then_no_env_keys_leaves_no_residue(self, monkeypatch):
-        from src.services import embedding_service as emb
+        from shared.runtime.services import embedding_service as emb
 
         # Tenant A attach: env keys land, singleton would be rebuilt lazily.
         pa._apply_session_embedding_env(
@@ -2205,7 +2205,7 @@ class TestScrubOnClaim:
         # Cleanup safety: nothing to restore — the helper popped everything.
 
     def test_partial_override_replaces_not_merges(self, monkeypatch):
-        from src.services import embedding_service as emb
+        from shared.runtime.services import embedding_service as emb
 
         pa._apply_session_embedding_env(
             {"EMBEDDING_MODEL": "a-model", "EMBEDDING_API_KEY": "sk-a"}
@@ -2218,7 +2218,7 @@ class TestScrubOnClaim:
         pa._apply_session_embedding_env(None)  # cleanup
 
     def test_executor_scrub_clears_dual_inboxes(self, harness):
-        import src.api.dual_app as dual_app
+        import agent.api.dual_app as dual_app
 
         dual_app._guidance_inbox["job-1"] = [{"id": "g1"}]
         dual_app._reply_inbox["job-1"] = [{"id": "r1"}]
@@ -2240,7 +2240,7 @@ class TestAffinity:
     def test_persistent_session_reuse_capability_follows_backend(
         self, supports_shell, expected
     ):
-        from src.api.persistent_session import PersistentSession
+        from agent.api.persistent_session import PersistentSession
 
         session = object.__new__(PersistentSession)
         session.workspace_manager = SimpleNamespace(
@@ -2632,7 +2632,7 @@ class _FenceConn:
 
 
 def _db_with_conn(conn):
-    from src.database.postgres_db import PostgresDB
+    from agent.database.postgres_db import PostgresDB
 
     db = PostgresDB(connection_string="postgresql://t:t@localhost:1/t")
 

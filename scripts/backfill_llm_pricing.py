@@ -43,27 +43,20 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-import sys
 from datetime import date, datetime
 from decimal import Decimal
-from pathlib import Path
 from typing import Optional
 
-# Put the orchestrator package dir on sys.path so bare imports (``database.*``,
-# ``services.*``) resolve the same way they do inside the running orchestrator.
-_ORCH = Path(__file__).resolve().parent.parent / "orchestrator"
-if _ORCH.is_dir() and str(_ORCH) not in sys.path:
-    sys.path.insert(0, str(_ORCH))
 
-from database.postgres import PostgresDB  # noqa: E402
-from services.openrouter_pricing import (  # noqa: E402
+from orchestrator.database.postgres import PostgresDB
+from orchestrator.services.openrouter_pricing import (
     _build_price_resolver,
     _pricing_id_for,
     fetch_openrouter_prices,
 )
-from services.usage_ledger import UsageLedger, UsageRates  # noqa: E402
-from services.usage_rollup import UsageRollup  # noqa: E402
-from utils.db_url import build_postgres_url  # noqa: E402
+from orchestrator.services.usage_ledger import UsageLedger, UsageRates
+from orchestrator.services.usage_rollup import UsageRollup
+from shared.db_url import build_postgres_url
 
 logger = logging.getLogger("backfill_llm_pricing")
 

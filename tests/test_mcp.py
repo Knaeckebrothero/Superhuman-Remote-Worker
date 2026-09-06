@@ -8,44 +8,17 @@ Covers:
 """
 
 import os
-import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import httpx
 import pytest
 
-# ---------------------------------------------------------------------------
-# Path & import setup
-#
-# The orchestrator's ``mcp/`` package name collides with the installed ``mcp``
-# SDK (used by fastmcp).  We work around this by:
-#   1. Pre-mocking ``fastmcp`` in sys.modules so importing our server module
-#      does NOT trigger the SDK's ``import mcp.types`` chain.
-#   2. Setting MCP_TRANSPORT=stdio to skip server-side auth setup that would
-#      try to import additional orchestrator modules.
-#   3. Adding the orchestrator dir to sys.path so ``from mcp import server``
-#      below resolves to orchestrator/mcp (deliberately shadowing the SDK's
-#      ``mcp`` — which is exactly why fastmcp must be pre-mocked first).
-# ---------------------------------------------------------------------------
-
-_orchestrator_dir = os.path.join(os.path.dirname(__file__), "..", "orchestrator")
-if _orchestrator_dir not in sys.path:
-    sys.path.insert(0, os.path.abspath(_orchestrator_dir))
-
-# Pre-mock fastmcp before importing the server module
-_mock_mcp_instance = MagicMock()
-_mock_mcp_instance.tool = lambda fn, **_kwargs: fn  # registration passthrough
-_mock_fastmcp = MagicMock()
-_mock_fastmcp.FastMCP.return_value = _mock_mcp_instance
-sys.modules.setdefault("fastmcp", _mock_fastmcp)
-
 # Skip auth setup in server module
 os.environ.setdefault("MCP_TRANSPORT", "stdio")
 
-# Now we can safely import the server module (fastmcp is mocked,
-# so it won't trigger the real ``import mcp.types`` chain)
-from mcp import server as _mcp_server_mod  # noqa: E402
+# The application package and the MCP SDK have independent import names.
+from mcp_server import server as _mcp_server_mod  # noqa: E402
 
 
 def test_ambiguous_mutation_is_not_labeled_as_confirmed_failure():
@@ -129,7 +102,7 @@ class TestFormatPersistentThreads:
     """Tests for format_persistent_threads."""
 
     def setup_method(self):
-        from src.shared.orch_surface.formatters import format_persistent_threads
+        from shared.orch_surface.formatters import format_persistent_threads
 
         self.fmt = format_persistent_threads
 
@@ -167,7 +140,7 @@ class TestFormatPersistentThreadDetail:
     """Tests for format_persistent_thread_detail."""
 
     def setup_method(self):
-        from src.shared.orch_surface.formatters import format_persistent_thread_detail
+        from shared.orch_surface.formatters import format_persistent_thread_detail
 
         self.fmt = format_persistent_thread_detail
 
@@ -246,7 +219,7 @@ class TestFormatCreatedThread:
     """Tests for format_created_thread."""
 
     def setup_method(self):
-        from src.shared.orch_surface.formatters import format_created_thread
+        from shared.orch_surface.formatters import format_created_thread
 
         self.fmt = format_created_thread
 
@@ -272,7 +245,7 @@ class TestFormatPersistentThreadMessages:
     """Tests for format_persistent_thread_messages."""
 
     def setup_method(self):
-        from src.shared.orch_surface.formatters import format_persistent_thread_messages
+        from shared.orch_surface.formatters import format_persistent_thread_messages
 
         self.fmt = format_persistent_thread_messages
 
@@ -342,7 +315,7 @@ class TestFormatPersistentThreadIde:
     """Tests for format_persistent_thread_ide."""
 
     def setup_method(self):
-        from src.shared.orch_surface.formatters import format_persistent_thread_ide
+        from shared.orch_surface.formatters import format_persistent_thread_ide
 
         self.fmt = format_persistent_thread_ide
 
@@ -370,7 +343,7 @@ class TestFormatThreadActionResult:
     """Tests for format_thread_action_result."""
 
     def setup_method(self):
-        from src.shared.orch_surface.formatters import format_thread_action_result
+        from shared.orch_surface.formatters import format_thread_action_result
 
         self.fmt = format_thread_action_result
 
@@ -399,7 +372,7 @@ class TestAsyncCockpitClientPersistentThreads:
 
     @pytest.fixture
     def client(self):
-        from src.shared.orch_surface.client import AsyncCockpitClient
+        from shared.orch_surface.client import AsyncCockpitClient
 
         c = AsyncCockpitClient(base_url="http://localhost:8085")
         return c
@@ -1017,7 +990,7 @@ class TestMcpAuthFallback:
     @pytest.mark.asyncio
     async def test_accepts_mcp_headers(self):
         """Valid X-MCP-User-Id + X-Internal-Key returns the user."""
-        from security.auth import get_current_user
+        from orchestrator.security.auth import get_current_user
 
         user_id = str(uuid4())
         # Approval now flows from the user row (app-side admission); the MCP
@@ -1052,7 +1025,7 @@ class TestMcpAuthFallback:
         """Wrong X-Internal-Key raises 401."""
         from fastapi import HTTPException
 
-        from security.auth import get_current_user
+        from orchestrator.security.auth import get_current_user
 
         mock_request = _mock_request_with_headers(
             {
@@ -1074,7 +1047,7 @@ class TestMcpAuthFallback:
         """No Bearer and no MCP headers raises 401."""
         from fastapi import HTTPException
 
-        from security.auth import get_current_user
+        from orchestrator.security.auth import get_current_user
 
         mock_request = _mock_request_with_headers({})
 
@@ -1090,7 +1063,7 @@ class TestMcpAuthFallback:
         """Valid headers but user not in DB raises 401."""
         from fastapi import HTTPException
 
-        from security.auth import get_current_user
+        from orchestrator.security.auth import get_current_user
 
         mock_request = _mock_request_with_headers(
             {
@@ -1120,7 +1093,7 @@ class TestAsyncCockpitClientAuditChatBulk:
 
     @pytest.fixture
     def client(self):
-        from src.shared.orch_surface.client import AsyncCockpitClient
+        from shared.orch_surface.client import AsyncCockpitClient
 
         return AsyncCockpitClient(base_url="http://localhost:8085")
 

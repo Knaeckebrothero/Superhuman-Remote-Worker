@@ -21,15 +21,9 @@ Covered here:
     vector store answers; fail-open (never "missing") when it can't
 """
 
-import sys
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
-project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
 
 from orchestrator.services.deliverable_gate import (  # noqa: E402
     DELIVERABLE_GATE_BOUNCE_CAP,
@@ -950,7 +944,7 @@ class TestCreatePlumbing:
     def test_jobcreate_accepts_and_normalizes(self):
         """The REST model carries the field; the create path stores the
         normalized manifest into context (both spellings collapse)."""
-        import main as orchestrator_main
+        import orchestrator.main as orchestrator_main
 
         body = orchestrator_main.JobCreate(
             description="ship it",
@@ -1081,7 +1075,7 @@ class TestCreationRefusesClonedRepoManifests:
         assert "pull request" in exc.value.message.lower()
 
     def test_ordinary_and_kb_deliverables_still_pass(self) -> None:
-        import main as orchestrator_main
+        import orchestrator.main as orchestrator_main
 
         body = orchestrator_main.JobCreate(
             description="ship it",

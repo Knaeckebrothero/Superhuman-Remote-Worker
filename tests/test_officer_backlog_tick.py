@@ -21,7 +21,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from services.officer_backlog import (
+from orchestrator.services.officer_backlog import (
     STALE_CLAIM_HOURS,
     _scan_eligible_tickets,
     auto_pull_enabled,
@@ -33,7 +33,7 @@ from services.officer_backlog import (
     stale_claims,
     tick_officer as _tick_officer,
 )
-from services.work_categories import EXECUTOR, RESEARCHER
+from orchestrator.services.work_categories import EXECUTOR, RESEARCHER
 
 NOW = datetime(2026, 8, 15, 12, 0, tzinfo=timezone.utc)
 OFFICER_THREAD_ID = "11111111-1111-1111-1111-111111111111"
@@ -703,7 +703,7 @@ class TestTickOfficer:
     async def test_equal_priority_timestamp_page_boundary_has_no_gap_or_duplicate(
         self, monkeypatch
     ):
-        import services.officer_backlog as module
+        import orchestrator.services.officer_backlog as module
 
         created_at = NOW - timedelta(days=1)
         first = [
@@ -795,7 +795,7 @@ class TestTickOfficer:
         await tick_officer(db, _vector_db(rows), _officer_row(), now=NOW)
         assert db.created["runner_kind"] == "lifecycle"
 
-        schema = Path("orchestrator/database/schema_current.sql").read_text()
+        schema = Path("src/orchestrator/database/schema_current.sql").read_text()
         constraint = next(
             line for line in schema.splitlines() if "jobs_runner_kind_check" in line
         )
@@ -884,7 +884,7 @@ class TestTickOfficer:
         it could not do the work. Hand-dispatched, that cost Better Resavio a
         night. Under auto-pull it would repeat every tick, unattended.
         """
-        import services.officer_backlog as mod
+        import orchestrator.services.officer_backlog as mod
 
         resolved = ([KB_DS, REPO_DS], {KB_DS: 2, REPO_DS: 4})
         monkeypatch.setattr(
@@ -918,7 +918,7 @@ class TestTickOfficer:
         can read the KB but cannot reach the code. The worker's slot backend is
         the only correct measure.
         """
-        import services.officer_backlog as mod
+        import orchestrator.services.officer_backlog as mod
 
         spy = AsyncMock(return_value=([KB_DS, REPO_DS], {}))
         monkeypatch.setattr(mod, "default_datasource_selection", spy)
@@ -949,8 +949,8 @@ class TestTickOfficer:
         credential contract, and it would burn the ticket's one-shot claim to
         do it. Skipping leaves the pool visibly below floor instead.
         """
-        import services.officer_backlog as mod
-        from services.datasource_policy import DatasourceUnavailableError
+        import orchestrator.services.officer_backlog as mod
+        from orchestrator.services.datasource_policy import DatasourceUnavailableError
 
         monkeypatch.setattr(
             mod,

@@ -8,7 +8,7 @@ exercised on a live stack (debug chat panel), not here.
 from __future__ import annotations
 
 from orchestrator.database.audit_store import _lean_chat_doc
-from src.shared.orch_surface.formatters import _format_chat_entry
+from shared.orch_surface.formatters import _format_chat_entry
 
 
 def _doc() -> dict:

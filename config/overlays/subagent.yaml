@@ -64,7 +64,7 @@ display_name: Framework Subagent Base
 
 llm:
   # A child runs on its PARENT's model unless a layer above pins one: the
-  # roster resolver (src/core/subagent_roster.py) replaces `inherit` with the
+  # roster resolver (src/shared/runtime/core/subagent_roster.py) replaces `inherit` with the
   # parent's llm.model + transport at resolve time and marks the entry so a
   # later parent model change is re-synced. A `$ref`'d expert that pins its
   # own llm.model, the roster-wide `subagents.llm`, or the entry's own
@@ -133,7 +133,7 @@ limits:
   # closed set of keys today, so they are not declared here yet — an
   # undeclared key under `limits` would be dropped silently, not carried.
   tool_retry_count: 2
-  # In-process LLM attempts per child turn (src/persistent_graph.py reads it):
+  # In-process LLM attempts per child turn (src/agent/persistent_graph.py reads it):
   # a parent is waiting on the child, so fail fast like a session, never the
   # worker's 5-attempt pause+backoff ladder.
   llm_inproc_retries: 3

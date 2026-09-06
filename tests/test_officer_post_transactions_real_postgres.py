@@ -28,9 +28,9 @@ import pytest
 import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
-import main as orch_main
+import orchestrator.main as orch_main
 from orchestrator.database.postgres import OfficerPostLifecycleConflict, PostgresDB
-from services.officer_admission import (
+from orchestrator.services.officer_admission import (
     OfficerAdmissionConflict,
     SlotAdmissionError,
     admit_and_create_job,
@@ -38,30 +38,32 @@ from services.officer_admission import (
     count_in_flight_by_slot,
     prepare_officer_admission,
 )
-from src.shared.persistent_input_delivery import (
+from shared.persistent_input_delivery import (
     mark_input_delivery_queued,
     persist_input_delivery,
     transition_input_delivery,
 )
-from src.shared.workspace_contract import (
+from shared.workspace_contract import (
     LEGACY_K8S_RUNTIME_ADOPTION_KEY,
     WORKSPACE_CONTRACT_CONTEXT_KEY,
     WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY,
     resolve_workspace_runtime,
 )
-from src.shared.worker_queue import claim_worker_batch
+from shared.worker_queue import claim_worker_batch
 from tests._previous_release_seed import (
     seed_previous_release_row as _seed_previous_release_row,
 )
 
 SCHEMA_FILE = (
     Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "schema_current.sql"
 )
 CLAIM_MIGRATION_FILE = (
     Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "migrations"
@@ -70,6 +72,7 @@ CLAIM_MIGRATION_FILE = (
 )
 DELIVERABLE_MIGRATION_FILE = (
     Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "migrations"
@@ -78,6 +81,7 @@ DELIVERABLE_MIGRATION_FILE = (
 )
 RUNTIME_AUTHORITY_MIGRATION_FILE = (
     Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "migrations"
@@ -942,7 +946,7 @@ def _k8s_job_attestation(
     host="workspace-job.internal",
     pod_ip="10.42.1.17",
 ):
-    from services.container_provisioner import WorkspaceRuntimeAttestation
+    from orchestrator.services.container_provisioner import WorkspaceRuntimeAttestation
 
     backing = str(uuid4())
     return WorkspaceRuntimeAttestation(
@@ -959,7 +963,7 @@ def _k8s_job_attestation(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["created", "paused"])
 async def test_pre_0175_k8s_job_runtime_adopts_after_live_attestation(db, status):
-    from services.job_workspace_adoption import (
+    from orchestrator.services.job_workspace_adoption import (
         LegacyK8sAdoptionOutcome,
         ensure_legacy_k8s_job_runtime_authority,
     )
@@ -987,7 +991,7 @@ async def test_pre_0175_k8s_job_runtime_adopts_after_live_attestation(db, status
 
 @pytest.mark.asyncio
 async def test_pre_0175_k8s_adoption_is_one_cas_and_claim_marker_is_preserved(db):
-    from services.job_workspace_adoption import (
+    from orchestrator.services.job_workspace_adoption import (
         LegacyK8sAdoptionOutcome,
         ensure_legacy_k8s_job_runtime_authority,
     )
@@ -1043,7 +1047,7 @@ async def test_pre_0175_k8s_adoption_is_one_cas_and_claim_marker_is_preserved(db
 
 @pytest.mark.asyncio
 async def test_pre_0175_adoption_cas_yields_to_concurrent_tier_transition(db):
-    from services.job_workspace_adoption import (
+    from orchestrator.services.job_workspace_adoption import (
         LegacyK8sAdoptionOutcome,
         ensure_legacy_k8s_job_runtime_authority,
     )
@@ -1108,7 +1112,7 @@ async def test_pre_0175_adoption_cas_yields_to_concurrent_tier_transition(db):
 
 @pytest.mark.asyncio
 async def test_pre_0175_post_cas_pod_replacement_reverts_tentative_stamp(db):
-    from services.job_workspace_adoption import (
+    from orchestrator.services.job_workspace_adoption import (
         LegacyK8sAdoptionOutcome,
         ensure_legacy_k8s_job_runtime_authority,
     )
@@ -1153,7 +1157,7 @@ async def test_adoption_is_one_shot_and_a_replacement_needs_creation_authority(d
     evidence-lighter door onto the same row.
     """
 
-    from services.job_workspace_adoption import (
+    from orchestrator.services.job_workspace_adoption import (
         LegacyK8sAdoptionOutcome,
         ensure_legacy_k8s_job_runtime_authority,
     )
@@ -1216,7 +1220,7 @@ async def test_historical_non_ready_k8s_job_is_never_adopted(db):
     refuses before it reads Kubernetes at all.
     """
 
-    from services.job_workspace_adoption import (
+    from orchestrator.services.job_workspace_adoption import (
         LegacyK8sAdoptionOutcome,
         ensure_legacy_k8s_job_runtime_authority,
     )
@@ -1242,7 +1246,7 @@ async def test_historical_non_ready_k8s_job_is_never_adopted(db):
 
 @pytest.mark.asyncio
 async def test_stamped_sandbox_residue_adopts_but_unstamped_both_tier_refuses(db):
-    from services.job_workspace_adoption import (
+    from orchestrator.services.job_workspace_adoption import (
         LegacyK8sAdoptionOutcome,
         ensure_legacy_k8s_job_runtime_authority,
     )
@@ -1311,7 +1315,7 @@ async def test_stamped_sandbox_residue_adopts_but_unstamped_both_tier_refuses(db
 
 @pytest.mark.asyncio
 async def test_bp07_strict_job_is_parked_then_concurrently_activated_once(db):
-    from services.officer_preflight import ensure_officer_job_activated
+    from orchestrator.services.officer_preflight import ensure_officer_job_activated
 
     seed = await _seed_post(db)
     job = await admit_and_create_job(
@@ -1349,8 +1353,8 @@ async def test_bp07_strict_job_is_parked_then_concurrently_activated_once(db):
 
 @pytest.mark.asyncio
 async def test_bp07_repository_and_cloud_preflights_never_enter_breaker_history(db):
-    from services.job_provisioning import JobProvisioningError
-    from services.officer_preflight import ensure_officer_job_activated
+    from orchestrator.services.job_provisioning import JobProvisioningError
+    from orchestrator.services.officer_preflight import ensure_officer_job_activated
 
     seed = await _seed_post(db, count=2)
     jobs = []
@@ -1384,7 +1388,7 @@ async def test_bp07_repository_and_cloud_preflights_never_enter_breaker_history(
 
 @pytest.mark.asyncio
 async def test_bp07_real_pg_faults_before_and_after_activation_are_recoverable(db):
-    from services.officer_preflight import ensure_officer_job_activated
+    from orchestrator.services.officer_preflight import ensure_officer_job_activated
 
     seed = await _seed_post(db, count=2)
     durable_resources: set[str] = set()
@@ -1573,7 +1577,7 @@ async def test_bp08_a_prior_canonical_payload_can_become_current_again(db):
 
 @pytest.mark.asyncio
 async def test_bp10_duplicate_floor_ticks_queue_one_durable_wake(db):
-    from services.session_wake import notify_officer
+    from orchestrator.services.session_wake import notify_officer
 
     seed = await _seed_post(db)
     kwargs = {
@@ -1603,7 +1607,7 @@ async def test_bp10_duplicate_floor_ticks_queue_one_durable_wake(db):
 
 @pytest.mark.asyncio
 async def test_bp10_outbox_rollback_retries_without_consuming_policy_debounce(db):
-    from services.session_wake import notify_officer
+    from orchestrator.services.session_wake import notify_officer
 
     seed = await _seed_post(db)
     now = datetime.now(timezone.utc)
@@ -1685,7 +1689,7 @@ async def test_bp10_notifier_failures_do_not_queue_or_debounce(db, mode):
 
 @pytest.mark.asyncio
 async def test_bp10_delivery_updates_the_same_durable_episode(db):
-    from services.session_wake import notify_officer
+    from orchestrator.services.session_wake import notify_officer
 
     seed = await _seed_post(db)
     queued = await db.queue_officer_floor_wake(
@@ -1780,7 +1784,7 @@ async def test_bp10_delivery_updates_the_same_durable_episode(db):
 
 @pytest.mark.asyncio
 async def test_bp10_durable_intent_survives_hold_and_decommission_supersedes_it(db):
-    from services.session_wake import notify_officer
+    from orchestrator.services.session_wake import notify_officer
 
     seed = await _seed_post(db)
     queued = await db.queue_officer_floor_wake(
@@ -1815,7 +1819,7 @@ async def test_bp10_durable_intent_survives_hold_and_decommission_supersedes_it(
 
 @pytest.mark.asyncio
 async def test_bp10_decommission_racing_queue_leaves_no_orphaned_wake(db):
-    from services.session_wake import notify_officer
+    from orchestrator.services.session_wake import notify_officer
 
     seed = await _seed_post(db)
     queued, decommissioned = await asyncio.gather(
@@ -1844,7 +1848,7 @@ async def test_bp10_decommission_racing_queue_leaves_no_orphaned_wake(db):
 
 @pytest.mark.asyncio
 async def test_bp10_hold_racing_queue_preserves_or_refuses_one_durable_intent(db):
-    from services.session_wake import notify_officer
+    from orchestrator.services.session_wake import notify_officer
 
     seed = await _seed_post(db)
     queued, held = await asyncio.gather(
@@ -3132,8 +3136,8 @@ async def test_database_funnel_strips_raw_claim_context_from_ordinary_jobs(db):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("internal", [False, True], ids=["public", "internal"])
 async def test_http_creation_paths_cannot_persist_raw_claim_context(db, internal):
-    import security.access as access_module
-    from main import JobCreate, create_job
+    import orchestrator.security.access as access_module
+    from orchestrator.main import JobCreate, create_job
 
     user_id = uuid4()
     async with db.acquire() as conn:
@@ -3170,17 +3174,34 @@ async def test_http_creation_paths_cannot_persist_raw_claim_context(db, internal
     )
     principal = {"id": user_id, "is_admin": False}
     patches = (
-        patch("main.postgres_db", db),
-        patch("main.require_approved_user", AsyncMock(return_value=principal)),
-        patch("main._enforce_readiness_gate", AsyncMock(return_value=None)),
-        patch("main._require_job_project_access", AsyncMock(return_value=None)),
-        patch("main._is_experts_db_enabled", MagicMock(return_value=False)),
-        patch("main._inherit_parent_datasource_ids", AsyncMock(return_value=[])),
-        patch("main._authorize_thread_datasource_ids", AsyncMock(return_value=[])),
-        patch("main._enforce_job_create_grants", AsyncMock(return_value=None)),
-        patch("services.job_provisioning.provision_job_repo", AsyncMock()),
-        patch("main._spawn_scholar_subjob", AsyncMock(return_value=None)),
-        patch("main._trigger_dispatch", MagicMock()),
+        patch("orchestrator.main.postgres_db", db),
+        patch(
+            "orchestrator.main.require_approved_user", AsyncMock(return_value=principal)
+        ),
+        patch(
+            "orchestrator.main._enforce_readiness_gate", AsyncMock(return_value=None)
+        ),
+        patch(
+            "orchestrator.main._require_job_project_access",
+            AsyncMock(return_value=None),
+        ),
+        patch(
+            "orchestrator.main._is_experts_db_enabled", MagicMock(return_value=False)
+        ),
+        patch(
+            "orchestrator.main._inherit_parent_datasource_ids",
+            AsyncMock(return_value=[]),
+        ),
+        patch(
+            "orchestrator.main._authorize_thread_datasource_ids",
+            AsyncMock(return_value=[]),
+        ),
+        patch(
+            "orchestrator.main._enforce_job_create_grants", AsyncMock(return_value=None)
+        ),
+        patch("orchestrator.services.job_provisioning.provision_job_repo", AsyncMock()),
+        patch("orchestrator.main._spawn_scholar_subjob", AsyncMock(return_value=None)),
+        patch("orchestrator.main._trigger_dispatch", MagicMock()),
     )
     with ExitStack() as stack:
         stack.enter_context(
@@ -3228,7 +3249,7 @@ async def test_completion_merge_can_record_server_owned_evidence_manifest(db):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("claimed", [False, True], ids=["ordinary", "claimed"])
 async def test_delete_response_reports_only_an_actual_durable_claim(db, claimed):
-    from main import delete_job
+    from orchestrator.main import delete_job
 
     seed = await _seed_post(db)
     if claimed:
@@ -3258,13 +3279,18 @@ async def test_delete_response_reports_only_an_actual_durable_claim(db, claimed)
     )
 
     with (
-        patch("main.postgres_db", db),
+        patch("orchestrator.main.postgres_db", db),
         patch.object(db, "job_has_durable_ticket_claim", post_commit_lookup),
-        patch("main.require_job_access", AsyncMock(return_value=(admin, job))),
-        patch("main._archive_and_cleanup_workspace", AsyncMock(return_value=[])),
-        patch("main.gitea_client", gitea),
-        patch("main.snapshot_service", snapshots),
-        patch("main.vector_db", vector),
+        patch(
+            "orchestrator.main.require_job_access", AsyncMock(return_value=(admin, job))
+        ),
+        patch(
+            "orchestrator.main._archive_and_cleanup_workspace",
+            AsyncMock(return_value=[]),
+        ),
+        patch("orchestrator.main.gitea_client", gitea),
+        patch("orchestrator.main.snapshot_service", snapshots),
+        patch("orchestrator.main.vector_db", vector),
     ):
         result = await delete_job(
             SimpleNamespace(headers={}, query_params={}), str(created["id"])

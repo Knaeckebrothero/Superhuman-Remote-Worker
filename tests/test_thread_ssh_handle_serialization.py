@@ -28,7 +28,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-import main
+import orchestrator.main
 
 
 # ---------------------------------------------------------------------------
@@ -38,13 +38,15 @@ import main
 
 class TestRedactThreadMetadataCarriesSshHandle:
     def test_present_handle_survives_redaction(self):
-        out = main._redact_thread_metadata({"id": "t", "ssh_handle": "s-7f3a91c2"})
+        out = orchestrator.main._redact_thread_metadata(
+            {"id": "t", "ssh_handle": "s-7f3a91c2"}
+        )
         assert out["ssh_handle"] == "s-7f3a91c2"
 
     def test_null_handle_survives_as_none(self):
         """A real ``SELECT *`` row for a thread predating 0202 carries the
         column with a NULL value, not an absent key."""
-        out = main._redact_thread_metadata({"id": "t", "ssh_handle": None})
+        out = orchestrator.main._redact_thread_metadata({"id": "t", "ssh_handle": None})
         assert out["ssh_handle"] is None
 
 
@@ -62,17 +64,19 @@ def _patch_caller_and_db(user, db):
     tests don't also have to wire up mount rows."""
     stack = ExitStack()
     stack.enter_context(
-        patch("main.require_approved_user", AsyncMock(return_value=user))
+        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user))
     )
     stack.enter_context(
         patch(
-            "security.access.require_approved_user",
+            "orchestrator.security.access.require_approved_user",
             AsyncMock(return_value=user),
         )
     )
-    stack.enter_context(patch("main.postgres_db", db))
+    stack.enter_context(patch("orchestrator.main.postgres_db", db))
     stack.enter_context(
-        patch("main._resolve_cloud_session_url", MagicMock(return_value=None))
+        patch(
+            "orchestrator.main._resolve_cloud_session_url", MagicMock(return_value=None)
+        )
     )
     return stack
 
@@ -80,7 +84,7 @@ def _patch_caller_and_db(user, db):
 class TestGetThreadMintsSshHandleOnView:
     @pytest.mark.asyncio
     async def test_mints_a_handle_when_missing(self, user_a, thread_a, fake_db):
-        from main import get_thread
+        from orchestrator.main import get_thread
 
         thread_a["ssh_handle"] = None
         fake_db.ensure_thread_ssh_handle = AsyncMock(return_value="s-newlymnt")
@@ -97,7 +101,7 @@ class TestGetThreadMintsSshHandleOnView:
     ):
         """Minting is a write; a thread that already has a handle must not
         pay for one on every view."""
-        from main import get_thread
+        from orchestrator.main import get_thread
 
         thread_a["ssh_handle"] = "s-7f3a91c2"
         fake_db.ensure_thread_ssh_handle = AsyncMock(
@@ -118,7 +122,7 @@ class TestGetThreadMintsSshHandleOnView:
         read-only view. A read-only replica or a full disk -- this
         deployment has actually had one -- must not turn the whole thread
         view into a 500 for the sake of one SSH-panel field."""
-        from main import get_thread
+        from orchestrator.main import get_thread
 
         thread_a["ssh_handle"] = None
         fake_db.ensure_thread_ssh_handle = AsyncMock(

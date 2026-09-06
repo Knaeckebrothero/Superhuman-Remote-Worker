@@ -7,8 +7,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-from src.core.message_markers import PERSIST_ROLE_EVENT, PERSIST_ROLE_KEY
-from src.persistent_graph import (
+from shared.runtime.core.message_markers import PERSIST_ROLE_EVENT, PERSIST_ROLE_KEY
+from agent.persistent_graph import (
     PersistentLoopCallbacks,
     TurnResult,
     _execute_turn,
@@ -93,7 +93,7 @@ async def test_persistent_loop_stamps_parent_turn_before_execution(monkeypatch):
         observed_turns.append(kwargs["tool_context"]._current_turn_count)
         return TurnResult(turn_id=0, messages_added=0, tool_calls_made=0)
 
-    monkeypatch.setattr("src.persistent_graph._execute_turn", _execute_stub)
+    monkeypatch.setattr("agent.persistent_graph._execute_turn", _execute_stub)
     callbacks = _callbacks(
         get_user_input=AsyncMock(
             side_effect=["delegate this", asyncio.CancelledError()]

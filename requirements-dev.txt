@@ -1,5 +1,5 @@
 # Dev/test-only dependencies — NOT installed into the runtime images.
-# CI installs this alongside requirements.txt + orchestrator/requirements.txt
+# CI installs this alongside requirements.txt + src/orchestrator/requirements.txt
 # in the test jobs (.github/workflows/{main,develop}.yml).
 
 # Ephemeral PostgreSQL for the audit-store schema + partition-module tests
@@ -11,3 +11,9 @@ testcontainers[postgres]>=4.0
 # ``-n auto``: importing this repository is memory-heavy, so a bounded worker
 # count is faster and more predictable across machines.
 pytest-xdist>=3.8,<4.0
+
+# Package-boundary contracts rely on 2.13's overlapping wildcard semantics.
+import-linter==2.13
+
+# Reproducible source-tree codemod fixtures run in the normal Python test job.
+-r scripts/requirements-flatten.txt

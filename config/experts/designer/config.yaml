@@ -90,7 +90,7 @@ tools:
     - web_search
     - extract_webpage
   # git: intentionally absent. This agent has shell tools, and
-  # ToolsConfig.__post_init__ (src/core/loader.py) suppresses the git_* group
+  # ToolsConfig.__post_init__ (src/shared/runtime/core/loader.py) suppresses the git_* group
   # whenever shell is present — a shell can run git against ANY repository in
   # the workspace, including repos/<name>/, which git_* cannot. Declaring them
   # here would advertise tools the pod never binds.

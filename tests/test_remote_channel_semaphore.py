@@ -10,17 +10,11 @@ override); excess execs queue instead of being refused. Long-lived channels
 Mocked paramiko; concurrency is exercised with real threads.
 """
 
-import sys
 import threading
 import time
-from pathlib import Path
 from unittest.mock import MagicMock
 
-project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-
-from src.core.backends.remote import RemoteBackend  # noqa: E402
+from shared.runtime.core.backends.remote import RemoteBackend  # noqa: E402
 
 
 def _backend() -> RemoteBackend:

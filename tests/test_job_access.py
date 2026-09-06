@@ -33,15 +33,15 @@ def _patch_caller_and_db(user: dict, db):
     """Stack the patches every endpoint test needs."""
     stack = ExitStack()
     stack.enter_context(
-        patch("main.require_approved_user", AsyncMock(return_value=user))
+        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user))
     )
     stack.enter_context(
         patch(
-            "security.access.require_approved_user",
+            "orchestrator.security.access.require_approved_user",
             AsyncMock(return_value=user),
         )
     )
-    stack.enter_context(patch("main.postgres_db", db))
+    stack.enter_context(patch("orchestrator.main.postgres_db", db))
     return stack
 
 
@@ -49,7 +49,7 @@ def _patch_audit_unavailable():
     """Make ``main.audit_reader.is_available`` False so list_jobs skips enrichment."""
     fake_reader = MagicMock()
     fake_reader.is_available = False
-    return patch("main.audit_reader", fake_reader)
+    return patch("orchestrator.main.audit_reader", fake_reader)
 
 
 def _scoped(user: dict, scope: str) -> dict:
@@ -85,13 +85,13 @@ _LIST_JOBS_DEFAULTS: dict = {
 
 
 async def _list_jobs(fake_request, **overrides):
-    from main import list_jobs
+    from orchestrator.main import list_jobs
 
     return await list_jobs(fake_request, **{**_LIST_JOBS_DEFAULTS, **overrides})
 
 
 def _result(jobs=None, **kwargs):
-    from database.postgres import JobQueryResult
+    from orchestrator.database.postgres import JobQueryResult
 
     return JobQueryResult(jobs=list(jobs or []), **kwargs)
 
@@ -236,10 +236,10 @@ class TestListJobs:
         fake_db.query_jobs = AsyncMock(return_value=_result())
         with (
             patch(
-                "main.require_approved_user",
+                "orchestrator.main.require_approved_user",
                 AsyncMock(side_effect=HTTPException(status_code=401)),
             ),
-            patch("main.postgres_db", fake_db),
+            patch("orchestrator.main.postgres_db", fake_db),
             _patch_audit_unavailable(),
         ):
             with pytest.raises(HTTPException) as exc:
@@ -394,7 +394,7 @@ class TestListJobsFilterValidation:
         self, user_a, fake_db, fake_request
     ):
         """A runaway MCP loop must not be able to table-scan the fleet."""
-        from main import JOBS_MAX_OFFSET
+        from orchestrator.main import JOBS_MAX_OFFSET
 
         fake_db.query_jobs = AsyncMock(return_value=_result())
         with _patch_caller_and_db(user_a, fake_db), _patch_audit_unavailable():
@@ -494,7 +494,7 @@ class TestListJobsFilterValidation:
     async def test_too_many_project_filters_is_422(self, user_a, fake_db, fake_request):
         """Repeated UUIDs hit nginx's URL ceiling around 40 values, where the
         failure is a truncated request rather than a clear error."""
-        from main import JOBS_MAX_PROJECT_FILTERS
+        from orchestrator.main import JOBS_MAX_PROJECT_FILTERS
 
         many = [
             f"{i:08d}-0000-4000-8000-000000000000"
@@ -548,7 +548,7 @@ class TestListJobsFilterValidation:
 class TestGetJob:
     @pytest.mark.asyncio
     async def test_owner_passes(self, user_a, job_a, fake_db, fake_request):
-        from main import get_job
+        from orchestrator.main import get_job
 
         with _patch_caller_and_db(user_a, fake_db), _patch_audit_unavailable():
             result = await get_job(fake_request, str(job_a["id"]))
@@ -558,7 +558,7 @@ class TestGetJob:
 
     @pytest.mark.asyncio
     async def test_cross_user_403(self, user_b, job_a, fake_db, fake_request):
-        from main import get_job
+        from orchestrator.main import get_job
 
         with _patch_caller_and_db(user_b, fake_db), _patch_audit_unavailable():
             with pytest.raises(HTTPException) as exc:
@@ -567,7 +567,7 @@ class TestGetJob:
 
     @pytest.mark.asyncio
     async def test_missing_404(self, user_a, fake_db, fake_request):
-        from main import get_job
+        from orchestrator.main import get_job
 
         with _patch_caller_and_db(user_a, fake_db), _patch_audit_unavailable():
             with pytest.raises(HTTPException) as exc:
@@ -576,7 +576,7 @@ class TestGetJob:
 
     @pytest.mark.asyncio
     async def test_admin_bypass(self, user_admin, job_a, fake_db, fake_request):
-        from main import get_job
+        from orchestrator.main import get_job
 
         with _patch_caller_and_db(user_admin, fake_db), _patch_audit_unavailable():
             result = await get_job(fake_request, str(job_a["id"]))
@@ -587,7 +587,7 @@ class TestGetJob:
         self, user_a, user_b, job_a, fake_db, fake_request
     ):
         """user_b added as viewer on project_a → can see job_a."""
-        from main import get_job
+        from orchestrator.main import get_job
         from uuid import UUID
 
         async def member_lookup(pid, uid):
@@ -608,7 +608,7 @@ class TestGetJob:
         self, user_admin, job_a, project_b, fake_db, fake_request
     ):
         """Even an admin with a `project:<other>` scope is denied for an outside job."""
-        from main import get_job
+        from orchestrator.main import get_job
 
         scoped = _scoped(user_admin, f"project:{project_b['id']}")
         with _patch_caller_and_db(scoped, fake_db), _patch_audit_unavailable():
@@ -653,11 +653,11 @@ class TestGatedReadEndpoints:
     async def test_get_job_audit_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from main import get_job_audit
+        from orchestrator.main import get_job_audit
 
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("main.audit_reader", _make_dud("audit_reader")),
+            patch("orchestrator.main.audit_reader", _make_dud("audit_reader")),
         ):
             with pytest.raises(HTTPException) as exc:
                 await get_job_audit(fake_request, str(job_a["id"]))
@@ -667,11 +667,11 @@ class TestGatedReadEndpoints:
     async def test_get_job_llm_requests_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from main import get_job_llm_requests
+        from orchestrator.main import get_job_llm_requests
 
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("main.audit_reader", _make_dud("audit_reader")),
+            patch("orchestrator.main.audit_reader", _make_dud("audit_reader")),
         ):
             with pytest.raises(HTTPException) as exc:
                 await get_job_llm_requests(fake_request, str(job_a["id"]))
@@ -681,11 +681,11 @@ class TestGatedReadEndpoints:
     async def test_get_job_todos_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from main import get_job_todos
+        from orchestrator.main import get_job_todos
 
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("main.gitea_client", _make_dud("gitea_client")),
+            patch("orchestrator.main.gitea_client", _make_dud("gitea_client")),
         ):
             with pytest.raises(HTTPException) as exc:
                 await get_job_todos(fake_request, str(job_a["id"]))
@@ -695,11 +695,11 @@ class TestGatedReadEndpoints:
     async def test_get_current_todos_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from main import get_current_todos
+        from orchestrator.main import get_current_todos
 
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("main.gitea_client", _make_dud("gitea_client")),
+            patch("orchestrator.main.gitea_client", _make_dud("gitea_client")),
         ):
             with pytest.raises(HTTPException) as exc:
                 await get_current_todos(fake_request, str(job_a["id"]))
@@ -709,11 +709,11 @@ class TestGatedReadEndpoints:
     async def test_list_todo_archives_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from main import list_todo_archives
+        from orchestrator.main import list_todo_archives
 
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("main.gitea_client", _make_dud("gitea_client")),
+            patch("orchestrator.main.gitea_client", _make_dud("gitea_client")),
         ):
             with pytest.raises(HTTPException) as exc:
                 await list_todo_archives(fake_request, str(job_a["id"]))
@@ -723,11 +723,11 @@ class TestGatedReadEndpoints:
     async def test_get_archived_todos_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from main import get_archived_todos
+        from orchestrator.main import get_archived_todos
 
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("main.gitea_client", _make_dud("gitea_client")),
+            patch("orchestrator.main.gitea_client", _make_dud("gitea_client")),
         ):
             with pytest.raises(HTTPException) as exc:
                 await get_archived_todos(
@@ -741,11 +741,11 @@ class TestGatedReadEndpoints:
     async def test_list_repo_contents_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from main import list_repo_contents
+        from orchestrator.main import list_repo_contents
 
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("main.gitea_client", _make_dud("gitea_client")),
+            patch("orchestrator.main.gitea_client", _make_dud("gitea_client")),
         ):
             with pytest.raises(HTTPException) as exc:
                 await list_repo_contents(
@@ -757,11 +757,11 @@ class TestGatedReadEndpoints:
     async def test_get_repo_file_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from main import get_repo_file
+        from orchestrator.main import get_repo_file
 
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("main.gitea_client", _make_dud("gitea_client")),
+            patch("orchestrator.main.gitea_client", _make_dud("gitea_client")),
         ):
             with pytest.raises(HTTPException) as exc:
                 await get_repo_file(
@@ -773,11 +773,11 @@ class TestGatedReadEndpoints:
     async def test_list_job_citations_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from main import list_job_citations
+        from orchestrator.main import list_job_citations
 
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("main.vector_db", _make_dud("vector_db")),
+            patch("orchestrator.main.vector_db", _make_dud("vector_db")),
         ):
             with pytest.raises(HTTPException) as exc:
                 await list_job_citations(
@@ -794,11 +794,11 @@ class TestGatedReadEndpoints:
     async def test_list_job_memories_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from main import list_job_memories
+        from orchestrator.main import list_job_memories
 
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("main.vector_db", _make_dud("vector_db")),
+            patch("orchestrator.main.vector_db", _make_dud("vector_db")),
         ):
             with pytest.raises(HTTPException) as exc:
                 await list_job_memories(
@@ -818,11 +818,11 @@ class TestGatedReadEndpoints:
     async def test_get_memory_stats_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from main import get_memory_stats
+        from orchestrator.main import get_memory_stats
 
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("main.vector_db", _make_dud("vector_db")),
+            patch("orchestrator.main.vector_db", _make_dud("vector_db")),
         ):
             with pytest.raises(HTTPException) as exc:
                 await get_memory_stats(fake_request, str(job_a["id"]))
@@ -832,11 +832,11 @@ class TestGatedReadEndpoints:
     async def test_get_citation_stats_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from main import get_citation_stats
+        from orchestrator.main import get_citation_stats
 
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("main.vector_db", _make_dud("vector_db")),
+            patch("orchestrator.main.vector_db", _make_dud("vector_db")),
         ):
             with pytest.raises(HTTPException) as exc:
                 await get_citation_stats(fake_request, str(job_a["id"]))
@@ -846,11 +846,11 @@ class TestGatedReadEndpoints:
     async def test_search_job_sources_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from main import search_job_sources
+        from orchestrator.main import search_job_sources
 
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("main.vector_db", _make_dud("vector_db")),
+            patch("orchestrator.main.vector_db", _make_dud("vector_db")),
         ):
             with pytest.raises(HTTPException) as exc:
                 await search_job_sources(
@@ -868,11 +868,11 @@ class TestGatedReadEndpoints:
     async def test_get_job_snapshot_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from main import get_job_snapshot
+        from orchestrator.main import get_job_snapshot
 
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("main.snapshot_service", _make_dud("snapshot_service")),
+            patch("orchestrator.main.snapshot_service", _make_dud("snapshot_service")),
         ):
             with pytest.raises(HTTPException) as exc:
                 await get_job_snapshot(fake_request, str(job_a["id"]))
@@ -882,7 +882,7 @@ class TestGatedReadEndpoints:
     async def test_get_job_shell_state_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from main import get_job_shell_state
+        from orchestrator.main import get_job_shell_state
 
         # Mark the job as not-processing — if the gate let through, we'd
         # see 400 from the status check instead of 403.
@@ -896,7 +896,7 @@ class TestGatedReadEndpoints:
     async def test_get_frozen_job_data_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from main import get_frozen_job_data
+        from orchestrator.main import get_frozen_job_data
 
         with _patch_caller_and_db(user_b, fake_db):
             with pytest.raises(HTTPException) as exc:
@@ -907,7 +907,7 @@ class TestGatedReadEndpoints:
     async def test_get_job_progress_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from main import get_job_progress
+        from orchestrator.main import get_job_progress
 
         fake_db.get_job_progress = AsyncMock(
             side_effect=AssertionError("progress called past the gate")
@@ -921,11 +921,11 @@ class TestGatedReadEndpoints:
     async def test_get_job_version_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from main import get_job_version
+        from orchestrator.main import get_job_version
 
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("main.audit_reader", _make_dud("audit_reader")),
+            patch("orchestrator.main.audit_reader", _make_dud("audit_reader")),
         ):
             with pytest.raises(HTTPException) as exc:
                 await get_job_version(fake_request, str(job_a["id"]))
@@ -935,7 +935,7 @@ class TestGatedReadEndpoints:
     async def test_list_message_threads_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from main import list_message_threads
+        from orchestrator.main import list_message_threads
 
         fake_db.get_message_threads = AsyncMock(
             side_effect=AssertionError("threads called past the gate")
@@ -956,14 +956,14 @@ class TestGatedReadEndpointsHappyPath:
     async def test_get_job_audit_owner_reaches_audit_store(
         self, user_a, job_a, fake_db, fake_request
     ):
-        from main import get_job_audit
+        from orchestrator.main import get_job_audit
 
         fake_reader = MagicMock()
         fake_reader.is_available = True
         fake_reader.get_job_audit = AsyncMock(return_value={"entries": [], "total": 0})
         with (
             _patch_caller_and_db(user_a, fake_db),
-            patch("main.audit_reader", fake_reader),
+            patch("orchestrator.main.audit_reader", fake_reader),
         ):
             await get_job_audit(fake_request, str(job_a["id"]))
         fake_reader.get_job_audit.assert_awaited_once()
@@ -973,7 +973,7 @@ class TestGatedReadEndpointsHappyPath:
         self, user_a, job_a, fake_db, fake_request
     ):
         """Owner gets the Gitea-backed todo state (todos.yaml + archives)."""
-        from main import get_job_todos
+        from orchestrator.main import get_job_todos
 
         # Legacy-fallback repo resolution: no project jobs-repo rows → job-{id}.
         fake_db.get_project_repositories = AsyncMock(return_value=[])
@@ -1003,7 +1003,7 @@ class TestGatedReadEndpointsHappyPath:
         )
         with (
             _patch_caller_and_db(user_a, fake_db),
-            patch("main.gitea_client", fake_gitea),
+            patch("orchestrator.main.gitea_client", fake_gitea),
         ):
             result = await get_job_todos(fake_request, str(job_a["id"]))
 
@@ -1022,13 +1022,13 @@ class TestGatedReadEndpointsHappyPath:
         self, user_a, job_a, fake_db, fake_request
     ):
         """House rule: Gitea being down must never 500 the cockpit todo view."""
-        from main import get_job_todos
+        from orchestrator.main import get_job_todos
 
         fake_gitea = MagicMock()
         fake_gitea.is_initialized = False
         with (
             _patch_caller_and_db(user_a, fake_db),
-            patch("main.gitea_client", fake_gitea),
+            patch("orchestrator.main.gitea_client", fake_gitea),
         ):
             result = await get_job_todos(fake_request, str(job_a["id"]))
         assert result == {
@@ -1045,7 +1045,7 @@ class TestGatedReadEndpointsHappyPath:
         """E1/E3: the route now composes the DB basis with the shared
         liveness verdict — the gate still runs first and the DB payload is
         preserved, with state/reasons/sources merged on top."""
-        from main import get_job_progress
+        from orchestrator.main import get_job_progress
 
         fake_db.get_job_progress = AsyncMock(return_value={"status": "ok"})
         with _patch_caller_and_db(user_admin, fake_db):
@@ -1072,11 +1072,11 @@ class TestJobMutationGates:
     async def test_delete_job_snapshot_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from main import delete_job_snapshot
+        from orchestrator.main import delete_job_snapshot
 
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("main.snapshot_service", _make_dud("snapshot_service")),
+            patch("orchestrator.main.snapshot_service", _make_dud("snapshot_service")),
         ):
             with pytest.raises(HTTPException) as exc:
                 await delete_job_snapshot(fake_request, str(job_a["id"]))
@@ -1086,11 +1086,11 @@ class TestJobMutationGates:
     async def test_toggle_snapshot_pin_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from main import toggle_snapshot_pin
+        from orchestrator.main import toggle_snapshot_pin
 
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("main.snapshot_service", _make_dud("snapshot_service")),
+            patch("orchestrator.main.snapshot_service", _make_dud("snapshot_service")),
         ):
             with pytest.raises(HTTPException) as exc:
                 await toggle_snapshot_pin(fake_request, str(job_a["id"]))
@@ -1100,11 +1100,14 @@ class TestJobMutationGates:
     async def test_start_ide_session_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from main import start_ide_session
+        from orchestrator.main import start_ide_session
 
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("main.ide_session_service", _make_dud("ide_session_service")),
+            patch(
+                "orchestrator.main.ide_session_service",
+                _make_dud("ide_session_service"),
+            ),
         ):
             with pytest.raises(HTTPException) as exc:
                 await start_ide_session(fake_request, str(job_a["id"]))
@@ -1114,11 +1117,14 @@ class TestJobMutationGates:
     async def test_get_ide_session_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from main import get_ide_session
+        from orchestrator.main import get_ide_session
 
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("main.ide_session_service", _make_dud("ide_session_service")),
+            patch(
+                "orchestrator.main.ide_session_service",
+                _make_dud("ide_session_service"),
+            ),
         ):
             with pytest.raises(HTTPException) as exc:
                 await get_ide_session(fake_request, str(job_a["id"]))
@@ -1128,11 +1134,14 @@ class TestJobMutationGates:
     async def test_stop_ide_session_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from main import stop_ide_session
+        from orchestrator.main import stop_ide_session
 
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("main.ide_session_service", _make_dud("ide_session_service")),
+            patch(
+                "orchestrator.main.ide_session_service",
+                _make_dud("ide_session_service"),
+            ),
         ):
             with pytest.raises(HTTPException) as exc:
                 await stop_ide_session(fake_request, str(job_a["id"]))
@@ -1142,11 +1151,11 @@ class TestJobMutationGates:
     async def test_get_source_annotations_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from main import get_source_annotations
+        from orchestrator.main import get_source_annotations
 
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("main.vector_db", _make_dud("vector_db")),
+            patch("orchestrator.main.vector_db", _make_dud("vector_db")),
         ):
             with pytest.raises(HTTPException) as exc:
                 await get_source_annotations(fake_request, str(job_a["id"]), 1)
@@ -1156,11 +1165,11 @@ class TestJobMutationGates:
     async def test_get_source_tags_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from main import get_source_tags
+        from orchestrator.main import get_source_tags
 
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("main.vector_db", _make_dud("vector_db")),
+            patch("orchestrator.main.vector_db", _make_dud("vector_db")),
         ):
             with pytest.raises(HTTPException) as exc:
                 await get_source_tags(fake_request, str(job_a["id"]), 1)
@@ -1170,11 +1179,13 @@ class TestJobMutationGates:
     async def test_get_job_logs_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from main import get_job_logs
+        from orchestrator.main import get_job_logs
 
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("main.workspace_service", _make_dud("workspace_service")),
+            patch(
+                "orchestrator.main.workspace_service", _make_dud("workspace_service")
+            ),
         ):
             with pytest.raises(HTTPException) as exc:
                 await get_job_logs(fake_request, str(job_a["id"]))
@@ -1184,7 +1195,7 @@ class TestJobMutationGates:
     async def test_upgrade_job_to_vm_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from main import upgrade_job_to_vm
+        from orchestrator.main import upgrade_job_to_vm
 
         # The gate runs before the body, so no downstream service patch needed —
         # the in-body postgres_db.get_job() call would itself fail the dud test
@@ -1198,7 +1209,7 @@ class TestJobMutationGates:
     async def test_promote_job_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from main import PromoteRequest, promote_job
+        from orchestrator.main import PromoteRequest, promote_job
 
         body = PromoteRequest(
             name="hijack",
@@ -1218,7 +1229,7 @@ class TestJobMutationGates:
         """Owner promotes their own job; the gate accepts user_a, and the
         handler must overwrite body.user_id with caller.id so a malicious body
         can't grant ownership of the new project to someone else."""
-        from main import PromoteRequest, promote_job
+        from orchestrator.main import PromoteRequest, promote_job
 
         body = PromoteRequest(
             name="hijack-attempt",
@@ -1240,7 +1251,7 @@ class TestJobMutationGates:
     async def test_reply_to_agent_message_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from main import MessageReplyRequest, reply_to_agent_message
+        from orchestrator.main import MessageReplyRequest, reply_to_agent_message
 
         body = MessageReplyRequest(message="hi", urgent=False)
         with _patch_caller_and_db(user_b, fake_db):
@@ -1254,12 +1265,12 @@ class TestJobMutationGates:
     async def test_delete_job_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from main import delete_job
+        from orchestrator.main import delete_job
 
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("main.gitea_client", _make_dud("gitea_client")),
-            patch("main.vector_db", _make_dud("vector_db")),
+            patch("orchestrator.main.gitea_client", _make_dud("gitea_client")),
+            patch("orchestrator.main.vector_db", _make_dud("vector_db")),
         ):
             with pytest.raises(HTTPException) as exc:
                 await delete_job(fake_request, str(job_a["id"]))
@@ -1272,7 +1283,7 @@ class TestJobMutationGates:
         """Plain project membership isn't enough — must be job owner OR
         project owner OR admin. user_b is a member of project_a here but
         only as 'editor', so the gate-pass should still be denied."""
-        from main import delete_job
+        from orchestrator.main import delete_job
 
         # Make user_b a non-owner member of project_a so require_job_access
         # passes but the secondary role check fails.
@@ -1286,8 +1297,8 @@ class TestJobMutationGates:
         fake_db.get_user_role_in_project = role_lookup
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("main.gitea_client", _make_dud("gitea_client")),
-            patch("main.vector_db", _make_dud("vector_db")),
+            patch("orchestrator.main.gitea_client", _make_dud("gitea_client")),
+            patch("orchestrator.main.vector_db", _make_dud("vector_db")),
         ):
             with pytest.raises(HTTPException) as exc:
                 await delete_job(fake_request, str(job_a["id"]))
@@ -1304,7 +1315,7 @@ class TestJobMutationGates:
         lifecycle reconciler can no longer reap the pod (no-bound-row is
         treated as in-flight provisioning). See
         knowledge-history/done/deleted_job_orphans_workspace_pod.md."""
-        from main import delete_job
+        from orchestrator.main import delete_job
 
         calls: list[str] = []
 
@@ -1338,10 +1349,10 @@ class TestJobMutationGates:
 
         with (
             _patch_caller_and_db(user_a, fake_db),
-            patch("main._archive_and_cleanup_workspace", cleanup),
-            patch("main.snapshot_service", fake_snapshot),
-            patch("main.gitea_client", fake_gitea),
-            patch("main.vector_db", _make_dud("vector_db")),
+            patch("orchestrator.main._archive_and_cleanup_workspace", cleanup),
+            patch("orchestrator.main.snapshot_service", fake_snapshot),
+            patch("orchestrator.main.gitea_client", fake_gitea),
+            patch("orchestrator.main.vector_db", _make_dud("vector_db")),
         ):
             result = await delete_job(fake_request, str(job_a["id"]))
 
@@ -1361,16 +1372,16 @@ class TestJobMutationGates:
         """A parent with surviving child rows can't be row-deleted (FK) — the
         endpoint must fail fast BEFORE tearing down the workspace, or the
         failed delete would leave the job alive with its pod gone."""
-        from main import delete_job
+        from orchestrator.main import delete_job
 
         fake_db.has_child_jobs = AsyncMock(return_value=True)
         cleanup = AsyncMock()
 
         with (
             _patch_caller_and_db(user_a, fake_db),
-            patch("main._archive_and_cleanup_workspace", cleanup),
-            patch("main.gitea_client", _make_dud("gitea_client")),
-            patch("main.vector_db", _make_dud("vector_db")),
+            patch("orchestrator.main._archive_and_cleanup_workspace", cleanup),
+            patch("orchestrator.main.gitea_client", _make_dud("gitea_client")),
+            patch("orchestrator.main.vector_db", _make_dud("vector_db")),
         ):
             with pytest.raises(HTTPException) as exc:
                 await delete_job(fake_request, str(job_a["id"]))
@@ -1383,7 +1394,7 @@ class TestJobMutationGates:
         self, user_a, job_a, fake_db, fake_request
     ):
         """Even the job owner can't manually assign — admin-only override."""
-        from main import assign_job_to_agent
+        from orchestrator.main import assign_job_to_agent
 
         with _patch_caller_and_db(user_a, fake_db):
             with pytest.raises(HTTPException) as exc:
@@ -1396,7 +1407,7 @@ class TestJobMutationGates:
     ):
         """Admin clears the gate; the in-body failure is a 500 (not a 403),
         proving the gate didn't fire."""
-        from main import assign_job_to_agent
+        from orchestrator.main import assign_job_to_agent
 
         fake_db.get_job = AsyncMock(side_effect=RuntimeError("past gate ok"))
         with _patch_caller_and_db(user_admin, fake_db):
@@ -1419,7 +1430,7 @@ class TestVmLifecycleGates:
     async def test_create_vm_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from main import VMCreateRequest, create_vm
+        from orchestrator.main import VMCreateRequest, create_vm
 
         body = VMCreateRequest(
             job_id=str(job_a["id"]),
@@ -1427,7 +1438,7 @@ class TestVmLifecycleGates:
         )
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("main.vm_provisioner", _make_dud("vm_provisioner")),
+            patch("orchestrator.main.vm_provisioner", _make_dud("vm_provisioner")),
         ):
             with pytest.raises(HTTPException) as exc:
                 await create_vm(fake_request, body)
@@ -1437,11 +1448,11 @@ class TestVmLifecycleGates:
     async def test_get_vm_status_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from main import get_vm_status
+        from orchestrator.main import get_vm_status
 
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("main.vm_provisioner", _make_dud("vm_provisioner")),
+            patch("orchestrator.main.vm_provisioner", _make_dud("vm_provisioner")),
         ):
             with pytest.raises(HTTPException) as exc:
                 await get_vm_status(fake_request, str(job_a["id"]))
@@ -1451,11 +1462,11 @@ class TestVmLifecycleGates:
     async def test_delete_vm_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from main import delete_vm
+        from orchestrator.main import delete_vm
 
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("main.vm_provisioner", _make_dud("vm_provisioner")),
+            patch("orchestrator.main.vm_provisioner", _make_dud("vm_provisioner")),
         ):
             with pytest.raises(HTTPException) as exc:
                 await delete_vm(fake_request, str(job_a["id"]))
@@ -1467,7 +1478,7 @@ class TestVmLifecycleGates:
     ):
         """Same shape as `delete_job` — plain editor membership must not
         be enough to delete the VM."""
-        from main import delete_vm
+        from orchestrator.main import delete_vm
 
         original_role = fake_db.get_user_role_in_project
 
@@ -1479,7 +1490,7 @@ class TestVmLifecycleGates:
         fake_db.get_user_role_in_project = role_lookup
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("main.vm_provisioner", _make_dud("vm_provisioner")),
+            patch("orchestrator.main.vm_provisioner", _make_dud("vm_provisioner")),
         ):
             with pytest.raises(HTTPException) as exc:
                 await delete_vm(fake_request, str(job_a["id"]))

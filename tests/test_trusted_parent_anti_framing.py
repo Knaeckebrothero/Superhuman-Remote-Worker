@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.testclient import TestClient
 
-from security.anti_framing import TrustedParentAntiFramingMiddleware
+from shared.anti_framing import TrustedParentAntiFramingMiddleware
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -279,27 +279,27 @@ def test_same_origin_compatibility_prefix_must_be_narrow(prefix: str) -> None:
 def test_ide_exception_fails_closed_when_api_and_cockpit_share_an_authority(
     monkeypatch,
 ) -> None:
-    import main
+    import orchestrator.main
 
     monkeypatch.setenv("IDE_PROXY_BASE_URL", "https://cockpit.example.test")
     monkeypatch.setenv("SRW_SPA_BASE_URL", "https://cockpit.example.test:443")
     monkeypatch.setenv("CORS_ORIGINS", "https://cockpit.example.test.")
-    assert main._isolated_ide_frame_authorities() == {}
+    assert orchestrator.main._isolated_ide_frame_authorities() == {}
 
     monkeypatch.setenv("IDE_PROXY_BASE_URL", "https://api.example.test:443")
-    assert main._isolated_ide_frame_authorities() == {
+    assert orchestrator.main._isolated_ide_frame_authorities() == {
         "/api/ide/": ("api.example.test", "api.example.test:443")
     }
 
 
 def test_orchestrator_registers_anti_framing_inside_request_correlation() -> None:
-    import main
+    import orchestrator.main
 
-    middleware_classes = [item.cls for item in main.app.user_middleware]
+    middleware_classes = [item.cls for item in orchestrator.main.app.user_middleware]
     assert middleware_classes[0].__name__ == "CorrelationIdMiddleware"
     assert middleware_classes[1] is TrustedParentAntiFramingMiddleware
 
-    response = TestClient(main.app).get("/openapi.json")
+    response = TestClient(orchestrator.main.app).get("/openapi.json")
     assert response.status_code == 200
     _assert_denies_framing(response)
 
@@ -327,12 +327,9 @@ def test_cockpit_production_and_dev_servers_deny_framing() -> None:
 
 
 def test_optional_mcp_documents_use_the_same_response_boundary() -> None:
-    run_source = (ROOT / "orchestrator/mcp/run.py").read_text()
+    run_source = (ROOT / "src/mcp_server/run.py").read_text()
     assert "middleware=[Middleware(TrustedParentAntiFramingMiddleware)]" in run_source
 
     for relative_path in ("docker/Dockerfile.mcp", "docker/Dockerfile.mcp.dev"):
         dockerfile = (ROOT / relative_path).read_text()
-        assert (
-            "orchestrator/security/anti_framing.py ./security/anti_framing.py"
-            in dockerfile
-        )
+        assert "COPY --chown=srw:srw src/shared/ ./src/shared/" in dockerfile

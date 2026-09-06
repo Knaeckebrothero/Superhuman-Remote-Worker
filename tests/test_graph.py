@@ -8,7 +8,6 @@ import inspect
 
 import pytest
 import tempfile
-import sys
 import yaml
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,16 +16,13 @@ from uuid import UUID
 
 # Add project root src to path for imports
 project_root = Path(__file__).parent.parent
-src_path = project_root / "src"
-if str(src_path) not in sys.path:
-    sys.path.insert(0, str(src_path))
 
 # Import from src package (requires langgraph in environment)
-from src.core.workspace import WorkspaceManager  # noqa: E402
-from src.core.state import create_initial_state  # noqa: E402
-from src.managers import TodoManager, PlanManager, MemoryManager  # noqa: E402
+from agent.core.workspace import WorkspaceManager  # noqa: E402
+from agent.core.state import create_initial_state  # noqa: E402
+from agent.managers import TodoManager, PlanManager, MemoryManager  # noqa: E402
 from tests._fs_backend import FilesystemTestBackend  # noqa: E402
-from src.graph import (  # noqa: E402
+from agent.graph import (  # noqa: E402
     WORKER_BATCH_MIN_WALL_SECONDS,
     route_entry,
     route_after_execute,
@@ -45,8 +41,8 @@ from src.graph import (  # noqa: E402
     worker_batch_boundary_updates,
 )
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage  # noqa: E402
-from src.core.loader import LimitsConfig  # noqa: E402
-from src.core.phase import (  # noqa: E402
+from shared.runtime.core.loader import LimitsConfig  # noqa: E402
+from agent.core.phase import (  # noqa: E402
     get_initial_strategic_todos,
     get_transition_strategic_todos,
     validate_todos_yaml,
@@ -310,7 +306,7 @@ class TestCheckTodosNode:
             "worker_batch_iteration_cap": None,
         }
 
-        with patch("src.graph.time.time", return_value=1300.0):
+        with patch("agent.graph.time.time", return_value=1300.0):
             result = node(state)
 
         assert result["should_stop"] is True
@@ -343,7 +339,7 @@ class TestCheckTodosNode:
             "worker_batch_iteration_cap": None,
         }
 
-        with patch("src.graph.time.time", return_value=1300.0):
+        with patch("agent.graph.time.time", return_value=1300.0):
             result = node(state)
 
         assert result["phase_complete"] is True
@@ -363,7 +359,7 @@ class TestCheckTodosNode:
             "worker_batch_iteration_cap": None,
         }
 
-        with patch("src.graph.time.time", return_value=1300.0):
+        with patch("agent.graph.time.time", return_value=1300.0):
             result = node(state)
 
         assert result["phase_complete"] is True
@@ -381,7 +377,7 @@ class TestCheckTodosNode:
             "worker_batch_iteration_cap": None,
         }
 
-        with patch("src.graph.time.time", return_value=1300.0):
+        with patch("agent.graph.time.time", return_value=1300.0):
             result = node(state)
 
         assert result["phase_complete"] is True
@@ -400,8 +396,8 @@ class TestCheckTodosNode:
         }
 
         with (
-            patch("src.graph.time.time", return_value=1300.0),
-            patch("src.graph._is_drain_requested", return_value=True),
+            patch("agent.graph.time.time", return_value=1300.0),
+            patch("agent.graph._is_drain_requested", return_value=True),
         ):
             result = node(state)
 
@@ -583,7 +579,7 @@ class TestCheckpointCompletionReport:
         from langgraph.checkpoint.memory import InMemorySaver
         from langgraph.graph import END, StateGraph
 
-        from src.core.state import UniversalAgentState
+        from agent.core.state import UniversalAgentState
 
         workflow = StateGraph(UniversalAgentState)
         workflow.add_node("checkpoint_completion_report", checkpoint_completion_report)
@@ -616,7 +612,7 @@ class TestRestoreTodoStateNode:
 
     def test_restores_from_checkpoint(self, managers):
         """Test that restore_todo_state restores TodoManager from checkpoint."""
-        from src.graph import create_restore_todo_state_node
+        from agent.graph import create_restore_todo_state_node
 
         node = create_restore_todo_state_node(managers["todo"])
 
@@ -673,7 +669,7 @@ class TestRestoreTodoStateNode:
 
     def test_handles_empty_checkpoint(self, managers):
         """Test that restore_todo_state handles checkpoints without todo data."""
-        from src.graph import create_restore_todo_state_node
+        from agent.graph import create_restore_todo_state_node
 
         node = create_restore_todo_state_node(managers["todo"])
 
@@ -699,7 +695,7 @@ class TestRestoreTodoStateNode:
         When resuming with staged todos but no active todos (phase-boundary
         freeze pattern), the node should apply them and flip to tactical.
         """
-        from src.graph import create_restore_todo_state_node
+        from agent.graph import create_restore_todo_state_node
 
         node = create_restore_todo_state_node(managers["todo"])
 
@@ -736,7 +732,7 @@ class TestRestoreTodoStateNode:
         When there are both active and staged todos, the node should NOT
         apply staged todos — this is a normal mid-phase restore.
         """
-        from src.graph import create_restore_todo_state_node
+        from agent.graph import create_restore_todo_state_node
 
         node = create_restore_todo_state_node(managers["todo"])
 
@@ -935,18 +931,20 @@ class TestArchivePhaseNode:
             SystemMessage,
         )
 
-        from src.core.context import (
+        from agent.core.context import (
             ContextConfig,
             ContextManager,
             ConversationSummary,
         )
-        from src.core.message_markers import (
+        from shared.runtime.core.message_markers import (
             PROTECTED_KEY,
             is_protected_message,
             protected_phase_key,
         )
-        from src.core.workspace_injection import create_phase_instruction_message
-        from src.services.auxiliary import AuxiliaryLLM
+        from shared.runtime.core.workspace_injection import (
+            create_phase_instruction_message,
+        )
+        from shared.runtime.services.auxiliary import AuxiliaryLLM
 
         managers["todo"].add("Task 1")
         managers["todo"].complete("todo_1")
@@ -1578,7 +1576,7 @@ class TestHandleTransitionNode:
             "worker_batch_target_wall_seconds": 300.0,
             "worker_batch_iteration_cap": 5,
         }
-        with patch("src.graph._is_drain_requested", return_value=True):
+        with patch("agent.graph._is_drain_requested", return_value=True):
             result = await node(state)
 
         assert result.get("should_stop") is True
@@ -1630,7 +1628,7 @@ class TestHandleTransitionNode:
             "phase_number": 0,
             "iteration": 10,
         }
-        with patch("src.graph._is_drain_requested", return_value=False):
+        with patch("agent.graph._is_drain_requested", return_value=False):
             result = await node(state)
 
         # Successful transition without any version_upgrade freeze.
@@ -1670,8 +1668,8 @@ class TestHandleTransitionNode:
         }
 
         with (
-            patch("src.graph._is_drain_requested", return_value=False),
-            patch("src.graph.time.time", return_value=1300.0),
+            patch("agent.graph._is_drain_requested", return_value=False),
+            patch("agent.graph.time.time", return_value=1300.0),
         ):
             result = await node(state)
 
@@ -1712,8 +1710,8 @@ class TestHandleTransitionNode:
         }
 
         with (
-            patch("src.graph._is_drain_requested", return_value=False),
-            patch("src.graph.time.time", return_value=1300.0),
+            patch("agent.graph._is_drain_requested", return_value=False),
+            patch("agent.graph.time.time", return_value=1300.0),
         ):
             result = await node(state)
 
@@ -1989,8 +1987,8 @@ class TestEditFileTool:
     @pytest.fixture
     def workspace_tools_dict(self, workspace_manager):
         """Create workspace tools and return as dict."""
-        from src.tools.workspace import create_workspace_tools
-        from src.tools.context import ToolContext
+        from agent.tools.workspace import create_workspace_tools
+        from agent.tools.context import ToolContext
 
         ctx = ToolContext(workspace_manager=workspace_manager)
         tools = create_workspace_tools(ctx)
@@ -2108,8 +2106,8 @@ class TestEditCitationTool:
     @pytest.fixture
     def edit_tool(self, workspace_manager, mock_engine):
         """Create citation tools and return the edit_citation tool."""
-        from src.tools.citation import create_citation_tools
-        from src.tools.context import ToolContext
+        from agent.tools.citation import create_citation_tools
+        from agent.tools.context import ToolContext
 
         ctx = ToolContext(
             workspace_manager=workspace_manager,
@@ -2222,7 +2220,7 @@ class TestEnsureWithinLimits:
     @pytest.fixture
     def context_mgr(self):
         """Create a ContextManager with low thresholds for testing."""
-        from src.core.context import ContextManager, ContextConfig
+        from agent.core.context import ContextManager, ContextConfig
 
         config = ContextConfig(
             compaction_threshold_tokens=1000,
@@ -2236,7 +2234,7 @@ class TestEnsureWithinLimits:
     @pytest.fixture
     def mock_auxiliary(self):
         """Create a mock AuxiliaryLLM that returns a summary."""
-        from src.services.auxiliary import AuxiliaryLLM
+        from shared.runtime.services.auxiliary import AuxiliaryLLM
         from langchain_core.messages import AIMessage
 
         llm = MagicMock()
@@ -2263,7 +2261,7 @@ class TestEnsureWithinLimits:
     async def test_no_compaction_when_under_threshold(self, context_mgr):
         """Test that messages are returned unchanged when under threshold."""
         from langchain_core.messages import HumanMessage
-        from src.services.auxiliary import AuxiliaryLLM
+        from shared.runtime.services.auxiliary import AuxiliaryLLM
 
         messages = [HumanMessage(content="Hello")]
 
@@ -2378,8 +2376,8 @@ class TestPerCallPhaseGate:
         auditor = MagicMock()
         auditor.audit_tool_call.side_effect = lambda **kw: f"doc-{kw['call_id']}"
         with (
-            patch("src.graph.ToolNode") as MockToolNode,
-            patch("src.graph.get_archiver", return_value=auditor),
+            patch("agent.graph.ToolNode") as MockToolNode,
+            patch("agent.graph.get_archiver", return_value=auditor),
         ):
             mock_tn = AsyncMock()
             mock_tn.ainvoke = AsyncMock(
@@ -2455,7 +2453,7 @@ class TestPerCallPhaseGate:
                 if isinstance(m, SystemMessage) and "OBSERVATION" in m.content
             ]
 
-        with patch("src.graph.ToolNode") as MockToolNode:
+        with patch("agent.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             MockToolNode.return_value = mock_tn
             audited = create_audited_tool_node(
@@ -2512,13 +2510,13 @@ class TestExecuteNodeBindings:
         )
 
     def test_one_binding_is_the_primary_argument(self):
-        from src.graph import create_execute_node
+        from agent.graph import create_execute_node
 
         node = create_execute_node(llm_with_tools=MagicMock(), **self._kwargs())
         assert callable(node)
 
     def test_binding_is_required(self):
-        from src.graph import create_execute_node
+        from agent.graph import create_execute_node
 
         with pytest.raises(TypeError, match="llm_with_tools"):
             create_execute_node(**self._kwargs())
@@ -2536,7 +2534,7 @@ class TestSubagentContextProbe:
 
     def _config(self):
         from pathlib import Path
-        from src.core.loader import load_agent_config
+        from shared.runtime.core.loader import load_agent_config
 
         root = Path(__file__).resolve().parents[1]
         config = load_agent_config(str(root / "config" / "worker_base.yaml"))
@@ -2548,9 +2546,9 @@ class TestSubagentContextProbe:
     ):
         from unittest.mock import patch
 
-        from src.core.context import ContextManager
-        from src.subagents import ContextProbe
-        from src.tools.context import ToolContext
+        from agent.core.context import ContextManager
+        from agent.subagents import ContextProbe
+        from agent.tools.context import ToolContext
 
         config = self._config()
         ctx = ToolContext(workspace_manager=workspace_manager)
@@ -2561,7 +2559,7 @@ class TestSubagentContextProbe:
             managers_seen.append(ContextManager(**kwargs))
             return managers_seen[-1]
 
-        with patch("src.graph.ContextManager", side_effect=capture):
+        with patch("agent.graph.ContextManager", side_effect=capture):
             build_phase_alternation_graph(
                 llm_with_tools=MagicMock(),
                 tools=[],

@@ -210,6 +210,14 @@ vulnerabilities privately according to [SECURITY.md](SECURITY.md).
 
 ## Contributing
 
+Python applications live under `src/agent/`, `src/orchestrator/`,
+`src/mcp_server/`, and `src/vm_controller/`, with common support in
+`src/shared/`. Install the component's requirements, then run
+`python -m pip install --no-deps -e .` from the repository root. Launch the
+agent with `python -m agent` and the backend with
+`uvicorn orchestrator.main:app --port 8085`. See the
+[development guide](docs/development.md) for dependency sets and local setup.
+
 Bug reports, focused fixes, documentation improvements, and design discussions
 are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md), and use the
 [issue tracker](https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/issues)

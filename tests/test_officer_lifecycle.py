@@ -25,8 +25,8 @@ import pytest
 import pytest_asyncio
 from fastapi import HTTPException
 
-import main as orch_main
-from main import (
+import orchestrator.main as orch_main
+from orchestrator.main import (
     OfficerDecommissionRequest,
     OfficerHoldRequest,
     _check_officer_sleep_bounds,
@@ -42,11 +42,11 @@ from main import (
     release_project_officer,
 )
 from orchestrator.database.postgres import PostgresDB
-from services import session_wake
-from services.persistent_recycler import PersistentRecycleResult
+from orchestrator.services import session_wake
+from orchestrator.services.persistent_recycler import PersistentRecycleResult
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SCHEMA_FILE = REPO_ROOT / "orchestrator" / "database" / "schema_current.sql"
+SCHEMA_FILE = REPO_ROOT / "src" / "orchestrator" / "database" / "schema_current.sql"
 
 PROJECT_ID = str(uuid4())
 THREAD_ID = str(uuid4())
@@ -1849,7 +1849,7 @@ class TestEndThreadReroute:
     async def test_notifier_failure_does_not_falsify_committed_handoff(
         self, db, monkeypatch
     ):
-        from services import message_routing
+        from orchestrator.services import message_routing
 
         route = {
             "route_id": str(uuid4()),
@@ -1891,7 +1891,7 @@ class TestEndThreadReroute:
     async def test_notifier_exception_does_not_falsify_committed_handoff(
         self, db, monkeypatch
     ):
-        from services import message_routing
+        from orchestrator.services import message_routing
 
         route = {
             "route_id": str(uuid4()),

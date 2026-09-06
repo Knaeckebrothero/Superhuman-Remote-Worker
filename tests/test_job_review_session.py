@@ -74,13 +74,13 @@ def _database() -> dict:
 
 def _authorized(user: dict, db):
     stack = ExitStack()
-    stack.enter_context(patch("main.postgres_db", db))
+    stack.enter_context(patch("orchestrator.main.postgres_db", db))
     stack.enter_context(
-        patch("main.require_approved_user", AsyncMock(return_value=user))
+        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user))
     )
     stack.enter_context(
         patch(
-            "security.access.require_approved_user",
+            "orchestrator.security.access.require_approved_user",
             AsyncMock(return_value=user),
         )
     )
@@ -92,7 +92,7 @@ class TestReviewSessionEndpoint:
     async def test_real_job_shape_derives_the_session_without_a_request_body(
         self, user_a, job_a, fake_db, fake_request
     ):
-        from main import create_job_review_session
+        from orchestrator.main import create_job_review_session
 
         job = _job(job_a)
         fake_db.get_job = AsyncMock(return_value=job)
@@ -101,7 +101,10 @@ class TestReviewSessionEndpoint:
         )
         created = AsyncMock(return_value={"thread_id": THREAD_ID, "status": "created"})
 
-        with _authorized(user_a, fake_db), patch("main.create_thread", created):
+        with (
+            _authorized(user_a, fake_db),
+            patch("orchestrator.main.create_thread", created),
+        ):
             result = await create_job_review_session(fake_request, JOB_ID)
 
         body, forwarded_request = created.await_args.args
@@ -154,7 +157,7 @@ class TestReviewSessionEndpoint:
     async def test_requires_a_recorded_pr_instead_of_guessing_from_model_prose(
         self, user_a, job_a, fake_db, fake_request
     ):
-        from main import create_job_review_session
+        from orchestrator.main import create_job_review_session
 
         fake_db.get_job = AsyncMock(
             return_value={**_job(job_a), "context": {"notes": "PR #1 is open"}}
@@ -162,7 +165,10 @@ class TestReviewSessionEndpoint:
         fake_db.resolve_datasources_for_job = AsyncMock()
         created = AsyncMock()
 
-        with _authorized(user_a, fake_db), patch("main.create_thread", created):
+        with (
+            _authorized(user_a, fake_db),
+            patch("orchestrator.main.create_thread", created),
+        ):
             with pytest.raises(HTTPException) as exc:
                 await create_job_review_session(fake_request, JOB_ID)
 
@@ -174,13 +180,16 @@ class TestReviewSessionEndpoint:
     async def test_cross_user_is_rejected_before_connectors_or_creation(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from main import create_job_review_session
+        from orchestrator.main import create_job_review_session
 
         fake_db.get_job = AsyncMock(return_value=_job(job_a))
         fake_db.resolve_datasources_for_job = AsyncMock()
         created = AsyncMock()
 
-        with _authorized(user_b, fake_db), patch("main.create_thread", created):
+        with (
+            _authorized(user_b, fake_db),
+            patch("orchestrator.main.create_thread", created),
+        ):
             with pytest.raises(HTTPException) as exc:
                 await create_job_review_session(fake_request, JOB_ID)
 
@@ -192,7 +201,7 @@ class TestReviewSessionEndpoint:
     async def test_refuses_a_detached_delivery_repository(
         self, user_a, job_a, fake_db, fake_request
     ):
-        from main import create_job_review_session
+        from orchestrator.main import create_job_review_session
 
         wrong = _repository()
         wrong["connection_url"] = "https://github.com/acme/not-the-delivery.git"
@@ -200,7 +209,10 @@ class TestReviewSessionEndpoint:
         fake_db.resolve_datasources_for_job = AsyncMock(return_value=[wrong])
         created = AsyncMock()
 
-        with _authorized(user_a, fake_db), patch("main.create_thread", created):
+        with (
+            _authorized(user_a, fake_db),
+            patch("orchestrator.main.create_thread", created),
+        ):
             with pytest.raises(HTTPException) as exc:
                 await create_job_review_session(fake_request, JOB_ID)
 
@@ -211,7 +223,7 @@ class TestReviewSessionEndpoint:
     async def test_refuses_same_repo_name_on_a_different_forge_host(
         self, user_a, job_a, fake_db, fake_request
     ):
-        from main import create_job_review_session
+        from orchestrator.main import create_job_review_session
 
         lookalike = _repository()
         lookalike["connection_url"] = (
@@ -222,7 +234,7 @@ class TestReviewSessionEndpoint:
 
         with (
             _authorized(user_a, fake_db),
-            patch("main.create_thread", AsyncMock()) as created,
+            patch("orchestrator.main.create_thread", AsyncMock()) as created,
         ):
             with pytest.raises(HTTPException) as exc:
                 await create_job_review_session(fake_request, JOB_ID)
@@ -231,7 +243,7 @@ class TestReviewSessionEndpoint:
         created.assert_not_awaited()
 
     def test_public_contract_accepts_only_request_and_job_id(self):
-        from main import create_job_review_session
+        from orchestrator.main import create_job_review_session
 
         assert list(inspect.signature(create_job_review_session).parameters) == [
             "request",
@@ -239,7 +251,7 @@ class TestReviewSessionEndpoint:
         ]
 
     def test_json_cannot_populate_the_private_server_seed(self):
-        from main import ThreadCreateRequest
+        from orchestrator.main import ThreadCreateRequest
 
         body = ThreadCreateRequest.model_validate(
             {
@@ -253,8 +265,8 @@ class TestReviewSessionEndpoint:
         assert body._trusted_seed is None
 
     def test_opening_event_is_bounded_for_large_job_deliverable_lists(self, job_a):
-        from main import _review_session_opening_event
-        from services.job_delivery import parse_job_pull_request
+        from orchestrator.main import _review_session_opening_event
+        from orchestrator.services.job_delivery import parse_job_pull_request
 
         job = _job(job_a)
         context = json.loads(job["context"])
@@ -275,8 +287,8 @@ class TestReviewSessionEndpoint:
 
 class TestReviewDeliveryAttach:
     def test_exact_repository_gets_the_persisted_branch_without_mutating_db_rows(self):
-        from main import _build_datasources_payload
-        from services.job_delivery import apply_review_delivery_branch
+        from orchestrator.main import _build_datasources_payload
+        from orchestrator.services.job_delivery import apply_review_delivery_branch
 
         repository = _repository()
         other = _database()
@@ -302,7 +314,7 @@ class TestReviewDeliveryAttach:
         assert payload[1]["require_default_branch"] is True
 
     def test_changed_connector_identity_fails_closed(self):
-        from services.job_delivery import (
+        from orchestrator.services.job_delivery import (
             ReviewDeliveryError,
             apply_review_delivery_branch,
         )
@@ -324,7 +336,7 @@ class TestReviewDeliveryAttach:
             apply_review_delivery_branch(metadata, [changed])
 
     def test_same_repo_name_on_a_changed_host_fails_closed(self):
-        from services.job_delivery import (
+        from orchestrator.services.job_delivery import (
             ReviewDeliveryError,
             apply_review_delivery_branch,
         )
@@ -348,7 +360,7 @@ class TestReviewDeliveryAttach:
             apply_review_delivery_branch(metadata, [changed])
 
     def test_present_but_malformed_review_marker_fails_closed(self):
-        from services.job_delivery import (
+        from orchestrator.services.job_delivery import (
             ReviewDeliveryError,
             apply_review_delivery_branch,
         )

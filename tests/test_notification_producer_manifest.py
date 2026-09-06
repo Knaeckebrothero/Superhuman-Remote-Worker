@@ -44,6 +44,13 @@ def _manifest_sites() -> list[str]:
     ]
 
 
+def test_empty_source_discovery_is_an_error(monkeypatch):
+    script = _load_script()
+    monkeypatch.setattr(script, "_roots", lambda: [])
+    with pytest.raises(RuntimeError, match="No Python sources"):
+        script.collect_sites()
+
+
 def test_manifest_matches_code():
     """The committed manifest must reflect the current tree."""
     script = _load_script()
@@ -72,7 +79,7 @@ def test_no_legacy_call_sites_remain():
     A new caller of a retired path is a regression, not a feature. Record it
     through ``notification_service.record()`` instead — every category,
     action and delivery rule lives in
-    ``orchestrator/services/notification_catalog.py``. An outbound
+    ``src/orchestrator/services/notification_catalog.py``. An outbound
     ``log_message`` that really is a message-ledger write (not a feed write)
     is excused by a ``# notification-ledger: <reason>`` line above the call.
     """
@@ -90,7 +97,7 @@ def test_no_legacy_call_sites_remain():
 
 def test_retired_symbols_do_not_exist():
     """The legacy fan-out is deleted, not merely unused."""
-    from services import notification_service as svc_mod
+    from orchestrator.services import notification_service as svc_mod
 
     service = svc_mod.NotificationService
     for name in (

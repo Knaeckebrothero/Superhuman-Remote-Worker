@@ -6,6 +6,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID
 
 import pytest
+import httpx
+from fastapi import FastAPI
+
+from agent.api.orchestrator_client import OrchestratorClient
 
 import orchestrator.main as main
 
@@ -115,7 +119,10 @@ async def test_hidden_preflight_does_not_advertise_permanent_end_intent():
 
 
 @pytest.mark.asyncio
-async def test_agent_ending_installs_and_authorizes_retirement_atomically():
+@pytest.mark.parametrize("through_client", [False, True])
+async def test_agent_ending_installs_and_authorizes_retirement_atomically(
+    monkeypatch, through_client
+):
     """The exact agent endpoint never exposes a crashable hidden T."""
 
     thread = {
@@ -132,8 +139,10 @@ async def test_agent_ending_installs_and_authorizes_retirement_atomically():
     }
     # The endpoint reads the thread row and then the reciprocal agent row; the
     # latter carries the exact Pod UID and registered process generation.
+    pod_uid = "88888888-8888-4888-8888-888888888888"
+    monkeypatch.setenv("POD_UID", pod_uid)
     reciprocal_agent = {
-        "pod_uid": None,
+        "pod_uid": pod_uid,
         "metadata": {"dispatch_process_generation": PROCESS_GENERATION},
     }
     conn = AsyncMock()
@@ -183,18 +192,46 @@ async def test_agent_ending_installs_and_authorizes_retirement_atomically():
         patch.object(main, "require_internal", AsyncMock()),
         patch.object(main, "postgres_db", db),
     ):
-        response = await main.agent_update_thread_status(
-            request,
-            THREAD_ID,
-            main.AgentThreadStatusRequest(
-                status="ending",
-                agent_id=AGENT_ID,
-                process_generation=PROCESS_GENERATION,
-                session_runtime_generation=RUNTIME_GENERATION,
-                session_runtime_attach_token=ATTACH_TOKEN,
-                retirement_disposition="ended",
-            ),
-        )
+        if through_client:
+            app = FastAPI()
+            app.add_api_route(
+                "/api/agents/threads/{thread_id}/status",
+                main.agent_update_thread_status,
+                methods=["PUT"],
+            )
+            client = OrchestratorClient(
+                orchestrator_url="http://test",
+                pod_ip="127.0.0.1",
+                pod_port=8001,
+                hostname="test-pinned-agent",
+                config_name="session_base",
+            )
+            client.dispatch_process_generation = PROCESS_GENERATION
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app)
+            ) as wire:
+                client._client = wire
+                response = await client.begin_thread_retirement(
+                    THREAD_ID,
+                    pinned_agent_id=AGENT_ID,
+                    session_runtime_generation=RUNTIME_GENERATION,
+                    session_runtime_attach_token=ATTACH_TOKEN,
+                    retirement_disposition="ended",
+                )
+        else:
+            response = await main.agent_update_thread_status(
+                request,
+                THREAD_ID,
+                main.AgentThreadStatusRequest(
+                    status="ending",
+                    agent_id=AGENT_ID,
+                    process_generation=PROCESS_GENERATION,
+                    pod_uid=pod_uid,
+                    session_runtime_generation=RUNTIME_GENERATION,
+                    session_runtime_attach_token=ATTACH_TOKEN,
+                    retirement_disposition="ended",
+                ),
+            )
 
     assert response == {
         "status": "ending",
@@ -296,6 +333,15 @@ async def test_permanent_retirement_deletes_original_before_pvc_fence():
     db.revoke_pinned_agent_workspace_claim = AsyncMock(return_value=True)
     db.fetchrow = AsyncMock(return_value={"status": "revoking", "pvc_uid": None})
     db.fence_pinned_agent_workspace_claim = AsyncMock(return_value=True)
+    db.get_thread = AsyncMock(
+        return_value={
+            "runtime_generation": RUNTIME_GENERATION,
+            "runtime_retirement_token": RETIREMENT_TOKEN,
+            "runtime_retirement_permanent": True,
+            "runtime_retirement_authorized_at": "authorized",
+        }
+    )
+    db.fetch = AsyncMock(return_value=[])
     with (
         patch.object(main, "agent_provisioner", provider),
         patch.object(main, "postgres_db", db),
@@ -334,6 +380,15 @@ async def test_permanent_retirement_accepts_exact_claim_already_reclaimed():
     db.fetchrow = AsyncMock(
         return_value={"status": "reclaimed", "pvc_uid": "fence-pvc-uid"}
     )
+    db.get_thread = AsyncMock(
+        return_value={
+            "runtime_generation": RUNTIME_GENERATION,
+            "runtime_retirement_token": RETIREMENT_TOKEN,
+            "runtime_retirement_permanent": True,
+            "runtime_retirement_authorized_at": "authorized",
+        }
+    )
+    db.fetch = AsyncMock(return_value=[])
 
     with (
         patch.object(main, "agent_provisioner", provider),

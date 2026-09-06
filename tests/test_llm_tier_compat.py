@@ -19,8 +19,8 @@ import pytest
 import yaml
 
 from orchestrator.services.config_resolver import resolve_config, unrouted_model_slots
-from src.core import loader
-from src.core.loader import (
+from shared.runtime.core import loader
+from shared.runtime.core.loader import (
     LLMConfig,
     load_agent_config,
     load_agent_config_from_dict,
@@ -286,7 +286,7 @@ def test_thread_override_legacy_subagent():
 
 def test_deprecation_logged_once_per_layer(caplog):
     layer = {"llm": {"strategic": {"model": "s"}, "subagent": {"model": "r"}}}
-    with caplog.at_level(logging.WARNING, logger="src.core.loader"):
+    with caplog.at_level(logging.WARNING, logger="shared.runtime.core.loader"):
         normalize_llm_tiers(layer, source="db-expert:x")
         normalize_llm_tiers(layer, source="db-expert:x")  # same layer: silent
         normalize_llm_tiers(layer, source="request-override")  # new source: logs
@@ -301,7 +301,7 @@ def test_deprecation_logged_once_per_layer(caplog):
 
 
 def test_no_warning_for_empty_legacy_blocks(caplog):
-    with caplog.at_level(logging.WARNING, logger="src.core.loader"):
+    with caplog.at_level(logging.WARNING, logger="shared.runtime.core.loader"):
         out = normalize_llm_tiers(
             {"llm": {"model": "m", "strategic": {}, "tactical": None}}, source="t"
         )

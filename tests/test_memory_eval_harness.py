@@ -63,8 +63,8 @@ from eval.memory.metrics import (
 from eval.memory.query import answer_retrieval, session_ranking
 from eval.memory.report import render_comparison, render_markdown
 from eval.memory.run import _existing_question_ids
-from src.core.loader import QueryConfig
-from src.services.memory.types import AssembleStats, InjectionBlock, MemoryPayload
+from shared.runtime.core.loader import QueryConfig
+from agent.services.memory.types import AssembleStats, InjectionBlock, MemoryPayload
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = REPO_ROOT / "eval" / "memory" / "fixtures" / "tiny_longmemeval.json"

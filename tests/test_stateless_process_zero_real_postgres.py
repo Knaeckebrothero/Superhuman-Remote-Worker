@@ -17,12 +17,14 @@ from tests._previous_release_seed import seed_previous_release_row
 
 SCHEMA_FILE = (
     Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "schema_current.sql"
 )
 PROCESS_ZERO_MIGRATION = (
     Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "migrations"

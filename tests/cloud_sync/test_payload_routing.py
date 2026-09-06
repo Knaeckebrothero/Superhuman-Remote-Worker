@@ -15,7 +15,7 @@ import pytest
 
 @pytest.fixture
 def build_sync_coordinator():
-    from src.api.persistent_app import _build_sync_coordinator
+    from agent.api.persistent_app import _build_sync_coordinator
 
     return _build_sync_coordinator
 

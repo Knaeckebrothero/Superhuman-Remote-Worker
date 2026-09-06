@@ -15,7 +15,7 @@ from typing import Any, Iterator, Literal, Mapping
 
 import httpx
 
-from ..runtime_actor import (
+from shared.runtime_actor import (
     RUNTIME_ACTOR_HEADER,
     RUNTIME_ACTOR_REFRESH_HEADER,
     RuntimeActorContext,

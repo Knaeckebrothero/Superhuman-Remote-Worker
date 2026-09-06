@@ -10,15 +10,15 @@ from uuid import uuid4
 import httpx
 import pytest
 
-from canvas_gateway import CanvasGatewayApp
-from services.canvas import CanvasRecord, WorkspaceAppSource
-from services.canvas_session_notifications import (
+from orchestrator.canvas_gateway import CanvasGatewayApp
+from orchestrator.services.canvas import CanvasRecord, WorkspaceAppSource
+from orchestrator.services.canvas_session_notifications import (
     CanvasConnectionLease,
     CanvasConnectionRegistry,
 )
-from services.canvas_ssh import RemoteWorkspaceTarget
-from services.canvas_viewer_config import CanvasViewerConfig
-from services.canvas_viewer_sessions import (
+from orchestrator.services.canvas_ssh import RemoteWorkspaceTarget
+from orchestrator.services.canvas_viewer_config import CanvasViewerConfig
+from orchestrator.services.canvas_viewer_sessions import (
     CanvasBootstrapExchange,
     CanvasBootstrapStart,
     CanvasOriginSession,

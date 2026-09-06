@@ -68,10 +68,10 @@ def _legacy_project(name="Better Resavio", provider="nextcloud"):
 
 def _run(db, *, apply=False, reattest=True):
     """Call the endpoint with the admin gate and re-attestation stubbed."""
-    import main
+    import orchestrator.main
 
     return patch.multiple(
-        main,
+        orchestrator.main,
         _require_admin=AsyncMock(return_value={"id": "admin"}),
         postgres_db=db,
         reload_active_main_cloud_instance=AsyncMock(return_value=reattest),
@@ -82,7 +82,7 @@ class TestBackfillRefusals:
     @pytest.mark.asyncio
     async def test_two_distinct_installations_abort(self, fake_request):
         """Two *proofs* for one provider is the real ambiguity — refuse."""
-        from main import backfill_main_cloud_instance_authority
+        from orchestrator.main import backfill_main_cloud_instance_authority
 
         db = _db(
             projects=[_legacy_project()],
@@ -109,7 +109,7 @@ class TestBackfillRefusals:
         share an installation proof, and the folders live in the installation
         — not in the snapshot — so this must NOT abort.
         """
-        from main import backfill_main_cloud_instance_authority
+        from orchestrator.main import backfill_main_cloud_instance_authority
 
         db = _db(
             projects=[_legacy_project()],
@@ -132,7 +132,7 @@ class TestBackfillRefusals:
     @pytest.mark.asyncio
     async def test_non_active_provider_refuses(self, fake_request):
         """A provider we cannot re-attest right now is never stamped."""
-        from main import backfill_main_cloud_instance_authority
+        from orchestrator.main import backfill_main_cloud_instance_authority
 
         db = _db(
             projects=[_legacy_project(provider="opencloud")],
@@ -150,7 +150,7 @@ class TestBackfillRefusals:
     @pytest.mark.asyncio
     async def test_registry_proof_must_match_the_live_attestation(self, fake_request):
         """Registry says one installation, the live probe says another."""
-        from main import backfill_main_cloud_instance_authority
+        from orchestrator.main import backfill_main_cloud_instance_authority
 
         db = _db(
             projects=[_legacy_project()],
@@ -168,7 +168,7 @@ class TestBackfillRefusals:
     @pytest.mark.asyncio
     async def test_failed_reattestation_refuses(self, fake_request):
         """No live proof, no stamp — the proof is the whole safety argument."""
-        from main import backfill_main_cloud_instance_authority
+        from orchestrator.main import backfill_main_cloud_instance_authority
 
         db = _db(projects=[_legacy_project()])
         ctx, _ = _run(db, reattest=False)
@@ -182,7 +182,7 @@ class TestBackfillRefusals:
 class TestBackfillHappyPath:
     @pytest.mark.asyncio
     async def test_dry_run_is_the_default_and_writes_nothing(self, fake_request):
-        from main import backfill_main_cloud_instance_authority
+        from orchestrator.main import backfill_main_cloud_instance_authority
 
         db = _db(projects=[_legacy_project(), _legacy_project("Test")])
         ctx, _ = _run(db)
@@ -197,7 +197,7 @@ class TestBackfillHappyPath:
 
     @pytest.mark.asyncio
     async def test_apply_stamps_and_reports(self, fake_request):
-        from main import backfill_main_cloud_instance_authority
+        from orchestrator.main import backfill_main_cloud_instance_authority
 
         db = _db(
             projects=[_legacy_project()],
@@ -221,7 +221,7 @@ class TestBackfillHappyPath:
     @pytest.mark.asyncio
     async def test_nothing_to_do_is_a_noop_without_reattesting(self, fake_request):
         """An already-clean deployment must not be made to probe its cloud."""
-        from main import backfill_main_cloud_instance_authority
+        from orchestrator.main import backfill_main_cloud_instance_authority
 
         db = _db()
         ctx, _ = _run(db)

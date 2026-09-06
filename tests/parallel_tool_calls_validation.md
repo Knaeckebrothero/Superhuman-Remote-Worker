@@ -15,9 +15,11 @@ reconstructs them from the *incremental* `response.output_item.added` /
 by the `langchain-openai>=1.1.12` bump. So the flip should be behaviour-neutral
 except that N tool calls now dispatch in one turn instead of one-at-a-time.
 
-Bind path: `supports_parallel_tool_calls()` (`src/core/loader.py`) gates the
-kwarg; worker binds it in `src/agent.py` (~2822), persistent sessions in
-`src/api/persistent_session.py` (~900).
+Current bind paths (source layout updated 2026-09-05):
+`supports_parallel_tool_calls()` in `src/shared/runtime/core/loader.py` gates
+the kwarg; workers bind it in `src/agent/agent.py`, persistent sessions in
+`src/agent/api/persistent_session.py`. Historical test observations below are
+unchanged by this path correction.
 
 ---
 

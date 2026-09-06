@@ -2,7 +2,7 @@
 # (prompt_matrix.yaml, instruction_matrix.yaml, settings_matrix.yaml).
 #
 # Top-level keys are model families (output of family_of() in
-# src/core/model_registry.py); `default` is the fall-through. Each family
+# src/shared/runtime/core/model_registry.py); `default` is the fall-through. Each family
 # block can carry up to three subsections:
 #   - prompts:       (prompt_type)      → filename in config/prompts/
 #   - instructions:  (instruction_type) → filename in config/templates/
@@ -17,14 +17,14 @@
 # The context-management `limits` leaves (model_max_context_tokens,
 # context_threshold_tokens, message_count_min_tokens) are DERIVED at load as
 # fixed fractions of that base (see the *_FRACTION constants +
-# _apply_settings_matrix in src/core/loader.py); do not hand-author them here.
+# _apply_settings_matrix in src/shared/runtime/core/loader.py); do not hand-author them here.
 # When a model is added with an explicit per-model context window (Admin →
 # Models `context_window`), that value overrides the family base and the same
 # fractions re-derive the leaves. To run a model below its true max, set a
 # smaller per-model `context_window` — the app imposes no default cap of its own.
 #
 # Summarization budgets are deliberately NOT derived here: they are computed
-# at call time from the AUXILIARY model's own window (src/core/summarizer.py).
+# at call time from the AUXILIARY model's own window (src/agent/core/summarizer.py).
 # Deriving them from the main model's window sent 951k-token payloads to a
 # 131k summarizer — knowledge-base/knowledge/features/context_summarization_rework.md.
 
@@ -168,7 +168,7 @@ o-series:
 # models with a thinking mode, served OpenAI-compatible via OpenRouter (LangChain
 # ChatOpenAI) — so tool calls use the standard parens-form serialization and
 # reasoning comes back out-of-band (DeepSeek `reasoning_content`, OpenRouter
-# `reasoning`/`reasoning_details`), captured by src/llm/reasoning_chat.py.
+# `reasoning`/`reasoning_details`), captured by src/shared/runtime/llm/reasoning_chat.py.
 #
 # Prompts: forks the every-call scaffold (`systemprompt` + `systemprompt_interactive`),
 # the identity (`persona`), and the auxiliary-path prompts (`memory_extraction`,
@@ -214,7 +214,7 @@ deepseek:
 # 744B-MoE / ~40B-active, with a usable 1M-token context window, served
 # OpenAI-compatible via OpenRouter (LangChain ChatOpenAI). Closest analogue is
 # `deepseek`: standard parens-form tool wire, reasoning returned out-of-band and
-# captured by src/llm/reasoning_chat.py. Reasoning EFFORT rides on the per-model
+# captured by src/shared/runtime/llm/reasoning_chat.py. Reasoning EFFORT rides on the per-model
 # catalog row (reasoning_level → OpenRouter `reasoning.effort`), NOT here. Vision
 # is a separate model (GLM-5V-Turbo), so this family is text-only.
 #
@@ -450,7 +450,7 @@ gpt-oss:
 #    parser silently rejects the call. The worker-path prompts and
 #    `instructions_gemma.md` teach the canonical format with concrete examples
 #    and a positive contrast ("braces, never parens"). The runtime-side
-#    no-tool-call streak detector in `src/graph.py` is the safety net.
+#    no-tool-call streak detector in `src/agent/graph.py` is the safety net.
 #    Precipitating incident: knowledge-base/knowledge/issues/gemma_tool_call_parser_loop.md.
 #
 # 2. Repetition loops: the structured-output (memory/curation) variants add
@@ -512,7 +512,7 @@ gemma:
 
 # Mistral 3 family — Large 3 / Medium 3.5 / Small 4 / Codestral, wired as a
 # native first-class provider (provider slug 'mistral' → ReasoningChatOpenAI at
-# api.mistral.ai/v1, see src/core/loader._create_mistral_llm). Like claude/
+# api.mistral.ai/v1, see src/shared/runtime/core/loader.py::_create_mistral_llm). Like claude/
 # gemini/o-series this is a SETTINGS-ONLY family: Mistral speaks the standard
 # OpenAI Chat Completions wire (parens-form tool calls + function calling), so
 # the `default` prompts/instructions and `default.yaml` guardrails apply

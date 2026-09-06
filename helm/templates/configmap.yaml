@@ -369,7 +369,7 @@ data:
 
   # LLM-outage/cooldown pause budget (seconds; default 12h). Read by BOTH the
   # orchestrator give-up ceiling (evaluate_llm_outage) AND every agent pod's
-  # cooldown pause-vs-fail-fast cutoff (src/graph.py _COOLDOWN_MAX_PAUSE_SECONDS)
+  # cooldown pause-vs-fail-fast cutoff (src/agent/graph.py _COOLDOWN_MAX_PAUSE_SECONDS)
   # — they MUST agree, so both read this one ConfigMap key. Agents inherit via
   # envFrom; the orchestrator references it explicitly (see
   # orchestrator/deployment.yaml). knowledge-base/knowledge/features/llm_cooldown_pause_and_resume.md
@@ -427,7 +427,7 @@ data:
 
   # Apply DB-backed config overrides (admin-curated rows in the config_overrides
   # table) to dynamically provisioned agents. Read by the agent prompt loader
-  # (src/core/loader.py) via envFrom on this shared ConfigMap. Default-off
+  # (src/shared/runtime/core/loader.py) via envFrom on this shared ConfigMap. Default-off
   # chart-wide (prod-safe); the dev/experimental values file turns it on.
   CONFIG_DB_OVERRIDES_ENABLED: {{ .Values.agent.configDbOverridesEnabled | default "false" | quote }}
   # DB-backed experts (experts table). The orchestrator owns selection and
@@ -518,7 +518,7 @@ data:
   # Effective context ceiling for models routed via the system codex proxy
   # (CLIProxyAPI / ChatGPT-OAuth backend), which caps context far below the
   # models' true API windows and rejects larger inputs with `context_too_large`.
-  # Read by src/core/model_registry.py (_cap_context_window) at dispatch. Set 0 to
+  # Read by src/shared/runtime/core/model_registry.py (_cap_context_window) at dispatch. Set 0 to
   # disable the day OpenAI ships 1M-for-Codex. New sessions only (agents read env
   # at pod start). See knowledge-base/knowledge/issues/codex_proxy_context_window_cap.md.
   CODEX_CONTEXT_WINDOW_CAP: {{ .Values.agent.codexContextWindowCap | default 400000 | quote }}

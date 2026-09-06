@@ -335,7 +335,7 @@ class TestGitManagerFromWorktree:
 
     def test_from_worktree_valid(self):
         """Creates GitManager for a valid git worktree."""
-        from src.managers.git_manager import GitManager
+        from agent.managers.git_manager import GitManager
 
         with tempfile.TemporaryDirectory() as tmpdir:
             worktree_path = Path(tmpdir)
@@ -352,7 +352,7 @@ class TestGitManagerFromWorktree:
 
     def test_from_worktree_with_git_file(self):
         """Creates GitManager for a worktree with .git file (not directory)."""
-        from src.managers.git_manager import GitManager
+        from agent.managers.git_manager import GitManager
 
         with tempfile.TemporaryDirectory() as tmpdir:
             parent_repo = Path(tmpdir) / "parent"
@@ -417,7 +417,7 @@ class TestGitManagerFromWorktree:
 
     def test_from_worktree_no_git(self):
         """Returns None for directory without .git."""
-        from src.managers.git_manager import GitManager
+        from agent.managers.git_manager import GitManager
 
         with tempfile.TemporaryDirectory() as tmpdir:
             mgr = GitManager.from_worktree(Path(tmpdir))
@@ -425,7 +425,7 @@ class TestGitManagerFromWorktree:
 
     def test_from_worktree_nonexistent(self):
         """Returns None for nonexistent path."""
-        from src.managers.git_manager import GitManager
+        from agent.managers.git_manager import GitManager
 
         mgr = GitManager.from_worktree(Path("/nonexistent/path"))
         assert mgr is None
@@ -807,8 +807,8 @@ def test_critic_config_override_resolves_safe_job_inspection_for_parent():
     """
     from orchestrator.main import _critic_config_override
     from orchestrator.services.config_resolver import resolve_config
-    from src.core.tool_policy import expand_category_true
-    from src.tools.registry import TOOL_REGISTRY, get_tools_by_category
+    from shared.runtime.core.tool_policy import expand_category_true
+    from agent.tools.registry import TOOL_REGISTRY, get_tools_by_category
 
     override = _critic_config_override(parent_llm=None)
     assert override["tools"]["job_inspection"] is True

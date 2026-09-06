@@ -11,9 +11,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from services import notification_catalog as cat
-from services.notification_service import RecordResult
-from services.sudo_gate import SudoGateService
+from orchestrator.services import notification_catalog as cat
+from orchestrator.services.notification_service import RecordResult
+from orchestrator.services.sudo_gate import SudoGateService
 
 
 def _gate(*, job=None, thread=None):
@@ -41,7 +41,7 @@ EVENT = {
 
 @pytest.fixture
 def record(monkeypatch):
-    from services import notification_service as ns
+    from orchestrator.services import notification_service as ns
 
     stub = AsyncMock(return_value=RecordResult("n-1", True, {"in_app": True}))
     monkeypatch.setattr(ns.notification_service, "record", stub)

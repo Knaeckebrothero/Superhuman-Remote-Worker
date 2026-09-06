@@ -26,7 +26,7 @@ from orchestrator.services.managed_repository_reconciliation import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
-MODULE = "operator_cli.managed_repository_reconciliation"
+MODULE = "orchestrator.operator_cli.managed_repository_reconciliation"
 
 
 def _rearm_args(*extra: str):
@@ -551,10 +551,17 @@ async def test_apply_exits_unresolved_for_durable_retry_even_when_inventory_is_c
     assert payload["pending_or_claimed_reconciliations"] == 1
 
 
-def test_operator_module_runs_from_flattened_image_layout(tmp_path):
-    shutil.copytree(ROOT / "orchestrator" / "operator_cli", tmp_path / "operator_cli")
+def test_operator_module_runs_from_installed_package_layout(tmp_path):
+    source_root = tmp_path / "src"
+    package_root = source_root / "orchestrator"
+    package_root.mkdir(parents=True)
+    shutil.copy2(ROOT / "src/orchestrator/__init__.py", package_root / "__init__.py")
+    shutil.copytree(
+        ROOT / "src/orchestrator/operator_cli", package_root / "operator_cli"
+    )
     environment = os.environ.copy()
-    environment["PYTHONPATH"] = str(tmp_path)
+    environment["PYTHONPATH"] = str(source_root)
+    environment["PYTHONSAFEPATH"] = "1"
     result = subprocess.run(
         [sys.executable, "-m", MODULE, "--help"],
         cwd=tmp_path,
@@ -577,7 +584,7 @@ def test_compatibility_script_is_a_thin_wrapper():
     wrapper = (
         ROOT / "scripts" / "inventory-managed-repository-authority.py"
     ).read_text()
-    assert "operator_cli.managed_repository_reconciliation" in wrapper
+    assert "orchestrator.operator_cli.managed_repository_reconciliation" in wrapper
     assert "SELECT " not in wrapper
     assert "GiteaClient" not in wrapper
     assert "PostgresDB" not in wrapper

@@ -17,7 +17,7 @@ Software. This file discharges that obligation for every bundled dependency.
 **Covered** (libraries we *convey* — i.e. ship inside our distributed artifacts):
 
 - **Backend:** Python packages installed into the orchestrator container image
-  (`requirements.txt`, `orchestrator/requirements.txt`, `orchestrator/mcp/requirements.txt`).
+  (`requirements.txt`, `src/orchestrator/requirements.txt`, `src/mcp_server/requirements.txt`).
 - **Frontend:** npm **production** dependencies bundled into the cockpit browser/SSR
   build (`cockpit/package.json` → `dependencies`; `devDependencies` are build-time
   only and are not shipped).
@@ -106,8 +106,8 @@ from `cockpit/package-lock.json` — no `npm install` needed.
 pip install pip-licenses
 pip install torch --index-url https://download.pytorch.org/whl/cpu   # matches the agent image
 pip install -r requirements.txt \
-            -r orchestrator/requirements.txt \
-            -r orchestrator/mcp/requirements.txt
+            -r src/orchestrator/requirements.txt \
+            -r src/mcp_server/requirements.txt
 python scripts/check_licenses.py --write   # gate + regenerate
 ```
 

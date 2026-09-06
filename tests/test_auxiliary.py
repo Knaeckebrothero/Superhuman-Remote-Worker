@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from src.services.auxiliary import (
+from shared.runtime.services.auxiliary import (
     AuxiliaryLLM,
     CurateKnowledgeTask,
     ExtractedMemories,
@@ -26,7 +26,7 @@ from src.services.auxiliary import (
     _format_messages_for_extraction,
     _get_message_role,
 )
-from src.core.loader import (
+from shared.runtime.core.loader import (
     _parse_auxiliary_config,
 )
 
@@ -144,7 +144,7 @@ class TestAuxiliaryConfigParsing:
 
     def test_full_config_from_yaml(self):
         """Test that worker_base.yaml's auxiliary section parses correctly."""
-        from src.core.loader import load_agent_config
+        from shared.runtime.core.loader import load_agent_config
 
         config = load_agent_config("config/worker_base.yaml")
         assert config.auxiliary.enabled is True
@@ -218,7 +218,8 @@ class TestExtractMemoriesTask:
         assert context == ""
 
     @patch(
-        "src.core.workspace_injection.is_workspace_injection_message", return_value=True
+        "shared.runtime.core.workspace_injection.is_workspace_injection_message",
+        return_value=True,
     )
     def test_build_context_skips_injections(self, mock_is_injection):
         messages = [
@@ -843,7 +844,7 @@ class TestArchiveError:
             return self.request_id
 
     def _archiver(self, connected=True, inserted_id="deadbeef"):
-        from src.core.archiver import LLMArchiver
+        from agent.core.archiver import LLMArchiver
 
         return LLMArchiver(
             writer=self._FakeWriter(ready=connected, request_id=inserted_id)

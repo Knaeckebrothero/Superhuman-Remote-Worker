@@ -43,7 +43,7 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from . import infra
+from eval.memory import infra
 
 logger = logging.getLogger(__name__)
 

@@ -21,6 +21,7 @@ import pytest_asyncio
 
 MIGRATIONS = (
     Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "migrations"

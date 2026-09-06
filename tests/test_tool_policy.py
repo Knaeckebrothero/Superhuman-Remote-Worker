@@ -31,15 +31,15 @@ from pathlib import Path
 import pytest
 import yaml
 
-from src.core.loader import (
+from shared.runtime.core.loader import (
     ToolsConfig,
     get_all_tool_names,
     load_agent_config_from_dict,
     load_and_merge_config,
     resolve_config_path,
 )
-from src.core.session_tool_overrides import SESSION_TOOL_OVERRIDE_NAMES
-from src.core.tool_policy import (
+from shared.runtime.core.session_tool_overrides import SESSION_TOOL_OVERRIDE_NAMES
+from shared.runtime.core.tool_policy import (
     ENUMERATE_ONLY_CATEGORIES,
     MCP_WILDCARD,
     ToolPolicyError,
@@ -50,7 +50,7 @@ from src.core.tool_policy import (
     expand_tool_policy,
     normalize_tool_policy,
 )
-from src.tools.registry import TOOL_REGISTRY, get_categories, get_tools_by_category
+from agent.tools.registry import TOOL_REGISTRY, get_categories, get_tools_by_category
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _CONFIG_DIR = _REPO_ROOT / "config"
@@ -479,7 +479,7 @@ class TestMachineOwnedCategories:
         assert expand_category_true(category) == []
 
     def test_it_warns(self, caplog):
-        with caplog.at_level("WARNING", logger="src.core.tool_policy"):
+        with caplog.at_level("WARNING", logger="shared.runtime.core.tool_policy"):
             expand_category_true("sql")
         assert any(
             "tools.sql: true expands to []" in r.getMessage() for r in caplog.records
@@ -729,7 +729,7 @@ class TestShippedConfigsResolveUnchanged:
         (with the merged chain's ``$ignore_keys`` honoured — the subagent
         overlay prunes ``tools.delegation``, and that pruning is the loader's
         documented step, not a perturbation)."""
-        from src.core.loader import deep_merge, prune_ignored_keys
+        from shared.runtime.core.loader import deep_merge, prune_ignored_keys
 
         path, _ = resolve_config_path(config_name)
 
@@ -751,7 +751,7 @@ class TestMergeOrder:
     """Layers merge by the existing, unmodified ``deep_merge``: lists REPLACE."""
 
     def _resolve(self, *layers: dict) -> dict:
-        from src.core.loader import deep_merge
+        from shared.runtime.core.loader import deep_merge
 
         out: dict = {}
         for layer in layers:
@@ -829,7 +829,7 @@ class TestResolveConfigSeam:
         assert layer == {"tools": {"canvas": True}}
 
     def test_the_pdp_sees_a_shell_grant_request(self):
-        from src.core.capability_grants import evaluate
+        from shared.runtime.core.capability_grants import evaluate
 
         frag = self._resolve(request_override={"tools": {"shell": ["run_command"]}})
         assert evaluate(frag, {"shell_tools": False}) != []
@@ -842,7 +842,7 @@ class TestSessionToolGroupMarkers:
     stay on when a request turned them off."""
 
     def test_false_sets_the_disable_marker(self):
-        from src.api.persistent_app import (
+        from agent.api.persistent_app import (
             _apply_session_tool_group_markers,
             _CANVAS_DISABLED_KEY,
         )
@@ -853,7 +853,7 @@ class TestSessionToolGroupMarkers:
         assert merged.get(_CANVAS_DISABLED_KEY) is True
 
     def test_true_clears_the_disable_marker(self):
-        from src.api.persistent_app import (
+        from agent.api.persistent_app import (
             _apply_session_tool_group_markers,
             _CANVAS_DISABLED_KEY,
         )
@@ -880,7 +880,7 @@ class TestEnumerateOnlyMembersAreServable:
 
     def test_every_served_enumeration_round_trips_through_the_write_boundary(self):
         """The payload it prescribes must be one the boundary accepts."""
-        from src.core.tool_policy import validate_tool_override_fragment
+        from shared.runtime.core.tool_policy import validate_tool_override_fragment
 
         for category, names in enumerate_only_members().items():
             assert names, f"{category} would be unenablable"
@@ -891,7 +891,7 @@ class TestEnumerateOnlyMembersAreServable:
 
     def test_true_is_still_refused_for_the_same_categories(self):
         """The served list is a workaround for the rule, not a repeal of it."""
-        from src.core.tool_policy import validate_tool_override_fragment
+        from shared.runtime.core.tool_policy import validate_tool_override_fragment
 
         for category in enumerate_only_members():
             with pytest.raises(ToolPolicyError, match="must enumerate"):
@@ -901,7 +901,7 @@ class TestEnumerateOnlyMembersAreServable:
         """`only` carrying a code-granted name would assert config manages it.
         An `explicit` name is the opposite case — naming it is how config
         grants it (`delegation`'s one member)."""
-        from src.tools.registry import TOOL_REGISTRY
+        from agent.tools.registry import TOOL_REGISTRY
 
         for names in enumerate_only_members().values():
             for name in names:

@@ -10,26 +10,18 @@ See knowledge-base/knowledge/features/stuck_agent_recovery.md for the full desig
 
 import asyncio
 import json
-import sys
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Optional
 from unittest.mock import MagicMock, AsyncMock, call, patch
 
 import pytest
 from langchain_core.messages import AIMessage, ToolMessage, SystemMessage
 
-# Add project root to path
-project_root = Path(__file__).parent.parent
-src_path = project_root / "src"
-if str(src_path) not in sys.path:
-    sys.path.insert(0, str(src_path))
-
-from src.graph import create_audited_tool_node  # noqa: E402
-from src.core.loader import InstructionFileEntry, LimitsConfig  # noqa: E402
-from src.core.workspace_backend import WorkspaceUnavailableError  # noqa: E402
-from src.tools.context import ToolContext  # noqa: E402
+from agent.graph import create_audited_tool_node  # noqa: E402
+from shared.runtime.core.loader import InstructionFileEntry, LimitsConfig  # noqa: E402
+from shared.runtime.core.workspace_backend import WorkspaceUnavailableError  # noqa: E402
+from agent.tools.context import ToolContext  # noqa: E402
 
 
 # =============================================================================
@@ -149,7 +141,7 @@ async def test_stateless_tool_batch_checkpoints_instruction_read_receipt(config)
     fake_read = MagicMock()
     fake_read.name = "read_file"
 
-    with patch("src.graph.ToolNode") as mock_tool_node_class:
+    with patch("agent.graph.ToolNode") as mock_tool_node_class:
         tool_node = AsyncMock()
         tool_node.ainvoke.return_value = {
             "messages": [make_tool_result("read_file", "guide", "call-read")]
@@ -190,7 +182,7 @@ async def test_pending_tools_resume_restores_phase_before_instruction_gate(confi
     fake_read = MagicMock()
     fake_read.name = "read_file"
 
-    with patch("src.graph.ToolNode") as mock_tool_node_class:
+    with patch("agent.graph.ToolNode") as mock_tool_node_class:
         tool_node = AsyncMock()
         tool_node.ainvoke.return_value = {
             "messages": [make_tool_result("read_file", "ok", "call-read")]
@@ -229,7 +221,7 @@ class TestFingerPrintWarning:
         fake_tool = MagicMock()
         fake_tool.name = "some_tool"
 
-        with patch("src.graph.ToolNode") as MockToolNode:
+        with patch("agent.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             MockToolNode.return_value = mock_tn
 
@@ -274,7 +266,7 @@ class TestFingerPrintWarning:
         fake_tool = MagicMock()
         fake_tool.name = "search"
 
-        with patch("src.graph.ToolNode") as MockToolNode:
+        with patch("agent.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             mock_tn.ainvoke = AsyncMock(
                 return_value={"messages": [make_tool_result("search", "results")]}
@@ -303,7 +295,7 @@ class TestFingerPrintWarning:
         fake_tool = MagicMock()
         fake_tool.name = "some_tool"
 
-        with patch("src.graph.ToolNode") as MockToolNode:
+        with patch("agent.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             mock_tn.ainvoke = AsyncMock(
                 return_value={"messages": [make_tool_result("some_tool", "ok")]}
@@ -336,7 +328,7 @@ class TestFingerPrintWarning:
         fake_tool = MagicMock()
         fake_tool.name = "stuck_tool"
 
-        with patch("src.graph.ToolNode") as MockToolNode:
+        with patch("agent.graph.ToolNode") as MockToolNode:
             call_count = [0]
 
             async def counting_ainvoke(state):
@@ -373,7 +365,7 @@ class TestProgressTracking:
         fake_complete = MagicMock()
         fake_complete.name = "todo_complete"
 
-        with patch("src.graph.ToolNode") as MockToolNode:
+        with patch("agent.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             MockToolNode.return_value = mock_tn
 
@@ -437,7 +429,7 @@ class TestProgressTracking:
         fake_complete = MagicMock()
         fake_complete.name = "todo_complete"
 
-        with patch("src.graph.ToolNode") as MockToolNode:
+        with patch("agent.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             MockToolNode.return_value = mock_tn
 
@@ -487,7 +479,7 @@ class TestStuckDetectionEscalation:
         fake_tool = MagicMock()
         fake_tool.name = "read_file"
 
-        with patch("src.graph.ToolNode") as MockToolNode:
+        with patch("agent.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             MockToolNode.return_value = mock_tn
 
@@ -528,7 +520,7 @@ class TestStuckDetectionEscalation:
         fake_tool = MagicMock()
         fake_tool.name = "read_file"
 
-        with patch("src.graph.ToolNode") as MockToolNode:
+        with patch("agent.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             MockToolNode.return_value = mock_tn
 
@@ -562,7 +554,7 @@ class TestStuckDetectionEscalation:
         fake_write = MagicMock()
         fake_write.name = "write_file"
 
-        with patch("src.graph.ToolNode") as MockToolNode:
+        with patch("agent.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             MockToolNode.return_value = mock_tn
 
@@ -628,7 +620,7 @@ class TestProgressHeartbeatMarker:
         fake_tool.name = "read_file"
         tool_context = ToolContext()
 
-        with patch("src.graph.ToolNode") as MockToolNode:
+        with patch("agent.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             mock_tn.ainvoke = AsyncMock(
                 return_value={"messages": [make_tool_result("read_file", "ok")]}
@@ -684,7 +676,7 @@ class TestBudgetCaps:
         mock_ctx.consume_freeze_request.return_value = None
         mock_ctx.drain_pending_memories.return_value = []
 
-        with patch("src.graph.ToolNode") as MockToolNode:
+        with patch("agent.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             mock_tn.ainvoke = AsyncMock(
                 return_value={"messages": [make_tool_result("read_file", "ok")]}
@@ -714,7 +706,7 @@ class TestBudgetCaps:
         fake_tool = MagicMock()
         fake_tool.name = "read_file"
 
-        with patch("src.graph.ToolNode") as MockToolNode:
+        with patch("agent.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             mock_tn.ainvoke = AsyncMock(
                 return_value={"messages": [make_tool_result("read_file", "ok")]}
@@ -750,7 +742,7 @@ class TestBudgetCaps:
         fake_tool = MagicMock()
         fake_tool.name = "read_file"
 
-        with patch("src.graph.ToolNode") as MockToolNode:
+        with patch("agent.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             mock_tn.ainvoke = AsyncMock(
                 return_value={"messages": [make_tool_result("read_file", "ok")]}
@@ -775,7 +767,7 @@ class TestBudgetCaps:
         fake_tool = MagicMock()
         fake_tool.name = "read_file"
 
-        with patch("src.graph.ToolNode") as MockToolNode:
+        with patch("agent.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             mock_tn.ainvoke = AsyncMock(
                 return_value={"messages": [make_tool_result("read_file", "ok")]}
@@ -818,7 +810,7 @@ class TestToolNotFoundEnrichment:
         fake_tool = MagicMock()
         fake_tool.name = "read_file"
 
-        with patch("src.graph.ToolNode") as MockToolNode:
+        with patch("agent.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             # Simulate ToolNode's response for unknown tool
             mock_tn.ainvoke = AsyncMock(
@@ -852,7 +844,7 @@ class TestToolNotFoundEnrichment:
         fake_tool = MagicMock()
         fake_tool.name = "read_file"
 
-        with patch("src.graph.ToolNode") as MockToolNode:
+        with patch("agent.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             mock_tn.ainvoke = AsyncMock(
                 return_value={
@@ -905,14 +897,14 @@ class TestCategoryFailureTracking:
             "read_file": {"category": "workspace"},
         }
 
-        with patch("src.graph.ToolNode") as MockToolNode:
+        with patch("agent.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             MockToolNode.return_value = mock_tn
 
             audited = create_audited_tool_node(fake_tools, config)
 
             # Patch the registry lookups inside the closure helpers
-            with patch("src.tools.registry.TOOL_REGISTRY", mock_registry):
+            with patch("agent.tools.registry.TOOL_REGISTRY", mock_registry):
                 # 3 different kb tools all fail
                 for i, name in enumerate(["kb_read", "kb_write", "kb_search"]):
                     mock_tn.ainvoke = AsyncMock(
@@ -977,7 +969,7 @@ class TestToolNodeTimeoutEscalation:
         ctx.consume_freeze_request.return_value = None
         ctx.drain_pending_memories.return_value = []
 
-        with patch("src.graph.ToolNode") as MockToolNode:
+        with patch("agent.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             mock_tn.ainvoke = slow_ainvoke
             MockToolNode.return_value = mock_tn
@@ -1025,7 +1017,7 @@ class TestToolNodeTimeoutEscalation:
         ctx.consume_freeze_request.return_value = None
         ctx.drain_pending_memories.return_value = []
 
-        with patch("src.graph.ToolNode") as MockToolNode:
+        with patch("agent.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             mock_tn.ainvoke = slow_ainvoke
             MockToolNode.return_value = mock_tn
@@ -1074,7 +1066,7 @@ class TestToolNodeTimeoutEscalation:
         ctx.consume_freeze_request.return_value = None
         ctx.drain_pending_memories.return_value = []
 
-        with patch("src.graph.ToolNode") as MockToolNode:
+        with patch("agent.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             mock_tn.ainvoke = slow_ainvoke
             MockToolNode.return_value = mock_tn
@@ -1116,7 +1108,7 @@ class TestToolNodeTimeoutEscalation:
         ctx.consume_freeze_request.return_value = None
         ctx.drain_pending_memories.return_value = []
 
-        with patch("src.graph.ToolNode") as MockToolNode:
+        with patch("agent.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             mock_tn.ainvoke = slow_ainvoke
             MockToolNode.return_value = mock_tn
@@ -1155,7 +1147,7 @@ class TestFreezePayload:
         fake_tool = MagicMock()
         fake_tool.name = "read_file"
 
-        with patch("src.graph.ToolNode") as MockToolNode:
+        with patch("agent.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             MockToolNode.return_value = mock_tn
 
@@ -1202,7 +1194,7 @@ class TestFreezePayload:
         mock_ctx.consume_freeze_request.return_value = None
         mock_ctx.drain_pending_memories.return_value = []
 
-        with patch("src.graph.ToolNode") as MockToolNode:
+        with patch("agent.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             mock_tn.ainvoke = AsyncMock(
                 return_value={"messages": [make_tool_result("read_file", "ok")]}
@@ -1247,7 +1239,7 @@ class TestRequestReplanReset:
         fake_rewind = MagicMock()
         fake_rewind.name = "request_replan"
 
-        with patch("src.graph.ToolNode") as MockToolNode:
+        with patch("agent.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             MockToolNode.return_value = mock_tn
 
@@ -1302,7 +1294,7 @@ class TestRequestReplanReset:
         fake_rewind = MagicMock()
         fake_rewind.name = "request_replan"
 
-        with patch("src.graph.ToolNode") as MockToolNode:
+        with patch("agent.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             MockToolNode.return_value = mock_tn
 
@@ -1368,7 +1360,7 @@ class TestPhaseGate:
         fake_tool = MagicMock()
         fake_tool.name = "job_complete"  # strategic-only in registry
 
-        with patch("src.graph.ToolNode") as MockToolNode:
+        with patch("agent.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             MockToolNode.return_value = mock_tn
 
@@ -1405,7 +1397,7 @@ class TestPhaseGate:
         fake_tool = MagicMock()
         fake_tool.name = "job_complete"
 
-        with patch("src.graph.ToolNode") as MockToolNode:
+        with patch("agent.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             mock_tn.ainvoke = AsyncMock(
                 return_value={
@@ -1435,7 +1427,7 @@ class TestPhaseGate:
         fake_tool = MagicMock()
         fake_tool.name = "request_replan"
 
-        with patch("src.graph.ToolNode") as MockToolNode:
+        with patch("agent.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             MockToolNode.return_value = mock_tn
 
@@ -1463,7 +1455,7 @@ class TestPhaseGate:
         fake_tool = MagicMock()
         fake_tool.name = "custom_dynamic_tool"  # Not in TOOL_REGISTRY
 
-        with patch("src.graph.ToolNode") as MockToolNode:
+        with patch("agent.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             mock_tn.ainvoke = AsyncMock(
                 return_value={
@@ -1505,7 +1497,7 @@ class TestPhaseGate:
         fake_jc = MagicMock()
         fake_jc.name = "job_complete"  # strategic only
 
-        with patch("src.graph.ToolNode") as MockToolNode:
+        with patch("agent.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             mock_tn.ainvoke = AsyncMock(
                 return_value={
@@ -1551,7 +1543,7 @@ class TestPhaseGate:
         fake_tool = MagicMock()
         fake_tool.name = "read_file"  # both phases in registry
 
-        with patch("src.graph.ToolNode") as MockToolNode:
+        with patch("agent.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             MockToolNode.return_value = mock_tn
 
@@ -1592,7 +1584,7 @@ class TestActRatioTripwire:
             t = MagicMock()
             t.name = name
             fake_tools.append(t)
-        patcher = patch("src.graph.ToolNode")
+        patcher = patch("agent.graph.ToolNode")
         MockToolNode = patcher.start()
         mock_tn = AsyncMock()
         MockToolNode.return_value = mock_tn

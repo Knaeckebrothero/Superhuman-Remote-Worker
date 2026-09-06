@@ -10,9 +10,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.core.loader import InstructionFileEntry
-from src.shared.runtime_actor import RuntimeActorContext
-from src.tools.context import ToolContext
+from shared.runtime.core.loader import InstructionFileEntry
+from shared.runtime_actor import RuntimeActorContext
+from agent.tools.context import ToolContext
 
 
 # =============================================================================
@@ -756,7 +756,7 @@ class TestWebSourceRegistration:
 
     @pytest.mark.asyncio
     async def test_citation_engine_does_not_fetch_when_content_is_supplied(self):
-        from src.citation_engine import CitationEngine
+        from agent.citation_engine import CitationEngine
 
         source = MagicMock()
         engine = CitationEngine(db=MagicMock())

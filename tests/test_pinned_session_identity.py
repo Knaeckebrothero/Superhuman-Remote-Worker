@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.shared.pinned_session_identity import (
+from shared.pinned_session_identity import (
     PINNED_SESSION_READY_IDENTITY_CONTRACT,
     PinnedSessionBinding,
     pinned_session_ready_identity_fingerprint,

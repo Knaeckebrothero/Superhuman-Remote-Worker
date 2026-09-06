@@ -6,19 +6,13 @@ Tests the read tracking mechanism and enforcement in workspace tools.
 import io
 import pytest
 import tempfile
-import sys
 import zipfile
 from pathlib import Path
 
-# Add project root to path
-project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-
 # Import from src package
-from src.core.workspace import WorkspaceManager  # noqa: E402
-from src.tools.context import ToolContext  # noqa: E402
-from src.tools.workspace import create_workspace_tools  # noqa: E402
+from agent.core.workspace import WorkspaceManager  # noqa: E402
+from agent.tools.context import ToolContext  # noqa: E402
+from agent.tools.workspace import create_workspace_tools  # noqa: E402
 from tests._fs_backend import FilesystemTestBackend  # noqa: E402
 
 
@@ -239,7 +233,7 @@ class TestReadFileBinaryAndArchiveHandling:
         of these members are actually separately readable — the exact dead
         end from the motivating incident, recreated one layer down.
         """
-        from src.tools.workspace.files import ZIP_REFUSAL_NOTE_SUFFIX
+        from agent.tools.workspace.files import ZIP_REFUSAL_NOTE_SUFFIX
 
         data = self._make_zip({"cover_letter.txt": b"...", "photos/big.bin": b"..."})
         workspace_manager.backend.write_file("bundle.zip", data)

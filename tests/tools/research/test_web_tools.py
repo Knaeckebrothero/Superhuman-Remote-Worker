@@ -7,8 +7,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.tools.context import ToolContext
-from src.tools.research.search import (
+from agent.tools.context import ToolContext
+from agent.tools.research.search import (
     ProviderAuthError,
     ProviderQuotaError,
     ProviderRateLimitError,
@@ -17,7 +17,7 @@ from src.tools.research.search import (
     Result,
     TavilyAdapter,
 )
-from src.tools.research.web import (
+from agent.tools.research.web import (
     MAX_TOTAL_INLINE_CHARS,
     RESEARCH_TOOLS_METADATA,
     _crawl_website,

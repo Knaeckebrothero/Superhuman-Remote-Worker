@@ -19,11 +19,11 @@ from unittest.mock import AsyncMock
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from src.core.loader import LLMConfig
-from src.core.message_markers import PERSIST_ROLE_KEY
-from src.core.subagent_roster import resolve_subagent_roster
-from src.core.workspace import WorkspaceManager, WorkspaceManagerConfig
-from src.subagents import (
+from shared.runtime.core.loader import LLMConfig
+from shared.runtime.core.message_markers import PERSIST_ROLE_KEY
+from shared.runtime.core.subagent_roster import resolve_subagent_roster
+from agent.core.workspace import WorkspaceManager, WorkspaceManagerConfig
+from agent.subagents import (
     SUBAGENT_STATUSES,
     DbSubagentLedger,
     NullLedger,
@@ -32,14 +32,14 @@ from src.subagents import (
     SubagentRuntime,
     WorkerHost,
 )
-from src.shared.subagent_parent_authority import ParentExecutionAuthority
-from src.subagents.persistence import (
+from shared.subagent_parent_authority import ParentExecutionAuthority
+from agent.subagents.persistence import (
     SUBAGENT_FORK_SEED_PROVIDER_KEY,
     SubagentForkSeedDecodeError,
     SubagentPersistenceRefused,
     restore_subagent_fork_seed_message,
 )
-from src.tools.context import ToolContext
+from agent.tools.context import ToolContext
 from tests._fake_chat_model import FakeChatModel, text_turn, tool_turn
 from tests._fs_backend import FilesystemTestBackend
 
@@ -881,7 +881,7 @@ async def test_agent_and_tool_install_the_db_ledger_when_the_context_carries_bot
     """``ensure_runtime`` (the tool's lazy path) makes the same choice as
     ``agent.py``: the DB ledger with both halves on the context, the null
     ledger otherwise."""
-    from src.tools.delegation.delegate_agent import ensure_runtime
+    from agent.tools.delegation.delegate_agent import ensure_runtime
 
     ctx = _parent(tmp_path, client=_client(), pool=_pool())
     assert isinstance(ensure_runtime(ctx).ledger, DbSubagentLedger)
@@ -890,7 +890,7 @@ async def test_agent_and_tool_install_the_db_ledger_when_the_context_carries_bot
 
 
 def test_lazy_runtime_never_downgrades_a_session_to_worker_or_null_ledger():
-    from src.tools.delegation.delegate_agent import ensure_runtime
+    from agent.tools.delegation.delegate_agent import ensure_runtime
 
     context = ToolContext(
         _job_id="11111111-2222-4333-8444-555555555555",

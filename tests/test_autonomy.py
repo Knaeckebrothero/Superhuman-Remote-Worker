@@ -13,26 +13,19 @@ import json
 import pytest
 import shutil
 import subprocess
-import sys
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-# Add project root to path
-project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-
-from src.core.phase import (  # noqa: E402
+from agent.core.phase import (  # noqa: E402
     should_freeze_at_boundary,
     freeze_for_review,
     finalize_job,
 )
-from src.core.loader import (  # noqa: E402
+from shared.runtime.core.loader import (  # noqa: E402
     AgentConfig,
     VALID_AUTONOMY_LEVELS,
     load_agent_config_from_dict,
 )
-from src.tools.core.job import _final_phase_data  # noqa: E402
+from agent.tools.core.job import _final_phase_data  # noqa: E402
 
 
 # =============================================================================
@@ -367,7 +360,10 @@ class TestSerializationRoundTrip:
 
     def test_round_trip(self):
         """Autonomy is preserved through serialize → load round-trip."""
-        from src.core.loader import serialize_resolved_config, load_config_from_resolved
+        from shared.runtime.core.loader import (
+            serialize_resolved_config,
+            load_config_from_resolved,
+        )
 
         config = AgentConfig(
             agent_id="test",
@@ -377,8 +373,8 @@ class TestSerializationRoundTrip:
 
         # serialize_resolved_config needs prompt files, so we mock the resolvers
         with (
-            patch("src.core.loader.PromptMatrixResolver") as mock_prompt,
-            patch("src.core.loader.InstructionMatrixResolver") as mock_instr,
+            patch("shared.runtime.core.loader.PromptMatrixResolver") as mock_prompt,
+            patch("shared.runtime.core.loader.InstructionMatrixResolver") as mock_instr,
         ):
             # Mock resolver to return dummy content
             mock_prompt_instance = MagicMock()
@@ -400,7 +396,7 @@ class TestSerializationRoundTrip:
 
     def test_round_trip_default(self):
         """Default autonomy 'partial' is preserved through round-trip."""
-        from src.core.loader import load_config_from_resolved
+        from shared.runtime.core.loader import load_config_from_resolved
 
         # Simulate a resolved config dict
         resolved = {
@@ -539,7 +535,7 @@ class TestFinalizeJobContentTree:
 
     @staticmethod
     def _make_real_workspace(base):
-        from src.core.workspace import WorkspaceManager, WorkspaceManagerConfig
+        from agent.core.workspace import WorkspaceManager, WorkspaceManagerConfig
         from tests._fs_backend import FilesystemTestBackend
 
         ws = WorkspaceManager(
@@ -558,7 +554,7 @@ class TestFinalizeJobContentTree:
 
     @staticmethod
     def _real_todo_manager(ws):
-        from src.managers.todo import TodoManager
+        from agent.managers.todo import TodoManager
 
         return TodoManager(ws)
 

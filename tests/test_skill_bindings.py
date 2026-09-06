@@ -11,7 +11,7 @@ Plan:   knowledge-base/knowledge/superpowers/plans/2026-06-19-skills-slice-3.md
 
 import pytest
 
-from src.core.loader import InstructionFileEntry, load_agent_config_from_dict
+from shared.runtime.core.loader import InstructionFileEntry, load_agent_config_from_dict
 
 
 # ---------------------------------------------------------------------------
@@ -107,9 +107,9 @@ def test_instruction_activation_options_validate(kwargs):
 from types import SimpleNamespace  # noqa: E402
 
 from tests._fs_backend import FilesystemTestBackend  # noqa: E402
-from src.core.workspace import WorkspaceManager  # noqa: E402
-from src.tools.context import ToolContext  # noqa: E402
-from src.tools.registry import apply_instruction_enforcement  # noqa: E402
+from agent.core.workspace import WorkspaceManager  # noqa: E402
+from agent.tools.context import ToolContext  # noqa: E402
+from agent.tools.registry import apply_instruction_enforcement  # noqa: E402
 
 
 def _ctx(tmp_path, entries):
@@ -208,7 +208,7 @@ async def test_apply_enforcement_wraps_async_tool_coroutine(tmp_path):
 # Task 3: bound-skill content rides the flag-independent instructions channel
 # ---------------------------------------------------------------------------
 
-from src.core.loader import serialize_resolved_config  # noqa: E402
+from shared.runtime.core.loader import serialize_resolved_config  # noqa: E402
 
 
 def test_serialize_freezes_bound_skill_md(tmp_path):
@@ -256,7 +256,7 @@ def test_serialize_freezes_bound_skill_md(tmp_path):
 
 from pathlib import Path as _P  # noqa: E402
 
-from src.core.skill_format import parse_skill_md, skill_identity  # noqa: E402
+from shared.runtime.core.skill_format import parse_skill_md, skill_identity  # noqa: E402
 
 
 def test_research_guide_skill_exists_and_parses():
@@ -304,7 +304,7 @@ def _bindings_source(config_path: str) -> dict:
     overlay, where ``instruction_files`` lives since the U1 split)."""
     import yaml
 
-    from src.core.loader import load_role_base
+    from shared.runtime.core.loader import load_role_base
 
     if config_path == "worker_base":
         return load_role_base("worker")
@@ -412,7 +412,7 @@ def test_runtime_and_cockpit_schemas_accept_bounded_skill_bindings():
 
 
 def test_todo_guide_dropped_from_instruction_matrix():
-    from src.core.loader import InstructionMatrixResolver
+    from shared.runtime.core.loader import InstructionMatrixResolver
 
     assert "todo_guide" not in InstructionMatrixResolver.HARDCODED_DEFAULTS
 
@@ -421,7 +421,7 @@ def test_todo_guide_dropped_from_instruction_matrix():
 # U2 WP2: the phase skills — worker bindings, expert-local overrides, freeze
 # ---------------------------------------------------------------------------
 
-from src.core.loader import (  # noqa: E402
+from shared.runtime.core.loader import (  # noqa: E402
     PHASE_SKILLS,
     chain_root,
     load_agent_config,

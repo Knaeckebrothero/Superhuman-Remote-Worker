@@ -24,6 +24,7 @@ from orchestrator.services.project_backlog import (  # noqa: E402
 PG_IMAGE = "pgvector/pgvector:pg15"
 VECTOR_MIGRATIONS = (
     Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "migrations"

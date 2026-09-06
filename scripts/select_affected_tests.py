@@ -3,7 +3,7 @@
 
 Why not the obvious thing
 -------------------------
-Mapping ``src/core/foo.py`` to ``tests/test_foo.py`` by name looks sufficient and
+Mapping ``src/agent/core/foo.py`` to ``tests/test_foo.py`` by name looks sufficient and
 is not. Measured on a real change (2026-08-03, commit a1d92680): nine test files
 failed and a naming rule selects **three** of them. The other six —
 ``test_app_guide_content``, ``test_persistent_session``,
@@ -17,8 +17,8 @@ graph is the right instrument and the filename is not.
 
 Two edge types
 --------------
-1. **Import edges** — AST-parsed, resolved against this repo's two import roots
-   (the repo root and ``orchestrator/``, mirroring ``tests/conftest.py``), then
+1. **Import edges** — AST-parsed, resolved against the editable ``src/`` package
+   root and the repo root (for tests and retained entry scripts), then
    closed transitively. Resolution yields the leaf module, so the package
    ``__init__.py`` files Python runs on the way there are added as edges too:
    ``from tests.e2e.app import harness`` executes three package bodies before
@@ -58,12 +58,12 @@ from pathlib import Path
 ALL = "ALL"
 
 #: Directories searched for first-party modules, in ``sys.path`` order.
-#: Mirrors tests/conftest.py, which inserts the repo root and orchestrator/ so
-#: ``import main`` and ``from services... import`` resolve inside the pod too.
-IMPORT_ROOTS = ("", "orchestrator")
+#: Application modules resolve as agent.*, orchestrator.*, mcp_server.*,
+#: vm_controller.*, and shared.*; tests/helpers retain their repository root.
+IMPORT_ROOTS = ("src", "")
 
 #: Trees scanned for first-party modules.
-SOURCE_TREES = ("src", "orchestrator", "tests")
+SOURCE_TREES = ("src", "tests")
 
 #: Changing any of these invalidates the whole graph or the environment the
 #: suite runs in, so selection is not safe. Matched as path prefixes.
@@ -76,8 +76,13 @@ FULL_SUITE_TRIGGERS = (
     "tox.ini",
     "requirements.txt",
     "requirements-dev.txt",
-    "orchestrator/requirements.txt",
-    "orchestrator/mcp/requirements.txt",
+    "requirements/",
+    "scripts/lock_dependencies.py",
+    "src/orchestrator/requirements.txt",
+    "src/mcp_server/requirements.txt",
+    "src/vm_controller/requirements.txt",
+    ".github/workflows/",
+    ".squawk.toml",
     "scripts/select_affected_tests.py",
     "tests/select_affected_tests_data",
 )
@@ -106,6 +111,11 @@ ALWAYS_RUN = (
     "tests/test_tool_policy.py",
     "tests/test_tool_grant_classification.py",
     "tests/test_config_tool_names_are_registered.py",
+    # These scanners read the source tree through computed paths, so their
+    # security inventories are invisible to ordinary import/data edges.
+    "tests/test_endpoint_inventory.py",
+    "tests/test_notification_producer_manifest.py",
+    "tests/test_runtime_coordinate_inventory.py",
 )
 
 
@@ -153,10 +163,17 @@ def build_module_index(repo: Path) -> dict[str, Path]:
     return index
 
 
-def _imported_names(tree: ast.AST, own_module: str | None) -> set[str]:
+def _imported_names(
+    tree: ast.AST, own_module: str | None, *, is_package: bool = False
+) -> set[str]:
     """Dotted names imported by one parsed module, relative imports resolved."""
     out: set[str] = set()
-    package = own_module.rsplit(".", 1)[0] if own_module and "." in own_module else ""
+    if is_package:
+        package = own_module or ""
+    else:
+        package = (
+            own_module.rsplit(".", 1)[0] if own_module and "." in own_module else ""
+        )
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -243,7 +260,9 @@ class Graph:
             own = next(iter(_module_candidates(path, self.repo)), None)
             deps = {
                 target
-                for name in _imported_names(tree, own)
+                for name in _imported_names(
+                    tree, own, is_package=path.name == "__init__.py"
+                )
                 if (target := self._resolve(name)) is not None and target != path
             }
             # Importing the module runs its own package chain, and each import
@@ -312,6 +331,8 @@ def select(changed: Iterable[str], repo: Path) -> list[str] | str:
 
     selected: set[Path] = {repo / rel for rel in ALWAYS_RUN if (repo / rel).exists()}
     tests = graph.test_files()
+    if not tests:
+        return ALL
 
     for rel in changed:
         abs_path = repo / rel
@@ -333,7 +354,12 @@ def select(changed: Iterable[str], repo: Path) -> list[str] | str:
                 # A .py outside the scanned trees (scripts/, vm/, generators).
                 # Nothing imports it as a module, so fall back rather than guess.
                 return ALL
-            selected.update(t for t in tests if graph.reaches(t, abs_path))
+            consumers = {t for t in tests if graph.reaches(t, abs_path)}
+            if rel.startswith("src/") and not consumers:
+                # Dynamic imports/entry points can escape the static graph.
+                # Always-run tripwires must not disguise zero source coverage.
+                return ALL
+            selected.update(consumers)
         else:
             selected.update(t for t in tests if graph.reads(t, rel))
 

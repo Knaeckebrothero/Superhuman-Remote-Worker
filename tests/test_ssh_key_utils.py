@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.utils.ssh_key import (
+from shared.runtime.utils.ssh_key import (
     GeneratedKeypair,
     InvalidSSHKeyError,
     generate_ed25519_keypair,

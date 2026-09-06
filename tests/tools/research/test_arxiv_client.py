@@ -5,8 +5,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.tools.research.utils.arxiv_client import ArxivClient, extract_arxiv_id
-from src.tools.research.utils.paper_types import AccessStatus, PaperSource
+from agent.tools.research.utils.arxiv_client import ArxivClient, extract_arxiv_id
+from agent.tools.research.utils.paper_types import AccessStatus, PaperSource
 
 
 @pytest.fixture

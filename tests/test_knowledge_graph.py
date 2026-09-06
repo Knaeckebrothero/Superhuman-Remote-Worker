@@ -23,7 +23,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.services.knowledge_graph import (
+from shared.runtime.services.knowledge_graph import (
     KnowledgeGraphDB,
     slugify,
     NOTE_TYPES,
@@ -40,7 +40,7 @@ from src.services.knowledge_graph import (
 
 def _make_kg():
     """Create a KnowledgeGraphDB with mocked Neo4jDB."""
-    with patch("src.services.knowledge_graph.Neo4jDB") as MockDB:
+    with patch("shared.runtime.services.knowledge_graph.Neo4jDB") as MockDB:
         mock_db = MagicMock()
         MockDB.return_value = mock_db
         kg = KnowledgeGraphDB(uri="bolt://test:7687", username="u", password="p")
@@ -165,7 +165,7 @@ class TestInit:
     def test_defaults_when_no_env(self):
         kg, _ = _make_kg()
         # Constructor params override env, but let's test env defaults
-        with patch("src.services.knowledge_graph.Neo4jDB") as MockDB:
+        with patch("shared.runtime.services.knowledge_graph.Neo4jDB") as MockDB:
             KnowledgeGraphDB()
             MockDB.assert_called_once_with("bolt://localhost:7687", "neo4j", "")
 
@@ -178,12 +178,12 @@ class TestInit:
         },
     )
     def test_reads_env_vars(self):
-        with patch("src.services.knowledge_graph.Neo4jDB") as MockDB:
+        with patch("shared.runtime.services.knowledge_graph.Neo4jDB") as MockDB:
             KnowledgeGraphDB()
             MockDB.assert_called_once_with("bolt://custom:7687", "admin", "secret")
 
     def test_constructor_params_override_env(self):
-        with patch("src.services.knowledge_graph.Neo4jDB") as MockDB:
+        with patch("shared.runtime.services.knowledge_graph.Neo4jDB") as MockDB:
             with patch.dict("os.environ", {"NEO4J_URL": "bolt://env:7687"}):
                 KnowledgeGraphDB(uri="bolt://param:7687")
                 MockDB.assert_called_once()

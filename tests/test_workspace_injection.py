@@ -6,7 +6,7 @@ and is_workspace_injection_message.
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
-from src.core.message_markers import (
+from shared.runtime.core.message_markers import (
     INSTRUCTION_PATH_KEY,
     PERSIST_ROLE_KEY,
     PHASE_KEY,
@@ -16,7 +16,7 @@ from src.core.message_markers import (
     protected_path,
     protected_phase_key,
 )
-from src.core.workspace_injection import (
+from shared.runtime.core.workspace_injection import (
     INSTRUCTION_TOOL_CALL_ID_PREFIX,
     PHASE_INSTRUCTION_CONTENT_PREFIX,
     TODOS_INJECTION_CONTENT_PREFIX,
@@ -164,21 +164,21 @@ class TestContentHashId:
         assert tool1.tool_call_id != tool2.tool_call_id
 
     def test_memory_pair_deterministic(self):
-        from src.core.memory_injection import create_memory_injection_messages
+        from agent.core.memory_injection import create_memory_injection_messages
 
         _, tool1 = create_memory_injection_messages("memories")
         _, tool2 = create_memory_injection_messages("memories")
         assert tool1.tool_call_id == tool2.tool_call_id
 
     def test_knowledge_pair_deterministic(self):
-        from src.core.knowledge_injection import create_knowledge_injection_messages
+        from agent.core.knowledge_injection import create_knowledge_injection_messages
 
         _, tool1 = create_knowledge_injection_messages("notes")
         _, tool2 = create_knowledge_injection_messages("notes")
         assert tool1.tool_call_id == tool2.tool_call_id
 
     def test_citation_pair_deterministic(self):
-        from src.core.citation_feedback_injection import (
+        from agent.core.citation_feedback_injection import (
             create_citation_feedback_injection_messages,
         )
 

@@ -14,8 +14,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from services import session_wake
-from services.usage_ledger import llm_tokens_from_rows
+from orchestrator.services import session_wake
+from orchestrator.services.usage_ledger import llm_tokens_from_rows
 
 THREAD_ID = str(uuid.uuid4())
 
@@ -169,7 +169,7 @@ class TestCeilingNotice:
     async def test_records_one_low_officer_runtime_row_and_stamps_the_day(
         self, monkeypatch
     ):
-        from services import notification_service as ns
+        from orchestrator.services import notification_service as ns
 
         record = AsyncMock()
         monkeypatch.setattr(ns.notification_service, "record", record)
@@ -250,7 +250,7 @@ class TestDrainBrake:
             "_officer_ceiling_deferral",
             AsyncMock(return_value=None),
         )
-        from services import sitrep
+        from orchestrator.services import sitrep
 
         monkeypatch.setattr(
             sitrep,
@@ -296,7 +296,7 @@ class TestDrainBrake:
         db.finish_session_wake_events = AsyncMock()
         db.release_session_wake_events = AsyncMock()
         retry_at = datetime.now(timezone.utc) + timedelta(minutes=5)
-        from services import runtime_actor
+        from orchestrator.services import runtime_actor
 
         gate = AsyncMock(return_value=(False, retry_at))
         monkeypatch.setattr(runtime_actor, "admit_officer_wake_for_runtime", gate)
@@ -351,7 +351,7 @@ class TestDrainBrake:
 class TestDeferPrimitive:
     @pytest.mark.asyncio
     async def test_defer_sets_fire_at_without_burning_attempts(self):
-        from database.postgres import PostgresDB
+        from orchestrator.database.postgres import PostgresDB
 
         captured = {}
 
@@ -390,7 +390,7 @@ class TestPageVsDigestSeverity:
     quiet-hours deferral itself."""
 
     def test_page_is_high_and_digest_is_low(self):
-        from services import notification_catalog as cat
+        from orchestrator.services import notification_catalog as cat
 
         spec = cat.category_spec("officer_question")
         assert spec.severity == "high"

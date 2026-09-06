@@ -26,10 +26,10 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import yaml
 
-import services.job_records as job_records
-import services.project_loops as project_loops
-from services.completion import write_job_change_record
-from services.job_records import (
+import orchestrator.services.job_records as job_records
+import orchestrator.services.project_loops as project_loops
+from orchestrator.services.completion import write_job_change_record
+from orchestrator.services.job_records import (
     derive_changes,
     job_delivered_nothing,
     record_exists_for_job,

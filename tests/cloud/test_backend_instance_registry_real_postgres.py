@@ -10,13 +10,13 @@ import pytest
 import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
-from database.postgres import PostgresDB
-from services.cloud.backend_instance_authority import (
+from orchestrator.database.postgres import PostgresDB
+from orchestrator.services.cloud.backend_instance_authority import (
     MainCloudBackendInstanceAuthority,
     main_cloud_installation_proof_sha256,
 )
-from services.cloud.handles import ProjectFolderHandle
-from services.cloud.protected_effect_contract import (
+from orchestrator.services.cloud.handles import ProjectFolderHandle
+from orchestrator.services.cloud.protected_effect_contract import (
     NextcloudEffectCapability,
     NextcloudEffectFenceIntent,
     NextcloudEffectHorizon,
@@ -25,21 +25,23 @@ from services.cloud.protected_effect_contract import (
     sign_protected_effect_capability,
     sign_protected_effect_request,
 )
-from services.cloud.protected_reader_authority import (
+from orchestrator.services.cloud.protected_reader_authority import (
     ProtectedNextcloudReaderGrantPlan,
 )
-from services.cloud_staging.source_identity import ProtectedMountSourceIdentity
+from orchestrator.services.cloud_staging.source_identity import (
+    ProtectedMountSourceIdentity,
+)
 
 
 _ROOT = Path(__file__).resolve().parents[2]
-_SCHEMA = _ROOT / "orchestrator/database/schema_current.sql"
+_SCHEMA = _ROOT / "src/orchestrator/database/schema_current.sql"
 _MIGRATION_0185 = (
     _ROOT
-    / "orchestrator/database/migrations/app/0185_thread_runtime_generation_retirement.sql"
+    / "src/orchestrator/database/migrations/app/0185_thread_runtime_generation_retirement.sql"
 )
 _MIGRATION_0186 = (
     _ROOT
-    / "orchestrator/database/migrations/app/0186_protected_cloud_instance_authority.sql"
+    / "src/orchestrator/database/migrations/app/0186_protected_cloud_instance_authority.sql"
 )
 _A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 _A_RACE = "aaaaaaaa-aaaa-4aaa-8aaa-bbbbbbbbbbbb"

@@ -10,7 +10,7 @@ import subprocess
 
 import pytest
 
-from services.ssh_public_keys import (
+from orchestrator.services.ssh_public_keys import (
     SIGNATURE_NAMESPACE,
     ParsedSshKey,
     SshKeyRejected,

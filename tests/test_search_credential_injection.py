@@ -3,19 +3,14 @@
 from __future__ import annotations
 
 import os
-import sys
-from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
-_ORCH = Path(__file__).parent.parent / "orchestrator"
-if str(_ORCH) not in sys.path:
-    sys.path.insert(0, str(_ORCH))
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
-import main  # noqa: E402
-from services.capability_credentials import CapabilityCredentials  # noqa: E402
+import orchestrator.main  # noqa: E402
+from orchestrator.services.capability_credentials import CapabilityCredentials  # noqa: E402
 
 
 @pytest.mark.asyncio
@@ -45,10 +40,10 @@ async def test_injects_primary_search_and_fetch_sections():
 
     config = {}
     with patch(
-        "services.capability_credentials.resolve_capability_credentials",
+        "orchestrator.services.capability_credentials.resolve_capability_credentials",
         AsyncMock(side_effect=resolve),
     ):
-        result = await main._inject_search_credentials(
+        result = await orchestrator.main._inject_search_credentials(
             config,
             user_settings={"default_search_model": "searxng"},
             user_id="user-1",
@@ -80,10 +75,10 @@ async def test_removes_stale_sections_when_nothing_resolves():
         }
     }
     with patch(
-        "services.capability_credentials.resolve_capability_credentials",
+        "orchestrator.services.capability_credentials.resolve_capability_credentials",
         AsyncMock(return_value=None),
     ):
-        await main._inject_search_credentials(
+        await orchestrator.main._inject_search_credentials(
             config,
             user_settings={},
             user_id="user-1",
@@ -104,10 +99,10 @@ async def test_malformed_provider_params_degrade_without_credentials():
     )
     config = {}
     with patch(
-        "services.capability_credentials.resolve_capability_credentials",
+        "orchestrator.services.capability_credentials.resolve_capability_credentials",
         AsyncMock(return_value=creds),
     ):
-        await main._inject_search_credentials(
+        await orchestrator.main._inject_search_credentials(
             config,
             user_settings={},
             user_id="user-1",
@@ -143,10 +138,10 @@ async def test_different_catalog_row_is_injected_as_search_fallback():
 
     config = {}
     with patch(
-        "services.capability_credentials.resolve_capability_credentials",
+        "orchestrator.services.capability_credentials.resolve_capability_credentials",
         AsyncMock(side_effect=resolve),
     ):
-        await main._inject_search_credentials(
+        await orchestrator.main._inject_search_credentials(
             config,
             user_settings={},
             user_id="user-1",
@@ -178,10 +173,10 @@ async def test_same_catalog_row_is_not_injected_as_its_own_fallback():
 
     config = {}
     with patch(
-        "services.capability_credentials.resolve_capability_credentials",
+        "orchestrator.services.capability_credentials.resolve_capability_credentials",
         AsyncMock(side_effect=resolve),
     ):
-        await main._inject_search_credentials(
+        await orchestrator.main._inject_search_credentials(
             config,
             user_settings={},
             user_id="user-1",

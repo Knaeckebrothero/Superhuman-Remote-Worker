@@ -143,7 +143,7 @@ async def require_session_parent_authority(
     if run_in_background and parsed.execution_lane == "stateless":
         raise SessionParentAuthorityRefused("stateless_background_unsupported")
 
-    from src.shared.persistent_input_delivery import (
+    from shared.persistent_input_delivery import (
         InputDeliveryAuthorityLost,
         _lock_stateless_runtime_authority,
         lock_runtime_authority,

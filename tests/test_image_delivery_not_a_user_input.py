@@ -30,10 +30,10 @@ import re
 
 from langchain_core.messages import HumanMessage
 
-from src.api.persistent_app import _db_rows_to_lc_messages, _serialize_message_row
-from src.api.turn_executor import _PENDING_INPUT_SQL
-from src.core.message_markers import PERSIST_ROLE_EVENT, PERSIST_ROLE_KEY
-from src.services.image_content import ExtractedImage, make_multimodal_user_message
+from agent.api.persistent_app import _db_rows_to_lc_messages, _serialize_message_row
+from agent.api.turn_executor import _PENDING_INPUT_SQL
+from shared.runtime.core.message_markers import PERSIST_ROLE_EVENT, PERSIST_ROLE_KEY
+from agent.services.image_content import ExtractedImage, make_multimodal_user_message
 
 MARKER = "Image content from tool call call_abc123:"
 

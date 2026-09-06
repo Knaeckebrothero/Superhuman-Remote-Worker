@@ -7,7 +7,7 @@ from uuid import UUID
 
 import pytest
 
-from src.shared.cloud_sync_generations import (
+from shared.cloud_sync_generations import (
     CloudSyncRequirement,
     CloudSyncScope,
     EMPTY_BASELINE_SHA256,

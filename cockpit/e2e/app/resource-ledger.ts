@@ -1,6 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs';
-import type { APIRequestContext } from '@playwright/test';
-import { requireJson } from './api';
+import type { APIRequestContext, APIResponse } from '@playwright/test';
 import { privateOutputPath, writePrivateJsonFile } from './environment';
 
 const THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -168,6 +167,21 @@ export class ResourceLedger {
     }
 
     const pathname = `/api/persistent/threads/${encodeURIComponent(threadId)}`;
+    const deletionConfirmed = async (response: APIResponse, deadline: number): Promise<boolean> => {
+      if (response.status() === 404) return true;
+      if (!response.ok()) return false;
+      // Pinned retirement can acknowledge End with 200 {status: "ending"}.
+      // Only exact absence proves deletion; keep its accepted work inside the
+      // same graceful budget before considering the existing force fallback.
+      const exact = await request.get(pathname, {
+        timeout: Math.min(15_000, remainingCleanupRequestTimeout(deadline, Date.now())),
+      });
+      if (exact.status() === 404) return true;
+      if (exact.status() === 200) return false;
+      throw new Error(
+        `Deletion verification for exact thread ${threadId} returned HTTP ${exact.status()}.`,
+      );
+    };
     const gracefulDeadline = Date.now() + GRACEFUL_CLEANUP_WINDOW_MS;
     let backoff = 250;
     let deleted = false;
@@ -184,11 +198,11 @@ export class ResourceLedger {
         // existing deadline instead of imposing an unrelated UI-sized cap.
         timeout: remainingCleanupRequestTimeout(gracefulDeadline, now),
       });
-      if (response.ok() || response.status() === 404) {
+      if (await deletionConfirmed(response, gracefulDeadline)) {
         deleted = true;
         break;
       }
-      if (response.status() !== 409 && response.status() !== 503) {
+      if (!response.ok() && response.status() !== 409 && response.status() !== 503) {
         throw new Error(
           `Permanent delete for exact thread ${threadId} returned HTTP ${response.status()}.`,
         );
@@ -209,11 +223,11 @@ export class ResourceLedger {
           timeout: remainingCleanupRequestTimeout(forcedDeadline, now),
         });
         lastStatus = forced.status();
-        if (forced.ok() || lastStatus === 404) {
+        if (await deletionConfirmed(forced, forcedDeadline)) {
           deleted = true;
           break;
         }
-        if (lastStatus !== 409 && lastStatus !== 503) {
+        if (!forced.ok() && lastStatus !== 409 && lastStatus !== 503) {
           throw new Error(
             `Bounded force delete for exact thread ${threadId} returned HTTP ${lastStatus}.`,
           );
@@ -227,22 +241,6 @@ export class ResourceLedger {
             `(last HTTP ${lastStatus}).`,
         );
       }
-    }
-
-    const exact = await request.get(pathname, { timeout: 15_000 });
-    if (exact.status() === 404) return;
-    if (exact.status() === 401 || exact.status() === 403 || exact.status() >= 500) {
-      throw new Error(
-        `Deletion verification for exact thread ${threadId} returned HTTP ${exact.status()}.`,
-      );
-    }
-
-    const listed = await requireJson<{ threads: Array<{ id: string }> }>(
-      await request.get('/api/persistent/threads', { timeout: 15_000 }),
-      'thread-list deletion verification',
-    );
-    if (listed.threads.some(({ id }) => id === threadId)) {
-      throw new Error(`Exact thread ${threadId} still exists after permanent cleanup.`);
     }
   }
 }

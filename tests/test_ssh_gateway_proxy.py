@@ -25,7 +25,7 @@ import pytest
 from asyncssh.constants import EXTENDED_DATA_STDERR
 from asyncssh.stream import SSHReader, SSHWriter
 
-from services.ssh_gateway_proxy import (
+from orchestrator.services.ssh_gateway_proxy import (
     ALLOWED_SUBSYSTEMS,
     UPSTREAM_FAILURE_EXIT_CODE,
     ProxyProcess,

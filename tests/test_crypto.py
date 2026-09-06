@@ -7,7 +7,7 @@ import secrets
 
 import pytest
 
-from security import crypto
+from orchestrator.security import crypto
 
 
 def _set_key(monkeypatch, raw: str | None) -> None:

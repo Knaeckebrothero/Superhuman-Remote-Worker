@@ -22,12 +22,13 @@ from orchestrator.services.job_completion_commands import (
     CompletionControlInProgress,
     accept_completion_command,
 )
-from src.shared.worker_queue import claim_worker_batch
+from shared.worker_queue import claim_worker_batch
 from tests._previous_release_seed import seed_previous_release_row
 
 
 SCHEMA_FILE = (
     Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "schema_current.sql"

@@ -1,13 +1,13 @@
 import pytest
 
-from src.core.backends.overlay import VirtualOverlayBackend
-from src.core.virtual_dirs import (
+from agent.core.backends.overlay import VirtualOverlayBackend
+from agent.core.virtual_dirs import (
     SingleFileProvider,
     ToolsProvider,
     sweep_legacy_tools_dir,
     unwrap_backend,
 )
-from src.core.workspace import WorkspaceManager, WorkspaceManagerConfig
+from agent.core.workspace import WorkspaceManager, WorkspaceManagerConfig
 from tests._fs_backend import FilesystemTestBackend
 
 
@@ -121,7 +121,7 @@ def test_sweep_is_non_fatal_without_a_tools_dir(tmp_path):
 
 
 def test_legacy_write_helpers_are_gone():
-    import src.tools as tools_pkg
+    import agent.tools as tools_pkg
 
     assert not hasattr(tools_pkg, "generate_workspace_tool_docs")
 
@@ -140,7 +140,7 @@ def test_provider_serves_full_docstrings_after_overrides_rebind(tmp_path, monkey
     pass-through branch, no copy is ever made, and the test passes under the
     buggy binding too — a placebo.
     """
-    from src.tools.description_manager import apply_description_overrides
+    from agent.tools.description_manager import apply_description_overrides
 
     full_doc = "Full docstring. Every argument explained at length."
     full_tools = [CopyableFakeTool("get_document_info", full_doc)]
@@ -266,7 +266,7 @@ def test_production_backend_swaps_go_through_swap_backend():
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[1]
-    for rel in ("src/agent.py", "src/api/persistent_session.py"):
+    for rel in ("src/agent/agent.py", "src/agent/api/persistent_session.py"):
         source = (root / rel).read_text(encoding="utf-8")
         assert "workspace_manager._backend = " not in source, rel
         assert ".swap_backend(new_backend)" in source, rel
@@ -286,7 +286,9 @@ def test_workspace_module_constructs_when_loaded_outside_its_package(tmp_path):
     import sys
     from pathlib import Path
 
-    module_path = Path(__file__).resolve().parents[1] / "src" / "core" / "workspace.py"
+    module_path = (
+        Path(__file__).resolve().parents[1] / "src" / "agent" / "core" / "workspace.py"
+    )
     spec = importlib.util.spec_from_file_location("direct_load_workspace", module_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -316,9 +318,9 @@ def test_production_probe_call_sites_bypass_the_overlay():
     """
     from pathlib import Path
 
-    source = (Path(__file__).resolve().parents[1] / "src" / "agent.py").read_text(
-        encoding="utf-8"
-    )
+    source = (
+        Path(__file__).resolve().parents[1] / "src" / "agent" / "agent.py"
+    ).read_text(encoding="utf-8")
 
     # Both seeded-content probes go through the marker helper, which unwraps.
     assert "workspace_is_seeded(workspace_backend)" in source
@@ -337,7 +339,7 @@ def test_production_probe_call_sites_bypass_the_overlay():
 
 def test_seeded_marker_probe_ignores_a_virtual_file(tmp_path):
     """A virtual file must never make a wiped workspace look seeded."""
-    from src.core.backends.seed import SEEDED_MARKER, workspace_is_seeded
+    from agent.core.backends.seed import SEEDED_MARKER, workspace_is_seeded
 
     overlay = VirtualOverlayBackend(FilesystemTestBackend(tmp_path))
     overlay.register(SingleFileProvider("task_brief.md", lambda: "# Task Brief\n"))
@@ -349,7 +351,7 @@ def test_seeded_marker_probe_ignores_a_virtual_file(tmp_path):
 
 
 def test_seeded_marker_round_trips_through_the_manager(tmp_path, monkeypatch):
-    from src.core.backends.seed import (
+    from agent.core.backends.seed import (
         SEEDED_MARKER,
         mark_workspace_seeded,
         workspace_is_seeded,
@@ -373,7 +375,7 @@ def test_legacy_workspace_without_a_marker_still_reads_as_seeded(tmp_path):
     would rewind them to the last phase boundary (VM probe) or wipe them
     (resume gate), so the legacy sentinel is still accepted as evidence.
     """
-    from src.core.backends.seed import workspace_is_seeded
+    from agent.core.backends.seed import workspace_is_seeded
 
     backend = FilesystemTestBackend(tmp_path)
     (tmp_path / "task_brief.md").write_text("seeded by a pre-marker release")
@@ -381,6 +383,6 @@ def test_legacy_workspace_without_a_marker_still_reads_as_seeded(tmp_path):
 
 
 def test_empty_workspace_reads_as_unseeded(tmp_path):
-    from src.core.backends.seed import workspace_is_seeded
+    from agent.core.backends.seed import workspace_is_seeded
 
     assert workspace_is_seeded(FilesystemTestBackend(tmp_path)) is False

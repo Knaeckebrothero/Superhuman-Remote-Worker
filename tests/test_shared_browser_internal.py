@@ -10,16 +10,16 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from routers import canvases
-from services.canvas import (
+from orchestrator.routers import canvases
+from orchestrator.services.canvas import (
     BrowserSource,
     CanvasCapabilities,
     CanvasMutation,
     CanvasRecord,
     build_public_canvas_representation,
 )
-from services.canvas_ssh import RemoteWorkspaceTarget
-from services.shared_browser_canvas import (
+from orchestrator.services.canvas_ssh import RemoteWorkspaceTarget
+from orchestrator.services.shared_browser_canvas import (
     BrowserCapabilityResponse,
     PreparedBrowser,
 )

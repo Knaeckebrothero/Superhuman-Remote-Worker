@@ -5,8 +5,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-import main
-from services.vm_remote_operation import VMRemoteOperationUnavailable
+import orchestrator.main
+from orchestrator.services.vm_remote_operation import VMRemoteOperationUnavailable
 
 
 VM_GENERATION = "11111111-1111-4111-8111-111111111111"
@@ -63,8 +63,10 @@ async def test_k8s_same_ip_successor_is_not_captured():
         },
     }
 
-    with patch.object(main, "snapshot_service", service):
-        assert not await main._capture_workspace_snapshot_for_freeze(job, job["id"])
+    with patch.object(orchestrator.main, "snapshot_service", service):
+        assert not await orchestrator.main._capture_workspace_snapshot_for_freeze(
+            job, job["id"]
+        )
 
     service.capture_vm_snapshot.assert_not_awaited()
 
@@ -95,14 +97,18 @@ async def test_explicit_vm_uses_one_exact_remote_operation_lease():
     }
 
     with (
-        patch.object(main, "snapshot_service", service),
-        patch("services.vm_remote_operation.claim_vm_remote_operation", claim),
+        patch.object(orchestrator.main, "snapshot_service", service),
+        patch(
+            "orchestrator.services.vm_remote_operation.claim_vm_remote_operation", claim
+        ),
     ):
-        assert await main._capture_workspace_snapshot_for_freeze(job, job["id"])
+        assert await orchestrator.main._capture_workspace_snapshot_for_freeze(
+            job, job["id"]
+        )
 
     claim.assert_awaited_once_with(
-        db=main.postgres_db,
-        provisioner=main.vm_provisioner,
+        db=orchestrator.main.postgres_db,
+        provisioner=orchestrator.main.vm_provisioner,
         owner_id="job-vm",
         owner_kind="job",
         operation_kind="snapshot_capture",
@@ -134,13 +140,15 @@ async def test_vm_claim_refusal_sends_no_snapshot_bytes():
     }
 
     with (
-        patch.object(main, "snapshot_service", service),
+        patch.object(orchestrator.main, "snapshot_service", service),
         patch(
-            "services.vm_remote_operation.claim_vm_remote_operation",
+            "orchestrator.services.vm_remote_operation.claim_vm_remote_operation",
             AsyncMock(side_effect=VMRemoteOperationUnavailable("dark")),
         ),
     ):
-        assert not await main._capture_workspace_snapshot_for_freeze(job, job["id"])
+        assert not await orchestrator.main._capture_workspace_snapshot_for_freeze(
+            job, job["id"]
+        )
 
     service.capture_vm_snapshot.assert_not_awaited()
 
@@ -163,8 +171,10 @@ async def test_explicit_local_container_capture_remains_available():
         },
     }
 
-    with patch.object(main, "snapshot_service", service):
-        assert await main._capture_workspace_snapshot_for_freeze(job, job["id"])
+    with patch.object(orchestrator.main, "snapshot_service", service):
+        assert await orchestrator.main._capture_workspace_snapshot_for_freeze(
+            job, job["id"]
+        )
 
     service.capture_vm_snapshot.assert_awaited_once_with(
         job_id="job-local",

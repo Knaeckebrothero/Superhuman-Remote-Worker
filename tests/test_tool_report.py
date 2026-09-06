@@ -9,9 +9,9 @@ bug in this series.
 
 import pytest
 
-from src.core.capability_grants import CATALOG, evaluate
-from src.core.session_tool_overrides import SESSION_TOOL_OVERRIDE_NAMES
-from src.core.tool_report import (
+from shared.runtime.core.capability_grants import CATALOG, evaluate
+from shared.runtime.core.session_tool_overrides import SESSION_TOOL_OVERRIDE_NAMES
+from shared.runtime.core.tool_report import (
     MEASURED_ORIGINS,
     ORIGIN_AGENT,
     ORIGIN_AGENT_PARTIAL,
@@ -56,7 +56,7 @@ class _Backend:
 # =============================================================================
 class TestVocabulary:
     def test_covers_every_config_addressable_category(self):
-        from src.core.tool_policy import config_tool_categories
+        from shared.runtime.core.tool_policy import config_tool_categories
 
         assert set(report_categories()) == set(config_tool_categories())
 
@@ -162,7 +162,7 @@ class TestBackendGate:
         assert backend_blocked_categories(None) == {}
 
     def test_no_shell_blocks_exactly_the_execution_categories(self):
-        from src.tools.registry import _EXECUTION_CATEGORIES
+        from agent.tools.registry import _EXECUTION_CATEGORIES
 
         blocked = backend_blocked_categories(
             backend_capabilities(_Backend(shell=False))
@@ -266,7 +266,7 @@ class TestGrantMapMatchesThePDP:
 
 class TestCodeGrantedCategories:
     def test_matches_the_registry(self):
-        from src.tools.registry import CODE_GRANTED_CATEGORIES
+        from agent.tools.registry import CODE_GRANTED_CATEGORIES
 
         assert set(code_granted_categories()) == set(CODE_GRANTED_CATEGORIES)
 
@@ -529,7 +529,7 @@ class TestOnIsRevocable:
         assert view[UNCLASSIFIED_CATEGORY]["settable"] is True
 
     def test_the_per_tool_tier_is_read_off_the_registry_not_a_literal(self):
-        from src.tools.registry import TOOL_REGISTRY
+        from agent.tools.registry import TOOL_REGISTRY
 
         expected = {n for n, m in TOOL_REGISTRY.items() if m.get("grant") == "code"}
         assert set(code_granted_tools()) == expected

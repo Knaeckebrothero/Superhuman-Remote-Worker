@@ -8,17 +8,10 @@ Verifies that:
 import pytest
 
 from tests._tool_invoke import invoke_tool
-import sys
-from pathlib import Path
 from unittest.mock import MagicMock
 
-# Add project root to path
-project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-
-from src.managers.todo import TodoManager  # noqa: E402
-from src.tools.context import ToolContext  # noqa: E402
+from agent.managers.todo import TodoManager  # noqa: E402
+from agent.tools.context import ToolContext  # noqa: E402
 
 
 # =============================================================================
@@ -60,7 +53,7 @@ class TestJobCompleteClears:
 
     def _get_job_complete(self, context: ToolContext):
         """Create and return the job_complete tool function."""
-        from src.tools.core.job import create_job_tools
+        from agent.tools.core.job import create_job_tools
 
         tools = create_job_tools(context)
         return next(t for t in tools if t.name == "job_complete")
@@ -128,7 +121,7 @@ class TestRequestReplanClearsStaged:
 
     def _get_request_replan(self, context: ToolContext):
         """Create and return the request_replan tool function."""
-        from src.tools.core.todo import create_todo_tools
+        from agent.tools.core.todo import create_todo_tools
 
         tools = create_todo_tools(context)
         return next(t for t in tools if t.name == "request_replan")

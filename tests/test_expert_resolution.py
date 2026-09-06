@@ -2,8 +2,8 @@
 
 import json
 
-from src.core.loader import deep_merge
-from src.core.expert_resolution import (
+from shared.runtime.core.loader import deep_merge
+from shared.runtime.core.expert_resolution import (
     with_role_tag,
     build_expert_config,
     canonical_key,

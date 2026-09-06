@@ -50,9 +50,9 @@ def _make_tools(ctx):
     ``asyncio.run()`` fallback at invocation time) — same pattern as
     tests/test_knowledge_tools.py::_make_tools.
     """
-    from src.tools.knowledge.knowledge_tools import create_kb_tools
+    from agent.tools.knowledge.knowledge_tools import create_kb_tools
 
-    with patch("src.tools.knowledge.knowledge_tools.asyncio") as mock_asyncio:
+    with patch("agent.tools.knowledge.knowledge_tools.asyncio") as mock_asyncio:
         mock_asyncio.get_running_loop.side_effect = RuntimeError("no loop")
         tools = create_kb_tools(ctx)
     return {t.name: t for t in tools}
@@ -80,7 +80,7 @@ def _capture_materialize():
         return {"status": "committed", "path": f"knowledge/{slug}.md"}
 
     patcher = patch(
-        "src.tools.knowledge.knowledge_tools._post_vault_file", side_effect=_fake
+        "agent.tools.knowledge.knowledge_tools._post_vault_file", side_effect=_fake
     )
     return patcher, rendered
 
@@ -89,7 +89,7 @@ def _capture_materialize():
 def _no_materialization_http():
     """Keep these tests off the network — kb_write/kb_update POST now."""
     with patch(
-        "src.tools.knowledge.knowledge_tools._post_vault_file",
+        "agent.tools.knowledge.knowledge_tools._post_vault_file",
         return_value={"status": "committed", "path": "knowledge/test.md"},
     ):
         yield
@@ -97,7 +97,7 @@ def _no_materialization_http():
 
 class TestPriorityRoundTrip:
     def test_render_emits_priority_word(self):
-        from src.tools.knowledge.knowledge_tools import _render_note_md
+        from agent.tools.knowledge.knowledge_tools import _render_note_md
 
         md = _render_note_md(
             {"id": "feature-x", "type": "feature", "content": "body", "priority": 0}
@@ -106,7 +106,7 @@ class TestPriorityRoundTrip:
 
     def test_render_omits_priority_when_absent(self):
         """Existing notes must not gain noise in their frontmatter."""
-        from src.tools.knowledge.knowledge_tools import _render_note_md
+        from agent.tools.knowledge.knowledge_tools import _render_note_md
 
         md = _render_note_md({"id": "d-1", "type": "decision", "content": "body"})
         assert "priority:" not in md
@@ -913,7 +913,7 @@ class TestBacklogIndexPredicateMatchesNoteTypes:
         from orchestrator.services.project_backlog import BACKLOG_NOTE_TYPES
 
         sql = Path(
-            "orchestrator/database/migrations/vector/0014_kb_backlog_index.notx.sql"
+            "src/orchestrator/database/migrations/vector/0014_kb_backlog_index.notx.sql"
         ).read_text()
         m = re.search(r"note_type IN \(([^)]+)\)", sql)
         assert m, "note_type IN (...) predicate not found in migration 0014"
@@ -1012,17 +1012,25 @@ class _SpawnLoopJobHarness:
 
         create = AsyncMock(return_value={"id": "job-1"})
         with ExitStack() as stack:
-            stack.enter_context(patch("main.postgres_db", AsyncMock()))
-            stack.enter_context(patch("main.vector_db", MagicMock()))
-            stack.enter_context(patch("main._trigger_dispatch"))
-            stack.enter_context(patch("services.project_loops.create_loop_job", create))
+            stack.enter_context(patch("orchestrator.main.postgres_db", AsyncMock()))
+            stack.enter_context(patch("orchestrator.main.vector_db", MagicMock()))
+            stack.enter_context(patch("orchestrator.main._trigger_dispatch"))
             stack.enter_context(
-                patch("services.job_provisioning.provision_job_repo", AsyncMock())
+                patch("orchestrator.services.project_loops.create_loop_job", create)
             )
             stack.enter_context(
-                patch("services.project_backlog.fetch_backlog", fetch_backlog_double)
+                patch(
+                    "orchestrator.services.job_provisioning.provision_job_repo",
+                    AsyncMock(),
+                )
             )
-            from main import _spawn_loop_job
+            stack.enter_context(
+                patch(
+                    "orchestrator.services.project_backlog.fetch_backlog",
+                    fetch_backlog_double,
+                )
+            )
+            from orchestrator.main import _spawn_loop_job
 
             job = await _spawn_loop_job(loop, role="critic", iteration=2)
         return job, create
@@ -1171,7 +1179,7 @@ class TestCloseBacklogTicket:
             "retry_state": "none",
         }
         with patch(
-            "services.kb_materialize.materialize_knowledge_metadata_update",
+            "orchestrator.services.kb_materialize.materialize_knowledge_metadata_update",
             AsyncMock(return_value=materialization),
         ):
             ok = await close_backlog_ticket(
@@ -1194,7 +1202,9 @@ class TestCloseBacklogTicket:
         from unittest.mock import AsyncMock, MagicMock
 
         from orchestrator.services.project_backlog import close_backlog_ticket
-        from services.project_loop_atomic import ProjectLoopHandoffAuthorityLost
+        from orchestrator.services.project_loop_atomic import (
+            ProjectLoopHandoffAuthorityLost,
+        )
 
         vector_db = MagicMock()
         gitea = MagicMock()
@@ -1892,11 +1902,11 @@ class TestCloseBacklogTicketRepoResolution:
 
         with (
             patch(
-                "services.kb_materialize.kb_client_for_repo",
+                "orchestrator.services.kb_materialize.kb_client_for_repo",
                 AsyncMock(return_value=github),
             ) as select,
             patch(
-                "services.project_backlog.GiteaKnowledgeGitSource",
+                "orchestrator.services.project_backlog.GiteaKnowledgeGitSource",
                 return_value=Source(),
             ),
         ):
@@ -2012,7 +2022,7 @@ class TestBacklogEndpoint:
         """
         from contextlib import ExitStack
 
-        from routers.project_loops import get_project_backlog
+        from orchestrator.routers.project_loops import get_project_backlog
 
         db = AsyncMock()
         db.get_active_project_loop = AsyncMock(return_value=loop)
@@ -2021,19 +2031,21 @@ class TestBacklogEndpoint:
         with ExitStack() as stack:
             stack.enter_context(
                 patch(
-                    "routers.project_loops.require_approved_user",
+                    "orchestrator.routers.project_loops.require_approved_user",
                     AsyncMock(return_value={"id": str(uuid.uuid4())}),
                 )
             )
             stack.enter_context(
                 patch(
-                    "routers.project_loops.require_project_member",
+                    "orchestrator.routers.project_loops.require_project_member",
                     AsyncMock(side_effect=member_side_effect),
                 )
             )
-            stack.enter_context(patch("main.postgres_db", db))
-            stack.enter_context(patch("main.vector_db", MagicMock()))
-            stack.enter_context(patch("routers.project_loops.fetch_backlog", fetch))
+            stack.enter_context(patch("orchestrator.main.postgres_db", db))
+            stack.enter_context(patch("orchestrator.main.vector_db", MagicMock()))
+            stack.enter_context(
+                patch("orchestrator.routers.project_loops.fetch_backlog", fetch)
+            )
 
             out = await get_project_backlog(MagicMock(), self.PROJECT_ID)
         return out, fetch

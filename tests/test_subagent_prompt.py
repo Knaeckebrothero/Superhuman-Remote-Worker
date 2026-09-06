@@ -7,15 +7,15 @@ from pathlib import Path
 import pytest
 import yaml
 
-from src.core.loader import (
+from shared.runtime.core.loader import (
     PromptMatrixResolver,
     get_all_tool_names,
     get_subagent_system_prompt,
     load_agent_config,
     load_agent_config_from_dict,
 )
-from src.subagents.budgets import ChildBudgets
-from src.subagents.child import render_subagent_environment
+from agent.subagents.budgets import ChildBudgets
+from agent.subagents.child import render_subagent_environment
 
 _REPO = Path(__file__).resolve().parents[1]
 _CONFIG = _REPO / "config"
