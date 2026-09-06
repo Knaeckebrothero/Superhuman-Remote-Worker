@@ -18,6 +18,7 @@ def boundary_tree(tmp_path):
         "agent",
         "orchestrator",
         "orchestrator/routers",
+        "orchestrator/schemas",
         "orchestrator/services",
         "mcp_server",
         "vm_controller",
@@ -38,6 +39,8 @@ def boundary_tree(tmp_path):
         "orchestrator/routers/contacts.py": "from shared.value import VALUE\n",
         "orchestrator/routers/tables.py": "from shared.value import VALUE\n",
         "orchestrator/routers/preferences.py": "from shared.value import VALUE\n",
+        "orchestrator/schemas/job_create.py": "from orchestrator.services.job_create_ingress import VALUE\n",
+        "orchestrator/services/job_create_ingress.py": "from shared.value import VALUE\n",
         "orchestrator/services/preference_defaults.py": "from shared.value import VALUE\n",
         "orchestrator/services/session_workspace_policy.py": "from shared.value import VALUE\n",
         "mcp_server/app.py": "from shared.contracts.item import VALUE\n",
@@ -66,7 +69,7 @@ def lint_boundaries(root):
 def test_allowed_runtime_and_lightweight_dependencies_pass(boundary_tree):
     result = lint_boundaries(boundary_tree)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "Contracts: 9 kept, 0 broken" in result.stdout
+    assert "Contracts: 10 kept, 0 broken" in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -91,6 +94,8 @@ def test_allowed_runtime_and_lightweight_dependencies_pass(boundary_tree):
         ("orchestrator/routers/preferences.py", "orchestrator.main"),
         ("orchestrator/services/preference_defaults.py", "orchestrator.main"),
         ("orchestrator/services/session_workspace_policy.py", "orchestrator.main"),
+        ("orchestrator/schemas/job_create.py", "orchestrator.main"),
+        ("orchestrator/services/job_create_ingress.py", "orchestrator.main"),
         ("vm_controller/app.py", "headscale_client"),
     ],
 )
@@ -99,3 +104,27 @@ def test_forbidden_dependency_fails_the_gate(boundary_tree, source, target):
     result = lint_boundaries(boundary_tree)
     assert result.returncode != 0, result.stdout + result.stderr
     assert "BROKEN" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "orchestrator/schemas/job_create.py",
+        "orchestrator/services/job_create_ingress.py",
+    ],
+)
+def test_job_create_boundary_rejects_indirect_startup_dependencies(
+    boundary_tree, source
+):
+    (boundary_tree / "src/orchestrator/services/bridge.py").write_text(
+        "from orchestrator.main import VALUE\n"
+    )
+    (boundary_tree / "src" / source).write_text(
+        "from orchestrator.services.bridge import VALUE\n"
+    )
+    result = lint_boundaries(boundary_tree)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert (
+        "Job creation schemas and ingress policy do not import application startup BROKEN"
+        in result.stdout
+    )
