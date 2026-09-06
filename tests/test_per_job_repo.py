@@ -162,6 +162,14 @@ class TestResolveJobRepo:
 class TestDeleteJobGiteaCleanup:
     """Tests for delete_job() Gitea branch/repo cleanup logic."""
 
+    @pytest.fixture(autouse=True)
+    def vector_retirement(self):
+        """Repository tests still complete the required vector retirement."""
+        with patch(f"{MODULE}.vector_db") as vector_db:
+            connection = AsyncMock()
+            vector_db.acquire.return_value.__aenter__.return_value = connection
+            yield connection
+
     @pytest.mark.asyncio
     async def test_root_job_deletes_repo(self):
         """Root job with repo_name: deletes the entire Gitea repo."""
@@ -192,7 +200,9 @@ class TestDeleteJobGiteaCleanup:
             mock_gitea.delete_repo = AsyncMock()
             mock_gitea.delete_branch = AsyncMock()
 
-            result = await orch_main.delete_job(_stub_request(), "abcd1234-xxxx")
+            result = await orch_main.delete_job(
+                _stub_request(), "abcd1234-1111-4111-8111-111111111111"
+            )
 
             assert result == DELETE_RESULT
             mock_gitea.delete_repo.assert_awaited_once_with(
@@ -223,7 +233,9 @@ class TestDeleteJobGiteaCleanup:
             mock_gitea.delete_branch = AsyncMock()
             mock_gitea.delete_repo = AsyncMock()
 
-            result = await orch_main.delete_job(_stub_request(), "abcd1234-xxxx")
+            result = await orch_main.delete_job(
+                _stub_request(), "abcd1234-1111-4111-8111-111111111111"
+            )
 
             assert result == DELETE_RESULT
             mock_gitea.delete_branch.assert_awaited_once_with(
@@ -257,7 +269,9 @@ class TestDeleteJobGiteaCleanup:
             mock_gitea.delete_branch = AsyncMock()
             mock_gitea.delete_repo = AsyncMock()
 
-            result = await orch_main.delete_job(_stub_request(), "legacy-id")
+            result = await orch_main.delete_job(
+                _stub_request(), "12345678-1111-4111-8111-111111111111"
+            )
 
             assert result == DELETE_RESULT
             mock_gitea.delete_branch.assert_awaited_once_with(
