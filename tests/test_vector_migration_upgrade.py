@@ -167,7 +167,9 @@ def _search_sql(variant):
     assert variant == "published_preload"
     anchor = "CREATE OR REPLACE FUNCTION public.knowledge_chunk_multi_angle_search("
     assert original.count(anchor) == 1
-    published = original.replace(anchor, PRELOAD_FRAGMENT.read_text() + anchor)
+    # The published artifact has a blank separator before CREATE FUNCTION.
+    # Spell it out so the fixture itself needs no trailing blank line.
+    published = original.replace(anchor, PRELOAD_FRAGMENT.read_text() + "\n" + anchor)
     assert hashlib.sha256(published.encode()).hexdigest() == PRELOAD_CHECKSUM
     return published
 
@@ -192,7 +194,7 @@ def test_vector_0025_is_restored_and_published_variant_is_exact():
     # present in a CI shallow checkout. The fragment reconstructs the exact
     # published artifact, with both complete-file digests pinned independently.
     assert _search_sql("published_preload").replace(
-        PRELOAD_FRAGMENT.read_text(), "", 1
+        PRELOAD_FRAGMENT.read_text() + "\n", "", 1
     ) == _search_sql("original")
 
 

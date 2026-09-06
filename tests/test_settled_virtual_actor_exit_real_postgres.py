@@ -1,7 +1,7 @@
 """Used pinned virtual actor crash recovery with actual retirement/admission SQL."""
 
 from types import SimpleNamespace as NS
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 import asyncpg
@@ -9,6 +9,7 @@ import pytest
 
 from orchestrator import main
 from orchestrator.services.agent_provisioner import AgentProvisioner
+from orchestrator.services.session_router import SessionRouterService
 from shared.persistent_input_delivery import (
     InputDeliveryAuthorityLost,
     lock_runtime_authority,
@@ -212,7 +213,35 @@ async def test_used_virtual_actor_exit_settles_after_exact_pod_stop(
     monkeypatch.setattr(
         thread_uploads, "purge_attested_pinned_virtual_workspace", purge
     )
+    # The captured route has disappeared with the stopped Pod. Exercise the
+    # real teardown's 404 handling using injected APIs, never a local cluster.
+    core_api = MagicMock()
+    networking_api = MagicMock()
+    core_api.read_namespaced_service.side_effect = fixtures._K8sError(404)
+    networking_api.read_namespaced_ingress.side_effect = fixtures._K8sError(404)
+    monkeypatch.setattr(
+        main,
+        "session_router",
+        SessionRouterService(
+            namespace="agents-a",
+            ingress_host="unused.example",
+            core_api=core_api,
+            networking_api=networking_api,
+        ),
+    )
     await main._cleanup_pinned_thread_retirement(retirement)
+    for read in (
+        core_api.read_namespaced_service,
+        networking_api.read_namespaced_ingress,
+    ):
+        if permanent:
+            assert read.call_count == 1
+            assert read.call_args.kwargs["namespace"] == "agents-a"
+            assert read.call_args.kwargs["name"] == f"session-{ids['thread']}"
+        else:
+            read.assert_not_called()
+    core_api.delete_namespaced_service.assert_not_called()
+    networking_api.delete_namespaced_ingress.assert_not_called()
     await db.delete_thread(
         ids["thread"],
         expected_runtime_retirement_token=retirement["token"],
