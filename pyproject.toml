@@ -101,6 +101,12 @@ forbidden_modules = ["orchestrator.main"]
 allow_indirect_imports = true
 
 [[tool.importlinter.contracts]]
+name = "Job creation schemas and ingress policy do not import application startup"
+type = "forbidden"
+source_modules = ["orchestrator.schemas.job_create", "orchestrator.services.job_create_ingress"]
+forbidden_modules = ["orchestrator.main"]
+
+[[tool.importlinter.contracts]]
 name = "Shared initializer stays lightweight"
 type = "forbidden"
 # Check the root initializer separately without including its child packages.

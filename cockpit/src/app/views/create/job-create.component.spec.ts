@@ -2,8 +2,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { signal } from '@angular/core';
 import { TestBed } from '@angular/core/testing';
 import { ActivatedRoute, Router, convertToParamMap } from '@angular/router';
-import { of } from 'rxjs';
-import { JobCreateRequest, Project } from '../../core/models/api.model';
+import { of, throwError } from 'rxjs';
+import { Expert, JobCreateRequest, Project } from '../../core/models/api.model';
 import { ApiService } from '../../core/services/api.service';
 import { CapabilitiesService } from '../../core/services/capabilities.service';
 import { ErrorMessageService } from '../../core/services/error-message.service';
@@ -242,6 +242,7 @@ describe('JobCreateComponent utilities', () => {
  */
 describe('JobCreateComponent project picker', () => {
   function setup(queryProject: string | null, deepLinked: Project | null = null) {
+    const errors = {translate: vi.fn((_e: unknown, k?: string) => k ?? '')};
     const api = {
       getProjects: vi
         .fn()
@@ -269,7 +270,7 @@ describe('JobCreateComponent project picker', () => {
         },
         {provide: Router, useValue: {navigate: vi.fn()}},
         {provide: UserService, useValue: {currentUserId: signal('user-1')}},
-        {provide: ErrorMessageService, useValue: {translate: (_e: unknown, k?: string) => k ?? ''}},
+        {provide: ErrorMessageService, useValue: errors},
         {provide: ModelService, useValue: {load: vi.fn()}},
         {
           provide: CapabilitiesService,
@@ -283,7 +284,7 @@ describe('JobCreateComponent project picker', () => {
     TestBed.overrideComponent(JobCreateComponent, {set: {imports: [], template: ''}});
     const fixture = TestBed.createComponent(JobCreateComponent);
     fixture.detectChanges();
-    return {fixture, component: fixture.componentInstance, api};
+    return {fixture, component: fixture.componentInstance, api, errors};
   }
 
   const ACTIVE_PROJECT = {
@@ -328,5 +329,66 @@ describe('JobCreateComponent project picker', () => {
 
     expect(component.selectedProjectId()).toBe('proj-1');
     expect(component.selectedProjectIsArchived()).toBe(false);
+  });
+
+  it.each([
+    {selection: null, expected: {}},
+    {selection: {id: 'worker_base', storage_kind: 'bundled'}, expected: {}},
+    {selection: {id: 'developer', storage_kind: 'bundled'}, expected: {config_name: 'developer'}},
+    {selection: {id: '44444444-4444-4444-8444-444444444444', storage_kind: 'db'},
+      expected: {expert_id: '44444444-4444-4444-8444-444444444444'}},
+  ])('real onSubmit preserves expert aliases and explicit connector opt-out: $selection', async ({selection, expected}) => {
+    const {component, api} = setup(null);
+    component.formData.description = 'Create a small report';
+    component.selectedExpert.set(selection as Expert | null);
+
+    await component.onSubmit();
+
+    expect(api.createJob).toHaveBeenCalledExactlyOnceWith({
+      description: 'Create a small report', ...expected,
+      datasource_ids: [], project_id: 'proj-1', user_id: 'user-1',
+    });
+    expect(component.isSubmitting()).toBe(false);
+    expect(component.formData.description).toBe('');
+  });
+
+  it('real onSubmit retains reviewed settings and only sends changed priority', async () => {
+    const {component, api} = setup(null);
+    component.formData.description = 'Keep my settings';
+    component.selectedPriority.set(7);
+    component.kickoffMessage = '  Start here  ';
+    component.agentSettings = {
+      getOverrides: () => ({llm: {model: 'selected-model'}}),
+      getInstructions: () => 'Instructions',
+      getSelectedDatasourceIds: () => ['connector-1'],
+      resetAll: vi.fn(),
+    } as unknown as JobCreateComponent['agentSettings'];
+
+    await component.onSubmit();
+
+    expect(api.createJob).toHaveBeenCalledExactlyOnceWith({
+      description: 'Keep my settings', config_override: {llm: {model: 'selected-model'}},
+      instructions: 'Instructions', kickoff_message: 'Start here', datasource_ids: ['connector-1'],
+      priority: 7, project_id: 'proj-1', user_id: 'user-1',
+    });
+  });
+
+  it('real onSubmit preserves selections and forwards the server error to translation', async () => {
+    const {component, api, errors} = setup(null);
+    const error = {status: 409, error: {detail: {code: 'contract_conflict', message: 'Review the contract'}}};
+    api.createJob.mockReturnValue(throwError(() => error));
+    component.formData.description = 'Keep this draft';
+    component.selectedPriority.set(7);
+    const selected = {id: 'developer', storage_kind: 'bundled'} as Expert;
+    component.selectedExpert.set(selected);
+
+    await component.onSubmit();
+
+    expect(api.createJob).toHaveBeenCalledTimes(1);
+    expect(errors.translate).toHaveBeenCalledWith(error, 'errors.jobs.createFailed');
+    expect(component.formData.description).toBe('Keep this draft');
+    expect(component.selectedExpert()).toBe(selected);
+    expect(component.selectedPriority()).toBe(7);
+    expect(component.isSubmitting()).toBe(false);
   });
 });

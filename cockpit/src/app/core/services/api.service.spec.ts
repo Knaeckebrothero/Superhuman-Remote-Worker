@@ -11,6 +11,55 @@ import {ApiService, SESSION_TOOL_GROUPS_TIMEOUT_MS} from './api.service';
 import {AppToastService} from '../../ui/toast';
 import {ErrorMessageService} from './error-message.service';
 import type {ThreadUploadedFile, ThreadUploadEvent} from '../models/file.model';
+import type {JobCreateRequest} from '../models/api.model';
+
+describe('ApiService.createJob public wire contract', () => {
+  let api: ApiService;
+  let httpMock: HttpTestingController;
+
+  beforeEach(() => {
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({providers: [
+      ApiService, provideHttpClient(), provideHttpClientTesting(),
+      {provide: AppToastService, useValue: {success: vi.fn()}},
+      {provide: TranslocoService, useValue: {translate: (key: string) => key}},
+      {provide: ErrorMessageService, useValue: {}},
+    ]});
+    api = TestBed.inject(ApiService);
+    httpMock = TestBed.inject(HttpTestingController);
+  });
+
+  afterEach(() => httpMock.verify());
+
+  it('posts modern selection fields once and preserves the serialized row response', async () => {
+    const body: JobCreateRequest = {
+      description: 'Create a report', expert: 'developer',
+      required_deliverables: ['output/report.txt'], use_datasource_defaults: true,
+    };
+    const pending = firstValueFrom(api.createJob(body));
+    const request = httpMock.expectOne((item) => item.url.endsWith('/jobs'));
+    expect(request.request.method).toBe('POST');
+    expect(request.request.body).toEqual(body);
+    expect(request.request.body).not.toHaveProperty('datasource_ids');
+    const response = {
+      id: 'job-1', description: body.description, config_name: 'developer', status: 'created',
+      created_at: '2026-09-06T08:00:00Z', assigned_agent_id: null, existing_extension: {nullable: null},
+    };
+    request.flush(response);
+    await expect(pending).resolves.toEqual(response);
+  });
+
+  it('propagates structured refusal details without retrying or replacing them', async () => {
+    const detail = {code: 'contract_conflict', message: 'Review the contract', paths: ['output/report.txt']};
+    const pending = firstValueFrom(api.createJob({description: 'Rejected draft', datasource_ids: []}));
+    const rejected = expect(pending).rejects.toMatchObject({status: 409, error: {detail}});
+    const request = httpMock.expectOne((item) => item.url.endsWith('/jobs'));
+    expect(request.request.body.datasource_ids).toEqual([]);
+    request.flush({detail}, {status: 409, statusText: 'Conflict'});
+    await rejected;
+    httpMock.expectNone((item) => item.url.endsWith('/jobs'));
+  });
+});
 
 describe('ApiService.getJobPullRequestStatus', () => {
   let api: ApiService;

@@ -10566,60 +10566,12 @@ _PUBLIC_JOB_CONTEXT_RESERVED_KEYS = {
     "vm",
     "workspace_container",
 }
-_SERVER_OWNED_OFFICER_CONTEXT_KEYS = {
-    "ticket_note_id",
-    "officer_admission",
-    "ticket_ready_at",
-    "ready_generation_at",
-    "ticket_claim_source",
-    "claim_source",
-    "officer_thread_id",
-    "officer_incarnation",
-    "provisioning_preflight",
-}
-_SERVER_OWNED_REPOSITORY_CONTEXT_KEYS = {
-    "git_remote_url",
-    "repo_name",
-    "managed_repository_credentials",
-    "managed_repository_authority",
-    "repository_auth",
-    "repository_credentials",
-    "_managed_repository_authority_pending",
-    "_managed_repository_process_zero",
-    "_stateless_workspace_process_zero_observation",
-}
-_SERVER_OWNED_RAW_CREATE_CONTEXT_KEYS = (
-    _SERVER_OWNED_OFFICER_CONTEXT_KEYS
-    | _SERVER_OWNED_REPOSITORY_CONTEXT_KEYS
-    | {
-        "evidence_manifest",
-        "pull_request",
-        "deliverable_contract_provenance",
-        "prior_deliverable_contract",
-        "required_pr_repositories",
-        "required_deliverables",
-        WORKSPACE_CONTRACT_CONTEXT_KEY,
-        WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY,
-        WORKSPACE_RUNTIME_CONTEXT_KEY,
-        "workspace_backend",
-        "vm",
-        "workspace_container",
-    }
+from orchestrator.services.job_create_ingress import (  # noqa: E402
+    _SERVER_OWNED_OFFICER_CONTEXT_KEYS as _SERVER_OWNED_OFFICER_CONTEXT_KEYS,
+    _SERVER_OWNED_RAW_CREATE_CONTEXT_KEYS,
+    _SERVER_OWNED_REPOSITORY_CONTEXT_KEYS as _SERVER_OWNED_REPOSITORY_CONTEXT_KEYS,
+    _strip_raw_repository_authority as _strip_raw_repository_authority,
 )
-
-
-def _strip_raw_repository_authority(value: Any) -> Any:
-    """Recursively remove server-owned Git transport from request JSON."""
-
-    if isinstance(value, dict):
-        return {
-            key: _strip_raw_repository_authority(item)
-            for key, item in value.items()
-            if key not in _SERVER_OWNED_REPOSITORY_CONTEXT_KEYS
-        }
-    if isinstance(value, list):
-        return [_strip_raw_repository_authority(item) for item in value]
-    return value
 
 
 _PUBLIC_JOB_CONFIG_RESERVED_KEYS = {
@@ -15384,185 +15336,10 @@ class AgentHeartbeat(BaseModel):
 # =============================================================================
 
 
-class JobCreate(BaseModel):
-    """Request body for creating a new job."""
-
-    description: str = Field(
-        ..., description="Job description - what the agent should accomplish"
-    )
-    upload_id: str | None = Field(
-        None, description="Upload ID for document files (from /api/uploads)"
-    )
-    config_upload_id: str | None = Field(
-        None, description="Upload ID for config YAML override"
-    )
-    instructions_upload_id: str | None = Field(
-        None, description="Upload ID for instructions markdown"
-    )
-    document_path: str | None = Field(
-        None, description="Path to a document (deprecated, use upload_id)"
-    )
-    document_dir: str | None = Field(
-        None, description="Directory containing documents (deprecated)"
-    )
-    expert: str | None = Field(
-        None,
-        description=(
-            "Which expert runs this job. One selector for the whole catalogue: "
-            "either a bundled expert id ('developer') or a DB expert UUID, "
-            "exactly as GET /api/experts lists them. Omit to accept the "
-            "deployment's configured default worker. Supersedes config_name "
-            "and expert_id, which remain as deprecated single-store aliases."
-        ),
-    )
-    config_name: str = Field(
-        "worker_base",
-        description=(
-            "DEPRECATED alias for `expert` (bundled experts only). Also still "
-            "the way to name a non-catalogue deployment config."
-        ),
-    )
-    expert_id: str | None = Field(
-        None,
-        description=(
-            "DEPRECATED alias for `expert` (DB-backed expert UUID only). The "
-            "orchestrator resolves it over the worker_base profile."
-        ),
-    )
-    config_override: dict[str, Any] | None = Field(
-        None, description="Per-job configuration overrides"
-    )
-    context: dict[str, Any] | None = Field(
-        None, description="Optional context dictionary"
-    )
-    instructions: str | None = Field(
-        None, description="Additional inline instructions for the agent"
-    )
-    kickoff_message: str | None = Field(
-        None, description="Opening message to the agent (task brief)"
-    )
-    required_deliverables: list[str] | None = Field(
-        None,
-        description=(
-            "Immutable deliverable contract: workspace-relative artifact "
-            "paths, 'kb:<slug>' knowledge notes, or exactly one "
-            "'pr:<owner>/<repository>' pull request bound to a writable "
-            "attached repository. Files inside repos/<name>/ are refused and "
-            "the response names the compatible PR contract. Select that "
-            "contract rather than replacing publication with a note."
-        ),
-    )
-
-    @field_validator("required_deliverables")
-    @classmethod
-    def _normalize_deliverables(cls, value: list[str] | None) -> list[str] | None:
-        """Reject malformed entries while deferring repository authority.
-
-        ``repos/<alias>`` cannot be interpreted until project/ticket scope and
-        the exact selected datasource set have been server-resolved. Refusing
-        it in Pydantic used to lose the ticket-generation provenance needed to
-        prevent a subsequent ``kb:`` downgrade.
-        """
-        if not value:
-            return value
-        from shared.deliverable_contract import parse_required_deliverables
-
-        return parse_required_deliverables(value, strict=True)
-
-    ticket: str | None = Field(
-        None,
-        description=(
-            "Backlog ticket (knowledge-note slug) this job claims. Officer "
-            "dispatches only. The server resolves its current ready generation "
-            "and atomically writes the durable claim plus job; the provenance "
-            "is also stamped into context.ticket_note_id. Pass it when working "
-            "a ticket by hand so the tick cannot dispatch duplicate work."
-        ),
-    )
-    work_category: str | None = Field(
-        None,
-        description=(
-            "The kind of work this is: researcher (the deliverable is an "
-            "ANSWER), tester (the deliverable is issue tickets), or executor "
-            "(the deliverable is shipped files). Officer dispatches into a "
-            "categorized slot only. The slot's own category always supplies "
-            "the contract the worker is held to; naming a different one here "
-            "is allowed and is stated in the kickoff rather than refused."
-        ),
-    )
-    datasource_ids: list[str] | None = Field(
-        None, description="Connector IDs to attach to the job"
-    )
-    use_datasource_defaults: bool = Field(
-        False,
-        description=(
-            "Resolve the owner's currently available automatic connector "
-            "defaults. Mutually exclusive with datasource_ids."
-        ),
-    )
-    user_id: str | None = Field(None, description="User UUID who created this job")
-    project_id: str | None = Field(
-        None, description="Project UUID to associate this job with"
-    )
-    thread_id: str | None = Field(
-        None,
-        description=(
-            "Persistent-session thread UUID. When provided and user_id "
-            "is unset, the owning user (and project) are inherited from "
-            "the thread row so dispatch can apply user preferences. Also "
-            "persisted as jobs.created_by_thread_id, which is what the "
-            "completion wake routes on. INTERNAL PATH ONLY — the public path "
-            "strips it (_strip_public_job_reserved_markers); a caller cannot "
-            "name someone else's session."
-        ),
-    )
-    parent_job_id: str | None = Field(
-        None, description="Parent job UUID for verification/follow-up jobs"
-    )
-    priority: int = Field(
-        5, ge=0, le=10, description="Job priority (0=low, 5=normal, 10=high)"
-    )
-    creation_order: int | None = Field(
-        None, description="0-based index for delegation subagent merge ordering"
-    )
-    worktree_path: str | None = Field(
-        None, description="Git worktree path for delegation subagents"
-    )
-    delegation_context: str | None = Field(
-        None, description="Shared context string from parent delegation"
-    )
-    execution_lane: Literal["pinned", "stateless"] | None = Field(
-        None,
-        description=(
-            "Execution plane opt-in. Omitted root jobs remain pinned; omitted "
-            "child jobs inherit their authoritative parent lane. Stateless "
-            "worker admission is deployment-gated and Kubernetes-sandbox only."
-        ),
-    )
-
-    @model_validator(mode="after")
-    def reject_null_datasource_selection(self) -> "JobCreate":
-        # Earliest ingress fence for both public and internally authenticated
-        # HTTP bodies. Completion/provisioning code may mint these namespaces
-        # only after resolving server authority. The route helper and Postgres
-        # funnel repeat the strip as independent defenses.
-        if isinstance(self.context, dict):
-            self.context = _strip_raw_repository_authority(
-                {
-                    key: value
-                    for key, value in self.context.items()
-                    if key not in _SERVER_OWNED_RAW_CREATE_CONTEXT_KEYS
-                }
-            )
-        if isinstance(self.config_override, dict):
-            self.config_override = _strip_raw_repository_authority(self.config_override)
-        if "datasource_ids" in self.model_fields_set and self.datasource_ids is None:
-            raise ValueError("datasource_ids may be omitted or an array, not null")
-        if self.use_datasource_defaults and "datasource_ids" in self.model_fields_set:
-            raise ValueError(
-                "use_datasource_defaults and datasource_ids are mutually exclusive"
-            )
-        return self
+from orchestrator.schemas.job_create import (  # noqa: E402
+    JobCreate,
+    PublicJobCreateBody,
+)
 
 
 class JobStartRequest(BaseModel):
@@ -19115,8 +18892,8 @@ async def get_job(request: Request, job_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
-@app.post("/api/jobs")
-async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
+@app.post("/api/jobs", operation_id="create_job_api_jobs_post")
+async def create_job(request: Request, job: PublicJobCreateBody) -> dict[str, Any]:
     """Create a new job. **Dual-callable** (P4b):
 
     * Cockpit / user path → ``require_approved_user``; if ``body.project_id``
@@ -70482,9 +70259,12 @@ async def unlink_datasource_from_project(
     return {"status": "unlinked"}
 
 
-@app.post("/api/projects/{project_id}/jobs")
+@app.post(
+    "/api/projects/{project_id}/jobs",
+    operation_id="create_project_job_api_projects__project_id__jobs_post",
+)
 async def create_project_job(
-    request: Request, project_id: str, job: JobCreate
+    request: Request, project_id: str, job: PublicJobCreateBody
 ) -> dict[str, Any]:
     """Create a job within a project — delegates to create_job. Requires editor or higher."""
     await require_project_member(
