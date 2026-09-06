@@ -2150,6 +2150,7 @@ class OrchestratorClient:
 
         if (
             not self._client
+            or not self.dispatch_process_generation
             or retirement_disposition not in {"ended", "suspended"}
             or type(retirement_permanent) is not bool
         ):
@@ -2162,11 +2163,15 @@ class OrchestratorClient:
         body = {
             "status": "ending",
             "agent_id": pinned_agent_id,
+            "process_generation": self.dispatch_process_generation,
             "session_runtime_generation": generation,
             "session_runtime_attach_token": attach_token,
             "retirement_disposition": retirement_disposition,
             "retirement_permanent": retirement_permanent,
         }
+        pod_uid = str(os.environ.get("POD_UID") or "").strip()
+        if pod_uid:
+            body["pod_uid"] = pod_uid
         try:
             response = await self._client.put(url, json=body)
             if response.status_code != 200:
