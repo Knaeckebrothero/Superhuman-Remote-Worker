@@ -151,6 +151,11 @@ test.describe('review composition', () => {
       // The viewer's box before and after expanding must be identical: the
       // chooser overlays it rather than pushing it out of view, which is what
       // kept the German conflict state reviewable at 375x667.
+      // Visibility can arrive during the dialog's translate/scale entrance.
+      // Compare settled geometry on both sides of the chooser interaction.
+      await dialog(page).evaluate(async element => {
+        await Promise.all(element.getAnimations().map(animation => animation.finished));
+      });
       const before = await box(review.locator('.review__viewer'));
       await review.locator('.review__files-toggle').click();
       await expect(review.locator('[role="listbox"]')).toBeVisible();
