@@ -377,7 +377,7 @@ APP_INPUT_DELIVERY_CONSTRAINTS_NOT_VALID = (
 )
 APP_CURRENT_MIGRATION_HEAD = (
     ROOT
-    / "src/orchestrator/database/migrations/app/0222_main_cloud_instance_pairing.sql"
+    / "src/orchestrator/database/migrations/app/0225_settled_virtual_actor_exit.sql"
 )
 AUDIT_EXPANSION = (
     ROOT
