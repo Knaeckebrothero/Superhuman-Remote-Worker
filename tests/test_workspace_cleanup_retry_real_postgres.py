@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 from uuid import uuid4
 
 import pytest
+import pytest_asyncio
+import asyncpg
 from kubernetes.client.exceptions import ApiException
 
 from orchestrator.services.container_provisioner import ContainerProvisioner
+from orchestrator.database.migrate import run_migrations
 from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 from tests import test_non_pinned_workspace_lifecycle_real_postgres as lifecycle_tests
 from tests.test_non_pinned_workspace_lifecycle_real_postgres import (
@@ -21,18 +25,27 @@ from tests.test_non_pinned_workspace_lifecycle_real_postgres import (
 
 
 pg_dsn = lifecycle_tests.pg_dsn
-_schema_applied = lifecycle_tests._schema_applied
 db = lifecycle_tests.db
 
 
-async def _capture(db, owner_id, runtime, *, owner_kind, pvc, service):
+@pytest_asyncio.fixture(scope="module")
+async def _schema_applied(pg_dsn):
+    async with asyncpg.create_pool(pg_dsn, min_size=1, max_size=2) as pool:
+        await run_migrations(
+            pool,
+            Path(__file__).resolve().parents[1]
+            / "src/orchestrator/database/migrations/app",
+        )
+
+
+async def _capture(db, owner_id, runtime, *, owner_kind, pvc, service, reclaim=True):
     intent = await db.prepare_managed_repository_workspace_cleanup_intent(
         str(owner_id),
         owner_kind=owner_kind,
         scope="workspace_container",
         runtime_incarnation=str(runtime),
         target_disposition="deleted",
-        reclaim_shared_resources=True,
+        reclaim_shared_resources=reclaim,
     )
     assert intent is not None
     claimed = await db.claim_managed_repository_workspace_cleanup_intent(
@@ -230,6 +243,210 @@ async def test_soft_end_then_permanent_cleanup_replays_exact_retired_pod(db):
         ) == dict(prior)
     assert p._core_api.delete_namespaced_persistent_volume_claim.call_count == 1
     assert p._core_api.delete_namespaced_service.call_count == 1
+    # Resource settlement is only complete when the normal owner lifecycle can
+    # finish. Soft End previously left a null UID that the delete guard refused.
+    await db.delete_thread(str(thread))
+    assert await db.get_thread(str(thread)) is None
+
+
+@pytest.mark.asyncio
+async def test_absent_soft_cleanup_settles_intent_before_clearing_projection(db):
+    thread, runtime, _reservation, _state = await _create_settled_authoritative_runtime(
+        db, owner_kind="thread", scope="workspace_container"
+    )
+    intent = await _capture(
+        db,
+        thread,
+        runtime,
+        owner_kind="thread",
+        pvc=uuid4(),
+        service=uuid4(),
+        reclaim=False,
+    )
+    assert await db.record_managed_repository_workspace_process_zero(
+        str(thread),
+        owner_kind="thread",
+        scope="workspace_container",
+        provisioner="k8s",
+        runtime_incarnation=str(runtime),
+    )
+    owner = WorkspaceOwner.session(str(thread))
+    p, resources = _absent_pod_provisioner(db, owner, intent)
+    assert await p.release_absent_workspace(
+        owner,
+        expected_runtime_incarnation=str(runtime),
+        reclaim_volume=False,
+        strict=True,
+    )
+    stored = await db.get_thread(str(thread))
+    metadata = stored["metadata"]
+    if isinstance(metadata, str):
+        metadata = json.loads(metadata)
+    assert metadata["workspace_container"]["_runtime_incarnation"] is None
+    assert metadata["workspace_container"]["status"] == "deleted"
+    assert set(resources) == {"pvc", "service"}
+    async with db.acquire() as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT result_kind FROM managed_repository_workspace_cleanup_intents WHERE id=$1",
+                intent["id"],
+            )
+            == "settled"
+        )
+    assert await p.release_absent_workspace(
+        owner,
+        expected_runtime_incarnation=str(runtime),
+        reclaim_volume=False,
+        strict=True,
+    )
+    assert set(resources) == {"pvc", "service"}
+    p._core_api.delete_namespaced_persistent_volume_claim.assert_not_called()
+    p._core_api.delete_namespaced_service.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "changed",
+    [
+        None,
+        "generation",
+        "runtime",
+        "queue_token",
+        "queue_live",
+        "queue_kind",
+        "soft_only",
+        "pending_overlap",
+        "missing_receipt",
+        "intent_generation",
+        "intent_runtime_generation",
+        "intent_token",
+        "capture_incomplete",
+        "unsettled",
+        "active_owner",
+    ],
+)
+async def test_previously_settled_null_projection_replays_only_exact_authority(
+    db, changed
+):
+    thread, runtime, prior, intent = await _soft_settled_reclaim(db)
+    owner = WorkspaceOwner.session(str(thread))
+    p, resources = _absent_pod_provisioner(db, owner, intent)
+    assert (
+        await p.reconcile_workspace_cleanup_intent(
+            owner,
+            expected_runtime_incarnation=str(runtime),
+            intent_generation=int(intent["intent_generation"]),
+        )
+    ).settled
+    assert resources == {}
+    async with db.acquire() as conn:
+        # Reproduce the exact persisted shape left by the previous release.
+        await _execute_pre_0195(
+            conn,
+            "UPDATE threads SET metadata=jsonb_set(metadata,"
+            "'{workspace_container,_runtime_incarnation}','null'::jsonb) WHERE id=$1",
+            thread,
+        )
+        statements = {
+            "generation": (
+                "UPDATE threads SET runtime_generation=$2 WHERE id=$1",
+                thread,
+                uuid4(),
+            ),
+            "runtime": (
+                "UPDATE threads SET metadata=jsonb_set(metadata,"
+                "'{workspace_container,_runtime_incarnation}',$2::jsonb) WHERE id=$1",
+                thread,
+                json.dumps(str(uuid4())),
+            ),
+            "queue_token": (
+                "UPDATE run_queue SET lease_token=9 WHERE unit_id=$1",
+                thread,
+            ),
+            "queue_live": (
+                "UPDATE run_queue SET state='leased',leased_by='successor' WHERE unit_id=$1",
+                thread,
+            ),
+            "queue_kind": (
+                "UPDATE run_queue SET unit_kind='worker_batch' WHERE unit_id=$1",
+                thread,
+            ),
+            "soft_only": (
+                "UPDATE threads SET metadata=jsonb_set(metadata,"
+                "'{_stateless_workspace_retirement_settled,permanent}','false'::jsonb) WHERE id=$1",
+                thread,
+            ),
+            "pending_overlap": (
+                "UPDATE threads SET metadata=jsonb_set(metadata,"
+                "'{_stateless_workspace_retirement_pending}','true'::jsonb) WHERE id=$1",
+                thread,
+            ),
+            "missing_receipt": (
+                "DELETE FROM managed_repository_process_zero_receipts WHERE owner_id=$1",
+                thread,
+            ),
+            "intent_runtime_generation": (
+                "UPDATE managed_repository_workspace_cleanup_intents SET thread_runtime_generation=$2 WHERE id=$1",
+                intent["id"],
+                uuid4(),
+            ),
+            "intent_token": (
+                "UPDATE managed_repository_workspace_cleanup_intents SET terminal_queue_token=9 WHERE id=$1",
+                intent["id"],
+            ),
+            "capture_incomplete": (
+                "UPDATE managed_repository_workspace_cleanup_intents SET "
+                "capture_complete=false,resources_captured_at=NULL,seed_configmap_uid=NULL,"
+                "pvc_uid=NULL,service_uid=NULL,result_kind=NULL,cleanup_completed_at=NULL,"
+                "projection_transaction_id=NULL,settled_at=NULL,phase='prepared' WHERE id=$1",
+                intent["id"],
+            ),
+            "unsettled": (
+                "UPDATE managed_repository_workspace_cleanup_intents SET "
+                "result_kind=NULL,cleanup_completed_at=NULL,projection_transaction_id=NULL,"
+                "settled_at=NULL,phase='captured' WHERE id=$1",
+                intent["id"],
+            ),
+            "active_owner": ("UPDATE threads SET status='active' WHERE id=$1", thread),
+        }
+        if changed in statements:
+            await _execute_pre_0195(conn, *statements[changed])
+        before = await conn.fetchval("SELECT metadata FROM threads WHERE id=$1", thread)
+        receipts = await conn.fetch(
+            "SELECT * FROM managed_repository_workspace_cleanup_intents WHERE owner_id=$1 ORDER BY id",
+            thread,
+        )
+    generation = int(intent["intent_generation"])
+    if changed == "intent_generation":
+        generation = int(prior["intent_generation"])
+    repaired = await db.restore_settled_thread_workspace_cleanup_projection(
+        str(thread), runtime_incarnation=str(runtime), intent_generation=generation
+    )
+    assert repaired is (changed is None)
+    async with db.acquire() as conn:
+        assert (
+            await conn.fetch(
+                "SELECT * FROM managed_repository_workspace_cleanup_intents WHERE owner_id=$1 ORDER BY id",
+                thread,
+            )
+            == receipts
+        )
+        if changed is not None:
+            assert (
+                await conn.fetchval("SELECT metadata FROM threads WHERE id=$1", thread)
+                == before
+            )
+    if changed is None:
+        # The normal reconciler also replays recovery without reissuing DELETE.
+        assert (
+            await p.reconcile_workspace_cleanup_intent(
+                owner,
+                expected_runtime_incarnation=str(runtime),
+                intent_generation=generation,
+            )
+        ).settled
+        await db.delete_thread(str(thread))
+        assert await db.get_thread(str(thread)) is None
 
 
 @pytest.mark.asyncio

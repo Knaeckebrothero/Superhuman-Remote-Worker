@@ -8842,6 +8842,20 @@ BEGIN
         old_runtime := old_state #>> ARRAY[state_key, '_runtime_incarnation'];
         new_runtime := new_state #>> ARRAY[state_key, '_runtime_incarnation'];
         old_status := old_state #>> ARRAY[state_key, 'status'];
+        -- Restoring the UID of a settled permanent cleanup is a terminal
+        -- projection, never a new runtime binding. All other fields and the
+        -- current owner/queue/receipt tuple must agree before this exception.
+        IF source_kind = 'thread' AND TG_OP = 'UPDATE'
+           AND scope_name = 'workspace_container'
+           AND to_jsonb(NEW) ->> 'status' = to_jsonb(OLD) ->> 'status'
+           AND to_jsonb(NEW) ->> 'status' = 'ended'
+           AND to_jsonb(NEW) ->> 'execution_lane' = to_jsonb(OLD) ->> 'execution_lane'
+           AND to_jsonb(NEW) ->> 'runtime_generation' = to_jsonb(OLD) ->> 'runtime_generation'
+           AND public.stateless_terminal_reclaim_projection_is_authorized(
+               source_id, new_runtime, old_state, new_state
+           ) THEN
+            CONTINUE;
+        END IF;
         new_status := new_state #>> ARRAY[state_key, 'status'];
         new_reservation := new_state #>> ARRAY[
             state_key, '_creation_reservation_id'
@@ -12292,6 +12306,50 @@ COMMENT ON FUNCTION public.resource_inventory_snapshot_item_size_bytes(source_ki
 
 
 --
+-- Name: restore_settled_thread_workspace_cleanup_projection(uuid, text, bigint); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.restore_settled_thread_workspace_cleanup_projection(requested_owner uuid, requested_runtime text, requested_intent_generation bigint) RETURNS boolean
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    state JSONB;
+    next_state JSONB;
+BEGIN
+    SELECT metadata INTO state FROM public.threads
+     WHERE id=requested_owner FOR UPDATE;
+    IF NOT FOUND THEN
+        RETURN FALSE;
+    END IF;
+    next_state := jsonb_set(state, '{workspace_container}',
+        (state -> 'workspace_container') || jsonb_build_object(
+            'status', 'deleted', 'pod_ip', NULL::TEXT, 'pod_name', NULL::TEXT,
+            '_runtime_incarnation', requested_runtime));
+    IF public.stateless_terminal_reclaim_projection_is_authorized(
+        requested_owner, requested_runtime, state, next_state) IS NOT TRUE THEN
+        RETURN FALSE;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM public.managed_repository_workspace_cleanup_intents AS intent
+        WHERE owner_kind='thread' AND owner_id=requested_owner
+          AND scope='workspace_container' AND runtime_incarnation::TEXT=requested_runtime
+          AND intent_generation=requested_intent_generation AND result_kind='settled'
+          AND resource_policy='terminal_reclaim'
+          AND NOT EXISTS (SELECT 1 FROM public.managed_repository_workspace_cleanup_intents AS newer
+              WHERE newer.owner_kind='thread' AND newer.owner_id=requested_owner
+                AND newer.scope='workspace_container'
+                AND newer.intent_generation > intent.intent_generation)) THEN
+        RETURN FALSE;
+    END IF;
+    IF state IS DISTINCT FROM next_state THEN
+        UPDATE public.threads SET metadata=next_state, last_activity=now()
+         WHERE id=requested_owner;
+    END IF;
+    RETURN TRUE;
+END;
+$$;
+
+
+--
 -- Name: revoke_canvas_sessions_for_bff_session(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -12558,6 +12616,105 @@ BEGIN
     RETURN NEW;
 END;
 $$;
+
+
+--
+-- Name: stateless_terminal_reclaim_projection_is_authorized(uuid, text, jsonb, jsonb); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.stateless_terminal_reclaim_projection_is_authorized(requested_owner uuid, requested_runtime text, old_state jsonb, new_state jsonb) RETURNS boolean
+    LANGUAGE plpgsql
+    AS $_$
+DECLARE
+    owner_row RECORD;
+    queue_row RECORD;
+    intent RECORD;
+    marker JSONB;
+    workspace JSONB;
+    expected_state JSONB;
+BEGIN
+    SELECT * INTO owner_row FROM public.threads
+     WHERE id = requested_owner FOR UPDATE;
+    IF NOT FOUND OR owner_row.execution_lane <> 'stateless'
+       OR owner_row.status::TEXT <> 'ended'
+       OR owner_row.metadata IS DISTINCT FROM old_state THEN
+        RETURN FALSE;
+    END IF;
+    workspace := old_state -> 'workspace_container';
+    IF (jsonb_typeof(workspace) = 'object'
+        AND workspace ->> 'provisioner' = 'k8s'
+        AND workspace ->> 'status' IN ('deleted', 'released', 'retiring_process_zero')
+        AND requested_runtime ~ '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$'
+        AND (workspace ->> '_runtime_incarnation' IS NULL
+             OR workspace ->> '_runtime_incarnation' = requested_runtime)) IS NOT TRUE THEN
+        RETURN FALSE;
+    END IF;
+    expected_state := jsonb_set(old_state, '{workspace_container}',
+        workspace || jsonb_build_object('status', 'deleted', 'pod_ip', NULL::TEXT,
+            'pod_name', NULL::TEXT, '_runtime_incarnation', requested_runtime));
+    IF new_state IS DISTINCT FROM expected_state THEN
+        RETURN FALSE;
+    END IF;
+    IF old_state ? '_stateless_workspace_retirement_pending' THEN
+        IF old_state -> '_stateless_workspace_retirement_pending'
+               IS DISTINCT FROM 'true'::JSONB
+           OR old_state ? '_stateless_workspace_retirement_settled' THEN
+            RETURN FALSE;
+        END IF;
+        marker := old_state -> '_stateless_claim_retirement';
+    ELSE
+        IF old_state ? '_stateless_claim_retirement' THEN
+            RETURN FALSE;
+        END IF;
+        marker := old_state -> '_stateless_workspace_retirement_settled';
+        IF marker -> 'cleanup_complete' IS DISTINCT FROM 'true'::JSONB THEN
+            RETURN FALSE;
+        END IF;
+    END IF;
+    IF (jsonb_typeof(marker) = 'object'
+        AND marker -> 'permanent' = 'true'::JSONB
+        AND marker ->> 'runtime_incarnation' = requested_runtime
+        AND jsonb_typeof(marker -> 'terminal_token') = 'number'
+        AND marker ->> 'terminal_token' ~ '^[1-9][0-9]*$') IS NOT TRUE THEN
+        RETURN FALSE;
+    END IF;
+    SELECT * INTO queue_row FROM public.run_queue
+     WHERE unit_id = requested_owner FOR UPDATE;
+    IF NOT FOUND OR queue_row.unit_kind <> 'session_turn'
+       OR queue_row.state <> 'done' OR queue_row.leased_by IS NOT NULL
+       OR marker -> 'terminal_token' IS DISTINCT FROM to_jsonb(queue_row.lease_token) THEN
+        RETURN FALSE;
+    END IF;
+    SELECT * INTO intent
+      FROM public.managed_repository_workspace_cleanup_intents
+     WHERE owner_kind = 'thread' AND owner_id = requested_owner
+       AND scope = 'workspace_container'
+     ORDER BY intent_generation DESC LIMIT 1 FOR SHARE;
+    IF NOT FOUND OR (
+        intent.runtime_incarnation::TEXT = requested_runtime
+        AND intent.thread_runtime_generation = owner_row.runtime_generation
+        AND intent.terminal_queue_token = queue_row.lease_token
+        AND intent.resource_policy = 'terminal_reclaim'
+        AND intent.reclaim_shared_resources
+        AND intent.target_disposition = 'deleted'
+        AND intent.result_kind = 'settled'
+        AND intent.cleanup_completed_at IS NOT NULL
+        AND intent.settled_at IS NOT NULL
+        AND intent.capture_complete AND intent.resources_captured_at IS NOT NULL
+        AND intent.pod_uid = intent.runtime_incarnation) IS NOT TRUE THEN
+        RETURN FALSE;
+    END IF;
+    IF EXISTS (SELECT 1 FROM public.managed_repository_workspace_creation_reservations
+        WHERE owner_kind='thread' AND owner_id=requested_owner
+          AND scope='workspace_container' AND settled_at IS NULL) THEN
+        RETURN FALSE;
+    END IF;
+    RETURN EXISTS (SELECT 1 FROM public.managed_repository_process_zero_receipts
+        WHERE owner_kind='thread' AND owner_id=requested_owner
+          AND scope='workspace_container' AND provisioner='k8s'
+          AND runtime_incarnation=requested_runtime);
+END;
+$_$;
 
 
 --

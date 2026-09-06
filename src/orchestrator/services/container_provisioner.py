@@ -5720,6 +5720,16 @@ class ContainerProvisioner:
         if not isinstance(intent, dict):
             return _WORKSPACE_CLEANUP_RETRYABLE
         if intent.get("result_kind") == "settled":
+            if (
+                owner.kind == "session"
+                and intent.get("resource_policy") == "terminal_reclaim"
+            ):
+                if not await self._db.restore_settled_thread_workspace_cleanup_projection(
+                    owner.id,
+                    runtime_incarnation=expected_runtime_incarnation,
+                    intent_generation=int(intent["intent_generation"]),
+                ):
+                    return _WORKSPACE_CLEANUP_RETRYABLE
             return WorkspaceCleanupOutcome("settled", int(intent["intent_generation"]))
         if intent.get("result_kind") == "superseded":
             return WorkspaceCleanupOutcome(
@@ -8361,6 +8371,33 @@ class ContainerProvisioner:
                 expected_runtime_incarnation,
             )
             return False
+
+        # A lost Pod DELETE response can arrive while its durable cleanup is
+        # still pending. Settle that exact intent before changing the guarded
+        # projection; the legacy context merge cannot publish this authority.
+        get_intent = getattr(
+            type(self._db), "get_managed_repository_workspace_cleanup_intent", None
+        )
+        if expected_runtime_incarnation and callable(get_intent):
+            intent = await get_intent(
+                self._db,
+                owner.id,
+                owner_kind="thread" if owner.kind == "session" else "job",
+                scope="workspace_container",
+                runtime_incarnation=expected_runtime_incarnation,
+            )
+            if isinstance(intent, dict):
+                if (
+                    intent.get("target_disposition") != "deleted"
+                    or bool(intent.get("reclaim_shared_resources")) != reclaim_volume
+                ):
+                    return False
+                outcome = await self.reconcile_workspace_cleanup_intent(
+                    owner,
+                    expected_runtime_incarnation=expected_runtime_incarnation,
+                    intent_generation=int(intent["intent_generation"]),
+                )
+                return outcome.settled
 
         # Mirror delete_workspace's 404 branch: absence still needs to clear a
         # stale ready endpoint and close its metering interval.  This happens

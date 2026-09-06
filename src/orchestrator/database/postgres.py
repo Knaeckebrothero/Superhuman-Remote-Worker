@@ -17457,13 +17457,12 @@ class PostgresDB:
                         # terminal reclaim is different: the owner-delete
                         # trigger still needs that immutable UID to select and
                         # authenticate this exact settled cleanup intent.
-                        if (
-                            owner_kind == "thread"
-                            and target == "deleted"
-                            and str(intent.get("resource_policy") or "")
-                            != "terminal_reclaim"
-                        ):
-                            next_runtime[_STATELESS_RUNTIME_INCARNATION_KEY] = None
+                        if owner_kind == "thread" and target == "deleted":
+                            next_runtime[_STATELESS_RUNTIME_INCARNATION_KEY] = (
+                                expected_runtime
+                                if intent.get("resource_policy") == "terminal_reclaim"
+                                else None
+                            )
                     else:
                         next_runtime["code_server_url"] = None
                         next_runtime["stopped_at"] = datetime.now(
@@ -17496,6 +17495,26 @@ class PostgresDB:
                     if updated != "UPDATE 1":
                         raise RuntimeError("workspace cleanup projection was lost")
                 return True
+
+    async def restore_settled_thread_workspace_cleanup_projection(
+        self, thread_id: str, *, runtime_incarnation: str, intent_generation: int
+    ) -> bool:
+        """Replay a settled terminal receipt without changing its authority.
+
+        The database locks owner -> queue -> intent and permits only the exact
+        terminal projection. This also repairs the old soft-End null-UID shape;
+        it never reactivates a runtime or alters a settled cleanup receipt.
+        """
+        async with self.acquire() as conn:
+            return bool(
+                await conn.fetchval(
+                    "SELECT restore_settled_thread_workspace_cleanup_projection("
+                    "$1::uuid, $2::text, $3::bigint)",
+                    UUID(str(thread_id)),
+                    runtime_incarnation,
+                    intent_generation,
+                )
+            )
 
     async def supersede_managed_repository_workspace_cleanup_intent(
         self,
