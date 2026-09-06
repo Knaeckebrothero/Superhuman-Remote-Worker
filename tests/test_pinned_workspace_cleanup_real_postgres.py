@@ -394,3 +394,38 @@ async def test_pinned_workspace_replays_lost_responses(db, monkeypatch, fault):
         authority._json(current["metadata"])["workspace_container"]["status"]
         == "deleted"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replaced_during_snapshot", [False, True])
+async def test_pinned_snapshot_pins_host_key_and_rechecks_pod_before_delete(
+    db, monkeypatch, replaced_during_snapshot
+):
+    ids, owner, p, resources, effects = await _scenario(db, monkeypatch)
+    retirement = await _begin(db, ids, False)
+    fingerprint = retirement["context"]["workspace_binding"]["ssh_host_key_fingerprint"]
+
+    async def capture(**kwargs):
+        assert kwargs["ssh_host"] == "10.0.0.8"
+        assert kwargs["expected_host_key_fingerprint"] == fingerprint
+        assert not effects
+        if replaced_during_snapshot:
+            resources["pod"].metadata.uid = str(uuid4())
+        return True
+
+    p._snapshot_service = NS(
+        is_available=True, capture_vm_snapshot=AsyncMock(side_effect=capture)
+    )
+    if replaced_during_snapshot:
+        with pytest.raises(RuntimeError, match="workspace cleanup is retryable"):
+            await main._cleanup_pinned_thread_retirement(
+                retirement, cleanup_agent_pod=False
+            )
+        assert not effects
+        assert set(resources) == {"pod", "pvc", "service"}
+    else:
+        await main._cleanup_pinned_thread_retirement(
+            retirement, cleanup_agent_pod=False
+        )
+        assert set(resources) == {"pvc"}
+    p._snapshot_service.capture_vm_snapshot.assert_awaited_once()
