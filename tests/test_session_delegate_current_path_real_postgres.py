@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 import socket
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
@@ -23,7 +23,7 @@ from testcontainers.postgres import PostgresContainer
 from agent.api.orchestrator_client import OrchestratorClient
 from agent.core.thread_messages import _serialize_message_row
 from agent.database.postgres_db import PostgresDB as AgentDB
-from agent.persistent_graph import _execute_turn
+from agent.persistent_graph import PermissionOutcome, _execute_turn
 from agent.subagents import SessionHost, SubagentRuntime
 from agent.subagents.session_persistence import SessionSubagentLedger
 from agent.tools.delegation.delegate_agent import create_delegate_agent_tools
@@ -286,7 +286,7 @@ def _runtime(parent, tmp_path, *, cap):
     return ctx, runtime, ledger, tool, models, exact_authority
 
 
-async def _run(parent, tmp_path, *, cap, count):
+async def _run(parent, tmp_path, *, cap, count, batch_sizes=None, permissions=None):
     ctx, runtime, ledger, tool, models, exact_authority = _runtime(
         parent, tmp_path, cap=cap
     )
@@ -308,8 +308,23 @@ async def _run(parent, tmp_path, *, cap, count):
         }
         for index in range(count)
     ]
-    assistant = AIMessage(content="", id=str(uuid4()), tool_calls=calls)
-    llm = FakeChatModel([[assistant], text_turn("parent done")])
+    if batch_sizes is None:
+        batch_sizes = [count]
+    assert sum(batch_sizes) == count
+    responses = []
+    offset = 0
+    for size in batch_sizes:
+        responses.append(
+            [
+                AIMessage(
+                    content="",
+                    id=str(uuid4()),
+                    tool_calls=calls[offset : offset + size],
+                )
+            ]
+        )
+        offset += size
+    llm = FakeChatModel([*responses, text_turn("parent done")])
     persisted = []
 
     async def persist(message):
@@ -326,6 +341,8 @@ async def _run(parent, tmp_path, *, cap, count):
         before_provider_admission=lambda: True,
         before_provider_execution=exact_authority,
     )
+    if permissions is not None:
+        callbacks.permission_check = AsyncMock(side_effect=permissions)
     messages = [
         SystemMessage(content="Delegate the requested independent tasks."),
         human,
@@ -356,9 +373,82 @@ async def _run(parent, tmp_path, *, cap, count):
             persisted=persisted,
             calls=calls,
             callbacks=callbacks,
+            parent_model=llm,
         )
     finally:
         await runtime.close()
+
+
+@pytest.mark.parametrize("cap", [1, 2])
+async def test_successive_single_delegate_batches_complete_in_one_parent_turn(
+    parent, tmp_path, cap
+):
+    run = await _run(parent, tmp_path, cap=cap, count=2, batch_sizes=[1, 1])
+    outputs = [message for message in run.messages if isinstance(message, ToolMessage)]
+    assert [message.tool_call_id for message in outputs] == ["call-0", "call-1"]
+    assert all("child evidence" in message.content for message in outputs)
+    assert all(not message.content.startswith("Error:") for message in outputs)
+    assert run.result.error is None
+    assert run.result.tool_calls_made == 2
+    assert len(run.parent_model.calls) == 3
+    assert len(run.models) == 2
+    assert all(len(model.calls) == 1 for model in run.models)
+    children = await _children(parent)
+    assert [row["parent_tool_call_id"] for row in children] == ["call-0", "call-1"]
+    assert all(row["subagent_status"] == "completed" for row in children)
+    assert all(row["status"] == "ended" for row in children)
+    async with parent.db.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT role, tool_calls, tool_call_id, turn_number FROM thread_messages "
+            "WHERE thread_id=$1 ORDER BY seq",
+            UUID(parent.thread_id),
+        )
+    assistant_batches = [
+        [call["id"] for call in json.loads(row["tool_calls"])]
+        for row in rows
+        if row["role"] == "ai" and row["tool_calls"]
+    ]
+    assert assistant_batches == [["call-0"], ["call-1"]]
+    assert [row["tool_call_id"] for row in rows if row["role"] == "tool"] == [
+        "call-0",
+        "call-1",
+    ]
+    assert {row["turn_number"] for row in rows} == {1}
+
+
+@pytest.mark.parametrize("approved_index", [0, 1])
+async def test_partly_approved_batch_runs_only_approved_child_in_provider_order(
+    parent, tmp_path, approved_index
+):
+    permissions = [PermissionOutcome.DECLINED, PermissionOutcome.DECLINED]
+    permissions[approved_index] = PermissionOutcome.APPROVED
+    run = await _run(parent, tmp_path, cap=2, count=2, permissions=permissions)
+    outputs = [message for message in run.messages if isinstance(message, ToolMessage)]
+    assert [message.tool_call_id for message in outputs] == ["call-0", "call-1"]
+    assert "child evidence" in outputs[approved_index].content
+    assert not outputs[approved_index].content.startswith("Error:")
+    assert outputs[1 - approved_index].content == "User declined this tool call."
+    assert run.result.error is None
+    assert run.result.tool_calls_made == 1
+    assert run.runtime.batch_size == 1
+    assert len(run.models) == 1
+    assert len(run.models[0].calls) == 1
+    assert run.callbacks.permission_check.await_count == 2
+    children = await _children(parent)
+    assert len(children) == 1
+    assert children[0]["parent_tool_call_id"] == f"call-{approved_index}"
+    assert children[0]["subagent_status"] == "completed"
+    assert children[0]["status"] == "ended"
+    async with parent.db.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT tool_call_id, content, turn_number FROM thread_messages "
+            "WHERE thread_id=$1 AND role='tool' ORDER BY seq",
+            UUID(parent.thread_id),
+        )
+    assert [(row["tool_call_id"], row["content"]) for row in rows] == [
+        (message.tool_call_id, message.content) for message in outputs
+    ]
+    assert {row["turn_number"] for row in rows} == {1}
 
 
 @pytest.mark.parametrize("cap", [2, 1])

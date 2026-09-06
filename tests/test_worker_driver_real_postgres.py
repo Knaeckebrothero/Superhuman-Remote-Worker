@@ -6,9 +6,10 @@ claim, the saver ``FOR SHARE`` exclusion against a steal, or transaction-wide
 rollback of stale checkpoint/blob/write mutations.
 
 Gate: ``RUN_QUEUE_TEST_DSN`` must point at a disposable database whose name
-contains ``test``.  The module drops and recreates its scratch tables.  It is
-therefore skipped in normal unit-test runs and refuses the live application
-database, following :mod:`tests.test_run_queue`'s safety contract.
+contains ``test`` and must be empty or already use the application migrations.
+The module migrates it and truncates its scratch rows. It is skipped in normal
+unit-test runs and refuses a database without the explicit test name, following
+:mod:`tests.test_run_queue`'s safety contract.
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ from psycopg import OperationalError
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
+from orchestrator.database.migrate import run_migrations
 from orchestrator.database.postgres import PostgresDB
 from agent.api.lease_context import LeaseHandle, LeaseLostError, current_lease
 from agent.core.fenced_checkpointer import FencedAsyncPostgresSaver
@@ -68,15 +70,6 @@ _MIGRATIONS_DIR = (
     / "migrations"
     / "app"
 )
-_QUEUE_MIGRATIONS = (
-    _MIGRATIONS_DIR / "0115a_run_queue.sql",
-    _MIGRATIONS_DIR / "0117_run_queue_affinity.sql",
-)
-_JOB_MIGRATIONS = (
-    _MIGRATIONS_DIR / "0054_jobs_execution_lease.sql",
-    _MIGRATIONS_DIR / "0118_jobs_execution_lane.sql",
-)
-
 _CLAIM_RACE_ROUNDS = 32
 _ROTATION_ROUNDS = 25
 _EXACT_DEPENDENCIES = {
@@ -99,77 +92,23 @@ def _assert_scratch_dsn() -> None:
 
 
 async def _apply_schema() -> None:
-    conn = await asyncpg.connect(DSN, timeout=10)
-    try:
-        await conn.execute("DROP TABLE IF EXISTS checkpoint_writes CASCADE")
-        await conn.execute("DROP TABLE IF EXISTS checkpoint_blobs CASCADE")
-        await conn.execute("DROP TABLE IF EXISTS checkpoints CASCADE")
-        await conn.execute("DROP TABLE IF EXISTS checkpoint_migrations CASCADE")
-        await conn.execute("DROP TABLE IF EXISTS retry_probe CASCADE")
-        await conn.execute("DROP TABLE IF EXISTS run_queue CASCADE")
-        await conn.execute("DROP TABLE IF EXISTS docker_workspace_leases CASCADE")
-        await conn.execute("DROP TABLE IF EXISTS jobs CASCADE")
-        await conn.execute("DROP TABLE IF EXISTS threads CASCADE")
-        await conn.execute('CREATE EXTENSION IF NOT EXISTS "uuid-ossp"')
-        await conn.execute("CREATE TABLE threads (id UUID PRIMARY KEY)")
-        await conn.execute(
-            """
-            CREATE TABLE jobs (
-                id UUID PRIMARY KEY,
-                parent_job_id UUID,
-                status TEXT NOT NULL DEFAULT 'created',
-                priority INTEGER NOT NULL DEFAULT 0,
-                user_id UUID,
-                assigned_agent_id UUID,
-                error_message TEXT,
-                error_details JSONB,
-                freeze_data JSONB,
-                context JSONB NOT NULL DEFAULT '{}'::jsonb,
-                config_override JSONB NOT NULL DEFAULT '{}'::jsonb,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    # Claim/rotation/deletion compose current input, completion and child SQL.
+    # A hand-maintained subset drifted from 0191 and the current delete path;
+    # exercise their real schema and guards rather than stubbing more tables.
+    async with asyncpg.create_pool(DSN, min_size=1, max_size=2) as pool:
+        await run_migrations(pool, _MIGRATIONS_DIR)
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS retry_probe (
+                    unit_id UUID NOT NULL,
+                    attempt INTEGER NOT NULL,
+                    PRIMARY KEY (unit_id, attempt)
+                )
+                """
             )
-            """
-        )
-        await conn.execute(
-            """
-            CREATE TABLE docker_workspace_leases (
-                owner_kind TEXT,
-                owner_id UUID,
-                status TEXT,
-                quarantine_reason TEXT,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            )
-            """
-        )
-        for migration in (*_QUEUE_MIGRATIONS, *_JOB_MIGRATIONS):
-            await conn.execute(migration.read_text())
 
-        # These columns are added by the complete 0119/0127 migrations.  The
-        # worker tests need their production queue shape, but not those
-        # migrations' session-only inbox tables and foreign-key prerequisites.
-        await conn.execute(
-            """
-            ALTER TABLE run_queue
-                ADD COLUMN control_input_seq BIGINT NOT NULL DEFAULT 0,
-                ADD COLUMN control_consumed_seq BIGINT NOT NULL DEFAULT 0,
-                ADD COLUMN interrupt_admission_lease_token BIGINT,
-                ADD COLUMN interrupt_admission_turn_id INTEGER
-            """
-        )
-        await conn.execute(
-            """
-            CREATE TABLE retry_probe (
-                unit_id UUID NOT NULL,
-                attempt INTEGER NOT NULL,
-                PRIMARY KEY (unit_id, attempt)
-            )
-            """
-        )
-    finally:
-        await conn.close()
-
-    # Apply the exact upstream checkpointer schema once.  Its setup path is
+    # Apply the exact upstream checkpointer schema once. Its setup path is
     # intentionally unfenced; only mutation hot paths require a worker lease.
     async with AsyncPostgresSaver.from_conn_string(DSN) as saver:
         await saver.setup()
@@ -238,8 +177,8 @@ async def _lease(unit_id: UUID, lease_token: int):
 async def _insert_stateless_job(conn: asyncpg.Connection, job_id: UUID) -> None:
     await conn.execute(
         """
-        INSERT INTO jobs (id, status, execution_lane)
-        VALUES ($1, 'created', 'stateless')
+        INSERT INTO jobs (id, description, status, execution_lane)
+        VALUES ($1, 'Worker fence test', 'created', 'stateless')
         """,
         job_id,
     )
@@ -774,16 +713,16 @@ async def test_stale_stateless_critic_hard_fences_and_prunes_before_parent_unsti
     critic_id = uuid4()
     async with pg.acquire() as conn:
         await conn.execute(
-            "INSERT INTO jobs (id, status, execution_lane) "
-            "VALUES ($1, 'failed', 'pinned')",
+            "INSERT INTO jobs (id, description, status, execution_lane) "
+            "VALUES ($1, 'Critic parent fence test', 'failed', 'pinned')",
             parent_id,
         )
         await conn.execute(
             """
             INSERT INTO jobs (
-                id, parent_job_id, status, execution_lane, context
+                id, description, parent_job_id, status, execution_lane, context
             )
-            VALUES ($1, $2, 'paused', 'stateless', $3::jsonb)
+            VALUES ($1, 'Critic fence test', $2, 'paused', 'stateless', $3::jsonb)
             """,
             critic_id,
             parent_id,
