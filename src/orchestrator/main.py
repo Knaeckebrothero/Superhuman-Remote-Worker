@@ -19619,29 +19619,20 @@ async def delete_job(request: Request, job_id: str) -> dict[str, Any]:
                         status_code=503,
                         detail="Repository credential revocation is retryable",
                     )
-        # Clean up vector DB tables (no FK cascade across databases)
+        # Fence delayed vector writers and prune this job's scope atomically.
+        # The destination tombstone survives the application row, so a late
+        # extraction cannot recreate orphaned memories after DELETE succeeds.
         try:
             async with vector_db.acquire() as conn:
                 await conn.execute(
-                    "DELETE FROM memories WHERE job_id = $1", UUID(job_id)
-                )
-                await conn.execute(
-                    "DELETE FROM citations WHERE job_id = $1", UUID(job_id)
-                )
-                await conn.execute(
-                    "DELETE FROM source_annotations WHERE job_id = $1", UUID(job_id)
-                )
-                await conn.execute(
-                    "DELETE FROM source_tags WHERE job_id = $1", UUID(job_id)
-                )
-                await conn.execute(
-                    "DELETE FROM source_embeddings WHERE job_id = $1", UUID(job_id)
-                )
-                await conn.execute(
-                    "DELETE FROM job_sources WHERE job_id = $1", UUID(job_id)
+                    "SELECT retire_job_vector_scope($1::uuid)", UUID(job_id)
                 )
         except Exception as e:
-            logger.warning(f"Failed to clean up vector DB tables for job {job_id}: {e}")
+            logger.warning("Vector retirement is incomplete for job %s: %s", job_id, e)
+            raise HTTPException(
+                status_code=503,
+                detail="Job vector cleanup is incomplete; retry deletion",
+            ) from e
 
         if job.get("execution_lane") == "stateless":
             delete_result = await postgres_db.delete_job(

@@ -741,6 +741,80 @@ $_$;
 
 
 --
+-- Name: protect_job_vector_scope_retirement(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_job_vector_scope_retirement() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'Vector scope fences cannot be removed'
+            USING ERRCODE='23514', CONSTRAINT='job_vector_scope_retirement_immutable';
+    END IF;
+    IF NEW.job_id IS DISTINCT FROM OLD.job_id
+       OR (OLD.retired_at IS NOT NULL AND NEW.retired_at IS DISTINCT FROM OLD.retired_at) THEN
+        RAISE EXCEPTION 'Vector scope retirement cannot be changed'
+            USING ERRCODE='23514', CONSTRAINT='job_vector_scope_retirement_immutable';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: require_active_job_vector_scope(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.require_active_job_vector_scope() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    retired TIMESTAMPTZ;
+BEGIN
+    INSERT INTO public.job_vector_scopes (job_id) VALUES (NEW.job_id)
+        ON CONFLICT (job_id) DO NOTHING;
+    -- FOR SHARE conflicts with the retirement's non-key UPDATE. Hold it until
+    -- the producer transaction commits, including any retrieval-message rows.
+    SELECT retired_at INTO retired FROM public.job_vector_scopes
+     WHERE job_id=NEW.job_id FOR SHARE;
+    IF retired IS NOT NULL THEN
+        RAISE EXCEPTION 'The job vector scope is permanently retired'
+            USING ERRCODE='23514', CONSTRAINT='job_vector_scope_retired';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: retire_job_vector_scope(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.retire_job_vector_scope(requested_job uuid) RETURNS void
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    INSERT INTO public.job_vector_scopes (job_id) VALUES (requested_job)
+        ON CONFLICT (job_id) DO NOTHING;
+    PERFORM 1 FROM public.job_vector_scopes WHERE job_id=requested_job FOR UPDATE;
+    UPDATE public.job_vector_scopes SET retired_at=clock_timestamp()
+     WHERE job_id=requested_job AND retired_at IS NULL;
+
+    -- One vector transaction commits the fence and the whole existing API
+    -- cleanup set. Retrieval messages cascade. Shared sources, project/session
+    -- memories, knowledge and audit retention remain outside this job scope.
+    DELETE FROM public.memories WHERE job_id=requested_job;
+    DELETE FROM public.citations WHERE job_id=requested_job;
+    DELETE FROM public.source_annotations WHERE job_id=requested_job;
+    DELETE FROM public.source_tags WHERE job_id=requested_job;
+    DELETE FROM public.source_embeddings WHERE job_id=requested_job;
+    DELETE FROM public.job_sources WHERE job_id=requested_job;
+END;
+$$;
+
+
+--
 -- Name: citations; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -794,6 +868,23 @@ CREATE TABLE public.job_sources (
     source_id integer NOT NULL,
     added_at timestamp with time zone DEFAULT now() NOT NULL
 );
+
+
+--
+-- Name: job_vector_scopes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.job_vector_scopes (
+    job_id uuid NOT NULL,
+    retired_at timestamp with time zone
+);
+
+
+--
+-- Name: TABLE job_vector_scopes; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.job_vector_scopes IS 'Destination write fence for the existing job_id scope. Session UUIDs also use this column and remain active: only permanent job deletion retires a scope. No cross-database FK or expiry; late writers must see the tombstone.';
 
 
 --
@@ -1169,6 +1260,14 @@ ALTER TABLE ONLY public.citations
 
 ALTER TABLE ONLY public.job_sources
     ADD CONSTRAINT job_sources_pkey PRIMARY KEY (job_id, source_id);
+
+
+--
+-- Name: job_vector_scopes job_vector_scopes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.job_vector_scopes
+    ADD CONSTRAINT job_vector_scopes_pkey PRIMARY KEY (job_id);
 
 
 --
@@ -1720,6 +1819,55 @@ CREATE INDEX schema_migrations_dirty_idx ON public.schema_migrations USING btree
 --
 
 CREATE UNIQUE INDEX uq_knowledge_kb_path ON public.knowledge_index USING btree (kb_id, path) WHERE ((kb_id IS NOT NULL) AND (path IS NOT NULL));
+
+
+--
+-- Name: source_annotations annotations_job_scope; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER annotations_job_scope BEFORE INSERT OR UPDATE OF job_id ON public.source_annotations FOR EACH ROW EXECUTE FUNCTION public.require_active_job_vector_scope();
+
+
+--
+-- Name: citations citations_job_scope; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER citations_job_scope BEFORE INSERT OR UPDATE OF job_id ON public.citations FOR EACH ROW EXECUTE FUNCTION public.require_active_job_vector_scope();
+
+
+--
+-- Name: source_embeddings embeddings_job_scope; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER embeddings_job_scope BEFORE INSERT OR UPDATE OF job_id ON public.source_embeddings FOR EACH ROW EXECUTE FUNCTION public.require_active_job_vector_scope();
+
+
+--
+-- Name: job_vector_scopes job_vector_scope_retirement_immutable; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER job_vector_scope_retirement_immutable BEFORE DELETE OR UPDATE ON public.job_vector_scopes FOR EACH ROW EXECUTE FUNCTION public.protect_job_vector_scope_retirement();
+
+
+--
+-- Name: memories memories_job_scope; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER memories_job_scope BEFORE INSERT OR UPDATE OF job_id ON public.memories FOR EACH ROW EXECUTE FUNCTION public.require_active_job_vector_scope();
+
+
+--
+-- Name: job_sources sources_job_scope; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER sources_job_scope BEFORE INSERT OR UPDATE OF job_id ON public.job_sources FOR EACH ROW EXECUTE FUNCTION public.require_active_job_vector_scope();
+
+
+--
+-- Name: source_tags tags_job_scope; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER tags_job_scope BEFORE INSERT OR UPDATE OF job_id ON public.source_tags FOR EACH ROW EXECUTE FUNCTION public.require_active_job_vector_scope();
 
 
 --
