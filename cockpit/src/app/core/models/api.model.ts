@@ -2029,7 +2029,8 @@ export interface Job {
   description: string;
   document_path?: string;
   config_name: string;
-  config_override?: Record<string, unknown>;
+  /** JSONB can arrive as JSON text; normalize before reading its fields. */
+  config_override?: Record<string, unknown> | string | null;
   assigned_agent_id?: string | null;
   user_id?: string | null;
   project_id?: string | null;

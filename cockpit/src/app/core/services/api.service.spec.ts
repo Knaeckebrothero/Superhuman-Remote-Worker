@@ -11,7 +11,7 @@ import {ApiService, SESSION_TOOL_GROUPS_TIMEOUT_MS} from './api.service';
 import {AppToastService} from '../../ui/toast';
 import {ErrorMessageService} from './error-message.service';
 import type {ThreadUploadedFile, ThreadUploadEvent} from '../models/file.model';
-import type {JobCreateRequest} from '../models/api.model';
+import type {Job, JobCreateRequest} from '../models/api.model';
 
 describe('ApiService.createJob public wire contract', () => {
   let api: ApiService;
@@ -31,7 +31,11 @@ describe('ApiService.createJob public wire contract', () => {
 
   afterEach(() => httpMock.verify());
 
-  it('posts modern selection fields once and preserves the serialized row response', async () => {
+  it.each([
+    {representation: 'object', override: {llm: {model: 'gpt-5-mini'}}},
+    {representation: 'JSON text', override: '{"llm":{"model":"gpt-5-mini"}}'},
+    {representation: 'null', override: null},
+  ])('posts modern selection fields once and preserves $representation overrides', async ({override}) => {
     const body: JobCreateRequest = {
       description: 'Create a report', expert: 'developer',
       required_deliverables: ['output/report.txt'], use_datasource_defaults: true,
@@ -41,9 +45,10 @@ describe('ApiService.createJob public wire contract', () => {
     expect(request.request.method).toBe('POST');
     expect(request.request.body).toEqual(body);
     expect(request.request.body).not.toHaveProperty('datasource_ids');
-    const response = {
+    const response: Job & {existing_extension: {nullable: null}} = {
       id: 'job-1', description: body.description, config_name: 'developer', status: 'created',
-      created_at: '2026-09-06T08:00:00Z', assigned_agent_id: null, existing_extension: {nullable: null},
+      created_at: '2026-09-06T08:00:00Z', assigned_agent_id: null,
+      config_override: override, existing_extension: {nullable: null},
     };
     request.flush(response);
     await expect(pending).resolves.toEqual(response);
