@@ -12,4 +12,3 @@
 -- already-applied migrations are grandfathered, NEW ones are not. Any future
 -- migration that creates a function with an hnsw.* SET clause needs this too.
 DO $load_pgvector$ BEGIN PERFORM '[1]'::vector; END $load_pgvector$;
-
