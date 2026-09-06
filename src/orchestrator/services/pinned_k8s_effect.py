@@ -100,6 +100,114 @@ def finalizer_release_patch(
     ]
 
 
+def pod_containers_are_terminal(pod: Any) -> bool:
+    """Require terminated regular, init and ephemeral containers in one read.
+
+    When the API supplies a spec, every declared container must have a terminal
+    status. Missing status is not evidence that a container cannot run.
+    """
+
+    status = getattr(pod, "status", None)
+    spec = getattr(pod, "spec", None)
+    for spec_field, status_field in (
+        ("containers", "container_statuses"),
+        ("init_containers", "init_container_statuses"),
+        ("ephemeral_containers", "ephemeral_container_statuses"),
+    ):
+        statuses = getattr(status, status_field, None) or []
+        if spec_field == "containers" and not statuses:
+            return False
+        if not all(
+            getattr(getattr(item, "state", None), "terminated", None) is not None
+            for item in statuses
+        ):
+            return False
+        declared = {str(item.name) for item in getattr(spec, spec_field, None) or []}
+        observed = {str(getattr(item, "name", "")) for item in statuses}
+        if not declared.issubset(observed):
+            return False
+    return True
+
+
+async def retire_terminal_claimant_pod(
+    core_api: Any,
+    *,
+    pod_name: str,
+    pod_uid: str,
+    namespace: str,
+    expected_labels: dict[str, str],
+    pvc_name: str,
+    known_successor_uids: frozenset[str] = frozenset(),
+) -> bool:
+    """Retire one historically authorized, terminal PVC claimant.
+
+    This is not process-zero recovery for an active actor. The caller must
+    possess immutable settlement/handoff proof and current retirement authority.
+    A UID/RV patch binds all finalizer preconditions to the same fresh Pod read.
+    """
+
+    async def read():
+        return await run_bounded_k8s_call(
+            core_api.read_namespaced_pod, name=pod_name, namespace=namespace
+        )
+
+    def exact(pod):
+        metadata = getattr(pod, "metadata", None)
+        labels = dict(getattr(metadata, "labels", None) or {})
+        volumes = getattr(getattr(pod, "spec", None), "volumes", None) or []
+        return (
+            str(getattr(metadata, "uid", "")) == pod_uid
+            and all(labels.get(key) == value for key, value in expected_labels.items())
+            and any(
+                getattr(
+                    getattr(volume, "persistent_volume_claim", None), "claim_name", None
+                )
+                == pvc_name
+                for volume in volumes
+            )
+            and pod_containers_are_terminal(pod)
+        )
+
+    try:
+        pod = await read()
+        observed_uid = str(getattr(getattr(pod, "metadata", None), "uid", ""))
+        if observed_uid != pod_uid:
+            # Same-name recycling may already have installed a durably
+            # published successor. Never mutate it or accept an unknown UID.
+            return observed_uid in known_successor_uids
+        if not exact(pod):
+            return False
+        if not getattr(pod.metadata, "deletion_timestamp", None):
+            await run_bounded_k8s_mutation(
+                core_api.delete_namespaced_pod,
+                name=pod_name,
+                namespace=namespace,
+                body={"preconditions": {"uid": pod_uid}},
+            )
+            pod = await read()
+        if not exact(pod) or not getattr(pod.metadata, "deletion_timestamp", None):
+            return False
+        resource_version = str(getattr(pod.metadata, "resource_version", "") or "")
+        if not resource_version:
+            return False
+        patch = finalizer_release_patch(
+            uid=pod_uid,
+            resource_version=resource_version,
+            finalizers=list(getattr(pod.metadata, "finalizers", None) or []),
+        )
+        if patch is not None:
+            await run_bounded_k8s_mutation(
+                core_api.patch_namespaced_pod,
+                name=pod_name,
+                namespace=namespace,
+                body=patch,
+            )
+        await read()
+        return False  # Kubernetes has not yet confirmed physical removal.
+    except Exception as exc:
+        return getattr(exc, "status", None) == 404
+
+
 def legacy_pinned_namespace_candidates(current_namespace: str) -> tuple[str, ...]:
     """Return the bounded, server-owned search space for 0185 adoption.
 

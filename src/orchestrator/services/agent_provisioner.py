@@ -40,9 +40,11 @@ from orchestrator.services.pinned_k8s_effect import (
     finalizer_release_patch,
     legacy_pinned_namespace_candidates,
     observe_planned_pinned_pod_authority,
+    pod_containers_are_terminal,
     protect_planned_pinned_pod_authority,
     protect_legacy_pinned_agent_authority as protect_legacy_pinned_objects,
     release_planned_pinned_pod_authority,
+    retire_terminal_claimant_pod,
     run_bounded_k8s_call,
     run_bounded_k8s_mutation,
 )
@@ -1585,15 +1587,8 @@ class AgentProvisioner:
         ]
         if uid != str(expected_pod_uid) or not resource_version:
             return False
-        if terminal_required:
-            statuses = (
-                getattr(getattr(pod, "status", None), "container_statuses", None) or []
-            )
-            if not statuses or not all(
-                getattr(getattr(status, "state", None), "terminated", None) is not None
-                for status in statuses
-            ):
-                return False
+        if terminal_required and not pod_containers_are_terminal(pod):
+            return False
         patch = finalizer_release_patch(
             uid=uid, resource_version=resource_version, finalizers=finalizers
         )
@@ -1609,6 +1604,13 @@ class AgentProvisioner:
             return True
         except Exception as exc:
             return getattr(exc, "status", None) == 404
+
+    async def retire_historical_claimant_pod_exact(self, **identity: Any) -> bool:
+        """Release an exact terminal Pod under historical settlement authority."""
+
+        if not self._k8s_available:
+            return False
+        return await retire_terminal_claimant_pod(self._core_api, **identity)
 
     async def _archive_pod_logs(self, pod_name: str) -> None:
         """Refuse name-addressed log reads during an exact-UID teardown.

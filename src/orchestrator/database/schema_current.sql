@@ -78,6 +78,172 @@ CREATE TYPE public.sudo_request_status AS ENUM (
 
 
 --
+-- Name: acknowledge_settled_virtual_actor_exit(uuid, uuid, uuid, uuid, uuid, text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.acknowledge_settled_virtual_actor_exit(owner_id uuid, generation_id uuid, retirement_id uuid, actor_id uuid, attach_id uuid, stopped_pod_uid text) RETURNS jsonb
+    LANGUAGE plpgsql
+    AS $_$
+DECLARE
+    owner_row public.threads%ROWTYPE;
+    actor_row public.agents%ROWTYPE;
+    context jsonb;
+    marker jsonb;
+    binding jsonb;
+    receipt jsonb;
+    input_count bigint;
+    input_digest text;
+BEGIN
+    SELECT * INTO owner_row FROM public.threads
+     WHERE id = owner_id FOR UPDATE;
+    IF NOT FOUND OR owner_row.kind IS DISTINCT FROM 'session'
+       OR owner_row.execution_lane IS DISTINCT FROM 'pinned'
+       OR owner_row.runtime_generation IS DISTINCT FROM generation_id
+       OR owner_row.runtime_retirement_token IS DISTINCT FROM retirement_id
+       OR owner_row.runtime_retirement_authorized_at IS NULL
+       OR owner_row.agent_id IS DISTINCT FROM actor_id
+       OR owner_row.runtime_attach_token IS DISTINCT FROM attach_id
+       OR (owner_row.control_admission_agent_id IS NOT NULL
+           AND owner_row.control_admission_agent_id IS DISTINCT FROM actor_id)
+       OR owner_row.runtime_authority_exposed IS DISTINCT FROM true
+       OR actor_id IS NULL OR attach_id IS NULL
+       OR NULLIF(stopped_pod_uid, '') IS NULL THEN
+        RETURN NULL;
+    END IF;
+    context := owner_row.runtime_retirement_context;
+    marker := context->'agent_pod';
+    binding := context->'workspace_binding';
+    IF context->>'generation' IS DISTINCT FROM generation_id::text
+       OR context->>'agent_id' IS DISTINCT FROM actor_id::text
+       OR context->>'runtime_attach_token' IS DISTINCT FROM attach_id::text
+       OR context->>'workspace_backend' IS DISTINCT FROM 'virtual'
+       OR context->>'settle_status' IS DISTINCT FROM 'ended'
+       OR jsonb_typeof(binding) IS DISTINCT FROM 'object'
+       OR binding->>'kind' IS DISTINCT FROM 'virtual'
+       OR COALESCE(binding->>'backing_id', '') !~ '^rclone:[0-9a-f]{64}$'
+       OR COALESCE(binding->>'generation', '') !~
+          '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+       OR binding->'ssh_host_key_fingerprint' IS DISTINCT FROM 'null'::jsonb
+       OR binding - ARRAY['generation','kind','backing_id','ssh_host_key_fingerprint']
+          IS DISTINCT FROM '{}'::jsonb
+       OR owner_row.metadata->'_workspace_binding' IS DISTINCT FROM binding
+       OR owner_row.metadata->'agent_pod' IS DISTINCT FROM marker
+       OR COALESCE(owner_row.metadata->'protected_cloud', 'false'::jsonb)
+          IS DISTINCT FROM 'false'::jsonb
+       OR EXISTS (
+           SELECT 1 FROM unnest(ARRAY[
+               'workspace_container','vm','workspace_provision_intent',
+               'agent_workspace_claim','agent_pod_provision_intent','protected_ro'
+           ]) AS field
+           WHERE COALESCE(context->field, 'null'::jsonb)
+                 NOT IN ('null'::jsonb, '{}'::jsonb)
+       )
+       OR marker->>'pod_uid' IS DISTINCT FROM stopped_pod_uid
+       OR marker->>'protection_protocol' IS DISTINCT FROM 'finalizer_v1'
+       OR NULLIF(marker->>'namespace', '') IS NULL
+       OR NULLIF(marker->>'pod_name', '') IS NULL
+       OR context->'agent'->>'hostname' IS DISTINCT FROM marker->>'pod_name'
+       OR context->'agent'->>'pod_uid' IS DISTINCT FROM stopped_pod_uid
+       OR NOT EXISTS (
+           SELECT 1 FROM public.thread_agent_pod_provision_intents intent
+            WHERE intent.thread_id = owner_id
+              AND intent.runtime_generation = generation_id
+              AND intent.attempt_id::text = marker->>'provision_attempt'
+              AND intent.pod_name = marker->>'pod_name'
+              AND intent.pod_uid = stopped_pod_uid
+              AND intent.namespace = marker->>'namespace'
+              AND intent.protection_protocol = 'finalizer_v1'
+              AND intent.status = 'published'
+              AND intent.workspace_claim_id IS NULL
+       ) THEN
+        RETURN NULL;
+    END IF;
+    SELECT * INTO actor_row FROM public.agents
+     WHERE id = actor_id FOR SHARE;
+    IF NOT FOUND OR actor_row.thread_id IS DISTINCT FROM owner_id
+       OR actor_row.pod_uid IS DISTINCT FROM stopped_pod_uid
+       OR actor_row.hostname IS DISTINCT FROM marker->>'pod_name'
+       OR actor_row.current_job_id IS NOT NULL
+       OR EXISTS (SELECT 1 FROM public.agents other
+                   WHERE other.id <> actor_id
+                     AND (other.thread_id = owner_id OR other.pod_uid = stopped_pod_uid))
+    THEN
+        RETURN NULL;
+    END IF;
+
+    -- All supported input/child/control admission locks the owner first and
+    -- rejects its retirement token. These reads run after that durable fence,
+    -- not before a still-open producer can commit an admission.
+    IF EXISTS (SELECT 1 FROM public.thread_input_deliveries
+                WHERE thread_id = owner_id AND state <> 'settled')
+       OR EXISTS (SELECT 1 FROM public.threads WHERE parent_thread_id = owner_id)
+       OR EXISTS (SELECT 1 FROM public.thread_control_requests
+                   WHERE thread_id = owner_id AND runtime_generation = generation_id)
+       OR EXISTS (SELECT 1 FROM public.thread_permission_requests
+                   WHERE thread_id = owner_id AND status = 'pending')
+       OR EXISTS (SELECT 1 FROM public.thread_interrupt_requests
+                   WHERE thread_id = owner_id AND
+                     (outcome IS NULL OR (outcome = 'applied' AND
+                      NOT (COALESCE(result, '{}'::jsonb) ? 'consumed_input_seq'))))
+       OR EXISTS (SELECT 1 FROM public.run_queue
+                   WHERE unit_id = owner_id AND (state <> 'done' OR leased_by IS NOT NULL))
+       OR EXISTS (SELECT 1 FROM public.completion_effects
+                   WHERE (scope_id = owner_id OR producer_id = owner_id)
+                     AND (state <> 'done' OR claimed_by IS NOT NULL))
+       OR EXISTS (SELECT 1 FROM public.thread_agent_workspace_claims
+                   WHERE thread_id = owner_id AND status <> 'reclaimed')
+       OR EXISTS (SELECT 1 FROM public.thread_workspace_provision_intents
+                   WHERE thread_id = owner_id)
+       OR EXISTS (SELECT 1 FROM public.managed_repository_workspace_creation_reservations
+                   WHERE owner_kind = 'thread' AND
+                         managed_repository_workspace_creation_reservations.owner_id =
+                         acknowledge_settled_virtual_actor_exit.owner_id)
+       OR EXISTS (SELECT 1 FROM public.cloud_ro_mounts
+                   WHERE thread_id = owner_id AND status IN ('engaging','active','revoking'))
+    THEN
+        RETURN NULL;
+    END IF;
+
+    -- owner_runtime_generation is a process UUID, not the thread generation.
+    -- The current published Pod/actor join above owns these completed inputs
+    -- across container process restarts inside that same Kubernetes UID.
+    SELECT count(*), md5(string_agg(delivery_id::text, ',' ORDER BY delivery_id))
+      INTO input_count, input_digest
+      FROM public.thread_input_deliveries
+     WHERE thread_id = owner_id AND owner_agent_id = actor_id
+       AND owner_pod_uid = stopped_pod_uid AND state = 'settled'
+       AND execution_lane = 'pinned';
+    IF input_count = 0 THEN
+        RETURN NULL;
+    END IF;
+    receipt := jsonb_build_object(
+        'version', 1,
+        'runtime_generation', generation_id,
+        'retirement_token', retirement_id,
+        'agent_id', actor_id,
+        'runtime_attach_token', attach_id,
+        'settle_status', 'ended',
+        'quiescence_protocol', 'agent_runtime_zero_v1',
+        'quiescence_actor', 'orchestrator',
+        'workspace_generation', NULL,
+        'workspace_runtime_incarnation', NULL,
+        'recovery_protocol', 'settled_virtual_actor_exit_v1',
+        'agent_pod_uid', stopped_pod_uid,
+        'settled_input_count', input_count,
+        'settled_input_ids_digest', input_digest
+    );
+    IF owner_row.runtime_retirement_local_quiescence IS NOT NULL THEN
+        RETURN CASE WHEN owner_row.runtime_retirement_local_quiescence = receipt
+                    THEN receipt ELSE NULL END;
+    END IF;
+    UPDATE public.threads SET runtime_retirement_local_quiescence = receipt
+     WHERE id = owner_id;
+    RETURN receipt;
+END;
+$_$;
+
+
+--
 -- Name: append_agent_metering_binding_event(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -531,6 +697,97 @@ BEGIN
                       CONSTRAINT = 'thread_control_runtime_generation';
         END IF;
     END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: capture_retired_pinned_agent_pod(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.capture_retired_pinned_agent_pod() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    owner_row public.threads%ROWTYPE;
+    actor_row public.agents%ROWTYPE;
+    intent_row public.thread_agent_pod_provision_intents%ROWTYPE;
+    claim_row public.thread_agent_workspace_claims%ROWTYPE;
+    marker jsonb;
+    captured_agent jsonb;
+BEGIN
+    IF NEW.retired_agent_pod IS NOT NULL THEN
+        RAISE EXCEPTION 'retired Pod identity is server-owned'
+            USING ERRCODE = '23514',
+                  CONSTRAINT = 'retired_agent_pod_identity_authority';
+    END IF;
+    -- The existing insert-authority trigger first validates the exact live
+    -- retirement and local-quiescence receipt. Only soft, claim-bearing actors
+    -- leave a reusable workspace whose historical Pod needs this relation.
+    IF NEW.permanent OR NEW.agent_id IS NULL THEN
+        RETURN NEW;
+    END IF;
+    SELECT * INTO owner_row FROM public.threads
+     WHERE id = NEW.thread_id FOR SHARE;
+    marker := owner_row.runtime_retirement_context->'agent_pod';
+    captured_agent := owner_row.runtime_retirement_context->'agent';
+    IF marker->>'protection_protocol' IS DISTINCT FROM 'finalizer_v1'
+       OR owner_row.runtime_retirement_context->'agent_workspace_claim'
+          IS NULL
+       OR owner_row.runtime_retirement_context->'agent_workspace_claim'
+          IN ('null'::jsonb, '{}'::jsonb) THEN
+        RETURN NEW;
+    END IF;
+
+    SELECT * INTO actor_row FROM public.agents
+     WHERE id = NEW.agent_id FOR SHARE;
+    SELECT * INTO intent_row FROM public.thread_agent_pod_provision_intents
+     WHERE attempt_id::text = marker->>'provision_attempt'
+       AND thread_id = NEW.thread_id FOR SHARE;
+    SELECT * INTO claim_row FROM public.thread_agent_workspace_claims
+     WHERE claim_id = intent_row.workspace_claim_id FOR SHARE;
+    IF actor_row.id IS NULL OR intent_row.attempt_id IS NULL
+       OR claim_row.claim_id IS NULL
+       OR owner_row.agent_id IS DISTINCT FROM NEW.agent_id
+       OR owner_row.runtime_attach_token IS DISTINCT FROM NEW.runtime_attach_token
+       OR actor_row.thread_id IS DISTINCT FROM NEW.thread_id
+       OR actor_row.hostname IS DISTINCT FROM marker->>'pod_name'
+       OR actor_row.pod_uid IS DISTINCT FROM marker->>'pod_uid'
+       OR actor_row.hostname IS DISTINCT FROM captured_agent->>'hostname'
+       OR actor_row.pod_uid IS DISTINCT FROM captured_agent->>'pod_uid'
+       OR intent_row.runtime_generation IS DISTINCT FROM NEW.runtime_generation
+       OR intent_row.status IS DISTINCT FROM 'published'
+       OR intent_row.pod_name IS DISTINCT FROM actor_row.hostname
+       OR intent_row.pod_uid IS DISTINCT FROM actor_row.pod_uid
+       OR intent_row.namespace IS DISTINCT FROM marker->>'namespace'
+       OR intent_row.protection_protocol IS DISTINCT FROM 'finalizer_v1'
+       OR claim_row.thread_id IS DISTINCT FROM NEW.thread_id
+       OR claim_row.claim_id::text IS DISTINCT FROM
+          owner_row.runtime_retirement_context->'agent_workspace_claim'->>'claim_id'
+       OR claim_row.namespace IS DISTINCT FROM intent_row.namespace
+       OR claim_row.provisioner IS DISTINCT FROM intent_row.provisioner
+       OR claim_row.status IS DISTINCT FROM 'ready'
+       OR NULLIF(claim_row.pvc_uid, '') IS NULL
+       OR claim_row.protection_protocol IS DISTINCT FROM 'finalizer_v1' THEN
+        RAISE EXCEPTION 'soft settlement lacks exact actor/Pod/claim identity'
+            USING ERRCODE = '23514',
+                  CONSTRAINT = 'retired_agent_pod_identity_authority';
+    END IF;
+    NEW.retired_agent_pod := jsonb_build_object(
+        'version', 1,
+        'pod_name', intent_row.pod_name,
+        'pod_uid', intent_row.pod_uid,
+        'namespace', intent_row.namespace,
+        'provisioner', intent_row.provisioner,
+        'provision_attempt', intent_row.attempt_id,
+        'protection_protocol', intent_row.protection_protocol,
+        'workspace_claim_id', claim_row.claim_id,
+        'workspace_create_attempt', claim_row.create_attempt,
+        'workspace_created_runtime_generation', claim_row.created_runtime_generation,
+        'pvc_name', claim_row.pvc_name,
+        'pvc_uid', claim_row.pvc_uid
+    );
     RETURN NEW;
 END;
 $$;
@@ -18947,6 +19204,7 @@ CREATE TABLE public.thread_runtime_retirement_outcomes (
     permanent boolean NOT NULL,
     outcome character varying(16) NOT NULL,
     settled_at timestamp with time zone DEFAULT now() NOT NULL,
+    retired_agent_pod jsonb,
     CONSTRAINT thread_runtime_retirement_outcomes_disposition_check CHECK (((disposition)::text = ANY ((ARRAY['ended'::character varying, 'suspended'::character varying])::text[]))),
     CONSTRAINT thread_runtime_retirement_outcomes_outcome_check CHECK (((outcome)::text = ANY ((ARRAY['settled'::character varying, 'deleted'::character varying])::text[])))
 );
@@ -24673,6 +24931,13 @@ CREATE TRIGGER thread_runtime_retirement_outcomes_append_only BEFORE DELETE OR U
 --
 
 CREATE TRIGGER thread_runtime_retirement_outcomes_insert_authority BEFORE INSERT ON public.thread_runtime_retirement_outcomes FOR EACH ROW EXECUTE FUNCTION public.enforce_thread_runtime_retirement_outcome_insert();
+
+
+--
+-- Name: thread_runtime_retirement_outcomes thread_runtime_retirement_outcomes_z_capture_pod; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER thread_runtime_retirement_outcomes_z_capture_pod BEFORE INSERT ON public.thread_runtime_retirement_outcomes FOR EACH ROW EXECUTE FUNCTION public.capture_retired_pinned_agent_pod();
 
 
 --

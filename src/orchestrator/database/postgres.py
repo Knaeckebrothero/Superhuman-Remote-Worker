@@ -35521,11 +35521,11 @@ class PostgresDB:
                     admitted_input = await conn.fetchval(
                         "SELECT EXISTS (SELECT 1 FROM thread_input_deliveries "
                         "WHERE thread_id=$1::uuid AND owner_agent_id=$2::uuid "
-                        "AND owner_runtime_generation=$3::uuid "
+                        "AND owner_pod_uid=$3 "
                         "AND state IN ('admitted','settled'))",
                         parsed_thread,
                         parsed_agent,
-                        parsed_generation,
+                        expected_agent_pod_uid,
                     )
                     admitted_control = await conn.fetchval(
                         "SELECT EXISTS (SELECT 1 FROM thread_control_requests "
@@ -35709,6 +35709,32 @@ class PostgresDB:
                     json.dumps(receipt, sort_keys=True, separators=(",", ":")),
                 )
                 return receipt if updated == "UPDATE 1" else None
+
+    async def acknowledge_settled_virtual_actor_exit(
+        self,
+        thread_id: str,
+        *,
+        runtime_generation: str,
+        retirement_token: str,
+        agent_id: str,
+        attach_token: str,
+        stopped_pod_uid: str,
+    ) -> dict[str, Any] | None:
+        """Receipt a stopped virtual actor only after the separate settled-work gate."""
+
+        value = await self.fetchval(
+            "SELECT acknowledge_settled_virtual_actor_exit("
+            "$1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::uuid,$6)",
+            thread_id,
+            runtime_generation,
+            retirement_token,
+            agent_id,
+            attach_token,
+            stopped_pod_uid,
+        )
+        if isinstance(value, str):
+            value = json.loads(value)
+        return value if isinstance(value, dict) else None
 
     async def acknowledge_pinned_thread_pre_registration_pod_zero(
         self,

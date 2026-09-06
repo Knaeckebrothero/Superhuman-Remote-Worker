@@ -12488,6 +12488,39 @@ async def _reconcile_agent_workspace_claim_for_retirement(
             raise RuntimeError("exact agent workspace retention is retryable")
         return
 
+    from orchestrator.services.historical_agent_pod_cleanup import (
+        retire_historical_claimant_pods,
+    )
+
+    async def assert_current_claim_retirement() -> None:
+        current = await postgres_db.get_thread(thread_id)
+        if not (
+            current
+            and str(current.get("runtime_generation") or "") == generation
+            and str(current.get("runtime_retirement_token") or "") == token
+            and current.get("runtime_retirement_permanent") is True
+            and current.get("runtime_retirement_authorized_at") is not None
+        ):
+            raise RuntimeError("historical claimant retirement authority changed")
+        if not (
+            not _retirement_context_runtime_exposed(retirement)
+            or _retirement_has_exact_local_quiescence(retirement, current)
+            or await postgres_db.pinned_thread_has_prior_soft_settlement(
+                thread_id,
+                runtime_generation=generation,
+                retirement_token=token,
+            )
+        ):
+            raise RuntimeError("historical claimant cleanup requires local quiescence")
+
+    await retire_historical_claimant_pods(
+        postgres_db,
+        claim=claim,
+        current_pod=context.get("agent_pod") or {},
+        assert_current=assert_current_claim_retirement,
+        agent_provisioner=agent_provisioner,
+    )
+
     if not await postgres_db.revoke_pinned_agent_workspace_claim(
         thread_id,
         expected_runtime_generation=generation,
@@ -12854,6 +12887,15 @@ async def _recover_captured_sandbox_process_zero(
                 expected_agent_pod_uid=next(iter(captured_pods))[1],
                 require_zero_admission=True,
             )
+            if receipt is None and virtual_binding_agent_zero_only:
+                receipt = await postgres_db.acknowledge_settled_virtual_actor_exit(
+                    thread_id,
+                    runtime_generation=generation,
+                    retirement_token=token,
+                    agent_id=str(context.get("agent_id") or ""),
+                    attach_token=str(context.get("runtime_attach_token") or ""),
+                    stopped_pod_uid=next(iter(captured_pods))[1],
+                )
             return receipt is not None
         workspace_generation = str(binding.get("generation") or "")
         runtime_incarnation = str(

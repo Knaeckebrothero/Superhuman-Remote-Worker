@@ -36,6 +36,7 @@ from orchestrator.services.pinned_k8s_effect import (
     discover_exact_pinned_pod_authority,
     fence_unmodified_planned_pod_authority,
     finalizer_release_patch,
+    pod_containers_are_terminal,
     legacy_pinned_namespace_candidates,
     observe_planned_pinned_pod_authority,
     protect_planned_pinned_pod_authority,
@@ -1564,17 +1565,8 @@ class PersistentProvisioner:
             return False
         if terminal_required:
             phase = str(getattr(getattr(pod, "status", None), "phase", "") or "")
-            statuses = (
-                getattr(getattr(pod, "status", None), "container_statuses", None) or []
-            )
-            if (
-                phase not in {"Failed", "Succeeded"}
-                or not statuses
-                or not all(
-                    getattr(getattr(status, "state", None), "terminated", None)
-                    is not None
-                    for status in statuses
-                )
+            if phase not in {"Failed", "Succeeded"} or not pod_containers_are_terminal(
+                pod
             ):
                 return False
         patch = finalizer_release_patch(

@@ -296,6 +296,15 @@ async def test_permanent_retirement_deletes_original_before_pvc_fence():
     db.revoke_pinned_agent_workspace_claim = AsyncMock(return_value=True)
     db.fetchrow = AsyncMock(return_value={"status": "revoking", "pvc_uid": None})
     db.fence_pinned_agent_workspace_claim = AsyncMock(return_value=True)
+    db.get_thread = AsyncMock(
+        return_value={
+            "runtime_generation": RUNTIME_GENERATION,
+            "runtime_retirement_token": RETIREMENT_TOKEN,
+            "runtime_retirement_permanent": True,
+            "runtime_retirement_authorized_at": "authorized",
+        }
+    )
+    db.fetch = AsyncMock(return_value=[])
     with (
         patch.object(main, "agent_provisioner", provider),
         patch.object(main, "postgres_db", db),
@@ -334,6 +343,15 @@ async def test_permanent_retirement_accepts_exact_claim_already_reclaimed():
     db.fetchrow = AsyncMock(
         return_value={"status": "reclaimed", "pvc_uid": "fence-pvc-uid"}
     )
+    db.get_thread = AsyncMock(
+        return_value={
+            "runtime_generation": RUNTIME_GENERATION,
+            "runtime_retirement_token": RETIREMENT_TOKEN,
+            "runtime_retirement_permanent": True,
+            "runtime_retirement_authorized_at": "authorized",
+        }
+    )
+    db.fetch = AsyncMock(return_value=[])
 
     with (
         patch.object(main, "agent_provisioner", provider),
