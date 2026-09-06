@@ -232,6 +232,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     continue-on-error: true
+    env:
+      # CodeQL's bundled Python scripts import helpers beside their entrypoints.
+      PYTHONSAFEPATH: ""
     permissions:
       security-events: write
       contents: read
