@@ -241,6 +241,30 @@ implementation grows. Keep pull requests narrowly scoped.
 Use the smallest relevant checks during iteration, then broaden them in
 proportion to risk.
 
+### Job HTTP contracts
+
+The public create request is described in
+[`schemas/job_create.py`](../src/orchestrator/schemas/job_create.py); the job-list
+envelope and its rows are described in
+[`schemas/job_list.py`](../src/orchestrator/schemas/job_list.py). List response
+models are documentation only: the route retains its dictionary serializer and
+existing redaction. Do not install a filtering response model as a schema cleanup.
+
+Cockpit's `JobListPage`/`JobSummary` projections live in `core/models/audit.model.ts`;
+`Job` lives in `core/models/api.model.ts`. The shared synthetic
+[`job-list-page.json`](../cockpit/src/app/core/models/fixtures/job-list-page.json)
+is checked against the mounted ASGI route and the real Cockpit HTTP service.
+Schema tests guard field names and nullable values. Current server responses
+always include `as_of` and `filters`; Cockpit retains optional metadata for
+compatibility and its synthetic empty result on errors.
+
+List counts and offsets refer to display roots, with matching child rows riding
+along. `total=null` means counting was skipped; `total_is_capped=true` marks a
+numeric lower bound. Carry `as_of` between pages to exclude newer inserts; it
+does not freeze status changes or deletions. Real PostgreSQL pagination coverage
+lives in `tests/test_job_subjob_roster_real_postgres.py`. Keep the existing
+agent/MCP bare-array compatibility adapter when extending this contract.
+
 ### Python
 
 ```bash

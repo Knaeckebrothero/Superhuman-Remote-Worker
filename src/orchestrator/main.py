@@ -15312,6 +15312,7 @@ from orchestrator.schemas.job_create import (  # noqa: E402
     JobCreate,
     PublicJobCreateBody,
 )
+from orchestrator.schemas.job_list import JOB_LIST_RESPONSES  # noqa: E402
 
 
 class JobStartRequest(BaseModel):
@@ -18244,7 +18245,11 @@ def _parse_job_project_filters(
 JOBS_MAX_PROJECT_FILTERS = 40
 
 
-@app.get("/api/jobs")
+@app.get(
+    "/api/jobs",
+    operation_id="list_jobs_api_jobs_get",
+    responses=JOB_LIST_RESPONSES,
+)
 async def list_jobs(
     request: Request,
     status: list[str] | None = Query(

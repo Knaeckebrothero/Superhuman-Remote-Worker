@@ -12,6 +12,7 @@ import {AppToastService} from '../../ui/toast';
 import {ErrorMessageService} from './error-message.service';
 import type {ThreadUploadedFile, ThreadUploadEvent} from '../models/file.model';
 import type {Job, JobCreateRequest} from '../models/api.model';
+import jobListPage from '../models/fixtures/job-list-page.json';
 
 describe('ApiService.createJob public wire contract', () => {
   let api: ApiService;
@@ -1191,15 +1192,16 @@ describe('ApiService job list envelope', () => {
     expect(page.filters?.include_archived_projects).toBe(false);
   });
 
-  it('repeats status and project_id rather than joining them', async () => {
+  it('repeats status, origin and project_id rather than joining them', async () => {
     // Wire shape, not a camelCase options object: job-filters.ts owns the
     // filter-state → params mapping, and a second mapping here would be a
     // second thing to keep in step.
     const pending = firstValueFrom(
-      api.getJobsPage({status: ['failed', 'paused'], project_id: ['p1', 'p2']}),
+      api.getJobsPage({status: ['failed', 'paused'], origin: ['user', 'session'], project_id: ['p1', 'p2']}),
     );
     const request = httpMock.expectOne((item) => item.url.endsWith('/jobs'));
     expect(request.request.params.getAll('status')).toEqual(['failed', 'paused']);
+    expect(request.request.params.getAll('origin')).toEqual(['user', 'session']);
     expect(request.request.params.getAll('project_id')).toEqual(['p1', 'p2']);
     request.flush({
       jobs: [],
@@ -1212,14 +1214,69 @@ describe('ApiService job list envelope', () => {
     await pending;
   });
 
-  it('falls back to an empty page instead of throwing', async () => {
-    const pending = firstValueFrom(api.getJobsPage());
+  it('consumes the backend wire fixture without flattening roots, nulls or filter metadata', async () => {
+    // This JSON is checked against the mounted FastAPI route by test_job_list_wire.py.
+    const pending = firstValueFrom(api.getJobsPage({
+      status: ['completed', 'completed'],
+      origin: ['user', 'subjob', 'user'],
+      project_id: jobListPage.filters.project_id,
+      as_of: jobListPage.as_of,
+      limit: 1,
+      offset: 2,
+    }));
     const request = httpMock.expectOne((item) => item.url.endsWith('/jobs'));
-    request.flush({detail: 'boom'}, {status: 500, statusText: 'Server Error'});
+    expect(request.request.params.getAll('origin')).toEqual(['user', 'subjob', 'user']);
+    expect(request.request.params.get('as_of')).toBe(jobListPage.as_of);
+    request.flush(jobListPage);
 
     const page = await pending;
-    expect(page.jobs).toEqual([]);
-    expect(page.has_more).toBe(false);
+    expect(page).toEqual(jobListPage);
+    expect(page.jobs.length).toBeGreaterThan(page.limit);
+    expect(page.jobs[0].config_name).toBeNull();
+    expect(page.jobs[0].audit_count).toBeNull();
+    expect(page.filters?.origin).toEqual(['user', 'subjob']);
+    expect(page.total).toBe(10_000);
+    expect(page.total_is_capped).toBe(true);
+  });
+
+  it('preserves false/empty query values, drops absent filters and accepts a skipped total', async () => {
+    const stamp = '2026-09-06T11:00:00+02:00';
+    const pending = firstValueFrom(api.getJobsPage({
+      include_total: false, has_project: false, search: '', origin: [],
+      user_id: null, status: undefined, as_of: stamp, offset: 25,
+    }));
+    const request = httpMock.expectOne((item) => item.url.endsWith('/jobs'));
+    expect(request.request.params.get('include_total')).toBe('false');
+    expect(request.request.params.get('has_project')).toBe('false');
+    expect(request.request.params.get('search')).toBe('');
+    for (const key of ['origin', 'user_id', 'status']) {
+      expect(request.request.params.has(key)).toBe(false);
+    }
+    // The '+' in an offset must survive actual URL query encoding.
+    expect(new URL(request.request.urlWithParams, 'http://list.test').searchParams.get('as_of')).toBe(stamp);
+    const skipped = {...jobListPage, total: null, total_is_capped: false, as_of: stamp};
+    request.flush(skipped);
+    await expect(pending).resolves.toEqual(skipped);
+  });
+
+  it.each([
+    [400, {detail: 'Offset exceeds the maximum'}],
+    [401, {detail: 'Authentication required'}],
+    [403, {detail: 'Access denied by MCP token scope'}],
+    [422, {detail: 'Unknown job origin'}],
+    [422, {detail: [{loc: ['query', 'limit'], msg: 'Invalid limit', type: 'greater_than_equal'}]}],
+    [500, {detail: 'boom'}],
+  ])('keeps the synthetic empty fallback for HTTP %s', async (status, body) => {
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const pending = firstValueFrom(api.getJobsPage());
+    const request = httpMock.expectOne((item) => item.url.endsWith('/jobs'));
+    request.flush(body, {status: status as number, statusText: 'Request failed'});
+
+    const page = await pending;
+    expect(page).toEqual({jobs: [], total: 0, total_is_capped: false, has_more: false, limit: 0, offset: 0});
+    expect(page.as_of).toBeUndefined();
+    expect(page.filters).toBeUndefined();
+    log.mockRestore();
   });
 });
 

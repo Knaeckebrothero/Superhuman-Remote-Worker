@@ -2027,8 +2027,8 @@ export interface WorkspaceContractProjection {
 export interface Job {
   id: string;
   description: string;
-  document_path?: string;
-  config_name: string;
+  document_path?: string | null;
+  config_name: string | null;
   /** JSONB can arrive as JSON text; normalize before reading its fields. */
   config_override?: Record<string, unknown> | string | null;
   assigned_agent_id?: string | null;
@@ -2049,10 +2049,10 @@ export interface Job {
   status: JobStatus;
   completion_outcome_kind?: 'blocked_undelivered' | null;
   created_at: string;
-  updated_at?: string;
-  completed_at?: string;
-  error_message?: string;
-  audit_count?: number;
+  updated_at?: string | null;
+  completed_at?: string | null;
+  error_message?: string | null;
+  audit_count?: number | null;
   /**
    * JSONB — **may arrive as a raw JSON STRING, not an object.** asyncpg hands
    * JSONB back as text and the orchestrator passes it through, so indexing
