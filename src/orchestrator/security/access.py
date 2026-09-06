@@ -41,6 +41,10 @@ from uuid import UUID
 from fastapi import HTTPException, Request
 
 from orchestrator.security.auth import require_approved_user
+from orchestrator.services.project_status import (
+    PROJECT_ARCHIVED_DETAIL as PROJECT_ARCHIVED_DETAIL,
+    project_is_archived as project_is_archived,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -249,25 +253,6 @@ KNOWN_PROJECT_STATUSES: tuple[str, ...] = ("active", "archived")
 
 #: What ``GET /api/projects`` returns when the caller passes no ``?status=``.
 DEFAULT_PROJECT_STATUSES: tuple[str, ...] = ("active",)
-
-#: Refusal body. A bare sentence, not a ``{code, message}`` dict: house style
-#: is overwhelmingly plain-string ``detail`` and the cockpit's generic error
-#: path types it as a string (a dict renders as ``[object Object]``).
-PROJECT_ARCHIVED_DETAIL = (
-    "This project is archived. Unarchive it before creating new work."
-)
-
-
-def project_is_archived(project: Any) -> bool:
-    """Whether ``project`` (a row dict) is in the archived lifecycle state.
-
-    Case-insensitive, and deliberately narrow: only the literal ``archived``
-    counts. A NULL, empty or unrecognised status is treated as live, so a row
-    nobody can classify keeps working rather than silently becoming read-only.
-    """
-    if not isinstance(project, dict):
-        return False
-    return str(project.get("status") or "").strip().lower() == "archived"
 
 
 def normalize_project_statuses(values: Any) -> list[str]:

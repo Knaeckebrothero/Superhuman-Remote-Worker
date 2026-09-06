@@ -607,7 +607,6 @@ from orchestrator.services.pinned_agent_authority import (  # noqa: E402
 from orchestrator.services.agent_provisioner import agent_provisioner  # noqa: E402
 from orchestrator.services.agent_pod_entrypoint import (  # noqa: E402
     InvalidConfigNameError,
-    validate_config_name,
 )
 from orchestrator.services.runtime_actor import (  # noqa: E402
     RuntimeActorCredentialError,
@@ -640,10 +639,6 @@ from orchestrator.services.default_experts import (  # noqa: E402
     personal_defaults_allowed,
     resolve_root_expert,
     seed_managed_default_experts,
-)
-from shared.expert_reference import (  # noqa: E402
-    ExpertReferenceConflict,
-    resolve_expert_selection,
 )
 from shared.runtime.core.loader import (  # noqa: E402
     INHERIT_MODEL,
@@ -1710,19 +1705,6 @@ async def _maybe_graft_completed_subjob(
     return await _graft_subjob_output(
         str(job["id"]), completion_command_id=completion_command_id
     )
-
-
-def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
-    """Deep merge two dicts. Override wins for scalars/lists; dicts merge recursively."""
-    result = base.copy()
-    for key, value in override.items():
-        if value is None:
-            result.pop(key, None)
-        elif isinstance(value, dict) and isinstance(result.get(key), dict):
-            result[key] = _deep_merge_dicts(result[key], value)
-        else:
-            result[key] = value
-    return result
 
 
 # =============================================================================
@@ -8933,30 +8915,6 @@ def _with_validated_tool_overrides(
     return {**config_override, "tools": _validated_tool_overrides(config_override)}
 
 
-def _validated_config_name(config_name: str | None) -> str | None:
-    """Return a caller-supplied ``config_name``, or 422 naming the rule it broke.
-
-    ``config_name`` is the one caller-controlled word in the agent pod's
-    ``sh -c`` entrypoint. Both provisioners re-check it at their own boundary
-    (``services/agent_pod_entrypoint.validate_config_name``, security audit
-    2026-08-27 finding #3), but they are reached from fire-and-forget tasks and
-    from rows read back long after the request that wrote them — a hostile
-    value that gets *persisted* explodes on every later resume, recycle and
-    magic-link wake, with no request left to answer. So the allow-list also
-    runs here, on WRITE, exactly like ``_with_validated_tool_overrides``: the
-    caller gets one clean 422 and the row is never created.
-
-    Deliberately NOT applied to values read back out of the database. A row
-    poisoned before this guard existed must still be listable, resumable-to-a
-    -clear-failure and deletable; it fails loudly at its provisioning attempt
-    instead (see the fire-and-forget handlers in this module).
-    """
-    try:
-        return validate_config_name(config_name)
-    except InvalidConfigNameError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-
 async def _emit_session_provisioning_failure(
     thread_id: str,
     user_id: str | None,
@@ -10566,6 +10524,14 @@ _PUBLIC_JOB_CONTEXT_RESERVED_KEYS = {
     "vm",
     "workspace_container",
 }
+from orchestrator.services.config_overrides import (  # noqa: E402
+    deep_merge_dicts as _deep_merge_dicts,
+    validated_config_name as _validated_config_name,
+)
+from orchestrator.services.job_admission_config import (  # noqa: E402
+    JobAdmissionConfigDependencies,
+    prepare_job_admission_config,
+)
 from orchestrator.services.job_admission_scope import (  # noqa: E402
     JobAdmissionActor,
     JobAdmissionScopeDependencies,
@@ -18670,6 +18636,30 @@ def _job_admission_scope_dependencies(
     )
 
 
+def _bundled_job_expert_exists(config_name: str) -> bool:
+    """Read the application-owned catalogue only when an explicit slug needs it."""
+    global _experts_cache
+    if _experts_cache is None:
+        _experts_cache = _scan_experts()
+    return any(e.id == config_name for e in _experts_cache)
+
+
+def _job_admission_config_dependencies() -> JobAdmissionConfigDependencies:
+    """Bind current collaborators; gates and the catalogue remain deferred."""
+    from functools import partial
+
+    return JobAdmissionConfigDependencies(
+        store=postgres_db,
+        require_project_access=_require_job_project_access,
+        bundled_expert_exists=_bundled_job_expert_exists,
+        experts_db_enabled=_is_experts_db_enabled,
+        user_experts_enabled=_user_experts_enabled,
+        resolve_worker_expert=partial(
+            resolve_root_expert, postgres_db, expert_type="worker"
+        ),
+    )
+
+
 async def _require_job_project_access(
     principal: dict[str, Any] | None,
     project_id: str | None,
@@ -18841,194 +18831,24 @@ async def create_job(request: Request, job: PublicJobCreateBody) -> dict[str, An
             origin="internal_rest" if internal_call else "user_rest",
             dependencies=_job_admission_scope_dependencies(request),
         )
-        context = scope.context
         internal_principal = scope.principal
         effective_user_id = scope.user_id
-        scoped_project_id = scope.project_id
         internal_origin_bound = scope.origin_bound
 
-        # Resolve project_id: authoritative internal origin / public request,
-        # then the user's default only when no thread/parent constrained scope.
-        project_id = scoped_project_id
-        if not project_id and effective_user_id and not internal_origin_bound:
-            try:
-                user = await postgres_db.get_user(effective_user_id)
-                if user and user.get("default_project_id"):
-                    project_id = str(user["default_project_id"])
-            except Exception as e:
-                logger.warning(
-                    f"Failed to resolve default project for user {effective_user_id}: {e}"
-                )
-
-        await _require_job_project_access(
-            internal_principal if internal_call else caller,
-            project_id,
-            denial_detail=(
-                _INTERNAL_JOB_SCOPE_DENIED
-                if internal_call
-                else "Project role 'editor' or higher required"
-            ),
+        prepared_config = await prepare_job_admission_config(
+            command=job,
+            scope=scope,
+            origin="internal_rest" if internal_call else "user_rest",
+            dependencies=_job_admission_config_dependencies(),
         )
-
-        # Resolve project config fallback plus the authoritative DB expert
-        # selection.  Root jobs persist a concrete expert id; internal
-        # children/specialists keep their explicit/inherited selector and never
-        # silently acquire a user's current default.
-        project = None
-        # One catalogue, one selector: `expert` takes a bundled slug or a DB
-        # expert UUID and resolves to the (base config, DB overlay) pair this
-        # funnel persists. The deprecated aliases go through the same helper,
-        # so the "two experts in one call" refusal is stated once — see
-        # knowledge-base/knowledge/issues/experts_one_catalogue_two_selection_paths.md.
-        try:
-            expert_choice = resolve_expert_selection(
-                expert=job.expert,
-                config_name=job.config_name,
-                expert_id=job.expert_id,
-            )
-        except ExpertReferenceConflict as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        if expert_choice.kind == "bundled" and job.expert:
-            # `expert` means "an entry from the catalogue", so a slug that is
-            # not in it is a typo, not a deployment config. Refuse now: the
-            # alternative is a job that provisions and only fails when the
-            # agent cannot load its config. `config_name` keeps accepting
-            # non-catalogue deployment configs, unvalidated, as it always did.
-            global _experts_cache
-            if _experts_cache is None:
-                _experts_cache = _scan_experts()
-            if not any(e.id == expert_choice.config_name for e in _experts_cache):
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"Unknown expert '{expert_choice.config_name}'. Use "
-                        "list_experts (GET /api/experts) to see the selectable "
-                        "experts; pass a bundled expert id or a DB expert UUID."
-                    ),
-                )
-        explicit_expert_id = expert_choice.expert_id
-        # Write boundary for the pod entrypoint's one caller-controlled word.
-        # `config_name` still accepts non-catalogue deployment configs (the
-        # branch above only vets `expert`), so this is the only charset check
-        # a job's stored selector ever gets — and jobs.config_name is read back
-        # by dispatch, resume, subjob grafting and every recovery path.
-        config_name = canonical_config_name(
-            _validated_config_name(expert_choice.config_name) or "worker_base"
-        )
-        # The resolver can never emit both halves; assert it rather than trust
-        # it, because "a DB expert layered over someone else's bundled base"
-        # is a config nobody reviewed.
-        if explicit_expert_id and config_name != "worker_base":
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "expert_id cannot be combined with a bundled worker "
-                    "config_name; select one expert source"
-                ),
-            )
-        request_config_override = job.config_override
-        try:
-            requested_workspace_backend = configured_workspace_backend(
-                request_config_override
-            )
-        except WorkspaceContractError as exc:
-            raise HTTPException(
-                status_code=422,
-                detail={"code": exc.code, "message": exc.detail},
-            ) from exc
-        project_default_override: dict[str, Any] | None = None
-        if project_id:
-            project = await postgres_db.get_project(project_id)
-            if not project:
-                raise HTTPException(
-                    status_code=404, detail=f"Project '{project_id}' not found"
-                )
-            # Layer 2 of the archived-project refusal (§4.3 of
-            # knowledge-base/knowledge/features/project_and_job_list_filtering.md).
-            # It has to be HERE and not on the guard above: an X-Internal-Key
-            # caller — all MCP traffic, all agent delegation, the bench
-            # sweeper — skips require_project_member entirely, so the flag
-            # would only ever cover the cockpit. This load is unconditional
-            # across both paths. Critic/scholar/curator subjobs call
-            # postgres_db.create_job directly and stay exempt by construction:
-            # finishing in-flight work is not new work.
-            if project_is_archived(project):
-                raise HTTPException(status_code=409, detail=PROJECT_ARCHIVED_DETAIL)
-            project_default_override = project.get("default_config_override")
-            if project_default_override:
-                # asyncpg may return JSONB as a string — parse it
-                if isinstance(project_default_override, str):
-                    project_default_override = json.loads(project_default_override)
-
-        config_override = project_default_override
-        resolved_expert_id = explicit_expert_id
-        # A worker launched from an interactive thread is still a user-level
-        # root job (the thread supplies scope/datasources, not a worker parent).
-        # Only actual worker children/specialists carry parent_job_id.
-        root_creation = not job.parent_job_id
-        should_resolve_default = (
-            root_creation
-            and bool(effective_user_id)
-            and config_name == "worker_base"
-            and _is_experts_db_enabled()
-            and await _user_experts_enabled()
-        )
-        should_validate_explicit = (
-            bool(explicit_expert_id)
-            and bool(effective_user_id)
-            and _is_experts_db_enabled()
-        )
-        selection = None
-        try:
-            if should_resolve_default or should_validate_explicit:
-                principal = internal_principal if internal_call else caller
-                selection = await resolve_root_expert(
-                    postgres_db,
-                    expert_type="worker",
-                    user_id=str(effective_user_id),
-                    project_id=project_id,
-                    explicit_expert_id=explicit_expert_id,
-                    is_admin=bool((principal or {}).get("is_admin")),
-                )
-                resolved_expert_id = str(selection.expert["id"])
-                config_name = "worker_base"
-                if selection.project_override:
-                    config_override = _deep_merge_dicts(
-                        config_override or {}, selection.project_override
-                    )
-                context["expert_selection"] = {
-                    "source": selection.source,
-                    "expert_id": resolved_expert_id,
-                }
-            elif (
-                root_creation
-                and config_name == "worker_base"
-                and project
-                and project.get("default_config_name")
-                and not _is_experts_db_enabled()
-            ):
-                # Emergency compatibility mode only.  In normal operation the
-                # typed project_experts pointer supersedes this legacy slug.
-                config_name = canonical_config_name(project["default_config_name"])
-        except ExpertSelectionError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        except DefaultExpertUnavailable as exc:
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
-
-        if selection is None and expert_choice.kind == "bundled":
-            # Same field the DB path stamps, so "who did this dispatcher pick,
-            # and did it pick at all?" has one answer whichever store the
-            # expert lives in. Reading exactly this key across eight jobs is
-            # how the two-path defect was diagnosed.
-            context["expert_selection"] = {
-                "source": "bundled",
-                "expert": expert_choice.reference,
-            }
-
-        if request_config_override:
-            config_override = _deep_merge_dicts(
-                config_override or {}, request_config_override
-            )
+        context = prepared_config.context
+        project_id = prepared_config.project_id
+        config_name = prepared_config.config_name
+        config_override = prepared_config.config_override
+        resolved_expert_id = prepared_config.expert_id
+        request_config_override = prepared_config.request_config_override
+        requested_workspace_backend = prepared_config.requested_workspace_backend
+        root_creation = prepared_config.root_creation
 
         # Officer admission preparation (BP-02/BP-03/BP-04). Expensive grant,
         # datasource and provisioning inputs are resolved after this snapshot

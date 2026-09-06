@@ -380,6 +380,77 @@ async def test_upload_refusal_precedes_project_expert_insert_and_provision(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("refusal,status", [("role", 403), ("archived", 409)])
+async def test_internal_project_refusal_never_reaches_expert_or_writes(
+    wire, refusal, status
+):
+    if refusal == "role":
+        wire.db.get_user_role_in_project.return_value = "viewer"
+    else:
+        wire.db.get_project.return_value = {"id": PROJECT, "status": "archived"}
+    response = await submit(
+        wire, body(parent_job_id=PARENT), **{"x-test-internal": "1"}
+    )
+    assert response.status_code == status, response.text
+    wire.expert.assert_not_awaited()
+    wire.authorize.assert_not_awaited()
+    wire.db.create_job.assert_not_awaited()
+    wire.provision.assert_not_awaited()
+    wire.dispatch.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_catalogue_stays_application_owned_and_only_scans_for_explicit_slug(
+    wire, monkeypatch
+):
+    scan = Mock(return_value=[SimpleNamespace(id="developer")])
+    monkeypatch.setattr(main, "_experts_cache", None)
+    monkeypatch.setattr(main, "_scan_experts", scan)
+    main._job_admission_config_dependencies()
+    scan.assert_not_called()
+    assert (
+        await submit(wire, body(config_name="deployment/custom.yaml"))
+    ).status_code == 200
+    scan.assert_not_called()
+    assert (await submit(wire, body(expert="developer"))).status_code == 200
+    assert (await submit(wire, body(expert="developer"))).status_code == 200
+    scan.assert_called_once_with()
+    wire.provision.reset_mock()
+    wire.db.create_job.reset_mock()
+    response = await submit(wire, body(expert="absent"))
+    assert response.status_code == 400 and "Unknown expert" in response.json()["detail"]
+    scan.assert_called_once_with()
+    wire.db.create_job.assert_not_awaited()
+    wire.provision.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_project_and_expert_overrides_merge_before_request_at_real_insert(wire):
+    wire.db.get_project.return_value = {
+        "id": PROJECT,
+        "default_config_override": '{"llm":{"model":"project","temperature":0.2},"extra":{"keep":true,"remove":1}}',
+    }
+    wire.expert.return_value = ExpertSelection(
+        expert={"id": EXPERT},
+        source="project",
+        project_override={"llm": {"model": "expert"}, "extra": {"remove": None}},
+    )
+    response = await submit(wire, body(config_override={"llm": {"model": "request"}}))
+    assert response.status_code == 200, response.text
+    args = wire.db.create_job.await_args.kwargs
+    assert args["config_override"] == {
+        "llm": {"model": "request", "temperature": 0.2},
+        "extra": {"keep": True},
+    }
+    assert args["context"]["expert_selection"] == {
+        "source": "project",
+        "expert_id": EXPERT,
+    }
+    assert args["expert_id"] == EXPERT
+    wire.provision.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_bench_adapter_revalidates_creator_and_preserves_provenance(
     wire, monkeypatch
 ):
