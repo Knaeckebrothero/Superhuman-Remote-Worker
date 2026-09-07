@@ -44263,6 +44263,36 @@ class PostgresDB:
             raise RuntimeError(f"managed expert seed disappeared: {managed_key}")
         return existing, False
 
+    async def upgrade_managed_expert_seed(
+        self,
+        *,
+        managed_key: str,
+        seed_version: int,
+        config_additions: Dict[str, Any],
+    ) -> Dict[str, Any] | None:
+        """Additive seed upgrade (services.default_experts.upgrade_managed_seed).
+
+        Merges ``config_additions`` UNDER the row's config — ``$2 || config``
+        lets the row win every key it already has — and stamps
+        ``seed_version``. A no-op (``None``) for a row already at or past the
+        version, so a rolled-back orchestrator never re-runs an upgrade.
+        """
+        row = await self.fetchrow(
+            """
+            UPDATE experts
+            SET config = $2::jsonb || config,
+                seed_version = $3,
+                version = version + 1,
+                updated_at = NOW()
+            WHERE managed_key = $1 AND seed_version < $3
+            RETURNING *
+            """,
+            managed_key,
+            json.dumps(config_additions or {}),
+            seed_version,
+        )
+        return dict(row) if row else None
+
     async def get_expert_visible_by_id(
         self,
         expert_id: str,

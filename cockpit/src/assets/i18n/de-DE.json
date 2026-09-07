@@ -3121,6 +3121,9 @@
         "predicted": "Vorhergesagt, nicht gemessen",
         "unknown": "Der aufgelöste Werkzeugsatz konnte nicht gelesen werden"
       },
+      "rosterTitle": "Subagenten, an die dieser Experte delegieren kann",
+      "rosterDefault": "(Standard)",
+      "rosterEmpty": "Dieser Experte hat keine Subagenten-Riege, delegate_agent hat also nichts auszuführen — jeder Aufruf liefert einen Fehler. Riege beim Experten unter Subagenten hinzufügen.",
       "unknownCategory": "Dieser Cockpit-Build hat keine Beschreibung für diese Kategorie."
     },
     "toolCategories": {

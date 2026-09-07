@@ -37,3 +37,17 @@ instruction_files:
   - skill: cite-as-you-write
     trigger: before_tool:cite_document
     enforce: true
+
+# Roster for delegate_agent (config/subagents/README.md). The generalist gets
+# the three library children a research/writing/light-coding session hands
+# off to; probe/tester/reviewer are worker-shaped and stay on their experts.
+# Delegation itself stays OFF until a session ticks it (tools.delegation +
+# delegation.enabled) — the roster only decides what that tick can reach. A
+# child's tools are capped by the parent's (a no-shell session yields a
+# no-shell implementer); the Delegation row shows the roster either way.
+subagents:
+  default: explorer
+  roster:
+    explorer: {$ref: subagents/explorer}
+    reader: {$ref: subagents/reader}
+    implementer: {$ref: subagents/implementer}

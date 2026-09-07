@@ -736,8 +736,11 @@ def test_load_agent_config_resolves_a_bundled_roster_from_disk(tmp_path):
         load_agent_config(str(bad))
 
 
-def test_public_bases_carry_no_roster_and_five_experts_resolve_the_library():
-    """Public bases stay neutral; the five U3 parents resolve usable rosters."""
+def test_public_bases_carry_no_roster_and_the_rostered_experts_resolve_the_library():
+    """Public bases stay neutral; the five U3 parents and the seeded session
+    assistant resolve usable rosters (the assistant gained its roster
+    2026-09-07 — before that, a ticked Delegation on the default session expert
+    bound ``delegate_agent`` with nothing to delegate to)."""
     for name in ("worker_base", "session_base", "subagent_base"):
         path, deployment_dir = resolve_config_path(name)
         cfg = load_agent_config(path, deployment_dir)
@@ -755,6 +758,7 @@ def test_public_bases_carry_no_roster_and_five_experts_resolve_the_library():
         "scholar": ("reader", {"explorer", "reader"}),
         "bughunter": ("probe", {"explorer", "probe"}),
         "product-qa": ("probe", {"explorer", "probe"}),
+        "assistant": ("explorer", {"explorer", "reader", "implementer"}),
     }
     for expert, (default, names) in expected.items():
         cfg = load_agent_config(*resolve_config_path(expert))

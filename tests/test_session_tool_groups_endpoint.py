@@ -604,3 +604,101 @@ class TestDelegationGate:
             experts=False,
         )
         assert sorted(on["categories"]["delegation"]["tools"]) == sorted(self._NAMES)
+
+
+# =============================================================================
+# The roster a Delegation tick reaches
+# =============================================================================
+
+
+class TestRosterReport:
+    """Both tool-groups reads carry ``subagents``: the roster the resolve
+    materialised, or an EMPTY one. The seeded ``assistant`` shipped without a
+    roster, so a ticked Delegation bound a ``delegate_agent`` whose every call
+    errored ("this expert has no roster", main-dev thread 54e31e45,
+    2026-09-07); the pane could not warn because nothing told it."""
+
+    _ROSTER = {
+        "subagents": {
+            "default": "explorer",
+            "roster": {
+                "explorer": {"$ref": "subagents/explorer"},
+                "scout": {
+                    "description": "Inline scout.",
+                    "tools": {"workspace": ["read_file"]},
+                    "write_policy": "none",
+                },
+            },
+        }
+    }
+
+    @pytest.mark.asyncio
+    async def test_reports_the_materialised_roster(self, user_a, fake_db, fake_request):
+        from tests.conftest import _UID_A
+
+        expert_id = "11111111-2222-3333-4444-555555555555"
+        fake_db.get_expert_by_id = AsyncMock(
+            return_value={
+                "id": expert_id,
+                "user_id": _UID_A,
+                "name": "rostered",
+                "config": self._ROSTER,
+            }
+        )
+        result = await _call(
+            user_a,
+            fake_db,
+            _thread(metadata={"expert_id": expert_id}),
+            fake_request,
+        )
+        summary = result["subagents"]
+        assert summary["default"] == "explorer"
+        by_name = {e["name"]: e for e in summary["roster"]}
+        assert set(by_name) == {"explorer", "scout"}
+        # A library `$ref` is materialised: the pane shows what the model sees.
+        assert by_name["explorer"]["ref"] == "subagents/explorer"
+        assert by_name["explorer"]["description"].startswith("Read-only investigator")
+        assert by_name["scout"] == {
+            "name": "scout",
+            "description": "Inline scout.",
+            "ref": None,
+        }
+
+    @pytest.mark.asyncio
+    async def test_an_expert_without_a_roster_reports_an_empty_one(
+        self, user_a, fake_db, fake_request
+    ):
+        """``[]`` is the answer that lets the pane warn — distinct from the
+        no-claim ``None`` of a failed resolve."""
+        from tests.conftest import _UID_A
+
+        expert_id = "11111111-2222-3333-4444-555555555555"
+        fake_db.get_expert_by_id = AsyncMock(
+            return_value={
+                "id": expert_id,
+                "user_id": _UID_A,
+                "name": "bare",
+                "config": {"tools": {"delegation": ["delegate_agent"]}},
+            }
+        )
+        result = await _call(
+            user_a,
+            fake_db,
+            _thread(
+                metadata={
+                    "expert_id": expert_id,
+                    "config_override": {"delegation": {"enabled": True}},
+                }
+            ),
+            fake_request,
+        )
+        assert result["subagents"] == {"default": None, "roster": []}
+        assert result["categories"]["delegation"]["state"] == "on"
+
+    @pytest.mark.asyncio
+    async def test_legacy_path_reports_an_empty_roster(
+        self, user_a, fake_db, fake_request
+    ):
+        result = await _call(user_a, fake_db, _thread(), fake_request, experts=False)
+        assert result["source"] == "legacy"
+        assert result["subagents"] == {"default": None, "roster": []}

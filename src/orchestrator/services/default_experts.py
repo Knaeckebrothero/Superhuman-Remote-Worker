@@ -43,7 +43,11 @@ MANAGED_SEEDS: tuple[dict[str, Any], ...] = (
         "managed_key": "application-default-session-seed",
         "directory": "assistant",
         "expert_type": "session",
-        "seed_version": 1,
+        # 2: the assistant gained its `subagents` roster (2026-09-07). Bump
+        # this whenever the bundle gains a NEW top-level config key that a
+        # seeded row should pick up; `upgrade_managed_seed` copies only keys
+        # the row does not carry, so operator edits are never overwritten.
+        "seed_version": 2,
     },
 )
 
@@ -120,11 +124,52 @@ def load_seed_bundle(
     }
 
 
+async def upgrade_managed_seed(
+    db, *, spec: dict[str, Any], bundle: dict[str, Any], row: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Additive seed upgrade for a row behind ``spec["seed_version"]``.
+
+    Copies only the bundle's top-level ``config`` keys the row does NOT carry
+    and stamps the new version; a key the row has — whatever its value — is
+    the operator's and stays. Returns the updated row, or ``None`` when the
+    row is current. This is how a seeded row gains a block the bundle grew
+    later (the assistant's ``subagents`` roster: every deployment seeded before
+    2026-09-07 bound ``delegate_agent`` with nothing to delegate to).
+    """
+    current = int(row.get("seed_version") or 0)
+    target = int(spec["seed_version"])
+    if current >= target:
+        return None
+    existing = _json_object(row.get("config"))
+    additions = {
+        key: value
+        for key, value in (bundle.get("config") or {}).items()
+        if key not in existing
+    }
+    updated = await db.upgrade_managed_expert_seed(
+        managed_key=spec["managed_key"],
+        seed_version=target,
+        config_additions=additions,
+    )
+    if updated:
+        logger.info(
+            "Managed expert %s: seed %s -> %s, added config keys %s",
+            spec["managed_key"],
+            current,
+            target,
+            sorted(additions) or "none",
+        )
+    return updated
+
+
 async def seed_managed_default_experts(db, config_dir: Path) -> dict[str, str]:
     """Insert missing managed experts and missing application pointers.
 
     Both operations are insert-only.  Existing expert content and an operator's
     current application pointer are preserved across restarts and upgrades.
+    The one exception is :func:`upgrade_managed_seed`: a row behind the
+    bundle's ``seed_version`` gains the top-level config keys it lacks — never
+    a different value for a key it has.
     """
     seeded: dict[str, str] = {}
     for spec in MANAGED_SEEDS:
@@ -133,11 +178,15 @@ async def seed_managed_default_experts(db, config_dir: Path) -> dict[str, str]:
             directory=spec["directory"],
             expert_type=spec["expert_type"],
         )
-        row, _created = await db.upsert_managed_expert(
+        row, created = await db.upsert_managed_expert(
             managed_key=spec["managed_key"],
             seed_version=spec["seed_version"],
             **bundle,
         )
+        if not created:
+            row = (
+                await upgrade_managed_seed(db, spec=spec, bundle=bundle, row=row) or row
+            )
         if row["expert_type"] != spec["expert_type"]:
             raise RuntimeError(
                 f"Managed expert {spec['managed_key']} has incompatible type "

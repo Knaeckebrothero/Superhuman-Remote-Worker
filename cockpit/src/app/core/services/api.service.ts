@@ -211,6 +211,26 @@ export interface SessionToolCategory {
   configured?: string[];
 }
 
+/** One `subagent_type` the expert's `delegate_agent` can name. */
+export interface SessionSubagentRosterEntry {
+  name: string;
+  /** What the parent model sees next to the type; null on a raw `$ref` the server could not resolve. */
+  description: string | null;
+  /** `subagents/explorer`, `experts/critic`, a DB expert id — or null for an inline entry. */
+  ref: string | null;
+}
+
+/**
+ * What a Delegation tick reaches: the roster as the resolve materialised it.
+ * `roster: []` is a real answer — the expert has no roster and every
+ * `delegate_agent` call will error — and is rendered as such. Absent on an
+ * orchestrator older than this contract, where nothing is claimed.
+ */
+export interface SessionSubagentRoster {
+  default: string | null;
+  roster: SessionSubagentRosterEntry[];
+}
+
 export interface SessionToolGroupsResponse {
   thread_id: string;
   /** Which agent path the PREDICTION models. Says nothing about `origin`. */
@@ -236,6 +256,8 @@ export interface SessionToolGroupsResponse {
   backend?: Record<string, boolean> | null;
   tool_groups: Record<string, boolean> | null;
   categories?: Record<string, SessionToolCategory> | null;
+  /** The delegation roster the resolve materialised; null when the resolve failed. */
+  subagents?: SessionSubagentRoster | null;
   /**
    * Categories that refuse `tools.<c>: true` at the write boundary, mapped to
    * the enumeration to send instead (`{shell: ["run_command", ...]}`).

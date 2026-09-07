@@ -20,6 +20,7 @@ import {
     isMeasured,
     lockedOnAdditions,
     resolvedToolRows,
+    rosterLines,
     toolsetProvenance,
     toolsFragment,
     type ResolvedToolRow,
@@ -174,6 +175,31 @@ export function delegationOverride(
                     ? 'agentSettings.tools.addRequested'
                     : 'agentSettings.tools.addAction') | transloco:{ n: additionsFor(row).length } }}</button>
             </div>
+          }
+          <!-- The roster a tick reaches, on or off: the empty case is the one
+               worth seeing BEFORE ticking — delegate_agent binds either way
+               and errors on every call when the expert has no roster. No
+               claim (older orchestrator, failed resolve) renders nothing. -->
+          @if (row.key === 'delegation') {
+            @let lines = roster();
+            @if (lines !== null) {
+              @if (lines.length) {
+                <ul class="roster-list" [attr.aria-label]="'agentSettings.tools.rosterTitle' | transloco">
+                  @for (line of lines; track line.name) {
+                    <li class="roster-entry">
+                      <span class="roster-name">{{ line.name }}@if (line.isDefault) { <span class="roster-default">{{ 'agentSettings.tools.rosterDefault' | transloco }}</span> }</span>
+                      @if (line.description) {
+                        <span class="roster-desc">{{ line.description }}</span>
+                      }
+                    </li>
+                  }
+                </ul>
+              } @else {
+                <div class="roster-empty">
+                  <span class="tool-toggle-reason">{{ 'agentSettings.tools.rosterEmpty' | transloco }}</span>
+                </div>
+              }
+            }
           }
           @if (row.key === 'delegation' && rowState(row) === 'on') {
             <div class="inline-params">
@@ -354,6 +380,32 @@ export function delegationOverride(
       display: flex;
       gap: 12px;
       padding: 6px 10px 6px 42px;
+    }
+    .roster-list {
+      list-style: none;
+      margin: 0;
+      padding: 0 10px 6px 42px;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+    .roster-entry {
+      font-size: 11px;
+      line-height: 1.4;
+      color: var(--text-muted);
+    }
+    .roster-name {
+      margin-right: 6px;
+      color: var(--text-primary);
+      font-weight: 600;
+    }
+    .roster-default {
+      margin-left: 4px;
+      color: var(--text-muted);
+      font-weight: 400;
+    }
+    .roster-empty {
+      padding: 0 10px 6px 42px;
     }
     .tool-additions {
       display: flex;
@@ -779,6 +831,10 @@ export class ToolsGroupComponent {
 
   // --- Resolved defaults ---
   private r(path: string): unknown { return readConfigPath(this.config(), path); }
+
+  /** What a Delegation tick reaches (resolved-toolset.ts `rosterLines`):
+   *  null = no claim, [] = the expert has no roster, else its types. */
+  readonly roster = computed(() => rosterLines(this.resolved()));
 
   readonly resolvedDelegationMaxConcurrent = computed(
     () => (this.r('delegation.max_concurrent') ?? 4) as number,

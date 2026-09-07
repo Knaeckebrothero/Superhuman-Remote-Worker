@@ -1217,3 +1217,61 @@ class TestBothAgentAppsRegisterTheRoute:
             app = create_dual_app()
         paths = {getattr(r, "path", "") for r in app.routes}
         assert "/session/toolset" in paths
+
+
+class TestPreviewRoster:
+    """The New Session form's read carries the same ``subagents`` summary as
+    the thread endpoint, so the Delegation row can warn BEFORE the session
+    exists that the picked expert has nothing to delegate to."""
+
+    @pytest.mark.asyncio
+    async def test_preview_reports_the_expert_roster(
+        self, user_a, fake_db, fake_request
+    ):
+        from orchestrator.main import ToolGroupPreviewRequest, preview_tool_groups
+        from tests.conftest import _UID_A
+
+        expert_id = "11111111-2222-3333-4444-555555555555"
+        fake_db.get_expert_by_id = AsyncMock(
+            return_value={
+                "id": expert_id,
+                "user_id": _UID_A,
+                "name": "rostered",
+                "config": {
+                    "subagents": {
+                        "default": "reader",
+                        "roster": {"reader": {"$ref": "subagents/reader"}},
+                    }
+                },
+            }
+        )
+        with (
+            patch(
+                "orchestrator.main.require_approved_user",
+                AsyncMock(return_value=user_a),
+            ),
+            patch("orchestrator.main.postgres_db", fake_db),
+            patch(
+                "orchestrator.main._is_experts_db_enabled", MagicMock(return_value=True)
+            ),
+            patch(
+                "orchestrator.main._user_experts_enabled", AsyncMock(return_value=True)
+            ),
+            patch(
+                "orchestrator.main._resolve_runner_grants", AsyncMock(return_value=None)
+            ),
+        ):
+            with_roster = await preview_tool_groups(
+                ToolGroupPreviewRequest(
+                    config_name="session_base", expert_id=expert_id
+                ),
+                fake_request,
+            )
+            bare = await preview_tool_groups(
+                ToolGroupPreviewRequest(config_name="session_base"), fake_request
+            )
+
+        assert with_roster["subagents"]["default"] == "reader"
+        assert [e["name"] for e in with_roster["subagents"]["roster"]] == ["reader"]
+        assert with_roster["subagents"]["roster"][0]["ref"] == "subagents/reader"
+        assert bare["subagents"] == {"default": None, "roster": []}

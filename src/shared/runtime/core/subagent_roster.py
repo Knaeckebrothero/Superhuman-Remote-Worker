@@ -561,3 +561,44 @@ def resolve_subagent_roster(
             list(existing) if isinstance(existing, list) else []
         ) + warnings
     return data
+
+
+def roster_summary(subagents: Any) -> Dict[str, Any]:
+    """The roster as a settings surface reports it: ``{"default", "roster":
+    [{"name", "description", "ref"}, ...]}``.
+
+    Takes the ``subagents`` block of a config in either shape — materialised
+    (``resolve_subagent_roster`` ran: entries carry ``description`` and
+    ``_ref``) or raw (``{$ref: subagents/explorer}``; ``description`` may be
+    absent and ``ref`` is the raw ``$ref``). Never raises: a malformed block
+    reads as an empty roster, which is what ``delegate_agent`` would bind.
+
+    The Cockpit's Delegation row shows this next to the toggle so a tick on an
+    expert with no roster is refused by the reader, not discovered by the
+    model — the seeded ``assistant`` shipped without one and a ticked
+    Delegation bound a ``delegate_agent`` whose every call errored (main-dev
+    thread 54e31e45, 2026-09-07).
+    """
+    if not isinstance(subagents, dict):
+        return {"default": None, "roster": []}
+    raw_roster = subagents.get("roster")
+    entries: List[Dict[str, Any]] = []
+    if isinstance(raw_roster, dict):
+        for raw_name, entry in raw_roster.items():
+            name = str(raw_name)
+            if not isinstance(entry, dict):
+                continue
+            description = entry.get("description")
+            ref = entry.get("_ref") or entry.get("$ref")
+            entries.append(
+                {
+                    "name": name,
+                    "description": (str(description).strip() if description else None),
+                    "ref": str(ref) if ref else None,
+                }
+            )
+    default = subagents.get("default")
+    default = str(default) if default else None
+    if default and default not in {e["name"] for e in entries}:
+        default = None
+    return {"default": default, "roster": entries}

@@ -12,6 +12,7 @@ import {
   lockedOnAdditions,
   orderedCategoryKeys,
   resolvedToolRows,
+  rosterLines,
   toolsFragment,
   toolsetProvenance,
 } from './resolved-toolset';
@@ -428,5 +429,42 @@ describe('humanizeCategoryKey', () => {
   it('beats rendering a raw transloco key on screen', () => {
     expect(humanizeCategoryKey('browser_direct')).toBe('Browser Direct');
     expect(humanizeCategoryKey('mcp')).toBe('Mcp');
+  });
+});
+
+describe('rosterLines', () => {
+  const base = (): SessionToolGroupsResponse => ({
+    thread_id: 't1',
+    source: 'resolved',
+    origin: 'prediction',
+    tool_groups: {},
+    categories: {},
+  });
+
+  it('is null — no claim — when the response carries no subagents field', () => {
+    expect(rosterLines(base())).toBeNull();
+    expect(rosterLines({...base(), subagents: null})).toBeNull();
+    expect(rosterLines(null)).toBeNull();
+  });
+
+  it('is [] — a real answer — when the expert has no roster', () => {
+    expect(rosterLines({...base(), subagents: {default: null, roster: []}})).toEqual([]);
+  });
+
+  it('keeps the authored order and flags exactly the default entry', () => {
+    const lines = rosterLines({
+      ...base(),
+      subagents: {
+        default: 'reader',
+        roster: [
+          {name: 'explorer', description: 'Looks.', ref: 'subagents/explorer'},
+          {name: 'reader', description: null, ref: 'subagents/reader'},
+        ],
+      },
+    });
+    expect(lines).toEqual([
+      {name: 'explorer', description: 'Looks.', isDefault: false},
+      {name: 'reader', description: null, isDefault: true},
+    ]);
   });
 });

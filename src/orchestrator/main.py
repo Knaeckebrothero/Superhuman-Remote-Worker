@@ -4006,8 +4006,16 @@ def _merged_session_tool_policy(
     request_override: dict[str, Any] | None,
     expert_type: str = "session",
     grant_strip: Callable[[dict], dict] | None = None,
+    db_refs: dict[str, Any] | None = None,
+    capture: dict[str, Any] | None = None,
 ) -> tuple[dict[str, list[str]], dict[str, str]]:
     """``(merged tools mapping, category -> deciding layer)``.
+
+    ``db_refs`` are the prefetched DB expert rows a ``subagents.roster``
+    names (:func:`_prefetch_roster_refs`); without them a DB ``$ref`` entry
+    drops out of the resolve. ``capture`` is the caller's dict for
+    ``resolve_config``'s ``merged_fragment`` — the tool-groups endpoints read
+    the materialised roster off it to report what a Delegation tick reaches.
 
     SYNCHRONOUS — see :func:`_merged_session_tool_groups`, whose skip ledger
     this shares because it runs the same resolve, with ONE exception:
@@ -4030,7 +4038,8 @@ def _merged_session_tool_policy(
     no honest toolset view: asking it for a worker prediction returned a
     session's answer, so the surface was left rendering six static rows instead.
     """
-    capture: dict[str, Any] = {}
+    if capture is None:
+        capture = {}
     resolve_config(
         base_config_name=base_config_name,
         base_defaults=None,
@@ -4040,6 +4049,7 @@ def _merged_session_tool_policy(
         expert_type=expert_type,
         capture=capture,
         grant_strip=grant_strip,
+        db_refs=db_refs,
     )
     merged_fragment = capture.get("merged_fragment") or {}
     merged = merged_fragment.get("tools")
@@ -52491,15 +52501,22 @@ async def get_thread_tool_groups(thread_id: str, request: Request) -> dict[str, 
     m = await _agent_toolset_measurement(thread)
     grants = await _session_tool_grants(thread)
 
+    from shared.runtime.core.subagent_roster import roster_summary
+
     source = "resolved"
     configured: dict[str, Any] = {}
     provenance: dict[str, str] = {}
+    # What a Delegation tick reaches: the expert's materialised roster, or an
+    # empty one the pane can name as such. None only when the resolve failed.
+    roster: dict[str, Any] | None = None
 
     if not _is_experts_db_enabled() or not await _user_experts_enabled():
         source = "legacy"
         configured, provenance = await asyncio.to_thread(
             _legacy_session_tool_policy, base, request_override
         )
+        # The legacy path merges a public base only; none carries a roster.
+        roster = roster_summary(None)
     else:
         try:
             expert_id = metadata.get("expert_id")
@@ -52527,6 +52544,16 @@ async def get_thread_tool_groups(thread_id: str, request: Request) -> dict[str, 
                 user_id=str(thread["user_id"]) if thread.get("user_id") else None,
                 project_id=project_id,
             )
+            # The same roster rows the attach prefetches: a DB `$ref` entry
+            # the resolve cannot see is dropped, and the pane would then
+            # report a roster the agent does bind as missing.
+            db_refs = await _prefetch_roster_refs(
+                expert_row=expert_row,
+                overrides=[project_overrides, request_override],
+                user_id=str(thread["user_id"]) if thread.get("user_id") else None,
+                project_ids=[project_id] if project_id else [],
+            )
+            capture: dict[str, Any] = {}
             configured, provenance = await asyncio.to_thread(
                 _merged_session_tool_policy,
                 base_config_name=base,
@@ -52534,6 +52561,11 @@ async def get_thread_tool_groups(thread_id: str, request: Request) -> dict[str, 
                 project_overrides=project_overrides,
                 request_override=request_override,
                 grant_strip=grant_strip,
+                db_refs=db_refs,
+                capture=capture,
+            )
+            roster = roster_summary(
+                (capture.get("merged_fragment") or {}).get("subagents")
             )
         except Exception:
             logger.exception("Tool-group resolve failed for thread %s", thread_id)
@@ -52548,6 +52580,7 @@ async def get_thread_tool_groups(thread_id: str, request: Request) -> dict[str, 
                     **_origin_fields(m),
                     "tool_groups": None,
                     "categories": None,
+                    "subagents": None,
                 }
 
     # Only a MEASURED answer carries backend capabilities: they come from the
@@ -52568,6 +52601,7 @@ async def get_thread_tool_groups(thread_id: str, request: Request) -> dict[str, 
         "enumerate_only": enumerate_only_members(),
         "tool_groups": tool_groups_from_view(view),
         "categories": view,
+        "subagents": roster,
     }
 
 
@@ -52639,6 +52673,9 @@ async def preview_tool_groups(
     # that correctly. Routing a worker preview through the session legacy policy
     # would predict appended session groups for a job that cannot hold them.
     use_legacy = legacy and not is_worker
+    from shared.runtime.core.subagent_roster import roster_summary
+
+    roster: dict[str, Any] = roster_summary(None)
     try:
         if use_legacy:
             configured, provenance = await asyncio.to_thread(
@@ -52650,6 +52687,13 @@ async def preview_tool_groups(
             # acknowledged anything against — unlike the thread endpoint
             # above, omitting it is not a gap to close, it is the correct
             # answer for a config that cannot yet have drifted.
+            db_refs = await _prefetch_roster_refs(
+                expert_row=expert_row,
+                overrides=[project_overrides, body.config_override],
+                user_id=str(user["id"]),
+                project_ids=[str(body.project_id)] if body.project_id else [],
+            )
+            capture: dict[str, Any] = {}
             configured, provenance = await asyncio.to_thread(
                 _merged_session_tool_policy,
                 base_config_name=base,
@@ -52657,6 +52701,11 @@ async def preview_tool_groups(
                 project_overrides=project_overrides,
                 request_override=body.config_override or None,
                 expert_type=body.expert_type,
+                db_refs=db_refs,
+                capture=capture,
+            )
+            roster = roster_summary(
+                (capture.get("merged_fragment") or {}).get("subagents")
             )
     except Exception:
         logger.exception("Tool-group preview resolve failed")
@@ -52694,6 +52743,7 @@ async def preview_tool_groups(
         "enumerate_only": enumerate_only_members(),
         "tool_groups": tool_groups_from_view(view),
         "categories": view,
+        "subagents": roster,
     }
 
 
