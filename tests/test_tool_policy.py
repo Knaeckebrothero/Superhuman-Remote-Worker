@@ -146,7 +146,7 @@ class TestPopulation:
     def test_the_declaration_scan_actually_found_the_configs(self):
         """A scan that silently found nothing would make every test below pass."""
         files = {rel for rel, _, _ in _DECLARATIONS}
-        assert len(files) == 21, f"expected 21 configs declaring tools:, got {files}"
+        assert len(files) == 22, f"expected 22 configs declaring tools:, got {files}"
         assert "config/expert_base.yaml" in files
         assert "config/overlays/worker.yaml" in files
         assert "config/overlays/session.yaml" in files
@@ -170,9 +170,11 @@ class TestPopulation:
         # overlays (4 + 6 + 13 role-owned groups); 143 with the subagent
         # library's explorer entry (6 read-only groups restated so it is
         # read-only standalone too); 187 with U3 WP5's six entries (44 explicit
-        # group declarations, including the reviewer/verifier inspection group).
-        assert len(_DECLARATIONS) == 187, (
-            f"expected 187 raw declarations, got {len(_DECLARATIONS)}"
+        # group declarations, including the reviewer/verifier inspection group);
+        # 192 with the engineer expert (shell, research, delegation, citation,
+        # graph — engineer_expert.md).
+        assert len(_DECLARATIONS) == 192, (
+            f"expected 192 raw declarations, got {len(_DECLARATIONS)}"
         )
 
     def test_every_shipped_declaration_is_already_a_list(self):
@@ -380,12 +382,12 @@ class TestShellMustEnumerate:
         ]
 
     def test_every_shipped_shell_declaration_is_still_accepted(self):
-        """Sixteen configs declare ``tools.shell`` (the prior ten plus all six
-        U3 WP5 library entries, including reader's explicit empty override);
-        all are bare lists or ``[]``, the legacy spellings of ``only`` and
-        ``false``. None is affected."""
+        """Seventeen configs declare ``tools.shell`` (the prior ten, all six
+        U3 WP5 library entries including reader's explicit empty override, and
+        the engineer expert); all are bare lists or ``[]``, the legacy
+        spellings of ``only`` and ``false``. None is affected."""
         decls = [(rel, v) for rel, cat, v in _DECLARATIONS if cat == "shell"]
-        assert len(decls) == 16, decls
+        assert len(decls) == 17, decls
         for rel, value in decls:
             assert (
                 normalize_tool_policy({"tools": {"shell": value}})["tools"]["shell"]

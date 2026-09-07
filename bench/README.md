@@ -79,6 +79,9 @@ stale the acceptance check.
 | D* | dev | developer | multi-phase spec/red/green flow, self-contained code katas |
 | R* | research | scholar | exploration sweeps + subjob spawning (noisy by design) |
 | A* | automation-shaped | worker_base | the recurring-digest shape, inputs inlined |
+| D3, D4 | dev, frontend | engineer | single-phase implement + verify with a check the task supplies (D3 inline module with three bugs and a duplicated helper; D4 a static page against an inline checker) |
+| D5 | dev-repo | engineer | clone a pinned public repository, extend it in its own conventions, run its suite (network; excluded as `infra` if the clone fails) |
+| O1 | ops | engineer | install a CLI into the sandbox, run it, report verbatim (network for `pip`) |
 
 All tasks are self-contained (inputs embedded in the description) so the
 task itself cannot drift between runs. Real-repo fix tasks are deliberately
@@ -136,8 +139,14 @@ absent from v1 — they change as the repo changes, which breaks pinning.
 
 ## Operating notes (from `p4-floor-trim-01` + `s4m2-rerun-01`, 2026-08-07)
 
-- **Two-arm runs:** `submit.py --server` builds a single arm only. For A/Bs,
-  build the spec yourself (tasks from `tasks.yaml`, `arms: [{name, model,
+- **Two-arm runs:** `submit.py --server --arms developer,engineer` builds one
+  arm per bundled config name (arm name = config name; the arm's config_name
+  overrides each task's), e.g. the developer-vs-engineer campaign
+  (`knowledge-base/knowledge/features/engineer_expert.md` §6):
+  `python bench/submit.py --server --run-id dev-vs-eng-01 --replicates 3 --model MiniMax-M3 --arms developer,engineer --only D1-wordfreq-kata,D2-inventory-bugfix,D3-ledger-refactor,D4-static-page,D5-clone-and-extend,O1-install-and-report`.
+  Its ceremony metric is `bench/queries/first_command_latency.sql` (attach → first
+  shell command, audit rows before it) over the member job ids. For arms that
+  need distinct `config_override`s or `project_id`s, build the spec yourself (tasks from `tasks.yaml`, `arms: [{name, model,
   config_override, project_id}, ...]`) and POST `/api/bench/runs` directly.
   Give each arm its own `project_id` when memory coupling could leak the
   treatment; an arm without one inherits the run-level project. The sweeper

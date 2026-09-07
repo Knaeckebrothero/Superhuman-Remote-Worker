@@ -120,21 +120,40 @@ def submit_one(task: dict, args, replicate: int) -> str:
 def server_payload(tasks: list[dict], args: argparse.Namespace) -> dict:
     """Build the inline v1 server spec without retaining a tasks-file link."""
 
-    arm: dict = {
-        "name": args.arm,
-        "config_override": {},
-        "model": args.model,
-    }
-    if args.config_name:
-        arm["config_name"] = args.config_name
-    if args.expert_id:
-        arm["expert_id"] = args.expert_id
+    arm_names = [
+        a.strip() for a in (getattr(args, "arms", None) or "").split(",") if a.strip()
+    ]
+    if arm_names:
+        # One arm per bundled config: the arm name IS the config_name, so the
+        # report's per-task x arm table reads as "developer vs engineer". The
+        # arm's config_name overrides the task's, so the same task set serves
+        # every arm.
+        arms = [
+            {
+                "name": name,
+                "config_name": name,
+                "config_override": {},
+                "model": args.model,
+            }
+            for name in arm_names
+        ]
+    else:
+        arm: dict = {
+            "name": args.arm,
+            "config_override": {},
+            "model": args.model,
+        }
+        if args.config_name:
+            arm["config_name"] = args.config_name
+        if args.expert_id:
+            arm["expert_id"] = args.expert_id
+        arms = [arm]
     payload = {
         "name": args.run_id,
         "tasks": tasks,
         "replicates": args.replicates,
         "max_in_flight": args.max_in_flight,
-        "arms": [arm],
+        "arms": arms,
     }
     if args.project_id:
         payload["project_id"] = args.project_id
@@ -156,6 +175,14 @@ def main():
     ap.add_argument(
         "--expert-id",
         help="server mode: arm-level DB-backed expert UUID",
+    )
+    ap.add_argument(
+        "--arms",
+        help=(
+            "server mode: comma-separated bundled config names, one arm each "
+            "(arm name = config name; the arm overrides each task's config_name); "
+            "exclusive with --config-name/--expert-id"
+        ),
     )
     ap.add_argument("--project-id", default=None)
     ap.add_argument("--max-in-flight", type=int, default=2)
@@ -183,6 +210,8 @@ def main():
             )
         if args.config_name and args.expert_id:
             raise SystemExit("pass --config-name or --expert-id, not both")
+        if args.arms and (args.config_name or args.expert_id):
+            raise SystemExit("pass --arms or --config-name/--expert-id, not both")
         payload = server_payload(tasks, args)
         if args.dry_run:
             print(json.dumps(payload, indent=2))

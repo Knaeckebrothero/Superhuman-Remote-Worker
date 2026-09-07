@@ -1,0 +1,10 @@
+# Engineer expert model config matrix. Only the `default` entry: without it,
+# families that ship their own generalist persona/instructions (gemma, gpt-5,
+# minimax, ...) would resolve those instead of the engineer's files.
+default:
+  prompts:
+    persona: persona.txt
+  instructions:
+    instructions: instructions.md
+    strategic_todos_initial: strategic_todos_initial.yaml
+    workspace_template: workspace_template.md

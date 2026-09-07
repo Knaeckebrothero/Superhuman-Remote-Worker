@@ -97,3 +97,53 @@ def test_report_server_mode_only_formats_server_metrics(capsys):
     assert "server Job Bench run run-uuid" in output
     assert "INFRA" in output
     assert "4 [3..5]" in output
+
+
+def test_submit_server_payload_builds_one_arm_per_bundled_config():
+    submit = _load_script("bench_submit_arms_test", "submit.py")
+    tasks = submit.load_tasks(BENCH_DIR / "tasks.yaml", {"D1-wordfreq-kata"})
+    args = argparse.Namespace(
+        arm="baseline",
+        arms="developer,engineer",
+        model="MiniMax-M3",
+        config_name=None,
+        expert_id=None,
+        run_id="dev-vs-eng-01",
+        replicates=3,
+        max_in_flight=2,
+        project_id=None,
+    )
+    payload = submit.server_payload(tasks, args)
+    assert payload["arms"] == [
+        {
+            "name": "developer",
+            "config_name": "developer",
+            "config_override": {},
+            "model": "MiniMax-M3",
+        },
+        {
+            "name": "engineer",
+            "config_name": "engineer",
+            "config_override": {},
+            "model": "MiniMax-M3",
+        },
+    ]
+    assert "project_id" not in payload
+
+
+def test_new_bench_tasks_are_pinned_to_the_engineer_and_self_describing():
+    submit = _load_script("bench_tasks_test", "submit.py")
+    ids = {
+        "D3-ledger-refactor",
+        "D4-static-page",
+        "D5-clone-and-extend",
+        "O1-install-and-report",
+    }
+    tasks = {t["id"]: t for t in submit.load_tasks(BENCH_DIR / "tasks.yaml", ids)}
+    assert set(tasks) == ids
+    for task in tasks.values():
+        assert task["config_name"] == "engineer", task["id"]
+        assert task["required_deliverables"], task["id"]
+        assert "output/" in " ".join(task["required_deliverables"]), task["id"]
+    assert tasks["D5-clone-and-extend"]["family"] == "dev-repo"
+    assert tasks["O1-install-and-report"]["family"] == "ops"
