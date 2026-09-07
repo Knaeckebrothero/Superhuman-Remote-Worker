@@ -143,6 +143,34 @@ excluded_rules = [
 #                shape idempotently so either lineage converges. Acting on this
 #                finding in place is precisely the outage; the file must stay
 #                byte-frozen forever, at these bytes.
+#        - app/0203: one prefer-robust-stmts finding on the concurrent unique
+#                index behind threads.ssh_handle. The app/0132 carve-out
+#                exactly, and 0203's own `rollout:` header already argues it:
+#                IF NOT EXISTS reports success against an INVALID same-name
+#                shell left by a failed concurrent build, which would record
+#                0203 as applied while uniqueness went unenforced. That is not
+#                cosmetic here -- the handle is how SSH addresses a session, so
+#                an unenforced index routes a connection to the wrong
+#                workspace. It buys nothing on the success path either, since
+#                the runner re-reads schema_migrations and skips an applied
+#                .notx migration. The file documents the explicit DROP INDEX
+#                CONCURRENTLY repair instead.
+#        - app/0204: two require-concurrent-index-creation findings on the
+#                ssh_attachments audit table. The app/0117 shape, but stronger:
+#                both indexes sit inside the same BEGIN/COMMIT as the
+#                CREATE TABLE IF NOT EXISTS public.ssh_attachments a few lines
+#                above them, so each build is against a table this same file
+#                just created -- empty, instant, no meaningful lock. The file
+#                is transactional-atomic by design (the table, its FK-lock
+#                retry wrapper and its indexes must land together) and
+#                CONCURRENTLY cannot run in a transaction, so the rule is
+#                unsatisfiable here rather than merely inconvenient.
+#          Both 0203 and 0204 were flagged on develop when they landed (run
+#          021232f4, 2026-08-29). That red self-cleared on the next push --
+#          the lint covers only files changed in that push -- and the files
+#          were applied and checksum-frozen before anyone acted on it. They
+#          are recorded here so the exemption lives where every other one
+#          does, rather than resting on the promotion skip in db-migrations.yml.
 #        - app/0212: one constraint-missing-not-valid on models_capabilities_check.
 #                The app/0123 carve-out shape: the migration REPLACES the
 #                existing constraint with a strictly wider one (same predicate
@@ -169,6 +197,8 @@ excluded_paths = [
     "src/orchestrator/database/migrations/app/0147_thread_permission_lease_receipts.sql",
     "src/orchestrator/database/migrations/app/0171_officer_runtime_grant_liveness.sql",
     "src/orchestrator/database/migrations/app/0183_persistent_input_delivery_cancellation.sql",
+    "src/orchestrator/database/migrations/app/0203_threads_ssh_handle_idx.notx.sql",
+    "src/orchestrator/database/migrations/app/0204_ssh_attachments.sql",
     "src/orchestrator/database/migrations/app/0212_search_fetch_capabilities.sql",
     "src/orchestrator/database/migrations/vector/0008_kb_index_chunking.sql",
 ]
