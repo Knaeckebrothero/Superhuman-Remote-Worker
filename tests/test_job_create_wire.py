@@ -1199,18 +1199,23 @@ async def test_bench_adapter_revalidates_creator_and_preserves_provenance(
     wire, monkeypatch
 ):
     from orchestrator.routers import bench
-    from orchestrator.security import access, auth
+    from orchestrator.security import access
 
-    # Exercise the retained real bench Request bridge and real MCP auth, with
-    # a test-only transport key and external storage/provisioning controlled.
-    monkeypatch.setenv("MCP_INTERNAL_KEY", "bench-fixture-key")
-    monkeypatch.setattr(access, "_INTERNAL_KEY", "bench-fixture-key")
-    monkeypatch.setattr(main, "is_internal_call", access.is_internal_call)
-    monkeypatch.setattr(main, "require_approved_user", auth.require_approved_user)
+    # Application-owned submission still revalidates the persisted creator,
+    # while admission no longer depends on an HTTP transport key or Request.
+    monkeypatch.delenv("MCP_INTERNAL_KEY", raising=False)
+    monkeypatch.setattr(access, "_INTERNAL_KEY", None)
+    monkeypatch.setattr(
+        main,
+        "require_approved_user",
+        AsyncMock(side_effect=AssertionError("benchmark must not fabricate HTTP auth")),
+    )
     run = {"id": JOB, "created_by": USER, "spec": {"project_id": PROJECT}}
     task = {"id": "scope-test", "description": "bench admission"}
     arm = {"name": "baseline", "model": "fixture-model"}
-    result = await bench._create_job_through_main(run, task, arm, 1)
+    result = await bench._create_job_through_admission(
+        run, task, arm, 1, create_job=main._create_bench_job
+    )
     assert str(result["id"]) == JOB
     args = wire.db.create_job.await_args.kwargs
     assert args["user_id"] == USER and args["project_id"] == PROJECT
@@ -1227,11 +1232,15 @@ async def test_bench_adapter_revalidates_creator_and_preserves_provenance(
     wire.dispatch.reset_mock()
     wire.db.get_user.return_value["is_approved"] = False
     with pytest.raises(HTTPException) as exc:
-        await bench._create_job_through_main(run, task, arm, 2)
+        await bench._create_job_through_admission(
+            run, task, arm, 2, create_job=main._create_bench_job
+        )
     assert exc.value.status_code == 403
     wire.db.get_user.return_value = None
     with pytest.raises(HTTPException) as exc:
-        await bench._create_job_through_main(run, task, arm, 3)
+        await bench._create_job_through_admission(
+            run, task, arm, 3, create_job=main._create_bench_job
+        )
     assert exc.value.status_code == 401
     wire.db.create_job.assert_not_awaited()
     wire.provision.assert_not_awaited()
@@ -1298,3 +1307,318 @@ async def test_success_keeps_jsonb_shape_and_redacts_private_workspace_fields(
     )
     assert projected == {"llm": {"model": "fixture"}, "workspace": {}}
     assert "synthetic-private-host" not in response.text
+
+
+def delivery_repository(**fields):
+    return {
+        "id": CONNECTOR,
+        "name": "Widget",
+        "type": "repository",
+        "connection_url": "https://github.com/Acme/Widget.git",
+        "read_only": False,
+        "project_read_only": False,
+        "config": {"forge": "github"},
+        "policy_revision": 7,
+        **fields,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "point,status,detail",
+    [
+        ("explicit", 403, "One or more selected connectors are unavailable"),
+        ("tier", 400, "repository requires a shell workspace"),
+        ("default", 403, "One or more selected connectors are unavailable"),
+        ("default_store", 500, "fixture store unavailable"),
+    ],
+)
+async def test_datasource_refusal_precedes_delivery_lookup_insert_and_provision(
+    wire, point, status, detail
+):
+    from orchestrator.services.datasource_policy import DatasourceUnavailableError
+
+    if point == "default":
+        wire.defaults.side_effect = DatasourceUnavailableError()
+    elif point == "default_store":
+        wire.defaults.side_effect = RuntimeError(detail)
+    else:
+        wire.authorize.side_effect = HTTPException(status, detail)
+    selection = (
+        {"use_datasource_defaults": True}
+        if point.startswith("default")
+        else {"datasource_ids": [CONNECTOR]}
+    )
+    response = await submit(
+        wire, body(required_deliverables=["output/report.txt"], **selection)
+    )
+    assert response.status_code == status, response.text
+    assert response.json() == {"detail": detail}
+    wire.db.resolve_datasources_for_thread.assert_not_awaited()
+    wire.db.create_job.assert_not_awaited()
+    wire.provision.assert_not_awaited()
+    wire.dispatch.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("child", [False, True])
+async def test_thread_dispatch_defaults_and_child_inheritance_reach_exact_insert(
+    officer_wire, monkeypatch, child
+):
+    wire = officer_wire
+    wire.officer.thread["metadata"]["config_override"]["officer"]["enabled"] = False
+    wire.officer.thread["metadata"]["datasource_ids"] = [CONNECTOR]
+    wire.db.get_project_officer_lineage.return_value = []
+    wire.defaults.return_value = ([EXPERT], {EXPERT: 17})
+    wire.authorize.side_effect = lambda _actor, ids, **_kw: (list(ids), {CONNECTOR: 7})
+    response = await submit(
+        wire,
+        body(
+            thread_id=THREAD,
+            parent_job_id=PARENT if child else None,
+            use_datasource_defaults=True,
+        ),
+        **{"x-test-internal": "1"},
+    )
+    assert response.status_code == 200, response.text
+    kwargs = wire.db.create_job.await_args.kwargs
+    expected_ids, expected_revisions = (
+        ([CONNECTOR], {CONNECTOR: 7}) if child else ([EXPERT], {EXPERT: 17})
+    )
+    assert kwargs["datasource_ids"] == expected_ids
+    assert kwargs["datasource_policy_revisions"] == expected_revisions
+    provenance = kwargs["datasource_selection_provenance"]
+    assert provenance["datasource_ids"] == expected_ids
+    assert provenance["policy_revisions"] == expected_revisions
+    assert provenance["origin"] == ("inherited" if child else "default")
+    assert provenance["project_ids"] == [PROJECT]
+    assert provenance["effective_work_owner_id"] == USER
+    assert kwargs["created_by_thread_id"] == (None if child else THREAD)
+    assert kwargs["wake_on_complete"] is (not child)
+    assert wire.defaults.await_count == int(not child)
+    assert wire.authorize.await_count == int(child)
+
+
+@pytest.mark.asyncio
+async def test_bound_pr_delivery_preserves_revision_and_provisions_after_insert(wire):
+    wire.authorize.side_effect = lambda _actor, ids, **_kw: (list(ids), {CONNECTOR: 7})
+    wire.db.resolve_datasources_for_thread.return_value = [delivery_repository()]
+    order = Mock()
+    for name, collaborator in (
+        ("authorize", wire.authorize),
+        ("resolve", wire.db.resolve_datasources_for_thread),
+        ("insert", wire.db.create_job),
+        ("provision", wire.provision),
+        ("dispatch", wire.dispatch),
+    ):
+        order.attach_mock(collaborator, name)
+    response = await submit(
+        wire,
+        body(
+            datasource_ids=[CONNECTOR],
+            required_deliverables=[" PR:Acme/Widget ", "pr:acme/widget"],
+        ),
+    )
+    assert response.status_code == 200, response.text
+    assert [event[0] for event in order.mock_calls] == [
+        "authorize",
+        "resolve",
+        "insert",
+        "provision",
+        "dispatch",
+    ]
+    wire.db.resolve_datasources_for_thread.assert_awaited_once_with(
+        [CONNECTOR], [PROJECT]
+    )
+    kwargs = wire.db.create_job.await_args.kwargs
+    assert kwargs["datasource_policy_revisions"] == {CONNECTOR: 7}
+    assert kwargs["context"]["required_deliverables"] == ["pr:acme/widget"]
+    assert kwargs["delivery_contract"]["pr_bindings"] == [
+        {
+            "repository": "acme/widget",
+            "datasource_id": CONNECTOR,
+            "forge": "github",
+            "policy_revision": 7,
+        }
+    ]
+    assert kwargs["delivery_contract"]["deliverables"] == ["pr:acme/widget"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "requested,rows,code",
+    [
+        (["pr:acme/other"], [delivery_repository()], "pr_deliverable_not_attached"),
+        (
+            ["pr:acme/widget"],
+            [delivery_repository(read_only=True)],
+            "pr_deliverable_read_only",
+        ),
+        (
+            ["repos/Widget/output/report.txt"],
+            [delivery_repository()],
+            "external_repository_requires_pr",
+        ),
+    ],
+)
+async def test_delivery_contract_refusals_keep_structured_http_without_inserting(
+    wire, requested, rows, code
+):
+    wire.db.resolve_datasources_for_thread.return_value = rows
+    response = await submit(
+        wire, body(datasource_ids=[CONNECTOR], required_deliverables=requested)
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == code
+    assert isinstance(response.json()["detail"]["message"], str)
+    wire.authorize.assert_awaited_once()
+    wire.db.resolve_datasources_for_thread.assert_awaited_once_with(
+        [CONNECTOR], [PROJECT]
+    )
+    wire.db.create_job.assert_not_awaited()
+    wire.provision.assert_not_awaited()
+    wire.dispatch.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("receipt_conflict", [False, True])
+async def test_officer_delivery_refusal_records_requirement_before_refusing_creation(
+    officer_wire, monkeypatch, receipt_conflict
+):
+    from orchestrator.services.officer_admission import OfficerAdmissionConflict
+
+    wire = officer_wire
+    wire.db.resolve_datasources_for_thread.return_value = [delivery_repository()]
+    receipt = AsyncMock()
+    if receipt_conflict:
+        receipt.side_effect = OfficerAdmissionConflict("officer_held", "Post was held.")
+    monkeypatch.setattr(
+        "orchestrator.services.officer_admission.record_rejected_ticket_delivery_requirement",
+        receipt,
+    )
+    response = await submit(
+        wire,
+        body(
+            thread_id=THREAD,
+            ticket="fixture",
+            datasource_ids=[CONNECTOR],
+            required_deliverables=["repos/Widget/output/report.txt"],
+        ),
+        **{"x-test-internal": "1"},
+    )
+    assert response.status_code == 409, response.text
+    expected_code = (
+        "officer_held" if receipt_conflict else "external_repository_requires_pr"
+    )
+    assert response.json()["detail"]["code"] == expected_code
+    receipt.assert_awaited_once()
+    assert receipt.await_args.args == (wire.db,)
+    args = receipt.await_args.kwargs
+    assert args["preparation"].thread_id == THREAD
+    assert args["ticket_note_id"] == "fixture"
+    assert args["ticket_ready_at"] == STAMP
+    assert args["required_pr_repositories"] == ["acme/widget"]
+    wire.db.create_job.assert_not_awaited()
+    wire.officer.admit.assert_not_awaited()
+    wire.officer.preflight.assert_not_awaited()
+    wire.provision.assert_not_awaited()
+    wire.dispatch.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error_type,status,detail",
+    [
+        (
+            "DatasourceMaterializationAuthorizationError",
+            403,
+            "Work owner is no longer authorized",
+        ),
+        (
+            "DatasourcePolicyConflictError",
+            409,
+            "Connector policy changed while creating work; retry the request",
+        ),
+        ("RuntimeError", 500, "fixture persistence failure"),
+    ],
+)
+async def test_insert_error_keeps_wire_mapping_and_never_provisions(
+    wire, error_type, status, detail
+):
+    from orchestrator.database import postgres
+
+    error_class = (
+        RuntimeError if error_type == "RuntimeError" else getattr(postgres, error_type)
+    )
+    wire.db.create_job.side_effect = error_class("fixture persistence failure")
+    response = await submit(wire, body())
+    assert response.status_code == status, response.text
+    assert response.json() == {"detail": detail}
+    wire.db.create_job.assert_awaited_once()
+    wire.provision.assert_not_awaited()
+    wire.dispatch.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_normal_provisioning_failure_leaves_insert_but_does_not_dispatch(wire):
+    wire.provision.side_effect = RuntimeError("fixture provisioning failure")
+    response = await submit(wire, body())
+    assert response.status_code == 500, response.text
+    assert response.json() == {"detail": "fixture provisioning failure"}
+    wire.db.create_job.assert_awaited_once()
+    wire.provision.assert_awaited_once()
+    main._spawn_scholar_subjob.assert_not_awaited()
+    wire.dispatch.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_inactive_officer_preflight_is_returned_without_scholar_or_normal_dispatch(
+    officer_wire,
+):
+    wire = officer_wire
+    wire.officer.preflight.return_value = SimpleNamespace(
+        activated=False,
+        state="retryable_failure",
+        retryable=True,
+        phase="repository",
+        error="fixture provisioning unavailable",
+    )
+    response = await submit(wire, body(thread_id=THREAD), **{"x-test-internal": "1"})
+    assert response.status_code == 200, response.text
+    assert response.json()["provisioning_preflight"] == {
+        "activated": False,
+        "state": "retryable_failure",
+        "retryable": True,
+        "phase": "repository",
+        "error": "fixture provisioning unavailable",
+    }
+    wire.officer.admit.assert_awaited_once()
+    wire.officer.preflight.assert_awaited_once()
+    main._spawn_scholar_subjob.assert_not_awaited()
+    wire.provision.assert_not_awaited()
+    wire.dispatch.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_bench_readiness_refusal_precedes_fresh_creator_lookup(wire, monkeypatch):
+    from orchestrator.routers import bench
+
+    monkeypatch.setattr(
+        main,
+        "_enforce_readiness_gate",
+        AsyncMock(side_effect=HTTPException(503, "not ready")),
+    )
+    run = {"id": JOB, "created_by": USER, "spec": {"project_id": PROJECT}}
+    with pytest.raises(HTTPException) as exc:
+        await bench._create_job_through_admission(
+            run,
+            {"id": "scope-test", "description": "bench admission"},
+            {"name": "baseline", "model": "fixture-model"},
+            1,
+            create_job=main._create_bench_job,
+        )
+    assert (exc.value.status_code, exc.value.detail) == (503, "not ready")
+    wire.db.get_user.assert_not_awaited()
+    wire.db.create_job.assert_not_awaited()
+    wire.provision.assert_not_awaited()
+    wire.dispatch.assert_not_called()

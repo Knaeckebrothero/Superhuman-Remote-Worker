@@ -21,6 +21,7 @@ import os
 from datetime import datetime, timedelta, UTC
 
 from fastapi import HTTPException, Request
+from orchestrator.security.account_approval import require_account_approved
 from orchestrator.security.kc_client import KeycloakClientError, kc_bff_client
 from orchestrator.security.oidc import oidc_validator
 
@@ -666,11 +667,7 @@ async def require_approved_user(request: Request, db) -> dict:
     knowledge-base/knowledge/features/admin_view_as_user.md.
     """
     user = await get_current_user(request, db)
-    if not user.get("is_approved"):
-        raise HTTPException(
-            status_code=403,
-            detail="Account pending approval. An administrator must approve your account.",
-        )
+    require_account_approved(user)
     view_as = request.headers.get(VIEW_AS_HEADER, "").lower()
     if view_as == "user" and user.get("is_admin"):
         return {**user, "is_admin": False, "real_is_admin": True}

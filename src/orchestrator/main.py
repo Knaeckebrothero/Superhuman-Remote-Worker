@@ -10543,18 +10543,28 @@ from orchestrator.services.config_overrides import (  # noqa: E402
     deep_merge_dicts as _deep_merge_dicts,
     validated_config_name as _validated_config_name,
 )
+from orchestrator.services.job_admission import (  # noqa: E402
+    JobAdmissionDependencies,
+    admit_job,
+)
+from orchestrator.services.job_admission_datasources import (  # noqa: E402
+    JobAdmissionDatasourcesDependencies,
+)
+from orchestrator.services.job_admission_delivery import (  # noqa: E402
+    JobAdmissionDeliveryDependencies,
+)
+from orchestrator.services.job_admission_creation import (  # noqa: E402
+    JobAdmissionCreationDependencies,
+)
 from orchestrator.services.job_admission_config import (  # noqa: E402
     JobAdmissionConfigDependencies,
-    prepare_job_admission_config,
 )
 from orchestrator.services.job_admission_workspace import (  # noqa: E402
     JobAdmissionWorkspaceDependencies,
-    prepare_job_admission_workspace,
 )
 from orchestrator.services.job_admission_officer import (  # noqa: E402
     JobAdmissionOfficerDependencies,
     compose_category_kickoff as _compose_category_kickoff,  # noqa: F401 -- compatibility export
-    prepare_job_admission_officer,
 )
 from orchestrator.services.officer_metadata import (  # noqa: E402
     officer_meta_enabled as _officer_meta_enabled,
@@ -10564,7 +10574,6 @@ from orchestrator.services.job_admission_scope import (  # noqa: E402
     JobAdmissionActor,
     JobAdmissionScopeDependencies,
     _INTERNAL_JOB_SCOPE_DENIED,
-    prepare_job_admission_scope,
 )
 from orchestrator.services.job_create_ingress import (  # noqa: E402
     _SERVER_OWNED_OFFICER_CONTEXT_KEYS as _SERVER_OWNED_OFFICER_CONTEXT_KEYS,
@@ -18816,6 +18825,133 @@ def _job_admission_workspace_dependencies() -> JobAdmissionWorkspaceDependencies
     )
 
 
+def _job_admission_datasources_dependencies() -> JobAdmissionDatasourcesDependencies:
+    """Bind current connector authorities without evaluating selection defaults."""
+    from functools import partial
+
+    from orchestrator.services.datasource_policy import default_datasource_selection
+
+    return JobAdmissionDatasourcesDependencies(
+        backend_from_override=_backend_from_override,
+        inherit_parent_ids=_inherit_parent_datasource_ids,
+        filter_implicit_lite_ids=_filter_implicit_lite_datasource_ids,
+        authorize_selection=_authorize_thread_datasource_selection,
+        default_selection=partial(default_datasource_selection, postgres_db),
+        defaults_on_omission=_datasource_defaults_on_omission,
+        selection_provenance=_datasource_selection_provenance,
+    )
+
+
+def _job_admission_delivery_dependencies() -> JobAdmissionDeliveryDependencies:
+    """Bind the existing delivery-refusal transaction to the current store."""
+    from functools import partial
+
+    from orchestrator.services.officer_admission import (
+        record_rejected_ticket_delivery_requirement,
+    )
+
+    db = postgres_db
+    return JobAdmissionDeliveryDependencies(
+        store=db,
+        record_rejected_ticket_delivery_requirement=partial(
+            record_rejected_ticket_delivery_requirement, db
+        ),
+    )
+
+
+def _job_admission_creation_dependencies() -> JobAdmissionCreationDependencies:
+    """Bind creation owners; defer provisioning imports until their operation."""
+    db, forge, cloud = postgres_db, gitea_client, main_cloud_router
+
+    async def admit_officer(**kwargs):
+        from orchestrator.services.officer_admission import admit_and_create_job
+
+        return await admit_and_create_job(db, **kwargs)
+
+    async def activate_officer(job_row, **kwargs):
+        from orchestrator.services.officer_preflight import ensure_officer_job_activated
+
+        return await ensure_officer_job_activated(db, job_row, **kwargs)
+
+    async def provision_repo(*, job_row):
+        from orchestrator.services.job_provisioning import provision_job_repo
+
+        return await provision_job_repo(
+            job_row=job_row,
+            gitea_client=forge,
+            postgres_db=db,
+            main_cloud_router=cloud,
+        )
+
+    return JobAdmissionCreationDependencies(
+        store=db,
+        admit_officer=admit_officer,
+        activate_officer=activate_officer,
+        provision_officer=_provision_officer_ticket_repo,
+        provision_repo=provision_repo,
+        spawn_scholar=_spawn_scholar_subjob,
+        resolve_origin=_resolve_submitted_job_origin,
+        trigger_dispatch=_trigger_dispatch,
+    )
+
+
+def _job_admission_dependencies(scope_factory) -> JobAdmissionDependencies:
+    """Construct the shared operation without eagerly binding later stages."""
+    return JobAdmissionDependencies(
+        validate_tool_overrides=_with_validated_tool_overrides,
+        enforce_readiness=_enforce_readiness_gate,
+        scope=scope_factory,
+        config=_job_admission_config_dependencies,
+        officer=_job_admission_officer_dependencies,
+        workspace=_job_admission_workspace_dependencies,
+        datasources=_job_admission_datasources_dependencies,
+        delivery=_job_admission_delivery_dependencies,
+        creation=_job_admission_creation_dependencies,
+        redact_result=_redact_job_config_override,
+    )
+
+
+async def _create_bench_job(creator_id: str, command: JobCreate) -> dict[str, Any]:
+    """Compose trusted in-process admission with deferred creator revalidation."""
+    from functools import partial
+
+    from orchestrator.services.job_admission_creator import authenticate_job_creator
+
+    _strip_raw_officer_claim_context(command)
+
+    def scope_factory() -> JobAdmissionScopeDependencies:
+        db = postgres_db
+        return JobAdmissionScopeDependencies(
+            store=db,
+            thread_project_ids=_thread_project_ids,
+            revalidate_thread_project_ids=_revalidate_thread_project_ids,
+            authenticate_forwarded_user=partial(
+                authenticate_job_creator, creator_id, db
+            ),
+            authorize_upload_reference=authorize_upload_reference,
+        )
+
+    return await admit_job(
+        command=command,
+        actor=JobAdmissionActor(forwarded_user_id=creator_id),
+        origin="internal_rest",
+        dependencies=_job_admission_dependencies(scope_factory),
+    )
+
+
+def _bench_dependencies():
+    """Bind the benchmark task to this application's creation operation."""
+    from orchestrator.routers.bench import BenchDependencies
+    from orchestrator.services.bench import BenchStore
+
+    return BenchDependencies(
+        store=BenchStore(postgres_db), create_job=_create_bench_job
+    )
+
+
+app.state.bench_dependencies_factory = _bench_dependencies
+
+
 async def _require_job_project_access(
     principal: dict[str, Any] | None,
     project_id: str | None,
@@ -18960,443 +19096,17 @@ async def create_job(request: Request, job: PublicJobCreateBody) -> dict[str, An
             await require_project_member(
                 request, postgres_db, str(job.project_id), min_role="editor"
             )
-    # The job surface had no tool vocabulary at all: it stripped four lifecycle
-    # markers and then accepted `tools.<anything>: [<any registered name>]`.
-    # That is the exact smuggle src/core/session_tool_overrides.py was written
-    # to prevent — the loader resolves a name against the global registry, not
-    # against the key it arrived under, so `tools.canvas: ["run_command"]`
-    # binds a shell tool — open on the other surface with only the dispatch PDP
-    # behind it, and the PDP keys off the category NAME (`_truthy(tools.shell)`)
-    # so it never sees the smuggled one.
-    #
-    # Applies to the internal path too: X-Internal-Key is transport
-    # authentication, not authorization, and create_job forwards a
-    # model-authored config_override verbatim. The server's own fragments are
-    # unaffected — _critic_config_override and the loop's `{"loop":
-    # ["loop_plan"]}` go through postgres_db.create_job directly, and the
-    # officer slot patch is merged in below, after this point.
-    job.config_override = _with_validated_tool_overrides(job.config_override)
-    await _enforce_readiness_gate()
-    try:
-        scope = await prepare_job_admission_scope(
-            command=job,
-            actor=JobAdmissionActor(
-                principal=caller,
-                forwarded_user_id=request.headers.get("X-MCP-User-Id"),
-            ),
-            origin="internal_rest" if internal_call else "user_rest",
-            dependencies=_job_admission_scope_dependencies(request),
-        )
-        internal_principal = scope.principal
-        effective_user_id = scope.user_id
-        internal_origin_bound = scope.origin_bound
-
-        prepared_config = await prepare_job_admission_config(
-            command=job,
-            scope=scope,
-            origin="internal_rest" if internal_call else "user_rest",
-            dependencies=_job_admission_config_dependencies(),
-        )
-        context = prepared_config.context
-        project_id = prepared_config.project_id
-        config_name = prepared_config.config_name
-        config_override = prepared_config.config_override
-        resolved_expert_id = prepared_config.expert_id
-        requested_workspace_backend = prepared_config.requested_workspace_backend
-        root_creation = prepared_config.root_creation
-
-        prepared_officer = await prepare_job_admission_officer(
-            command=job,
-            config=prepared_config,
-            dependencies=_job_admission_officer_dependencies(),
-        )
-        context = prepared_officer.context
-        config_override = prepared_officer.config_override
-        officer_admission_preparation = prepared_officer.preparation
-        officer_ticket_ready_at = prepared_officer.ticket_ready_at
-
-        execution_lane = await prepare_job_admission_workspace(
-            context=context,
-            config_override=config_override,
-            effective_user_id=effective_user_id,
-            project_id=project_id,
-            requested_lane=job.execution_lane,
-            root_creation=root_creation,
-            dependencies=_job_admission_workspace_dependencies(),
-        )
-
-        # Resolve one complete attachment set before persistence. Presence —
-        # not truthiness — distinguishes an explicit [] from omission.
-        from orchestrator.services.datasource_policy import default_datasource_selection
-
-        selection_actor = internal_principal if internal_call else caller
-        target_project_ids = [project_id] if project_id else []
-        lite_backend = _backend_from_override(config_override)
-        selection_was_supplied = "datasource_ids" in job.model_fields_set
-        trusted_system_origin = bool(
-            internal_call and internal_origin_bound and selection_actor is None
-        )
-        # Inheritance is for DELEGATION; project defaults are for DISPATCH.
-        #
-        # A parented subjob (critic, curator, pre-job scholar, a legacy delegation child)
-        # must never exceed its parent's connectors, so ``parent_job_id`` keeps
-        # inheriting unconditionally. But a thread that *commissions* fresh
-        # project work — an officer, a session — is not delegating its own
-        # charge, and it only landed in the inheritance branch because it
-        # happens to be a thread. That mis-classification made
-        # ``use_datasource_defaults`` unreachable for every thread-originated
-        # job: the branch below it was never evaluated, so the flag the client
-        # already sends on omission (orch_surface/client.py) was silently
-        # dropped.
-        #
-        # Cost of that, found live on Better Resavio 2026-08-15: the officer's
-        # own thread had been created without a selection, which persists as
-        # ``datasource_ids: []`` (origin ``omitted_compat``). Every job he
-        # commissioned faithfully inherited the empty list, so his workers got
-        # no KurortEngine checkout, could not clone/commit/push, and he
-        # correctly refused to dispatch further against a candidate that could
-        # never be produced — a full night idle on one absent field.
-        wants_dispatch_defaults = bool(
-            effective_user_id and job.use_datasource_defaults and not job.parent_job_id
-        )
-
-        if selection_was_supplied:
-            selection_origin = "explicit"
-            requested_datasource_ids = job.datasource_ids or []
-            trusted_explicit_reuse = False
-            if trusted_system_origin and effective_user_id is None:
-                # An ownerless internal caller has no ambient connector
-                # authority. It may narrow an authoritative thread/parent
-                # selection, but it cannot turn the trusted-inheritance seam
-                # into an arbitrary UUID capability.
-                inherited_ids = await _inherit_parent_datasource_ids(
-                    thread_id=job.thread_id,
-                    parent_job_id=job.parent_job_id,
-                )
-                try:
-                    requested_set = {
-                        str(UUID(str(value))) for value in requested_datasource_ids
-                    }
-                    inherited_set = {str(UUID(str(value))) for value in inherited_ids}
-                except (TypeError, ValueError) as exc:
-                    raise HTTPException(
-                        status_code=403,
-                        detail="One or more selected connectors are unavailable",
-                    ) from exc
-                if not requested_set.issubset(inherited_set):
-                    raise HTTPException(
-                        status_code=403,
-                        detail="One or more selected connectors are unavailable",
-                    )
-                trusted_explicit_reuse = True
-            (
-                selected_ds_ids,
-                selected_ds_revisions,
-            ) = await _authorize_thread_datasource_selection(
-                selection_actor,
-                requested_datasource_ids,
-                workspace_backend=lite_backend,
-                target_project_ids=target_project_ids,
-                effective_work_owner_id=(
-                    str(effective_user_id) if effective_user_id else None
-                ),
-                trusted_system_inheritance=trusted_explicit_reuse,
-                legacy_job_id=str(job.parent_job_id) if job.parent_job_id else None,
-            )
-        elif (job.thread_id or job.parent_job_id) and not wants_dispatch_defaults:
-            selection_origin = "inherited"
-            inherited_ids = await _inherit_parent_datasource_ids(
-                thread_id=job.thread_id, parent_job_id=job.parent_job_id
-            )
-            inherited_ids = await _filter_implicit_lite_datasource_ids(
-                inherited_ids, lite_backend
-            )
-            (
-                selected_ds_ids,
-                selected_ds_revisions,
-            ) = await _authorize_thread_datasource_selection(
-                selection_actor,
-                inherited_ids,
-                workspace_backend=None,
-                target_project_ids=target_project_ids,
-                effective_work_owner_id=(
-                    str(effective_user_id) if effective_user_id else None
-                ),
-                trusted_system_inheritance=trusted_system_origin,
-                legacy_job_id=str(job.parent_job_id) if job.parent_job_id else None,
-            )
-        elif effective_user_id and (
-            job.use_datasource_defaults or _datasource_defaults_on_omission()
-        ):
-            selection_origin = "default"
-            try:
-                (
-                    selected_ds_ids,
-                    selected_ds_revisions,
-                ) = await default_datasource_selection(
-                    postgres_db,
-                    str(effective_user_id),
-                    target_project_ids,
-                    lite_backend,
-                )
-            except Exception as exc:
-                from orchestrator.services.datasource_policy import (
-                    DatasourceUnavailableError,
-                )
-
-                if isinstance(exc, DatasourceUnavailableError):
-                    raise HTTPException(
-                        status_code=403,
-                        detail="One or more selected connectors are unavailable",
-                    ) from exc
-                raise
-        else:
-            selection_origin = "omitted_compat" if effective_user_id else "system_empty"
-            selected_ds_ids = []
-            selected_ds_revisions = {}
-
-        selection_provenance = await _datasource_selection_provenance(
-            datasource_ids=selected_ds_ids,
-            policy_revisions=selected_ds_revisions,
-            origin=selection_origin,
-            effective_work_owner_id=(
-                str(effective_user_id) if effective_user_id else None
-            ),
-            actor=selection_actor,
-            project_ids=target_project_ids,
-            creation_path="internal_rest" if internal_call else "user_rest",
-        )
-
-        # Bind the caller's semantic contract to the exact authorized
-        # datasource set before insertion.  This is also where the historical
-        # ``repos/<alias>/...`` form becomes a loud PR requirement: Pydantic
-        # cannot do that because project/ticket/datasource authority has not
-        # been resolved at that boundary.
-        from orchestrator.services.deliverable_contracts import (
-            DeliveryContractConflict,
-            prepare_delivery_contract,
-        )
-
-        # Repository binding is needed only for a declared contract. Keep
-        # jobs without deliverables on the historical creation path (and
-        # avoid turning an optional connector read into a new admission
-        # dependency for every job).
-        selected_datasources = []
-        if job.required_deliverables:
-            selected_datasources = await postgres_db.resolve_datasources_for_thread(
-                selected_ds_ids, target_project_ids
-            )
-        try:
-            delivery_plan = prepare_delivery_contract(
-                job.required_deliverables or [],
-                datasources=selected_datasources,
-            )
-        except DeliveryContractConflict as exc:
-            if (
-                exc.code == "external_repository_requires_pr"
-                and officer_admission_preparation is not None
-                and job.ticket
-                and officer_ticket_ready_at is not None
-            ):
-                from orchestrator.services.officer_admission import (
-                    OfficerAdmissionConflict,
-                    record_rejected_ticket_delivery_requirement,
-                )
-
-                try:
-                    await record_rejected_ticket_delivery_requirement(
-                        postgres_db,
-                        preparation=officer_admission_preparation,
-                        ticket_note_id=str(job.ticket),
-                        ticket_ready_at=officer_ticket_ready_at,
-                        required_pr_repositories=list(
-                            exc.fields.get("required_pr_repositories") or []
-                        ),
-                    )
-                except OfficerAdmissionConflict as admission_exc:
-                    raise HTTPException(
-                        status_code=409,
-                        detail={
-                            "code": admission_exc.code,
-                            "message": admission_exc.detail,
-                            **admission_exc.fields,
-                        },
-                    ) from admission_exc
-            raise HTTPException(
-                status_code=409,
-                detail={"code": exc.code, "message": exc.message, **exc.fields},
-            ) from exc
-
-        if delivery_plan.deliverables:
-            context["required_deliverables"] = list(delivery_plan.deliverables)
-            delivery_contract_record = delivery_plan.as_database_record()
-        else:
-            context.pop("required_deliverables", None)
-            delivery_contract_record = None
-
-        # Session ↔ job backref. `job.thread_id` is authenticated on the
-        # internal path (prepare_job_admission_scope 403s on a thread
-        # that is missing or owned by someone else) and forced to None on the
-        # public path by _strip_public_job_reserved_markers — so persisting it
-        # here cannot be steered from a request body.
-        #
-        # Only ROOT creations carry the backref: a worker child (scholar,
-        # critic, delegation subagent) inherits its thread scope for datasources
-        # but its completion is the parent job's business, not the session's.
-        # Waking the session per subjob would turn one delegation into a status
-        # feed. (Those call sites hit postgres_db.create_job directly anyway and
-        # simply never pass the kwarg.)
-        #
-        # wake_on_complete is set here, server-side, rather than being a
-        # create_job parameter: an opt-in flag the model must remember
-        # fails SILENTLY — it forgets, then never learns the job finished, which
-        # is indistinguishable from having no wake feature at all. A surplus
-        # wake costs one cheap turn the agent can go straight back to sleep
-        # from. knowledge-base/knowledge/features/session_wake_on_job_completion.md.
-        creating_thread_id = (
-            str(job.thread_id) if (job.thread_id and root_creation) else None
-        )
-
-        create_kwargs = {
-            "description": job.description,
-            "document_path": job.document_path,
-            "document_dir": job.document_dir,
-            "config_name": config_name,
-            "expert_id": resolved_expert_id,
-            "config_override": config_override,
-            "context": context if context else None,
-            "user_id": effective_user_id,
-            "project_id": project_id,
-            "parent_job_id": job.parent_job_id,
-            "priority": job.priority,
-            "creation_order": job.creation_order,
-            "worktree_path": job.worktree_path,
-            "delegation_context": job.delegation_context,
-            "created_by_thread_id": creating_thread_id,
-            "wake_on_complete": bool(creating_thread_id),
-            "datasource_ids": selected_ds_ids,
-            "datasource_selection_provenance": selection_provenance,
-            "datasource_policy_revisions": selected_ds_revisions,
-            "authority_user_id": (
-                str(effective_user_id) if effective_user_id else None
-            ),
-            "authority_project_ids": (
-                target_project_ids if effective_user_id else None
-            ),
-            "execution_lane": execution_lane,
-            "origin": _resolve_submitted_job_origin(
-                context=context,
-                parent_job_id=job.parent_job_id,
-                thread_id=creating_thread_id,
-            ),
-            "requested_workspace_backend": requested_workspace_backend,
-            "workspace_assignment_source": (
-                "request"
-                if requested_workspace_backend is not None
-                else "resolved_config"
-            ),
-            "delivery_contract": delivery_contract_record,
-        }
-        if officer_admission_preparation is not None:
-            from orchestrator.services.officer_admission import (
-                OfficerAdmissionConflict,
-                SlotAdmissionError,
-                admit_and_create_job,
-            )
-
-            try:
-                result = await admit_and_create_job(
-                    postgres_db,
-                    preparation=officer_admission_preparation,
-                    job_kwargs=create_kwargs,
-                    ticket_note_id=str(job.ticket) if job.ticket else None,
-                    ticket_ready_at=officer_ticket_ready_at,
-                    ticket_claim_source="manual",
-                    strict_provisioning=True,
-                )
-            except OfficerAdmissionConflict as exc:
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "code": exc.code,
-                        "message": exc.detail,
-                        **exc.fields,
-                    },
-                ) from exc
-            except SlotAdmissionError as exc:
-                raise HTTPException(status_code=409, detail=str(exc)) from exc
-        else:
-            result = await postgres_db.create_job(**create_kwargs)
-
-        officer_preflight_activated = True
-        if officer_admission_preparation is not None:
-            from orchestrator.services.officer_preflight import (
-                ensure_officer_job_activated,
-            )
-
-            preflight = await ensure_officer_job_activated(
-                postgres_db,
-                result,
-                provision=_provision_officer_ticket_repo,
-                category=officer_admission_preparation.category,
-                trigger_dispatch=_trigger_dispatch,
-            )
-            officer_preflight_activated = preflight.activated
-            result = await postgres_db.get_job(str(result["id"])) or result
-            result["provisioning_preflight"] = {
-                "state": preflight.state,
-                "activated": preflight.activated,
-                "retryable": preflight.retryable,
-                "phase": preflight.phase,
-                "error": preflight.error,
-            }
-        else:
-            from orchestrator.services.job_provisioning import provision_job_repo
-
-            await provision_job_repo(
-                job_row=result,
-                gitea_client=gitea_client,
-                postgres_db=postgres_db,
-                main_cloud_router=main_cloud_router,
-            )
-
-        # Spawn scholar subjob if enabled (root jobs only)
-        if not job.parent_job_id and officer_preflight_activated:
-            try:
-                # Re-fetch the job so _spawn_scholar_subjob has repo_name etc.
-                fresh_job = await postgres_db.get_job(str(result["id"]))
-                if fresh_job:
-                    scholar_result = await _spawn_scholar_subjob(
-                        fresh_job,
-                        config_name,
-                        config_override,
-                        context,
-                    )
-                    if scholar_result:
-                        result["scholar_job_id"] = str(scholar_result["id"])
-            except Exception as e:
-                logger.warning(f"Failed to spawn scholar for job {result['id']}: {e}")
-
-        # Trigger auto-assignment dispatcher (fire-and-forget)
-        if officer_admission_preparation is None:
-            _trigger_dispatch()
-
-        return _redact_job_config_override(result)
-    except DatasourceMaterializationAuthorizationError as exc:
-        raise HTTPException(
-            status_code=403,
-            detail="Work owner is no longer authorized",
-        ) from exc
-    except DatasourcePolicyConflictError as exc:
-        raise HTTPException(
-            status_code=409,
-            detail="Connector policy changed while creating work; retry the request",
-        ) from exc
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("Failed to create job: %s", e)
-        raise HTTPException(status_code=500, detail=str(e)) from e
+    return await admit_job(
+        command=job,
+        actor=JobAdmissionActor(
+            principal=caller,
+            forwarded_user_id=request.headers.get("X-MCP-User-Id"),
+        ),
+        origin="internal_rest" if internal_call else "user_rest",
+        dependencies=_job_admission_dependencies(
+            lambda: _job_admission_scope_dependencies(request)
+        ),
+    )
 
 
 @app.delete("/api/jobs/{job_id}")

@@ -42,6 +42,15 @@ try:
 except ImportError:
     asyncpg = None
 
+from orchestrator.services.datasource_policy_errors import (
+    DatasourcePolicyError as DatasourcePolicyError,
+    DatasourcePolicyValidationError as DatasourcePolicyValidationError,
+    DatasourcePolicyConflictError as DatasourcePolicyConflictError,
+    DatasourceProjectAuthorizationError as DatasourceProjectAuthorizationError,
+    DatasourceScopeAuthorizationError as DatasourceScopeAuthorizationError,
+    DatasourceMaterializationAuthorizationError as DatasourceMaterializationAuthorizationError,
+)
+
 from orchestrator.database.repositories.contacts import (
     CONTACT_OPT_IN_DEFAULT as CONTACT_OPT_IN_DEFAULT,
     _CONTACT_SELECT as _CONTACT_SELECT,
@@ -912,30 +921,6 @@ def _workspace_runtime_mutation_lock_name(
     """Stable cross-version name for one physical workspace mutation domain."""
 
     return f"workspace_runtime_mutation:{owner_kind}:{owner_id}:{scope}"
-
-
-class DatasourcePolicyError(ValueError):
-    """Base class for datasource scope/default persistence failures."""
-
-
-class DatasourcePolicyValidationError(DatasourcePolicyError):
-    """A requested datasource policy is structurally invalid."""
-
-
-class DatasourcePolicyConflictError(DatasourcePolicyError):
-    """The caller edited a stale datasource policy revision."""
-
-
-class DatasourceProjectAuthorizationError(DatasourcePolicyError):
-    """A project-link addition lost its required owner authority."""
-
-
-class DatasourceScopeAuthorizationError(DatasourcePolicyError):
-    """A project-scoped principal attempted a cross-scope datasource mutation."""
-
-
-class DatasourceMaterializationAuthorizationError(DatasourcePolicyError):
-    """A work owner lost approval or target-project access before insert."""
 
 
 class DatasourceCatalogCursorError(ValueError):

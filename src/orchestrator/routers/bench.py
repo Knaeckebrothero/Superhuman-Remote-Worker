@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from contextlib import asynccontextmanager
-from typing import Any, Literal
+from dataclasses import dataclass
+from functools import partial
+from typing import Any, Awaitable, Callable, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from orchestrator.schemas.job_create import JobCreate
 from orchestrator.security.access import mcp_scope_project_id, require_project_member
 from orchestrator.security.auth import require_approved_user
 from orchestrator.services.agent_pod_entrypoint import validate_config_name
@@ -115,70 +117,47 @@ class BenchRunCreate(BaseModel):
         return self
 
 
-def _bench_internal_request(created_by: str) -> Request:
-    """Build the authenticated in-process request used by ``create_job``.
-
-    The shared key authenticates the transport; ``X-MCP-User-Id`` makes the
-    existing handler resolve and re-check the creator from Postgres.  No body
-    identity is trusted, matching normal MCP-forwarded job creation.
-    """
-
-    internal_key = os.getenv("MCP_INTERNAL_KEY", "")
-    if not internal_key:
-        raise RuntimeError(
-            "MCP_INTERNAL_KEY is required for server-side bench job creation"
-        )
-    headers = [
-        (b"x-internal-key", internal_key.encode("latin-1")),
-        (b"x-mcp-user-id", created_by.encode("ascii")),
-    ]
-    return Request(
-        {
-            "type": "http",
-            "asgi": {"version": "3.0", "spec_version": "2.3"},
-            "http_version": "1.1",
-            "method": "POST",
-            "scheme": "http",
-            "path": "/api/jobs",
-            "raw_path": b"/api/jobs",
-            "query_string": b"",
-            "headers": headers,
-            "client": ("127.0.0.1", 0),
-            "server": ("orchestrator", 8085),
-        }
-    )
+CreateBenchJob = Callable[[str, JobCreate], Awaitable[dict[str, Any]]]
 
 
-async def _create_job_through_main(
+@dataclass(frozen=True)
+class BenchDependencies:
+    store: BenchStore
+    create_job: CreateBenchJob
+
+
+async def _create_job_through_admission(
     run: dict[str, Any],
     task: dict[str, Any],
     arm: dict[str, Any],
     replicate: int,
+    *,
+    create_job: CreateBenchJob,
 ) -> dict[str, Any]:
-    """Call the regular job-creation handler directly (never over HTTP)."""
-
-    from orchestrator.main import JobCreate, create_job
+    """Submit the frozen payload through application-owned job admission."""
 
     created_by = str(run["created_by"])
     payload = build_bench_job_payload(run, task, arm, replicate)
     return await create_job(
-        _bench_internal_request(created_by),
+        created_by,
         JobCreate(**payload),
     )
 
 
 @asynccontextmanager
-async def _bench_lifespan(_app: Any):
+async def _bench_lifespan(app: Any):
     """Start after the app DB lifespan and drain before DB shutdown."""
 
-    from orchestrator.main import postgres_db
+    dependencies = app.state.bench_dependencies_factory()
 
     shutdown_event = asyncio.Event()
     task = asyncio.create_task(
         bench_sweeper_loop(
-            BenchStore(postgres_db),
+            dependencies.store,
             shutdown_event,
-            create_job_fn=_create_job_through_main,
+            create_job_fn=partial(
+                _create_job_through_admission, create_job=dependencies.create_job
+            ),
         )
     )
     try:
