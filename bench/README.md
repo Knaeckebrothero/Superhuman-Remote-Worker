@@ -52,6 +52,24 @@ In `--server` mode the frozen spec and submission ledger instead live in the
 orchestrator's `bench_runs` row. The CLI reads and resolves `tasks.yaml` before
 posting it; the server never reads a mutable task registry.
 
+For the U2 phase-skills gate, run the audit helper against the audit database
+with the member job ids from the server report:
+
+```bash
+psql "$AUDIT_DB_URL" -v job_ids='uuid-1,uuid-2' \
+  -f bench/queries/phase_illegal_calls.sql
+```
+
+Its first result separates correctly rejected phase-mismatched attempts from
+unsafe or unclassified calls. The latter must be zero. Its second result checks
+the persistent `[phase: ...]` blocks: skills-mode jobs must have no requests
+without a block, and new phases normally increase the count one at a time;
+historical legacy-mode jobs intentionally have zero blocks. A compaction may
+drop older, superseded blocks, which is reported separately rather than treated
+as loss of the current block. The query's single-phase tool list has a test that
+compares it directly with `TOOL_REGISTRY`, so registry changes cannot silently
+stale the acceptance check.
+
 ## Task families
 
 | prefix | family | config | what it exercises |
@@ -72,13 +90,21 @@ absent from v1 — they change as the repo changes, which breaks pinning.
   Memory-Light recall, so replicate 3 can recall replicate 1's memories.
   v1 accepts this (it matches production behaviour); pass `--project-id`
   to scope a run to a dedicated project, and interleaved submission order
-  spreads any order effect across tasks. Per-arm projects are the plan for
-  real A/Bs.
+  spreads any order effect across tasks. For real A/Bs, use a distinct
+  `project_id` on each arm to prevent cross-arm contamination.
 - **Scholar tasks are high-variance** (subjob fan-out). One task in the
   set on purpose; don't let R* dominate group medians.
 - **Cost attribution is main-loop only.** The reporter counts
   `call_type=main` requests; auxiliary calls (memory extraction, curation)
   are not in the ceremony numbers, matching the §10 methodology.
+- **Raw and uncached input are different metrics.** Uncached input is reported
+  input minus reported cache-read tokens. Report both: a larger stable prefix
+  can increase total input while reducing uncached input. This is not an
+  invoice calculation or a claim about how a subscription counts tokens.
+- **Pin auxiliary inference when isolating a provider.** Setting an arm's
+  `model` pins its main loop only. Also set `config_override.auxiliary.model`
+  when background tasks must use that provider; otherwise deployment defaults
+  still apply. Check actual model usage across all archived call types.
 
 ## Operating notes (from `baseline-02`, the first live server-side run)
 
@@ -112,10 +138,16 @@ absent from v1 — they change as the repo changes, which breaks pinning.
 
 - **Two-arm runs:** `submit.py --server` builds a single arm only. For A/Bs,
   build the spec yourself (tasks from `tasks.yaml`, `arms: [{name, model,
-  config_override}, ...]`) and POST `/api/bench/runs` directly. The sweeper
+  config_override, project_id}, ...]`) and POST `/api/bench/runs` directly.
+  Give each arm its own `project_id` when memory coupling could leak the
+  treatment; an arm without one inherits the run-level project. The sweeper
   schedules arms adjacent within each replicate's shuffled wave — that
   adjacency is what neutralizes time-varying confounds (pool growth,
   contention), so never split arms across runs or clusters.
+- **U2 attribution controls are retired:** WP5 used temporary legacy/union and
+  skills/filtered arms to isolate phase prose from schema shape. WP6 removed
+  those live configuration switches after the MiniMax verdict; use the recorded
+  run IDs in the design note for historical comparisons.
 - **Running on k3d:** mint the test id_token per the auth memo (admin-cli
   password grant, use `id_token` not `access_token`); `POST /api/projects`
   requires `user_id` in the body. Give memory-sensitive experiments a

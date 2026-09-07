@@ -19,7 +19,7 @@ paths that create work) is pinned in
 ``tests/test_archived_projects_refuse_new_work.py``.
 """
 
-from src.shared.orch_surface.formatters import format_project_detail, format_projects
+from shared.orch_surface.formatters import format_project_detail, format_projects
 
 LIVE = {
     "id": "a572e4a0-d97a-4103-91fd-92a980d6717d",

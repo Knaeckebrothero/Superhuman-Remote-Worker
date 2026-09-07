@@ -18,6 +18,7 @@ from pydantic import ValidationError
 _REPO = Path(__file__).resolve().parents[1]
 _MIGRATION = (
     _REPO
+    / "src"
     / "orchestrator"
     / "database"
     / "migrations"
@@ -55,19 +56,19 @@ class TestMigration:
 
 class TestRouterModels:
     def test_start_accepts_officer(self):
-        from routers.project_loops import ProjectLoopStart
+        from orchestrator.routers.project_loops import ProjectLoopStart
 
         body = ProjectLoopStart(scheduling="officer")
         assert body.scheduling == "officer"
 
     def test_start_rejects_unknown_mode(self):
-        from routers.project_loops import ProjectLoopStart
+        from orchestrator.routers.project_loops import ProjectLoopStart
 
         with pytest.raises(ValidationError):
             ProjectLoopStart(scheduling="centurion")
 
     def test_conversion_body_is_officer_only(self):
-        from routers.project_loops import ProjectLoopScheduling
+        from orchestrator.routers.project_loops import ProjectLoopScheduling
 
         assert ProjectLoopScheduling(scheduling="officer").scheduling == "officer"
         with pytest.raises(ValidationError):
@@ -104,20 +105,24 @@ def _job_row(status="completed"):
 
 @pytest.fixture
 def patched_main(monkeypatch):
-    import main
+    import orchestrator.main
 
     db = SimpleNamespace()
     db.claim_project_loop_stage_barrier = AsyncMock(return_value=True)
     db.get_loop_stage_member_statuses = AsyncMock(return_value={JOB_ID: "completed"})
     db.update_project_loop = AsyncMock(return_value=_loop_row())
-    monkeypatch.setattr(main, "postgres_db", db)
-    monkeypatch.setattr(main, "_record_loop_job_outcome", AsyncMock())
-    monkeypatch.setattr(main, "_notify_loop_user_questions", AsyncMock())
-    monkeypatch.setattr(main, "notify_officer", AsyncMock(return_value=True))
-    monkeypatch.setattr(main, "_kick_officer_event_drain", MagicMock())
-    monkeypatch.setattr(main, "_loop_cooldown_park_until", AsyncMock(return_value=None))
-    monkeypatch.setattr(main, "_rotate_loop_to_next_stage", AsyncMock())
-    return main, db
+    monkeypatch.setattr(orchestrator.main, "postgres_db", db)
+    monkeypatch.setattr(orchestrator.main, "_record_loop_job_outcome", AsyncMock())
+    monkeypatch.setattr(orchestrator.main, "_notify_loop_user_questions", AsyncMock())
+    monkeypatch.setattr(
+        orchestrator.main, "notify_officer", AsyncMock(return_value=True)
+    )
+    monkeypatch.setattr(orchestrator.main, "_kick_officer_event_drain", MagicMock())
+    monkeypatch.setattr(
+        orchestrator.main, "_loop_cooldown_park_until", AsyncMock(return_value=None)
+    )
+    monkeypatch.setattr(orchestrator.main, "_rotate_loop_to_next_stage", AsyncMock())
+    return orchestrator.main, db
 
 
 class TestOfficerAdvanceBranch:
@@ -193,7 +198,7 @@ class TestOfficerAdvanceBranch:
 class TestSweeperGuard:
     @pytest.mark.asyncio
     async def test_officer_loop_empty_pointers_not_healed(self, monkeypatch):
-        from services import project_loop_sweeper as sweeper
+        from orchestrator.services import project_loop_sweeper as sweeper
 
         db = SimpleNamespace()
         db.list_running_project_loops = AsyncMock(
@@ -210,7 +215,7 @@ class TestSweeperGuard:
 
     @pytest.mark.asyncio
     async def test_officer_loop_inflight_turn_still_swept(self, monkeypatch):
-        from services import project_loop_sweeper as sweeper
+        from orchestrator.services import project_loop_sweeper as sweeper
 
         stage_sweep = AsyncMock(return_value=1)
         monkeypatch.setattr(sweeper, "_sweep_stage", stage_sweep)
@@ -223,7 +228,7 @@ class TestSweeperGuard:
 
     @pytest.mark.asyncio
     async def test_standard_loop_heal_still_runs(self, monkeypatch):
-        from services import project_loop_sweeper as sweeper
+        from orchestrator.services import project_loop_sweeper as sweeper
 
         heal = AsyncMock(return_value=None)
         monkeypatch.setattr(sweeper, "_heal_wedged_loop", heal)
@@ -261,7 +266,7 @@ class _FakeAcquire:
 class TestConversionWriter:
     @pytest.mark.asyncio
     async def test_guards_live_in_where_clause(self):
-        from database.postgres import PostgresDB
+        from orchestrator.database.postgres import PostgresDB
 
         captured = {}
 
@@ -290,7 +295,7 @@ class TestConversionWriter:
 
     @pytest.mark.asyncio
     async def test_guard_miss_returns_none(self):
-        from database.postgres import PostgresDB
+        from orchestrator.database.postgres import PostgresDB
 
         async def fetchrow(sql, *params):
             return None

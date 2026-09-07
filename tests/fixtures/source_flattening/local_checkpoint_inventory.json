@@ -1,0 +1,83 @@
+{
+  "observed_at_utc": "2026-09-05T10:49:14.946888+00:00",
+  "read_only": true,
+  "scope": "Retained local k3d-srw authoritative POSTGRES store; immutable old-layout agent image. No remote environments or other stores are covered.",
+  "serializer": {
+    "dedicated_checkpoint_host_configured": false,
+    "dedicated_checkpoint_url_configured": false,
+    "default_pickle_fallback": false,
+    "source_sha256": "daad0d87adccf5a2b135e9c10b2e85ac200dd5576a3b729a03caf90b727215c8",
+    "strict_msgpack_enabled": true
+  },
+  "tables": {
+    "checkpoint_blobs": {
+      "encodings": {
+        "msgpack": 1330
+      },
+      "errors": {},
+      "extensions": {
+        "5": 12297
+      },
+      "first_party_references": [],
+      "rows": 1330,
+      "type_references": [
+        {
+          "class": "AIMessage",
+          "count": 5889,
+          "module": "langchain_core.messages.ai"
+        },
+        {
+          "class": "HumanMessage",
+          "count": 564,
+          "module": "langchain_core.messages.human"
+        },
+        {
+          "class": "SystemMessage",
+          "count": 111,
+          "module": "langchain_core.messages.system"
+        },
+        {
+          "class": "ToolMessage",
+          "count": 5733,
+          "module": "langchain_core.messages.tool"
+        }
+      ]
+    },
+    "checkpoint_writes": {
+      "encodings": {
+        "msgpack": 498,
+        "null": 163
+      },
+      "errors": {},
+      "extensions": {
+        "5": 66
+      },
+      "first_party_references": [],
+      "rows": 661,
+      "type_references": [
+        {
+          "class": "AIMessage",
+          "count": 37,
+          "module": "langchain_core.messages.ai"
+        },
+        {
+          "class": "HumanMessage",
+          "count": 16,
+          "module": "langchain_core.messages.human"
+        },
+        {
+          "class": "ToolMessage",
+          "count": 13,
+          "module": "langchain_core.messages.tool"
+        }
+      ]
+    }
+  },
+  "versions": {
+    "langchain-core": "1.6.1",
+    "langgraph-checkpoint": "4.1.1",
+    "langgraph-checkpoint-postgres": "3.1.1",
+    "ormsgpack": "1.12.2",
+    "pydantic": "2.13.5"
+  }
+}

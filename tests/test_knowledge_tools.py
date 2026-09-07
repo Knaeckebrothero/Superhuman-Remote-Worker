@@ -23,7 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from pydantic import ValidationError
 
-from src.tools.knowledge.knowledge_tools import (
+from agent.tools.knowledge.knowledge_tools import (
     KNOWLEDGE_TOOLS_METADATA,
     _post_vault_file,
     create_kb_tools,
@@ -50,7 +50,7 @@ def _make_context(project_id=None, project_ids=None, job_id=None):
 def _make_tools(context=None):
     """Create kb tools with mocked context, patching asyncio loop."""
     ctx = context or _make_context()
-    with patch("src.tools.knowledge.knowledge_tools.asyncio") as mock_asyncio:
+    with patch("agent.tools.knowledge.knowledge_tools.asyncio") as mock_asyncio:
         mock_asyncio.get_running_loop.side_effect = RuntimeError("no loop")
         tools = create_kb_tools(ctx)
     return tools, ctx
@@ -99,7 +99,7 @@ def _no_materialization_http():
     holds its own module-level reference and is unaffected.
     """
     with patch(
-        "src.tools.knowledge.knowledge_tools._post_vault_file",
+        "agent.tools.knowledge.knowledge_tools._post_vault_file",
         return_value={"status": "committed", "path": "knowledge/test.md"},
     ):
         yield
@@ -117,7 +117,14 @@ def _capture_materialize(result=None):
     """
     calls: list = []
 
-    def _fake(project_id, slug, content, job_id, retrieval_messages=None):
+    def _fake(
+        project_id,
+        slug,
+        content,
+        job_id,
+        retrieval_messages=None,
+        expected_blob_sha=None,
+    ):
         calls.append(
             {
                 "project_id": project_id,
@@ -125,12 +132,13 @@ def _capture_materialize(result=None):
                 "content": content,
                 "job_id": job_id,
                 "retrieval_messages": retrieval_messages,
+                "expected_blob_sha": expected_blob_sha,
             }
         )
         return dict(result or {"status": "committed", "path": f"knowledge/{slug}.md"})
 
     patcher = patch(
-        "src.tools.knowledge.knowledge_tools._post_vault_file", side_effect=_fake
+        "agent.tools.knowledge.knowledge_tools._post_vault_file", side_effect=_fake
     )
     return patcher, calls
 
@@ -149,7 +157,11 @@ def _fake_http(status_code=200, body=None, raises=None):
         client.post.return_value = response
     ctor = MagicMock()
     ctor.return_value.__enter__.return_value = client
-    return patch("src.tools.knowledge.knowledge_tools.httpx.Client", ctor), ctor, client
+    return (
+        patch("agent.tools.knowledge.knowledge_tools.httpx.Client", ctor),
+        ctor,
+        client,
+    )
 
 
 def _store_row(note_id, note_type="learning", content="", **extra):
@@ -217,16 +229,18 @@ def _fake_kb_workspace(files: dict):
 class TestMetadataRegistry:
     """Tests for KNOWLEDGE_TOOLS_METADATA."""
 
-    def test_contains_exactly_12_tools(self):
-        assert len(KNOWLEDGE_TOOLS_METADATA) == 12
+    def test_contains_exactly_14_tools(self):
+        assert len(KNOWLEDGE_TOOLS_METADATA) == 14
 
     def test_expected_tool_names(self):
         expected = {
             "kb_write",
             "kb_update",
+            "kb_delete",
             "kb_read",
             "kb_list",
             "kb_search",
+            "kb_grep",
             "kb_related",
             "kb_contradictions",
             "kb_provenance",
@@ -261,22 +275,22 @@ class TestCreateKbTools:
         # (the pgvector index is canonical for retrieval; files for content).
         ctx = _make_context()
         ctx.knowledge_graph = None
-        with patch("src.tools.knowledge.knowledge_tools.asyncio") as ma:
+        with patch("agent.tools.knowledge.knowledge_tools.asyncio") as ma:
             ma.get_running_loop.side_effect = RuntimeError
             tools = create_kb_tools(ctx)
-        assert len(tools) == 12
+        assert len(tools) == 14
 
     def test_raises_when_knowledge_store_is_none(self):
         ctx = _make_context()
         ctx.knowledge_store = None
         with pytest.raises(ValueError, match="knowledge_store"):
-            with patch("src.tools.knowledge.knowledge_tools.asyncio") as ma:
+            with patch("agent.tools.knowledge.knowledge_tools.asyncio") as ma:
                 ma.get_running_loop.side_effect = RuntimeError
                 create_kb_tools(ctx)
 
-    def test_returns_list_of_12_tools(self):
+    def test_returns_list_of_14_tools(self):
         tools, _ = _make_tools()
-        assert len(tools) == 12
+        assert len(tools) == 14
 
 
 # =============================================================================
@@ -307,7 +321,7 @@ class TestKbWrite:
         kg.create_note.return_value = "test-slug"
         ctx.knowledge_store.upsert_note = AsyncMock(return_value=uuid.uuid4())
 
-        with patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             _invoke(
                 _get_tool(tools, "kb_write"),
                 {
@@ -329,7 +343,7 @@ class TestKbWrite:
         ctx.knowledge_graph.create_note.return_value = "my-note"
         ctx.knowledge_store.upsert_note = AsyncMock(return_value=uuid.uuid4())
 
-        with patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             result = _invoke(
                 _get_tool(tools, "kb_write"),
                 {
@@ -406,7 +420,7 @@ class TestKbUpdate:
         ctx.knowledge_graph.update_note.return_value = True
         ctx.knowledge_graph.read_note.return_value = {"title": "T", "content": "x"}
 
-        with patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             _invoke(
                 _get_tool(tools, "kb_update"),
                 {
@@ -428,7 +442,7 @@ class TestKbUpdate:
         ctx.knowledge_graph.update_note.return_value = True
         ctx.knowledge_graph.read_note.return_value = {"title": "T", "content": "x"}
 
-        with patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             result = _invoke(
                 _get_tool(tools, "kb_update"),
                 {
@@ -496,6 +510,10 @@ class TestKbRead:
             None,
             {"id": "n1", "title": "Found", "content": "x"},
         ]
+        # The first binding's graph miss must not be masked by the index
+        # fallback's default (truthy) AsyncMock return — force a real miss
+        # there so the second binding's graph hit is what's exercised.
+        ctx.knowledge_store.get_note_by_slug.return_value = None
 
         result = _invoke(_get_tool(tools, "kb_read"), {"note": "n1"})
         assert "Found" in result
@@ -530,6 +548,9 @@ class TestKbRead:
     def test_not_found(self):
         tools, ctx = _make_tools()
         ctx.knowledge_graph.read_note.return_value = None
+        # The graph miss must be a genuine miss, not an accidental hit off
+        # AsyncMock's default (truthy) auto-speccing on the index fallback.
+        ctx.knowledge_store.get_note_by_slug.return_value = None
 
         result = _invoke(_get_tool(tools, "kb_read"), {"note": "missing"})
         assert "not found" in result
@@ -539,6 +560,7 @@ class TestKbRead:
         # look like a genuine miss (agent could otherwise conclude "KB empty").
         tools, ctx = _make_tools()
         ctx.knowledge_graph.read_note.return_value = None
+        ctx.knowledge_store.get_note_by_slug.return_value = None
         ctx.knowledge_store.get_watermark.return_value = MagicMock(
             status="pending", indexed_commit=None, source_head=None
         )
@@ -546,6 +568,201 @@ class TestKbRead:
         assert "not found" in result
         assert "Still indexing" in result
         assert "pending" in result
+
+    def test_read_falls_back_to_store_when_graph_has_no_node(self):
+        tools, ctx = _make_tools()
+        ctx.knowledge_graph.read_note.return_value = None
+        ctx.knowledge_store.get_note_by_slug.return_value = {
+            "id": "vault-note",
+            "title": "From the vault",
+            "type": "learning",
+            "status": "active",
+            "content": "imported by the sweep",
+        }
+        result = _invoke(_get_tool(tools, "kb_read"), {"note": "vault-note"})
+        assert "From the vault" in result and "not found" not in result
+        ctx.knowledge_store.get_note_by_slug.assert_called_once()
+
+    def test_read_does_not_touch_store_when_graph_has_the_note(self):
+        tools, ctx = _make_tools()
+        ctx.knowledge_graph.read_note.return_value = {
+            "id": "g",
+            "title": "Graph",
+            "type": "learning",
+            "status": "active",
+            "content": "c",
+            "relationships": [],
+            "incoming_relationships": [],
+        }
+        _invoke(_get_tool(tools, "kb_read"), {"note": "g"})
+        ctx.knowledge_store.get_note_by_slug.assert_not_called()
+
+
+# =============================================================================
+# 13.6b: _index_readiness_notice — wedged vs rebuilding (WP4, decision H4)
+# =============================================================================
+
+
+class TestReadinessNotice:
+    def _read_missing(self, wm):
+        tools, ctx = _make_tools()
+        ctx.knowledge_graph.read_note.return_value = None
+        ctx.knowledge_store.get_note_by_slug.return_value = None
+        ctx.knowledge_store.get_watermark.return_value = wm
+        return _invoke(_get_tool(tools, "kb_read"), {"note": "missing"})
+
+    def test_rebuilding_keeps_todays_wording(self):
+        wm = MagicMock(
+            status="partial",
+            indexed_commit="a" * 40,
+            source_head="b" * 40,
+            error_streak=1,
+            wedged_since=None,
+            last_error="3 note operation(s) failed",
+        )
+        out = self._read_missing(wm)
+        assert "Still indexing — results may be incomplete" in out
+
+    def test_wedged_says_failed_not_incomplete(self):
+        from datetime import datetime, timedelta, timezone
+
+        wm = MagicMock(
+            status="partial",
+            indexed_commit="a" * 40,
+            source_head="b" * 40,
+            error_streak=9,
+            wedged_since=datetime.now(timezone.utc) - timedelta(hours=26),
+            last_error="1 note operation(s) failed; retry scheduled",
+        )
+        out = self._read_missing(wm)
+        assert "1 note(s) have failed to index for 26 h" in out
+        assert "rest of this knowledge base is current" in out
+        assert "may be incomplete" not in out
+
+    def test_old_watermark_row_without_new_fields_still_renders(self):
+        wm = MagicMock(
+            spec=["status", "indexed_commit", "source_head"],
+            status="partial",
+            indexed_commit="a" * 40,
+            source_head="b" * 40,
+        )
+        assert "Still indexing" in self._read_missing(wm)
+
+    def test_wedged_since_recent_clamps_to_one_hour(self):
+        from datetime import datetime, timedelta, timezone
+
+        wm = MagicMock(
+            status="partial",
+            indexed_commit="a" * 40,
+            source_head="b" * 40,
+            error_streak=4,
+            wedged_since=datetime.now(timezone.utc) - timedelta(minutes=5),
+            last_error="1 note operation(s) failed",
+        )
+        out = self._read_missing(wm)
+        assert "for 1 h" in out
+
+    def test_wedged_last_error_none_falls_back_to_some(self):
+        from datetime import datetime, timedelta, timezone
+
+        wm = MagicMock(
+            status="partial",
+            indexed_commit="a" * 40,
+            source_head="b" * 40,
+            error_streak=4,
+            wedged_since=datetime.now(timezone.utc) - timedelta(hours=3),
+            last_error=None,
+        )
+        out = self._read_missing(wm)
+        assert "some note(s) have failed to index" in out
+
+    def test_mixed_wedged_and_rebuilding_join_with_newline(self):
+        # Two native bindings: the first's watermark is wedged, the second's
+        # is a plain rebuilding partial — the spec requires both notices,
+        # wedged first, joined with "\n".
+        from datetime import datetime, timedelta, timezone
+
+        id_a = str(uuid.uuid4())
+        id_b = str(uuid.uuid4())
+        ctx = _make_context(project_ids=[id_a, id_b])
+        tools, _ = _make_tools(ctx)
+        ctx.knowledge_graph.read_note.return_value = None
+        ctx.knowledge_store.get_note_by_slug.return_value = None
+
+        wedged_wm = MagicMock(
+            status="partial",
+            indexed_commit="a" * 40,
+            source_head="b" * 40,
+            error_streak=9,
+            wedged_since=datetime.now(timezone.utc) - timedelta(hours=5),
+            last_error="2 note operation(s) failed",
+        )
+        rebuilding_wm = MagicMock(
+            status="partial",
+            indexed_commit="c" * 40,
+            source_head="d" * 40,
+            error_streak=1,
+            wedged_since=None,
+            last_error="1 note operation(s) failed",
+        )
+
+        def _watermark_for(kb_id):
+            return wedged_wm if str(kb_id) == id_a else rebuilding_wm
+
+        ctx.knowledge_store.get_watermark.side_effect = _watermark_for
+
+        result = _invoke(_get_tool(tools, "kb_read"), {"note": "missing"})
+
+        second_alias = f"project-{uuid.UUID(id_b).hex[:8]}"
+        assert "[project] 2 note(s) have failed to index for 5 h" in result
+        assert f"Still indexing — results may be incomplete: [{second_alias}]" in result
+        # Wedged notice comes first, and the two notices are newline-joined.
+        assert "current.\n⚠️ Still indexing" in result
+        assert result.index("note(s) have failed") < result.index("Still indexing")
+
+    # -- advisory (final review, Important 2a) --------------------------------
+    # `advisory` had no reader anywhere: the reindexer wrote "1 note skipped
+    # (duplicate id)" and nothing ever showed it. A skipped duplicate is
+    # precisely the explanation a zero-result branch owes the reader, and it
+    # applies to a *ready* knowledge base — the index is clean and still
+    # incomplete.
+
+    def test_ready_watermark_still_surfaces_its_advisory(self):
+        wm = MagicMock(
+            spec=["status", "advisory"],
+            status="ready",
+            advisory="1 note skipped (duplicate id `foo`)",
+        )
+        out = self._read_missing(wm)
+        assert "ℹ️ [project] 1 note skipped (duplicate id `foo`)" in out
+        assert "Still indexing" not in out
+
+    def test_partial_watermark_renders_both_rebuilding_and_advisory(self):
+        wm = MagicMock(
+            status="partial",
+            indexed_commit="a" * 40,
+            source_head="b" * 40,
+            error_streak=1,
+            wedged_since=None,
+            last_error="3 note operation(s) failed",
+            advisory="2 notes skipped (duplicate ids)",
+        )
+        out = self._read_missing(wm)
+        assert "Still indexing — results may be incomplete" in out
+        assert "ℹ️ [project] 2 notes skipped (duplicate ids)" in out
+        # Advisory lines come last, after the rebuilding notice.
+        assert out.index("Still indexing") < out.index("ℹ️")
+
+    def test_blank_or_non_string_advisory_emits_nothing(self):
+        # A MagicMock-shaped watermark (every other test in this class) hands
+        # back a Mock for `.advisory`; a real row can hold "" or NULL. Neither
+        # may become an ℹ️ line.
+        for value in ("", "   ", None, MagicMock()):
+            wm = MagicMock(
+                status="ready",
+                advisory=value,
+            )
+            assert "ℹ️" not in self._read_missing(wm)
 
 
 # =============================================================================
@@ -578,6 +795,9 @@ class TestKbList:
     def test_empty_with_filter_description(self):
         tools, ctx = _make_tools()
         ctx.knowledge_graph.list_notes.return_value = []
+        # An empty graph must fall through to a genuinely empty index, not
+        # AsyncMock's default (non-iterable, truthy) auto-return.
+        ctx.knowledge_store.list_notes.return_value = []
 
         result = _invoke(
             _get_tool(tools, "kb_list"),
@@ -593,6 +813,7 @@ class TestKbList:
     def test_empty_surfaces_indexing_status(self):
         tools, ctx = _make_tools()
         ctx.knowledge_graph.list_notes.return_value = []
+        ctx.knowledge_store.list_notes.return_value = []
         ctx.knowledge_store.get_watermark.return_value = MagicMock(
             status="partial", indexed_commit="a" * 40, source_head="b" * 40
         )
@@ -600,6 +821,25 @@ class TestKbList:
         assert "No knowledge notes found" in result
         assert "Still indexing" in result
         assert "partial" in result
+
+    def test_list_falls_back_to_store_when_graph_is_empty(self):
+        tools, ctx = _make_tools()
+        ctx.knowledge_graph.list_notes.return_value = []
+        ctx.knowledge_store.list_notes.return_value = [
+            {
+                "id": "n1",
+                "title": "T",
+                "type": "decision",
+                "status": "active",
+                "confidence": None,
+            },
+        ]
+        # For T6 (tag_vocabulary): harmless here, keeps this test valid once
+        # kb_list starts consulting tag vocabulary.
+        ctx.knowledge_store.tag_vocabulary = AsyncMock(return_value=[])
+        result = _invoke(_get_tool(tools, "kb_list"), {})
+        assert "n1" in result
+        ctx.knowledge_store.list_notes.assert_called_once()
 
     def test_formats_with_status_icon(self):
         tools, ctx = _make_tools()
@@ -697,6 +937,104 @@ class TestKbSearch:
 
 
 # =============================================================================
+# 13.8c: kb_grep (spec WP8, D9)
+# =============================================================================
+
+
+class TestKbGrep:
+    def _ctx(self, matches, total):
+        from shared.runtime.services.knowledge_store import GrepMatch
+
+        ctx = _make_context()
+        ctx.knowledge_store.grep_notes = AsyncMock(return_value=(matches, total))
+        ctx.knowledge_store.get_watermark.return_value = None
+        return ctx, GrepMatch
+
+    def test_renders_lines_with_context_and_truncation_tail(self):
+        ctx, GrepMatch = self._ctx([], 0)
+        kb = uuid.UUID(ctx.project_id)
+        m = GrepMatch(
+            kb_id=kb,
+            note_id="n1",
+            title="Note One",
+            line_no=7,
+            line="see sales_page_2026_09",
+            before=["ctx before"],
+            after=["ctx after"],
+        )
+        ctx.knowledge_store.grep_notes.return_value = ([m], 3)
+        tools, _ = _make_tools(ctx)
+        out = _invoke(
+            _get_tool(tools, "kb_grep"), {"pattern": "sales_page", "max_matches": 1}
+        )
+        assert "**n1** — Note One" in out
+        assert "L7: see sales_page_2026_09" in out
+        assert "ctx before" in out and "ctx after" in out
+        assert "2 more matching note(s)" in out
+
+    def test_zero_matches_says_so(self):
+        ctx, _ = self._ctx([], 0)
+        tools, _ = _make_tools(ctx)
+        out = _invoke(_get_tool(tools, "kb_grep"), {"pattern": "nope"})
+        assert "No lines match 'nope'" in out
+
+    def test_store_value_error_becomes_usage_error(self):
+        ctx, _ = self._ctx([], 0)
+        ctx.knowledge_store.grep_notes.side_effect = ValueError(
+            "pattern must not be empty"
+        )
+        tools, _ = _make_tools(ctx)
+        out = _invoke(_get_tool(tools, "kb_grep"), {"pattern": " "})
+        assert out.startswith("Error:") and "empty" in out
+
+    def test_registered_in_metadata(self):
+        from agent.tools.knowledge.knowledge_tools import KNOWLEDGE_TOOLS_METADATA
+
+        assert KNOWLEDGE_TOOLS_METADATA["kb_grep"]["category"] == "knowledge"
+
+    def test_grep_is_a_body_tool_and_never_asks_for_title_candidates(self):
+        """Final review, Important 1. ``grep_notes``' title branch makes a
+        title-only hit a candidate — it counts toward ``total`` and burns a
+        LIMIT slot — but line extraction reads ``content`` only, so it renders
+        nothing. Left on, kb_grep answered "No lines match" for content that IS
+        present and offered "raise max_matches" for notes that can never render
+        a line. Titles belong to kb_search(exact=)."""
+        ctx, _ = self._ctx([], 0)
+        tools, _ = _make_tools(ctx)
+        _invoke(_get_tool(tools, "kb_grep"), {"pattern": "sales_page"})
+        assert (
+            ctx.knowledge_store.grep_notes.await_args.kwargs["include_titles"] is False
+        )
+
+    def test_docstring_points_titles_at_kb_search_exact(self):
+        tools, _ = _make_tools()
+        doc = _get_tool(tools, "kb_grep").description or ""
+        assert "matches note bodies" in doc.lower()
+        assert "kb_search(exact=)" in doc
+
+
+class TestKbListVocabulary:
+    def test_unfiltered_list_prefixes_tag_vocabulary(self):
+        tools, ctx = _make_tools()
+        ctx.knowledge_graph.list_notes.return_value = [
+            {"id": "n1", "title": "T", "type": "decision", "status": "active"}
+        ]
+        ctx.knowledge_store.tag_vocabulary = AsyncMock(
+            return_value=[("web", 12), ("sales", 7)]
+        )
+        out = _invoke(_get_tool(tools, "kb_list"), {})
+        assert "**Tags:** web (12), sales (7)" in out
+
+    def test_filtered_list_has_no_vocabulary(self):
+        tools, ctx = _make_tools()
+        ctx.knowledge_graph.list_notes.return_value = []
+        ctx.knowledge_store.list_notes.return_value = []
+        ctx.knowledge_store.tag_vocabulary = AsyncMock(return_value=[("web", 1)])
+        out = _invoke(_get_tool(tools, "kb_list"), {"tag": "web"})
+        assert "**Tags:**" not in out
+
+
+# =============================================================================
 # 13.8b: kb_search chunk-retrieval cutover (slice-3 PR4)
 # =============================================================================
 
@@ -767,6 +1105,64 @@ class TestKbSearchChunkCutover:
         tools, _ = _make_tools(ctx)
         result = _invoke(_get_tool(tools, "kb_search"), {"query": "q"})
         assert "n1" in result
+
+    def test_plain_query_passes_no_new_arms(self):
+        ctx = self._ctx_with_store([_srec("n1")])
+        tools, _ = _make_tools(ctx)
+        _invoke(_get_tool(tools, "kb_search"), {"query": "auth"})
+        kwargs = ctx.knowledge_store.search_chunks.call_args.kwargs
+        assert kwargs.get("exact") in (None, []) and kwargs.get("tags") in (None, [])
+
+    def test_exact_and_tags_are_normalised_to_lists_and_attributed(self):
+        rec = _srec("n1")
+        rec.matched_arms = ["exact", "tag"]
+        ctx = self._ctx_with_store([rec])
+        tools, _ = _make_tools(ctx)
+        out = _invoke(
+            _get_tool(tools, "kb_search"), {"exact": "sales_page", "tags": ["sales"]}
+        )
+        kwargs = ctx.knowledge_store.search_chunks.call_args.kwargs
+        assert kwargs["exact"] == ["sales_page"] and kwargs["tags"] == ["sales"]
+        assert kwargs["query"] == ""
+        assert "⟨exact+tag⟩" in out
+        assert "exact 'sales_page'" in out  # per-arm coverage line
+
+    def test_requires_at_least_one_angle(self):
+        ctx = self._ctx_with_store([])
+        tools, _ = _make_tools(ctx)
+        out = _invoke(_get_tool(tools, "kb_search"), {})
+        assert out.startswith("Error:") and "query" in out and "exact" in out
+
+    def test_coverage_line_reports_per_arm_hit_counts(self):
+        # Per exact TERM, not per arm: "sales_page" and "billing_id" hit
+        # different, differently-sized subsets of the results, so the two
+        # coverage lines must carry their own counts rather than one
+        # aggregate "matched the exact arm at all" number.
+        rec1 = _srec("n1", content="ships the sales_page redesign")
+        rec2 = _srec("n2", content="also touches sales_page copy")
+        rec3 = _srec("n3", content="unrelated billing_id migration")
+        ctx = self._ctx_with_store([rec1, rec2, rec3])
+        tools, _ = _make_tools(ctx)
+        out = _invoke(
+            _get_tool(tools, "kb_search"),
+            {"query": "auth", "exact": ["sales_page", "billing_id"]},
+        )
+        assert "exact 'sales_page': 2 shown" in out
+        assert "exact 'billing_id': 1 shown" in out
+
+    def test_tags_are_case_folded_to_match_storage(self):
+        ctx = self._ctx_with_store([])
+        tools, _ = _make_tools(ctx)
+        _invoke(_get_tool(tools, "kb_search"), {"query": "q", "tags": ["Sales"]})
+        kwargs = ctx.knowledge_store.search_chunks.call_args.kwargs
+        assert kwargs["tags"] == ["sales"]
+
+    def test_tags_accepts_a_bare_string(self):
+        ctx = self._ctx_with_store([])
+        tools, _ = _make_tools(ctx)
+        _invoke(_get_tool(tools, "kb_search"), {"query": "q", "tags": "sales"})
+        kwargs = ctx.knowledge_store.search_chunks.call_args.kwargs
+        assert kwargs["tags"] == ["sales"]
 
 
 # =============================================================================
@@ -1413,7 +1809,7 @@ class TestRenderNoteMd:
     """Tests for the pure OKF markdown serializer (_render_note_md)."""
 
     def test_emits_frontmatter_fences_and_required_keys(self):
-        from src.tools.knowledge.knowledge_tools import _render_note_md
+        from agent.tools.knowledge.knowledge_tools import _render_note_md
 
         md = _render_note_md({"id": "chose-jwt", "type": "decision", "content": "body"})
         assert md.startswith("---\n")
@@ -1423,7 +1819,7 @@ class TestRenderNoteMd:
         assert "status: active" in md  # defaults to active
 
     def test_title_and_body(self):
-        from src.tools.knowledge.knowledge_tools import _render_note_md
+        from agent.tools.knowledge.knowledge_tools import _render_note_md
 
         md = _render_note_md(
             {
@@ -1437,7 +1833,7 @@ class TestRenderNoteMd:
         assert "The full body." in md
 
     def test_title_falls_back_to_id(self):
-        from src.tools.knowledge.knowledge_tools import _render_note_md
+        from agent.tools.knowledge.knowledge_tools import _render_note_md
 
         md = _render_note_md({"id": "abc-slug", "type": "learning", "content": "x"})
         assert "# abc-slug" in md
@@ -1445,7 +1841,7 @@ class TestRenderNoteMd:
     def test_no_double_h1_when_content_starts_with_same_h1(self):
         # Run-8 nit (docs §11.1): the serializer prepended `# {title}` even when
         # the body already opened with the same H1 → every note's title twice.
-        from src.tools.knowledge.knowledge_tools import _render_note_md
+        from agent.tools.knowledge.knowledge_tools import _render_note_md
 
         md = _render_note_md(
             {
@@ -1460,7 +1856,7 @@ class TestRenderNoteMd:
         assert "The body." in md
 
     def test_content_own_h1_suppresses_prepended_title(self):
-        from src.tools.knowledge.knowledge_tools import _render_note_md
+        from agent.tools.knowledge.knowledge_tools import _render_note_md
 
         md = _render_note_md(
             {
@@ -1476,7 +1872,7 @@ class TestRenderNoteMd:
 
     def test_h2_leading_content_still_gets_title(self):
         # An H2 opener is not a title — the H1 title should still be prepended.
-        from src.tools.knowledge.knowledge_tools import _render_note_md
+        from agent.tools.knowledge.knowledge_tools import _render_note_md
 
         md = _render_note_md(
             {
@@ -1490,7 +1886,7 @@ class TestRenderNoteMd:
         assert "# Real Title" in lines
 
     def test_derives_description_from_content_first_sentence(self):
-        from src.tools.knowledge.knowledge_tools import _render_note_md
+        from agent.tools.knowledge.knowledge_tools import _render_note_md
 
         md = _render_note_md(
             {
@@ -1502,7 +1898,7 @@ class TestRenderNoteMd:
         assert 'description: "We chose JWT because it is stateless."' in md
 
     def test_explicit_description_wins_and_is_quoted(self):
-        from src.tools.knowledge.knowledge_tools import _render_note_md
+        from agent.tools.knowledge.knowledge_tools import _render_note_md
 
         md = _render_note_md(
             {
@@ -1515,7 +1911,7 @@ class TestRenderNoteMd:
         assert 'description: "A one: liner"' in md
 
     def test_description_escapes_double_quotes(self):
-        from src.tools.knowledge.knowledge_tools import _render_note_md
+        from agent.tools.knowledge.knowledge_tools import _render_note_md
 
         md = _render_note_md(
             {
@@ -1528,7 +1924,7 @@ class TestRenderNoteMd:
         assert 'description: "has \\"quotes\\""' in md
 
     def test_emits_markdown_links_not_wikilinks(self):
-        from src.tools.knowledge.knowledge_tools import _render_note_md
+        from agent.tools.knowledge.knowledge_tools import _render_note_md
 
         md = _render_note_md(
             {
@@ -1550,7 +1946,7 @@ class TestRenderNoteMd:
         assert "**REFERENCES:** [rfc-7519](rfc-7519.md)" in md
 
     def test_emits_provenance_when_present(self):
-        from src.tools.knowledge.knowledge_tools import _render_note_md
+        from agent.tools.knowledge.knowledge_tools import _render_note_md
 
         md = _render_note_md(
             {
@@ -1567,7 +1963,7 @@ class TestRenderNoteMd:
         assert "branch: job/abc" in md
 
     def test_omits_optional_fields_when_absent(self):
-        from src.tools.knowledge.knowledge_tools import _render_note_md
+        from agent.tools.knowledge.knowledge_tools import _render_note_md
 
         md = _render_note_md({"id": "n1", "type": "decision", "content": "b"})
         assert "confidence:" not in md
@@ -1576,7 +1972,7 @@ class TestRenderNoteMd:
         assert "superseded_by:" not in md
 
     def test_emits_tags_keywords_confidence_and_superseded_by(self):
-        from src.tools.knowledge.knowledge_tools import _render_note_md
+        from agent.tools.knowledge.knowledge_tools import _render_note_md
 
         md = _render_note_md(
             {
@@ -1744,7 +2140,7 @@ class TestKbWriteMaterialization:
         tools, _ = _make_tools(ctx)
 
         patcher, calls = _capture_materialize()
-        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patcher, patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             _invoke(
                 _get_tool(tools, "kb_write"),
                 {"title": "Chose JWT", "type": "decision", "content": "We chose JWT."},
@@ -1767,7 +2163,7 @@ class TestKbWriteMaterialization:
         tools, _ = _make_tools(ctx)
 
         patcher, _ = _capture_materialize()
-        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patcher, patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             _invoke(
                 _get_tool(tools, "kb_write"),
                 {"title": "T", "type": "decision", "content": "x"},
@@ -1784,7 +2180,7 @@ class TestKbWriteMaterialization:
         tools, _ = _make_tools(ctx)
 
         patcher, calls = _capture_materialize()
-        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patcher, patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             result = _invoke(
                 _get_tool(tools, "kb_write"),
                 {"title": "From A Session", "type": "learning", "content": "x"},
@@ -1804,7 +2200,7 @@ class TestKbWriteMaterialization:
         patcher, calls = _capture_materialize(
             {"status": "failed", "reason": "commit-refused"}
         )
-        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patcher, patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             result = _invoke(
                 _get_tool(tools, "kb_write"),
                 {"title": "T", "type": "decision", "content": "x"},
@@ -1827,8 +2223,8 @@ class TestKbWriteMaterialization:
         patcher, _ = _capture_materialize(
             {"status": "failed", "reason": "resolve-error"}
         )
-        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
-            with patch("src.tools.knowledge.knowledge_tools.logger") as log:
+        with patcher, patch("agent.tools.knowledge.knowledge_tools.asyncio"):
+            with patch("agent.tools.knowledge.knowledge_tools.logger") as log:
                 _invoke(
                     _get_tool(tools, "kb_write"),
                     {"title": "T", "type": "decision", "content": "x"},
@@ -1845,7 +2241,7 @@ class TestKbWriteMaterialization:
         tools, _ = _make_tools(ctx)
 
         patcher, calls = _capture_materialize()
-        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patcher, patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             _invoke(
                 _get_tool(tools, "kb_write"),
                 {
@@ -1866,7 +2262,7 @@ class TestKbWriteMaterialization:
         tools, _ = _make_tools(ctx)
 
         patcher, calls = _capture_materialize()
-        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patcher, patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             _invoke(
                 _get_tool(tools, "kb_write"),
                 {
@@ -1894,7 +2290,7 @@ class TestKbWriteMaterialization:
         tools, _ = _make_tools(ctx)
 
         patcher, calls = _capture_materialize()
-        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patcher, patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             _invoke(
                 _get_tool(tools, "kb_write"),
                 {"title": "T", "type": "decision", "content": "x"},
@@ -1911,7 +2307,7 @@ class TestKbWriteMaterialization:
         tools, _ = _make_tools(ctx)
 
         patcher, calls = _capture_materialize()
-        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patcher, patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             _invoke(
                 _get_tool(tools, "kb_write"),
                 {"title": "T", "type": "decision", "content": "x"},
@@ -1930,14 +2326,14 @@ class TestKbWriteMaterialization:
         # repo has been bitten by loading orchestrator modules under two names.
         from orchestrator.services.kb_reindex import note_fields
 
-        from src.tools.knowledge.gardener import parse_note_md
+        from shared.runtime.knowledge.gardener import parse_note_md
 
         ctx = _make_git_context()
         ctx.knowledge_graph.create_note.return_value = "n1"
         tools, _ = _make_tools(ctx)
 
         patcher, calls = _capture_materialize()
-        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patcher, patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             _invoke(
                 _get_tool(tools, "kb_write"),
                 {"title": "Round Trip", "type": "decision", "content": "x"},
@@ -1973,7 +2369,7 @@ def materializer():
     its result dict is where ``indexed`` / ``index_reason`` come from.
     """
     with patch(
-        "src.tools.knowledge.knowledge_tools._materialize_note",
+        "agent.tools.knowledge.knowledge_tools._materialize_note",
         return_value={
             "status": "committed",
             "canonical_state": "canonical",
@@ -2157,7 +2553,7 @@ class TestKbUpdateForwardsRetrievalMessages:
         ctx.knowledge_graph.update_note.return_value = True
         tools, _ = _make_tools(ctx)
         patcher, calls = _capture_materialize()
-        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patcher, patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             _invoke(
                 _get_tool(tools, "kb_update"),
                 {"note": "an-existing-note", "append": "more text"},
@@ -2198,6 +2594,300 @@ class TestKbUpdateForwardsRetrievalMessages:
         assert calls[0]["retrieval_messages"] is None
 
 
+class TestRetireDenied:
+    """kb_gardening G5 — the retirement guard as a pure function."""
+
+    @staticmethod
+    def _row(**over):
+        from datetime import datetime, timedelta, timezone
+
+        base = {
+            "id": "old-state",
+            "type": "state",
+            "status": "active",
+            "tags": [],
+            "ready_at": None,
+            "created": datetime.now(timezone.utc) - timedelta(days=3),
+        }
+        base.update(over)
+        return base
+
+    def test_plain_old_nursery_note_may_be_retired(self):
+        from agent.tools.knowledge.knowledge_tools import _retire_denied
+
+        assert _retire_denied(self._row(), []) is None
+
+    def test_charter_is_never_retired(self):
+        from agent.tools.knowledge.knowledge_tools import _retire_denied
+
+        assert "charter" in _retire_denied(self._row(type="charter"), [])
+
+    @pytest.mark.parametrize("ticket", ["feature", "issue", "idea"])
+    def test_tickets_are_closed_not_retired(self, ticket):
+        from agent.tools.knowledge.knowledge_tools import _retire_denied
+
+        assert "ticket" in _retire_denied(self._row(type=ticket), [])
+
+    @pytest.mark.parametrize("tag", ["pinned", "ready", "parallel-safe", "Pinned"])
+    def test_protected_tags(self, tag):
+        from agent.tools.knowledge.knowledge_tools import _retire_denied
+
+        assert "tagged" in _retire_denied(self._row(tags=[tag]), [])
+
+    def test_dispatch_authorised_note(self):
+        from agent.tools.knowledge.knowledge_tools import _retire_denied
+
+        assert "dispatch" in _retire_denied(
+            self._row(ready_at="2026-09-01T00:00:00Z"), []
+        )
+
+    def test_evidence_of_an_active_durable_note(self):
+        from agent.tools.knowledge.knowledge_tools import _retire_denied
+
+        denied = _retire_denied(
+            self._row(),
+            [{"id": "chose-jwt", "type": "decision", "status": "active"}],
+        )
+        assert "chose-jwt (decision)" in denied
+
+    def test_fresh_note_is_protected_from_a_racing_curator(self):
+        from datetime import datetime, timezone
+
+        from agent.tools.knowledge.knowledge_tools import _retire_denied
+
+        assert "24 hours" in _retire_denied(
+            self._row(created=datetime.now(timezone.utc)), []
+        )
+
+    def test_naive_created_timestamp_is_treated_as_utc(self):
+        from datetime import datetime
+
+        from agent.tools.knowledge.knowledge_tools import _retire_denied
+
+        assert "24 hours" in _retire_denied(self._row(created=datetime.utcnow()), [])
+
+
+class TestKbDelete:
+    """kb_delete = tombstone (kb_gardening G1): status archived + reason in the
+    note, through the same materialise path as kb_update; refusals name
+    their rule; already-archived is a no-op."""
+
+    def _tools(self, existing, inbound=None):
+        ctx = _make_gitless_context()
+        ctx.knowledge_graph = None
+        ctx.knowledge_store.get_note_by_slug = AsyncMock(return_value=existing)
+        ctx.knowledge_store.get_inbound_links = AsyncMock(return_value=inbound or [])
+        ctx.knowledge_store.upsert_note = AsyncMock(return_value=uuid.uuid4())
+        tools, _ = _make_tools(ctx)
+        return ctx, tools
+
+    @staticmethod
+    def _old(**over):
+        from datetime import datetime, timedelta, timezone
+
+        fields = {
+            "type": "state",
+            "created": datetime.now(timezone.utc) - timedelta(days=5),
+            "blob_sha": "c" * 40,
+        }
+        fields.update(over)
+        return _existing_note(
+            note_id="old-state", content="Iteration 12 state.", **fields
+        )
+
+    def test_is_registered(self):
+        ctx, tools = self._tools(self._old())
+        assert _get_tool(tools, "kb_delete") is not None
+
+    def test_retires_with_a_reason_and_forwards_the_cas_token(self):
+        ctx, tools = self._tools(self._old())
+        patcher, calls = _capture_materialize()
+        with patcher:
+            result = _invoke(
+                _get_tool(tools, "kb_delete"),
+                {"note": "old-state", "reason": "superseded by iter-13 state note"},
+            )
+        assert result.startswith("Retired **old-state**")
+        assert "kb_update" in result and 'status="active"' in result
+        assert len(calls) == 1
+        committed = calls[0]["content"]
+        assert "status: archived" in committed
+        assert "**Retired**" in committed
+        assert "superseded by iter-13 state note" in committed
+        assert calls[0]["expected_blob_sha"] == "c" * 40
+        ctx.knowledge_store.get_inbound_links.assert_awaited_once()
+        kwargs = ctx.knowledge_store.get_inbound_links.await_args.kwargs
+        assert kwargs["active_only"] is True
+        assert "decision" in kwargs["note_types"]
+
+    def test_requires_a_reason(self):
+        ctx, tools = self._tools(self._old())
+        patcher, calls = _capture_materialize()
+        with patcher:
+            result = _invoke(
+                _get_tool(tools, "kb_delete"), {"note": "old-state", "reason": "x"}
+            )
+        assert result.startswith("Error")
+        assert calls == []
+
+    def test_refuses_when_an_active_decision_links_to_it(self):
+        ctx, tools = self._tools(
+            self._old(),
+            inbound=[{"id": "chose-jwt", "type": "decision", "status": "active"}],
+        )
+        patcher, calls = _capture_materialize()
+        with patcher:
+            result = _invoke(
+                _get_tool(tools, "kb_delete"),
+                {"note": "old-state", "reason": "looks stale to me"},
+            )
+        assert result.startswith("Refused")
+        assert "chose-jwt (decision)" in result
+        assert calls == []
+
+    def test_refuses_the_charter(self):
+        ctx, tools = self._tools(self._old(type="charter"))
+        patcher, calls = _capture_materialize()
+        with patcher:
+            result = _invoke(
+                _get_tool(tools, "kb_delete"),
+                {"note": "old-state", "reason": "charter is long and boring"},
+            )
+        assert result.startswith("Refused")
+        assert calls == []
+
+    def test_already_archived_is_a_noop(self):
+        ctx, tools = self._tools(self._old(status="archived"))
+        patcher, calls = _capture_materialize()
+        with patcher:
+            result = _invoke(
+                _get_tool(tools, "kb_delete"),
+                {"note": "old-state", "reason": "duplicate of something"},
+            )
+        assert "already archived" in result
+        assert calls == []
+
+    def test_unknown_note(self):
+        ctx, tools = self._tools(None)
+        result = _invoke(
+            _get_tool(tools, "kb_delete"),
+            {"note": "nope", "reason": "duplicate of something"},
+        )
+        assert result.startswith("Error")
+
+    def test_guard_lookup_failure_fails_closed(self):
+        ctx, tools = self._tools(self._old())
+        ctx.knowledge_store.get_inbound_links = AsyncMock(
+            side_effect=RuntimeError("db")
+        )
+        patcher, calls = _capture_materialize()
+        with patcher:
+            result = _invoke(
+                _get_tool(tools, "kb_delete"),
+                {"note": "old-state", "reason": "duplicate of something"},
+            )
+        assert result.startswith("Error")
+        assert "refusing to retire blind" in result
+        assert calls == []
+
+    def test_precondition_failure_surfaces_as_a_re_read_error(self):
+        ctx, tools = self._tools(self._old())
+        patcher, _calls = _capture_materialize(
+            {
+                "status": "failed",
+                "reason": "precondition-failed",
+                "retry_state": "permanent",
+            }
+        )
+        with patcher:
+            result = _invoke(
+                _get_tool(tools, "kb_delete"),
+                {"note": "old-state", "reason": "duplicate of something"},
+            )
+        assert result.startswith("Error")
+        assert "since you read it" in result
+
+
+class TestKbUpdateForwardsCompareAndSwapToken:
+    """kb_gardening G3: every rewrite carries the blob SHA the row was indexed
+    from, so the endpoint can refuse a write that would overwrite a
+    concurrent edit — or re-create a note that was removed."""
+
+    def test_storeonly_path_sends_the_rows_blob_sha(self):
+        ctx = _make_gitless_context()
+        ctx.knowledge_graph = None
+        ctx.knowledge_store.get_note_by_slug = AsyncMock(
+            return_value=_existing_note(note_id="an-existing-note", blob_sha="a" * 40)
+        )
+        ctx.knowledge_store.upsert_note = AsyncMock(return_value=uuid.uuid4())
+        tools, _ = _make_tools(ctx)
+        patcher, calls = _capture_materialize()
+        with patcher:
+            _invoke(
+                _get_tool(tools, "kb_update"),
+                {"note": "an-existing-note", "append": "x"},
+            )
+        assert calls[0]["expected_blob_sha"] == "a" * 40
+
+    def test_storeonly_path_writes_unconditionally_while_the_index_is_deferred(self):
+        # blob_sha is NULL until the inline index (or the sweep) stamps it;
+        # a rewrite then has no token to send and stays last-writer-wins.
+        ctx = _make_gitless_context()
+        ctx.knowledge_graph = None
+        ctx.knowledge_store.get_note_by_slug = AsyncMock(
+            return_value=_existing_note(note_id="an-existing-note", blob_sha=None)
+        )
+        ctx.knowledge_store.upsert_note = AsyncMock(return_value=uuid.uuid4())
+        tools, _ = _make_tools(ctx)
+        patcher, calls = _capture_materialize()
+        with patcher:
+            _invoke(
+                _get_tool(tools, "kb_update"),
+                {"note": "an-existing-note", "append": "x"},
+            )
+        assert calls[0]["expected_blob_sha"] is None
+
+    def test_graph_path_reads_the_token_from_the_row(self):
+        ctx = _make_git_context()
+        ctx.knowledge_graph.read_note.return_value = _graph_existing()
+        ctx.knowledge_graph.update_note.return_value = True
+        ctx.knowledge_store.get_note_by_slug = AsyncMock(
+            return_value=_existing_note(note_id="an-existing-note", blob_sha="b" * 40)
+        )
+        tools, _ = _make_tools(ctx)
+        patcher, calls = _capture_materialize()
+        with patcher:
+            _invoke(
+                _get_tool(tools, "kb_update"),
+                {"note": "an-existing-note", "append": "more text"},
+            )
+        assert calls[0]["expected_blob_sha"] == "b" * 40
+
+    def test_precondition_failure_tells_the_agent_to_re_read(self):
+        ctx = _make_gitless_context()
+        ctx.knowledge_graph = None
+        ctx.knowledge_store.get_note_by_slug = AsyncMock(
+            return_value=_existing_note(note_id="an-existing-note", blob_sha="a" * 40)
+        )
+        tools, _ = _make_tools(ctx)
+        patcher, _calls = _capture_materialize(
+            {
+                "status": "failed",
+                "reason": "precondition-failed",
+                "canonical_state": "failed",
+                "retry_state": "permanent",
+            }
+        )
+        with patcher:
+            result = _invoke(
+                _get_tool(tools, "kb_update"),
+                {"note": "an-existing-note", "append": "x"},
+            )
+        assert result.startswith("Error:")
+        assert "changed (or was removed) since you read it" in result
+        assert "kb_read" in result
+
+
 class TestKbUpdateKeepsTheNotesTimestamps:
     """Every kb_update rewrites the whole file. ``created:`` is the only
     carrier of a note's birth date — ``created_at`` is absent from
@@ -2215,7 +2905,7 @@ class TestKbUpdateKeepsTheNotesTimestamps:
         ctx = self._graph_ctx()
         tools, _ = _make_tools(ctx)
         patcher, calls = _capture_materialize()
-        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patcher, patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             _invoke(
                 _get_tool(tools, "kb_update"),
                 {"note": "an-existing-note", "append": "more"},
@@ -2257,7 +2947,7 @@ class TestKbUpdateKeepsTheNotesTimestamps:
         ctx = self._graph_ctx(created=_dt(2025, 12, 31, 9, 0, tzinfo=_tz.utc))
         tools, _ = _make_tools(ctx)
         patcher, calls = _capture_materialize()
-        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patcher, patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             _invoke(
                 _get_tool(tools, "kb_update"),
                 {"note": "an-existing-note", "append": "more"},
@@ -2278,7 +2968,7 @@ class TestKbUpdateKeepsTheNotesTimestamps:
         ctx = self._graph_ctx(created=_GraphDateTime())
         tools, _ = _make_tools(ctx)
         patcher, calls = _capture_materialize()
-        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patcher, patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             _invoke(
                 _get_tool(tools, "kb_update"),
                 {"note": "an-existing-note", "append": "more"},
@@ -2298,7 +2988,7 @@ class TestKbUpdateKeepsTheNotesTimestamps:
         ctx = self._graph_ctx(created=None)
         tools, _ = _make_tools(ctx)
         patcher, calls = _capture_materialize()
-        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patcher, patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             _invoke(
                 _get_tool(tools, "kb_update"),
                 {"note": "an-existing-note", "append": "more"},
@@ -2314,7 +3004,7 @@ class TestKbUpdateKeepsTheNotesTimestamps:
         ctx = self._graph_ctx()
         tools, _ = _make_tools(ctx)
         patcher, calls = _capture_materialize()
-        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patcher, patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             _invoke(
                 _get_tool(tools, "kb_update"),
                 {"note": "an-existing-note", "append": "more"},
@@ -2338,7 +3028,7 @@ class TestKbUpdateErrorPathsDoNotOverclaim:
         ctx.knowledge_graph.update_note.side_effect = RuntimeError("neo4j down")
         tools, _ = _make_tools(ctx)
         with patch(
-            "src.tools.knowledge.knowledge_tools._materialize_note",
+            "agent.tools.knowledge.knowledge_tools._materialize_note",
             return_value=materialization,
         ):
             return _invoke(
@@ -2397,7 +3087,7 @@ class TestKbUpdateMaterialization:
         tools, _ = _make_tools(ctx)
 
         patcher, calls = _capture_materialize()
-        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patcher, patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             _invoke(
                 _get_tool(tools, "kb_update"),
                 {"note": "n1", "content": "updated body"},
@@ -2421,7 +3111,7 @@ class TestKbUpdateMaterialization:
         tools, _ = _make_tools(ctx)
 
         patcher, calls = _capture_materialize()
-        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patcher, patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             result = _invoke(
                 _get_tool(tools, "kb_update"),
                 {"note": "n1", "content": "x"},
@@ -2466,7 +3156,7 @@ class TestKbUpdateMaterialization:
         patcher, calls = _capture_materialize(
             {"status": "failed", "reason": "commit-error"}
         )
-        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patcher, patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             result = _invoke(
                 _get_tool(tools, "kb_update"),
                 {"note": "n1", "content": "x"},
@@ -2483,8 +3173,8 @@ class TestKbUpdateMaterialization:
 import hashlib as _hashlib  # noqa: E402
 from types import SimpleNamespace  # noqa: E402
 
-from src.services.auxiliary import KnowledgeVerdict  # noqa: E402
-from src.services.knowledge.ingestion import KnowledgeVerdictService  # noqa: E402
+from shared.runtime.services.auxiliary import KnowledgeVerdict  # noqa: E402
+from agent.services.knowledge.ingestion import KnowledgeVerdictService  # noqa: E402
 
 
 class _GateAux:
@@ -2649,7 +3339,7 @@ class TestKbWriteErrorPathsDoNotOverclaim:
         ctx.knowledge_graph.read_note.return_value = None
         ctx.knowledge_graph.create_note.side_effect = RuntimeError("neo4j down")
         with patch(
-            "src.tools.knowledge.knowledge_tools._materialize_note",
+            "agent.tools.knowledge.knowledge_tools._materialize_note",
             return_value={
                 "status": "committed",
                 "canonical_state": "canonical",
@@ -2683,7 +3373,7 @@ class TestKbWriteErrorPathsDoNotOverclaim:
             KnowledgeVerdict(action="SUPERSEDE", target_indices=[1], reason="replaced"),
         )
         with patch(
-            "src.tools.knowledge.knowledge_tools._materialize_note",
+            "agent.tools.knowledge.knowledge_tools._materialize_note",
             return_value={
                 "status": "committed",
                 "canonical_state": "canonical",
@@ -2713,7 +3403,7 @@ class TestKbWriteErrorPathsDoNotOverclaim:
         ctx.knowledge_graph.read_note.return_value = None
         ctx.knowledge_graph.create_note.side_effect = RuntimeError("neo4j down")
         with patch(
-            "src.tools.knowledge.knowledge_tools._materialize_note",
+            "agent.tools.knowledge.knowledge_tools._materialize_note",
             return_value={
                 "status": "committed",
                 "canonical_state": "canonical",
@@ -2744,7 +3434,7 @@ class TestKbWriteSlugDedup:
             "type": "decision",
             "title": "Test",
         }
-        with patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             result = _invoke(
                 _get_tool(tools, "kb_write"),
                 {"title": "Test", "type": "decision", "content": "body"},
@@ -2767,7 +3457,7 @@ class TestKbWriteSlugDedup:
         }
         kg.create_note.return_value = "test-abc123"
         ctx.knowledge_store.upsert_note = AsyncMock(return_value=uuid.uuid4())
-        with patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             _invoke(
                 _get_tool(tools, "kb_write"),
                 {"title": "Test", "type": "decision", "content": "NEW body"},
@@ -2780,7 +3470,7 @@ class TestKbWriteSlugDedup:
         kg.read_note.return_value = None
         kg.create_note.return_value = "fresh-slug"
         ctx.knowledge_store.upsert_note = AsyncMock(return_value=uuid.uuid4())
-        with patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        with patch("agent.tools.knowledge.knowledge_tools.asyncio"):
             result = _invoke(
                 _get_tool(tools, "kb_write"),
                 {"title": "Fresh", "type": "learning", "content": "x"},
@@ -2873,7 +3563,7 @@ class TestKbLintUrlSweep:
         ctx = self._ctx(_KB_LINT_URL_ROWS)
         tools, _ = _make_tools(ctx)
         with patch(
-            "src.tools.knowledge.knowledge_tools._check_external_url"
+            "agent.tools.knowledge.knowledge_tools._check_external_url"
         ) as checker:
             result = _invoke(_get_tool(tools, "kb_lint"), {})
         checker.assert_not_called()
@@ -2883,7 +3573,7 @@ class TestKbLintUrlSweep:
         ctx = self._ctx(_KB_LINT_URL_ROWS)
         tools, _ = _make_tools(ctx)
         with patch(
-            "src.tools.knowledge.knowledge_tools._check_external_url",
+            "agent.tools.knowledge.knowledge_tools._check_external_url",
             return_value="HTTP 404",
         ):
             result = _invoke(_get_tool(tools, "kb_lint"), {"check_urls": True})
@@ -2894,7 +3584,7 @@ class TestKbLintUrlSweep:
         ctx = self._ctx(_KB_LINT_URL_ROWS)
         tools, _ = _make_tools(ctx)
         with patch(
-            "src.tools.knowledge.knowledge_tools._check_external_url",
+            "agent.tools.knowledge.knowledge_tools._check_external_url",
             return_value=None,
         ):
             result = _invoke(_get_tool(tools, "kb_lint"), {"check_urls": True})
@@ -2912,7 +3602,7 @@ class TestKbLintUrlSweep:
         ctx = self._ctx(rows)
         tools, _ = _make_tools(ctx)
         with patch(
-            "src.tools.knowledge.knowledge_tools._check_external_url",
+            "agent.tools.knowledge.knowledge_tools._check_external_url",
             return_value=None,
         ) as checker:
             result = _invoke(_get_tool(tools, "kb_lint"), {"check_urls": True})

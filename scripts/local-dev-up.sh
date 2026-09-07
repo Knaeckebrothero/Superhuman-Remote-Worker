@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 # =============================================================================
 # Local development bootstrap: k3d cluster + cert-manager + mkcert ClusterIssuer
-# + namespace + vm-ssh-key Secret + vendored Helm chart dependencies.
+# + namespace + local runtime Secrets + vendored Helm chart dependencies.
 #
 # Idempotent: re-runs are safe. Skips anything that already exists.
 #
 # After this, copy the values template and `helm install`:
 #   cp deployment/values-local.yaml.example deployment/values-local.yaml
 #   $EDITOR deployment/values-local.yaml      # paste at least one LLM key
-#   helm install srw ./helm -n srw -f deployment/values-local.yaml
+#   helm install srw ./helm -n srw --kube-context k3d-srw \
+#     -f deployment/values-local.yaml -f deployment/values-local-images.yaml
 #
 # Prerequisites (must be done once on the host BEFORE running this):
-#   - docker + k3d + kubectl + helm + mkcert installed
+#   - docker + k3d + kubectl + helm + mkcert + openssl installed
 #   - `mkcert -install` (user-level trust)
 #   - `sudo CAROOT="$HOME/.local/share/mkcert" mkcert -install` (system + Chrome trust)
 # =============================================================================
@@ -32,7 +33,7 @@ skip() { printf '\033[1;33m[skip]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
 
 # --- Prereq checks ----------------------------------------------------------
-for bin in docker k3d kubectl helm mkcert ssh-keygen; do
+for bin in docker k3d kubectl helm mkcert openssl ssh-keygen git curl; do
   command -v "$bin" >/dev/null || die "missing required binary: $bin"
 done
 
@@ -99,8 +100,18 @@ EOF
   ok "ClusterIssuer created"
 fi
 
-# --- 4. SRW namespace + vm-ssh-key Secret -----------------------------------
+# --- 4. SRW namespace + local runtime Secrets -------------------------------
 $KCTL create namespace "$NAMESPACE" --dry-run=client -o yaml | $KCTL apply -f - >/dev/null
+
+if $KCTL -n "$NAMESPACE" get secret srw-session-jwt >/dev/null 2>&1; then
+  skip "secret srw-session-jwt already exists in namespace $NAMESPACE"
+else
+  log "minting session-router JWT secret"
+  JWT_SECRET=$(openssl rand -base64 48 | tr -d '\n' | head -c 64)
+  $KCTL -n "$NAMESPACE" create secret generic srw-session-jwt \
+    --from-literal=jwt-secret="$JWT_SECRET"
+  ok "session-jwt Secret created"
+fi
 
 if $KCTL -n "$NAMESPACE" get secret srw-vm-ssh-key >/dev/null 2>&1; then
   skip "secret srw-vm-ssh-key already exists in namespace $NAMESPACE"
@@ -119,14 +130,11 @@ fi
 
 # --- 5. In-cluster DNS for *.localhost ingress hosts -------------------------
 # Pods cannot resolve cloud.localhost / auth.localhost / git.localhost (no
-# DNS exists for .localhost), but several in-cluster flows must reach the
-# ingress hostnames: OpenCloud's ocdav forwards every upload to its public
-# data-gateway URL (https://cloud.localhost/data), rclone tus uploads PATCH
-# the same URL from workspace pods, and OpenCloud's OIDC verifier fetches
-# JWKS from auth.localhost. Map them to Traefik's ClusterIP via the k3s
-# coredns-custom hook so every pod resolves them — supersedes per-pod
-# hostAliases workarounds. Idempotent; the ClusterIP is stable for the life
-# of the cluster (re-run this script after `k3d cluster delete && create`).
+# ordinary DNS exists for .localhost), but cloud, git, OIDC, and workspace
+# flows must reach those ingress hostnames from inside the cluster. Map them
+# to Traefik's ClusterIP through the k3s coredns-custom hook so every pod gets
+# the same answer. Idempotent; the ClusterIP is stable for the life of the
+# cluster (re-run this script after `k3d cluster delete && create`).
 TRAEFIK_IP=$($KCTL -n kube-system get svc traefik -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)
 if [ -z "$TRAEFIK_IP" ]; then
   skip "traefik svc not up yet — re-run this script later to install the *.localhost DNS override"
@@ -166,11 +174,94 @@ CHART_DEPS=$(helm dependency list "$REPO_ROOT/helm" 2>/dev/null || true)
 if [[ "$CHART_DEPS" == *missing* ]]; then
   log "vendoring Helm chart dependencies into helm/charts/"
   helm repo add collabora https://collaboraonline.github.io/online --force-update >/dev/null
-  helm repo add cloudnative-pg https://cloudnative-pg.github.io/charts --force-update >/dev/null
   helm dependency build "$REPO_ROOT/helm" >/dev/null
   ok "chart dependencies vendored"
 else
   skip "Helm chart dependencies already vendored"
+fi
+
+# --- 7. Pin component images to this checkout ------------------------------
+# The chart defaults every component to `:latest`, which is published by the
+# MAIN pipeline. A checkout of `develop` (the default branch) therefore installs
+# develop's chart against main's images, and the two disagree whenever develop
+# has changed a chart<->image contract since the last release — the research
+# seed hook's `--research-providers-only` broke exactly this way on 2026-09-04.
+# Develop CI publishes `sha-<7>` tags for every component it builds, keyed by
+# the newest commit that touched that component's build inputs. Walk this
+# checkout's history and take, per component, the newest commit whose image
+# exists on GHCR; write the result to a gitignored overlay that the install
+# command passes after values-local.yaml. Disable with SRW_IMAGE_PIN=0.
+IMAGES_FILE="$REPO_ROOT/deployment/values-local-images.yaml"
+if [ "${SRW_IMAGE_PIN:-1}" = "0" ]; then
+  skip "image pinning disabled (SRW_IMAGE_PIN=0); the chart's :latest tags apply"
+elif ! git -C "$REPO_ROOT" rev-parse --verify HEAD >/dev/null 2>&1; then
+  skip "not a git checkout; cannot pin images to a commit — the chart's :latest tags apply"
+else
+  log "pinning component images to this checkout's history"
+  GHCR_NS="ghcr.io/knaeckebrothero/superhuman-remote-worker"
+  PIN_DEPTH="${SRW_IMAGE_PIN_DEPTH:-300}"
+  ghcr_token() {
+    curl -fsS "https://ghcr.io/token?scope=repository:knaeckebrothero/superhuman-remote-worker-$1:pull" \
+      | sed -n 's/.*"token":"\([^"]*\)".*/\1/p'
+  }
+  ghcr_has_tag() {  # token component tag
+    local code
+    code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $1" \
+      -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json' \
+      "https://ghcr.io/v2/knaeckebrothero/superhuman-remote-worker-$2/manifests/$3")
+    [ "$code" = "200" ]
+  }
+  resolve_tag() {  # component -> prints "sha-xxxxxxx depth" or nothing (one anonymous pull token per component)
+    local component="$1" depth=0 sha tok
+    tok=$(ghcr_token "$component") || return 1
+    [ -n "$tok" ] || return 1
+    while read -r sha; do
+      if ghcr_has_tag "$tok" "$component" "sha-${sha:0:7}"; then
+        printf '%s %s\n' "sha-${sha:0:7}" "$depth"; return 0
+      fi
+      depth=$((depth+1))
+    done < <(git -C "$REPO_ROOT" rev-list --max-count="$PIN_DEPTH" HEAD)
+    return 1
+  }
+  # Resolve all components in parallel; each writes its answer to a temp file.
+  PIN_TMP=$(mktemp -d)
+  for component in orchestrator agent cockpit mcp workspace vm-controller; do
+    ( resolve_tag "$component" > "$PIN_TMP/$component" 2>/dev/null || : ) &
+  done
+  wait
+  {
+    echo "# Generated by scripts/local-dev-up.sh — component image tags resolved from"
+    echo "# this checkout's git history ($(git -C "$REPO_ROOT" rev-parse --short=7 HEAD),"
+    echo "# $(date -u +%Y-%m-%dT%H:%M:%SZ)). Re-run the script after pulling to refresh."
+    echo "# Pass it AFTER values-local.yaml so it wins: helm ... -f deployment/values-local.yaml -f deployment/values-local-images.yaml"
+    echo "image:"
+  } > "$IMAGES_FILE"
+  PIN_FAILED=""
+  for component in orchestrator agent cockpit mcp workspace; do
+    resolved=$(cat "$PIN_TMP/$component")
+    if [ -n "$resolved" ]; then
+      tag="${resolved%% *}"; depth="${resolved##* }"
+      printf '  %s:\n    tag: %s\n' "$component" "$tag" >> "$IMAGES_FILE"
+      if [ "$depth" = "0" ]; then ok "$component → $tag (HEAD)"; else ok "$component → $tag (newest commit with a published image; $depth commit(s) behind HEAD)"; fi
+    else
+      PIN_FAILED="$PIN_FAILED $component"
+      printf '  %s:\n    tag: latest\n' "$component" >> "$IMAGES_FILE"
+    fi
+  done
+  resolved=$(cat "$PIN_TMP/vm-controller")
+  if [ -n "$resolved" ]; then
+    tag="${resolved%% *}"
+    printf 'vmController:\n  image:\n    tag: %s\n' "$tag" >> "$IMAGES_FILE"
+    ok "vm-controller → $tag"
+  else
+    PIN_FAILED="$PIN_FAILED vm-controller"
+    printf 'vmController:\n  image:\n    tag: latest\n' >> "$IMAGES_FILE"
+  fi
+  rm -rf "$PIN_TMP"
+  if [ -n "$PIN_FAILED" ]; then
+    printf '\033[1;33m[warn]\033[0m no sha-tagged image within %s commits for:%s — left on :latest, which may be OLDER than this chart\n' "$PIN_DEPTH" "$PIN_FAILED"
+  fi
+  ok "wrote $IMAGES_FILE"
 fi
 
 # --- Done -------------------------------------------------------------------
@@ -181,9 +272,11 @@ $(printf '\033[1;32m✓ Local cluster ready.\033[0m')
 Next:
   cp deployment/values-local.yaml.example deployment/values-local.yaml
   \$EDITOR deployment/values-local.yaml      # paste at least one LLM key
-  helm install srw ./helm -n $NAMESPACE -f deployment/values-local.yaml
+  helm install srw ./helm -n $NAMESPACE --kube-context $KUBE_CONTEXT \
+    -f deployment/values-local.yaml \
+    -f deployment/values-local-images.yaml   # images pinned to this checkout
 
-Then open https://localhost/ and log in as test / test.
+Then open https://localhost/ and log in as test / srw-k3d-dev-test.
 
 Cluster lifecycle:
   k3d cluster stop  $CLUSTER_NAME

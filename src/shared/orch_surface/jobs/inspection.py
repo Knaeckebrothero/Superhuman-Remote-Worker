@@ -12,11 +12,26 @@ import asyncio
 import json
 from typing import Literal
 
-from .. import formatters as fmt
-from ..client import AsyncCockpitClient
-from ._utils import job_read_error, repo_head_line, resolve_job_id
-from .descriptors import CallerCtx, JobToolResult, ToolImageAttachment, descriptor
-from .envelope import Source, build_envelope, friendly_reason, http_status_of, observe
+from shared.orch_surface import formatters as fmt
+from shared.orch_surface.client import AsyncCockpitClient
+from shared.orch_surface.jobs._utils import (
+    job_read_error,
+    repo_head_line,
+    resolve_job_id,
+)
+from shared.orch_surface.jobs.descriptors import (
+    CallerCtx,
+    JobToolResult,
+    ToolImageAttachment,
+    descriptor,
+)
+from shared.orch_surface.jobs.envelope import (
+    Source,
+    build_envelope,
+    friendly_reason,
+    http_status_of,
+    observe,
+)
 
 _ALL = frozenset({"mcp", "session", "officer"})
 _MCP = frozenset({"mcp"})

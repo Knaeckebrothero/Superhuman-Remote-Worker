@@ -19,7 +19,7 @@ from orchestrator.services.completion_command_resolution import (
 )
 from orchestrator.services.completion_effect_policy import COMPLETION_EFFECT_PLAN
 from orchestrator.services.completion_monitor import CompletionMonitor
-from src.shared.workspace_contract import (
+from shared.workspace_contract import (
     WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY,
     pinned_dispatch_authority_jsonb_sql,
 )
@@ -27,6 +27,7 @@ from src.shared.workspace_contract import (
 
 SCHEMA_FILE = (
     Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "schema_current.sql"

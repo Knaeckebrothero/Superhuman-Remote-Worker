@@ -8,7 +8,7 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from openai import BadRequestError
 
-from src.persistent_graph import PersistentLoopCallbacks, run_persistent_loop
+from agent.persistent_graph import PersistentLoopCallbacks, run_persistent_loop
 
 
 def _config() -> MagicMock:
@@ -183,7 +183,7 @@ async def test_two_equivalent_pairing_400s_escalate_once_and_stop_spend():
 
 @pytest.mark.asyncio
 async def test_non_pairing_provider_400_keeps_normal_error_behavior(monkeypatch):
-    monkeypatch.setattr("src.persistent_graph._SESSION_LLM_RETRY_BASE_DELAY", 0.0)
+    monkeypatch.setattr("agent.persistent_graph._SESSION_LLM_RETRY_BASE_DELAY", 0.0)
     provider_calls = 0
 
     async def _astream(_messages, **_kwargs):
@@ -281,7 +281,7 @@ async def test_normal_paired_tool_traffic_is_unchanged():
 async def test_mid_tool_drift_waits_for_pair_then_replacement_restore_is_valid():
     """Lifecycle intent never cuts the transcript between call and result."""
 
-    from src.api import persistent_app
+    from agent.api import persistent_app
 
     saved = {
         name: getattr(persistent_app, name)

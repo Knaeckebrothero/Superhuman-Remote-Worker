@@ -44,14 +44,14 @@ class TestVocabularyDrift:
     """
 
     def test_citation_literals_match_engine_enums(self):
-        from src.citation_engine.models import (
+        from shared.runtime.citation_engine.models import (
             AnnotationType,
             Confidence,
             ExtractionMethod,
             SourceType,
             VerificationStatus,
         )
-        from src.tools.citation.sources import (
+        from agent.tools.citation.sources import (
             AnnotationTypeValue,
             ConfidenceValue,
             ExtractionMethodValue,
@@ -73,12 +73,12 @@ class TestVocabularyDrift:
 
     def test_kb_literals_match_knowledge_graph_vocabularies(self):
         """The 'datasource' omission this catches was live in the docstring."""
-        from src.services.knowledge_graph import (
+        from shared.runtime.services.knowledge_graph import (
             CONFIDENCE_LEVELS,
             NOTE_STATUSES,
             NOTE_TYPES,
         )
-        from src.tools.knowledge.knowledge_tools import (
+        from agent.tools.knowledge.knowledge_tools import (
             NoteConfidenceValue,
             NoteStatusValue,
             NoteTypeValue,
@@ -92,7 +92,7 @@ class TestVocabularyDrift:
         """propose_automation.autonomy named its values nowhere the model could
         see — not in the type, not even in prose. Only in _AUTONOMY_VALUES,
         surfaced solely in a post-hoc rejection."""
-        from src.tools.orchestrator.workflows import (
+        from agent.tools.orchestrator.workflows import (
             _AUTONOMY_VALUES,
             create_workflow_tools,
         )
@@ -106,8 +106,8 @@ class TestVocabularyDrift:
         """A ticket type missing from any one site silently degrades: the tool
         rejects it, or kb_reindex rewrites it to 'learning' on the next pass."""
         from orchestrator.services.kb_reindex import VALID_NOTE_TYPES
-        from src.services.knowledge_graph import NOTE_TYPES
-        from src.tools.knowledge.knowledge_tools import NoteTypeValue
+        from shared.runtime.services.knowledge_graph import NOTE_TYPES
+        from agent.tools.knowledge.knowledge_tools import NoteTypeValue
 
         for ticket_type in ("feature", "issue", "idea"):
             assert ticket_type in NOTE_TYPES
@@ -118,8 +118,8 @@ class TestVocabularyDrift:
         """A set-of-keys comparison alone would still pass if the rank
         numbers were scrambled (e.g. high=2, low=0), silently reversing the
         backlog's sort order. Pin the actual word -> rank mapping."""
-        from src.services.knowledge_graph import PRIORITY_RANKS
-        from src.tools.knowledge.knowledge_tools import PriorityValue
+        from shared.runtime.services.knowledge_graph import PRIORITY_RANKS
+        from agent.tools.knowledge.knowledge_tools import PriorityValue
 
         assert set(get_args(PriorityValue)) == set(PRIORITY_RANKS)
         assert PRIORITY_RANKS == {"high": 0, "normal": 1, "low": 2}
@@ -138,11 +138,11 @@ class TestVocabularyDrift:
         from orchestrator.services.project_backlog import (
             PRIORITY_WORDS as backlog_words,
         )
-        from src.services.knowledge_graph import (
+        from shared.runtime.services.knowledge_graph import (
             PRIORITY_RANKS as canonical_ranks,
             PRIORITY_WORDS as canonical_words,
         )
-        from src.tools.knowledge.knowledge_tools import _TICKET_TYPES
+        from agent.tools.knowledge.knowledge_tools import _TICKET_TYPES
 
         assert backlog_words == canonical_words
         assert reindex_ranks == canonical_ranks
@@ -169,7 +169,7 @@ def _enum_of(tool, param):
 
 @pytest.fixture
 def citation_tools():
-    from src.tools.citation.sources import create_source_tools
+    from agent.tools.citation.sources import create_source_tools
 
     return {t.name: t for t in create_source_tools(MagicMock())}
 
@@ -244,7 +244,7 @@ class TestOtherToolConstraints:
         'type', ten values, and a docstring that listed nine of them."""
         import inspect
 
-        from src.tools.knowledge.knowledge_tools import create_kb_tools
+        from agent.tools.knowledge.knowledge_tools import create_kb_tools
 
         sig = inspect.signature(create_kb_tools)
         tools = {
@@ -267,7 +267,7 @@ class TestOtherToolConstraints:
     def test_task_add_priority_is_constrained(self):
         """Silently downgraded anything unrecognised to 'medium', with no word
         of it in the confirmation."""
-        from src.tools.core.session_task_tools import create_session_task_tools
+        from agent.tools.core.session_task_tools import create_session_task_tools
 
         tools = {t.name: t for t in create_session_task_tools(MagicMock())}
         assert set(_enum_of(tools["task_add"], "priority")) == {
@@ -277,7 +277,7 @@ class TestOtherToolConstraints:
         }
 
     def test_edit_file_position_is_constrained(self):
-        from src.tools.workspace.files import create_file_tools
+        from agent.tools.workspace.files import create_file_tools
 
         ctx = MagicMock()
         ctx.get_config.side_effect = lambda k, *a: {
@@ -297,7 +297,7 @@ class TestTagSourceAction:
 
     @pytest.fixture
     def tag_tool(self):
-        from src.tools.citation.sources import create_source_tools
+        from agent.tools.citation.sources import create_source_tools
 
         ctx = MagicMock()
         engine = MagicMock()
@@ -348,14 +348,14 @@ class TestDeferralSurvival:
 
     def test_edit_citation_is_actually_deferred(self):
         """Guards the premise: if it stops being deferred, the below is moot."""
-        from src.tools.registry import TOOL_REGISTRY
+        from agent.tools.registry import TOOL_REGISTRY
 
         meta = TOOL_REGISTRY["edit_citation"]
         assert meta.get("defer_to_workspace") is True
         assert meta.get("short_description")
 
     def test_enum_survives_description_override(self, citation_tools):
-        from src.tools.description_manager import apply_description_overrides
+        from agent.tools.description_manager import apply_description_overrides
 
         before = citation_tools["edit_citation"]
         full_description = before.description
@@ -397,7 +397,7 @@ class TestEditCitationValidation:
 
     @pytest.fixture
     def engine(self):
-        from src.citation_engine.engine import CitationEngine
+        from agent.citation_engine.engine import CitationEngine
 
         return CitationEngine(db=AsyncMock())
 
@@ -451,7 +451,7 @@ class TestErrorHumanizer:
     """Last-resort net: name the values even if a raw DB enum error escapes."""
 
     def test_translates_enum_error_into_actionable_message(self):
-        from src.tools.citation.sources import _humanize_db_enum_error
+        from agent.tools.citation.sources import _humanize_db_enum_error
 
         msg = _humanize_db_enum_error(
             Exception('invalid input value for enum extraction_method: "direct"')
@@ -460,12 +460,12 @@ class TestErrorHumanizer:
         assert "direct_quote" in msg and "paraphrase" in msg
 
     def test_returns_none_for_unrelated_errors(self):
-        from src.tools.citation.sources import _humanize_db_enum_error
+        from agent.tools.citation.sources import _humanize_db_enum_error
 
         assert _humanize_db_enum_error(Exception("connection reset")) is None
 
     def test_returns_none_for_unknown_enum(self):
-        from src.tools.citation.sources import _humanize_db_enum_error
+        from agent.tools.citation.sources import _humanize_db_enum_error
 
         assert (
             _humanize_db_enum_error(
@@ -486,7 +486,7 @@ class TestVerbatimGating:
     """
 
     def test_direct_quote_is_filed_as_verbatim(self):
-        from src.tools.citation.sources import _verbatim_or_none
+        from agent.tools.citation.sources import _verbatim_or_none
 
         assert _verbatim_or_none("exact text", "direct_quote") == "exact text"
 
@@ -494,12 +494,12 @@ class TestVerbatimGating:
         "method", ["paraphrase", "inference", "aggregation", "negative"]
     )
     def test_non_quote_methods_file_no_verbatim(self, method):
-        from src.tools.citation.sources import _verbatim_or_none
+        from agent.tools.citation.sources import _verbatim_or_none
 
         assert _verbatim_or_none("a rewording of the source", method) is None
 
     def test_overlong_quote_is_still_treated_as_context(self):
         """Pre-existing behaviour, preserved: a huge 'quote' is not a quote."""
-        from src.tools.citation.sources import _verbatim_or_none
+        from agent.tools.citation.sources import _verbatim_or_none
 
         assert _verbatim_or_none("x" * 1500, "direct_quote") is None

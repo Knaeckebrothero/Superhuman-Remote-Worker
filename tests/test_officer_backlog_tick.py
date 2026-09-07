@@ -21,7 +21,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from services.officer_backlog import (
+from orchestrator.services.officer_backlog import (
     STALE_CLAIM_HOURS,
     _scan_eligible_tickets,
     auto_pull_enabled,
@@ -33,7 +33,7 @@ from services.officer_backlog import (
     stale_claims,
     tick_officer as _tick_officer,
 )
-from services.work_categories import EXECUTOR, RESEARCHER
+from orchestrator.services.work_categories import EXECUTOR, RESEARCHER
 
 NOW = datetime(2026, 8, 15, 12, 0, tzinfo=timezone.utc)
 OFFICER_THREAD_ID = "11111111-1111-1111-1111-111111111111"
@@ -50,6 +50,9 @@ async def _noop_provision(_job, *, category=None):
 async def tick_officer(*args, **kwargs):
     """Unit default mirrors the lifespan's configured provisioner."""
     kwargs.setdefault("provision_repo", _noop_provision)
+    # Existing behavioral tests exercise a deliberately released century.
+    # Production defaults dark; dedicated tests below prove that boundary.
+    kwargs.setdefault("release_enabled", True)
     return await _tick_officer(*args, **kwargs)
 
 
@@ -115,6 +118,35 @@ class TestAutoPullGate:
         }
         db.list_commissioned_officer_posts_for_backlog.assert_awaited_once()
         db.list_officer_threads.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_deployment_release_gate_blocks_new_queue_reads(self):
+        db = _db()
+        vector_db = MagicMock()
+        vector_db.acquire.side_effect = AssertionError(
+            "a dark release gate must not read the ticket queue"
+        )
+
+        counts = await _tick_officer(
+            db,
+            vector_db,
+            _officer_row(),
+            now=NOW,
+            release_enabled=False,
+            provision_repo=_noop_provision,
+        )
+
+        assert counts == {
+            "dispatched": 0,
+            "skipped": 0,
+            "breakers_opened": 0,
+            "wakes": 0,
+        }
+        db.create_job.assert_not_awaited()
+        vector_db.acquire.assert_not_called()
+        # BP-07 work was already admitted and owns its claim/capacity. Its
+        # recovery stays live while new unattended admission is dark.
+        db.list_officer_job_preflights.assert_awaited_once()
 
 
 # =============================================================================
@@ -671,7 +703,7 @@ class TestTickOfficer:
     async def test_equal_priority_timestamp_page_boundary_has_no_gap_or_duplicate(
         self, monkeypatch
     ):
-        import services.officer_backlog as module
+        import orchestrator.services.officer_backlog as module
 
         created_at = NOW - timedelta(days=1)
         first = [
@@ -696,9 +728,11 @@ class TestTickOfficer:
             }
         ]
         cursors = []
+        include_counts = []
 
         async def _fetch(_vector, _project, *, after=None, **_kwargs):
             cursors.append(after)
+            include_counts.append(_kwargs.get("include_counts"))
             return (first if after is None else tail), {}
 
         monkeypatch.setattr(module, "fetch_backlog", _fetch)
@@ -710,6 +744,7 @@ class TestTickOfficer:
         assert ids == [f"ticket-{index:03d}" for index in range(101)]
         assert len(ids) == len(set(ids))
         assert cursors[1].note_id == "ticket-099"
+        assert include_counts == [False, False]
         assert scan.exhausted is True
 
     @pytest.mark.asyncio
@@ -760,7 +795,7 @@ class TestTickOfficer:
         await tick_officer(db, _vector_db(rows), _officer_row(), now=NOW)
         assert db.created["runner_kind"] == "lifecycle"
 
-        schema = Path("orchestrator/database/schema_current.sql").read_text()
+        schema = Path("src/orchestrator/database/schema_current.sql").read_text()
         constraint = next(
             line for line in schema.splitlines() if "jobs_runner_kind_check" in line
         )
@@ -849,7 +884,7 @@ class TestTickOfficer:
         it could not do the work. Hand-dispatched, that cost Better Resavio a
         night. Under auto-pull it would repeat every tick, unattended.
         """
-        import services.officer_backlog as mod
+        import orchestrator.services.officer_backlog as mod
 
         resolved = ([KB_DS, REPO_DS], {KB_DS: 2, REPO_DS: 4})
         monkeypatch.setattr(
@@ -883,7 +918,7 @@ class TestTickOfficer:
         can read the KB but cannot reach the code. The worker's slot backend is
         the only correct measure.
         """
-        import services.officer_backlog as mod
+        import orchestrator.services.officer_backlog as mod
 
         spy = AsyncMock(return_value=([KB_DS, REPO_DS], {}))
         monkeypatch.setattr(mod, "default_datasource_selection", spy)
@@ -914,8 +949,8 @@ class TestTickOfficer:
         credential contract, and it would burn the ticket's one-shot claim to
         do it. Skipping leaves the pool visibly below floor instead.
         """
-        import services.officer_backlog as mod
-        from services.datasource_policy import DatasourceUnavailableError
+        import orchestrator.services.officer_backlog as mod
+        from orchestrator.services.datasource_policy import DatasourceUnavailableError
 
         monkeypatch.setattr(
             mod,

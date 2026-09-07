@@ -24,7 +24,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from fastapi import HTTPException
 
-from security import access
+from orchestrator.security import access
 
 
 # =============================================================================
@@ -36,15 +36,15 @@ def _patch_caller_and_db(user: dict, db):
     """Patch the caller (require_approved_user) and DB on the main module."""
     stack = ExitStack()
     stack.enter_context(
-        patch("main.require_approved_user", AsyncMock(return_value=user))
+        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user))
     )
     stack.enter_context(
         patch(
-            "security.access.require_approved_user",
+            "orchestrator.security.access.require_approved_user",
             AsyncMock(return_value=user),
         )
     )
-    stack.enter_context(patch("main.postgres_db", db))
+    stack.enter_context(patch("orchestrator.main.postgres_db", db))
     return stack
 
 
@@ -243,7 +243,7 @@ class TestListDatasourcesEndpoint:
     async def test_user_sees_only_own(
         self, user_a, datasource_a, fake_db, fake_request
     ):
-        from main import list_datasources
+        from orchestrator.main import list_datasources
 
         with _patch_caller_and_db(user_a, fake_db):
             rows = await list_datasources(fake_request)
@@ -252,7 +252,7 @@ class TestListDatasourcesEndpoint:
 
     @pytest.mark.asyncio
     async def test_admin_sees_all(self, user_admin, fake_db, fake_request):
-        from main import list_datasources
+        from orchestrator.main import list_datasources
 
         with _patch_caller_and_db(user_admin, fake_db):
             rows = await list_datasources(fake_request)
@@ -270,7 +270,7 @@ class TestGetDatasourceEndpoint:
     async def test_creator_gets_redacted(
         self, user_a, datasource_a, fake_db, fake_request
     ):
-        from main import get_datasource
+        from orchestrator.main import get_datasource
 
         with _patch_caller_and_db(user_a, fake_db):
             result = await get_datasource(fake_request, str(datasource_a["id"]))
@@ -279,7 +279,7 @@ class TestGetDatasourceEndpoint:
 
     @pytest.mark.asyncio
     async def test_cross_user_403(self, user_b, datasource_a, fake_db, fake_request):
-        from main import get_datasource
+        from orchestrator.main import get_datasource
 
         with _patch_caller_and_db(user_b, fake_db):
             with pytest.raises(HTTPException) as exc:
@@ -296,7 +296,7 @@ class TestGetDatasourceEndpoint:
         fake_db,
         fake_request,
     ):
-        from main import get_datasource
+        from orchestrator.main import get_datasource
 
         scoped = {
             **user_a,
@@ -322,7 +322,7 @@ class TestCreateDatasourceEndpoint:
     async def test_project_scoped_token_must_create_inside_its_project(
         self, user_a, project_a, fake_db, fake_request
     ):
-        from main import DatasourceCreate, create_datasource
+        from orchestrator.main import DatasourceCreate, create_datasource
 
         scoped = {
             **user_a,
@@ -345,13 +345,13 @@ class TestCreateDatasourceEndpoint:
     async def test_create_passes_actor_to_transactional_owner_recheck(
         self, user_a, project_a, datasource_a, fake_db, fake_request
     ):
-        from main import DatasourceCreate, create_datasource
+        from orchestrator.main import DatasourceCreate, create_datasource
 
         fake_db.create_datasource = AsyncMock(
             return_value={**datasource_a, "type": "generic"}
         )
         with _patch_caller_and_db(user_a, fake_db):
-            with patch("main._sync_datasource_knowledge", AsyncMock()):
+            with patch("orchestrator.main._sync_datasource_knowledge", AsyncMock()):
                 await create_datasource(
                     DatasourceCreate(
                         name="Database",
@@ -377,7 +377,7 @@ class TestUpdateDatasourceEndpoint:
     async def test_creator_passes_gate(
         self, user_a, datasource_a, fake_db, fake_request
     ):
-        from main import DatasourceUpdate, update_datasource
+        from orchestrator.main import DatasourceUpdate, update_datasource
 
         fake_db.update_datasource = AsyncMock(return_value=True)
         fake_db.list_datasource_projects = AsyncMock(return_value=[])
@@ -393,7 +393,7 @@ class TestUpdateDatasourceEndpoint:
 
     @pytest.mark.asyncio
     async def test_non_owner_403(self, user_b, datasource_a, fake_db, fake_request):
-        from main import DatasourceUpdate, update_datasource
+        from orchestrator.main import DatasourceUpdate, update_datasource
 
         with _patch_caller_and_db(user_b, fake_db):
             with pytest.raises(HTTPException) as exc:
@@ -410,7 +410,7 @@ class TestUpdateDatasourceEndpoint:
     ):
         """Body without credentials → DB call gets credentials=None → stored
         secret stays intact (the real DB layer skips the column when None)."""
-        from main import DatasourceUpdate, update_datasource
+        from orchestrator.main import DatasourceUpdate, update_datasource
 
         fake_db.update_datasource = AsyncMock(return_value=True)
         fake_db.list_datasource_projects = AsyncMock(return_value=[])
@@ -428,7 +428,7 @@ class TestUpdateDatasourceEndpoint:
         self, user_a, datasource_a, fake_db, fake_request
     ):
         """Body with empty dict credentials → same preservation as None."""
-        from main import DatasourceUpdate, update_datasource
+        from orchestrator.main import DatasourceUpdate, update_datasource
 
         fake_db.update_datasource = AsyncMock(return_value=True)
         fake_db.list_datasource_projects = AsyncMock(return_value=[])
@@ -445,7 +445,7 @@ class TestUpdateDatasourceEndpoint:
     async def test_explicit_credentials_pass_through(
         self, user_a, datasource_a, fake_db, fake_request
     ):
-        from main import DatasourceUpdate, update_datasource
+        from orchestrator.main import DatasourceUpdate, update_datasource
 
         fake_db.update_datasource = AsyncMock(return_value=True)
         fake_db.list_datasource_projects = AsyncMock(return_value=[])
@@ -472,7 +472,7 @@ class TestUpdateDatasourceEndpoint:
         fake_db,
         fake_request,
     ):
-        from main import DatasourceUpdate, update_datasource
+        from orchestrator.main import DatasourceUpdate, update_datasource
 
         scoped = {
             **user_a,
@@ -502,7 +502,7 @@ class TestUpdateDatasourceEndpoint:
     async def test_project_token_cannot_edit_content_on_all_scope_connector(
         self, user_a, project_a, datasource_a, fake_db, fake_request
     ):
-        from main import DatasourceUpdate, update_datasource
+        from orchestrator.main import DatasourceUpdate, update_datasource
 
         scoped = {
             **user_a,
@@ -537,7 +537,7 @@ class TestUpdateDatasourceEndpoint:
 class TestDeleteDatasourceEndpoint:
     @pytest.mark.asyncio
     async def test_creator_passes(self, user_a, datasource_a, fake_db, fake_request):
-        from main import delete_datasource
+        from orchestrator.main import delete_datasource
 
         fake_db.delete_datasource = AsyncMock(return_value=True)
         fake_db.list_datasource_projects = AsyncMock(return_value=[])
@@ -547,7 +547,7 @@ class TestDeleteDatasourceEndpoint:
 
     @pytest.mark.asyncio
     async def test_non_owner_403(self, user_b, datasource_a, fake_db, fake_request):
-        from main import delete_datasource
+        from orchestrator.main import delete_datasource
 
         fake_db.delete_datasource = AsyncMock()
         with _patch_caller_and_db(user_b, fake_db):
@@ -560,7 +560,7 @@ class TestDeleteDatasourceEndpoint:
     async def test_native_project_kb_cannot_be_deleted_directly(
         self, user_a, project_a, datasource_a, fake_db, fake_request
     ):
-        from main import delete_datasource
+        from orchestrator.main import delete_datasource
 
         native = {
             **datasource_a,
@@ -584,14 +584,16 @@ class TestDeleteDatasourceEndpoint:
     async def test_failed_db_delete_does_not_remove_project_knowledge(
         self, user_a, project_a, datasource_a, fake_db, fake_request
     ):
-        from main import delete_datasource
+        from orchestrator.main import delete_datasource
 
         fake_db.list_datasource_projects = AsyncMock(
             return_value=[str(project_a["id"])]
         )
         fake_db.delete_datasource = AsyncMock(return_value=False)
         with _patch_caller_and_db(user_a, fake_db):
-            with patch("main._delete_datasource_knowledge", AsyncMock()) as delete_note:
+            with patch(
+                "orchestrator.main._delete_datasource_knowledge", AsyncMock()
+            ) as delete_note:
                 with pytest.raises(HTTPException) as exc:
                     await delete_datasource(fake_request, str(datasource_a["id"]))
 
@@ -602,7 +604,7 @@ class TestDeleteDatasourceEndpoint:
     async def test_project_token_cannot_delete_cross_scope_connector(
         self, user_a, project_a, datasource_a, fake_db, fake_request
     ):
-        from main import delete_datasource
+        from orchestrator.main import delete_datasource
 
         scoped = {
             **user_a,
@@ -635,7 +637,7 @@ class TestGetJobDatasourcesEndpoint:
     async def test_owner_gets_redacted_list(
         self, user_a, job_a, datasource_a, fake_db, fake_request
     ):
-        from main import get_job_datasources
+        from orchestrator.main import get_job_datasources
 
         fake_db.resolve_datasources_for_job = AsyncMock(return_value=[datasource_a])
         with _patch_caller_and_db(user_a, fake_db):
@@ -645,7 +647,7 @@ class TestGetJobDatasourcesEndpoint:
 
     @pytest.mark.asyncio
     async def test_cross_user_403(self, user_b, job_a, fake_db, fake_request):
-        from main import get_job_datasources
+        from orchestrator.main import get_job_datasources
 
         fake_db.resolve_datasources_for_job = AsyncMock()
         with _patch_caller_and_db(user_b, fake_db):
@@ -665,7 +667,7 @@ class TestListProjectDatasourcesEndpoint:
     async def test_member_gets_redacted_list(
         self, user_a, project_a, datasource_a, fake_db, fake_request
     ):
-        from main import list_project_datasources
+        from orchestrator.main import list_project_datasources
 
         fake_db.list_project_datasources = AsyncMock(return_value=[datasource_a])
         with _patch_caller_and_db(user_a, fake_db):
@@ -674,7 +676,7 @@ class TestListProjectDatasourcesEndpoint:
 
     @pytest.mark.asyncio
     async def test_non_member_403(self, user_b, project_a, fake_db, fake_request):
-        from main import list_project_datasources
+        from orchestrator.main import list_project_datasources
 
         fake_db.list_project_datasources = AsyncMock()
         with _patch_caller_and_db(user_b, fake_db):
@@ -694,7 +696,7 @@ class TestEligibleDatasourcesEndpoint:
     async def test_member_gets_redacted_union(
         self, user_a, project_a, datasource_a, datasource_global, fake_db, fake_request
     ):
-        from main import list_eligible_datasources
+        from orchestrator.main import list_eligible_datasources
 
         fake_db.list_eligible_datasources = AsyncMock(
             return_value=[datasource_a, datasource_global]
@@ -714,7 +716,7 @@ class TestEligibleDatasourcesEndpoint:
     async def test_non_member_project_403(
         self, user_b, project_a, fake_db, fake_request
     ):
-        from main import list_eligible_datasources
+        from orchestrator.main import list_eligible_datasources
 
         fake_db.list_eligible_datasources = AsyncMock()
         with _patch_caller_and_db(user_b, fake_db):
@@ -729,7 +731,7 @@ class TestEligibleDatasourcesEndpoint:
     async def test_no_project_owned_and_global(
         self, user_a, datasource_a, datasource_global, fake_db, fake_request
     ):
-        from main import list_eligible_datasources
+        from orchestrator.main import list_eligible_datasources
 
         fake_db.list_eligible_datasources = AsyncMock(
             return_value=[datasource_a, datasource_global]
@@ -744,7 +746,7 @@ class TestEligibleDatasourcesEndpoint:
     async def test_project_scoped_token_omission_binds_to_token_project(
         self, user_a, project_a, datasource_a, fake_db, fake_request
     ):
-        from main import list_eligible_datasources
+        from orchestrator.main import list_eligible_datasources
 
         scoped = {
             **user_a,
@@ -764,7 +766,7 @@ class TestEligibleDatasourcesEndpoint:
     async def test_project_scoped_token_rejects_different_or_added_context(
         self, user_a, project_a, project_b, fake_db, fake_request
     ):
-        from main import list_eligible_datasources
+        from orchestrator.main import list_eligible_datasources
 
         scoped = {
             **user_a,
@@ -795,7 +797,7 @@ class TestLinkableDatasourceTargetsEndpoint:
     async def test_edit_response_keeps_unpaginated_selected_items(
         self, user_a, datasource_a, project_a, fake_db, fake_request
     ):
-        from main import list_linkable_datasource_targets
+        from orchestrator.main import list_linkable_datasource_targets
 
         selected = {
             "id": project_a["id"],
@@ -840,7 +842,7 @@ class TestProjectLinkableDatasourcesEndpoint:
     async def test_owner_gets_redacted_target_aware_page(
         self, user_a, project_a, datasource_a, fake_db, fake_request
     ):
-        from main import list_project_linkable_datasources
+        from orchestrator.main import list_project_linkable_datasources
 
         fake_db.list_project_linkable_datasources = AsyncMock(
             return_value={
@@ -872,7 +874,7 @@ class TestProjectLinkableDatasourcesEndpoint:
     async def test_project_token_cannot_list_candidates_for_another_project(
         self, user_a, project_a, project_b, fake_db, fake_request
     ):
-        from main import list_project_linkable_datasources
+        from orchestrator.main import list_project_linkable_datasources
 
         scoped = {
             **user_a,
@@ -896,13 +898,16 @@ class TestLinkDatasourceToProjectEndpoint:
     async def test_kb_link_is_forced_read_only(
         self, user_a, project_a, datasource_a, fake_db, fake_request
     ):
-        from main import ProjectDatasourceSettings, link_datasource_to_project
+        from orchestrator.main import (
+            ProjectDatasourceSettings,
+            link_datasource_to_project,
+        )
 
         kb = {**datasource_a, "type": "kb"}
         fake_db.get_datasource = AsyncMock(return_value=kb)
         fake_db.link_datasource_to_project = AsyncMock(return_value=None)
         with _patch_caller_and_db(user_a, fake_db):
-            with patch("main._sync_datasource_knowledge", AsyncMock()):
+            with patch("orchestrator.main._sync_datasource_knowledge", AsyncMock()):
                 await link_datasource_to_project(
                     fake_request,
                     str(project_a["id"]),
@@ -916,11 +921,11 @@ class TestLinkDatasourceToProjectEndpoint:
     async def test_owner_links_their_own_datasource(
         self, user_a, project_a, datasource_a, fake_db, fake_request
     ):
-        from main import link_datasource_to_project
+        from orchestrator.main import link_datasource_to_project
 
         fake_db.link_datasource_to_project = AsyncMock(return_value=None)
         with _patch_caller_and_db(user_a, fake_db):
-            with patch("main._sync_datasource_knowledge", AsyncMock()):
+            with patch("orchestrator.main._sync_datasource_knowledge", AsyncMock()):
                 result = await link_datasource_to_project(
                     fake_request,
                     str(project_a["id"]),
@@ -935,7 +940,7 @@ class TestLinkDatasourceToProjectEndpoint:
     async def test_transactional_owner_recheck_failure_maps_to_generic_403(
         self, user_a, project_a, datasource_a, fake_db, fake_request
     ):
-        from main import (
+        from orchestrator.main import (
             DatasourceProjectAuthorizationError,
             link_datasource_to_project,
         )
@@ -958,7 +963,7 @@ class TestLinkDatasourceToProjectEndpoint:
     async def test_non_owner_403(
         self, user_b, project_a, datasource_a, fake_db, fake_request
     ):
-        from main import link_datasource_to_project
+        from orchestrator.main import link_datasource_to_project
 
         fake_db.link_datasource_to_project = AsyncMock()
         with _patch_caller_and_db(user_b, fake_db):
@@ -978,7 +983,7 @@ class TestLinkDatasourceToProjectEndpoint:
         """user_a owns project_a, but datasource_b is user_b's. Even though
         user_a is the project owner, they shouldn't be able to link a
         datasource they can't see — that would be a UUID-enumeration probe."""
-        from main import link_datasource_to_project
+        from orchestrator.main import link_datasource_to_project
 
         fake_db.link_datasource_to_project = AsyncMock()
         with _patch_caller_and_db(user_a, fake_db):
@@ -997,11 +1002,14 @@ class TestUpdateProjectDatasourceEndpoint:
     async def test_owner_passes(
         self, user_a, project_a, datasource_a, fake_db, fake_request
     ):
-        from main import ProjectDatasourceSettings, update_project_datasource
+        from orchestrator.main import (
+            ProjectDatasourceSettings,
+            update_project_datasource,
+        )
 
         fake_db.update_project_datasource = AsyncMock(return_value=True)
         with _patch_caller_and_db(user_a, fake_db):
-            with patch("main._sync_datasource_knowledge", AsyncMock()):
+            with patch("orchestrator.main._sync_datasource_knowledge", AsyncMock()):
                 result = await update_project_datasource(
                     fake_request,
                     str(project_a["id"]),
@@ -1017,7 +1025,7 @@ class TestUpdateProjectDatasourceEndpoint:
     async def test_transactional_owner_demotion_maps_to_403(
         self, user_a, project_a, datasource_a, fake_db, fake_request
     ):
-        from main import (
+        from orchestrator.main import (
             DatasourceProjectAuthorizationError,
             ProjectDatasourceSettings,
             update_project_datasource,
@@ -1044,7 +1052,10 @@ class TestUpdateProjectDatasourceEndpoint:
     async def test_non_owner_403(
         self, user_b, project_a, datasource_a, fake_db, fake_request
     ):
-        from main import ProjectDatasourceSettings, update_project_datasource
+        from orchestrator.main import (
+            ProjectDatasourceSettings,
+            update_project_datasource,
+        )
 
         fake_db.update_project_datasource = AsyncMock()
         with _patch_caller_and_db(user_b, fake_db):
@@ -1064,11 +1075,11 @@ class TestUnlinkDatasourceFromProjectEndpoint:
     async def test_owner_unlinks(
         self, user_a, project_a, datasource_a, fake_db, fake_request
     ):
-        from main import unlink_datasource_from_project
+        from orchestrator.main import unlink_datasource_from_project
 
         fake_db.unlink_datasource_from_project = AsyncMock(return_value=True)
         with _patch_caller_and_db(user_a, fake_db):
-            with patch("main._delete_datasource_knowledge", AsyncMock()):
+            with patch("orchestrator.main._delete_datasource_knowledge", AsyncMock()):
                 result = await unlink_datasource_from_project(
                     fake_request,
                     str(project_a["id"]),
@@ -1083,7 +1094,7 @@ class TestUnlinkDatasourceFromProjectEndpoint:
     async def test_transactional_authority_loss_maps_to_403(
         self, user_a, project_a, datasource_a, fake_db, fake_request
     ):
-        from main import (
+        from orchestrator.main import (
             DatasourceProjectAuthorizationError,
             unlink_datasource_from_project,
         )
@@ -1108,7 +1119,7 @@ class TestUnlinkDatasourceFromProjectEndpoint:
     async def test_non_owner_403(
         self, user_b, project_a, datasource_a, fake_db, fake_request
     ):
-        from main import unlink_datasource_from_project
+        from orchestrator.main import unlink_datasource_from_project
 
         fake_db.unlink_datasource_from_project = AsyncMock()
         with _patch_caller_and_db(user_b, fake_db):
@@ -1131,7 +1142,7 @@ class TestUnlinkDatasourceFromProjectEndpoint:
         fake_db,
         fake_request,
     ):
-        from main import unlink_datasource_from_project
+        from orchestrator.main import unlink_datasource_from_project
 
         scoped = {
             **user_a,

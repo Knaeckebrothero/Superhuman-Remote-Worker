@@ -89,7 +89,6 @@ type AgentSettingsTab = 'settings' | 'instructions' | 'advanced' | 'resolved';
             [config]="config()"
             [mode]="mode()"
             [disabled]="disabled()"
-            [settingsMatrix]="settingsMatrix()"
             [effectiveModels]="effectiveModels()"
             [showSubagent]="delegationEnabled()"
             (change)="onChange()"
@@ -153,9 +152,7 @@ type AgentSettingsTab = 'settings' | 'instructions' | 'advanced' | 'resolved';
               [mode]="mode()"
               [disabled]="disabled()"
               [settingsMatrix]="settingsMatrix()"
-              [strategicModelOverride]="modelGroup?.strategicModel() ?? null"
-              [tacticalModelOverride]="modelGroup?.tacticalModel() ?? null"
-              [sessionModelOverride]="modelGroup?.sessionModel() ?? null"
+              [modelOverride]="modelGroup?.model() ?? null"
               [backendOverride]="executionGroup?.workspaceBackend() ?? null"
               (change)="onChange()"
             />
@@ -323,9 +320,9 @@ export class AgentSettingsComponent {
    *  toggle needs this to re-run the computed when the toggle (or the query
    *  itself) resolves. */
   private readonly toolsGroupQuery = viewChild(ToolsGroupComponent);
-  /** The Subagent (delegation reader) model only applies when the Delegation
-   *  tool is enabled — hide its picker otherwise. Shown until the view resolves
-   *  (delegation defaults on for the experts that use it). */
+  /** The roster-wide subagent model (`subagents.llm.model`) only applies when
+   *  the Delegation tool is enabled — hide its picker otherwise. Shown until
+   *  the view resolves (delegation defaults on for the experts that use it). */
   readonly delegationEnabled = computed(() =>
     this.toolsGroupQuery()?.isCategoryEnabled('delegation') ?? true,
   );
@@ -397,15 +394,15 @@ export class AgentSettingsComponent {
     return this.datasourcesGroup?.getSelectedIds() ?? [];
   }
 
-  /** Session mode: pin the single model picker to an explicit value, the same
-   *  as the user picking it themselves — used to carry a source thread's
-   *  model forward on "Start a new session"
-   *  (session_config_drift_resume.md §8.3). Must be called AFTER
-   *  `prefillFromConfig` for whichever expert ends up selected: that call
-   *  resets the model group to the expert's own config-derived default, and
-   *  would silently win over an override applied before it. */
+  /** Session mode: pin the model picker to an explicit value, the same as the
+   *  user picking it themselves — used to carry a source thread's model
+   *  forward on "Start a new session" (session_config_drift_resume.md §8.3).
+   *  Must be called AFTER `prefillFromConfig` for whichever expert ends up
+   *  selected: that call resets the model group to the expert's own
+   *  config-derived default, and would silently win over an override applied
+   *  before it. */
   setSessionModelOverride(model: string): void {
-    this.modelGroup?.onSessionModelChange(model);
+    this.modelGroup?.onModelChange(model);
   }
 
   /** Category → the enumeration a requested locked-on addition writes.

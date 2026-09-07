@@ -12,9 +12,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-import src.agent as agent_module
-from src.agent import UniversalAgent
-from src.core.workspace_backend import (
+import agent.agent as agent_module
+from agent.agent import UniversalAgent
+from shared.runtime.core.workspace_backend import (
     WorkspaceAuthenticationError,
     WorkspaceUnavailableError,
     completion_error_payload,
@@ -154,7 +154,7 @@ class TestCompletionErrorPayload:
         ``{"error": {"message": str(e)}}`` reintroduces the type strip."""
         import pathlib
 
-        for rel in ("src/api/app.py", "src/api/dual_app.py"):
+        for rel in ("src/agent/api/app.py", "src/agent/api/dual_app.py"):
             text = pathlib.Path(rel).read_text()
             assert '{"error": {"message": str(e)}}' not in text, rel
             assert "completion_error_payload" in text, rel
@@ -170,7 +170,7 @@ class TestDualAppExceptPreservesType:
         """Snapshot/restore the module globals this test mutates (same pattern
         as tests/test_dual_app_stop_reset.py). AGENT_LOOP=1 keeps the
         completion path from scheduling a process exit."""
-        from src.api import dual_app
+        from agent.api import dual_app
 
         monkeypatch.setenv("AGENT_LOOP", "1")
         names = (
@@ -198,7 +198,7 @@ class TestDualAppExceptPreservesType:
 
     @pytest.mark.asyncio
     async def test_escaping_stream_exception_reports_typed_payload(self):
-        from src.api import dual_app
+        from agent.api import dual_app
 
         client = AsyncMock()
         client.agent_id = "agent-1"

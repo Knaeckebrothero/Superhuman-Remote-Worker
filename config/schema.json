@@ -3,12 +3,26 @@
   "$id": "https://example.com/agent-config.schema.json",
   "title": "Universal Agent Configuration",
   "description": "Configuration schema for the Universal Agent in the workspace-centric architecture",
+  "$comment": "U1 (universal experts): an expert has ONE llm.model. The per-phase tiers llm.strategic / llm.tactical / llm.subagent were removed from this schema; the loader still accepts them in any authored layer (bundled YAML, DB expert, job/thread override, frozen resolved_config) and maps them with a deprecation warning — strategic/tactical lift into llm.model when the layer sets no llm.model (strategic wins; an explicit llm.model in the same layer wins over both), subagent moves to subagents.llm. See knowledge-base/knowledge/features/universal_experts_and_subagents.md §1.1.",
   "type": "object",
   "required": ["agent_id", "display_name", "llm", "workspace", "tools", "connections"],
   "properties": {
     "$schema": {
       "type": "string",
       "description": "JSON Schema reference"
+    },
+    "$extends": {
+      "type": "string",
+      "description": "Parent config this file deep-merges onto (objects merge, lists replace, null clears). Chain roots: worker_base / session_base / subagent_base — the role overlays under config/overlays/ by their public names (default(s), persistent_default(s) and overlays/<role> are aliases) — and expert_base, the shared root every overlay extends. Any other value names another expert (config/experts/<name>, config/subagents/<name> or config/<name>.yaml) whose own chain is followed. When a config is resolved FOR a role (a job asks for worker, a session for session, a roster entry for subagent), the link that ends the chain is re-rooted onto that role's overlay, so every expert is usable in every role. See knowledge-base/knowledge/features/universal_experts_and_subagents.md §1.1.",
+      "examples": ["worker_base", "session_base", "expert_base", "critic"]
+    },
+    "$ignore_keys": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Dotted key paths the config's ROLE ignores — declared by a role overlay (config/overlays/subagent.yaml ignores workspace.backend, autonomy, verification, ...). Pruned from the merged config after every merge, again after the job/thread override layers, and after a roster override: a key that does not apply to a role is dropped silently, never an error. Rides the merge like any list (a child that declares its own list replaces it wholesale; an empty list disables pruning). Never parsed into the agent config.",
+      "examples": [["workspace.backend", "autonomy", "verification", "phase_settings"]]
     },
     "agent_id": {
       "type": "string",
@@ -43,17 +57,42 @@
       "items": {
         "type": "string"
       },
-      "description": "Tags for categorization and filtering in expert discovery",
-      "examples": [["research", "academic"], ["documentation", "writing"]]
+      "description": "Metadata for categorization and filtering in expert discovery — a soft UI filter, never read for behaviour (U1 D4). Role tags (worker / session / subagent) mark the roles an expert is meant for: the orchestrator derives a bundled expert's role tag from its $extends chain root and a DB expert's from expert_type; `subagent` is authored (library entries under config/subagents/ carry it). Every expert stays usable in every role.",
+      "examples": [["research", "academic"], ["subagent"], ["documentation", "writing"]]
+    },
+    "subagents": {
+      "type": "object",
+      "description": "Built-in subagents (universal_experts_and_subagents.md §1.1). `roster` names the children this expert may delegate to: inline small experts (same schema as an expert, resolved on the subagent role overlay) or `$ref` entries — a bundled expert dir name (`critic`), a library entry (`subagents/explorer` / `explorer`) or a DB expert id — with sibling keys deep-merged over the referenced expert. `llm` is the roster-wide model default (below every entry's own `llm`, above the base and the `$ref` target). A job/thread override deep-merges into `subagents.roster.<name>`. Entries are materialised at resolve time (merged chain, settings matrix per entry, parent-only keys pruned); a referenced expert's own `subagents` block is dropped (depth 1). See config/subagents/README.md.",
+      "properties": {
+        "default": {
+          "type": ["string", "null"],
+          "description": "Roster entry a `delegate_agent` call falls back to when it names no `subagent_type`"
+        },
+        "llm": {
+          "$ref": "#/$defs/llmPhaseOverride",
+          "description": "Roster-wide LLM partial (model / provider / transport / params) applied to every entry that does not pin its own `llm` key. `model: inherit` = the parent's model. A legacy `llm.subagent` tier maps here."
+        },
+        "roster": {
+          "type": "object",
+          "description": "Subagent name -> inline entry or `$ref` entry. The name is the child's agent_id and the `subagent_type` the parent passes to `delegate_agent`.",
+          "propertyNames": {
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]*$"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/subagentRosterEntry"
+          }
+        }
+      },
+      "additionalProperties": false
     },
     "llm": {
       "type": "object",
-      "description": "LLM configuration with optional phase-specific overrides",
+      "description": "LLM configuration: one model per expert (runs every phase and session turn) plus an optional summarization override. Legacy llm.strategic/tactical/subagent keys are accepted by the loader and mapped (see the top-level $comment) but are no longer schema keys.",
       "required": ["model"],
       "properties": {
         "model": {
           "type": "string",
-          "description": "Default model identifier (used when no phase override)",
+          "description": "Model identifier — the single model every phase runs on",
           "examples": ["RedHatAI/gemma-4-31B-it-FP8-Dynamic", "gpt-4o", "claude-sonnet-4-20250514", "gemini-2.0-flash", "codex/gpt-5.4", "codex/gpt-5.3-codex", "codex/gpt-5.3-codex-spark"]
         },
         "provider": {
@@ -127,21 +166,9 @@
           "default": null,
           "description": "Override max output tokens (auto-detected if null)"
         },
-        "strategic": {
-          "$ref": "#/$defs/llmPhaseOverride",
-          "description": "LLM overrides for strategic (planning) phases. Uses more capable models for high-level decisions."
-        },
-        "tactical": {
-          "$ref": "#/$defs/llmPhaseOverride",
-          "description": "LLM overrides for tactical (execution) phases. Can use faster/cheaper models for task execution."
-        },
         "summarization": {
           "$ref": "#/$defs/llmPhaseOverride",
           "description": "LLM overrides for context summarization. Can use different model for compacting conversation history."
-        },
-        "subagent": {
-          "$ref": "#/$defs/llmPhaseOverride",
-          "description": "LLM overrides for throwaway light subagents spawned via spawn_subagent (delegation.mode: light). Lets a top-tier parent spawn a mid-tier reader (e.g. opus → sonnet). Falls back to the tactical tier, then base, when unset."
         }
       }
     },
@@ -180,6 +207,33 @@
           "minimum": 100,
           "default": 10000,
           "description": "Maximum word count for a single write_file call. Returns an error with guidance to split into multiple calls if exceeded."
+        },
+        "vm": {
+          "type": "object",
+          "description": "Sizing of the VM workspace (workspace.backend = vm). Ignored on container and virtual backends. Jobs set these via config_override.workspace.vm.",
+          "properties": {
+            "image": {
+              "type": "string",
+              "description": "VM base image reference. Omit for the deployment default (the current golden image)."
+            },
+            "cpu_cores": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 8,
+              "description": "Virtual CPU cores for the VM."
+            },
+            "memory": {
+              "type": "string",
+              "pattern": "^[0-9]+(Ki|Mi|Gi|Ti)$",
+              "default": "16Gi",
+              "description": "Guest memory as a Kubernetes quantity (e.g. 24Gi)."
+            },
+            "disk_size": {
+              "type": "string",
+              "pattern": "^[0-9]+(Ki|Mi|Gi|Ti|K|M|G|T)$",
+              "description": "Rootdisk size as a Kubernetes quantity (e.g. 120Gi). Omit for the deployment's controller default; a value below that default is raised to it, because the clone target cannot be smaller than the golden image it is cloned from."
+            }
+          }
         },
         "max_read_size": {
           "type": "integer",
@@ -268,7 +322,7 @@
       ],
       "properties": {
         "agent_catalog": {
-          "description": "Agent catalog tools: manage experts and skills. Primarily for persistent agents (src/tools/orchestrator/catalog.py). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "Agent catalog tools: manage experts and skills. Primarily for persistent agents (src/agent/tools/orchestrator/catalog.py). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "examples": [
             [
               "list_experts",
@@ -326,7 +380,7 @@
           ]
         },
         "browser_direct": {
-          "description": "Direct browser-control tools (src/tools/research/browser_direct.py). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "Direct browser-control tools (src/agent/tools/research/browser_direct.py). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "oneOf": [
             {
               "type": "boolean"
@@ -375,7 +429,7 @@
           ]
         },
         "catalog_authoring": {
-          "description": "Catalogue-authoring tools: create or update experts, skills and automations from portable JSON bundles (src/tools/orchestrator/catalog.py, workflows.py). Split out of agent_catalog/workflows so those groups hold only reads and their `true` expansion is safe by construction. Gated by the catalog_authoring capability grant, deny-by-default, because these tools write rows the user's other agents then run. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "Catalogue-authoring tools: create or update experts, skills and automations from portable JSON bundles (src/agent/tools/orchestrator/catalog.py, workflows.py). Split out of agent_catalog/workflows so those groups hold only reads and their `true` expansion is safe by construction. Gated by the catalog_authoring capability grant, deny-by-default, because these tools write rows the user's other agents then run. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "examples": [
             [
               "get_expert_bundle",
@@ -434,7 +488,7 @@
           ]
         },
         "canvas": {
-          "description": "Dynamic Canvas presentation tools for persistent sessions (src/tools/canvas/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "Dynamic Canvas presentation tools for persistent sessions (src/agent/tools/canvas/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "examples": [
             [
               "get_canvas",
@@ -490,7 +544,7 @@
           ]
         },
         "citation": {
-          "description": "Citation management tools (src/tools/citation/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "Citation management tools (src/agent/tools/citation/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "examples": [
             [
               "cite_document",
@@ -546,7 +600,7 @@
           ]
         },
         "communication": {
-          "description": "Communication tools: agent-initiated messaging to humans via email (src/tools/communication/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "Communication tools: agent-initiated messaging to humans via email (src/agent/tools/communication/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "examples": [
             [
               "send_message"
@@ -600,7 +654,7 @@
           ]
         },
         "core": {
-          "description": "Core tools: todo management + job completion (src/tools/core/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "Core tools: todo management + job completion (src/agent/tools/core/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "examples": [
             [
               "next_phase_todos",
@@ -657,15 +711,21 @@
           ]
         },
         "delegation": {
-          "description": "Delegation tools: spawn child jobs that branch off the workspace (src/tools/delegation/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "Built-in subagent tools: `delegate_agent` plus `wait_agent`, `message_agent`, `stop_agent`, and `list_agents` (src/agent/tools/delegation/). Every tool is explicit: it binds only when named here AND `delegation.enabled` is true. New configuration must use false, a bare list, or {only: [...]} — true and {except: [...]} are rejected so later control tools never appear without a reviewed grant. Stored legacy true and the deleted names `spawn_subagent` / `delegate_work` / `resume_delegation_child` normalize only to `delegate_agent`, with a deprecation warning.",
           "examples": [
             [
-              "delegate_work"
+              "delegate_agent",
+              "wait_agent",
+              "message_agent",
+              "stop_agent",
+              "list_agents"
             ]
           ],
           "oneOf": [
             {
-              "type": "boolean"
+              "type": "boolean",
+              "const": false,
+              "description": "Only `false` is accepted here. delegation must enumerate its tools: only `{only: [...]}` (or a bare list, the same thing) and `false` (or []) are accepted. `true` and `except` both auto-track the registry, so later background controls would otherwise land in an expert with no reviewed grant."
             },
             {
               "type": "array",
@@ -685,28 +745,12 @@
                   },
                   "uniqueItems": true,
                   "minItems": 1
-                },
-                "except": {
-                  "type": "array",
-                  "items": {
-                    "type": "string"
-                  },
-                  "uniqueItems": true,
-                  "minItems": 1
                 }
               },
-              "oneOf": [
-                {
-                  "required": [
-                    "only"
-                  ]
-                },
-                {
-                  "required": [
-                    "except"
-                  ]
-                }
-              ]
+              "required": [
+                "only"
+              ],
+              "description": "Only `{only: [...]}` is accepted here. delegation must enumerate its tools: only `{only: [...]}` (or a bare list, the same thing) and `false` (or []) are accepted. `true` and `except` both auto-track the registry, so later background controls would otherwise land in an expert with no reviewed grant."
             }
           ]
         },
@@ -760,7 +804,7 @@
           ]
         },
         "evaluation": {
-          "description": "Evaluation/verdict tools for critic agents: approve or return jobs with feedback (src/tools/evaluation/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "Evaluation/verdict tools for critic agents: approve or return jobs with feedback (src/agent/tools/evaluation/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "examples": [
             [
               "approve_job_verdict",
@@ -815,7 +859,7 @@
           ]
         },
         "git": {
-          "description": "Git version control tools for workspace history (src/tools/git/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "Git version control tools for workspace history (src/agent/tools/git/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "examples": [
             [
               "git_log",
@@ -873,7 +917,7 @@
           ]
         },
         "graph": {
-          "description": "Neo4j graph tools (src/tools/graph/). Injected automatically when a Neo4j datasource is attached to the job. Usually left empty in config. Machine-owned: every tool here is code-granted (a neo4j datasource is attached), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "Neo4j graph tools (src/agent/tools/graph/). Injected automatically when a Neo4j datasource is attached to the job. Usually left empty in config. Machine-owned: every tool here is code-granted (a neo4j datasource is attached), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "examples": [
             [
               "cypher_query",
@@ -929,7 +973,7 @@
           ]
         },
         "knowledge": {
-          "description": "Knowledge base tools: project knowledge CRUD + search (src/tools/knowledge/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "Knowledge base tools: project knowledge CRUD + search (src/agent/tools/knowledge/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "examples": [
             [
               "kb_write",
@@ -988,7 +1032,7 @@
           ]
         },
         "loop": {
-          "description": "Loop campaign tools (src/tools/loop/); injected per job via config_override for a planner loop's checkpoint critic, never listed in bundled configs. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "Loop campaign tools (src/agent/tools/loop/); injected per job via config_override for a planner loop's checkpoint critic, never listed in bundled configs. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "oneOf": [
             {
               "type": "boolean"
@@ -1086,7 +1130,7 @@
           ]
         },
         "mongodb": {
-          "description": "MongoDB query tools (src/tools/mongodb/). Injected automatically when a MongoDB datasource is attached to the job. Machine-owned: every tool here is code-granted (a mongodb datasource is attached), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "MongoDB query tools (src/agent/tools/mongodb/). Injected automatically when a MongoDB datasource is attached to the job. Machine-owned: every tool here is code-granted (a mongodb datasource is attached), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "examples": [
             [
               "mongo_query",
@@ -1315,7 +1359,7 @@
           ]
         },
         "product_help": {
-          "description": "Product-guide reader tools (src/tools/product_help.py, src/tools/product_capabilities.py). Machine-owned: every tool here is code-granted (persistent-session floor; see each tool's own gate), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "Product-guide reader tools (src/agent/tools/product_help.py, src/agent/tools/product_capabilities.py). Machine-owned: every tool here is code-granted (persistent-session floor; see each tool's own gate), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "oneOf": [
             {
               "type": "boolean"
@@ -1364,7 +1408,7 @@
           ]
         },
         "repo": {
-          "description": "Repository-datasource write tools (src/tools/repo/); distinct from `git`, which is the workspace's own version control. Machine-owned: every tool here is code-granted (a repository datasource is attached), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "Repository-datasource write tools (src/agent/tools/repo/); distinct from `git`, which is the workspace's own version control. Machine-owned: every tool here is code-granted (a repository datasource is attached), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "oneOf": [
             {
               "type": "boolean"
@@ -1413,7 +1457,7 @@
           ]
         },
         "research": {
-          "description": "Research/web search tools (src/tools/research/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "Research/web search tools (src/agent/tools/research/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "examples": [
             [
               "web_search"
@@ -1467,7 +1511,7 @@
           ]
         },
         "session_task": {
-          "description": "Lightweight session todo tools (src/tools/core/session_task_tools.py). Machine-owned: every tool here is code-granted (persistent session, unconditional (src/api/persistent_session.py:1415)), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "Lightweight session todo tools (src/agent/tools/core/session_task_tools.py). Machine-owned: every tool here is code-granted (persistent session, unconditional (src/agent/api/persistent_session.py:1415)), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "oneOf": [
             {
               "type": "boolean"
@@ -1516,7 +1560,7 @@
           ]
         },
         "shell": {
-          "description": "Shell tools: command execution (src/tools/shell/). shell must enumerate its tools: only `{only: [...]}` (or a bare list, the same thing) and `false` (or []) are accepted. `true` and `except` both auto-track the registry, so a tool added to the shell category later would land here with no diff to review; for a code-execution category that is the wrong default.",
+          "description": "Shell tools: command execution (src/agent/tools/shell/). shell must enumerate its tools: only `{only: [...]}` (or a bare list, the same thing) and `false` (or []) are accepted. `true` and `except` both auto-track the registry, so a tool added to the shell category later would land here with no diff to review; for a code-execution category that is the wrong default.",
           "examples": [
             [
               "run_command",
@@ -1561,7 +1605,7 @@
           ]
         },
         "sql": {
-          "description": "PostgreSQL query tools (src/tools/sql/). Injected automatically when a PostgreSQL datasource is attached to the job. Machine-owned: every tool here is code-granted (a postgresql datasource is attached), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "PostgreSQL query tools (src/agent/tools/sql/). Injected automatically when a PostgreSQL datasource is attached to the job. Machine-owned: every tool here is code-granted (a postgresql datasource is attached), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "examples": [
             [
               "sql_query",
@@ -1617,7 +1661,7 @@
           ]
         },
         "webdav": {
-          "description": "WebDAV / cloud-storage tools (src/tools/webdav/). Machine-owned: every tool here is code-granted (a webdav datasource is attached), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "WebDAV / cloud-storage tools (src/agent/tools/webdav/). Machine-owned: every tool here is code-granted (a webdav datasource is attached), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "oneOf": [
             {
               "type": "boolean"
@@ -1666,7 +1710,7 @@
           ]
         },
         "workflows": {
-          "description": "Workflow tools: inspect automations and project loops, and draft disabled automations. Primarily for persistent agents (src/tools/orchestrator/workflows.py). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "Workflow tools: inspect automations and project loops, and draft disabled automations. Primarily for persistent agents (src/agent/tools/orchestrator/workflows.py). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "examples": [
             [
               "list_automations",
@@ -1726,7 +1770,7 @@
           ]
         },
         "workspace": {
-          "description": "Workspace file operation tools (src/tools/workspace/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "Workspace file operation tools (src/agent/tools/workspace/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "examples": [
             [
               "read_file",
@@ -2240,84 +2284,23 @@
     },
     "delegation": {
       "type": "object",
-      "description": "Subagent delegation: let agents spawn child jobs that branch off the workspace. Children inherit the parent's workspace as a git branch and work in parallel via git worktrees. See knowledge-base/knowledge/features/subagent_delegation.md.",
+      "description": "The built-in subagents' settings (universal_experts_and_subagents.md §0 D7; runtime in src/agent/subagents/). `enabled` gates `delegate_agent` and all four background controls; each tool exists only when also named in `tools.delegation`. Which children exist, their model, tools, write policy and budgets live in `subagents.roster`; a child never delegates or receives the control plane (depth 1). The pre-U3 keys (`max_depth`, `default_timeout`, `max_timeout`, `allowed_configs`, `mode`, `light`) are no longer accepted by this schema; the loader still drops them from any authored layer with a deprecation warning.",
       "properties": {
         "enabled": {
           "type": "boolean",
           "default": false,
-          "description": "Opt-in: agent gets the delegate_work tool to spawn child jobs"
+          "description": "Opt-in: the expert may bind explicitly named spawn/control tools from `tools.delegation`"
         },
-        "max_depth": {
+        "max_concurrent": {
           "type": "integer",
-          "default": 1,
+          "default": 4,
           "minimum": 1,
-          "maximum": 3,
-          "description": "Maximum nesting depth (1 = no grandchildren)"
+          "description": "Roster runtime (D7): how many `delegate_agent` children may run concurrently per parent; calls above the cap queue and run in waves. Values below 1 are raised to 1 by the loader."
         },
-        "default_timeout": {
-          "type": "integer",
-          "default": 7200,
-          "description": "Default timeout per delegation in seconds (2 hours)"
-        },
-        "max_timeout": {
-          "type": "integer",
-          "default": 14400,
-          "description": "Maximum allowed timeout in seconds (4 hours)"
-        },
-        "allowed_configs": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "default": [],
-          "description": "Which expert configs children can use (empty array = any config allowed)"
-        },
-        "mode": {
-          "type": "string",
-          "enum": ["heavy", "light"],
-          "default": "heavy",
-          "description": "Backend for the shared spawn_subagent tool. 'heavy' = full child jobs (delegate_work path: worktree + dispatch + parent freeze + merge); 'light' = throwaway in-process ReAct readers that return a string with no freeze/merge. The agent-facing name and schema are identical; the backend is operator-selected."
-        },
-        "light": {
-          "type": "object",
-          "description": "Light-backend knobs (used only when mode is 'light'). Throwaway readers that read sources and return a distilled string; per-reader git worktree, discarded never merged. The reader MODEL is set via llm.subagent (a first-class tier alongside strategic/tactical), not here.",
-          "properties": {
-            "enabled": {
-              "type": "boolean",
-              "default": true,
-              "description": "Whether the light backend is available when mode is 'light'"
-            },
-            "max_iterations": {
-              "type": "integer",
-              "default": 10,
-              "minimum": 1,
-              "description": "Per-reader ReAct loop iteration cap"
-            },
-            "max_tokens": {
-              "type": "integer",
-              "default": 40000,
-              "minimum": 1000,
-              "description": "Per-reader token budget"
-            },
-            "max_parallel": {
-              "type": "integer",
-              "default": 3,
-              "minimum": 1,
-              "description": "Maximum concurrent readers per turn"
-            },
-            "timeout_seconds": {
-              "type": "number",
-              "default": 240,
-              "minimum": 0,
-              "description": "Wall-clock budget for one reader, in seconds (0 = unbounded). This is a deadline, not a retryable timeout — light_runner never retries it."
-            },
-            "allow_writes": {
-              "type": "boolean",
-              "default": false,
-              "description": "Whether readers may write to their worktree (default read-and-distill only)"
-            }
-          },
-          "additionalProperties": false
+        "run_in_background_default": {
+          "type": "boolean",
+          "default": false,
+          "description": "Roster runtime: the `run_in_background` value used only when a `delegate_agent` call omits the argument. false = wait for the report as this tool result; true = return a durable receipt and push the child's completion automatically. An explicit false always wins."
         }
       },
       "additionalProperties": false
@@ -2337,9 +2320,64 @@
   },
   "additionalProperties": true,
   "$defs": {
+    "subagentRosterEntry": {
+      "type": "object",
+      "description": "One `subagents.roster` entry. Inline: any expert-schema key (the entry resolves on the subagent overlay: expert_base <- overlays/subagent <- these keys). Reference: `$ref` plus optional sibling keys deep-merged over the referenced expert. Keys that do not apply to a child (workspace.backend, autonomy, verification, phase_settings, delegation, tools.delegation, communication, scholar, curator, officer, headless — the subagent overlay's `$ignore_keys`) are pruned, never errors. `isolation`, `write_policy`, `return` and the child budgets under `limits` are U3 runtime keys carried verbatim on the resolved entry in U1.",
+      "properties": {
+        "$ref": {
+          "type": "string",
+          "description": "A bundled expert dir name (`critic` / `experts/critic`), a library entry (`explorer` / `subagents/explorer`) or a DB expert id (UUID). Never a path. Sibling keys override the referenced expert."
+        },
+        "description": {
+          "type": "string",
+          "description": "What this child is for — the text the parent model sees next to the `subagent_type`. Required in spirit for inline entries."
+        },
+        "llm": {
+          "$ref": "#/$defs/llmPhaseOverride",
+          "description": "The child's model / transport / params. `model: inherit` (the subagent overlay's default) = the parent's model + transport, materialised at resolve time."
+        },
+        "tools": {
+          "$ref": "#/properties/tools",
+          "description": "The child's tool groups. Unqualified children get the subagent overlay's read-only floor; a `$ref` to a fuller expert keeps that expert's tools (minus `delegation`)."
+        },
+        "prompts": {
+          "type": "object",
+          "additionalProperties": { "type": ["string", "null"] },
+          "description": "Prompt files or text. Inline entries name files resolved against the parent expert's directory (`_deployment_dir` on the resolved entry); a DB-referenced expert's prompt text is inlined by the resolver. Read by the roster runtime (U3)."
+        },
+        "isolation": {
+          "type": "string",
+          "enum": ["shared", "worktree"],
+          "description": "U3: where the child works — the parent's tree (`shared`) or its own git worktree. A per-call `isolation` may override."
+        },
+        "write_policy": {
+          "type": "string",
+          "enum": ["none", "scratch_only", "owned_paths", "full"],
+          "description": "U3: what the child may write (owned paths come from the brief)."
+        },
+        "limits": {
+          "type": "object",
+          "description": "The ordinary `limits` keys plus the child budgets the roster runtime enforces (U3): max_turns, max_tokens, return_budget_tokens, stale_idle_s, stale_in_tool_s. Operator-owned, never model-facing parameters.",
+          "properties": {
+            "max_turns": { "type": "integer", "minimum": 1 },
+            "max_tokens": { "type": "integer", "minimum": 1000 },
+            "return_budget_tokens": { "type": "integer", "minimum": 100 },
+            "stale_idle_s": { "type": "number", "minimum": 0 },
+            "stale_in_tool_s": { "type": "number", "minimum": 0 }
+          },
+          "additionalProperties": true
+        },
+        "return": {
+          "type": "string",
+          "enum": ["summary", "structured", "evidence", "diff"],
+          "description": "U3: the shape of what the child hands back to the parent."
+        }
+      },
+      "additionalProperties": true
+    },
     "llmPhaseOverride": {
       "type": "object",
-      "description": "Phase-specific LLM overrides. Only specified fields override the base config.",
+      "description": "Partial LLM overrides (llm.summarization). Only specified fields override the base config.",
       "properties": {
         "model": {
           "type": "string",

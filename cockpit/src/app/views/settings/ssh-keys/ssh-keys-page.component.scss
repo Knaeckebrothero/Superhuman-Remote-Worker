@@ -1,0 +1,183 @@
+/* overflow: auto matches the parent settings page — see the identical note
+   on api-keys-page.component.ts. Without it a short viewport clips the
+   registration flow below the fold with no scrollbar anywhere. */
+:host {
+  display: block;
+  height: 100%;
+  overflow: auto;
+}
+
+.ssh-keys-page {
+  padding: 24px;
+  max-width: var(--content-max-width);
+  margin: 0 auto;
+}
+
+.ssh-keys-container {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.page-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.page-title {
+  margin: 0;
+  font-size: 1.5rem;
+}
+
+.back-button {
+  background: none;
+  border: none;
+  color: var(--text-primary);
+  cursor: pointer;
+  padding: 4px;
+  display: inline-flex;
+  align-items: center;
+}
+
+.page-desc {
+  color: var(--text-secondary);
+  margin: 0;
+}
+
+.section-title {
+  margin: 0 0 4px;
+  font-size: 1.1rem;
+}
+
+.section-desc {
+  color: var(--text-secondary);
+  margin: 0 0 12px;
+  font-size: 0.9rem;
+}
+
+.empty-state {
+  color: var(--text-tertiary);
+  font-style: italic;
+}
+
+.keys-section,
+.create-section {
+  background: var(--surface-1);
+  border-radius: var(--radius-surface);
+  padding: 16px 20px;
+}
+
+.keys-table {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.keys-header,
+.keys-row {
+  display: grid;
+  grid-template-columns: 1.2fr 0.9fr 1.6fr 1fr 1fr auto;
+  gap: 12px;
+  align-items: center;
+  padding: 8px 4px;
+}
+
+.keys-header {
+  font-weight: 600;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  border-bottom: 1px solid var(--border-1);
+}
+
+.keys-row {
+  border-bottom: 1px solid var(--border-1);
+}
+
+.keys-row.disabled {
+  opacity: 0.6;
+}
+
+.col-action {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.disabled-badge {
+  font-size: 0.7rem;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--warning) 30%, transparent);
+  color: var(--warning);
+  margin-left: 6px;
+}
+
+.mono {
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+}
+
+.error-banner {
+  color: var(--danger);
+  padding: 8px 12px;
+  border-radius: var(--radius-control);
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+}
+
+.registration-flow {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.step {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border-1);
+}
+
+.step:first-child {
+  padding-top: 0;
+  border-top: none;
+}
+
+.step-title {
+  margin: 0 0 4px;
+  font-size: 0.95rem;
+}
+
+.command-row {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.code-block {
+  flex: 1;
+  background: var(--surface-2);
+  padding: 12px;
+  border-radius: var(--radius-control);
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0;
+}
+
+.create-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.form-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.form-actions {
+  display: flex;
+  gap: 8px;
+}

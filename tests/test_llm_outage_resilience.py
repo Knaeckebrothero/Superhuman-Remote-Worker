@@ -8,14 +8,7 @@ knowledge-base/knowledge/features/llm_outage_pause_and_backoff_redispatch.md:
 * determine_job_status — the llm_unavailable -> paused/failed mapping
 """
 
-import sys
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
-
-# Add project root to path
-project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
 
 from orchestrator.services.completion import (  # noqa: E402
     LLM_OUTAGE_BACKOFF_CAP_SECONDS,

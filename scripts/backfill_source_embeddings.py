@@ -132,8 +132,8 @@ async def main() -> int:
 
         # Apply mode mirrors CitationEngine._embed_source_content: same
         # chunker, the shared batching seam, the same upsert.
-        from src.citation_engine.chunking import SemanticChunker
-        from src.services.embedding_service import EmbeddingService
+        from agent.citation_engine.chunking import SemanticChunker
+        from shared.runtime.services.embedding_service import EmbeddingService
 
         service = EmbeddingService()
         chunker = SemanticChunker(embedding_service=None)

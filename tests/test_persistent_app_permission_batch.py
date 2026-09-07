@@ -10,8 +10,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-import src.api.persistent_app as pa
-from src.persistent_graph import PermissionOutcome
+import agent.api.persistent_app as pa
+from agent.persistent_graph import PermissionOutcome
 
 
 PINNED_AGENT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -46,6 +46,8 @@ def _mock_session(permission_mode: str = "supervised"):
     session = MagicMock()
     session.permission_mode = permission_mode
     session.tool_decisions = {}
+    session.quiesce_subagents = AsyncMock()
+    session.resume_subagents = AsyncMock()
     # None (not an unconfigured MagicMock): a bare MagicMock auto-chains
     # through `async with conn.acquire() as c: await c.fetchval(...)` and
     # returns a truthy AsyncMock rather than raising or returning None,

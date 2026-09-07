@@ -7,11 +7,11 @@ content block format used by models like GPT-5.2-pro.
 
 from unittest.mock import MagicMock
 
-from src.llm.reasoning_chat import (
+from shared.runtime.llm.reasoning_chat import (
     _extract_responses_api_reasoning,
     extract_reasoning_text_from_block,
 )
-from src.core.archiver import _normalize_content
+from agent.core.archiver import _normalize_content
 
 
 # =============================================================================

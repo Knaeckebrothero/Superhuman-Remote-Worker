@@ -27,8 +27,8 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import tool
 
-from src.core.context import sanitize_history_for_provider_boundary
-from src.core.loader import LLMConfig, create_llm
+from agent.core.context import sanitize_history_for_provider_boundary
+from shared.runtime.core.loader import LLMConfig, create_llm
 
 _RAW = os.environ.get("SRW_SMOKE_LLM_ENDPOINTS", "")
 

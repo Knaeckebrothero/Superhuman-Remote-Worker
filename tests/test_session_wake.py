@@ -25,12 +25,12 @@ import asyncio
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import ANY, AsyncMock
+from unittest.mock import AsyncMock
 
 import pytest
 
-from services import session_wake
-from src.shared.pinned_session_identity import PinnedSessionBinding
+from orchestrator.services import session_wake
+from shared.pinned_session_identity import PinnedSessionBinding
 
 # Captured at import, before the autouse fixture replaces it with a mock — the
 # two tests below need the REAL implementation.
@@ -44,14 +44,14 @@ ATTACH_TOKEN = "ee55ff66-0000-4000-8000-000000000005"
 POD_UID = "ff660077-0000-4000-8000-000000000006"
 
 
-def test_every_production_live_inject_supplies_the_exact_db_recheck() -> None:
-    """No caller may bypass the post-client-entry joined authority read."""
+def test_wake_service_has_no_direct_pod_ip_injection() -> None:
+    """Kubernetes wakes must enter the durable inbox, never a raw Pod IP."""
 
     repository = Path(__file__).resolve().parents[1]
     calls: list[tuple[str, int]] = []
     for relative in (
-        "orchestrator/services/session_wake.py",
-        "orchestrator/main.py",
+        "src/orchestrator/services/session_wake.py",
+        "src/orchestrator/main.py",
     ):
         tree = ast.parse((repository / relative).read_text())
         for node in ast.walk(tree):
@@ -71,7 +71,10 @@ def test_every_production_live_inject_supplies_the_exact_db_recheck() -> None:
             assert any(keyword.arg == "db" for keyword in node.keywords), (
                 f"{relative}:{node.lineno} bypasses the exact DB recheck"
             )
-    assert len(calls) == 5
+    assert all(
+        relative != "src/orchestrator/services/session_wake.py" for relative, _ in calls
+    )
+    assert len(calls) == 2
 
 
 # --------------------------------------------------------------------------
@@ -186,6 +189,7 @@ def _binding(thread: dict | None, agent: dict | None) -> PinnedSessionBinding | 
                 "agent_id": agent.get("id"),
                 "runtime_attach_token": thread.get("runtime_attach_token"),
                 "agent_hostname": agent.get("hostname"),
+                "pod_namespace": "srw",
                 "pod_uid": agent.get("pod_uid"),
                 "pod_ip": agent.get("pod_ip"),
                 "pod_port": agent.get("pod_port"),
@@ -197,7 +201,13 @@ def _binding(thread: dict | None, agent: dict | None) -> PinnedSessionBinding | 
 
 
 def _db(*, claimed=None, thread=None, agent=None) -> SimpleNamespace:
-    save_thread_message = AsyncMock(return_value={"transcript_inserted": True})
+    save_thread_message = AsyncMock(
+        return_value={
+            "transcript_inserted": True,
+            "thread_id": THREAD_ID,
+            "state": "persisted",
+        }
+    )
     return SimpleNamespace(
         claim_pending_job_wakes=AsyncMock(
             return_value=list(claimed) if claimed is not None else []
@@ -228,8 +238,6 @@ def _reset_http(monkeypatch):
     _FakeAsyncClient.next_delivery_state = "admitted"
     _FakeAsyncClient.raises = None
     _FakeAsyncClient.on_enter = None
-    monkeypatch.setattr(session_wake.httpx, "AsyncClient", _FakeAsyncClient)
-    monkeypatch.setattr(session_wake, "probe_ready", AsyncMock(return_value=True))
     monkeypatch.setattr(session_wake, "_notify_owner", AsyncMock())
 
 
@@ -302,21 +310,18 @@ async def test_route_auto_close_failure_does_not_cost_the_wake():
 
 
 @pytest.mark.asyncio
-async def test_live_session_receives_the_input_as_role_event():
+async def test_live_kubernetes_session_uses_durable_role_event():
     db = _db(claimed=[_claim_row()], thread=_thread(), agent=_agent())
 
-    assert await session_wake.drain_pending_wakes(db) == 1
+    assert await session_wake.drain_pending_wakes(db) == 0
 
-    assert len(_FakeAsyncClient.posts) == 1
-    url, body = _FakeAsyncClient.posts[0]
-    assert url == "http://10.1.2.3:8001/api/input"
-    # role='event' is what keeps the persisted row out of the human-bubble
-    # family — without it the transcript claims the user said this.
-    assert body["role"] == "event"
-    assert body["content"].startswith("[JOB_FINISHED]")
-    assert body["session_identity_fingerprint"].startswith("sha256:")
-    db.finish_job_wake.assert_awaited_once_with(JOB_ID, "completed")
-    db.save_thread_message.assert_not_awaited()
+    assert _FakeAsyncClient.posts == []
+    kwargs = db.persist_thread_input_delivery.await_args.kwargs
+    assert kwargs["thread_id"] == THREAD_ID
+    assert kwargs["role"] == "event"
+    assert kwargs["content"].startswith("[JOB_FINISHED]")
+    db.defer_job_wake_for_input.assert_awaited_once_with(JOB_ID)
+    db.finish_job_wake.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -364,41 +369,37 @@ async def test_completion_hook_and_outbox_share_blocked_officer_dedup_key(
 
 
 @pytest.mark.asyncio
-async def test_live_inject_uses_a_split_timeout_not_a_flat_one():
-    """A flat 30s against a black-holed pod IP burns 30s inside the drain."""
+async def test_kubernetes_wake_opens_no_http_client():
     db = _db(claimed=[_claim_row()], thread=_thread(), agent=_agent())
     await session_wake.drain_pending_wakes(db)
-    timeout = _FakeAsyncClient.posts and session_wake.httpx.Timeout(10.0, connect=3.0)
-    assert timeout.connect == 3.0 and timeout.read == 10.0
+    assert _FakeAsyncClient.posts == []
 
 
 @pytest.mark.asyncio
 async def test_queued_receipt_stays_retryable_until_provider_admission():
     row = _claim_row()
     db = _db(claimed=[row], thread=_thread(), agent=_agent())
-    _FakeAsyncClient.next_status = 202
-    _FakeAsyncClient.next_delivery_state = "queued"
+    db.persist_thread_input_delivery.side_effect = [
+        {"thread_id": THREAD_ID, "state": "queued", "transcript_inserted": True},
+        {"thread_id": THREAD_ID, "state": "admitted", "transcript_inserted": False},
+    ]
 
     assert await session_wake.drain_pending_wakes(db) == 0
     db.defer_job_wake_for_input.assert_awaited_once_with(JOB_ID)
     db.finish_job_wake.assert_not_awaited()
 
-    _FakeAsyncClient.next_status = 200
-    _FakeAsyncClient.next_delivery_state = "admitted"
     assert await session_wake.drain_pending_wakes(db) == 1
     db.finish_job_wake.assert_awaited_once_with(JOB_ID, "completed")
-    assert len(_FakeAsyncClient.posts) == 2
-    assert (
-        _FakeAsyncClient.posts[0][1]["delivery_id"]
-        == _FakeAsyncClient.posts[1][1]["delivery_id"]
-    )
+    calls = db.persist_thread_input_delivery.await_args_list
+    assert calls[0].kwargs["delivery_id"] == calls[1].kwargs["delivery_id"]
 
 
 @pytest.mark.asyncio
-async def test_pod_port_defaults_when_the_column_is_null():
+async def test_pod_port_is_irrelevant_to_durable_wake():
     db = _db(claimed=[_claim_row()], thread=_thread(), agent=_agent(pod_port=None))
     await session_wake.drain_pending_wakes(db)
-    assert _FakeAsyncClient.posts[0][0] == "http://10.1.2.3:8001/api/input"
+    assert _FakeAsyncClient.posts == []
+    db.persist_thread_input_delivery.assert_awaited_once()
 
 
 # --------------------------------------------------------------------------
@@ -407,11 +408,8 @@ async def test_pod_port_defaults_when_the_column_is_null():
 
 
 @pytest.mark.asyncio
-async def test_probe_failure_falls_back_to_durable(monkeypatch):
-    """agent.status is heartbeat-driven and lags reality by up to ~4 minutes, and
-    zombies heartbeat normally — so the probe, not the column, decides."""
+async def test_durable_wake_does_not_probe_a_recyclable_pod_ip(monkeypatch):
     probe = AsyncMock(return_value=False)
-    monkeypatch.setattr(session_wake, "probe_ready", probe)
     db = _db(claimed=[_claim_row()], thread=_thread(), agent=_agent())
 
     assert await session_wake.drain_pending_wakes(db) == 0
@@ -421,13 +419,7 @@ async def test_probe_failure_falls_back_to_durable(monkeypatch):
     assert db.save_thread_message.await_args.kwargs["role"] == "event"
     db.finish_job_wake.assert_not_awaited()
     db.defer_job_wake_for_input.assert_awaited_once_with(JOB_ID)
-    probe.assert_awaited_once_with(
-        "10.1.2.3",
-        8001,
-        required_capability="durable_input_delivery",
-        require_protected_cloud=False,
-        expected_session_identity_fingerprint=ANY,
-    )
+    probe.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -467,9 +459,7 @@ async def test_post_probe_binding_change_never_reaches_live_input(changed_bindin
 
 
 @pytest.mark.asyncio
-async def test_post_probe_live_status_transition_keeps_the_same_target():
-    """Heartbeat state may advance while the physical target remains exact."""
-
+async def test_live_status_transition_still_uses_durable_inbox():
     thread = _thread()
     agent = _agent(status="ready")
     original = _binding(thread, agent)
@@ -481,8 +471,9 @@ async def test_post_probe_live_status_transition_keeps_the_same_target():
         replace(original, agent_status="working"),
     ]
 
-    assert await session_wake.drain_pending_wakes(db) == 1
-    assert len(_FakeAsyncClient.posts) == 1
+    assert await session_wake.drain_pending_wakes(db) == 0
+    assert _FakeAsyncClient.posts == []
+    db.persist_thread_input_delivery.assert_awaited_once()
 
 
 @pytest.mark.parametrize(
@@ -596,48 +587,60 @@ async def test_durable_branch_notifies_the_owner(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_owner_notification_resolves_the_recipient_address(monkeypatch):
-    """dispatch() takes user_id for PREFERENCES only — its email leg sends to
-    ``recipient_email or ""``, so omitting it does not fall back to the user's
-    address, it hands the empty string to the email service, which refuses to
-    send and merely logs. Nothing raises, so the notification is silently
-    dropped while the wake still reports success. (Live-gate regression,
-    2026-07-27.)"""
-    sent = {}
+async def test_owner_notification_records_a_session_wake_row(monkeypatch):
+    """The owner's half of the durable branch is a ``session_wake`` feed row
+    (unified notification system): addressed to the thread owner, deduped per
+    (thread, job) so a re-claimed wake never files twice, with the session
+    thread as its source so the cockpit can deep-link back. Which channel
+    reaches the owner — and at what address — is the notification system's
+    business; nothing here resolves an email. (The old dispatch() path handed
+    the email leg an empty address and silently dropped the notice — live-gate
+    regression, 2026-07-27; a feed row cannot be dropped that way.)"""
+    recorded = {}
 
     class _Svc:
-        async def dispatch(self, **kw):
-            sent.update(kw)
+        async def record(self, **kw):
+            recorded.update(kw)
+            return SimpleNamespace(notification_id="n-1", inserted=True)
 
     monkeypatch.setitem(
         __import__("sys").modules,
-        "services.notification_service",
+        "orchestrator.services.notification_service",
         type("M", (), {"notification_service": _Svc()}),
     )
     db = _db(claimed=[_claim_row()], thread=_thread(agent_id=None))
-    db.get_user = AsyncMock(
-        return_value={"id": "u", "email": "owner@example.test", "display_name": "Owner"}
-    )
     monkeypatch.setattr(session_wake, "_notify_owner", _REAL_NOTIFY_OWNER)
 
     assert await session_wake.drain_pending_wakes(db) == 0
 
-    assert sent.get("recipient_email") == "owner@example.test"
-    assert sent.get("recipient_name") == "Owner"
-    assert sent.get("thread_id") == THREAD_ID
+    assert recorded["recipient_id"] == "u"
+    assert recorded["category"] == "session_wake"
+    assert recorded["dedup_key"] == f"session_wake:{THREAD_ID}:{JOB_ID}"
+    assert recorded["source_kind"] == "thread"
+    assert recorded["source_id"] == THREAD_ID
+    assert recorded["action_params"] == {"thread_id": THREAD_ID, "job_id": JOB_ID}
+    assert recorded["payload"]["job_id"] == JOB_ID
+    assert recorded["payload"]["status"] == "completed"
+    assert recorded["payload"]["title"] == "Theme work"
+    assert JOB_ID[:8] in recorded["subject"]
 
 
 @pytest.mark.asyncio
-async def test_owner_without_an_email_is_skipped_not_dispatched(monkeypatch):
+async def test_owner_without_an_email_still_gets_the_row(monkeypatch):
+    """An owner with no address on file is NOT skipped at this layer: the feed
+    row is the durable half and lands in-app regardless. Suppressing the email
+    leg for an addressless recipient is the notification system's job — the
+    wake never looks the user up."""
     calls = []
 
     class _Svc:
-        async def dispatch(self, **kw):
+        async def record(self, **kw):
             calls.append(kw)
+            return SimpleNamespace(notification_id="n-1", inserted=True)
 
     monkeypatch.setitem(
         __import__("sys").modules,
-        "services.notification_service",
+        "orchestrator.services.notification_service",
         type("M", (), {"notification_service": _Svc()}),
     )
     db = _db(claimed=[_claim_row()], thread=_thread(agent_id=None))
@@ -645,17 +648,18 @@ async def test_owner_without_an_email_is_skipped_not_dispatched(monkeypatch):
     monkeypatch.setattr(session_wake, "_notify_owner", _REAL_NOTIFY_OWNER)
 
     assert await session_wake.drain_pending_wakes(db) == 0
-    assert calls == [], "dispatching with no address just logs a refusal"
+    assert len(calls) == 1
+    assert calls[0]["recipient_id"] == "u"
+    db.get_user.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_live_delivery_does_not_email_the_user(monkeypatch):
-    """The user is right there watching; an email would be noise."""
+async def test_durable_kubernetes_delivery_notifies_the_owner(monkeypatch):
     notify = AsyncMock()
     monkeypatch.setattr(session_wake, "_notify_owner", notify)
     db = _db(claimed=[_claim_row()], thread=_thread(), agent=_agent())
     await session_wake.drain_pending_wakes(db)
-    notify.assert_not_awaited()
+    notify.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -667,6 +671,42 @@ async def test_failed_notification_does_not_undeliver_the_notice(monkeypatch):
     assert await session_wake.drain_pending_wakes(db) == 0
     db.finish_job_wake.assert_not_awaited()
     db.defer_job_wake_for_input.assert_awaited_once_with(JOB_ID)
+
+
+@pytest.mark.asyncio
+async def test_durable_retry_finishes_only_after_provider_admission():
+    db = _db(claimed=[_claim_row()], thread=_thread(agent_id=None))
+    db.persist_thread_input_delivery = AsyncMock(
+        return_value={
+            "transcript_inserted": False,
+            "thread_id": THREAD_ID,
+            "state": "admitted",
+        }
+    )
+
+    assert await session_wake.drain_pending_wakes(db) == 1
+
+    db.finish_job_wake.assert_awaited_once_with(JOB_ID, "completed")
+    db.defer_job_wake_for_input.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_wrong_thread_delivery_receipt_cannot_settle_wake():
+    db = _db(claimed=[_claim_row()], thread=_thread(agent_id=None))
+    db.persist_thread_input_delivery = AsyncMock(
+        return_value={
+            "transcript_inserted": True,
+            "thread_id": "ffffffff-ffff-4fff-8fff-ffffffffffff",
+            "state": "admitted",
+        }
+    )
+
+    assert await session_wake.drain_pending_wakes(db) == 0
+    db.finish_job_wake.assert_not_awaited()
+    db.release_job_wake.assert_awaited_once_with(
+        JOB_ID,
+        max_attempts=session_wake.MAX_ATTEMPTS,
+    )
 
 
 # --------------------------------------------------------------------------

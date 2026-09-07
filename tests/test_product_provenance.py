@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from contextlib import asynccontextmanager
@@ -15,19 +16,19 @@ from uuid import UUID
 import pytest
 import yaml
 
-from services.product_capabilities import (
+from orchestrator.services.product_capabilities import (
     ProductCapabilityService,
     ResolutionRequest,
     registered_agent_provenance,
 )
 from orchestrator.database.postgres import PostgresDB
-from src.core.product_capabilities import (
+from shared.runtime.core.product_capabilities import (
     ComponentProvenance,
     ProductComponent,
     ProvenanceStatus,
     REGISTRY_REVISION,
 )
-from src.core.runtime_provenance import (
+from shared.runtime.core.runtime_provenance import (
     build_product_provenance,
     component_provenance_from_environment,
     inherited_content_provenance,
@@ -253,6 +254,8 @@ async def test_agent_registration_persists_full_provenance_beside_legacy_short_s
     sql, *parameters = connection.fetchrow.call_args.args
     assert "INSERT INTO agents" in sql
     metadata = json.loads(parameters[7])
+    process_generation = metadata.pop("dispatch_process_generation")
+    assert str(UUID(process_generation)) == process_generation
     assert metadata == {
         "build_sha": _AGENT_REVISION[:7],
         "product_provenance": provenance,
@@ -458,7 +461,7 @@ def test_all_release_dockerfiles_carry_standard_declared_oci_metadata():
         "docker/Dockerfile.cockpit",
         "docker/Dockerfile.mcp",
         "docker/Dockerfile.workspace",
-        "vm/controller/Dockerfile",
+        "docker/Dockerfile.vm-controller",
         "docker/agent-vm-base/Dockerfile.containerDisk",
         "docker/agent-vm-base/Dockerfile.containerDisk-stage1",
     )
@@ -540,13 +543,17 @@ def test_image_workflows_pass_full_source_revision_separately_from_short_sha():
 
     # ...and it must stay *derived* from the full sha, so the two cannot drift
     # apart into an image tagged with one commit and labeled with another.
-    assert develop.count("short=${FULL::7}") == 5
-    assert develop.count('COMPONENT_TAG="sha-${COMPONENT_SHA::7}"') == 5
+    # Six ident steps: the five service components plus vm-controller.
+    assert develop.count("short=${FULL::7}") == 6
+    # The chart-stamping step derives every baked tag from the same identity
+    # sha whose full form ships as that component's provenance revision —
+    # six of them since the VM controller stopped being left at "latest".
+    assert len(re.findall(r'="sha-\$\{SHA_[A-Z]+::7\}"', develop)) == 6
 
     assert (
         ".provenance.components[strenv(component)].sourceRevision = strenv(GITHUB_SHA)"
     ) in main
-    assert develop.count("sourceRevision = strenv(COMPONENT_SHA)") >= 5
+    assert len(re.findall(r"sourceRevision\s*= strenv\(REV_[A-Z]+\)", develop)) == 6
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="helm is unavailable")
@@ -614,10 +621,14 @@ def test_helm_rejects_tags_and_short_values_in_digest_and_revision_fields():
     )
 
 
-def test_compose_provenance_is_explicit_and_empty_by_default():
-    compose = (_ROOT / "docker-compose.yaml").read_text(encoding="utf-8")
+def test_env_example_provenance_is_explicit_and_empty_by_default():
+    """The public env template must document the variable and ship it EMPTY.
+
+    Provenance is an attestation: a non-empty default would advertise a
+    source revision / image digest the running artifact does not actually
+    carry. The chart-side wiring is covered by the two helm tests above.
+    """
     environment = (_ROOT / ".env.example").read_text(encoding="utf-8")
 
-    assert compose.count("\n      SRW_DEPLOYMENT_PROVENANCE_JSON:") == 2
-    assert "SRW_DEPLOYMENT_PROVENANCE_JSON=" in environment
-    assert "Ordinary local/tag-only Compose runs should leave this empty" in environment
+    assert "SRW_DEPLOYMENT_PROVENANCE_JSON=\n" in environment
+    assert "leave this empty" in environment

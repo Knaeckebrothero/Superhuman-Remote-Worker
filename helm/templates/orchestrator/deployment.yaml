@@ -1,4 +1,8 @@
 {{- $runtimeAuthorityCutover := .Values.orchestrator.runtimeAuthorityMigrationMaintenanceAck | default false -}}
+{{- $vmRemoteProtocol := .Values.orchestrator.vmRemoteOperationProtocol.enabled | default false -}}
+{{- $workspaceCleanupProtocol := .Values.orchestrator.workspaceCleanupReconciliationEnabled | default false -}}
+{{- $workspaceLifecycleCutover := .Values.orchestrator.workspaceLifecycleProtocolCutoverEnabled | default false -}}
+{{- $orchestratorRecreate := or $runtimeAuthorityCutover (or $vmRemoteProtocol (or $workspaceLifecycleCutover $workspaceCleanupProtocol)) -}}
 {{- if and $runtimeAuthorityCutover (ne (lower (toString (.Values.agent.requirePinnedStatusIdentity | default "true"))) "true") -}}
 {{- fail "orchestrator.runtimeAuthorityMigrationMaintenanceAck requires agent.requirePinnedStatusIdentity=true" -}}
 {{- end }}
@@ -15,7 +19,7 @@ metadata:
 spec:
   replicas: {{ .Values.orchestrator.replicas }}
   strategy:
-    type: {{ ternary "Recreate" "RollingUpdate" $runtimeAuthorityCutover }}
+    type: {{ ternary "Recreate" "RollingUpdate" $orchestratorRecreate }}
   selector:
     matchLabels:
       {{- include "srw.componentSelectorLabels" (dict "context" . "component" "orchestrator") | nindent 6 }}
@@ -23,10 +27,23 @@ spec:
     metadata:
       labels:
         {{- include "srw.componentSelectorLabels" (dict "context" . "component" "orchestrator") | nindent 8 }}
+        {{- if $vmRemoteProtocol }}
+        srw.io/vm-remote-operation-protocol: v1
+        {{- end }}
       annotations:
         checksum/infrastructure-metering-gates: {{ toJson .Values.infrastructureMetering | sha256sum | quote }}
+        # This flag is a money-spending admission fence. The orchestrator reads
+        # it from a ConfigMap key, so bind its exact value into the Pod template
+        # even when the optional Reloader controller is disabled. A source-
+        # controlled enable/disable therefore deterministically converges every
+        # replica before operators rely on the new policy.
+        checksum/officer-auto-pull-release: {{ dict "officerAutoPullReleaseEnabled" (.Values.orchestrator.officerAutoPullReleaseEnabled | default false) | toJson | sha256sum | quote }}
+        checksum/workspace-cleanup-reconciliation: {{ dict "enabled" $workspaceCleanupProtocol | toJson | sha256sum | quote }}
+        checksum/workspace-lifecycle-protocol-cutover: {{ dict "enabled" $workspaceLifecycleCutover | toJson | sha256sum | quote }}
+        checksum/workspace-lifecycle-service-account: {{ .Values.orchestrator.workspaceLifecycleServiceAccountGeneration | default "0197" | toString | sha256sum | quote }}
+        checksum/vm-remote-operation-protocol: {{ dict "enabled" $vmRemoteProtocol | toJson | sha256sum | quote }}
     spec:
-      serviceAccountName: {{ include "srw.fullname" . }}-orchestrator
+      serviceAccountName: {{ include "srw.orchestratorServiceAccountName" . }}
       terminationGracePeriodSeconds: {{ .Values.orchestrator.terminationGracePeriodSeconds }}
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
@@ -72,6 +89,26 @@ spec:
             # old orchestrator overlaps the migration transaction.
             - name: MIGRATION_MAINTENANCE_GATES
               value: {{ ternary "pinned-runtime-authority-v1" "" $runtimeAuthorityCutover | quote }}
+            - name: VM_REMOTE_OPERATION_PROTOCOL_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: VM_REMOTE_OPERATION_PROTOCOL_ENABLED
+            - name: WORKSPACE_CLEANUP_RECONCILIATION_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: WORKSPACE_CLEANUP_RECONCILIATION_ENABLED
+            # The orchestrator is the only reader of this key
+            # (services/pinned_k8s_effect.py). Without it the bounded legacy
+            # namespace search collapses to the release namespace alone, which
+            # silently disables both 0185 adoption across a namespace move and
+            # the session-route shadow refusal.
+            - name: PINNED_LEGACY_AGENT_NAMESPACES
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: PINNED_LEGACY_AGENT_NAMESPACES
             - name: PORT
               value: "8085"
             # License acceptance — orchestrator refuses to start if not "true"
@@ -90,7 +127,7 @@ spec:
                   name: {{ include "srw.secretName" . }}
                   key: APP_ENCRYPTION_KEY
             # Core databases — DSNs are composed at runtime from the parts
-            # below (orchestrator/utils/db_url.py). Storing a full URL in
+            # below (src/shared/db_url.py). Storing a full URL in
             # the Secret is no longer needed and was a footgun: passwords
             # with `/` truncated the netloc under urlsplit.
             - name: POSTGRES_USER
@@ -704,7 +741,7 @@ spec:
             # Name + key of the Secret holding the shared HS256 JWT key.
             # The orchestrator passes both through to dynamically-provisioned
             # agent pod manifests (services/agent_provisioner.py) so the
-            # pod's JWT validator (src/api/_session_auth.py) can resolve the
+            # pod's JWT validator (src/agent/api/_session_auth.py) can resolve the
             # same secret/key pair and verify handshake tokens.
             - name: SESSION_JWT_SECRET_NAME
               value: {{ .Values.sessionRouter.jwtSecretName | default (printf "%s-session-jwt" (include "srw.fullname" .)) | quote }}
@@ -718,6 +755,18 @@ spec:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: MCP_INTERNAL_KEY
+                  optional: true
+            # Root key for per-workspace code-server credentials. The IDE proxy
+            # derives one credential per workspace runtime and injects it into
+            # the workspace Pod; code-server refuses anything else, so a proxy
+            # that dialled a reused Pod IP is rejected by the destination.
+            # `optional` keeps the fail-closed default: without the key no
+            # credential exists and the browser IDE stays contained.
+            - name: IDE_CREDENTIAL_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: IDE_CREDENTIAL_KEY
                   optional: true
             {{- if .Values.mcp.enabled }}
             # MCP_DEV_TOKEN — dev-only fixed admin MCP token. When set, the
@@ -750,19 +799,6 @@ spec:
             # provider key from system_api_keys (seeded via the llm-seed-job).
             # See knowledge-base/knowledge/api_key_resolution.md for the wire-format vs config-source
             # split.
-            #
-            # TAVILY_API_KEY — the builder's web_search tool (builder_search.py)
-            # runs in-process here, not on an agent, so the orchestrator needs the
-            # key directly. Tavily is a search engine, not a DB-seeded LLM provider;
-            # it rides the shared Secret. Agents get the same key via envFrom in
-            # agent_provisioner.py. optional:true so installs without web search
-            # still start.
-            - name: TAVILY_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "srw.secretName" . }}
-                  key: TAVILY_API_KEY
-                  optional: true
             # ELEVENLABS_API_KEY — one ElevenLabs account per deployment for the
             # TTS read-aloud voice provider (knowledge-base/knowledge/features/tts_vendor_providers.md).
             # TTS runs in-process here (orchestrator-only), so the orchestrator
@@ -853,7 +889,7 @@ spec:
                   name: {{ include "srw.secretName" . }}
                   key: NEXTCLOUD_AGENT_PASSWORD
                   optional: true
-            {{- if and .Values.nextcloud.enabled .Values.nextcloud.protectedEffect.enabled }}
+            {{- if and .Values.nextcloud.enabled (eq (include "srw.nextcloudProtectedEffectEnabled" .) "true") }}
             - name: NEXTCLOUD_PROTECTED_EFFECT_URL
               valueFrom:
                 configMapKeyRef:
@@ -1367,6 +1403,11 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: OFFICER_RUNTIME_VERIFICATION_ENABLED
+            - name: OFFICER_AUTO_PULL_RELEASE_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: OFFICER_AUTO_PULL_RELEASE_ENABLED
             {{- if eq (include "srw.vmMode" .) "external" }}
             # Agent tailscale sidecar gate (consumed by AgentProvisioner)
             - name: AGENT_TAILSCALE_ENABLED
@@ -1695,6 +1736,27 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: LOG_FORMAT
+            {{- if .Values.sshGateway.enabled }}
+            # SSH gateway host-key publication. `GET /api/ssh/host-keys` runs
+            # HERE, not in the gateway: it reads these two variables and the
+            # .pub files the volume below projects. Without them the endpoint
+            # answers 200 with `{"host_keys": [], "hostname": ""}` forever and
+            # a pinning client silently degrades to trust-on-first-use.
+            #
+            # Explicit `env:` entries because this Deployment does not use
+            # `envFrom` at all — a key added to the shared ConfigMap would
+            # never arrive here.
+            #
+            # APPENDED AT THE END OF THIS LIST ON PURPOSE. Inserting into the
+            # middle of an existing env list can trip the Kubernetes
+            # strategic-merge bug that reports `env[N].valueFrom` patch errors
+            # and needs a delete+recreate of the Deployment; appending leaves
+            # every pre-existing index where it was.
+            - name: SSH_GATEWAY_PUBLIC_HOST_KEYS
+              value: {{ include "srw.sshGatewayPublicHostKeyPaths" . | quote }}
+            - name: SSH_GATEWAY_HOSTNAME
+              value: {{ .Values.sshGateway.hostname | quote }}
+            {{- end }}
           volumeMounts:
             - name: workspace
               mountPath: /workspace
@@ -1702,6 +1764,11 @@ spec:
               mountPath: /run/secrets/vm-ssh-key
               subPath: ssh-privatekey
               readOnly: true
+            {{- if .Values.sshGateway.enabled }}
+            - name: ssh-gateway-host-keys
+              mountPath: {{ include "srw.sshGatewayHostKeyDir" . }}
+              readOnly: true
+            {{- end }}
           lifecycle:
             preStop:
               exec:
@@ -1754,3 +1821,26 @@ spec:
             # non-root production image without relying on OpenSSH's
             # owner-dependent permission exception.
             defaultMode: 0444
+        {{- if .Values.sshGateway.enabled }}
+        # The ssh-gateway's host keys, PUBLIC HALVES ONLY. This pod serves
+        # `GET /api/ssh/host-keys` and needs the .pub files on disk to
+        # fingerprint them; `items:` is what keeps the gateway's host private
+        # keys out of a second pod. Pointing the endpoint at the private files
+        # instead would also work (asyncssh emits only public material) and is
+        # deliberately rejected.
+        #
+        # NOT `optional`. A hostKeySecret missing its .pub halves fails this
+        # pod loudly, at the moment the operator enables the component, rather
+        # than publishing an empty key list forever — which reads as "no
+        # gateway configured" to a client and is indistinguishable from one.
+        # 0444 for the same reason as vm-ssh-key above.
+        - name: ssh-gateway-host-keys
+          secret:
+            secretName: {{ .Values.sshGateway.hostKeySecret }}
+            defaultMode: 0444
+            items:
+              {{- range .Values.sshGateway.hostKeyNames }}
+              - key: {{ printf "%s.pub" . | quote }}
+                path: {{ printf "%s.pub" . | quote }}
+              {{- end }}
+        {{- end }}

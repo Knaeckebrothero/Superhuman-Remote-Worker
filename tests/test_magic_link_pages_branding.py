@@ -14,7 +14,7 @@ the neutral else and two branches' hexes were never checked.)
 
 import re
 
-from services import brand
+from orchestrator.services import brand
 
 CATPPUCCIN = {
     "#1e1e2e",

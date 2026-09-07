@@ -18,7 +18,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.shared.pinned_session_identity import PinnedSessionBinding
+from shared.pinned_session_identity import PinnedSessionBinding
 
 THREAD_ID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 USER = {"id": "user-1", "is_admin": False}
@@ -32,6 +32,7 @@ def _pinned_binding() -> PinnedSessionBinding:
         agent_id="cccccccc-cccc-4ccc-8ccc-cccccccccccc",
         runtime_attach_token="dddddddd-dddd-4ddd-8ddd-dddddddddddd",
         agent_hostname="persistent-aaaaaaaaaaaa",
+        pod_namespace="srw",
         pod_uid="pod-uid-a",
         pod_ip="10.0.0.9",
         pod_port=8001,
@@ -220,7 +221,7 @@ async def test_stateless_input_single_transaction_and_response_parity(monkeypatc
     assert turn_number == 6  # total_turns + 1
     assert "'human'" in insert[1]  # role literal in the mirrored insert
     # row id is the agent's own uuid5 coercion of the minted msg_ id
-    from src.database.postgres_db import _coerce_row_id
+    from agent.database.postgres_db import _coerce_row_id
 
     raw_msg_id = out["queue"]["message_id"]
     assert raw_msg_id.startswith("msg_") and len(raw_msg_id) == 4 + 24

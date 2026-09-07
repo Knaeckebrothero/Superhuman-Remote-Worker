@@ -13,17 +13,10 @@ Covers:
 """
 
 from __future__ import annotations
-
-import sys
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
-_ORCH = Path(__file__).parent.parent / "orchestrator"
-if str(_ORCH) not in sys.path:
-    sys.path.insert(0, str(_ORCH))
 
 from orchestrator.services import discovery  # noqa: E402
 

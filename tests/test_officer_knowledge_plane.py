@@ -7,7 +7,7 @@ Covers the three shipped slices:
   no override can replace the write target) plus degraded availability: a
   vector/KB outage never kills the officer — KB tools fail closed with a clear
   `project knowledge unavailable` error and the wake sitrep says so.
-- **K2** the Centurion expert's explicit nine-tool knowledge grant, without
+- **K2** the Centurion expert's explicit eleven-tool knowledge grant, without
   ``kb_export`` (the snapshot test pins the fixture; this file pins intent).
 - **K3** the background-officer capability ceiling: object-plane tools are
   suppressed regardless of overrides or backend capability, while conferences
@@ -23,30 +23,34 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.api.persistent_session import (
+from agent.api.persistent_session import (
     OfficerKnowledgeBindingError,
     PersistentSession,
 )
-from src.core.loader import DelegationConfig, OfficerConfig
-from src.services.knowledge.bindings import KnowledgeBinding, build_knowledge_bindings
-from src.tools.registry import (
+from shared.runtime.core.loader import DelegationConfig, OfficerConfig, SubagentsConfig
+from agent.services.knowledge.bindings import KnowledgeBinding, build_knowledge_bindings
+from agent.tools.registry import (
     apply_officer_tool_ceiling,
     officer_ceiling_active,
 )
 
-from database.postgres import JobQueryResult
+from orchestrator.database.postgres import JobQueryResult
 
 PROJECT_A = str(uuid.uuid4())
 PROJECT_B = str(uuid.uuid4())
 EXTERNAL_KB = str(uuid.uuid4())
 
-#: The reviewed grant (officer_knowledge_plane.md §3) — exactly these nine.
-NINE_KB_TOOLS = [
+#: The reviewed grant (officer_knowledge_plane.md §3) — exactly these eleven
+#: (kb_delete added by kb_gardening G1; kb_grep added by kb_retrieval_hardening T7).
+OFFICER_KB_TOOLS = [
     "kb_write",
     "kb_update",
+    # kb_gardening G1: retire (archive with a reason) — reversible, guarded.
+    "kb_delete",
     "kb_read",
     "kb_list",
     "kb_search",
+    "kb_grep",
     "kb_related",
     "kb_contradictions",
     "kb_provenance",
@@ -80,6 +84,10 @@ def _make_config(**overrides):
     cfg.instruction_files = []
     cfg.tools = MagicMock()
     cfg.delegation = DelegationConfig()
+    # U1 WP3: `subagents` / `tags` are parsed fields the session asdict()s
+    # into tool_config next to `delegation`.
+    cfg.subagents = SubagentsConfig()
+    cfg.tags = []
     if "officer" in overrides:
         cfg.officer = overrides["officer"]
     return cfg
@@ -290,7 +298,7 @@ OBJECT_PLANE_SAMPLE = [
 ]
 
 CONTROL_AND_KNOWLEDGE_SAMPLE = [
-    *NINE_KB_TOOLS,
+    *OFFICER_KB_TOOLS,
     "create_job",
     "approve_job",
     "cancel_job",
@@ -313,8 +321,7 @@ CONTROL_AND_KNOWLEDGE_SAMPLE = [
     "task_add",
     "task_complete",
     "task_list",
-    "delegate_work",
-    "spawn_subagent",
+    "delegate_agent",
     "web_search",
 ]
 
@@ -407,16 +414,16 @@ def _run_setup_tools(session, requested):
 
     with (
         patch(
-            "src.api.persistent_session.get_all_tool_names",
+            "agent.api.persistent_session.get_all_tool_names",
             return_value=list(requested),
         ),
-        patch("src.api.persistent_session.load_tools", side_effect=load),
+        patch("agent.api.persistent_session.load_tools", side_effect=load),
         patch(
-            "src.api.persistent_session.apply_description_overrides",
+            "agent.api.persistent_session.apply_description_overrides",
             side_effect=lambda tools: tools,
         ),
         patch(
-            "src.api.persistent_session.apply_instruction_enforcement",
+            "agent.api.persistent_session.apply_instruction_enforcement",
             side_effect=lambda tools, _context: tools,
         ),
         patch.object(session, "_scope_skills_for_tool_names"),
@@ -543,7 +550,7 @@ class TestOfficerCloudMountRefusal:
         with patch.dict(
             "sys.modules",
             {
-                "src.services.cloud_mount": MagicMock(
+                "shared.runtime.services.cloud_mount": MagicMock(
                     RcloneMountManager=MagicMock(return_value=manager)
                 )
             },
@@ -555,7 +562,7 @@ class TestOfficerCloudMountRefusal:
 
 class TestGetCurrentProjectTrim:
     def test_format_project_drops_cloud_link_for_officers(self):
-        from src.tools.orchestrator.projects import _format_project
+        from agent.tools.orchestrator.projects import _format_project
 
         project = {
             "id": PROJECT_A,
@@ -567,7 +574,7 @@ class TestGetCurrentProjectTrim:
 
     @pytest.mark.asyncio
     async def test_officer_session_tool_output_has_no_cloud_link(self):
-        from src.tools.orchestrator import projects as projects_mod
+        from agent.tools.orchestrator import projects as projects_mod
 
         class _FakeResp:
             def raise_for_status(self):
@@ -622,24 +629,24 @@ class TestGetCurrentProjectTrim:
 
 
 class TestCenturionKnowledgeGrant:
-    def test_grant_is_exactly_the_nine_kb_tools(self):
-        from src.core.loader import (
+    def test_grant_is_exactly_the_officer_kb_tools(self):
+        from shared.runtime.core.loader import (
             get_all_tool_names,
             load_agent_config,
             resolve_config_path,
         )
-        from src.tools.registry import TOOL_REGISTRY, expand_tool_wildcards
+        from agent.tools.registry import TOOL_REGISTRY, expand_tool_wildcards
 
         path, deployment_dir = resolve_config_path("centurion")
         config = load_agent_config(path, deployment_dir)
         granted = set(expand_tool_wildcards(get_all_tool_names(config)))
 
         kb_granted = {name for name in granted if name.startswith("kb_")}
-        assert kb_granted == set(NINE_KB_TOOLS)
+        assert kb_granted == set(OFFICER_KB_TOOLS)
         assert "kb_export" not in granted
         # Every granted name is a real registry tool (registration test's
         # guarantee, restated here so a rename breaks THIS intent pin too).
-        for name in NINE_KB_TOOLS:
+        for name in OFFICER_KB_TOOLS:
             assert name in TOOL_REGISTRY, name
 
 
@@ -650,13 +657,13 @@ class TestCenturionKnowledgeGrant:
 
 class TestDegradedKnowledgeTools:
     def test_stubs_fail_closed_with_clear_error(self):
-        from src.tools.knowledge.knowledge_tools import (
+        from agent.tools.knowledge.knowledge_tools import (
             KB_UNAVAILABLE_ERROR,
             create_degraded_knowledge_tools,
         )
 
-        stubs = create_degraded_knowledge_tools(NINE_KB_TOOLS)
-        assert [t.name for t in stubs] == NINE_KB_TOOLS
+        stubs = create_degraded_knowledge_tools(OFFICER_KB_TOOLS)
+        assert [t.name for t in stubs] == OFFICER_KB_TOOLS
         # Arbitrary args must validate (extra=allow) and answer the outage.
         out = stubs[0].invoke(
             {"title": "x", "type": "decision", "content": "y", "tags": ["a"]}
@@ -666,7 +673,7 @@ class TestDegradedKnowledgeTools:
         assert stubs[3].invoke({}) == KB_UNAVAILABLE_ERROR
 
     def test_unknown_names_are_not_stubbed(self):
-        from src.tools.knowledge.knowledge_tools import (
+        from agent.tools.knowledge.knowledge_tools import (
             create_degraded_knowledge_tools,
         )
 
@@ -693,16 +700,16 @@ class TestDegradedKnowledgeTools:
 
         with (
             patch(
-                "src.api.persistent_session.get_all_tool_names",
-                return_value=["web_search", *NINE_KB_TOOLS],
+                "agent.api.persistent_session.get_all_tool_names",
+                return_value=["web_search", *OFFICER_KB_TOOLS],
             ),
-            patch("src.api.persistent_session.load_tools", side_effect=load),
+            patch("agent.api.persistent_session.load_tools", side_effect=load),
             patch(
-                "src.api.persistent_session.apply_description_overrides",
+                "agent.api.persistent_session.apply_description_overrides",
                 side_effect=lambda tools: tools,
             ),
             patch(
-                "src.api.persistent_session.apply_instruction_enforcement",
+                "agent.api.persistent_session.apply_instruction_enforcement",
                 side_effect=lambda tools, _context: tools,
             ),
             patch.object(session, "_scope_skills_for_tool_names"),
@@ -711,12 +718,12 @@ class TestDegradedKnowledgeTools:
             session._setup_tools(None)
 
         by_name = {t.name: t for t in session.tools}
-        for name in NINE_KB_TOOLS:
+        for name in OFFICER_KB_TOOLS:
             assert name in by_name, name
         assert "kb_export" not in by_name
         out = by_name["kb_write"].invoke({"title": "t", "content": "c"})
         assert "project knowledge unavailable" in out
-        assert set(NINE_KB_TOOLS) <= set(session.tool_context._resolved_tool_names)
+        assert set(OFFICER_KB_TOOLS) <= set(session.tool_context._resolved_tool_names)
 
     def test_plain_session_outage_gets_no_stubs(self):
         session = _make_session(project_ids=[PROJECT_A])
@@ -728,16 +735,16 @@ class TestDegradedKnowledgeTools:
 
         with (
             patch(
-                "src.api.persistent_session.get_all_tool_names",
+                "agent.api.persistent_session.get_all_tool_names",
                 return_value=["web_search", "kb_write"],
             ),
-            patch("src.api.persistent_session.load_tools", side_effect=load),
+            patch("agent.api.persistent_session.load_tools", side_effect=load),
             patch(
-                "src.api.persistent_session.apply_description_overrides",
+                "agent.api.persistent_session.apply_description_overrides",
                 side_effect=lambda tools: tools,
             ),
             patch(
-                "src.api.persistent_session.apply_instruction_enforcement",
+                "agent.api.persistent_session.apply_instruction_enforcement",
                 side_effect=lambda tools, _context: tools,
             ),
             patch.object(session, "_scope_skills_for_tool_names"),
@@ -753,7 +760,7 @@ class TestOfficerSurvivesMemoryOutage:
     officer — the configured⇒required memory gates degrade instead of raising."""
 
     _BROKEN_EMBEDDINGS = {
-        "src.services.embedding_service": MagicMock(
+        "shared.runtime.services.embedding_service": MagicMock(
             get_embedding_service=MagicMock(
                 side_effect=RuntimeError("embedding endpoint down")
             ),
@@ -761,7 +768,7 @@ class TestOfficerSurvivesMemoryOutage:
                 side_effect=RuntimeError("embedding endpoint down")
             ),
         ),
-        "src.services.knowledge_store": MagicMock(
+        "shared.runtime.services.knowledge_store": MagicMock(
             KnowledgeStore=MagicMock(side_effect=RuntimeError("vector down"))
         ),
     }
@@ -788,7 +795,7 @@ class TestOfficerSurvivesMemoryOutage:
         assert session.knowledge_store is None
 
     def test_plain_session_required_memory_outage_still_raises(self):
-        from src.api.persistent_session import MemoryUnavailableError
+        from agent.api.persistent_session import MemoryUnavailableError
 
         cfg = _make_config(memory_enabled=True, memory_required=True)
         session = _make_session(config=cfg, project_ids=[PROJECT_A])
@@ -843,7 +850,7 @@ class TestSitrepKnowledgeSection:
 
     @pytest.mark.asyncio
     async def test_outage_puts_unavailable_line_in_wake(self):
-        from services import sitrep
+        from orchestrator.services import sitrep
 
         vec = SimpleNamespace(acquire=lambda: self._BrokenAcquire())
         text, patch_state = await sitrep.build_wake_message(
@@ -861,7 +868,7 @@ class TestSitrepKnowledgeSection:
 
     @pytest.mark.asyncio
     async def test_healthy_probe_stays_silent(self):
-        from services import sitrep
+        from orchestrator.services import sitrep
 
         conn = SimpleNamespace(fetchval=AsyncMock(return_value=1))
         vec = SimpleNamespace(acquire=lambda: self._Acquire(conn))
@@ -878,7 +885,7 @@ class TestSitrepKnowledgeSection:
 
     @pytest.mark.asyncio
     async def test_missing_vector_handle_is_not_an_outage(self):
-        from services import sitrep
+        from orchestrator.services import sitrep
 
         text, _ = await sitrep.build_wake_message(
             self._db(),
@@ -899,7 +906,7 @@ class TestSitrepKnowledgeSection:
 
 class TestExternalKbWriteRefusal:
     def test_write_scope_error_names_external_read_only(self):
-        from src.tools.knowledge.knowledge_tools import (
+        from agent.tools.knowledge.knowledge_tools import (
             _get_project_id,
             _write_scope_error,
         )

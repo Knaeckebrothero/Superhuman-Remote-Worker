@@ -12,12 +12,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.tools.shell.shell_manager import (
+from agent.tools.shell.shell_manager import (
     COLLIDING_COMMAND_TEMPLATE,
     STILL_RUNNING_TEMPLATE,
     ShellManager,
 )
-from src.tools.shell.shell_tools import create_shell_tools
+from agent.tools.shell.shell_tools import create_shell_tools
 
 
 def make_backend():
@@ -296,7 +296,7 @@ class TestShellExecuteWorkingDir:
 
     def test_async_working_dir_forwarded_to_send(self, manager, backend):
         tool = self._get_shell_execute(manager)
-        with patch("src.tools.shell.shell_tools.time.sleep"):
+        with patch("agent.tools.shell.shell_tools.time.sleep"):
             tool.invoke(
                 {
                     "command": "npm run dev",
@@ -315,7 +315,7 @@ class TestShellExecuteWorkingDir:
 
     def test_keys_mode_ignores_working_dir(self, manager, backend):
         tool = self._get_shell_execute(manager)
-        with patch("src.tools.shell.shell_tools.time.sleep"):
+        with patch("agent.tools.shell.shell_tools.time.sleep"):
             tool.invoke(
                 {
                     "command": "C-c",
@@ -337,7 +337,7 @@ class TestToolNameAliasing:
     """Tests for shell mode aliasing in get_all_tool_names."""
 
     def test_stateless_aliases_shell_execute_to_run_command(self):
-        from src.core.loader import get_all_tool_names
+        from shared.runtime.core.loader import get_all_tool_names
 
         config = MagicMock()
         config.tools.workspace = []
@@ -365,7 +365,7 @@ class TestToolNameAliasing:
         assert "shell_read" in names
 
     def test_persistent_aliases_run_command_to_shell_execute(self):
-        from src.core.loader import get_all_tool_names
+        from shared.runtime.core.loader import get_all_tool_names
 
         config = MagicMock()
         config.tools.workspace = []
@@ -393,7 +393,7 @@ class TestToolNameAliasing:
         assert "shell_read" in names
 
     def test_default_mode_is_stateless(self):
-        from src.core.loader import get_all_tool_names
+        from shared.runtime.core.loader import get_all_tool_names
 
         config = MagicMock()
         config.tools.workspace = []

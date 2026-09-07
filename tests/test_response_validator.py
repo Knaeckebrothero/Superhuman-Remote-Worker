@@ -3,7 +3,7 @@
 Tests each detection pattern and the overall validate_response function.
 """
 
-from src.core.response_validator import (
+from agent.core.response_validator import (
     ValidationResult,
     validate_response,
     _detect_tag_repetition,

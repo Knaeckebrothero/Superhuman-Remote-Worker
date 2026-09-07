@@ -1,6 +1,6 @@
 """Worker-job composition over the shared :mod:`run_queue` substrate.
 
-``src.shared.run_queue`` deliberately touches only ``run_queue``.  Worker
+``shared.run_queue`` deliberately touches only ``run_queue``.  Worker
 claims need one additional invariant: the queue lease and the authoritative
 ``jobs`` row move together.  This module is the narrow composition layer used
 by both the orchestrator (admission/control/fence reads) and the stateless
@@ -24,7 +24,7 @@ from datetime import datetime
 from typing import Any, AsyncIterator
 from uuid import UUID
 
-from .run_queue import (
+from shared.run_queue import (
     AFFINITY_GRACE_SECONDS,
     LANE_STATELESS,
     LEASE_TTL_SECONDS,
@@ -36,11 +36,13 @@ from .run_queue import (
     complete_unit,
     enqueue_unit,
 )
-from .workspace_contract import (
+from shared.workspace_contract import (
     WORKSPACE_CONTRACT_CONTEXT_KEY,
     WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY,
     WorkspaceContractError,
     resolve_workspace_contract,
+    stateless_worker_backend_admissible,
+    vm_mode_from_env,
 )
 
 logger = logging.getLogger(__name__)
@@ -477,10 +479,15 @@ def _job_requests_vm(job: Any) -> bool:
     """
 
     try:
-        # The stateless worker plane supports exactly the sandbox tier. Treat
-        # malformed/ambiguous legacy state and every other tier as ineligible;
-        # a claimant must never infer authority from a ready container alone.
-        return resolve_workspace_contract(job).assigned_backend != "sandbox"
+        # The lane serves the sandbox tier everywhere and the VM tier on the
+        # pod network only (same predicate as the agent's workspace guard —
+        # keep them from drifting apart). Malformed/ambiguous legacy state
+        # and every other tier stay ineligible; a claimant must never infer
+        # authority from a ready container alone.
+        return not stateless_worker_backend_admissible(
+            resolve_workspace_contract(job).assigned_backend,
+            vm_mode=vm_mode_from_env(),
+        )
     except WorkspaceContractError:
         return True
 

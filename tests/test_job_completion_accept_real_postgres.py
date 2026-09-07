@@ -34,11 +34,12 @@ from orchestrator.services.job_completion_commands import (
     canonical_completion_payload,
     completion_payload_digest,
 )
-from src.shared.worker_queue import get_worker_completion_acceptance
+from shared.worker_queue import get_worker_completion_acceptance
 
 
 SCHEMA_FILE = (
     Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "schema_current.sql"

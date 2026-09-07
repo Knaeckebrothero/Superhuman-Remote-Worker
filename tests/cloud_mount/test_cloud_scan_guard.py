@@ -1,12 +1,12 @@
 from types import SimpleNamespace
 
-from src.services.cloud_mount.guardrails import (
+from agent.services.cloud_mount.guardrails import (
     CloudScanRisk,
     detect_cloud_delete_risk,
     detect_cloud_scan_risk,
     format_cloud_delete_guard_message,
 )
-from src.tools.shell.shell_tools import create_shell_tools
+from agent.tools.shell.shell_tools import create_shell_tools
 
 
 class FakeShellManager:

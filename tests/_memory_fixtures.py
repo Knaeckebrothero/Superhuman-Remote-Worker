@@ -12,10 +12,10 @@ from unittest.mock import AsyncMock
 
 from langchain_core.messages import AIMessage, ToolMessage
 
-from src.core.knowledge_injection import KNOWLEDGE_TOOL_CALL_ID_PREFIX
-from src.core.memory_injection import MEMORY_TOOL_CALL_ID_PREFIX
-from src.services.knowledge_store import KnowledgeRecord
-from src.services.recall_store import MemoryRecord
+from agent.core.knowledge_injection import KNOWLEDGE_TOOL_CALL_ID_PREFIX
+from agent.core.memory_injection import MEMORY_TOOL_CALL_ID_PREFIX
+from shared.runtime.services.knowledge_store import KnowledgeRecord
+from shared.runtime.services.recall_store import MemoryRecord
 
 PROJECT_ID = "12345678-1234-5678-1234-567812345678"
 

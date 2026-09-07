@@ -5,9 +5,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from src.tools.research.utils import semantic_scholar_client as client_module
-from src.tools.research.utils import provider_health
-from src.tools.research.utils.semantic_scholar_client import (
+from agent.tools.research.utils import semantic_scholar_client as client_module
+from agent.tools.research.utils import provider_health
+from agent.tools.research.utils.semantic_scholar_client import (
     SemanticScholarProviderError,
     get_semantic_scholar_health,
     get_semantic_scholar_paper,

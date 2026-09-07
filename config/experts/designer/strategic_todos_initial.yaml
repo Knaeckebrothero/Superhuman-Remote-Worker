@@ -32,11 +32,11 @@ todos:
 
       Steps:
       (1) Read the design_guide.md file — this is the design system reference with all tokens.
-      (2) Use list_files on repo/cockpit/src/app/ to understand the component structure.
+      (2) Use list_files on repos/<name>/cockpit/src/app/ (the <name> is listed in README.md) to understand the component structure.
       (3) Read 3-5 components that are most relevant to the feature you're designing.
           Focus on their HTML templates (.component.html or inline template) and styles
           (.component.scss or inline styles).
-      (4) Read repo/cockpit/src/styles.scss for global design tokens.
+      (4) Read repos/<name>/cockpit/src/styles.scss for global design tokens.
       (5) If relevant, explore the simple/ (mobile) layout to understand mobile patterns.
       (6) If the app is running, use browser_navigate then browser_screenshot to see the current UI rendered.
 

@@ -6,7 +6,7 @@ from uuid import UUID
 
 import pytest
 
-from src.shared.thread_controls import control_receipt_result
+from shared.thread_controls import control_receipt_result
 
 
 REQUEST_ID = UUID("aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb")

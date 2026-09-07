@@ -25,15 +25,15 @@ from fastapi import HTTPException
 def _patch_caller_and_db(user: dict, db):
     stack = ExitStack()
     stack.enter_context(
-        patch("main.require_approved_user", AsyncMock(return_value=user))
+        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user))
     )
     stack.enter_context(
         patch(
-            "security.access.require_approved_user",
+            "orchestrator.security.access.require_approved_user",
             AsyncMock(return_value=user),
         )
     )
-    stack.enter_context(patch("main.postgres_db", db))
+    stack.enter_context(patch("orchestrator.main.postgres_db", db))
     return stack
 
 
@@ -43,24 +43,28 @@ class TestExpertsGated:
         """The gate fires before the global cache is touched. We patch
         ``require_approved_user`` to make it raise, then assert the call
         bubbles 403."""
-        from main import list_experts
+        from orchestrator.main import list_experts
 
         async def _denied(*_a, **_kw):
             raise HTTPException(status_code=403, detail="denied")
 
-        with patch("main.require_approved_user", AsyncMock(side_effect=_denied)):
+        with patch(
+            "orchestrator.main.require_approved_user", AsyncMock(side_effect=_denied)
+        ):
             with pytest.raises(HTTPException) as exc:
                 await list_experts(fake_request)
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
     async def test_get_expert_runs_gate(self, user_a, fake_db, fake_request):
-        from main import get_expert
+        from orchestrator.main import get_expert
 
         async def _denied(*_a, **_kw):
             raise HTTPException(status_code=403, detail="denied")
 
-        with patch("main.require_approved_user", AsyncMock(side_effect=_denied)):
+        with patch(
+            "orchestrator.main.require_approved_user", AsyncMock(side_effect=_denied)
+        ):
             with pytest.raises(HTTPException) as exc:
                 await get_expert(fake_request, "scholar")
         assert exc.value.status_code == 403
@@ -69,12 +73,14 @@ class TestExpertsGated:
 class TestSshKeyGenerateGated:
     @pytest.mark.asyncio
     async def test_runs_gate(self, fake_request):
-        from main import generate_datasource_ssh_key
+        from orchestrator.main import generate_datasource_ssh_key
 
         async def _denied(*_a, **_kw):
             raise HTTPException(status_code=403, detail="denied")
 
-        with patch("main.require_approved_user", AsyncMock(side_effect=_denied)):
+        with patch(
+            "orchestrator.main.require_approved_user", AsyncMock(side_effect=_denied)
+        ):
             with pytest.raises(HTTPException) as exc:
                 await generate_datasource_ssh_key(fake_request)
         assert exc.value.status_code == 403
@@ -86,7 +92,7 @@ class TestPendingActions:
         self, user_admin, fake_db, fake_request
     ):
         """Admin path passes no owner filter — DB returns global counts."""
-        from main import _pending_actions_cache, get_pending_actions
+        from orchestrator.main import _pending_actions_cache, get_pending_actions
 
         _pending_actions_cache.clear()
         fake_db.get_pending_action_counts = AsyncMock(
@@ -103,7 +109,7 @@ class TestPendingActions:
     ):
         """Non-admin path resolves caller's project memberships and passes
         owner_user_id + visible_project_ids — narrowing the DB query."""
-        from main import _pending_actions_cache, get_pending_actions
+        from orchestrator.main import _pending_actions_cache, get_pending_actions
 
         _pending_actions_cache.clear()
         fake_db.get_pending_action_counts = AsyncMock(
@@ -124,7 +130,7 @@ class TestPendingActions:
         """Two callers with different visibility hit the DB twice (different
         cache keys). Without the fix, the admin's first response would have
         leaked into user_a's slot."""
-        from main import _pending_actions_cache, get_pending_actions
+        from orchestrator.main import _pending_actions_cache, get_pending_actions
 
         _pending_actions_cache.clear()
         fake_db.get_pending_action_counts = AsyncMock(
@@ -139,14 +145,16 @@ class TestPendingActions:
 
     @pytest.mark.asyncio
     async def test_runs_gate(self, fake_request):
-        from main import _pending_actions_cache, get_pending_actions
+        from orchestrator.main import _pending_actions_cache, get_pending_actions
 
         _pending_actions_cache.clear()
 
         async def _denied(*_a, **_kw):
             raise HTTPException(status_code=403, detail="denied")
 
-        with patch("main.require_approved_user", AsyncMock(side_effect=_denied)):
+        with patch(
+            "orchestrator.main.require_approved_user", AsyncMock(side_effect=_denied)
+        ):
             with pytest.raises(HTTPException) as exc:
                 await get_pending_actions(fake_request)
         assert exc.value.status_code == 403
@@ -155,19 +163,21 @@ class TestPendingActions:
 class TestCitationDetail:
     @pytest.mark.asyncio
     async def test_runs_gate(self, fake_request):
-        from main import get_citation_detail
+        from orchestrator.main import get_citation_detail
 
         async def _denied(*_a, **_kw):
             raise HTTPException(status_code=403, detail="denied")
 
-        with patch("main.require_approved_user", AsyncMock(side_effect=_denied)):
+        with patch(
+            "orchestrator.main.require_approved_user", AsyncMock(side_effect=_denied)
+        ):
             with pytest.raises(HTTPException) as exc:
                 await get_citation_detail(fake_request, 1)
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
     async def test_missing_citation_404(self, user_a, fake_db, fake_request):
-        from main import get_citation_detail
+        from orchestrator.main import get_citation_detail
 
         fake_conn = MagicMock()
         fake_conn.fetchrow = AsyncMock(return_value=None)
@@ -179,7 +189,7 @@ class TestCitationDetail:
 
         with (
             _patch_caller_and_db(user_a, fake_db),
-            patch("main.vector_db", fake_vector_db),
+            patch("orchestrator.main.vector_db", fake_vector_db),
         ):
             with pytest.raises(HTTPException) as exc:
                 await get_citation_detail(fake_request, 9999)
@@ -192,7 +202,7 @@ class TestCitationDetail:
         """Citation links to job_a (owned by user_a). user_b is a stranger
         to project_a, so user_can_access_any_job returns False and the
         endpoint 404s (probe-resistant — doesn't leak existence)."""
-        from main import get_citation_detail
+        from orchestrator.main import get_citation_detail
 
         fake_conn = MagicMock()
         fake_conn.fetchrow = AsyncMock(
@@ -211,7 +221,7 @@ class TestCitationDetail:
 
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("main.vector_db", fake_vector_db),
+            patch("orchestrator.main.vector_db", fake_vector_db),
         ):
             with pytest.raises(HTTPException) as exc:
                 await get_citation_detail(fake_request, 1)
@@ -219,7 +229,7 @@ class TestCitationDetail:
 
     @pytest.mark.asyncio
     async def test_owner_succeeds(self, user_a, job_a, fake_db, fake_request):
-        from main import get_citation_detail
+        from orchestrator.main import get_citation_detail
 
         row = {
             "id": 1,
@@ -237,7 +247,7 @@ class TestCitationDetail:
 
         with (
             _patch_caller_and_db(user_a, fake_db),
-            patch("main.vector_db", fake_vector_db),
+            patch("orchestrator.main.vector_db", fake_vector_db),
         ):
             result = await get_citation_detail(fake_request, 1)
         assert result["id"] == 1

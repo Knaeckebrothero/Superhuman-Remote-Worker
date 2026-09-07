@@ -62,6 +62,32 @@ if [ -f /tmp/ssh-pubkey/ssh-publickey ]; then
     chmod 644 /etc/ssh/authorized_keys/agent-host
 fi
 
+# Gateway user CA. Absent on deployments without the ssh-gateway, in which case
+# sshd simply has no CA to trust and certificate auth is unavailable -- the
+# agent's own key path is unaffected.
+if [ -f /tmp/ssh-pubkey/user-ca.pub ]; then
+    cp /tmp/ssh-pubkey/user-ca.pub /etc/ssh/srw_user_ca.pub
+    chmod 644 /etc/ssh/srw_user_ca.pub
+
+    # Scope certificate auth to THIS workspace. Every workspace image bakes
+    # in the same Unix user and trusts the same CA, so without this file a
+    # certificate minted for any workspace would authenticate to all of
+    # them for its whole validity window (sshd_config's
+    # AuthorizedPrincipalsFile /etc/ssh/principals/%u reads this, keyed by
+    # login user -- always "agent-host" here). SRW_WORKSPACE_OWNER_ID is the
+    # same thread id the gateway resolves for this workspace's ssh handle,
+    # and connect_upstream() mints each certificate's principal from that
+    # same value, so the two agree without either side hard-coding the
+    # other. No identity, no file: sshd then finds AuthorizedPrincipalsFile
+    # pointing at a missing file and refuses every certificate, which is
+    # the safe default for a workspace with nothing to scope to.
+    if [ -n "${SRW_WORKSPACE_OWNER_ID:-}" ]; then
+        install -d -o root -g root -m 0755 /etc/ssh/principals
+        printf '%s\n' "$SRW_WORKSPACE_OWNER_ID" > /etc/ssh/principals/agent-host
+        chmod 644 /etc/ssh/principals/agent-host
+    fi
+fi
+
 # ---------------------------------------------------------------------------
 # 2a. Install a per-workspace SSH host identity.
 #
@@ -141,11 +167,41 @@ if [ -n "${SRW_WORKSPACE_PROCESS_TAG:-}" ]; then
 else
     CODE_SERVER_PROCESS_PREFIX="exec"
 fi
-su -s /bin/sh agent-host -c "$CODE_SERVER_PROCESS_PREFIX code-server \
-    --bind-addr 0.0.0.0:38080 \
-    --user-data-dir /var/lib/code-server \
-    --extensions-dir /var/lib/code-server/extensions \
-    /home/agent-host/workspace" &
+
+# 3a. Recipient binding. The orchestrator derives one credential per workspace
+#     runtime (src/orchestrator/services/ide_credentials.py) and presents it on
+#     every proxied request, so a proxy that dialled a reused Pod IP meets a
+#     credential this code-server does not accept and is refused HERE — the
+#     one check the control plane cannot get wrong. Without the credential we
+#     do NOT fall back to `auth: none`: an unauthenticated IDE on the Pod
+#     network is the hole this closes, so code-server simply does not start.
+#     The workspace itself is unaffected — SSH is the primary transport and is
+#     already listening.
+#
+#     Written to a file rather than passed in argv or through `su`: the value
+#     would otherwise sit in `ps` output, and env does not reliably survive
+#     `su` (which is why the process tag above is re-exported explicitly).
+#     /var/lib/code-server is container-local, not the workspace PVC, so the
+#     credential dies with the Pod and never lands in a snapshot.
+CODE_SERVER_CONFIG=/var/lib/code-server/.srw-auth.yaml
+if [ -z "${HASHED_PASSWORD:-}" ]; then
+    echo "code-server NOT started: no workspace credential was injected" >&2
+    echo "  (set IDE_CREDENTIAL_KEY on the orchestrator; see ide_credentials.py)" >&2
+else
+    printf 'auth: password\nhashed-password: "%s"\n' "$HASHED_PASSWORD" \
+        > "$CODE_SERVER_CONFIG"
+    chown agent-host:agent-host "$CODE_SERVER_CONFIG"
+    chmod 0600 "$CODE_SERVER_CONFIG"
+    # Drop it from this process's environment so it is not inherited by the
+    # agent's own shells further down the tree.
+    unset HASHED_PASSWORD
+    su -s /bin/sh agent-host -c "$CODE_SERVER_PROCESS_PREFIX code-server \
+        --config $CODE_SERVER_CONFIG \
+        --bind-addr 0.0.0.0:38080 \
+        --user-data-dir /var/lib/code-server \
+        --extensions-dir /var/lib/code-server/extensions \
+        /home/agent-host/workspace" &
+fi
 
 # ---------------------------------------------------------------------------
 # 4. Keep the container alive, anchored to SSHD (PID exits → container exits,

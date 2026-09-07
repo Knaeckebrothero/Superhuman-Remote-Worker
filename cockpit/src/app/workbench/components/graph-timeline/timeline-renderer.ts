@@ -1,3 +1,4 @@
+import { debugLog } from '../../debug-log';
 /**
  * Timeline renderer for Cytoscape graph.
  * Handles snapshot/delta rendering with velocity-based strategy selection.
@@ -64,13 +65,13 @@ export class TimelineRenderer {
     this.positionCache.clear();
     this.varToIdPersistent.clear();
 
-    console.log('[TimelineRenderer] Loading:', {
+    debugLog('[TimelineRenderer] Loading:', {
       snapshots: snapshots.length,
       deltas: deltas.length,
     });
 
     if (snapshots.length === 0 || deltas.length === 0) {
-      console.log('[TimelineRenderer] No data to render');
+      debugLog('[TimelineRenderer] No data to render');
       return;
     }
 
@@ -83,7 +84,7 @@ export class TimelineRenderer {
       }
     }
 
-    console.log('[TimelineRenderer] Rendering snapshot at index:', targetSnapshot.toolCallIndex,
+    debugLog('[TimelineRenderer] Rendering snapshot at index:', targetSnapshot.toolCallIndex,
       'with nodes:', Object.keys(targetSnapshot.nodes).length);
 
     // Render the snapshot with data
@@ -260,7 +261,7 @@ export class TimelineRenderer {
       const resolvedTarget = this.findNodeInGraph(targetId);
 
       if (!resolvedSource || !resolvedTarget) {
-        console.log('[TimelineRenderer] Skipping edge - missing node:', {
+        debugLog('[TimelineRenderer] Skipping edge - missing node:', {
           sourceId,
           resolvedSource: resolvedSource?.id(),
           targetId,
@@ -367,7 +368,7 @@ export class TimelineRenderer {
    * Render a complete snapshot (replaces all elements).
    */
   private renderFullSnapshot(snapshot: GraphSnapshot): void {
-    console.log('[TimelineRenderer] renderFullSnapshot:', {
+    debugLog('[TimelineRenderer] renderFullSnapshot:', {
       nodeCount: Object.keys(snapshot.nodes).length,
       relCount: Object.keys(snapshot.relationships).length,
       nodes: Object.keys(snapshot.nodes),
@@ -388,7 +389,7 @@ export class TimelineRenderer {
 
         const position = snapshot.positions?.[id] ?? this.positionCache.get(id) ?? this.getNewNodePosition();
 
-        console.log('[TimelineRenderer] Adding node:', id, 'at position:', position);
+        debugLog('[TimelineRenderer] Adding node:', id, 'at position:', position);
 
         elements.push({
           group: 'nodes',
@@ -423,7 +424,7 @@ export class TimelineRenderer {
 
         // Skip edges where source or target node doesn't exist
         if (!sourceId || !targetId) {
-          console.log('[TimelineRenderer] Skipping edge in snapshot - missing node:', {
+          debugLog('[TimelineRenderer] Skipping edge in snapshot - missing node:', {
             relId: rel.id,
             sourceId: rel.sourceId,
             resolvedSource: sourceId,
@@ -446,16 +447,16 @@ export class TimelineRenderer {
         });
       }
 
-      console.log('[TimelineRenderer] Adding elements:', elements.length);
+      debugLog('[TimelineRenderer] Adding elements:', elements.length);
       this.cy.add(elements);
     });
 
-    console.log('[TimelineRenderer] After add, cy.nodes():', this.cy.nodes().length);
+    debugLog('[TimelineRenderer] After add, cy.nodes():', this.cy.nodes().length);
 
     // Run layout if no positions
     const hasPositions = Object.keys(snapshot.positions ?? {}).length > 0;
     if (!hasPositions && !this.layoutRunning && this.cy.nodes().length > 0) {
-      console.log('[TimelineRenderer] Running layout...');
+      debugLog('[TimelineRenderer] Running layout...');
       this.runLayout(false); // Don't animate on initial load
     }
 
@@ -560,7 +561,7 @@ export class TimelineRenderer {
       }
     }
 
-    console.log('[TimelineRenderer] Rebuilt varToId mapping up to index', upToIndex,
+    debugLog('[TimelineRenderer] Rebuilt varToId mapping up to index', upToIndex,
       'with', this.varToIdPersistent.size, 'entries');
   }
 

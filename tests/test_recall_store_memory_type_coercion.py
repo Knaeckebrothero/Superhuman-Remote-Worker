@@ -17,7 +17,7 @@ import logging
 
 import pytest
 
-from src.services.recall_store import (
+from shared.runtime.services.recall_store import (
     DEFAULT_MEMORY_TYPE,
     VALID_MEMORY_TYPES,
     coerce_memory_type,
@@ -59,7 +59,7 @@ class TestConstantMatchesSchema:
         """
         from pathlib import Path
 
-        schema = Path("orchestrator/database/vector_schema.sql").read_text()
+        schema = Path("src/orchestrator/database/vector_schema.sql").read_text()
         line = next(
             ln
             for ln in schema.splitlines()

@@ -16,7 +16,7 @@ from uuid import UUID
 
 import pytest
 
-from services.canvas import (
+from orchestrator.services.canvas import (
     CanvasEditError,
     CanvasRecord,
     CanvasService,
@@ -25,7 +25,7 @@ from services.canvas import (
     canonical_source_fingerprint,
     canvas_file_lock_key,
 )
-from services.canvas_files import (
+from orchestrator.services.canvas_files import (
     CanvasFileError,
     RawWorkspaceFile,
     ThreadWorkspaceFileGateway,
@@ -44,7 +44,7 @@ def test_canvas_mutation_etags_are_exposed_to_cross_origin_cockpit() -> None:
     """The :4200 dev Cockpit must be able to read both save validators."""
 
     from fastapi.middleware.cors import CORSMiddleware
-    from main import app
+    from orchestrator.main import app
 
     cors = next(
         middleware
@@ -186,7 +186,7 @@ class _EditConnection:
 async def test_gateway_rechecks_hash_then_writes_and_validates_readback(
     monkeypatch,
 ) -> None:
-    from services import canvas_files
+    from orchestrator.services import canvas_files
 
     monkeypatch.setattr(canvas_files, "magic", _Magic)
     storage = {"output/report.md": OLD_BYTES}
@@ -240,7 +240,7 @@ async def test_gateway_rechecks_hash_then_writes_and_validates_readback(
 async def test_office_renderer_enters_gateway_and_existing_coordinator(
     monkeypatch,
 ) -> None:
-    from services import canvas_files
+    from orchestrator.services import canvas_files
 
     class _OfficeMagic:
         @staticmethod
@@ -405,7 +405,7 @@ async def test_edit_cancellation_releases_session_lock_and_capacity() -> None:
 async def test_edit_admission_is_bounded_before_dedicated_connection(
     monkeypatch,
 ) -> None:
-    from services import canvas as canvas_service
+    from orchestrator.services import canvas as canvas_service
 
     db = _EditDB()
     service = CanvasService(db)
@@ -436,7 +436,7 @@ async def test_edit_admission_is_bounded_before_dedicated_connection(
 
 @pytest.mark.asyncio
 async def test_refresh_admission_is_bounded_before_connection(monkeypatch) -> None:
-    from services import canvas as canvas_service
+    from orchestrator.services import canvas as canvas_service
 
     db = _EditDB()
     service = CanvasService(db)

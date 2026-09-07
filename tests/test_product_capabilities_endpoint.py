@@ -10,12 +10,12 @@ import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
-from services.product_capabilities import (
+from orchestrator.services.product_capabilities import (
     MAX_EXPLICIT_CAPABILITY_IDS,
     MAX_RESPONSE_BYTES,
     ProductCapabilityService,
 )
-from src.core.product_capabilities import (
+from shared.runtime.core.product_capabilities import (
     AgentAction,
     Completeness,
     EvaluationErrorCode,
@@ -406,7 +406,7 @@ def test_limit_truncation_is_explicit_and_schema_valid(endpoint):
 
 
 def test_main_application_includes_the_endpoint_exactly_once():
-    import main
+    import orchestrator.main
 
     def effective_routes(routes):
         """Flatten both copied and lazily included FastAPI router layouts."""
@@ -420,7 +420,7 @@ def test_main_application_includes_the_endpoint_exactly_once():
 
     matches = [
         route
-        for route in effective_routes(main.app.routes)
+        for route in effective_routes(orchestrator.main.app.routes)
         if getattr(route, "path", None) == "/api/users/me/product-capabilities"
         and "GET" in getattr(route, "methods", set())
     ]
@@ -435,7 +435,6 @@ def test_operator_rollout_gate_is_wired_default_off_in_deployments():
     deployment = (
         _ROOT / "helm" / "templates" / "orchestrator" / "deployment.yaml"
     ).read_text(encoding="utf-8")
-    compose = (_ROOT / "docker-compose.yaml").read_text(encoding="utf-8")
     env_example = (_ROOT / ".env.example").read_text(encoding="utf-8")
 
     assert 'productCapabilitiesEndpointEnabled: "false"' in values
@@ -443,8 +442,4 @@ def test_operator_rollout_gate_is_wired_default_off_in_deployments():
     assert ".Values.agent.productCapabilitiesEndpointEnabled" in configmap
     assert "- name: PRODUCT_CAPABILITIES_ENDPOINT_ENABLED" in deployment
     assert "key: PRODUCT_CAPABILITIES_ENDPOINT_ENABLED" in deployment
-    assert (
-        "PRODUCT_CAPABILITIES_ENDPOINT_ENABLED: "
-        '"${PRODUCT_CAPABILITIES_ENDPOINT_ENABLED:-false}"'
-    ) in compose
     assert "PRODUCT_CAPABILITIES_ENDPOINT_ENABLED=false" in env_example

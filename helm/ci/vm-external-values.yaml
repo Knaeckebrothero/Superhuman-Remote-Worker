@@ -1,5 +1,6 @@
 # External VM controller scenario. The controller itself is installed from
-# helm-vm-cluster; this chart renders only the orchestrator-facing contract.
+# a paired external VM controller; this chart renders only the
+# orchestrator-facing contract.
 license:
   acceptTerms: true
 

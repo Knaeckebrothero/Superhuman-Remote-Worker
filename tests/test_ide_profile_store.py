@@ -30,8 +30,15 @@ class FakeS3:
         body = self.objects[(Bucket, Key)]
 
         class _B:
-            def read(self_inner):
-                return body
+            def __init__(self_inner):
+                self_inner.offset = 0
+
+            def read(self_inner, amount=-1):
+                if amount is None or amount < 0:
+                    amount = len(body) - self_inner.offset
+                chunk = body[self_inner.offset : self_inner.offset + amount]
+                self_inner.offset += len(chunk)
+                return chunk
 
         return {"Body": _B()}
 
@@ -58,9 +65,9 @@ async def test_put_then_get_globalstorage_roundtrip(tmp_path):
     store = IdeProfileStore(s3, "srw-snapshots")
     src = tmp_path / "gs.tar.zst"
     src.write_bytes(b"BLOB")
-    await store.put_globalstorage(UID, str(src))
+    pointer = await store.put_globalstorage(UID, str(src))
     dst = tmp_path / "out.tar.zst"
-    ok = await store.get_globalstorage(UID, str(dst))
+    ok = await store.get_globalstorage(UID, str(dst), pointer)
     assert ok and dst.read_bytes() == b"BLOB"
 
 
@@ -77,5 +84,5 @@ async def test_ext_bytes_exists(tmp_path):
     assert await store.ext_bytes_exists(UID, "a.b", "1.0.0") is False
     src = tmp_path / "e.tar.zst"
     src.write_bytes(b"E")
-    await store.put_ext_bytes(UID, "a.b", "1.0.0", str(src))
-    assert await store.ext_bytes_exists(UID, "a.b", "1.0.0") is True
+    pointer = await store.put_ext_bytes(UID, "a.b", "1.0.0", str(src))
+    assert await store.ext_bytes_exists(UID, "a.b", "1.0.0", pointer) is True

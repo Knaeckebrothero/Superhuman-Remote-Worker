@@ -6,7 +6,7 @@ menu keeps ALL names (bundled is the floor) instead of picking one winner.
 
 import pytest
 
-from src.core.skill_resolution import (
+from shared.runtime.core.skill_resolution import (
     APP_GUIDE_BREAK_GLASS_ENV,
     APP_GUIDE_LOADER_TOOL,
     APP_GUIDE_SKILL,
@@ -21,7 +21,7 @@ from src.core.skill_resolution import (
     skill_bundle_digest,
     skill_files_to_workspace,
 )
-from src.core.expert_resolution import fence_skills_menu
+from shared.runtime.core.expert_resolution import fence_skills_menu
 
 U = "11111111-1111-1111-1111-111111111111"
 
@@ -359,7 +359,7 @@ def test_fence_skills_menu_names_managed_app_guide_reader():
 
 # --- Slice 3: bound skills are removed from the model-invoked catalog ---
 
-from src.core.skill_resolution import filter_bound_skills  # noqa: E402
+from shared.runtime.core.skill_resolution import filter_bound_skills  # noqa: E402
 
 
 def test_filter_removes_bound_skill_from_menu_and_files():

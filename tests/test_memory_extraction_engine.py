@@ -13,9 +13,9 @@ import uuid
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
-from src.core.llm_retry import NO_RETRY
-from src.services.auxiliary import ExtractedMemories, ExtractedMemory
-from src.services.memory.extraction_engine import (
+from shared.runtime.core.llm_retry import NO_RETRY
+from shared.runtime.services.auxiliary import ExtractedMemories, ExtractedMemory
+from agent.services.memory.extraction_engine import (
     MemoryExtractionEngine,
     _dedup_in_memory,
 )
@@ -30,7 +30,7 @@ def char_counter(text: str) -> int:
 def fast_backoff(monkeypatch):
     """No real sleeps between extraction retries in tests."""
     monkeypatch.setattr(
-        "src.services.memory.extraction_engine.EXTRACTION_BACKOFF_SECONDS", (0.0, 0.0)
+        "agent.services.memory.extraction_engine.EXTRACTION_BACKOFF_SECONDS", (0.0, 0.0)
     )
 
 

@@ -23,7 +23,7 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
-from src.core.context import (
+from agent.core.context import (
     ContextConfig,
     ContextManager,
     sanitize_history_for_provider_boundary,
@@ -274,7 +274,7 @@ BIG_HISTORY = [HumanMessage(content="word " * 600)]
 @pytest.mark.asyncio
 class TestModelSwapFitLadder:
     async def _run(self, monkeypatch, session, *, in_flight=False):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         record = AsyncMock()
         monkeypatch.setattr(mod, "_session", session)
@@ -461,7 +461,7 @@ class TestConfigUpdateSwapWiring:
     def _src(self):
         from inspect import getsource
 
-        from src.api.persistent_app import _handle_config_update
+        from agent.api.persistent_app import _handle_config_update
 
         return getsource(_handle_config_update)
 
@@ -494,7 +494,7 @@ class TestSanitizeRestoredHistory:
     for the currently-bound model at attach (covers Slice C offline swaps)."""
 
     def test_remaps_foreign_ids_for_bound_model(self, monkeypatch):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         session = SimpleNamespace(
             config=SimpleNamespace(llm=SimpleNamespace(model="mistral-large-latest"))
@@ -505,7 +505,7 @@ class TestSanitizeRestoredHistory:
         assert out[0].tool_calls[0]["id"] == out[1].tool_call_id
 
     def test_survives_missing_session(self, monkeypatch):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         monkeypatch.setattr(mod, "_session", None)
         out = mod._sanitize_restored_history(_tool_pair("call_ok"))
@@ -514,7 +514,7 @@ class TestSanitizeRestoredHistory:
     def test_both_restore_paths_call_it_after_pairing_repair(self):
         from inspect import getsource
 
-        from src.api.persistent_app import _restore_session_messages
+        from agent.api.persistent_app import _restore_session_messages
 
         src = getsource(_restore_session_messages)
         assert src.count("_sanitize_restored_history(") == 2

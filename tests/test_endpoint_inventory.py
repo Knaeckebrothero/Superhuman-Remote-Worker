@@ -1,8 +1,10 @@
 """C2 — endpoint inventory snapshot test.
 
-Re-runs ``scripts/check_endpoint_auth.py`` against the live ``orchestrator/main.py``
-and asserts the result matches the committed manifest at
-``policy/endpoint_inventory.txt``.
+Re-runs ``scripts/check_endpoint_auth.py`` against the declared application in
+``src/orchestrator/main.py`` and its included routers. Mounted HTTP methods and
+WebSockets under /api, /auth and /wopi must match the committed manifest at
+``policy/endpoint_inventory.txt``. Unmounted routers and framework-generated
+routes are excluded; unsupported dynamic composition fails explicitly.
 
 When a new endpoint is added (or an existing endpoint's gate changes), this
 test fails until either:
@@ -11,10 +13,10 @@ test fails until either:
     and ``python scripts/check_endpoint_auth.py --write`` is re-run; **or**
   * the endpoint is deliberately public, in which case mark it with
     ``# nosec: public <reason>`` on the line immediately above the
-    ``@app.METHOD(...)`` decorator, then re-run ``--write``.
+    app or router route decorator, then re-run ``--write``.
 
-The point is to make adding an unscoped endpoint an explicit, visible choice
-rather than something that ships without review.
+The snapshot makes route and source-gate changes reviewable. Gate-name labels
+do not prove authorization behavior; dedicated access-control tests do that.
 """
 
 import difflib
@@ -38,8 +40,21 @@ def _load_script():
     return module
 
 
+def test_missing_source_is_an_error(tmp_path):
+    script = _load_script()
+    with pytest.raises(FileNotFoundError, match="route source is missing"):
+        script.collect_endpoints(tmp_path / "missing" / "main.py")
+
+
+def test_existing_source_may_have_no_endpoints(tmp_path):
+    script = _load_script()
+    main = tmp_path / "main.py"
+    main.write_text("app = object()\n")
+    assert script.collect_endpoints(main) == []
+
+
 def test_endpoint_inventory_matches_manifest():
-    """The committed manifest must reflect the current state of main.py."""
+    """The manifest must reflect the mounted application and its source gates."""
     script = _load_script()
     endpoints = script.collect_endpoints()
     rendered = script.render_manifest(endpoints)
@@ -64,11 +79,12 @@ def test_endpoint_inventory_matches_manifest():
 def test_no_new_unscoped_endpoints():
     """The number of unscoped endpoints must not increase.
 
-    main.py carries no unscoped endpoints at all. The remaining backlog is the
-    five ``/api/uploads`` routes, which surfaced when the walk was extended to
-    include_router-mounted modules and take no user identity of any kind — not
-    grandfathered on purpose, just not yet gated. New unscoped endpoints have
-    to be acknowledged either by adding a gate or by marking them
+    Neither main.py nor any mounted router carries an unscoped endpoint. The
+    last five — the ``/api/uploads`` routes, which surfaced when the walk was
+    extended to include_router-mounted modules and took no user identity of
+    any kind — were gated in the 2026-08-27 security audit follow-up
+    (``tests/test_uploads_security.py``). New unscoped endpoints have to be
+    acknowledged either by adding a gate or by marking them
     ``# nosec: public <reason>`` above the decorator.
     """
     script = _load_script()

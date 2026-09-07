@@ -10,12 +10,12 @@ import yaml
 from orchestrator.security.credential_files import (
     CREDENTIAL_FILE_TYPES as ORCHESTRATOR_CREDENTIAL_FILE_TYPES,
 )
-from src.core.datasource_catalog import (
+from shared.runtime.core.datasource_catalog import (
     DATASOURCE_TYPE_CATALOG,
     DATASOURCE_TYPE_IDS,
     DATASOURCE_TYPES,
 )
-from src.core.datasource_setup import CREDENTIAL_FILE_TYPES, DATASOURCE_TOOL_MAP
+from agent.core.datasource_setup import CREDENTIAL_FILE_TYPES, DATASOURCE_TOOL_MAP
 
 _ROOT = Path(__file__).resolve().parents[1]
 _GUIDE = _ROOT / "config" / "skills" / "app-guide"
@@ -53,7 +53,7 @@ def test_datasource_catalog_matches_agent_consumers():
 
 
 def test_orchestrator_validation_consumes_the_catalog():
-    source = (_ROOT / "orchestrator" / "main.py").read_text(encoding="utf-8")
+    source = (_ROOT / "src" / "orchestrator" / "main.py").read_text(encoding="utf-8")
     create_route = source.split("async def create_datasource(", 1)[1].split(
         "\n\n@app.", 1
     )[0]

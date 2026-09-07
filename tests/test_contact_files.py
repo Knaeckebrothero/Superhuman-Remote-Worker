@@ -1,6 +1,6 @@
 """contacts/<slug>.md rendering — pure functions, no I/O."""
 
-from src.core.contact_files import (
+from agent.core.contact_files import (
     contact_slug,
     contacts_to_workspace_files,
     render_contact_md,

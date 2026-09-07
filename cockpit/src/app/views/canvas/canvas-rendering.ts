@@ -48,16 +48,13 @@ const STATIC_HTML_ATTRIBUTES = [
 export const STATIC_HTML_CSP =
   "default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; " +
   "img-src 'none'; font-src 'none'; connect-src 'none'; form-action 'none'; " +
-  "base-uri 'none'; object-src 'none';";
+  "base-uri about:; object-src 'none'; child-src 'none'; frame-src 'none';";
 
 export const INTERACTIVE_HTML_CSP =
   "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; " +
   "img-src data:; font-src data:; media-src data:; connect-src 'none'; " +
-  "form-action 'none'; base-uri 'none'; object-src 'none'; child-src 'none'; " +
+  "form-action 'none'; base-uri about:; object-src 'none'; child-src 'none'; " +
   "frame-src 'none'; webrtc 'block';";
-
-const CANVAS_FRAME_WRAPPER_CSP =
-  "default-src 'none'; style-src 'unsafe-inline'; frame-src blob:; child-src blob:;";
 
 export const CANVAS_MATH_MAX_EXPRESSIONS = 256;
 export const CANVAS_MATH_MAX_EXPRESSION_CHARS = 4_096;
@@ -68,6 +65,11 @@ export const CANVAS_MARKDOWN_MAX_SYNTAX_MARKERS = 40_000;
 export const CANVAS_MARKDOWN_MAX_SOURCE_CHARS = 2 * 1024 * 1024;
 export const CANVAS_RENDER_MAX_NODES = 20_000;
 export const CANVAS_RENDER_MAX_OUTPUT_CHARS = 4 * 1024 * 1024;
+// HTML attribute serialization can expand each accepted inner-document character
+// to a six-character entity. Keep that bounded without rejecting any document
+// which already passed CANVAS_RENDER_MAX_OUTPUT_CHARS.
+export const CANVAS_FRAME_WRAPPER_MAX_OUTPUT_CHARS =
+  CANVAS_RENDER_MAX_OUTPUT_CHARS * 6 + 16_384;
 export const CANVAS_STATIC_MAX_STYLE_ATTRIBUTE_CHARS = 2_048;
 export const CANVAS_STATIC_MAX_TOTAL_STYLE_CHARS = 64 * 1024;
 
@@ -553,7 +555,7 @@ function exceedsStaticHtmlDelimiterBudget(source: string): boolean {
 }
 
 /**
- * Strict static HTML becomes an opaque, script-free Blob document. Sanitization and
+ * Strict static HTML becomes an opaque, script-free srcdoc document. Sanitization and
  * CSP are both required; neither is treated as a substitute for the other.
  */
 export function renderCanvasStaticHtml(source: string): CanvasRenderResult {
@@ -577,6 +579,14 @@ export function renderCanvasStaticHtml(source: string): CanvasRenderResult {
     SANITIZE_NAMED_PROPS: true,
   }) as unknown as DocumentFragment;
 
+  const sanitizedTargets = new Map<string, string>();
+  for (const element of Array.from(fragment.querySelectorAll<HTMLElement>('[id]'))) {
+    const id = element.id;
+    if (id.startsWith('user-content-')) {
+      sanitizedTargets.set(id.slice('user-content-'.length), id);
+    }
+  }
+
   let totalStyleChars = 0;
   for (const element of Array.from(fragment.querySelectorAll('*'))) {
     // DOMPurify already removes on* attributes; the loop is a second explicit
@@ -588,7 +598,13 @@ export function renderCanvasStaticHtml(source: string): CanvasRenderResult {
 
     if (element instanceof HTMLAnchorElement) {
       const href = element.getAttribute('href') ?? '';
-      if (!/^#[A-Za-z0-9_.:-]*$/.test(href)) element.removeAttribute('href');
+      if (!/^#[A-Za-z0-9_.:-]*$/.test(href)) {
+        element.removeAttribute('href');
+      } else if (href.length > 1) {
+        const target = sanitizedTargets.get(href.slice(1));
+        if (target) element.setAttribute('href', `#${target}`);
+        else element.removeAttribute('href');
+      }
       element.removeAttribute('target');
       element.removeAttribute('download');
     } else {
@@ -620,6 +636,7 @@ function wrapStaticHtml(body: string): string {
   return (
     '<!doctype html><html><head>' +
     `<meta http-equiv="Content-Security-Policy" content="${escapeHtml(STATIC_HTML_CSP)}">` +
+    '<base href="about:srcdoc" target="_self">' +
     '<meta name="referrer" content="no-referrer"></head><body>' +
     body +
     '</body></html>'
@@ -643,11 +660,13 @@ export function renderCanvasInteractiveHtml(source: string): CanvasRenderResult 
   const csp = parsed.createElement('meta');
   csp.httpEquiv = 'Content-Security-Policy';
   csp.content = INTERACTIVE_HTML_CSP;
+  const base = parsed.createElement('base');
+  base.href = 'about:srcdoc';
+  base.target = '_self';
   const referrer = parsed.createElement('meta');
   referrer.name = 'referrer';
   referrer.content = 'no-referrer';
-  parsed.head.insertBefore(referrer, parsed.head.firstChild);
-  parsed.head.insertBefore(csp, parsed.head.firstChild);
+  parsed.head.prepend(csp, base, referrer);
 
   const html = `<!doctype html>${parsed.documentElement.outerHTML}`;
   if (html.length > CANVAS_RENDER_MAX_OUTPUT_CHARS) return CANVAS_CONTENT_TOO_COMPLEX;
@@ -655,21 +674,27 @@ export function renderCanvasInteractiveHtml(source: string): CanvasRenderResult 
 }
 
 /**
- * Build the trusted outer document for a Blob-backed Canvas document. The
- * nested frame gives fragment links a real document URL while the outer CSP
- * blocks any attempted navigation away from Blob documents.
+ * Build the trusted outer document around an inline Canvas document. The
+ * nested srcdoc keeps both frames opaque, while the outer frame-src 'none'
+ * policy blocks every real child navigation without blocking about:srcdoc
+ * creation or same-document fragment changes.
  */
 export function buildCanvasFrameWrapper(
-  contentUrl: string,
+  contentHtml: string,
   title: string,
   allowScripts: boolean,
-): string {
-  if (typeof document === 'undefined' || !contentUrl.startsWith('blob:')) return '';
+): CanvasRenderResult {
+  if (
+    typeof document === 'undefined' ||
+    contentHtml.length > CANVAS_RENDER_MAX_OUTPUT_CHARS
+  ) {
+    return CANVAS_CONTENT_TOO_COMPLEX;
+  }
 
   const wrapper = document.implementation.createHTMLDocument('');
   const csp = wrapper.createElement('meta');
   csp.httpEquiv = 'Content-Security-Policy';
-  csp.content = CANVAS_FRAME_WRAPPER_CSP;
+  csp.content = allowScripts ? INTERACTIVE_HTML_CSP : STATIC_HTML_CSP;
   const referrer = wrapper.createElement('meta');
   referrer.name = 'referrer';
   referrer.content = 'no-referrer';
@@ -680,7 +705,7 @@ export function buildCanvasFrameWrapper(
   wrapper.head.replaceChildren(csp, referrer, style);
 
   const frame = wrapper.createElement('iframe');
-  frame.src = contentUrl;
+  frame.srcdoc = contentHtml;
   frame.title = title.trim() || 'Canvas preview';
   frame.loading = 'lazy';
   frame.referrerPolicy = 'no-referrer';
@@ -691,5 +716,9 @@ export function buildCanvasFrameWrapper(
       "clipboard-read 'none'; clipboard-write 'none'",
   );
   wrapper.body.replaceChildren(frame);
-  return `<!doctype html>${wrapper.documentElement.outerHTML}`;
+  const html = `<!doctype html>${wrapper.documentElement.outerHTML}`;
+  if (html.length > CANVAS_FRAME_WRAPPER_MAX_OUTPUT_CHARS) {
+    return CANVAS_CONTENT_TOO_COMPLEX;
+  }
+  return {html, errorCode: null};
 }

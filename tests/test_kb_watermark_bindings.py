@@ -35,12 +35,13 @@ pytest.importorskip("testcontainers.postgres")
 
 from orchestrator.database.migrate import run_migrations  # noqa: E402
 from orchestrator.database.postgres import PostgresDB  # noqa: E402
-from src.services.knowledge_store import KnowledgeStore  # noqa: E402
+from shared.runtime.services.knowledge_store import KnowledgeStore  # noqa: E402
 
 # pgvector, not plain postgres: the vector migrations CREATE EXTENSION vector.
 PG_IMAGE = "pgvector/pgvector:pg15"
 VECTOR_MIGRATIONS = (
     Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "migrations"

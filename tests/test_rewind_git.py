@@ -10,11 +10,11 @@ from uuid import UUID
 
 import pytest
 
-from src.managers.git_manager import (
+from agent.managers.git_manager import (
     GitManager,
     WorkspaceUndoInvariantViolation,
 )
-from src.services.workspace_undo import apply_workspace_undo
+from agent.services.workspace_undo import apply_workspace_undo
 
 
 UNDO_REQUEST_ID = UUID("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")

@@ -5,39 +5,12 @@ Tests the stateful todo management for the nested loop graph architecture.
 
 import pytest
 import tempfile
-import sys
-import importlib.util
 from datetime import datetime
 from pathlib import Path
 
-# Add project root to path
-project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-
-
-def _import_module_directly(module_path: Path, module_name: str):
-    """Import a module directly without triggering __init__.py side effects."""
-    spec = importlib.util.spec_from_file_location(module_name, module_path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-# Import workspace manager first (dependency)
-workspace_path = project_root / "src" / "core" / "workspace.py"
-workspace_module = _import_module_directly(workspace_path, "test_workspace_mgr")
-WorkspaceManager = workspace_module.WorkspaceManager
-
-from tests._fs_backend import FilesystemTestBackend  # noqa: E402
-
-# Import the todo module
-todo_path = project_root / "src" / "managers" / "todo.py"
-todo_module = _import_module_directly(todo_path, "test_todo_manager")
-TodoManager = todo_module.TodoManager
-TodoItem = todo_module.TodoItem
-TodoStatus = todo_module.TodoStatus
+from agent.core.workspace import WorkspaceManager
+from agent.managers.todo import TodoManager, TodoItem, TodoStatus
+from tests._fs_backend import FilesystemTestBackend
 
 
 @pytest.fixture
@@ -664,7 +637,7 @@ class TestTodoManagerStatePersistence:
         state = todo_manager.export_state()
 
         # Create a new manager and restore
-        from src.managers.todo import TodoManager
+        from agent.managers.todo import TodoManager
 
         new_manager = TodoManager(todo_manager._workspace)
         new_manager.restore_state(state)
@@ -876,7 +849,7 @@ class TestTodoManagerPhaseStatePersistence:
         state = todo_manager.export_state()
 
         # Create new manager and restore
-        from src.managers.todo import TodoManager
+        from agent.managers.todo import TodoManager
 
         new_manager = TodoManager(todo_manager._workspace)
         new_manager.restore_state(state)

@@ -23,6 +23,28 @@ If release name contains chart name, don't repeat it.
 {{- end }}
 
 {{/*
+Orchestrator Kubernetes-mutation authority epoch. Only the ServiceAccount
+named by the current chart receives the namespace RoleBinding. Advancing the
+epoch therefore revokes predecessor replicas before their replacement image
+can own workspace lifecycle mutations. Reserve the suffix length explicitly:
+long release names must not truncate the authority epoch away.
+*/}}
+{{- define "srw.orchestratorServiceAccountName" -}}
+{{- $epoch := .Values.orchestrator.workspaceLifecycleServiceAccountGeneration | default "0197" | toString -}}
+{{- $base := include "srw.fullname" . | trunc 43 | trimSuffix "-" -}}
+{{- printf "%s-ows%s" $base $epoch | trunc 63 | trimSuffix "-" -}}
+{{- end }}
+
+{{/*
+Temporary cross-namespace pinned adoption RBAC. Preserve the semantic suffix
+while keeping every legal long Helm release name within DNS-1123's 63 bytes.
+*/}}
+{{- define "srw.pinnedLegacyAuthorityName" -}}
+{{- $base := include "srw.fullname" . | trunc 39 | trimSuffix "-" -}}
+{{- printf "%s-pinned-legacy-authority" $base -}}
+{{- end }}
+
+{{/*
 Common labels applied to all resources.
 */}}
 {{- define "srw.labels" -}}
@@ -257,16 +279,46 @@ authority even when every timing knob remains unchanged.
 {{- end -}}
 {{- end }}
 
+{{/*
+Whether the bundled protected-effect lane is deployed.
+
+`nextcloud.protectedEffect.enabled` is deliberately tri-state:
+
+  unset (default) — derive it. Protected cloud mode has exactly one valid
+                    server topology, so a bundled+internal Nextcloud follows
+                    agent.protectedCloudModeEnabled rather than making the
+                    operator assert the same decision twice.
+  true            — deploy the lane regardless of the feature flag. This is the
+                    staged rollout: stand the lane (and its adoption-once HMAC
+                    root) up first, verify it, then flip the flag.
+  false           — refuse to deploy it. Combined with protected cloud mode
+                    this is a contradiction and still fails the render, because
+                    the mode is inert without the lane (nextcloud.py raises
+                    NOT_SUPPORTED on every capability request).
+*/}}
+{{- define "srw.nextcloudProtectedEffectEnabled" -}}
+{{- $effect := .Values.nextcloud.protectedEffect -}}
+{{- if kindIs "invalid" $effect.enabled -}}
+{{- $protectedCloud := eq (lower (toString .Values.agent.protectedCloudModeEnabled)) "true" -}}
+{{- if and $protectedCloud .Values.nextcloud.enabled .Values.nextcloud.internal -}}true{{- end -}}
+{{- else if $effect.enabled -}}true{{- end -}}
+{{- end }}
+
 {{- define "srw.nextcloudProtectedEffectValidate" -}}
 {{- $effect := .Values.nextcloud.protectedEffect -}}
+{{- $effectEnabled := eq (include "srw.nextcloudProtectedEffectEnabled" .) "true" -}}
 {{- $protectedCloud := eq (lower (toString .Values.agent.protectedCloudModeEnabled)) "true" -}}
-{{- if and $protectedCloud .Values.nextcloud.enabled (not $effect.enabled) -}}
-  {{- fail "agent.protectedCloudModeEnabled=true with bundled Nextcloud requires nextcloud.protectedEffect.enabled=true" -}}
+{{- if and $protectedCloud .Values.nextcloud.enabled (not $effectEnabled) -}}
+  {{- if kindIs "invalid" $effect.enabled -}}
+    {{- fail "agent.protectedCloudModeEnabled=true requires a bundled nextcloud.internal=true deployment; the protected-effect lane cannot be derived for an external Nextcloud" -}}
+  {{- else -}}
+    {{- fail "agent.protectedCloudModeEnabled=true with bundled Nextcloud contradicts nextcloud.protectedEffect.enabled=false; unset it to derive the lane from the feature flag, or turn the flag off" -}}
+  {{- end -}}
 {{- end -}}
 {{- if and $protectedCloud (eq (default "" .Values.cloud.externalBackend) "nextcloud") -}}
   {{- fail "agent.protectedCloudModeEnabled=true is not supported for external Nextcloud without an attested server-enforced protected-effect lane" -}}
 {{- end -}}
-{{- if $effect.enabled -}}
+{{- if $effectEnabled -}}
   {{- if not (and .Values.nextcloud.enabled .Values.nextcloud.internal) -}}
     {{- fail "nextcloud.protectedEffect.enabled requires bundled nextcloud.enabled=true and nextcloud.internal=true; external Nextcloud is ineligible without an equivalent server-enforced effect lane" -}}
   {{- end -}}
@@ -341,6 +393,29 @@ Centralized so every URL helper picks up local-dev (no-TLS) deployments.
 
 {{- define "srw.apiUrl" -}}
 {{- printf "%s://%s" (include "srw.urlScheme" .) (include "srw.host" (dict "context" . "key" "api" "default" "api")) }}
+{{- end }}
+
+{{/*
+The origin cockpit's own SPA actually dials for the API — NOT always
+"srw.apiUrl". When `auth.bff.sameOriginApi` is on, cockpit's served env.js
+points `apiUrl` at the cockpit's own origin (`srw.cockpitUrl`) instead, so
+same-origin path routing on the cockpit ingress can carry `/api`, `/auth`,
+`/ws` without a cross-site cookie (see cockpit/deployment.yaml's env.js
+ternary, which this mirrors exactly — keep the two in sync).
+
+Any ingress rule that must match wherever the BROWSER's own JS will dial —
+as opposed to the REST api ingress, which is deliberately host-pinned to
+`srw.apiUrl` regardless of this flag — needs to key off THIS helper, not
+`srw.apiUrl` directly. Ported to ssh-gateway/ingress.yaml after a live gate
+(task-7-brief.md, controller correction C1) found the two host names had
+drifted apart: cockpit dialled `apiHost` (`new URL(environment.apiUrl)
+.hostname`, persistent-chat.component.ts) on the cockpit origin, but the
+gateway's WSS ingress was still pinned to the bare `srw.apiUrl` host, so a
+generated ProxyCommand routed to the orchestrator's own ASGI app instead of
+the gateway pod and came back a bare 403 with nothing in the gateway's logs.
+*/}}
+{{- define "srw.cockpitFacingApiUrl" -}}
+{{- ternary (include "srw.cockpitUrl" .) (include "srw.apiUrl" .) .Values.auth.bff.sameOriginApi }}
 {{- end }}
 
 {{- define "srw.authUrl" -}}
@@ -881,6 +956,21 @@ operator-precreated Secret keeps its explicit name.
 {{- end -}}
 
 {{/*
+Effective Secret name consumed by CloudNativePG's DatabaseRole. Chart-created
+and Vault/ESO credentials get a dedicated basic-auth projection so upgrades do
+not have to mutate the type of the gateway's long-lived Opaque Secret. An
+operator-precreated CNPG-compatible Secret can serve both consumers.
+*/}}
+{{- define "srw.canvasGatewayDatabaseRoleSecretName" -}}
+{{- $credentials := .Values.canvas.livePreview.viewer.database.credentials -}}
+{{- if or $credentials.create (ne (trim $credentials.vaultPath) "") -}}
+{{- printf "%s-canvas-gateway-db-cnpg" (include "srw.fullname" .) -}}
+{{- else -}}
+{{- $credentials.existingSecret -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Keycloak SMTP port and STARTTLS flag for the realm bootstrap (kcadm).
 
 Both are WHITELISTS, not sanitizers: each emits either a literal drawn from a
@@ -1268,5 +1358,104 @@ Takes: dict "params" $params "limitMi" $limitMi "name" <cluster name>
 {{- $floor := add $sb $mwm (mul $avwm $workers) -}}
 {{- if ge (int $floor) (int $limitMi) -}}
 {{- fail (printf "database %s: shared_buffers (%dMi) + maintenance_work_mem (%dMi) + autovacuum_work_mem (%dMi x %d workers) = %dMi, which is at or above the memory limit of %dMi. That is an OOM kill during the first index build or autovacuum, not a slow one. Raise cnpgResources.limits.memory, lower databases.tuning.sharedBuffersPercent, or set autovacuum_work_mem explicitly -- it defaults to maintenance_work_mem, once per worker." .name $sb $mwm $avwm $workers $floor $limitMi) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+=============================================================================
+SSH gateway (templates/ssh-gateway/*, plus the orchestrator's host-key
+publication mount).
+=============================================================================
+*/}}
+
+{{- define "srw.sshGatewayName" -}}
+{{- printf "%s-ssh-gateway" (include "srw.fullname" .) -}}
+{{- end }}
+
+{{/*
+Where the gateway's host-key Secret is projected. The SAME path in both pods:
+the gateway mounts the private halves here, the orchestrator mounts only the
+`.pub` halves here, and both environment variables below are built from this
+one string so a moved mount cannot leave a stale path behind.
+*/}}
+{{- define "srw.sshGatewayHostKeyDir" -}}/run/secrets/ssh-gateway/host{{- end }}
+{{- define "srw.sshGatewayCaDir" -}}/run/secrets/ssh-gateway/ca{{- end }}
+
+{{/*
+`SSH_GATEWAY_HOST_KEYS` — the PRIVATE key paths the gateway process loads.
+*/}}
+{{- define "srw.sshGatewayHostKeyPaths" -}}
+{{- $dir := include "srw.sshGatewayHostKeyDir" . -}}
+{{- $paths := list -}}
+{{- range .Values.sshGateway.hostKeyNames -}}
+{{- $paths = append $paths (printf "%s/%s" $dir .) -}}
+{{- end -}}
+{{- join "," $paths -}}
+{{- end }}
+
+{{/*
+`SSH_GATEWAY_PUBLIC_HOST_KEYS` — the PUBLIC key paths the orchestrator's
+`GET /api/ssh/host-keys` reads and publishes.
+
+Rendered from the same `hostKeyNames` list as the private paths above, on
+purpose. These are two variables in two different Deployments read by two
+different processes, with no runtime cross-check anywhere: when they drift,
+an SSH client sees a host-key mismatch that is indistinguishable from an
+active MITM. One list is the only thing that makes drift unrepresentable.
+
+Pointing this at the PRIVATE files would also "work" (asyncssh's
+import_public_key emits only public material) and is deliberately not done:
+it would put the gateway's host private keys in a second pod for no benefit.
+*/}}
+{{- define "srw.sshGatewayPublicHostKeyPaths" -}}
+{{- $dir := include "srw.sshGatewayHostKeyDir" . -}}
+{{- $paths := list -}}
+{{- range .Values.sshGateway.hostKeyNames -}}
+{{- $paths = append $paths (printf "%s/%s.pub" $dir .) -}}
+{{- end -}}
+{{- join "," $paths -}}
+{{- end }}
+
+{{/*
+Every precondition `services/ssh_gateway_config.load_config` fails closed on,
+checked at render time instead. Included from the gateway Deployment (which
+renders whenever the component is enabled), so one `fail` aborts the whole
+release rather than shipping a pod that cannot boot.
+
+Emits nothing.
+*/}}
+{{- define "srw.sshGatewayValidate" -}}
+{{- $gw := .Values.sshGateway -}}
+{{- if empty $gw.allowedOrigins -}}
+{{- fail "sshGateway.enabled requires a non-empty sshGateway.allowedOrigins; an empty list would accept cross-site WebSocket handshakes, and load_config refuses to boot without it" -}}
+{{- end -}}
+{{- if eq (trim $gw.hostKeySecret) "" -}}
+{{- fail "sshGateway.enabled requires sshGateway.hostKeySecret. The chart never generates host keys: a generated key would rotate on upgrade and break every user's known_hosts." -}}
+{{- end -}}
+{{- if empty $gw.hostKeyNames -}}
+{{- fail "sshGateway.enabled requires a non-empty sshGateway.hostKeyNames; with no names neither the gateway's SSH_GATEWAY_HOST_KEYS nor the orchestrator's SSH_GATEWAY_PUBLIC_HOST_KEYS has anything to point at" -}}
+{{- end -}}
+{{- range $gw.hostKeyNames -}}
+{{- if regexMatch "(?i)(rsa|ecdsa|dss|dsa)" . -}}
+{{- fail (printf "sshGateway.hostKeyNames entry %q is not an Ed25519 host key. _require_ed25519_host_key (services/ssh_gateway_config.py) raises on any algorithm that is not ssh-ed25519, so the gateway would refuse to start -- a crash-loop three files away from this value. Use ssh_host_ed25519_key. (Naming-convention tripwire only; the load-time check is the real enforcement.)" .) -}}
+{{- end -}}
+{{- end -}}
+{{- if eq (trim $gw.userCaSecret) "" -}}
+{{- fail "sshGateway.enabled requires sshGateway.userCaSecret (the user CA the gateway signs inner-hop certificates with)" -}}
+{{- end -}}
+{{- if and (empty .Values.sessionRouter.jwtSecret) (empty .Values.sessionRouter.jwtSecretName) -}}
+{{- fail "sshGateway.enabled requires a configured sessionRouter JWT secret (sessionRouter.jwtSecret for the chart-rendered Secret, or sessionRouter.jwtSecretName for one you own). SESSION_JWT_SECRET is the HMAC key the gateway verifies the attach token the orchestrator mints with; load_config refuses to boot without it. With neither value set no Secret is rendered at all, the secretKeyRef is `optional: true`, and the gateway crash-loops with the reason three files away from the values file." -}}
+{{- end -}}
+{{- if eq (trim $gw.trustedProxies) "" -}}
+{{- fail "sshGateway.enabled requires sshGateway.trustedProxies: the source addresses whose X-Forwarded-For header the gateway may believe (the ingress hop, as an IP/CIDR list), or the literal string \"none\" when nothing proxies it. Left unset behind an ingress every WSS client is rate limited as one source and the seventeenth concurrent user is refused." -}}
+{{- end -}}
+{{- if or (lt (int $gw.tcp.port) 1024) (gt (int $gw.tcp.port) 65535) -}}
+{{- fail (printf "sshGateway.tcp.port must be between 1024 and 65535 (got %v). The gateway runs as uid 999 with every capability dropped, so it cannot bind a privileged port: the accept loop would never come up, /healthz would answer 503 forever, and the pod would never go Ready." $gw.tcp.port) -}}
+{{- end -}}
+{{- if and $gw.tcp.enabled (empty $gw.tcp.allowedClientCIDRs) -}}
+{{- fail "sshGateway.tcp.enabled requires sshGateway.tcp.allowedClientCIDRs; an unscoped SSH LoadBalancer is not a supported default" -}}
+{{- end -}}
+{{- if and $gw.networkPolicy.enabled (or (empty $gw.networkPolicy.edgeNamespaceSelector) (empty $gw.networkPolicy.edgePodSelector)) -}}
+{{- fail "sshGateway.networkPolicy.enabled requires non-empty edgeNamespaceSelector and edgePodSelector; an empty selector matches everything, which is not a policy" -}}
 {{- end -}}
 {{- end }}

@@ -209,6 +209,85 @@
         }
       }
     },
+    "agent": {
+      "type": "object",
+      "properties": {
+        "pinnedLegacyNamespaces": {
+          "type": "array",
+          "maxItems": 15,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 63,
+            "pattern": "^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "searxng": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "image": {
+          "type": "string",
+          "minLength": 1
+        },
+        "service": {
+          "type": "object",
+          "properties": {
+            "port": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535
+            }
+          }
+        },
+        "resources": {
+          "type": "object"
+        }
+      }
+    },
+    "crawl4ai": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "image": {
+          "type": "string",
+          "minLength": 1
+        },
+        "service": {
+          "type": "object",
+          "properties": {
+            "port": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535
+            }
+          }
+        },
+        "apiTokenSecret": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "key": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "resources": {
+          "type": "object"
+        }
+      }
+    },
     "provenance": {
       "type": "object",
       "properties": {
@@ -240,6 +319,9 @@
               "$ref": "#/definitions/componentProvenanceDeclaration"
             },
             "workspace": {
+              "$ref": "#/definitions/componentProvenanceDeclaration"
+            },
+            "vmController": {
               "$ref": "#/definitions/componentProvenanceDeclaration"
             }
           }
@@ -630,7 +712,7 @@
         "protectedEffect": {
           "type": "object",
           "properties": {
-            "enabled": { "type": "boolean" },
+            "enabled": { "type": ["boolean", "null"] },
             "hmacSecretName": { "type": "string" },
             "hmacVaultPath": { "type": "string" },
             "fpmImage": { "type": "string", "minLength": 1 },
@@ -789,6 +871,9 @@
                           "type": "string",
                           "maxLength": 253,
                           "pattern": "^$|^[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?$"
+                        },
+                        "existingSecretCnpgCompatible": {
+                          "type": "boolean"
                         },
                         "vaultPath": {
                           "type": "string",
@@ -952,6 +1037,7 @@
                             "required": [
                               "create",
                               "existingSecret",
+                              "existingSecretCnpgCompatible",
                               "vaultPath",
                               "passwordKey"
                             ]
@@ -1003,42 +1089,6 @@
                       },
                       "pslBoundaryVerified": {
                         "const": true
-                      },
-                      "database": {
-                        "properties": {
-                          "credentials": {
-                            "properties": {
-                              "create": {
-                                "const": false
-                              }
-                            },
-                            "oneOf": [
-                              {
-                                "properties": {
-                                  "existingSecret": {
-                                    "minLength": 1
-                                  },
-                                  "vaultPath": {
-                                    "maxLength": 0
-                                  }
-                                }
-                              },
-                              {
-                                "properties": {
-                                  "existingSecret": {
-                                    "maxLength": 0
-                                  },
-                                  "vaultPath": {
-                                    "minLength": 1
-                                  }
-                                }
-                              }
-                            ]
-                          },
-                          "provisionRole": {
-                            "const": false
-                          }
-                        }
                       }
                     }
                   }
@@ -1170,9 +1220,53 @@
     "orchestratorId": {
       "type": "string"
     },
+    "orchestrator": {
+      "type": "object",
+      "properties": {
+        "workspaceCleanupReconciliationEnabled": {
+          "type": "boolean"
+        },
+        "workspaceLifecycleProtocolCutoverEnabled": {
+          "type": "boolean"
+        },
+        "workspaceLifecycleServiceAccountGeneration": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16,
+          "pattern": "^[a-z0-9](?:[a-z0-9-]{0,14}[a-z0-9])?$"
+        },
+        "vmRemoteOperationProtocol": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
     "databases": {
       "type": "object",
       "properties": {
+        "operator": {
+          "type": "object",
+          "properties": {
+            "namespace": {
+              "type": "string",
+              "minLength": 1
+            },
+            "install": {
+              "const": false,
+              "description": "Removed compatibility tombstone. CloudNativePG must be installed as a separate infrastructure release; true is rejected to prevent unsafe operator deletion during upgrade."
+            }
+          },
+          "required": [
+            "namespace"
+          ],
+          "additionalProperties": false
+        },
         "postgres": {
           "type": "object",
           "properties": {

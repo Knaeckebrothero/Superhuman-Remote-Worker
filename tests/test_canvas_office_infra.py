@@ -81,36 +81,8 @@ def test_collabora_runtime_config_and_network_policy_fail_closed() -> None:
     assert "{{- if .Values.collabora.enabled }}" in ingress
 
 
-def test_collabora_compose_and_ci_wiring_is_complete() -> None:
-    compose_files = (
-        ROOT / "docker-compose.yaml",
-        ROOT / "docker-compose.local.yaml",
-    )
+def test_collabora_public_example_and_ci_wiring_is_complete() -> None:
     public_example = (ROOT / ".env.example").read_text()
-
-    for compose_file in compose_files:
-        compose = compose_file.read_text()
-        for name in (
-            "COLLABORA_ENABLED",
-            "COLLABORA_INTERNAL_URL",
-            "COLLABORA_PUBLIC_URL",
-            "COLLABORA_WOPI_BASE_URL",
-            "COLLABORA_COCKPIT_ORIGIN",
-            "COLLABORA_TOKEN_TTL_SECONDS",
-            "COLLABORA_DISCOVERY_CACHE_TTL_SECONDS",
-            "COLLABORA_DISCOVERY_TIMEOUT_SECONDS",
-            "CANVAS_MAX_OFFICE_BYTES",
-            "SESSION_JWT_SECRET",
-        ):
-            assert name in compose
-        # The public origin is supplied to both orchestrator and Cockpit.
-        assert (
-            sum(
-                line.strip().startswith("COLLABORA_PUBLIC_URL:")
-                for line in compose.splitlines()
-            )
-            == 2
-        )
 
     for name in (
         "COLLABORA_ENABLED",

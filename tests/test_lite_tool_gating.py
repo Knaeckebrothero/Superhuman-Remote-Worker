@@ -13,16 +13,9 @@ session (``persistent_session.py``) bind seams both call after
 """
 
 from __future__ import annotations
-
-import sys
-from pathlib import Path
 from types import SimpleNamespace
 
-_ROOT = Path(__file__).parent.parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-
-from src.tools.registry import (  # noqa: E402
+from agent.tools.registry import (  # noqa: E402
     filter_tools_by_backend,
     get_tools_by_category,
 )
@@ -102,7 +95,7 @@ class TestFilterToolsByBackend:
 # ---------------------------------------------------------------------------
 class TestBackendCapabilityFlags:
     def test_scratch_backend_is_shell_and_file_less(self):
-        from src.core.backends.scratch import ScratchBackend
+        from agent.core.backends.scratch import ScratchBackend
 
         b = ScratchBackend(job_id="t")
         try:
@@ -112,7 +105,7 @@ class TestBackendCapabilityFlags:
             b.disconnect()
 
     def test_virtual_backend_has_files_but_no_shell(self):
-        from src.core.backends.factory import create_lite_backend
+        from agent.core.backends.factory import create_lite_backend
 
         mount = {
             "name": "workspace",

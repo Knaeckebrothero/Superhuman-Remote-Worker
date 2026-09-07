@@ -14,22 +14,14 @@ Import pattern mirrors test_dispatch_phase_credentials.py: ``orchestrator/`` on
 from __future__ import annotations
 
 import os
-import sys
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-_ROOT = Path(__file__).parent.parent
-_ORCH = _ROOT / "orchestrator"
-for _p in (str(_ROOT), str(_ORCH)):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
-
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
-import main  # noqa: E402
-from src.core.backends.factory import create_lite_backend  # noqa: E402
+import orchestrator.main  # noqa: E402
+from agent.core.backends.factory import create_lite_backend  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -38,26 +30,31 @@ from src.core.backends.factory import create_lite_backend  # noqa: E402
 class TestBackendFromOverride:
     def test_dict(self):
         assert (
-            main._backend_from_override({"workspace": {"backend": "virtual"}})
+            orchestrator.main._backend_from_override(
+                {"workspace": {"backend": "virtual"}}
+            )
             == "virtual"
         )
 
     def test_json_string(self):
         assert (
-            main._backend_from_override('{"workspace": {"backend": "none"}}') == "none"
+            orchestrator.main._backend_from_override(
+                '{"workspace": {"backend": "none"}}'
+            )
+            == "none"
         )
 
     def test_none(self):
-        assert main._backend_from_override(None) is None
+        assert orchestrator.main._backend_from_override(None) is None
 
     def test_no_workspace_key(self):
-        assert main._backend_from_override({"llm": {"model": "x"}}) is None
+        assert orchestrator.main._backend_from_override({"llm": {"model": "x"}}) is None
 
     def test_bad_json_string(self):
-        assert main._backend_from_override("not json at all") is None
+        assert orchestrator.main._backend_from_override("not json at all") is None
 
     def test_non_dict_workspace(self):
-        assert main._backend_from_override({"workspace": "oops"}) is None
+        assert orchestrator.main._backend_from_override({"workspace": "oops"}) is None
 
 
 # ---------------------------------------------------------------------------
@@ -76,14 +73,14 @@ class TestVirtualWorkspaceRcloneSpec:
 
     def test_unset_type_returns_none(self, monkeypatch):
         monkeypatch.delenv("VIRTUAL_WORKSPACE_RCLONE_TYPE", raising=False)
-        assert main._virtual_workspace_rclone_spec() is None
+        assert orchestrator.main._virtual_workspace_rclone_spec() is None
 
     def test_s3_builds_spec_from_discrete_env(self, monkeypatch):
         monkeypatch.setenv("VIRTUAL_WORKSPACE_RCLONE_TYPE", "s3")
         monkeypatch.setenv("VIRTUAL_WORKSPACE_RCLONE_ROOT", "srw-workspaces")
         for key, value in self.S3_ENV.items():
             monkeypatch.setenv(key, value)
-        spec = main._virtual_workspace_rclone_spec()
+        spec = orchestrator.main._virtual_workspace_rclone_spec()
         assert spec["type"] == "s3"
         assert spec["root"] == "srw-workspaces"
         # no_check_bucket is baked in (scoped key can't create the bucket).
@@ -102,7 +99,7 @@ class TestVirtualWorkspaceRcloneSpec:
         monkeypatch.setenv("VIRTUAL_WORKSPACE_S3_SECRET_ACCESS_KEY", "S")
         for key in ("VIRTUAL_WORKSPACE_S3_PROVIDER", "VIRTUAL_WORKSPACE_S3_REGION"):
             monkeypatch.delenv(key, raising=False)
-        config = main._virtual_workspace_rclone_spec()["config"]
+        config = orchestrator.main._virtual_workspace_rclone_spec()["config"]
         assert config["provider"] == "Minio"
         assert config["region"] == "us-east-1"
         assert config["no_check_bucket"] == "true"
@@ -113,7 +110,7 @@ class TestVirtualWorkspaceRcloneSpec:
         # s3 creds are ignored for non-s3 types — config stays empty.
         for key in self.S3_ENV:
             monkeypatch.setenv(key, "leaked")
-        assert main._virtual_workspace_rclone_spec() == {
+        assert orchestrator.main._virtual_workspace_rclone_spec() == {
             "type": "memory",
             "config": {},
             "root": "",
@@ -126,14 +123,19 @@ class TestVirtualWorkspaceRcloneSpec:
 class TestInjectLiteWorkspaceConfig:
     def test_non_lite_returns_unchanged(self):
         co = {"workspace": {"backend": "sandbox"}}
-        assert main._inject_lite_workspace_config(co, prefix="jobs/j/") is co
+        assert (
+            orchestrator.main._inject_lite_workspace_config(co, prefix="jobs/j/") is co
+        )
 
     def test_none_override_stays_none(self):
         # backend is None -> not lite -> no enrichment, no crash.
-        assert main._inject_lite_workspace_config(None, prefix="jobs/j/") is None
+        assert (
+            orchestrator.main._inject_lite_workspace_config(None, prefix="jobs/j/")
+            is None
+        )
 
     def test_none_backend_git_off_no_mounts(self):
-        co = main._inject_lite_workspace_config(
+        co = orchestrator.main._inject_lite_workspace_config(
             {"workspace": {"backend": "none"}}, prefix="jobs/j/"
         )
         ws = co["workspace"]
@@ -142,7 +144,7 @@ class TestInjectLiteWorkspaceConfig:
         assert "mounts" not in ws
 
     def test_none_backend_strips_stray_mounts(self):
-        co = main._inject_lite_workspace_config(
+        co = orchestrator.main._inject_lite_workspace_config(
             {"workspace": {"backend": "none", "mounts": [{"x": 1}]}},
             prefix="jobs/j/",
         )
@@ -152,7 +154,7 @@ class TestInjectLiteWorkspaceConfig:
         monkeypatch.setenv("VIRTUAL_WORKSPACE_RCLONE_TYPE", "memory")
         monkeypatch.delenv("VIRTUAL_WORKSPACE_S3_ACCESS_KEY_ID", raising=False)
         monkeypatch.delenv("VIRTUAL_WORKSPACE_RCLONE_ROOT", raising=False)
-        co = main._inject_lite_workspace_config(
+        co = orchestrator.main._inject_lite_workspace_config(
             {"workspace": {"backend": "virtual"}}, prefix="jobs/j7/"
         )
         ws = co["workspace"]
@@ -167,8 +169,8 @@ class TestInjectLiteWorkspaceConfig:
 
     def test_virtual_without_objectstore_raises(self, monkeypatch):
         monkeypatch.delenv("VIRTUAL_WORKSPACE_RCLONE_TYPE", raising=False)
-        with pytest.raises(main.LiteWorkspaceConfigError):
-            main._inject_lite_workspace_config(
+        with pytest.raises(orchestrator.main.LiteWorkspaceConfigError):
+            orchestrator.main._inject_lite_workspace_config(
                 {"workspace": {"backend": "virtual"}}, prefix="jobs/j/"
             )
 
@@ -182,24 +184,24 @@ class TestRepositoryDatasourceNames:
             {"type": "postgresql", "name": "pg"},
             {"type": "repository", "name": "repo1"},
         ]
-        assert main._repository_datasource_names(ds) == ["repo1"]
+        assert orchestrator.main._repository_datasource_names(ds) == ["repo1"]
 
     def test_case_insensitive(self):
-        assert main._repository_datasource_names(
+        assert orchestrator.main._repository_datasource_names(
             [{"type": "Repository", "name": "r"}]
         ) == ["r"]
 
     def test_id_fallback_when_no_name(self):
-        assert main._repository_datasource_names(
+        assert orchestrator.main._repository_datasource_names(
             [{"type": "repository", "id": "abc"}]
         ) == ["abc"]
 
     def test_empty_and_none(self):
-        assert main._repository_datasource_names(None) == []
-        assert main._repository_datasource_names([]) == []
+        assert orchestrator.main._repository_datasource_names(None) == []
+        assert orchestrator.main._repository_datasource_names([]) == []
 
     def test_skips_non_dict_entries(self):
-        assert main._repository_datasource_names(
+        assert orchestrator.main._repository_datasource_names(
             ["junk", {"type": "repository", "name": "r"}]
         ) == ["r"]
 
@@ -213,35 +215,37 @@ class TestLiteNeverProvisions:
         # the module references for stand-ins that report available. This is
         # the worst case for the lite short-circuit: a provisioner *is* ready.
         monkeypatch.setattr(
-            main, "container_provisioner", SimpleNamespace(is_available=True)
+            orchestrator.main,
+            "container_provisioner",
+            SimpleNamespace(is_available=True),
         )
         monkeypatch.setattr(
-            main, "docker_provisioner", SimpleNamespace(is_available=True)
+            orchestrator.main, "docker_provisioner", SimpleNamespace(is_available=True)
         )
 
     def test_virtual_does_not_need_sandbox(self, monkeypatch):
         self._force_provisioners_available(monkeypatch)
         job = {"config_override": {"workspace": {"backend": "virtual"}}}
-        assert main._job_needs_sandbox(job) is False
+        assert orchestrator.main._job_needs_sandbox(job) is False
 
     def test_none_does_not_need_sandbox(self, monkeypatch):
         self._force_provisioners_available(monkeypatch)
         job = {"config_override": {"workspace": {"backend": "none"}}}
-        assert main._job_needs_sandbox(job) is False
+        assert orchestrator.main._job_needs_sandbox(job) is False
 
     def test_unset_backend_still_needs_sandbox(self, monkeypatch):
         # Sanity: the stand-ins really do report available, so the lite=False
         # results above are the short-circuit, not an inert provisioner.
         self._force_provisioners_available(monkeypatch)
-        assert main._job_needs_sandbox({"config_override": {}}) is True
+        assert orchestrator.main._job_needs_sandbox({"config_override": {}}) is True
 
     def test_virtual_does_not_need_vm(self):
         job = {"config_override": {"workspace": {"backend": "virtual"}}}
-        assert main._job_needs_vm(job) is False
+        assert orchestrator.main._job_needs_vm(job) is False
 
     def test_none_does_not_need_vm(self):
         job = {"config_override": {"workspace": {"backend": "none"}}}
-        assert main._job_needs_vm(job) is False
+        assert orchestrator.main._job_needs_vm(job) is False
 
 
 # ---------------------------------------------------------------------------
@@ -258,7 +262,7 @@ class TestPayloadContractRoundtrip:
         monkeypatch.delenv("VIRTUAL_WORKSPACE_S3_ACCESS_KEY_ID", raising=False)
         monkeypatch.delenv("VIRTUAL_WORKSPACE_RCLONE_ROOT", raising=False)
 
-        co = main._inject_lite_workspace_config(
+        co = orchestrator.main._inject_lite_workspace_config(
             {"workspace": {"backend": "virtual"}}, prefix="jobs/roundtrip/"
         )
         ws = co["workspace"]
@@ -279,7 +283,7 @@ class TestPayloadContractRoundtrip:
         assert "notes/" in backend.list_dir("")
 
     def test_none_payload_builds_scratch_backend(self):
-        co = main._inject_lite_workspace_config(
+        co = orchestrator.main._inject_lite_workspace_config(
             {"workspace": {"backend": "none"}}, prefix="jobs/n/"
         )
         cfg = SimpleNamespace(backend=co["workspace"]["backend"], mounts=None)
@@ -302,21 +306,31 @@ class TestLiteSubjobGating:
     lite jobs; all three guards key on ``_is_lite_config_override``."""
 
     def test_lite_backends_detected(self):
-        assert main._is_lite_config_override({"workspace": {"backend": "virtual"}})
-        assert main._is_lite_config_override({"workspace": {"backend": "none"}})
+        assert orchestrator.main._is_lite_config_override(
+            {"workspace": {"backend": "virtual"}}
+        )
+        assert orchestrator.main._is_lite_config_override(
+            {"workspace": {"backend": "none"}}
+        )
 
     def test_full_backends_not_lite(self):
-        assert not main._is_lite_config_override({"workspace": {"backend": "sandbox"}})
-        assert not main._is_lite_config_override({"workspace": {"backend": "vm"}})
+        assert not orchestrator.main._is_lite_config_override(
+            {"workspace": {"backend": "sandbox"}}
+        )
+        assert not orchestrator.main._is_lite_config_override(
+            {"workspace": {"backend": "vm"}}
+        )
 
     def test_missing_or_none_not_lite(self):
-        assert not main._is_lite_config_override(None)
-        assert not main._is_lite_config_override({})
-        assert not main._is_lite_config_override({"llm": {"model": "x"}})
+        assert not orchestrator.main._is_lite_config_override(None)
+        assert not orchestrator.main._is_lite_config_override({})
+        assert not orchestrator.main._is_lite_config_override({"llm": {"model": "x"}})
 
     def test_json_string_override(self):
-        assert main._is_lite_config_override('{"workspace": {"backend": "none"}}')
-        assert not main._is_lite_config_override("not json at all")
+        assert orchestrator.main._is_lite_config_override(
+            '{"workspace": {"backend": "none"}}'
+        )
+        assert not orchestrator.main._is_lite_config_override("not json at all")
 
 
 # ---------------------------------------------------------------------------
@@ -333,7 +347,7 @@ class TestObjectStoreStartupWarning:
 
     def test_silent_only_when_both_seams_configured(self):
         assert (
-            main._object_store_startup_warning(
+            orchestrator.main._object_store_startup_warning(
                 {
                     "S3_ENDPOINT": "http://minio.minio.svc:9000",
                     "VIRTUAL_WORKSPACE_RCLONE_TYPE": "s3",
@@ -343,7 +357,7 @@ class TestObjectStoreStartupWarning:
         )
 
     def test_warns_when_no_store_at_all(self):
-        msg = main._object_store_startup_warning({})
+        msg = orchestrator.main._object_store_startup_warning({})
         assert msg is not None
         assert "LiteWorkspaceConfigError" in msg  # virtual bullet
         assert "snapshots" in msg.lower()  # snapshot bullet
@@ -353,7 +367,9 @@ class TestObjectStoreStartupWarning:
     def test_warns_about_virtual_when_only_snapshots_configured(self):
         # S3_ENDPOINT set (snapshots OK) but the virtual tier is unconfigured —
         # warn about the virtual tier ONLY, don't claim snapshots are disabled.
-        msg = main._object_store_startup_warning({"S3_ENDPOINT": "http://minio:9000"})
+        msg = orchestrator.main._object_store_startup_warning(
+            {"S3_ENDPOINT": "http://minio:9000"}
+        )
         assert msg is not None
         assert "LiteWorkspaceConfigError" in msg
         assert "snapshots" not in msg.lower()
@@ -361,7 +377,7 @@ class TestObjectStoreStartupWarning:
     def test_warns_about_snapshots_when_only_virtual_configured(self):
         # Durable virtual store but no S3_ENDPOINT — warn about snapshots ONLY,
         # don't claim virtual sessions fail.
-        msg = main._object_store_startup_warning(
+        msg = orchestrator.main._object_store_startup_warning(
             {"VIRTUAL_WORKSPACE_RCLONE_TYPE": "s3"}
         )
         assert msg is not None
@@ -369,7 +385,7 @@ class TestObjectStoreStartupWarning:
         assert "LiteWorkspaceConfigError" not in msg
 
     def test_memory_store_flagged_non_durable(self):
-        msg = main._object_store_startup_warning(
+        msg = orchestrator.main._object_store_startup_warning(
             {"VIRTUAL_WORKSPACE_RCLONE_TYPE": "memory"}
         )
         assert msg is not None
@@ -379,7 +395,7 @@ class TestObjectStoreStartupWarning:
     def test_memory_with_snapshots_flags_only_non_durable(self):
         # Snapshots configured + memory virtual — warn only about the non-durable
         # virtual store, not about snapshots.
-        msg = main._object_store_startup_warning(
+        msg = orchestrator.main._object_store_startup_warning(
             {
                 "S3_ENDPOINT": "http://minio:9000",
                 "VIRTUAL_WORKSPACE_RCLONE_TYPE": "memory",
@@ -391,7 +407,7 @@ class TestObjectStoreStartupWarning:
 
     def test_whitespace_values_treated_as_empty(self):
         assert (
-            main._object_store_startup_warning(
+            orchestrator.main._object_store_startup_warning(
                 {"S3_ENDPOINT": "   ", "VIRTUAL_WORKSPACE_RCLONE_TYPE": "  "}
             )
             is not None
@@ -404,24 +420,26 @@ class TestObjectStoreRequiredEnforcement:
     (unset/falsey) stays warn-only. Truthy per the repo convention: true/1/yes."""
 
     def test_warns_not_raises_when_flag_unset(self):
-        msg = main._check_object_store_config({})
+        msg = orchestrator.main._check_object_store_config({})
         assert msg is not None
         assert "Object store not fully configured" in msg
 
     def test_raises_when_required_and_store_missing(self):
         with pytest.raises(RuntimeError, match="refuses to start"):
-            main._check_object_store_config({"OBJECT_STORE_REQUIRED": "true"})
+            orchestrator.main._check_object_store_config(
+                {"OBJECT_STORE_REQUIRED": "true"}
+            )
 
     def test_raises_on_partial_config_when_required(self):
         # snapshots set but virtual tier missing + required -> still fail-closed
         with pytest.raises(RuntimeError):
-            main._check_object_store_config(
+            orchestrator.main._check_object_store_config(
                 {"S3_ENDPOINT": "http://minio:9000", "OBJECT_STORE_REQUIRED": "1"}
             )
 
     def test_no_raise_when_required_and_both_configured(self):
         assert (
-            main._check_object_store_config(
+            orchestrator.main._check_object_store_config(
                 {
                     "S3_ENDPOINT": "http://minio:9000",
                     "VIRTUAL_WORKSPACE_RCLONE_TYPE": "s3",
@@ -433,10 +451,14 @@ class TestObjectStoreRequiredEnforcement:
 
     def test_falsey_flag_values_warn_not_raise(self):
         for val in ("false", "0", "no", "", "  "):
-            msg = main._check_object_store_config({"OBJECT_STORE_REQUIRED": val})
+            msg = orchestrator.main._check_object_store_config(
+                {"OBJECT_STORE_REQUIRED": val}
+            )
             assert msg is not None, f"{val!r} should warn, not raise"
 
     def test_truthy_flag_variants_raise(self):
         for val in ("true", "TRUE", "1", "yes", " Yes "):
             with pytest.raises(RuntimeError):
-                main._check_object_store_config({"OBJECT_STORE_REQUIRED": val})
+                orchestrator.main._check_object_store_config(
+                    {"OBJECT_STORE_REQUIRED": val}
+                )

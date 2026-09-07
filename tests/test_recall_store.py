@@ -12,8 +12,12 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import pytest_asyncio
 
-import src.services.recall_store as recall_store_module
-from src.services.recall_store import MemoryRecord, RecallStore, memory_health
+import shared.runtime.services.recall_store as recall_store_module
+from shared.runtime.services.recall_store import (
+    MemoryRecord,
+    RecallStore,
+    memory_health,
+)
 
 
 # =============================================================================
@@ -1029,7 +1033,7 @@ class TestIntegration:
     @pytest_asyncio.fixture
     async def live_db(self):
         """Create a live database connection."""
-        from src.database.postgres_db import PostgresDB
+        from agent.database.postgres_db import PostgresDB
 
         db = PostgresDB()
         await db.connect()
@@ -1038,6 +1042,7 @@ class TestIntegration:
         async with db.acquire() as conn:
             db_dir = (
                 __import__("pathlib").Path(__file__).parent.parent
+                / "src"
                 / "orchestrator"
                 / "database"
             )
@@ -1050,7 +1055,7 @@ class TestIntegration:
     @pytest_asyncio.fixture
     async def live_store(self, live_db):
         """Create a RecallStore with live database."""
-        from src.services.embedding_service import get_embedding_service
+        from shared.runtime.services.embedding_service import get_embedding_service
 
         job_id = uuid.uuid4()
 

@@ -890,10 +890,18 @@ export class PersistentChatService {
   // --- Session metadata (loaded from REST on connect) ---
   readonly sessionTitle = signal<string | null>(null);
   readonly modelName = signal<string | null>(null);
+  /** True on a commissioned background officer's own thread (metadata.config_override.officer.enabled). */
+  readonly isOfficerThread = signal<boolean>(false);
   readonly temperature = signal<number>(0);
   readonly turnCount = signal<number>(0);
   readonly ncSessionFolder = signal<string | null>(null);
   readonly cloudSessionUrl = signal<string | null>(null);
+  /** `Thread.ssh_handle` — minted once and static, so it rides the loaded
+   *  Thread (below) alongside `cloudSessionUrl`, not the 10-second
+   *  `IdeSessionStatus` poll. Feeds the session view's "Connect over SSH"
+   *  panel. Null on threads predating migration 0202 or before the thread
+   *  has loaded. */
+  readonly sshHandle = signal<string | null>(null);
 
   // --- Protected cloud mode (Slice C, Task 14): status-bar badge + review
   //     drawer for the thread's staged cloud-diff. `protectedCloud` comes
@@ -1808,6 +1816,7 @@ export class PersistentChatService {
       if (!opts.carryOutbox) this.isVmSession.set(false);
       this.sessionTitle.set(null);
       this.modelName.set(null);
+      this.isOfficerThread.set(false);
       this.temperature.set(0);
       this.turnCount.set(0);
       // Token telemetry is per-thread. `currentUsage` would refuse to render
@@ -1816,6 +1825,7 @@ export class PersistentChatService {
       this.usage.set(null);
       this.ncSessionFolder.set(null);
       this.cloudSessionUrl.set(null);
+      this.sshHandle.set(null);
       this.tasks.set([]);
       this.undoAvailable.set(false);
       this.rewindInFlight.set(false);
@@ -2235,6 +2245,8 @@ export class PersistentChatService {
       // not an LLM model.  Leave the display unknown until the resolved
       // session-state snapshot supplies the effective model.
       this.modelName.set(model || null);
+      const officer = thread.metadata?.config_override?.officer;
+      this.isOfficerThread.set(officer?.enabled === true || officer?.enabled === 'true');
       const temperature = thread.metadata?.config_override?.llm?.temperature;
       if (temperature != null) {
         this.temperature.set(temperature);
@@ -2242,6 +2254,7 @@ export class PersistentChatService {
       this.turnCount.set(thread.total_turns || 0);
       this.ncSessionFolder.set(thread.nc_session_folder || null);
       this.cloudSessionUrl.set(thread.cloud_session_url || null);
+      this.sshHandle.set(thread.ssh_handle || null);
       this.threadStatus.set(effectiveStatus);
       this.endedAt.set(thread.ended_at || thread.last_activity || null);
       this.retirementDisposition.set(retirementDisposition);
@@ -2630,7 +2643,12 @@ export class PersistentChatService {
   private _startSseWatchdog(threadId: string): void {
     this._stopSseWatchdog();
     this.sseLastEventAt = Date.now();
-    this.agentLastEventAt = Date.now();
+    // The agent clock measures agent output, not stream health: a stream
+    // reopen (mobile background/foreground, a dropped socket) must not make
+    // a silent agent look freshly active. Seed it only on the first open.
+    if (this.agentLastEventAt <= 0) {
+      this.agentLastEventAt = Date.now();
+    }
     this.sseWatchdogTimer = setInterval(() => {
       // Piggyback the agent-quiet signal on this 5s tick (audit #8):
       // only meaningful while a turn is open — an idle agent being
@@ -3814,10 +3832,12 @@ export class PersistentChatService {
     this.continueAfterUpgrade.set(false);
     this.sessionTitle.set(null);
     this.modelName.set(null);
+    this.isOfficerThread.set(false);
     this.temperature.set(0);
     this.turnCount.set(0);
     this.ncSessionFolder.set(null);
     this.cloudSessionUrl.set(null);
+    this.sshHandle.set(null);
     this.threadStatus.set(null);
     this.endedAt.set(null);
     this.retirementDisposition.set(null);
@@ -5357,8 +5377,12 @@ export class PersistentChatService {
     // "Connected" only proves the orchestrator SSE is up. Every frame
     // reaching this dispatcher is agent-origin (orchestrator pings and
     // ws.ping never get here), so its age is a fair proxy for "is the
-    // agent producing anything".
-    this.agentLastEventAt = now;
+    // agent producing anything" — except the REST snapshot, which this
+    // service injects as a frame itself: counting it made every reconnect
+    // restart the silence clock while the agent had been quiet for minutes.
+    if (data.method !== 'session.state') {
+      this.agentLastEventAt = now;
+    }
 
     switch (data.method) {
       case 'session.state': {
@@ -5399,6 +5423,22 @@ export class PersistentChatService {
         ) {
           const turnId = String(params['turn_count']);
           this.dispatch({ type: 'reattach_turn', turnId, timestamp: now });
+        }
+        // The durable snapshot is the authority on whether a turn is open.
+        // A retained tab whose turn never got its terminal frame (the loop
+        // died in settlement; the journal has turn.started with no
+        // turn.completed/turn.error) would otherwise spin forever — the
+        // handler above only ever *reopens*. Close it now: the replay floor
+        // sits at the journal's tail, so nothing that follows reopens it,
+        // and a genuinely new turn arrives as a fresh turn.started.
+        if (
+          durableSnapshot &&
+          params['turn_in_flight'] === false &&
+          this.conversation().activeAssistantTurnId != null
+        ) {
+          this._closeActiveTurnIfAny('turn_interrupted');
+          this.runningTool.set(null);
+          this.compaction.set(null);
         }
         if (params['model']) {
           this.modelName.set(params['model'] as string);
@@ -6565,6 +6605,14 @@ export function cloudCountFromSummary(s: ThreadCloudDiffSummary | null): number 
 // (src/services/image_content.py + src/persistent_graph.py). The base64 is
 // dropped at persist, leaving a bare marker that would otherwise render as a
 // user bubble — hide it from the transcript entirely.
+//
+// Matched on content, before the role dispatch, because the row's role
+// changed: these used to persist as 'human' (which made the stateless
+// run-queue claim them as unanswered user input and re-run a finished turn)
+// and now carry the 'event' persist role. Rows written before that fix keep
+// the old role until migration 0211 backfills them, and either role must
+// stay invisible — an 'event' row renders as a muted system line, which is
+// no better here than a user bubble.
 const SYNTHETIC_IMAGE_DELIVERY_RE = /^Image content from tool call \S+:\s*$/;
 
 export function historyToTurns(messages: HistoryMessage[]): Turn[] {
@@ -6579,6 +6627,11 @@ export function historyToTurns(messages: HistoryMessage[]): Turn[] {
     const isTool = m.role === 'tool' || m.role === 'ToolMessageChunk';
 
     const ts = m.created_at ? Date.parse(m.created_at) || Date.now() : Date.now();
+
+    // Role-independent (see SYNTHETIC_IMAGE_DELIVERY_RE): these carry no
+    // reader-facing content under any role, so drop them before the dispatch
+    // rather than inside the user branch alone.
+    if (SYNTHETIC_IMAGE_DELIVERY_RE.test(m.content || '')) continue;
 
     // Compaction boundary marker (role='summary'). Consecutive identical
     // summaries collapse to one marker (threads written before the
@@ -6646,7 +6699,6 @@ export function historyToTurns(messages: HistoryMessage[]): Turn[] {
     if (!isUser && !isAssistant && !isTool) continue;
 
     if (isUser) {
-      if (SYNTHETIC_IMAGE_DELIVERY_RE.test(m.content || '')) continue;
       const u: UserTurn = {
         kind: 'user',
         id: m.id,

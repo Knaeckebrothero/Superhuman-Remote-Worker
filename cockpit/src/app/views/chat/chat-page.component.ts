@@ -14,7 +14,7 @@ import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
 import {ActivatedRoute, Router} from '@angular/router';
 import {TranslocoPipe} from '@jsverse/transloco';
 import {AngularSplitModule, SplitGutterInteractionEvent} from 'angular-split';
-import {distinctUntilChanged, map} from 'rxjs';
+import {distinctUntilChanged, finalize, forkJoin, map, of} from 'rxjs';
 import {PersistentChatComponent} from '../../views/persistent-chat/persistent-chat.component';
 import {PersistentChatService} from '../../core/services/persistent-chat.service';
 import {AppToastService} from '../../ui/toast';
@@ -30,12 +30,18 @@ import {CanvasPaneComponent} from '../canvas/canvas-pane.component';
 import {canvasSourceKey} from '../canvas/canvas-rendering';
 import {SettingsPaneComponent} from './settings-pane.component';
 import {ConfigDriftDialogComponent} from './config-drift-dialog.component';
+import {ApiService} from '../../core/services/api.service';
+import {PersistentThreadMessage, Thread} from '../../core/models/api.model';
+import {SubagentTranscriptComponent} from './subagent-transcript.component';
 
 export interface BrowserReplacementTarget {
     readonly threadId: string;
     readonly presentationRevision: number;
     readonly sourceKey: string;
 }
+
+/** Child threads have no event journal; refresh their durable rows at a bounded rate. */
+const SUBAGENT_REFRESH_MS = 5_000;
 
 /** Keep a replacement confirmation scoped to the presentation the user saw. */
 export function browserReplacementTargetMatches(
@@ -64,8 +70,18 @@ export function browserReplacementTargetMatches(
         AppButtonComponent,
         AppDialogComponent,
         ConfigDriftDialogComponent,
+        SubagentTranscriptComponent,
     ],
     template: `
+      @if (subagentThread(); as thread) {
+        <app-subagent-transcript
+          [thread]="thread"
+          [messages]="subagentMessages()"
+          [loading]="subagentLoading()"
+          [error]="subagentError()"
+          (refresh)="refreshSubagentTranscript()"
+        />
+      } @else {
       @if (canvasAvailable()) {
         <button type="button" class="canvas-skip-link" (click)="openCanvas(true)">
           {{ 'canvas.skipToCanvas' | transloco }}
@@ -163,6 +179,7 @@ export function browserReplacementTargetMatches(
           (dismissed)="chat.pendingDrift.set(null)"
         />
       }
+      }
     `,
     styles: `
       :host {
@@ -257,10 +274,18 @@ export class ChatPageComponent implements OnInit, OnDestroy {
     readonly chat = inject(PersistentChatService);
     private readonly toast = inject(AppToastService);
     private readonly errors = inject(ErrorMessageService);
+    private readonly api = inject(ApiService);
     private readonly canvas = inject(CanvasService);
     readonly viewport = inject(ViewportService);
     private readonly destroyRef = inject(DestroyRef);
     private routeGeneration = 0;
+    private subagentRefreshInterval: ReturnType<typeof setInterval> | null = null;
+    /** The route generation whose child detail/history pair is currently in flight. */
+    private subagentRefreshInFlightGeneration: number | null = null;
+    readonly subagentThread = signal<Thread | null>(null);
+    readonly subagentMessages = signal<PersistentThreadMessage[]>([]);
+    readonly subagentLoading = signal(false);
+    readonly subagentError = signal(false);
     readonly canvasOpen = signal(false);
     readonly canvasFocus = signal(false);
     readonly canvasDirty = signal(false);
@@ -623,6 +648,15 @@ export class ChatPageComponent implements OnInit, OnDestroy {
 
     private handleThreadRoute(threadId: string | null): void {
         const routeGeneration = ++this.routeGeneration;
+        this.stopSubagentRefresh();
+        // A stale request from the previous route is still subscribed until it
+        // settles, but its generation guard cannot paint this route. Releasing
+        // the latch lets the new route perform its own initial read.
+        this.subagentRefreshInFlightGeneration = null;
+        this.subagentThread.set(null);
+        this.subagentMessages.set([]);
+        this.subagentLoading.set(false);
+        this.subagentError.set(false);
 
         if (threadId === '_creating') {
             this.canvas.selectThread(null);
@@ -650,26 +684,154 @@ export class ChatPageComponent implements OnInit, OnDestroy {
                 void this.router.navigate(['/sessions']);
             }
         } else if (threadId) {
-            // Canvas state reconciles independently from chat history and may
-            // remain available even when the live agent transport is offline.
-            this.canvas.selectThread(threadId);
-            // Already connected or mid-start on this thread? Don't reconnect.
-            // The mid-start case is the draft flow landing here right after
-            // createAndConnect — a second connect() would race the first.
-            if (
-                this.chat.threadId() === threadId &&
-                (this.chat.isConnected() || this.chat.isStartingSession())
-            ) return;
+            // Identify a child before touching any session transport. A child
+            // runs inside its parent job's pod; attaching it as a session would
+            // provision/connect a runtime that does not exist.
+            this.api.getPersistentThread(threadId)
+                .pipe(takeUntilDestroyed(this.destroyRef))
+                .subscribe(row => {
+                    if (routeGeneration !== this.routeGeneration) return;
+                    // A failed read (older orchestrator, transient error) is
+                    // not a verdict on the thread: take the ordinary session
+                    // path exactly as before the preflight existed.
+                    const thread = row ? (row as unknown as Thread) : null;
+                    if (thread?.kind === 'subagent') {
+                        this.canvas.selectThread(null);
+                        this.subagentThread.set(thread);
+                        this.loadSubagentTranscript(thread.id, routeGeneration, {
+                            refreshThread: false,
+                            showLoading: true,
+                        });
+                        this.startSubagentRefresh(thread.id, routeGeneration);
+                        return;
+                    }
 
-            void this.chat.connect(threadId);
+                    // Canvas state reconciles independently from chat history
+                    // and may remain available while transport is offline.
+                    this.canvas.selectThread(threadId);
+                    // Already connected or mid-start on this thread? Don't
+                    // reconnect. The latter is the draft flow landing here
+                    // right after createAndConnect.
+                    if (
+                        this.chat.threadId() === threadId &&
+                        (this.chat.isConnected() || this.chat.isStartingSession())
+                    ) return;
+
+                    void this.chat.connect(threadId);
+                });
         } else {
             this.canvas.selectThread(null);
             void this.router.navigate(['/sessions']);
         }
     }
 
+    refreshSubagentTranscript(): void {
+        const thread = this.subagentThread();
+        if (thread) {
+            this.loadSubagentTranscript(thread.id, this.routeGeneration, {
+                refreshThread: true,
+                showLoading: this.subagentMessages().length === 0,
+            });
+        }
+    }
+
+    private loadSubagentTranscript(
+        threadId: string,
+        routeGeneration: number,
+        options: {refreshThread: boolean; showLoading: boolean},
+    ): void {
+        // A slow REST response must not build a queue of identical reads. The
+        // next 5s tick will catch up after this pair settles.
+        if (this.subagentRefreshInFlightGeneration === routeGeneration) return;
+        this.subagentRefreshInFlightGeneration = routeGeneration;
+        if (options.showLoading) {
+            this.subagentLoading.set(true);
+            this.subagentError.set(false);
+        }
+
+        const current = this.subagentThread();
+        const thread$ = options.refreshThread
+            ? this.api.getPersistentThread(threadId)
+            : of(current as unknown as Record<string, unknown> | null);
+
+        forkJoin({
+            row: thread$,
+            history: this.api.getPersistentThreadHistory(threadId),
+        })
+            .pipe(
+                finalize(() => {
+                    // A previous route's late finalizer must not release the
+                    // current route's in-flight latch.
+                    if (this.subagentRefreshInFlightGeneration === routeGeneration) {
+                        this.subagentRefreshInFlightGeneration = null;
+                    }
+                }),
+                takeUntilDestroyed(this.destroyRef),
+            )
+            .subscribe(({row, history}) => {
+                if (
+                    routeGeneration !== this.routeGeneration ||
+                    this.subagentThread()?.id !== threadId
+                ) return;
+
+                const refreshed = row ? (row as unknown as Thread) : null;
+                if (refreshed?.kind === 'subagent' && refreshed.id === threadId) {
+                    this.subagentThread.set(refreshed);
+                    if (!this.isLiveSubagent(refreshed)) this.stopSubagentRefresh();
+                }
+
+                this.subagentLoading.set(false);
+                if (history) {
+                    this.subagentError.set(false);
+                    this.subagentMessages.set(history.messages ?? []);
+                } else if (this.subagentMessages().length === 0) {
+                    // A transient poll failure does not replace an already-read
+                    // transcript with an error screen.
+                    this.subagentError.set(true);
+                }
+            });
+    }
+
+    private startSubagentRefresh(threadId: string, routeGeneration: number): void {
+        this.stopSubagentRefresh();
+        const thread = this.subagentThread();
+        if (!thread || !this.isLiveSubagent(thread)) return;
+        this.subagentRefreshInterval = setInterval(() => {
+            const current = this.subagentThread();
+            if (
+                routeGeneration !== this.routeGeneration ||
+                current?.id !== threadId ||
+                !this.isLiveSubagent(current)
+            ) {
+                this.stopSubagentRefresh();
+                return;
+            }
+            if (
+                typeof document !== 'undefined' &&
+                document.visibilityState !== 'visible'
+            ) return;
+            this.loadSubagentTranscript(threadId, routeGeneration, {
+                refreshThread: true,
+                showLoading: false,
+            });
+        }, SUBAGENT_REFRESH_MS);
+    }
+
+    private stopSubagentRefresh(): void {
+        if (this.subagentRefreshInterval !== null) {
+            clearInterval(this.subagentRefreshInterval);
+            this.subagentRefreshInterval = null;
+        }
+    }
+
+    private isLiveSubagent(thread: Thread): boolean {
+        return thread.subagent_status === 'queued' || thread.subagent_status === 'running';
+    }
+
     ngOnDestroy(): void {
         this.routeGeneration++;
+        this.stopSubagentRefresh();
+        this.subagentRefreshInFlightGeneration = null;
         // Don't disconnect — keep session alive across navigation
     }
 }

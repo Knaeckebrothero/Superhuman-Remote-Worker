@@ -5,10 +5,11 @@ from __future__ import annotations
 import copy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import UUID
 
 import pytest
 
-from src.api import persistent_app
+from agent.api import persistent_app
 
 
 def _protected_mount() -> dict:
@@ -553,6 +554,7 @@ async def test_dedicated_attach_initial_engaging_polls_to_ready(monkeypatch):
     )
     session = MagicMock()
     session.setup = AsyncMock()
+    session.recover_subagents = AsyncMock()
     session.cleanup = AsyncMock()
     session.protected_cloud_ready.return_value = True
     session.cloud_mount_manager = SimpleNamespace(active=True, mounts=[])
@@ -594,9 +596,9 @@ async def test_dedicated_attach_initial_engaging_polls_to_ready(monkeypatch):
         patch.object(persistent_app, "_start_watchdogs"),
         patch.object(persistent_app, "_officer_cfg", return_value=None),
         patch.object(persistent_app, "_broadcast"),
-        patch("src.tools.registry.register_mcp_tools"),
+        patch("agent.tools.registry.register_mcp_tools"),
         patch(
-            "src.services.knowledge.bindings.build_knowledge_bindings",
+            "agent.services.knowledge.bindings.build_knowledge_bindings",
             return_value=[],
         ),
     ):
@@ -619,7 +621,8 @@ async def test_dedicated_attach_initial_engaging_polls_to_ready(monkeypatch):
     )
     update_status.assert_awaited_once_with("active")
     assert persistent_app._session is session
-    assert persistent_app._input_runtime_generation == client.session_runtime_generation
+    assert UUID(str(persistent_app._input_runtime_generation))
+    assert persistent_app._input_runtime_generation != client.session_runtime_generation
 
     # This is a successful live attach, so invoking the delivered-attach abort
     # protocol here would now (correctly) require a real workspace process-zero
@@ -627,7 +630,7 @@ async def test_dedicated_attach_initial_engaging_polls_to_ready(monkeypatch):
     # process-global restoration at test teardown instead.
 
 
-def test_strict_pinned_input_identity_rejects_non_session_generation(monkeypatch):
+def test_strict_pinned_input_identity_keeps_process_generation_separate(monkeypatch):
     client = _runtime_client([])
     monkeypatch.setattr(persistent_app, "_orchestrator_client", client)
     monkeypatch.setattr(persistent_app, "_pinned_runtime_generation_enabled", True)
@@ -648,8 +651,12 @@ def test_strict_pinned_input_identity_rejects_non_session_generation(monkeypatch
     )
     monkeypatch.setenv("POD_UID", "pod-uid")
 
-    with pytest.raises(persistent_app.DurableInputUnavailable):
-        persistent_app._pinned_input_runtime_identity()
+    assert persistent_app._pinned_input_runtime_identity() == (
+        client.agent_id,
+        "pod-uid",
+        "ffffffff-ffff-4fff-8fff-ffffffffffff",
+        client.session_runtime_attach_token,
+    )
 
 
 @pytest.mark.asyncio
@@ -848,9 +855,10 @@ async def test_workspace_identity_change_during_setup_rolls_back(monkeypatch):
             side_effect=lambda value: value,
         ),
         patch(
-            "src.core.loader.load_config_from_resolved", return_value=effective_config
+            "shared.runtime.core.loader.load_config_from_resolved",
+            return_value=effective_config,
         ),
-        patch("src.core.loader.create_llm", return_value=object()),
+        patch("shared.runtime.core.loader.create_llm", return_value=object()),
     ):
         with pytest.raises(
             persistent_app.ProtectedCloudUnavailable,

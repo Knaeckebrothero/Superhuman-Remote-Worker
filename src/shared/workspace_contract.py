@@ -45,6 +45,25 @@ def vm_mode_from_env() -> str:
     return normalized if normalized in _VM_MODES else "external"
 
 
+def stateless_worker_backend_admissible(backend: object, *, vm_mode: str) -> bool:
+    """One truth for which workspace tiers the stateless worker lane serves.
+
+    Used by BOTH admission twins — the claim-side queue eligibility check and
+    the agent's workspace-creation guard — so they can never drift apart
+    again (the enqueue CAS admitting VM while the claim CAS rejected it was
+    an unbounded livelock). Sandbox is always admissible; VM only on the
+    pod network (``vm_mode == "same-cluster"``); lite tiers never, on this
+    lane. Aliases normalize; anything unrecognized is inadmissible.
+    """
+
+    if not isinstance(backend, str):
+        return False
+    canonical = _ALIASES.get(backend.strip().lower(), backend.strip().lower())
+    if canonical == "sandbox":
+        return True
+    return canonical == "vm" and vm_mode == "same-cluster"
+
+
 class WorkspaceContractError(ValueError):
     """The authoritative workspace contract is malformed or contradictory."""
 
@@ -189,14 +208,8 @@ def strip_and_stamp_workspace_creation(
     *,
     requested_backend: Any = None,
     assignment_source: str | None = None,
-    preserve_runtime_context: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any], WorkspaceContract]:
-    """Strip caller authority and stamp the canonical creation-time contract.
-
-    ``preserve_runtime_context`` is reserved for server-built child jobs that
-    intentionally inherit a parent's already-authoritative runtime.  Raw REST,
-    session, tool, automation and ordinary direct DB callers must leave it off.
-    """
+    """Strip runtime authority and stamp the canonical creation-time contract."""
 
     clean_context = _object(context)
     clean_context.pop(WORKSPACE_CONTRACT_CONTEXT_KEY, None)
@@ -205,9 +218,8 @@ def strip_and_stamp_workspace_creation(
     # Historical callers used this unnamespaced hint.  It was never runtime
     # attestation and must not survive a creation boundary.
     clean_context.pop("workspace_backend", None)
-    if not preserve_runtime_context:
-        clean_context.pop("vm", None)
-        clean_context.pop("workspace_container", None)
+    clean_context.pop("vm", None)
+    clean_context.pop("workspace_container", None)
 
     contract = build_workspace_contract(
         config_override,
@@ -558,6 +570,53 @@ def workspace_runtime_authority_digest(
     return hashlib.sha256(encoded).hexdigest()
 
 
+def workspace_contract_authority_identity(
+    job: Mapping[str, Any],
+    *,
+    vm_mode: str = "external",
+    allow_vm_suspending: bool = False,
+) -> tuple[str, str] | None:
+    """Return the selected tier plus a coordinate-free contract digest.
+
+    Durable remote-effect receipts bind the selected workspace contract as
+    well as an endpoint. Runtime coordinates are excluded because each receipt
+    binds them separately.
+    """
+
+    decision = resolve_workspace_runtime(job, vm_mode=vm_mode)
+    if not decision.ready and allow_vm_suspending:
+        # Suspension first reserves the lifecycle by changing only this state
+        # marker.  Exact read/capture effects still need the same canonical
+        # contract proof while the endpoint remains alive.  Re-run the pure
+        # resolver against a copy with that one server-owned phase projected
+        # as ready; endpoint identity is validated independently by the VM
+        # lease and controller attestation.
+        context = _object(job.get("context"))
+        vm = _object(context.get("vm"))
+        if vm.get("status") == "suspending":
+            vm["status"] = "ready"
+            context["vm"] = vm
+            projected = dict(job)
+            projected["context"] = context
+            decision = resolve_workspace_runtime(projected, vm_mode=vm_mode)
+    if not decision.ready or decision.contract is None:
+        return None
+    config = _object(job.get("config_override"))
+    workspace = _object(config.get("workspace"))
+    workspace.pop("remote", None)
+    workspace["backend"] = decision.contract.assigned_backend
+    material = {
+        "version": 1,
+        "contract": decision.contract.to_context(),
+        "effective_backend": decision.effective_backend,
+        "workspace_config": workspace,
+    }
+    encoded = json.dumps(
+        material, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode()
+    return decision.effective_backend or "", hashlib.sha256(encoded).hexdigest()
+
+
 def validate_worker_workspace_projection(
     *,
     config_override: Any,
@@ -632,6 +691,7 @@ __all__ = [
     "resolve_workspace_runtime",
     "strip_and_stamp_workspace_creation",
     "workspace_contract_projection",
+    "workspace_contract_authority_identity",
     "workspace_runtime_authority_digest",
     "validate_worker_workspace_projection",
 ]

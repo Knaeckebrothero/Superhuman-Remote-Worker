@@ -32,9 +32,9 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, Callable, List, Optional
 
-from .arms import ArmSpec
-from .datasets import LMEQuestion, LMESession
-from .infra import build_manager, make_recall_store, project_uuid, session_uuid
+from eval.memory.arms import ArmSpec
+from eval.memory.datasets import LMEQuestion, LMESession
+from eval.memory.infra import build_manager, make_recall_store, project_uuid, session_uuid
 
 logger = logging.getLogger(__name__)
 
@@ -197,11 +197,11 @@ def _form_query_text(handles: HarnessHandles, messages: List[Any]) -> str:
     """Production-faithful query formation: the persistent loop's exact
     flag switch (memory.query.digest → unified digest, else legacy
     last-user-message) so digest arms measure the real read path."""
-    from src.services.memory.plugins.legacy import build_persistent_query_text
+    from agent.services.memory.plugins.legacy import build_persistent_query_text
 
     query_cfg = getattr(handles.config.memory, "query", None)
     if query_cfg is not None and query_cfg.digest:
-        from src.services.memory.query import build_digest_query_text
+        from agent.services.memory.query import build_digest_query_text
 
         return build_digest_query_text(
             messages,
@@ -221,7 +221,7 @@ async def _replay_session_seam(
 ) -> None:
     from langchain_core.messages import AIMessage, HumanMessage
 
-    from src.services.memory import AssembleRequest, CaptureEvent
+    from agent.services.memory import AssembleRequest, CaptureEvent
 
     model = getattr(handles.config.llm, "model", None)
     messages: List[Any] = []

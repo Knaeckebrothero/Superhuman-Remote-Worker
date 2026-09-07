@@ -61,9 +61,6 @@ where you are:
 | Batch processing | 4–6 | Repetitive operation over many similar items |
 | Integration | 3–5 | Combine separately-produced parts into a coherent whole |
 | Verification | 2–4 | Quality check before declaring done |
-{% if has_tool("delegate_work") -%}
-| Delegation | 2–3 | Independent subtasks that benefit from parallel agents |
-{%- endif %}
 
 Two of these defer to dedicated skills — load them when you plan that phase:
 - **Verification** → the `verify-before-done` skill covers *how* to produce

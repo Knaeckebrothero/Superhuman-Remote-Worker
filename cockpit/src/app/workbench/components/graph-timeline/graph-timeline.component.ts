@@ -1,3 +1,4 @@
+import { debugLog } from '../../debug-log';
 import {
     ChangeDetectionStrategy,
     Component,
@@ -511,12 +512,12 @@ export class GraphTimelineComponent implements OnDestroy {
     effect(() => {
       const graphData = this.graph.changes();
       if (graphData && graphData.deltas.length > 0) {
-        console.log('[GraphTimeline] Data available:', graphData.deltas.length, 'deltas');
+        debugLog('[GraphTimeline] Data available:', graphData.deltas.length, 'deltas');
 
         if (!this.cy) {
           // Initialize Cytoscape first, then load data
           this.initializeCytoscape().then(() => {
-            console.log('[GraphTimeline] Cytoscape initialized, loading data');
+            debugLog('[GraphTimeline] Cytoscape initialized, loading data');
             if (this.renderer && graphData) {
               this.renderer.load(graphData.snapshots, graphData.deltas);
               // Jump to end to show the final state
@@ -525,7 +526,7 @@ export class GraphTimelineComponent implements OnDestroy {
           });
         } else if (this.renderer) {
           // Cytoscape already exists, just load new data
-          console.log('[GraphTimeline] Reloading data into existing renderer');
+          debugLog('[GraphTimeline] Reloading data into existing renderer');
           this.renderer.load(graphData.snapshots, graphData.deltas);
           this.graph.jumpToEnd();
         }
@@ -536,7 +537,7 @@ export class GraphTimelineComponent implements OnDestroy {
     effect(() => {
       const index = this.graph.currentIndex();
       if (this.renderer && this.cy) {
-        console.log('[GraphTimeline] Seeking to index:', index);
+        debugLog('[GraphTimeline] Seeking to index:', index);
         this.renderer.seekTo(index);
       }
     });
@@ -591,7 +592,7 @@ export class GraphTimelineComponent implements OnDestroy {
 
         // Register fcose layout
         cytoscape.use(fcose);
-        console.log('[GraphTimeline] Cytoscape and fcose loaded');
+        debugLog('[GraphTimeline] Cytoscape and fcose loaded');
       } catch (e) {
         console.error('Failed to load Cytoscape:', e);
         this.graph.error.set('Failed to load graph library. Please install cytoscape and cytoscape-fcose.');

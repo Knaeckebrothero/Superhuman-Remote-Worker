@@ -33,9 +33,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-import src.api.dual_app as dual_app
-from src.core.phase import push_evidence_snapshot
-from src.managers.git_manager import GitManager
+import agent.api.dual_app as dual_app
+from agent.core.phase import push_evidence_snapshot
+from agent.managers.git_manager import GitManager
 
 
 def _workspace(*, active=True, committed=True, unpushed=False, pushed=True):
@@ -222,7 +222,7 @@ class TestEvidencePushOnCooperativeStop:
         self._working(workspace=ws)
         dual_app._request_stop("cancel")
 
-        with patch("src.api.dual_app.push_evidence_snapshot") as snap:
+        with patch("agent.api.dual_app.push_evidence_snapshot") as snap:
             await dual_app._complete_stop("job cancel")
 
         # Called with the live workspace handle and the honest reason, before
@@ -242,7 +242,7 @@ class TestEvidencePushOnCooperativeStop:
         )
         assert dual_app._stop_reason == "pause"
 
-        with patch("src.api.dual_app.push_evidence_snapshot") as snap:
+        with patch("agent.api.dual_app.push_evidence_snapshot") as snap:
             await dual_app._complete_stop("job pause")
 
         snap.assert_called_once_with(ws, "pause", "steered-job")
@@ -254,7 +254,7 @@ class TestEvidencePushOnCooperativeStop:
         dual_app._request_stop("cancel")
 
         with patch(
-            "src.api.dual_app.push_evidence_snapshot",
+            "agent.api.dual_app.push_evidence_snapshot",
             side_effect=RuntimeError("git exploded"),
         ):
             await dual_app._complete_stop("job cancel")
@@ -272,7 +272,7 @@ class TestEvidencePushOnCooperativeStop:
         with (
             patch.object(dual_app, "_EVIDENCE_PUSH_TIMEOUT_SECONDS", 0.05),
             patch(
-                "src.api.dual_app.push_evidence_snapshot",
+                "agent.api.dual_app.push_evidence_snapshot",
                 side_effect=lambda *a: time.sleep(1.0),
             ),
         ):
@@ -292,7 +292,7 @@ class TestEvidencePushOnCooperativeStop:
         dual_app._agent = None
         dual_app._request_stop("cancel")
 
-        with patch("src.api.dual_app.push_evidence_snapshot") as snap:
+        with patch("agent.api.dual_app.push_evidence_snapshot") as snap:
             await dual_app._complete_stop("job cancel")
 
         snap.assert_not_called()
@@ -304,7 +304,7 @@ class TestEvidencePushOnCooperativeStop:
         self._working(workspace=None)
         dual_app._request_stop("cancel")
 
-        with patch("src.api.dual_app.push_evidence_snapshot") as snap:
+        with patch("agent.api.dual_app.push_evidence_snapshot") as snap:
             await dual_app._complete_stop("job cancel")
 
         snap.assert_not_called()

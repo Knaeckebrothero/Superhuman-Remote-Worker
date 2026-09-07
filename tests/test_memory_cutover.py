@@ -31,15 +31,23 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
-from src.core.loader import InstructionFileEntry, QueryConfig, load_agent_config
-from src.core.workspace import WorkspaceManager
-from src.core.workspace_injection import (
+from shared.runtime.core.loader import (
+    InstructionFileEntry,
+    QueryConfig,
+    load_agent_config,
+)
+from shared.runtime.core.message_markers import (
+    is_protected_message,
+    protected_phase_key,
+)
+from agent.core.workspace import WorkspaceManager
+from shared.runtime.core.workspace_injection import (
     TODOS_INJECTION_CONTENT_PREFIX,
     is_workspace_injection_message,
 )
-from src.llm.exceptions import ContextOverflowError
-from src.managers import TodoManager, PlanManager
-from src.services.memory import (
+from shared.runtime.llm.exceptions import ContextOverflowError
+from agent.managers import TodoManager, PlanManager
+from agent.services.memory import (
     AssembleStats,
     Candidate,
     InjectionBlock,
@@ -47,7 +55,7 @@ from src.services.memory import (
     MemoryPayload,
     MemoryRuntime,
 )
-from src.tools.context import ToolContext
+from agent.tools.context import ToolContext
 from tests._fs_backend import FilesystemTestBackend
 from tests._memory_fixtures import (
     PROJECT_ID,
@@ -91,8 +99,8 @@ def make_payload(
     memory_text: str = "MEMBLOCK", knowledge_text: str = "KBBLOCK"
 ) -> MemoryPayload:
     """A payload with real injection pairs (the production message shapes)."""
-    from src.core.knowledge_injection import create_knowledge_injection_messages
-    from src.core.memory_injection import create_memory_injection_messages
+    from agent.core.knowledge_injection import create_knowledge_injection_messages
+    from agent.core.memory_injection import create_memory_injection_messages
 
     blocks: List[InjectionBlock] = []
     if memory_text:
@@ -137,9 +145,10 @@ class FakeContextMgr:
         self._state = SimpleNamespace(summaries=[])
         self._ensure_hook = ensure_hook
         self._should_summarize = should_summarize
+        self.phase_key: Optional[str] = None
 
-    def set_current_phase(self, phase: str) -> None:
-        pass
+    def set_current_phase(self, phase: str, phase_key: Optional[str] = None) -> None:
+        self.phase_key = phase_key
 
     def should_summarize(self, messages) -> bool:
         # The pre_compaction emit gates on this; off by default so these
@@ -244,7 +253,7 @@ class TestPipelineDefaults:
         """
         import dataclasses
 
-        from src.core.loader import deep_merge, load_agent_config_from_dict
+        from shared.runtime.core.loader import deep_merge, load_agent_config_from_dict
 
         worker_config.memory.manager_enabled = True
         base = dataclasses.asdict(worker_config)
@@ -267,17 +276,20 @@ class TestWorkerConstruction:
     """build_phase_alternation_graph builds the manager behind the flag."""
 
     def _build(self, config, workspace_manager, tool_context):
-        from src.graph import build_phase_alternation_graph
+        from agent.graph import build_phase_alternation_graph
 
         return build_phase_alternation_graph(
-            strategic_llm_with_tools=MagicMock(),
-            tactical_llm_with_tools=MagicMock(),
+            llm_with_tools=MagicMock(),
             tools=[],
             config=config,
             workspace=workspace_manager,
             todo_manager=TodoManager(workspace_manager),
             tool_context=tool_context,
         )
+
+    def test_one_binding_builds(self, worker_config, workspace_manager):
+        worker_config.memory.manager_enabled = False
+        self._build(worker_config, workspace_manager, None)
 
     def test_flag_on_constructs_with_worker_runtime(
         self, worker_config, workspace_manager
@@ -291,7 +303,7 @@ class TestWorkerConstruction:
         ctx.recall_store = marker_store
 
         with patch(
-            "src.services.memory.MemoryManager.from_config",
+            "agent.services.memory.MemoryManager.from_config",
             return_value=RecordingManager(),
         ) as from_config:
             self._build(worker_config, workspace_manager, ctx)
@@ -322,7 +334,7 @@ class TestWorkerConstruction:
         ctx = ToolContext(workspace_manager=workspace_manager)
         ctx.recall_store = SimpleNamespace()
         mgr = RecordingManager()
-        with patch("src.services.memory.MemoryManager.from_config", return_value=mgr):
+        with patch("agent.services.memory.MemoryManager.from_config", return_value=mgr):
             graph = self._build(worker_config, workspace_manager, ctx)
         assert getattr(graph, "_srw_memory_service", None) is mgr
 
@@ -339,7 +351,7 @@ class TestWorkerConstruction:
         ctx = ToolContext(workspace_manager=workspace_manager)
 
         with patch(
-            "src.services.memory.MemoryManager.from_config",
+            "agent.services.memory.MemoryManager.from_config",
             return_value=RecordingManager(),
         ) as from_config:
             self._build(worker_config, workspace_manager, ctx)
@@ -351,7 +363,7 @@ class TestPersistentConstruction:
     """PersistentSession._setup_memory builds the manager behind the flag."""
 
     def _make_session(self, persistent_config):
-        from src.api.persistent_session import PersistentSession
+        from agent.api.persistent_session import PersistentSession
 
         return PersistentSession(thread_id=str(uuid.uuid4()), config=persistent_config)
 
@@ -366,11 +378,11 @@ class TestPersistentConstruction:
         recorder = RecordingManager()
         with (
             patch(
-                "src.services.embedding_service.get_embedding_service",
+                "shared.runtime.services.embedding_service.get_embedding_service",
                 return_value=MagicMock(verify_dimensions=AsyncMock()),
             ),
             patch(
-                "src.services.memory.MemoryManager.from_config",
+                "agent.services.memory.MemoryManager.from_config",
                 return_value=recorder,
             ) as from_config,
         ):
@@ -396,10 +408,10 @@ class TestPersistentConstruction:
 
         with (
             patch(
-                "src.services.embedding_service.get_embedding_service",
+                "shared.runtime.services.embedding_service.get_embedding_service",
                 return_value=MagicMock(verify_dimensions=AsyncMock()),
             ),
-            patch("src.services.memory.MemoryManager.from_config") as from_config,
+            patch("agent.services.memory.MemoryManager.from_config") as from_config,
         ):
             session._setup_memory(None, vector_conn=MagicMock())
 
@@ -413,11 +425,10 @@ class TestPersistentConstruction:
 
 
 def _make_execute_node(config, workspace_manager, todo_manager, ctx, service, mgr):
-    from src.graph import create_execute_node
+    from agent.graph import create_execute_node
 
     return create_execute_node(
-        strategic_llm_with_tools=MagicMock(),
-        tactical_llm_with_tools=mgr["llm"],
+        llm_with_tools=mgr["llm"],
         todo_manager=todo_manager,
         memory_manager=MagicMock(),  # vestigial workspace.md manager
         workspace_manager=workspace_manager,
@@ -472,22 +483,89 @@ def execute_env(worker_config, workspace_manager):
     }
 
 
+def _bind_phase_start(env, body: str, *, duplicate: bool = False):
+    """Bind research-guide at phase_start:tactical and write ``body`` to it."""
+    entry = InstructionFileEntry(
+        trigger="phase_start:tactical",
+        skill="research-guide",
+        enforce=False,
+    )
+    entries = [entry, entry] if duplicate else [entry]
+    env["config"].instruction_files = entries
+    env["ctx"]._instruction_files = entries
+    env["workspace"].write_file(entry.path, body)
+    return entry
+
+
+def _apply_turn(state: dict, result: dict) -> None:
+    """What the graph does between turns: the add_messages reducer (append
+    everything that is not a RemoveMessage) plus the scalar updates."""
+    state["messages"] = state["messages"] + [
+        m for m in result["messages"] if not isinstance(m, RemoveMessage)
+    ]
+    state["iteration"] = result["iteration"]
+    state["turn_count"] = result["turn_count"]
+    if "phase_instruction_injections" in result:
+        state["phase_instruction_injections"] = result["phase_instruction_injections"]
+
+
+def _phase_blocks(request, phase_key: str):
+    return [
+        m
+        for m in request
+        if is_protected_message(m) and protected_phase_key(m) == phase_key
+    ]
+
+
+def _count_text(request, text: str) -> int:
+    return sum(text in str(getattr(m, "content", "")) for m in request)
+
+
+def _mock_aux():
+    """AuxiliaryLLM whose structured summariser returns a fixed short summary."""
+    from agent.core.context import ConversationSummary
+    from shared.runtime.services.auxiliary import AuxiliaryLLM
+
+    parsed = ConversationSummary(
+        summary="Summary of the work so far.",
+        tasks_completed="- read files",
+        key_decisions="",
+        current_state="mid-phase",
+        blockers="",
+    )
+    structured = AsyncMock()
+    structured.ainvoke = AsyncMock(
+        return_value={
+            "raw": AIMessage(content="s"),
+            "parsed": parsed,
+            "parsing_error": None,
+        }
+    )
+    llm = MagicMock()
+    llm.with_structured_output = MagicMock(return_value=structured)
+    return AuxiliaryLLM(llm=llm, max_context_tokens=15_000)
+
+
+_EXECUTE_PATCHES = (
+    ("agent.graph.get_archiver", None),
+    ("agent.graph.get_phase_system_prompt", "SYS"),
+)
+
+
 class TestWorkerExecuteWiring:
     @pytest.mark.asyncio
     async def test_phase_start_instruction_is_injected_once_per_phase_instance(
         self, execute_env
     ):
+        """U2 WP1 durability: the body is delivered ONCE per concrete phase
+        as a persistent, protected HumanMessage — present exactly once in
+        EVERY request of the phase (from history, not the transient tail),
+        returned in state on the delivery turn, and a new phase instance
+        gets its own block while the old one stays in uncompacted history."""
         env = execute_env
-        entry = InstructionFileEntry(
-            trigger="phase_start:tactical",
-            skill="research-guide",
-            enforce=False,
-        )
-        # Duplicate bindings to the same artifact must still inject one body.
-        env["config"].instruction_files = [entry, entry]
-        env["ctx"]._instruction_files = [entry, entry]
         marker = "UNIQUE PHASE-START RESEARCH PROCEDURE"
-        env["workspace"].write_file(entry.path, marker)
+        # Duplicate bindings to the same artifact must still deliver one body.
+        _bind_phase_start(env, marker, duplicate=True)
         node = _make_execute_node(
             env["config"],
             env["workspace"],
@@ -499,52 +577,231 @@ class TestWorkerExecuteWiring:
         state = _worker_state()
 
         with (
-            patch("src.graph.get_archiver", return_value=None),
-            patch("src.graph.get_phase_system_prompt", return_value="SYS"),
+            patch("agent.graph.get_archiver", return_value=None),
+            patch("agent.graph.get_phase_system_prompt", return_value="SYS"),
         ):
             first = await node(state)
-            state.update(
-                {
-                    "iteration": first["iteration"],
-                    "turn_count": first["turn_count"],
-                    "phase_instruction_injections": first[
-                        "phase_instruction_injections"
-                    ],
-                }
-            )
+            _apply_turn(state, first)
             second = await node(state)
-            state.update(
-                {
-                    "iteration": second["iteration"],
-                    "turn_count": second["turn_count"],
-                    "phase_instruction_injections": second.get(
-                        "phase_instruction_injections",
-                        state["phase_instruction_injections"],
-                    ),
-                    "phase_number": 4,
-                }
-            )
+            _apply_turn(state, second)
+            state["phase_number"] = 4
             third = await node(state)
 
         requests = [call.args[0] for call in env["llm"].ainvoke.call_args_list]
 
-        def carries_marker(request):
-            return any(
-                marker in str(getattr(message, "content", "")) for message in request
-            )
+        # Delivery turn: the block is returned in state ahead of the response
+        # and the ledger records the concrete phase instance.
+        assert is_protected_message(first["messages"][0])
+        assert marker in first["messages"][0].content
+        assert isinstance(first["messages"][1], AIMessage)
+        assert first["phase_instruction_injections"] == [
+            "2:tactical:skills/research-guide/SKILL.md"
+        ]
+        assert env["context"].phase_key == "4:tactical"
 
-        assert carries_marker(requests[0]) is True
-        assert (
-            sum(
-                marker in str(getattr(message, "content", ""))
-                for message in requests[0]
-            )
-            == 1
+        # Every request of the phase carries it exactly once.
+        for request in requests[:2]:
+            assert len(_phase_blocks(request, "2:tactical")) == 1
+            assert _count_text(request, marker) == 1
+        # Second turn: nothing re-delivered, ledger untouched.
+        assert "phase_instruction_injections" not in second
+        assert not any(is_protected_message(m) for m in second["messages"])
+        # It is history: it sits before the transient tail (todos last).
+        todo_idx = next(
+            i
+            for i, m in enumerate(requests[1])
+            if isinstance(m, HumanMessage)
+            and str(m.content).startswith(TODOS_INJECTION_CONTENT_PREFIX)
         )
-        assert carries_marker(requests[1]) is False
-        assert carries_marker(requests[2]) is True
-        assert len(first["phase_instruction_injections"]) == 1
+        block_idx = next(
+            i for i, m in enumerate(requests[1]) if is_protected_message(m)
+        )
+        assert block_idx < todo_idx
+        assert requests[1][block_idx] is state["messages"][1]
+
+        # Phase 4 gets its own block; phase 2's stays in uncompacted history.
+        assert len(_phase_blocks(requests[2], "4:tactical")) == 1
+        assert len(_phase_blocks(requests[2], "2:tactical")) == 1
         assert len(third["phase_instruction_injections"]) == 2
+
+    @pytest.mark.asyncio
+    async def test_ledger_present_but_block_missing_self_heals_once(self, execute_env):
+        """A job resumed mid-phase from a pre-change checkpoint has the ledger
+        entry but no block in history: deliver once more (logged), then the
+        presence check takes over — no second delivery, ledger unchanged."""
+        env = execute_env
+        marker = "SELF-HEAL PHASE BODY"
+        _bind_phase_start(env, marker)
+        node = _make_execute_node(
+            env["config"],
+            env["workspace"],
+            env["todo"],
+            env["ctx"],
+            env["service"],
+            {"llm": env["llm"], "context": env["context"]},
+        )
+        key = "2:tactical:skills/research-guide/SKILL.md"
+        state = _worker_state()
+        state["phase_instruction_injections"] = [key]
+
+        with (
+            patch("agent.graph.get_archiver", return_value=None),
+            patch("agent.graph.get_phase_system_prompt", return_value="SYS"),
+        ):
+            first = await node(state)
+            _apply_turn(state, first)
+            second = await node(state)
+
+        requests = [call.args[0] for call in env["llm"].ainvoke.call_args_list]
+        assert len(_phase_blocks(requests[0], "2:tactical")) == 1
+        assert _count_text(requests[0], marker) == 1
+        assert is_protected_message(first["messages"][0])
+        assert first["phase_instruction_injections"] == [key]
+        # Healed: the next turn sees the block and delivers nothing.
+        assert len(_phase_blocks(requests[1], "2:tactical")) == 1
+        assert _count_text(requests[1], marker) == 1
+        assert "phase_instruction_injections" not in second
+        assert not any(is_protected_message(m) for m in second["messages"])
+
+    @pytest.mark.asyncio
+    async def test_prompt_tokens_grow_only_by_new_messages_across_two_tactical_turns(
+        self, execute_env
+    ):
+        """Acceptance (b): the block is never re-billed. Across two consecutive
+        tactical turns the request grows only by the new messages; the prefix
+        up to and including the block is byte-identical, and the tail is the
+        same block of transients."""
+        env = execute_env
+        body = "PHASE BODY " * 50
+        _bind_phase_start(env, body)
+        node = _make_execute_node(
+            env["config"],
+            env["workspace"],
+            env["todo"],
+            env["ctx"],
+            env["service"],
+            {"llm": env["llm"], "context": env["context"]},
+        )
+        state = _worker_state()
+
+        with (
+            patch("agent.graph.get_archiver", return_value=None),
+            patch("agent.graph.get_phase_system_prompt", return_value="SYS"),
+        ):
+            first = await node(state)
+            _apply_turn(state, first)
+            await node(state)
+
+        req1, req2 = [call.args[0] for call in env["llm"].ainvoke.call_args_list]
+
+        def chars(messages) -> int:
+            return sum(len(str(getattr(m, "content", ""))) for m in messages)
+
+        new_messages = first["messages"][1:]  # response (+ any reminder)
+        assert chars(req2) - chars(req1) == chars(new_messages)
+        assert _count_text(req1, body) == 1
+        assert _count_text(req2, body) == 1
+
+        # [system, task, block] is the stable prefix; then the new messages;
+        # then the unchanged transient tail.
+        prefix = 3
+        assert [m.content for m in req2[:prefix]] == [m.content for m in req1[:prefix]]
+        assert is_protected_message(req1[prefix - 1])
+        assert [m.content for m in req2[prefix : prefix + len(new_messages)]] == [
+            m.content for m in new_messages
+        ]
+        assert [m.content for m in req2[prefix + len(new_messages) :]] == [
+            m.content for m in req1[prefix:]
+        ]
+
+    @pytest.mark.asyncio
+    async def test_phase_block_is_present_exactly_once_after_each_strategy(
+        self, execute_env
+    ):
+        """Acceptance (a): over the same history, tool-result clearing,
+        trimming and summarisation each leave exactly one phase block —
+        and summarisation seats it right after the summary, before the
+        kept window."""
+        from agent.core.context import ContextConfig, ContextManager
+
+        env = execute_env
+        body = "RESEARCH PROCEDURE " * 40
+        _bind_phase_start(env, body)
+        node = _make_execute_node(
+            env["config"],
+            env["workspace"],
+            env["todo"],
+            env["ctx"],
+            env["service"],
+            {"llm": env["llm"], "context": env["context"]},
+        )
+        with (
+            patch("agent.graph.get_archiver", return_value=None),
+            patch("agent.graph.get_phase_system_prompt", return_value="SYS"),
+        ):
+            first = await node(_worker_state())
+        block = first["messages"][0]
+        assert is_protected_message(block)
+        block.id = "blk"  # what the reducer assigns on append
+
+        # Grow the history the way the tools node would, after the block.
+        history = [HumanMessage(content="start", id="h0"), block]
+        for i in range(6):
+            history.append(
+                AIMessage(
+                    content=f"step {i}",
+                    id=f"a{i}",
+                    tool_calls=[
+                        {"name": "read_file", "args": {"path": f"f{i}"}, "id": f"c{i}"}
+                    ],
+                )
+            )
+            history.append(
+                ToolMessage(
+                    content=f"result {i} " + "z" * 300, tool_call_id=f"c{i}", id=f"t{i}"
+                )
+            )
+        history.append(HumanMessage(content="continue", id="h1"))
+
+        mgr = ContextManager(
+            config=ContextConfig(
+                compaction_threshold_tokens=500,
+                summarization_threshold_tokens=500,
+                keep_recent_messages=3,
+                keep_recent_tool_results=2,
+                model_max_context_tokens=4000,
+            )
+        )
+        mgr.set_current_phase("tactical", phase_key="2:tactical")
+
+        def protected(messages):
+            return [m for m in messages if is_protected_message(m)]
+
+        cleared = mgr.clear_old_tool_results(history)
+        assert protected(cleared) == [block]
+        assert cleared[1] is block
+
+        trimmed = mgr.trim_messages(history, keep_recent=3)
+        assert protected(trimmed) == [block]
+        assert trimmed[1] is block  # after the task, before the window
+
+        summarised = await mgr.summarize_and_compact(history, _mock_aux())
+        kept = [m for m in summarised if not isinstance(m, RemoveMessage)]
+        summary_idx = next(
+            i
+            for i, m in enumerate(kept)
+            if isinstance(m, SystemMessage) and "[Summary of prior work]" in m.content
+        )
+        blocks = protected(kept)
+        assert len(blocks) == 1
+        assert kept.index(blocks[0]) == summary_idx + 1
+        assert blocks[0].content == block.content
+        assert blocks[0].additional_kwargs == block.additional_kwargs
+        assert blocks[0].id is None
+        assert "blk" in {m.id for m in summarised if isinstance(m, RemoveMessage)}
+        assert [m.content for m in kept[summary_idx + 2 :]] == [
+            m.content for m in history[-3:]
+        ]
 
     @pytest.mark.asyncio
     async def test_phase_start_instruction_survives_emergency_compaction_retry(
@@ -576,8 +833,8 @@ class TestWorkerExecuteWiring:
         )
 
         with (
-            patch("src.graph.get_archiver", return_value=None),
-            patch("src.graph.get_phase_system_prompt", return_value="SYS"),
+            patch("agent.graph.get_archiver", return_value=None),
+            patch("agent.graph.get_phase_system_prompt", return_value="SYS"),
         ):
             result = await node(_worker_state())
 
@@ -603,11 +860,11 @@ class TestWorkerExecuteWiring:
         )
 
         with (
-            patch("src.graph.get_archiver", return_value=auditor),
+            patch("agent.graph.get_archiver", return_value=auditor),
             # The real prompt templates aren't under test (their Jinja
             # blocks trip get_phase_system_prompt's .format with the
             # bare default model) — the wiring is.
-            patch("src.graph.get_phase_system_prompt", return_value="SYS"),
+            patch("agent.graph.get_phase_system_prompt", return_value="SYS"),
         ):
             result = await node(_worker_state())
         await asyncio.sleep(0)  # let the fire-and-forget capture task run
@@ -684,8 +941,8 @@ class TestWorkerExecuteWiring:
         )
 
         with (
-            patch("src.graph.get_archiver", return_value=None),
-            patch("src.graph.get_phase_system_prompt", return_value="SYS"),
+            patch("agent.graph.get_archiver", return_value=None),
+            patch("agent.graph.get_phase_system_prompt", return_value="SYS"),
         ):
             await node(_worker_state())
         await asyncio.sleep(0)
@@ -707,7 +964,7 @@ class TestWorkerExecuteWiring:
 class TestArchiveNodeWiring:
     @pytest.mark.asyncio
     async def test_phase_boundary_capture(self, workspace_manager):
-        from src.graph import create_archive_phase_node
+        from agent.graph import create_archive_phase_node
 
         todo_manager = TodoManager(workspace_manager)
         plan_manager = PlanManager(workspace_manager)
@@ -755,7 +1012,7 @@ class TestAuditedToolsWiring:
     async def test_todo_complete_capture_drains_queue(
         self, worker_config, workspace_manager
     ):
-        from src.graph import create_audited_tool_node
+        from agent.graph import create_audited_tool_node
 
         ctx = ToolContext(workspace_manager=workspace_manager)
         ctx.queue_memory(content="Queued insight", importance=0.7, source="todo")
@@ -765,7 +1022,7 @@ class TestAuditedToolsWiring:
         fake_tool = MagicMock()
         fake_tool.name = "fake_tool"
 
-        with patch("src.graph.ToolNode") as MockToolNode:
+        with patch("agent.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             mock_tn.ainvoke = AsyncMock(
                 return_value={
@@ -796,7 +1053,7 @@ class TestAuditedToolsWiring:
                 "phase_number": 2,
                 "metadata": {},
             }
-            with patch("src.graph.get_archiver", return_value=None):
+            with patch("agent.graph.get_archiver", return_value=None):
                 await node(state)
 
         assert [e.kind for e in service.captures] == ["todo_complete"]
@@ -809,14 +1066,14 @@ class TestAuditedToolsWiring:
 
     @pytest.mark.asyncio
     async def test_empty_queue_emits_nothing(self, worker_config, workspace_manager):
-        from src.graph import create_audited_tool_node
+        from agent.graph import create_audited_tool_node
 
         ctx = ToolContext(workspace_manager=workspace_manager)
         service = RecordingManager()
         fake_tool = MagicMock()
         fake_tool.name = "fake_tool"
 
-        with patch("src.graph.ToolNode") as MockToolNode:
+        with patch("agent.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             mock_tn.ainvoke = AsyncMock(
                 return_value={
@@ -847,7 +1104,7 @@ class TestAuditedToolsWiring:
                 "phase_number": 2,
                 "metadata": {},
             }
-            with patch("src.graph.get_archiver", return_value=None):
+            with patch("agent.graph.get_archiver", return_value=None):
                 await node(state)
 
         assert service.captures == []
@@ -859,7 +1116,7 @@ class TestAuditedToolsWiring:
 
 
 def _persistent_callbacks():
-    from src.persistent_graph import PersistentLoopCallbacks
+    from agent.persistent_graph import PersistentLoopCallbacks
 
     return PersistentLoopCallbacks(
         get_user_input=AsyncMock(return_value="hello"),
@@ -878,7 +1135,7 @@ def _persistent_callbacks():
 class TestPersistentTurnWiring:
     @pytest.mark.asyncio
     async def test_flag_on_assemble_and_insertion(self):
-        from src.persistent_graph import _execute_turn
+        from agent.persistent_graph import _execute_turn
 
         captured_prepared: List[List[Any]] = []
 
@@ -945,7 +1202,7 @@ class TestPersistentTurnWiring:
 
     @pytest.mark.asyncio
     async def test_digest_flag_switches_query_formation(self):
-        from src.persistent_graph import _execute_turn
+        from agent.persistent_graph import _execute_turn
 
         async def _astream(msgs, **kwargs):
             yield AIMessage(content="ok")
@@ -1005,27 +1262,29 @@ def _archive_session(service: RecordingManager) -> MagicMock:
     session.auxiliary_llm = None
     session.postgres_conn = None
     session.workspace_sync = None
+    session.quiesce_subagents = AsyncMock()
+    session.resume_subagents = AsyncMock()
     return session
 
 
 class TestTeardownWiring:
     @pytest.mark.asyncio
     async def test_archive_captures_session_end(self):
-        from src.api.persistent_app import _handle_archive
+        from agent.api.persistent_app import _handle_archive
 
         service = RecordingManager()
         session = _archive_session(service)
         ws = AsyncMock()
 
         with (
-            patch("src.api.persistent_app._session", session),
-            patch("src.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session", session),
+            patch("agent.api.persistent_app._thread_id", "tid"),
             patch(
-                "src.api.persistent_app._update_thread_status",
+                "agent.api.persistent_app._update_thread_status",
                 new=AsyncMock(return_value=True),
             ),
             patch(
-                "src.api.persistent_app._terminate_session",
+                "agent.api.persistent_app._terminate_session",
                 new=AsyncMock(),
             ),
         ):
@@ -1043,21 +1302,21 @@ class TestTeardownWiring:
 
     @pytest.mark.asyncio
     async def test_idle_archive_captures_idle_kind(self):
-        from src.api.persistent_app import _handle_idle_archive
+        from agent.api.persistent_app import _handle_idle_archive
 
         service = RecordingManager()
         session = _archive_session(service)
         session.workspace_manager = None
 
         with (
-            patch("src.api.persistent_app._session", session),
-            patch("src.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session", session),
+            patch("agent.api.persistent_app._thread_id", "tid"),
             patch(
-                "src.api.persistent_app._update_thread_status",
+                "agent.api.persistent_app._update_thread_status",
                 new=AsyncMock(return_value=True),
             ),
             patch(
-                "src.api.persistent_app._terminate_session",
+                "agent.api.persistent_app._terminate_session",
                 new=AsyncMock(),
             ),
         ):
@@ -1069,7 +1328,7 @@ class TestTeardownWiring:
     @pytest.mark.asyncio
     async def test_terminate_captures_session_end_once(self):
         """B11: detach-style endings now capture — exactly once."""
-        from src.api import persistent_app
+        from agent.api import persistent_app
 
         service = RecordingManager()
         session = MagicMock()
@@ -1079,6 +1338,8 @@ class TestTeardownWiring:
         session.workspace_sync = None
         session.workspace_manager = None
         session.cleanup = AsyncMock()
+        session.quiesce_subagents = AsyncMock()
+        session.resume_subagents = AsyncMock()
         persistent_app._session = session
         persistent_app._thread_id = "tid-b11-1"
         persistent_app._terminating = False
@@ -1097,8 +1358,8 @@ class TestTeardownWiring:
     @pytest.mark.asyncio
     async def test_terminate_skips_when_archive_already_captured(self):
         """B11 guard: archive → terminate must not double-extract."""
-        from src.api import persistent_app
-        from src.api.persistent_app import _handle_archive
+        from agent.api import persistent_app
+        from agent.api.persistent_app import _handle_archive
 
         service = RecordingManager()
         session = _archive_session(service)
@@ -1117,7 +1378,7 @@ class TestTeardownWiring:
             patch.object(persistent_app, "_stop_watchdogs"),
         ):
             # _handle_archive reads the patched-in module globals directly
-            with patch("src.api.persistent_app._thread_id", "tid-b11-2"):
+            with patch("agent.api.persistent_app._thread_id", "tid-b11-2"):
                 await _handle_archive(ws)
             await persistent_app._terminate_session("loop_complete")
 
@@ -1157,7 +1418,7 @@ class TestStripRecognitionB10:
                 ("kb_notes", _make_kb_retriever(runtime)),
             ],
         )
-        from src.services.memory import AssembleRequest
+        from agent.services.memory import AssembleRequest
 
         payload = await manager.assemble(
             AssembleRequest(query_text="anything", model=None)
@@ -1177,7 +1438,7 @@ class TestStripRecognitionB10:
         manager = MemoryManager(
             MemoryRuntime(), retrievers=[("exotic", _ExoticRetriever())]
         )
-        from src.services.memory import AssembleRequest
+        from agent.services.memory import AssembleRequest
 
         payload = await manager.assemble(AssembleRequest(query_text="q"))
         assert payload.stats.candidates_total == 1
@@ -1185,12 +1446,137 @@ class TestStripRecognitionB10:
 
 
 def _make_recall_retriever(runtime):
-    from src.services.memory.plugins.legacy import RecallTwoTierRetriever
+    from agent.services.memory.plugins.legacy import RecallTwoTierRetriever
 
     return RecallTwoTierRetriever(runtime.recall_store)
 
 
 def _make_kb_retriever(runtime):
-    from src.services.memory.plugins.legacy import KbNotesRetriever
+    from agent.services.memory.plugins.legacy import KbNotesRetriever
 
     return KbNotesRetriever(runtime.knowledge_store, project_id=runtime.project_id)
+
+
+# ---------------------------------------------------------------------------
+# U2 WP2: phase skills as phase_start blocks and the DB addendum
+# ---------------------------------------------------------------------------
+
+_TACTICAL_SKILL_MD = (
+    "---\n"
+    "name: tactical-phase\n"
+    "description: test body\n"
+    "catalog: hidden\n"
+    "---\n\n"
+    "# Tactical phase\n\n"
+    "You are in TACTICAL mode. UNIQUE TACTICAL SKILL BODY\n"
+)
+
+
+def _bind_tactical_phase_skill(env, *, also_research_guide: bool = False):
+    entries = [
+        InstructionFileEntry(
+            trigger="phase_start:tactical", skill="tactical-phase", enforce=False
+        )
+    ]
+    env["workspace"].write_file("skills/tactical-phase/SKILL.md", _TACTICAL_SKILL_MD)
+    if also_research_guide:
+        guide = InstructionFileEntry(
+            trigger="phase_start:tactical", skill="research-guide", enforce=False
+        )
+        env["workspace"].write_file(guide.path, "RESEARCH GUIDE BODY")
+        entries.append(guide)
+    env["config"].instruction_files = entries
+    env["ctx"]._instruction_files = entries
+    return entries
+
+
+class TestPhaseSkillBlocks:
+    @pytest.mark.asyncio
+    async def test_bound_skill_block_delivers_the_body_without_frontmatter(
+        self, execute_env
+    ):
+        """A bound skill delivers its instructions, not its catalog frontmatter;
+        the factory's [phase: ...] header is the only header."""
+        from shared.runtime.core.message_markers import protected_path
+
+        env = execute_env
+        _bind_tactical_phase_skill(env)
+        node = _make_execute_node(
+            env["config"],
+            env["workspace"],
+            env["todo"],
+            env["ctx"],
+            env["service"],
+            {"llm": env["llm"], "context": env["context"]},
+        )
+        state = _worker_state()
+        with (
+            patch("agent.graph.get_archiver", return_value=None),
+            patch("agent.graph.get_phase_system_prompt", return_value="ONE-SYS"),
+        ):
+            first = await node(state)
+
+        block = first["messages"][0]
+        assert is_protected_message(block)
+        assert protected_path(block) == "skills/tactical-phase/SKILL.md"
+        assert block.content.startswith(
+            "[phase: tactical] Phase instructions (from skills/tactical-phase/SKILL.md)"
+        )
+        assert "UNIQUE TACTICAL SKILL BODY" in block.content
+        assert "catalog: hidden" not in block.content
+        assert "name: tactical-phase" not in block.content
+        assert block.content.count("[phase:") == 1
+        assert "<expert_workflow" not in block.content  # no DB addendum here
+        # Skills mode: the ONE phase-agnostic prompt heads the request.
+        request = env["llm"].ainvoke.call_args_list[0].args[0]
+        assert request[0].content == "ONE-SYS"
+
+    @pytest.mark.asyncio
+    async def test_db_phase_addendum_rides_inside_the_phase_block(self, execute_env):
+        """A DB expert's own tactical prompt is fenced (<expert_workflow>) and
+        appended INSIDE the tactical-phase block — one protected identity per
+        path, delivered once, brace-safe."""
+        env = execute_env
+        _bind_tactical_phase_skill(env)
+        env["config"].extra["_db_prompt_keys"] = ["tactical"]
+        env["config"].extra["_resolved_prompts"] = {
+            "tactical": 'FORK TACTICAL RULE {"json": true}',
+        }
+        node = _make_execute_node(
+            env["config"],
+            env["workspace"],
+            env["todo"],
+            env["ctx"],
+            env["service"],
+            {"llm": env["llm"], "context": env["context"]},
+        )
+        state = _worker_state()
+        with (
+            patch("agent.graph.get_archiver", return_value=None),
+            patch("agent.graph.get_phase_system_prompt", return_value="ONE-SYS"),
+        ):
+            first = await node(state)
+            _apply_turn(state, first)
+            second = await node(state)
+
+        blocks = [m for m in first["messages"] if is_protected_message(m)]
+        assert len(blocks) == 1
+        content = blocks[0].content
+        assert content.index("UNIQUE TACTICAL SKILL BODY") < content.index(
+            "<expert_workflow"
+        )
+        assert "FORK TACTICAL RULE" in content
+        assert (
+            '"json": true' in content
+            and "{" not in content.split("<expert_workflow")[1]
+        )
+        assert content.count("<expert_workflow") == 1
+        assert first["phase_instruction_injections"] == [
+            "2:tactical:skills/tactical-phase/SKILL.md"
+        ]
+        # Second turn: the addendum is in history, nothing is re-delivered.
+        assert not any(is_protected_message(m) for m in second["messages"])
+        requests = [c.args[0] for c in env["llm"].ainvoke.call_args_list]
+        for request in requests:
+            assert _count_text(request, "FORK TACTICAL RULE") == 1
+            assert _count_text(request, "<expert_workflow") == 1

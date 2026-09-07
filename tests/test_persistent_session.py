@@ -15,13 +15,13 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
-from src.api.persistent_session import (
+from agent.api.persistent_session import (
     PersistentSession,
     _EXCLUDED_TOOLS,
 )
-from src.core.backends.remote import WorkspaceHostIdentityMismatch
-from src.core.session_tool_overrides import SESSION_TOOL_OVERRIDE_NAMES
-from src.core.workspace_backend import WorkspaceUnavailableError
+from shared.runtime.core.backends.remote import WorkspaceHostIdentityMismatch
+from shared.runtime.core.session_tool_overrides import SESSION_TOOL_OVERRIDE_NAMES
+from shared.runtime.core.workspace_backend import WorkspaceUnavailableError
 
 
 # ---------------------------------------------------------------------------
@@ -62,9 +62,13 @@ def _make_config(**overrides):
     cfg.tools = MagicMock()
     # Real dataclass, not a MagicMock: _setup_tools passes it through
     # dataclasses.asdict() to inject delegation settings into tool_config.
-    from src.core.loader import DelegationConfig
+    from shared.runtime.core.loader import DelegationConfig, SubagentsConfig
 
     cfg.delegation = overrides.get("delegation", DelegationConfig())
+    # Same for the built-in subagents + tags (U1 WP3): parsed fields the
+    # session injects into tool_config next to `delegation`.
+    cfg.subagents = overrides.get("subagents", SubagentsConfig())
+    cfg.tags = overrides.get("tags", [])
     return cfg
 
 
@@ -266,7 +270,7 @@ def test_protected_cloud_ready_requires_a_current_health_proof():
 async def test_overlay_monitor_revokes_health_while_healing_and_requires_post_proof(
     monkeypatch, heal_fails
 ):
-    import src.api.persistent_session as module
+    import agent.api.persistent_session as module
 
     monkeypatch.setattr(module, "_CLOUD_OVERLAY_MONITOR_INTERVAL_SECONDS", 0)
     session = _make_session(protected_cloud_required=True)
@@ -364,8 +368,8 @@ class TestDeployBoundSkillWithoutDeploymentDir:
     """
 
     def test_bound_skill_deploys_when_deployment_dir_none(self, tmp_path):
-        from src.core.loader import InstructionFileEntry
-        from src.core.workspace import WorkspaceManager
+        from shared.runtime.core.loader import InstructionFileEntry
+        from agent.core.workspace import WorkspaceManager
         from tests._fs_backend import FilesystemTestBackend
 
         cfg = _make_config(
@@ -402,7 +406,7 @@ class TestSessionRegistersNoInstructionsProviders:
     """
 
     def test_neither_instructions_nor_task_brief_provider_is_registered(self, tmp_path):
-        from src.core.workspace import WorkspaceManager
+        from agent.core.workspace import WorkspaceManager
         from tests._fs_backend import FilesystemTestBackend
 
         session = _make_session()
@@ -469,7 +473,7 @@ class TestCapabilityScopedCanvasSkillDeployment:
         self,
         monkeypatch,
     ):
-        from src.core.product_capabilities import (
+        from shared.runtime.core.product_capabilities import (
             ProductComponent,
             ProvenanceStatus,
         )
@@ -514,7 +518,7 @@ class TestCapabilityScopedCanvasSkillDeployment:
         assert components[ProductComponent.WORKSPACE].source_revision == "b" * 40
 
     def test_break_glass_removes_stale_guide_during_session_rebind(self, monkeypatch):
-        from src.core.skill_resolution import APP_GUIDE_BREAK_GLASS_ENV
+        from shared.runtime.core.skill_resolution import APP_GUIDE_BREAK_GLASS_ENV
 
         cfg = _make_config(
             extra={
@@ -542,7 +546,7 @@ class TestCapabilityScopedCanvasSkillDeployment:
         assert "STALE" not in restored["files"]["app-guide"]["SKILL.md"]
 
     def test_stale_bound_app_guide_instruction_is_removed(self):
-        from src.core.loader import InstructionFileEntry
+        from shared.runtime.core.loader import InstructionFileEntry
 
         cfg = _make_config(
             extra={
@@ -802,7 +806,7 @@ class TestSetup:
             patch.object(session, "_setup_shell_manager"),
             patch.object(session, "_setup_memory"),
             patch(
-                "src.api.persistent_session.get_phase_system_prompt",
+                "agent.api.persistent_session.get_phase_system_prompt",
                 return_value="sys prompt",
             ),
         ):
@@ -824,7 +828,7 @@ class TestSetup:
             patch.object(session, "_setup_shell_manager"),
             patch.object(session, "_setup_memory"),
             patch(
-                "src.api.persistent_session.get_phase_system_prompt",
+                "agent.api.persistent_session.get_phase_system_prompt",
                 return_value="sys prompt",
             ),
         ):
@@ -874,7 +878,7 @@ class TestSetup:
             patch.object(session, "_setup_shell_manager", side_effect=track("shell")),
             patch.object(session, "_setup_memory", side_effect=track("memory")),
             patch(
-                "src.api.persistent_session.get_phase_system_prompt",
+                "agent.api.persistent_session.get_phase_system_prompt",
                 return_value="sys prompt",
             ),
         ):
@@ -903,7 +907,7 @@ class TestSetup:
             patch.object(session, "_setup_shell_manager"),
             patch.object(session, "_setup_memory"),
             patch(
-                "src.api.persistent_session.get_phase_system_prompt",
+                "agent.api.persistent_session.get_phase_system_prompt",
                 return_value="interactive prompt",
             ) as mock_prompt,
         ):
@@ -935,7 +939,7 @@ class TestShellToolsIncludedWhenShellManagerAvailable:
 
     def test_shell_tools_include_shell_when_shell_manager_set(self):
         """create_shell_tools returns shell tools when context.shell_manager is set."""
-        from src.tools.context import ToolContext
+        from agent.tools.context import ToolContext
 
         mock_wm = MagicMock()
         mock_wm.is_initialized = True
@@ -946,7 +950,7 @@ class TestShellToolsIncludedWhenShellManagerAvailable:
             shell_manager=mock_sm,
         )
 
-        from src.tools.shell import create_shell_tools
+        from agent.tools.shell import create_shell_tools
 
         tools = create_shell_tools(ctx)
         tool_names = [t.name for t in tools]
@@ -955,7 +959,7 @@ class TestShellToolsIncludedWhenShellManagerAvailable:
 
     def test_shell_tools_exclude_shell_when_shell_manager_none(self):
         """create_shell_tools omits shell tools when context.shell_manager is None."""
-        from src.tools.context import ToolContext
+        from agent.tools.context import ToolContext
 
         mock_wm = MagicMock()
         mock_wm.is_initialized = True
@@ -965,7 +969,7 @@ class TestShellToolsIncludedWhenShellManagerAvailable:
             shell_manager=None,
         )
 
-        from src.tools.shell import create_shell_tools
+        from agent.tools.shell import create_shell_tools
 
         tools = create_shell_tools(ctx)
         tool_names = [t.name for t in tools]
@@ -990,16 +994,18 @@ class TestShellToolsIncludedWhenShellManagerAvailable:
 
         with (
             patch(
-                "src.api.persistent_session.get_all_tool_names",
+                "agent.api.persistent_session.get_all_tool_names",
                 return_value=["run_command", "shell_read"],
             ),
-            patch("src.api.persistent_session.load_tools", side_effect=spy_load_tools),
             patch(
-                "src.api.persistent_session.apply_description_overrides",
+                "agent.api.persistent_session.load_tools", side_effect=spy_load_tools
+            ),
+            patch(
+                "agent.api.persistent_session.apply_description_overrides",
                 side_effect=lambda x: x,
             ),
             patch(
-                "src.api.persistent_session.apply_instruction_enforcement",
+                "agent.api.persistent_session.apply_instruction_enforcement",
                 side_effect=lambda x, y: x,
             ),
         ):
@@ -1012,7 +1018,7 @@ class TestShellToolsIncludedWhenShellManagerAvailable:
         )
 
     def test_setup_tools_withholds_product_reader_during_break_glass(self, monkeypatch):
-        from src.core.skill_resolution import APP_GUIDE_BREAK_GLASS_ENV
+        from shared.runtime.core.skill_resolution import APP_GUIDE_BREAK_GLASS_ENV
 
         cfg = _make_config()
         session = _make_session(config=cfg)
@@ -1026,16 +1032,18 @@ class TestShellToolsIncludedWhenShellManagerAvailable:
 
         with (
             patch(
-                "src.api.persistent_session.get_all_tool_names",
+                "agent.api.persistent_session.get_all_tool_names",
                 return_value=["read_product_guide"],
             ),
-            patch("src.api.persistent_session.load_tools", side_effect=spy_load_tools),
             patch(
-                "src.api.persistent_session.apply_description_overrides",
+                "agent.api.persistent_session.load_tools", side_effect=spy_load_tools
+            ),
+            patch(
+                "agent.api.persistent_session.apply_description_overrides",
                 side_effect=lambda x: x,
             ),
             patch(
-                "src.api.persistent_session.apply_instruction_enforcement",
+                "agent.api.persistent_session.apply_instruction_enforcement",
                 side_effect=lambda x, y: x,
             ),
         ):
@@ -1064,9 +1072,9 @@ class TestSetupWorkspace:
 
     @pytest.mark.asyncio
     async def test_remote_backend_creation(self):
-        """Remote backend created and connected when config says 'sandbox'."""
+        """A generic explicit remote keeps its non-Kubernetes trust contract."""
         cfg = _make_config(
-            ws_backend="sandbox",
+            ws_backend="remote",
             ws_remote={"host": "10.0.0.1", "port": 22, "key_path": "/key"},
         )
         cfg.extra = {"shell": {"default_timeout": 60, "max_tabs": 5}}
@@ -1076,12 +1084,12 @@ class TestSetupWorkspace:
         mock_remote.connect = MagicMock()
 
         with (
-            patch("src.api.persistent_session.WorkspaceManager") as MockWM,
-            patch("src.api.persistent_session.WorkspaceManagerConfig"),
+            patch("agent.api.persistent_session.WorkspaceManager") as MockWM,
+            patch("agent.api.persistent_session.WorkspaceManagerConfig"),
             patch.dict(
                 "sys.modules",
                 {
-                    "src.core.backends.remote": MagicMock(
+                    "shared.runtime.core.backends.remote": MagicMock(
                         RemoteBackend=MagicMock(return_value=mock_remote)
                     )
                 },
@@ -1119,6 +1127,7 @@ class TestSetupWorkspace:
         remote_constructor = MagicMock(return_value=mock_remote)
         workspace_override = {
             "backend": "sandbox",
+            "workspace_provisioner": "k8s",
             "remote": {"host": "10.0.0.1", "port": 22, "key_path": "/key"},
             "workspace_generation": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
             "workspace_runtime_incarnation": ("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
@@ -1126,12 +1135,12 @@ class TestSetupWorkspace:
         }
 
         with (
-            patch("src.api.persistent_session.WorkspaceManager") as MockWM,
-            patch("src.api.persistent_session.WorkspaceManagerConfig"),
+            patch("agent.api.persistent_session.WorkspaceManager") as MockWM,
+            patch("agent.api.persistent_session.WorkspaceManagerConfig"),
             patch.dict(
                 "sys.modules",
                 {
-                    "src.core.backends.remote": MagicMock(
+                    "shared.runtime.core.backends.remote": MagicMock(
                         RemoteBackend=remote_constructor
                     )
                 },
@@ -1165,6 +1174,7 @@ class TestSetupWorkspace:
         remote_constructor = MagicMock(return_value=mock_remote)
         workspace_override = {
             "backend": "sandbox",
+            "workspace_provisioner": "k8s",
             "remote": {"host": "10.0.0.1", "port": 22, "key_path": "/key"},
             "workspace_generation": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
             "workspace_runtime_incarnation": ("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
@@ -1172,12 +1182,12 @@ class TestSetupWorkspace:
         }
 
         with (
-            patch("src.api.persistent_session.WorkspaceManager") as MockWM,
-            patch("src.api.persistent_session.WorkspaceManagerConfig"),
+            patch("agent.api.persistent_session.WorkspaceManager") as MockWM,
+            patch("agent.api.persistent_session.WorkspaceManagerConfig"),
             patch.dict(
                 "sys.modules",
                 {
-                    "src.core.backends.remote": MagicMock(
+                    "shared.runtime.core.backends.remote": MagicMock(
                         RemoteBackend=remote_constructor
                     )
                 },
@@ -1213,6 +1223,7 @@ class TestSetupWorkspace:
         )
         workspace_override = {
             "backend": "sandbox",
+            "workspace_provisioner": "k8s",
             "remote": {"host": "10.0.0.1", "port": 22, "key_path": "/key"},
             "workspace_generation": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
             "workspace_runtime_incarnation": ("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
@@ -1221,11 +1232,11 @@ class TestSetupWorkspace:
         sleep = AsyncMock()
 
         with (
-            patch("src.api.persistent_session.asyncio.sleep", sleep),
+            patch("agent.api.persistent_session.asyncio.sleep", sleep),
             patch.dict(
                 "sys.modules",
                 {
-                    "src.core.backends.remote": MagicMock(
+                    "shared.runtime.core.backends.remote": MagicMock(
                         RemoteBackend=MagicMock(return_value=mock_remote)
                     )
                 },
@@ -1274,6 +1285,7 @@ class TestSetupWorkspace:
         session.shell_owner_token = 24
         workspace_override = {
             "backend": "sandbox",
+            "workspace_provisioner": "k8s",
             "remote": {"host": "10.0.0.1", "port": 22, "key_path": "/key"},
             **workspace_override,
         }
@@ -1306,6 +1318,7 @@ class TestSetupWorkspace:
         )
         workspace_override = {
             "backend": "sandbox",
+            "workspace_provisioner": "k8s",
             "remote": {"host": "10.0.0.1", "port": 22, "key_path": "/key"},
             "workspace_generation": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
             "workspace_runtime_incarnation": ("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
@@ -1333,6 +1346,7 @@ class TestSetupWorkspace:
         )
         workspace_override = {
             "backend": "sandbox",
+            "workspace_provisioner": "k8s",
             "remote": {"host": "10.0.0.1", "port": 22, "key_path": "/key"},
             "workspace_generation": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
             "workspace_runtime_incarnation": ("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
@@ -1341,11 +1355,11 @@ class TestSetupWorkspace:
         sleep = AsyncMock()
 
         with (
-            patch("src.api.persistent_session.asyncio.sleep", sleep),
+            patch("agent.api.persistent_session.asyncio.sleep", sleep),
             patch.dict(
                 "sys.modules",
                 {
-                    "src.core.backends.remote": MagicMock(
+                    "shared.runtime.core.backends.remote": MagicMock(
                         RemoteBackend=MagicMock(return_value=mock_remote)
                     )
                 },
@@ -1371,22 +1385,23 @@ class TestSetupWorkspace:
         remote_constructor = MagicMock(return_value=mock_remote)
         workspace_override = {
             "backend": "sandbox",
+            "workspace_provisioner": "k8s",
             "remote": {"host": "paired.test", "port": 30022},
-            # A pinned attach during rollout may see the pre-existing durable
-            # backing generation before its pod context carries the new UID.
             "workspace_generation": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "workspace_runtime_incarnation": ("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+            "workspace_ssh_host_key_fingerprint": "SHA256:trusted",
             "canvas_presentation_available": True,
             "canvas_live_apps_available": True,
             "canvas_shared_browser_available": True,
         }
 
         with (
-            patch("src.api.persistent_session.WorkspaceManager") as MockWM,
-            patch("src.api.persistent_session.WorkspaceManagerConfig"),
+            patch("agent.api.persistent_session.WorkspaceManager") as MockWM,
+            patch("agent.api.persistent_session.WorkspaceManagerConfig"),
             patch.dict(
                 "sys.modules",
                 {
-                    "src.core.backends.remote": MagicMock(
+                    "shared.runtime.core.backends.remote": MagicMock(
                         RemoteBackend=remote_constructor
                     )
                 },
@@ -1399,11 +1414,38 @@ class TestSetupWorkspace:
         assert mock_remote.supports_canvas_presentation is True
         assert mock_remote.supports_canvas_live_apps is True
         assert mock_remote.supports_canvas_shared_browser is True
-        assert remote_constructor.call_args.kwargs["workspace_generation"] is None
-        assert remote_constructor.call_args.kwargs["runtime_incarnation"] is None
-        assert (
-            remote_constructor.call_args.kwargs["expected_host_key_fingerprint"] is None
+        assert remote_constructor.call_args.kwargs["workspace_generation"] == (
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         )
+        assert remote_constructor.call_args.kwargs["runtime_incarnation"] == (
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        )
+        assert (
+            remote_constructor.call_args.kwargs["expected_host_key_fingerprint"]
+            == "SHA256:trusted"
+        )
+        assert remote_constructor.call_args.kwargs["require_host_key_fingerprint"]
+
+    @pytest.mark.asyncio
+    async def test_config_cannot_forge_docker_to_bypass_k8s_host_identity(self):
+        cfg = _make_config(
+            ws_backend="sandbox",
+            ws_remote={"host": "configured.test", "port": 22},
+        )
+        # Config is caller state, not the server-derived wire authority.
+        cfg.workspace.provisioner = "docker"
+        session = _make_session(config=cfg)
+        workspace_override = {
+            "backend": "sandbox",
+            "workspace_provisioner": "k8s",
+            "remote": {"host": "reused-ip.test", "port": 30022},
+        }
+
+        with pytest.raises(
+            WorkspaceUnavailableError,
+            match="backing, runtime incarnation, and SSH host identity",
+        ):
+            await session._setup_workspace(workspace_override=workspace_override)
 
     @pytest.mark.asyncio
     async def test_vm_remote_backend_disables_canvas_presentation(self):
@@ -1416,12 +1458,12 @@ class TestSetupWorkspace:
         mock_remote.connect = MagicMock()
 
         with (
-            patch("src.api.persistent_session.WorkspaceManager") as MockWM,
-            patch("src.api.persistent_session.WorkspaceManagerConfig"),
+            patch("agent.api.persistent_session.WorkspaceManager") as MockWM,
+            patch("agent.api.persistent_session.WorkspaceManagerConfig"),
             patch.dict(
                 "sys.modules",
                 {
-                    "src.core.backends.remote": MagicMock(
+                    "shared.runtime.core.backends.remote": MagicMock(
                         RemoteBackend=MagicMock(return_value=mock_remote)
                     )
                 },
@@ -1439,7 +1481,7 @@ class TestSetupWorkspace:
     async def test_remote_retry_succeeds_after_failures(self):
         """Retry loop recovers when connect fails then succeeds."""
         cfg = _make_config(
-            ws_backend="sandbox",
+            ws_backend="remote",
             ws_remote={"host": "10.0.0.1"},
         )
         session = _make_session(config=cfg)
@@ -1452,9 +1494,11 @@ class TestSetupWorkspace:
         mock_module.RemoteBackend = MagicMock(return_value=mock_remote)
 
         with (
-            patch("src.api.persistent_session.WorkspaceManager") as MockWM,
-            patch("src.api.persistent_session.WorkspaceManagerConfig"),
-            patch.dict("sys.modules", {"src.core.backends.remote": mock_module}),
+            patch("agent.api.persistent_session.WorkspaceManager") as MockWM,
+            patch("agent.api.persistent_session.WorkspaceManagerConfig"),
+            patch.dict(
+                "sys.modules", {"shared.runtime.core.backends.remote": mock_module}
+            ),
             patch("asyncio.sleep", new_callable=AsyncMock),
         ):
             MockWM.return_value.path = "/tmp/test"
@@ -1468,7 +1512,7 @@ class TestSetupWorkspace:
     async def test_remote_retry_raises_after_timeout(self):
         """Retry loop raises WorkspaceUnavailableError after max duration."""
         cfg = _make_config(
-            ws_backend="sandbox",
+            ws_backend="remote",
             ws_remote={"host": "10.0.0.1"},
         )
         session = _make_session(config=cfg)
@@ -1487,11 +1531,14 @@ class TestSetupWorkspace:
             return val
 
         with (
-            patch("src.api.persistent_session.WorkspaceManager"),
-            patch("src.api.persistent_session.WorkspaceManagerConfig"),
-            patch.dict("sys.modules", {"src.core.backends.remote": mock_module}),
+            patch("agent.api.persistent_session.WorkspaceManager"),
+            patch("agent.api.persistent_session.WorkspaceManagerConfig"),
+            patch.dict(
+                "sys.modules", {"shared.runtime.core.backends.remote": mock_module}
+            ),
             patch(
-                "src.api.persistent_session.time.monotonic", side_effect=fake_monotonic
+                "agent.api.persistent_session.time.monotonic",
+                side_effect=fake_monotonic,
             ),
             patch("asyncio.sleep", new_callable=AsyncMock),
         ):
@@ -1505,7 +1552,7 @@ class TestSetupWorkspace:
         session = _make_session(config=cfg)
 
         override = {
-            "backend": "sandbox",
+            "backend": "remote",
             "remote": {"host": "override-host"},
         }
 
@@ -1515,9 +1562,11 @@ class TestSetupWorkspace:
         mock_module.RemoteBackend = MagicMock(return_value=mock_remote)
 
         with (
-            patch("src.api.persistent_session.WorkspaceManager") as MockWM,
-            patch("src.api.persistent_session.WorkspaceManagerConfig"),
-            patch.dict("sys.modules", {"src.core.backends.remote": mock_module}),
+            patch("agent.api.persistent_session.WorkspaceManager") as MockWM,
+            patch("agent.api.persistent_session.WorkspaceManagerConfig"),
+            patch.dict(
+                "sys.modules", {"shared.runtime.core.backends.remote": mock_module}
+            ),
         ):
             MockWM.return_value.path = "/tmp/test"
             MockWM.return_value.initialize = MagicMock()
@@ -1567,7 +1616,7 @@ class TestAttachExistingWorkspaceGuard:
     """
 
     def _session_with_manager(self, tmp_path, git_remote_url=None):
-        from src.core.workspace import WorkspaceManager, WorkspaceManagerConfig
+        from agent.core.workspace import WorkspaceManager, WorkspaceManagerConfig
 
         session = _make_session(config=_make_config())
         backend = _ShellProbeBackend(tmp_path)
@@ -1658,17 +1707,17 @@ class TestSetupWorkspaceGuardWiring:
         mock_remote.list_dir = MagicMock(return_value=[])
 
         cfg = _make_config(
-            ws_backend="sandbox",
+            ws_backend="remote",
             ws_remote={"host": "10.0.0.1", "port": 22, "key_path": "/key"},
         )
         session = _make_session(config=cfg)
         with (
-            patch("src.api.persistent_session.WorkspaceManager") as MockWM,
-            patch("src.api.persistent_session.WorkspaceManagerConfig"),
+            patch("agent.api.persistent_session.WorkspaceManager") as MockWM,
+            patch("agent.api.persistent_session.WorkspaceManagerConfig"),
             patch.dict(
                 "sys.modules",
                 {
-                    "src.core.backends.remote": MagicMock(
+                    "shared.runtime.core.backends.remote": MagicMock(
                         RemoteBackend=MagicMock(return_value=mock_remote)
                     )
                 },
@@ -1687,17 +1736,17 @@ class TestSetupWorkspaceGuardWiring:
         mock_remote.exists = MagicMock(return_value=True)
 
         cfg = _make_config(
-            ws_backend="sandbox",
+            ws_backend="remote",
             ws_remote={"host": "10.0.0.1", "port": 22, "key_path": "/key"},
         )
         session = _make_session(config=cfg)
         with (
-            patch("src.api.persistent_session.WorkspaceManager") as MockWM,
-            patch("src.api.persistent_session.WorkspaceManagerConfig"),
+            patch("agent.api.persistent_session.WorkspaceManager") as MockWM,
+            patch("agent.api.persistent_session.WorkspaceManagerConfig"),
             patch.dict(
                 "sys.modules",
                 {
-                    "src.core.backends.remote": MagicMock(
+                    "shared.runtime.core.backends.remote": MagicMock(
                         RemoteBackend=MagicMock(return_value=mock_remote)
                     )
                 },
@@ -1765,11 +1814,11 @@ class TestSetupCloudMountOverlayFailure:
 
         with (
             patch(
-                "src.services.cloud_mount.RcloneMountManager",
+                "shared.runtime.services.cloud_mount.RcloneMountManager",
                 return_value=fake_rclone_manager,
             ),
             patch(
-                "src.services.cloud_overlay.OverlayMountManager",
+                "shared.runtime.services.cloud_overlay.OverlayMountManager",
                 return_value=fake_overlay_manager,
             ),
         ):
@@ -1804,11 +1853,11 @@ class TestSetupCloudMountOverlayFailure:
 
         with (
             patch(
-                "src.services.cloud_mount.RcloneMountManager",
+                "shared.runtime.services.cloud_mount.RcloneMountManager",
                 return_value=fake_rclone_manager,
             ),
             patch(
-                "src.services.cloud_overlay.OverlayMountManager",
+                "shared.runtime.services.cloud_overlay.OverlayMountManager",
                 return_value=fake_overlay_manager,
             ),
         ):
@@ -1836,11 +1885,11 @@ class TestSetupCloudMountOverlayFailure:
 
         with (
             patch(
-                "src.services.cloud_mount.RcloneMountManager",
+                "shared.runtime.services.cloud_mount.RcloneMountManager",
                 return_value=fake_rclone_manager,
             ),
             patch(
-                "src.services.cloud_overlay.OverlayMountManager",
+                "shared.runtime.services.cloud_overlay.OverlayMountManager",
                 return_value=fake_overlay_manager,
             ),
         ):
@@ -1879,11 +1928,11 @@ class TestSetupCloudMountOverlayFailure:
 
         with (
             patch(
-                "src.services.cloud_mount.RcloneMountManager",
+                "shared.runtime.services.cloud_mount.RcloneMountManager",
                 return_value=fake_rclone_manager,
             ),
             patch(
-                "src.services.cloud_overlay.OverlayMountManager",
+                "shared.runtime.services.cloud_overlay.OverlayMountManager",
                 return_value=fake_overlay_manager,
             ),
         ):
@@ -1940,11 +1989,11 @@ class TestStatelessCloudMountClaimSetup:
 
         with (
             patch(
-                "src.services.cloud_mount.RcloneMountManager",
+                "shared.runtime.services.cloud_mount.RcloneMountManager",
                 return_value=manager,
             ),
             patch(
-                "src.api.persistent_session.get_phase_system_prompt",
+                "agent.api.persistent_session.get_phase_system_prompt",
                 return_value="prompt",
             ),
         ):
@@ -1982,7 +2031,7 @@ class TestStatelessCloudMountClaimSetup:
         )
 
         with patch(
-            "src.services.cloud_mount.RcloneMountManager",
+            "shared.runtime.services.cloud_mount.RcloneMountManager",
             return_value=manager,
         ):
             with pytest.raises(RuntimeError, match="ENOTCONN"):
@@ -1990,6 +2039,103 @@ class TestStatelessCloudMountClaimSetup:
 
         assert session.cloud_mount_manager is None
         assert "ENOTCONN" in session.cloud_mount_error
+
+    @pytest.mark.asyncio
+    async def test_exactly_rolled_back_optional_mount_degrades_stateless_setup(self):
+        from shared.runtime.services.cloud_mount import RcloneMountCleanFailure
+
+        session = _make_session(
+            shell_owner_token=24,
+            workspace_manager=SimpleNamespace(
+                path="/workspace",
+                backend=MagicMock(),
+            ),
+        )
+        manager = MagicMock()
+        manager.start_all = AsyncMock(
+            side_effect=RcloneMountCleanFailure("exact resident cleanup")
+        )
+
+        with patch(
+            "shared.runtime.services.cloud_mount.RcloneMountManager",
+            return_value=manager,
+        ):
+            await session._setup_cloud_mount(
+                {
+                    "driver": "rclone",
+                    "protected": False,
+                    "required": False,
+                    "mounts": [{}],
+                }
+            )
+
+        assert session.cloud_mount_manager is None
+        assert session.cloud_mount_error == "exact resident cleanup"
+
+    @pytest.mark.asyncio
+    async def test_clean_failure_still_fails_closed_for_protected_cloud(self):
+        from shared.runtime.services.cloud_mount import RcloneMountCleanFailure
+
+        session = _make_session(
+            shell_owner_token=25,
+            workspace_manager=SimpleNamespace(
+                path="/workspace",
+                backend=MagicMock(),
+            ),
+        )
+        manager = MagicMock()
+        manager.start_all = AsyncMock(
+            side_effect=RcloneMountCleanFailure("exact resident cleanup")
+        )
+
+        with patch(
+            "shared.runtime.services.cloud_mount.RcloneMountManager",
+            return_value=manager,
+        ):
+            with pytest.raises(RcloneMountCleanFailure):
+                await session._setup_cloud_mount(
+                    {
+                        "driver": "rclone",
+                        "protected": True,
+                        "required": True,
+                        "mounts": [{}],
+                    }
+                )
+
+        assert session.cloud_mount_manager is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("required", [True, None, "false"])
+    async def test_clean_failure_cannot_mask_required_or_untyped_mount(self, required):
+        from shared.runtime.services.cloud_mount import RcloneMountCleanFailure
+
+        session = _make_session(
+            shell_owner_token=26,
+            workspace_manager=SimpleNamespace(
+                path="/workspace",
+                backend=MagicMock(),
+            ),
+        )
+        manager = MagicMock()
+        manager.start_all = AsyncMock(
+            side_effect=RcloneMountCleanFailure("exact resident cleanup")
+        )
+        payload = {
+            "driver": "rclone",
+            "protected": False,
+            "mounts": [{}],
+        }
+        if required is not None:
+            payload["required"] = required
+
+        with patch(
+            "shared.runtime.services.cloud_mount.RcloneMountManager",
+            return_value=manager,
+        ):
+            with pytest.raises(RcloneMountCleanFailure):
+                await session._setup_cloud_mount(payload)
+
+        assert session.cloud_mount_manager is None
 
     @pytest.mark.asyncio
     async def test_pinned_mount_failure_retains_historical_degraded_mode(self):
@@ -2004,7 +2150,7 @@ class TestStatelessCloudMountClaimSetup:
         manager.start_all = AsyncMock(side_effect=RuntimeError("mount unavailable"))
 
         with patch(
-            "src.services.cloud_mount.RcloneMountManager",
+            "shared.runtime.services.cloud_mount.RcloneMountManager",
             return_value=manager,
         ):
             await session._setup_cloud_mount({"driver": "rclone", "mounts": []})
@@ -2025,7 +2171,7 @@ class TestSetupTools:
     ):
         """The M2c canary survives every user group being off and guide break-glass."""
 
-        from src.tools.product_capabilities import (
+        from agent.tools.product_capabilities import (
             PRODUCT_CAPABILITIES_TOOL_ENABLED_ENV,
             PRODUCT_CAPABILITIES_TOOL_NAME,
         )
@@ -2061,7 +2207,7 @@ class TestSetupTools:
 
         with (
             patch(
-                "src.api.persistent_session.get_all_tool_names",
+                "agent.api.persistent_session.get_all_tool_names",
                 return_value=[
                     "read_product_guide",
                     "create_job",
@@ -2070,13 +2216,13 @@ class TestSetupTools:
                     "set_canvas",
                 ],
             ),
-            patch("src.api.persistent_session.load_tools", side_effect=load),
+            patch("agent.api.persistent_session.load_tools", side_effect=load),
             patch(
-                "src.api.persistent_session.apply_description_overrides",
+                "agent.api.persistent_session.apply_description_overrides",
                 side_effect=lambda tools: tools,
             ),
             patch(
-                "src.api.persistent_session.apply_instruction_enforcement",
+                "agent.api.persistent_session.apply_instruction_enforcement",
                 side_effect=lambda tools, _context: tools,
             ),
             patch.object(session, "_scope_skills_for_tool_names"),
@@ -2097,7 +2243,7 @@ class TestSetupTools:
         )
 
     def test_final_post_enforcement_tool_names_are_published(self, monkeypatch):
-        from src.tools.product_capabilities import (
+        from agent.tools.product_capabilities import (
             PRODUCT_CAPABILITIES_TOOL_ENABLED_ENV,
             PRODUCT_CAPABILITIES_TOOL_NAME,
         )
@@ -2119,21 +2265,21 @@ class TestSetupTools:
 
         with (
             patch(
-                "src.api.persistent_session.get_all_tool_names",
+                "agent.api.persistent_session.get_all_tool_names",
                 return_value=["web_search"],
             ),
             patch(
-                "src.api.persistent_session.load_tools",
+                "agent.api.persistent_session.load_tools",
                 side_effect=lambda names, _context: [
                     _named_tool(name) for name in names
                 ],
             ),
             patch(
-                "src.api.persistent_session.apply_description_overrides",
+                "agent.api.persistent_session.apply_description_overrides",
                 side_effect=lambda tools: tools,
             ),
             patch(
-                "src.api.persistent_session.apply_instruction_enforcement",
+                "agent.api.persistent_session.apply_instruction_enforcement",
                 side_effect=enforce,
             ),
             patch.object(session, "_scope_skills_for_tool_names"),
@@ -2164,7 +2310,7 @@ class TestSetupTools:
 
         with (
             patch(
-                "src.api.persistent_session.get_all_tool_names",
+                "agent.api.persistent_session.get_all_tool_names",
                 return_value=[
                     "web_search",
                     "next_phase_todos",
@@ -2173,17 +2319,17 @@ class TestSetupTools:
                 ],
             ),
             patch(
-                "src.api.persistent_session.load_tools", return_value=[mock_tool]
+                "agent.api.persistent_session.load_tools", return_value=[mock_tool]
             ) as mock_load,
             patch(
-                "src.api.persistent_session.apply_description_overrides",
+                "agent.api.persistent_session.apply_description_overrides",
                 side_effect=lambda x: x,
             ),
             patch(
-                "src.api.persistent_session.apply_instruction_enforcement",
+                "agent.api.persistent_session.apply_instruction_enforcement",
                 side_effect=lambda x, y: x,
             ),
-            patch("src.api.persistent_session.ToolContext"),
+            patch("agent.api.persistent_session.ToolContext"),
         ):
             session._setup_tools(None)
 
@@ -2238,21 +2384,21 @@ class TestSetupTools:
 
         with (
             patch(
-                "src.api.persistent_session.get_all_tool_names",
+                "agent.api.persistent_session.get_all_tool_names",
                 return_value=["web_search"],
             ),
             patch(
-                "src.api.persistent_session.load_tools", return_value=[]
+                "agent.api.persistent_session.load_tools", return_value=[]
             ) as mock_load,
             patch(
-                "src.api.persistent_session.apply_description_overrides",
+                "agent.api.persistent_session.apply_description_overrides",
                 side_effect=lambda x: x,
             ),
             patch(
-                "src.api.persistent_session.apply_instruction_enforcement",
+                "agent.api.persistent_session.apply_instruction_enforcement",
                 side_effect=lambda x, y: x,
             ),
-            patch("src.api.persistent_session.ToolContext"),
+            patch("agent.api.persistent_session.ToolContext"),
         ):
             session._setup_tools(None)
 
@@ -2287,21 +2433,21 @@ class TestSetupTools:
 
         with (
             patch(
-                "src.api.persistent_session.get_all_tool_names",
+                "agent.api.persistent_session.get_all_tool_names",
                 return_value=["web_search"],
             ),
             patch(
-                "src.api.persistent_session.load_tools", return_value=[]
+                "agent.api.persistent_session.load_tools", return_value=[]
             ) as mock_load,
             patch(
-                "src.api.persistent_session.apply_description_overrides",
+                "agent.api.persistent_session.apply_description_overrides",
                 side_effect=lambda x: x,
             ),
             patch(
-                "src.api.persistent_session.apply_instruction_enforcement",
+                "agent.api.persistent_session.apply_instruction_enforcement",
                 side_effect=lambda x, y: x,
             ),
-            patch("src.api.persistent_session.ToolContext"),
+            patch("agent.api.persistent_session.ToolContext"),
         ):
             session._setup_tools(None)
 
@@ -2327,7 +2473,7 @@ class TestSetupTools:
 
         with (
             patch(
-                "src.api.persistent_session.get_all_tool_names",
+                "agent.api.persistent_session.get_all_tool_names",
                 return_value=[
                     "web_search",
                     "create_job",
@@ -2337,17 +2483,17 @@ class TestSetupTools:
                 ],
             ),
             patch(
-                "src.api.persistent_session.load_tools", return_value=[]
+                "agent.api.persistent_session.load_tools", return_value=[]
             ) as mock_load,
             patch(
-                "src.api.persistent_session.apply_description_overrides",
+                "agent.api.persistent_session.apply_description_overrides",
                 side_effect=lambda x: x,
             ),
             patch(
-                "src.api.persistent_session.apply_instruction_enforcement",
+                "agent.api.persistent_session.apply_instruction_enforcement",
                 side_effect=lambda x, y: x,
             ),
-            patch("src.api.persistent_session.ToolContext"),
+            patch("agent.api.persistent_session.ToolContext"),
         ):
             session._setup_tools(None)
 
@@ -2372,7 +2518,7 @@ class TestSetupTools:
 
         with (
             patch(
-                "src.api.persistent_session.get_all_tool_names",
+                "agent.api.persistent_session.get_all_tool_names",
                 return_value=[
                     "web_search",
                     "create_job",
@@ -2384,17 +2530,17 @@ class TestSetupTools:
                 ],
             ),
             patch(
-                "src.api.persistent_session.load_tools", return_value=[]
+                "agent.api.persistent_session.load_tools", return_value=[]
             ) as mock_load,
             patch(
-                "src.api.persistent_session.apply_description_overrides",
+                "agent.api.persistent_session.apply_description_overrides",
                 side_effect=lambda x: x,
             ),
             patch(
-                "src.api.persistent_session.apply_instruction_enforcement",
+                "agent.api.persistent_session.apply_instruction_enforcement",
                 side_effect=lambda x, y: x,
             ),
-            patch("src.api.persistent_session.ToolContext"),
+            patch("agent.api.persistent_session.ToolContext"),
         ):
             session._setup_tools(None)
 
@@ -2425,7 +2571,7 @@ class TestSetupTools:
 
         with (
             patch(
-                "src.api.persistent_session.get_all_tool_names",
+                "agent.api.persistent_session.get_all_tool_names",
                 return_value=[
                     "web_search",
                     "create_job",
@@ -2435,17 +2581,17 @@ class TestSetupTools:
                 ],
             ),
             patch(
-                "src.api.persistent_session.load_tools", return_value=[]
+                "agent.api.persistent_session.load_tools", return_value=[]
             ) as mock_load,
             patch(
-                "src.api.persistent_session.apply_description_overrides",
+                "agent.api.persistent_session.apply_description_overrides",
                 side_effect=lambda x: x,
             ),
             patch(
-                "src.api.persistent_session.apply_instruction_enforcement",
+                "agent.api.persistent_session.apply_instruction_enforcement",
                 side_effect=lambda x, y: x,
             ),
-            patch("src.api.persistent_session.ToolContext"),
+            patch("agent.api.persistent_session.ToolContext"),
         ):
             session._setup_tools(None)
 
@@ -2480,7 +2626,7 @@ class TestSetupTools:
 
         with (
             patch(
-                "src.api.persistent_session.get_all_tool_names",
+                "agent.api.persistent_session.get_all_tool_names",
                 return_value=[
                     "web_search",
                     "list_skills",
@@ -2494,17 +2640,17 @@ class TestSetupTools:
                 ],
             ),
             patch(
-                "src.api.persistent_session.load_tools", return_value=[]
+                "agent.api.persistent_session.load_tools", return_value=[]
             ) as mock_load,
             patch(
-                "src.api.persistent_session.apply_description_overrides",
+                "agent.api.persistent_session.apply_description_overrides",
                 side_effect=lambda x: x,
             ),
             patch(
-                "src.api.persistent_session.apply_instruction_enforcement",
+                "agent.api.persistent_session.apply_instruction_enforcement",
                 side_effect=lambda x, y: x,
             ),
-            patch("src.api.persistent_session.ToolContext"),
+            patch("agent.api.persistent_session.ToolContext"),
         ):
             session._setup_tools(None)
 
@@ -2523,7 +2669,7 @@ class TestSetupTools:
 
         with (
             patch(
-                "src.api.persistent_session.get_all_tool_names",
+                "agent.api.persistent_session.get_all_tool_names",
                 return_value=[
                     "read_file",
                     "use_skill",
@@ -2533,17 +2679,17 @@ class TestSetupTools:
                 ],
             ),
             patch(
-                "src.api.persistent_session.load_tools", return_value=[]
+                "agent.api.persistent_session.load_tools", return_value=[]
             ) as mock_load,
             patch(
-                "src.api.persistent_session.apply_description_overrides",
+                "agent.api.persistent_session.apply_description_overrides",
                 side_effect=lambda x: x,
             ),
             patch(
-                "src.api.persistent_session.apply_instruction_enforcement",
+                "agent.api.persistent_session.apply_instruction_enforcement",
                 side_effect=lambda x, y: x,
             ),
-            patch("src.api.persistent_session.ToolContext"),
+            patch("agent.api.persistent_session.ToolContext"),
         ):
             session._setup_tools(None)
 
@@ -2566,24 +2712,24 @@ class TestSetupTools:
 
         with (
             patch(
-                "src.api.persistent_session.get_all_tool_names",
+                "agent.api.persistent_session.get_all_tool_names",
                 return_value=[
                     "web_search",
                     "create_job",
                 ],
             ),
             patch(
-                "src.api.persistent_session.load_tools", return_value=[]
+                "agent.api.persistent_session.load_tools", return_value=[]
             ) as mock_load,
             patch(
-                "src.api.persistent_session.apply_description_overrides",
+                "agent.api.persistent_session.apply_description_overrides",
                 side_effect=lambda x: x,
             ),
             patch(
-                "src.api.persistent_session.apply_instruction_enforcement",
+                "agent.api.persistent_session.apply_instruction_enforcement",
                 side_effect=lambda x, y: x,
             ),
-            patch("src.api.persistent_session.ToolContext"),
+            patch("agent.api.persistent_session.ToolContext"),
         ):
             session._setup_tools(None)
 
@@ -2614,19 +2760,19 @@ class TestSetupTools:
 
         with (
             patch(
-                "src.api.persistent_session.get_all_tool_names",
+                "agent.api.persistent_session.get_all_tool_names",
                 return_value=["web_search"],
             ),
-            patch("src.api.persistent_session.load_tools", side_effect=_load),
+            patch("agent.api.persistent_session.load_tools", side_effect=_load),
             patch(
-                "src.api.persistent_session.apply_description_overrides",
+                "agent.api.persistent_session.apply_description_overrides",
                 side_effect=lambda x: x,
             ),
             patch(
-                "src.api.persistent_session.apply_instruction_enforcement",
+                "agent.api.persistent_session.apply_instruction_enforcement",
                 side_effect=lambda x, y: x,
             ),
-            patch("src.api.persistent_session.ToolContext"),
+            patch("agent.api.persistent_session.ToolContext"),
         ):
             session._setup_tools(None)
 
@@ -2639,17 +2785,17 @@ class TestSetupTools:
         session.workspace_manager = MagicMock()
 
         with (
-            patch("src.api.persistent_session.get_all_tool_names", return_value=[]),
-            patch("src.api.persistent_session.load_tools", return_value=[]),
+            patch("agent.api.persistent_session.get_all_tool_names", return_value=[]),
+            patch("agent.api.persistent_session.load_tools", return_value=[]),
             patch(
-                "src.api.persistent_session.apply_description_overrides",
+                "agent.api.persistent_session.apply_description_overrides",
                 side_effect=lambda x: x,
             ),
             patch(
-                "src.api.persistent_session.apply_instruction_enforcement",
+                "agent.api.persistent_session.apply_instruction_enforcement",
                 side_effect=lambda x, y: x,
             ),
-            patch("src.api.persistent_session.ToolContext") as MockTC,
+            patch("agent.api.persistent_session.ToolContext") as MockTC,
         ):
             session._setup_tools(None)
 
@@ -2668,17 +2814,17 @@ class TestSetupTools:
         session.shell_manager = mock_sm
 
         with (
-            patch("src.api.persistent_session.get_all_tool_names", return_value=[]),
-            patch("src.api.persistent_session.load_tools", return_value=[]),
+            patch("agent.api.persistent_session.get_all_tool_names", return_value=[]),
+            patch("agent.api.persistent_session.load_tools", return_value=[]),
             patch(
-                "src.api.persistent_session.apply_description_overrides",
+                "agent.api.persistent_session.apply_description_overrides",
                 side_effect=lambda x: x,
             ),
             patch(
-                "src.api.persistent_session.apply_instruction_enforcement",
+                "agent.api.persistent_session.apply_instruction_enforcement",
                 side_effect=lambda x, y: x,
             ),
-            patch("src.api.persistent_session.ToolContext") as MockTC,
+            patch("agent.api.persistent_session.ToolContext") as MockTC,
         ):
             session._setup_tools(None)
 
@@ -2693,17 +2839,17 @@ class TestSetupTools:
         session.shell_manager = None
 
         with (
-            patch("src.api.persistent_session.get_all_tool_names", return_value=[]),
-            patch("src.api.persistent_session.load_tools", return_value=[]),
+            patch("agent.api.persistent_session.get_all_tool_names", return_value=[]),
+            patch("agent.api.persistent_session.load_tools", return_value=[]),
             patch(
-                "src.api.persistent_session.apply_description_overrides",
+                "agent.api.persistent_session.apply_description_overrides",
                 side_effect=lambda x: x,
             ),
             patch(
-                "src.api.persistent_session.apply_instruction_enforcement",
+                "agent.api.persistent_session.apply_instruction_enforcement",
                 side_effect=lambda x, y: x,
             ),
-            patch("src.api.persistent_session.ToolContext") as MockTC,
+            patch("agent.api.persistent_session.ToolContext") as MockTC,
         ):
             session._setup_tools(None)
 
@@ -2853,7 +2999,7 @@ class TestSetupContextManager:
         cfg = _make_config()
         session = _make_session(config=cfg)
 
-        with patch("src.api.persistent_session.ContextManager") as MockCM:
+        with patch("agent.api.persistent_session.ContextManager") as MockCM:
             session._setup_context_manager()
 
         assert session.context_manager is not None
@@ -2865,7 +3011,7 @@ class TestSetupContextManager:
         cfg.llm.model = None
         session = _make_session(config=cfg)
 
-        with patch("src.api.persistent_session.ContextManager") as MockCM:
+        with patch("agent.api.persistent_session.ContextManager") as MockCM:
             session._setup_context_manager()
 
         call_kwargs = MockCM.call_args[1]
@@ -2890,14 +3036,14 @@ class TestSetupShellManager:
         session.tool_context = MagicMock()
         session.config.extra = {"shell": {}}
 
-        with patch("src.api.persistent_session.ShellManager", create=True) as MockSM:
+        with patch("agent.api.persistent_session.ShellManager", create=True) as MockSM:
             # Patch the import
             import sys
 
             mock_module = MagicMock()
             mock_module.ShellManager = MockSM
             with patch.dict(
-                sys.modules, {"src.tools.shell.shell_manager": mock_module}
+                sys.modules, {"agent.tools.shell.shell_manager": mock_module}
             ):
                 session._setup_shell_manager()
 
@@ -2945,7 +3091,7 @@ class TestSetupShellManager:
         with patch.dict(
             "sys.modules",
             {
-                "src.tools.shell.shell_manager": MagicMock(
+                "agent.tools.shell.shell_manager": MagicMock(
                     ShellManager=MagicMock(side_effect=RuntimeError("ssh broken")),
                 )
             },
@@ -2972,7 +3118,7 @@ class TestSetupShellManager:
         with patch.dict(
             "sys.modules",
             {
-                "src.tools.shell.shell_manager": MagicMock(
+                "agent.tools.shell.shell_manager": MagicMock(
                     ShellManager=MagicMock(return_value=mock_sm)
                 )
             },
@@ -3014,13 +3160,13 @@ class TestSetupMemory:
             patch.dict(
                 "sys.modules",
                 {
-                    "src.services.embedding_service": MagicMock(
+                    "shared.runtime.services.embedding_service": MagicMock(
                         get_embedding_service=MagicMock(return_value=mock_embedding)
                     ),
-                    "src.services.recall_store": MagicMock(
+                    "shared.runtime.services.recall_store": MagicMock(
                         RecallStore=MagicMock(return_value=mock_recall)
                     ),
-                    "src.services.knowledge_store": MagicMock(
+                    "shared.runtime.services.knowledge_store": MagicMock(
                         KnowledgeStore=MagicMock(return_value=mock_ks)
                     ),
                 },
@@ -3042,10 +3188,10 @@ class TestSetupMemory:
             patch.dict(
                 "sys.modules",
                 {
-                    "src.services.embedding_service": MagicMock(
+                    "shared.runtime.services.embedding_service": MagicMock(
                         get_embedding_service=MagicMock()
                     ),
-                    "src.services.knowledge_store": MagicMock(
+                    "shared.runtime.services.knowledge_store": MagicMock(
                         KnowledgeStore=MagicMock(return_value=mock_ks)
                     ),
                 },
@@ -3067,10 +3213,10 @@ class TestSetupMemory:
             patch.dict(
                 "sys.modules",
                 {
-                    "src.services.embedding_service": MagicMock(
+                    "shared.runtime.services.embedding_service": MagicMock(
                         get_embedding_service=MagicMock()
                     ),
-                    "src.services.knowledge_store": MagicMock(
+                    "shared.runtime.services.knowledge_store": MagicMock(
                         KnowledgeStore=MagicMock(return_value=mock_ks)
                     ),
                 },
@@ -3093,12 +3239,12 @@ class TestSetupMemory:
             patch.dict(
                 "sys.modules",
                 {
-                    "src.services.embedding_service": MagicMock(
+                    "shared.runtime.services.embedding_service": MagicMock(
                         get_embedding_service=MagicMock(
                             side_effect=RuntimeError("embedding init failed")
                         ),
                     ),
-                    "src.services.knowledge_store": MagicMock(
+                    "shared.runtime.services.knowledge_store": MagicMock(
                         KnowledgeStore=MagicMock(return_value=mock_ks)
                     ),
                 },
@@ -3117,7 +3263,7 @@ class TestSetupMemory:
             patch.dict(
                 "sys.modules",
                 {
-                    "src.services.embedding_service": MagicMock(
+                    "shared.runtime.services.embedding_service": MagicMock(
                         get_embedding_service=MagicMock(
                             side_effect=RuntimeError("embedding broke")
                         ),
@@ -3133,7 +3279,7 @@ class TestSetupMemory:
         (fail loud, don't run the session half-working). Regression for
         knowledge-base/knowledge/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md.
         """
-        from src.api.persistent_session import MemoryUnavailableError
+        from agent.api.persistent_session import MemoryUnavailableError
 
         cfg = _make_config(memory_enabled=True, memory_required=True)
         session = _make_session(config=cfg)
@@ -3143,12 +3289,12 @@ class TestSetupMemory:
         with patch.dict(
             "sys.modules",
             {
-                "src.services.embedding_service": MagicMock(
+                "shared.runtime.services.embedding_service": MagicMock(
                     get_embedding_service=MagicMock(
                         side_effect=RuntimeError("embedding endpoint down")
                     ),
                 ),
-                "src.services.knowledge_store": MagicMock(
+                "shared.runtime.services.knowledge_store": MagicMock(
                     KnowledgeStore=MagicMock(return_value=MagicMock())
                 ),
             },
@@ -3161,7 +3307,7 @@ class TestSetupMemory:
     def test_configured_pipeline_makes_memory_required(self):
         """A configured pipeline (scorers present) implies required even when
         memory.required is False: a store failure must fail loud."""
-        from src.api.persistent_session import MemoryUnavailableError
+        from agent.api.persistent_session import MemoryUnavailableError
 
         cfg = _make_config(
             memory_enabled=True,
@@ -3176,12 +3322,12 @@ class TestSetupMemory:
         with patch.dict(
             "sys.modules",
             {
-                "src.services.embedding_service": MagicMock(
+                "shared.runtime.services.embedding_service": MagicMock(
                     get_embedding_service=MagicMock(
                         side_effect=RuntimeError("embedding endpoint down")
                     ),
                 ),
-                "src.services.knowledge_store": MagicMock(
+                "shared.runtime.services.knowledge_store": MagicMock(
                     KnowledgeStore=MagicMock(return_value=MagicMock())
                 ),
             },
@@ -3194,7 +3340,7 @@ class TestSetupMemory:
     def test_pipeline_bind_failure_raises_memory_unavailable(self):
         """A plugin factory that can't resolve its transport (e.g. the reranker
         endpoint) fails the session loud, not a raw crash."""
-        from src.api.persistent_session import MemoryUnavailableError
+        from agent.api.persistent_session import MemoryUnavailableError
 
         cfg = _make_config(
             memory_enabled=True,
@@ -3212,16 +3358,16 @@ class TestSetupMemory:
             patch.dict(
                 "sys.modules",
                 {
-                    "src.services.embedding_service": MagicMock(
+                    "shared.runtime.services.embedding_service": MagicMock(
                         get_embedding_service=MagicMock(return_value=MagicMock())
                     ),
-                    "src.services.recall_store": MagicMock(
+                    "shared.runtime.services.recall_store": MagicMock(
                         RecallStore=MagicMock(return_value=MagicMock())
                     ),
-                    "src.services.knowledge_store": MagicMock(
+                    "shared.runtime.services.knowledge_store": MagicMock(
                         KnowledgeStore=MagicMock(return_value=MagicMock())
                     ),
-                    "src.services.memory": MagicMock(
+                    "agent.services.memory": MagicMock(
                         MemoryManager=MagicMock(
                             from_config=MagicMock(
                                 side_effect=ValueError("reranker needs a base_url")
@@ -3246,12 +3392,14 @@ class TestSetupKnowledge:
         knowledge_store = MagicMock(name="knowledge_store")
 
         with (
-            patch("src.services.embedding_service.get_kb_embedding_service"),
+            patch("shared.runtime.services.embedding_service.get_kb_embedding_service"),
             patch(
-                "src.services.knowledge_store.KnowledgeStore",
+                "shared.runtime.services.knowledge_store.KnowledgeStore",
                 return_value=knowledge_store,
             ),
-            patch("src.services.knowledge_graph.KnowledgeGraphDB") as graph_cls,
+            patch(
+                "shared.runtime.services.knowledge_graph.KnowledgeGraphDB"
+            ) as graph_cls,
         ):
             session._setup_knowledge(MagicMock(name="vector_conn"))
 
@@ -3270,15 +3418,15 @@ class TestSetupKnowledge:
 
         with (
             patch(
-                "src.services.embedding_service.get_kb_embedding_service",
+                "shared.runtime.services.embedding_service.get_kb_embedding_service",
                 return_value=embedding_service,
             ),
             patch(
-                "src.services.knowledge_store.KnowledgeStore",
+                "shared.runtime.services.knowledge_store.KnowledgeStore",
                 return_value=knowledge_store,
             ) as store_cls,
             patch(
-                "src.services.knowledge_graph.KnowledgeGraphDB",
+                "shared.runtime.services.knowledge_graph.KnowledgeGraphDB",
                 return_value=knowledge_graph,
             ),
         ):
@@ -3300,12 +3448,12 @@ class TestSetupKnowledge:
 
         with (
             patch(
-                "src.services.embedding_service.get_kb_embedding_service",
+                "shared.runtime.services.embedding_service.get_kb_embedding_service",
                 side_effect=RuntimeError("embedding unavailable"),
             ),
-            patch("src.core.archiver.audit_unavailable") as audit_unavailable,
+            patch("agent.core.archiver.audit_unavailable") as audit_unavailable,
             patch(
-                "src.services.knowledge_graph.KnowledgeGraphDB",
+                "shared.runtime.services.knowledge_graph.KnowledgeGraphDB",
                 return_value=knowledge_graph,
             ),
         ):
@@ -3556,11 +3704,11 @@ class TestResetupToolsForBackend:
     """
 
     def test_swap_then_resetup_readmits_shell_and_git(self, monkeypatch):
-        from src.tools.product_capabilities import (
+        from agent.tools.product_capabilities import (
             PRODUCT_CAPABILITIES_TOOL_ENABLED_ENV,
             PRODUCT_CAPABILITIES_TOOL_NAME,
         )
-        from src.tools.registry import get_tools_by_category
+        from agent.tools.registry import get_tools_by_category
 
         monkeypatch.setenv(PRODUCT_CAPABILITIES_TOOL_ENABLED_ENV, "true")
         shell = get_tools_by_category("shell")[0]
@@ -3581,32 +3729,32 @@ class TestResetupToolsForBackend:
 
         with (
             patch(
-                "src.api.persistent_session.get_all_tool_names",
+                "agent.api.persistent_session.get_all_tool_names",
                 return_value=[shell, git, web],
             ),
             patch(
-                "src.api.persistent_session.load_tools",
+                "agent.api.persistent_session.load_tools",
                 side_effect=lambda names, ctx: [_named_tool(n) for n in names],
             ),
             patch(
-                "src.api.persistent_session.apply_description_overrides",
+                "agent.api.persistent_session.apply_description_overrides",
                 side_effect=lambda x: x,
             ),
             patch(
-                "src.api.persistent_session.apply_instruction_enforcement",
+                "agent.api.persistent_session.apply_instruction_enforcement",
                 side_effect=lambda x, y: x,
             ),
-            patch("src.api.persistent_session.ToolContext"),
+            patch("agent.api.persistent_session.ToolContext"),
             patch(
-                "src.api.persistent_session.supports_parallel_tool_calls",
+                "agent.api.persistent_session.supports_parallel_tool_calls",
                 return_value=False,
             ),
             patch(
-                "src.api.persistent_session.get_phase_system_prompt",
+                "agent.api.persistent_session.get_phase_system_prompt",
                 return_value="post-upgrade prompt",
             ),
             patch(
-                "src.services.guardrails.apply_guardrails_to_tools",
+                "shared.runtime.services.guardrails.apply_guardrails_to_tools",
                 side_effect=lambda tools, model=None: tools,
             ),
         ):
@@ -3681,30 +3829,30 @@ class TestConfiguredButUnboundToolsAreReported:
         name list asked for."""
         with (
             patch(
-                "src.api.persistent_session.get_all_tool_names",
+                "agent.api.persistent_session.get_all_tool_names",
                 return_value=list(requested),
             ),
             patch(
-                "src.api.persistent_session.load_tools",
+                "agent.api.persistent_session.load_tools",
                 side_effect=lambda names, ctx: [
                     _named_tool(n) for n in names if n not in missing
                 ],
             ),
             patch(
-                "src.api.persistent_session.apply_description_overrides",
+                "agent.api.persistent_session.apply_description_overrides",
                 side_effect=lambda x: x,
             ),
             patch(
-                "src.api.persistent_session.apply_instruction_enforcement",
+                "agent.api.persistent_session.apply_instruction_enforcement",
                 side_effect=lambda x, y: x,
             ),
-            patch("src.api.persistent_session.ToolContext"),
+            patch("agent.api.persistent_session.ToolContext"),
             patch(
-                "src.api.persistent_session.supports_parallel_tool_calls",
+                "agent.api.persistent_session.supports_parallel_tool_calls",
                 return_value=False,
             ),
             patch(
-                "src.services.guardrails.apply_guardrails_to_tools",
+                "shared.runtime.services.guardrails.apply_guardrails_to_tools",
                 side_effect=lambda tools, model=None: tools,
             ),
         ):
@@ -3718,7 +3866,7 @@ class TestConfiguredButUnboundToolsAreReported:
         )
         session._llm = MagicMock()
 
-        with caplog.at_level("WARNING", logger="src.api.persistent_session"):
+        with caplog.at_level("WARNING", logger="agent.api.persistent_session"):
             self._run_setup(
                 session,
                 requested=["run_command", "cancel_command", "shell_read"],
@@ -3739,7 +3887,7 @@ class TestConfiguredButUnboundToolsAreReported:
         )
         session._llm = MagicMock()
 
-        with caplog.at_level("WARNING", logger="src.api.persistent_session"):
+        with caplog.at_level("WARNING", logger="agent.api.persistent_session"):
             self._run_setup(session, requested=["run_command", "shell_read"])
 
         assert not [
@@ -3789,12 +3937,39 @@ def test_runtime_backend_id_comes_from_active_backend_features(backend, expected
 
 class TestCleanup:
     @pytest.mark.asyncio
+    async def test_quiesces_subagents_before_other_background_writers(self):
+        order: list[str] = []
+        session = _make_session(shell_owner_token=19)
+        runtime = SimpleNamespace(
+            quiesce=AsyncMock(side_effect=lambda _reason: order.append("subagents"))
+        )
+        citation = SimpleNamespace(
+            aclose=AsyncMock(side_effect=lambda: order.append("citation"))
+        )
+        session.tool_context = SimpleNamespace(
+            subagent_runtime=runtime,
+            citation_engine=citation,
+            close_citation_engine=MagicMock(
+                side_effect=lambda: order.append("citation-cache")
+            ),
+        )
+        session.memory_service = SimpleNamespace(
+            close_background=AsyncMock(side_effect=lambda: order.append("memory"))
+        )
+
+        await session.quiesce_background_tasks()
+
+        assert order == ["subagents", "citation", "citation-cache", "memory"]
+        runtime.quiesce.assert_awaited_once_with("session background work quiescing")
+
+    @pytest.mark.asyncio
     async def test_quiesces_memory_and_citation_before_cleanup(self):
         session = _make_session(shell_owner_token=19)
         citation = SimpleNamespace(aclose=AsyncMock())
         context = MagicMock()
         context.citation_engine = citation
         context.close_citation_engine = MagicMock()
+        context.subagent_runtime = None
         session.tool_context = context
         session.memory_service = SimpleNamespace(close_background=AsyncMock())
 

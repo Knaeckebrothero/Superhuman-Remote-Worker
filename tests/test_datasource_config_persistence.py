@@ -14,7 +14,7 @@ from orchestrator.database.postgres import PostgresDB, _datasource_row_to_dict
 
 MIGRATION = (
     Path(__file__).parents[1]
-    / "orchestrator/database/migrations/app/0055_datasource_config.sql"
+    / "src/orchestrator/database/migrations/app/0055_datasource_config.sql"
 )
 DATASOURCE_ID = "11111111-1111-1111-1111-111111111111"
 PROJECT_ID = "22222222-2222-2222-2222-222222222222"

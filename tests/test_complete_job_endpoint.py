@@ -7,17 +7,10 @@ Tests cover:
 3. OrchestratorClient.approve_job: success/failure paths
 """
 
-import sys
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import asyncpg
 import pytest
-
-# Add project root to path
-project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
 
 from orchestrator.services.completion import (  # noqa: E402
     determine_job_status,
@@ -478,6 +471,44 @@ class TestVerificationTriggerGuards:
         assert any("critic job" in a and "created" in a for a in actions)
 
     @pytest.mark.asyncio
+    async def test_critic_does_not_copy_parent_runtime_authority(self, monkeypatch):
+        """The child inherits by parent reference, not by owning its runtime."""
+        from orchestrator import main
+
+        create_job_mock = AsyncMock(return_value={"id": "critic-999"})
+        monkeypatch.setattr(main.postgres_db, "create_job", create_job_mock)
+        monkeypatch.setattr(
+            main,
+            "_revalidate_job_datasource_selection",
+            AsyncMock(return_value=([], {})),
+        )
+        monkeypatch.setattr(main, "_trigger_dispatch", lambda: None)
+        monkeypatch.setattr(
+            main.postgres_db,
+            "has_live_verification_critic",
+            AsyncMock(return_value=False),
+        )
+
+        runtime = {
+            "provisioner": "k8s",
+            "status": "ready",
+            "_runtime_incarnation": "11111111-2222-4333-8444-555555555555",
+        }
+        job = self._passing_job(
+            context={"workspace_container": runtime},
+            config_override={"workspace": {"backend": "sandbox"}},
+        )
+
+        await main._trigger_verification_on_complete(job, self._passing_result(), [])
+
+        kwargs = create_job_mock.call_args.kwargs
+        assert kwargs["context"]["inherits_parent_workspace"] is True
+        assert "workspace_container" not in kwargs["context"]
+        assert "vm" not in kwargs["context"]
+        assert kwargs["workspace_assignment_source"] == "parent_inheritance"
+        assert "authoritative_workspace_context" not in kwargs
+
+    @pytest.mark.asyncio
     async def test_no_critic_created_when_one_is_already_in_flight(self, monkeypatch):
         """Guard 7: the same baseline, with a live critic already spawned for
         this target — a retried /complete must not double it."""
@@ -513,18 +544,14 @@ class TestVerificationTriggerGuards:
 
         critic_id = "11111111-2222-3333-4444-555555555555"
         create_job_mock = AsyncMock()
-        # The indexed critic row carries its OWN context — including the
-        # inherits_parent_workspace flag stamped at spawn when it copied the
-        # parent's workspace snapshot. That flag, not the parent's context, is
-        # what the handoff reads to decide the worktree path.
+        # The indexed critic row carries its OWN context, including the
+        # inherits_parent_workspace flag stamped at spawn. That flag, not the
+        # parent's context, decides the worktree path.
         round_lookup_mock = AsyncMock(
             return_value={
                 "id": critic_id,
                 "config_name": "critic",
-                "context": {
-                    "workspace_container": {"status": "ready"},
-                    "inherits_parent_workspace": True,
-                },
+                "context": {"inherits_parent_workspace": True},
             }
         )
         monkeypatch.setattr(main.postgres_db, "create_job", create_job_mock)
@@ -607,7 +634,7 @@ class TestVerificationTriggerGuards:
     async def test_replay_leaves_worktree_null_for_a_non_inheriting_critic(
         self, monkeypatch
     ):
-        """A critic that did NOT copy the parent workspace gets no worktree.
+        """A critic without the inherit discriminator gets no worktree.
 
         The parent still carries a workspace_container here — presence of that
         key on the PARENT is exactly the ambiguous signal this handoff must not
@@ -825,7 +852,7 @@ class TestOrchestratorClientApproveJob:
 
     @pytest.fixture
     def client(self):
-        from src.api.orchestrator_client import OrchestratorClient
+        from agent.api.orchestrator_client import OrchestratorClient
 
         return OrchestratorClient(
             orchestrator_url="http://localhost:8085",
@@ -923,7 +950,7 @@ class TestOrchestratorClientReportCompletion:
 
     @pytest.fixture
     def client(self):
-        from src.api.orchestrator_client import OrchestratorClient
+        from agent.api.orchestrator_client import OrchestratorClient
 
         return OrchestratorClient(
             orchestrator_url="http://localhost:8085",
@@ -1081,7 +1108,7 @@ class TestOrchestratorClientReportCompletion:
 
     @pytest.mark.asyncio
     async def test_machine_coded_nonterminal_422_is_definitive(self, client):
-        from src.api.orchestrator_client import CompletionNonTerminalReportError
+        from agent.api.orchestrator_client import CompletionNonTerminalReportError
 
         mock_response = MagicMock()
         mock_response.status_code = 422

@@ -9,16 +9,10 @@ import pytest
 import shutil
 import subprocess
 import tempfile
-import sys
 from pathlib import Path
 
-# Add project root to path
-project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-
-from src.core.workspace import WorkspaceManager, WorkspaceManagerConfig  # noqa: E402
-from src.managers.git_manager import GitManager  # noqa: E402
+from agent.core.workspace import WorkspaceManager, WorkspaceManagerConfig  # noqa: E402
+from agent.managers.git_manager import GitManager  # noqa: E402
 from tests._fs_backend import FilesystemTestBackend  # noqa: E402
 
 
@@ -82,7 +76,7 @@ class TestWorkspaceGitInitialization:
         disconnected workspace — that path rebuilt from scratch and lost every
         push on teardown in loop runs 5 & 6.
         """
-        import src.core.workspace as ws_mod
+        import agent.core.workspace as ws_mod
 
         # No real backoff waits in the test.
         monkeypatch.setattr(ws_mod, "_CLONE_BACKOFF_SECONDS", (0, 0))
@@ -120,7 +114,7 @@ class TestWorkspaceGitInitialization:
         rollout) must not kill the job: the bounded retry recovers on a later
         attempt instead of hard-failing on the first miss.
         """
-        import src.core.workspace as ws_mod
+        import agent.core.workspace as ws_mod
 
         monkeypatch.setattr(ws_mod, "_CLONE_BACKOFF_SECONDS", (0, 0))
         sentinel = object()

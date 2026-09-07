@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.persistent_graph import IdleTimeoutError
+from agent.persistent_graph import IdleTimeoutError
 
 
 # =============================================================================
@@ -1245,7 +1245,7 @@ class TestOrchestratorClientUpdateStatus:
 
 class TestIdleTimeoutConfig:
     def test_interactive_config_has_idle_timeout(self):
-        from src.core.loader import InteractiveConfig
+        from shared.runtime.core.loader import InteractiveConfig
 
         ic = InteractiveConfig()
         assert hasattr(ic, "idle_timeout_minutes")

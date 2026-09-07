@@ -38,6 +38,8 @@ interface ModelsResponse {
   whisper_models: HelperModel[];
   tts_models: HelperModel[];
   embedding_models: EmbeddingModel[];
+  search_models: HelperModel[];
+  fetch_models: HelperModel[];
   configured_providers: string[];
   reasoning_by_model?: Record<string, ReasoningCapability>;
 }
@@ -58,6 +60,8 @@ export class ModelService {
   readonly whisperModels = signal<HelperModel[]>([]);
   readonly ttsModels = signal<HelperModel[]>([]);
   readonly embeddingModels = signal<EmbeddingModel[]>([]);
+  readonly searchModels = signal<HelperModel[]>([]);
+  readonly fetchModels = signal<HelperModel[]>([]);
   readonly providers = signal<string[]>([]);
   /** model_id → reasoning capability (family-derived); drives the reasoning UI. */
   readonly reasoningByModel = signal<Record<string, ReasoningCapability>>({});
@@ -84,6 +88,8 @@ export class ModelService {
         this.whisperModels.set(resp.whisper_models ?? []);
         this.ttsModels.set(resp.tts_models ?? []);
         this.embeddingModels.set(resp.embedding_models ?? []);
+        this.searchModels.set(resp.search_models ?? []);
+        this.fetchModels.set(resp.fetch_models ?? []);
         this.providers.set(resp.configured_providers);
         this.reasoningByModel.set(resp.reasoning_by_model ?? {});
         this.loading.set(false);
@@ -100,6 +106,8 @@ export class ModelService {
         this.whisperModels.set([]);
         this.ttsModels.set([]);
         this.embeddingModels.set([]);
+        this.searchModels.set([]);
+        this.fetchModels.set([]);
         this.providers.set([]);
         this.reasoningByModel.set({});
         this.loading.set(false);

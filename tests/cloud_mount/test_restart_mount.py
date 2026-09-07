@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from src.services.cloud_mount import RcloneMountError, RcloneMountManager
+from shared.runtime.services.cloud_mount import RcloneMountError, RcloneMountManager
 
 
 class FakeRemoteBackend:

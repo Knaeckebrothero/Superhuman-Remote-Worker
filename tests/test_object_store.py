@@ -8,16 +8,9 @@ None), prefix listing, and idempotent delete. The backend's own contract is
 exercised in test_virtual_workspace_backend.py over this same store.
 """
 
-import sys
-from pathlib import Path
-
 import pytest
 
-project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-
-from src.core.backends.object_store import (  # noqa: E402
+from shared.runtime.core.backends.object_store import (  # noqa: E402
     InMemoryObjectStore,
     ObjectInfo,
     ObjectStore,

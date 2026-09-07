@@ -1,22 +1,30 @@
-"""Tests for steering lane B — queued replies delivered at a natural break.
+"""Tests for source-aware steering lane B delivery.
 
 Steering has two lanes. Lane A (``pending_guidance``) is urgent and renders as
 a transient block on every LLM turn; it is deliberately untouched by this work.
 Lane B is non-urgent mail, which used to be delivered only at a
 tactical->strategic phase boundary. That stops being a usable cadence as
 tactical phases grow — at three phases a job has exactly one such boundary, and
-a reply sent during the review phase would never be delivered at all. It is now
-keyed to a completed todo, with a wall-clock floor for the stuck case.
+a reply sent during the review phase would never be delivered at all. Human
+mail is now keyed to a completed todo, with a wall-clock floor for the stuck
+case. Background child completions are events and drain on every tool pass.
 """
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.graph import _deliver_queued_replies, _replies_overdue
-from src.tools.context import ToolContext
+from agent.graph import (
+    _deliver_queued_replies,
+    _reply_key,
+    _replies_overdue,
+    _write_reply_files,
+)
+from shared.runtime.core.message_markers import PERSIST_ROLE_EVENT, PERSIST_ROLE_KEY
+from agent.tools.context import ToolContext
 
 
 def iso(seconds_ago: float) -> str:
@@ -38,11 +46,25 @@ def make_context(workspace=None, *, stateless=False):
 @pytest.fixture
 def acks(monkeypatch):
     recorded = []
+
+    def record(
+        job_id,
+        guidance_ids=None,
+        reply_threads=None,
+        reply_keys=None,
+    ):
+        recorded.append(
+            {
+                "job_id": job_id,
+                "guidance_ids": guidance_ids,
+                "reply_threads": reply_threads,
+                "reply_keys": reply_keys,
+            }
+        )
+
     monkeypatch.setattr(
-        "src.graph._ack_supervisor_guidance",
-        lambda job_id, guidance_ids=None, reply_threads=None: recorded.append(
-            (job_id, reply_threads)
-        ),
+        "agent.graph._ack_supervisor_guidance",
+        record,
     )
     return recorded
 
@@ -51,14 +73,14 @@ def acks(monkeypatch):
 def written(monkeypatch):
     recorded = []
     monkeypatch.setattr(
-        "src.graph._write_reply_files",
+        "agent.graph._write_reply_files",
         lambda job_id, workspace, replies: recorded.append(list(replies)),
     )
     return recorded
 
 
 def set_inbox(monkeypatch, replies):
-    monkeypatch.setattr("src.graph._get_queued_replies", lambda job_id: list(replies))
+    monkeypatch.setattr("agent.graph._get_queued_replies", lambda job_id: list(replies))
 
 
 class TestRepliesOverdue:
@@ -96,11 +118,63 @@ class TestRepliesOverdue:
 
 
 class TestDelivery:
-    def test_completed_todo_delivers(self, monkeypatch, acks, written):
-        set_inbox(
-            monkeypatch,
-            [{"thread_id": "t1", "message": "check X", "timestamp": iso(5)}],
+    def test_post_commit_local_child_event_pushes_without_heartbeat_delay(
+        self, monkeypatch, acks, written
+    ):
+        child = {
+            "id": "child-local-1",
+            "source": "subagent",
+            "thread_id": "child-thread",
+            "handle": "probe-ab12",
+            "run_generation": "generation-1",
+            "message": "The probe found the boundary.",
+            "timestamp": iso(0),
+        }
+        set_inbox(monkeypatch, [])
+        ctx = make_context()
+        ctx.subagent_runtime = SimpleNamespace(
+            drain_local_deliveries=MagicMock(return_value=[child])
         )
+        result = {"messages": []}
+
+        _deliver_queued_replies("job-1", ctx, make_config(), result)
+
+        assert "probe found the boundary" in result["messages"][0].content
+        assert result["delivered_reply_keys"] == [_reply_key(child)]
+        assert acks[0]["reply_keys"] == [_reply_key(child)]
+        assert written == [[child]]
+        ctx.subagent_runtime.drain_local_deliveries.assert_called_once_with()
+
+    def test_heartbeat_copy_wins_a_stable_local_delivery_collision(
+        self, monkeypatch, acks, written
+    ):
+        durable = {
+            "id": "child-same",
+            "source": "subagent",
+            "thread_id": "child-thread",
+            "handle": "probe-ab12",
+            "run_generation": "generation-1",
+            "message": "durable report",
+            "timestamp": iso(1),
+        }
+        local = {**durable, "message": "unexpected local mismatch"}
+        set_inbox(monkeypatch, [durable])
+        ctx = make_context()
+        ctx.subagent_runtime = SimpleNamespace(
+            drain_local_deliveries=MagicMock(return_value=[local])
+        )
+        result = {"messages": []}
+
+        _deliver_queued_replies("job-1", ctx, make_config(), result)
+
+        assert "durable report" in result["messages"][0].content
+        assert "unexpected local mismatch" not in result["messages"][0].content
+        assert written == [[durable]]
+        assert result["delivered_reply_keys"] == [_reply_key(durable)]
+
+    def test_completed_todo_delivers(self, monkeypatch, acks, written):
+        reply = {"thread_id": "t1", "message": "check X", "timestamp": iso(5)}
+        set_inbox(monkeypatch, [reply])
         ctx = make_context()
         ctx.request_reply_drain()  # todo_complete fired
         result = {"messages": []}
@@ -110,7 +184,14 @@ class TestDelivery:
         assert len(result["messages"]) == 1
         assert "check X" in result["messages"][0].content
         assert "[QUEUED MESSAGES]" in result["messages"][0].content
-        assert acks == [("job-1", ["t1"])]
+        assert acks == [
+            {
+                "job_id": "job-1",
+                "guidance_ids": None,
+                "reply_threads": None,
+                "reply_keys": [_reply_key(reply)],
+            }
+        ]
         assert written and written[0][0]["message"] == "check X"
 
     def test_no_break_and_not_overdue_holds_the_reply(self, monkeypatch, acks, written):
@@ -127,21 +208,93 @@ class TestDelivery:
         assert acks == []
         assert written == []
 
+    def test_child_event_delivers_immediately_while_fresh_human_mail_waits(
+        self, monkeypatch, acks, written
+    ):
+        child = {
+            "id": "child-delivery-1",
+            "source": "subagent",
+            "thread_id": "child-thread",
+            "handle": "reviewer-7f3a",
+            "run_generation": "generation-1",
+            "message": "The implementation violates invariant X.",
+            "timestamp": iso(1),
+        }
+        human = {
+            "id": "human-delivery-1",
+            "thread_id": "officer",
+            "message": "Consider optional cleanup Y later.",
+            "timestamp": iso(1),
+        }
+        set_inbox(monkeypatch, [child, human])
+        ctx = make_context()
+        result = {"messages": []}
+
+        # No todo completed and neither entry is overdue. The completed child
+        # still pushes; unrelated fresh human mail keeps its own cadence.
+        _deliver_queued_replies("job-1", ctx, make_config(), result)
+
+        assert len(result["messages"]) == 1
+        event = result["messages"][0]
+        assert "[BACKGROUND SUBAGENT EVIDENCE]" in event.content
+        assert "violates invariant X" in event.content
+        assert "cleanup Y" not in event.content
+        assert event.additional_kwargs[PERSIST_ROLE_KEY] == PERSIST_ROLE_EVENT
+        assert "from user" not in event.content.lower()
+        assert result["delivered_reply_keys"] == [_reply_key(child)]
+        assert acks[0]["reply_keys"] == [_reply_key(child)]
+        assert written == [[child]]
+
+        # The next pass does not duplicate the child. Once the human lane gets
+        # its own natural break, only that held reply is delivered.
+        ctx.request_reply_drain()
+        later = {"messages": []}
+        _deliver_queued_replies("job-1", ctx, make_config(), later)
+        assert len(later["messages"]) == 1
+        assert "cleanup Y" in later["messages"][0].content
+        assert PERSIST_ROLE_KEY not in later["messages"][0].additional_kwargs
+        assert acks[1]["reply_keys"] == [_reply_key(human)]
+        assert written == [[child], [human]]
+
+    def test_child_event_ignores_the_human_expiry_setting(
+        self, monkeypatch, acks, written
+    ):
+        child = {
+            "id": "child-delivery-2",
+            "source": "subagent",
+            "thread_id": "child-thread",
+            "handle": "tester-1234",
+            "message": "Tests passed.",
+            "timestamp": iso(0),
+        }
+        set_inbox(monkeypatch, [child])
+        result = {"messages": []}
+
+        _deliver_queued_replies(
+            "job-1", make_context(), make_config(max_wait=0), result
+        )
+
+        assert "Tests passed" in result["messages"][0].content
+        assert acks[0]["reply_keys"] == [_reply_key(child)]
+
     def test_wall_clock_floor_delivers_without_a_break(
         self, monkeypatch, acks, written
     ):
         """The stuck agent — never completes a todo, must still get its mail."""
-        set_inbox(
-            monkeypatch,
-            [{"thread_id": "t1", "message": "urgent-ish", "timestamp": iso(400)}],
-        )
+        reply = {
+            "thread_id": "t1",
+            "message": "urgent-ish",
+            "timestamp": iso(400),
+        }
+        set_inbox(monkeypatch, [reply])
         ctx = make_context()
         result = {"messages": []}
 
         _deliver_queued_replies("job-1", ctx, make_config(), result)
 
         assert len(result["messages"]) == 1
-        assert acks == [("job-1", ["t1"])]
+        assert acks[0]["reply_keys"] == [_reply_key(reply)]
+        assert acks[0]["reply_threads"] is None
 
     def test_floor_disabled_holds_forever(self, monkeypatch, acks, written):
         set_inbox(
@@ -243,7 +396,7 @@ class TestDelivery:
         def boom(job_id, workspace, replies):
             raise RuntimeError("workspace unreachable")
 
-        monkeypatch.setattr("src.graph._write_reply_files", boom)
+        monkeypatch.setattr("agent.graph._write_reply_files", boom)
         set_inbox(
             monkeypatch, [{"thread_id": "t1", "message": "m", "timestamp": iso(5)}]
         )
@@ -254,23 +407,22 @@ class TestDelivery:
         _deliver_queued_replies("job-1", ctx, make_config(), result)
 
         assert len(result["messages"]) == 1
-        assert acks == [("job-1", ["t1"])]
+        assert len(acks) == 1 and acks[0]["reply_keys"]
 
     def test_multiple_threads_all_acked(self, monkeypatch, acks, written):
-        set_inbox(
-            monkeypatch,
-            [
-                {"thread_id": "t1", "message": "a", "timestamp": iso(5)},
-                {"thread_id": "t2", "message": "b", "timestamp": iso(5)},
-            ],
-        )
+        replies = [
+            {"thread_id": "t1", "message": "a", "timestamp": iso(5)},
+            {"thread_id": "t2", "message": "b", "timestamp": iso(5)},
+        ]
+        set_inbox(monkeypatch, replies)
         ctx = make_context()
         ctx.request_reply_drain()
         result = {"messages": []}
 
         _deliver_queued_replies("job-1", ctx, make_config(), result)
 
-        assert acks == [("job-1", ["t1", "t2"])]
+        assert acks[0]["reply_threads"] is None
+        assert acks[0]["reply_keys"] == sorted(_reply_key(r) for r in replies)
         body = result["messages"][0].content
         assert "a" in body and "b" in body
 
@@ -292,15 +444,69 @@ class TestDelivery:
         assert result["delivered_reply_keys"] == ["id:reply-1"]
         assert acks == [], "stateless ack must wait for fenced aput commit"
 
+    def test_stateless_child_is_immediate_but_still_waits_for_checkpoint_ack(
+        self, monkeypatch, acks, written
+    ):
+        child = {
+            "id": "child-reply-1",
+            "source": "subagent",
+            "thread_id": "child-thread",
+            "handle": "probe-abcd",
+            "message": "Observed the service boundary.",
+            "timestamp": iso(1),
+        }
+        set_inbox(monkeypatch, [child])
+        ctx = make_context(stateless=True)
+        result = {"messages": []}
+
+        _deliver_queued_replies("job-1", ctx, make_config(), result)
+
+        assert len(result["messages"]) == 1
+        assert result["delivered_reply_keys"] == ["id:child-reply-1"]
+        assert acks == [], "stateless ack must follow the absorbing checkpoint"
+
+
+class TestSourceAwareArchive:
+    def test_child_report_file_never_claims_to_be_user_mail(self):
+        workspace = MagicMock()
+        workspace.list_directory.side_effect = FileNotFoundError
+        workspace.git_manager = None
+        child = {
+            "id": "child-delivery",
+            "source": "subagent",
+            "thread_id": "child-thread",
+            "handle": "reviewer-7f3a",
+            "run_generation": "generation-1",
+            "message": "Found invariant X.",
+            "timestamp": iso(1),
+        }
+        human = {
+            "id": "human-delivery",
+            "thread_id": "officer",
+            "message": "Thanks.",
+            "timestamp": iso(1),
+        }
+
+        _write_reply_files("job-1", workspace, [child, human])
+
+        child_call, human_call = workspace.write_file.call_args_list
+        assert child_call.args[0] == "messages/child-thread/001_subagent_report.md"
+        assert "from: subagent:reviewer-7f3a" in child_call.args[1]
+        assert "source: subagent" in child_call.args[1]
+        assert "run_generation: generation-1" in child_call.args[1]
+        assert "from: user" not in child_call.args[1]
+        assert human_call.args[0] == "messages/officer/001_received.md"
+        assert "from: user" in human_call.args[1]
+
 
 class TestTodoCompleteSetsTheBreak:
     def _tool(self, context):
-        from src.tools.core.todo import create_todo_tools
+        from agent.tools.core.todo import create_todo_tools
 
         return next(t for t in create_todo_tools(context) if t.name == "todo_complete")
 
     def test_completing_a_todo_requests_a_drain(self):
-        from src.managers.todo import TodoManager
+        from agent.managers.todo import TodoManager
 
         mgr = TodoManager(workspace=MagicMock())
         mgr.stage_tactical_todos(
@@ -327,8 +533,8 @@ class TestBoundaryBackstop:
     def _node(self, tool_context, monkeypatch, returned):
         from unittest.mock import MagicMock
 
-        from src.graph import _reply_key, create_handle_transition_node
-        from src.managers.todo import TodoManager
+        from agent.graph import _reply_key, create_handle_transition_node
+        from agent.managers.todo import TodoManager
 
         async def fake_process(
             job_id,
@@ -344,7 +550,7 @@ class TestBoundaryBackstop:
                 or _reply_key(reply) not in delivered_reply_keys
             ]
 
-        monkeypatch.setattr("src.graph._process_queued_replies", fake_process)
+        monkeypatch.setattr("agent.graph._process_queued_replies", fake_process)
 
         config = MagicMock()
         config.phase_settings = SimpleNamespace(min_todos=5, max_todos=20)
@@ -375,10 +581,73 @@ class TestBoundaryBackstop:
 
         bodies = [getattr(m, "content", "") for m in result.get("messages", [])]
         assert any("from the db" in b for b in bodies)
+        assert acks[0]["reply_threads"] is None
+        assert acks[0]["reply_keys"] == [_reply_key(reply)]
+
+    @pytest.mark.asyncio
+    async def test_backstop_keeps_child_completion_an_event(self, monkeypatch, acks):
+        child = {
+            "id": "boundary-child",
+            "source": "subagent",
+            "thread_id": "child-thread",
+            "handle": "verifier-7f3a",
+            "run_generation": "generation-2",
+            "message": "Verification evidence.",
+            "timestamp": iso(5),
+        }
+        ctx = make_context()
+        node = self._node(ctx, monkeypatch, [child])
+
+        result = await node(
+            {
+                "job_id": "job-1",
+                "is_strategic_phase": False,
+                "phase_number": 2,
+                "iteration": 5,
+            }
+        )
+
+        events = [
+            message
+            for message in result.get("messages", [])
+            if getattr(message, "additional_kwargs", {}).get(PERSIST_ROLE_KEY)
+            == PERSIST_ROLE_EVENT
+        ]
+        assert len(events) == 1
+        assert "Verification evidence" in events[0].content
+        assert "not user messages" in events[0].content
+        assert acks[0]["reply_keys"] == ["id:boundary-child"]
+
+    @pytest.mark.asyncio
+    async def test_stateless_backstop_records_key_without_precheckpoint_ack(
+        self, monkeypatch, acks
+    ):
+        reply = {
+            "id": "boundary-stateless",
+            "source": "subagent",
+            "thread_id": "child-thread",
+            "handle": "probe-abcd",
+            "message": "Recovered evidence.",
+            "timestamp": iso(5),
+        }
+        ctx = make_context(stateless=True)
+        node = self._node(ctx, monkeypatch, [reply])
+
+        result = await node(
+            {
+                "job_id": "job-1",
+                "is_strategic_phase": False,
+                "phase_number": 2,
+                "iteration": 5,
+            }
+        )
+
+        assert result["delivered_reply_keys"] == ["id:boundary-stateless"]
+        assert acks == [], "checkpoint saver owns the stateless exact-key ack"
 
     @pytest.mark.asyncio
     async def test_backstop_suppresses_already_delivered_mail(self, monkeypatch, acks):
-        from src.graph import _reply_key
+        from agent.graph import _reply_key
 
         reply = {"thread_id": "t1", "message": "already seen", "timestamp": iso(5)}
         ctx = make_context()
@@ -401,7 +670,7 @@ class TestBoundaryBackstop:
     async def test_checkpointed_reply_is_filtered_before_workspace_write(
         self, monkeypatch
     ):
-        from src.graph import _process_queued_replies, _reply_key
+        from agent.graph import _process_queued_replies, _reply_key
 
         reply = {
             "id": "reply-committed-before-ack",
@@ -413,7 +682,7 @@ class TestBoundaryBackstop:
             fetchrow=AsyncMock(return_value={"context": {"queued_replies": [reply]}})
         )
         write_files = MagicMock()
-        monkeypatch.setattr("src.graph._write_reply_files", write_files)
+        monkeypatch.setattr("agent.graph._write_reply_files", write_files)
 
         result = await _process_queued_replies(
             "job-1",
@@ -430,7 +699,7 @@ class TestInboxContract:
     """The heartbeat prune contract, shared by both lanes."""
 
     def test_list_overwrites_empty_clears_none_keeps(self):
-        from src.api.dual_app import _replace_inbox
+        from agent.api.dual_app import _replace_inbox
 
         inbox = {}
         _replace_inbox(inbox, "job-1", [{"thread_id": "t1"}], "Queued replies")
@@ -443,3 +712,18 @@ class TestInboxContract:
         # Empty list = authoritative "nothing pending" — prune.
         _replace_inbox(inbox, "job-1", [], "Queued replies")
         assert "job-1" not in inbox
+
+    @pytest.mark.asyncio
+    async def test_dual_app_forwards_exact_reply_keys(self, monkeypatch):
+        from agent.api import dual_app
+
+        client = MagicMock()
+        client.ack_job_guidance = AsyncMock(return_value=True)
+        monkeypatch.setattr(dual_app, "_orchestrator_client", client)
+
+        dual_app.ack_guidance("job-1", reply_keys=["id:child-delivery"])
+        await asyncio.sleep(0)
+
+        client.ack_job_guidance.assert_awaited_once_with(
+            "job-1", reply_keys=["id:child-delivery"]
+        )

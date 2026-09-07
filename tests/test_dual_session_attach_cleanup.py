@@ -7,8 +7,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-import src.api.dual_app as dual_app
-import src.api.persistent_app as persistent_app
+import agent.api.dual_app as dual_app
+import agent.api.persistent_app as persistent_app
 
 
 GENERATION = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -16,6 +16,7 @@ ATTACH_TOKEN = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 WORKSPACE_GENERATION = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 WORKSPACE_RUNTIME = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
 POD_UID = "pod-uid-a"
+PROCESS_GENERATION = "process-a"
 
 
 def _attach_endpoint():
@@ -40,6 +41,12 @@ def _request(*, workspace: bool = False) -> dict:
         "pinned_runtime_generation_contract": 1,
         "session_runtime_generation": GENERATION,
         "session_runtime_attach_token": ATTACH_TOKEN,
+        "_recipient": {
+            "expected_thread_id": "thread-a",
+            "expected_agent_id": "agent-a",
+            "expected_pod_uid": POD_UID,
+            "expected_process_generation": PROCESS_GENERATION,
+        },
     }
     if workspace:
         payload.update(
@@ -103,6 +110,7 @@ def _restore_globals(monkeypatch):
 def _client(*, bound: bool = True, release=True) -> MagicMock:
     client = MagicMock()
     client.agent_id = "agent-a"
+    client.dispatch_process_generation = PROCESS_GENERATION
     client.adopt_session_runtime_identity.return_value = True
     client.bind_pod_runtime_actor = AsyncMock(return_value=bound)
     client.release_thread_agent = AsyncMock(
@@ -115,7 +123,7 @@ def _client(*, bound: bool = True, release=True) -> MagicMock:
 
 @pytest.mark.asyncio
 async def test_dual_ready_reports_exact_non_secret_session_identity(monkeypatch):
-    from src.shared.pinned_session_identity import (
+    from shared.pinned_session_identity import (
         pinned_session_ready_identity_fingerprint,
     )
 
@@ -194,6 +202,22 @@ async def test_actor_refusal_uses_only_monotonic_pre_setup_proof():
     )
     assert dual_app._session_attach_claim is None
     assert dual_app._pod_state is dual_app.PodState.IDLE
+
+
+@pytest.mark.asyncio
+async def test_setup_forwards_canonical_workspace_identity_to_shared_attach():
+    client = _client()
+    dual_app._orchestrator_client = client
+
+    with patch.object(persistent_app, "_attach_session", AsyncMock()) as setup:
+        response = await _attach_endpoint()(_request(workspace=True))
+        assert response.status_code == 200
+        await dual_app._session_attach_task
+
+    setup.assert_awaited_once()
+    kwargs = setup.await_args.kwargs
+    assert kwargs["workspace_generation"] == WORKSPACE_GENERATION
+    assert kwargs["workspace_runtime_incarnation"] == WORKSPACE_RUNTIME
 
 
 @pytest.mark.asyncio

@@ -8,13 +8,21 @@ Covers the new pool management and reservation-aware provisioning:
   - Pool fallback paths are tested indirectly via the provisioner methods
 """
 
+import shlex
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID
 
 import pytest
 
+from orchestrator.services.agent_pod_entrypoint import InvalidConfigNameError
 from orchestrator.services.agent_provisioner import AgentProvisioner
+from shared.runtime.core.loader import canonical_config_name
+from orchestrator.services.pinned_k8s_effect import (
+    K8S_MUTATION_REQUEST_TIMEOUT,
+    PINNED_AUTHORITY_FINALIZER,
+)
 
 
 # =============================================================================
@@ -72,6 +80,8 @@ def _make_provisioner(
         attempt_id,
         pod_name,
         provisioner,
+        namespace,
+        protection_protocol="finalizer_v1",
         pvc_name=None,
     ):
         claim = (
@@ -84,6 +94,8 @@ def _make_provisioner(
                 "pvc_name": pvc_name,
                 "status": "planned",
                 "pvc_uid": None,
+                "namespace": namespace,
+                "protection_protocol": protection_protocol,
             }
             if pvc_name
             else None
@@ -96,6 +108,8 @@ def _make_provisioner(
             "pod_name": pod_name,
             "status": "planned",
             "pod_uid": None,
+            "namespace": namespace,
+            "protection_protocol": protection_protocol,
             "workspace_claim": claim,
         }
 
@@ -129,6 +143,7 @@ def _make_pod(
     """
     pod = MagicMock()
     pod.metadata.name = name
+    pod.metadata.uid = f"uid-{name}"
     pod.metadata.labels = {
         "srw/managed-by": "agent-provisioner",
         "srw/purpose": purpose,
@@ -171,6 +186,132 @@ def _make_pod(
 async def _fake_to_thread(fn, *args, **kwargs):
     """Execute a function synchronously (replaces asyncio.to_thread in tests)."""
     return fn(*args, **kwargs)
+
+
+def _ready_recipient_pod(
+    *,
+    purpose: str,
+    thread_id: str | None = None,
+    runtime_generation: str | None = None,
+    finalizers: list[str] | None = None,
+) -> SimpleNamespace:
+    labels = {
+        "srw/component": "agent",
+        "srw/managed-by": "agent-provisioner",
+        "srw/purpose": purpose,
+    }
+    if thread_id is not None:
+        labels["srw.io/thread-id"] = thread_id
+    if runtime_generation is not None:
+        labels["srw.io/runtime-generation"] = runtime_generation
+    return SimpleNamespace(
+        metadata=SimpleNamespace(
+            name="agent-a",
+            namespace="test-ns",
+            uid="pod-a",
+            deletion_timestamp=None,
+            labels=labels,
+            finalizers=list(finalizers or []),
+        ),
+        status=SimpleNamespace(
+            phase="Running",
+            pod_ip="10.42.0.17",
+            container_statuses=[SimpleNamespace(name="agent", ready=True)],
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_pinned_session_recipient_accepts_exact_provisioned_session_pod():
+    provisioner, _ = _make_provisioner()
+    generation = "22222222-2222-4222-8222-222222222222"
+    thread_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    provisioner._core_api.read_namespaced_pod.return_value = _ready_recipient_pod(
+        purpose="session",
+        thread_id=thread_id,
+        runtime_generation=generation,
+    )
+
+    assert await provisioner.attest_pinned_session_recipient(
+        "agent-a",
+        thread_id=thread_id,
+        expected_runtime_generation=generation,
+        expected_pod_uid="pod-a",
+        expected_pod_ip="10.42.0.17",
+        authority_kind="provisioned",
+        namespace="test-ns",
+    )
+
+
+@pytest.mark.asyncio
+async def test_pinned_session_recipient_accepts_only_protected_warm_pool_pod():
+    provisioner, _ = _make_provisioner()
+    generation = "22222222-2222-4222-8222-222222222222"
+    thread_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    pod = _ready_recipient_pod(
+        purpose="job",
+        finalizers=[PINNED_AUTHORITY_FINALIZER],
+    )
+    provisioner._core_api.read_namespaced_pod.return_value = pod
+
+    assert await provisioner.attest_pinned_session_recipient(
+        "agent-a",
+        thread_id=thread_id,
+        expected_runtime_generation=generation,
+        expected_pod_uid="pod-a",
+        expected_pod_ip="10.42.0.17",
+        authority_kind="warm_pool",
+        namespace="test-ns",
+    )
+
+    pod.metadata.finalizers = []
+    assert not await provisioner.attest_pinned_session_recipient(
+        "agent-a",
+        thread_id=thread_id,
+        expected_runtime_generation=generation,
+        expected_pod_uid="pod-a",
+        expected_pod_ip="10.42.0.17",
+        authority_kind="warm_pool",
+        namespace="test-ns",
+    )
+
+
+@pytest.mark.asyncio
+async def test_pinned_session_recipient_never_crosses_authority_shapes():
+    provisioner, _ = _make_provisioner()
+    generation = "22222222-2222-4222-8222-222222222222"
+    thread_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    warm_pod = _ready_recipient_pod(
+        purpose="job",
+        finalizers=[PINNED_AUTHORITY_FINALIZER],
+    )
+    provisioner._core_api.read_namespaced_pod.return_value = warm_pod
+    assert not await provisioner.attest_pinned_session_recipient(
+        "agent-a",
+        thread_id=thread_id,
+        expected_runtime_generation=generation,
+        expected_pod_uid="pod-a",
+        expected_pod_ip="10.42.0.17",
+        authority_kind="provisioned",
+        namespace="test-ns",
+    )
+
+    session_pod = _ready_recipient_pod(
+        purpose="session",
+        thread_id=thread_id,
+        runtime_generation=generation,
+        finalizers=[PINNED_AUTHORITY_FINALIZER],
+    )
+    provisioner._core_api.read_namespaced_pod.return_value = session_pod
+    assert not await provisioner.attest_pinned_session_recipient(
+        "agent-a",
+        thread_id=thread_id,
+        expected_runtime_generation=generation,
+        expected_pod_uid="pod-a",
+        expected_pod_ip="10.42.0.17",
+        authority_kind="warm_pool",
+        namespace="test-ns",
+    )
 
 
 # =============================================================================
@@ -594,7 +735,12 @@ class TestScaleDownIdle:
 
         # DB has 4 idle agents
         conn.fetch.return_value = [
-            {"id": f"agent-{i}", "hostname": f"pod-{i}"} for i in range(4)
+            {
+                "id": f"agent-{i}",
+                "hostname": f"pod-{i}",
+                "pod_uid": f"uid-pod-{i}",
+            }
+            for i in range(4)
         ]
         p._count_idle_agents = AsyncMock(return_value=4)
 
@@ -617,7 +763,12 @@ class TestScaleDownIdle:
         p._core_api.list_namespaced_pod.return_value = pods_result
 
         conn.fetch.return_value = [
-            {"id": f"agent-{i}", "hostname": f"pod-{i}"} for i in range(8)
+            {
+                "id": f"agent-{i}",
+                "hostname": f"pod-{i}",
+                "pod_uid": f"uid-pod-{i}",
+            }
+            for i in range(8)
         ]
         p._count_idle_agents = AsyncMock(return_value=8)
 
@@ -646,7 +797,9 @@ class TestScaleDownIdle:
         pods_result.items = [_make_pod(f"pod-{i}") for i in range(4)]
         p._core_api.list_namespaced_pod.return_value = pods_result
 
-        conn.fetch.return_value = [{"id": "agent-0", "hostname": "pod-0"}]
+        conn.fetch.return_value = [
+            {"id": "agent-0", "hostname": "pod-0", "pod_uid": "uid-pod-0"}
+        ]
         p._count_idle_agents = AsyncMock(return_value=1)
 
         with patch(
@@ -699,7 +852,11 @@ class TestTryEvictForReservation:
 
         # DB: one idle job agent
         conn.fetch.return_value = [
-            {"id": "agent-idle-job", "hostname": "srw-agent-j-idle"},
+            {
+                "id": "agent-idle-job",
+                "hostname": "srw-agent-j-idle",
+                "pod_uid": "uid-srw-agent-j-idle",
+            },
         ]
 
         # K8s: one job pod matching the idle agent
@@ -740,7 +897,11 @@ class TestTryEvictForReservation:
         p, conn = _make_provisioner(reserved_job_slots=1)
 
         conn.fetch.return_value = [
-            {"id": "agent-idle-session", "hostname": "srw-agent-s-idle"},
+            {
+                "id": "agent-idle-session",
+                "hostname": "srw-agent-s-idle",
+                "pod_uid": "uid-srw-agent-s-idle",
+            },
         ]
 
         pods_result = MagicMock()
@@ -777,7 +938,13 @@ class TestProvisionWithEviction:
         # For eviction: one idle job agent matching a pod
         conn.fetch.side_effect = [
             # First fetch: idle agents for eviction
-            [{"id": "agent-idle", "hostname": "pod-0"}],
+            [
+                {
+                    "id": "agent-idle",
+                    "hostname": "pod-0",
+                    "pod_uid": "uid-pod-0",
+                }
+            ],
         ]
 
         # After eviction, need to list pods again for eviction check
@@ -1148,6 +1315,8 @@ class TestSessionAgentWorkspacePvc:
             attempt_id,
             pod_name,
             provisioner,
+            namespace,
+            protection_protocol="finalizer_v1",
             pvc_name=None,
         ):
             return {
@@ -1158,6 +1327,8 @@ class TestSessionAgentWorkspacePvc:
                 "pod_name": pod_name,
                 "status": "planned",
                 "pod_uid": None,
+                "namespace": namespace,
+                "protection_protocol": protection_protocol,
                 "workspace_claim": {
                     "claim_id": "33333333-3333-4333-8333-333333333333",
                     "thread_id": thread_id,
@@ -1167,6 +1338,8 @@ class TestSessionAgentWorkspacePvc:
                     "pvc_name": pvc_name,
                     "status": "planned",
                     "pvc_uid": None,
+                    "namespace": namespace,
+                    "protection_protocol": protection_protocol,
                 },
             }
 
@@ -1228,6 +1401,7 @@ class TestSessionAgentWorkspacePvc:
                 claim_id="33333333-3333-4333-8333-333333333333",
                 create_attempt="44444444-4444-4444-8444-444444444444",
                 expected_pvc_uid=None,
+                namespace="test-ns",
             )
         assert uid == "pvc-uid-after-timeout"
 
@@ -1246,6 +1420,7 @@ class TestSessionAgentWorkspacePvc:
                     claim_id="33333333-3333-4333-8333-333333333333",
                     create_attempt="44444444-4444-4444-8444-444444444444",
                     expected_pvc_uid=None,
+                    namespace="test-ns",
                 )
                 is None
             )
@@ -1275,6 +1450,7 @@ class TestSessionAgentWorkspacePvc:
                 expected_runtime_generation=("22222222-2222-4222-8222-222222222222"),
                 expected_claim_id="33333333-3333-4333-8333-333333333333",
                 expected_create_attempt="44444444-4444-4444-8444-444444444444",
+                namespace="test-ns",
             )
         assert result == {"state": "exact_original", "pvc_uid": "original-pvc-uid"}
 
@@ -1298,6 +1474,7 @@ class TestSessionAgentWorkspacePvc:
                 expected_runtime_generation=("22222222-2222-4222-8222-222222222222"),
                 expected_claim_id="33333333-3333-4333-8333-333333333333",
                 expected_create_attempt="44444444-4444-4444-8444-444444444444",
+                namespace="test-ns",
             )
         assert result == {"state": "exact_fence", "pvc_uid": "fence-pvc-uid"}
         manifest = (
@@ -1477,6 +1654,60 @@ def test_pod_manifest_omits_thread_id_label_for_worker():
     labels = manifest["metadata"]["labels"]
     assert "srw.io/thread-id" not in labels
     assert "srw/thread-id" not in labels
+
+
+def test_pod_manifest_checks_readiness_immediately_after_startup_probe():
+    p = _bare_provisioner_for_manifest()
+
+    manifest = p._build_pod_manifest(
+        pod_name="srw-agent-j-deadbeef",
+        purpose="job",
+        thread_id=None,
+        config_name="developer",
+        cpu_request="100m",
+        memory_request="256Mi",
+        cpu_limit="1",
+        memory_limit="2Gi",
+    )
+
+    container = manifest["spec"]["containers"][0]
+    assert container["startupProbe"]["httpGet"]["path"] == "/health"
+    assert container["startupProbe"]["periodSeconds"] == 1
+    assert container["startupProbe"]["failureThreshold"] == 100
+    assert container["readinessProbe"]["httpGet"]["path"] == "/ready"
+    assert container["readinessProbe"]["initialDelaySeconds"] == 0
+
+
+@pytest.mark.parametrize(
+    ("purpose", "thread_id", "expected_mode"),
+    [
+        ("job", None, "--config developer"),
+        (
+            "session",
+            "11111111-2222-3333-4444-555555555555",
+            "--mode persistent",
+        ),
+    ],
+)
+def test_pod_manifest_execs_python_as_pid_one(purpose, thread_id, expected_mode):
+    """Kubelet SIGTERM must reach the agent's graceful-drain handler."""
+    p = _bare_provisioner_for_manifest()
+
+    manifest = p._build_pod_manifest(
+        pod_name=f"srw-agent-{purpose}-deadbeef",
+        purpose=purpose,
+        thread_id=thread_id,
+        config_name="developer",
+        cpu_request="100m",
+        memory_request="256Mi",
+        cpu_limit="1",
+        memory_limit="2Gi",
+    )
+
+    command = manifest["spec"]["containers"][0]["command"]
+    assert command[:2] == ["sh", "-c"]
+    assert command[2].startswith("exec python agent.py ")
+    assert expected_mode in command[2]
 
 
 def test_pod_manifest_injects_pod_uid_via_downward_api():
@@ -1681,148 +1912,26 @@ def _make_snapshot_mock(available=True, put_ok=True):
 
 
 class TestArchivePodLogs:
-    """Tests for _archive_pod_logs() + the delete_agent_pod hook."""
-
-    def _wire_pod(self, p, pod, current="line1\nline2", previous=None):
-        """Wire read_namespaced_pod + read_namespaced_pod_log on the mock API."""
-        p._core_api.read_namespaced_pod.return_value = pod
-
-        def _read_log(name, namespace, container, **kwargs):
-            if kwargs.get("previous"):
-                if previous is None:
-                    raise RuntimeError("no previous container")
-                return previous
-            return current
-
-        p._core_api.read_namespaced_pod_log.side_effect = _read_log
+    """Deletion paths never read logs through a mutable Pod name."""
 
     @pytest.mark.asyncio
-    async def test_archives_and_stamps_session_pod(self):
+    async def test_archive_helper_refuses_name_addressed_read(self):
         p, conn = _make_provisioner()
-        pod = _make_pod(
-            "srw-agent-s-abc", thread_id="11111111-2222-3333-4444-555555555555"
-        )
-        pod.metadata.labels["srw.io/thread-id"] = "11111111-2222-3333-4444-555555555555"
-        self._wire_pod(p, pod, current="hello", previous="crashed earlier")
-        snap = _make_snapshot_mock()
-        with (
-            patch("services.snapshot_service.snapshot_service", snap),
-            patch(
-                "orchestrator.services.agent_provisioner.asyncio.to_thread",
-                side_effect=_fake_to_thread,
-            ),
-        ):
-            await p._archive_pod_logs("srw-agent-s-abc")
-
-        # Both incarnations uploaded under agent_logs/<pod>/
-        keys = [c.args[0] for c in snap.put_blob.await_args_list]
-        assert len(keys) == 2
-        assert all(k.startswith("agent_logs/srw-agent-s-abc/") for k in keys)
-        assert any(k.endswith(".previous.log") for k in keys)
-
-        # Thread stamped (metadata) AND jobs stamped (context via agents join)
-        sqls = [c.args[0] for c in conn.execute.await_args_list]
-        assert any("UPDATE threads" in s for s in sqls)
-        assert any("UPDATE jobs" in s for s in sqls)
-        thread_call = next(
-            c for c in conn.execute.await_args_list if "UPDATE threads" in c.args[0]
-        )
-        assert thread_call.args[1] == "11111111-2222-3333-4444-555555555555"
-
-    @pytest.mark.asyncio
-    async def test_worker_pod_stamps_jobs_only(self):
-        p, conn = _make_provisioner()
-        pod = _make_pod("srw-agent-j-xyz")  # no thread labels
-        self._wire_pod(p, pod, current="worker log")
-        snap = _make_snapshot_mock()
-        with (
-            patch("services.snapshot_service.snapshot_service", snap),
-            patch(
-                "orchestrator.services.agent_provisioner.asyncio.to_thread",
-                side_effect=_fake_to_thread,
-            ),
-        ):
-            await p._archive_pod_logs("srw-agent-j-xyz")
-
-        sqls = [c.args[0] for c in conn.execute.await_args_list]
-        assert not any("UPDATE threads" in s for s in sqls)
-        jobs_call = next(
-            c for c in conn.execute.await_args_list if "UPDATE jobs" in c.args[0]
-        )
-        # Resolves jobs through the agents registration by pod hostname
-        assert "agents" in jobs_call.args[0]
-        assert jobs_call.args[1] == "srw-agent-j-xyz"
-
-    @pytest.mark.asyncio
-    async def test_noop_when_snapshot_store_unavailable(self):
-        p, conn = _make_provisioner()
-        snap = _make_snapshot_mock(available=False)
-        with patch("services.snapshot_service.snapshot_service", snap):
-            await p._archive_pod_logs("srw-agent-j-xyz")
+        await p._archive_pod_logs("srw-agent-s-reused")
         p._core_api.read_namespaced_pod.assert_not_called()
+        p._core_api.read_namespaced_pod_log.assert_not_called()
         conn.execute.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_noop_when_pod_already_gone(self):
-        p, conn = _make_provisioner()
-        err = RuntimeError("gone")
-        err.status = 404
-        p._core_api.read_namespaced_pod.side_effect = err
-        snap = _make_snapshot_mock()
-        with (
-            patch("services.snapshot_service.snapshot_service", snap),
-            patch(
-                "orchestrator.services.agent_provisioner.asyncio.to_thread",
-                side_effect=_fake_to_thread,
-            ),
-        ):
-            await p._archive_pod_logs("srw-agent-j-xyz")
-        snap.put_blob.assert_not_awaited()
-        conn.execute.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_no_stamp_when_upload_fails(self):
-        p, conn = _make_provisioner()
-        pod = _make_pod("srw-agent-j-xyz")
-        self._wire_pod(p, pod, current="some log")
-        snap = _make_snapshot_mock(put_ok=False)
-        with (
-            patch("services.snapshot_service.snapshot_service", snap),
-            patch(
-                "orchestrator.services.agent_provisioner.asyncio.to_thread",
-                side_effect=_fake_to_thread,
-            ),
-        ):
-            await p._archive_pod_logs("srw-agent-j-xyz")
-        conn.execute.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_archive_failure_never_blocks_deletion(self):
+    async def test_exact_delete_does_not_read_successor_logs(self):
         p, _ = _make_provisioner()
-        p._core_api.read_namespaced_pod.side_effect = RuntimeError("k8s down")
-        snap = _make_snapshot_mock()
-        with (
-            patch("services.snapshot_service.snapshot_service", snap),
-            patch(
-                "orchestrator.services.agent_provisioner.asyncio.to_thread",
-                side_effect=_fake_to_thread,
-            ),
-        ):
-            # Must not raise — and the pod delete must still go through.
-            assert await p.delete_agent_pod("srw-agent-j-xyz") is True
-        p._core_api.delete_namespaced_pod.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_delete_agent_pod_archives_first(self):
-        p, _ = _make_provisioner()
-        p._archive_pod_logs = AsyncMock()
         with patch(
             "orchestrator.services.agent_provisioner.asyncio.to_thread",
             side_effect=_fake_to_thread,
         ):
-            assert await p.delete_agent_pod("srw-agent-j-xyz") is True
-        p._archive_pod_logs.assert_awaited_once_with("srw-agent-j-xyz")
+            assert await p.delete_agent_pod("srw-agent-j-xyz", expected_pod_uid="uid-a")
         p._core_api.delete_namespaced_pod.assert_called_once()
+        p._core_api.read_namespaced_pod_log.assert_not_called()
 
 
 class TestExactClaimantPodAuthority:
@@ -1898,4 +2007,166 @@ class TestExactClaimantPodAuthority:
             namespace="test-ns",
             grace_period_seconds=180,
             body={"preconditions": {"uid": "uid-a"}},
+            _request_timeout=K8S_MUTATION_REQUEST_TIMEOUT,
+        )
+
+
+# =============================================================================
+# config_name at the provisioner boundary
+# (security audit 2026-08-27, finding #3: caller-controlled config_name was
+#  f-spliced unquoted into the agent pod's ``sh -c`` entrypoint, in a pod
+#  carrying the platform Secret via envFrom)
+# =============================================================================
+
+_HOSTILE_CONFIG_NAMES = [
+    "worker_base; touch /tmp/pwned",
+    "$(id)",
+    "`id`",
+    "a b",
+    "../x",
+    "x" * 1000,
+]
+
+# Bare names, a relative YAML path, and the compatibility aliases in both the
+# name and the path form. The alias mapping itself belongs to
+# canonical_config_name() (covered by test_unified_expert_selection.py); here
+# the point is that every one of these survives the validator and boots with
+# the alias layer's answer on ``--config``.
+_VALID_CONFIG_NAMES = [
+    "worker_base",
+    "session_base",
+    "scholar",
+    "config/experts/scholar/config.yaml",
+    "default",
+    "defaults",
+    "persistent_default",
+    "persistent_defaults",
+    "experts/default.yaml",
+]
+
+
+def _expected_agent_argv(config_name, thread_id=None):
+    argv = ["exec", "python", "agent.py"]
+    if thread_id:
+        argv += ["--mode", "persistent", "--thread-id", thread_id]
+    return argv + ["--config", config_name, "--port", "8001", "--host", "0.0.0.0"]
+
+
+def _manifest(p, purpose, thread_id, config_name):
+    return p._build_pod_manifest(
+        pod_name=f"srw-agent-{purpose[0]}-deadbeef",
+        purpose=purpose,
+        thread_id=thread_id,
+        config_name=config_name,
+        cpu_request="100m",
+        memory_request="256Mi",
+        cpu_limit="1",
+        memory_limit="2Gi",
+    )
+
+
+class TestConfigNameBoundary:
+    """A hostile name never reaches Kubernetes or a pod spec; valid ones boot."""
+
+    _TID = "11111111-2222-3333-4444-555555555555"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("hostile", _HOSTILE_CONFIG_NAMES)
+    async def test_job_rejects_hostile_name_before_any_kubernetes_call(self, hostile):
+        p, _conn = _make_provisioner()
+        with patch.object(p, "_build_pod_manifest") as build:
+            with pytest.raises(InvalidConfigNameError):
+                await p.provision_agent(purpose="job", config_name=hostile)
+        build.assert_not_called()
+        assert p._core_api.mock_calls == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("hostile", _HOSTILE_CONFIG_NAMES)
+    async def test_session_rejects_hostile_name_before_any_kubernetes_or_db_call(
+        self, hostile
+    ):
+        p, _conn = _make_provisioner()
+        with patch.object(p, "_build_pod_manifest") as build:
+            with pytest.raises(InvalidConfigNameError):
+                await p.provision_agent(
+                    purpose="session", thread_id=self._TID, config_name=hostile
+                )
+        build.assert_not_called()
+        assert p._core_api.mock_calls == []
+        p._db.get_thread.assert_not_awaited()
+        p._db.reserve_pinned_agent_pod_provision_intent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_hostile_name_is_rejected_even_without_kubernetes(self):
+        """The check precedes the availability short-circuit: a rejected name
+        is loud everywhere, not silently swallowed into ``None``."""
+        p, _ = _make_provisioner(k8s_available=False)
+        with pytest.raises(InvalidConfigNameError):
+            await p.provision_agent(purpose="job", config_name="$(id)")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("given", _VALID_CONFIG_NAMES)
+    async def test_valid_names_still_boot_a_job_pod(self, given):
+        booted = canonical_config_name(given)
+        p, _conn = _make_provisioner()
+        pods_list = MagicMock()
+        pods_list.items = []
+        p._core_api.list_namespaced_pod.return_value = pods_list
+        bodies = []
+
+        def _create(**kw):
+            bodies.append(kw["body"])
+            created = MagicMock()
+            created.metadata.uid = "pod-uid-created"
+            return created
+
+        p._core_api.create_namespaced_pod.side_effect = _create
+
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            name = await p.provision_agent(purpose="job", config_name=given)
+
+        assert name is not None and name.startswith("srw-agent-j-")
+        assert len(bodies) == 1
+        container = bodies[0]["spec"]["containers"][0]
+        assert container["command"][:2] == ["sh", "-c"]
+        assert shlex.split(container["command"][2]) == _expected_agent_argv(booted)
+        env = {e["name"]: e.get("value") for e in container["env"]}
+        assert env["AGENT_CONFIG"] == booted
+
+    @pytest.mark.parametrize("hostile", _HOSTILE_CONFIG_NAMES)
+    def test_manifest_builder_itself_refuses_a_hostile_name(self, hostile):
+        """The sink re-checks: no path to a pod spec bypasses the allow-list."""
+        p = _bare_provisioner_for_manifest()
+        with pytest.raises(InvalidConfigNameError):
+            _manifest(p, "job", None, hostile)
+
+    @pytest.mark.parametrize(
+        ("purpose", "thread_id"),
+        [("job", None), ("session", _TID)],
+    )
+    def test_manifest_command_parses_back_to_exactly_the_intended_argv(
+        self, purpose, thread_id
+    ):
+        p = _bare_provisioner_for_manifest()
+        name = "config/experts/scholar/config.yaml"
+        manifest = _manifest(p, purpose, thread_id, name)
+        command = manifest["spec"]["containers"][0]["command"]
+        assert command[:2] == ["sh", "-c"]
+        assert shlex.split(command[2]) == _expected_agent_argv(name, thread_id)
+        init = manifest["spec"]["initContainers"][0]["command"]
+        assert init[:2] == ["sh", "-c"]
+        assert "nc -z srw-orchestrator 8085" in init[2]
+
+    def test_manifest_quotes_every_argv_word_not_just_config_name(self):
+        """``thread_id`` is a DB UUID today; the sink still quotes it as one
+        word so no future caller can turn it into shell syntax."""
+        p = _bare_provisioner_for_manifest()
+        hostile_thread = "a b;$(id)"
+        manifest = _manifest(p, "session", hostile_thread, "scholar")
+        command = manifest["spec"]["containers"][0]["command"]
+        assert shlex.split(command[2]) == _expected_agent_argv(
+            "scholar", hostile_thread
         )

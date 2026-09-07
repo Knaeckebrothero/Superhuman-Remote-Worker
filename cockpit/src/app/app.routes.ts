@@ -6,6 +6,7 @@ import {JobReviewPageComponent} from './views/job-review/job-review-page.compone
 import {CreatePageComponent} from './views/create/create-page.component';
 import {ProjectListPageComponent} from './views/projects/project-list.component';
 import {ProjectDetailPageComponent} from './views/project-detail/project-detail.component';
+import {ConferenceLauncherComponent} from './views/project-detail/conference-launcher.component';
 import {InboxPageComponent} from './views/inbox/inbox-page.component';
 import {MessageRedirectComponent} from './core/routing/message-redirect/message-redirect.component';
 import {ChatPageComponent} from './views/chat/chat-page.component';
@@ -43,6 +44,11 @@ export const routes: Routes = [
   { path: 'projects', component: ProjectListPageComponent, canActivate: [authGuard] },
   { path: 'projects/:id', component: ProjectDetailPageComponent, canActivate: [authGuard, projectAccessGuard] },
   {
+    path: 'projects/:id/officer/conference',
+    component: ConferenceLauncherComponent,
+    canActivate: [authGuard, projectAccessGuard],
+  },
+  {
     path: 'datasources',
     loadComponent: () =>
       import('./views/datasources/datasources-page.component').then(m => m.DatasourcesPageComponent),
@@ -71,6 +77,18 @@ export const routes: Routes = [
   },
   { path: 'settings', component: SettingsComponent, canActivate: [authGuard] },
   { path: 'settings/api-keys', component: ApiKeysPageComponent, canActivate: [authGuard] },
+  // Lazy, unlike the PAT route above: the bundle has ~30 KB of headroom
+  // against the hard-fail initial-bundle budget, and this page (plus the
+  // ssh-keygen instructions it renders) is not something every session
+  // visits — see the `automations` route's rationale.
+  {
+    path: 'settings/ssh-keys',
+    loadComponent: () =>
+      import('./views/settings/ssh-keys/ssh-keys-page.component').then(
+        (m) => m.SshKeysPageComponent,
+      ),
+    canActivate: [authGuard],
+  },
   // Admin and the workbench load on demand. They are large (the config, usage
   // and grants screens alone are most of a megabyte of source, and the
   // workbench pulls the graph timeline), and no ordinary session ever opens

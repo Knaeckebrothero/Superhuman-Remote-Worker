@@ -22,7 +22,7 @@ from testcontainers.postgres import PostgresContainer
 from orchestrator.database.postgres import PostgresDB
 
 _MIGRATION = Path(
-    "orchestrator/database/migrations/app/0046_jobs_dispatchable_partial_idx.notx.sql"
+    "src/orchestrator/database/migrations/app/0046_jobs_dispatchable_partial_idx.notx.sql"
 )
 
 

@@ -14,15 +14,9 @@ knowledge-base/knowledge/issues/maxsessions_parallel_tools_false_workspace_death
 
 import asyncio
 import socket
-import sys
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
-project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
 
 from orchestrator.services.completion import (  # noqa: E402
     handle_pod_workspace_recovery,

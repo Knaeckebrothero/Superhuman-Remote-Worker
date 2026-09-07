@@ -31,15 +31,15 @@ from pathlib import Path
 import pytest
 import yaml
 
-from src.core.loader import (
+from shared.runtime.core.loader import (
     ToolsConfig,
     get_all_tool_names,
     load_agent_config_from_dict,
     load_and_merge_config,
     resolve_config_path,
 )
-from src.core.session_tool_overrides import SESSION_TOOL_OVERRIDE_NAMES
-from src.core.tool_policy import (
+from shared.runtime.core.session_tool_overrides import SESSION_TOOL_OVERRIDE_NAMES
+from shared.runtime.core.tool_policy import (
     ENUMERATE_ONLY_CATEGORIES,
     MCP_WILDCARD,
     ToolPolicyError,
@@ -50,7 +50,7 @@ from src.core.tool_policy import (
     expand_tool_policy,
     normalize_tool_policy,
 )
-from src.tools.registry import TOOL_REGISTRY, get_categories, get_tools_by_category
+from agent.tools.registry import TOOL_REGISTRY, get_categories, get_tools_by_category
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _CONFIG_DIR = _REPO_ROOT / "config"
@@ -110,7 +110,15 @@ def _raw_declarations() -> list[tuple[str, str, object]]:
 
 _DECLARATIONS = _raw_declarations()
 
-_STANDALONE_CONFIGS = ["session_base", "worker_base", "interactive"]
+# The chain roots by their public names (expert_base + the three role
+# overlays) plus the one standalone session profile.
+_STANDALONE_CONFIGS = [
+    "expert_base",
+    "session_base",
+    "subagent_base",
+    "worker_base",
+    "interactive",
+]
 
 
 def _all_config_names() -> list[str]:
@@ -119,7 +127,12 @@ def _all_config_names() -> list[str]:
         for p in _CONFIG_DIR.glob("experts/*/config.yaml")
         if p.parent.name != "__pycache__"
     )
-    return _STANDALONE_CONFIGS + experts
+    library = sorted(
+        f"subagents/{p.parent.name}"
+        for p in _CONFIG_DIR.glob("subagents/*/config.yaml")
+        if p.parent.name != "__pycache__"
+    )
+    return _STANDALONE_CONFIGS + experts + library
 
 
 def _minimal(**extra) -> dict:
@@ -133,18 +146,33 @@ class TestPopulation:
     def test_the_declaration_scan_actually_found_the_configs(self):
         """A scan that silently found nothing would make every test below pass."""
         files = {rel for rel, _, _ in _DECLARATIONS}
-        assert len(files) == 12, f"expected 12 configs declaring tools:, got {files}"
-        assert "config/session_base.yaml" in files
-        assert "config/worker_base.yaml" in files
+        assert len(files) == 21, f"expected 21 configs declaring tools:, got {files}"
+        assert "config/expert_base.yaml" in files
+        assert "config/overlays/worker.yaml" in files
+        assert "config/overlays/session.yaml" in files
+        assert "config/overlays/subagent.yaml" in files
+        assert "config/subagents/explorer/config.yaml" in files
+        assert "config/subagents/implementer/config.yaml" in files
+        assert "config/subagents/probe/config.yaml" in files
+        assert "config/subagents/reader/config.yaml" in files
+        assert "config/subagents/reviewer/config.yaml" in files
+        assert "config/subagents/tester/config.yaml" in files
+        assert "config/subagents/verifier/config.yaml" in files
         assert any("experts/centurion" in f for f in files)
         # 148 after job_control/job_inspection became descriptor-owned groups;
         # 149 with the Centurion's explicit knowledge grant
         # (officer_knowledge_plane.md §3, K2); 141 after the eight shell-having
         # configs dropped their `git:` blocks — ToolsConfig.__post_init__
         # suppresses that group whenever shell tools are present, so declaring
-        # it there advertised tools the pod never binds.
-        assert len(_DECLARATIONS) == 141, (
-            f"expected 141 raw declarations, got {len(_DECLARATIONS)}"
+        # it there advertised tools the pod never binds; 137 after the U1 root
+        # split: the two self-contained bases (21 + 23 declarations) became
+        # expert_base (17 shared groups) + the worker / session / subagent
+        # overlays (4 + 6 + 13 role-owned groups); 143 with the subagent
+        # library's explorer entry (6 read-only groups restated so it is
+        # read-only standalone too); 187 with U3 WP5's six entries (44 explicit
+        # group declarations, including the reviewer/verifier inspection group).
+        assert len(_DECLARATIONS) == 187, (
+            f"expected 187 raw declarations, got {len(_DECLARATIONS)}"
         )
 
     def test_every_shipped_declaration_is_already_a_list(self):
@@ -352,33 +380,47 @@ class TestShellMustEnumerate:
         ]
 
     def test_every_shipped_shell_declaration_is_still_accepted(self):
-        """Eleven configs declare ``tools.shell``; all are bare lists or ``[]``,
-        the legacy spellings of ``only`` and ``false``. None is affected."""
+        """Sixteen configs declare ``tools.shell`` (the prior ten plus all six
+        U3 WP5 library entries, including reader's explicit empty override);
+        all are bare lists or ``[]``, the legacy spellings of ``only`` and
+        ``false``. None is affected."""
         decls = [(rel, v) for rel, cat, v in _DECLARATIONS if cat == "shell"]
-        assert len(decls) == 11, decls
+        assert len(decls) == 16, decls
         for rel, value in decls:
             assert (
                 normalize_tool_policy({"tools": {"shell": value}})["tools"]["shell"]
                 == value
             ), rel
 
-    def test_the_rule_is_scoped_to_shell(self):
-        assert ENUMERATE_ONLY_CATEGORIES == {"shell"}
+    def test_the_rule_is_scoped_to_shell_and_delegation(self):
+        """``delegation`` joined in U3 WP4: its one tool is ``grant: explicit``,
+        so ``true`` would silently expand to ``[]`` — refusing it keeps the
+        settings toggle honest (the cockpit sends the served enumeration). A
+        STORED ``true`` is compat, not vocabulary: ``normalize_tool_policy``
+        maps it to ``[delegate_agent]`` (tests/test_delegation_config_compat)."""
+        assert ENUMERATE_ONLY_CATEGORIES == {"shell", "delegation"}
         assert expand_category_true("git")
         assert expand_tool_policy({"except": ["git_log"]}, "git")
+        with pytest.raises(ToolPolicyError, match="must enumerate"):
+            expand_category_true("delegation")
 
     def test_the_legacy_coding_alias_obeys_the_shell_rule(self):
         for value in (True, {"except": ["srw_cloud_status"]}):
             with pytest.raises(ToolPolicyError):
                 normalize_tool_policy({"tools": {"coding": value}})
 
-    def test_schema_json_refuses_true_and_except_on_shell(self):
+    @pytest.mark.parametrize("category", sorted(ENUMERATE_ONLY_CATEGORIES))
+    def test_schema_json_refuses_true_and_except_on_enumerated_categories(
+        self, category
+    ):
         schema = json.loads((_REPO_ROOT / "config" / "schema.json").read_text())
-        block = schema["properties"]["tools"]["properties"]["shell"]
+        block = schema["properties"]["tools"]["properties"][category]
         boolean, array, mapping = block["oneOf"]
-        assert boolean["const"] is False, "shell must not accept `true`"
+        assert boolean["const"] is False, f"{category} must not accept `true`"
         assert array["type"] == "array", "bare lists stay legal"
-        assert set(mapping["properties"]) == {"only"}, "shell must not accept `except`"
+        assert set(mapping["properties"]) == {"only"}, (
+            f"{category} must not accept `except`"
+        )
         assert mapping["required"] == ["only"]
 
 
@@ -437,7 +479,7 @@ class TestMachineOwnedCategories:
         assert expand_category_true(category) == []
 
     def test_it_warns(self, caplog):
-        with caplog.at_level("WARNING", logger="src.core.tool_policy"):
+        with caplog.at_level("WARNING", logger="shared.runtime.core.tool_policy"):
             expand_category_true("sql")
         assert any(
             "tools.sql: true expands to []" in r.getMessage() for r in caplog.records
@@ -447,7 +489,9 @@ class TestMachineOwnedCategories:
         empties = {
             c
             for c in get_categories()
-            if c not in ("mcp", "shell") and not expand_category_true(c)
+            if c != "mcp"
+            and c not in ENUMERATE_ONLY_CATEGORIES  # `true` is refused there
+            and not expand_category_true(c)
         }
         assert empties == set(self._MACHINE_OWNED)
 
@@ -481,8 +525,11 @@ class TestExpansionAgainstTheClosedVocabulary:
 
     @pytest.mark.parametrize("category", sorted(get_categories()))
     def test_production_expansion_matches_an_independent_derivation(self, category):
-        if category in ("mcp", "shell"):
-            pytest.skip("special-cased; covered by TestMcp / TestShell*")
+        if category == "mcp" or category in ENUMERATE_ONLY_CATEGORIES:
+            pytest.skip(
+                "special-cased; covered by TestMcp / TestShell* / "
+                "test_the_rule_is_scoped_to_shell_and_delegation"
+            )
         assert set(expand_category_true(category)) == _reference_expand_true(category)
 
 
@@ -593,7 +640,7 @@ class TestCategoryVocabularyAgreement:
     """``TOOL_REGISTRY`` is the authority; three other lists mirror it.
 
     ``ToolsConfig`` cannot derive its fields at runtime — ``src/tools/registry``
-    imports ``src/core/loader`` (via ``spawn_subagent``), so a module-level
+    imports ``src/core/loader`` (via the tool packages), so a module-level
     import the other way is a cycle.  ``get_all_tool_names`` *is* derived from
     ``ToolsConfig``, which removes one of the four lists outright; the
     remaining two are pinned here so adding a registry category fails loudly at
@@ -678,8 +725,11 @@ class TestShippedConfigsResolveUnchanged:
     @pytest.mark.parametrize("config_name", _all_config_names())
     def test_merged_config_matches_the_raw_yaml_chain(self, config_name):
         """Normalising inside ``load_and_merge_config`` must not perturb the
-        ``$extends`` merge: the result has to equal a merge of the raw files."""
-        from src.core.loader import deep_merge
+        ``$extends`` merge: the result has to equal a merge of the raw files
+        (with the merged chain's ``$ignore_keys`` honoured — the subagent
+        overlay prunes ``tools.delegation``, and that pruning is the loader's
+        documented step, not a perturbation)."""
+        from shared.runtime.core.loader import deep_merge, prune_ignored_keys
 
         path, _ = resolve_config_path(config_name)
 
@@ -693,7 +743,7 @@ class TestShippedConfigsResolveUnchanged:
             return data
 
         assert (load_and_merge_config(path) or {}).get("tools") == (
-            raw_chain(path).get("tools")
+            prune_ignored_keys(raw_chain(path)).get("tools")
         )
 
 
@@ -701,7 +751,7 @@ class TestMergeOrder:
     """Layers merge by the existing, unmodified ``deep_merge``: lists REPLACE."""
 
     def _resolve(self, *layers: dict) -> dict:
-        from src.core.loader import deep_merge
+        from shared.runtime.core.loader import deep_merge
 
         out: dict = {}
         for layer in layers:
@@ -779,7 +829,7 @@ class TestResolveConfigSeam:
         assert layer == {"tools": {"canvas": True}}
 
     def test_the_pdp_sees_a_shell_grant_request(self):
-        from src.core.capability_grants import evaluate
+        from shared.runtime.core.capability_grants import evaluate
 
         frag = self._resolve(request_override={"tools": {"shell": ["run_command"]}})
         assert evaluate(frag, {"shell_tools": False}) != []
@@ -792,7 +842,7 @@ class TestSessionToolGroupMarkers:
     stay on when a request turned them off."""
 
     def test_false_sets_the_disable_marker(self):
-        from src.api.persistent_app import (
+        from agent.api.persistent_app import (
             _apply_session_tool_group_markers,
             _CANVAS_DISABLED_KEY,
         )
@@ -803,7 +853,7 @@ class TestSessionToolGroupMarkers:
         assert merged.get(_CANVAS_DISABLED_KEY) is True
 
     def test_true_clears_the_disable_marker(self):
-        from src.api.persistent_app import (
+        from agent.api.persistent_app import (
             _apply_session_tool_group_markers,
             _CANVAS_DISABLED_KEY,
         )
@@ -830,7 +880,7 @@ class TestEnumerateOnlyMembersAreServable:
 
     def test_every_served_enumeration_round_trips_through_the_write_boundary(self):
         """The payload it prescribes must be one the boundary accepts."""
-        from src.core.tool_policy import validate_tool_override_fragment
+        from shared.runtime.core.tool_policy import validate_tool_override_fragment
 
         for category, names in enumerate_only_members().items():
             assert names, f"{category} would be unenablable"
@@ -841,19 +891,28 @@ class TestEnumerateOnlyMembersAreServable:
 
     def test_true_is_still_refused_for_the_same_categories(self):
         """The served list is a workaround for the rule, not a repeal of it."""
-        from src.core.tool_policy import validate_tool_override_fragment
+        from shared.runtime.core.tool_policy import validate_tool_override_fragment
 
         for category in enumerate_only_members():
             with pytest.raises(ToolPolicyError, match="must enumerate"):
                 validate_tool_override_fragment({"tools": {category: True}})
 
     def test_it_names_no_code_granted_tool(self):
-        """`only` carrying a code-granted name would assert config manages it."""
-        from src.tools.registry import TOOL_REGISTRY
+        """`only` carrying a code-granted name would assert config manages it.
+        An `explicit` name is the opposite case — naming it is how config
+        grants it (`delegation`'s one member)."""
+        from agent.tools.registry import TOOL_REGISTRY
 
         for names in enumerate_only_members().values():
             for name in names:
-                assert "grant" not in TOOL_REGISTRY[name], name
+                assert TOOL_REGISTRY[name].get("grant") != "code", name
+        assert enumerate_only_members()["delegation"] == [
+            "delegate_agent",
+            "list_agents",
+            "message_agent",
+            "stop_agent",
+            "wait_agent",
+        ]
 
     def test_shell_is_the_current_membership(self):
         assert enumerate_only_members()["shell"] == [

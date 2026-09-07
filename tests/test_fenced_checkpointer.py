@@ -7,8 +7,8 @@ from uuid import uuid4
 import pytest
 from psycopg import OperationalError
 
-import src.core.fenced_checkpointer as fenced
-from src.api.lease_context import LeaseHandle, LeaseLostError, current_lease
+import agent.core.fenced_checkpointer as fenced
+from agent.api.lease_context import LeaseHandle, LeaseLostError, current_lease
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 

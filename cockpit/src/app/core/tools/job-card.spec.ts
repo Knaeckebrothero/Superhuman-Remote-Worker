@@ -89,7 +89,7 @@ describe('parseJobEntity', () => {
     });
 
     it('never attaches to another tool', () => {
-        expect(parseJobEntity(call({tool: 'delegate_work'}))).toBeUndefined();
+        expect(parseJobEntity(call({tool: 'send_message'}))).toBeUndefined();
     });
 });
 

@@ -8,7 +8,7 @@ import json
 import shutil
 import sqlite3
 
-from src.core.phase_snapshot import (
+from agent.core.phase_snapshot import (
     PhaseSnapshot,
     PhaseSnapshotManager,
     discover_thread_id_from_checkpoint,

@@ -12,7 +12,7 @@ from uuid import UUID
 import pytest
 from fastapi import HTTPException
 
-from security import access
+from orchestrator.security import access
 
 
 # =============================================================================
@@ -439,7 +439,7 @@ class TestUserCanAccessJobOrThread:
 class TestRequireSudoRequestAuthority:
     @pytest.mark.asyncio
     async def test_unknown_request_404(self, user_a, fake_db, fake_request):
-        with patch("services.sudo_gate.sudo_gate") as gate:
+        with patch("orchestrator.services.sudo_gate.sudo_gate") as gate:
             gate.get_request = AsyncMock(return_value=None)
             with _patch_caller(user_a):
                 with pytest.raises(HTTPException) as exc:
@@ -451,7 +451,7 @@ class TestRequireSudoRequestAuthority:
     @pytest.mark.asyncio
     async def test_admin_passes(self, user_admin, job_a, fake_db, fake_request):
         sudo_req = {"id": "req-1", "job_id": str(job_a["id"])}
-        with patch("services.sudo_gate.sudo_gate") as gate:
+        with patch("orchestrator.services.sudo_gate.sudo_gate") as gate:
             gate.get_request = AsyncMock(return_value=sudo_req)
             with _patch_caller(user_admin):
                 result = await access.require_sudo_request_authority(
@@ -466,7 +466,7 @@ class TestRequireSudoRequestAuthority:
         # user_a is owner of project_a, job_a is in project_a → user_a passes
         # even though they're not the job owner.
         sudo_req = {"id": "req-1", "job_id": str(job_a["id"])}
-        with patch("services.sudo_gate.sudo_gate") as gate:
+        with patch("orchestrator.services.sudo_gate.sudo_gate") as gate:
             gate.get_request = AsyncMock(return_value=sudo_req)
             with _patch_caller(user_a):
                 result = await access.require_sudo_request_authority(
@@ -477,7 +477,7 @@ class TestRequireSudoRequestAuthority:
     @pytest.mark.asyncio
     async def test_unrelated_user_403(self, user_b, job_a, fake_db, fake_request):
         sudo_req = {"id": "req-1", "job_id": str(job_a["id"])}
-        with patch("services.sudo_gate.sudo_gate") as gate:
+        with patch("orchestrator.services.sudo_gate.sudo_gate") as gate:
             gate.get_request = AsyncMock(return_value=sudo_req)
             with _patch_caller(user_b):
                 with pytest.raises(HTTPException) as exc:
@@ -490,7 +490,7 @@ class TestRequireSudoRequestAuthority:
     async def test_orphan_request_admin_only(self, user_a, fake_db, fake_request):
         """Sudo request with no job_id is admin-only."""
         sudo_req = {"id": "req-1", "job_id": None}
-        with patch("services.sudo_gate.sudo_gate") as gate:
+        with patch("orchestrator.services.sudo_gate.sudo_gate") as gate:
             gate.get_request = AsyncMock(return_value=sudo_req)
             with _patch_caller(user_a):
                 with pytest.raises(HTTPException) as exc:

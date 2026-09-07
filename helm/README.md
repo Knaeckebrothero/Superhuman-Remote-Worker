@@ -52,9 +52,10 @@ Optional but recommended:
 - **External Secrets Operator** + a backing store (Vault, AWS Secrets Manager, etc.) — see `externalSecrets.*`
 - **An OIDC IdP** if you don't want the bundled Keycloak (Azure AD, Google Workspace, Okta, etc.)
 - **Managed databases** for production (any standard Postgres 14+ for app + pgvector + audit, Neo4j 5+)
-- **CloudNativePG** + the **Barman Cloud plugin**, only if you run the bundled
-  databases on `databases.<name>.engine: cnpg` and want backups — see
-  [Bundled databases on CloudNativePG](#bundled-databases-on-cloudnativepg) below.
+- **CloudNativePG 1.30+ on Kubernetes 1.29+**, only if a bundled database uses
+  `databases.<name>.engine: cnpg|migrating`; add the **Barman Cloud plugin**
+  only for object-store backups — see
+  [Bundled databases on CloudNativePG](#bundled-databases-on-cloudnativepg).
   Neither is needed for the default StatefulSet engine.
 
 ---
@@ -69,23 +70,139 @@ Each bundled database carries its own `databases.<name>.engine`:
 | `migrating` | **both** — the Cluster imports from the legacy Service | the legacy Service |
 | `cnpg` | the CloudNativePG `Cluster` only | `<name>-rw` |
 
-`statefulset` is the default and needs nothing installed. The rest of this
-section applies only if you change it.
+`statefulset` is the default for every database. Together with
+`databases.profile: single`, it is the supported non-HA posture and requires no
+CNPG installation. The profile controls replica counts only; setting
+`profile: ha` does **not** silently replace database engines.
 
-### The operator
+### Default non-HA installation
 
-`databases.operator.install` ships **false**, because one operator serving many
-namespaces is the normal deployment and a second install fights the first over
-cluster-scoped CRDs — which Helm neither upgrades on `helm upgrade` nor removes
-on `helm uninstall`. Set it to `true` only on a cluster that has no
-CloudNativePG operator yet.
+No database override is required. These are the effective defaults:
+
+```yaml
+databases:
+  profile: single
+  postgres:
+    engine: statefulset
+  vector:
+    engine: statefulset
+  audit:
+    engine: statefulset
+  gitea:
+    engine: statefulset
+  keycloak:
+    engine: statefulset
+```
+
+This keeps each enabled internal PostgreSQL database on one chart-owned
+StatefulSet. It is appropriate for evaluation, local development, and
+non-HA/self-hosted installations that accept single-node database availability.
+
+### HA installation: install CNPG first
+
+The SRW chart owns its namespaced `Cluster`, `DatabaseRole`, credential, backup,
+and policy resources. It deliberately does **not** install, upgrade, or remove
+the cluster-scoped CNPG operator and CRDs. One operator normally serves many
+application namespaces and needs an independent lifecycle.
+
+First check whether the cluster already has CNPG. Never install a second
+cluster-wide operator:
+
+```bash
+kubectl get deployment --all-namespaces \
+  -l app.kubernetes.io/name=cloudnative-pg
+kubectl get crd clusters.postgresql.cnpg.io databaseroles.postgresql.cnpg.io
+```
+
+If an operator exists, record its namespace and verify its controller image is
+CNPG 1.30 or newer. Automatic Dynamic Canvas role provisioning uses the 1.30
+`DatabaseRole` API.
+
+If none exists, install the pinned official operator as its own Helm release:
+
+```bash
+helm repo add cloudnative-pg https://cloudnative-pg.github.io/charts --force-update
+helm upgrade --install cnpg cloudnative-pg/cloudnative-pg \
+  --version 0.29.0 \
+  --namespace cnpg-system \
+  --create-namespace \
+  --wait \
+  --timeout 10m
+```
+
+Do not proceed merely because Helm returned successfully. Verify the
+controller, its admission-webhook endpoint, and both CRDs used by this chart:
+
+```bash
+kubectl -n cnpg-system rollout status deployment/cnpg-cloudnative-pg \
+  --timeout=5m
+test -n "$(kubectl -n cnpg-system get endpointslice \
+  -l kubernetes.io/service-name=cnpg-webhook-service \
+  -o jsonpath='{.items[0].endpoints[0].addresses[0]}')"
+kubectl wait --for=condition=Established \
+  crd/clusters.postgresql.cnpg.io \
+  crd/databaseroles.postgresql.cnpg.io \
+  --timeout=2m
+kubectl -n cnpg-system get deployment/cnpg-cloudnative-pg \
+  -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+```
+
+Then select CNPG explicitly in the SRW values. The operator namespace must
+match the namespace verified above because database NetworkPolicies permit its
+health and failover traffic by that exact label:
+
+```yaml
+databases:
+  profile: ha
+  operator:
+    namespace: cnpg-system
+  postgres:
+    engine: cnpg
+  vector:
+    engine: cnpg
+  audit:
+    engine: cnpg
+  gitea:
+    engine: cnpg
+  keycloak:
+    engine: cnpg
+```
+
+Install SRW normally, then wait for every enabled internal cluster:
+
+```bash
+helm upgrade --install srw \
+  oci://ghcr.io/knaeckebrothero/charts/superhuman-remote-worker \
+  --version <chart-version> \
+  --namespace srw \
+  --create-namespace \
+  --values my-values.yaml \
+  --wait \
+  --timeout 20m
+
+kubectl -n srw get clusters.postgresql.cnpg.io
+kubectl -n srw wait --for=condition=Ready \
+  clusters.postgresql.cnpg.io --all --timeout=15m
+```
+
+For an existing StatefulSet installation, do not jump directly to `cnpg`.
+Migrate one database at a time through `engine: migrating`, verify the imported
+target, and only then cut over. CNPG/CRD upgrades likewise happen in the
+separate operator release before an SRW chart version that needs the newer API.
+
+The removed `databases.operator.install` key remains only as a schema tombstone:
+an old stored value of `false` is accepted during upgrade, while `true` fails
+before Helm changes anything. If a prior release actually installed the
+operator subchart, do not bypass that failure with `--reset-values`; hand the
+operator to a separate infrastructure release first or the upgrade could remove
+the controller while retained database clusters are still running.
 
 ### The Barman Cloud plugin — the chart cannot install this
 
 Backups (`databases.backup.method: objectstore`) additionally require the
 [Barman Cloud plugin](https://github.com/cloudnative-pg/plugin-barman-cloud).
 `barmanObjectStore` on the `Cluster` resource was deprecated in CloudNativePG
-1.26 and is slated for removal in 1.30, so the plugin is the supported path.
+1.26 and is slated for removal in 1.31, so the plugin is the supported path.
 
 **This chart cannot install it, and will not try.** The plugin ships as a raw
 manifest with no Helm chart, and every namespaced object in it hardcodes the
@@ -129,7 +246,7 @@ Neo4j, Keycloak, Gitea, OpenCloud all bundled):
 
 ```bash
 helm install srw oci://ghcr.io/knaeckebrothero/charts/superhuman-remote-worker \
-  --version 0.0.1 \
+  --version <chart-version> \
   --namespace srw --create-namespace \
   --set license.acceptTerms=true \
   --set global.domain=srw.example.com \
@@ -152,7 +269,7 @@ manage your own secrets. Start by extracting the example values:
 
 ```bash
 helm pull oci://ghcr.io/knaeckebrothero/charts/superhuman-remote-worker \
-  --version 0.0.1 --untar
+  --version <chart-version> --untar
 cp superhuman-remote-worker/values.example.yaml my-values.yaml
 $EDITOR my-values.yaml
 ```
@@ -160,12 +277,20 @@ $EDITOR my-values.yaml
 Edit at minimum:
 - `license.acceptTerms` → `true`
 - `global.domain` → your base hostname
+- `image.{orchestrator,agent,cockpit,mcp,workspace}.tag` → the matching
+  `vX.Y.Z` release tag, or set each component's verified `digest`
 - `secrets.existingSecret` → name of a Secret you create yourself (see below)
 - `databases.*.externalUrl` → connection strings for managed Postgres, vector
 - `keycloak.externalIssuerUrl` → your IdP issuer URL
 - `gitea.internal: false` + `*.externalUrl` → your git server URLs
 - `cloud.externalBackend` + `cloud.externalUrl` → your cloud storage endpoint
 - `ingress.className` and `ingress.tls.issuerName` → your cluster's ingress + cert-manager issuer
+
+The chart source keeps those five image tags at `latest` for the development
+workflow, and selecting an OCI chart version alone does not pin them. Production
+values must override every component tag or digest. If VM workspaces are
+enabled, pin `vmController.image.tag` as well; the default VM base image already
+derives its version from the released chart unless explicitly overridden.
 
 ### Per-component hostname overrides
 
@@ -202,7 +327,7 @@ Install:
 
 ```bash
 helm install srw oci://ghcr.io/knaeckebrothero/charts/superhuman-remote-worker \
-  --version 0.0.1 \
+  --version <chart-version> \
   --namespace srw \
   -f my-values.yaml
 ```
@@ -279,9 +404,7 @@ aren't set), but the URL form is legacy and a footgun under `urlsplit`.
   leak on one instance doesn't compromise the other. Citations, embeddings,
   and memories all live in this instance (`srw_vector`); the citation engine
   is a native SRW subsystem on the vector pool, **not** a separate role or
-  database (the former `srw_citations` / `citation_engine` DB was retired in
-  the citation-engine native integration — see
-  `knowledge-history/done/citation_engine_integration.md`).
+  database. The former `srw_citations` / `citation_engine` database is retired.
 - `NEO4J_USERNAME`, `NEO4J_PASSWORD` — both live in Vault (mirroring
   the `POSTGRES_USER` / `VECTOR_POSTGRES_USER`
   pattern, so all DB credentials sit in one place). Community edition
@@ -298,20 +421,37 @@ from `databases.<which>.externalHost/externalPort/externalDb` in values;
 only the credentials live in Vault.
 
 An enabled Dynamic Canvas viewer uses a separate PostgreSQL login and never
-receives the application `POSTGRES_*` credential. Production accepts either a
-pre-created dedicated Secret named by
-`canvas.livePreview.viewer.database.credentials.existingSecret`, or a dedicated
-Vault KV path in `credentials.vaultPath` that the chart maps into such a Secret
-through ESO. The Vault-backed ExternalSecret is rendered only while
-`viewer.enabled=true`; preconfiguring the path while the gateway is disabled
-does not contact the provider or require the properties to exist. Pick exactly
-one source and provision that role with only the documented Canvas viewer
-grants. For development with the bundled database, `credentials.create=true`
-plus `provisionRole=true` generates a dedicated Secret and runs the bounded
-role reconciler. That mode is rejected for a production viewer.
-The secret-safe production workflow, preflight, direct-Secret option, and
-rotation cautions are documented in
-`knowledge-base/knowledge/operations/dynamic_canvas_gateway_database.md`.
+receives the application `POSTGRES_*` credential. For a chart-owned
+`databases.postgres.engine=cnpg` database, set `provisionRole=true` and choose
+exactly one credential source. `credentials.create=true` is the completely
+self-contained path: the chart creates a gateway credential Secret plus a
+dedicated CNPG basic-auth projection from the same generated password. CNPG
+1.30's `DatabaseRole` reconciles the fixed login and password, and a tracked
+revision-scoped Job applies and attests the database/object allowlist as the
+ordinary application owner. This works for production and development and
+requires no database administrator credential, pre-created Secret, or
+pre-install role step.
+
+`credentials.vaultPath` provides the same automatic path through ESO. Both
+Kubernetes Secrets read the property named by `passwordKey` from that one Vault
+entry; do not create or copy a second Vault value. The separate Kubernetes
+objects are deliberate because Kubernetes does not permit an existing Opaque
+Secret to be changed to `kubernetes.io/basic-auth` during an upgrade. The
+gateway Secret keeps its existing type, while the CNPG-only Secret always has
+the operator-required shape.
+
+A pre-created `credentials.existingSecret` can also be used; with automatic
+CNPG provisioning it must already be
+`kubernetes.io/basic-auth`, contain matching `username`/`password`, carry
+`cnpg.io/reload=true`, and set `existingSecretCnpgCompatible=true` as an
+explicit offline-render assertion. The Vault-backed ExternalSecret is rendered
+only while `viewer.enabled=true`.
+
+External PostgreSQL remains operator-provisioned because the Helm release does
+not own its control plane. The legacy bundled StatefulSet keeps its existing
+development-only identity branch until that engine is retired. Keep the
+gateway's database lifecycle, Secret rotation, and backup policy aligned with
+the operator that owns the external database.
 
 **OIDC / SSO** (when Keycloak or external IdP enabled):
 - `KEYCLOAK_ADMIN_USER`, `KEYCLOAK_ADMIN_PASSWORD` (internal Keycloak only)
@@ -361,6 +501,37 @@ container in the Pod shares one data PVC. Upgrades therefore include a brief,
 deliberate Nextcloud restart instead of risking a cross-node ReadWriteOnce
 multi-attach deadlock.
 
+### Self-hosted web research
+
+The chart deploys SearXNG by default (`searxng.enabled=true`) and seeds its
+keyless in-cluster Service as the primary search provider on a fresh install.
+If a Tavily key or an admin-selected search default already exists, SearXNG is
+seeded into the empty fallback slot instead. Both catalog and default writes
+are insert-only; later admin changes are not repaired or overwritten at boot.
+
+Crawl4AI is available with `crawl4ai.enabled=true`, but remains off by default
+because its browser service has a 4 GiB memory limit. Before enabling it, add a
+strong `CRAWL4AI_API_TOKEN` to the Secret selected by
+`crawl4ai.apiTokenSecret`; the chart uses the same high-entropy value as
+Crawl4AI's stable JWT signing key.
+
+Enabling it also registers it: the same post-install hook seeds a `crawl4ai`
+catalog row (adapter `crawl4ai`, operations `extract` and `crawl`, `api_key`
+carrying the bearer credential) and fills the **fetch** slot when that slot is
+empty. SearXNG cannot serve `fetch` at all, so on a keyless install this is
+what gives experts a provider-backed way to read the pages they find. A keyed
+provider that already holds `fetch` (Tavily, Firecrawl) keeps it — there is no
+fetch fallback slot — and Crawl4AI stays in the catalog for an admin to select
+under Admin → Providers. If the token key is missing the hook logs a warning
+and registers nothing rather than failing the release. Like the SearXNG and
+Tavily seeds, catalog and default writes are insert-only: later admin changes
+are never repaired or overwritten at boot.
+
+Both workloads always render an egress NetworkPolicy. They may resolve DNS and
+reach public HTTP(S), but RFC1918, cluster/service, link-local/metadata, and
+loopback ranges are excluded. There is no value that deploys either workload
+without this policy.
+
 **LLM provider keys** (any combination, depending on which providers you use):
 - `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GROQ_API_KEY`, `GOOGLE_API_KEY`, `OPENROUTER_API_KEY`, `TAVILY_API_KEY`, `SEMANTIC_SCHOLAR_API_KEY`, `UNPAYWALL_EMAIL`
 
@@ -371,6 +542,8 @@ multi-attach deadlock.
 - `DISCORD_WEBHOOK_URL`, `SLACK_WEBHOOK_URL` (chat notifications)
 - `TAILSCALE_AUTH_KEY` (when `agent.tailscale.enabled`)
 - `CODEX_MANAGEMENT_KEY` (when `codexProxy.enabled`)
+- `CRAWL4AI_API_TOKEN` (required when `crawl4ai.enabled`; use a long random
+  bearer token)
 - `MCP_INTERNAL_KEY` (when `mcp.enabled` or delegated Dynamic Canvas tools are
   enabled). External-Secret and pre-existing-Secret deployments must provide
   this independently generated shared secret. If it is absent, the
@@ -483,15 +656,33 @@ on another node and the VM never schedules.
 selection, KVM detection, the patches below, and a smoke test).
 
 **Storage.** The VM root disks are CDI DataVolumes on `vmController.vmStorageClass`
-(default `local-path`). With `local-path`:
+(default `local-path`).
 
-- the StorageProfile has no capabilities entry, so CDI cannot infer access modes — the chart's
-  template sets them explicitly; if you write your own DataVolumes, patch the profile once:
-  `kubectl patch storageprofile local-path --type merge -p '{"spec":{"claimPropertySets":[{"accessModes":["ReadWriteOnce"],"volumeMode":"Filesystem"}]}}'`
-- clones are host-assisted full copies (no snapshots), and volumes are pinned to the node
-  they were created on — set `vmController.nodeSelector` on any multi-node cluster;
-- set CDI's `scratchSpaceStorageClass` to the same class (done above). If your cluster has
-  several default StorageClasses, every VM-related object must name its class.
+Every DataVolume the chart and the controller create names **both** its access modes and
+`volumeMode: Filesystem` explicitly, and never lets CDI infer them from the target class's
+StorageProfile. Keep doing that if you write your own, because inference is storage-dependent
+and fails in opposite directions: `local-path` has no capabilities entry so there is nothing to
+infer, while a real CSI usually *does* have one and resolves to `Block` — and a Block root disk
+cannot be imported on a node running SELinux with the importer's capabilities dropped
+(`blockdev: cannot open /dev/cdi-block-volume: Permission denied`). Because the chart names them,
+no `kubectl patch storageprofile` is required on any class.
+
+With `local-path`:
+
+- clones are host-assisted full copies (no snapshots), and volumes carry a
+  `kubernetes.io/hostname` affinity, so a VM can only mount its disk on the node that created
+  it — **set `vmController.nodeSelector` on any multi-node cluster**, or a VM scheduled
+  elsewhere will never bind its root disk.
+
+With a CSI whose volumes attach on any node (Longhorn, Ceph, most cloud disks) that pinning is
+**not** needed — it is a property of node-local storage, not of the VM tier. Leave
+`vmController.nodeSelector` empty and let the scheduler place VMs, so VM and container workloads
+draw on one capacity pool. KubeVirt decides per node whether VMs can run there at all: check
+allocatable `devices.kubevirt.io/kvm`, **not** the `kubevirt.io/schedulable` label, which only
+tracks whether virt-handler is healthy and is true even on nodes with no usable virtualisation.
+
+Either way, set CDI's `scratchSpaceStorageClass` to the same class (done above). If your cluster
+has several default StorageClasses, every VM-related object must name its class.
 
 **Network.** The workspace NetworkPolicy must actually be enforced by your CNI. Calico,
 Cilium, OVN-Kubernetes and Antrea enforce natively; **k3s** enforces through its embedded
@@ -516,7 +707,8 @@ vmController:
   maxConcurrentVms: 4
   vmStorageClass: local-path
   vmDiskSize: 20Gi
-  nodeSelector: {}         # mandatory on multi-node clusters, e.g. {srw.io/vm-node: "true"}
+  nodeSelector: {}         # mandatory on multi-node clusters ONLY with node-local storage
+                           # (e.g. local-path): {srw.io/vm-node: "true"}. Leave empty on a CSI.
   tolerations: []          #   and the matching toleration for your taint
   goldenImage:
     enabled: true          # import the base image once, clone per VM
@@ -532,7 +724,8 @@ Two Secrets must exist in the release namespace:
   platform uses to reach every workspace. The chart mounts the private half into the
   orchestrator and agents and injects the public half into each VM. `scripts/local-dev-up.sh`
   mints it locally; in production provide it via `secrets.existingVmSshKeySecret` or
-  `externalSecrets.vmSshKeyVaultPath`.
+  `externalSecrets.vmSshKeyVaultPath`. When `sshGateway.enabled`, this Secret must carry a
+  third key, `user-ca.pub` — see [SSH gateway](#ssh-gateway) below.
 - **`vm.lifecycleAuthSecretName`** with key `VM_LIFECYCLE_HMAC_SECRET` (≥ 32 random bytes,
   e.g. `python3 -c 'import secrets; print(secrets.token_hex(32))'`). The orchestrator and the
   controller share it to sign lifecycle requests, and the controller derives each VM's guest
@@ -547,6 +740,146 @@ matches the chart's `appVersion`, which exists only for released charts.
 kubectl get nodes -l kubevirt.io/schedulable=true
 kubectl get pods -l app.kubernetes.io/component=vm-controller
 ```
+
+## SSH gateway
+
+`sshGateway.enabled` adds a component that lets a user `ssh s-<handle>@<sshGateway.hostname>`
+straight into their session workspace. It runs the orchestrator image with a different command
+(`uvicorn orchestrator.ssh_gateway:create_app --factory`), authenticates the user's own public key, and mints
+a short-lived certificate for the inner hop to the workspace. It is off by default.
+
+### Three Secrets, three places
+
+The chart never generates key material. A template-time `genPrivateKey` guarded by `lookup`
+silently returns empty under `helm template` and `--dry-run`, which would rotate the host key on
+every Argo sync and break every user's `known_hosts`.
+
+```bash
+# Ed25519 ONLY. services/ssh_gateway_config._require_ed25519_host_key raises on any
+# other algorithm at load_config, so an RSA host key means the gateway will not start:
+# a server's advertised host-key algorithms come straight from the loaded key material,
+# and an RSA key drags in legacy SHA-1 ssh-rsa.
+ssh-keygen -t ed25519 -N "" -C srw-ssh-gateway -f ./ssh_host_ed25519_key
+ssh-keygen -t ed25519 -N "" -C srw-user-ca      -f ./user-ca
+
+kubectl -n <ns> create secret generic srw-ssh-gateway-hostkey \
+  --from-file=ssh_host_ed25519_key --from-file=ssh_host_ed25519_key.pub
+kubectl -n <ns> create secret generic srw-ssh-gateway-ca \
+  --from-file=user-ca --from-file=user-ca.pub
+```
+
+1. **`sshGateway.hostKeySecret`** — one entry per name in `sshGateway.hostKeyNames`, and **both
+   halves of each**. The private half is mounted into the gateway
+   (`SSH_GATEWAY_HOST_KEYS`); the `.pub` half is mounted into the **orchestrator**, which is
+   where `GET /api/ssh/host-keys` runs (`SSH_GATEWAY_PUBLIC_HOST_KEYS`). Both variables are
+   rendered from that one `hostKeyNames` list, because when the served and published key sets
+   drift a client sees a host-key mismatch indistinguishable from an active MITM. Omit the
+   `.pub` halves and the orchestrator pod will not start — deliberately, because the
+   alternative is publishing an empty key list forever while every client silently degrades to
+   trust-on-first-use.
+2. **`sshGateway.userCaSecret`** — key `user-ca`, the private CA half the gateway signs
+   inner-hop certificates with.
+3. **`user-ca.pub` inside the `vm-ssh-key` Secret.** This one is easy to miss and nothing else
+   catches it. `container_provisioner` projects `user-ca.pub` out of the Secret named by
+   `WORKSPACE_SSH_SECRET` (i.e. `vm-ssh-key`) into every workspace pod, where the entrypoint
+   installs it as sshd's `TrustedUserCAKeys`. It does **not** travel through
+   `sshGateway.userCaSecret`. Without it the pod starts fine (the projection is `optional`),
+   the entrypoint skips the write, and every attach ends in `PermissionDenied` — fail-closed,
+   but the whole feature inert.
+
+   There are four ways that Secret gets filled, and the fix differs for each:
+
+   | Supply path | What to do |
+   |---|---|
+   | `externalSecrets.vmSshKeyVaultPath` (layout A, `dataFrom: extract`) | the chart adds a `data:` entry alongside the bundle pull; put `SSH_GATEWAY_USER_CA_PUBLIC_KEY` in the bundle at `externalSecrets.vaultPath`. (ESO permits `data` next to `dataFrom`, and `data` wins on conflict.) There is no value that drops that entry: it renders whenever `sshGateway.enabled`, so a layout A bundle that already carries its own `user-ca.pub` must **still** have `SSH_GATEWAY_USER_CA_PUBLIC_KEY` at `externalSecrets.vaultPath` or ESO fails the whole `vm-ssh-key` sync. |
+   | `externalSecrets.vaultPath` (layout B, the default) | the chart adds `secretKey: user-ca.pub`; put `SSH_GATEWAY_USER_CA_PUBLIC_KEY` in the same bundle. |
+   | `secrets.existingVmSshKeySecret` | the chart renders no template here at all. Add the key yourself: `kubectl -n <ns> patch secret <name> -p "{\"data\":{\"user-ca.pub\":\"$(base64 -w0 user-ca.pub)\"}}"` |
+   | `scripts/local-dev-up.sh` (k3d) | the script creates `srw-vm-ssh-key` with two keys only. Patch the third in with the same command before enabling the gateway. |
+
+   Both ESO entries render **only** when `sshGateway.enabled`: ESO fails the whole
+   ExternalSecret sync when a `data` entry names a property the bundle lacks, and an ungated
+   entry would break `vm-ssh-key` — the key the platform reaches every workspace with — for
+   every install that never asked for an ssh-gateway.
+
+   Verify it by reading the projected file inside a running workspace pod, not by inspecting
+   the template:
+
+   ```bash
+   kubectl -n <ns> exec deploy/<workspace-pod> -- cat /etc/ssh/srw_user_ca.pub
+   ```
+
+### Required values
+
+| Value | Why it has no default |
+|---|---|
+| `allowedOrigins` | an empty list accepts cross-site WebSocket handshakes; `load_config` refuses to boot |
+| `trustedProxies` | unset behind an ingress, every WSS client presents the *ingress's* address, so all of them share one source's 16-slot concurrency bucket and the seventeenth concurrent user is refused. Set it to cover **every** proxy hop in front of the gateway — the ingress *and* anything ahead of it (a Cloudflare Tunnel connector runs as an in-cluster pod and the ingress appends *its* address, not the client's); the gateway walks `X-Forwarded-For` right-to-left past trusted entries, so a CIDR covering the chain yields the real client at any depth. Use the literal `none` when nothing proxies the gateway. Both possible defaults are wrong |
+| `hostKeySecret`, `userCaSecret` | operator-provided; see above |
+| `sessionRouter.jwtSecret` **or** `sessionRouter.jwtSecretName` | `SESSION_JWT_SECRET` is the HMAC key the gateway verifies the attach token the orchestrator minted. With neither set, no Secret is rendered, the gateway's `secretKeyRef` (`optional: true`) resolves to nothing, and `load_config` refuses to boot — a crash-loop, not a render error. Set `jwtSecret` for the chart-rendered Secret (layout A) or `jwtSecretName` for one you own (layout B) |
+| `tcp.allowedClientCIDRs` | required when `tcp.enabled`: an unscoped SSH LoadBalancer is not a supported default |
+| `tcp.port` | has a default (2222) but is range-checked: the gateway runs as uid 999 with all capabilities dropped, so anything below 1024 never binds and `/healthz` answers 503 forever |
+
+The chart `fail`s at render time on each of these rather than shipping a pod that crash-loops.
+
+### Doors
+
+`/api/ssh/attach` (the WSS transport) rides the existing API ingress at Traefik
+`router.priority: 130`, as `pathType: Exact`. Exact is load-bearing, not tidiness: Traefik renders
+`Prefix` as `PathPrefix()`, a raw string prefix, and the explicit priority beats the `/api` rule —
+so `Prefix` here would route `POST /api/ssh/attach-token` to the gateway too and 404 every attempt
+to mint a token. Both `/api/ssh/attach-token` and `/api/ssh/host-keys` stay on the orchestrator.
+The raw TCP listener
+always runs inside the pod on `tcp.port` (`/healthz` reports 503 while its accept loop is down)
+and the ClusterIP Service always carries it, so a port-forward works with `tcp.enabled: false`;
+`tcp.enabled` only adds the MetalLB LoadBalancer. Set `tcp.externalTrafficPolicy: Local` if you
+want the NetworkPolicy's ipBlock rules and the per-source connection bucket to see real client
+addresses — `Cluster` SNATs every client to a node IP and collapses them into one source.
+
+### Behind a CDN or tunnel (Cloudflare Tunnel, etc.)
+
+The Ingress above is only half the path when something other than Traefik terminates the public
+hostname. Verified end to end on the dev deployment 2026-09-02; each of these cost a debugging round.
+
+1. **The CDN must be told to route `/api/ssh/attach` to Traefik.** If it forwards `api.<domain>`
+   straight to the orchestrator Service — a very normal setup, since every *other* `/api` route
+   belongs there — then Traefik, and therefore this Ingress, is never consulted. The attach lands on
+   the orchestrator's ASGI app, which has no route for it, and every client gets a bare rejection
+   with **nothing in the gateway pod's log**, indistinguishable from an auth failure. Add a
+   CDN-side rule for exactly `^/api/ssh/attach$`, ahead of the catch-all, and **anchor it**:
+   swallowing `/api/ssh/attach-token` kills the feature one layer further in.
+
+2. **Send it to Traefik's TLS entrypoint, not port 80.** With `ingress.tls.enabled` this Ingress
+   carries `router.entrypoints: websecure`, so no router for it exists on `web`. Port 80 returns
+   Traefik's own 404 while the config looks entirely correct.
+
+3. **Tell the three 404s apart by body, not status.** They come from three different components:
+
+   | Body | Length | Who answered | Meaning |
+   |---|---|---|---|
+   | `{"detail":"Not Found"}` | 22 B, JSON | FastAPI — the orchestrator | the CDN never handed off to Traefik (step 1) |
+   | `404 page not found` | 19 B, plain | Traefik | no router matched: host, path, or **entrypoint** (step 2) |
+   | `Not Found` | 9 B, plain | the gateway itself | **routing is correct** — this is the right answer to a non-WebSocket GET |
+
+4. **Probe with `--http1.1`.** A `curl` upgrade probe that negotiates HTTP/2 returns 404 and looks
+   exactly like the CDN stripping the upgrade; the classic `Upgrade:` handshake does not exist in
+   h2. Over HTTP/1.1 a *successful* upgrade presents as curl hanging on 101, not as a 200.
+
+5. Many tunnel daemons do not hot-reload their config — restart the daemon after editing it.
+
+### Concurrency
+
+The gateway's caps are `GatewayConfig` dataclass defaults with no environment lever, so there is
+deliberately no chart value for them. **Per gateway pod:** 64 concurrent SSH connections, 16 per
+source, 12 channels per connection, 4 attachments per workspace. The pre-auth slot is held for a
+connection's whole life, so despite the name these are session limits, not startup limits.
+`SshTcpListener` is AF_INET only — it does not bind IPv6.
+
+None of those numbers is fleet-wide. `GatewayLimiter` is constructed once per process with no
+shared store, and the WSS ingress has no session affinity, so **`sshGateway.replicas` multiplies
+every one of them** — including `max_attachments_per_workspace`, which bounds how many people can
+be attached to a single workspace at once. That is a security cap, not a capacity cap, and
+`replicas: 2` doubles it to 8 with nothing in the chart or the logs saying so. `replicas: 1` is
+load-bearing; raise it only with that understood.
 
 Then create a job with the VM backend (Cockpit → Create → workspace: VM, or
 `"workspace": {"backend": "vm"}` in the API call) and watch:
@@ -568,9 +901,54 @@ approval request in the cockpit; approve it and the command runs.
 | VMI stuck in `Scheduling` | no node with `kubevirt.io/schedulable=true` that matches `nodeSelector`/tolerations, or `devices.kubevirt.io/kvm` missing (no KVM) |
 | DataVolume `Pending` forever | WaitForFirstConsumer with no consumer — normal until the VM starts; for a standalone DataVolume add the `cdi.kubevirt.io/storage.bind.immediate.requested: "true"` annotation |
 | DataVolume stuck in `ImportScheduled` | CDI has no scratch space: set `scratchSpaceStorageClass` |
-| `UnrecognizedProvisioner` on the StorageProfile | normal for `local-path`; the chart sets access modes explicitly |
+| `UnrecognizedProvisioner` on the StorageProfile | normal for `local-path`; the chart names access modes and volume mode explicitly, so nothing needs to be inferred |
+| importer dies with `blockdev: cannot open /dev/cdi-block-volume: Permission denied` | the DataVolume left `volumeMode` unset and CDI inferred `Block` from the class's StorageProfile. The importer runs unprivileged with capabilities dropped and cannot open a raw device on an SELinux-enforcing node. Name `volumeMode: Filesystem` on the DataVolume |
 | VM `Stopped` after the guest powered off | KubeVirt does not restart a voluntary shutdown; the orchestrator recovers the job with the kept root disk |
 | `sudo` inside the VM is denied with "orchestrator unreachable" | the guest daemon cannot reach the orchestrator Service on 8085 — check the workspace NetworkPolicy and that `vm.mode` is `same-cluster` |
+| the agent logs `the final git push did NOT land` and the job's Gitea repo stays at "Initial commit" | the workspace was handed a remote it cannot authenticate. The orchestrator logs `Dispatch: repository transport for job …` at every dispatch: it must name an `ssh://srw-repo-…` alias with `1 managed credential(s)`; a plain `http://…` with `0 managed credential(s)` means the job row reached dispatch without `repo_name` or the managed repository authority could not be proven (a `No managed repository authority for job …` warning precedes it) |
+| the job page reports the IDE as `unavailable: code-server is not running on the live VM` | expected: the VM image ships `code-server.service` disabled and the live-VM IDE is not wired yet; the snapshot-based IDE still works after the job ends |
+| the orchestrator logs `VM controller rejected delete … persistentvolumeclaims … is forbidden` after a job completes | a chart older than 2026-08-25 granted the controller only `get,list` on PersistentVolumeClaims; the captured teardown deletes the exact rootdisk PVC by UID and needs `delete`. Upgrade the chart |
+| `srw-vmi-metering` / `srw-storage-metering` crash-loop with `configuration is invalid` or post to an empty URL | a chart older than 2026-08-25 rendered the same-cluster collectors' orchestrator URL as `""` and `maxSnapshotBytes` as `6.7108864e+07`; upgrade the chart |
+| the orchestrator logs `Infrastructure metering collection requested but capabilities are incomplete (vm/claim-requested durable source shadow activation)` and every collector gets `503` on `/v1/tickets` | a Helm shadow gate (`vmShadowEnabled`, `vmPvcShadowEnabled`) is on before the durable activation row is in `shadow`. Order: inventory gates on → fleet-admin `…/compute-activation/workspace_vm/shadow` and `…/storage-source-activation/vm/claim-requested/shadow` → shadow gates on |
+| `POST …/compute-activation/workspace_vm/schedule` answers `409 … requires a fresh item-for-item shadow snapshot` while VMs are running, or `500 … scheduling failed` | metering-engine limits fixed after 2026-08-25 (VMI shadow comparisons; initial authority on a recovery epoch) — upgrade the orchestrator; on an older release the class can only be scheduled with no VM in the last relist snapshot |
+
+### Metering the VM tier
+
+VM compute and root-disk storage are metered by two extra collectors that the chart
+renders only in `same-cluster` mode. They are dark-launched: inventory and shadow
+evidence first, publication never before a fleet-admin activation boundary.
+
+```yaml
+infrastructureMetering:
+  collectorEnabled: true              # mandatory master (also runs the Pod collector)
+  shadowEnabled: true
+  stableClusterId: my-cluster
+  vmInventoryEnabled: true            # VMI collector
+  vmShadowEnabled: true               # only after the durable row is in shadow — see below
+  vmIngestionSecretName: srw-infra-metering-vmi-ingestion
+  vmPvcInventoryEnabled: true         # root-disk PVC collector
+  vmPvcShadowEnabled: true
+  vmStorageIngestionSecretName: srw-infra-metering-vm-storage-ingestion
+  networkPolicy:
+    enabled: true                     # or allowUnrestrictedEgress: true on a dev cluster
+    apiServerCidrs: ["10.43.0.1/32"]
+```
+
+`vmStableClusterId` and `vmNamespace` default to the release's own values in this mode.
+The two ingestion Secrets hold `INFRASTRUCTURE_METERING_VMI_INGESTION_KEY` and
+`INFRASTRUCTURE_METERING_VM_STORAGE_INGESTION_KEY` (≥ 32 random bytes each) and must be
+distinct from each other, from the application Secret and from the chart-managed
+`<release>-infra-ingestion`. Leave `pvcInventoryEnabled` off: the release namespace holds the
+root-disk PVCs and inventorying them twice is refused at render time.
+
+Enable in this order, rolling the orchestrator between steps: inventory gates on → as a
+fleet admin `POST /api/admin/usage/v2/compute-activation/workspace_vm/shadow` and
+`POST /api/admin/usage/v2/storage-source-activation/vm/claim-requested/shadow` → shadow gates
+on. Evidence lands in `compute_shadow_observations` (one row per VMI per relist,
+`owner_kind=job|thread`) and `storage_shadow_observations` (`vm_rootdisk_claim`); evidence
+is written at relist time (`relistIntervalSeconds`, default 300 s), so a VM shorter than
+that may not be observed. Durable intervals require scheduling the class for a future UTC
+midnight; nothing is backfilled.
 
 ### Network isolation
 
@@ -615,8 +993,8 @@ veth. Pod-level NetworkPolicy therefore only sees the encrypted WireGuard
 envelope (UDP/41641 + DERP/443), not the in-VM traffic. Egress restriction
 on virt-launcher pods is meaningful for boot-time + tunnel handshake
 traffic and meaningless for everything inside the tunnel — Headscale ACLs
-are the right layer for tailnet-source filtering. See
-`knowledge-base/knowledge/features/workspace_network_policy_unification.md` for details.
+are the right layer for tailnet-source filtering. See the public
+[security model](../docs/security-model.md) for the surrounding trust assumptions.
 
 ## Post-install verification
 
@@ -698,7 +1076,7 @@ The full configurable surface is documented inline in `values.yaml`
 
 ```bash
 helm show values oci://ghcr.io/knaeckebrothero/charts/superhuman-remote-worker \
-  --version 0.0.1
+  --version <chart-version>
 ```
 
 A reference customer overlay is shipped as `values.example.yaml` inside the

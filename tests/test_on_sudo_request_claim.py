@@ -10,7 +10,7 @@ import json
 import pytest
 from unittest.mock import AsyncMock
 
-from services.sudo_gate import SudoGateService
+from orchestrator.services.sudo_gate import SudoGateService
 
 
 class FakeMsg:

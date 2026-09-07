@@ -22,7 +22,7 @@ import pytest
 from langchain_core.messages import AIMessage
 from openai import APIError, APIStatusError, AuthenticationError
 
-from src.persistent_graph import PersistentLoopCallbacks, run_persistent_loop
+from agent.persistent_graph import PersistentLoopCallbacks, run_persistent_loop
 
 _MIDSTREAM_MSG = (
     "An error occurred while processing your request. You can retry your "
@@ -156,7 +156,7 @@ def _single_turn_input():
 @pytest.mark.asyncio
 async def test_transient_midstream_api_error_is_retried(monkeypatch):
     """A mid-stream APIError retries and the user sees the answer, not the error."""
-    monkeypatch.setattr("src.persistent_graph._SESSION_LLM_RETRY_BASE_DELAY", 0.0)
+    monkeypatch.setattr("agent.persistent_graph._SESSION_LLM_RETRY_BASE_DELAY", 0.0)
 
     on_error = AsyncMock()
     on_token = AsyncMock()
@@ -188,7 +188,7 @@ async def test_transient_midstream_api_error_is_retried(monkeypatch):
 @pytest.mark.asyncio
 async def test_permanent_auth_error_is_not_retried(monkeypatch):
     """Fail-fast verdicts keep failing fast — no retry budget burned on a bad key."""
-    monkeypatch.setattr("src.persistent_graph._SESSION_LLM_RETRY_BASE_DELAY", 0.0)
+    monkeypatch.setattr("agent.persistent_graph._SESSION_LLM_RETRY_BASE_DELAY", 0.0)
 
     # Deliberately NOT via the codex proxy: a 401 straight from the provider is
     # a genuinely bad key. (A proxy 401 is a token-refresh blip — see the test
@@ -214,7 +214,7 @@ async def test_codex_proxy_401_is_retried_like_worker_jobs(monkeypatch):
     the Codex/CLIProxyAPI token may be mid-refresh. Worker jobs have retried it
     since the 2026-06-22 incident; sessions failed the turn outright.
     """
-    monkeypatch.setattr("src.persistent_graph._SESSION_LLM_RETRY_BASE_DELAY", 0.0)
+    monkeypatch.setattr("agent.persistent_graph._SESSION_LLM_RETRY_BASE_DELAY", 0.0)
 
     on_error = AsyncMock()
     llm, attempts = _flaky_llm(
@@ -234,7 +234,7 @@ async def test_codex_proxy_401_is_retried_like_worker_jobs(monkeypatch):
 @pytest.mark.asyncio
 async def test_transient_error_after_tokens_streamed_is_not_retried(monkeypatch):
     """Once tokens reached the client, a restart would duplicate them — surface instead."""
-    monkeypatch.setattr("src.persistent_graph._SESSION_LLM_RETRY_BASE_DELAY", 0.0)
+    monkeypatch.setattr("agent.persistent_graph._SESSION_LLM_RETRY_BASE_DELAY", 0.0)
 
     on_error = AsyncMock()
     on_token = AsyncMock()
@@ -273,7 +273,7 @@ async def test_context_overflow_is_not_retried(monkeypatch):
     to exclude context overflow explicitly or it re-creates the retry storm that
     session_silent_failure_audit.md #3 removed.
     """
-    monkeypatch.setattr("src.persistent_graph._SESSION_LLM_RETRY_BASE_DELAY", 0.0)
+    monkeypatch.setattr("agent.persistent_graph._SESSION_LLM_RETRY_BASE_DELAY", 0.0)
 
     on_error = AsyncMock()
     llm, attempts = _flaky_llm(
@@ -297,7 +297,7 @@ async def test_context_overflow_is_not_retried(monkeypatch):
 @pytest.mark.asyncio
 async def test_retries_are_bounded_and_then_surface(monkeypatch):
     """A provider that keeps failing exhausts the budget instead of looping forever."""
-    monkeypatch.setattr("src.persistent_graph._SESSION_LLM_RETRY_BASE_DELAY", 0.0)
+    monkeypatch.setattr("agent.persistent_graph._SESSION_LLM_RETRY_BASE_DELAY", 0.0)
 
     on_error = AsyncMock()
     llm, attempts = _flaky_llm(

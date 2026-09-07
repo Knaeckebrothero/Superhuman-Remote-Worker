@@ -16,8 +16,8 @@ import struct
 import pytest
 from langchain_core.messages import HumanMessage
 
-from src.core.context import ContextConfig, ContextManager
-from src.core.image_tokens import (
+from agent.core.context import ContextConfig, ContextManager
+from shared.runtime.core.image_tokens import (
     DEFAULT_IMAGE_TOKENS,
     estimate_image_block_tokens,
     read_image_dimensions,
@@ -230,7 +230,7 @@ class TestDispatchFallbacks:
 
 class TestLoaderRouting:
     def test_gpt5_routes_to_limits(self):
-        from src.core.loader import _apply_settings_matrix
+        from shared.runtime.core.loader import _apply_settings_matrix
 
         data = {"llm": {"model": "gpt-5.5"}}
         _apply_settings_matrix(data, set())
@@ -240,7 +240,7 @@ class TestLoaderRouting:
         assert "image_tokens" not in data["llm"]
 
     def test_claude_sonnet_row_now_multimodal(self):
-        from src.core.loader import _apply_settings_matrix
+        from shared.runtime.core.loader import _apply_settings_matrix
 
         data = {"llm": {"model": "claude-sonnet-4-6"}}
         _apply_settings_matrix(data, set())
@@ -248,7 +248,7 @@ class TestLoaderRouting:
         assert data["limits"]["image_tokens"]["mode"] == "anthropic_patches"
 
     def test_claude_sonnet_routes_pdf_render_dpi(self):
-        from src.core.loader import _apply_settings_matrix
+        from shared.runtime.core.loader import _apply_settings_matrix
 
         data = {"llm": {"model": "claude-sonnet-4-6"}}
         _apply_settings_matrix(data, set())
@@ -257,7 +257,7 @@ class TestLoaderRouting:
         assert "pdf_render_dpi" not in data["llm"]
 
     def test_gpt5_has_no_pdf_render_dpi_override(self):
-        from src.core.loader import _apply_settings_matrix
+        from shared.runtime.core.loader import _apply_settings_matrix
 
         data = {"llm": {"model": "gpt-5.5"}}
         _apply_settings_matrix(data, set())

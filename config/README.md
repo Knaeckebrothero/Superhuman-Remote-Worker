@@ -6,33 +6,37 @@ This directory contains agent configuration files and templates.
 
 ```
 config/
-├── worker_base.yaml             # Conservative inheritance base for worker experts
-├── session_base.yaml            # Conservative inheritance base for session experts
+├── expert_base.yaml             # The ONE shared root every expert resolves on (every role)
+├── overlays/                    # Role overlays — each `$extends: expert_base`
+│   ├── worker.yaml              #   public name `worker_base`  (job / phase-loop experts)
+│   ├── session.yaml             #   public name `session_base` (interactive / persistent experts)
+│   └── subagent.yaml            #   public name `subagent_base` (roster entries; declares `$ignore_keys`)
 ├── schema.json                  # JSON Schema for config validation
-├── prompt_matrix.yaml           # Base prompt matrix (model family → filename)
-├── instruction_matrix.yaml      # Base instruction matrix (model family → filename)
-├── settings_matrix.yaml         # Model-family-specific inference params & context limits
+├── model_config_matrix.yaml     # Per model family: prompt/instruction filenames, inference params, context limits
 ├── README.md                    # This file
 ├── experts/                     # Bundled roles and application-default seed bundles
 │   └── <expert>/
-│       ├── config.yaml              # Expert overlay (extends one mode base)
-│       ├── prompt_matrix.yaml       # Expert-level prompt matrix (optional)
-│       └── instruction_matrix.yaml  # Expert-level instruction matrix (optional)
-├── prompts/                     # Prompt templates (system prompt, phase prompts)
+│       ├── config.yaml              # Expert overlay (`$extends: worker_base` or `session_base`)
+│       ├── model_config_matrix.yaml # Expert-level matrix override (optional)
+│       └── skills/                  # Expert-local skill overrides (optional)
+│           ├── strategic-phase/SKILL.md
+│           └── tactical-phase/SKILL.md
+├── subagents/                   # Subagent library — small experts a roster references by name (see subagents/README.md)
+│   └── <name>/
+│       ├── config.yaml              # `$extends: expert_base`, `tags: [subagent]`, read-only tools, `llm: {model: inherit}`
+│       └── persona.txt              # Prompt files next to the config, like an expert's
+├── skills/                      # Bundled skills, including the two hidden worker phase skills
+│   ├── strategic-phase/SKILL.md
+│   └── tactical-phase/SKILL.md
+├── prompts/                     # System, persona, and auxiliary prompt templates
 │   ├── systemprompt.txt         # Main system prompt
 │   ├── persona.txt              # Agent persona/identity prompt
-│   ├── strategic.txt            # Strategic phase system prompt
-│   ├── tactical.txt             # Tactical phase system prompt
 │   ├── summarization_prompt.txt # Context compaction prompt
 │   ├── systemprompt_minimax.txt # MiniMax M2.7-optimized system prompt
 │   ├── persona_minimax.txt      # MiniMax M2.7-optimized persona
-│   ├── strategic_minimax.txt    # MiniMax M2.7-optimized strategic prompt
-│   ├── tactical_minimax.txt     # MiniMax M2.7-optimized tactical prompt
 │   ├── summarization_prompt_minimax.txt  # MiniMax M2.7-optimized summarization
 │   ├── systemprompt_minimax_m3.txt        # MiniMax M3 system prompt (1M ctx, multimodal)
 │   ├── persona_minimax_m3.txt             # MiniMax M3 persona
-│   ├── strategic_minimax_m3.txt           # MiniMax M3 strategic prompt
-│   ├── tactical_minimax_m3.txt            # MiniMax M3 tactical prompt
 │   ├── summarization_prompt_minimax_m3.txt # MiniMax M3 summarization
 │   ├── systemprompt_glm.txt                # GLM-5.2 worker system prompt
 │   ├── systemprompt_interactive_glm.txt    # GLM-5.2 persistent-chat system prompt
@@ -49,11 +53,72 @@ config/
     └── phase_retrospective_template.md  # Template for phase retrospectives
 ```
 
+## Roles, the shared root and the overlays
+
+Every expert resolves on the same chain, most specific last:
+
+```
+expert_base  <-  overlays/<role>  <-  expert ($extends chain)  <-  model family (matrix)  <-  job / thread / roster override
+```
+
+- `expert_base.yaml` carries everything every role shares (llm, tools, limits,
+  memory, auxiliary, browser, shell, ...). It is never loaded on its own by a
+  runtime.
+- `overlays/<role>.yaml` adds the role's own keys and the role's values of
+  shared keys. The worker overlay owns the phase loop (`instruction_files`,
+  `phase_settings`, `delegation`, `autonomy`, `verification`, `scholar`,
+  `curator`, `communication`, the `core` tool group); the session overlay owns
+  the canvas grant, the session-only application groups and the session memory
+  writers; the subagent overlay is a read-only tool floor with memory and
+  background tasks off.
+- The overlays' **public names** are `worker_base`, `session_base` and
+  `subagent_base`. They are what `$extends`, `--config`, `config_name` and the
+  experts API use; `default`/`defaults`, `persistent_default`/`persistent_defaults`
+  and the file spelling `overlays/<role>` are accepted aliases. A path such as
+  `config/worker_base.yaml` still loads (it lands on the overlay).
+
+**Role re-rooting.** A config is normally loaded on the root its own chain
+names. When it is resolved *for* a role — a job resolves for `worker`, a
+session for `session`, a roster entry for `subagent` — the loader
+(`load_and_merge_config(path, role=...)`) replaces the link that ends the chain
+with that role's overlay. So a session expert dispatched as a job gains the
+worker keys underneath it, and a worker expert used in a session sits on the
+session overlay; the expert's own values always win ("expert wins").
+
+**Session account layer — `workspace.backend` needs an owner.** For sessions
+the orchestrator inserts an *account* layer between the merged role base and
+the expert's own file: the owner's saved `settings.persistent_agent.
+workspace_backend`, else the platform default `virtual`. That layer always
+emits `workspace.backend`, so `expert_base`'s `backend: sandbox` never reaches
+a session. An expert whose role needs a shell (build, run, browser, git) must
+declare `workspace.backend` in its **own** `config.yaml`; the New Session form
+then shows it like an expert-pinned model and the user may still change it.
+An expert that lists shell tools without declaring a backend starts on the
+lite tier with shell/browser/git stripped — a tripwire in
+`tests/test_expert_defaults.py::TestShellBoundBundledExpertsPinTheirTier`
+fails on that unless the expert is on its documented exception list
+(`scholar`). Jobs ignore the key: the workspace contract stamps a job's tier
+from `config_override` (default `sandbox`).
+
+**Ignored keys.** A role overlay may declare `$ignore_keys`, a list of dotted
+paths its role never reads. They are pruned from the merged config after every
+merge, again after the job/thread override layers, and after a roster
+override, so no later layer can re-introduce them. A key that does not apply
+to a role is dropped silently — never an error. Today only the subagent
+overlay declares any (`workspace.backend/remote/mounts/structure/instructions_template/initial_files/git_versioning`,
+`autonomy`, `verification`, `scholar`, `curator`, `phase_settings`,
+`delegation`, `communication`, `officer`, `headless`); the worker and session
+overlays declare none, so a re-rooted expert keeps everything it authored.
+
+Never read a base file directly — an overlay alone is only the role's residue.
+Use `load_role_base(role)` (the merged `expert_base` + overlay) from
+`src/shared/runtime/core/loader.py`.
+
 ## Creating a Custom Agent Config
 
 ### Option 1: Single File Config
 
-Create a worker YAML file that extends the worker mode base:
+Create a worker YAML file that extends the worker role base:
 
 ```yaml
 # yaml-language-server: $schema=schema.json
@@ -74,13 +139,15 @@ tools:
 Save as `config/my_agent.yaml` and run:
 
 ```bash
-python agent.py --config my_agent
+python -m agent --config my_agent
 ```
 
-Persistent/session experts use `$extends: session_base` instead. The legacy
+Persistent/session experts use `$extends: session_base` instead; a shared
+"small expert" meant for rosters uses `$extends: subagent_base`. The legacy
 names `default`, `defaults`, `persistent_default`, and `persistent_defaults`
 remain accepted as compatibility aliases, but new configs should use the
-explicit mode-base names.
+explicit public root names. Whichever root an expert names, it can be used in
+every role (see "Roles, the shared root and the overlays" above).
 
 ### Option 2: Directory Config (with prompt overrides)
 
@@ -90,10 +157,11 @@ For configs that need custom prompts or instructions, create a directory:
 config/
 └── my_agent/
     ├── config.yaml              # Expert overlay (extends a mode base)
-    ├── prompt_matrix.yaml       # Expert-level prompt matrix (optional)
-    ├── instruction_matrix.yaml  # Expert-level instruction matrix (optional)
+    ├── model_config_matrix.yaml # Expert-level matrix overrides (optional)
     ├── instructions.md          # Custom instructions (optional)
-    └── strategic.txt            # Custom strategic prompt (optional)
+    └── skills/
+        ├── strategic-phase/SKILL.md # Custom planning/review guidance (optional)
+        └── tactical-phase/SKILL.md  # Custom execution guidance (optional)
 ```
 
 ### Two Matrix Systems
@@ -101,7 +169,7 @@ config/
 The agent uses two parallel matrix systems with the same 4-level fallback chain:
 
 **Prompt Matrix** (`prompt_matrix.yaml`) — resolves system prompts:
-- Entries: `systemprompt`, `persona`, `strategic`, `tactical`, `summarization`
+- Entries include `systemprompt`, `persona`, and `summarization`
 - File search: expert directory → `config/prompts/`
 
 **Instruction Matrix** (`instruction_matrix.yaml`) — resolves non-prompt templates:
@@ -179,11 +247,11 @@ workspace:
 
 ### Tool Categories
 
-Tools are organized into categories. Each category maps to a module under `src/tools/`:
+Tools are organized into categories. Each category maps to a module under `src/agent/tools/`:
 
 ```yaml
 tools:
-  # File operations (src/tools/workspace/)
+  # File operations (src/agent/tools/workspace/)
   workspace:
     - read_file
     - write_file
@@ -200,7 +268,7 @@ tools:
     - create_directory
     - delete_directory
 
-  # Task management + completion (src/tools/core/)
+  # Task management + completion (src/agent/tools/core/)
   core:
     - next_phase_todos      # Stage todos for next tactical phase
     - todo_complete          # Mark current todo done
@@ -209,7 +277,7 @@ tools:
     - mark_complete          # Signal phase/task completion
     - job_complete           # Signal final completion (strategic only)
 
-  # Research: web, papers, browser, workflows (src/tools/research/)
+  # Research: web, papers, browser, workflows (src/agent/tools/research/)
   research:
     - web_search             # Tavily web search
     - extract_webpage        # Extract content from a URL
@@ -224,7 +292,7 @@ tools:
     # group below. Names listed here must exist in TOOL_REGISTRY; an unknown
     # name fails the whole batch load (tests/test_config_tool_names_are_registered.py).
 
-  # Citation management (src/tools/citation/)
+  # Citation management (src/agent/tools/citation/)
   citation:
     - cite_document
     - cite_web
@@ -238,30 +306,29 @@ tools:
     - search_library
     - generate_bibliography
 
-  # Database tool categories (src/tools/graph/, sql/, mongodb/)
+  # Database tool categories (src/agent/tools/graph/, sql/, mongodb/)
   # These are injected/stripped automatically by the orchestrator based on
   # which datasources are attached to the job. Usually left empty in config.
-  # See knowledge-base/knowledge/datasources.md for details.
   graph: []      # Neo4j: execute_cypher_query, get_database_schema
   sql: []        # PostgreSQL: sql_query, sql_schema, sql_execute
   mongodb: []    # MongoDB: mongo_query, mongo_aggregate, mongo_schema, mongo_insert, mongo_update
 
-  # Shell command execution (src/tools/shell/)
+  # Shell command execution (src/agent/tools/shell/)
   # Mode controlled by shell.mode: "stateless" (default) or "persistent"
   shell:
     - run_command     # Execute commands, get output (stateless mode, default)
     - shell_read      # Read more output from scrollback
     # Alternative (persistent mode): shell_execute + shell_read
 
-  # Evaluation tools for critic agents (src/tools/evaluation/)
+  # Evaluation tools for critic agents (src/agent/tools/evaluation/)
   # Enable in critic config for approve/return capabilities.
   evaluation: []
 
-  # Version control (src/tools/git/) — reads the job's own repo by default and
+  # Version control (src/agent/tools/git/) — reads the job's own repo by default and
   # an attached repository datasource with repo="<clone-dir>".
   #
   # ONLY BOUND WHEN THE AGENT HAS NO SHELL TOOLS. If `shell` above is
-  # non-empty, ToolsConfig.__post_init__ (src/core/loader.py) drops this whole
+  # non-empty, ToolsConfig.__post_init__ (src/shared/runtime/core/loader.py) drops this whole
   # group: a shell can run git against any repository in the workspace, and
   # granting both gives the agent two ways to ask one question — the weaker of
   # which silently answers about a different repo. Shell-having agents should
@@ -288,7 +355,8 @@ tools:
     - cite_document
 ```
 
-See `worker_base.yaml` and `session_base.yaml` for the conservative inherited
+See `expert_base.yaml` (the shared groups) and `overlays/worker.yaml` /
+`overlays/session.yaml` (the role-owned groups) for the conservative inherited
 tool surfaces. Privileged and orchestration-oriented groups such as shell,
 delegation, automations, and loops are opt-in at the expert layer.
 
@@ -313,7 +381,8 @@ browser:
 ```
 
 The browser itself runs on the workspace (`browser-exec` daemon) — the agent
-pod never executes Chromium. See `knowledge-base/knowledge/features/browser_workspace_executor.md`.
+pod never executes Chromium. See the public
+[workspace architecture](../docs/architecture.md#workspace-tiers).
 
 Proxy can also be set via environment variables: `RESEARCH_PROXY_TYPE`, `RESEARCH_PROXY_HOST`, `RESEARCH_PROXY_PORT`, `RESEARCH_PROXY_USER`, `RESEARCH_PROXY_PASS`.
 
@@ -324,7 +393,8 @@ connections:
   postgres: true
 ```
 
-External datasources (Neo4j, MongoDB, additional PostgreSQL) are managed through the datasource connector system. See `knowledge-base/knowledge/datasources.md`.
+External datasources (Neo4j, MongoDB, and additional PostgreSQL instances) are
+managed through the datasource connector system and resolved at dispatch.
 
 ### Multi-Stage Config Pipeline (Database Tools)
 
@@ -340,7 +410,7 @@ Database tool categories (`graph`, `sql`, `mongodb`) are **not** controlled by t
 - If no datasource of a type is attached, the orchestrator **strips** the category (even if the config lists it).
 - The `read_only` flag on the datasource controls whether write tools are included.
 
-This means the agent config controls non-database tools, while the orchestrator controls database tools based on what's actually connected. See `_build_datasource_tool_override()` in `orchestrator/main.py`.
+This means the agent config controls non-database tools, while the orchestrator controls database tools based on what's actually connected. See `_build_datasource_tool_override()` in `src/orchestrator/main.py`.
 
 ### Context Management
 
@@ -353,7 +423,7 @@ limits:
   # context_threshold_tokens, model_max_context_tokens,
   # message_count_min_tokens
   # (summarization budgets are not config leaves — they are computed at call
-  # time from the auxiliary model's window, see src/core/summarizer.py)
+  # time from the auxiliary model's window, see src/agent/core/summarizer.py)
 
 context_management:
   compact_on_archive: true
@@ -363,7 +433,7 @@ context_management:
 
 ### Settings Matrix
 
-`settings_matrix.yaml` is the single source of truth for model-family-specific inference parameters and context limits. Keys match `detect_model_family()` output in `src/core/loader.py`.
+`settings_matrix.yaml` is the single source of truth for model-family-specific inference parameters and context limits. Keys match `detect_model_family()` output in `src/shared/runtime/core/loader.py`.
 
 ```yaml
 # Resolution: default → family-specific (deep_merge)
@@ -411,7 +481,9 @@ verification:
 
 ### Memory Light
 
-Opt-in recall system backed by PostgreSQL (pgvector hybrid search). Stores and retrieves insights across context compactions. See `knowledge-base/knowledge/features/memory_light.md` for full design.
+Opt-in recall system backed by PostgreSQL and pgvector hybrid search. It stores
+and retrieves project-scoped insights across context compactions; see
+[state, knowledge, and recovery](../docs/architecture.md#state-knowledge-and-recovery).
 
 ```yaml
 memory:
@@ -424,8 +496,10 @@ memory:
 
 ## Inheritance
 
-Configs use `$extends: worker_base` or `$extends: session_base` to inherit the
-appropriate execution-mode fallback. Deep merge applies:
+Configs use `$extends: worker_base`, `$extends: session_base` or
+`$extends: subagent_base` to inherit a role base (`expert_base` + that role's
+overlay), or `$extends: <expert>` to build on another expert's chain. Deep
+merge applies at every link:
 - Objects (dicts): Recursively merged
 - Arrays (lists): Override replaces entirely
 - Scalars: Override replaces
@@ -439,6 +513,10 @@ $extends: worker_base
 tools:
   research: null  # Clears all research tools
 ```
+
+`null` clears a key for *that* merge only — a later layer (a job override)
+re-adds it. Keys a role must never see are declared with `$ignore_keys` on the
+role overlay instead (see above); they are pruned after every layer.
 
 ## Schema Validation
 
@@ -454,14 +532,14 @@ This works with VS Code + Red Hat YAML extension.
 
 ```bash
 # Use the worker framework base directly (normally a named expert is selected)
-python agent.py
+python -m agent
 
 # Use custom config
-python agent.py --config my_agent
+python -m agent --config my_agent
 
 # Use explicit path
-python agent.py --config /path/to/config.yaml
+python -m agent --config /path/to/config.yaml
 
 # As API server
-python agent.py --config my_agent --port 8001
+python -m agent --config my_agent --port 8001
 ```

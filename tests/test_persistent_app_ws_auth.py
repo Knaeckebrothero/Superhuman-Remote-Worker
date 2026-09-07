@@ -6,7 +6,7 @@ from starlette.websockets import WebSocketDisconnect
 from unittest.mock import MagicMock
 
 from orchestrator.services.session_tokens import SessionTokenService
-from src.shared.pinned_session_identity import (
+from shared.pinned_session_identity import (
     pinned_session_ready_identity_fingerprint,
 )
 
@@ -36,7 +36,7 @@ def configure_pod_env(monkeypatch):
     monkeypatch.setenv("SESSION_BOUND_THREAD_ID", THREAD_ID)
     monkeypatch.setenv("POD_UID", POD_UID)
 
-    import src.api.persistent_app as pa
+    import agent.api.persistent_app as pa
 
     monkeypatch.setattr(pa, "_thread_id", THREAD_ID)
     monkeypatch.setattr(pa, "_session_runtime_generation", RUNTIME_GENERATION)
@@ -50,7 +50,7 @@ def configure_pod_env(monkeypatch):
 
 @pytest.fixture
 def app():
-    from src.api.persistent_app import create_persistent_app
+    from agent.api.persistent_app import create_persistent_app
 
     # config_path is required; we never actually run the lifespan / session,
     # but the constructor needs a value. A dummy string is fine — the route
@@ -123,7 +123,7 @@ def test_ws_chat_accepts_valid_token(app, monkeypatch):
     are 4401 (auth), 4403 (mismatch), and 4500 (misconfig). Anything else
     means the validator allowed the request through.
     """
-    import src.api.persistent_app as pa
+    import agent.api.persistent_app as pa
 
     async def _accepted_downstream(ws):
         await ws.accept()

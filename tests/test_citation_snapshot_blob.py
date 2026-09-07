@@ -20,8 +20,8 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 
-from src.api.orchestrator_client import OrchestratorClient
-from src.tools.context import ToolContext
+from agent.api.orchestrator_client import OrchestratorClient
+from agent.tools.context import ToolContext
 
 
 # ---------------------------------------------------------------------------
@@ -88,10 +88,11 @@ async def test_save_blob_unavailable_or_empty_returns_none():
 async def test_get_blob_round_trips_bytes():
     svc = _make_service()
     body = MagicMock()
-    body.read.return_value = b"the original"
+    body.read.side_effect = [b"the original", b""]
     svc._s3.get_object.return_value = {"Body": body}
 
     assert await svc.get_blob("citations/ab/abcd") == b"the original"
+    body.close.assert_called_once_with()
     svc._s3.get_object.assert_called_once_with(
         Bucket="srw-snapshots", Key="citations/ab/abcd"
     )

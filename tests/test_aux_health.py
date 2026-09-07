@@ -5,7 +5,7 @@ See knowledge-base/knowledge/issues/surface_silent_aux_failures.md.
 
 import logging
 
-from src.services.auxiliary import AuxHealth
+from shared.runtime.services.auxiliary import AuxHealth
 
 
 class TestAuxHealth:

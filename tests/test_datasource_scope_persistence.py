@@ -24,7 +24,7 @@ from orchestrator.database.postgres import (
 
 MIGRATION = (
     Path(__file__).parents[1]
-    / "orchestrator/database/migrations/app/0083_datasource_scope_auto_attach.sql"
+    / "src/orchestrator/database/migrations/app/0083_datasource_scope_auto_attach.sql"
 )
 DATASOURCE_ID = "11111111-1111-4111-8111-111111111111"
 PROJECT_A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"

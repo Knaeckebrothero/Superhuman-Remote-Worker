@@ -12,7 +12,7 @@ from typing import Dict, List, Optional
 import pytest
 from pydantic import BaseModel
 
-from src.shared.tool_arg_coercion import coerce_tool_args
+from shared.tool_arg_coercion import coerce_tool_args
 
 
 class _Schema(BaseModel):

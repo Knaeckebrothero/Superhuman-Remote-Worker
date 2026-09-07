@@ -13,7 +13,7 @@ import pytest
 import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
-import main
+import orchestrator.main
 from orchestrator.database.postgres import PostgresDB
 from orchestrator.services.completion_finalizer import (
     CompletionDispositionSuperseded,
@@ -22,11 +22,12 @@ from orchestrator.services.completion_finalizer import (
     CompletionLeaseLost,
 )
 from orchestrator.services.job_completion_commands import accept_completion_command
-from src.shared import worker_queue
+from shared import worker_queue
 
 
 SCHEMA_FILE = (
     Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "schema_current.sql"
@@ -392,14 +393,16 @@ async def test_s27_reviewing_cas_and_effect_marker_commit_together(
         pg, target_lane=target_lane
     )
     db = _pool_db(pg)
-    monkeypatch.setattr(main, "postgres_db", db)
+    monkeypatch.setattr(orchestrator.main, "postgres_db", db)
     runner = await _claimed_runner(db, accepted.command_id)
     critic = await db.get_job(str(critic_id))
 
     plan = await runner.run_transactional(
         name="critic_verdict",
         group="critic_verdict",
-        callback=lambda: main._materialize_critic_verdict_transactional(critic),
+        callback=lambda: orchestrator.main._materialize_critic_verdict_transactional(
+            critic
+        ),
         supersede_if=lambda output: output["world_cas_won"] is False,
     )
 
@@ -451,9 +454,9 @@ async def test_s27_approval_consumes_the_reviewed_completion_decision(pg, monkey
             target_id,
         )
     db = _pool_db(pg)
-    monkeypatch.setattr(main, "postgres_db", db)
+    monkeypatch.setattr(orchestrator.main, "postgres_db", db)
     monkeypatch.setattr(
-        main,
+        orchestrator.main,
         "_resolve_critic_outcome",
         lambda *_args: ("approved", "round 2 approved"),
     )
@@ -463,7 +466,9 @@ async def test_s27_approval_consumes_the_reviewed_completion_decision(pg, monkey
     plan = await runner.run_transactional(
         name="critic_verdict",
         group="critic_verdict",
-        callback=lambda: main._materialize_critic_verdict_transactional(critic),
+        callback=lambda: orchestrator.main._materialize_critic_verdict_transactional(
+            critic
+        ),
         supersede_if=lambda output: output["world_cas_won"] is False,
     )
 
@@ -488,14 +493,16 @@ async def test_s27_oversized_findings_persist_in_domain_not_effect_detail(
         pg, finding_claim=large_claim
     )
     db = _pool_db(pg)
-    monkeypatch.setattr(main, "postgres_db", db)
+    monkeypatch.setattr(orchestrator.main, "postgres_db", db)
     runner = await _claimed_runner(db, accepted.command_id)
     critic = await db.get_job(str(critic_id))
 
     plan = await runner.run_transactional(
         name="critic_verdict",
         group="critic_verdict",
-        callback=lambda: main._materialize_critic_verdict_transactional(critic),
+        callback=lambda: orchestrator.main._materialize_critic_verdict_transactional(
+            critic
+        ),
         supersede_if=lambda output: output["world_cas_won"] is False,
     )
 
@@ -533,7 +540,7 @@ async def test_s27_stateless_return_uses_ledger_recomputed_after_queue_lock(
         finding_claim="hint finding must not survive",
     )
     db = _pool_db(pg)
-    monkeypatch.setattr(main, "postgres_db", db)
+    monkeypatch.setattr(orchestrator.main, "postgres_db", db)
     original_enqueue = worker_queue.enqueue_worker_batch_wake
 
     async def enqueue_then_change_ledger(conn, **kwargs):
@@ -577,7 +584,9 @@ async def test_s27_stateless_return_uses_ledger_recomputed_after_queue_lock(
     plan = await runner.run_transactional(
         name="critic_verdict",
         group="critic_verdict",
-        callback=lambda: main._materialize_critic_verdict_transactional(critic),
+        callback=lambda: orchestrator.main._materialize_critic_verdict_transactional(
+            critic
+        ),
         supersede_if=lambda output: output["world_cas_won"] is False,
     )
 
@@ -600,10 +609,10 @@ async def test_s27_stateless_return_uses_ledger_recomputed_after_queue_lock(
 async def test_s27_multibyte_escalation_is_bounded_before_domain_write(pg, monkeypatch):
     accepted, target_id, critic_id = await _critic_verdict_fixture(pg)
     db = _pool_db(pg)
-    monkeypatch.setattr(main, "postgres_db", db)
+    monkeypatch.setattr(orchestrator.main, "postgres_db", db)
     huge_reason = "誤" * 20_000
     monkeypatch.setattr(
-        main,
+        orchestrator.main,
         "_resolve_critic_outcome",
         lambda *_args: ("escalate", huge_reason),
     )
@@ -613,7 +622,9 @@ async def test_s27_multibyte_escalation_is_bounded_before_domain_write(pg, monke
     plan = await runner.run_transactional(
         name="critic_verdict",
         group="critic_verdict",
-        callback=lambda: main._materialize_critic_verdict_transactional(critic),
+        callback=lambda: orchestrator.main._materialize_critic_verdict_transactional(
+            critic
+        ),
         supersede_if=lambda output: output["world_cas_won"] is False,
     )
 
@@ -641,14 +652,16 @@ async def test_s27_human_decision_supersedes_effect_without_followup(pg, monkeyp
         pg, target_status="pending_review"
     )
     db = _pool_db(pg)
-    monkeypatch.setattr(main, "postgres_db", db)
+    monkeypatch.setattr(orchestrator.main, "postgres_db", db)
     runner = await _claimed_runner(db, accepted.command_id)
     critic = await db.get_job(str(critic_id))
 
     plan = await runner.run_transactional(
         name="critic_verdict",
         group="critic_verdict",
-        callback=lambda: main._materialize_critic_verdict_transactional(critic),
+        callback=lambda: orchestrator.main._materialize_critic_verdict_transactional(
+            critic
+        ),
         supersede_if=lambda output: output["world_cas_won"] is False,
     )
 
@@ -670,7 +683,7 @@ async def test_s27_human_decision_supersedes_effect_without_followup(pg, monkeyp
         )
 
 
-async def _verification_parent_fixture(pg):
+async def _verification_parent_fixture(pg, *, with_workspace: bool = False):
     async with pg.acquire() as conn:
         agent_id = await conn.fetchval(
             "INSERT INTO agents (config_name, hostname, status) "
@@ -688,6 +701,57 @@ async def _verification_parent_fixture(pg):
             '\'{"freeze_type":"job_complete","summary":"done",'
             '"deliverables":["output/result.md"]}\'::jsonb) RETURNING id',
             agent_id,
+        )
+    if with_workspace:
+        db = _pool_db(pg)
+        runtime_uid = str(uuid4())
+        reservation = await db.reserve_managed_repository_workspace_creation(
+            str(parent_id),
+            owner_kind="job",
+            scope="workspace_container",
+            claimant="verification-parent-fixture",
+            desired_manifest_digest="0" * 64,
+        )
+        assert reservation is not None
+        reservation = await db.mark_managed_repository_workspace_creation_started(
+            str(parent_id),
+            owner_kind="job",
+            scope="workspace_container",
+            reservation_generation=int(reservation["reservation_generation"]),
+            claimant="verification-parent-fixture",
+            claim_token=int(reservation["claim_token"]),
+        )
+        assert reservation is not None
+        assert await db.authorize_managed_repository_workspace_creation_runtime(
+            str(parent_id),
+            owner_kind="job",
+            scope="workspace_container",
+            reservation_generation=int(reservation["reservation_generation"]),
+            claimant="verification-parent-fixture",
+            claim_token=int(reservation["claim_token"]),
+            runtime_incarnation=runtime_uid,
+        )
+        workspace = {
+            "provisioner": "k8s",
+            "status": "ready",
+            "_runtime_incarnation": runtime_uid,
+            "_creation_reservation_id": str(reservation["id"]),
+            "_creation_claim_token": str(reservation["claim_token"]),
+        }
+        async with pg.acquire() as conn:
+            await conn.execute(
+                "UPDATE jobs SET context=context || $2::jsonb WHERE id=$1",
+                parent_id,
+                json.dumps({"workspace_container": workspace}),
+            )
+        assert await db.settle_managed_repository_workspace_creation_reservation(
+            str(parent_id),
+            owner_kind="job",
+            scope="workspace_container",
+            reservation_generation=int(reservation["reservation_generation"]),
+            claimant="verification-parent-fixture",
+            claim_token=int(reservation["claim_token"]),
+            runtime_incarnation=runtime_uid,
         )
     accepted = await accept_completion_command(
         pg,
@@ -716,14 +780,14 @@ async def _verification_parent_fixture(pg):
 async def test_s30_materializes_one_critic_before_external_handoff(pg, monkeypatch):
     accepted, parent_id = await _verification_parent_fixture(pg)
     db = _pool_db(pg)
-    monkeypatch.setattr(main, "postgres_db", db)
+    monkeypatch.setattr(orchestrator.main, "postgres_db", db)
     runner = await _claimed_runner(db, accepted.command_id)
     parent = await db.get_job(str(parent_id))
 
     plan = await runner.run_transactional(
         name="verification_critic_spawn",
         group="verification",
-        callback=lambda: main._materialize_verification_critic_transactional(
+        callback=lambda: orchestrator.main._materialize_verification_critic_transactional(
             parent,
             {"should_stop": True, "goal_achieved": True, "error": None},
             expected_round=0,
@@ -753,14 +817,48 @@ async def test_s30_materializes_one_critic_before_external_handoff(pg, monkeypat
 
 
 @pytest.mark.asyncio
+async def test_s30_inherits_parent_workspace_without_rebinding_runtime(pg, monkeypatch):
+    accepted, parent_id = await _verification_parent_fixture(pg, with_workspace=True)
+    db = _pool_db(pg)
+    monkeypatch.setattr(orchestrator.main, "postgres_db", db)
+    runner = await _claimed_runner(db, accepted.command_id)
+    parent = await db.get_job(str(parent_id))
+
+    plan = await runner.run_transactional(
+        name="verification_critic_spawn",
+        group="verification",
+        callback=lambda: orchestrator.main._materialize_verification_critic_transactional(
+            parent,
+            {"should_stop": True, "goal_achieved": True, "error": None},
+            expected_round=0,
+        ),
+        supersede_if=lambda output: output["world_cas_won"] is False,
+    )
+
+    assert plan["action"] == "handoff"
+    critic = await db.get_job(plan["critic_job_id"])
+    critic_context = critic["context"]
+    if isinstance(critic_context, str):
+        critic_context = json.loads(critic_context)
+    assert critic_context["inherits_parent_workspace"] is True
+    assert "workspace_container" not in critic_context
+    assert "vm" not in critic_context
+    assert critic_context["_workspace_contract"]["assignment_source"] == (
+        "parent_inheritance"
+    )
+
+
+@pytest.mark.asyncio
 async def test_s30_create_job_and_effect_marker_roll_back_as_one_unit(pg, monkeypatch):
     accepted, parent_id = await _verification_parent_fixture(pg)
     db = _pool_db(pg)
-    monkeypatch.setattr(main, "postgres_db", db)
+    monkeypatch.setattr(orchestrator.main, "postgres_db", db)
     workspace_handoff = AsyncMock()
     dispatch = MagicMock()
-    monkeypatch.setattr(main, "_setup_verification_critic_workspace", workspace_handoff)
-    monkeypatch.setattr(main, "_trigger_dispatch", dispatch)
+    monkeypatch.setattr(
+        orchestrator.main, "_setup_verification_critic_workspace", workspace_handoff
+    )
+    monkeypatch.setattr(orchestrator.main, "_trigger_dispatch", dispatch)
     runner = await _claimed_runner(db, accepted.command_id)
     parent = await db.get_job(str(parent_id))
 
@@ -771,7 +869,7 @@ async def test_s30_create_job_and_effect_marker_roll_back_as_one_unit(pg, monkey
         await runner.run_transactional(
             name="verification_critic_spawn",
             group="verification",
-            callback=lambda: main._materialize_verification_critic_transactional(
+            callback=lambda: orchestrator.main._materialize_verification_critic_transactional(
                 parent,
                 {"should_stop": True, "goal_achieved": True, "error": None},
                 expected_round=0,
@@ -801,7 +899,7 @@ async def test_s30_multibyte_delivery_error_is_bounded_before_domain_write(
 ):
     accepted, parent_id = await _verification_parent_fixture(pg)
     db = _pool_db(pg)
-    monkeypatch.setattr(main, "postgres_db", db)
+    monkeypatch.setattr(orchestrator.main, "postgres_db", db)
     runner = await _claimed_runner(db, accepted.command_id)
     parent = await db.get_job(str(parent_id))
     huge_error = "配" * 20_000
@@ -814,7 +912,7 @@ async def test_s30_multibyte_delivery_error_is_bounded_before_domain_write(
     plan = await runner.run_transactional(
         name="verification_critic_spawn",
         group="verification",
-        callback=lambda: main._materialize_verification_critic_transactional(
+        callback=lambda: orchestrator.main._materialize_verification_critic_transactional(
             parent,
             {"should_stop": True, "goal_achieved": True, "error": None},
             expected_round=0,
@@ -847,7 +945,7 @@ async def test_s30_reviewing_or_round_miss_supersedes_without_spawn(
 ):
     accepted, parent_id = await _verification_parent_fixture(pg)
     db = _pool_db(pg)
-    monkeypatch.setattr(main, "postgres_db", db)
+    monkeypatch.setattr(orchestrator.main, "postgres_db", db)
     runner = await _claimed_runner(db, accepted.command_id)
     parent = await db.get_job(str(parent_id))
     async with pg.acquire() as conn:
@@ -865,7 +963,7 @@ async def test_s30_reviewing_or_round_miss_supersedes_without_spawn(
     plan = await runner.run_transactional(
         name="verification_critic_spawn",
         group="verification",
-        callback=lambda: main._materialize_verification_critic_transactional(
+        callback=lambda: orchestrator.main._materialize_verification_critic_transactional(
             parent,
             {"should_stop": True, "goal_achieved": True, "error": None},
             expected_round=0,

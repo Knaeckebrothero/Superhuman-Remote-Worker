@@ -19,10 +19,10 @@ class TestSrcCoreLazyImports:
 
     def test_all_lazy_entries_resolve(self):
         """Every name in _LAZY_IMPORTS must resolve to a real attribute."""
-        from src.core import _LAZY_IMPORTS
+        from agent.core import _LAZY_IMPORTS
 
         for name, (module_path, attr) in _LAZY_IMPORTS.items():
-            mod = importlib.import_module(module_path, package="src.core")
+            mod = importlib.import_module(module_path, package="agent.core")
             assert hasattr(mod, attr), (
                 f"_LAZY_IMPORTS[{name!r}] points to {module_path}.{attr} "
                 f"which does not exist"
@@ -40,7 +40,7 @@ class TestSrcCoreLazyImports:
 
         # Force a fresh import of the core package + loader
         # (they may already be cached, so we check the delta)
-        importlib.import_module("src.core.loader")
+        importlib.import_module("shared.runtime.core.loader")
 
         after = set(sys.modules.keys())
         newly_loaded = after - before
@@ -54,24 +54,24 @@ class TestSrcCoreLazyImports:
 
     def test_state_import_does_load_langgraph(self):
         """Importing state via the lazy mechanism should still work."""
-        from src.core import UniversalAgentState
+        from agent.core import UniversalAgentState
 
         assert UniversalAgentState is not None
 
     def test_unknown_attr_raises(self):
         """Accessing a non-existent attribute must raise AttributeError."""
-        import src.core
+        import agent.core
 
         with pytest.raises(AttributeError, match="no attribute"):
-            _ = src.core.this_does_not_exist
+            _ = agent.core.this_does_not_exist
 
     def test_cached_after_first_access(self):
         """Lazy-loaded attrs are cached in module globals after first access."""
-        import src.core
+        import agent.core
 
-        _ = src.core.WorkspaceManager  # trigger lazy load
+        _ = agent.core.WorkspaceManager  # trigger lazy load
         # Second access should come from globals, not __getattr__
-        assert "WorkspaceManager" in vars(src.core)
+        assert "WorkspaceManager" in vars(agent.core)
 
 
 # ── src/ root lazy imports ───────────────────────────────────────────────────
@@ -82,10 +82,10 @@ class TestSrcRootLazyImports:
 
     def test_all_lazy_entries_resolve(self):
         """Every name in _LAZY_IMPORTS must resolve to a real attribute."""
-        from src import _LAZY_IMPORTS
+        from agent import _LAZY_IMPORTS
 
         for name, (module_path, attr) in _LAZY_IMPORTS.items():
-            mod = importlib.import_module(module_path, package="src")
+            mod = importlib.import_module(module_path, package="agent")
             assert hasattr(mod, attr), (
                 f"_LAZY_IMPORTS[{name!r}] points to {module_path}.{attr} "
                 f"which does not exist"
@@ -93,7 +93,7 @@ class TestSrcRootLazyImports:
 
     def test_unknown_attr_raises(self):
         """Accessing a non-existent attribute must raise AttributeError."""
-        import src
+        import agent
 
         with pytest.raises(AttributeError, match="no attribute"):
-            _ = src.this_does_not_exist
+            _ = agent.this_does_not_exist

@@ -1,0 +1,70 @@
+{{- if .Values.sshGateway.enabled }}
+{{- $gw := .Values.sshGateway -}}
+# Internal target. The WSS attach socket rides the existing API ingress
+# (ssh-gateway/ingress.yaml); the SSH port is here because the raw listener
+# runs unconditionally and a port-forward against this name is how the local
+# gate reaches it without a LoadBalancer.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "srw.sshGatewayName" . }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "ssh-gateway") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 8087
+      targetPort: http
+      protocol: TCP
+    - name: ssh
+      port: {{ $gw.tcp.port }}
+      targetPort: ssh
+      protocol: TCP
+  selector:
+    {{- include "srw.componentSelectorLabels" (dict "context" . "component" "ssh-gateway") | nindent 4 }}
+{{- if $gw.tcp.enabled }}
+---
+# The external SSH door. Off by default and CIDR-scoped when on: an
+# unrestricted SSH LoadBalancer is not a supported default (the render fails
+# without allowedClientCIDRs — see srw.sshGatewayValidate).
+#
+# Annotations follow the same MetalLB convention as the neo4j Bolt
+# LoadBalancer: draw from a named pool, optionally pin an address, and
+# suppress k3s servicelb so it does not race MetalLB for ownership.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "srw.sshGatewayName" . }}-tcp
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "ssh-gateway") | nindent 4 }}
+  annotations:
+    svccontroller.k3s.cattle.io/enablelb: "false"
+    {{- with $gw.tcp.ipAddressPool }}
+    metallb.universe.tf/ip-address-pool: {{ . | quote }}
+    {{- end }}
+    {{- with $gw.tcp.loadBalancerIP }}
+    metallb.universe.tf/loadBalancerIPs: {{ . | quote }}
+    {{- end }}
+spec:
+  type: LoadBalancer
+  {{- with $gw.tcp.externalTrafficPolicy }}
+  # `Local` preserves the real client source IP, which the gateway's
+  # NetworkPolicy ipBlock rules and the per-source connection bucket both
+  # depend on. `Cluster` SNATs every client to a node IP and collapses them
+  # into one rate-limit source.
+  externalTrafficPolicy: {{ . }}
+  {{- end }}
+  # The outer network fence. Every connection still has to present a
+  # certificate the gateway minted; this gates reachability, not access.
+  loadBalancerSourceRanges:
+    {{- toYaml $gw.tcp.allowedClientCIDRs | nindent 4 }}
+  ports:
+    - name: ssh
+      port: {{ $gw.tcp.port }}
+      targetPort: ssh
+      protocol: TCP
+  selector:
+    {{- include "srw.componentSelectorLabels" (dict "context" . "component" "ssh-gateway") | nindent 4 }}
+{{- end }}
+{{- end }}

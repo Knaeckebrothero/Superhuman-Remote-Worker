@@ -21,7 +21,7 @@ list, here.
 
 Deliberately narrow: this module knows the *shape* of machine tags. What a
 category means, which experts belong to it, and what contract it carries are the
-orchestrator's business (``orchestrator/services/work_categories.py``).
+orchestrator's business (``src/orchestrator/services/work_categories.py``).
 """
 
 from __future__ import annotations

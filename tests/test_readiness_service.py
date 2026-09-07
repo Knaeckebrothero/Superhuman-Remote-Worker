@@ -13,15 +13,9 @@ intent obvious without aspaths through the encrypted-secrets layer.
 from __future__ import annotations
 
 import os
-import sys
-from pathlib import Path
 from typing import Any
 
 import pytest
-
-_ORCH = Path(__file__).parent.parent / "orchestrator"
-if str(_ORCH) not in sys.path:
-    sys.path.insert(0, str(_ORCH))
 
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
@@ -33,7 +27,7 @@ def test_readiness_route_registered() -> None:
     paint. If the route disappears, the UI degrades silently."""
     # Local import — defers main.app construction until pytest has set up
     # the env var sys.path tweaks above.
-    from main import app
+    from orchestrator.main import app
 
     paths: set[tuple[str, str]] = set()
     for route in app.routes:

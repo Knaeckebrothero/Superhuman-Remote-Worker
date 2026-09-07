@@ -36,7 +36,7 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from .judge import READER_MAX_TOKENS, LLMRoute, _chat, reader_messages
+from eval.memory.judge import READER_MAX_TOKENS, LLMRoute, _chat, reader_messages
 
 logger = logging.getLogger(__name__)
 

@@ -20,6 +20,7 @@ import {AppTextareaComponent} from '../../ui/textarea';
 import {AppIconComponent} from '../../ui/icon';
 import {AppSpinnerComponent} from '../../ui/spinner';
 import {AppFormFieldComponent} from '../../ui/form-field';
+import {AppSwitchComponent} from '../../ui/switch';
 import {AppTooltipDirective} from '../../ui/tooltip';
 
 /**
@@ -38,6 +39,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
     AppIconComponent,
     AppSpinnerComponent,
     AppFormFieldComponent,
+    AppSwitchComponent,
     AppTooltipDirective,
   ],
   template: `
@@ -116,9 +118,16 @@ import {AppTooltipDirective} from '../../ui/tooltip';
             />
           </app-form-field>
 
-          <!-- Expert Selector -->
+          <!-- Expert Selector: worker experts by default (expert_type || tags);
+               "Show all experts" lists every role — the server accepts a
+               cross-role pick and resolves it on the worker overlay. -->
           <div class="form-group">
-            <label class="form-label">{{ 'jobs.create.expertLabel' | transloco }}</label>
+            <div class="form-label-row">
+              <label class="form-label">{{ 'jobs.create.expertLabel' | transloco }}</label>
+              <app-switch size="sm" [checked]="showAllExperts()" [disabled]="isSubmitting()" (changed)="setShowAllExperts($event)">
+                {{ 'experts.showAll' | transloco }}
+              </app-switch>
+            </div>
             @if (isLoadingExperts()) {
               <div class="expert-loading">
                 <app-spinner size="sm" />
@@ -142,9 +151,9 @@ import {AppTooltipDirective} from '../../ui/tooltip';
                     <app-icon size="inherit" class="expert-icon">{{ expert.icon }}</app-icon>
                     <span class="expert-name">{{ expert.display_name }}</span>
                     <span class="expert-desc">{{ expert.description }}</span>
-                    @if (expert.tags.length > 0) {
+                    @if (pickerTags(expert).length > 0) {
                       <div class="expert-tags">
-                        @for (tag of expert.tags; track tag) {
+                        @for (tag of pickerTags(expert); track tag) {
                           <span class="expert-tag">{{ tag }}</span>
                         }
                       </div>
@@ -681,6 +690,18 @@ import {AppTooltipDirective} from '../../ui/tooltip';
         color: var(--text-muted);
       }
 
+      .form-label-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+
+      .form-label-row .form-label {
+        margin-bottom: 0;
+      }
+
       .field-error {
         display: block;
         margin-top: 4px;
@@ -1158,6 +1179,9 @@ export class JobCreateComponent implements OnInit {
   readonly filePreviews = signal<FilePreview[]>([]);
 
   readonly experts = signal<Expert[]>([]);
+  /** "Show all experts": drop the worker role filter (U1 — every expert stays
+   *  usable in every role; the picker's role is pre-selected, not enforced). */
+  readonly showAllExperts = signal(false);
   readonly selectedExpert = signal<Expert | null>(null);
   private readonly effectiveDefaultExpertId = signal<string | null>(null);
   readonly selectedExpertSource = signal<'project' | 'user' | 'application' | 'explicit' | null>(null);
@@ -1275,8 +1299,15 @@ export class JobCreateComponent implements OnInit {
   }
 
   private loadExperts(): void {
+    this.loadExpertList();
+    this.loadEffectiveDefault();
+  }
+
+  /** The picker's rows: worker experts (`expert_type || tags`), or every
+   *  expert when "Show all experts" is on. */
+  private loadExpertList(): void {
     this.isLoadingExperts.set(true);
-    this.api.getExperts('worker').subscribe({
+    this.api.getExperts('worker', {showAll: this.showAllExperts()}).subscribe({
       next: (experts) => {
         this.experts.set(experts);
         this.applyEffectiveDefault();
@@ -1284,7 +1315,20 @@ export class JobCreateComponent implements OnInit {
       },
       error: () => { this.isLoadingExperts.set(false); },
     });
-    this.loadEffectiveDefault();
+  }
+
+  setShowAllExperts(value: boolean): void {
+    if (value === this.showAllExperts()) return;
+    this.showAllExperts.set(value);
+    this.loadExpertList();
+  }
+
+  /** Tags worth showing on a card: everything but this picker's own role —
+   *  every worker expert carries `worker` since U1, which would just be noise
+   *  here, while another role's tag (visible under "Show all") is the one
+   *  thing that tells the two apart. */
+  pickerTags(expert: Expert): string[] {
+    return (expert.tags ?? []).filter((t) => t !== 'worker');
   }
 
   private loadEffectiveDefault(): void {

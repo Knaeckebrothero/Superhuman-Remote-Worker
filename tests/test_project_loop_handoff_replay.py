@@ -10,16 +10,16 @@ from uuid import uuid4
 
 import pytest
 
-import main
-from services.completion_finalizer import (
+import orchestrator.main
+from orchestrator.services.completion_finalizer import (
     EFFECT_DETAIL_LIMIT_BYTES,
     _bounded_effect_detail,
 )
-from services.project_loop_atomic import (
+from orchestrator.services.project_loop_atomic import (
     ProjectLoopHandoffAuthorityLost,
     plan_loop_advance,
 )
-from services.project_loop_sweeper import _sweep_tick
+from orchestrator.services.project_loop_sweeper import _sweep_tick
 
 
 def _marker_job(output, *, state="pending", result=None, command_id=None):
@@ -38,7 +38,9 @@ def _marker_job(output, *, state="pending", result=None, command_id=None):
 
 
 def test_handoff_retry_error_output_bounds_multibyte_provider_diagnostic():
-    output = main._project_loop_handoff_error_output(RuntimeError("界" * 20_000))
+    output = orchestrator.main._project_loop_handoff_error_output(
+        RuntimeError("界" * 20_000)
+    )
 
     assert output["actions"] == []
     assert len(output["error"].encode("utf-8")) <= 1024
@@ -54,10 +56,13 @@ async def test_done_predecessor_marker_replays_without_external_tail(monkeypatch
     db = AsyncMock()
     db.get_job.return_value = job
     tail = AsyncMock(side_effect=AssertionError("external tail must not replay"))
-    monkeypatch.setattr(main, "postgres_db", db)
-    monkeypatch.setattr(main, "_handoff_atomic_project_loop_advance", tail)
+    monkeypatch.setattr(orchestrator.main, "postgres_db", db)
+    monkeypatch.setattr(orchestrator.main, "_handoff_atomic_project_loop_advance", tail)
 
-    assert await main._execute_persisted_project_loop_handoff(job, output) == stored
+    assert (
+        await orchestrator.main._execute_persisted_project_loop_handoff(job, output)
+        == stored
+    )
     tail.assert_not_awaited()
     db.finish_project_loop_handoff.assert_not_awaited()
 
@@ -73,16 +78,22 @@ async def test_pending_marker_settles_only_after_full_tail(monkeypatch):
     db.renew_project_loop_handoff.return_value = True
     db.finish_project_loop_handoff.return_value = result
     tail = AsyncMock(return_value=result)
-    monkeypatch.setattr(main, "postgres_db", db)
-    monkeypatch.setattr(main, "_handoff_atomic_project_loop_advance", tail)
+    monkeypatch.setattr(orchestrator.main, "postgres_db", db)
+    monkeypatch.setattr(orchestrator.main, "_handoff_atomic_project_loop_advance", tail)
 
-    assert await main._execute_persisted_project_loop_handoff(job, output) == result
+    assert (
+        await orchestrator.main._execute_persisted_project_loop_handoff(job, output)
+        == result
+    )
     tail.assert_awaited_once_with(job, output, authority_check=ANY)
     claim = db.claim_project_loop_handoff.await_args
     assert claim.args == (job["id"],)
     assert claim.kwargs["expected_output"] == output
     assert claim.kwargs["claimant_id"].startswith("project-loop-handoff:")
-    assert claim.kwargs["lease_seconds"] == main._PROJECT_LOOP_HANDOFF_LEASE_SECONDS
+    assert (
+        claim.kwargs["lease_seconds"]
+        == orchestrator.main._PROJECT_LOOP_HANDOFF_LEASE_SECONDS
+    )
     finish = db.finish_project_loop_handoff.await_args
     assert finish.args == (job["id"],)
     assert finish.kwargs == {
@@ -120,15 +131,15 @@ async def test_two_commandless_sweepers_share_one_leased_external_tail(monkeypat
         return result
 
     tail = AsyncMock(side_effect=slow_tail)
-    monkeypatch.setattr(main, "postgres_db", db)
-    monkeypatch.setattr(main, "_handoff_atomic_project_loop_advance", tail)
+    monkeypatch.setattr(orchestrator.main, "postgres_db", db)
+    monkeypatch.setattr(orchestrator.main, "_handoff_atomic_project_loop_advance", tail)
 
     first = asyncio.create_task(
-        main._execute_persisted_project_loop_handoff(job, output)
+        orchestrator.main._execute_persisted_project_loop_handoff(job, output)
     )
     await entered.wait()
     with pytest.raises(RuntimeError, match="another live claimant"):
-        await main._execute_persisted_project_loop_handoff(job, output)
+        await orchestrator.main._execute_persisted_project_loop_handoff(job, output)
     release.set()
     assert await first == result
     tail.assert_awaited_once_with(job, output, authority_check=ANY)
@@ -186,17 +197,23 @@ async def test_lease_loss_after_first_consequence_stops_tail_and_keeps_caller_al
     ttl = AsyncMock()
     notify = AsyncMock()
     dispatch = MagicMock()
-    monkeypatch.setattr(main, "postgres_db", db)
-    monkeypatch.setattr(main, "vector_db", MagicMock())
-    monkeypatch.setattr(main, "_record_loop_job_outcome", first_consequence)
-    monkeypatch.setattr(main, "_notify_loop_user_questions", user_questions)
-    monkeypatch.setattr(main, "_decrement_project_loop_kb_ttl_once", ttl)
-    monkeypatch.setattr(main, "_notify_loop_event", notify)
-    monkeypatch.setattr(main, "_trigger_dispatch", dispatch)
-    monkeypatch.setattr("services.job_provisioning.provision_job_repo", provision)
+    monkeypatch.setattr(orchestrator.main, "postgres_db", db)
+    monkeypatch.setattr(orchestrator.main, "vector_db", MagicMock())
+    monkeypatch.setattr(
+        orchestrator.main, "_record_loop_job_outcome", first_consequence
+    )
+    monkeypatch.setattr(
+        orchestrator.main, "_notify_loop_user_questions", user_questions
+    )
+    monkeypatch.setattr(orchestrator.main, "_decrement_project_loop_kb_ttl_once", ttl)
+    monkeypatch.setattr(orchestrator.main, "_notify_loop_event", notify)
+    monkeypatch.setattr(orchestrator.main, "_trigger_dispatch", dispatch)
+    monkeypatch.setattr(
+        "orchestrator.services.job_provisioning.provision_job_repo", provision
+    )
 
     with pytest.raises(ProjectLoopHandoffAuthorityLost, match="lease was lost"):
-        await main._execute_persisted_project_loop_handoff(origin, output)
+        await orchestrator.main._execute_persisted_project_loop_handoff(origin, output)
 
     first_consequence.assert_awaited_once()
     user_questions.assert_not_awaited()
@@ -214,8 +231,13 @@ async def test_lease_loss_after_first_consequence_stops_tail_and_keeps_caller_al
     db.renew_project_loop_handoff.side_effect = None
     db.renew_project_loop_handoff.return_value = True
     db.finish_project_loop_handoff.return_value = settled
-    monkeypatch.setattr(main, "_handoff_atomic_project_loop_advance", next_tail)
-    assert await main._execute_persisted_project_loop_handoff(origin, output) == settled
+    monkeypatch.setattr(
+        orchestrator.main, "_handoff_atomic_project_loop_advance", next_tail
+    )
+    assert (
+        await orchestrator.main._execute_persisted_project_loop_handoff(origin, output)
+        == settled
+    )
     next_tail.assert_awaited_once_with(origin, output, authority_check=ANY)
 
 
@@ -257,17 +279,25 @@ async def test_expired_or_parked_route_nudges_then_sweeper_synthesizes(
     prepare = AsyncMock(return_value=prepared)
     materialize = AsyncMock(return_value=output)
     handoff = AsyncMock(return_value={"actions": ["next stage"]})
-    monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", True)
-    monkeypatch.setattr(main, "postgres_db", db)
-    monkeypatch.setattr(main, "_get_completion_sweep_router", lambda: router)
-    monkeypatch.setattr(main, "_prepare_atomic_project_loop_advance", prepare)
-    monkeypatch.setattr(main, "_materialize_prepared_project_loop_advance", materialize)
-    monkeypatch.setattr(main, "_execute_persisted_project_loop_handoff", handoff)
+    monkeypatch.setattr(orchestrator.main, "COMPLETION_COMMANDS_ENABLED", True)
+    monkeypatch.setattr(orchestrator.main, "postgres_db", db)
+    monkeypatch.setattr(
+        orchestrator.main, "_get_completion_sweep_router", lambda: router
+    )
+    monkeypatch.setattr(
+        orchestrator.main, "_prepare_atomic_project_loop_advance", prepare
+    )
+    monkeypatch.setattr(
+        orchestrator.main, "_materialize_prepared_project_loop_advance", materialize
+    )
+    monkeypatch.setattr(
+        orchestrator.main, "_execute_persisted_project_loop_handoff", handoff
+    )
 
     assert (
         await _sweep_tick(
             db,
-            main._advance_project_loop,
+            orchestrator.main._advance_project_loop,
             completion_commands_enabled=True,
         )
         == 1
@@ -290,11 +320,15 @@ async def test_main_loop_synthesizer_stands_down_on_live_route(monkeypatch):
         )
     )
     prepare = AsyncMock()
-    monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", True)
-    monkeypatch.setattr(main, "_get_completion_sweep_router", lambda: router)
-    monkeypatch.setattr(main, "_prepare_atomic_project_loop_advance", prepare)
+    monkeypatch.setattr(orchestrator.main, "COMPLETION_COMMANDS_ENABLED", True)
+    monkeypatch.setattr(
+        orchestrator.main, "_get_completion_sweep_router", lambda: router
+    )
+    monkeypatch.setattr(
+        orchestrator.main, "_prepare_atomic_project_loop_advance", prepare
+    )
 
-    await main._advance_project_loop(job, {}, [])
+    await orchestrator.main._advance_project_loop(job, {}, [])
 
     router.enqueue_job.assert_awaited_once_with(
         member_id, source="project_loop_advance"
@@ -317,10 +351,12 @@ async def test_commandless_reconciler_uses_full_persisted_output(monkeypatch):
     db = AsyncMock()
     db.list_pending_project_loop_handoffs.return_value = [origin]
     execute = AsyncMock(return_value={"actions": []})
-    monkeypatch.setattr(main, "postgres_db", db)
-    monkeypatch.setattr(main, "_execute_persisted_project_loop_handoff", execute)
+    monkeypatch.setattr(orchestrator.main, "postgres_db", db)
+    monkeypatch.setattr(
+        orchestrator.main, "_execute_persisted_project_loop_handoff", execute
+    )
 
-    assert await main._reconcile_atomic_project_loop_handoff() == 1
+    assert await orchestrator.main._reconcile_atomic_project_loop_handoff() == 1
     execute.assert_awaited_once_with(origin, output)
 
 
@@ -336,11 +372,15 @@ async def test_command_owned_reconciler_routes_finalizer_never_parallel_tail(
         route_job=AsyncMock(return_value=SimpleNamespace(legacy=False))
     )
     execute = AsyncMock()
-    monkeypatch.setattr(main, "postgres_db", db)
-    monkeypatch.setattr(main, "_get_completion_sweep_router", lambda: router)
-    monkeypatch.setattr(main, "_execute_persisted_project_loop_handoff", execute)
+    monkeypatch.setattr(orchestrator.main, "postgres_db", db)
+    monkeypatch.setattr(
+        orchestrator.main, "_get_completion_sweep_router", lambda: router
+    )
+    monkeypatch.setattr(
+        orchestrator.main, "_execute_persisted_project_loop_handoff", execute
+    )
 
-    assert await main._reconcile_atomic_project_loop_handoff() == 0
+    assert await orchestrator.main._reconcile_atomic_project_loop_handoff() == 0
     router.route_job.assert_awaited_once_with(
         origin["id"], source="project_loop_handoff"
     )
@@ -382,18 +422,20 @@ async def test_response_lost_provisioning_replays_exact_persisted_ids(monkeypatc
         provisioned.add(str(job_row["id"]))
         return job_row
 
-    monkeypatch.setattr(main, "postgres_db", db)
-    monkeypatch.setattr(main, "vector_db", None)
-    monkeypatch.setattr(main, "_record_loop_job_outcome", AsyncMock())
-    monkeypatch.setattr(main, "_trigger_dispatch", MagicMock())
-    monkeypatch.setattr("services.job_provisioning.provision_job_repo", provision_once)
+    monkeypatch.setattr(orchestrator.main, "postgres_db", db)
+    monkeypatch.setattr(orchestrator.main, "vector_db", None)
+    monkeypatch.setattr(orchestrator.main, "_record_loop_job_outcome", AsyncMock())
+    monkeypatch.setattr(orchestrator.main, "_trigger_dispatch", MagicMock())
+    monkeypatch.setattr(
+        "orchestrator.services.job_provisioning.provision_job_repo", provision_once
+    )
 
     # Models crash/response loss after provisioning but before the predecessor
     # marker/effect acknowledgment. The retry targets the same committed ID.
-    await main._handoff_atomic_project_loop_advance(
+    await orchestrator.main._handoff_atomic_project_loop_advance(
         {"id": member_id, "context": {}}, output
     )
-    await main._handoff_atomic_project_loop_advance(
+    await orchestrator.main._handoff_atomic_project_loop_advance(
         {"id": member_id, "context": {}}, output
     )
     assert provisioned == {successor_id}
@@ -469,15 +511,15 @@ async def test_multibyte_campaign_replay_and_final_action_are_bounded(monkeypatc
     db = AsyncMock()
     db.get_project_loop.return_value = {**loop, "project_id": None, "owner_id": None}
     db.get_job.return_value = successor
-    monkeypatch.setattr(main, "postgres_db", db)
-    monkeypatch.setattr(main, "vector_db", None)
-    monkeypatch.setattr(main, "_record_loop_job_outcome", AsyncMock())
-    monkeypatch.setattr(main, "_trigger_dispatch", MagicMock())
+    monkeypatch.setattr(orchestrator.main, "postgres_db", db)
+    monkeypatch.setattr(orchestrator.main, "vector_db", None)
+    monkeypatch.setattr(orchestrator.main, "_record_loop_job_outcome", AsyncMock())
+    monkeypatch.setattr(orchestrator.main, "_trigger_dispatch", MagicMock())
     monkeypatch.setattr(
-        "services.job_provisioning.provision_job_repo",
+        "orchestrator.services.job_provisioning.provision_job_repo",
         AsyncMock(return_value=successor),
     )
-    projected = await main._handoff_atomic_project_loop_advance(
+    projected = await orchestrator.main._handoff_atomic_project_loop_advance(
         {"id": member_id, "context": {}}, output
     )
     assert projected["actions"]

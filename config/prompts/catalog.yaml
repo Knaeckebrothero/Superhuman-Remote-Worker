@@ -23,7 +23,12 @@
   title: "Expert persona / identity"
   description: >-
     Injected as {expert_identity} on every call. Defines who the agent is and
-    how it thinks.
+    how it thinks. Plain role prose only: the framework's own placeholders
+    ({agent_display_name}, {expert_identity}, {available_skills},
+    {subagent_environment}, {prompt_content}, {phase_number}) are reserved for
+    the prompt assembler and are rejected on save. A persona is a value the
+    assembler substitutes IN, never a template it renders, so a placeholder
+    written here would never expand. Write the agent's name literally.
 - kind: prompts
   name: summarization
   group: "Prompts · all agents"
@@ -32,22 +37,8 @@
     Used when the conversation is compacted to free context. Runs in both worker
     and persistent modes.
 
-# --- Prompts · worker (job) agents only ---------------------------------------
-# src/graph.py alternates these two each phase; persistent sessions never use
-# them.
-- kind: prompts
-  name: strategic
-  group: "Prompts · worker (jobs)"
-  title: "Strategic-phase directive"
-  description: "Appended during strategic (planning / reflection) phases."
-- kind: prompts
-  name: tactical
-  group: "Prompts · worker (jobs)"
-  title: "Tactical-phase directive"
-  description: "Appended during tactical (execution) phases."
-
 # --- Prompts · persistent (session) agents only -------------------------------
-# src/persistent_graph.py has no phases; this single prompt is the persistent-
+# src/agent/persistent_graph.py has no phases; this single prompt is the persistent-
 # mode counterpart to the worker's strategic/tactical directives.
 - kind: prompts
   name: systemprompt_interactive
@@ -58,9 +49,21 @@
     every turn. Resolves to a model-family variant
     (systemprompt_interactive_<family>.txt) where one exists, else the base file.
 
+# --- Prompts · headless child agents only ------------------------------------
+# Framework-owned like systemprompt_interactive: editable as a global prompt,
+# never accepted in an expert's prompts payload. Per-type identity is persona.txt.
+- kind: prompts
+  name: systemprompt_subagent
+  group: "Prompts · subagents"
+  title: "Subagent system prompt"
+  description: >-
+    The single framework prompt used by every headless child session. The
+    roster entry's persona and spawn-specific environment are injected into
+    it; there are no model-family variants.
+
 # --- Instructions · worker (job) agents only ----------------------------------
 # Workspace scaffolding + the strategic todo/phase system. Persistent sessions
-# use none of these (no phases, no todos); src/persistent_graph.py never loads
+# use none of these (no phases, no todos); src/agent/persistent_graph.py never loads
 # them. Resolved via InstructionMatrixResolver, so model-family variants apply
 # (e.g. instructions_minimax.md, strategic_todos_transition_gpt_oss.yaml). The vestigial
 # workspace_template.md is intentionally not exposed — workspace.md was removed.
@@ -137,7 +140,7 @@
   description: "Token count at which summarization / compaction is triggered."
 # limits.summarization_safe_limit was removed 2026-06-12: summarization
 # budgets are computed at call time from the auxiliary model's own window
-# (src/core/summarizer.py), not configured per main-model family.
+# (src/agent/core/summarizer.py), not configured per main-model family.
 
 # --- Guardrails (tool examples + nudges) --------------------------------------
 - kind: guardrails

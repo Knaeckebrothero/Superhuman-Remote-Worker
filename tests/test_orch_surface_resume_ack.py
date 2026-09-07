@@ -27,7 +27,7 @@ import json
 import httpx
 import pytest
 
-from src.shared.orch_surface.client import AsyncCockpitClient, SessionConfigDriftError
+from shared.orch_surface.client import AsyncCockpitClient, SessionConfigDriftError
 
 RESUME_URL = "http://orchestrator.test/api/persistent/threads/t1/resume"
 

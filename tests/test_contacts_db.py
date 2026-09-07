@@ -3,9 +3,9 @@
 Run:  podman run -d --rm --name contacts-pg -e POSTGRES_USER=srw \
         -e POSTGRES_PASSWORD=t -e POSTGRES_DB=srw -p 5433:5432 \
         docker.io/library/postgres:16
-      PYTHONPATH=orchestrator python orchestrator/database/migrate.py \
+      python -m orchestrator.database.migrate \
         --database-url postgresql://srw:t@localhost:5433/srw \
-        --dir orchestrator/database/migrations/app
+        --dir src/orchestrator/database/migrations/app
       CONTACTS_TEST_DSN=postgresql://srw:t@localhost:5433/srw \
         python -m pytest tests/test_contacts_db.py -v
 """

@@ -49,11 +49,11 @@ Every todo must be specific enough to act on immediately.
 | Phase | Vague (fails) | Execution-ready (works) |
 |---|---|---|
 | spec | "Define the requirements" | "Interview user about magic-link TTL extension via kb_search of related decisions. Produce spec.yaml with 2-4 EARS acceptance criteria covering: (1) link click resets deadline, (2) watchdog skips awaiting threads. Each AC has an ID and test_oracle path. Lock spec into spec_lock.md `## Acceptance Criteria` section." |
-| red | "Write tests for the feature" | "Write failing test for AC-1 in repo/tests/test_persistent_ttl.py::test_magic_link_extends_deadline. Cover: thread in awaiting_user state, magic_link_clicked event arrives, awaiting_user_deadline must equal now + ttl_default. Follow fixture style from repo/tests/test_persistent_chat.py. Run `pytest tests/test_persistent_ttl.py::test_magic_link_extends_deadline -x -v` — confirm AssertionError, NOT ImportError." |
-| red | "Add a test for the bug" | "Write regression test for AC-3 (auth bypass on empty session) in repo/tests/test_auth.py::test_empty_session_rejected. Cover: empty string session token returns 401. Follow style from repo/tests/test_auth.py::test_invalid_token. Run `pytest tests/test_auth.py::test_empty_session_rejected -x -v` — must fail with assertion mismatch on status code." |
-| green | "Implement the endpoint" | "Make AC-1 test pass: in repo/src/persistent/lifecycle.py:handle_event, add MagicLinkClicked branch that sets thread.awaiting_user_deadline = now() + ttl_default. Reference pattern: repo/src/persistent/lifecycle.py:handle_idle. Forbidden: editing tests/. Run `pytest tests/test_persistent_ttl.py -x` — must go red → green; then `pytest tests/ -x` — full suite stays green." |
-| green | "Fix the bug" | "Make AC-3 test pass: in repo/src/auth/login.py:45, add guard `if not session_token: return Response(status=401)` before token validation. Run `pytest tests/test_auth.py::test_empty_session_rejected -x` — must turn green; `pytest tests/test_auth.py -x` — no other tests turn red." |
-| refactor | "Clean up the code" | "Extract MagicLinkClicked handler from repo/src/persistent/lifecycle.py into repo/src/persistent/handlers/magic_link.py. Behavior identical. Update import in lifecycle.py. Run `pytest tests/ -x` — every previously-green test stays green." |
+| red | "Write tests for the feature" | "Write failing test for AC-1 in repos/<name>/tests/test_persistent_ttl.py::test_magic_link_extends_deadline. Cover: thread in awaiting_user state, magic_link_clicked event arrives, awaiting_user_deadline must equal now + ttl_default. Follow fixture style from repos/<name>/tests/test_persistent_chat.py. Run `pytest tests/test_persistent_ttl.py::test_magic_link_extends_deadline -x -v` — confirm AssertionError, NOT ImportError." |
+| red | "Add a test for the bug" | "Write regression test for AC-3 (auth bypass on empty session) in repos/<name>/tests/test_auth.py::test_empty_session_rejected. Cover: empty string session token returns 401. Follow style from repos/<name>/tests/test_auth.py::test_invalid_token. Run `pytest tests/test_auth.py::test_empty_session_rejected -x -v` — must fail with assertion mismatch on status code." |
+| green | "Implement the endpoint" | "Make AC-1 test pass: in repos/<name>/src/persistent/lifecycle.py:handle_event, add MagicLinkClicked branch that sets thread.awaiting_user_deadline = now() + ttl_default. Reference pattern: repos/<name>/src/persistent/lifecycle.py:handle_idle. Forbidden: editing tests/. Run `pytest tests/test_persistent_ttl.py -x` — must go red → green; then `pytest tests/ -x` — full suite stays green." |
+| green | "Fix the bug" | "Make AC-3 test pass: in repos/<name>/src/auth/login.py:45, add guard `if not session_token: return Response(status=401)` before token validation. Run `pytest tests/test_auth.py::test_empty_session_rejected -x` — must turn green; `pytest tests/test_auth.py -x` — no other tests turn red." |
+| refactor | "Clean up the code" | "Extract MagicLinkClicked handler from repos/<name>/src/persistent/lifecycle.py into repos/<name>/src/persistent/handlers/magic_link.py. Behavior identical. Update import in lifecycle.py. Run `pytest tests/ -x` — every previously-green test stays green." |
 
 ### What Makes an Execution-Ready Todo
 
@@ -91,8 +91,8 @@ Example todos:
 Purpose: For each AC, write a test that fails for the right reason (AssertionError, not ImportError).
 
 Example todos:
-- "Write failing test for AC-1 in repo/tests/<area>/test_<feature>.py::test_<behavior>. Cover: <Given> <When> <Then>. Follow fixture style from repo/tests/<neighbor>. Run `pytest tests/<area>/test_<feature>.py::test_<behavior> -x -v` — confirm AssertionError."
-- "Write failing test for AC-2 boundary case in repo/tests/<area>/test_<feature>.py::test_<boundary>. Cover: empty input returns <expected error>. Run `pytest tests/<area>/test_<feature>.py::test_<boundary> -x -v` — confirm AssertionError."
+- "Write failing test for AC-1 in repos/<name>/tests/<area>/test_<feature>.py::test_<behavior>. Cover: <Given> <When> <Then>. Follow fixture style from repos/<name>/tests/<neighbor>. Run `pytest tests/<area>/test_<feature>.py::test_<behavior> -x -v` — confirm AssertionError."
+- "Write failing test for AC-2 boundary case in repos/<name>/tests/<area>/test_<feature>.py::test_<boundary>. Cover: empty input returns <expected error>. Run `pytest tests/<area>/test_<feature>.py::test_<boundary> -x -v` — confirm AssertionError."
 - "Update traceability matrix: AC-1 and AC-2 status → `red`. Verify all in-scope AC now have an entry."
 
 ### 3. Green Phase (minimum implementation)
@@ -100,8 +100,8 @@ Example todos:
 Purpose: Make the failing tests pass with the minimum implementation. No speculative features.
 
 Example todos:
-- "Make AC-1 test pass: in repo/src/<file>:<function>, [minimum change]. Reference pattern: repo/src/<neighbor>. Forbidden: editing tests/. Run `pytest tests/<file>::<test> -x` — confirm red → green; `pytest tests/ -x` — full suite stays green."
-- "Make AC-2 test pass: in repo/src/<file>:<function>, [minimum change]. Run `pytest tests/<file>::<test> -x`."
+- "Make AC-1 test pass: in repos/<name>/src/<file>:<function>, [minimum change]. Reference pattern: repos/<name>/src/<neighbor>. Forbidden: editing tests/. Run `pytest tests/<file>::<test> -x` — confirm red → green; `pytest tests/ -x` — full suite stays green."
+- "Make AC-2 test pass: in repos/<name>/src/<file>:<function>, [minimum change]. Run `pytest tests/<file>::<test> -x`."
 - "Update traceability matrix: AC-1 and AC-2 status → `green`. Run full project suite from spec.yaml done_when[0]."
 
 ### 4. Refactor Phase (optional — only when green and structure needs work)
@@ -110,7 +110,7 @@ Purpose: Improve code quality while keeping all tests green.
 
 Example todos:
 - "Run full test suite (`pytest tests/ -x -v`) and record baseline — must be all green before refactoring. Save baseline output to archive/phase_N_baseline.txt."
-- "Extract <logic> from repo/src/<file> into repo/src/<new_file>. Update imports in callers. Run `pytest tests/ -x` — every previously-green test stays green."
+- "Extract <logic> from repos/<name>/src/<file> into repos/<name>/src/<new_file>. Update imports in callers. Run `pytest tests/ -x` — every previously-green test stays green."
 - "Verify via git diff: only structural changes, no behavior changes, no edits under tests/."
 
 ### 5. Integration Phase (PR / commit)
@@ -119,7 +119,11 @@ Purpose: Package the work for review.
 
 Example todos:
 - "Review all changes via `git diff` against the job's first commit (the \"[Phase 0 Seed]\" commit from `git log`). Confirm scope matches spec.yaml feature and respects not_included."
+{% if has_tool("repo_open_pr") -%}
+- "Deliver via the repo tools on repos/<name>/ (name + base branch from README.md): repo_checkout(repo=<name>, branch=<feature-branch>, create=True) unless already on it; repo_commit(repo=<name>, message=`feat: <feature> (AC-1, AC-2, ...)`); repo_push(repo=<name>); repo_open_pr(repo=<name>, title=<feature>, base=<base branch>, body=<AC list + done_when evidence>). Do not merge — the job goes to review with the PR open."
+{% else -%}
 - "Stage and commit with message `feat: <feature> (AC-1, AC-2, ...)`. Push to origin <branch>."
+{% endif -%}
 - "Verify via `git log` and `git status`: commit landed, branch clean."
 
 ### 6. Bug Fix Variant (red → green within one feature)
@@ -153,7 +157,7 @@ For GREEN phase:
 **Evidence-based completion.** Todo notes should include concrete evidence:
 - Bad: "Implemented the feature, tests pass"
 - Good red: "Added tests/test_persistent_ttl.py::test_extends (35 lines). pytest output: `FAILED tests/test_persistent_ttl.py::test_extends - AssertionError: 0 != 600`. AC-1 → red."
-- Good green: "Modified repo/src/persistent/lifecycle.py:handle_event (+8 lines). pytest output: `tests/test_persistent_ttl.py::test_extends PASSED`. Full suite `pytest tests/ -x`: 142 passed, 0 failed. AC-1 → green."
+- Good green: "Modified repos/<name>/src/persistent/lifecycle.py:handle_event (+8 lines). pytest output: `tests/test_persistent_ttl.py::test_extends PASSED`. Full suite `pytest tests/ -x`: 142 passed, 0 failed. AC-1 → green."
 
 ---
 

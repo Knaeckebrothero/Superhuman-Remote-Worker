@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from src.shared.pinned_session_identity import PinnedSessionBinding
+from shared.pinned_session_identity import PinnedSessionBinding
 
 
 THREAD_ID = "11111111-1111-4111-8111-111111111111"
@@ -60,6 +60,7 @@ def _binding(
         agent_id=AGENT_ID,
         runtime_attach_token=ATTACH_TOKEN,
         agent_hostname=hostname,
+        pod_namespace="srw",
         pod_uid=pod_uid,
         pod_ip=pod_ip,
         pod_port=pod_port,
@@ -90,7 +91,7 @@ def _install_fake_main(monkeypatch, **overrides) -> types.ModuleType:
     triggering the real ``main.py`` side-effect chain (license gate, agent
     provisioner connect, etc.).
     """
-    stub = types.ModuleType("main")
+    stub = types.ModuleType("orchestrator.main")
 
     # Defaults — individual tests override via `overrides`.
     fake_db = MagicMock()
@@ -155,14 +156,14 @@ def _install_fake_main(monkeypatch, **overrides) -> types.ModuleType:
     for k, v in overrides.items():
         setattr(stub, k, v)
 
-    monkeypatch.setitem(sys.modules, "main", stub)
+    monkeypatch.setitem(sys.modules, "orchestrator.main", stub)
     return stub
 
 
 def _install_fake_lifecycle_module(monkeypatch, emit_calls: list[dict]):
     """Stub ``services.session_lifecycle`` so the function-under-test's late
     import resolves to our capture helpers."""
-    stub = types.ModuleType("services.session_lifecycle")
+    stub = types.ModuleType("orchestrator.services.session_lifecycle")
 
     def _capture_emit(user_id, thread_id, state, **extra):
         emit_calls.append(
@@ -175,7 +176,7 @@ def _install_fake_lifecycle_module(monkeypatch, emit_calls: list[dict]):
     stub.emit = _capture_emit
     stub.wait_for_ready = AsyncMock(return_value=True)
     stub.wait_for_binding = _bound
-    monkeypatch.setitem(sys.modules, "services.session_lifecycle", stub)
+    monkeypatch.setitem(sys.modules, "orchestrator.services.session_lifecycle", stub)
     return stub
 
 
@@ -193,7 +194,7 @@ async def test_create_path_refetch_treats_stateless_as_ready_without_lifecycle_e
     emit_calls: list[dict] = []
     _install_fake_lifecycle_module(monkeypatch, emit_calls)
 
-    from services.provision_or_assign import provision_or_assign
+    from orchestrator.services.provision_or_assign import provision_or_assign
 
     await provision_or_assign(
         "u1",
@@ -231,7 +232,7 @@ async def test_create_path_refetch_fails_closed_for_missing_or_unknown_lane(
     emit_calls: list[dict] = []
     _install_fake_lifecycle_module(monkeypatch, emit_calls)
 
-    from services.provision_or_assign import provision_or_assign
+    from orchestrator.services.provision_or_assign import provision_or_assign
 
     await provision_or_assign(
         "u1",
@@ -280,7 +281,7 @@ async def test_failed_pool_reservation_refetches_lane_before_pod_fallback(monkey
     emit_calls: list[dict] = []
     _install_fake_lifecycle_module(monkeypatch, emit_calls)
 
-    from services.provision_or_assign import provision_or_assign
+    from orchestrator.services.provision_or_assign import provision_or_assign
 
     await provision_or_assign(
         "u1",
@@ -317,7 +318,7 @@ async def test_idle_pool_attach_emits_provisioning_booting_ready(monkeypatch):
     emit_calls: list[dict] = []
     lifecycle = _install_fake_lifecycle_module(monkeypatch, emit_calls)
 
-    from services.provision_or_assign import provision_or_assign
+    from orchestrator.services.provision_or_assign import provision_or_assign
 
     await provision_or_assign(
         uid="u1",
@@ -384,7 +385,7 @@ async def test_create_path_never_emits_ready_for_a_changed_binding(
     emit_calls: list[dict] = []
     lifecycle = _install_fake_lifecycle_module(monkeypatch, emit_calls)
 
-    from services.provision_or_assign import provision_or_assign
+    from orchestrator.services.provision_or_assign import provision_or_assign
 
     await provision_or_assign(
         uid="u1",
@@ -431,7 +432,7 @@ async def test_create_path_allows_booting_status_lag_after_exact_ready_probe(
     emit_calls: list[dict] = []
     _install_fake_lifecycle_module(monkeypatch, emit_calls)
 
-    from services.provision_or_assign import provision_or_assign
+    from orchestrator.services.provision_or_assign import provision_or_assign
 
     await provision_or_assign(
         uid="u1",
@@ -473,7 +474,7 @@ async def test_create_path_rejects_offline_status_after_exact_ready_probe(monkey
     emit_calls: list[dict] = []
     _install_fake_lifecycle_module(monkeypatch, emit_calls)
 
-    from services.provision_or_assign import provision_or_assign
+    from orchestrator.services.provision_or_assign import provision_or_assign
 
     await provision_or_assign(
         uid="u1",
@@ -512,7 +513,7 @@ async def test_fresh_pod_path_emits_full_sequence(monkeypatch):
     emit_calls: list[dict] = []
     _install_fake_lifecycle_module(monkeypatch, emit_calls)
 
-    from services.provision_or_assign import provision_or_assign
+    from orchestrator.services.provision_or_assign import provision_or_assign
 
     await provision_or_assign(
         uid="u1",
@@ -554,7 +555,7 @@ async def test_fresh_pod_path_waits_when_agent_pod_marker_in_flight(monkeypatch)
     emit_calls: list[dict] = []
     _install_fake_lifecycle_module(monkeypatch, emit_calls)
 
-    from services.provision_or_assign import provision_or_assign
+    from orchestrator.services.provision_or_assign import provision_or_assign
 
     await provision_or_assign(
         uid="u1",
@@ -581,7 +582,7 @@ async def test_no_idle_and_provision_fails_emits_failed(monkeypatch):
     emit_calls: list[dict] = []
     _install_fake_lifecycle_module(monkeypatch, emit_calls)
 
-    from services.provision_or_assign import provision_or_assign
+    from orchestrator.services.provision_or_assign import provision_or_assign
 
     await provision_or_assign(
         uid="u1",
@@ -620,7 +621,7 @@ async def test_grant_denied_fails_fast_without_pool_or_pod(monkeypatch):
     emit_calls: list[dict] = []
     _install_fake_lifecycle_module(monkeypatch, emit_calls)
 
-    from services.provision_or_assign import provision_or_assign
+    from orchestrator.services.provision_or_assign import provision_or_assign
 
     await provision_or_assign(
         uid="u1",
@@ -664,7 +665,7 @@ async def test_endpoint_denied_fails_fast_without_pool_or_pod(monkeypatch):
     emit_calls: list[dict] = []
     _install_fake_lifecycle_module(monkeypatch, emit_calls)
 
-    from services.provision_or_assign import provision_or_assign
+    from orchestrator.services.provision_or_assign import provision_or_assign
 
     await provision_or_assign(
         uid="u1",
@@ -695,7 +696,7 @@ async def test_grant_ok_but_endpoint_check_runs(monkeypatch):
     emit_calls: list[dict] = []
     _install_fake_lifecycle_module(monkeypatch, emit_calls)
 
-    from services.provision_or_assign import provision_or_assign
+    from orchestrator.services.provision_or_assign import provision_or_assign
 
     await provision_or_assign(
         uid="u1",
@@ -724,7 +725,7 @@ async def test_already_bound_exits_without_emitting_booting_or_ready(monkeypatch
     emit_calls: list[dict] = []
     _install_fake_lifecycle_module(monkeypatch, emit_calls)
 
-    from services.provision_or_assign import provision_or_assign
+    from orchestrator.services.provision_or_assign import provision_or_assign
 
     await provision_or_assign(
         uid="u1",

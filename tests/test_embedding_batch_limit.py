@@ -21,7 +21,7 @@ import httpx
 import openai
 import pytest
 
-from src.services.embedding_service import (
+from shared.runtime.services.embedding_service import (
     EmbeddingDimensionError,
     EmbeddingInvalidVectorError,
     EmbeddingService,
@@ -84,7 +84,7 @@ def _service(provider: FakeProvider, monkeypatch, cap_env: str | None = None):
 @pytest.fixture(autouse=True)
 def _instant_retry_sleep(monkeypatch):
     """Retry backoff must not slow the suite down."""
-    import src.core.llm_retry as llm_retry
+    import shared.runtime.core.llm_retry as llm_retry
 
     async def _no_sleep(_delay):
         return None
@@ -234,7 +234,7 @@ class TestEngineEmbeddingState:
     """CitationEngine persists typed per-source state (fix 5)."""
 
     def _engine(self):
-        from src.citation_engine.engine import CitationEngine
+        from agent.citation_engine.engine import CitationEngine
 
         engine = object.__new__(CitationEngine)
         engine.db = MagicMock()
@@ -243,7 +243,7 @@ class TestEngineEmbeddingState:
         return engine
 
     def test_classify_embed_failure_types(self):
-        from src.citation_engine.engine import CitationEngine
+        from agent.citation_engine.engine import CitationEngine
 
         classify = CitationEngine._classify_embed_failure
         assert classify(EmbeddingInvalidVectorError("nan")) == "invalid_vector"

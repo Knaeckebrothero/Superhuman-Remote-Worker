@@ -10,7 +10,7 @@
 #      list deletion make layers non-deterministic and kill BuildKit's
 #      cache on warm rebuilds. See knowledge-base/knowledge/features/tilt_inner_loop_dev.md
 #      for the full diagnosis.
-#   2. **watchfiles wrapper instead of plain `python run.py`** — Tilt's
+#   2. **watchfiles wrapper instead of plain `python -m mcp_server`** — Tilt's
 #      live_update sync drops new files into /app, and `watchfiles`
 #      restarts the FastMCP process. ~5 s edit-to-new-code vs ~15-30 s
 #      for a full image rebuild + pod roll.
@@ -30,6 +30,7 @@ LABEL maintainer="SRW Team"
 LABEL description="MCP Server (Tilt dev image)"
 
 ENV PYTHONUNBUFFERED=1 \
+    PYTHONSAFEPATH=1 \
     PYTHONDONTWRITEBYTECODE=1
 
 RUN groupadd -r srw && useradd -r -g srw srw
@@ -43,7 +44,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends curl
 
 # Install MCP deps. Drop --no-cache-dir so pip uses the cache mount.
-COPY orchestrator/mcp/requirements.txt .
+COPY src/mcp_server/requirements.txt .
 RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     pip install -r requirements.txt
 
@@ -56,15 +57,13 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
 
 # Source code LAST. live_update will sync these paths into the running
 # container without a rebuild for ordinary edits.
-COPY --chown=srw:srw orchestrator/mcp/ ./
-# Shared orchestrator-surface package (REST client + formatters), imported by
-# server.py as src.shared.orch_surface — the same path the repo layout uses.
+COPY --chown=srw:srw src/mcp_server/ ./src/mcp_server/
 COPY --chown=srw:srw src/shared/ ./src/shared/
-# Shared trusted-origin response boundary used by the optional OAuth pages.
-COPY --chown=srw:srw orchestrator/security/__init__.py ./security/__init__.py
-COPY --chown=srw:srw orchestrator/security/anti_framing.py ./security/anti_framing.py
+COPY --chown=srw:srw pyproject.toml ./
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    pip install --no-deps -e .
 
-# /app and /app/services are created by COPY/WORKDIR with root ownership;
+# /app and its package directories are created with root ownership;
 # `USER srw` then can't write into them, which kills Tilt's live_update
 # sync (it needs to land synced files inside /app and may create temp
 # files in /app/ itself). Chown the tree so srw owns it end-to-end.
@@ -83,4 +82,4 @@ EXPOSE 8000
 # watchfiles signature: `watchfiles <python-callable-or-shell-cmd> <path-to-watch>`
 # Passing `--filter python` and the watch path /app keeps the watcher
 # scope tight to .py file changes under the synced source tree.
-CMD ["watchfiles", "--filter", "python", "python run.py", "/app"]
+CMD ["watchfiles", "--filter", "python", "python -m mcp_server", "/app"]

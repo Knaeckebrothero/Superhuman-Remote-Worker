@@ -798,6 +798,24 @@ spec:
       - "X-CSRF"
       # X-Admin-View-As: set by the cockpit view-as interceptor for admin view-as.
       - "X-Admin-View-As"
+      # ngsw-bypass: set by auth.interceptor.ts on every non-safe (mutating)
+      # orchestrator request so the Angular service worker hands it to the
+      # browser untouched (bd31e072 — the SW re-issue corrupts multipart
+      # uploads). Cross-origin cockpit/api (real prod, where cockpit and api
+      # are sibling subdomains — see `sameOriginApi`'s doc comment above)
+      # sends this on the CORS preflight for POST/PUT/PATCH/DELETE, and
+      # without it here every one of those requests was silently rejected by
+      # the browser before reaching the orchestrator at all. Found live via
+      # task-7-brief.md's SSH gate: `POST /api/ssh-keys/challenge` failed
+      # with "Request header field ngsw-bypass is not allowed by
+      # Access-Control-Allow-Headers in preflight response" the moment
+      # `sameOriginApi` was turned off to match this deployment's ssh-gateway
+      # ingress host — i.e. this was already broken for any real deployment
+      # that uses cross-origin cockpit/api hosts (the chart's own default),
+      # not just this gate. Nothing upstream of the browser logs a CORS
+      # preflight rejection, so there is no server-side signal this ever
+      # fires — grep for `ngsw-bypass` before removing either side.
+      - "ngsw-bypass"
     accessControlAllowOriginList:
       - {{ include "srw.cockpitUrl" . | quote }}
       {{- range .Values.ingress.cors.additionalOrigins | default list }}

@@ -26,16 +26,19 @@ import io
 import json
 import tarfile
 from contextlib import ExitStack
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
 
-import main
-from services.cloud.protected_reader_authority import (
+import orchestrator.main
+from orchestrator.services.cloud.protected_reader_authority import (
     ProtectedNextcloudReaderGrantPlan,
 )
-from services.cloud_staging.source_identity import ProtectedMountSourceIdentity
+from orchestrator.services.cloud_staging.source_identity import (
+    ProtectedMountSourceIdentity,
+)
 from tests.cloud.fake import FakeMainCloudBackend
 
 THREAD_ID = "thread-cd-1"
@@ -173,10 +176,21 @@ def _thread_mounts_row(*, mountpoint="MyProject", cloud_handle="proj-1") -> dict
 def _snapshot_service(blobs: dict[str, bytes] | None = None):
     svc = MagicMock()
 
-    async def _get_blob(key):
-        return (blobs or {}).get(key)
+    async def _get_blob(key, *, max_bytes=None):
+        blob = (blobs or {}).get(key)
+        if blob is not None and max_bytes is not None and len(blob) > max_bytes:
+            return None
+        return blob
+
+    async def _download_blob_file(key, local_path, *, max_bytes):
+        blob = (blobs or {}).get(key)
+        if blob is None or len(blob) > max_bytes:
+            return False
+        Path(local_path).write_bytes(blob)
+        return True
 
     svc.get_blob = AsyncMock(side_effect=_get_blob)
+    svc.download_blob_file = AsyncMock(side_effect=_download_blob_file)
     return svc
 
 
@@ -200,26 +214,34 @@ def _patch_endpoint(
     stack = ExitStack()
     if require_thread_owner_result is not None:
         stack.enter_context(
-            patch("main.require_thread_owner", require_thread_owner_result)
+            patch("orchestrator.main.require_thread_owner", require_thread_owner_result)
         )
     else:
         stack.enter_context(
-            patch("main.require_thread_owner", AsyncMock(return_value=(user, thread)))
+            patch(
+                "orchestrator.main.require_thread_owner",
+                AsyncMock(return_value=(user, thread)),
+            )
         )
     db = MagicMock()
     db.get_ro_mount_by_thread = AsyncMock(return_value=ro_mount_row)
     db.list_thread_mounts = AsyncMock(return_value=thread_mounts or [])
-    stack.enter_context(patch("main.postgres_db", db))
+    stack.enter_context(patch("orchestrator.main.postgres_db", db))
     stack.enter_context(
-        patch("main.snapshot_service", snapshot_service or _snapshot_service())
+        patch(
+            "orchestrator.main.snapshot_service",
+            snapshot_service or _snapshot_service(),
+        )
     )
     stack.enter_context(
         patch(
-            "main.main_cloud_router",
+            "orchestrator.main.main_cloud_router",
             _cloud_router(backend if backend is not None else FakeMainCloudBackend()),
         )
     )
-    stack.enter_context(patch("main._is_protected_cloud_mode_enabled", lambda: True))
+    stack.enter_context(
+        patch("orchestrator.main._is_protected_cloud_mode_enabled", lambda: True)
+    )
     return stack, db
 
 
@@ -264,7 +286,9 @@ class TestCloudDiffSummary:
             snapshot_service=svc,
         )
         with stack:
-            result = await main.get_thread_cloud_diff_summary(THREAD_ID, fake_request)
+            result = await orchestrator.main.get_thread_cloud_diff_summary(
+                THREAD_ID, fake_request
+            )
 
         assert result == {
             "thread_id": THREAD_ID,
@@ -290,7 +314,9 @@ class TestCloudDiffSummary:
             thread_mounts=[_thread_mounts_row()],
         )
         with stack:
-            result = await main.get_thread_cloud_diff_summary(THREAD_ID, fake_request)
+            result = await orchestrator.main.get_thread_cloud_diff_summary(
+                THREAD_ID, fake_request
+            )
 
         assert result == {
             "thread_id": THREAD_ID,
@@ -307,7 +333,9 @@ class TestCloudDiffSummary:
         thread = _make_thread(protected=False)
         stack, _db = _patch_endpoint(user=user, thread=thread)
         with stack, pytest.raises(HTTPException) as ei:
-            await main.get_thread_cloud_diff_summary(THREAD_ID, fake_request)
+            await orchestrator.main.get_thread_cloud_diff_summary(
+                THREAD_ID, fake_request
+            )
         assert ei.value.status_code == 404
 
     @pytest.mark.asyncio
@@ -343,7 +371,9 @@ class TestCloudDiffSummary:
             snapshot_service=svc,
         )
         with stack:
-            result = await main.get_thread_cloud_diff_summary(THREAD_ID, fake_request)
+            result = await orchestrator.main.get_thread_cloud_diff_summary(
+                THREAD_ID, fake_request
+            )
 
         assert result["epoch"] == 4
         assert result["counts"] == {"added": 0, "modified": 0, "deleted": 1}
@@ -389,7 +419,7 @@ class TestCloudDiffFile:
             backend=backend,
         )
         with stack:
-            result = await main.get_thread_cloud_diff_file(
+            result = await orchestrator.main.get_thread_cloud_diff_file(
                 THREAD_ID, "mod.txt", fake_request
             )
 
@@ -431,7 +461,7 @@ class TestCloudDiffFile:
             snapshot_service=svc,
         )
         with stack, pytest.raises(HTTPException) as ei:
-            await main.get_thread_cloud_diff_file(
+            await orchestrator.main.get_thread_cloud_diff_file(
                 THREAD_ID, "does-not-exist.txt", fake_request
             )
         assert ei.value.status_code == 404
@@ -476,7 +506,9 @@ class TestCloudDiffFile:
             snapshot_service=svc,
         )
         with stack, pytest.raises(HTTPException) as ei:
-            await main.get_thread_cloud_diff_file(THREAD_ID, "mod.txt", fake_request)
+            await orchestrator.main.get_thread_cloud_diff_file(
+                THREAD_ID, "mod.txt", fake_request
+            )
         assert ei.value.status_code == 404
         assert ei.value.detail["code"] == "staged_content_unreadable"
 
@@ -498,37 +530,42 @@ class TestCloudDiffRestage:
             ro_mount_row=row,
         )
         stage_mock = AsyncMock(return_value={"epoch": 1, "counts": {}})
-        main._cloud_stage_tasks.clear()
+        orchestrator.main._cloud_stage_tasks.clear()
         with (
             stack,
-            patch("services.cloud_staging.stage.stage_thread_cloud_diff", stage_mock),
+            patch(
+                "orchestrator.services.cloud_staging.stage.stage_thread_cloud_diff",
+                stage_mock,
+            ),
         ):
-            result = await main.restage_thread_cloud_diff(THREAD_ID, fake_request)
+            result = await orchestrator.main.restage_thread_cloud_diff(
+                THREAD_ID, fake_request
+            )
             assert result == {"scheduled": True}
-            assert len(main._cloud_stage_tasks) == 1
-            task = next(iter(main._cloud_stage_tasks.values()))
+            assert len(orchestrator.main._cloud_stage_tasks) == 1
+            task = next(iter(orchestrator.main._cloud_stage_tasks.values()))
             await task
 
             # Assert inside the patch context: main.postgres_db/snapshot_service
             # are only the patched fakes while ``stack`` is still active.
             call = stage_mock.await_args
             assert call.kwargs["thread_id"] == THREAD_ID
-            assert call.kwargs["postgres_db"] is main.postgres_db
-            assert call.kwargs["snapshot_service"] is main.snapshot_service
+            assert call.kwargs["postgres_db"] is orchestrator.main.postgres_db
+            assert call.kwargs["snapshot_service"] is orchestrator.main.snapshot_service
             assert call.kwargs["authority"]["source_binding_sha256"] == _SOURCE.sha256
-        assert not main._cloud_stage_tasks
+        assert not orchestrator.main._cloud_stage_tasks
 
     @pytest.mark.asyncio
     async def test_restage_409_without_workspace(self, fake_request):
         user = _make_user()
         thread = _make_thread(workspace=False)
         stack, _db = _patch_endpoint(user=user, thread=thread)
-        main._cloud_stage_tasks.clear()
+        orchestrator.main._cloud_stage_tasks.clear()
         with stack, pytest.raises(HTTPException) as ei:
-            await main.restage_thread_cloud_diff(THREAD_ID, fake_request)
+            await orchestrator.main.restage_thread_cloud_diff(THREAD_ID, fake_request)
         assert ei.value.status_code == 409
         assert ei.value.detail == {"code": "no_workspace"}
-        assert THREAD_ID not in main._cloud_stage_tasks
+        assert THREAD_ID not in orchestrator.main._cloud_stage_tasks
 
 
 # --------------------------------------------------------------------------- #
@@ -548,5 +585,7 @@ class TestOwnerAuthPropagation:
             require_thread_owner_result=denied,
         )
         with stack, pytest.raises(HTTPException) as ei:
-            await main.get_thread_cloud_diff_summary(THREAD_ID, fake_request)
+            await orchestrator.main.get_thread_cloud_diff_summary(
+                THREAD_ID, fake_request
+            )
         assert ei.value.status_code == 403

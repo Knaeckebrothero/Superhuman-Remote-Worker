@@ -13,7 +13,7 @@ Covers the three backend surfaces:
   in-place registry swap, deferred-close contract, category application
   outside the validated tools vocabulary, repo/kb handling, index rewrite.
 
-Plus ``inject_datasource_index``'s rewrite (not re-append) semantics.
+Plus ``inject_workspace_facts``'s replace-the-marked-block (not re-append) semantics.
 
 Slice C additions: the owner-facing disconnected-session PATCH
 (``update_thread_config``) that runs the same ``_apply_thread_config_update``
@@ -338,7 +338,7 @@ class TestAgentPatchDatasourceIds:
     async def test_policy_change_before_selection_persist_returns_conflict(
         self, patched_main
     ):
-        from database.postgres import DatasourcePolicyConflictError
+        from orchestrator.database.postgres import DatasourcePolicyConflictError
 
         main, db, _ = patched_main
         db.set_thread_datasource_ids.side_effect = DatasourcePolicyConflictError(
@@ -658,8 +658,8 @@ class TestConfigChangeSummary:
 
 
 def _make_session(datasource_configs=None, datasources=None, clients=None):
-    from src.api.persistent_session import PersistentSession
-    from src.core.loader import ToolsConfig
+    from agent.api.persistent_session import PersistentSession
+    from shared.runtime.core.loader import ToolsConfig
 
     cfg = MagicMock()
     cfg.tools = ToolsConfig(sql=["stale_sql_tool"])
@@ -687,8 +687,8 @@ class TestResetupDatasources:
     async def test_live_detach_invalidates_an_already_bound_email_send_tool(self):
         """A prior ready observation and stale closure are not authorization."""
 
-        from src.tools.context import ToolContext
-        from src.tools.email.tools import create_email_tools
+        from agent.tools.context import ToolContext
+        from agent.tools.email.tools import create_email_tools
 
         old_connection = SimpleNamespace(
             access="send",
@@ -707,7 +707,7 @@ class TestResetupDatasources:
         )
 
         with patch(
-            "src.core.datasource_setup.process_datasources",
+            "agent.core.datasource_setup.process_datasources",
             return_value=({}, {}, []),
         ):
             await session.resetup_datasources([])
@@ -736,7 +736,7 @@ class TestResetupDatasources:
         }
 
         with patch(
-            "src.core.datasource_setup.process_datasources",
+            "agent.core.datasource_setup.process_datasources",
             return_value=({}, {}, []),
         ):
             await session.resetup_datasources([email])
@@ -747,7 +747,7 @@ class TestResetupDatasources:
 
         connection = SimpleNamespace(access="send", unattended_send=True)
         with patch(
-            "src.core.datasource_setup.process_datasources",
+            "agent.core.datasource_setup.process_datasources",
             return_value=({"email": connection}, {}, []),
         ):
             await session.resetup_datasources([email])
@@ -766,7 +766,7 @@ class TestResetupDatasources:
         assert clamped.email_access_tier == "read"
 
         with patch(
-            "src.core.datasource_setup.process_datasources",
+            "agent.core.datasource_setup.process_datasources",
             return_value=({}, {}, []),
         ):
             await session.resetup_datasources([])
@@ -795,7 +795,7 @@ class TestResetupDatasources:
         registry_ref = session.datasources
         new_conn = MagicMock()
         with patch(
-            "src.core.datasource_setup.process_datasources",
+            "agent.core.datasource_setup.process_datasources",
             return_value=({"webdav": new_conn}, {}, []),
         ):
             summary = await session.resetup_datasources([_ds("webdav", "Cloud")])
@@ -814,7 +814,7 @@ class TestResetupDatasources:
         session tools override's closed vocabulary would drop them."""
         session = _make_session(datasource_configs=[_ds("postgresql", "PG")])
         with patch(
-            "src.core.datasource_setup.process_datasources",
+            "agent.core.datasource_setup.process_datasources",
             return_value=({}, {}, []),
         ):
             await session.resetup_datasources([_ds("webdav", "Cloud")])
@@ -833,7 +833,7 @@ class TestResetupDatasources:
         session = _make_session()
         session.config.tools.canvas = []  # user disabled Canvas live
         with patch(
-            "src.core.datasource_setup.process_datasources",
+            "agent.core.datasource_setup.process_datasources",
             return_value=({}, {}, []),
         ):
             await session.resetup_datasources([_ds("postgresql", "PG")])
@@ -846,7 +846,7 @@ class TestResetupDatasources:
             datasource_configs=[_ds("postgresql", "Keep"), _ds("webdav", "Drop")]
         )
         with patch(
-            "src.core.datasource_setup.process_datasources",
+            "agent.core.datasource_setup.process_datasources",
             return_value=({}, {}, []),
         ):
             summary = await session.resetup_datasources(
@@ -860,7 +860,7 @@ class TestResetupDatasources:
     async def test_kb_entries_skip_processing_and_flag_deferred(self):
         session = _make_session()
         with patch(
-            "src.core.datasource_setup.process_datasources",
+            "agent.core.datasource_setup.process_datasources",
             return_value=({}, {}, []),
         ) as process:
             summary = await session.resetup_datasources(
@@ -876,14 +876,15 @@ class TestResetupDatasources:
         new_list = [_ds("postgresql", "PG"), {"type": "kb", "name": "KB"}]
         with (
             patch(
-                "src.core.datasource_setup.process_datasources",
+                "agent.core.datasource_setup.process_datasources",
                 return_value=({}, {}, []),
             ),
-            patch("src.core.datasource_setup.inject_datasource_index") as inject,
+            patch("agent.core.datasource_setup.inject_workspace_facts") as inject,
         ):
             await session.resetup_datasources(new_list)
 
-        inject.assert_called_once_with(new_list, session.workspace_manager)
+        inject.assert_called_once()
+        assert inject.call_args.args == (new_list, session.workspace_manager)
         assert session.datasource_configs == new_list
 
     @pytest.mark.asyncio
@@ -902,11 +903,11 @@ class TestResetupDatasources:
         session.workspace_manager.source_repos = {"old-repo": MagicMock()}
         with (
             patch(
-                "src.core.datasource_setup.process_datasources",
+                "agent.core.datasource_setup.process_datasources",
                 return_value=({}, {}, []),
             ),
-            patch("src.core.datasource_setup.clone_repository_datasources") as clone,
-            patch("src.core.datasource_setup.inject_datasource_index"),
+            patch("agent.core.datasource_setup.clone_repository_datasources") as clone,
+            patch("agent.core.datasource_setup.inject_workspace_facts"),
         ):
             await session.resetup_datasources([repo_new])
 
@@ -935,11 +936,11 @@ class TestResetupDatasources:
         }
         with (
             patch(
-                "src.core.datasource_setup.process_datasources",
+                "agent.core.datasource_setup.process_datasources",
                 return_value=({}, {}, []),
             ),
-            patch("src.core.datasource_setup.clone_repository_datasources"),
-            patch("src.core.datasource_setup.inject_datasource_index"),
+            patch("agent.core.datasource_setup.clone_repository_datasources"),
+            patch("agent.core.datasource_setup.inject_workspace_facts"),
         ):
             await session.resetup_datasources([])
 
@@ -956,11 +957,11 @@ class TestResetupDatasources:
 
         with (
             patch(
-                "src.core.datasource_setup.process_datasources",
+                "agent.core.datasource_setup.process_datasources",
                 return_value=({"mcp": manager}, {}, []),
             ),
-            patch("src.core.datasource_setup.inject_datasource_index"),
-            patch("src.tools.registry.register_mcp_tools") as register,
+            patch("agent.core.datasource_setup.inject_workspace_facts"),
+            patch("agent.tools.registry.register_mcp_tools") as register,
         ):
             await session.resetup_datasources([_ds("mcp", "MCP")])
 
@@ -980,11 +981,11 @@ class TestResetupDatasources:
 
         with (
             patch(
-                "src.core.datasource_setup.process_datasources",
+                "agent.core.datasource_setup.process_datasources",
                 return_value=({}, {}, []),
             ),
-            patch("src.core.datasource_setup.inject_datasource_index"),
-            patch("src.tools.registry.register_mcp_tools") as register,
+            patch("agent.core.datasource_setup.inject_workspace_facts"),
+            patch("agent.tools.registry.register_mcp_tools") as register,
         ):
             summary = await session.resetup_datasources([])
 
@@ -1003,11 +1004,14 @@ class TestResetupDatasources:
 
 
 # ---------------------------------------------------------------------------
-# inject_datasource_index: rewrite, not re-append
+# inject_workspace_facts: replace the marked README block, never re-append
 # ---------------------------------------------------------------------------
 
 
-class TestDatasourceIndexRewrite:
+class TestWorkspaceFactsRewrite:
+    START = "<!-- srw:workspace-facts:start -->"
+    END = "<!-- srw:workspace-facts:end -->"
+
     def _ws(self, existing=""):
         ws = MagicMock()
         if existing:
@@ -1020,41 +1024,45 @@ class TestDatasourceIndexRewrite:
         )
         return ws, written
 
-    def test_second_injection_replaces_previous_section(self):
-        from src.core.datasource_setup import inject_datasource_index
+    def test_second_injection_replaces_previous_block(self):
+        from agent.core.datasource_setup import inject_workspace_facts
 
         ws, written = self._ws()
-        inject_datasource_index([_ds("postgresql", "First DB")], ws)
+        inject_workspace_facts([_ds("postgresql", "First DB")], ws)
         ws.read_file.side_effect = None
-        ws.read_file.return_value = written["datasources.md"]
-        inject_datasource_index([_ds("mongodb", "Second DB")], ws)
+        ws.read_file.return_value = written["README.md"]
+        inject_workspace_facts([_ds("mongodb", "Second DB")], ws)
 
-        content = written["datasources.md"]
-        assert content.count("## Available Connectors") == 1
-        assert "## Available Datasources" not in content
+        content = written["README.md"]
+        assert content.count(self.START) == 1
+        assert content.count(self.END) == 1
+        assert content.count("## Connectors") == 1
         assert "First DB" not in content
         assert "Second DB" in content
 
-    def test_preserves_content_before_the_section(self):
-        from src.core.datasource_setup import inject_datasource_index
+    def test_human_readme_is_appended_to_not_rewritten(self):
+        from agent.core.datasource_setup import inject_workspace_facts
 
         ws, written = self._ws(existing="# Datasources\n\nintro text\n")
-        inject_datasource_index([_ds("postgresql", "PG")], ws)
+        inject_workspace_facts([_ds("postgresql", "PG")], ws)
 
-        content = written["datasources.md"]
+        content = written["README.md"]
         assert content.startswith("# Datasources\n\nintro text")
-        assert "**PG**" in content
+        assert content.index("**PG**") > content.index("intro text")
 
     def test_remove_all_writes_explicit_empty_state(self):
-        from src.core.datasource_setup import inject_datasource_index
+        from agent.core.datasource_setup import inject_workspace_facts
 
         ws, written = self._ws(
-            existing="intro\n\n## Available Datasources\n\n- **Gone** (postgresql)"
+            existing=(
+                f"intro\n\n{self.START}\n## Connectors\n\n"
+                f"- **Gone** (postgresql)\n{self.END}\n"
+            )
         )
-        inject_datasource_index([], ws)
+        inject_workspace_facts([], ws)
 
-        content = written["datasources.md"]
+        content = written["README.md"]
+        assert content.startswith("intro\n\n")
         assert "Gone" not in content
-        assert "## Available Connectors" in content
-        assert "## Available Datasources" not in content
+        assert "## Connectors" in content
         assert "_No connectors attached._" in content

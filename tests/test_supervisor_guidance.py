@@ -25,7 +25,6 @@ Covered here:
 
 import asyncio
 import contextlib
-import sys
 import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -34,15 +33,10 @@ import pytest
 from fastapi import HTTPException
 from langchain_core.messages import AIMessage, HumanMessage
 
-project_root = Path(__file__).parent.parent
-src_path = project_root / "src"
-if str(src_path) not in sys.path:
-    sys.path.insert(0, str(src_path))
-
-import src.api.dual_app as dual_app  # noqa: E402
-from src.core.guidance_injection import format_supervisor_guidance  # noqa: E402
-from src.core.workspace import WorkspaceManager  # noqa: E402
-from src.managers import TodoManager  # noqa: E402
+import agent.api.dual_app as dual_app  # noqa: E402
+from agent.core.guidance_injection import format_supervisor_guidance  # noqa: E402
+from agent.core.workspace import WorkspaceManager  # noqa: E402
+from agent.managers import TodoManager  # noqa: E402
 from tests._fs_backend import FilesystemTestBackend  # noqa: E402
 
 
@@ -575,7 +569,7 @@ class TestExecuteRendersGuidance:
         *,
         tool_context=None,
     ):
-        from src.graph import create_execute_node
+        from agent.graph import create_execute_node
 
         async def fake_ainvoke(prepared, **kwargs):
             captured_requests.append(list(prepared))
@@ -588,11 +582,11 @@ class TestExecuteRendersGuidance:
         config.agent_id = "test-agent"
         config.extra = {}
         config.llm.model = "test-model"
-        phase_cfg = MagicMock()
-        phase_cfg.model = "test-model"
-        phase_cfg.timeout = 10.0
-        phase_cfg.model_max_context_tokens = 100000
-        config.llm.get_phase_config.return_value = phase_cfg
+        # U1: the execute node reads the single config.llm directly (one model
+        # for every phase, no per-phase resolution), so the fields the node
+        # consults live on it rather than on a get_phase_config() result.
+        config.llm.timeout = 10.0
+        config.llm.model_max_context_tokens = 100000
         config.limits.model_max_context_tokens = 100000
         config.limits.response_validation.enabled = False
         config.context_management.max_summary_length = 500
@@ -608,8 +602,7 @@ class TestExecuteRendersGuidance:
         context_mgr.clear_old_tool_results.side_effect = lambda msgs: msgs
 
         return create_execute_node(
-            strategic_llm_with_tools=llm,
-            tactical_llm_with_tools=llm,
+            llm_with_tools=llm,
             todo_manager=todo_manager,
             memory_manager=MagicMock(),
             workspace_manager=workspace_manager,
@@ -653,8 +646,9 @@ class TestExecuteRendersGuidance:
         ack = MagicMock()
 
         with (
-            patch("src.graph.get_phase_system_prompt", return_value="SYS"),
-            patch("src.graph.get_archiver", return_value=None),
+            patch("agent.graph.get_phase_system_prompt", return_value="SYS"),
+            patch("agent.graph.get_phase_system_prompt", return_value="SYS"),
+            patch("agent.graph.get_archiver", return_value=None),
             patch.object(dual_app, "ack_guidance", ack),
         ):
             # The tail of execute (response validation, reminders) is not
@@ -687,8 +681,9 @@ class TestExecuteRendersGuidance:
         ack = MagicMock()
 
         with (
-            patch("src.graph.get_phase_system_prompt", return_value="SYS"),
-            patch("src.graph.get_archiver", return_value=None),
+            patch("agent.graph.get_phase_system_prompt", return_value="SYS"),
+            patch("agent.graph.get_phase_system_prompt", return_value="SYS"),
+            patch("agent.graph.get_archiver", return_value=None),
             patch.object(dual_app, "ack_guidance", ack),
         ):
             with contextlib.suppress(Exception):
@@ -706,7 +701,7 @@ class TestExecuteRendersGuidance:
     async def test_stateless_guidance_is_checkpointed_before_ack(
         self, workspace_manager, todo_manager
     ):
-        from src.tools.context import ToolContext
+        from agent.tools.context import ToolContext
 
         dual_app._guidance_inbox["job-under-test"] = [
             {"id": "g1", "text": "read file Z", "source": "officer"}
@@ -723,8 +718,9 @@ class TestExecuteRendersGuidance:
         ack = MagicMock()
 
         with (
-            patch("src.graph.get_phase_system_prompt", return_value="SYS"),
-            patch("src.graph.get_archiver", return_value=None),
+            patch("agent.graph.get_phase_system_prompt", return_value="SYS"),
+            patch("agent.graph.get_phase_system_prompt", return_value="SYS"),
+            patch("agent.graph.get_archiver", return_value=None),
             patch.object(dual_app, "ack_guidance", ack),
         ):
             result = await execute(self._state())
@@ -737,7 +733,7 @@ class TestExecuteRendersGuidance:
     async def test_stateless_reclaim_suppresses_checkpointed_guidance(
         self, workspace_manager, todo_manager
     ):
-        from src.tools.context import ToolContext
+        from agent.tools.context import ToolContext
 
         dual_app._guidance_inbox["job-under-test"] = [
             {"id": "g1", "text": "already absorbed", "source": "officer"}
@@ -755,8 +751,9 @@ class TestExecuteRendersGuidance:
         state["delivered_guidance_ids"] = ["g1"]
 
         with (
-            patch("src.graph.get_phase_system_prompt", return_value="SYS"),
-            patch("src.graph.get_archiver", return_value=None),
+            patch("agent.graph.get_phase_system_prompt", return_value="SYS"),
+            patch("agent.graph.get_phase_system_prompt", return_value="SYS"),
+            patch("agent.graph.get_archiver", return_value=None),
         ):
             await execute(state)
 
@@ -774,7 +771,7 @@ class TestExecuteRendersGuidance:
 
 class TestQueuedReplyDrain:
     def _node(self, managers_ws, todo_mgr, mock_config, postgres_db):
-        from src.graph import create_handle_transition_node
+        from agent.graph import create_handle_transition_node
 
         phase_settings = MagicMock()
         phase_settings.min_todos = 5
@@ -798,28 +795,25 @@ class TestQueuedReplyDrain:
         }
 
     @pytest.mark.asyncio
-    async def test_drain_injects_visible_message_and_acks_threads(
+    async def test_drain_injects_visible_message_and_acks_exact_reply(
         self, workspace_manager, todo_manager, mock_config
     ):
+        from shared.job_steering import queued_reply_key
+
         todo_manager.add("Task 1")
         todo_manager.complete("todo_1")
 
-        db = AsyncMock()
-        db.fetchrow.return_value = {
-            "context": {
-                "queued_replies": [
-                    {
-                        "thread_id": "officer",
-                        "message": "prioritize the report",
-                        "timestamp": "2026-07-30T10:00:00Z",
-                    }
-                ]
-            }
+        reply = {
+            "thread_id": "officer",
+            "message": "prioritize the report",
+            "timestamp": "2026-07-30T10:00:00Z",
         }
+        db = AsyncMock()
+        db.fetchrow.return_value = {"context": {"queued_replies": [reply]}}
         node = self._node(workspace_manager, todo_manager, mock_config, db)
 
         ack = MagicMock()
-        with patch("src.graph._ack_supervisor_guidance", ack):
+        with patch("agent.graph._ack_supervisor_guidance", ack):
             result = await node(self._tactical_state())
 
         contents = [m.content for m in result["messages"]]
@@ -830,7 +824,7 @@ class TestQueuedReplyDrain:
         # audit file still written
         assert workspace_manager.exists("messages/officer/001_received.md")
 
-        ack.assert_called_once_with("test-123", reply_threads=["officer"])
+        ack.assert_called_once_with("test-123", reply_keys=[queued_reply_key(reply)])
 
     @pytest.mark.asyncio
     async def test_cleared_context_does_not_rematerialize(
@@ -846,7 +840,7 @@ class TestQueuedReplyDrain:
         node = self._node(workspace_manager, todo_manager, mock_config, db)
 
         ack = MagicMock()
-        with patch("src.graph._ack_supervisor_guidance", ack):
+        with patch("agent.graph._ack_supervisor_guidance", ack):
             result = await node(self._tactical_state())
 
         assert not any("[QUEUED MESSAGES]" in m.content for m in result["messages"])
@@ -861,7 +855,7 @@ class TestQueuedReplyDrain:
 
 class TestFeedbackResume:
     def _node(self, workspace_manager, todo_manager, mock_config):
-        from src.graph import create_restore_from_feedback_node
+        from agent.graph import create_restore_from_feedback_node
 
         context_mgr = MagicMock()
         context_mgr.ensure_within_limits = AsyncMock(
@@ -896,7 +890,7 @@ class TestFeedbackResume:
             "The critic reviewed the completed work and returned it with "
             "open findings; address them."
         )
-        with patch("src.graph.get_resume_strategic_todos", return_value=[]):
+        with patch("agent.graph.get_resume_strategic_todos", return_value=[]):
             result = await node(self._base_state(resume_reason=reason))
 
         banner = result["messages"][-1].content
@@ -914,7 +908,7 @@ class TestFeedbackResume:
         self, workspace_manager, todo_manager, mock_config
     ):
         node = self._node(workspace_manager, todo_manager, mock_config)
-        with patch("src.graph.get_resume_strategic_todos", return_value=[]):
+        with patch("agent.graph.get_resume_strategic_todos", return_value=[]):
             result = await node(self._base_state())
 
         banner = result["messages"][-1].content
@@ -945,7 +939,7 @@ class TestFeedbackResume:
             ],
             todo_next_id=3,
         )
-        with patch("src.graph.get_resume_strategic_todos", return_value=[]):
+        with patch("agent.graph.get_resume_strategic_todos", return_value=[]):
             await node(state)
 
         archive_files = workspace_manager.list_files("archive")
@@ -962,7 +956,7 @@ class TestFeedbackResume:
         self, workspace_manager, todo_manager, mock_config
     ):
         node = self._node(workspace_manager, todo_manager, mock_config)
-        with patch("src.graph.get_resume_strategic_todos", return_value=[]):
+        with patch("agent.graph.get_resume_strategic_todos", return_value=[]):
             await node(self._base_state())
 
         try:

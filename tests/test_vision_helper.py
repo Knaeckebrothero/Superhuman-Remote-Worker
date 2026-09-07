@@ -18,7 +18,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.services.vision_helper import VisionHelper
+from agent.services.vision_helper import VisionHelper
 
 
 # =============================================================================

@@ -204,6 +204,16 @@ export interface RuntimeEnvironment {
   providerBaseUrl: string;
   chatModel: string;
   embeddingModel: string;
+  workspaceBackend: 'virtual' | 'sandbox';
+  expectedExecutionLane: 'pinned' | 'stateless';
+}
+
+function expectedChoice<T extends string>(name: string, fallback: T, allowed: readonly T[]): T {
+  const value = process.env[name]?.trim() || fallback;
+  if (!allowed.includes(value as T)) {
+    throw new Error(`${name} must be one of: ${allowed.join(', ')}.`);
+  }
+  return value as T;
 }
 
 export function runtimeEnvironment(): RuntimeEnvironment {
@@ -220,6 +230,21 @@ export function runtimeEnvironment(): RuntimeEnvironment {
     throw new Error('APP_E2E_PROVIDER_BASE_URL must end in /v1.');
   }
 
+  const workspaceBackend = expectedChoice('APP_E2E_WORKSPACE_BACKEND', 'virtual', [
+    'virtual',
+    'sandbox',
+  ] as const);
+  const expectedExecutionLane = expectedChoice('APP_E2E_EXPECT_EXECUTION_LANE', 'pinned', [
+    'pinned',
+    'stateless',
+  ] as const);
+  if (
+    (workspaceBackend === 'virtual' && expectedExecutionLane !== 'pinned') ||
+    (workspaceBackend === 'sandbox' && expectedExecutionLane !== 'stateless')
+  ) {
+    throw new Error('The application E2E workspace and execution-lane profile is invalid.');
+  }
+
   return {
     username: requiredEnvironment('APP_E2E_USERNAME'),
     password: requiredEnvironment('APP_E2E_PASSWORD'),
@@ -230,5 +255,7 @@ export function runtimeEnvironment(): RuntimeEnvironment {
     providerBaseUrl: provider.toString().replace(/\/$/, ''),
     chatModel: process.env['APP_E2E_CHAT_MODEL']?.trim() || 'e2e-chat',
     embeddingModel: process.env['APP_E2E_EMBEDDING_MODEL']?.trim() || 'e2e-embedding',
+    workspaceBackend,
+    expectedExecutionLane,
   };
 }

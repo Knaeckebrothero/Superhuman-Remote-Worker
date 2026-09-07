@@ -4,7 +4,7 @@ from uuid import UUID
 
 import pytest
 
-from src.shared.session_retirement import (
+from shared.session_retirement import (
     active_claim_authority,
     acknowledge_session_claim_quiesced,
     claim_loss_hold,

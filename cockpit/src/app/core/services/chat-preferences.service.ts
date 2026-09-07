@@ -6,6 +6,7 @@ const TOOL_CALLS_EXPANDED_KEY = 'cockpit:chat:toolCallsExpanded';
 const READING_WIDTH_KEY = 'cockpit:chat:readingWidth';
 const TEXT_SIZE_KEY = 'cockpit:chat:textSize';
 const PLAYBACK_SPEED_KEY = 'cockpit:chat:playbackSpeed';
+const OFFICER_LENS_FOLDED_KEY = 'cockpit:chat:officerLensFolded';
 
 /** Reading-column width preset for the chat transcript. */
 export type ReadingWidth = 'comfortable' | 'wide' | 'full';
@@ -61,6 +62,18 @@ export class ChatPreferencesService {
   setToolCallsExpanded(expanded: boolean): void {
     this.toolCallsExpanded.set(expanded);
     this.writeBool(TOOL_CALLS_EXPANDED_KEY, expanded);
+  }
+
+  /**
+   * Officer log lens: fold each `[SITREP]` + sleep-only wake into one line so
+   * the transcript reads as his decision history. Only consulted on officer
+   * threads (PersistentChatService.isOfficerThread). Defaults to folded.
+   */
+  readonly officerLensFolded = signal<boolean>(this.readBool(OFFICER_LENS_FOLDED_KEY, true));
+
+  setOfficerLensFolded(folded: boolean): void {
+    this.officerLensFolded.set(folded);
+    this.writeBool(OFFICER_LENS_FOLDED_KEY, folded);
   }
 
   /**

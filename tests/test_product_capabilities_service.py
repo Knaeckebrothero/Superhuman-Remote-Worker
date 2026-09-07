@@ -10,7 +10,7 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 
-from services.product_capabilities import (
+from orchestrator.services.product_capabilities import (
     MAX_EXPLICIT_CAPABILITY_IDS,
     MAX_RESPONSE_BYTES,
     PRODUCT_CAPABILITIES_ENDPOINT_ENABLED_ENV,
@@ -18,8 +18,8 @@ from services.product_capabilities import (
     ResolutionRequest,
     product_capabilities_endpoint_enabled,
 )
-from services.shared_browser_canvas import BrowserCapabilityResponse
-from src.core.product_capabilities import (
+from orchestrator.services.shared_browser_canvas import BrowserCapabilityResponse
+from shared.runtime.core.product_capabilities import (
     AgentAction,
     BuildEvaluation,
     BuildState,
@@ -635,7 +635,7 @@ async def test_service_emits_privacy_safe_shadow_metrics(caplog):
 
     caplog.set_level(
         logging.INFO,
-        logger="services.product_capabilities",
+        logger="orchestrator.services.product_capabilities",
     )
     response = await _service(
         resolver_overrides={

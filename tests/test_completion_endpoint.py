@@ -5,14 +5,8 @@ and the orchestrator endpoint helpers.
 """
 
 import json
-import sys
 from pathlib import Path
 from unittest.mock import patch
-
-# Add project root to path
-project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
 
 from orchestrator.services.completion import (  # noqa: E402
     determine_job_status,
@@ -384,6 +378,10 @@ class TestFormatVerificationInstructions:
         assert "output/data.json" in result
         assert "Completed the analysis" in result
         assert "85%" in result
+        assert "MUST delegate one independent evidence pass" in result
+        assert '`subagent_type="verifier"`' in result
+        assert '`isolation="shared"`' in result
+        assert "`run_in_background=false`" in result
 
     def test_no_deliverables(self):
         freeze_data = {"summary": "Done", "confidence": 0.5}

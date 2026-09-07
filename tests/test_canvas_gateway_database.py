@@ -5,16 +5,16 @@ from contextlib import asynccontextmanager
 
 import pytest
 
-import canvas_gateway as canvas_gateway_module
-from canvas_gateway import CanvasGatewayApp
-from services.canvas_session_notifications import CanvasConnectionRegistry
-from services.canvas_viewer_config import CanvasViewerConfig
-from services.canvas_viewer_database import (
+import orchestrator.canvas_gateway as canvas_gateway_module
+from orchestrator.canvas_gateway import CanvasGatewayApp
+from orchestrator.services.canvas_session_notifications import CanvasConnectionRegistry
+from orchestrator.services.canvas_viewer_config import CanvasViewerConfig
+from orchestrator.services.canvas_viewer_database import (
     CanvasViewerDatabaseConfigurationError,
     CanvasViewerDatabasePrivilegeError,
     attest_canvas_viewer_database_privileges,
 )
-import services.canvas_viewer_database as viewer_database_module
+import orchestrator.services.canvas_viewer_database as viewer_database_module
 
 
 _VIEWER_DATABASE_ENV = (
@@ -98,6 +98,7 @@ def test_viewer_database_uses_only_explicit_identity_and_small_pool(
         "env_prefix": "CANVAS_VIEWER_POSTGRES",
         "default_min_connections": 1,
         "default_max_connections": 4,
+        "server_settings": {"search_path": "pg_catalog, public, pg_temp"},
     }
 
 
@@ -139,6 +140,7 @@ class _PrivilegeConnection:
             "role_name": "canvas-viewer",
             "session_role_name": "canvas-viewer",
             "session_role_matches": True,
+            "search_path_safe": True,
             "database_connect": True,
             "database_create": False,
             "public_schema_usage": True,
@@ -167,6 +169,7 @@ class _PrivilegeConnection:
         assert "pg_catalog.pg_roles" in query
         assert "rolbypassrls" in query
         assert "session_user" in query
+        assert "current_setting('search_path')" in query
         self.identity_checks += 1
         return self.identity
 
@@ -339,6 +342,7 @@ async def test_privilege_attestation_rejects_a_missing_required_column_grant() -
         ),
         ({"database_create": True}, "CREATE current_database"),
         ({"public_schema_create": True}, "CREATE public schema"),
+        ({"search_path_safe": False}, "search_path differs"),
     ],
 )
 async def test_privilege_attestation_rejects_elevated_identity_capabilities(

@@ -17,9 +17,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from services import session_wake, sitrep
+from orchestrator.services import session_wake, sitrep
 
-from database.postgres import JobQueryResult
+from orchestrator.database.postgres import JobQueryResult
 
 THREAD_ID = str(uuid.uuid4())
 PROJECT_ID = str(uuid.uuid4())

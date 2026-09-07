@@ -17,6 +17,7 @@ import {AppInputComponent} from '../../ui/input';
 import {AppChipComponent} from '../../ui/chip';
 import {AppIconComponent} from '../../ui/icon';
 import {AppFormFieldComponent} from '../../ui/form-field';
+import {AppSwitchComponent} from '../../ui/switch';
 import {EffectiveModels, EligibleDatasource, ExpertDefaultsResponse} from '../../core/models/api.model';
 
 interface Project {
@@ -128,6 +129,7 @@ interface ExpertDetail extends Expert {
     AppChipComponent,
     AppIconComponent,
     AppFormFieldComponent,
+    AppSwitchComponent,
   ],
   template: `
     <div class="session-create-page">
@@ -181,8 +183,15 @@ interface ExpertDetail extends Expert {
           <span class="field-hint">{{ 'sessions.create.protectedCloudHint' | transloco }}</span>
         }
 
-        <!-- Expert selector -->
+        <!-- Expert selector: session experts by default (expert_type || tags);
+             "Show all experts" lists every role — the server accepts a
+             cross-role pick and resolves it on the session overlay. -->
         <app-form-field [label]="'sessions.create.expertLabel' | transloco">
+          <div class="expert-toolbar">
+            <app-switch size="sm" [checked]="showAllExperts()" [disabled]="creating()" (changed)="setShowAllExperts($event)">
+              {{ 'experts.showAll' | transloco }}
+            </app-switch>
+          </div>
           @if (loadingExperts()) {
             <div class="loading-hint">{{ 'sessions.create.expertLoading' | transloco }}</div>
           } @else if (experts().length > 0) {
@@ -202,6 +211,9 @@ interface ExpertDetail extends Expert {
                   <app-icon size="inherit" class="expert-icon" [style.color]="expert.color">{{ expert.icon }}</app-icon>
                   <span class="expert-name">{{ expert.display_name }}</span>
                   <span class="expert-desc">{{ expert.description }}</span>
+                  @if (expert.expert_type && expert.expert_type !== 'session') {
+                    <span class="expert-role">{{ expert.expert_type }}</span>
+                  }
                 </button>
               }
             </div>
@@ -344,10 +356,22 @@ interface ExpertDetail extends Expert {
       color: var(--text-muted);
       padding: 8px 0;
     }
+    .expert-toolbar {
+      display: flex;
+      justify-content: flex-end;
+      margin-bottom: 8px;
+    }
     .expert-grid {
       display: grid;
       grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
       gap: 10px;
+    }
+    .expert-role {
+      font-size: 10px;
+      padding: 1px 6px;
+      border-radius: var(--radius-tag);
+      background: color-mix(in srgb, var(--accent-color) 8%, transparent);
+      color: var(--text-secondary);
     }
     .expert-card {
       position: relative;
@@ -468,6 +492,9 @@ export class SessionCreateComponent implements OnInit {
     protectedCloudToggleVisible(this.capabilities.protectedCloudAvailable(), this.selectedProjects()),
   );
   readonly experts = signal<Expert[]>([]);
+  /** "Show all experts": drop the session role filter (U1 — every expert stays
+   *  usable in every role; the picker's role is pre-selected, not enforced). */
+  readonly showAllExperts = signal(false);
   readonly selectedExpert = signal<Expert | null>(null);
   private readonly effectiveDefaultExpertId = signal<string | null>(null);
   readonly selectedExpertSource = signal<'project' | 'user' | 'application' | 'explicit' | null>(null);
@@ -699,8 +726,18 @@ export class SessionCreateComponent implements OnInit {
   }
 
   private loadExperts(): void {
+    this.loadExpertList();
+    this.loadEffectiveDefault();
+  }
+
+  /** The picker's rows: session experts (`expert_type || tags`), or every
+   *  expert when "Show all experts" is on (no `type` filter). */
+  private loadExpertList(): void {
     this.loadingExperts.set(true);
-    this.http.get<Expert[]>(`${environment.apiUrl}/experts?type=session`).subscribe({
+    const url = this.showAllExperts()
+      ? `${environment.apiUrl}/experts`
+      : `${environment.apiUrl}/experts?type=session`;
+    this.http.get<Expert[]>(url).subscribe({
       next: (experts) => {
         this.experts.set(experts);
         this.applyEffectiveDefault();
@@ -708,7 +745,12 @@ export class SessionCreateComponent implements OnInit {
       },
       error: () => this.loadingExperts.set(false),
     });
-    this.loadEffectiveDefault();
+  }
+
+  setShowAllExperts(value: boolean): void {
+    if (value === this.showAllExperts()) return;
+    this.showAllExperts.set(value);
+    this.loadExpertList();
   }
 
   private loadEffectiveDefault(): void {

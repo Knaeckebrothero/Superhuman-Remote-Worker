@@ -18,7 +18,7 @@ import {
     ViewChild,
     ViewChildren,
 } from '@angular/core';
-import {NgTemplateOutlet, TitleCasePipe} from '@angular/common';
+import {DatePipe, NgTemplateOutlet, TitleCasePipe} from '@angular/common';
 import {HttpClient} from '@angular/common/http';
 import {FormsModule} from '@angular/forms';
 import {Router, RouterLink} from '@angular/router';
@@ -36,21 +36,27 @@ import {
     EventGroup,
     firstSentence,
     firstTextOf,
+    foldWakeCycles,
     FoldableEvent,
     FoldedSummary,
     groupEvents,
     isAssistantTurn,
+    isSessionBoundary,
     isSystemTurn,
     isUserTurn,
     lastTextOf,
+    lastTurnOf,
     MIN_FOLD_RUN,
+    nextSpeakingTurn,
     notifyToolCalls,
     summarizeFolded,
     TextEvent,
     ThoughtEvent,
     ToolCallEvent,
+    trailingText,
     Turn,
     TurnEvent,
+    TurnView,
     UserTurn,
 } from '../../core/models/turn.model';
 import {ToolCardView} from '../../core/models/tool-card.model';
@@ -74,6 +80,8 @@ import {AppBadgeComponent} from '../../ui/badge';
 import {CitationsPanelComponent} from './citations-panel/citations-panel.component';
 import {CloudReviewDialogComponent} from '../job-diff-review/cloud-review-dialog.component';
 import {CloudReviewBannerComponent} from './cloud-review-banner/cloud-review-banner.component';
+import {SshConnectPanelComponent} from './ssh-connect-panel/ssh-connect-panel.component';
+import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {AppSelectComponent} from '../../ui/select';
 import {AppIconComponent} from '../../ui/icon';
 import {AppDialogComponent} from '../../ui/dialog';
@@ -191,7 +199,11 @@ const TOOL_LABELS: Record<string, string> = {
 
     // Communication & delegation
     send_message: 'Sending message',
-    delegate_work: 'Delegating work',
+    delegate_agent: 'Delegating to subagent',
+    wait_agent: 'Waiting for subagent',
+    message_agent: 'Messaging subagent',
+    stop_agent: 'Stopping subagent',
+    list_agents: 'Listing subagents',
 
     // Job lifecycle
     mark_complete: 'Marking complete',
@@ -634,6 +646,22 @@ export function pickCodeServerUrlToOpen(status: IdeSessionStatus | null): string
 }
 
 /**
+ * Whether this session's workspace is something the SSH gateway can reach.
+ * The SSH button used to render off `capabilities.sshGateway()` alone and so
+ * appeared on sessions with no container-backed workspace at all (connecting
+ * answers `srw: this session has no workspace yet`). Reachability is the same
+ * signal the IDE button reads: `active` and `restoring` mean a pod exists or
+ * is being made, and a typed refusal `code` means the IDE advertisement was
+ * withheld from a pod that IS ready (contain_ide_status_for only downgrades
+ * payloads that were about to advertise a URL) — where SSH is exactly the
+ * working fallback.
+ */
+export function sshWorkspaceReachable(status: IdeSessionStatus | null): boolean {
+    if (!status) return false;
+    return status.status === 'active' || status.status === 'restoring' || !!status.code;
+}
+
+/**
  * Pull file payloads out of a paste's clipboard items (#11 paste-to-attach),
  * dropping the `kind: 'string'` entries (plain text / HTML) so a text paste
  * falls through to the textarea untouched. Clipboard images frequently arrive
@@ -842,6 +870,7 @@ export function clearDraft(threadId: string | null): void {
         FormsModule,
         NgTemplateOutlet,
         TitleCasePipe,
+        DatePipe,
         RouterLink,
         MarkdownComponent,
         ExternalImageDirective,
@@ -865,6 +894,7 @@ export function clearDraft(threadId: string | null): void {
         CitationsPanelComponent,
         CloudReviewDialogComponent,
         CloudReviewBannerComponent,
+        SshConnectPanelComponent,
     ],
     template: `
     <div class="chat-container"
@@ -946,6 +976,9 @@ export function clearDraft(threadId: string | null): void {
                     <app-menu-item [disabled]="true">{{ 'chat.header.ideLoadingTooltip' | transloco }}</app-menu-item>
                   }
                 }
+                @if (sshButtonVisible()) {
+                  <app-menu-item (activated)="showSshPanel.update(v => !v)">{{ 'chat.header.sshButton' | transloco }}</app-menu-item>
+                }
               </app-menu>
             } @else {
               <button class="settings-btn" (click)="settingsRequested.emit(undefined)"
@@ -1002,8 +1035,18 @@ export function clearDraft(threadId: string | null): void {
                   </button>
                 }
               }
+              @if (sshButtonVisible()) {
+                <button class="ide-btn" (click)="showSshPanel.update(v => !v)"
+                        [title]="'chat.header.sshTooltip' | transloco">
+                  <app-icon size="sm" class="ide-icon">terminal</app-icon>
+                  {{ 'chat.header.sshButton' | transloco }}
+                </button>
+              }
             }
-            <app-button variant="ghost" size="sm" (clicked)="disconnectAndLeave()">
+            <app-button variant="ghost" size="sm"
+                        [loading]="isDisconnecting()"
+                        [ariaLabel]="(isDisconnecting() ? 'chat.header.disconnecting' : 'chat.header.disconnect') | transloco"
+                        (clicked)="disconnectAndLeave()">
               {{ 'chat.header.disconnect' | transloco }}
             </app-button>
           } @else if (chat.cloudSessionUrl() || chat.ncSessionFolder() || chat.verifiedProjectFolder()) {
@@ -1160,6 +1203,17 @@ export function clearDraft(threadId: string | null): void {
               <option value="large">{{ 'chat.settings.textLarge' | transloco }}</option>
             </app-select>
           </div>
+          @if (chat.isOfficerThread()) {
+            <div class="settings-row">
+              <label class="settings-label">{{ 'chat.settings.officerLens' | transloco }}</label>
+              <app-select size="sm" [fullWidth]="false"
+                          [value]="chatPrefs.officerLensFolded() ? 'folded' : 'all'"
+                          (changed)="onOfficerLensChange($event)">
+                <option value="folded">{{ 'chat.settings.officerLensFolded' | transloco }}</option>
+                <option value="all">{{ 'chat.settings.officerLensAll' | transloco }}</option>
+              </app-select>
+            </div>
+          }
         </div>
       }
 
@@ -1168,6 +1222,27 @@ export function clearDraft(threadId: string | null): void {
         <div class="settings-panel citations-panel-wrap">
           <app-citations-panel (close)="showCitations.set(false)" />
         </div>
+      }
+
+      <!-- Connect over SSH (workspace_ssh_access.md §5.1). @defer'd on the
+           toggle: the session view sits in the INITIAL bundle
+           (app.routes.ts eagerly imports ChatPageComponent, which eagerly
+           imports this component), and a plain import of the panel plus its
+           stylesheet would land in that same chunk — which after Task 4
+           measures 2.73MB against a 2.75MB hard-fail budget, ~20kB of
+           headroom (ruling P-11). The panel only ever exists after a click,
+           so deferring on that click is its natural shape, not a workaround. -->
+      @defer (when showSshPanel()) {
+        @if (showSshPanel()) {
+          <div class="settings-panel">
+            <app-ssh-connect-panel
+              [handle]="chat.sshHandle()"
+              [apiHost]="sshApiHost"
+              [sshHost]="sshGatewayHostname()"
+              [hostKeyFingerprint]="sshHostKeyFingerprint()"
+            />
+          </div>
+        }
       }
 
       <!-- Cloud-diff review. Was an inline 70vh block wedged into the chat
@@ -1292,7 +1367,33 @@ export function clearDraft(threadId: string | null): void {
              stays at the pane edge. .jump-latest is kept OUTSIDE this wrapper so
              it floats over the scroll container (sticky + align-self:center). -->
         <div class="messages-inner" #messagesInner>
-        @for (turn of chat.visibleTurns(); track turn.id; let isLast = $last) {
+        @for (view of turnViews(); track view.id; let isLast = $last) {
+          @if (view.kind === 'wake_cycle') {
+            <details class="message message-system wake-cycle" data-testid="wake-cycle">
+              <summary class="system-message wake-cycle-summary">
+                <app-icon size="sm" class="system-icon">bedtime</app-icon>
+                {{ 'chat.settings.wakeLine' | transloco:{
+                    time: (view.sitrep.timestamp | date:'HH:mm'),
+                    minutes: view.minutes ?? '?',
+                    reason: view.reason || ('chat.settings.wakeNoReason' | transloco)
+                  } }}
+              </summary>
+              <div class="wake-cycle-body">
+                <pre class="wake-cycle-sitrep">{{ view.sitrep.content }}</pre>
+                @if (trailingText(view.wake); as said) {
+                  <div class="wake-cycle-said">{{ said }}</div>
+                }
+                <div class="wake-cycle-sleep">
+                  <app-icon size="sm">bedtime</app-icon>
+                  {{ 'chat.settings.wakeSleepLine' | transloco:{
+                      minutes: view.minutes ?? '?',
+                      reason: view.reason || ('chat.settings.wakeNoReason' | transloco)
+                    } }}
+                </div>
+              </div>
+            </details>
+          } @else {
+          @let turn = view.turn;
           @switch (turn.kind) {
             @case ('system') {
               <div class="message message-system">
@@ -1616,8 +1717,9 @@ export function clearDraft(threadId: string | null): void {
               </div>
             }
           }
+          }
           <!-- Divider between historical-loaded turns and the live session. -->
-          @if (showSessionDividerAfter(turn, $index)) {
+          @if (showSessionDividerAfterView(view, $index)) {
             <div class="session-divider">
               <span class="divider-line"></span>
               <span class="divider-text">{{ 'chat.system.sessionResumed' | transloco }}</span>
@@ -2382,6 +2484,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     readonly chatWidthValue = computed(() => readingWidthToCss(this.chatPrefs.readingWidth()));
     readonly chatTextSizeValue = computed(() => textSizeToCss(this.chatPrefs.textSize()));
     private readonly deviceCapabilities = inject(DeviceCapabilitiesService);
+    readonly capabilities = inject(CapabilitiesService);
     readonly voiceCaps = inject(VoiceCapabilitiesService);
     private readonly voiceRecording = inject(VoiceRecordingService);
     private readonly router = inject(Router);
@@ -2481,6 +2584,49 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     // Settings panel
     readonly showViewMenu = signal(false);
     readonly showCitations = signal(false);
+    readonly showSshPanel = signal(false);
+
+    /** Disconnect is a ~5s round trip (DELETE + agent/workspace teardown). The
+     *  header button spins for it so the click reads as accepted; without it
+     *  the whole wait looks like a dead button. */
+    readonly isDisconnecting = signal(false);
+
+    /** Bare hostname for `srw-ssh-proxy --stdio <apiHost>` (ssh-config.ts's
+     *  HOST_PATTERN admits no scheme, path or port). `environment.apiUrl`
+     *  carries the `/api` suffix and, in local/k3d dev, a scheme and port —
+     *  only the hostname survives here. Computed once: the orchestrator's
+     *  public host does not change without a page reload. */
+    readonly sshApiHost = (() => {
+        try {
+            return new URL(environment.apiUrl).hostname;
+        } catch {
+            return '';
+        }
+    })();
+
+    /** `SshGatewayInfo.hostname` (ssh.srw.works), or '' while loading / when
+     *  the deployment has no gateway. Pulled out of the template because
+     *  Angular's template type-checker mis-narrows the chained optional
+     *  member + `noUncheckedIndexedAccess` index access below when written
+     *  inline (TS2532 on a fully-guarded expression). */
+    readonly sshGatewayHostname = computed(() => this.capabilities.sshGateway()?.hostname ?? '');
+
+    /** First published host key's fingerprint, for first-connect
+     *  verification. Only ever one entry in practice — the gateway rejects
+     *  any host key that isn't Ed25519 (services/ssh_gateway_config.py) —
+     *  but this still degrades to '' rather than assume the array is
+     *  non-empty. */
+    readonly sshHostKeyFingerprint = computed(() => {
+        const gateway = this.capabilities.sshGateway();
+        if (!gateway || gateway.host_keys.length === 0) return '';
+        return gateway.host_keys[0]?.fingerprint ?? '';
+    });
+
+    /** SSH button gate: a deployed gateway AND a workspace it can reach —
+     *  see {@link sshWorkspaceReachable} for what counts as reachable. */
+    readonly sshButtonVisible = computed(
+        () => !!this.capabilities.sshGateway() && sshWorkspaceReachable(this.ideStatus()),
+    );
 
     /**
      * Fold the header's secondary actions into the `⋮` overflow menu.
@@ -3855,12 +4001,18 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     }
 
     async disconnectAndLeave(): Promise<void> {
+        if (this.isDisconnecting()) return;
+        this.isDisconnecting.set(true);
         try {
             await this.chat.endSession();
         } catch (e: any) {
             this.toast.danger(this.errors.translate(e, 'errors.sessions.endFailed'));
         } finally {
-            this.router.navigate(['/sessions']);
+            // Leaving destroys this component, so clearing the flag is normally
+            // moot — but a guard can refuse the navigation, and then the header
+            // has to come back rather than spin forever.
+            const left = await this.router.navigate(['/sessions']);
+            if (!left) this.isDisconnecting.set(false);
         }
     }
 
@@ -4016,6 +4168,22 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     turnEventCounts(turn: AssistantTurn) {
         return countEvents(turn);
     }
+
+    /** Officer lens (§3.2): fold quiet wake cycles on officer threads unless the user asked for everything. */
+    readonly turnViews = computed<TurnView[]>(() => {
+        const turns = this.chat.visibleTurns();
+        if (this.chat.isOfficerThread() && this.chatPrefs.officerLensFolded()) {
+            return foldWakeCycles(turns);
+        }
+        return turns.map((turn) => ({kind: 'turn' as const, id: turn.id, turn}));
+    });
+
+    onOfficerLensChange(value: string | null): void {
+        this.chatPrefs.setOfficerLensFolded(value === 'folded');
+    }
+
+    /** Exposed for the wake-cycle template: what the officer said, if anything, before sleeping. */
+    readonly trailingText = trailingText;
 
     /** Coalesce a turn's events into render groups (live edge pinned, rest folded). */
     // Memoized per turn object. The reducer rebuilds the turn immutably on
@@ -4244,16 +4412,9 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         };
     }
 
-    /**
-     * True when the current turn is historical and the next turn isn't —
-     * the boundary between session reload and live activity.
-     */
-    showSessionDividerAfter(turn: Turn, index: number): boolean {
-        const next = this.chat.visibleTurns()[index + 1];
-        if (!next) return false;
-        const turnHistorical = (turn.kind === 'assistant' || turn.kind === 'user') && !!turn.historical;
-        const nextHistorical = (next.kind === 'assistant' || next.kind === 'user') && !!next.historical;
-        return turnHistorical && !nextHistorical;
+    /** Divider placement under the lens: boundaries are judged between VIEWS (a folded cycle counts as its wake). */
+    showSessionDividerAfterView(view: TurnView, index: number): boolean {
+        return isSessionBoundary(lastTurnOf(view), nextSpeakingTurn(this.turnViews(), index));
     }
 
     // Tool call display helpers

@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from src.tools.research.papers import (
+from agent.tools.research.papers import (
     DOI_PATTERN,
     ARXIV_PATTERN,
     _detect_identifier_type,
@@ -15,10 +15,10 @@ from src.tools.research.papers import (
     _transfer_to_workspace,
     create_paper_tools,
 )
-from src.tools.research.utils.semantic_scholar_client import (
+from agent.tools.research.utils.semantic_scholar_client import (
     SemanticScholarProviderError,
 )
-from src.tools.research.utils.paper_types import (
+from agent.tools.research.utils.paper_types import (
     AccessStatus,
     DownloadResult,
     Paper,
@@ -93,7 +93,7 @@ class TestSearchPapers:
         search_papers = next(t for t in tools if t.name == "search_papers")
 
         with patch(
-            "src.tools.research.papers._search_arxiv",
+            "agent.tools.research.papers._search_arxiv",
             new_callable=AsyncMock,
             return_value="arXiv Search Results for: test\nResults: 1",
         ) as mock_search:
@@ -108,7 +108,7 @@ class TestSearchPapers:
         search_papers = next(t for t in tools if t.name == "search_papers")
 
         with patch(
-            "src.tools.research.papers._search_semantic_scholar",
+            "agent.tools.research.papers._search_semantic_scholar",
             new_callable=AsyncMock,
             return_value="Semantic Scholar Results for: test\nResults: 1",
         ):
@@ -127,7 +127,7 @@ class TestSearchPapers:
             retryable=False,
         )
         with patch(
-            "src.tools.research.utils.semantic_scholar_client.search_semantic_scholar",
+            "agent.tools.research.utils.semantic_scholar_client.search_semantic_scholar",
             new_callable=AsyncMock,
             side_effect=error,
         ):
@@ -150,7 +150,7 @@ class TestSearchPapers:
         search_papers = next(t for t in tools if t.name == "search_papers")
 
         with patch(
-            "src.tools.research.papers._search_arxiv",
+            "agent.tools.research.papers._search_arxiv",
             new_callable=AsyncMock,
             return_value="Results",
         ) as mock_search:
@@ -180,7 +180,7 @@ class TestDownloadPaper:
         mock_result.path.write_bytes(b"%PDF test")
 
         with patch(
-            "src.tools.research.papers._try_arxiv_download",
+            "agent.tools.research.papers._try_arxiv_download",
             new_callable=AsyncMock,
             return_value=mock_result,
         ):
@@ -215,12 +215,12 @@ class TestDownloadPaper:
 
         with (
             patch(
-                "src.tools.research.papers._try_arxiv_download",
+                "agent.tools.research.papers._try_arxiv_download",
                 new_callable=AsyncMock,
                 return_value=DownloadResult(success=False, error="Not on arXiv"),
             ),
             patch(
-                "src.tools.research.papers._try_unpaywall_download",
+                "agent.tools.research.papers._try_unpaywall_download",
                 new_callable=AsyncMock,
                 return_value=mock_result,
             ),
@@ -239,12 +239,12 @@ class TestDownloadPaper:
 
         with (
             patch(
-                "src.tools.research.papers._try_arxiv_download",
+                "agent.tools.research.papers._try_arxiv_download",
                 new_callable=AsyncMock,
                 return_value=DownloadResult(success=False, error="Not found"),
             ),
             patch(
-                "src.tools.research.papers._try_unpaywall_download",
+                "agent.tools.research.papers._try_unpaywall_download",
                 new_callable=AsyncMock,
                 return_value=DownloadResult(success=False, error="Not found"),
             ),
@@ -271,7 +271,7 @@ class TestDownloadPaper:
 
         with (
             patch(
-                "src.tools.research.papers._try_unpaywall_download",
+                "agent.tools.research.papers._try_unpaywall_download",
                 new_callable=AsyncMock,
                 return_value=DownloadResult(
                     success=False,
@@ -303,7 +303,7 @@ class TestDownloadPaper:
         mock_result.path.write_bytes(b"%PDF test")
 
         with patch(
-            "src.tools.research.papers._try_arxiv_download",
+            "agent.tools.research.papers._try_arxiv_download",
             new_callable=AsyncMock,
             return_value=mock_result,
         ):
@@ -323,7 +323,7 @@ class TestGetPaperInfo:
         get_paper_info = next(t for t in tools if t.name == "get_paper_info")
 
         with patch(
-            "src.tools.research.papers._get_semantic_scholar_info",
+            "agent.tools.research.papers._get_semantic_scholar_info",
             new_callable=AsyncMock,
             return_value="Paper: Test Paper\nAuthors: Alice\nCitations: 100",
         ):
@@ -338,12 +338,12 @@ class TestGetPaperInfo:
 
         with (
             patch(
-                "src.tools.research.papers._get_semantic_scholar_info",
+                "agent.tools.research.papers._get_semantic_scholar_info",
                 new_callable=AsyncMock,
                 return_value=None,
             ),
             patch(
-                "src.tools.research.papers._get_arxiv_info",
+                "agent.tools.research.papers._get_arxiv_info",
                 new_callable=AsyncMock,
                 return_value="Paper: Arxiv Paper\narXiv: 1706.03762",
             ),
@@ -367,12 +367,12 @@ class TestGetPaperInfo:
 
         with (
             patch(
-                "src.tools.research.papers._get_semantic_scholar_info",
+                "agent.tools.research.papers._get_semantic_scholar_info",
                 new_callable=AsyncMock,
                 side_effect=error,
             ),
             patch(
-                "src.tools.research.papers._get_arxiv_info",
+                "agent.tools.research.papers._get_arxiv_info",
                 new_callable=AsyncMock,
                 return_value="Paper: Arxiv Paper\narXiv: 1706.03762",
             ),
@@ -389,7 +389,7 @@ class TestGetPaperInfo:
         get_paper_info = next(t for t in tools if t.name == "get_paper_info")
 
         with patch(
-            "src.tools.research.papers._get_semantic_scholar_info",
+            "agent.tools.research.papers._get_semantic_scholar_info",
             new_callable=AsyncMock,
             return_value=None,
         ):
@@ -402,20 +402,20 @@ class TestPaperToolsMetadata:
     """Tests for paper tools metadata."""
 
     def test_metadata_has_all_tools(self):
-        from src.tools.research.papers import PAPER_TOOLS_METADATA
+        from agent.tools.research.papers import PAPER_TOOLS_METADATA
 
         assert "search_papers" in PAPER_TOOLS_METADATA
         assert "download_paper" in PAPER_TOOLS_METADATA
         assert "get_paper_info" in PAPER_TOOLS_METADATA
 
     def test_metadata_category_is_research(self):
-        from src.tools.research.papers import PAPER_TOOLS_METADATA
+        from agent.tools.research.papers import PAPER_TOOLS_METADATA
 
         for name, meta in PAPER_TOOLS_METADATA.items():
             assert meta["category"] == "research", f"{name} has wrong category"
 
     def test_metadata_has_phases(self):
-        from src.tools.research.papers import PAPER_TOOLS_METADATA
+        from agent.tools.research.papers import PAPER_TOOLS_METADATA
 
         for name, meta in PAPER_TOOLS_METADATA.items():
             assert "phases" in meta, f"{name} missing phases"
@@ -504,7 +504,7 @@ class TestDownloadPaperRemote:
 
         try:
             with patch(
-                "src.tools.research.papers._try_arxiv_download",
+                "agent.tools.research.papers._try_arxiv_download",
                 new_callable=AsyncMock,
                 return_value=mock_result,
             ):

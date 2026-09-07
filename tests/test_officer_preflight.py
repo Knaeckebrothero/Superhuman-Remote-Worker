@@ -8,8 +8,8 @@ import uuid
 
 import pytest
 
-from services.job_provisioning import JobProvisioningError
-from services.officer_preflight import (
+from orchestrator.services.job_provisioning import JobProvisioningError
+from orchestrator.services.officer_preflight import (
     ensure_officer_job_activated,
     initial_preflight_context,
     initial_preflight_freeze,

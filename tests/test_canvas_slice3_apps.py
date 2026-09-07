@@ -10,12 +10,12 @@ from uuid import UUID
 
 import pytest
 
-from services.canvas import (
+from orchestrator.services.canvas import (
     CanvasRecord,
     WorkspaceAppSource,
     canonical_source_fingerprint,
 )
-from services.canvas_apps import (
+from orchestrator.services.canvas_apps import (
     CANVAS_APP_DENYLIST_ENV,
     CanvasAppError,
     ThreadWorkspaceAppGateway,
@@ -23,7 +23,10 @@ from services.canvas_apps import (
     canvas_live_preview_enabled,
     validate_workspace_port,
 )
-from services.canvas_ssh import CanvasDirectChannelUnavailable, CanvasSSHError
+from orchestrator.services.canvas_ssh import (
+    CanvasDirectChannelUnavailable,
+    CanvasSSHError,
+)
 
 THREAD_ID = "a3333333-3333-3333-3333-333333333333"
 GENERATION = UUID("11111111-aaaa-4aaa-8aaa-111111111111")

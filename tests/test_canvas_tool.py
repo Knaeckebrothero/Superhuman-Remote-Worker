@@ -8,10 +8,10 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from src.api.orchestrator_client import CanvasClearResult, CanvasSetResult
-from src.tools.canvas import create_canvas_tools, get_canvas_metadata
-from src.tools.context import ToolContext
-from src.tools.registry import filter_tools_by_backend, load_tools
+from agent.api.orchestrator_client import CanvasClearResult, CanvasSetResult
+from agent.tools.canvas import create_canvas_tools, get_canvas_metadata
+from agent.tools.context import ToolContext
+from agent.tools.registry import filter_tools_by_backend, load_tools
 
 
 @pytest.fixture(autouse=True)
@@ -82,7 +82,7 @@ def canvas_client(monkeypatch):
         clients.append(client)
         return client
 
-    monkeypatch.setattr("src.tools.canvas._new_orchestrator_client", factory)
+    monkeypatch.setattr("agent.tools.canvas._new_orchestrator_client", factory)
     return clients, identities
 
 
@@ -382,7 +382,7 @@ async def test_get_uses_delegated_identity_and_strips_browser_internal_fields(
         clients.append(client)
         return client
 
-    monkeypatch.setattr("src.tools.canvas._new_orchestrator_client", factory)
+    monkeypatch.setattr("agent.tools.canvas._new_orchestrator_client", factory)
     result = await get_canvas.ainvoke({})
 
     assert identities[0] == ("persistent-test", "user-1")
@@ -426,7 +426,7 @@ async def test_get_app_state_exposes_only_logical_type_and_entry_path(
         clients.append(client)
         return client
 
-    monkeypatch.setattr("src.tools.canvas._new_orchestrator_client", factory)
+    monkeypatch.setattr("agent.tools.canvas._new_orchestrator_client", factory)
     result = await get_canvas.ainvoke({})
 
     assert identities == [("persistent-test", "user-1")]
@@ -513,7 +513,7 @@ async def test_set_port_sends_exact_flat_payload_and_redacts_returned_source(
         clients.append(client)
         return client
 
-    monkeypatch.setattr("src.tools.canvas._new_orchestrator_client", factory)
+    monkeypatch.setattr("agent.tools.canvas._new_orchestrator_client", factory)
     set_canvas = _tool(
         create_canvas_tools(
             _live_app_context(lambda method, params: events.append((method, params)))
@@ -590,7 +590,7 @@ async def test_set_browser_sends_exact_payload_redacts_identity_and_emits_once(
     repeated_client.set_result = CanvasSetResult(state=browser_state, changed=False)
     clients = iter((changed_client, repeated_client))
     monkeypatch.setattr(
-        "src.tools.canvas._new_orchestrator_client", lambda *a, **kw: next(clients)
+        "agent.tools.canvas._new_orchestrator_client", lambda *a, **kw: next(clients)
     )
     set_canvas = _tool(
         create_canvas_tools(
@@ -648,7 +648,7 @@ async def test_set_failure_never_emits_an_invalidation(monkeypatch):
 
     client = FailingClient()
     monkeypatch.setattr(
-        "src.tools.canvas._new_orchestrator_client", lambda *a, **kw: client
+        "agent.tools.canvas._new_orchestrator_client", lambda *a, **kw: client
     )
     set_canvas = _tool(
         create_canvas_tools(
@@ -689,7 +689,7 @@ async def test_clear_emits_only_for_a_real_transition(canvas_client):
         status="cleared",
         presentation_revision=4,
     )
-    import src.tools.canvas as canvas_module
+    import agent.tools.canvas as canvas_module
 
     transition_client = _CanvasClient()
     transition_client.clear_result = CanvasClearResult(state=transition, changed=True)
@@ -756,7 +756,7 @@ def test_registry_and_skill_fail_closed_without_internal_key(
     )
     assert loaded == []
 
-    from src.core.skill_resolution import (
+    from shared.runtime.core.skill_resolution import (
         add_default_canvas_skill,
         scope_skills_for_tools,
     )
@@ -828,7 +828,7 @@ def test_unknown_backend_must_explicitly_attest_canvas_materialization():
 def test_canvas_registration_follows_materializable_backend_capability(
     backend, expected
 ):
-    from src.core.skill_resolution import (
+    from shared.runtime.core.skill_resolution import (
         add_default_canvas_skill,
         scope_skills_for_tools,
     )
@@ -844,9 +844,9 @@ def test_canvas_registration_follows_materializable_backend_capability(
 
 
 def test_real_virtual_backend_marks_process_local_memory_unpresentable():
-    from src.core.backends.object_store import InMemoryObjectStore
-    from src.core.backends.rclone import RcloneObjectStore
-    from src.core.backends.virtual import VirtualWorkspaceBackend
+    from shared.runtime.core.backends.object_store import InMemoryObjectStore
+    from shared.runtime.core.backends.rclone import RcloneObjectStore
+    from agent.core.backends.virtual import VirtualWorkspaceBackend
 
     process_local = VirtualWorkspaceBackend(InMemoryObjectStore())
     durable = VirtualWorkspaceBackend(RcloneObjectStore("s3", root="bucket"))

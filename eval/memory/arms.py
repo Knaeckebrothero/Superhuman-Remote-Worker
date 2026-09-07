@@ -97,7 +97,7 @@ def build_agent_config(arm: ArmSpec) -> Any:
     nothing to measure), and seam-mode arms must bind at least one writer
     or ingestion would be a silent no-op.
     """
-    from src.core.loader import (
+    from shared.runtime.core.loader import (
         _apply_settings_matrix,
         deep_merge,
         load_agent_config_from_dict,

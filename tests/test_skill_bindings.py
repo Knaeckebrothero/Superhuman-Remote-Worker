@@ -11,7 +11,7 @@ Plan:   knowledge-base/knowledge/superpowers/plans/2026-06-19-skills-slice-3.md
 
 import pytest
 
-from src.core.loader import InstructionFileEntry, load_agent_config_from_dict
+from shared.runtime.core.loader import InstructionFileEntry, load_agent_config_from_dict
 
 
 # ---------------------------------------------------------------------------
@@ -107,9 +107,9 @@ def test_instruction_activation_options_validate(kwargs):
 from types import SimpleNamespace  # noqa: E402
 
 from tests._fs_backend import FilesystemTestBackend  # noqa: E402
-from src.core.workspace import WorkspaceManager  # noqa: E402
-from src.tools.context import ToolContext  # noqa: E402
-from src.tools.registry import apply_instruction_enforcement  # noqa: E402
+from agent.core.workspace import WorkspaceManager  # noqa: E402
+from agent.tools.context import ToolContext  # noqa: E402
+from agent.tools.registry import apply_instruction_enforcement  # noqa: E402
 
 
 def _ctx(tmp_path, entries):
@@ -208,7 +208,7 @@ async def test_apply_enforcement_wraps_async_tool_coroutine(tmp_path):
 # Task 3: bound-skill content rides the flag-independent instructions channel
 # ---------------------------------------------------------------------------
 
-from src.core.loader import serialize_resolved_config  # noqa: E402
+from shared.runtime.core.loader import serialize_resolved_config  # noqa: E402
 
 
 def test_serialize_freezes_bound_skill_md(tmp_path):
@@ -256,7 +256,7 @@ def test_serialize_freezes_bound_skill_md(tmp_path):
 
 from pathlib import Path as _P  # noqa: E402
 
-from src.core.skill_format import parse_skill_md, skill_identity  # noqa: E402
+from shared.runtime.core.skill_format import parse_skill_md, skill_identity  # noqa: E402
 
 
 def test_research_guide_skill_exists_and_parses():
@@ -298,10 +298,21 @@ def test_todo_guide_skill_exists_and_parses():
     assert len(body) > 500
 
 
-def test_worker_base_binds_todo_guide_as_skill():
+def _bindings_source(config_path: str) -> dict:
+    """A bundled config's raw YAML, or — for the public base name
+    ``worker_base`` — the merged worker role base (``expert_base`` + the worker
+    overlay, where ``instruction_files`` lives since the U1 split)."""
     import yaml
 
-    cfg = yaml.safe_load(_P("config/worker_base.yaml").read_text())
+    from shared.runtime.core.loader import load_role_base
+
+    if config_path == "worker_base":
+        return load_role_base("worker")
+    return yaml.safe_load(_P(config_path).read_text())
+
+
+def test_worker_base_binds_todo_guide_as_skill():
+    cfg = _bindings_source("worker_base")
     entries = cfg["instruction_files"]
     todo = [e for e in entries if e.get("skill") == "todo-guide"]
     assert len(todo) == 1
@@ -328,16 +339,14 @@ def test_interactive_designer_uses_an_action_gate_not_setup_injection():
 @pytest.mark.parametrize(
     "config_path",
     [
-        "config/worker_base.yaml",
+        "worker_base",
         "config/experts/scholar/config.yaml",
         "config/experts/product-qa/config.yaml",
         "config/experts/designer/config.yaml",
     ],
 )
 def test_verify_before_done_is_passive_and_freshness_scoped(config_path):
-    import yaml
-
-    cfg = yaml.safe_load(_P(config_path).read_text())
+    cfg = _bindings_source(config_path)
     entries = [
         entry
         for entry in cfg["instruction_files"]
@@ -360,7 +369,6 @@ def test_runtime_and_cockpit_schemas_accept_bounded_skill_bindings():
     import json
 
     import jsonschema
-    import yaml
 
     runtime = json.loads(_P("config/schema.json").read_text())["properties"][
         "instruction_files"
@@ -387,14 +395,14 @@ def test_runtime_and_cockpit_schemas_accept_bounded_skill_bindings():
     ]
     jsonschema.validate(bindings, runtime)
     for config_path in (
-        "config/worker_base.yaml",
+        "worker_base",
         "config/experts/assistant/config.yaml",
         "config/experts/designer/config.yaml",
         "config/experts/designer-interactive/config.yaml",
         "config/experts/product-qa/config.yaml",
         "config/experts/scholar/config.yaml",
     ):
-        config = yaml.safe_load(_P(config_path).read_text())
+        config = _bindings_source(config_path)
         jsonschema.validate(config["instruction_files"], runtime)
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(
@@ -404,6 +412,129 @@ def test_runtime_and_cockpit_schemas_accept_bounded_skill_bindings():
 
 
 def test_todo_guide_dropped_from_instruction_matrix():
-    from src.core.loader import InstructionMatrixResolver
+    from shared.runtime.core.loader import InstructionMatrixResolver
 
     assert "todo_guide" not in InstructionMatrixResolver.HARDCODED_DEFAULTS
+
+
+# ---------------------------------------------------------------------------
+# U2 WP2: the phase skills — worker bindings, expert-local overrides, freeze
+# ---------------------------------------------------------------------------
+
+from shared.runtime.core.loader import (  # noqa: E402
+    PHASE_SKILLS,
+    chain_root,
+    load_agent_config,
+    load_and_merge_config,
+    load_role_base,
+    resolve_bound_skill_dir,
+    resolve_config_path,
+)
+
+_PHASE_BINDINGS = {
+    "strategic-phase": "phase_start:strategic",
+    "tactical-phase": "phase_start:tactical",
+}
+
+
+def _phase_bindings(entries):
+    return {e["skill"]: e for e in entries if e.get("skill") in _PHASE_BINDINGS}
+
+
+def test_worker_base_binds_both_phase_skills():
+    entries = load_role_base("worker")["instruction_files"]
+    # At the top of the list, before the enforced action gates.
+    assert [e.get("skill") for e in entries[:2]] == list(_PHASE_BINDINGS)
+    for skill, trigger in _PHASE_BINDINGS.items():
+        binding = _phase_bindings(entries)[skill]
+        assert binding["trigger"] == trigger
+        assert binding["enforce"] is False
+        assert "file" not in binding
+    # The session overlay has no phase loop and no phase bindings.
+    assert not _phase_bindings(load_role_base("session").get("instruction_files") or [])
+
+
+def _worker_expert_leaves():
+    leaves = [
+        p
+        for p in sorted(_P("config/experts").glob("*/config.yaml"))
+        if chain_root(str(p)) == "worker_base"
+    ]
+    assert len(leaves) >= 6
+    return leaves
+
+
+@pytest.mark.parametrize("leaf", _worker_expert_leaves(), ids=lambda p: p.parent.name)
+def test_every_worker_expert_resolves_both_phase_bindings(leaf):
+    """deep_merge replaces lists wholesale: an expert that declares its own
+    instruction_files (scholar, product-qa, designer) must restate the two
+    phase bindings or silently lose its phase guidance."""
+    for role in (None, "worker"):
+        data = load_and_merge_config(str(leaf), role=role)
+        bindings = _phase_bindings(data["instruction_files"])
+        assert set(bindings) == set(_PHASE_BINDINGS), (leaf.parent.name, role)
+        for skill, trigger in _PHASE_BINDINGS.items():
+            assert bindings[skill]["trigger"] == trigger
+            assert bindings[skill]["enforce"] is False
+    cfg = load_agent_config(str(leaf), str(leaf.parent))
+    parsed = {e.skill: e for e in cfg.instruction_files if e.skill in _PHASE_BINDINGS}
+    assert {e.path for e in parsed.values()} == {
+        "skills/strategic-phase/SKILL.md",
+        "skills/tactical-phase/SKILL.md",
+    }
+
+
+def test_expert_local_phase_skill_overrides_bundled():
+    """Location-primary like prompt files: the developer ships its own
+    skills/<phase>-phase/SKILL.md, which outranks config/skills/<name>; an
+    expert without one (writer) and a config without a deployment dir fall
+    back to the bundled skill. Binding and workspace path do not change."""
+    _dev_path, dev_dir = resolve_config_path("developer")
+    _writer_path, writer_dir = resolve_config_path("writer")
+    bundled = _P("config/skills").resolve()
+    for phase, skill in PHASE_SKILLS.items():
+        local = resolve_bound_skill_dir(skill, dev_dir)
+        assert local == _P(dev_dir) / "skills" / skill
+        assert (local / "SKILL.md").is_file()
+        assert resolve_bound_skill_dir(skill, writer_dir) == bundled / skill
+        assert resolve_bound_skill_dir(skill, None) == bundled / skill
+        assert resolve_bound_skill_dir(skill, "/nonexistent/dir") == bundled / skill
+        fm, body = parse_skill_md((local / "SKILL.md").read_text(encoding="utf-8"))
+        assert skill_identity(fm)[0] == skill  # same name -> same binding
+        assert f"You are in {phase.upper()} mode." in body
+    # The developer's body is the developer's, not the generic one.
+    dev_strategic = (
+        resolve_bound_skill_dir("strategic-phase", dev_dir) / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    assert "tdd_phase" in dev_strategic
+    assert "tdd_phase" not in (bundled / "strategic-phase" / "SKILL.md").read_text()
+
+
+def test_serialize_freezes_expert_local_phase_skill():
+    dev_path, dev_dir = resolve_config_path("developer")
+    cfg = load_agent_config(dev_path, dev_dir)
+    blob = serialize_resolved_config(cfg, model=cfg.llm.model)
+    frozen = blob["instructions"]
+    for skill in PHASE_SKILLS.values():
+        assert frozen[skill] == (_P(dev_dir) / "skills" / skill / "SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        assert frozen[skill].startswith("---\nname: " + skill)
+    assert "tdd_phase" in frozen["strategic-phase"]
+    # An expert without a local override freezes the bundled body.
+    writer_path, writer_dir = resolve_config_path("writer")
+    wcfg = load_agent_config(writer_path, writer_dir)
+    wblob = serialize_resolved_config(wcfg, model=wcfg.llm.model)
+    assert wblob["instructions"]["strategic-phase"] == (
+        _P("config/skills/strategic-phase/SKILL.md").read_text(encoding="utf-8")
+    )
+    # The bindings and the workspace paths are unchanged by the override.
+    dev_bindings = [
+        e
+        for e in blob["agent"]["instruction_files"]
+        if e["skill"] in PHASE_SKILLS.values()
+    ]
+    assert [e["trigger"] for e in dev_bindings] == [
+        "phase_start:strategic",
+        "phase_start:tactical",
+    ]

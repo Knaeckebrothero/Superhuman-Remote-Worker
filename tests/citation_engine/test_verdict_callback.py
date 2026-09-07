@@ -18,7 +18,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from src.citation_engine.engine import CitationEngine
+from agent.citation_engine.engine import CitationEngine
 
 
 def _engine(on_verdict=None):
@@ -28,7 +28,7 @@ def _engine(on_verdict=None):
 
 def _patch_verify(monkeypatch, return_value):
     """Stub the aux funnel that ``_run_verification`` imports at call time."""
-    import src.services.auxiliary as aux
+    import shared.runtime.services.auxiliary as aux
 
     async def _fake(*_args, **_kwargs):
         return return_value
@@ -87,7 +87,7 @@ async def test_callback_exception_is_swallowed(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_aclose_disarms_and_joins_blocked_verifier(monkeypatch):
-    import src.services.auxiliary as aux
+    import shared.runtime.services.auxiliary as aux
 
     started = asyncio.Event()
 

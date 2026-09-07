@@ -1,4 +1,4 @@
-"""Workspace seeding regressions: instructions clobber, job README, Phase 0 commit.
+"""Workspace seeding regressions: instructions clobber, README facts, Phase 0 commit.
 
 instructions.md is now a virtual file (knowledge-base/knowledge/features/virtual_directories.md):
 TestInstructionsClobber verifies the provider's inline > upload > template
@@ -6,7 +6,7 @@ precedence — the direct descendant of a real historical bug where
 _deploy_instruction_files's guard called .exists() on a local Path for a path
 that only ever exists on the remote host, unconditionally overwriting
 user-provided instructions with the template. Plus the Phase 0 seed behavior
-(README rewrite + seed commit).
+(README.md workspace-facts block + seed commit).
 """
 
 from types import SimpleNamespace
@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.core.workspace import WorkspaceManager
+from agent.core.workspace import WorkspaceManager
 from tests._fs_backend import FilesystemTestBackend
 
 
@@ -33,7 +33,7 @@ class RemoteLikeBackend(FilesystemTestBackend):
 
 def _bare_agent(workspace_manager, config=None):
     """UniversalAgent shell (no __init__) for unit-testing instance methods."""
-    from src.agent import UniversalAgent
+    from agent.agent import UniversalAgent
 
     agent = UniversalAgent.__new__(UniversalAgent)
     agent._workspace_manager = workspace_manager
@@ -70,7 +70,7 @@ class TestInstructionsClobber:
         assert ws.read_file("instructions.md") == "CUSTOM USER BRIEF"
 
     def test_template_deployed_when_instructions_missing(self, tmp_path, monkeypatch):
-        import src.core.loader as loader
+        import shared.runtime.core.loader as loader
 
         monkeypatch.setattr(loader, "load_instructions", lambda *a, **k: "TEMPLATE")
         monkeypatch.setattr(
@@ -103,7 +103,7 @@ class TestBoundSkillCapabilityRendering:
     ):
         from pathlib import Path
 
-        from src.core.loader import InstructionFileEntry
+        from shared.runtime.core.loader import InstructionFileEntry
 
         raw_skill = Path("config/skills/verify-before-done/SKILL.md").read_text(
             encoding="utf-8"
@@ -213,7 +213,7 @@ class TestResolveUploadedInstructions:
     async def test_falls_back_to_local_uploads_dir_when_http_fails(
         self, tmp_path, monkeypatch
     ):
-        import src.core.workspace as workspace_module
+        import agent.core.workspace as workspace_module
 
         monkeypatch.setattr(
             workspace_module, "get_workspace_base_path", lambda: tmp_path
@@ -235,7 +235,7 @@ class TestResolveUploadedInstructions:
     async def test_returns_none_when_upload_id_resolves_to_nothing(
         self, tmp_path, monkeypatch
     ):
-        import src.core.workspace as workspace_module
+        import agent.core.workspace as workspace_module
 
         monkeypatch.setattr(
             workspace_module, "get_workspace_base_path", lambda: tmp_path
@@ -250,53 +250,153 @@ class TestResolveUploadedInstructions:
         assert result is None
 
 
-class TestJobReadme:
-    """README seeding: replace the Gitea stub, never a real README."""
+class TestWorkspaceFactsReadme:
+    """README.md carries a marker-delimited facts block: create it, replace
+    only the marked span, replace the Gitea stub, append to a human README —
+    and never carry the job id, description, or kickoff."""
 
-    METADATA = {
-        "description": "Analyze the quarterly reports.",
-        "config_name": "scholar",
-    }
+    START = "<!-- srw:workspace-facts:start -->"
+    END = "<!-- srw:workspace-facts:end -->"
+    JOB_ID = "ab12cd34-0000-0000-0000-000000000000"
+    DESCRIPTION = "Analyze the quarterly reports."
+    KICKOFF = "Start with the Q3 deck and report back."
 
-    def test_gitea_stub_is_replaced_with_description(self, tmp_path):
-        ws = WorkspaceManager(job_id="t", backend=FilesystemTestBackend(tmp_path))
-        ws.write_file("README.md", "# job-ab12cd34\n\nWorkspace for job-ab12cd34")
-        agent = _bare_agent(ws)
+    def _ws(self, tmp_path):
+        return WorkspaceManager(job_id="t", backend=FilesystemTestBackend(tmp_path))
 
-        agent._write_job_readme("ab12cd34-0000-0000-0000-000000000000", self.METADATA)
+    def _inject(self, ws, ds_configs=None, **kwargs):
+        from agent.core.datasource_setup import inject_workspace_facts
 
-        content = ws.read_file("README.md")
-        assert content.startswith("# Job ab12cd34")
-        assert "Analyze the quarterly reports." in content
-        assert agent._agent_seed_files["README.md"] == content
-
-    def test_real_readme_is_never_touched(self, tmp_path):
-        ws = WorkspaceManager(job_id="t", backend=FilesystemTestBackend(tmp_path))
-        original = "# My Project\n\nHand-written project docs."
-        ws.write_file("README.md", original)
-        agent = _bare_agent(ws)
-
-        agent._write_job_readme("ab12cd34-0000-0000-0000-000000000000", self.METADATA)
-
-        assert ws.read_file("README.md") == original
-        assert "README.md" not in agent._agent_seed_files
+        return inject_workspace_facts(ds_configs or [], ws, **kwargs)
 
     def test_readme_created_when_absent(self, tmp_path):
-        ws = WorkspaceManager(job_id="t", backend=FilesystemTestBackend(tmp_path))
-        agent = _bare_agent(ws)
+        ws = self._ws(tmp_path)
 
-        agent._write_job_readme("ab12cd34-0000-0000-0000-000000000000", self.METADATA)
+        content = self._inject(ws, expert="Scholar")
+
+        assert ws.read_file("README.md") == content
+        assert content.startswith(f"# Workspace\n\n{self.START}\n")
+        assert content.rstrip("\n").endswith(self.END)
+        assert "- **Expert**: Scholar" in content
+        assert "_No connectors attached._" in content
+        assert "_No input documents._" in content
+        assert "- `output/` — deliverables" in content
+
+    def test_marked_block_is_replaced_and_the_rest_is_byte_identical(self, tmp_path):
+        ws = self._ws(tmp_path)
+        head = "# My notes\n\nkeep me\n\n"
+        tail = "\n\n## Appendix\n\nalso keep me\n"
+        ws.write_file(
+            "README.md",
+            f"{head}{self.START}\nstale block\n{self.END}{tail}",
+        )
+
+        self._inject(ws, [{"type": "postgresql", "name": "Sales DB"}])
 
         content = ws.read_file("README.md")
-        assert "Analyze the quarterly reports." in content
+        assert content.startswith(head + self.START)
+        assert content.endswith(self.END + tail)
+        assert "stale block" not in content
+        assert content.count(self.START) == 1 and content.count(self.END) == 1
+        assert "**Sales DB**" in content
 
-    def test_empty_description_still_yields_readme(self, tmp_path):
-        ws = WorkspaceManager(job_id="t", backend=FilesystemTestBackend(tmp_path))
-        agent = _bare_agent(ws)
+    def test_gitea_stub_is_replaced(self, tmp_path):
+        ws = self._ws(tmp_path)
+        ws.write_file("README.md", "# job-ab12cd34\n\nWorkspace for job-ab12cd34")
 
-        agent._write_job_readme("ab12cd34-0000-0000-0000-000000000000", {})
+        self._inject(ws)
 
-        assert ws.read_file("README.md").startswith("# Job ab12cd34")
+        content = ws.read_file("README.md")
+        assert content.startswith(f"# Workspace\n\n{self.START}")
+        assert "job-ab12cd34" not in content
+
+    def test_current_gitea_intent_stub_is_replaced(self):
+        """The orchestrator's current auto-init README ("SRW managed repository;
+        creation-intent=<uuid>", orchestrator/services/gitea.py) is a stub too —
+        it must be replaced, not appended to (seen live on k3d job 2e6a4518)."""
+        from agent.core.datasource_setup import merge_workspace_facts
+
+        stub = (
+            "# job-2e6a4518\n\n"
+            "SRW managed repository; creation-intent="
+            "d1c02575-ce3d-4e2e-a8ff-77ef2d275a34\n"
+        )
+        block = (
+            "<!-- srw:workspace-facts:start -->\nX\n<!-- srw:workspace-facts:end -->"
+        )
+        out = merge_workspace_facts(stub, block)
+        assert out.startswith("# Workspace\n\n<!-- srw:workspace-facts:start -->")
+        assert "creation-intent" not in out
+        assert "# job-2e6a4518" not in out
+
+    def test_human_readme_is_appended_to_never_modified(self, tmp_path):
+        ws = self._ws(tmp_path)
+        original = "# My Project\n\nHand-written project docs.\n"
+        ws.write_file("README.md", original)
+
+        self._inject(ws)
+
+        content = ws.read_file("README.md")
+        assert content.startswith(original.rstrip("\n") + "\n\n" + self.START)
+        assert content.count(self.START) == 1
+
+    def test_facts_only_never_the_job_id_description_or_kickoff(self, tmp_path):
+        import inspect
+
+        from agent.core.datasource_setup import (
+            inject_workspace_facts,
+            render_workspace_facts,
+        )
+
+        for fn in (inject_workspace_facts, render_workspace_facts):
+            params = set(inspect.signature(fn).parameters)
+            assert not params & {"job_id", "description", "kickoff_message", "todos"}
+
+        ws = self._ws(tmp_path)
+        ws.write_file("README.md", "# job-ab12cd34\n\nWorkspace for job-ab12cd34")
+        content = self._inject(ws, project_name="Acme Reports", expert="Scholar")
+
+        assert "- **Project**: Acme Reports" in content
+        assert self.JOB_ID not in content
+        assert self.JOB_ID[:8] not in content
+        assert self.DESCRIPTION not in content
+        assert self.KICKOFF not in content
+
+    def test_project_line_omitted_when_unknown(self, tmp_path):
+        content = self._inject(self._ws(tmp_path), expert="Scholar")
+        assert "**Project**" not in content
+        assert "- **Expert**: Scholar" in content
+
+    def test_materials_list_documents_capped_at_30(self, tmp_path):
+        ws = self._ws(tmp_path)
+        for i in range(32):
+            ws.write_file(f"documents/report_{i:02d}.pdf", "x")
+        ws.write_file("documents/nested/deck.pptx", "x")
+        ws.write_file("documents/.DS_Store", "x")
+
+        content = self._inject(ws)
+
+        listed = [
+            line for line in content.splitlines() if line.startswith("- `documents/")
+        ]
+        assert len(listed) == 30
+        assert listed[0] == "- `documents/nested/deck.pptx`"
+        assert "… and 3 more" in content
+        assert ".DS_Store" not in content
+        assert "_No input documents._" not in content
+
+    def test_notes_layout_line_only_when_the_directory_exists(self, tmp_path):
+        ws = self._ws(tmp_path)
+        assert "- `notes/`" not in self._inject(ws)
+        ws.backend.mkdir("notes")
+        assert "- `notes/` — working notes" in self._inject(ws)
+
+    def test_write_failure_is_non_fatal(self, tmp_path):
+        ws = MagicMock()
+        ws.read_file.side_effect = FileNotFoundError
+        ws.write_file.side_effect = OSError("sftp down")
+
+        assert self._inject(ws) is None
 
 
 class TestPhase0SeedCommit:
@@ -399,7 +499,7 @@ class TestPersistentSessionSkillGuard:
 
     def test_bound_skill_not_overwritten_on_remote_backend(self, tmp_path):
         pytest.importorskip("langgraph")
-        from src.core.loader import InstructionFileEntry
+        from shared.runtime.core.loader import InstructionFileEntry
         from tests.test_persistent_session import _make_config, _make_session
 
         cfg = _make_config(
@@ -458,7 +558,7 @@ class TestReseedFromSnapshotIfFresh:
     def test_seeded_workspace_does_not_rewind_to_the_last_snapshot(
         self, tmp_path, monkeypatch
     ):
-        from src.core.backends.seed import mark_workspace_seeded
+        from agent.core.backends.seed import mark_workspace_seeded
 
         backend = FilesystemTestBackend(tmp_path)
         agent = self._agent(tmp_path, backend)
@@ -467,7 +567,7 @@ class TestReseedFromSnapshotIfFresh:
 
         snapshot_mgr = MagicMock()
         monkeypatch.setattr(
-            "src.core.phase_snapshot.PhaseSnapshotManager",
+            "agent.core.phase_snapshot.PhaseSnapshotManager",
             MagicMock(return_value=snapshot_mgr),
         )
 
@@ -485,7 +585,7 @@ class TestReseedFromSnapshotIfFresh:
 
         snapshot_mgr = MagicMock()
         monkeypatch.setattr(
-            "src.core.phase_snapshot.PhaseSnapshotManager",
+            "agent.core.phase_snapshot.PhaseSnapshotManager",
             MagicMock(return_value=snapshot_mgr),
         )
 
@@ -502,7 +602,7 @@ class TestReseedFromSnapshotIfFresh:
         snapshot_mgr = MagicMock()
         snapshot_mgr.get_latest_snapshot.return_value = SimpleNamespace(phase_number=3)
         monkeypatch.setattr(
-            "src.core.phase_snapshot.PhaseSnapshotManager",
+            "agent.core.phase_snapshot.PhaseSnapshotManager",
             MagicMock(return_value=snapshot_mgr),
         )
 
@@ -514,7 +614,7 @@ class TestReseedFromSnapshotIfFresh:
         self, tmp_path, monkeypatch
     ):
         """The original hazard, inverted: virtual files must not read as seeded."""
-        from src.core.virtual_dirs import SingleFileProvider
+        from agent.core.virtual_dirs import SingleFileProvider
 
         backend = FilesystemTestBackend(tmp_path)
         agent = self._agent(tmp_path, backend)
@@ -526,7 +626,7 @@ class TestReseedFromSnapshotIfFresh:
         snapshot_mgr = MagicMock()
         snapshot_mgr.get_latest_snapshot.return_value = SimpleNamespace(phase_number=1)
         monkeypatch.setattr(
-            "src.core.phase_snapshot.PhaseSnapshotManager",
+            "agent.core.phase_snapshot.PhaseSnapshotManager",
             MagicMock(return_value=snapshot_mgr),
         )
 

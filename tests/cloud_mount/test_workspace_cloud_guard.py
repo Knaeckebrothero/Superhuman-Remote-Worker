@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from src.tools.context import ToolContext
-from src.tools.workspace.files import create_file_tools
-from src.tools.workspace.filesystem import create_filesystem_tools
+from agent.tools.context import ToolContext
+from agent.tools.workspace.files import create_file_tools
+from agent.tools.workspace.filesystem import create_filesystem_tools
 
 
 class FakeWorkspace:

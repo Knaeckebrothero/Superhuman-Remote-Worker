@@ -12,7 +12,7 @@ import asyncio
 
 import pytest
 
-from src.core.llm_retry import (
+from shared.runtime.core.llm_retry import (
     RETRYABLE_CLASSIFICATIONS,
     RetryPolicy,
     invoke_with_retry,

@@ -48,20 +48,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-import sys
-from pathlib import Path
 
-# Put the orchestrator package dir on sys.path so bare imports (``database.*``,
-# ``services.*``) resolve the same way they do inside the running orchestrator.
-# In the image the code is flattened to /app and PYTHONPATH already covers it.
-_ORCH = Path(__file__).resolve().parent.parent / "orchestrator"
-if _ORCH.is_dir() and str(_ORCH) not in sys.path:
-    sys.path.insert(0, str(_ORCH))
 
-from database.postgres import PostgresDB  # noqa: E402
-from services.cloud import build_backend  # noqa: E402
-from services.cloud.handles import SessionFolderHandle  # noqa: E402
-from services.cloud.identity import resolve_user_identity_cached  # noqa: E402
+from orchestrator.database.postgres import PostgresDB
+from orchestrator.services.cloud import build_backend
+from orchestrator.services.cloud.handles import SessionFolderHandle
+from orchestrator.services.cloud.identity import resolve_user_identity_cached
 
 logger = logging.getLogger("backfill_session_folder_shares")
 

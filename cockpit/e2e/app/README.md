@@ -6,13 +6,49 @@ and it never intercepts application requests. The lifecycle owner is:
 
 ```bash
 ./scripts/e2e-app.sh run
+./scripts/e2e-app.sh run --profile stateless-sandbox
 ```
+
+The default `pinned-virtual` profile is the low-cost memory-backed baseline.
+`stateless-sandbox` reuses the same browser journey but enables the shared
+executor pool, selects a physical Kubernetes workspace, and includes the
+current-source workspace image in the build/import/deployment proof. The
+journey fails if orchestration silently falls back to the pinned lane.
 
 The initial blocking journey proves that opening `/` creates nothing, the first
 visible Send creates exactly one session and submits exactly one input, the
 deterministic multi-chunk reply renders, reload hydrates one durable transcript,
 the session list finds the correlation marker, and exact-id teardown deletes
 only the resource recorded by that test.
+
+For `stateless-sandbox`, setup additionally proves the user's saved workspace
+preference is `sandbox`, the created thread is on the `stateless` lane, and a
+physical Kubernetes workspace is materialized. These are profile preconditions,
+not brittle browser assertions: the public chat journey remains identical across
+both profiles. The harness builds the workspace image from the current checkout
+and verifies every application tag plus its CRI config digest on both k3d nodes
+before deployment, so a cached pinned/virtual fallback cannot produce a green
+stateless result.
+
+Permanent cleanup is part of the gate. The browser transport closes first, then
+the exact ledger-owned thread is deleted under a 180-second graceful deadline.
+Retryable `409`/`503` responses keep retrying the same terminal authority; if the
+graceful phase does not settle, a separately bounded 60-second force phase may
+run. Each HTTP request receives only the time remaining in its phase. A green run
+requires a verified `404`, successful provider reset, and deletion of the exact
+owned cluster.
+
+Use a separate private state root for a dirty-tree development run and expect the
+harness to label its result non-authoritative:
+
+```bash
+APP_E2E_ALLOW_DIRTY=1 \
+APP_E2E_STATE_DIR="$PWD/cockpit/test-results/app-harness-stateless-local" \
+  ./scripts/e2e-app.sh run --profile stateless-sandbox
+```
+
+Do not reuse a state root with an active ownership ledger; finish its `cleanup`
+and `down` lifecycle first.
 
 ## Direct Playwright use
 
@@ -34,12 +70,19 @@ APP_E2E_ADMIN_PASSWORD
 APP_E2E_PROVIDER_BASE_URL
 APP_E2E_CONTROL_URL
 APP_E2E_CONTROL_TOKEN
+APP_E2E_WORKSPACE_BACKEND
+APP_E2E_EXPECT_EXECUTION_LANE
 ```
 
 The base URL accepts loopback and `.localhost` origins by default. A disposable
 container/cluster hostname additionally requires `APP_E2E_ALLOW_REMOTE=1`.
 `APP_E2E_PROVIDER_BASE_URL` is the exact in-cluster inference URL ending in
 `/v1`; setup rejects any catalog transport that points elsewhere.
+The topology variables form one of two accepted pairs: `virtual` + `pinned`,
+or `sandbox` + `stateless`. They default to the pinned pair for direct local
+Playwright use. Attach mode never changes an existing user's workspace
+preference, so a stateless attach run requires that user to be preconfigured
+for the sandbox tier.
 
 The owned-cluster runner may set `APP_E2E_AUTH_STATE` and
 `APP_E2E_RESOURCE_LEDGER` to its private run directory. Auth state is written

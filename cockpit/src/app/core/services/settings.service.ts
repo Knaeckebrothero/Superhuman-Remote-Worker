@@ -70,30 +70,9 @@ export class SettingsService {
       .pipe(tap(() => this.loadPreferences()));
   }
 
-  // ── Project API Keys ──────────────────────────────────────────────
-
-  getProjectApiKeys(projectId: string): Observable<ApiKeyEntry[]> {
-    return this.http
-      .get<ApiKeyEntry[]>(`${this.baseUrl}/projects/${projectId}/api-keys`)
-      .pipe(catchError(() => of([])));
-  }
-
-  setProjectApiKey(
-    projectId: string,
-    provider: string,
-    body: ApiKeySetRequest,
-  ): Observable<ApiKeyEntry> {
-    return this.http.put<ApiKeyEntry>(
-      `${this.baseUrl}/projects/${projectId}/api-keys/${provider}`,
-      body,
-    );
-  }
-
-  deleteProjectApiKey(projectId: string, provider: string): Observable<{ status: string }> {
-    return this.http.delete<{ status: string }>(
-      `${this.baseUrl}/projects/${projectId}/api-keys/${provider}`,
-    );
-  }
+  // Per-project LLM provider keys (`/api/projects/{id}/api-keys`) have no
+  // cockpit surface; the endpoints and their place in the system > project >
+  // user precedence chain are exercised at dispatch, not from the browser.
 
   // ── Codex Proxy (Admin) ───────────────────────────────────────
 
@@ -170,13 +149,6 @@ export class SettingsService {
     return this.http.post<MainCloudTestResponse>(
       `${this.baseUrl}/admin/system-settings/main_cloud/test`,
       body,
-    );
-  }
-
-  reloadMainCloudSettings(): Observable<{ status: string; backend_id: string }> {
-    return this.http.post<{ status: string; backend_id: string }>(
-      `${this.baseUrl}/admin/system-settings/main_cloud/reload`,
-      {},
     );
   }
 

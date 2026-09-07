@@ -17,7 +17,7 @@ import base64
 import pytest
 from langchain_core.messages import HumanMessage
 
-from src.services.image_content import (
+from agent.services.image_content import (
     IMAGE_DATA_TAG_TEMPLATE,
     PAGE_IMAGE_TAG_TEMPLATE,
     ExtractedImage,

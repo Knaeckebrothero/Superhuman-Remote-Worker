@@ -20,8 +20,8 @@ import pytest
 import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
-from src.api.lease_context import LeaseHandle, LeaseLostError, current_lease
-from src.database.postgres_db import PostgresDB, _coerce_row_id
+from agent.api.lease_context import LeaseHandle, LeaseLostError, current_lease
+from agent.database.postgres_db import PostgresDB, _coerce_row_id
 
 _TID = "aaaaaaaa-0000-0000-0000-000000000001"
 _PROJECT_ID = "aaaaaaaa-0000-0000-0000-000000000099"
@@ -763,7 +763,7 @@ async def test_stateless_message_flush_commits_under_ordered_locks(db):
 
 @pytest.mark.asyncio
 async def test_stateless_event_flush_commits_under_ordered_locks(db):
-    import src.api.persistent_app as persistent_app
+    import agent.api.persistent_app as persistent_app
 
     lease = LeaseHandle()
     lease.update(_TID, 17)
@@ -800,7 +800,7 @@ async def test_stateless_event_flush_commits_under_ordered_locks(db):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("event_mode", ["ordinary", "stateless_control"])
 async def test_two_stateless_event_writers_serialize_before_hwm_update(db, event_mode):
-    import src.api.persistent_app as persistent_app
+    import agent.api.persistent_app as persistent_app
 
     advisory_key = 742_013_342
     function_name = "test_gate_thread_event_insert"
@@ -929,7 +929,7 @@ async def test_terminal_end_cannot_deadlock_with_message_flush(db):
 
 @pytest.mark.asyncio
 async def test_terminal_end_cannot_deadlock_with_event_flush(db):
-    import src.api.persistent_app as persistent_app
+    import agent.api.persistent_app as persistent_app
 
     thread_locked = asyncio.Event()
     release_queue = asyncio.Event()

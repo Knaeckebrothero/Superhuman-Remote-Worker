@@ -1,4 +1,4 @@
-## CSP override for the dev compose stack.
+## CSP override reference copy (local/dev).
 ##
 ## OpenCloud's default connect-src only allows 'self'. When the OIDC issuer
 ## (Keycloak at localhost:8180) is on a different port, the browser's
@@ -6,7 +6,8 @@
 ## document. This override adds the Keycloak origin so browser-side OIDC
 ## login works in the dev environment.
 ##
-## Mounted via PROXY_CSP_CONFIG_FILE_OVERRIDE_LOCATION in docker-compose.dev.yaml.
+## The deployed copy lives inline in helm/templates/services/opencloud.yaml and is
+## mounted via PROXY_CSP_CONFIG_FILE_OVERRIDE_LOCATION; keep the two in sync.
 ##
 ## Production deployments behind a single domain (reverse proxy) don't need
 ## this — the issuer and the app share the same origin.

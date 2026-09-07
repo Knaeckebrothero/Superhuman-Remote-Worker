@@ -1,0 +1,40 @@
+FROM python:3.12-slim
+
+ARG SRW_SOURCE_REVISION=""
+ARG SRW_SOURCE_URL="https://github.com/knaeckebrothero/Superhuman-Remote-Worker"
+ARG SRW_RELEASE_VERSION=""
+ARG SRW_DOCUMENTATION_URL="https://github.com/knaeckebrothero/Superhuman-Remote-Worker"
+
+LABEL org.opencontainers.image.source="${SRW_SOURCE_URL}"
+LABEL org.opencontainers.image.revision="${SRW_SOURCE_REVISION}"
+LABEL org.opencontainers.image.version="${SRW_RELEASE_VERSION}"
+LABEL org.opencontainers.image.documentation="${SRW_DOCUMENTATION_URL}"
+LABEL io.srw.component="vm-controller"
+
+ENV PYTHONSAFEPATH=1
+
+WORKDIR /app
+
+COPY requirements/ ./requirements/
+COPY scripts/lock_dependencies.py ./scripts/
+COPY src/vm_controller/requirements.txt ./src/vm_controller/requirements.txt
+RUN python scripts/lock_dependencies.py check vm-controller \
+    && pip install --no-cache-dir --require-hashes -r requirements/locks/vm-controller-py312.txt
+
+COPY src/vm_controller/ ./src/vm_controller/
+COPY src/shared/__init__.py src/shared/vm_lifecycle_auth.py ./src/shared/
+COPY pyproject.toml ./
+RUN pip install --no-cache-dir --no-deps -e .
+RUN --network=none python -I scripts/lock_dependencies.py check vm-controller --installed \
+    && python -m pip check
+
+# Check generated SDK auth and token refresh in this final installed environment.
+# The bind mount is build-only; the probe never reads credentials or uses a network.
+RUN --network=none --mount=type=bind,source=scripts/check_kubernetes_sdk_auth.py,target=/tmp/check_kubernetes_sdk_auth.py \
+    python -I /tmp/check_kubernetes_sdk_auth.py
+
+# Non-root user — K8s RBAC handles authorization
+RUN useradd --create-home --no-log-init controller
+USER controller
+
+ENTRYPOINT ["python", "-u", "-m", "vm_controller"]

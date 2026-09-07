@@ -12,7 +12,9 @@ from pathlib import Path
 
 import pytest
 
-SCHEMA_PATH = Path(__file__).parent.parent / "orchestrator" / "database" / "schema.sql"
+SCHEMA_PATH = (
+    Path(__file__).parent.parent / "src" / "orchestrator" / "database" / "schema.sql"
+)
 
 
 @pytest.fixture(scope="module")

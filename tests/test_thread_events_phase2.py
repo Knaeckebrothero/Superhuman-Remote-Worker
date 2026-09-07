@@ -60,7 +60,7 @@ def test_applied_session_memory_migration_checksum_is_immutable():
 
     path = (
         Path(__file__).resolve().parents[1]
-        / "orchestrator/database/migrations/app/0145_session_turn_memory_effects.sql"
+        / "src/orchestrator/database/migrations/app/0145_session_turn_memory_effects.sql"
     )
     assert hashlib.sha256(path.read_bytes()).hexdigest() == (
         "2cfd047791f6530f7640571cdc4108e16e1012447899628faa341deca38e80f9"
@@ -93,7 +93,7 @@ class TestEventJournalEpochAllocation:
         client cursors stay valid and no gone_beyond_horizon cascade fires.
         The full bump/reuse matrix lives in test_event_journal_epoch.py; this
         asserts the attach-path default is reuse."""
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         conn = MagicMock()
         conn.fetchrow = AsyncMock(
@@ -121,7 +121,7 @@ class TestEventJournalEpochAllocation:
 
     @pytest.mark.asyncio
     async def test_missing_thread_fails_closed(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         conn = MagicMock()
         conn.fetchrow = AsyncMock(return_value=None)
@@ -131,7 +131,7 @@ class TestEventJournalEpochAllocation:
 
     @pytest.mark.asyncio
     async def test_database_error_is_wrapped_as_journal_unavailable(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         conn = MagicMock()
         conn.fetchrow = AsyncMock(side_effect=RuntimeError("database offline"))
@@ -145,7 +145,7 @@ class TestBroadcastCursor:
     into the frame's params, and queues one ordered DB writer."""
 
     def setup_method(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._subscribers.clear()
         mod._events_epoch = 0
@@ -154,7 +154,7 @@ class TestBroadcastCursor:
         mod._session = None  # disables the DB write scheduling
 
     def teardown_method(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._subscribers.clear()
         mod._events_epoch = 0
@@ -163,7 +163,7 @@ class TestBroadcastCursor:
         mod._session = None
 
     def test_broadcast_increments_seq_monotonically(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         q = mod._subscribe("c1")
         mod._broadcast("token", {"content": "a"})
@@ -179,7 +179,7 @@ class TestBroadcastCursor:
         assert mod._next_seq == 3
 
     def test_broadcast_uses_current_epoch(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._events_epoch = 7
         mod._next_seq = 0
@@ -190,7 +190,7 @@ class TestBroadcastCursor:
         assert frame["params"]["_seq"] == [7, 1]
 
     def test_broadcast_keeps_original_params(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         q = mod._subscribe("c1")
         mod._broadcast("tool.started", {"tool": "read_file", "id": "tc1"})
@@ -206,7 +206,7 @@ class TestBroadcastCursor:
         self,
     ):
         """A DB-backed session routes broadcast persistence through its writer."""
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         # Fake session with a no-op acquire that records the fenced flush
         # (fetchval returning the inserted count — the epoch-guard contract).
@@ -257,7 +257,7 @@ class TestBroadcastCursor:
 
     @pytest.mark.asyncio
     async def test_durable_broadcast_waits_for_commit_and_links_request(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         write_started = asyncio.Event()
         allow_commit = asyncio.Event()
@@ -363,7 +363,7 @@ class TestOrderedPersistentEventWriter:
     @pytest.mark.asyncio
     async def test_never_starts_later_write_while_earlier_batch_is_blocked(self):
         """The regression: seq 2 cannot race past a slow seq 1 insert."""
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         first_started = asyncio.Event()
         release_first = asyncio.Event()
@@ -422,7 +422,7 @@ class TestOrderedPersistentEventWriter:
 
     @pytest.mark.asyncio
     async def test_persists_a_fifo_burst_in_one_batch(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         calls = []
 
@@ -452,8 +452,8 @@ class TestOrderedPersistentEventWriter:
 
     @pytest.mark.asyncio
     async def test_stateless_flush_locks_epoch_thread_then_bound_queue(self):
-        import src.api.persistent_app as mod
-        from src.api.lease_context import LeaseHandle
+        import agent.api.persistent_app as mod
+        from agent.api.lease_context import LeaseHandle
 
         thread_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
         calls = []
@@ -503,8 +503,8 @@ class TestOrderedPersistentEventWriter:
 
     @pytest.mark.asyncio
     async def test_stateless_flush_rejects_repointed_unit_before_sql(self):
-        import src.api.persistent_app as mod
-        from src.api.lease_context import LeaseHandle
+        import agent.api.persistent_app as mod
+        from agent.api.lease_context import LeaseHandle
 
         lease = LeaseHandle()
         lease.update("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", 18)
@@ -526,7 +526,7 @@ class TestOrderedPersistentEventWriter:
 
     @pytest.mark.asyncio
     async def test_pinned_flush_locks_exact_live_runtime_then_reciprocal_agent(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         thread_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         agent_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
@@ -586,7 +586,7 @@ class TestOrderedPersistentEventWriter:
     async def test_pinned_flush_rejects_retired_or_nonreciprocal_runtime(
         self, failed_fence
     ):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         calls = []
 
@@ -639,7 +639,7 @@ class TestOrderedPersistentEventWriter:
         remain the authority fence; excluding ``suspended`` would terminally
         close the writer on its first valid frame.
         """
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         seen_sql: list[str] = []
 
@@ -682,7 +682,7 @@ class TestOrderedPersistentEventWriter:
 
     @pytest.mark.asyncio
     async def test_canvas_failure_retries_then_sends_unjournaled_reconcile(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         attempts = 0
 
@@ -724,7 +724,7 @@ class TestOrderedPersistentEventWriter:
 
     @pytest.mark.asyncio
     async def test_full_queue_does_not_silently_drop_canvas_invalidation(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         class _Conn:
             async def fetchval(self, _sql, _thread_id, rows_json, _epoch):
@@ -769,13 +769,13 @@ class TestInterruptModeSelection:
     The mode picks the right behavior at the persistent_graph check sites."""
 
     def setup_method(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._loop_interrupt_flag = None
         mod._tool_inflight = False
 
     def test_loop_on_tool_start_does_not_claim_execution_inflight(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         async def _run():
             await mod._loop_on_tool_start("read_file", {"path": "/x"}, "tc1")
@@ -784,7 +784,7 @@ class TestInterruptModeSelection:
         assert mod._tool_inflight is False
 
     def test_loop_on_tool_execution_start_sets_inflight_at_effect_boundary(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         async def _run():
             await mod._loop_on_tool_execution_start("read_file", "tc1")
@@ -794,7 +794,7 @@ class TestInterruptModeSelection:
         assert mod._tool_inflight is True
 
     def test_loop_on_tool_result_clears_inflight(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._tool_inflight = True
 
@@ -824,7 +824,7 @@ class TestPersistentGraphInterruptModes:
             SystemMessage,
         )
 
-        from src.persistent_graph import PersistentLoopCallbacks, _execute_turn
+        from agent.persistent_graph import PersistentLoopCallbacks, _execute_turn
 
         # First chunk arrives, then interrupt fires before the second.
         chunk1 = AIMessage(content="Half-typed ")
@@ -891,7 +891,7 @@ class TestPersistentGraphInterruptModes:
             SystemMessage,
         )
 
-        from src.persistent_graph import PersistentLoopCallbacks, _execute_turn
+        from agent.persistent_graph import PersistentLoopCallbacks, _execute_turn
 
         chunk1 = AIMessageChunk(content="Tool calling now")
 
@@ -1020,7 +1020,7 @@ class TestAgentRestInputEndpointsNoSession:
     contract as POST /session/detach."""
 
     def setup_method(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._session = None
         mod._loop_user_queue = None
@@ -1028,7 +1028,7 @@ class TestAgentRestInputEndpointsNoSession:
     def test_api_input_503_without_session(self):
         from fastapi.testclient import TestClient
 
-        from src.api.persistent_app import create_persistent_app
+        from agent.api.persistent_app import create_persistent_app
 
         app = create_persistent_app("interactive")
         client = TestClient(app)
@@ -1038,7 +1038,7 @@ class TestAgentRestInputEndpointsNoSession:
     def test_api_interrupt_503_without_session(self):
         from fastapi.testclient import TestClient
 
-        from src.api.persistent_app import create_persistent_app
+        from agent.api.persistent_app import create_persistent_app
 
         app = create_persistent_app("interactive")
         client = TestClient(app)
@@ -1048,7 +1048,7 @@ class TestAgentRestInputEndpointsNoSession:
     def test_api_approve_503_without_session(self):
         from fastapi.testclient import TestClient
 
-        from src.api.persistent_app import create_persistent_app
+        from agent.api.persistent_app import create_persistent_app
 
         app = create_persistent_app("interactive")
         client = TestClient(app)
@@ -1060,8 +1060,8 @@ class TestAgentRestInputEndpointsNoSession:
 
         from fastapi.testclient import TestClient
 
-        import src.api.persistent_app as mod
-        from src.api.persistent_app import create_persistent_app
+        import agent.api.persistent_app as mod
+        from agent.api.persistent_app import create_persistent_app
 
         # Stand up a minimal session so we get past the 503 gate.
         mod._session = MagicMock()
@@ -1094,7 +1094,7 @@ class TestAgentRestInputEndpointsNoSession:
 
         from starlette.requests import Request
 
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         exact_session_fingerprint = "sha256:" + ("a" * 64)
 
@@ -1493,7 +1493,7 @@ class TestThreadEventStreamPresence:
     @pytest.mark.asyncio
     async def test_stateless_establishes_after_owner_gate(self, monkeypatch):
         import orchestrator.main as om
-        from src.shared.thread_presence import PresenceRefresh
+        from shared.thread_presence import PresenceRefresh
 
         auth = AsyncMock(return_value=self._owner_row("stateless"))
         refresh = AsyncMock(return_value=PresenceRefresh(True, True))
@@ -1517,7 +1517,7 @@ class TestThreadEventStreamPresence:
     @pytest.mark.asyncio
     async def test_periodic_renewal_reauthorizes_before_touch(self, monkeypatch):
         import orchestrator.main as om
-        from src.shared.thread_presence import PresenceRefresh
+        from shared.thread_presence import PresenceRefresh
 
         auth = AsyncMock(
             side_effect=[
@@ -1549,7 +1549,7 @@ class TestThreadEventStreamPresence:
     async def test_renewal_auth_failure_closes_without_refresh(self, monkeypatch):
         import orchestrator.main as om
         from fastapi import HTTPException
-        from src.shared.thread_presence import PresenceRefresh
+        from shared.thread_presence import PresenceRefresh
 
         auth = AsyncMock(
             side_effect=[

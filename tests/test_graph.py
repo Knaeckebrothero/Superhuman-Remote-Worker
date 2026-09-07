@@ -8,24 +8,21 @@ import inspect
 
 import pytest
 import tempfile
-import sys
 import yaml
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, AsyncMock, patch
 from uuid import UUID
 
 # Add project root src to path for imports
 project_root = Path(__file__).parent.parent
-src_path = project_root / "src"
-if str(src_path) not in sys.path:
-    sys.path.insert(0, str(src_path))
 
 # Import from src package (requires langgraph in environment)
-from src.core.workspace import WorkspaceManager  # noqa: E402
-from src.core.state import create_initial_state  # noqa: E402
-from src.managers import TodoManager, PlanManager, MemoryManager  # noqa: E402
+from agent.core.workspace import WorkspaceManager  # noqa: E402
+from agent.core.state import create_initial_state  # noqa: E402
+from agent.managers import TodoManager, PlanManager, MemoryManager  # noqa: E402
 from tests._fs_backend import FilesystemTestBackend  # noqa: E402
-from src.graph import (  # noqa: E402
+from agent.graph import (  # noqa: E402
     WORKER_BATCH_MIN_WALL_SECONDS,
     route_entry,
     route_after_execute,
@@ -43,7 +40,9 @@ from src.graph import (  # noqa: E402
     get_managers_from_workspace,
     worker_batch_boundary_updates,
 )
-from src.core.phase import (  # noqa: E402
+from langchain_core.messages import AIMessage, SystemMessage, ToolMessage  # noqa: E402
+from shared.runtime.core.loader import LimitsConfig  # noqa: E402
+from agent.core.phase import (  # noqa: E402
     get_initial_strategic_todos,
     get_transition_strategic_todos,
     validate_todos_yaml,
@@ -271,6 +270,28 @@ class TestCheckTodosNode:
         assert "todos" in result
         assert result["todos"][0]["status"] == "completed"
 
+    @pytest.mark.parametrize(
+        "decision_field", ["is_final_phase", "completion_decision", "verdict_decision"]
+    )
+    def test_empty_final_phase_does_not_reload_seed_todos(
+        self, managers, mock_config, decision_field
+    ):
+        node = create_check_todos_node(managers["todo"], mock_config)
+        decision = True if decision_field == "is_final_phase" else {"recorded": True}
+
+        result = node(
+            {
+                "job_id": "final-after-archive",
+                "iteration": 12,
+                "is_strategic_phase": True,
+                decision_field: decision,
+            }
+        )
+
+        assert result["phase_complete"] is True
+        assert result["todos"] == []
+        assert managers["todo"].list_all() == []
+
     def test_due_batch_freezes_only_at_safe_todo_check(self, managers, mock_config):
         managers["todo"].add("Task still in progress")
         node = create_check_todos_node(managers["todo"], mock_config)
@@ -285,7 +306,7 @@ class TestCheckTodosNode:
             "worker_batch_iteration_cap": None,
         }
 
-        with patch("src.graph.time.time", return_value=1300.0):
+        with patch("agent.graph.time.time", return_value=1300.0):
             result = node(state)
 
         assert result["should_stop"] is True
@@ -318,7 +339,7 @@ class TestCheckTodosNode:
             "worker_batch_iteration_cap": None,
         }
 
-        with patch("src.graph.time.time", return_value=1300.0):
+        with patch("agent.graph.time.time", return_value=1300.0):
             result = node(state)
 
         assert result["phase_complete"] is True
@@ -338,7 +359,7 @@ class TestCheckTodosNode:
             "worker_batch_iteration_cap": None,
         }
 
-        with patch("src.graph.time.time", return_value=1300.0):
+        with patch("agent.graph.time.time", return_value=1300.0):
             result = node(state)
 
         assert result["phase_complete"] is True
@@ -356,7 +377,7 @@ class TestCheckTodosNode:
             "worker_batch_iteration_cap": None,
         }
 
-        with patch("src.graph.time.time", return_value=1300.0):
+        with patch("agent.graph.time.time", return_value=1300.0):
             result = node(state)
 
         assert result["phase_complete"] is True
@@ -375,8 +396,8 @@ class TestCheckTodosNode:
         }
 
         with (
-            patch("src.graph.time.time", return_value=1300.0),
-            patch("src.graph._is_drain_requested", return_value=True),
+            patch("agent.graph.time.time", return_value=1300.0),
+            patch("agent.graph._is_drain_requested", return_value=True),
         ):
             result = node(state)
 
@@ -558,7 +579,7 @@ class TestCheckpointCompletionReport:
         from langgraph.checkpoint.memory import InMemorySaver
         from langgraph.graph import END, StateGraph
 
-        from src.core.state import UniversalAgentState
+        from agent.core.state import UniversalAgentState
 
         workflow = StateGraph(UniversalAgentState)
         workflow.add_node("checkpoint_completion_report", checkpoint_completion_report)
@@ -591,7 +612,7 @@ class TestRestoreTodoStateNode:
 
     def test_restores_from_checkpoint(self, managers):
         """Test that restore_todo_state restores TodoManager from checkpoint."""
-        from src.graph import create_restore_todo_state_node
+        from agent.graph import create_restore_todo_state_node
 
         node = create_restore_todo_state_node(managers["todo"])
 
@@ -648,7 +669,7 @@ class TestRestoreTodoStateNode:
 
     def test_handles_empty_checkpoint(self, managers):
         """Test that restore_todo_state handles checkpoints without todo data."""
-        from src.graph import create_restore_todo_state_node
+        from agent.graph import create_restore_todo_state_node
 
         node = create_restore_todo_state_node(managers["todo"])
 
@@ -674,7 +695,7 @@ class TestRestoreTodoStateNode:
         When resuming with staged todos but no active todos (phase-boundary
         freeze pattern), the node should apply them and flip to tactical.
         """
-        from src.graph import create_restore_todo_state_node
+        from agent.graph import create_restore_todo_state_node
 
         node = create_restore_todo_state_node(managers["todo"])
 
@@ -711,7 +732,7 @@ class TestRestoreTodoStateNode:
         When there are both active and staged todos, the node should NOT
         apply staged todos — this is a normal mid-phase restore.
         """
-        from src.graph import create_restore_todo_state_node
+        from agent.graph import create_restore_todo_state_node
 
         node = create_restore_todo_state_node(managers["todo"])
 
@@ -893,6 +914,139 @@ class TestArchivePhaseNode:
         assert call_kwargs.kwargs.get("force") is False, (
             "Expected force=False for tactical→strategic transition"
         )
+
+    @pytest.mark.asyncio
+    async def test_boundary_compaction_drops_ending_phase_block_keeps_generic_pin(
+        self, managers, mock_config
+    ):
+        """U2 WP1: the archive node clears the protected-block phase key before
+        its boundary compaction, so the ending phase's instruction block is
+        summarised away with its region (not re-seated after the summary),
+        while a generic pin (no phase key) survives. The execute node stays
+        the only place that sets a non-None key."""
+        from langchain_core.messages import (
+            AIMessage,
+            HumanMessage,
+            RemoveMessage,
+            SystemMessage,
+        )
+
+        from agent.core.context import (
+            ContextConfig,
+            ContextManager,
+            ConversationSummary,
+        )
+        from shared.runtime.core.message_markers import (
+            PROTECTED_KEY,
+            is_protected_message,
+            protected_phase_key,
+        )
+        from shared.runtime.core.workspace_injection import (
+            create_phase_instruction_message,
+        )
+        from shared.runtime.services.auxiliary import AuxiliaryLLM
+
+        managers["todo"].add("Task 1")
+        managers["todo"].complete("todo_1")
+        managers["plan"].write("## Phase 2: Test\n\n- [x] Task 1")
+
+        # A real context manager, thresholds low enough that the boundary
+        # compaction summarises, left as the execute node leaves it (key set).
+        context_mgr = ContextManager(
+            config=ContextConfig(
+                compaction_threshold_tokens=200,
+                summarization_threshold_tokens=200,
+                message_count_threshold=1000,
+                message_count_min_tokens=100,
+                keep_recent_messages=2,
+                keep_recent_tool_results=2,
+                model_max_context_tokens=4000,
+            )
+        )
+        context_mgr.set_current_phase("tactical", phase_key="2:tactical")
+
+        parsed = ConversationSummary(
+            summary="Phase 2 work.",
+            tasks_completed="- Task 1",
+            key_decisions="",
+            current_state="phase ended",
+            blockers="",
+        )
+        structured = AsyncMock()
+        structured.ainvoke = AsyncMock(
+            return_value={
+                "raw": AIMessage(content="s"),
+                "parsed": parsed,
+                "parsing_error": None,
+            }
+        )
+        aux_llm = MagicMock()
+        aux_llm.with_structured_output = MagicMock(return_value=structured)
+        auxiliary = AuxiliaryLLM(llm=aux_llm, max_context_tokens=15_000)
+
+        block = create_phase_instruction_message(
+            "skills/research-guide/SKILL.md",
+            "TACTICAL GUIDANCE " * 30,
+            "tactical",
+            "2:tactical",
+        )
+        block.id = "blk"
+        pin = HumanMessage(
+            content="GENERIC PIN", id="pin", additional_kwargs={PROTECTED_KEY: True}
+        )
+        history = [HumanMessage(content="start", id="h0"), block, pin]
+        for i in range(6):
+            history.append(
+                HumanMessage(content=f"question {i} " + "x" * 200, id=f"h{i + 1}")
+            )
+            history.append(
+                AIMessage(content=f"answer {i} " + "y" * 200, id=f"a{i + 1}")
+            )
+
+        mock_config.context_management = MagicMock()
+        mock_config.context_management.compact_on_archive = True
+        mock_config.context_management.reasoning_level = None
+        mock_config.context_management.max_summary_length = 10000
+        mock_config.llm = MagicMock()
+        mock_config.llm.reasoning_level = "high"
+
+        node = create_archive_phase_node(
+            managers["todo"],
+            managers["plan"],
+            mock_config,
+            context_mgr,
+            auxiliary,
+            "Summarize this conversation.",
+        )
+        state = {
+            "job_id": "test-123",
+            "messages": history,
+            "is_strategic_phase": False,
+            "phase_number": 2,
+        }
+        result = await node(state)
+
+        assert context_mgr.current_phase_key is None
+        kept = [m for m in result["messages"] if not isinstance(m, RemoveMessage)]
+        removed = {m.id for m in result["messages"] if isinstance(m, RemoveMessage)}
+        assert "blk" in removed
+        assert "pin" in removed
+        # The ending phase's block is gone from the compacted history...
+        assert not any(
+            is_protected_message(m) and protected_phase_key(m) == "2:tactical"
+            for m in kept
+        )
+        assert not any("TACTICAL GUIDANCE" in str(m.content) for m in kept)
+        # ...while the generic pin is re-seated right after the summary.
+        summary_idx = next(
+            i
+            for i, m in enumerate(kept)
+            if isinstance(m, SystemMessage) and "[Summary of prior work]" in m.content
+        )
+        assert kept[summary_idx + 1].content == "GENERIC PIN"
+        assert is_protected_message(kept[summary_idx + 1])
+        assert kept[summary_idx + 1].id is None
+        assert "Phase complete" in kept[-1].content
 
 
 class TestCheckGoalNode:
@@ -1422,7 +1576,7 @@ class TestHandleTransitionNode:
             "worker_batch_target_wall_seconds": 300.0,
             "worker_batch_iteration_cap": 5,
         }
-        with patch("src.graph._is_drain_requested", return_value=True):
+        with patch("agent.graph._is_drain_requested", return_value=True):
             result = await node(state)
 
         assert result.get("should_stop") is True
@@ -1474,7 +1628,7 @@ class TestHandleTransitionNode:
             "phase_number": 0,
             "iteration": 10,
         }
-        with patch("src.graph._is_drain_requested", return_value=False):
+        with patch("agent.graph._is_drain_requested", return_value=False):
             result = await node(state)
 
         # Successful transition without any version_upgrade freeze.
@@ -1514,8 +1668,8 @@ class TestHandleTransitionNode:
         }
 
         with (
-            patch("src.graph._is_drain_requested", return_value=False),
-            patch("src.graph.time.time", return_value=1300.0),
+            patch("agent.graph._is_drain_requested", return_value=False),
+            patch("agent.graph.time.time", return_value=1300.0),
         ):
             result = await node(state)
 
@@ -1556,8 +1710,8 @@ class TestHandleTransitionNode:
         }
 
         with (
-            patch("src.graph._is_drain_requested", return_value=False),
-            patch("src.graph.time.time", return_value=1300.0),
+            patch("agent.graph._is_drain_requested", return_value=False),
+            patch("agent.graph.time.time", return_value=1300.0),
         ):
             result = await node(state)
 
@@ -1833,8 +1987,8 @@ class TestEditFileTool:
     @pytest.fixture
     def workspace_tools_dict(self, workspace_manager):
         """Create workspace tools and return as dict."""
-        from src.tools.workspace import create_workspace_tools
-        from src.tools.context import ToolContext
+        from agent.tools.workspace import create_workspace_tools
+        from agent.tools.context import ToolContext
 
         ctx = ToolContext(workspace_manager=workspace_manager)
         tools = create_workspace_tools(ctx)
@@ -1952,8 +2106,8 @@ class TestEditCitationTool:
     @pytest.fixture
     def edit_tool(self, workspace_manager, mock_engine):
         """Create citation tools and return the edit_citation tool."""
-        from src.tools.citation import create_citation_tools
-        from src.tools.context import ToolContext
+        from agent.tools.citation import create_citation_tools
+        from agent.tools.context import ToolContext
 
         ctx = ToolContext(
             workspace_manager=workspace_manager,
@@ -2066,7 +2220,7 @@ class TestEnsureWithinLimits:
     @pytest.fixture
     def context_mgr(self):
         """Create a ContextManager with low thresholds for testing."""
-        from src.core.context import ContextManager, ContextConfig
+        from agent.core.context import ContextManager, ContextConfig
 
         config = ContextConfig(
             compaction_threshold_tokens=1000,
@@ -2080,7 +2234,7 @@ class TestEnsureWithinLimits:
     @pytest.fixture
     def mock_auxiliary(self):
         """Create a mock AuxiliaryLLM that returns a summary."""
-        from src.services.auxiliary import AuxiliaryLLM
+        from shared.runtime.services.auxiliary import AuxiliaryLLM
         from langchain_core.messages import AIMessage
 
         llm = MagicMock()
@@ -2107,7 +2261,7 @@ class TestEnsureWithinLimits:
     async def test_no_compaction_when_under_threshold(self, context_mgr):
         """Test that messages are returned unchanged when under threshold."""
         from langchain_core.messages import HumanMessage
-        from src.services.auxiliary import AuxiliaryLLM
+        from shared.runtime.services.auxiliary import AuxiliaryLLM
 
         messages = [HumanMessage(content="Hello")]
 
@@ -2179,3 +2333,266 @@ class TestEnsureWithinLimits:
 
         # Should return same messages since there's nothing to summarize
         assert result == messages
+
+
+# =============================================================================
+# Per-call phase gate (U2 WP3) and the one-binding execute node
+# =============================================================================
+
+
+def _gate_config(**limits):
+    """The config surface ``create_audited_tool_node`` reads."""
+    return SimpleNamespace(
+        agent_id="gate-agent",
+        limits=LimitsConfig(**limits),
+        llm=SimpleNamespace(model=None),
+    )
+
+
+def _named_tool(name):
+    fake = MagicMock()
+    fake.name = name
+    return fake
+
+
+def _gate_state(calls, is_strategic=False, phase_number=4):
+    return {
+        "messages": [AIMessage(content="", tool_calls=calls)],
+        "job_id": "gate-job",
+        "iteration": 1,
+        "is_strategic_phase": is_strategic,
+        "phase_number": phase_number,
+        "metadata": {},
+    }
+
+
+class TestPerCallPhaseGate:
+    """With one binding for every phase, the audited tool node decides per call."""
+
+    @pytest.mark.asyncio
+    async def test_mixed_batch_runs_the_legal_call_and_rejects_the_illegal_one(
+        self,
+    ):
+        auditor = MagicMock()
+        auditor.audit_tool_call.side_effect = lambda **kw: f"doc-{kw['call_id']}"
+        with (
+            patch("agent.graph.ToolNode") as MockToolNode,
+            patch("agent.graph.get_archiver", return_value=auditor),
+        ):
+            mock_tn = AsyncMock()
+            mock_tn.ainvoke = AsyncMock(
+                return_value={
+                    "messages": [
+                        ToolMessage(content="body", tool_call_id="c1", name="read_file")
+                    ]
+                }
+            )
+            MockToolNode.return_value = mock_tn
+            audited = create_audited_tool_node(
+                [_named_tool("read_file"), _named_tool("job_complete")],
+                _gate_config(max_tool_calls_per_job=2),
+            )
+            result = await audited(
+                _gate_state(
+                    [
+                        {"name": "read_file", "id": "c1", "args": {"path": "a"}},
+                        {"name": "job_complete", "id": "c2", "args": {}},
+                    ]
+                )
+            )
+
+            # The legal call executed — the ToolNode saw only it — and the
+            # illegal one is an error ToolMessage in its original position.
+            mock_tn.ainvoke.assert_awaited_once()
+            seen = mock_tn.ainvoke.await_args.args[0]["messages"][-1]
+            assert [c["name"] for c in seen.tool_calls] == ["read_file"]
+            msgs = [m for m in result["messages"] if isinstance(m, ToolMessage)]
+            assert [m.tool_call_id for m in msgs] == ["c1", "c2"]
+            assert msgs[0].content == "body"
+            assert msgs[1].content == (
+                "Error: 'job_complete' is a strategic-phase tool; you are in the "
+                "tactical phase (phase 4). Finish or replan the current todos — it "
+                "becomes available at the next strategic phase. Other calls in "
+                "this batch were executed normally."
+            )
+
+            # Both calls are in the audit; the rejection is a recorded failure.
+            assert [
+                c.kwargs["call_id"] for c in auditor.audit_tool_call.call_args_list
+            ] == ["c1", "c2"]
+            updates = {
+                c.kwargs["audit_doc_id"]: c.kwargs
+                for c in auditor.update_tool_result.call_args_list
+            }
+            assert updates["doc-c1"]["success"] is True
+            assert updates["doc-c2"]["success"] is False
+            assert updates["doc-c2"]["error"].startswith(
+                "Error: 'job_complete' is a strategic-phase tool"
+            )
+
+            # The budget counted both: the cap of 2 trips on the next call.
+            mock_tn.ainvoke = AsyncMock(
+                return_value={
+                    "messages": [
+                        ToolMessage(content="body", tool_call_id="c3", name="read_file")
+                    ]
+                }
+            )
+            frozen = await audited(
+                _gate_state([{"name": "read_file", "id": "c3", "args": {}}])
+            )
+            assert frozen["freeze_data"]["freeze_type"] == "budget_exceeded"
+            assert frozen["freeze_data"]["tool_calls_this_job"] == 3
+
+    @pytest.mark.asyncio
+    async def test_stuck_detection_progress_counts_only_the_executed_call(self):
+        def nudges(result):
+            return [
+                m
+                for m in result.get("messages", [])
+                if isinstance(m, SystemMessage) and "OBSERVATION" in m.content
+            ]
+
+        with patch("agent.graph.ToolNode") as MockToolNode:
+            mock_tn = AsyncMock()
+            MockToolNode.return_value = mock_tn
+            audited = create_audited_tool_node(
+                [_named_tool("write_file"), _named_tool("job_complete")],
+                _gate_config(progress_stall_threshold=2),
+            )
+            # Two rejected calls are two calls without progress: the stall nudge.
+            for call_id in ("c1", "c2"):
+                result = await audited(
+                    _gate_state([{"name": "job_complete", "id": call_id, "args": {}}])
+                )
+            assert nudges(result)
+            mock_tn.ainvoke.assert_not_called()
+
+            # A legal write_file next to a rejected call is progress: reset.
+            mock_tn.ainvoke = AsyncMock(
+                return_value={
+                    "messages": [
+                        ToolMessage(
+                            content="written", tool_call_id="c3", name="write_file"
+                        )
+                    ]
+                }
+            )
+            result = await audited(
+                _gate_state(
+                    [
+                        {"name": "write_file", "id": "c3", "args": {"path": "p"}},
+                        {"name": "job_complete", "id": "c4", "args": {}},
+                    ]
+                )
+            )
+            assert not nudges(result)
+            result = await audited(
+                _gate_state([{"name": "job_complete", "id": "c5", "args": {}}])
+            )
+            assert not nudges(result)  # one call since the write, below 2
+
+
+class TestExecuteNodeBindings:
+    """The execute node has exactly one bound-LLM input."""
+
+    @staticmethod
+    def _kwargs():
+        return dict(
+            todo_manager=MagicMock(),
+            memory_manager=MagicMock(),
+            workspace_manager=MagicMock(),
+            config=MagicMock(),
+            context_mgr=MagicMock(),
+            retry_manager=MagicMock(),
+            auxiliary_llm=None,
+            summarization_prompt="",
+        )
+
+    def test_one_binding_is_the_primary_argument(self):
+        from agent.graph import create_execute_node
+
+        node = create_execute_node(llm_with_tools=MagicMock(), **self._kwargs())
+        assert callable(node)
+
+    def test_binding_is_required(self):
+        from agent.graph import create_execute_node
+
+        with pytest.raises(TypeError, match="llm_with_tools"):
+            create_execute_node(**self._kwargs())
+
+
+# =============================================================================
+# Built-in subagents (U3 WP2): the context probe the graph stashes
+# =============================================================================
+
+
+class TestSubagentContextProbe:
+    """``build_phase_alternation_graph`` stashes ``parent_context_probe`` on
+    the ToolContext (plan B.5): a live read of the graph's ContextManager
+    that the return envelope shares the parent's headroom against."""
+
+    def _config(self):
+        from pathlib import Path
+        from shared.runtime.core.loader import load_agent_config
+
+        root = Path(__file__).resolve().parents[1]
+        config = load_agent_config(str(root / "config" / "worker_base.yaml"))
+        config.memory.manager_enabled = False
+        return config
+
+    def test_graph_build_stashes_a_live_probe_on_the_tool_context(
+        self, workspace_manager
+    ):
+        from unittest.mock import patch
+
+        from agent.core.context import ContextManager
+        from agent.subagents import ContextProbe
+        from agent.tools.context import ToolContext
+
+        config = self._config()
+        ctx = ToolContext(workspace_manager=workspace_manager)
+        assert ctx.parent_context_probe is None
+        managers_seen = []
+
+        def capture(**kwargs):
+            managers_seen.append(ContextManager(**kwargs))
+            return managers_seen[-1]
+
+        with patch("agent.graph.ContextManager", side_effect=capture):
+            build_phase_alternation_graph(
+                llm_with_tools=MagicMock(),
+                tools=[],
+                config=config,
+                workspace=workspace_manager,
+                todo_manager=TodoManager(workspace_manager),
+                tool_context=ctx,
+            )
+        assert callable(ctx.parent_context_probe)
+        probe = ctx.parent_context_probe()
+        assert isinstance(probe, ContextProbe)
+        assert (
+            probe.compaction_threshold_tokens == config.limits.context_threshold_tokens
+        )
+        assert probe.model_max_context_tokens == config.limits.model_max_context_tokens
+        assert probe.last_provider_input_tokens is None
+        assert probe.current_token_count == 0
+
+        # Live, not a snapshot: the graph's own manager is what it reads.
+        (context_mgr,) = managers_seen
+        context_mgr.state.current_token_count = 4321
+        context_mgr.state.last_provider_input_tokens = 5000
+        again = ctx.parent_context_probe()
+        assert (again.current_token_count, again.last_provider_input_tokens) == (
+            4321,
+            5000,
+        )
+
+    def test_a_graph_without_a_tool_context_builds_as_before(self, workspace_manager):
+        build_phase_alternation_graph(
+            llm_with_tools=MagicMock(),
+            tools=[],
+            config=self._config(),
+            workspace=workspace_manager,
+            todo_manager=TodoManager(workspace_manager),
+        )

@@ -13,19 +13,13 @@ tests/test_remote_forward_channel.py).
 """
 
 import socket
-import sys
-from pathlib import Path
 from unittest.mock import MagicMock
 
 import paramiko
 import pytest
 
-project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-
-from src.core.backends.remote import RemoteBackend  # noqa: E402
-from src.core.workspace_backend import (  # noqa: E402
+from shared.runtime.core.backends.remote import RemoteBackend  # noqa: E402
+from shared.runtime.core.workspace_backend import (  # noqa: E402
     RemoteChannelBusyError,
     WorkspaceUnavailableError,
 )
@@ -67,7 +61,9 @@ def _wire(be: RemoteBackend, exec_side_effect, transport_active: bool, monkeypat
     be._ssh = ssh
     monkeypatch.setattr(be, "_ensure_connected", lambda: None)
     # Retry backoff must not slow the suite down.
-    monkeypatch.setattr("src.core.backends.remote.time.sleep", lambda _s: None)
+    monkeypatch.setattr(
+        "shared.runtime.core.backends.remote.time.sleep", lambda _s: None
+    )
     return ssh
 
 

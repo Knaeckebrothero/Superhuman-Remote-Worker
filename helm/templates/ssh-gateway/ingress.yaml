@@ -1,0 +1,88 @@
+{{- if and .Values.sshGateway.enabled .Values.ingress.enabled }}
+{{- $fullName := include "srw.fullname" . -}}
+{{- /*
+  Host wherever cockpit's OWN generated ProxyCommand will actually dial --
+  not the bare API host. Those two are the same host except when
+  auth.bff.sameOriginApi is on, in which case cockpit's served env.js points
+  apiUrl at its own origin (srw.cockpitFacingApiUrl mirrors that ternary
+  exactly; keep both in sync with cockpit/deployment.yaml's env.js block).
+  A live gate (task-7-brief.md, controller correction C1) found these two
+  had drifted apart on a sameOriginApi:true deployment: cockpit dialled the
+  cockpit host, this ingress was still pinned to the bare api host, and the
+  generated config's WSS attach landed on the orchestrator's own ASGI app
+  (no route there) instead of the gateway pod -- a bare 403 with nothing in
+  the gateway's own logs, indistinguishable from a token/auth failure until
+  someone checks the gateway pod's log and finds it empty.
+*/}}
+{{- $apiHost := include "srw.urlHost" (include "srw.cockpitFacingApiUrl" .) -}}
+# The WSS attach door, on whatever host cockpit's own generated ProxyCommand
+# dials (see the note above) -- the api host, unless sameOriginApi moves it.
+#
+# ONLY `/api/ssh/attach` comes here, and only as an EXACT match. Every other
+# `/api/ssh*` route is served by the ORCHESTRATOR:
+#
+#   * `/api/ssh/attach-token` MINTS the WSS token this door then verifies.
+#   * `/api/ssh/host-keys` publishes the .pub halves a client pins.
+#
+# Traefik maps `pathType: Prefix` to `PathPrefix()`, which is a RAW STRING
+# prefix rather than a path-element match, and the explicit priority below
+# beats the api/cockpit ingress's length-derived default. Under `Prefix` this
+# rule therefore swallows `/api/ssh/attach-token` (or, on the cockpit host,
+# every other `/api/*` route the same-origin block carries) and answers it
+# with the gateway's Starlette 404 -- no token can ever be minted, and the
+# whole feature is dead with nothing in any log naming the cause. `Exact`
+# maps to `Path()` and claims exactly the one route the gateway serves.
+# (tests/test_ssh_gateway_chart.py asserts this against the committed
+# orchestrator endpoint inventory, so a future `/api/ssh/attach-*` endpoint
+# fails the suite instead of the feature.)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullName }}-ssh-gateway-ingress
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "ssh-gateway") | nindent 4 }}
+  annotations:
+    {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
+    {{- end }}
+    {{- if .Values.ingress.tls.enabled }}
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- else }}
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    {{- end }}
+    # Explicit, because without one Traefik may evaluate the api ingress's
+    # shorter `/` prefix first and send the WebSocket upgrade to the
+    # orchestrator, which has no route for it. 100/110/120/140 are taken by
+    # the routes in templates/ingress.yaml.
+    traefik.ingress.kubernetes.io/router.priority: "130"
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ $apiHost }}
+      # Reuse whichever TLS secret the host we just landed on already owns --
+      # the cockpit ingress's own secret when sameOriginApi moved us onto its
+      # host, the dedicated api-tls secret otherwise. Naming the wrong one
+      # doesn't break TLS (cert-manager happily issues a second cert into it
+      # for the same host), it just leaves a redundant certificate behind.
+      secretName: {{ $fullName }}-{{ ternary "cockpit" "api" .Values.auth.bff.sameOriginApi }}-tls
+  {{- end }}
+  rules:
+    - host: {{ $apiHost }}
+      http:
+        paths:
+          - path: /api/ssh/attach
+            # Exact, NOT Prefix -- see the header comment. `Prefix` routes
+            # `/api/ssh/attach-token` here too and 404s every token request.
+            pathType: Exact
+            backend:
+              service:
+                name: {{ include "srw.sshGatewayName" . }}
+                port:
+                  number: 8087
+{{- end }}

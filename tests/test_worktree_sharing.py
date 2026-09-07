@@ -335,7 +335,7 @@ class TestGitManagerFromWorktree:
 
     def test_from_worktree_valid(self):
         """Creates GitManager for a valid git worktree."""
-        from src.managers.git_manager import GitManager
+        from agent.managers.git_manager import GitManager
 
         with tempfile.TemporaryDirectory() as tmpdir:
             worktree_path = Path(tmpdir)
@@ -352,7 +352,7 @@ class TestGitManagerFromWorktree:
 
     def test_from_worktree_with_git_file(self):
         """Creates GitManager for a worktree with .git file (not directory)."""
-        from src.managers.git_manager import GitManager
+        from agent.managers.git_manager import GitManager
 
         with tempfile.TemporaryDirectory() as tmpdir:
             parent_repo = Path(tmpdir) / "parent"
@@ -417,7 +417,7 @@ class TestGitManagerFromWorktree:
 
     def test_from_worktree_no_git(self):
         """Returns None for directory without .git."""
-        from src.managers.git_manager import GitManager
+        from agent.managers.git_manager import GitManager
 
         with tempfile.TemporaryDirectory() as tmpdir:
             mgr = GitManager.from_worktree(Path(tmpdir))
@@ -425,7 +425,7 @@ class TestGitManagerFromWorktree:
 
     def test_from_worktree_nonexistent(self):
         """Returns None for nonexistent path."""
-        from src.managers.git_manager import GitManager
+        from agent.managers.git_manager import GitManager
 
         mgr = GitManager.from_worktree(Path("/nonexistent/path"))
         assert mgr is None
@@ -796,3 +796,41 @@ def test_critic_config_override_removes_communication_tools():
         "deep_merge REPLACES lists, so an empty list is what actually strips "
         "the inherited send_message"
     )
+
+
+def test_critic_config_override_resolves_safe_job_inspection_for_parent():
+    """The generated verification critic gets evidence reads for its verifier.
+
+    Keep this as policy (``true``), not a copied membership list: registry grant
+    metadata is the authority that excludes the explicitly gated audit/debug
+    surface.  Dispatch resolves the policy before the critic runs.
+    """
+    from orchestrator.main import _critic_config_override
+    from orchestrator.services.config_resolver import resolve_config
+    from shared.runtime.core.tool_policy import expand_category_true
+    from agent.tools.registry import TOOL_REGISTRY, get_tools_by_category
+
+    override = _critic_config_override(parent_llm=None)
+    assert override["tools"]["job_inspection"] is True
+
+    capture = {}
+    blob = resolve_config(
+        base_config_name="critic",
+        expert_type="worker",
+        request_override=override,
+        capture=capture,
+    )
+    expected = expand_category_true("job_inspection")
+    resolved = capture["merged_fragment"]["tools"]["job_inspection"]
+
+    assert resolved == expected
+    assert blob["agent"]["tools"]["job_inspection"] == expected
+    assert resolved, "the critic parent must expose evidence reads to its children"
+    assert all("grant" not in TOOL_REGISTRY[name] for name in resolved)
+    explicit = {
+        name
+        for name in get_tools_by_category("job_inspection")
+        if TOOL_REGISTRY[name].get("grant") == "explicit"
+    }
+    assert explicit
+    assert explicit.isdisjoint(resolved)

@@ -14,15 +14,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from main import get_thread_messages_history
+from orchestrator.main import get_thread_messages_history
 
 
 def _patched(db):
     """Patch the endpoint's module-level deps: auth + the db singleton."""
     owner = AsyncMock(return_value=({"id": "u1"}, {"id": "t1", "user_id": "u1"}))
     return (
-        patch("main.require_thread_owner", owner),
-        patch("main.postgres_db", db),
+        patch("orchestrator.main.require_thread_owner", owner),
+        patch("orchestrator.main.postgres_db", db),
     )
 
 

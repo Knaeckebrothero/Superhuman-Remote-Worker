@@ -30,7 +30,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from services.project_loop_sweeper import (
+from orchestrator.services.project_loop_sweeper import (
     HEAL_GRACE_SECONDS,
     _derive_loop_counters,
     _heal_wedged_loop,

@@ -35,6 +35,21 @@ Read the original job description above carefully. Identify:
 
 ### 2. Inspect the Deliverables
 
+Before rendering any verdict, you MUST delegate one independent evidence pass
+to a `verifier` child. Call `delegate_agent` in a turn by itself with:
+- `subagent_type="verifier"`
+- `isolation="shared"`
+- `run_in_background=false`
+- a self-contained `prompt` naming `{target_job_id}`, the reported deliverables,
+  and concrete acceptance checks
+
+The verifier is read-only. Tell it to inspect tracked deliverables and the target
+job through its safe job-inspection tools, run independent checks where useful,
+and return per-criterion evidence. Do not treat `.subagents/` scratch reports as
+deliverables. Wait for the foreground result and incorporate its evidence into
+your own review. The verifier gathers evidence only; YOU still inspect the work,
+write `output/verification_report.json`, and call the final verdict tool.
+
 Use the MCP tools to access the target job's workspace:
 - Read the deliverables listed above — do they exist? Are they complete?
 - Search the knowledge base (kb_search) and read `plan.md` for context on what the agent intended

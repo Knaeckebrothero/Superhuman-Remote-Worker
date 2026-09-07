@@ -316,7 +316,7 @@ async def test_automation_expert_validation_rejects_ambiguous_sources(
 
 def test_automation_expert_id_migration_shape() -> None:
     sql = (
-        ROOT / "orchestrator/database/migrations/app/0069_automation_expert_id.sql"
+        ROOT / "src/orchestrator/database/migrations/app/0069_automation_expert_id.sql"
     ).read_text()
     assert "ADD COLUMN IF NOT EXISTS expert_id UUID" in sql
     assert "experts.expert_type = 'worker'" in sql

@@ -1,0 +1,9 @@
+# Resolver environment only (Linux Python 3.11/3.12), never runtime dependencies.
+pip==26.2.1
+pip-tools==7.6.1
+build==1.6.0
+click==8.5.0
+packaging==26.3
+pyproject-hooks==1.2.0
+setuptools==84.0.0
+wheel==0.48.0

@@ -63,7 +63,7 @@ from orchestrator.services.usage_ledger import StrictUsagePublishResult
 
 
 ROOT = Path(__file__).parents[1]
-APP_MIGRATIONS = ROOT / "orchestrator/database/migrations/app"
+APP_MIGRATIONS = ROOT / "src" / "orchestrator" / "database" / "migrations" / "app"
 STORAGE_MIGRATION = APP_MIGRATIONS / "0102_storage_asset_foundations.sql"
 SOURCE_ACTIVATION_MIGRATION = APP_MIGRATIONS / "0105_storage_source_activation.sql"
 

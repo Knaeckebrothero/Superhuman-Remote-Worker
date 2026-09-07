@@ -1,6 +1,6 @@
 """Exact-turn durable interrupt inbox primitives (stateless-agents S2)."""
 
-from .queries import (
+from shared.thread_interrupts.queries import (
     InterruptInputConsumption,
     InterruptReceipt,
     InterruptRequest,

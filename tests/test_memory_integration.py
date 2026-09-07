@@ -10,8 +10,8 @@ from typing import List, Optional
 from unittest.mock import MagicMock
 
 
-from src.services.recall_store import extract_keywords
-from src.tools.context import ToolContext
+from shared.runtime.services.recall_store import extract_keywords
+from agent.tools.context import ToolContext
 
 
 # =============================================================================
@@ -218,7 +218,7 @@ class TestTurnCountState:
     """Tests for turn_count field in UniversalAgentState."""
 
     def test_create_initial_state_has_turn_count_zero(self):
-        from src.core.state import create_initial_state
+        from agent.core.state import create_initial_state
 
         state = create_initial_state(
             job_id="test-job",
@@ -228,7 +228,7 @@ class TestTurnCountState:
         assert state["phase_instruction_injections"] == []
 
     def test_turn_count_is_int(self):
-        from src.core.state import create_initial_state
+        from agent.core.state import create_initial_state
 
         state = create_initial_state(
             job_id="test-job",
@@ -237,7 +237,7 @@ class TestTurnCountState:
         assert isinstance(state["turn_count"], int)
 
     def test_create_initial_state_has_last_observed_turn_zero(self):
-        from src.core.state import create_initial_state
+        from agent.core.state import create_initial_state
 
         state = create_initial_state(
             job_id="test-job",
@@ -275,13 +275,13 @@ class TestAuxiliaryMemoryExtraction:
     """Tests for _should_extract_memories and extract_and_store_memories."""
 
     def test_should_extract_at_interval(self):
-        from src.services.auxiliary import _should_extract_memories
+        from shared.runtime.services.auxiliary import _should_extract_memories
 
         assert _should_extract_memories(turn_count=5, interval=5, last_observed_turn=0)
         assert _should_extract_memories(turn_count=10, interval=5, last_observed_turn=5)
 
     def test_should_not_extract_between_intervals(self):
-        from src.services.auxiliary import _should_extract_memories
+        from shared.runtime.services.auxiliary import _should_extract_memories
 
         assert not _should_extract_memories(
             turn_count=3, interval=5, last_observed_turn=0
@@ -291,14 +291,14 @@ class TestAuxiliaryMemoryExtraction:
         )
 
     def test_should_not_extract_at_zero(self):
-        from src.services.auxiliary import _should_extract_memories
+        from shared.runtime.services.auxiliary import _should_extract_memories
 
         assert not _should_extract_memories(
             turn_count=0, interval=5, last_observed_turn=0
         )
 
     def test_should_not_re_extract_same_turn(self):
-        from src.services.auxiliary import _should_extract_memories
+        from shared.runtime.services.auxiliary import _should_extract_memories
 
         assert not _should_extract_memories(
             turn_count=5, interval=5, last_observed_turn=5
@@ -306,6 +306,6 @@ class TestAuxiliaryMemoryExtraction:
 
     def test_observation_window_caps_messages(self):
         """extract_and_store_memories should cap at _MAX_OBSERVATION_WINDOW."""
-        from src.services.auxiliary import _MAX_OBSERVATION_WINDOW
+        from shared.runtime.services.auxiliary import _MAX_OBSERVATION_WINDOW
 
         assert _MAX_OBSERVATION_WINDOW == 40  # Same as old MemoryObserver

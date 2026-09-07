@@ -11,9 +11,9 @@ import httpx
 import pytest
 from langchain_core.messages import AIMessage
 
-from src.api.orchestrator_client import OrchestratorClient
-from src.persistent_graph import PersistentLoopCallbacks, run_persistent_loop
-from src.shared.runtime_actor import (
+from agent.api.orchestrator_client import OrchestratorClient
+from agent.persistent_graph import PersistentLoopCallbacks, run_persistent_loop
+from shared.runtime_actor import (
     RUNTIME_ACTOR_MAINTENANCE_PHASE_HEADER,
     RUNTIME_ACTOR_MAINTENANCE_PHASE_PRE_TURN,
     RUNTIME_ACTOR_REFRESH_HEADER,
@@ -390,8 +390,8 @@ async def test_no_spend_callback_survives_model_tool_hot_swap_for_direct_and_que
 async def test_no_spend_callback_survives_real_live_config_rebuild(monkeypatch):
     """Exercise persistent_app's shipped config-update rebuild, not a fake swap."""
 
-    from src.api import persistent_app
-    from src.core.loader import load_agent_config
+    from agent.api import persistent_app
+    from shared.runtime.core.loader import load_agent_config
 
     provider_calls = 0
 
@@ -428,7 +428,9 @@ async def test_no_spend_callback_survives_real_live_config_rebuild(monkeypatch):
     monkeypatch.setattr(persistent_app, "_orchestrator_client", client)
     monkeypatch.setattr(persistent_app, "_broadcast", MagicMock())
     monkeypatch.setattr(persistent_app, "_runtime_authorization_admission_open", True)
-    monkeypatch.setattr("src.core.loader.create_llm", lambda *_args: rebuilt_llm)
+    monkeypatch.setattr(
+        "shared.runtime.core.loader.create_llm", lambda *_args: rebuilt_llm
+    )
 
     gate_calls = 0
 
@@ -485,7 +487,7 @@ async def test_no_spend_callback_survives_real_live_config_rebuild(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_persistent_officer_gate_uses_the_maintenance_channel(monkeypatch):
-    from src.api import persistent_app
+    from agent.api import persistent_app
 
     client = MagicMock()
     client.maintain_runtime_actor = AsyncMock(return_value=(True, "recovered"))
@@ -500,7 +502,7 @@ async def test_persistent_officer_gate_uses_the_maintenance_channel(monkeypatch)
 
 
 def test_attach_shares_one_rotatable_actor_with_the_maintenance_client(monkeypatch):
-    from src.api import persistent_app
+    from agent.api import persistent_app
 
     actor = _actor(expires_in=timedelta(hours=5))
     client, _http = _client(_actor(expires_in=timedelta(hours=5)))

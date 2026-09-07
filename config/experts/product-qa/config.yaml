@@ -22,7 +22,28 @@ tags:
 llm:
   reasoning_level: high
 
+# Built-in subagents (delegate_agent): independent product vectors fan out to
+# raw-evidence probes; the parent classifies and files. `enabled` gates the
+# tool binding; the roster defines the children and their budgets.
+delegation:
+  enabled: true
+  max_concurrent: 4
+
+subagents:
+  default: probe
+  roster:
+    explorer: {$ref: subagents/explorer}
+    probe: {$ref: subagents/probe}
+
 workspace:
+  # Pinned: this expert's role needs a shell, and a session's account layer
+  # overrides expert_base's `sandbox` with the owner's default (platform
+  # default `virtual`, which strips shell/browser/git). Declaring it HERE
+  # sits above that layer; the New Session form shows it and the user may
+  # still change it. Jobs ignore this key (the workspace contract stamps
+  # the job tier from config_override). See tests/test_expert_defaults.py
+  # ::TestShellBoundBundledExpertsPinTheirTier.
+  backend: sandbox
   structure:
     - archive/
     - documents/
@@ -30,10 +51,16 @@ workspace:
     - output/repros/
     - output/audits/
     - notes/
-    - repo/
   git_versioning: true
 
 instruction_files:
+  # Phase skills restated: this list replaces the worker overlay's wholesale.
+  - skill: strategic-phase
+    trigger: phase_start:strategic
+    enforce: false
+  - skill: tactical-phase
+    trigger: phase_start:tactical
+    enforce: false
   - skill: todo-guide
     trigger: before_tool:next_phase_todos
     enforce: true
@@ -72,7 +99,7 @@ tools:
     - cancel_command
     - shell_read
   # git: intentionally absent. This agent has shell tools, and
-  # ToolsConfig.__post_init__ (src/core/loader.py) suppresses the git_* group
+  # ToolsConfig.__post_init__ (src/shared/runtime/core/loader.py) suppresses the git_* group
   # whenever shell is present — a shell can run git against ANY repository in
   # the workspace, including repos/<name>/, which git_* cannot. Declaring them
   # here would advertise tools the pod never binds.
@@ -89,7 +116,13 @@ tools:
   research:
     - web_search
     - extract_webpage
-  delegation: []
+  # Spawn + background controls (each bound only with delegation.enabled).
+  delegation:
+    - delegate_agent
+    - wait_agent
+    - message_agent
+    - stop_agent
+    - list_agents
   citation: []
   graph: []
   sql: []

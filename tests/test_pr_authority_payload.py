@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from orchestrator import main as orch_main
-from src.shared.runtime_actor import RuntimeActorContext
+from shared.runtime_actor import RuntimeActorContext
 
 DATASOURCE_ID = "22222222-2222-4222-8222-222222222222"
 FOREIGN_ID = "33333333-3333-4333-8333-333333333333"
@@ -180,6 +180,46 @@ async def test_resume_payload_uses_resolved_repository_uuid():
             orch_main,
             "_workspace_runtime_unchanged_before_delivery",
             AsyncMock(return_value=True),
+        ),
+        patch.object(
+            orch_main.container_provisioner,
+            "attest_workspace_runtime",
+            AsyncMock(
+                return_value=orch_main.WorkspaceRuntimeAttestation(
+                    backing_id=f"k8s-pvc:test:{RUNTIME_ID}",
+                    workspace_generation=RUNTIME_ID,
+                    runtime_incarnation=RUNTIME_ID,
+                    ssh_host_key_fingerprint="SHA256:payload-workspace",
+                    host="workspace.test",
+                    pod_ip="10.42.0.17",
+                    port=30022,
+                )
+            ),
+        ),
+        patch.object(
+            orch_main,
+            "_pinned_k8s_job_workspace_authority_is_current",
+            AsyncMock(return_value=True),
+        ),
+        patch.object(
+            orch_main,
+            "_prepare_pinned_job_mutation_target",
+            AsyncMock(
+                return_value=orch_main._PinnedJobMutationTarget(
+                    {
+                        "id": AGENT_ID,
+                        "status": "ready",
+                        "pod_ip": "10.0.0.8",
+                        "pod_port": 8080,
+                    },
+                    orch_main.PinnedJobRecipient(
+                        expected_agent_id=AGENT_ID,
+                        expected_pod_uid=None,
+                        expected_process_generation=RUNTIME_GENERATION,
+                        expected_job_id=JOB_ID,
+                    ),
+                )
+            ),
         ),
         patch.object(
             orch_main.postgres_db,

@@ -8,9 +8,9 @@ WorkspaceManager + ToolContext.
 from unittest.mock import patch
 
 from tests._fs_backend import FilesystemTestBackend
-from src.core.workspace import WorkspaceManager
-from src.tools.context import ToolContext
-from src.tools.workspace.skills import create_skill_tools
+from agent.core.workspace import WorkspaceManager
+from agent.tools.context import ToolContext
+from agent.tools.workspace.skills import create_skill_tools
 
 
 def _use_skill(tmp_path, *, allowed=("hello-skill", "nope"), menu=None):
@@ -63,7 +63,7 @@ def test_use_skill_missing_is_friendly(tmp_path):
 
 
 def test_use_skill_metadata_registered():
-    from src.tools.workspace.skills import SKILL_TOOLS_METADATA
+    from agent.tools.workspace.skills import SKILL_TOOLS_METADATA
 
     assert "use_skill" in SKILL_TOOLS_METADATA
     assert SKILL_TOOLS_METADATA["use_skill"]["category"] == "workspace"

@@ -398,6 +398,32 @@ class TestHeartbeatGraphProgress:
         assert "graph_progress_seen_at" not in latest
 
 
+class TestHeartbeatRecipientAuthority:
+    """Heartbeat metrics cannot overwrite the registration generation."""
+
+    @pytest.mark.asyncio
+    async def test_process_generation_is_stripped_from_metadata_merge(self):
+        db, conn = _make_db_with_mocked_acquire(prev_status="ready")
+
+        await db.heartbeat(
+            agent_id="00000000-0000-0000-0000-000000000001",
+            status="ready",
+            metrics={
+                "dispatch_process_generation": "forged-generation",
+                "memory_mb": 128,
+            },
+        )
+
+        _, *params = conn.execute.call_args[0]
+        metadata_payloads = [
+            json.loads(value)
+            for value in params
+            if isinstance(value, str) and value.startswith("{")
+        ]
+        assert metadata_payloads
+        assert metadata_payloads[-1] == {"memory_mb": 128}
+
+
 class TestHeartbeatReturnsBoundThread:
     """The handler slides a thread-bound runtime-actor grant on liveness, so
     it needs the agent's bound thread. It rides the row heartbeat already

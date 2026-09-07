@@ -28,8 +28,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-import main
-from services.completion import (
+import orchestrator.main
+from orchestrator.services.completion import (
     apply_terminal_job_side_effects,
     job_has_file_contract,
     should_merge_job_contribution,
@@ -245,7 +245,7 @@ class TestMergeGate:
         dispatch MUST ask the same question: a disagreement means calling in
         for a job the merge considers contract-less, i.e. a FULL squash-merge
         of the whole scratchpad onto ``main``."""
-        from services.project_loops import contracted_file_deliverables
+        from orchestrator.services.project_loops import contracted_file_deliverables
 
         for context in (
             {"required_deliverables": [CONTRACT]},
@@ -611,31 +611,36 @@ class TestBestEffort:
 def _patch_approve(stack: ExitStack, job: dict, gitea: MagicMock, db: _FakeDB, tmp):
     stack.enter_context(
         patch(
-            "main.require_internal_or_job_access", AsyncMock(return_value=(None, job))
+            "orchestrator.main.require_internal_or_job_access",
+            AsyncMock(return_value=(None, job)),
         )
     )
-    stack.enter_context(patch("main.postgres_db", db))
-    stack.enter_context(patch("main.gitea_client", gitea))
-    stack.enter_context(patch("main.vector_db", None))
+    stack.enter_context(patch("orchestrator.main.postgres_db", db))
+    stack.enter_context(patch("orchestrator.main.gitea_client", gitea))
+    stack.enter_context(patch("orchestrator.main.vector_db", None))
     stack.enter_context(
-        patch("main.resolve_job_repo", AsyncMock(return_value=(REPO, BRANCH)))
+        patch(
+            "orchestrator.main.resolve_job_repo", AsyncMock(return_value=(REPO, BRANCH))
+        )
     )
-    stack.enter_context(patch("main.maybe_wake_session", AsyncMock()))
-    stack.enter_context(patch("main._kick_session_wake_drain", MagicMock()))
-    stack.enter_context(patch("main._trigger_dispatch", MagicMock()))
+    stack.enter_context(patch("orchestrator.main.maybe_wake_session", AsyncMock()))
+    stack.enter_context(
+        patch("orchestrator.main._kick_session_wake_drain", MagicMock())
+    )
+    stack.enter_context(patch("orchestrator.main._trigger_dispatch", MagicMock()))
     ws = MagicMock()
     ws.base_path = tmp / "workspace"
-    stack.enter_context(patch("main.workspace_service", ws))
+    stack.enter_context(patch("orchestrator.main.workspace_service", ws))
 
 
 def _patch_complete(stack: ExitStack, job: dict, gitea: MagicMock, db: _FakeDB):
-    stack.enter_context(patch("main.require_internal", AsyncMock()))
-    stack.enter_context(patch("main.postgres_db", db))
-    stack.enter_context(patch("main.gitea_client", gitea))
-    stack.enter_context(patch("main.vector_db", None))
+    stack.enter_context(patch("orchestrator.main.require_internal", AsyncMock()))
+    stack.enter_context(patch("orchestrator.main.postgres_db", db))
+    stack.enter_context(patch("orchestrator.main.gitea_client", gitea))
+    stack.enter_context(patch("orchestrator.main.vector_db", None))
     stack.enter_context(
         patch(
-            "services.completion.apply_deliverable_gate",
+            "orchestrator.services.completion.apply_deliverable_gate",
             AsyncMock(side_effect=lambda j, r, s, **kw: (s, [], False)),
         )
     )
@@ -646,13 +651,20 @@ def _patch_complete(stack: ExitStack, job: dict, gitea: MagicMock, db: _FakeDB):
         "_advance_project_loop",
         "_archive_and_cleanup_workspace",
     ):
-        stack.enter_context(patch(f"main.{helper}", AsyncMock(return_value=[])))
+        stack.enter_context(
+            patch(f"orchestrator.main.{helper}", AsyncMock(return_value=[]))
+        )
     stack.enter_context(
-        patch("main._trigger_verification_on_complete", AsyncMock(return_value=None))
+        patch(
+            "orchestrator.main._trigger_verification_on_complete",
+            AsyncMock(return_value=None),
+        )
     )
-    stack.enter_context(patch("main.maybe_wake_session", AsyncMock()))
-    stack.enter_context(patch("main._kick_session_wake_drain", MagicMock()))
-    stack.enter_context(patch("main._trigger_dispatch", MagicMock()))
+    stack.enter_context(patch("orchestrator.main.maybe_wake_session", AsyncMock()))
+    stack.enter_context(
+        patch("orchestrator.main._kick_session_wake_drain", MagicMock())
+    )
+    stack.enter_context(patch("orchestrator.main._trigger_dispatch", MagicMock()))
 
 
 class TestApproveJobCallSite:
@@ -664,7 +676,7 @@ class TestApproveJobCallSite:
 
         with ExitStack() as stack:
             _patch_approve(stack, job, g, db, tmp_path)
-            result = await main.approve_job(MagicMock(), str(JOB_ID), None)
+            result = await orchestrator.main.approve_job(MagicMock(), str(JOB_ID), None)
 
         assert result["status"] == "approved"
         messages = [c["message"] for c in _commits(g)]
@@ -683,11 +695,11 @@ class TestApproveJobCallSite:
             _patch_approve(stack, job, g, db, tmp_path)
             stack.enter_context(
                 patch(
-                    "services.completion.apply_terminal_job_side_effects",
+                    "orchestrator.services.completion.apply_terminal_job_side_effects",
                     AsyncMock(side_effect=RuntimeError("gitea down")),
                 )
             )
-            result = await main.approve_job(MagicMock(), str(JOB_ID), None)
+            result = await orchestrator.main.approve_job(MagicMock(), str(JOB_ID), None)
 
         assert result["status"] == "approved"
 
@@ -701,7 +713,7 @@ class TestApproveJobCallSite:
 
         with ExitStack() as stack:
             _patch_approve(stack, job, g, db, tmp_path)
-            await main.approve_job(MagicMock(), str(JOB_ID), None)
+            await orchestrator.main.approve_job(MagicMock(), str(JOB_ID), None)
 
         g.merge_pr.assert_not_called()
         g.create_pr.assert_not_called()
@@ -719,12 +731,15 @@ class TestRejectStaysMergeFree:
 
         with ExitStack() as stack:
             stack.enter_context(
-                patch("main.require_job_access", AsyncMock(return_value=({}, job)))
+                patch(
+                    "orchestrator.main.require_job_access",
+                    AsyncMock(return_value=({}, job)),
+                )
             )
-            stack.enter_context(patch("main.postgres_db", db))
-            stack.enter_context(patch("main.gitea_client", g))
-            stack.enter_context(patch("main.vector_db", None))
-            result = await main.reject_job_diff(MagicMock(), str(JOB_ID))
+            stack.enter_context(patch("orchestrator.main.postgres_db", db))
+            stack.enter_context(patch("orchestrator.main.gitea_client", g))
+            stack.enter_context(patch("orchestrator.main.vector_db", None))
+            result = await orchestrator.main.reject_job_diff(MagicMock(), str(JOB_ID))
 
         assert result["diff_status"] == "rejected"
         g.get_compare.assert_not_called()
@@ -761,7 +776,7 @@ class TestLoopCloudCompletion:
             },
         )
         db = _FakeDB(job)
-        body = main.JobCompleteRequest(
+        body = orchestrator.main.JobCompleteRequest(
             should_stop=True,
             goal_achieved=False,
             freeze_data={
@@ -772,7 +787,9 @@ class TestLoopCloudCompletion:
 
         with ExitStack() as stack:
             _patch_complete(stack, job, _make_gitea(), db)
-            handled = await main.complete_job(MagicMock(), str(JOB_ID), body)
+            handled = await orchestrator.main.complete_job(
+                MagicMock(), str(JOB_ID), body
+            )
 
         assert handled == {
             "status": "handled",
@@ -810,7 +827,7 @@ class TestLoopCloudCompletion:
             },
         )
         db = _FakeDB(job)
-        body = main.JobCompleteRequest(
+        body = orchestrator.main.JobCompleteRequest(
             should_stop=True,
             goal_achieved=False,
             freeze_data={
@@ -821,7 +838,9 @@ class TestLoopCloudCompletion:
 
         with ExitStack() as stack:
             _patch_complete(stack, job, _make_gitea(), db)
-            handled = await main.complete_job(MagicMock(), str(JOB_ID), body)
+            handled = await orchestrator.main.complete_job(
+                MagicMock(), str(JOB_ID), body
+            )
 
         assert handled["new_status"] == "pending_review"
         assert handled["actions"] == [
@@ -853,7 +872,7 @@ class TestLoopCloudCompletion:
         }
         db = _FakeDB(job, project=project)
         gitea = _make_gitea()
-        body = main.JobCompleteRequest(
+        body = orchestrator.main.JobCompleteRequest(
             should_stop=True,
             goal_achieved=True,
             freeze_data=job["freeze_data"],
@@ -870,15 +889,17 @@ class TestLoopCloudCompletion:
         with ExitStack() as stack:
             _patch_complete(stack, job, gitea, db)
             advance = stack.enter_context(
-                patch("main._advance_project_loop", new_callable=AsyncMock)
+                patch("orchestrator.main._advance_project_loop", new_callable=AsyncMock)
             )
             deliver = stack.enter_context(
                 patch(
-                    "services.job_cloud_baseline.deliver_loop_diff_to_cloud",
+                    "orchestrator.services.job_cloud_baseline.deliver_loop_diff_to_cloud",
                     AsyncMock(return_value=delivery_result),
                 )
             )
-            handled = await main.complete_job(MagicMock(), str(JOB_ID), body)
+            handled = await orchestrator.main.complete_job(
+                MagicMock(), str(JOB_ID), body
+            )
 
         assert handled["new_status"] == "completed"
         assert job["merge_status"] == "cloud-applied"
@@ -907,7 +928,7 @@ class TestLoopCloudCompletion:
         }
         db = _FakeDB(job, project=project)
         gitea = _make_gitea()
-        body = main.JobCompleteRequest(
+        body = orchestrator.main.JobCompleteRequest(
             should_stop=True,
             goal_achieved=True,
             freeze_data=job["freeze_data"],
@@ -916,11 +937,11 @@ class TestLoopCloudCompletion:
         with ExitStack() as stack:
             _patch_complete(stack, job, gitea, db)
             advance = stack.enter_context(
-                patch("main._advance_project_loop", new_callable=AsyncMock)
+                patch("orchestrator.main._advance_project_loop", new_callable=AsyncMock)
             )
             stack.enter_context(
                 patch(
-                    "services.job_cloud_baseline.deliver_loop_diff_to_cloud",
+                    "orchestrator.services.job_cloud_baseline.deliver_loop_diff_to_cloud",
                     AsyncMock(
                         return_value={
                             "delivery_status": "cloud-conflict",
@@ -931,7 +952,9 @@ class TestLoopCloudCompletion:
                     ),
                 )
             )
-            handled = await main.complete_job(MagicMock(), str(JOB_ID), body)
+            handled = await orchestrator.main.complete_job(
+                MagicMock(), str(JOB_ID), body
+            )
 
         assert handled["new_status"] == "pending_review"
         assert job["status"] == "pending_review"
@@ -953,19 +976,21 @@ class TestBothPathsAgree:
         db_approve = _FakeDB(approve_job_row)
         with ExitStack() as stack:
             _patch_approve(stack, approve_job_row, g_approve, db_approve, tmp_path)
-            await main.approve_job(MagicMock(), str(JOB_ID), None)
+            await orchestrator.main.approve_job(MagicMock(), str(JOB_ID), None)
 
         complete_job_row = _job(status="processing")
         g_complete = _make_gitea()
         db_complete = _FakeDB(complete_job_row)
-        body = main.JobCompleteRequest(
+        body = orchestrator.main.JobCompleteRequest(
             should_stop=True,
             goal_achieved=True,
             freeze_data=complete_job_row["freeze_data"],
         )
         with ExitStack() as stack:
             _patch_complete(stack, complete_job_row, g_complete, db_complete)
-            handled = await main.complete_job(MagicMock(), str(JOB_ID), body)
+            handled = await orchestrator.main.complete_job(
+                MagicMock(), str(JOB_ID), body
+            )
 
         assert handled["new_status"] == "completed"
         assert "job change record written to database" in handled["actions"]
@@ -985,19 +1010,19 @@ class TestBothPathsAgree:
         db_approve = _FakeDB(approve_job_row)
         with ExitStack() as stack:
             _patch_approve(stack, approve_job_row, g_approve, db_approve, tmp_path)
-            await main.approve_job(MagicMock(), str(JOB_ID), None)
+            await orchestrator.main.approve_job(MagicMock(), str(JOB_ID), None)
 
         complete_job_row = _job(status="processing", context={})
         g_complete = _make_gitea()
         db_complete = _FakeDB(complete_job_row)
-        body = main.JobCompleteRequest(
+        body = orchestrator.main.JobCompleteRequest(
             should_stop=True,
             goal_achieved=True,
             freeze_data=complete_job_row["freeze_data"],
         )
         with ExitStack() as stack:
             _patch_complete(stack, complete_job_row, g_complete, db_complete)
-            await main.complete_job(MagicMock(), str(JOB_ID), body)
+            await orchestrator.main.complete_job(MagicMock(), str(JOB_ID), body)
 
         assert _commits(g_approve) == _commits(g_complete)
         assert len(_commits(g_approve)) == 0

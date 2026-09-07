@@ -1,4 +1,4 @@
-"""Rendered contracts for same-cluster and parked external VM charts."""
+"""Rendered contracts for the VM topologies of the main chart."""
 
 from __future__ import annotations
 
@@ -14,11 +14,10 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CONTROLLER_SRC = ROOT / "vm/controller/controller.py"
+CONTROLLER_SRC = ROOT / "src/vm_controller/controller.py"
 DAEMON_SRC = ROOT / "docker/agent-vm-base/files/management-daemon.py"
 RELEASE_NAMESPACE = "lane-c-contract"
 GUEST_ENV_PATH = "/etc/default/srw-guest"
-EXTERNAL_DAEMON_ENV_PATH = "/etc/default/management-daemon"
 AUTHORIZED_KEYS_PATH = "/etc/ssh/authorized_keys/agent-host"
 
 pytestmark = pytest.mark.skipif(
@@ -41,9 +40,6 @@ MAIN_EXTERNAL = Chart("main-external", "helm", "helm/ci/vm-external-values.yaml"
 MAIN_TEST = Chart("main-test", "helm", "helm/ci/test-values.yaml")
 INSTALLER_ALIAS = Chart(
     "installer-alias", "helm", "helm/ci/installer-production-vms-values.yaml"
-)
-EXTERNAL = Chart(
-    "external", "helm-vm-cluster", "helm-vm-cluster/ci/default-values.yaml"
 )
 
 
@@ -307,6 +303,30 @@ def test_same_cluster_vm_and_cloud_init_contract() -> None:
     }
     assert "NATS_URL" not in cloud_init(rendered)
     assert "tailscale up" not in cloud_init(rendered)
+    assert "rm -f /etc/ssh/ssh_host_*" not in cloud_init(rendered)
+    assert "ssh-keygen -A" not in cloud_init(rendered)
+
+
+def test_rootdisk_names_its_volume_mode() -> None:
+    """The templated rootdisk must name volumeMode, never inherit it.
+
+    CDI fills an unset volumeMode from the target StorageClass's StorageProfile.
+    That profile is empty for ``rancher.io/local-path`` — which is why the
+    omission stayed invisible — but populated for a real CSI, where it resolves
+    to ``Block``. A Block rootdisk cannot be imported on a node running SELinux
+    with the importer's capabilities dropped: it dies with "blockdev: cannot
+    open /dev/cdi-block-volume: Permission denied". The controller hardcodes
+    Filesystem for the golden DataVolume and the clone target, so an unset mode
+    here left the DEFAULT path (goldenImage is off) as the only disagreeing one.
+    """
+    rendered = render_chart(MAIN)
+    storage = vm_template(rendered)["spec"]["dataVolumeTemplates"][0]["spec"]["storage"]
+    assert storage["volumeMode"] == "Filesystem"
+    assert storage["accessModes"] == ["ReadWriteOnce"]
+
+    # The template's mode must agree with the two paths the controller pins in
+    # Python, or a golden clone and a templated disk would disagree at runtime.
+    assert '"volumeMode": "Filesystem"' in CONTROLLER_SRC.read_text()
 
 
 def test_same_cluster_network_policy_ports() -> None:
@@ -460,6 +480,16 @@ def test_same_cluster_vmi_metering_defaults_to_release_authority() -> None:
     assert deployment["metadata"]["namespace"] == RELEASE_NAMESPACE
     assert env["INFRASTRUCTURE_METERING_VM_STABLE_CLUSTER_ID"] == "stable-main"
     assert env["INFRASTRUCTURE_METERING_VM_NAMESPACE"] == RELEASE_NAMESPACE
+    # Same-cluster collectors talk to this release's orchestrator Service; the
+    # remote-cluster `orchestratorUrl` knob does not exist in this chart, and
+    # an empty URL would leave the collector unable to ingest anything.
+    assert (
+        env["INFRASTRUCTURE_METERING_ORCHESTRATOR_URL"]
+        == "http://t-superhuman-remote-worker-orchestrator:8085"
+    )
+    # Helm hands large YAML integers to templates as float64; without `int64`
+    # the byte cap renders as 6.7108864e+07 and the collector refuses to start.
+    assert env["INFRASTRUCTURE_METERING_MAX_SNAPSHOT_BYTES"] == "67108864"
     orchestrator_config = next(
         doc
         for doc in documents(rendered)
@@ -473,6 +503,37 @@ def test_same_cluster_vmi_metering_defaults_to_release_authority() -> None:
     assert (
         orchestrator_config["INFRASTRUCTURE_METERING_VM_NAMESPACE"] == RELEASE_NAMESPACE
     )
+
+
+def test_same_cluster_storage_metering_targets_release_orchestrator() -> None:
+    rendered = render_chart(
+        MAIN,
+        "vm.preflight.enabled=true",
+        "infrastructureMetering.collectorEnabled=true",
+        "infrastructureMetering.vmPvcInventoryEnabled=true",
+        "infrastructureMetering.stableClusterId=stable-main",
+        "infrastructureMetering.vmStorageIngestionSecretName=vm-storage-ingestion",
+        "infrastructureMetering.networkPolicy.allowUnrestrictedEgress=true",
+    )
+    deployment = next(
+        doc
+        for doc in documents(rendered)
+        if doc.get("kind") == "Deployment"
+        and doc["metadata"]["name"].endswith("-storage-metering")
+    )
+    env = {
+        item["name"]: item.get("value")
+        for item in deployment["spec"]["template"]["spec"]["containers"][0]["env"]
+    }
+    assert deployment["metadata"]["namespace"] == RELEASE_NAMESPACE
+    assert (
+        env["INFRASTRUCTURE_METERING_ORCHESTRATOR_URL"]
+        == "http://t-superhuman-remote-worker-orchestrator:8085"
+    )
+    # Helm hands large YAML integers to templates as float64; without `int64`
+    # the byte cap renders as 6.7108864e+07 and the collector refuses to start.
+    assert env["INFRASTRUCTURE_METERING_MAX_SNAPSHOT_BYTES"] == "67108864"
+    assert env["INFRASTRUCTURE_METERING_VM_NAMESPACE"] == RELEASE_NAMESPACE
 
 
 def test_same_cluster_metering_rejects_double_pvc_inventory() -> None:
@@ -610,10 +671,11 @@ def test_named_validation_reasons(
 
 def test_capability_checks_are_opt_in() -> None:
     # Disable chart-generated random Secret values so byte comparison is stable.
-    normal = render_chart(MAIN, "secrets.create=false")
+    normal = render_chart(MAIN, "secrets.create=false", "searxng.enabled=false")
     with_versions = render_chart(
         MAIN,
         "secrets.create=false",
+        "searxng.enabled=false",
         api_versions=("kubevirt.io/v1", "cdi.kubevirt.io/v1beta1"),
     )
     assert normal == with_versions
@@ -641,27 +703,6 @@ def test_every_same_cluster_placeholder_is_substituted() -> None:
     assert not emitted - controller_replacements()
 
 
-def test_external_template_contract_remains_self_contained() -> None:
-    rendered = render_chart(EXTERNAL)
-    vm = vm_template(rendered)
-    files = write_files(cloud_init(rendered))
-    assert daemon_required_env("nats") <= env_keys(files[EXTERNAL_DAEMON_ENV_PATH])
-    assert not placeholders(yaml.safe_dump(vm)) - controller_replacements()
-
-
-def test_external_vault_key_placeholder_is_controller_owned() -> None:
-    rendered = render_chart(
-        EXTERNAL,
-        "ssh.publicKey=",
-        "ssh.publicKeyVaultPath=secret/data/srw/vm-ssh",
-        "externalSecrets.enabled=true",
-    )
-    assert (
-        not placeholders(yaml.safe_dump(vm_template(rendered)))
-        - controller_replacements()
-    )
-
-
 SUBSTITUTION_WIDTHS = {
     "DESCRIPTION": 200,
     "JOB_ID": 36,
@@ -684,9 +725,7 @@ SUBSTITUTION_WIDTHS = {
 }
 
 
-@pytest.mark.parametrize(
-    ("chart", "limit"), [(MAIN, 16 * 1024), (EXTERNAL, 2048)], ids=str
-)
+@pytest.mark.parametrize(("chart", "limit"), [(MAIN, 16 * 1024)], ids=str)
 def test_cloud_init_sanity_budget(chart: Chart, limit: int) -> None:
     text = cloud_init(render_chart(chart))
     for name, width in SUBSTITUTION_WIDTHS.items():

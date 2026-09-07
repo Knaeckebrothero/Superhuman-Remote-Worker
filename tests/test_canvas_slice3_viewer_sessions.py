@@ -13,24 +13,24 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from routers import canvases as canvas_routes
-from services.canvas import (
+from orchestrator.routers import canvases as canvas_routes
+from orchestrator.services.canvas import (
     CanvasCapabilities,
     CanvasRecord,
     WorkspaceAppSource,
     build_public_canvas_representation,
 )
-from services.canvas_session_notifications import (
+from orchestrator.services.canvas_session_notifications import (
     CANVAS_SESSION_CHANGE_CHANNEL,
     CanvasConnectionRegistry,
     CanvasSessionNotificationListener,
 )
-from services.canvas_viewer_config import (
+from orchestrator.services.canvas_viewer_config import (
     CanvasViewerConfig,
     CanvasViewerConfigurationError,
     canvas_viewer_config,
 )
-from services.canvas_viewer_sessions import (
+from orchestrator.services.canvas_viewer_sessions import (
     CanvasBootstrapAuthorization,
     CanvasViewerAttachmentGrant,
     CanvasViewerError,
@@ -230,7 +230,7 @@ async def test_notification_listener_cancels_the_matching_session_only() -> None
 
 def test_viewer_migration_stores_only_hashes_and_installs_revocation_triggers() -> None:
     initial_path = Path(
-        "orchestrator/database/migrations/app/0061_canvas_viewer_sessions.sql"
+        "src/orchestrator/database/migrations/app/0061_canvas_viewer_sessions.sql"
     )
     initial_bytes = initial_path.read_bytes()
     initial = initial_bytes.decode()
@@ -254,7 +254,7 @@ def test_viewer_migration_stores_only_hashes_and_installs_revocation_triggers() 
     assert "canvas_session_changes" in initial
 
     exchange_path = Path(
-        "orchestrator/database/migrations/app/0062_canvas_bootstrap_exchange.sql"
+        "src/orchestrator/database/migrations/app/0062_canvas_bootstrap_exchange.sql"
     )
     exchange_bytes = exchange_path.read_bytes()
     exchange = exchange_bytes.decode()

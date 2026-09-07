@@ -358,6 +358,9 @@ data:
   # Admin-only exact-binding longevity/fault verification seam. Dark in every
   # normal profile and consumed only by the orchestrator.
   OFFICER_RUNTIME_VERIFICATION_ENABLED: {{ .Values.orchestrator.officerRuntimeVerificationEnabled | default false | quote }}
+  # BP-01 owner control ships dark until the unattended-release scorecard is
+  # complete. This gates new pulls even if unsupported JSON already says true.
+  OFFICER_AUTO_PULL_RELEASE_ENABLED: {{ .Values.orchestrator.officerAutoPullReleaseEnabled | default false | quote }}
   WORKER_BATCH_MIN_WALL_SECONDS: {{ .Values.agent.stateless.worker.batchMinWallSeconds | default 300 | quote }}
 
   # Reject pickle fallback in LangGraph checkpoint serialization. This is
@@ -366,7 +369,7 @@ data:
 
   # LLM-outage/cooldown pause budget (seconds; default 12h). Read by BOTH the
   # orchestrator give-up ceiling (evaluate_llm_outage) AND every agent pod's
-  # cooldown pause-vs-fail-fast cutoff (src/graph.py _COOLDOWN_MAX_PAUSE_SECONDS)
+  # cooldown pause-vs-fail-fast cutoff (src/agent/graph.py _COOLDOWN_MAX_PAUSE_SECONDS)
   # — they MUST agree, so both read this one ConfigMap key. Agents inherit via
   # envFrom; the orchestrator references it explicitly (see
   # orchestrator/deployment.yaml). knowledge-base/knowledge/features/llm_cooldown_pause_and_resume.md
@@ -406,7 +409,11 @@ data:
   # (gives a transient node reboot time to recover before discarding) + the
   # data-destructive discard kill-switch.
   WORKSPACE_REATTACH_READY_TIMEOUT: {{ .Values.workspace.reattachReadyTimeout | default 180 | quote }}
-  WORKSPACE_REATTACH_FRESH_FALLBACK: {{ .Values.workspace.freshFallback | default true | quote }}
+  WORKSPACE_REATTACH_FRESH_FALLBACK: {{ .Values.workspace.freshFallback | quote }}
+  # Default-dark background replay for durable non-pinned cleanup generations.
+  # Explicit operations and generations already admitted by the database can
+  # still converge while this is false.
+  WORKSPACE_CLEANUP_RECONCILIATION_ENABLED: {{ .Values.orchestrator.workspaceCleanupReconciliationEnabled | default false | quote }}
   # Reclaim-on-idle (Task 7, opt-in, fail-safe): drop a session's workspace
   # PVC on idle-suspend once its S3 snapshot verifies restorable. Default off
   # keeps today's retain-on-idle behavior. See workspace_suspension.py and
@@ -420,7 +427,7 @@ data:
 
   # Apply DB-backed config overrides (admin-curated rows in the config_overrides
   # table) to dynamically provisioned agents. Read by the agent prompt loader
-  # (src/core/loader.py) via envFrom on this shared ConfigMap. Default-off
+  # (src/shared/runtime/core/loader.py) via envFrom on this shared ConfigMap. Default-off
   # chart-wide (prod-safe); the dev/experimental values file turns it on.
   CONFIG_DB_OVERRIDES_ENABLED: {{ .Values.agent.configDbOverridesEnabled | default "false" | quote }}
   # DB-backed experts (experts table). The orchestrator owns selection and
@@ -455,6 +462,13 @@ data:
   # Exact-owner lifecycle CAS. Migration 0185 uses a drained maintenance
   # cutover, so every post-cutover pinned runtime must carry this identity.
   REQUIRE_PINNED_STATUS_IDENTITY: {{ .Values.agent.requirePinnedStatusIdentity | default "true" | quote }}
+  # 0200 never guesses where a historical NULL-namespace authority lives.
+  # The active Release.Namespace is searched automatically; this is the
+  # bounded, operator-owned set of prior namespaces retained for adoption.
+  PINNED_LEGACY_AGENT_NAMESPACES: {{ .Values.agent.pinnedLegacyNamespaces | default list | uniq | join "," | quote }}
+  # Forward-only v1 VM remote-effect admission. It remains dark until Helm's
+  # Recreate cutover has eliminated every predecessor replica.
+  VM_REMOTE_OPERATION_PROTOCOL_ENABLED: {{ ternary "true" "false" (.Values.orchestrator.vmRemoteOperationProtocol.enabled | default false) | quote }}
   # Dynamic Canvas workspace-port live preview master gate. The orchestrator
   # derives the positive attach capability and rechecks every mutation; agents
   # never infer support from this environment value. Provisioned agents inherit
@@ -504,7 +518,7 @@ data:
   # Effective context ceiling for models routed via the system codex proxy
   # (CLIProxyAPI / ChatGPT-OAuth backend), which caps context far below the
   # models' true API windows and rejects larger inputs with `context_too_large`.
-  # Read by src/core/model_registry.py (_cap_context_window) at dispatch. Set 0 to
+  # Read by src/shared/runtime/core/model_registry.py (_cap_context_window) at dispatch. Set 0 to
   # disable the day OpenAI ships 1M-for-Codex. New sessions only (agents read env
   # at pod start). See knowledge-base/knowledge/issues/codex_proxy_context_window_cap.md.
   CODEX_CONTEXT_WINDOW_CAP: {{ .Values.agent.codexContextWindowCap | default 400000 | quote }}
@@ -673,7 +687,7 @@ data:
   NEXTCLOUD_PUBLIC_URL: {{ include "srw.cloudUrl" . | quote }}
   NEXTCLOUD_ADMIN_USER: {{ "admin" | quote }}
   NEXTCLOUD_AGENT_USER: {{ "agent-service" | quote }}
-  {{- if .Values.nextcloud.protectedEffect.enabled }}
+  {{- if (eq (include "srw.nextcloudProtectedEffectEnabled" .) "true") }}
   # Server-enforced bounded lane for the five attempt-scoped authority POSTs.
   NEXTCLOUD_PROTECTED_EFFECT_URL: {{ printf "http://%s" (include "srw.nextcloudProtectedEffectName" .) | quote }}
   NEXTCLOUD_PROTECTED_EFFECT_CONFIG_SHA256: {{ include "srw.nextcloudProtectedEffectConfigSha256" . | quote }}
@@ -754,7 +768,7 @@ data:
 
   # -- Persistent VM rootdisks (knowledge-base/knowledge/features/vm_persistent_rootdisk.md).
   # MUST mirror the VM controller's own vmController.persistentRootdisk.enabled
-  # (which may live in the separate helm-vm-cluster chart). The orchestrator
+  # (in same-cluster mode, this release's own vm-controller). The orchestrator
   # reads this to decide whether a VM's files survive a teardown — notably
   # whether VM session suspend may proceed without a snapshot. Enable the
   # CONTROLLER first: turning it on here against a controller that still

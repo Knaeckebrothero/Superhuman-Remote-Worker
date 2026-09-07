@@ -9,10 +9,10 @@ from uuid import UUID, uuid4
 
 import pytest
 
-import src.api.persistent_app as pa
-import src.api.turn_executor as te
-from src.api.lease_context import LeaseHandle, current_lease
-from src.shared.thread_interrupts import (
+import agent.api.persistent_app as pa
+import agent.api.turn_executor as te
+from agent.api.lease_context import LeaseHandle, current_lease
+from shared.thread_interrupts import (
     InterruptInputConsumption,
     InterruptReceipt,
     InterruptRequest,
@@ -160,15 +160,15 @@ async def test_signal_precedes_receipt_and_finalization(stateless_owner):
 
     with (
         patch(
-            "src.shared.thread_interrupts.owner_fence_current",
+            "shared.thread_interrupts.owner_fence_current",
             AsyncMock(return_value=True),
         ),
         patch(
-            "src.shared.thread_interrupts.fetch_next_interrupt_request",
+            "shared.thread_interrupts.fetch_next_interrupt_request",
             AsyncMock(side_effect=[request, None]),
         ),
         patch(
-            "src.shared.thread_interrupts.fetch_interrupt_receipt",
+            "shared.thread_interrupts.fetch_interrupt_receipt",
             AsyncMock(return_value=None),
         ),
         patch.object(pa, "_signal_interrupt_for_turn", side_effect=signal),
@@ -214,15 +214,15 @@ async def test_receipt_recovery_never_resignals_or_rejournals(stateless_owner):
 
     with (
         patch(
-            "src.shared.thread_interrupts.owner_fence_current",
+            "shared.thread_interrupts.owner_fence_current",
             AsyncMock(return_value=True),
         ),
         patch(
-            "src.shared.thread_interrupts.fetch_next_interrupt_request",
+            "shared.thread_interrupts.fetch_next_interrupt_request",
             AsyncMock(side_effect=[request, None]),
         ),
         patch(
-            "src.shared.thread_interrupts.fetch_interrupt_receipt",
+            "shared.thread_interrupts.fetch_interrupt_receipt",
             AsyncMock(return_value=_receipt()),
         ),
         patch.object(pa, "_signal_interrupt_for_turn", signal),
@@ -276,15 +276,15 @@ async def test_stop_joins_slow_receipt_without_cancel_or_duplicate(
 
     with (
         patch(
-            "src.shared.thread_interrupts.owner_fence_current",
+            "shared.thread_interrupts.owner_fence_current",
             AsyncMock(return_value=True),
         ),
         patch(
-            "src.shared.thread_interrupts.fetch_next_interrupt_request",
+            "shared.thread_interrupts.fetch_next_interrupt_request",
             fetch_next,
         ),
         patch(
-            "src.shared.thread_interrupts.fetch_interrupt_receipt",
+            "shared.thread_interrupts.fetch_interrupt_receipt",
             AsyncMock(return_value=None),
         ),
         patch.object(pa, "_signal_interrupt_for_turn", signal),
@@ -415,15 +415,15 @@ async def test_terminal_edge_is_durably_rejected_without_ram_signal(
 
     with (
         patch(
-            "src.shared.thread_interrupts.owner_fence_current",
+            "shared.thread_interrupts.owner_fence_current",
             AsyncMock(return_value=True),
         ),
         patch(
-            "src.shared.thread_interrupts.fetch_next_interrupt_request",
+            "shared.thread_interrupts.fetch_next_interrupt_request",
             AsyncMock(side_effect=[request, None]),
         ),
         patch(
-            "src.shared.thread_interrupts.fetch_interrupt_receipt",
+            "shared.thread_interrupts.fetch_interrupt_receipt",
             AsyncMock(return_value=None),
         ),
         patch.object(pa, "_broadcast_interrupt_durable", journal),
@@ -461,15 +461,15 @@ async def test_journal_failure_leaves_request_unfinalized(stateless_owner):
     finalize = AsyncMock()
     with (
         patch(
-            "src.shared.thread_interrupts.owner_fence_current",
+            "shared.thread_interrupts.owner_fence_current",
             AsyncMock(return_value=True),
         ),
         patch(
-            "src.shared.thread_interrupts.fetch_next_interrupt_request",
+            "shared.thread_interrupts.fetch_next_interrupt_request",
             AsyncMock(return_value=request),
         ),
         patch(
-            "src.shared.thread_interrupts.fetch_interrupt_receipt",
+            "shared.thread_interrupts.fetch_interrupt_receipt",
             AsyncMock(return_value=None),
         ),
         patch.object(
@@ -491,7 +491,7 @@ async def test_stale_local_handle_never_reads_or_signals(stateless_owner):
     fetch = AsyncMock()
     signal = MagicMock()
     with (
-        patch("src.shared.thread_interrupts.fetch_next_interrupt_request", fetch),
+        patch("shared.thread_interrupts.fetch_next_interrupt_request", fetch),
         patch.object(pa, "_signal_interrupt_for_turn", signal),
     ):
         with pytest.raises(pa.InterruptInboxBlocked):
@@ -547,11 +547,11 @@ async def test_permission_only_successor_recovery_rotates_after_lock_release(
 
     with (
         patch(
-            "src.shared.thread_interrupts.owner_fence_current_for_update",
+            "shared.thread_interrupts.owner_fence_current_for_update",
             AsyncMock(return_value=True),
         ),
         patch(
-            "src.shared.thread_interrupts.fetch_stale_interrupt_requests",
+            "shared.thread_interrupts.fetch_stale_interrupt_requests",
             AsyncMock(return_value=[]),
         ),
         patch.object(pa, "_rotate_thread_interrupt_recovery_epoch", rotate),
@@ -573,11 +573,11 @@ async def test_stale_permission_probe_includes_legacy_null(stateless_owner):
 
     with (
         patch(
-            "src.shared.thread_interrupts.owner_fence_current_for_update",
+            "shared.thread_interrupts.owner_fence_current_for_update",
             AsyncMock(return_value=True),
         ),
         patch(
-            "src.shared.thread_interrupts.fetch_stale_interrupt_requests",
+            "shared.thread_interrupts.fetch_stale_interrupt_requests",
             AsyncMock(return_value=[]),
         ),
     ):
@@ -616,15 +616,15 @@ async def test_owner_crash_before_receipt_applies_stop_without_successor_signal(
 
     with (
         patch(
-            "src.shared.thread_interrupts.owner_fence_current_for_update",
+            "shared.thread_interrupts.owner_fence_current_for_update",
             AsyncMock(return_value=True),
         ),
         patch(
-            "src.shared.thread_interrupts.fetch_stale_interrupt_requests",
+            "shared.thread_interrupts.fetch_stale_interrupt_requests",
             AsyncMock(return_value=[request]),
         ) as fetch_stale,
         patch(
-            "src.shared.thread_interrupts.fetch_interrupt_receipt",
+            "shared.thread_interrupts.fetch_interrupt_receipt",
             AsyncMock(return_value=None),
         ),
         patch.object(pa, "_rotate_thread_interrupt_recovery_epoch", rotate),
@@ -687,15 +687,15 @@ async def test_owner_crash_after_receipt_finalizes_without_successor_signal(
 
     with (
         patch(
-            "src.shared.thread_interrupts.owner_fence_current_for_update",
+            "shared.thread_interrupts.owner_fence_current_for_update",
             AsyncMock(return_value=True),
         ),
         patch(
-            "src.shared.thread_interrupts.fetch_stale_interrupt_requests",
+            "shared.thread_interrupts.fetch_stale_interrupt_requests",
             AsyncMock(return_value=[request]),
         ),
         patch(
-            "src.shared.thread_interrupts.fetch_interrupt_receipt",
+            "shared.thread_interrupts.fetch_interrupt_receipt",
             AsyncMock(return_value=_receipt()),
         ),
         patch.object(
@@ -764,15 +764,15 @@ async def test_stale_recovery_emits_one_singular_boundary_per_exact_target(
 
     with (
         patch(
-            "src.shared.thread_interrupts.owner_fence_current_for_update",
+            "shared.thread_interrupts.owner_fence_current_for_update",
             AsyncMock(return_value=True),
         ),
         patch(
-            "src.shared.thread_interrupts.fetch_stale_interrupt_requests",
+            "shared.thread_interrupts.fetch_stale_interrupt_requests",
             AsyncMock(return_value=requests),
         ),
         patch(
-            "src.shared.thread_interrupts.fetch_interrupt_receipt",
+            "shared.thread_interrupts.fetch_interrupt_receipt",
             AsyncMock(side_effect=[_receipt(), second_receipt]),
         ),
         patch.object(
@@ -824,23 +824,23 @@ async def test_terminal_applied_stale_row_settles_and_makes_progress_without_loo
 
     with (
         patch(
-            "src.shared.thread_interrupts.owner_fence_current",
+            "shared.thread_interrupts.owner_fence_current",
             AsyncMock(return_value=True),
         ),
         patch(
-            "src.shared.thread_interrupts.owner_fence_current_for_update",
+            "shared.thread_interrupts.owner_fence_current_for_update",
             AsyncMock(return_value=True),
         ),
         patch(
-            "src.shared.thread_interrupts.fetch_stale_interrupt_requests",
+            "shared.thread_interrupts.fetch_stale_interrupt_requests",
             fetch_stale,
         ),
         patch(
-            "src.shared.thread_interrupts.fetch_interrupt_receipt",
+            "shared.thread_interrupts.fetch_interrupt_receipt",
             AsyncMock(return_value=_receipt()),
         ),
         patch(
-            "src.shared.thread_interrupts.consume_applied_interrupt_input_live",
+            "shared.thread_interrupts.consume_applied_interrupt_input_live",
             consume,
         ),
         patch.object(
@@ -911,8 +911,7 @@ async def test_recovery_epoch_closes_old_writer_before_exact_fenced_bump(
     with (
         patch.object(pa._event_journal, "bump_epoch", side_effect=bump),
         patch(
-            "src.shared.session_permission_retirement."
-            "retire_stale_stateless_permissions",
+            "shared.session_permission_retirement.retire_stale_stateless_permissions",
             AsyncMock(return_value=retirement),
         ),
         patch.object(pa, "_OrderedPersistentEventWriter", return_value=new_writer),
@@ -959,8 +958,7 @@ async def test_recovery_epoch_seeds_after_multiple_permission_receipts(
 
     with (
         patch(
-            "src.shared.session_permission_retirement."
-            "retire_stale_stateless_permissions",
+            "shared.session_permission_retirement.retire_stale_stateless_permissions",
             AsyncMock(return_value=retirement),
         ),
         patch.object(pa._event_journal, "bump_epoch") as bump,
@@ -1139,7 +1137,7 @@ async def test_finalizer_rechecks_owner_then_request_and_receipt():
 
     consumption = InterruptInputConsumption(5, "leased", False, False, True)
     with patch(
-        "src.shared.thread_interrupts.queries.consume_applied_interrupt_input_live",
+        "shared.thread_interrupts.queries.consume_applied_interrupt_input_live",
         AsyncMock(return_value=consumption),
     ) as consume:
         result = await finalize_interrupt_request(
@@ -1177,7 +1175,7 @@ async def test_rejected_finalizer_never_consumes_input():
     conn = _FinalizeConn(applied=False)
     consume = AsyncMock()
     with patch(
-        "src.shared.thread_interrupts.queries.consume_applied_interrupt_input_live",
+        "shared.thread_interrupts.queries.consume_applied_interrupt_input_live",
         consume,
     ):
         result = await finalize_interrupt_request(

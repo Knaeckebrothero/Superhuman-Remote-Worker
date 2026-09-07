@@ -9,13 +9,16 @@ territory, same split as the rest of the officer suite.
 
 import pytest
 
-from services.officer_slots import (
+from orchestrator.services.officer_slots import (
     SlotAdmissionError,
     admit,
     capacity_lines,
     validate_slots_spec,
 )
-from services.officer_admission import OfficerAdmissionConflict, _validate_slot_pins
+from orchestrator.services.officer_admission import (
+    OfficerAdmissionConflict,
+    _validate_slot_pins,
+)
 
 ROSTER_META = {
     "enabled": True,

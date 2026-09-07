@@ -256,9 +256,9 @@ Pass criteria:
 - [ ] Both servers' tools are namespaced
       `mcp__<server_slug>__<tool>`.
 - [ ] At least one remote and one stdio tool call succeeds.
-- [ ] `datasources.md` contains **Available Connectors** and an
+- [ ] `README.md` contains **Available Connectors** and an
       `### MCP Servers` section with status and namespaced tool names.
-- [ ] `datasources.md` contains no URL credentials, headers, tokens, stdio
+- [ ] `README.md` contains no URL credentials, headers, tokens, stdio
       environment values, or other secret material.
 - [ ] The audit trail shows the successful `mcp__…` calls and correct job ID.
 - [ ] Native tools still bind and work; MCP registration does not replace the
@@ -274,7 +274,7 @@ Pass criteria:
 - [ ] Job startup is delayed by no more than the configured per-server connect
       bound (approximately 10 seconds for the bad server).
 - [ ] The job still runs and can call the healthy MCP tool.
-- [ ] The bad server is marked `unavailable` in `datasources.md`.
+- [ ] The bad server is marked `unavailable` in `README.md`.
 - [ ] The error is concise and contains no credential/header values.
 - [ ] The job is not marked failed solely because one MCP server is down.
 
@@ -325,7 +325,7 @@ Using the second user:
 Use disposable canaries—not real secrets—for bearer tokens, custom headers,
 and stdio environment values. Search only for those known canaries.
 
-- [ ] No canary appears in `datasources.md`.
+- [ ] No canary appears in `README.md`.
 - [ ] No canary appears in orchestrator or agent logs.
 - [ ] No canary appears in connection-test errors or job error strings.
 - [ ] No canary appears in Cockpit toasts or browser console output.
@@ -413,7 +413,7 @@ Test each remote auth mode with disposable canaries:
       after namespacing and remain at most 64 characters.
 - [ ] Rebinding does not duplicate dynamic registry entries.
 - [ ] A server exposing more than 40 tools registers all tools while
-      `datasources.md` lists 40 plus a correct `+N more` tail.
+      `README.md` lists 40 plus a correct `+N more` tail.
 - [ ] A 100+ tool catalog does not make the agent/job fail at bind time.
 
 ## P1.7 Restart and resume
@@ -534,7 +534,7 @@ Rollout impact / temporary restriction:
 ```
 
 Stop immediately and rotate the disposable credential if any secret value
-appears in logs, API output, `datasources.md`, Cockpit, or audit records.
+appears in logs, API output, `README.md`, Cockpit, or audit records.
 
 ---
 

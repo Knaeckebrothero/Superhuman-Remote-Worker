@@ -18,13 +18,13 @@ func TestTransportPrefersHTTP(t *testing.T) {
 	}
 }
 
-func TestTransportFallsBackToNATSForPartialHTTPConfig(t *testing.T) {
+func TestTransportRefusesUnauthenticatedNATSForPartialHTTPConfig(t *testing.T) {
 	cfg := Defaults()
 	cfg.Orchestrator.URL = "http://orchestrator:8085"
 	cfg.NATS.URL = "nats://nats:4222"
 
 	got, err := cfg.Transport()
-	if err != nil || got != "nats" {
+	if err == nil || got != "" {
 		t.Fatalf("Transport() = %q, %v", got, err)
 	}
 }

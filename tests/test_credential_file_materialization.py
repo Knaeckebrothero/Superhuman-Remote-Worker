@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from src.core.datasource_setup import (
+from agent.core.datasource_setup import (
     AGENT_HOME,
     cleanup_credential_files,
     process_credential_files,

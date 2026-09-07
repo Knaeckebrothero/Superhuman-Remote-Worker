@@ -16,7 +16,7 @@ from orchestrator.database.postgres import PostgresDB
 from orchestrator.services.session_memory_effects import SessionMemoryEffectDrain
 
 ROOT = Path(__file__).resolve().parents[1]
-APP_MIGRATIONS = ROOT / "orchestrator/database/migrations/app"
+APP_MIGRATIONS = ROOT / "src" / "orchestrator" / "database" / "migrations" / "app"
 SESSION_COLUMNS = APP_MIGRATIONS / "0145_session_turn_memory_effects.sql"
 SESSION_DRAIN_INDEX = APP_MIGRATIONS / "0146_completion_effects_session_drain.notx.sql"
 

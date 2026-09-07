@@ -42,6 +42,7 @@ function mountLogic(overrides: {
     getJobUsage: vi.fn().mockReturnValue(of(null)),
     getJobProgress: vi.fn().mockReturnValue(of(null)),
     getJobSubjobs: vi.fn().mockReturnValue(of(null)),
+    getJobSubagents: vi.fn().mockReturnValue(of(null)),
     ...overrides.api,
   } as unknown as ApiService;
 
@@ -407,6 +408,27 @@ describe('JobListComponent — server-resolved tree', () => {
     expect(getJobSubjobs).toHaveBeenCalledWith('root-1');
   });
 
+  it('fetches and unwraps subagents with the rest of the panel', () => {
+    const roster = {
+      job_id: 'root-1',
+      count: 1,
+      subagents: [{thread_id: 'thread-a', handle: 'tester-7f3a', status: 'running'}],
+    };
+    const getJobSubagents = vi.fn().mockReturnValue(of(roster));
+    const {fixture, component} = mountLogic({
+      api: {
+        getJobsPage: vi.fn().mockReturnValue(of(page([job('root-1')]))),
+        getJobSubagents,
+      } as Partial<ApiService>,
+    });
+    fixture.detectChanges();
+
+    component.toggleExpand('root-1');
+
+    expect(getJobSubagents).toHaveBeenCalledWith('root-1');
+    expect(component.jobDetails()['root-1'].subagents).toEqual(roster.subagents);
+  });
+
   it('unwraps the roster envelope into the panel state', () => {
     const roster = {
       job_id: 'root-1',
@@ -700,6 +722,25 @@ describe('JobListComponent — filters drive the URL', () => {
     component.goToPage(1);
     expect(navigate.mock.calls[0][1].queryParams.as_of).toBeNull();
   });
+
+  it('keeps a capped total when the next HTTP page skips counting', () => {
+    const params = new BehaviorSubject(paramMap({}));
+    const stamp = '2026-09-06T09:00:00Z';
+    const getJobsPage = vi.fn()
+      .mockReturnValueOnce(of(page([job('a')], {total: 10_000, total_is_capped: true, has_more: true, as_of: stamp})))
+      .mockReturnValueOnce(of(page([job('b')], {total: null, total_is_capped: false, has_more: false, offset: 25, as_of: stamp})));
+    const {fixture, component} = mountLogic({params, api: {getJobsPage} as Partial<ApiService>});
+    fixture.detectChanges();
+    params.next(paramMap({page: '2', as_of: stamp}));
+
+    const query = getJobsPage.mock.calls[1][0] as Record<string, unknown>;
+    expect(query['include_total']).toBe(false);
+    expect(query['as_of']).toBe(stamp);
+    expect(component.total()).toBe(10_000);
+    expect(component.totalIsCapped()).toBe(true);
+    expect(component.hasMore()).toBe(false);
+    expect(component.jobs().map((row) => row.id)).toEqual(['b']);
+  });
 });
 
 describe('JobListComponent — live refresh', () => {
@@ -740,6 +781,30 @@ describe('JobListComponent — live refresh', () => {
     const before = getJobsPage.mock.calls.length;
     await vi.advanceTimersByTimeAsync(30_000);
     expect(getJobsPage.mock.calls.length).toBe(before);
+  });
+
+  it('refreshes an expanded live job roster and stops after the parent is terminal', async () => {
+    let row = job('root-1', {status: 'processing'});
+    const getJobsPage = vi.fn().mockImplementation(() => of(page([row])));
+    const getJobSubagents = vi.fn().mockReturnValue(of({
+      job_id: 'root-1',
+      count: 0,
+      subagents: [],
+    }));
+    const {fixture, component} = mountLogic({
+      api: {getJobsPage, getJobSubagents} as Partial<ApiService>,
+    });
+    fixture.detectChanges();
+    component.toggleExpand('root-1');
+    expect(getJobSubagents).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(getJobSubagents).toHaveBeenCalledTimes(2);
+
+    row = job('root-1', {status: 'completed'});
+    component.jobs.set([row as JobSummary]);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(getJobSubagents).toHaveBeenCalledTimes(2);
   });
 
   it('announces new jobs instead of splicing them above the cursor', async () => {

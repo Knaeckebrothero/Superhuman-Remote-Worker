@@ -1,8 +1,7 @@
-"""Contract tests for the duplicated Postgres DSN builder.
+"""Contract tests for the shared Postgres DSN builder.
 
-``build_postgres_url`` exists byte-identically in two trees so the orchestrator
-image need not bundle the agent ``src/`` tree. These tests exercise both copies
-and assert they have not drifted.
+The applications import the same lightweight ``shared.db_url`` implementation.
+These tests exercise its shared and orchestrator bindings and assert identity.
 
 asyncpg's accepted ``sslmode`` values were verified directly against the
 installed 0.31.0: ``disable, allow, prefer, require, verify-ca, verify-full``.
@@ -13,44 +12,23 @@ and check_hostname=True.
 
 from __future__ import annotations
 
-import ast
 import asyncio
 import os
-from pathlib import Path
 
 import pytest
+from shared import db_url
 
-ROOT = Path(__file__).resolve().parents[1]
-ORCHESTRATOR_COPY = ROOT / "orchestrator" / "utils" / "db_url.py"
-AGENT_COPY = ROOT / "src" / "utils" / "db_url.py"
 
 SSL_MODES = ["disable", "allow", "prefer", "require", "verify-ca", "verify-full"]
 
 
-def _load(path: Path):
-    """Exec one module's source in a bare namespace.
-
-    Importing ``orchestrator.utils.db_url`` and ``src.utils.db_url`` in the same
-    process would rely on two package roots resolving unambiguously, which the
-    flattened orchestrator image deliberately breaks. The module has no
-    intra-repo imports, so exec'ing the file is sufficient and isolated.
-    """
-    namespace: dict = {}
-    exec(compile(path.read_text(), str(path), "exec"), namespace)
-    return namespace["build_postgres_url"]
-
-
-def _function_source(path: Path, name: str) -> str:
-    source = path.read_text()
-    for node in ast.walk(ast.parse(source)):
-        if isinstance(node, ast.FunctionDef) and node.name == name:
-            return ast.get_source_segment(source, node)
-    raise AssertionError(f"{name} not found in {path}")
-
-
-@pytest.fixture(params=[ORCHESTRATOR_COPY, AGENT_COPY], ids=["orchestrator", "agent"])
+@pytest.fixture(params=["orchestrator", "shared"])
 def build(request):
-    return _load(request.param)
+    if request.param == "orchestrator":
+        from orchestrator.database.postgres import build_postgres_url
+
+        return build_postgres_url
+    return db_url.build_postgres_url
 
 
 @pytest.fixture(autouse=True)
@@ -138,10 +116,9 @@ def test_asyncpg_accepts_every_sslmode_we_expose(build, clean_env, mode):
     assert "sslmode" not in str(excinfo.value).lower()
 
 
-def test_both_trees_define_an_identical_build_postgres_url():
-    assert _function_source(
-        ORCHESTRATOR_COPY, "build_postgres_url"
-    ) == _function_source(AGENT_COPY, "build_postgres_url"), (
-        "build_postgres_url has drifted between orchestrator/utils/db_url.py and "
-        "src/utils/db_url.py. The duplication is deliberate; keep both in sync."
-    )
+def test_applications_use_the_shared_database_url_module():
+    from agent.agent import resolve_checkpoint_url
+    from orchestrator.database.postgres import build_postgres_url
+
+    assert build_postgres_url is db_url.build_postgres_url
+    assert resolve_checkpoint_url is db_url.resolve_checkpoint_url

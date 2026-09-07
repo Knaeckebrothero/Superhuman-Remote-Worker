@@ -8,7 +8,7 @@ import copy
 
 import pytest
 
-from src.core.capability_grants import (
+from shared.runtime.core.capability_grants import (
     CATALOG,
     evaluate,
     meet,
@@ -216,20 +216,20 @@ def test_admin_short_circuits_and_empty_is_clean():
 
 
 def test_rejects_duplicate_keys():
-    from src.core.expert_resolution import scan_fragment_text
+    from shared.runtime.core.expert_resolution import scan_fragment_text
 
     assert scan_fragment_text('{"llm": {"api_key": null, "api_key": "x"}}')
 
 
 def test_rejects_non_ascii_key():
     # fullwidth 'api_key' — reject the non-ASCII key outright, don't try to normalize.
-    from src.core.expert_resolution import scan_fragment_text
+    from shared.runtime.core.expert_resolution import scan_fragment_text
 
     assert scan_fragment_text('{"llm": {"ａｐｉ＿ｋｅｙ": "x"}}')
 
 
 def test_allows_clean_fragment_text():
-    from src.core.expert_resolution import scan_fragment_text
+    from shared.runtime.core.expert_resolution import scan_fragment_text
 
     assert (
         scan_fragment_text('{"llm": {"model": "gemma-4-moe"}, "tools": {"shell": []}}')
@@ -269,7 +269,7 @@ def test_null_deletion_of_guardrail_caught_in_merged():
 
 
 def test_cross_layer_credential_assembly_denied():
-    from src.core.expert_resolution import hard_deny_scan
+    from shared.runtime.core.expert_resolution import hard_deny_scan
 
     assert hard_deny_scan({"llm": {"model": "x", "api_key": "leaked"}})
 
@@ -300,15 +300,21 @@ def test_session_base_is_safe_for_a_new_principal():
 
 
 def test_specialists_explicitly_opt_in_to_delegation():
-    """Profiles that declare spawn_subagent must not inherit the safe-base off."""
+    """The five delegating profiles explicitly grant spawn and controls."""
     from orchestrator.services.config_resolver import resolve_config
 
-    for name in ("developer", "critic", "scholar"):
+    for name in ("bughunter", "critic", "developer", "product-qa", "scholar"):
         cap: dict = {}
         resolve_config(base_config_name=name, capture=cap, expert_type="worker")
         fragment = cap["merged_fragment"]
         assert fragment["delegation"]["enabled"] is True
-        assert fragment["tools"]["delegation"] == ["spawn_subagent"]
+        assert fragment["tools"]["delegation"] == [
+            "delegate_agent",
+            "wait_agent",
+            "message_agent",
+            "stop_agent",
+            "list_agents",
+        ]
 
 
 # --- strip_to_grants (2026-08-04 plan, expert-write-gate-holes, task 3) ------
@@ -369,8 +375,12 @@ def _deny_only(key: str) -> dict:
 _RULE_FRAGMENTS: dict[str, dict] = {
     "shell_tools": {"tools": {"shell": ["run_command"], "git": ["git_status"]}},
     "delegation": {
-        "tools": {"delegation": ["spawn_subagent"], "git": ["git_status"]},
-        "delegation": {"enabled": True, "max_depth": 3, "default_timeout": 600},
+        "tools": {"delegation": ["delegate_agent"], "git": ["git_status"]},
+        "delegation": {
+            "enabled": True,
+            "max_concurrent": 3,
+            "run_in_background_default": True,
+        },
     },
     "datasource_tools": {
         "tools": {
@@ -426,7 +436,8 @@ def test_delegation_strip_keeps_settings_that_were_never_the_violation():
     `.enabled is True` or a non-empty `tools.delegation`, not on the settings
     dict merely existing — so the strip must take `tools.delegation` and only
     the `.enabled` flag, never the whole `delegation` dict (that would also
-    drop `max_depth`/`default_timeout`, which were never the problem)."""
+    drop `max_concurrent`/`run_in_background_default`, which were never the
+    problem)."""
     stripped, dropped = strip_to_grants(
         _RULE_FRAGMENTS["delegation"], _deny_only("delegation")
     )
@@ -434,8 +445,8 @@ def test_delegation_strip_keeps_settings_that_were_never_the_violation():
     assert "delegation" not in stripped["tools"]
     assert stripped["tools"]["git"] == ["git_status"]
     assert "enabled" not in stripped["delegation"]
-    assert stripped["delegation"]["max_depth"] == 3
-    assert stripped["delegation"]["default_timeout"] == 600
+    assert stripped["delegation"]["max_concurrent"] == 3
+    assert stripped["delegation"]["run_in_background_default"] is True
 
 
 def test_unattended_operations_gates_officer_enabled_only():
@@ -546,7 +557,7 @@ def test_a_user_with_every_grant_gets_an_unmodified_copy():
     fragment = {
         "tools": {
             "shell": ["run_command"],
-            "delegation": ["spawn_subagent"],
+            "delegation": ["delegate_agent"],
             "sql": ["run_query"],
             "browser_direct": ["browser_navigate"],
             "catalog_authoring": ["create_expert"],
@@ -574,7 +585,7 @@ def test_defaults_grant_browser_and_datasource_but_deny_shell_and_delegation():
     fragment = {
         "tools": {
             "shell": ["run_command"],
-            "delegation": ["spawn_subagent"],
+            "delegation": ["delegate_agent"],
             "browser_direct": ["browser_navigate"],
             "sql": ["run_query"],
         },
@@ -603,7 +614,7 @@ def test_kitchen_sink_fragment_strips_every_current_violation_at_once():
     kitchen_sink = {
         "tools": {
             "shell": ["run_command"],
-            "delegation": ["spawn_subagent"],
+            "delegation": ["delegate_agent"],
             "sql": ["run_query"],
             "mongodb": ["run_query"],
             "graph": ["run_query"],
@@ -697,7 +708,7 @@ def test_strip_map_covers_every_catalog_key_or_is_explicitly_excluded(monkeypatc
     (like the reviewer's `network_egress`) is automatically in-scope with no
     edit to this test.
     """
-    import src.core.capability_grants as capability_grants
+    import shared.runtime.core.capability_grants as capability_grants
 
     for key in CATALOG:
         if key in _NOT_ENFORCED_BY_EVALUATE_FRAGMENT_PDP:
@@ -729,3 +740,153 @@ def test_every_catalog_key_is_handled_or_excluded_not_both():
     assert set(_NOT_ENFORCED_BY_EVALUATE_FRAGMENT_PDP) <= set(CATALOG)
     for key, reason in _NOT_ENFORCED_BY_EVALUATE_FRAGMENT_PDP.items():
         assert reason, f"{key!r} needs a real reason, not a placeholder"
+
+
+# --- U1 WP4: roster entries are a tool / model surface of their own ----------
+#
+# A child runs with the tools its `subagents.roster.<name>` entry names, so the
+# tool gates and model_selection apply per entry — at save on the raw entries,
+# at dispatch on the materialised ones (`resolve_config` resolves the roster
+# BEFORE the PDP capture). Parent-only keys (`workspace.backend`, `autonomy`,
+# `delegation`, `tools.core`, `officer`) are pruned from every child by the
+# subagent overlay and `interactive.permission_mode` is `autonomous` on every
+# child by design, so those rules are NOT applied to entries.
+
+
+def test_roster_shell_tools_require_grant():
+    fragment = {
+        "tools": {"git": ["git_status"]},
+        "subagents": {
+            "roster": {
+                "fixer": {"tools": {"shell": ["run_command"], "git": ["git_status"]}},
+                "reader": {"tools": {"workspace": ["read_file"]}},
+            }
+        },
+    }
+
+    v = evaluate(fragment, DEFAULTS)
+
+    assert len(v) == 1
+    assert v[0].startswith("shell_tools:") and "subagents.roster.fixer" in v[0]
+    assert evaluate(fragment, {**DEFAULTS, "shell_tools": True}) == []
+
+    stripped, dropped = strip_to_grants(fragment, DEFAULTS)
+
+    assert dropped == ["shell_tools"]
+    fixer = stripped["subagents"]["roster"]["fixer"]["tools"]
+    assert "shell" not in fixer and fixer["git"] == ["git_status"]
+    assert (
+        stripped["subagents"]["roster"]["reader"]
+        == fragment["subagents"]["roster"]["reader"]
+    )
+    assert stripped["tools"] == {"git": ["git_status"]}
+    assert evaluate(stripped, DEFAULTS) == []
+
+
+@pytest.mark.parametrize(
+    ("grant_key", "tools"),
+    [
+        ("datasource_tools", {"sql": ["run_query"], "repo": ["clone_repo"]}),
+        ("browser", {"browser_direct": ["browser_navigate"]}),
+        ("catalog_authoring", {"catalog_authoring": ["create_expert"]}),
+    ],
+)
+def test_roster_tool_gates_apply_per_entry(grant_key, tools):
+    fragment = {
+        "subagents": {"roster": {"x": {"tools": {**tools, "git": ["git_log"]}}}}
+    }
+    grants = _deny_only(grant_key)
+
+    v = evaluate(fragment, grants)
+
+    assert len(v) == 1 and v[0].startswith(f"{grant_key}:")
+    assert "subagents.roster.x" in v[0]
+
+    stripped, dropped = strip_to_grants(fragment, grants)
+
+    assert dropped == [grant_key]
+    assert stripped["subagents"]["roster"]["x"]["tools"]["git"] == ["git_log"]
+    assert evaluate(stripped, grants) == []
+
+
+def test_roster_model_selection():
+    """The roster-wide `subagents.llm.model` and each entry's own pin are model
+    selections; `inherit` is the parent's (already gated) model, not one."""
+    fragment = {
+        "llm": {"model": "allowed"},
+        "subagents": {
+            "llm": {"model": "roster-wide-blocked"},
+            "roster": {
+                "pinned": {"llm": {"model": "entry-blocked"}},
+                "ok": {"llm": {"model": "allowed"}},
+                "twin": {"llm": {"model": "inherit"}},
+            },
+        },
+    }
+    grants = {**_deny_only("model_selection"), "model_selection": ["allowed"]}
+
+    v = evaluate(fragment, grants)
+
+    assert sorted(v) == [
+        "model_selection: model 'entry-blocked' is not in the permitted set",
+        "model_selection: model 'roster-wide-blocked' is not in the permitted set",
+    ]
+
+    stripped, dropped = strip_to_grants(fragment, grants)
+
+    assert dropped == ["model_selection"]
+    assert "model" not in stripped["subagents"]["llm"]
+    assert "model" not in stripped["subagents"]["roster"]["pinned"]["llm"]
+    assert stripped["subagents"]["roster"]["ok"]["llm"]["model"] == "allowed"
+    assert stripped["subagents"]["roster"]["twin"]["llm"]["model"] == "inherit"
+    assert stripped["llm"]["model"] == "allowed"
+    assert evaluate(stripped, grants) == []
+
+
+def test_resolved_roster_children_are_safe_for_a_new_principal():
+    """The dispatch shape: a materialised roster (the read-only library entry
+    and an inline child) under the safe worker base trips nothing for a
+    default-grants principal — in particular NOT `permission_mode`, which
+    every child pins to `autonomous` by design."""
+    from orchestrator.services.config_resolver import resolve_config
+
+    parent = {
+        "expert_type": "worker",
+        "name": "lead",
+        "config": {
+            "llm": {"model": "lead-model"},
+            "subagents": {
+                "roster": {
+                    "explorer": {"$ref": "subagents/explorer"},
+                    "inline": {"tools": {"workspace": ["read_file"]}},
+                }
+            },
+        },
+        "prompts": {},
+    }
+    cap: dict = {}
+    resolve_config(
+        base_config_name="worker_base",
+        expert_row=parent,
+        expert_type="worker",
+        capture=cap,
+    )
+    roster = cap["merged_fragment"]["subagents"]["roster"]
+    assert set(roster) == {"explorer", "inline"}
+    assert all(
+        e["interactive"]["permission_mode"] == "autonomous" for e in roster.values()
+    )
+    assert evaluate(cap["merged_fragment"], DEFAULTS) == []
+    # …and a child that names a shell IS caught on the materialised entry.
+    parent["config"]["subagents"]["roster"]["inline"]["tools"]["shell"] = [
+        "run_command"
+    ]
+    cap = {}
+    resolve_config(
+        base_config_name="worker_base",
+        expert_row=parent,
+        expert_type="worker",
+        capture=cap,
+    )
+    flagged = evaluate(cap["merged_fragment"], DEFAULTS)
+    assert len(flagged) == 1 and "subagents.roster.inline" in flagged[0]

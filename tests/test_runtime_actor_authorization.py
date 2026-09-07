@@ -10,7 +10,7 @@ from fastapi import HTTPException
 from starlette.datastructures import Headers
 
 from orchestrator.services import runtime_actor as service
-from src.shared.runtime_actor import (
+from shared.runtime_actor import (
     RUNTIME_ACTOR_BOOTSTRAP_HEADER,
     RUNTIME_ACTOR_HEADER,
     SENSITIVE_KNOWLEDGE_HUMAN_ROLE_POLICY,
@@ -424,7 +424,7 @@ def _grant_row(*, caller_kind="officer", thread_id=OFFICER_THREAD):
 
 
 def _refresh_request():
-    from src.shared.runtime_actor import RUNTIME_ACTOR_REFRESH_HEADER
+    from shared.runtime_actor import RUNTIME_ACTOR_REFRESH_HEADER
 
     request = MagicMock()
     request.method = "POST"

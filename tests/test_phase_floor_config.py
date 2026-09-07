@@ -11,16 +11,12 @@ Also pins the act-ratio tripwire limits parsing (same change).
 """
 
 import re
-import sys
 from pathlib import Path
 
-import yaml
 
 project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
 
-from src.core.loader import load_agent_config_from_dict  # noqa: E402
+from shared.runtime.core.loader import load_agent_config_from_dict  # noqa: E402
 
 _BASE = {"agent_id": "a", "display_name": "A"}
 
@@ -37,9 +33,11 @@ class TestPhaseSettingsParsing:
         assert cfg.phase_settings.max_todos == 20
 
     def test_worker_base_sets_floor_of_two(self):
-        data = yaml.safe_load(
-            (project_root / "config" / "worker_base.yaml").read_text()
-        )
+        # The worker base is expert_base + the worker overlay; phase_settings
+        # lives in the overlay, so read the merged role base, not one file.
+        from shared.runtime.core.loader import load_role_base
+
+        data = load_role_base("worker")
         assert data["phase_settings"]["min_todos"] == 2
 
 
@@ -50,7 +48,7 @@ class TestConstructionWiring:
         This is the exact historical bug shape: the yaml key parsed fine but
         no construction site passed it, so the dataclass default silently won.
         """
-        source = (project_root / "src" / "agent.py").read_text()
+        source = (project_root / "src" / "agent" / "agent.py").read_text()
         sites = re.findall(r"TodoManager\((?:[^()]|\([^()]*\))*\)", source)
         assert sites, "expected TodoManager construction sites in src/agent.py"
         for site in sites:

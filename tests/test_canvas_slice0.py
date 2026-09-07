@@ -16,7 +16,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 from tests._route_inventory import mounted_routes
-from services.canvas import (
+from orchestrator.services.canvas import (
     BrowserSource,
     CanvasCapabilities,
     CanvasEditError,
@@ -611,7 +611,7 @@ async def test_only_main_canvas_is_accepted() -> None:
 
 
 def _route_app(monkeypatch, db: _FakeCanvasDB):
-    from routers import canvases as canvases_router_module
+    from orchestrator.routers import canvases as canvases_router_module
 
     owner_calls: list[tuple[Any, str]] = []
 
@@ -847,7 +847,7 @@ def test_reset_origin_route_rejects_non_app_and_request_body(monkeypatch) -> Non
 
 
 def test_routes_fail_at_owner_gate_before_canvas_access(monkeypatch) -> None:
-    from routers import canvases as canvases_router_module
+    from orchestrator.routers import canvases as canvases_router_module
 
     db = _FakeCanvasDB()
 
@@ -866,7 +866,7 @@ def test_routes_fail_at_owner_gate_before_canvas_access(monkeypatch) -> None:
 
 
 def test_main_app_mounts_slice_one_canvas_routes() -> None:
-    from main import app
+    from orchestrator.main import app
 
     routes = mounted_routes(app)
     path = "/api/persistent/threads/{thread_id}/canvases/main"
@@ -886,8 +886,8 @@ def test_main_app_mounts_slice_one_canvas_routes() -> None:
 
 
 def test_main_cors_exposes_canvas_etag_to_local_cockpit(monkeypatch) -> None:
-    from main import app
-    from routers import canvases as canvases_router_module
+    from orchestrator.main import app
+    from orchestrator.routers import canvases as canvases_router_module
 
     db = _FakeCanvasDB()
     _seed_presented(db)
@@ -909,7 +909,7 @@ def test_main_cors_exposes_canvas_etag_to_local_cockpit(monkeypatch) -> None:
 
 
 def test_canvas_migration_has_thread_cascade_and_single_slot_key() -> None:
-    migration_path = Path("orchestrator/database/migrations/app/0058_canvases.sql")
+    migration_path = Path("src/orchestrator/database/migrations/app/0058_canvases.sql")
     migration_bytes = migration_path.read_bytes()
     migration = migration_bytes.decode()
     assert hashlib.sha256(migration_bytes).hexdigest() == (

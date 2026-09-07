@@ -26,15 +26,20 @@ import pytest
 import pytest_asyncio
 
 from orchestrator.database.postgres import PostgresDB
-from services import sitrep
-from services.officer_admission import count_in_flight_by_slot
-from services.officer_slots import SlotAdmissionError, admit, capacity_lines
-from src.shared.orch_surface.formatters import format_officer_post
+from orchestrator.services import sitrep
+from orchestrator.services.officer_admission import count_in_flight_by_slot
+from orchestrator.services.officer_slots import (
+    SlotAdmissionError,
+    admit,
+    capacity_lines,
+)
+from shared.orch_surface.formatters import format_officer_post
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SCHEMA_FILE = REPO_ROOT / "orchestrator" / "database" / "schema_current.sql"
+SCHEMA_FILE = REPO_ROOT / "src" / "orchestrator" / "database" / "schema_current.sql"
 MIGRATION_FILE = (
     REPO_ROOT
+    / "src"
     / "orchestrator"
     / "database"
     / "migrations"
@@ -459,10 +464,16 @@ class TestLookupFlip:
 
 class TestRegistration:
     @pytest.mark.asyncio
-    async def test_claim_stamps_config_minus_runtime_keys(self, db):
+    async def test_generic_claim_never_overwrites_the_durable_post_config(self, db):
         project_id = await _seed_project(db)
         thread_id = await _seed_thread(db, project_id, officer_enabled=True)
-        fragment = {
+        durable = {
+            "officer": {"auto_pull": False, "slots": {"line": {"count": 1}}},
+            "llm": {"model": "durable"},
+        }
+        await db.get_or_create_project_officer(project_id)
+        await db.merge_project_officer_config(project_id, durable)
+        untrusted_fragment = {
             "officer": {
                 "enabled": True,
                 "slots": {"line": {"count": 2}},
@@ -472,15 +483,93 @@ class TestRegistration:
             "llm": {"model": "MiniMax-M3"},
         }
         post = await db.register_project_officer_thread(
-            project_id, thread_id, config_override=fragment
+            project_id, thread_id, config_override=untrusted_fragment
         )
         assert post is not None
         assert str(post["thread_id"]) == thread_id
         officer_cfg = post["config_override"]["officer"]
-        assert officer_cfg["slots"]["line"]["count"] == 2
+        assert officer_cfg == durable["officer"]
         assert "hold" not in officer_cfg
         assert "last_respawn_at" not in officer_cfg
-        assert post["config_override"]["llm"]["model"] == "MiniMax-M3"
+        assert post["config_override"]["llm"]["model"] == "durable"
+
+    @pytest.mark.asyncio
+    async def test_snapshot_claim_requires_the_candidates_exact_post_owned_projection(
+        self, db
+    ):
+        project_id = await _seed_project(db)
+        durable = {
+            "officer": {
+                "auto_pull": True,
+                "worker_spend_ceiling_daily": 10.5,
+                "slots": {"line": {"count": 1, "spend_ceiling_daily": 4.0}},
+            }
+        }
+        await db.get_or_create_project_officer(project_id)
+        await db.merge_project_officer_config(project_id, durable)
+        matching = await _seed_thread(
+            db,
+            project_id,
+            metadata={
+                "config_override": {"officer": {"enabled": True, **durable["officer"]}}
+            },
+        )
+
+        post = await db.register_project_officer_thread(
+            project_id,
+            matching,
+            expected_post_config_override=durable,
+            commission_continuity=True,
+        )
+
+        assert post is not None
+        assert post["config_override"] == durable
+
+        other_project = await _seed_project(db)
+        await db.get_or_create_project_officer(other_project)
+        await db.merge_project_officer_config(other_project, durable)
+        mismatched = await _seed_thread(
+            db,
+            other_project,
+            metadata={
+                "config_override": {
+                    "officer": {
+                        "enabled": True,
+                        **durable["officer"],
+                        "worker_spend_ceiling_daily": 99.0,
+                    }
+                }
+            },
+        )
+        refused = await db.register_project_officer_thread(
+            other_project,
+            mismatched,
+            expected_post_config_override=durable,
+            commission_continuity=True,
+        )
+        assert refused is None
+        assert (await db.get_project_officer(other_project))["thread_id"] is None
+
+        malformed_project = await _seed_project(db)
+        await db.get_or_create_project_officer(malformed_project)
+        malformed = {"officer": {"auto_pull": 1}}
+        await db.merge_project_officer_config(malformed_project, malformed)
+        malformed_thread = await _seed_thread(
+            db,
+            malformed_project,
+            metadata={
+                "config_override": {"officer": {"enabled": True, "auto_pull": 1}}
+            },
+        )
+        assert (
+            await db.register_project_officer_thread(
+                malformed_project,
+                malformed_thread,
+                expected_post_config_override=malformed,
+                commission_continuity=True,
+            )
+            is None
+        )
 
     @pytest.mark.asyncio
     async def test_second_commission_refused_and_first_stands(self, db):

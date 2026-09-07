@@ -85,7 +85,11 @@ Jinja2>=3.1
 # Remote workspace backend (SSH/SFTP to VM)
 paramiko>=3.4.0
 # Host-key-pinned, bounded SFTP reads for Dynamic Canvas workspace files.
-asyncssh>=2.21.0
+# Floor is CVE-2026-62949 (GHSA-rw4j-r22c-9gc3): asyncssh <=2.23.1 can be wedged
+# by a channel-open carrying maximum packet size 0 — an infinite synchronous
+# loop that freezes the whole asyncio event loop. Fixed in 2.24.0. This binds
+# canvas-gateway and ssh-gateway, both of which face untrusted peers.
+asyncssh>=2.24.0
 # AES-GCM encryption at rest for stored credentials (user/system API keys,
 # custom LLM endpoint keys). Already a transitive dep via paramiko; listed
 # explicitly so crypto.py keeps working if that changes.
@@ -97,7 +101,10 @@ nats-py>=2.9.0
 # DST-aware next-fire-time computation against IANA-named timezones.
 croniter>=2.0.0
 # Runtime deps of the citation_engine package (src/citation_engine/).
-# Its other deps (beautifulsoup4, langchain-openai/-core, langgraph, tiktoken,
-# httpx, psycopg2-binary, docx2txt, pydantic) are already pinned above.
-pymupdf>=1.23.0
+# Its other deps (pypdf, beautifulsoup4, langchain-openai/-core, langgraph,
+# tiktoken, httpx, psycopg2-binary, docx2txt, pydantic) are already pinned
+# above. PDF text extraction deliberately uses pypdf (line 1, BSD-3-Clause),
+# NOT PyMuPDF/fitz: PyMuPDF is AGPL-3.0-or-Artifex-commercial and must never
+# re-enter the bundled set of an FSL-1.1-ALv2 product — scripts/check_licenses.py
+# denies it.
 requests>=2.31.0

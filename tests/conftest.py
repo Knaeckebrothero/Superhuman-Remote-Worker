@@ -3,21 +3,10 @@
 import os
 import sys
 import tempfile
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID
 
 import pytest
-
-# Add project root AND orchestrator/ to path. orchestrator/ is on sys.path
-# at runtime (uvicorn --app-dir orchestrator + PYTHONPATH=orchestrator:.)
-# so modules under it use sibling imports (``from security.crypto import``
-# rather than ``from orchestrator.security.crypto``). Tests that import
-# ``orchestrator.database.postgres`` would otherwise fail to resolve the
-# transitive ``from security.crypto import`` inside it.
-project_root = Path(__file__).parent.parent
-sys.path.insert(0, str(project_root))
-sys.path.insert(0, str(project_root / "orchestrator"))
 
 # orchestrator/main.py SystemExits at import time unless the license gate is
 # accepted. Tests only exercise its utility functions — auto-accept here so
@@ -37,7 +26,7 @@ os.environ.setdefault(
     "APP_ENCRYPTION_KEY", "eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHg="
 )
 
-from security import crypto as _encryption_crypto  # noqa: E402
+from orchestrator.security import crypto as _encryption_crypto  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -48,27 +37,44 @@ def _isolate_encryption_cipher_cache():
     _encryption_crypto.reset_cipher_cache()
 
 
+from orchestrator.services import notification_catalog as _notification_catalog  # noqa: E402
+
+_NOTIFICATION_REGISTRIES = (
+    _notification_catalog._ACTION_HANDLERS,
+    _notification_catalog._SOURCE_LOADERS,
+    _notification_catalog._SOURCE_PROBES,
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_notification_registries():
+    """Keep the notification catalog's process-global registries per-test.
+
+    ``main._register_notification_actions()`` installs the live action
+    handlers, source loaders and source probes into module-level dicts. A
+    test that calls it leaves them installed for every later test in the
+    same xdist worker, and under ``--dist loadfile`` which files share a
+    worker is a scheduling detail — so the damage lands as an intermittent,
+    order-dependent CI failure far from the test that caused it. The live
+    ``job`` probe, for one, reads a non-existent job as *resolved* ("deleted:
+    nothing left to decide"), which silently cancels the deferred steps a
+    sweeper test is asserting on.
+
+    Restoring the snapshot keeps the registries the caller's own business,
+    the way ``tests/test_notification_record.py``'s ``handlers`` fixture
+    already does for its own registrations.
+    """
+    saved = [dict(registry) for registry in _NOTIFICATION_REGISTRIES]
+    yield
+    for registry, snapshot in zip(_NOTIFICATION_REGISTRIES, saved):
+        registry.clear()
+        registry.update(snapshot)
+
+
 # orchestrator/main.py also guards on vector-DB credentials at import time.
 # Tests only exercise its utility functions / pure models, never the vector
 # store, so provide a dummy URL. setdefault never overrides a real CI/prod value.
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test:test@localhost:5432/test")
-
-# Pin the orchestrator's top-level packages (``database``, ``services``, ...) in
-# sys.modules before any test runs. Both ``src`` and ``orchestrator`` ship
-# same-named top-level packages (each is its own import root in its own
-# container), and several agent-side tests prepend ``src`` to sys.path. Without
-# this, ``orchestrator.main``'s sibling imports (``from database import ...``,
-# ``from services... import ...``) can resolve to ``src/*`` once an agent test
-# has run, raising ImportError. Importing ``main`` here, while orchestrator/
-# leads sys.path, caches its whole import graph for the session. Agent code and
-# the src-inserting tests never bare-import these colliding packages, so the pin
-# is invisible to them. Best-effort: a failure here just leaves the prior
-# (order-dependent) behavior.
-try:
-    import main as _srw_orchestrator_main  # noqa: F401
-except Exception:
-    pass
-
 
 # =============================================================================
 # Hermetic build-provenance environment
@@ -82,7 +88,7 @@ except Exception:
 # no local run can reproduce. Strip the whole surface before each test; a test
 # that wants a value still sets it via monkeypatch, which runs after this.
 
-from src.core.product_capabilities import ProductComponent  # noqa: E402
+from shared.runtime.core.product_capabilities import ProductComponent  # noqa: E402
 
 _PROVENANCE_FIELDS = (
     "SOURCE_REVISION",
@@ -125,10 +131,10 @@ def _isolate_declared_provenance_env(monkeypatch):
 # Snapshot the identities around every test and put them back, so a missing
 # restore stays local to the test that made it.
 #
-# ``main`` and ``orchestrator.main`` are distinct module objects here (both
-# import roots are on sys.path), so both are guarded.
+# All tests and applications use the installed canonical package, so there is
+# one orchestrator module and one set of process-wide singletons to guard.
 
-_ORCH_MAIN_MODULE_NAMES = ("main", "orchestrator.main")
+_ORCH_MAIN_MODULE_NAMES = ("orchestrator.main",)
 _ORCH_MAIN_SINGLETONS = (
     "postgres_db",
     "workspace_suspension_service",

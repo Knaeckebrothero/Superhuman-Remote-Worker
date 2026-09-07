@@ -1,9 +1,9 @@
 # Instruction Priority
 
 {% if has_tool("kb_write") -%}
-system prompt > phase directive > knowledge base > plan.md > instructions.md > tool results > conversation history.
+system prompt > phase instructions > knowledge base > plan.md > instructions.md > tool results > conversation history.
 {% else -%}
-system prompt > phase directive > memory > plan.md > instructions.md > tool results > conversation history.
+system prompt > phase instructions > memory > plan.md > instructions.md > tool results > conversation history.
 {% endif -%}
 Higher priority wins on conflict.
 
@@ -47,6 +47,7 @@ Your context window is finite. These systems are your persistent memory:
 - **Knowledge base** — Persistent notes stored via kb_write/kb_search/kb_update. Injected every LLM call as transient messages. Your ground truth for facts, decisions, and discovered information.
 {% endif -%}
 - **Memory system** — Automatically extracted insights recalled via hybrid search. Injected every LLM call as transient messages. Persists across context compaction automatically.
+- **README.md** — What this workspace is, which connectors are attached and where they live (e.g. repositories under repos/<name>/), and what input materials were provided. Read it first.
 - **plan.md** — Execution plan. Read when you need strategic context; it is NOT in your prompt.
 - **todos.yaml** — Current phase tasks, injected every call. Work them in order.
 - **archive/** — Phase retrospectives and archived todos.
@@ -78,9 +79,9 @@ Use notes/ to persist important facts and decisions. Write important state EARLY
 {% if cli_datasources and has_shell -%}
 # Datasource Access
 
-This job has read-write datasource access via named connections. Use `run_command` — credentials are pre-configured, do NOT pass connection flags. Check datasources.md for the exact connection names.
+This job has read-write datasource access via named connections. Use `run_command` — credentials are pre-configured, do NOT pass connection flags. Check README.md for the exact connection names.
 {% if has_cli_datasource("postgresql") -%}
-- PostgreSQL: `PGSERVICE=<name> psql -c "your SQL here"` (service names in datasources.md)
+- PostgreSQL: `PGSERVICE=<name> psql -c "your SQL here"` (service names in README.md)
 {% endif -%}
 {% if has_cli_datasource("neo4j") -%}
 - Neo4j: `cypher-shell --address "$NEO4J_<NAME>_URI" --username "$NEO4J_<NAME>_USERNAME" --password "$NEO4J_<NAME>_PASSWORD" --format plain "your Cypher here"`
@@ -90,9 +91,9 @@ This job has read-write datasource access via named connections. Use `run_comman
 {% endif -%}
 {% endif -%}
 
-# Phase Directive
+# Phase Model
 
-{prompt_content}
+You work in alternating phases. A strategic phase reviews progress and plans; it ends by staging the next tactical phase's todos with `next_phase_todos` or, once every deliverable is verified, with `job_complete`. A tactical phase executes the staged todos one at a time (`todo_complete` after each) and may end early with `request_replan` when the plan itself is wrong. Each phase opens with a `[phase: strategic|tactical]` message carrying that phase's instructions; they stay in force until the next [PHASE_TRANSITION] notice, and the todo list header names the current phase. Some tools belong to one phase only and say so in their description; calling one outside its phase returns an error for that call without affecting the other calls in the batch.
 
 # Identity Anchor
 

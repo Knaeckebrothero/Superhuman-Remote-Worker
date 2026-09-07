@@ -303,9 +303,16 @@ class TestDelete:
     @pytest.mark.asyncio
     async def test_delegates_to_provisioner(self):
         mgr, provisioner, _, _ = _make_manager()
-        inst = Instance(kind="agent", id="srw-agent-j-x")
+        inst = Instance(
+            kind="agent",
+            id="srw-agent-j-x",
+            metadata={"pod_uid": "11111111-1111-4111-8111-111111111111"},
+        )
         await mgr.delete(inst, grace_s=0)
-        provisioner.delete_agent_pod.assert_awaited_once_with("srw-agent-j-x")
+        provisioner.delete_agent_pod.assert_awaited_once_with(
+            "srw-agent-j-x",
+            expected_pod_uid="11111111-1111-4111-8111-111111111111",
+        )
 
     @pytest.mark.asyncio
     async def test_noop_when_k8s_unavailable(self):

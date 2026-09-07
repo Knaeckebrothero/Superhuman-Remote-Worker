@@ -13,7 +13,7 @@ FROM ubuntu:24.04
 ARG SRW_SOURCE_REVISION=""
 ARG SRW_SOURCE_URL="https://github.com/knaeckebrothero/Superhuman-Remote-Worker"
 ARG SRW_RELEASE_VERSION=""
-ARG SRW_DOCUMENTATION_URL="https://github.com/knaeckebrothero/Superhuman-Remote-Worker/tree/main/docs"
+ARG SRW_DOCUMENTATION_URL="https://github.com/knaeckebrothero/Superhuman-Remote-Worker"
 ARG DEBIAN_FRONTEND=noninteractive
 ARG CODE_SERVER_VERSION=4.100.3
 ARG NODE_MAJOR=22
@@ -284,6 +284,18 @@ PermitRootLogin no
 PasswordAuthentication no
 PubkeyAuthentication yes
 AuthorizedKeysFile /etc/ssh/authorized_keys/%u
+# Certificates minted by the ssh-gateway's user CA. The gateway signs a fresh
+# key per attachment with a validity measured in minutes, so no standing
+# credential for this workspace exists anywhere outside the workspace itself.
+# The agent's own access still uses AuthorizedKeysFile above.
+TrustedUserCAKeys /etc/ssh/srw_user_ca.pub
+# Every workspace image bakes in the same Unix user (agent-host) and trusts
+# the same CA, so TrustedUserCAKeys alone would let a certificate minted for
+# ANY workspace authenticate to THIS one for its whole validity window. This
+# file (written at boot by the entrypoint from this workspace's own owner
+# id) restricts accepted certificates to the one principal the gateway
+# mints for this specific workspace, regardless of the shared login name.
+AuthorizedPrincipalsFile /etc/ssh/principals/%u
 X11Forwarding no
 PrintMotd no
 AcceptEnv LANG LC_*
@@ -342,7 +354,13 @@ RUN su -c 'git config --global init.defaultBranch main' agent-host \
 RUN mkdir -p /home/agent-host/.config/code-server \
     && tee /home/agent-host/.config/code-server/config.yaml > /dev/null <<'CSEOF'
 bind-addr: 0.0.0.0:38080
-auth: none
+# Never `auth: none`. The entrypoint writes the real config (with the
+# orchestrator-derived per-workspace credential) to
+# /var/lib/code-server/.srw-auth.yaml and passes it via --config; this file is
+# shadowed by the workspace PVC mount at /home/agent-host anyway. It stays
+# `password` so that any invocation which somehow reads it still refuses
+# anonymous callers instead of serving the workspace to the Pod network.
+auth: password
 cert: false
 disable-telemetry: true
 CSEOF

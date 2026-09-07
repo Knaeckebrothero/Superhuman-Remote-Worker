@@ -24,7 +24,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from src.shared import event_journal
+from shared import event_journal
 
 
 # ---------------------------------------------------------------------------
@@ -96,7 +96,7 @@ class TestEpochReuse:
     async def test_reuse_seeds_from_hwm_when_hwm_above_max(self):
         """Retention pruned the tail's rows; the mark keeps the seed above
         every seq a client ever saw. No correction UPDATE is issued."""
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         conn = ScriptedConn()
         conn.fetchrow_results = [_thread_row(3, 500, "active")]
@@ -112,7 +112,7 @@ class TestEpochReuse:
     async def test_reuse_seeds_from_max_and_persists_hwm_correction(self):
         """Pre-0116 rows can put MAX above the mark; the correction UPDATE
         makes the mark authoritative again."""
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         conn = ScriptedConn()
         conn.fetchrow_results = [_thread_row(3, 10, "active")]
@@ -132,7 +132,7 @@ class TestEpochReuse:
     async def test_virgin_thread_reuses_epoch_zero_with_seed_zero(self):
         """First attach of a never-journaled thread: epoch stays 0 — no
         pointless generation burn, and no client holds any cursor to serve."""
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         conn = ScriptedConn()
         conn.fetchrow_results = [_thread_row(0, 0, "created")]
@@ -147,7 +147,7 @@ class TestEpochReuse:
     async def test_reuse_probes_terminal_kinds_in_cockpit_lockstep(self):
         """The EXISTS probe must carry exactly the kinds the cockpit's
         _isSupersededLifecycleFrame-guarded handlers listen for."""
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         conn = ScriptedConn()
         conn.fetchrow_results = [_thread_row(5, 7, "awaiting_user")]
@@ -176,7 +176,7 @@ class TestEpochReuse:
 class TestEpochBump:
     @pytest.mark.asyncio
     async def test_terminal_status_bumps_without_probing_frames(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         conn = ScriptedConn()
         conn.fetchrow_results = [
@@ -198,7 +198,7 @@ class TestEpochBump:
         session.ended/idle_timeout must move to a higher epoch — otherwise the
         cockpit's resumedFromEpoch guard swallows the next life's terminal
         frames forever."""
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         conn = ScriptedConn()
         conn.fetchrow_results = [
@@ -216,7 +216,7 @@ class TestEpochBump:
     async def test_beyond_retention_epoch_bumps_even_without_terminal_signal(self):
         """hwm > 0 with zero surviving rows: the epoch's whole history is
         past retention, so no client cursor can be served — bump."""
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         conn = ScriptedConn()
         conn.fetchrow_results = [
@@ -234,7 +234,7 @@ class TestEpochBump:
         """Cutover poison: an old epoch fully pruned before 0116 backfills
         hwm=0. Reusing it would seed at 0, below any cached cursor (dead
         polls). epoch > 0 marks it non-virgin → bump."""
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         conn = ScriptedConn()
         conn.fetchrow_results = [
@@ -250,7 +250,7 @@ class TestEpochBump:
     @pytest.mark.asyncio
     async def test_seed_probe_failure_falls_back_to_bump(self):
         """Never reuse an epoch we could not read: MAX/EXISTS errors bump."""
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         conn = ScriptedConn()
         conn.fetchrow_results = [
@@ -266,7 +266,7 @@ class TestEpochBump:
 
     @pytest.mark.asyncio
     async def test_missing_thread_fails_closed(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         conn = ScriptedConn()
         conn.fetchrow_results = [None]
@@ -276,7 +276,7 @@ class TestEpochBump:
 
     @pytest.mark.asyncio
     async def test_thread_vanishing_before_bump_fails_closed(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         conn = ScriptedConn()
         conn.fetchrow_results = [_thread_row(1, 5, "ended"), None]
@@ -286,7 +286,7 @@ class TestEpochBump:
 
     @pytest.mark.asyncio
     async def test_database_error_is_wrapped_as_journal_unavailable(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         conn = ScriptedConn()
         conn.fail_on["FROM threads"] = RuntimeError("database offline")
@@ -315,7 +315,7 @@ class TestFencedWriter:
 
     @pytest.mark.asyncio
     async def test_flush_carries_writer_epoch_and_updates_hwm_in_statement(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         conn = ScriptedConn()
         conn.fetchval_results = [2]
@@ -342,7 +342,7 @@ class TestFencedWriter:
         """Zero rows inserted on a non-empty batch = the epoch moved
         underneath us. No retry, loud failure, and the writer accepts nothing
         further — a superseded runtime must never keep writing."""
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         conn = ScriptedConn()
         conn.fetchval_results = [0]
@@ -366,7 +366,7 @@ class TestFencedWriter:
 
     @pytest.mark.asyncio
     async def test_mixed_epoch_batch_is_terminal_and_stops_the_writer(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         conn = ScriptedConn()
         conn.fetchval_results = [2]  # would succeed if it ever reached SQL
@@ -386,7 +386,7 @@ class TestFencedWriter:
         await writer.close()
 
     def test_writer_requires_a_non_negative_epoch(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         with pytest.raises(ValueError, match="epoch"):
             mod._OrderedPersistentEventWriter(
@@ -509,7 +509,7 @@ class TestSharedEventJournal:
 class TestRewindBump:
     @pytest.mark.asyncio
     async def test_bump_wrapper_uses_shared_statement(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         conn = ScriptedConn()
         conn.fetchrow_results = [{"events_epoch": 8}]
@@ -523,7 +523,7 @@ class TestRewindBump:
 
     @pytest.mark.asyncio
     async def test_bump_wrapper_wraps_missing_thread(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         conn = ScriptedConn()
         conn.fetchrow_results = [None]
@@ -535,7 +535,7 @@ class TestRewindBump:
         """The rewind handler sets (_events_epoch=new, _next_seq=0);
         _broadcast pre-increments, so rewind.done stamps (new_epoch, 1) — the
         row whose flush pushes the hwm to 1 and closes doc §5.3.2 item 5."""
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._subscribers.clear()
         mod._session = None  # keeps the journal enqueue out of this test

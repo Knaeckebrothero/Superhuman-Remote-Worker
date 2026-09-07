@@ -20,7 +20,7 @@ import zipfile
 
 import pytest
 
-from services.thread_uploads import (
+from orchestrator.services.thread_uploads import (
     MAX_FILE_SIZE,
     MAX_FILES_PER_REQUEST,
     MAX_ZIP_ENTRIES_PER_REQUEST,
@@ -44,8 +44,8 @@ from services.thread_uploads import (
     resolve_thread_upload_destination,
     upload_files_to_thread_workspace,
 )
-from services.workspace_binding import virtual_thread_backing_id
-from src.core.backends.object_store import InMemoryObjectStore
+from orchestrator.services.workspace_binding import virtual_thread_backing_id
+from shared.runtime.core.backends.object_store import InMemoryObjectStore
 
 THREAD_ID = "e6e6d412-04ba-4c82-9188-114f72bb0835"
 PREFIX = f"threads/{THREAD_ID}/"
@@ -91,7 +91,7 @@ def _bound_virtual_thread(spec: dict = SPEC) -> dict:
 @pytest.fixture
 def virtual_env(monkeypatch):
     """A deployment with an object store configured and rclone present."""
-    from services import workspace_binding
+    from orchestrator.services import workspace_binding
 
     monkeypatch.setattr(
         workspace_binding, "virtual_workspace_rclone_spec", lambda: SPEC
@@ -108,7 +108,7 @@ def virtual_env(monkeypatch):
 
 class TestSshDestinations:
     def test_ready_container_resolves_to_ssh(self, monkeypatch):
-        from services import thread_uploads
+        from orchestrator.services import thread_uploads
 
         monkeypatch.setattr(thread_uploads, "resolve_ssh_key_path", lambda: "/key")
         thread = _thread(
@@ -122,7 +122,7 @@ class TestSshDestinations:
         assert (target.host, target.port) == ("10.42.0.9", 22)
 
     def test_ready_vm_wins_over_container(self, monkeypatch):
-        from services import thread_uploads
+        from orchestrator.services import thread_uploads
 
         monkeypatch.setattr(thread_uploads, "resolve_ssh_key_path", lambda: "/key")
         thread = _thread(
@@ -148,7 +148,7 @@ class TestSshDestinations:
         assert "try again in a moment" in err.value.detail
 
     def test_missing_ssh_key_is_a_deployment_problem(self, monkeypatch):
-        from services import thread_uploads
+        from orchestrator.services import thread_uploads
 
         monkeypatch.setattr(thread_uploads, "resolve_ssh_key_path", lambda: "")
         thread = _thread(
@@ -193,7 +193,7 @@ class TestLiteDestinations:
         assert "no workspace" in err.value.detail.lower()
 
     def test_unconfigured_object_store_is_503(self, monkeypatch):
-        from services import workspace_binding
+        from orchestrator.services import workspace_binding
 
         monkeypatch.setattr(
             workspace_binding, "virtual_workspace_rclone_spec", lambda: None
@@ -206,7 +206,7 @@ class TestLiteDestinations:
 
     def test_memory_spec_is_not_a_real_backing(self, monkeypatch):
         """Process-local storage is invisible to the other replica."""
-        from services import workspace_binding
+        from orchestrator.services import workspace_binding
 
         monkeypatch.setattr(
             workspace_binding,
@@ -220,7 +220,7 @@ class TestLiteDestinations:
         assert err.value.status_code == 503
 
     def test_missing_rclone_is_503(self, monkeypatch):
-        from services import workspace_binding
+        from orchestrator.services import workspace_binding
 
         monkeypatch.setattr(
             workspace_binding, "virtual_workspace_rclone_spec", lambda: SPEC
@@ -430,7 +430,7 @@ class TestPlanZipExtraction:
             _plan_zip_extraction(b"", stem="bundle")
 
     def test_rejects_too_many_entries(self, monkeypatch):
-        from services import thread_uploads
+        from orchestrator.services import thread_uploads
 
         monkeypatch.setattr(thread_uploads, "MAX_ZIP_ENTRIES_PER_REQUEST", 3)
         data = _make_zip({f"f{i}.txt": b"x" for i in range(4)})
@@ -439,7 +439,7 @@ class TestPlanZipExtraction:
             _plan_zip_extraction(data, stem="bundle")
 
     def test_rejects_entry_over_the_per_entry_cap(self, monkeypatch):
-        from services import thread_uploads
+        from orchestrator.services import thread_uploads
 
         monkeypatch.setattr(thread_uploads, "MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES", 10)
         data = _make_zip({"big.bin": b"x" * 11})
@@ -448,7 +448,7 @@ class TestPlanZipExtraction:
             _plan_zip_extraction(data, stem="bundle")
 
     def test_rejects_when_total_uncompressed_exceeds_the_total_cap(self, monkeypatch):
-        from services import thread_uploads
+        from orchestrator.services import thread_uploads
 
         monkeypatch.setattr(thread_uploads, "MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES", 100)
         monkeypatch.setattr(
@@ -715,7 +715,7 @@ class TestPerRequestZipBudget:
     20x."""
 
     def test_entry_budget_is_shared_across_zips_in_one_batch(self, monkeypatch):
-        from services import thread_uploads
+        from orchestrator.services import thread_uploads
 
         monkeypatch.setattr(thread_uploads, "MAX_ZIP_ENTRIES_PER_REQUEST", 3)
         first = _make_zip({f"f{i}.txt": b"x" for i in range(3)})  # exactly fills it
@@ -736,7 +736,7 @@ class TestPerRequestZipBudget:
         assert "second.zip" in names
 
     def test_byte_budget_is_shared_across_zips_in_one_batch(self, monkeypatch):
-        from services import thread_uploads
+        from orchestrator.services import thread_uploads
 
         monkeypatch.setattr(thread_uploads, "MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES", 1_000)
         monkeypatch.setattr(
@@ -760,7 +760,7 @@ class TestPerRequestZipBudget:
     def test_unspent_budget_carries_forward_to_a_later_zip(self, monkeypatch):
         """Not just a hard per-zip reset in disguise: a small first zip
         leaves room for a second one, as long as both fit the shared cap."""
-        from services import thread_uploads
+        from orchestrator.services import thread_uploads
 
         monkeypatch.setattr(thread_uploads, "MAX_ZIP_ENTRIES_PER_REQUEST", 2)
         first = _make_zip({"a.txt": b"1"})
@@ -1517,7 +1517,7 @@ class TestLimitsAndRouting:
     async def test_virtual_thread_routes_to_the_object_store_writer(
         self, virtual_env, monkeypatch
     ):
-        from services import thread_uploads
+        from orchestrator.services import thread_uploads
 
         seen: dict = {}
 
@@ -1538,7 +1538,7 @@ class TestLimitsAndRouting:
     @pytest.mark.asyncio
     async def test_pre_resolved_destination_is_honoured(self, monkeypatch):
         """The endpoint resolves first, then hands the destination back in."""
-        from services import thread_uploads
+        from orchestrator.services import thread_uploads
 
         called: dict = {}
 
@@ -1560,7 +1560,7 @@ class TestLimitsAndRouting:
 
     @pytest.mark.asyncio
     async def test_saturated_upload_capacity_fails_fast(self, monkeypatch):
-        from services import thread_uploads
+        from orchestrator.services import thread_uploads
 
         saturated = asyncio.Semaphore(1)
         await saturated.acquire()
@@ -1590,7 +1590,7 @@ class TestDeleteRoutingAndTaxonomy:
         """The validator runs BEFORE destination resolution and before any
         connection: the check must never be delegated to the remote, which
         would remove whatever it was handed."""
-        from services import thread_uploads
+        from orchestrator.services import thread_uploads
 
         reached: dict = {}
 
@@ -1617,7 +1617,7 @@ class TestDeleteRoutingAndTaxonomy:
     ):
         """Not the raw input — acting on the un-normalized string would
         undo the whole point of normalizing before the prefix check."""
-        from services import thread_uploads
+        from orchestrator.services import thread_uploads
 
         seen: dict = {}
 
@@ -1640,7 +1640,7 @@ class TestDeleteRoutingAndTaxonomy:
         """The route interpolates this straight into its 200 body. Echoing
         the caller's raw string instead reported ``bundle/sub/../a.txt`` as
         deleted while ``bundle/a.txt`` was the file that actually went."""
-        from services import thread_uploads
+        from orchestrator.services import thread_uploads
 
         monkeypatch.setattr(
             thread_uploads, "_virtual_delete_file", lambda target, relpath: True
@@ -1659,7 +1659,7 @@ class TestDeleteRoutingAndTaxonomy:
     async def test_a_virtual_thread_routes_to_the_object_store_deleter(
         self, virtual_env, monkeypatch
     ):
-        from services import thread_uploads
+        from orchestrator.services import thread_uploads
 
         seen: dict = {}
 
@@ -1680,7 +1680,7 @@ class TestDeleteRoutingAndTaxonomy:
 
     @pytest.mark.asyncio
     async def test_an_ssh_thread_routes_to_the_sftp_deleter(self, monkeypatch):
-        from services import thread_uploads
+        from orchestrator.services import thread_uploads
 
         seen: dict = {}
 
@@ -1723,7 +1723,7 @@ class TestDeleteRoutingAndTaxonomy:
     ):
         """Each delete spawns another rclone subprocess (one per key for a
         zip stem), so it shares the writer's concurrency ceiling."""
-        from services import thread_uploads
+        from orchestrator.services import thread_uploads
 
         saturated = asyncio.Semaphore(1)
         await saturated.acquire()

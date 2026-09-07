@@ -5,7 +5,7 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-from src.core.loader import (
+from shared.runtime.core.loader import (
     _should_use_reasoning_summary,
     _clamp_reasoning_level,
     _supported_efforts,
@@ -43,8 +43,8 @@ def _make_config(**overrides):
 
 # Patches applied to all routing integration tests
 _common_patches = [
-    patch("src.core.loader.ReasoningChatOpenAI"),
-    patch("src.llm.key_ring.KeyRing", new_callable=MagicMock),
+    patch("shared.runtime.core.loader.ReasoningChatOpenAI"),
+    patch("shared.runtime.llm.key_ring.KeyRing", new_callable=MagicMock),
 ]
 
 
@@ -63,7 +63,7 @@ class TestOpenAILLMRouting:
 
     _LOCAL_MODEL = "RedHatAI/gemma-4-31B-it-FP8-Dynamic"
 
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_self_hosted_model_uses_dispatcher_injected_base_url(self, mock_chat):
         """Self-hosted models receive base_url via dispatcher-injected
         config.base_url — not via the deleted LLM_BASE_URL fallback."""
@@ -85,7 +85,7 @@ class TestOpenAILLMRouting:
     @patch.dict(
         os.environ, {"LLM_BASE_URL": "http://stale-leftover:8080/v1"}, clear=False
     )
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_env_var_does_not_leak_into_native_openai_models(self, mock_chat):
         """A stale LLM_BASE_URL in the test env (the orchestrator boot
         check would refuse to start in production) must NOT reach the
@@ -101,7 +101,7 @@ class TestOpenAILLMRouting:
     @patch.dict(
         os.environ, {"LLM_BASE_URL": "http://stale-leftover:8080/v1"}, clear=False
     )
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_gpt4o_routes_to_native_openai(self, mock_chat):
         """gpt-4o is native — no base_url override, ever."""
         mock_chat.return_value = MagicMock()
@@ -112,7 +112,7 @@ class TestOpenAILLMRouting:
         call_kwargs = mock_chat.call_args[1]
         assert "base_url" not in call_kwargs
 
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_explicit_base_url_always_wins(self, mock_chat):
         """Explicit config.base_url is the dispatcher-injection path."""
         mock_chat.return_value = MagicMock()
@@ -123,7 +123,7 @@ class TestOpenAILLMRouting:
         call_kwargs = mock_chat.call_args[1]
         assert call_kwargs["base_url"] == "http://custom-proxy:9000/v1"
 
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_self_hosted_without_dispatcher_injection_falls_to_native(self, mock_chat):
         """Self-hosted ID with no base_url leaks through to api.openai.com.
 
@@ -179,7 +179,7 @@ class TestShouldUseReasoningSummary:
 class TestReasoningSummaryRouting:
     """Integration tests verifying correct reasoning kwargs reach ReasoningChatOpenAI."""
 
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_gpt5_gets_reasoning_effort(self, mock_chat):
         """gpt-5.2-pro should use Chat Completions reasoning_effort (not Responses API)."""
         mock_chat.return_value = MagicMock()
@@ -191,7 +191,7 @@ class TestReasoningSummaryRouting:
         assert "reasoning" not in call_kwargs
         assert call_kwargs["model_kwargs"]["reasoning_effort"] == "high"
 
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_o3_gets_reasoning_effort(self, mock_chat):
         """o3-mini should use Chat Completions reasoning_effort (not Responses API)."""
         mock_chat.return_value = MagicMock()
@@ -203,7 +203,7 @@ class TestReasoningSummaryRouting:
         assert "reasoning" not in call_kwargs
         assert call_kwargs["model_kwargs"]["reasoning_effort"] == "medium"
 
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_gpt_oss_is_prompt_delivered_not_api(self, mock_chat):
         """gpt-oss reasoning rides the system-prompt `Reasoning:` line
         (detect_reasoning_method=='prompt'), so the OpenAI factory must NOT also
@@ -217,7 +217,7 @@ class TestReasoningSummaryRouting:
         assert "reasoning" not in call_kwargs
         assert "reasoning_effort" not in call_kwargs.get("model_kwargs", {})
 
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_no_reasoning_when_none(self, mock_chat):
         """reasoning_level='none' should skip both paths."""
         mock_chat.return_value = MagicMock()
@@ -229,7 +229,7 @@ class TestReasoningSummaryRouting:
         assert "reasoning" not in call_kwargs
         assert "model_kwargs" not in call_kwargs
 
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_no_reasoning_when_unset(self, mock_chat):
         """No reasoning_level should skip both paths."""
         mock_chat.return_value = MagicMock()
@@ -246,7 +246,7 @@ class TestOpenRouterLLMCreation:
     """Integration tests for _create_openrouter_llm."""
 
     @patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-or-test-key"}, clear=False)
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_strips_prefix_and_sets_base_url(self, mock_chat):
         """Should strip openrouter/ prefix and use OpenRouter base URL."""
         mock_chat.return_value = MagicMock()
@@ -260,7 +260,7 @@ class TestOpenRouterLLMCreation:
         assert call_kwargs["use_responses_api"] is False
 
     @patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-or-test-key"}, clear=False)
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_explicit_base_url_overrides(self, mock_chat):
         """Explicit config.base_url should override the default OpenRouter URL."""
         mock_chat.return_value = MagicMock()
@@ -283,7 +283,7 @@ class TestOpenRouterLLMCreation:
         },
         clear=False,
     )
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_custom_headers(self, mock_chat):
         """Should pass HTTP-Referer and X-Title headers when env vars are set."""
         mock_chat.return_value = MagicMock()
@@ -298,7 +298,7 @@ class TestOpenRouterLLMCreation:
         }
 
     @patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-or-test-key"}, clear=False)
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_reasoning_in_model_kwargs(self, mock_chat):
         """Reasoning should use nested reasoning object for OpenRouter."""
         mock_chat.return_value = MagicMock()
@@ -330,7 +330,7 @@ class TestOpenRouterLLMCreation:
     @patch.dict(
         os.environ, {"OPENROUTER_API_KEY": "sk-or-key1,sk-or-key2"}, clear=False
     )
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_multiple_keys(self, mock_chat):
         """Should support comma-separated keys for rotation."""
         mock_chat.return_value = MagicMock()
@@ -404,7 +404,7 @@ class TestFamilyOptionsDriveClamp:
     """The matrix `reasoning.options` — not a hardcoded transport set — decide
     what effort reaches the wire (knowledge-history/done/family_centered_reasoning.md)."""
 
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_deepseek_xhigh_survives_openai_factory(self, mock_chat):
         """deepseek declares xhigh in its options → no clamp on the OpenAI wire."""
         mock_chat.return_value = MagicMock()
@@ -415,7 +415,7 @@ class TestFamilyOptionsDriveClamp:
         call_kwargs = mock_chat.call_args[1]
         assert call_kwargs["model_kwargs"]["reasoning_effort"] == "xhigh"
 
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_gpt5_xhigh_still_clamped(self, mock_chat):
         """gpt-5 family still lists only low/medium/high → xhigh clamps to high."""
         mock_chat.return_value = MagicMock()
@@ -437,7 +437,7 @@ class TestGpt56Reasoning:
         assert cap["default"] == "high"
         assert cap["options"] == ["low", "medium", "high", "xhigh", "max"]
 
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_max_reaches_codex_responses_api(self, mock_chat):
         mock_chat.return_value = MagicMock()
         config = _make_config(model="gpt-5.6-sol", reasoning_level="max")
@@ -447,7 +447,7 @@ class TestGpt56Reasoning:
         call_kwargs = mock_chat.call_args[1]
         assert call_kwargs["reasoning"] == {"effort": "max", "summary": "auto"}
 
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_xhigh_reaches_codex_responses_api(self, mock_chat):
         mock_chat.return_value = MagicMock()
         config = _make_config(model="codex/gpt-5.6-terra", reasoning_level="xhigh")
@@ -461,7 +461,7 @@ class TestGpt56Reasoning:
 class TestOpenAIReasoningClamping:
     """Integration tests verifying clamping reaches ReasoningChatOpenAI for OpenAI."""
 
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_xhigh_clamped_to_high(self, mock_chat):
         """xhigh should be clamped to high for a native-effort OpenAI model.
         (gpt-oss is prompt-delivered, so an effort_enum/native family is used.)"""
@@ -473,7 +473,7 @@ class TestOpenAIReasoningClamping:
         call_kwargs = mock_chat.call_args[1]
         assert call_kwargs["model_kwargs"]["reasoning_effort"] == "high"
 
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_minimal_clamped_to_low(self, mock_chat):
         """minimal should be clamped to low for OpenAI reasoning models."""
         mock_chat.return_value = MagicMock()
@@ -490,7 +490,7 @@ class TestOpenRouterReasoningFormat:
     """Verify OpenRouter gets nested reasoning object without clamping."""
 
     @patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-or-test-key"}, clear=False)
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_xhigh_not_clamped(self, mock_chat):
         """OpenRouter should pass xhigh through without clamping."""
         mock_chat.return_value = MagicMock()
@@ -506,7 +506,7 @@ class TestOpenRouterReasoningFormat:
         assert call_kwargs["use_responses_api"] is False
 
     @patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-or-test-key"}, clear=False)
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_minimal_not_clamped(self, mock_chat):
         """OpenRouter should pass minimal through without clamping."""
         mock_chat.return_value = MagicMock()
@@ -525,7 +525,7 @@ class TestOpenRouterReasoningFormat:
 class TestCodexLLMCreation:
     """Integration tests for _create_codex_llm."""
 
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_strips_prefix_and_sets_default_base_url(self, mock_chat):
         """Should strip codex/ prefix and use default CLIProxyAPI base URL."""
         mock_chat.return_value = MagicMock()
@@ -537,7 +537,7 @@ class TestCodexLLMCreation:
         assert call_kwargs["model"] == "gpt-5.4-pro"
         assert call_kwargs["base_url"] == "http://localhost:8317/v1"
 
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_explicit_base_url_overrides(self, mock_chat):
         """Explicit config.base_url should override env and default."""
         mock_chat.return_value = MagicMock()
@@ -552,7 +552,7 @@ class TestCodexLLMCreation:
         assert call_kwargs["base_url"] == "http://custom-proxy:9000/v1"
 
     @patch.dict(os.environ, {"CODEX_BASE_URL": "http://remote:8317/v1"}, clear=False)
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_env_base_url_overrides_default(self, mock_chat):
         """CODEX_BASE_URL env var should override the default."""
         mock_chat.return_value = MagicMock()
@@ -563,7 +563,7 @@ class TestCodexLLMCreation:
         call_kwargs = mock_chat.call_args[1]
         assert call_kwargs["base_url"] == "http://remote:8317/v1"
 
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_default_api_key_is_not_needed(self, mock_chat):
         """When no env var set, API key should default to 'not-needed'."""
         mock_chat.return_value = MagicMock()
@@ -578,7 +578,7 @@ class TestCodexLLMCreation:
         assert call_kwargs["api_key"] == "not-needed"
 
     @patch.dict(os.environ, {"CODEX_API_KEY": "sk-codex-test"}, clear=False)
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_explicit_api_key_from_env(self, mock_chat):
         """CODEX_API_KEY env var should be used when set."""
         mock_chat.return_value = MagicMock()
@@ -589,7 +589,7 @@ class TestCodexLLMCreation:
         call_kwargs = mock_chat.call_args[1]
         assert call_kwargs["api_key"] == "sk-codex-test"
 
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_reasoning_uses_responses_api_for_native_models(self, mock_chat):
         """Native OpenAI reasoning models use Responses API (Codex proxy requires it)."""
         mock_chat.return_value = MagicMock()
@@ -601,7 +601,7 @@ class TestCodexLLMCreation:
         assert call_kwargs["reasoning"] == {"effort": "high", "summary": "auto"}
         assert "reasoning_effort" not in call_kwargs.get("model_kwargs", {})
 
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_reasoning_uses_chat_completions_for_proxy_models(self, mock_chat):
         """Non-native models (with / in name after prefix strip) use chat completions."""
         mock_chat.return_value = MagicMock()
@@ -613,7 +613,7 @@ class TestCodexLLMCreation:
         assert "reasoning" not in call_kwargs
         assert call_kwargs["model_kwargs"]["reasoning_effort"] == "high"
 
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_reasoning_clamped(self, mock_chat):
         """xhigh should be clamped to high for Codex (OpenAI limits)."""
         mock_chat.return_value = MagicMock()
@@ -625,7 +625,7 @@ class TestCodexLLMCreation:
         assert call_kwargs["reasoning"] == {"effort": "high", "summary": "auto"}
 
     @patch.dict(os.environ, {"CODEX_API_KEY": "sk-key1,sk-key2"}, clear=False)
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_multiple_keys(self, mock_chat):
         """Should support comma-separated keys for rotation."""
         mock_chat.return_value = MagicMock()
@@ -636,7 +636,7 @@ class TestCodexLLMCreation:
         call_kwargs = mock_chat.call_args[1]
         assert call_kwargs["api_key"] == "sk-key1"
 
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_top_k_not_forwarded(self, mock_chat):
         """top_k must NOT be forwarded — the Codex proxy speaks ONLY the
         Responses API, which rejects top_k with 400 'Unsupported parameter:
@@ -710,7 +710,7 @@ class TestFamilyCenteredReasoning:
         # Explicit override still wins.
         assert detect_reasoning_method("gemma-4-moe", explicit_method="api") == "api"
 
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_gemma_enables_thinking_no_effort(self, mock_chat):
         """gemma (binary_toggle) → chat_template_kwargs.enable_thinking=True, and
         NO inert reasoning_effort (the bug this feature fixes)."""
@@ -729,7 +729,7 @@ class TestFamilyCenteredReasoning:
         }
         assert "reasoning_effort" not in call_kwargs.get("model_kwargs", {})
 
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_gemma_thinking_off_when_level_none(self, mock_chat):
         """reasoning_level='none' on gemma → enable_thinking=False."""
         mock_chat.return_value = MagicMock()
@@ -746,7 +746,7 @@ class TestFamilyCenteredReasoning:
             "enable_thinking": False
         }
 
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_gemma_thinking_on_when_level_unset(self, mock_chat):
         """Unset level on gemma falls back to the family default (ON), so SRW
         gets reasoning regardless of the upstream endpoint default."""
@@ -764,7 +764,7 @@ class TestFamilyCenteredReasoning:
             "enable_thinking": True
         }
 
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_minimax_injects_nothing(self, mock_chat):
         """minimax (method=none) → neither reasoning_effort nor a toggle (was an
         inert reasoning_effort before)."""
@@ -781,7 +781,7 @@ class TestFamilyCenteredReasoning:
         assert "reasoning_effort" not in call_kwargs.get("model_kwargs", {})
         assert "chat_template_kwargs" not in call_kwargs.get("extra_body", {})
 
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_openrouter_effort_keeps_xhigh_unclamped(self, mock_chat):
         """An OpenRouter-served effort family keeps xhigh (no OpenAI clamp)."""
         mock_chat.return_value = MagicMock()
@@ -809,7 +809,7 @@ class TestMinimaxM3ThinkingToggle:
         assert cap["default"] == "on"
         assert cap["options"] == ["on", "off"]
 
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_default_sends_thinking_adaptive(self, mock_chat):
         """Unset level → family default ON → explicit thinking.type=adaptive,
         robust against an upstream endpoint-default flip (gemma precedent).
@@ -824,7 +824,7 @@ class TestMinimaxM3ThinkingToggle:
         assert call_kwargs["extra_body"]["thinking"] == {"type": "adaptive"}
         assert "reasoning_effort" not in call_kwargs.get("model_kwargs", {})
 
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_off_sends_thinking_disabled(self, mock_chat):
         """'off' (the cockpit option) → thinking.type=disabled (M3 supports it)."""
         mock_chat.return_value = MagicMock()
@@ -835,7 +835,7 @@ class TestMinimaxM3ThinkingToggle:
         call_kwargs = mock_chat.call_args[1]
         assert call_kwargs["extra_body"]["thinking"] == {"type": "disabled"}
 
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_toggle_coexists_with_declared_extra_body(self, mock_chat):
         """The family's declared reasoning_split must survive alongside the
         toggle — different extra_body keys, deep-merged."""
@@ -858,7 +858,7 @@ class TestDeclaredExtraBody:
     """Family settings-matrix `extra_body` (e.g. MiniMax `reasoning_split`)
     must reach the request body via the factory extra_body merge."""
 
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_openai_factory_forwards_declared_extra_body(self, mock_chat):
         mock_chat.return_value = MagicMock()
         config = _make_config(
@@ -872,7 +872,7 @@ class TestDeclaredExtraBody:
         call_kwargs = mock_chat.call_args[1]
         assert call_kwargs["extra_body"]["reasoning_split"] is True
 
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_declared_merges_over_computed_without_clobbering(self, mock_chat):
         """Declared values deep-merge over factory-computed entries (gemma's
         enable_thinking toggle) while sibling computed keys survive."""
@@ -893,7 +893,7 @@ class TestDeclaredExtraBody:
         }
         assert call_kwargs["extra_body"]["top_k"] == 40
 
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_prompt_cache_key_reaches_first_party_openai(self, mock_chat):
         """The runtime per-thread cache-routing key is transmitted when the
         target is first-party OpenAI (no dispatcher-injected base_url)."""
@@ -905,7 +905,7 @@ class TestDeclaredExtraBody:
         call_kwargs = mock_chat.call_args[1]
         assert call_kwargs["extra_body"]["prompt_cache_key"] == "srw-thread-abc"
 
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_prompt_cache_key_withheld_from_compatible_endpoints(self, mock_chat):
         """An explicit base_url means an OpenAI-compatible endpoint (vLLM et
         al.), which may reject unknown body fields — the key must not be
@@ -922,7 +922,7 @@ class TestDeclaredExtraBody:
         call_kwargs = mock_chat.call_args[1]
         assert "prompt_cache_key" not in (call_kwargs.get("extra_body") or {})
 
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_prompt_cache_key_defers_to_declared_extra_body(self, mock_chat):
         """A value declared in config.extra_body wins over the runtime key
         (the house rule: declared beats factory-computed)."""
@@ -938,7 +938,7 @@ class TestDeclaredExtraBody:
         call_kwargs = mock_chat.call_args[1]
         assert call_kwargs["extra_body"]["prompt_cache_key"] == "declared-wins"
 
-    @patch("src.core.loader.ReasoningChatOpenAI")
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_openrouter_factory_forwards_declared_extra_body(self, mock_chat):
         mock_chat.return_value = MagicMock()
         config = _make_config(

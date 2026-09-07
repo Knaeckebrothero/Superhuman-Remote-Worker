@@ -1,6 +1,6 @@
 """Durable session-control inbox primitives (stateless-agents S1)."""
 
-from .queries import (
+from shared.thread_controls.queries import (
     ControlRequest,
     ControlReceipt,
     adopt_next_pinned_control_request,

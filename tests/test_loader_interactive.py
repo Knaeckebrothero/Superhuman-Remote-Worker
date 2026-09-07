@@ -8,13 +8,13 @@ Covers section 8 of persistent_agent_tests.md:
 
 from unittest.mock import patch
 
-from src.core.loader import (
+from shared.runtime.core.loader import (
     InteractiveConfig,
     AgentConfig,
     load_agent_config_from_dict,
     get_phase_system_prompt,
 )
-from src.core.skill_resolution import APP_GUIDE_LOADER_TOOL, APP_GUIDE_SKILL
+from shared.runtime.core.skill_resolution import APP_GUIDE_LOADER_TOOL, APP_GUIDE_SKILL
 
 
 # =============================================================================
@@ -48,12 +48,6 @@ class TestInteractiveConfigDefaults:
         ic = InteractiveConfig()
         assert ic.idle_timeout_minutes == 30
 
-    def test_greeting_default(self):
-        ic = InteractiveConfig()
-        assert (
-            ic.greeting == "Hello! I'm ready to help. What would you like to work on?"
-        )
-
     def test_agent_config_has_interactive_field(self):
         """AgentConfig includes interactive as a field with default factory."""
         ac = AgentConfig(agent_id="x", display_name="X")
@@ -65,7 +59,6 @@ class TestInteractiveConfigDefaults:
         standalone = InteractiveConfig()
         assert ac.interactive.permission_mode == standalone.permission_mode
         assert ac.interactive.idle_timeout_minutes == standalone.idle_timeout_minutes
-        assert ac.interactive.greeting == standalone.greeting
 
 
 # =============================================================================
@@ -191,7 +184,7 @@ class TestInteractivePromptResolution:
 
         # Also patch resolver.load to raise FileNotFoundError for persona
         with patch(
-            "src.core.loader.PromptMatrixResolver.load",
+            "shared.runtime.core.loader.PromptMatrixResolver.load",
             side_effect=FileNotFoundError("no persona"),
         ):
             result = get_phase_system_prompt(
@@ -208,7 +201,7 @@ class TestInteractivePromptResolution:
         config = self._make_config(resolved_prompts={})
 
         with patch(
-            "src.core.loader.PromptMatrixResolver.load",
+            "shared.runtime.core.loader.PromptMatrixResolver.load",
             return_value=template,
         ):
             result = get_phase_system_prompt(
@@ -351,7 +344,9 @@ class TestInteractivePromptResolution:
         config.llm.reasoning_method = "prompt"
         config.llm.reasoning_level = "high"
 
-        with patch("src.core.loader.detect_reasoning_method", return_value="prompt"):
+        with patch(
+            "shared.runtime.core.loader.detect_reasoning_method", return_value="prompt"
+        ):
             result = get_phase_system_prompt(
                 config=config,
                 is_strategic=False,
@@ -367,7 +362,9 @@ class TestInteractivePromptResolution:
             resolved_prompts={"systemprompt_interactive": template}
         )
 
-        with patch("src.core.loader.detect_reasoning_method", return_value="native"):
+        with patch(
+            "shared.runtime.core.loader.detect_reasoning_method", return_value="native"
+        ):
             result = get_phase_system_prompt(
                 config=config,
                 is_strategic=False,

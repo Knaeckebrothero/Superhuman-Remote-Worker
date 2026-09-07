@@ -10,8 +10,8 @@ Covers:
 import pytest
 from langchain_core.messages import HumanMessage
 
-from src.core.context import ContextConfig, ContextManager
-from src.core.image_tokens import (
+from agent.core.context import ContextConfig, ContextManager
+from shared.runtime.core.image_tokens import (
     DEFAULT_IMAGE_TOKENS,
     estimate_image_tokens,
     split_text_and_images,

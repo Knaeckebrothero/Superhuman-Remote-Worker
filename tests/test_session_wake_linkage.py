@@ -39,7 +39,7 @@ JOB_ID = str(uuid.uuid4())
 
 class TestPublicPathStripsThreadId:
     def test_thread_id_is_stripped_from_a_public_payload(self):
-        from main import JobCreate, _strip_public_job_reserved_markers
+        from orchestrator.main import JobCreate, _strip_public_job_reserved_markers
 
         job = JobCreate(description="d", thread_id=VICTIM_THREAD_ID)
         _strip_public_job_reserved_markers(job)
@@ -52,7 +52,7 @@ class TestPublicPathStripsThreadId:
     def test_thread_id_joins_the_other_system_only_markers(self):
         """It is stripped for the same reason parent_job_id is: derived, never
         submitted."""
-        from main import JobCreate, _strip_public_job_reserved_markers
+        from orchestrator.main import JobCreate, _strip_public_job_reserved_markers
 
         job = JobCreate(
             description="d",
@@ -73,7 +73,7 @@ class TestPublicPathStripsThreadId:
         ) == (None, None, None, None, None)
 
     def test_claim_identity_is_stripped_from_raw_job_context(self):
-        from main import JobCreate, _strip_raw_officer_claim_context
+        from orchestrator.main import JobCreate, _strip_raw_officer_claim_context
 
         job = JobCreate(
             description="d",
@@ -94,7 +94,7 @@ class TestPublicPathStripsThreadId:
         assert job.context == {"ordinary": "preserved", "officer_slot": "line"}
 
     def test_job_create_model_strips_evidence_manifest_at_raw_ingress(self):
-        from main import JobCreate
+        from orchestrator.main import JobCreate
 
         job = JobCreate(
             description="d",
@@ -145,10 +145,12 @@ def _patched(db):
     lose its point if it were mocked away.
     """
     return [
-        patch("main.postgres_db", db),
-        patch("main._enforce_readiness_gate", AsyncMock(return_value=None)),
+        patch("orchestrator.main.postgres_db", db),
         patch(
-            "main._thread_project_ids",
+            "orchestrator.main._enforce_readiness_gate", AsyncMock(return_value=None)
+        ),
+        patch(
+            "orchestrator.main._thread_project_ids",
             AsyncMock(
                 side_effect=lambda _thread_id: (
                     [str(db.get_thread.return_value["project_id"])]
@@ -158,25 +160,38 @@ def _patched(db):
             ),
         ),
         patch(
-            "main._revalidate_thread_project_ids",
+            "orchestrator.main._revalidate_thread_project_ids",
             AsyncMock(side_effect=lambda _thread, project_ids: project_ids),
         ),
-        patch("main._require_job_project_access", AsyncMock(return_value=None)),
-        patch("main._is_experts_db_enabled", MagicMock(return_value=False)),
-        patch("main._inherit_parent_datasource_ids", AsyncMock(return_value=[])),
-        patch("main._authorize_thread_datasource_ids", AsyncMock(return_value=[])),
-        patch("main._enforce_job_create_grants", AsyncMock(return_value=None)),
-        patch("services.job_provisioning.provision_job_repo", AsyncMock()),
-        patch("main._spawn_scholar_subjob", AsyncMock(return_value=None)),
-        patch("main._trigger_dispatch", MagicMock()),
+        patch(
+            "orchestrator.main._require_job_project_access",
+            AsyncMock(return_value=None),
+        ),
+        patch(
+            "orchestrator.main._is_experts_db_enabled", MagicMock(return_value=False)
+        ),
+        patch(
+            "orchestrator.main._inherit_parent_datasource_ids",
+            AsyncMock(return_value=[]),
+        ),
+        patch(
+            "orchestrator.main._authorize_thread_datasource_ids",
+            AsyncMock(return_value=[]),
+        ),
+        patch(
+            "orchestrator.main._enforce_job_create_grants", AsyncMock(return_value=None)
+        ),
+        patch("orchestrator.services.job_provisioning.provision_job_repo", AsyncMock()),
+        patch("orchestrator.main._spawn_scholar_subjob", AsyncMock(return_value=None)),
+        patch("orchestrator.main._trigger_dispatch", MagicMock()),
     ]
 
 
 async def _create(db, fake_request, body):
     from contextlib import ExitStack
 
-    import security.access as access_module
-    from main import create_job
+    import orchestrator.security.access as access_module
+    from orchestrator.main import create_job
 
     with ExitStack() as stack:
         stack.enter_context(patch.object(access_module, "_INTERNAL_KEY", "secret"))
@@ -190,7 +205,7 @@ class TestLinkagePersistence:
     async def test_internal_job_context_cannot_bypass_ticket_admission(
         self, linkage_db, fake_request
     ):
-        from main import JobCreate
+        from orchestrator.main import JobCreate
 
         await _create(
             linkage_db,
@@ -221,11 +236,11 @@ class TestLinkagePersistence:
     async def test_public_job_context_cannot_bypass_ticket_admission(
         self, linkage_db, fake_request
     ):
-        from main import JobCreate
+        from orchestrator.main import JobCreate
 
         fake_request.headers = {}
         with patch(
-            "main.require_approved_user",
+            "orchestrator.main.require_approved_user",
             AsyncMock(return_value={"id": USER_ID, "is_admin": False}),
         ):
             await _create(
@@ -260,7 +275,7 @@ class TestLinkagePersistence:
     async def test_session_created_job_carries_the_backref_and_opts_into_wake(
         self, linkage_db, fake_request
     ):
-        from main import JobCreate
+        from orchestrator.main import JobCreate
 
         await _create(
             linkage_db, fake_request, JobCreate(description="d", thread_id=THREAD_ID)
@@ -276,7 +291,7 @@ class TestLinkagePersistence:
     @pytest.mark.asyncio
     async def test_job_without_a_thread_gets_no_backref(self, linkage_db, fake_request):
         """A cockpit/automation job has nobody to wake."""
-        from main import JobCreate
+        from orchestrator.main import JobCreate
 
         fake_request.headers = {"X-Internal-Key": "secret", "X-MCP-User-Id": USER_ID}
         parent = str(uuid.uuid4())
@@ -301,7 +316,7 @@ class TestLinkagePersistence:
         """A subjob inherits thread scope for datasources but its completion is
         the parent job's business. Waking the session per subjob would turn one
         delegation into a status feed."""
-        from main import JobCreate
+        from orchestrator.main import JobCreate
 
         parent = str(uuid.uuid4())
         linkage_db.get_job = AsyncMock(
@@ -325,9 +340,9 @@ class TestLinkagePersistence:
         """Manual REST creation and the backlog tick call the same final
         admission-and-INSERT service; the endpoint never performs a second
         unlocked ``create_job`` after checking the slot."""
-        from main import JobCreate
-        from services.officer_admission import OfficerAdmissionPreparation
-        from services.officer_preflight import OfficerPreflightOutcome
+        from orchestrator.main import JobCreate
+        from orchestrator.services.officer_admission import OfficerAdmissionPreparation
+        from orchestrator.services.officer_preflight import OfficerPreflightOutcome
 
         project_id = str(uuid.uuid4())
         linkage_db.get_thread.return_value = {
@@ -385,14 +400,19 @@ class TestLinkagePersistence:
         }
 
         with (
-            patch("services.officer_admission.prepare_officer_admission", prepare),
-            patch("services.officer_admission.admit_and_create_job", admit),
             patch(
-                "services.officer_preflight.ensure_officer_job_activated",
+                "orchestrator.services.officer_admission.prepare_officer_admission",
+                prepare,
+            ),
+            patch(
+                "orchestrator.services.officer_admission.admit_and_create_job", admit
+            ),
+            patch(
+                "orchestrator.services.officer_preflight.ensure_officer_job_activated",
                 preflight,
             ),
             patch(
-                "services.project_backlog.fetch_ticket_state",
+                "orchestrator.services.project_backlog.fetch_ticket_state",
                 AsyncMock(return_value=ticket_state),
             ),
         ):
@@ -437,8 +457,8 @@ class TestLinkagePersistence:
     async def test_manual_ticket_claim_fails_closed_on_untrusted_state(
         self, linkage_db, fake_request, ticket_case
     ):
-        from main import JobCreate
-        from services.officer_admission import OfficerAdmissionPreparation
+        from orchestrator.main import JobCreate
+        from orchestrator.services.officer_admission import OfficerAdmissionPreparation
 
         project_id = str(uuid.uuid4())
         linkage_db.get_thread.return_value = {
@@ -500,10 +520,15 @@ class TestLinkagePersistence:
         prepare = AsyncMock(return_value=preparation)
         admit = AsyncMock(return_value={"id": JOB_ID, "status": "created"})
         with (
-            patch("services.officer_admission.prepare_officer_admission", prepare),
-            patch("services.officer_admission.admit_and_create_job", admit),
             patch(
-                "services.project_backlog.fetch_ticket_state",
+                "orchestrator.services.officer_admission.prepare_officer_admission",
+                prepare,
+            ),
+            patch(
+                "orchestrator.services.officer_admission.admit_and_create_job", admit
+            ),
+            patch(
+                "orchestrator.services.project_backlog.fetch_ticket_state",
                 AsyncMock(return_value=ticket_state),
             ),
         ):
@@ -523,7 +548,7 @@ class TestLinkagePersistence:
         admit.assert_not_awaited()
 
     def test_ready_generation_is_not_model_selectable(self):
-        from main import JobCreate
+        from orchestrator.main import JobCreate
 
         assert "ready_at" not in JobCreate.model_fields
         assert "ticket_ready_at" not in JobCreate.model_fields

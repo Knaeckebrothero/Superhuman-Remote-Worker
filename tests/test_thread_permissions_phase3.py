@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.persistent_graph import PermissionOutcome
+from agent.persistent_graph import PermissionOutcome
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +86,7 @@ def _install_session(postgres_conn=None, permission_mode="supervised"):
     Note: call AFTER create_persistent_app() if you also need _thread_id
     set — create_persistent_app overwrites _thread_id from its arg.
     """
-    import src.api.persistent_app as mod
+    import agent.api.persistent_app as mod
 
     session = MagicMock()
     session.permission_mode = permission_mode
@@ -104,20 +104,20 @@ def _install_session(postgres_conn=None, permission_mode="supervised"):
 
 class TestPermissionCheckEarlyReturns:
     def setup_method(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._session = None
         mod._thread_id = None
 
     def teardown_method(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._session = None
         mod._thread_id = None
 
     @pytest.mark.asyncio
     async def test_no_session_denies(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         result = await mod._loop_permission_check("read_file", {}, "tc1")
         # A gone session can never be answered — a real stop, not a pending
@@ -126,7 +126,7 @@ class TestPermissionCheckEarlyReturns:
 
     @pytest.mark.asyncio
     async def test_autonomous_approves_without_db(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         _install_session(postgres_conn=None, permission_mode="autonomous")
         result = await mod._loop_permission_check("run_command", {}, "tc1")
@@ -134,7 +134,7 @@ class TestPermissionCheckEarlyReturns:
 
     @pytest.mark.asyncio
     async def test_auto_accept_approves_non_shell(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         _install_session(postgres_conn=None, permission_mode="auto_accept")
         result = await mod._loop_permission_check("read_file", {}, "tc1")
@@ -144,7 +144,7 @@ class TestPermissionCheckEarlyReturns:
     async def test_auto_accept_falls_through_for_shell(self):
         """Shell tools under auto_accept go through the DB path; with no
         postgres_conn the INSERT fails and we deny conservatively."""
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         session = _install_session(postgres_conn=None, permission_mode="auto_accept")
         result = await mod._loop_permission_check("run_command", {}, "tc1")
@@ -160,20 +160,20 @@ class TestPermissionCheckEarlyReturns:
 
 class TestInsertPermissionRequest:
     def setup_method(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._session = None
         mod._thread_id = None
 
     def teardown_method(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._session = None
         mod._thread_id = None
 
     @pytest.mark.asyncio
     async def test_returns_uuid_string(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         postgres = _make_postgres_conn(insert_returns="aaaaaaaa-1111")
         _install_session(postgres_conn=postgres)
@@ -185,7 +185,7 @@ class TestInsertPermissionRequest:
 
     @pytest.mark.asyncio
     async def test_returns_none_when_session_missing(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         # No _session set.
         rid = await mod._insert_permission_request("tc1", "x", {})
@@ -193,7 +193,7 @@ class TestInsertPermissionRequest:
 
     @pytest.mark.asyncio
     async def test_returns_none_on_db_error(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         postgres = _make_postgres_conn()
         postgres._fake_conn.fetchval.side_effect = RuntimeError("db down")
@@ -205,8 +205,8 @@ class TestInsertPermissionRequest:
     async def test_stateless_insert_stamps_exact_accepted_lease_token(
         self, monkeypatch
     ):
-        import src.api.persistent_app as mod
-        from src.api.lease_context import LeaseHandle
+        import agent.api.persistent_app as mod
+        from agent.api.lease_context import LeaseHandle
 
         postgres = _make_postgres_conn(insert_returns="aaaaaaaa-1111")
         _install_session(postgres_conn=postgres)
@@ -236,20 +236,20 @@ class TestInsertPermissionRequest:
 
 class TestResolvePendingPermission:
     def setup_method(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._session = None
         mod._thread_id = None
 
     def teardown_method(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._session = None
         mod._thread_id = None
 
     @pytest.mark.asyncio
     async def test_resolves_by_explicit_id(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         postgres = _make_postgres_conn(
             update_returns={
@@ -272,7 +272,7 @@ class TestResolvePendingPermission:
 
     @pytest.mark.asyncio
     async def test_resolves_most_recent_when_no_id(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         postgres = _make_postgres_conn(
             update_returns={
@@ -292,7 +292,7 @@ class TestResolvePendingPermission:
 
     @pytest.mark.asyncio
     async def test_rejects_invalid_decision(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         postgres = _make_postgres_conn()
         _install_session(postgres_conn=postgres)
@@ -309,7 +309,7 @@ class TestResolvePendingPermission:
 
 class TestWaitForPermissionResolution:
     def setup_method(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._session = None
         mod._thread_id = None
@@ -321,7 +321,7 @@ class TestWaitForPermissionResolution:
         mod._hard_interrupt_event = None
 
     def teardown_method(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._session = None
         mod._thread_id = None
@@ -330,7 +330,7 @@ class TestWaitForPermissionResolution:
     @pytest.mark.asyncio
     async def test_returns_immediately_if_already_approved(self):
         """The first short acquisition observes a decision without waiting."""
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         postgres = _make_postgres_conn(
             select_status_sequence=["approved"],
@@ -343,7 +343,7 @@ class TestWaitForPermissionResolution:
 
     @pytest.mark.asyncio
     async def test_returns_denied_when_already_denied(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         postgres = _make_postgres_conn(
             select_status_sequence=["denied"],
@@ -356,7 +356,7 @@ class TestWaitForPermissionResolution:
     async def test_timeout_marks_expired_and_returns_expired(self):
         """When the listener never fires and the wait times out, the
         function UPDATEs the row to expired (CAS-style) and re-reads."""
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         postgres = _make_postgres_conn(
             # First SELECT: still pending → enter wait.
@@ -376,7 +376,7 @@ class TestWaitForPermissionResolution:
         """A read that blows up says nothing about what the user wanted, so it
         must not come back as a refusal — the model would be told the user
         declined a call they were never asked about."""
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         postgres = _make_postgres_conn()
         postgres._fake_conn.fetchval.side_effect = RuntimeError("status read failed")
@@ -389,7 +389,7 @@ class TestWaitForPermissionResolution:
 
     @pytest.mark.asyncio
     async def test_dead_session_is_a_non_decision_not_a_denial(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._session = None
         result = await mod._wait_for_permission_resolution("rid-6", timeout=0.1)
@@ -399,7 +399,7 @@ class TestWaitForPermissionResolution:
     async def test_retired_row_reads_as_expired_not_denied(self):
         """The untethered CAS found no row to re-read — the question is gone
         unanswered, which is an expiry, not a refusal."""
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         postgres = _make_postgres_conn(select_status_sequence=["pending", None])
         _install_session(postgres_conn=postgres)
@@ -410,7 +410,7 @@ class TestWaitForPermissionResolution:
     @pytest.mark.asyncio
     async def test_short_poll_observes_resolution(self, monkeypatch):
         """A decision committed during the slice is observed on a fresh poll."""
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         postgres = _make_postgres_conn(
             # First short acquisition: pending. Next acquisition: approved.
@@ -431,7 +431,7 @@ class TestWaitForPermissionResolution:
 
 class TestLoopPermissionCheckDBPath:
     def setup_method(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._session = None
         mod._thread_id = None
@@ -442,7 +442,7 @@ class TestLoopPermissionCheckDBPath:
         mod._hard_interrupt_event = None
 
     def teardown_method(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._session = None
         mod._thread_id = None
@@ -451,7 +451,7 @@ class TestLoopPermissionCheckDBPath:
 
     @pytest.mark.asyncio
     async def test_denies_when_insert_fails(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         session = _install_session(postgres_conn=None, permission_mode="supervised")
         result = await mod._loop_permission_check("run_command", {}, "tc1")
@@ -460,7 +460,7 @@ class TestLoopPermissionCheckDBPath:
 
     @pytest.mark.asyncio
     async def test_approved_path_returns_true_and_records_decision(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         postgres = _make_postgres_conn(
             insert_returns="rid-approve",
@@ -473,7 +473,7 @@ class TestLoopPermissionCheckDBPath:
 
     @pytest.mark.asyncio
     async def test_denied_path_returns_false_and_records_decision(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         postgres = _make_postgres_conn(
             insert_returns="rid-deny",
@@ -491,7 +491,7 @@ class TestLoopPermissionCheckDBPath:
     async def test_broadcast_carries_approval_id(self):
         """The permission.request frame must include approval_id so
         clients can refer back via either tool_call_id or approval_id."""
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         postgres = _make_postgres_conn(
             insert_returns="rid-broadcast",
@@ -515,20 +515,20 @@ class TestLoopPermissionCheckDBPath:
 
 class TestApiApproveRestEndpoint:
     def setup_method(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._session = None
 
     def teardown_method(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         mod._session = None
 
     def test_resolves_via_db_helper_with_explicit_id(self):
         from fastapi.testclient import TestClient
 
-        import src.api.persistent_app as mod
-        from src.api.persistent_app import create_persistent_app
+        import agent.api.persistent_app as mod
+        from agent.api.persistent_app import create_persistent_app
 
         postgres = _make_postgres_conn(
             update_returns={
@@ -558,8 +558,8 @@ class TestApiApproveRestEndpoint:
     def test_returns_404_when_no_pending(self):
         from fastapi.testclient import TestClient
 
-        import src.api.persistent_app as mod
-        from src.api.persistent_app import create_persistent_app
+        import agent.api.persistent_app as mod
+        from agent.api.persistent_app import create_persistent_app
 
         postgres = _make_postgres_conn(update_returns=None)
         app = create_persistent_app("interactive")
@@ -577,8 +577,8 @@ class TestApiApproveRestEndpoint:
     def test_rejects_invalid_decision(self):
         from fastapi.testclient import TestClient
 
-        import src.api.persistent_app as mod
-        from src.api.persistent_app import create_persistent_app
+        import agent.api.persistent_app as mod
+        from agent.api.persistent_app import create_persistent_app
 
         postgres = _make_postgres_conn()
         app = create_persistent_app("interactive")
@@ -603,7 +603,7 @@ def test_persistent_app_no_longer_imports_sentinels():
     """Phase 3 removed the APPROVE_SENTINEL/DENY_SENTINEL imports because
     the queue-based approval path was replaced with the DB-backed one.
     They still live in persistent_graph for dual_app's worker-mode flow."""
-    import src.api.persistent_app as mod
+    import agent.api.persistent_app as mod
 
     assert not hasattr(mod, "APPROVE_SENTINEL")
     assert not hasattr(mod, "DENY_SENTINEL")

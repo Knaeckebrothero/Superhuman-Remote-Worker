@@ -7,18 +7,12 @@ transport to reach code-server on the VM's loopback, which is not exposed on
 the mesh network. These tests mock paramiko so no SSH/VM is required.
 """
 
-import sys
-from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
-project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-
-from src.core.backends.remote import RemoteBackend  # noqa: E402
-from src.core.workspace_backend import WorkspaceUnavailableError  # noqa: E402
+from shared.runtime.core.backends.remote import RemoteBackend  # noqa: E402
+from shared.runtime.core.workspace_backend import WorkspaceUnavailableError  # noqa: E402
 
 
 def _backend() -> RemoteBackend:

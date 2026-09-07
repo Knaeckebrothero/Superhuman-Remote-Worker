@@ -8,8 +8,8 @@ import pytest
 # These are the exact seams that make removing the substring watchdog safe.
 from langgraph.prebuilt.tool_node import _handle_tool_error, _infer_handled_types
 
-from src.core.workspace_backend import WorkspaceUnavailableError
-from src.graph import _handle_tool_errors_reraise_workspace
+from shared.runtime.core.workspace_backend import WorkspaceUnavailableError
+from agent.graph import _handle_tool_errors_reraise_workspace
 
 
 def test_handler_reraises_workspace_error():

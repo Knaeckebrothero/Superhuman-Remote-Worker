@@ -111,3 +111,6 @@ cockpit:
     limits:
       memory: "2Gi"
       cpu: "2000m"
+
+# Inner-loop dev: chart default is INFO; Tilt opts back into DEBUG.
+logLevel: "DEBUG"

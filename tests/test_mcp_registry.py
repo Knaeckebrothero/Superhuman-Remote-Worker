@@ -4,8 +4,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from src.tools.context import ToolContext
-from src.tools.registry import (
+from agent.tools.context import ToolContext
+from agent.tools.registry import (
     TOOL_REGISTRY,
     expand_tool_wildcards,
     filter_tools_by_phase,

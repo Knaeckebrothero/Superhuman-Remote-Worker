@@ -6,7 +6,7 @@ text-sparse pages are always rendered, so a pictogram-bearing page is never
 dropped.
 """
 
-from src.utils.pdf import (
+from agent.utils.pdf import (
     DEFAULT_MIN_TEXT_CHARS_FOR_SKIP,
     compress_ranges,
     should_render_page,

@@ -9,13 +9,13 @@ from types import SimpleNamespace
 
 from langchain_core.messages import HumanMessage
 
-from src.core.citation_feedback_injection import (
+from agent.core.citation_feedback_injection import (
     CITATION_FEEDBACK_TOOL_CALL_ID_PREFIX,
     create_citation_feedback_injection_messages,
     format_failed_citations,
     is_citation_feedback_injection_message,
 )
-from src.core.workspace_injection import is_workspace_injection_message
+from shared.runtime.core.workspace_injection import is_workspace_injection_message
 
 
 def _cit(cid, claim, notes="quote not found", score=0.2):

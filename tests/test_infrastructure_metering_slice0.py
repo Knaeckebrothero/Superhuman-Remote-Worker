@@ -62,7 +62,7 @@ def _read_capabilities() -> MeteringSchemaCapabilities:
 
 
 def test_cutover_wiring_uses_configured_inventory_freshness() -> None:
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
 
     source = inspect.getsource(orchestrator_main.lifespan)
     assert "max_scope_age=timedelta(" in source
@@ -72,7 +72,7 @@ def test_cutover_wiring_uses_configured_inventory_freshness() -> None:
 
 
 def test_storage_publication_resources_require_effective_activation() -> None:
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
     from orchestrator.services.infrastructure_metering.storage_assets import (
         StorageActivation,
     )
@@ -196,7 +196,7 @@ def test_storage_publication_resources_require_effective_activation() -> None:
 
 
 def test_durable_reporting_policy_survives_write_gate_and_auth_loss() -> None:
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
 
     boundary = datetime(2026, 8, 8, tzinfo=timezone.utc)
     before_boundary = boundary - timedelta(hours=1)
@@ -292,7 +292,7 @@ def test_durable_reporting_policy_survives_write_gate_and_auth_loss() -> None:
 
 
 def test_durable_volume_reporting_fails_closed_without_mapping_registry() -> None:
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
 
     capabilities = MagicMock(
         slice3_compute_inventory_ready=True,
@@ -315,8 +315,8 @@ def test_durable_volume_reporting_fails_closed_without_mapping_registry() -> Non
 
 
 def test_storage_shadow_configuration_must_match_frozen_source_scopes() -> None:
-    import main as orchestrator_main
-    from services.infrastructure_metering.storage_assets import (
+    import orchestrator.main as orchestrator_main
+    from orchestrator.services.infrastructure_metering.storage_assets import (
         StorageSourceRequirement,
     )
 
@@ -792,7 +792,7 @@ def test_slice2_storage_gates_are_independent_and_fail_closed():
 
 
 def test_vm_storage_dark_gates_are_independent_and_cannot_activate(monkeypatch):
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
 
     defaults = InfrastructureMeteringSettings.from_env({})
     assert defaults.vm_pvc_inventory_enabled is False
@@ -1400,7 +1400,7 @@ def test_legacy_v2_readiness_is_unchanged_while_source_aware_gate_is_off():
 
 @pytest.mark.asyncio
 async def test_usage_v2_route_is_hidden_while_its_gate_is_off(monkeypatch):
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
 
     monkeypatch.setattr(
         orchestrator_main,
@@ -1426,7 +1426,7 @@ async def test_usage_v2_route_is_hidden_while_its_gate_is_off(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_usage_v2_restricts_non_customer_rows_to_fleet_admin(monkeypatch):
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
 
     monkeypatch.setattr(
         orchestrator_main,
@@ -1454,7 +1454,7 @@ async def test_usage_v2_restricts_non_customer_rows_to_fleet_admin(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_usage_v2_fleet_admin_passes_explicit_visibility(monkeypatch):
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
 
     now = datetime(2026, 8, 6, tzinfo=timezone.utc)
     response = UsageV2QueryService._row(
@@ -1544,7 +1544,7 @@ async def test_usage_v2_fleet_admin_passes_explicit_visibility(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_usage_v2_refuses_reads_until_bootstrap_is_complete(monkeypatch):
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
 
     class _Service:
         is_available = True
@@ -1584,7 +1584,7 @@ async def test_usage_v2_refuses_reads_until_bootstrap_is_complete(monkeypatch):
 async def test_usage_v2_does_not_echo_server_contract_failures_as_client_errors(
     monkeypatch,
 ):
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
 
     class _Service:
         is_available = True
@@ -1629,7 +1629,7 @@ async def test_usage_v2_does_not_echo_server_contract_failures_as_client_errors(
 
 
 def test_internal_inventory_ingestion_routes_are_hidden_from_openapi():
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
 
     prefix = "/api/internal/infrastructure-metering/v1"
     expected = {
@@ -1653,7 +1653,7 @@ def test_internal_inventory_ingestion_routes_are_hidden_from_openapi():
 
 @pytest.mark.asyncio
 async def test_infrastructure_admin_operations_require_real_fleet_view(monkeypatch):
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
 
     request = MagicMock()
     request.url.path = "/api/admin/usage/v2/infrastructure-cutover"
@@ -1701,7 +1701,7 @@ async def test_infrastructure_admin_operations_require_real_fleet_view(monkeypat
 async def test_cutover_prepare_is_explicit_gated_idempotent_admin_operation(
     monkeypatch,
 ):
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
     from orchestrator.services.infrastructure_metering.cutover import (
         CutoverPhase,
         CutoverStatus,
@@ -1774,7 +1774,7 @@ async def test_cutover_prepare_is_explicit_gated_idempotent_admin_operation(
 
 @pytest.mark.asyncio
 async def test_coverage_waiver_route_maps_result_and_audits(monkeypatch):
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
     from orchestrator.services.infrastructure_metering.coverage import (
         CoverageDayDegradation,
         CoverageGapWaiverResult,
@@ -1835,7 +1835,7 @@ async def test_coverage_waiver_route_maps_result_and_audits(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_correction_route_is_idempotent_fleet_admin_operation(monkeypatch):
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
 
     actor_id, correction_id = uuid4(), uuid4()
     period_start = datetime(2026, 8, 5, tzinfo=timezone.utc)
@@ -1924,7 +1924,7 @@ async def test_correction_route_is_idempotent_fleet_admin_operation(monkeypatch)
 
 
 def test_infrastructure_admin_routes_are_explicit_and_publicly_documented():
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
 
     expected = {
         "/api/admin/usage/v2/infrastructure-cutover": {"GET"},
@@ -1958,7 +1958,7 @@ def test_infrastructure_admin_routes_are_explicit_and_publicly_documented():
 
 @pytest.mark.asyncio
 async def test_storage_activation_routes_are_explicit_and_audited(monkeypatch):
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
     from orchestrator.services.infrastructure_metering.storage_assets import (
         StorageActivation,
         StorageSourceActivation,
@@ -2038,7 +2038,7 @@ async def test_storage_activation_routes_are_explicit_and_audited(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_storage_activation_schedule_is_generation_fenced(monkeypatch):
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
     from orchestrator.services.infrastructure_metering.storage_assets import (
         StorageActivation,
         StorageSourceActivation,
@@ -2129,7 +2129,7 @@ async def test_storage_activation_schedule_is_generation_fenced(monkeypatch):
 async def test_vm_volume_source_shadow_freezes_quantity_and_attribution_scopes(
     monkeypatch,
 ):
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
     from orchestrator.services.infrastructure_metering.storage_assets import (
         StorageActivation,
         StorageSourceActivation,
@@ -2215,7 +2215,7 @@ async def test_vm_volume_source_shadow_freezes_quantity_and_attribution_scopes(
 
 @pytest.mark.asyncio
 async def test_compute_activation_shadow_is_class_gated_and_audited(monkeypatch):
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
     from orchestrator.services.infrastructure_metering.compute_activation import (
         ComputeActivation,
     )
@@ -2271,7 +2271,7 @@ async def test_compute_activation_shadow_is_class_gated_and_audited(monkeypatch)
 async def test_vm_compute_shadow_transition_requires_inventory_not_shadow_config(
     monkeypatch,
 ):
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
     from orchestrator.services.infrastructure_metering.compute_activation import (
         ComputeActivation,
     )
@@ -2336,7 +2336,7 @@ async def test_vm_compute_shadow_transition_requires_inventory_not_shadow_config
 
 @pytest.mark.asyncio
 async def test_vm_compute_activation_uses_remote_scope_and_collector(monkeypatch):
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
     from orchestrator.services.infrastructure_metering.compute_activation import (
         ComputeActivation,
         ComputeActivationScheduleResult,
@@ -2422,7 +2422,7 @@ async def test_vm_compute_activation_uses_remote_scope_and_collector(monkeypatch
 
 @pytest.mark.asyncio
 async def test_storage_destruction_assertion_is_idempotent_and_audited(monkeypatch):
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
     from orchestrator.services.infrastructure_metering.storage_assets import (
         BackendDestructionResult,
     )
@@ -2490,7 +2490,7 @@ async def test_storage_destruction_assertion_is_idempotent_and_audited(monkeypat
 async def test_storage_asset_operator_list_and_detail_are_safe_and_bounded(
     monkeypatch,
 ):
-    import main as orchestrator_main
+    import orchestrator.main as orchestrator_main
     from orchestrator.services.infrastructure_metering.storage_assets import (
         BackendUnverifiedAssetPage,
         BackendUnverifiedAssetRecord,

@@ -1,19 +1,12 @@
 """Tests for persistent-session project context tools."""
 
 from __future__ import annotations
-
-import sys
-from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
-project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-
-from src.tools.context import ToolContext  # noqa: E402
-from src.tools.orchestrator import create_orchestrator_tools  # noqa: E402
+from agent.tools.context import ToolContext  # noqa: E402
+from agent.tools.orchestrator import create_orchestrator_tools  # noqa: E402
 
 
 def _tool_by_name(tools, name):
@@ -62,7 +55,7 @@ async def test_get_current_project_uses_context_project_id(monkeypatch):
         captured["user_id"] = user_id
         return cap
 
-    monkeypatch.setattr("src.tools.orchestrator.projects._get_client", _factory)
+    monkeypatch.setattr("agent.tools.orchestrator.projects._get_client", _factory)
 
     tools = create_orchestrator_tools(
         ToolContext(user_id="user-xyz", _project_id=project_id)
@@ -106,7 +99,9 @@ async def test_list_project_jobs_defaults_to_context_project(monkeypatch):
         }
     )
 
-    monkeypatch.setattr("src.tools.orchestrator.projects._get_client", lambda **kw: cap)
+    monkeypatch.setattr(
+        "agent.tools.orchestrator.projects._get_client", lambda **kw: cap
+    )
 
     tools = create_orchestrator_tools(
         ToolContext(user_id="user-xyz", _project_id=project_id)
@@ -126,7 +121,9 @@ async def test_list_project_jobs_accepts_explicit_project_id(monkeypatch):
     project_id = "explicit-project"
     url = f"http://localhost:8085/api/projects/{project_id}/jobs"
     cap = _CapturingClient({url: []})
-    monkeypatch.setattr("src.tools.orchestrator.projects._get_client", lambda **kw: cap)
+    monkeypatch.setattr(
+        "agent.tools.orchestrator.projects._get_client", lambda **kw: cap
+    )
 
     tools = create_orchestrator_tools(ToolContext(user_id="user-xyz"))
     list_jobs = _tool_by_name(tools, "list_project_jobs")

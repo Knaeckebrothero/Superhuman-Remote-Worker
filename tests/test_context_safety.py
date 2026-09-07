@@ -18,8 +18,19 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
-from src.core.context import ContextManager, ContextConfig, ConversationSummary
-from src.core.summarizer import (
+from agent.core.context import (
+    ContextManager,
+    ContextConfig,
+    ConversationSummary,
+    place_pinned_after_summary,
+)
+from shared.runtime.core.message_markers import (
+    PROTECTED_KEY,
+    is_protected_message,
+    protected_phase_key,
+)
+from shared.runtime.core.workspace_injection import create_phase_instruction_message
+from agent.core.summarizer import (
     SummarizationEngine,
     SummarizationFailed,
     is_overflow_error,
@@ -58,7 +69,7 @@ def context_manager(context_config):
 
 def make_mock_aux(max_context_tokens=15_000):
     """Create a mock AuxiliaryLLM that returns structured summaries."""
-    from src.services.auxiliary import AuxiliaryLLM
+    from shared.runtime.services.auxiliary import AuxiliaryLLM
 
     llm = MagicMock()
 
@@ -91,7 +102,7 @@ def mock_llm():
 
 def make_failing_aux(error: Exception, max_context_tokens=15_000):
     """Create a mock AuxiliaryLLM whose every call raises ``error``."""
-    from src.services.auxiliary import AuxiliaryLLM
+    from shared.runtime.services.auxiliary import AuxiliaryLLM
 
     llm = MagicMock()
     structured_llm = AsyncMock()
@@ -104,7 +115,7 @@ def make_failing_aux(error: Exception, max_context_tokens=15_000):
 @pytest.fixture(autouse=True)
 def fast_backoff(monkeypatch):
     """No real sleeps between summarization retries in tests."""
-    monkeypatch.setattr("src.core.summarizer.BACKOFF_SECONDS", (0.0, 0.0))
+    monkeypatch.setattr("agent.core.summarizer.BACKOFF_SECONDS", (0.0, 0.0))
 
 
 def create_large_message_history(
@@ -210,7 +221,7 @@ class TestSummarizationPlanner:
     def test_unknown_window_falls_back_conservative(self):
         aux = make_mock_aux(max_context_tokens=None)
         engine = make_engine(aux)
-        from src.core.summarizer import DEFAULT_AUX_WINDOW
+        from agent.core.summarizer import DEFAULT_AUX_WINDOW
 
         assert engine.aux_window == DEFAULT_AUX_WINDOW
 
@@ -229,7 +240,7 @@ class TestChunkPlannerParity:
     def test_engine_delegates_byte_identically(self, mock_llm):
         import math
 
-        from src.core.chunk_planner import ChunkPlanner
+        from shared.runtime.core.chunk_planner import ChunkPlanner
 
         engine = make_engine(mock_llm)
         # A standalone planner built from the same authority as the engine's
@@ -262,7 +273,7 @@ class TestChunkPlannerParity:
         silently oversize every fold chunk (the 5dbb5770-class failure)."""
         import math
 
-        from src.core.chunk_planner import SAFETY_MARGIN
+        from shared.runtime.core.chunk_planner import SAFETY_MARGIN
 
         engine = make_engine(mock_llm)
         expected = (
@@ -279,7 +290,7 @@ class TestChunkPlannerOverlap:
     exceeds the budget and every part is still covered."""
 
     def _planner(self, overlap_ratio):
-        from src.core.chunk_planner import ChunkPlanner
+        from shared.runtime.core.chunk_planner import ChunkPlanner
 
         # Window comfortably above the 1_000-token planning floor.
         return ChunkPlanner(
@@ -431,7 +442,7 @@ class TestRollingFold:
             await engine.run(plan)
 
         assert exc_info.value.reason == "aux_unavailable"
-        from src.core.summarizer import MAX_ATTEMPTS
+        from agent.core.summarizer import MAX_ATTEMPTS
 
         structured = aux.llm.with_structured_output.return_value
         assert structured.ainvoke.call_count == MAX_ATTEMPTS
@@ -480,7 +491,7 @@ class TestOverflowDetection:
         assert is_overflow_error(e)
 
     def test_detects_aux_preflight_guard(self):
-        from src.services.auxiliary import AuxInputTooLarge
+        from shared.runtime.services.auxiliary import AuxInputTooLarge
 
         assert is_overflow_error(AuxInputTooLarge(951_682, 131_072, "SummarizeTask"))
 
@@ -499,7 +510,7 @@ class TestAuxPreflightGuard:
     async def test_chain_rejects_oversized_input(self):
         """Non-summarization aux tasks fail fast instead of overflowing at
         the transport (951k memory-extraction payloads to a 131k model)."""
-        from src.services.auxiliary import AuxInputTooLarge, SummarizeTask
+        from shared.runtime.services.auxiliary import AuxInputTooLarge, SummarizeTask
 
         aux = make_mock_aux(max_context_tokens=100)
         task = SummarizeTask(
@@ -517,7 +528,7 @@ class TestAuxPreflightGuard:
 
     @pytest.mark.asyncio
     async def test_chain_allows_fitting_input(self, mock_llm):
-        from src.services.auxiliary import SummarizeTask
+        from shared.runtime.services.auxiliary import SummarizeTask
 
         task = SummarizeTask(
             conversation_text="User: short conversation",
@@ -529,7 +540,7 @@ class TestAuxPreflightGuard:
 
     @pytest.mark.asyncio
     async def test_no_guard_when_window_unknown(self):
-        from src.services.auxiliary import SummarizeTask
+        from shared.runtime.services.auxiliary import SummarizeTask
 
         aux = make_mock_aux(max_context_tokens=None)
         task = SummarizeTask(
@@ -1623,3 +1634,289 @@ class TestCompactionBoundaryId:
             messages=[HumanMessage(content="hi", id="x0")], auxiliary=mock_llm
         )
         assert context_manager._last_compaction_boundary_id is None
+
+
+# =============================================================================
+# Protected phase blocks across summarisation — U2 WP1
+# =============================================================================
+
+
+class TestPinnedAfterSummary:
+    """A protected phase block that fell into the summarised region is
+    re-seated right after the ``[Summary of prior work]`` message and before
+    the kept window — for the CURRENT phase only. The context_manager
+    fixture keeps 3 recent messages."""
+
+    BODY = "PROTECTED PHASE BODY " * 20
+
+    @classmethod
+    def _block(cls, phase_key, msg_id="blk", path="skills/tactical-phase/SKILL.md"):
+        block = create_phase_instruction_message(path, cls.BODY, "tactical", phase_key)
+        block.id = msg_id  # what the reducer assigned when it was delivered
+        return block
+
+    @staticmethod
+    def _base():
+        msgs = []
+        for i in range(8):
+            msgs.append(HumanMessage(content=f"question {i} " + "x" * 200, id=f"h{i}"))
+            msgs.append(AIMessage(content=f"answer {i} " + "y" * 200, id=f"a{i}"))
+        return msgs
+
+    @classmethod
+    def _history(cls, block, block_at):
+        msgs = cls._base()
+        msgs.insert(block_at, block)
+        return msgs
+
+    @staticmethod
+    def _split(result):
+        kept = [m for m in result if not isinstance(m, RemoveMessage)]
+        removed = {m.id for m in result if isinstance(m, RemoveMessage)}
+        summary_idx = next(
+            i
+            for i, m in enumerate(kept)
+            if isinstance(m, SystemMessage) and "[Summary of prior work]" in m.content
+        )
+        return kept, removed, summary_idx
+
+    @pytest.mark.asyncio
+    async def test_current_phase_block_reinjected_after_summary_before_keep_window(
+        self, context_manager, mock_llm
+    ):
+        block = self._block("2:tactical")
+        messages = self._history(block, block_at=2)
+        context_manager.set_current_phase("tactical", phase_key="2:tactical")
+
+        result = await context_manager.summarize_and_compact(
+            messages=messages, auxiliary=mock_llm
+        )
+
+        kept, removed, summary_idx = self._split(result)
+        protected = [m for m in kept if is_protected_message(m)]
+        assert len(protected) == 1
+        reseated = protected[0]
+        assert kept.index(reseated) == summary_idx + 1
+        assert reseated.content == block.content
+        assert reseated.additional_kwargs == block.additional_kwargs
+        # Appended fresh (no id); the original is evicted by its id.
+        assert reseated.id is None
+        assert "blk" in removed
+        # The kept window follows the block.
+        assert [m.content for m in kept[summary_idx + 2 :]] == [
+            m.content for m in messages[-3:]
+        ]
+
+    @pytest.mark.asyncio
+    async def test_other_phase_blocks_are_summarised_away(
+        self, context_manager, mock_llm
+    ):
+        stale = self._block("1:strategic", msg_id="stale")
+        messages = self._history(stale, block_at=2)
+        context_manager.set_current_phase("tactical", phase_key="2:tactical")
+
+        result = await context_manager.summarize_and_compact(
+            messages=messages, auxiliary=mock_llm
+        )
+
+        kept, removed, _ = self._split(result)
+        assert not any(is_protected_message(m) for m in kept)
+        assert "stale" in removed
+        assert not any(self.BODY in str(m.content) for m in kept)
+
+    @pytest.mark.asyncio
+    async def test_block_in_keep_window_keeps_marker_and_is_not_duplicated(
+        self, context_manager, mock_llm
+    ):
+        block = self._block("2:tactical")
+        base = self._base()
+        messages = base[:-1] + [block, base[-1]]  # window = [h7, block, a7]
+        context_manager.set_current_phase("tactical", phase_key="2:tactical")
+
+        result = await context_manager.summarize_and_compact(
+            messages=messages, auxiliary=mock_llm
+        )
+
+        kept, removed, summary_idx = self._split(result)
+        protected = [m for m in kept if is_protected_message(m)]
+        assert len(protected) == 1
+        assert protected[0].additional_kwargs == block.additional_kwargs
+        # It stayed at its window position (after h7) — not pinned a second time.
+        assert kept.index(protected[0]) == summary_idx + 2
+        assert kept[summary_idx + 1].content == messages[-3].content
+        assert "blk" in removed  # original evicted, fresh copy appended
+
+    @pytest.mark.asyncio
+    async def test_protected_text_absent_from_summary_input(
+        self, context_manager, mock_llm
+    ):
+        block = self._block("2:tactical")
+        messages = self._history(block, block_at=2)
+        context_manager.set_current_phase("tactical", phase_key="2:tactical")
+
+        parts = context_manager._format_messages_for_summary(messages)
+        assert parts
+        assert not any(self.BODY in p for p in parts)
+        assert any("question 0" in p for p in parts)
+
+        await context_manager.summarize_and_compact(
+            messages=messages, auxiliary=mock_llm
+        )
+        structured = mock_llm.llm.with_structured_output.return_value
+        assert structured.ainvoke.await_count >= 1
+        sent = str(structured.ainvoke.call_args_list)
+        assert self.BODY not in sent
+        assert "question 0" in sent
+
+    @pytest.mark.asyncio
+    async def test_generic_pin_survives_any_phase(self, context_manager, mock_llm):
+        pin = HumanMessage(
+            content="GENERIC PIN", id="pin", additional_kwargs={PROTECTED_KEY: True}
+        )
+        messages = self._history(pin, block_at=2)
+        context_manager.set_current_phase("tactical", phase_key="9:tactical")
+
+        result = await context_manager.summarize_and_compact(
+            messages=messages, auxiliary=mock_llm
+        )
+
+        kept, removed, summary_idx = self._split(result)
+        assert kept[summary_idx + 1].content == "GENERIC PIN"
+        assert is_protected_message(kept[summary_idx + 1])
+        assert "pin" in removed
+
+    def test_place_pinned_after_summary_dedupes_and_filters(self):
+        summary = SystemMessage(content="[Summary of prior work]\nS")
+        current = self._block("2:tactical", msg_id="c")
+        duplicate = self._block("2:tactical", msg_id="d")
+        stale = self._block("1:strategic", msg_id="s")
+        summarized = [stale, current, duplicate, HumanMessage(content="old")]
+
+        # The window already holds the identity: nothing is re-seated.
+        window_block = self._block("2:tactical", msg_id="k")
+        kept = [window_block, HumanMessage(content="w")]
+        assert place_pinned_after_summary(summary, summarized, kept, "2:tactical") == [
+            summary,
+            *kept,
+        ]
+
+        # Otherwise exactly one fresh copy of the current block: id-less,
+        # markers intact, the stale phase filtered out.
+        kept = [HumanMessage(content="w")]
+        out = place_pinned_after_summary(summary, summarized, kept, "2:tactical")
+        assert len(out) == 3
+        assert out[0] is summary
+        assert out[2] is kept[0]
+        assert is_protected_message(out[1])
+        assert out[1].id is None
+        assert protected_phase_key(out[1]) == "2:tactical"
+        assert out[1].content == current.content
+
+
+# =============================================================================
+# preserve_message_identity — the persistent loop's compaction contract
+# =============================================================================
+
+
+class TestPreserveMessageIdentity:
+    """``preserve_message_identity``: the persistent loop replaces its history
+    wholesale (no ``add_messages`` reducer), so the kept window must keep its
+    objects — ids and ``additional_kwargs`` such as the turn stamp — and a
+    pinned message is re-seated as the original. The default mode keeps the
+    id-less fresh copies the worker graph's reducer relies on.
+    knowledge-base/knowledge/issues/stateless_turn_settlement_crashes_after_midturn_compaction.md
+    """
+
+    @staticmethod
+    def _manager(context_config, preserve: bool) -> ContextManager:
+        return ContextManager(
+            config=context_config,
+            model="gpt-4",
+            preserve_message_identity=preserve,
+        )
+
+    @staticmethod
+    def _history(n: int = 12):
+        from shared.runtime.core.message_markers import stamp_turn_membership
+
+        body = "The quick brown fox jumps over the lazy dog. " * 8
+        messages = []
+        for i in range(n):
+            msg = (
+                HumanMessage(content=f"question {i}: {body}", id=f"msg-{i}")
+                if i % 2 == 0
+                else AIMessage(content=f"answer {i}: {body}", id=f"msg-{i}")
+            )
+            messages.append(stamp_turn_membership(msg, 4))
+        return messages
+
+    @pytest.mark.asyncio
+    async def test_kept_window_keeps_objects_ids_and_stamps(
+        self, context_config, mock_llm
+    ):
+        from langchain_core.messages import RemoveMessage
+        from shared.runtime.core.message_markers import turn_membership
+
+        manager = self._manager(context_config, preserve=True)
+        messages = self._history()
+        result = await manager.summarize_and_compact(messages, mock_llm)
+
+        assert manager.compaction_runs == 1
+        tail = [m for m in result if not isinstance(m, (SystemMessage, RemoveMessage))]
+        assert tail
+        assert all(any(m is original for original in messages) for m in tail)
+        assert all(m.id and turn_membership(m) == 4 for m in tail)
+        # A marker for a surviving id would delete the message it means to keep.
+        evicted = {m.id for m in result if isinstance(m, RemoveMessage)}
+        assert not evicted & {m.id for m in tail}
+        assert evicted  # the summarised region is still evicted
+
+    @pytest.mark.asyncio
+    async def test_default_mode_recreates_idless_fresh_copies(
+        self, context_config, mock_llm
+    ):
+        from langchain_core.messages import RemoveMessage
+
+        manager = self._manager(context_config, preserve=False)
+        messages = self._history()
+        result = await manager.summarize_and_compact(messages, mock_llm)
+
+        tail = [m for m in result if not isinstance(m, (SystemMessage, RemoveMessage))]
+        assert tail
+        assert all(m.id is None for m in tail)
+        assert not any(any(m is original for original in messages) for m in tail)
+
+    @pytest.mark.asyncio
+    async def test_pinned_turn_input_is_reseated_as_the_original(
+        self, context_config, mock_llm
+    ):
+        from langchain_core.messages import RemoveMessage
+        from shared.runtime.core.message_markers import (
+            PROTECTED_KEY,
+            pin_turn_input,
+            unpin_turn_input,
+        )
+
+        manager = self._manager(context_config, preserve=True)
+        messages = self._history()
+        turn_input = messages[0]
+        pin_turn_input(turn_input)
+
+        result = await manager.summarize_and_compact(messages, mock_llm)
+
+        kept = [m for m in result if not isinstance(m, RemoveMessage)]
+        summary_at = next(
+            i
+            for i, m in enumerate(kept)
+            if isinstance(m, SystemMessage) and "[Summary of prior work]" in m.content
+        )
+        assert kept[summary_at + 1] is turn_input
+        assert turn_input.id == "msg-0"
+        # The pin is the loop's, removed when the turn ends; other pins stay.
+        unpin_turn_input(turn_input)
+        assert PROTECTED_KEY not in turn_input.additional_kwargs
+        other = HumanMessage(
+            content="phase block", additional_kwargs={PROTECTED_KEY: True}
+        )
+        unpin_turn_input(other)
+        assert other.additional_kwargs[PROTECTED_KEY] is True

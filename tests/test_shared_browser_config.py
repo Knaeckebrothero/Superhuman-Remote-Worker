@@ -2,7 +2,7 @@
 
 import pytest
 
-from services.browser_stream_config import (
+from orchestrator.services.browser_stream_config import (
     BrowserStreamConfigurationError,
     browser_stream_config,
 )

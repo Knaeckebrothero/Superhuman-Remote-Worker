@@ -7,6 +7,7 @@ import {pinResolvedValue, readConfigPath, resolveMatrixForModel, SettingsMode} f
 import {PinOnInteractDirective} from './pin-on-interact.directive';
 import {reasoningOptionsForModel} from './reasoning-options';
 import {ModelService} from '../../core/services/model.service';
+import {liftLegacyTiers} from '../experts/expert-config';
 
 /**
  * Advanced settings tab: collapsible accordion sections for power-user settings.
@@ -29,147 +30,63 @@ import {ModelService} from '../../core/services/model.service';
         </button>
         @if (expanded().has('inference')) {
           <div class="accordion-body">
+            <!-- One model runs the whole job since U1, so there is ONE
+                 inference section (the per-phase strategic/tactical pair is
+                 gone). Job mode owns the reasoning level here; in session
+                 mode the Reasoning select lives in the Settings tab's MODEL
+                 group (model-group.component.ts), the single session-mode
+                 writer of llm.reasoning_level. -->
             @if (mode() === 'job') {
-              <!-- Strategic phase -->
-              <div class="phase-section">
-                <span class="phase-label">{{ 'advanced.phases.strategic' | transloco }}</span>
-                <div class="field-row" [class.modified]="strategicReasoning() !== null">
-                  <label class="field-label">{{ 'advanced.labels.reasoning' | transloco }}</label>
-                  <div class="field-control">
-                    <select class="form-input"
-                      [ngModel]="strategicReasoning() ?? resolvedStrategicReasoning()"
-                  appPinOnInteract (pin)="pinValue(strategicReasoning, resolvedStrategicReasoning())"
-                      (ngModelChange)="onStrategicReasoningChange($event)"
-                      [disabled]="disabled()">
-                      @for (opt of strategicReasoningOptions(); track opt.value) {
-                        @if (opt.value === null) {
-                          <option [ngValue]="null">{{ opt.label }}</option>
-                        } @else {
-                          <option [value]="opt.value">{{ opt.label }}</option>
-                        }
-                      }
-                    </select>
-                    @if (strategicReasoning() !== null) {
-                      <button type="button" class="reset-btn" (click)="strategicReasoning.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
-                    }
-                  </div>
-                </div>
-                <div class="field-row" [class.modified]="strategicTemperature() !== null">
-                  <label class="field-label">
-                    {{ 'advanced.labels.temperature' | transloco: {value: effectiveStrategicTemp()} }}
-                  </label>
-                  <div class="slider-row">
-                    <span class="slider-label">0</span>
-                    <input type="range" class="form-range" min="0" max="2" step="0.1"
-                      [ngModel]="strategicTemperature() ?? resolvedStrategicTemp()"
-                      (ngModelChange)="onStrategicTempChange($event)"
-                      [disabled]="disabled()">
-                    <span class="slider-label">2</span>
-                    @if (strategicTemperature() !== null) {
-                      <button type="button" class="reset-btn" (click)="strategicTemperature.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
-                    }
-                  </div>
-                </div>
-                <div class="field-row toggle-row" [class.modified]="strategicMultimodal() !== null">
-                  <label class="toggle-label">
-                    <input type="checkbox"
-                      [checked]="strategicMultimodal() ?? resolvedStrategicMultimodal()"
-                      (change)="onStrategicMultimodalChange($event)"
-                      [disabled]="disabled()">
-                    <span>{{ 'advanced.labels.multimodal' | transloco }}</span>
-                  </label>
-                  @if (strategicMultimodal() !== null) {
-                    <button type="button" class="reset-btn" (click)="strategicMultimodal.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
-                  }
-                </div>
-              </div>
-              <!-- Tactical phase -->
-              <div class="phase-section">
-                <span class="phase-label">{{ 'advanced.phases.tactical' | transloco }}</span>
-                <div class="field-row" [class.modified]="tacticalReasoning() !== null">
-                  <label class="field-label">{{ 'advanced.labels.reasoning' | transloco }}</label>
-                  <div class="field-control">
-                    <select class="form-input"
-                      [ngModel]="tacticalReasoning() ?? resolvedTacticalReasoning()"
-                  appPinOnInteract (pin)="pinValue(tacticalReasoning, resolvedTacticalReasoning())"
-                      (ngModelChange)="onTacticalReasoningChange($event)"
-                      [disabled]="disabled()">
-                      @for (opt of tacticalReasoningOptions(); track opt.value) {
-                        @if (opt.value === null) {
-                          <option [ngValue]="null">{{ opt.label }}</option>
-                        } @else {
-                          <option [value]="opt.value">{{ opt.label }}</option>
-                        }
-                      }
-                    </select>
-                    @if (tacticalReasoning() !== null) {
-                      <button type="button" class="reset-btn" (click)="tacticalReasoning.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
-                    }
-                  </div>
-                </div>
-                <div class="field-row" [class.modified]="tacticalTemperature() !== null">
-                  <label class="field-label">
-                    {{ 'advanced.labels.temperature' | transloco: {value: effectiveTacticalTemp()} }}
-                  </label>
-                  <div class="slider-row">
-                    <span class="slider-label">0</span>
-                    <input type="range" class="form-range" min="0" max="2" step="0.1"
-                      [ngModel]="tacticalTemperature() ?? resolvedTacticalTemp()"
-                      (ngModelChange)="onTacticalTempChange($event)"
-                      [disabled]="disabled()">
-                    <span class="slider-label">2</span>
-                    @if (tacticalTemperature() !== null) {
-                      <button type="button" class="reset-btn" (click)="tacticalTemperature.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
-                    }
-                  </div>
-                </div>
-                <div class="field-row toggle-row" [class.modified]="tacticalMultimodal() !== null">
-                  <label class="toggle-label">
-                    <input type="checkbox"
-                      [checked]="tacticalMultimodal() ?? resolvedTacticalMultimodal()"
-                      (change)="onTacticalMultimodalChange($event)"
-                      [disabled]="disabled()">
-                    <span>{{ 'advanced.labels.multimodal' | transloco }}</span>
-                  </label>
-                  @if (tacticalMultimodal() !== null) {
-                    <button type="button" class="reset-btn" (click)="tacticalMultimodal.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
-                  }
-                </div>
-              </div>
-            } @else {
-              <!-- Session: single model inference settings. The Reasoning
-                   select moved to the Settings tab's MODEL group
-                   (model-group.component.ts), which is the single session-mode
-                   writer of llm.reasoning_level. -->
-              <div class="field-row" [class.modified]="sessionTemperature() !== null">
-                <label class="field-label">
-                  {{ 'advanced.labels.temperature' | transloco: {value: effectiveSessionTemp()} }}
-                </label>
-                <div class="slider-row">
-                  <span class="slider-label">0</span>
-                  <input type="range" class="form-range" min="0" max="2" step="0.1"
-                    [ngModel]="sessionTemperature() ?? resolvedSessionTemp()"
-                    (ngModelChange)="onSessionTempChange($event)"
+              <div class="field-row" [class.modified]="reasoning() !== null">
+                <label class="field-label">{{ 'advanced.labels.reasoning' | transloco }}</label>
+                <div class="field-control">
+                  <select class="form-input"
+                    [ngModel]="reasoning() ?? resolvedReasoning()"
+                    appPinOnInteract (pin)="pinValue(reasoning, resolvedReasoning())"
+                    (ngModelChange)="onReasoningChange($event)"
                     [disabled]="disabled()">
-                  <span class="slider-label">2</span>
-                  @if (sessionTemperature() !== null) {
-                    <button type="button" class="reset-btn" (click)="sessionTemperature.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
+                    @for (opt of reasoningOptions(); track opt.value) {
+                      @if (opt.value === null) {
+                        <option [ngValue]="null">{{ opt.label }}</option>
+                      } @else {
+                        <option [value]="opt.value">{{ opt.label }}</option>
+                      }
+                    }
+                  </select>
+                  @if (reasoning() !== null) {
+                    <button type="button" class="reset-btn" (click)="reasoning.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                   }
                 </div>
-              </div>
-              <div class="field-row toggle-row" [class.modified]="sessionMultimodal() !== null">
-                <label class="toggle-label">
-                  <input type="checkbox"
-                    [checked]="sessionMultimodal() ?? resolvedSessionMultimodal()"
-                    (change)="onSessionMultimodalChange($event)"
-                    [disabled]="disabled()">
-                  <span>{{ 'advanced.labels.multimodal' | transloco }}</span>
-                </label>
-                @if (sessionMultimodal() !== null) {
-                  <button type="button" class="reset-btn" (click)="sessionMultimodal.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
-                }
               </div>
             }
+            <div class="field-row" [class.modified]="temperature() !== null">
+              <label class="field-label">
+                {{ 'advanced.labels.temperature' | transloco: {value: effectiveTemp()} }}
+              </label>
+              <div class="slider-row">
+                <span class="slider-label">0</span>
+                <input type="range" class="form-range" min="0" max="2" step="0.1"
+                  [ngModel]="temperature() ?? resolvedTemp()"
+                  (ngModelChange)="onTempChange($event)"
+                  [disabled]="disabled()">
+                <span class="slider-label">2</span>
+                @if (temperature() !== null) {
+                  <button type="button" class="reset-btn" (click)="temperature.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
+                }
+              </div>
+            </div>
+            <div class="field-row toggle-row" [class.modified]="multimodal() !== null">
+              <label class="toggle-label">
+                <input type="checkbox"
+                  [checked]="multimodal() ?? resolvedMultimodal()"
+                  (change)="onMultimodalChange($event)"
+                  [disabled]="disabled()">
+                <span>{{ 'advanced.labels.multimodal' | transloco }}</span>
+              </label>
+              @if (multimodal() !== null) {
+                <button type="button" class="reset-btn" (click)="multimodal.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
+              }
+            </div>
 
             <!-- Shared inference params -->
             <div class="shared-params">
@@ -415,6 +332,18 @@ import {ModelService} from '../../core/services/model.service';
                   }
                 </div>
               </div>
+              <div class="field-row" [class.modified]="vmDiskSize() !== null">
+                <label class="field-label">{{ 'advanced.labels.vmDiskSize' | transloco }}</label>
+                <div class="field-control">
+                  <input type="text" class="form-input compact-input" placeholder="20Gi"
+                    [ngModel]="vmDiskSize() ?? resolvedVmDiskSize()"
+                    (ngModelChange)="vmDiskSize.set($event); emitChange()"
+                    [disabled]="disabled()">
+                  @if (vmDiskSize() !== null) {
+                    <button type="button" class="reset-btn" (click)="vmDiskSize.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
+                  }
+                </div>
+              </div>
             }
             <div class="field-row" [class.modified]="maxReadWords() !== null">
               <label class="field-label">{{ 'advanced.labels.maxReadWords' | transloco }}</label>
@@ -525,7 +454,7 @@ import {ModelService} from '../../core/services/model.service';
         }
       </div>
 
-      <!-- Research & Browser -->
+      <!-- Research -->
       <div class="accordion-section" [class.expanded]="expanded().has('research')">
         <button type="button" class="accordion-header" (click)="toggleSection('research')">
           <app-icon size="md" class="accordion-icon">{{ expanded().has('research') ? 'expand_less' : 'expand_more' }}</app-icon>
@@ -543,30 +472,6 @@ import {ModelService} from '../../core/services/model.service';
               </label>
               @if (proxyEnabled() !== null) {
                 <button type="button" class="reset-btn" (click)="proxyEnabled.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
-              }
-            </div>
-            <div class="field-row toggle-row" [class.modified]="browserHeadless() !== null">
-              <label class="toggle-label">
-                <input type="checkbox"
-                  [checked]="browserHeadless() ?? resolvedBrowserHeadless()"
-                  (change)="onBrowserHeadlessChange($event)"
-                  [disabled]="disabled() || isLiteBackend()">
-                <span>{{ 'advanced.labels.browserHeadless' | transloco }}</span>
-              </label>
-              @if (browserHeadless() !== null) {
-                <button type="button" class="reset-btn" (click)="browserHeadless.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
-              }
-            </div>
-            <div class="field-row toggle-row" [class.modified]="browserVision() !== null">
-              <label class="toggle-label">
-                <input type="checkbox"
-                  [checked]="browserVision() ?? resolvedBrowserVision()"
-                  (change)="onBrowserVisionChange($event)"
-                  [disabled]="disabled() || isLiteBackend()">
-                <span>{{ 'advanced.labels.browserVision' | transloco }}</span>
-              </label>
-              @if (browserVision() !== null) {
-                <button type="button" class="reset-btn" (click)="browserVision.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
               }
             </div>
           </div>
@@ -628,7 +533,7 @@ import {ModelService} from '../../core/services/model.service';
         }
       </div>
 
-      <!-- Session-specific: idle timeout, greeting, claude code -->
+      <!-- Session-specific: idle timeout -->
       @if (mode() === 'session') {
         <div class="accordion-section" [class.expanded]="expanded().has('session')">
           <button type="button" class="accordion-header" (click)="toggleSection('session')">
@@ -649,18 +554,6 @@ import {ModelService} from '../../core/services/model.service';
                   }
                 </div>
                 <span class="field-hint">{{ 'advanced.hints.idleDisabled' | transloco }}</span>
-              </div>
-              <div class="field-row" [class.modified]="greeting() !== null">
-                <label class="field-label">{{ 'advanced.labels.greeting' | transloco }}</label>
-                <div class="field-control">
-                  <input type="text" class="form-input"
-                    [ngModel]="greeting() ?? resolvedGreeting()"
-                    (ngModelChange)="greeting.set($event); emitChange()"
-                    [disabled]="disabled()">
-                  @if (greeting() !== null) {
-                    <button type="button" class="reset-btn" (click)="greeting.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
-                  }
-                </div>
               </div>
             </div>
           }
@@ -716,24 +609,6 @@ import {ModelService} from '../../core/services/model.service';
     .accordion-body {
       padding: 12px 14px;
       background: var(--panel-bg, var(--panel-bg));
-    }
-    .phase-section {
-      margin-bottom: 16px;
-      padding-bottom: 12px;
-      border-bottom: 1px solid var(--border-color, var(--surface-0));
-    }
-    .phase-section:last-of-type {
-      border-bottom: none;
-      margin-bottom: 8px;
-    }
-    .phase-label {
-      display: block;
-      font-size: 11px;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-      color: var(--text-muted);
-      margin-bottom: 8px;
     }
     .shared-params {
       padding-top: 8px;
@@ -859,10 +734,10 @@ export class AdvancedAccordionComponent {
   disabled = input(false);
   /** Raw settings_matrix for model-family-aware defaults. */
   settingsMatrix = input<Record<string, Record<string, unknown>>>({});
-  /** The currently selected model(s), used for reasoning options. */
-  strategicModelOverride = input<string | null>(null);
-  tacticalModelOverride = input<string | null>(null);
-  sessionModelOverride = input<string | null>(null);
+  /** The model chosen in the Settings tab's MODEL group (null = inherit the
+   *  config default) — the ONE model since U1; drives the family-aware
+   *  defaults and the reasoning options. */
+  modelOverride = input<string | null>(null);
   /** The workspace backend chosen in the Settings tab's EXECUTION group, or
    *  null when it is unset there. The selector is a level-1 control and lives
    *  in ExecutionGroupComponent; this section reads it to grey the tools a lite
@@ -874,15 +749,11 @@ export class AdvancedAccordionComponent {
   // Accordion state
   readonly expanded = signal<Set<string>>(new Set());
 
-  // --- Inference params ---
-  readonly strategicReasoning = signal<string | null>(null);
-  readonly strategicTemperature = signal<number | null>(null);
-  readonly strategicMultimodal = signal<boolean | null>(null);
-  readonly tacticalReasoning = signal<string | null>(null);
-  readonly tacticalTemperature = signal<number | null>(null);
-  readonly tacticalMultimodal = signal<boolean | null>(null);
-  readonly sessionTemperature = signal<number | null>(null);
-  readonly sessionMultimodal = signal<boolean | null>(null);
+  // --- Inference params (one model, one section) ---
+  /** Job mode only — session mode's reasoning is owned by ModelGroupComponent. */
+  readonly reasoning = signal<string | null>(null);
+  readonly temperature = signal<number | null>(null);
+  readonly multimodal = signal<boolean | null>(null);
   readonly topP = signal<number | null>(null);
   readonly topK = signal<number | null>(null);
   readonly maxOutputTokens = signal<number | null>(null);
@@ -907,6 +778,7 @@ export class AdvancedAccordionComponent {
   private readonly modelService = inject(ModelService);
   readonly vmCpuCores = signal<number | null>(null);
   readonly vmMemory = signal<string | null>(null);
+  readonly vmDiskSize = signal<string | null>(null);
   readonly maxReadWords = signal<number | null>(null);
   readonly maxWriteWords = signal<number | null>(null);
   readonly gitVersioning = signal<boolean | null>(null);
@@ -919,8 +791,6 @@ export class AdvancedAccordionComponent {
 
   // --- Research ---
   readonly proxyEnabled = signal<boolean | null>(null);
-  readonly browserHeadless = signal<boolean | null>(null);
-  readonly browserVision = signal<boolean | null>(null);
 
   // --- Auxiliary ---
   readonly auxEnabled = signal<boolean | null>(null);
@@ -929,13 +799,17 @@ export class AdvancedAccordionComponent {
 
   // --- Session-specific ---
   readonly idleTimeout = signal<number | null>(null);
-  readonly greeting = signal<string | null>(null);
   // ===== Resolved defaults =====
-  // Resolution order: phase-specific config → matrix for effective model → base config → hardcoded.
+  // Resolution order: matrix for the effective model → base config → hardcoded.
   // The server sends raw config (no matrix baked in) + the raw settings_matrix.
   // The client resolves matrix values for the effective model (user override or config default).
 
-  private r(path: string): unknown { return readConfigPath(this.config(), path); }
+  // The config input may be a merged dict that still carries a pre-U1
+  // expert's per-phase tiers as stored; read it through the compat mapping so
+  // a legacy `llm.strategic` pin is THE model (and its params ride along).
+  private readonly normalizedConfig = computed(() => liftLegacyTiers(this.config(), {merged: true}));
+
+  private r(path: string): unknown { return readConfigPath(this.normalizedConfig(), path); }
 
   /** Look up a settings_matrix value for a model. Returns null if key not found. */
   private mv(model: string | null, key: string): unknown {
@@ -944,41 +818,22 @@ export class AdvancedAccordionComponent {
     return resolved[key] ?? null;
   }
 
-  // Effective models: user override falls back to config default.
-  private readonly effectiveStrategicModel = computed(() =>
-    this.strategicModelOverride() ?? (this.r('llm.strategic.model') as string) ?? (this.r('llm.model') as string) ?? null);
-  private readonly effectiveTacticalModel = computed(() =>
-    this.tacticalModelOverride() ?? (this.r('llm.tactical.model') as string) ?? (this.r('llm.model') as string) ?? null);
-  private readonly effectiveSessionModel = computed(() =>
-    this.sessionModelOverride() ?? (this.r('llm.model') as string) ?? null);
+  // Effective model: user override falls back to the config default.
+  private readonly effectiveModel = computed(() =>
+    this.modelOverride() ?? (this.r('llm.model') as string) ?? null);
 
-  readonly resolvedStrategicReasoning = computed(() => (this.r('llm.strategic.reasoning_level') ?? this.r('llm.reasoning_level')) as string | null);
-  readonly resolvedStrategicTemp = computed(() =>
-    (this.r('llm.strategic.temperature') ?? this.mv(this.effectiveStrategicModel(), 'temperature') ?? this.r('llm.temperature') ?? 0) as number);
-  readonly resolvedStrategicMultimodal = computed(() =>
-    (this.r('llm.strategic.multimodal') ?? this.mv(this.effectiveStrategicModel(), 'multimodal') ?? this.r('llm.multimodal') ?? false) as boolean);
-  readonly resolvedTacticalReasoning = computed(() => (this.r('llm.tactical.reasoning_level') ?? this.r('llm.reasoning_level')) as string | null);
-  readonly resolvedTacticalTemp = computed(() =>
-    (this.r('llm.tactical.temperature') ?? this.mv(this.effectiveTacticalModel(), 'temperature') ?? this.r('llm.temperature') ?? 0) as number);
-  readonly resolvedTacticalMultimodal = computed(() =>
-    (this.r('llm.tactical.multimodal') ?? this.mv(this.effectiveTacticalModel(), 'multimodal') ?? this.r('llm.multimodal') ?? false) as boolean);
-  readonly resolvedSessionTemp = computed(() =>
-    (this.mv(this.effectiveSessionModel(), 'temperature') ?? this.r('llm.temperature') ?? 0) as number);
-  readonly resolvedSessionMultimodal = computed(() =>
-    (this.mv(this.effectiveSessionModel(), 'multimodal') ?? this.r('llm.multimodal') ?? false) as boolean);
-  readonly resolvedTopP = computed(() => {
-    const model = this.mode() === 'session' ? this.effectiveSessionModel() : this.effectiveStrategicModel();
-    return (this.mv(model, 'top_p') ?? this.r('llm.top_p')) as number | null;
-  });
-  readonly resolvedTopK = computed(() => {
-    const model = this.mode() === 'session' ? this.effectiveSessionModel() : this.effectiveStrategicModel();
-    return (this.mv(model, 'top_k') ?? this.r('llm.top_k')) as number | null;
-  });
+  readonly resolvedReasoning = computed(() => this.r('llm.reasoning_level') as string | null);
+  readonly resolvedTemp = computed(() =>
+    (this.mv(this.effectiveModel(), 'temperature') ?? this.r('llm.temperature') ?? 0) as number);
+  readonly resolvedMultimodal = computed(() =>
+    (this.mv(this.effectiveModel(), 'multimodal') ?? this.r('llm.multimodal') ?? false) as boolean);
+  readonly resolvedTopP = computed(() =>
+    (this.mv(this.effectiveModel(), 'top_p') ?? this.r('llm.top_p')) as number | null);
+  readonly resolvedTopK = computed(() =>
+    (this.mv(this.effectiveModel(), 'top_k') ?? this.r('llm.top_k')) as number | null);
   readonly resolvedMaxOutputTokens = computed(() => this.r('llm.max_output_tokens') as number | null);
-  readonly resolvedParallelToolCalls = computed(() => {
-    const model = this.mode() === 'session' ? this.effectiveSessionModel() : this.effectiveStrategicModel();
-    return (this.mv(model, 'parallel_tool_calls') ?? this.r('llm.parallel_tool_calls') ?? false) as boolean;
-  });
+  readonly resolvedParallelToolCalls = computed(() =>
+    (this.mv(this.effectiveModel(), 'parallel_tool_calls') ?? this.r('llm.parallel_tool_calls') ?? false) as boolean);
 
   readonly resolvedMessageCountThreshold = computed(() => (this.r('limits.message_count_threshold') ?? 300) as number);
   readonly resolvedToolRetryCount = computed(() => (this.r('limits.tool_retry_count') ?? 3) as number);
@@ -995,6 +850,9 @@ export class AdvancedAccordionComponent {
   readonly resolvedWorkspaceBackend = computed(() => (this.r('workspace.backend') ?? 'sandbox') as string);
   readonly resolvedVmCpuCores = computed(() => (this.r('workspace.vm.cpu_cores') ?? 8) as number);
   readonly resolvedVmMemory = computed(() => (this.r('workspace.vm.memory') ?? '16Gi') as string);
+  // Empty means "the deployment's controller default" — the orchestrator omits
+  // disk_size from the VM create payload unless a job sets it.
+  readonly resolvedVmDiskSize = computed(() => (this.r('workspace.vm.disk_size') ?? '') as string);
   readonly resolvedMaxReadWords = computed(() => (this.r('workspace.max_read_words') ?? 25000) as number);
   readonly resolvedMaxWriteWords = computed(() => (this.r('workspace.max_write_words') ?? 10000) as number);
   readonly resolvedGitVersioning = computed(() => {
@@ -1020,44 +878,25 @@ export class AdvancedAccordionComponent {
   readonly resolvedSudoAction = computed(() => (this.r('shell.sudo_action') ?? 'freeze') as string);
 
   readonly resolvedProxyEnabled = computed(() => (this.r('research.proxy.enabled') ?? false) as boolean);
-  readonly resolvedBrowserHeadless = computed(() => (this.r('browser.headless') ?? true) as boolean);
-  readonly resolvedBrowserVision = computed(() => (this.r('browser.use_vision') ?? false) as boolean);
 
   readonly resolvedAuxEnabled = computed(() => (this.r('auxiliary.enabled') ?? true) as boolean);
   readonly resolvedAuxModel = computed(() => (this.r('auxiliary.model') ?? 'RedHatAI/gemma-4-31B-it-FP8-Dynamic') as string);
   readonly resolvedAuxTemperature = computed(() => (this.r('auxiliary.temperature') ?? 0) as number);
 
   readonly resolvedIdleTimeout = computed(() => (this.r('interactive.idle_timeout_minutes') ?? 30) as number);
-  readonly resolvedGreeting = computed(() => (this.r('interactive.greeting') ?? '') as string);
   // ===== Computed helpers =====
   readonly effectiveAuxEnabled = computed(() => this.auxEnabled() ?? this.resolvedAuxEnabled());
-  readonly effectiveStrategicTemp = computed(() => this.strategicTemperature() ?? this.resolvedStrategicTemp());
-  readonly effectiveTacticalTemp = computed(() => this.tacticalTemperature() ?? this.resolvedTacticalTemp());
-  readonly effectiveSessionTemp = computed(() => this.sessionTemperature() ?? this.resolvedSessionTemp());
+  readonly effectiveTemp = computed(() => this.temperature() ?? this.resolvedTemp());
   readonly effectiveAuxTemp = computed(() => this.auxTemperature() ?? this.resolvedAuxTemperature());
 
-  readonly strategicReasoningOptions = computed(() =>
-    reasoningOptionsForModel(
-      this.strategicModelOverride() ?? (this.r('llm.strategic.model') ?? this.r('llm.model')) as string | null,
-      this.modelService.reasoningByModel(),
-    )
-  );
-  readonly tacticalReasoningOptions = computed(() =>
-    reasoningOptionsForModel(
-      this.tacticalModelOverride() ?? (this.r('llm.tactical.model') ?? this.r('llm.model')) as string | null,
-      this.modelService.reasoningByModel(),
-    )
+  readonly reasoningOptions = computed(() =>
+    reasoningOptionsForModel(this.effectiveModel(), this.modelService.reasoningByModel()),
   );
   readonly inferenceModifiedCount = computed(() => {
     let c = 0;
-    if (this.strategicReasoning() !== null) c++;
-    if (this.strategicTemperature() !== null) c++;
-    if (this.strategicMultimodal() !== null) c++;
-    if (this.tacticalReasoning() !== null) c++;
-    if (this.tacticalTemperature() !== null) c++;
-    if (this.tacticalMultimodal() !== null) c++;
-    if (this.sessionTemperature() !== null) c++;
-    if (this.sessionMultimodal() !== null) c++;
+    if (this.reasoning() !== null) c++;
+    if (this.temperature() !== null) c++;
+    if (this.multimodal() !== null) c++;
     if (this.topP() !== null) c++;
     if (this.topK() !== null) c++;
     if (this.maxOutputTokens() !== null) c++;
@@ -1090,14 +929,9 @@ export class AdvancedAccordionComponent {
     return Math.round(Math.min(2, Math.max(0, value)) * 10) / 10;
   }
 
-  onStrategicReasoningChange(v: string | null): void { this.strategicReasoning.set(v); this.emitChange(); }
-  onStrategicTempChange(v: number): void { this.strategicTemperature.set(this.clampTemp(v)); this.emitChange(); }
-  onStrategicMultimodalChange(e: Event): void { this.strategicMultimodal.set((e.target as HTMLInputElement).checked); this.emitChange(); }
-  onTacticalReasoningChange(v: string | null): void { this.tacticalReasoning.set(v); this.emitChange(); }
-  onTacticalTempChange(v: number): void { this.tacticalTemperature.set(this.clampTemp(v)); this.emitChange(); }
-  onTacticalMultimodalChange(e: Event): void { this.tacticalMultimodal.set((e.target as HTMLInputElement).checked); this.emitChange(); }
-  onSessionTempChange(v: number): void { this.sessionTemperature.set(this.clampTemp(v)); this.emitChange(); }
-  onSessionMultimodalChange(e: Event): void { this.sessionMultimodal.set((e.target as HTMLInputElement).checked); this.emitChange(); }
+  onReasoningChange(v: string | null): void { this.reasoning.set(v); this.emitChange(); }
+  onTempChange(v: number): void { this.temperature.set(this.clampTemp(v)); this.emitChange(); }
+  onMultimodalChange(e: Event): void { this.multimodal.set((e.target as HTMLInputElement).checked); this.emitChange(); }
   onTopPChange(v: number | null): void { this.topP.set(v); this.emitChange(); }
   onTopKChange(v: number | null): void { this.topK.set(v); this.emitChange(); }
   onMaxOutputTokensChange(v: number | null): void { this.maxOutputTokens.set(v); this.emitChange(); }
@@ -1107,31 +941,18 @@ export class AdvancedAccordionComponent {
   onGitVersioningChange(e: Event): void { this.gitVersioning.set((e.target as HTMLInputElement).checked); this.emitChange(); }
   onShellSandboxChange(e: Event): void { this.shellSandbox.set((e.target as HTMLInputElement).checked); this.emitChange(); }
   onProxyEnabledChange(e: Event): void { this.proxyEnabled.set((e.target as HTMLInputElement).checked); this.emitChange(); }
-  onBrowserHeadlessChange(e: Event): void { this.browserHeadless.set((e.target as HTMLInputElement).checked); this.emitChange(); }
-  onBrowserVisionChange(e: Event): void { this.browserVision.set((e.target as HTMLInputElement).checked); this.emitChange(); }
   onAuxEnabledChange(e: Event): void { this.auxEnabled.set((e.target as HTMLInputElement).checked); this.emitChange(); }
   /** Build the advanced settings config_override fragment. */
   getOverrides(): Record<string, unknown> {
     const o: Record<string, unknown> = {};
     const llm: Record<string, unknown> = {};
 
-    if (this.mode() === 'job') {
-      const s: Record<string, unknown> = {};
-      if (this.strategicReasoning() !== null) s['reasoning_level'] = this.strategicReasoning();
-      if (this.strategicTemperature() !== null) s['temperature'] = this.strategicTemperature();
-      if (this.strategicMultimodal() !== null) s['multimodal'] = this.strategicMultimodal();
-      if (Object.keys(s).length) llm['strategic'] = s;
-
-      const t: Record<string, unknown> = {};
-      if (this.tacticalReasoning() !== null) t['reasoning_level'] = this.tacticalReasoning();
-      if (this.tacticalTemperature() !== null) t['temperature'] = this.tacticalTemperature();
-      if (this.tacticalMultimodal() !== null) t['multimodal'] = this.tacticalMultimodal();
-      if (Object.keys(t).length) llm['tactical'] = t;
-    } else {
-      // llm.reasoning_level is owned by ModelGroupComponent in session mode.
-      if (this.sessionTemperature() !== null) llm['temperature'] = this.sessionTemperature();
-      if (this.sessionMultimodal() !== null) llm['multimodal'] = this.sessionMultimodal();
-    }
+    // One model, one llm block (U1): the inference params ride on llm.* —
+    // never on a per-phase tier. llm.reasoning_level is owned by
+    // ModelGroupComponent in session mode.
+    if (this.mode() === 'job' && this.reasoning() !== null) llm['reasoning_level'] = this.reasoning();
+    if (this.temperature() !== null) llm['temperature'] = this.temperature();
+    if (this.multimodal() !== null) llm['multimodal'] = this.multimodal();
 
     if (this.topP() !== null) llm['top_p'] = this.topP();
     if (this.topK() !== null) llm['top_k'] = this.topK();
@@ -1172,6 +993,7 @@ export class AdvancedAccordionComponent {
       const vm: Record<string, unknown> = {};
       if (this.vmCpuCores() !== null) vm['cpu_cores'] = this.vmCpuCores();
       if (this.vmMemory() !== null) vm['memory'] = this.vmMemory();
+      if (this.vmDiskSize() !== null && this.vmDiskSize() !== '') vm['disk_size'] = this.vmDiskSize();
       if (Object.keys(vm).length) ws['vm'] = vm;
     }
     if (!this.isNoneBackend()) {
@@ -1191,15 +1013,12 @@ export class AdvancedAccordionComponent {
       if (Object.keys(sh).length) o['shell'] = sh;
     }
 
-    // Research & Browser — browser tools are gated off on lite tiers; the proxy
-    // toggle stays (web_search egress still applies).
+    // Research — the proxy toggle applies on every tier (web_search egress).
+    // The browser fragment that used to live here emitted `browser.headless` /
+    // `browser.use_vision`, knobs of the removed `browse_website` sub-agent;
+    // the live browser config is `browser.snapshot.*` / `browser.security.*`
+    // and vision is derived from the model's multimodal flag.
     if (this.proxyEnabled() !== null) o['research'] = { proxy: { enabled: this.proxyEnabled() } };
-    if (!lite) {
-      const br: Record<string, unknown> = {};
-      if (this.browserHeadless() !== null) br['headless'] = this.browserHeadless();
-      if (this.browserVision() !== null) br['use_vision'] = this.browserVision();
-      if (Object.keys(br).length) o['browser'] = br;
-    }
 
     // Auxiliary
     const aux: Record<string, unknown> = {};
@@ -1212,36 +1031,30 @@ export class AdvancedAccordionComponent {
     if (this.mode() === 'session') {
       const inter: Record<string, unknown> = {};
       if (this.idleTimeout() !== null) inter['idle_timeout_minutes'] = this.idleTimeout();
-      if (this.greeting() !== null) inter['greeting'] = this.greeting();
       if (Object.keys(inter).length) o['interactive'] = { ...(o['interactive'] as any ?? {}), ...inter };
     }
 
     return o;
   }
 
-  /** Prefill from expert config. */
+  /** Prefill from expert config. Job mode pins the config's inference values
+   *  (as it always has); session mode's inference fields stay inherited. A
+   *  pre-U1 fragment's `llm.strategic` block is read through the compat
+   *  mapping — its params ride into `llm.*`, never into a phase tier. */
   prefillFromConfig(config: Record<string, unknown>): void {
-    const llm = config['llm'] as Record<string, unknown> | undefined;
-    const strat = llm?.['strategic'] as Record<string, unknown> | undefined;
-    const tact = llm?.['tactical'] as Record<string, unknown> | undefined;
+    if (this.mode() !== 'job') return;
+    const lifted = liftLegacyTiers(config, {merged: true});
+    const llm = lifted['llm'] as Record<string, unknown> | undefined;
 
-    this.strategicReasoning.set((strat?.['reasoning_level'] as string) ?? (llm?.['reasoning_level'] as string) ?? null);
-    this.strategicTemperature.set((strat?.['temperature'] as number) ?? (llm?.['temperature'] as number) ?? null);
-    this.strategicMultimodal.set((strat?.['multimodal'] as boolean) ?? (llm?.['multimodal'] as boolean) ?? null);
-    this.tacticalReasoning.set((tact?.['reasoning_level'] as string) ?? (llm?.['reasoning_level'] as string) ?? null);
-    this.tacticalTemperature.set((tact?.['temperature'] as number) ?? (llm?.['temperature'] as number) ?? null);
-    this.tacticalMultimodal.set((tact?.['multimodal'] as boolean) ?? (llm?.['multimodal'] as boolean) ?? null);
+    this.reasoning.set((llm?.['reasoning_level'] as string) ?? null);
+    this.temperature.set((llm?.['temperature'] as number) ?? null);
+    this.multimodal.set((llm?.['multimodal'] as boolean) ?? null);
   }
 
   resetAll(): void {
-    this.strategicReasoning.set(null);
-    this.strategicTemperature.set(null);
-    this.strategicMultimodal.set(null);
-    this.tacticalReasoning.set(null);
-    this.tacticalTemperature.set(null);
-    this.tacticalMultimodal.set(null);
-    this.sessionTemperature.set(null);
-    this.sessionMultimodal.set(null);
+    this.reasoning.set(null);
+    this.temperature.set(null);
+    this.multimodal.set(null);
     this.topP.set(null);
     this.topK.set(null);
     this.maxOutputTokens.set(null);
@@ -1257,6 +1070,7 @@ export class AdvancedAccordionComponent {
     this.keepRecentMessages.set(null);
     this.vmCpuCores.set(null);
     this.vmMemory.set(null);
+    this.vmDiskSize.set(null);
     this.maxReadWords.set(null);
     this.maxWriteWords.set(null);
     this.gitVersioning.set(null);
@@ -1265,13 +1079,10 @@ export class AdvancedAccordionComponent {
     this.shellTimeout.set(null);
     this.sudoAction.set(null);
     this.proxyEnabled.set(null);
-    this.browserHeadless.set(null);
-    this.browserVision.set(null);
     this.auxEnabled.set(null);
     this.auxModel.set(null);
     this.auxTemperature.set(null);
     this.idleTimeout.set(null);
-    this.greeting.set(null);
     this.expanded.set(new Set());
   }
 }

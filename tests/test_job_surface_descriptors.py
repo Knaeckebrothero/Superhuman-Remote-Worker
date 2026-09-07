@@ -14,19 +14,19 @@ from typing import Any
 import httpx
 import pytest
 
-from orchestrator.mcp.capabilities import TOOL_CAPABILITIES
-from orchestrator.mcp.job_adapter import register_job_tools
-from src.shared.orch_surface.client import AsyncCockpitClient
-from src.shared.orch_surface.jobs import (
+from mcp_server.capabilities import TOOL_CAPABILITIES
+from mcp_server.job_adapter import register_job_tools
+from shared.orch_surface.client import AsyncCockpitClient
+from shared.orch_surface.jobs import (
     CallerCtx,
     JOB_DESCRIPTORS,
     JobToolResult,
     get_descriptor,
     make_bound_handler,
 )
-from src.tools.context import ToolContext
-from src.tools.orchestrator import jobs as jobs_module
-from src.tools.orchestrator.jobs import create_orchestrator_tools
+from agent.tools.context import ToolContext
+from agent.tools.orchestrator import jobs as jobs_module
+from agent.tools.orchestrator.jobs import create_orchestrator_tools
 
 
 ROOT = Path(__file__).parent.parent
@@ -151,19 +151,32 @@ def test_caller_context_scopes_only_one_trusted_project_binding() -> None:
     )
 
 
-def test_shared_surface_imports_only_stdlib_httpx_and_itself() -> None:
+def test_shared_surface_imports_only_stdlib_httpx_and_shared_contracts() -> None:
     violations: list[str] = []
+    shared_contracts = (
+        "shared.orch_surface",
+        "shared.runtime_actor",
+        "shared.job_outcome",
+        "shared.expert_reference",
+    )
     for path in SHARED_ROOT.rglob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
-                modules = [alias.name.split(".", 1)[0] for alias in node.names]
+                modules = [alias.name for alias in node.names]
             elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-                modules = [node.module.split(".", 1)[0]]
+                modules = [node.module]
             else:
                 continue
             for module in modules:
-                if module not in sys.stdlib_module_names and module != "httpx":
+                if (
+                    module.split(".", 1)[0] not in sys.stdlib_module_names
+                    and module.split(".", 1)[0] != "httpx"
+                    and not any(
+                        module == allowed or module.startswith(allowed + ".")
+                        for allowed in shared_contracts
+                    )
+                ):
                     violations.append(f"{path.relative_to(ROOT)} imports {module}")
     assert violations == []
 
@@ -195,8 +208,8 @@ def test_adapter_schemas_match_for_every_job_descriptor() -> None:
     script = """
 import asyncio
 import json
-from orchestrator.mcp.server import canonical_tool_schema
-from src.shared.orch_surface.jobs import JOB_DESCRIPTORS
+from mcp_server.server import canonical_tool_schema
+from shared.orch_surface.jobs import JOB_DESCRIPTORS
 
 async def main():
     tools, _ = await canonical_tool_schema()
@@ -539,7 +552,8 @@ def test_cockpit_generated_mirror_contains_every_canonical_name() -> None:
 
 def test_stored_config_migration_covers_every_hard_rename_and_config_store() -> None:
     source = (
-        ROOT / "orchestrator/database/migrations/app/0156_unified_job_tool_names.sql"
+        ROOT
+        / "src/orchestrator/database/migrations/app/0156_unified_job_tool_names.sql"
     ).read_text(encoding="utf-8")
     renames = {
         "create_worker_job": "create_job",
@@ -587,7 +601,7 @@ def test_active_runtime_config_and_cockpit_have_no_legacy_tool_names() -> None:
         "list_job_workspace_files",
     }
     offenders: list[str] = []
-    roots = (ROOT / "src", ROOT / "config", ROOT / "cockpit/src")
+    roots = (ROOT / "src" / "agent", ROOT / "config", ROOT / "cockpit/src")
     suffixes = {".py", ".yaml", ".yml", ".json", ".ts", ".html", ".md", ".txt"}
     for root in roots:
         for path in root.rglob("*"):

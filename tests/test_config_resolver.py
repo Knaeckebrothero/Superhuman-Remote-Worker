@@ -9,14 +9,16 @@ without an expert changes nothing.
 """
 
 import asyncio
+import copy
 
 from orchestrator.security.access import redact_config_override
 from orchestrator.services.config_resolver import (
     inject_blob_credentials,
     resolve_config,
 )
-from src.core.loader import (
+from shared.runtime.core.loader import (
     load_agent_config,
+    load_config_from_resolved,
     resolve_config_path,
     serialize_resolved_config,
 )
@@ -199,6 +201,42 @@ def test_credentials_injected_into_delivery_copy_only():
     assert "api_key" not in blob["agent"].get("llm", {})
 
 
+def test_research_credentials_reach_resolved_config_delivery_only():
+    """Per-dispatch search config must survive the resolved-blob delivery seam.
+
+    The hydrated agent reads this unknown top-level section through
+    ``AgentConfig.extra``. The persistable source blob must remain untouched so
+    provider credentials never enter dispatch state.
+    """
+    blob = resolve_config(base_config_name="persistent_defaults")
+    original_research = copy.deepcopy(blob["agent"].get("research"))
+
+    async def fake_injector(co):
+        co["research"] = {
+            "search": {
+                "provider": "searxng",
+                "base_url": "http://searxng.svc:8080",
+                "api_key": None,
+                "ops": ["search"],
+            }
+        }
+        return co
+
+    delivered = asyncio.run(inject_blob_credentials(blob, fake_injector))
+
+    assert delivered["agent"]["research"] == {
+        "search": {
+            "provider": "searxng",
+            "base_url": "http://searxng.svc:8080",
+            "api_key": None,
+            "ops": ["search"],
+        }
+    }
+    hydrated = load_config_from_resolved(delivered)
+    assert hydrated.extra["research"] == delivered["agent"]["research"]
+    assert blob["agent"].get("research") == original_research
+
+
 def test_redact_strips_secrets_from_blob_for_persist():
     """The persisted copy goes through redact_config_override (the canonical
     strip), which removes api_key / *_API_KEY anywhere while keeping non-secrets."""
@@ -217,10 +255,11 @@ def test_redact_strips_secrets_from_blob_for_persist():
 # --- fail-fast: transport-less pinned models (Option D) ---------------------
 
 
-def test_unrouted_model_slots_flags_transportless_phase_pin():
+def test_unrouted_model_slots_flags_transportless_summarization_pin():
     """A pinned model with NO base_url / api_key / provider after injection would
     silently fall back to api.openai.com and 401/404 (eec20eeb). Flag it so
-    dispatch can fail fast with an actionable error instead."""
+    dispatch can fail fast with an actionable error instead. Since U1 the
+    model-bearing slots are llm, llm.summarization and auxiliary."""
     from orchestrator.services.config_resolver import unrouted_model_slots
 
     blob = {
@@ -228,21 +267,48 @@ def test_unrouted_model_slots_flags_transportless_phase_pin():
             "llm": {
                 "model": "gemma",
                 "base_url": "http://router/v1",  # base: routed
-                "strategic": {"model": "gpt-5.5"},  # UNROUTED — no transport
-                "tactical": {  # routed via provider + key
-                    "model": "gpt-5.4-mini",
-                    "provider": "openai",
-                    "api_key": "sk-x",
-                },
+                "summarization": {"model": "gpt-5.5"},  # UNROUTED — no transport
             },
             "auxiliary": {"model": "aux", "base_url": "http://aux/v1"},  # routed
         }
     }
     problems = unrouted_model_slots(blob)
-    assert any("strategic" in p and "gpt-5.5" in p for p in problems)
-    assert not any("tactical" in p for p in problems)
+    assert any("summarization" in p and "gpt-5.5" in p for p in problems)
     assert not any(p.startswith("llm model") for p in problems)
     assert not any("auxiliary" in p for p in problems)
+
+    routed = {
+        "agent": {
+            "llm": {
+                "model": "gemma",
+                "base_url": "http://router/v1",
+                "summarization": {  # routed via provider + key
+                    "model": "gpt-5.4-mini",
+                    "provider": "openai",
+                    "api_key": "sk-x",
+                },
+            }
+        }
+    }
+    assert unrouted_model_slots(routed) == []
+
+
+def test_unrouted_model_slots_sees_lifted_legacy_pin_at_top_level():
+    """A legacy transport-less tactical pin in the request override is lifted
+    into llm.model by resolve_config, so the fail-fast names the TOP-LEVEL slot
+    (the nested phase check is gone with the tiers)."""
+    from orchestrator.services.config_resolver import unrouted_model_slots
+
+    blob = resolve_config(
+        base_config_name="defaults",
+        request_override={"llm": {"tactical": {"model": "orphan-pin"}}},
+        expert_type="worker",
+    )
+    assert blob["agent"]["llm"]["model"] == "orphan-pin"
+    assert "tactical" not in blob["agent"]["llm"]
+    problems = unrouted_model_slots(blob)
+    assert "llm model 'orphan-pin'" in problems
+    assert not any("tactical" in p for p in problems)
 
 
 def test_unrouted_model_slots_empty_when_all_routed():
@@ -254,10 +320,10 @@ def test_unrouted_model_slots_empty_when_all_routed():
 
 def test_unrouted_model_slots_ignores_slots_without_a_model():
     """Empty/absent model sections are not failures (the base may legitimately
-    omit a phase pin)."""
+    omit a summarization override)."""
     from orchestrator.services.config_resolver import unrouted_model_slots
 
-    blob = {"agent": {"llm": {"model": "m", "base_url": "u", "strategic": {}}}}
+    blob = {"agent": {"llm": {"model": "m", "base_url": "u", "summarization": {}}}}
     assert unrouted_model_slots(blob) == []
 
 
@@ -310,3 +376,318 @@ def test_no_per_model_window_falls_back_to_family_default():
     assert limits["context_threshold_tokens"] == int(
         limits["model_max_context_tokens"] * 0.80
     )
+
+
+# --- U1 WP2: role re-rooting, role-wins on root names, $ignore_keys pruning ---
+
+
+def test_worker_base_only_matches_load_agent_config():
+    """Worker twin of the fidelity guard: the worker root is expert_base +
+    the worker overlay, and the resolver's explicit-llm-key handling for that
+    pair must equal the agent's from_config path."""
+    path, dep = resolve_config_path("worker_base")
+    cfg = load_agent_config(path, dep)
+    expected = serialize_resolved_config(cfg, model=cfg.llm.model)
+
+    blob = resolve_config(base_config_name="worker_base", expert_type="worker")
+
+    assert blob["agent"] == expected["agent"]
+    assert blob["prompts"] == expected["prompts"]
+    assert blob["instructions"] == expected["instructions"]
+
+
+def test_session_expert_as_worker_gets_worker_keys():
+    """A session expert (assistant extends session_base) dispatched as a
+    worker re-roots onto the worker overlay: it gains the phase loop's keys."""
+    cap: dict = {}
+    blob = resolve_config(
+        base_config_name="assistant", expert_type="worker", capture=cap
+    )
+    merged = cap["merged_fragment"]
+    assert blob["agent"]["agent_id"] == "assistant"
+    assert merged["phase_settings"]["min_todos"] == 2
+    assert merged["autonomy"] == "review"
+    assert "next_phase_todos" in merged["tools"]["core"]
+    assert merged["llm"]["max_retries"] == 0
+
+
+def test_worker_expert_as_session_uses_session_overlay_and_drops_nothing():
+    cap: dict = {}
+    blob = resolve_config(
+        base_config_name="developer", expert_type="session", capture=cap
+    )
+    merged = cap["merged_fragment"]
+    assert blob["agent"]["agent_id"] == "developer"
+    assert merged["llm"]["max_retries"] == 3
+    assert "get_canvas" in merged["tools"]["canvas"]
+    assert merged["memory"]["pipeline"]["writers"][0] == "persistent_interval_extractor"
+    # expert wins: the developer's own keys survive, session-relevant or not
+    assert merged["tools"]["shell"]
+    assert merged["delegation"]["enabled"] is True
+
+
+def test_role_wins_over_a_root_base_name():
+    """The roots are one thing in different roles: a job that names
+    ``session_base`` resolves the worker base, and vice versa."""
+    worker = resolve_config(base_config_name="session_base", expert_type="worker")
+    assert worker["agent"]["agent_id"] == "worker_base"
+    session = resolve_config(base_config_name="worker_base", expert_type="session")
+    assert session["agent"]["agent_id"] == "session_base"
+    # a non-role expert_type keeps the chain's own root (call-site intent only)
+    as_is = resolve_config(base_config_name="session_base", expert_type="preview")
+    assert as_is["agent"]["agent_id"] == "session_base"
+
+
+def test_ignored_keys_pruned_after_request_layers():
+    """A job override re-adding a key the subagent role ignores is pruned
+    again after the request layers (pruning point 2 of 3)."""
+    cap: dict = {}
+    blob = resolve_config(
+        base_config_name="critic",
+        expert_type="subagent",
+        request_override={
+            "workspace": {"backend": "vm", "max_read_words": 123},
+            "autonomy": "full",
+            "verification": {"enabled": True},
+        },
+        capture=cap,
+    )
+    merged = cap["merged_fragment"]
+    assert "backend" not in merged["workspace"]
+    assert merged["workspace"]["max_read_words"] == 123  # not ignored: kept
+    assert "autonomy" not in merged and "verification" not in merged
+    assert merged["tools"]["shell"]  # the critic's own tools survive
+    assert "$ignore_keys" not in blob["agent"]
+    assert "verification" not in blob["agent"]
+
+
+def test_bundled_expert_base_layer_keeps_the_frameworks_explicit_llm_keys():
+    """Pre-split resolver behaviour, pinned: the framework base's own llm keys
+    (now authored across expert_base + the overlay) are explicit under a
+    bundled expert, so a family default does not clobber the base's
+    temperature at dispatch. (This differs from ``load_agent_config(expert)``,
+    where only the leaf's keys are explicit — a long-standing resolver
+    property the split must not silently change either way.)"""
+    blob = resolve_config(
+        base_config_name="developer",
+        request_override={"llm": {"model": "openai/minimax-m2.7"}},
+        expert_type="worker",
+    )
+    assert blob["agent"]["llm"]["model"] == "openai/minimax-m2.7"
+    assert blob["agent"]["llm"]["temperature"] == 0.0  # base-authored, kept
+    assert blob["agent"]["llm"]["top_p"] == 0.95  # matrix-owned, applied
+
+
+# --- U1 WP4: the roster at dispatch — prefetched DB rows, the drop policy ---
+
+_DB_HELPER = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+
+
+def test_roster_resolved_into_blob_with_db_ref():
+    """A UUID `$ref` is materialised from the caller's prefetched row (keys
+    matched case-insensitively): the row's fragment, prompts (inlined, fenced)
+    and tags land on the entry, parent-only keys are pruned, the entry's own
+    `inherit` still wins over the target's pin, and the PDP capture sees the
+    materialised entry — never `{$ref: <uuid>}`."""
+    helper_row = {
+        "id": _DB_HELPER,
+        "name": "db-helper",
+        "expert_type": "worker",
+        "display_name": "DB Helper",
+        "tags": ["helper", "worker"],
+        "config": {
+            "llm": {"model": "helper-model"},
+            "tools": {"workspace": ["read_file"]},
+            "autonomy": "full",
+        },
+        "prompts": {"persona": "HELPER-PERSONA"},
+    }
+    parent = {
+        "expert_type": "worker",
+        "name": "lead",
+        "config": {
+            "llm": {"model": "lead-model"},
+            "subagents": {
+                "default": "helper",
+                "roster": {
+                    "helper": {"$ref": _DB_HELPER},
+                    "twin": {"$ref": _DB_HELPER.upper(), "llm": {"model": "inherit"}},
+                },
+            },
+        },
+        "prompts": {},
+    }
+    cap: dict = {}
+    blob = resolve_config(
+        base_config_name="worker_base",
+        expert_row=parent,
+        expert_type="worker",
+        capture=cap,
+        db_refs={_DB_HELPER: helper_row},
+    )
+    agent = blob["agent"]
+    roster = agent["subagents"]["roster"]
+    assert set(roster) == {"helper", "twin"}
+    helper = roster["helper"]
+    assert helper["_ref"] == _DB_HELPER
+    assert helper["_ref_kind"] == "db" and helper["_ref_name"] == "db-helper"
+    assert helper["agent_id"] == "helper" and helper["display_name"] == "DB Helper"
+    assert helper["tags"] == ["helper", "worker"]
+    assert helper["llm"]["model"] == "helper-model"
+    assert helper["tools"]["workspace"] == ["read_file"]
+    assert helper["prompts"]["persona"] == "HELPER-PERSONA"
+    assert helper["_persona_source"] == "db" and helper["_db_prompt_keys"] == [
+        "persona"
+    ]
+    assert "autonomy" not in helper  # parent-only, pruned on the subagent overlay
+    twin = roster["twin"]
+    assert twin["llm"]["model"] == "lead-model" and twin["llm"]["_inherit_llm"] is True
+    assert agent["subagents"]["default"] == "helper"
+    assert "_roster_warnings" not in agent
+    captured = cap["merged_fragment"]["subagents"]["roster"]["helper"]
+    assert captured["tools"]["workspace"] == ["read_file"] and "$ref" not in captured
+
+
+def test_unresolvable_ref_dropped_with_warning(caplog):
+    """Dispatch never fails a job over its roster: a DB ref nobody prefetched
+    and an unknown disk ref are dropped, logged, and recorded in
+    `agent._roster_warnings`; the rest of the roster and the blob survive."""
+    import logging
+
+    from shared.runtime.core.loader import load_config_from_resolved
+
+    parent = {
+        "expert_type": "worker",
+        "name": "lead",
+        "config": {
+            "llm": {"model": "lead-model"},
+            "subagents": {
+                "roster": {
+                    "ghost": {"$ref": _DB_HELPER},
+                    "nope": {"$ref": "no-such-expert"},
+                    "explorer": {"$ref": "subagents/explorer"},
+                }
+            },
+        },
+        "prompts": {},
+    }
+    with caplog.at_level(logging.WARNING, logger="shared.runtime.core.subagent_roster"):
+        blob = resolve_config(
+            base_config_name="worker_base",
+            expert_row=parent,
+            expert_type="worker",
+            db_refs={},  # nothing prefetched
+        )
+    agent = blob["agent"]
+    assert set(agent["subagents"]["roster"]) == {"explorer"}
+    warnings = agent["_roster_warnings"]
+    assert any("subagents.roster.ghost" in w and _DB_HELPER in w for w in warnings)
+    assert any("subagents.roster.nope" in w and "no-such-expert" in w for w in warnings)
+    assert any("subagents.roster.ghost" in r.getMessage() for r in caplog.records)
+    cfg = load_config_from_resolved(blob)
+    assert set(cfg.subagents.roster) == {"explorer"}
+    assert cfg.extra["_roster_warnings"] == warnings
+
+
+# --- U2 WP2/WP6: the phase-skill floor and single worker path ----------------
+
+
+def _phase_bindings(entries):
+    return [
+        e for e in entries if e.get("skill") in ("strategic-phase", "tactical-phase")
+    ]
+
+
+def test_worker_resolution_restores_the_phase_skill_bindings_an_expert_replaced():
+    """``instruction_files`` replaces wholesale on merge; the assistant (a
+    session expert) authors its own list. Dispatched as a worker it must still
+    carry the two phase bindings — they replaced the unconditional system-prompt
+    swap — restored at the front, frozen in the blob, visible to the PDP."""
+    from shared.runtime.core.loader import load_config_from_resolved
+
+    cap: dict = {}
+    blob = resolve_config(
+        base_config_name="assistant", expert_type="worker", capture=cap
+    )
+    entries = blob["agent"]["instruction_files"]
+    assert [e["skill"] for e in entries[:2]] == ["strategic-phase", "tactical-phase"]
+    assert [e["trigger"] for e in entries[:2]] == [
+        "phase_start:strategic",
+        "phase_start:tactical",
+    ]
+    assert all(e["enforce"] is False for e in entries[:2])
+    # The assistant's own bindings survive behind them.
+    assert any(e["skill"] == "cite-as-you-write" for e in entries[2:])
+    assert [e["skill"] for e in cap["merged_fragment"]["instruction_files"][:2]] == [
+        "strategic-phase",
+        "tactical-phase",
+    ]
+    assert blob["instructions"]["strategic-phase"].startswith(
+        "---\nname: strategic-phase"
+    )
+    cfg = load_config_from_resolved(blob)
+    assert {e.path for e in cfg.instruction_files} >= {
+        "skills/strategic-phase/SKILL.md",
+        "skills/tactical-phase/SKILL.md",
+    }
+    # An expert that already carries them is left alone (no duplicates).
+    dev = resolve_config(base_config_name="developer", expert_type="worker")
+    assert len(_phase_bindings(dev["agent"]["instruction_files"])) == 2
+    # Sessions have no phase loop: no floor there.
+    session = resolve_config(base_config_name="assistant", expert_type="session")
+    assert _phase_bindings(session["agent"]["instruction_files"]) == []
+
+
+def test_a_db_expert_forked_before_u2_gets_the_phase_bindings_back():
+    row = {
+        "expert_type": "worker",
+        "name": "old-fork",
+        "config": {
+            "instruction_files": [
+                {"skill": "todo-guide", "trigger": "before_tool:next_phase_todos"}
+            ]
+        },
+        "prompts": {"strategic": "FORK STRATEGIC ADDENDUM"},
+    }
+    blob = resolve_config(
+        base_config_name="worker_base", expert_type="worker", expert_row=row
+    )
+    entries = blob["agent"]["instruction_files"]
+    assert [e["skill"] for e in entries] == [
+        "strategic-phase",
+        "tactical-phase",
+        "todo-guide",
+    ]
+    # The DB prompt keeps its key and its DB-authored marker: at delivery it is
+    # the fenced <expert_workflow> addendum of the strategic block.
+    assert blob["prompts"]["strategic"] == "FORK STRATEGIC ADDENDUM"
+    assert blob["agent"]["_db_prompt_keys"] == ["strategic"]
+
+
+def test_retired_phase_mode_override_keys_are_ignored_and_floor_is_kept():
+    from shared.runtime.core.loader import load_config_from_resolved
+
+    blob = resolve_config(
+        base_config_name="assistant",
+        expert_type="worker",
+        request_override={
+            "phase_settings": {
+                "prompt_mode": "legacy",
+                "tool_binding_mode": "union",
+            }
+        },
+    )
+    assert set(blob["agent"]["phase_settings"]) == {"min_todos", "max_todos"}
+    assert blob["agent"]["phase_settings"]["min_todos"] == 2
+    assert len(_phase_bindings(blob["agent"]["instruction_files"])) == 2
+    hydrated = load_config_from_resolved(blob)
+    assert not hasattr(hydrated.phase_settings, "prompt_mode")
+    assert not hasattr(hydrated.phase_settings, "tool_binding_mode")
+
+
+def test_new_worker_blob_has_no_phase_prompt_segments_or_mode_keys():
+    blob = resolve_config(base_config_name="developer", expert_type="worker")
+    assert set(blob["agent"]["phase_settings"]) == {"min_todos", "max_todos"}
+    assert "strategic" not in blob["prompts"]
+    assert "tactical" not in blob["prompts"]
+    assert len(_phase_bindings(blob["agent"]["instruction_files"])) == 2

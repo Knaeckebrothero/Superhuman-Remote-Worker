@@ -3,19 +3,13 @@
 from __future__ import annotations
 
 import json
-import sys
-from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
-project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-
-from src.tools.context import ToolContext  # noqa: E402
-from src.tools.orchestrator import create_orchestrator_tools  # noqa: E402
-from src.tools.registry import get_tools_by_category  # noqa: E402
+from agent.tools.context import ToolContext  # noqa: E402
+from agent.tools.orchestrator import create_orchestrator_tools  # noqa: E402
+from agent.tools.registry import get_tools_by_category  # noqa: E402
 
 
 def _tool_by_name(tools, name):
@@ -110,7 +104,9 @@ async def test_list_experts_filters_visible_catalog(monkeypatch):
             ]
         }
     )
-    monkeypatch.setattr("src.tools.orchestrator.catalog._get_client", lambda **kw: cap)
+    monkeypatch.setattr(
+        "agent.tools.orchestrator.catalog._get_client", lambda **kw: cap
+    )
 
     tools = create_orchestrator_tools(ToolContext(user_id="user-xyz"))
     list_experts = _tool_by_name(tools, "list_experts")
@@ -150,7 +146,9 @@ async def test_get_expert_summarizes_detail(monkeypatch):
             }
         }
     )
-    monkeypatch.setattr("src.tools.orchestrator.catalog._get_client", lambda **kw: cap)
+    monkeypatch.setattr(
+        "agent.tools.orchestrator.catalog._get_client", lambda **kw: cap
+    )
 
     tools = create_orchestrator_tools(ToolContext(user_id="user-xyz"))
     get_expert = _tool_by_name(tools, "get_expert")
@@ -191,7 +189,9 @@ async def test_search_skills_filters_catalog(monkeypatch):
             ]
         }
     )
-    monkeypatch.setattr("src.tools.orchestrator.catalog._get_client", lambda **kw: cap)
+    monkeypatch.setattr(
+        "agent.tools.orchestrator.catalog._get_client", lambda **kw: cap
+    )
 
     tools = create_orchestrator_tools(ToolContext(user_id="user-xyz"))
     search_skills = _tool_by_name(tools, "search_skills")
@@ -222,7 +222,9 @@ async def test_get_skill_shows_file_index_and_skill_preview(monkeypatch):
             }
         }
     )
-    monkeypatch.setattr("src.tools.orchestrator.catalog._get_client", lambda **kw: cap)
+    monkeypatch.setattr(
+        "agent.tools.orchestrator.catalog._get_client", lambda **kw: cap
+    )
 
     tools = create_orchestrator_tools(ToolContext(user_id="user-xyz"))
     get_skill = _tool_by_name(tools, "get_skill")
@@ -256,7 +258,9 @@ async def test_get_expert_bundle_returns_portable_json(monkeypatch):
             }
         }
     )
-    monkeypatch.setattr("src.tools.orchestrator.catalog._get_client", lambda **kw: cap)
+    monkeypatch.setattr(
+        "agent.tools.orchestrator.catalog._get_client", lambda **kw: cap
+    )
 
     tools = create_orchestrator_tools(ToolContext(user_id="user-xyz"))
     get_expert_bundle = _tool_by_name(tools, "get_expert_bundle")
@@ -276,7 +280,9 @@ async def test_set_expert_bundle_update_sends_only_editable_fields(monkeypatch):
     expert_id = "11111111-1111-1111-1111-111111111111"
     url = f"http://localhost:8085/api/experts/{expert_id}"
     cap = _CapturingClient({url: {"id": expert_id}})
-    monkeypatch.setattr("src.tools.orchestrator.catalog._get_client", lambda **kw: cap)
+    monkeypatch.setattr(
+        "agent.tools.orchestrator.catalog._get_client", lambda **kw: cap
+    )
 
     tools = create_orchestrator_tools(ToolContext(user_id="user-xyz"))
     set_expert_bundle = _tool_by_name(tools, "set_expert_bundle")
@@ -315,7 +321,9 @@ async def test_set_expert_bundle_update_sends_only_editable_fields(monkeypatch):
 @pytest.mark.asyncio
 async def test_set_skill_bundle_dry_run_validates_file_tree(monkeypatch):
     cap = _CapturingClient()
-    monkeypatch.setattr("src.tools.orchestrator.catalog._get_client", lambda **kw: cap)
+    monkeypatch.setattr(
+        "agent.tools.orchestrator.catalog._get_client", lambda **kw: cap
+    )
 
     tools = create_orchestrator_tools(ToolContext(user_id="user-xyz"))
     set_skill_bundle = _tool_by_name(tools, "set_skill_bundle")
@@ -362,7 +370,7 @@ class TestFalseIsLegibleToTheAgent:
 
     @staticmethod
     def _lines(tools: dict) -> str:
-        from src.tools.orchestrator.catalog import _format_expert_detail
+        from agent.tools.orchestrator.catalog import _format_expert_detail
 
         return _format_expert_detail("e1", {"id": "e1", "config": {"tools": tools}})
 

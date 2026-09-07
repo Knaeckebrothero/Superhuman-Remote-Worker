@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.shared.pinned_session_identity import (
+from shared.pinned_session_identity import (
     PINNED_SESSION_READY_IDENTITY_CONTRACT,
     PinnedSessionBinding,
     pinned_session_ready_identity_fingerprint,
@@ -66,6 +66,7 @@ def _binding(**overrides: object) -> PinnedSessionBinding:
         "agent_id": AGENT_ID,
         "runtime_attach_token": ATTACH_TOKEN,
         "agent_hostname": "agent-pinned-1",
+        "pod_namespace": "srw",
         "pod_uid": POD_UID,
         "pod_ip": "10.42.0.17",
         "pod_port": 8001,
@@ -87,9 +88,11 @@ def test_pinned_binding_freezes_full_route_target_without_repr_secret() -> None:
         AGENT_ID,
         ATTACH_TOKEN,
         "agent-pinned-1",
+        "srw",
         POD_UID,
         "10.42.0.17",
         8001,
+        "provisioned",
     )
     assert ATTACH_TOKEN not in repr(binding)
     assert _binding(agent_status="working").target_key == binding.target_key
@@ -104,6 +107,9 @@ def test_pinned_binding_freezes_full_route_target_without_repr_secret() -> None:
         ("runtime_attach_token", "bad"),
         ("agent_hostname", ""),
         ("agent_hostname", " padded"),
+        ("pod_namespace", ""),
+        ("pod_namespace", "Invalid_Namespace"),
+        ("pod_namespace", "-invalid"),
         ("pod_uid", "bad\0uid"),
         ("pod_uid", {"not": "text"}),
         ("pod_ip", ""),
@@ -113,6 +119,7 @@ def test_pinned_binding_freezes_full_route_target_without_repr_secret() -> None:
         ("pod_port", 0),
         ("pod_port", 65_536),
         ("agent_status", ""),
+        ("pod_authority_kind", "foreign"),
     ],
 )
 def test_pinned_binding_rejects_malformed_joined_coordinates(

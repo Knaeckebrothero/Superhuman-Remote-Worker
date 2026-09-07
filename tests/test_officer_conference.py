@@ -10,13 +10,14 @@ enqueues the coalescing `conference` brief wake. Live delivery is k3d-smoke
 territory, as with the substrate suite.
 """
 
+import json
 import uuid
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-import main
+import orchestrator.main
 
 OFFICER_TID = str(uuid.uuid4())
 CONF_TID = str(uuid.uuid4())
@@ -24,7 +25,7 @@ PROJECT_ID = str(uuid.uuid4())
 
 
 def _officer_row(hold=None, officer_state=None, **over):
-    officer = {"enabled": True, "max_pages_per_day": 3}
+    officer = {"enabled": True}
     if hold is not None:
         officer["hold"] = hold
     metadata = {"config_override": {"officer": officer}}
@@ -54,13 +55,16 @@ def _conference_row(status="active"):
 
 class TestConferencePredicate:
     def test_conference_thread_detected(self):
-        assert main._thread_is_conference(_conference_row()) is True
+        assert orchestrator.main._thread_is_conference(_conference_row()) is True
 
     def test_officer_thread_is_not_a_conference(self):
-        assert main._thread_is_conference(_officer_row()) is False
+        assert orchestrator.main._thread_is_conference(_officer_row()) is False
 
     def test_ordinary_thread_is_not_a_conference(self):
-        assert main._thread_is_conference({"id": "x", "metadata": {}}) is False
+        assert (
+            orchestrator.main._thread_is_conference({"id": "x", "metadata": {}})
+            is False
+        )
 
 
 class TestHoldStamp:
@@ -72,12 +76,12 @@ class TestHoldStamp:
             return_value={"thread": _officer_row(), "routes": []}
         )
         db.get_thread = AsyncMock(return_value=_officer_row())
-        monkeypatch.setattr(main, "postgres_db", db)
-        from services import session_wake as sw
+        monkeypatch.setattr(orchestrator.main, "postgres_db", db)
+        from orchestrator.services import session_wake as sw
 
         monkeypatch.setattr(sw, "_resolve_live_agent", AsyncMock(return_value=None))
 
-        await main._hold_officer_for_conference(PROJECT_ID, CONF_TID)
+        await orchestrator.main._hold_officer_for_conference(PROJECT_ID, CONF_TID)
         db.set_project_officer_hold.assert_awaited_once()
         args, kwargs = db.set_project_officer_hold.await_args
         assert args == (PROJECT_ID,)
@@ -92,8 +96,8 @@ class TestHoldStamp:
         db = SimpleNamespace()
         db.get_officer_thread_for_project = AsyncMock(return_value=None)
         db.set_project_officer_hold = AsyncMock()
-        monkeypatch.setattr(main, "postgres_db", db)
-        await main._hold_officer_for_conference(PROJECT_ID, CONF_TID)
+        monkeypatch.setattr(orchestrator.main, "postgres_db", db)
+        await orchestrator.main._hold_officer_for_conference(PROJECT_ID, CONF_TID)
         db.set_project_officer_hold.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -103,8 +107,8 @@ class TestHoldStamp:
             return_value={"id": CONF_TID, "metadata": {}}
         )
         db.set_project_officer_hold = AsyncMock()
-        monkeypatch.setattr(main, "postgres_db", db)
-        await main._hold_officer_for_conference(PROJECT_ID, CONF_TID)
+        monkeypatch.setattr(orchestrator.main, "postgres_db", db)
+        await orchestrator.main._hold_officer_for_conference(PROJECT_ID, CONF_TID)
         db.set_project_officer_hold.assert_not_awaited()
 
 
@@ -118,11 +122,13 @@ class TestConferenceConclude:
             return_value={"thread": _officer_row(), "routes": []}
         )
         db.enqueue_session_wake_event = AsyncMock(return_value=True)
-        monkeypatch.setattr(main, "postgres_db", db)
+        monkeypatch.setattr(orchestrator.main, "postgres_db", db)
         kick = MagicMock()
-        monkeypatch.setattr(main, "_kick_officer_event_drain", kick)
+        monkeypatch.setattr(orchestrator.main, "_kick_officer_event_drain", kick)
 
-        await main._conclude_conference_if_any(_conference_row(status="ended"))
+        await orchestrator.main._conclude_conference_if_any(
+            _conference_row(status="ended")
+        )
 
         db.set_project_officer_hold.assert_awaited_once_with(
             PROJECT_ID,
@@ -145,10 +151,12 @@ class TestConferenceConclude:
         db.get_officer_thread_for_project = AsyncMock(return_value=held)
         db.set_project_officer_hold = AsyncMock()
         db.enqueue_session_wake_event = AsyncMock(return_value=True)
-        monkeypatch.setattr(main, "postgres_db", db)
-        monkeypatch.setattr(main, "_kick_officer_event_drain", MagicMock())
+        monkeypatch.setattr(orchestrator.main, "postgres_db", db)
+        monkeypatch.setattr(orchestrator.main, "_kick_officer_event_drain", MagicMock())
 
-        await main._conclude_conference_if_any(_conference_row(status="ended"))
+        await orchestrator.main._conclude_conference_if_any(
+            _conference_row(status="ended")
+        )
         db.set_project_officer_hold.assert_not_awaited()
         db.enqueue_session_wake_event.assert_awaited_once()
 
@@ -156,8 +164,8 @@ class TestConferenceConclude:
     async def test_ordinary_session_noop(self, monkeypatch):
         db = SimpleNamespace()
         db.get_officer_thread_for_project = AsyncMock()
-        monkeypatch.setattr(main, "postgres_db", db)
-        await main._conclude_conference_if_any(
+        monkeypatch.setattr(orchestrator.main, "postgres_db", db)
+        await orchestrator.main._conclude_conference_if_any(
             {"id": CONF_TID, "project_id": PROJECT_ID, "metadata": {}}
         )
         db.get_officer_thread_for_project.assert_not_awaited()
@@ -166,15 +174,17 @@ class TestConferenceConclude:
     async def test_never_raises(self, monkeypatch):
         db = SimpleNamespace()
         db.get_officer_thread_for_project = AsyncMock(side_effect=RuntimeError("db"))
-        monkeypatch.setattr(main, "postgres_db", db)
-        await main._conclude_conference_if_any(_conference_row())  # no raise
+        monkeypatch.setattr(orchestrator.main, "postgres_db", db)
+        await orchestrator.main._conclude_conference_if_any(
+            _conference_row()
+        )  # no raise
 
 
 class TestWatchdogHold:
     @pytest.fixture(autouse=True)
     def _runtime_authorization_is_healthy(self, monkeypatch):
         monkeypatch.setattr(
-            main,
+            orchestrator.main,
             "_maintain_officer_runtime_authorization",
             AsyncMock(return_value=SimpleNamespace(authorized=True)),
         )
@@ -184,11 +194,13 @@ class TestWatchdogHold:
         held = _officer_row(hold={"kind": "conference", "thread_id": CONF_TID})
         db = SimpleNamespace()
         db.get_thread = AsyncMock(return_value=_conference_row(status="active"))
-        monkeypatch.setattr(main, "postgres_db", db)
+        monkeypatch.setattr(orchestrator.main, "postgres_db", db)
         maintain = AsyncMock()
-        monkeypatch.setattr(main, "_maintain_officer_runtime_authorization", maintain)
+        monkeypatch.setattr(
+            orchestrator.main, "_maintain_officer_runtime_authorization", maintain
+        )
 
-        await main._officer_watchdog_check_one(held, SimpleNamespace())
+        await orchestrator.main._officer_watchdog_check_one(held, SimpleNamespace())
 
         maintain.assert_awaited_once_with(held)
 
@@ -198,11 +210,11 @@ class TestWatchdogHold:
         db = SimpleNamespace()
         db.get_thread = AsyncMock(return_value=_conference_row(status="active"))
         db.enqueue_session_wake_event = AsyncMock()
-        monkeypatch.setattr(main, "postgres_db", db)
+        monkeypatch.setattr(orchestrator.main, "postgres_db", db)
         conclude = AsyncMock()
-        monkeypatch.setattr(main, "_conclude_conference_if_any", conclude)
+        monkeypatch.setattr(orchestrator.main, "_conclude_conference_if_any", conclude)
 
-        await main._officer_watchdog_check_one(held, SimpleNamespace())
+        await orchestrator.main._officer_watchdog_check_one(held, SimpleNamespace())
         conclude.assert_not_awaited()
         db.enqueue_session_wake_event.assert_not_awaited()
 
@@ -212,11 +224,11 @@ class TestWatchdogHold:
         ended_conf = _conference_row(status="ended")
         db = SimpleNamespace()
         db.get_thread = AsyncMock(return_value=ended_conf)
-        monkeypatch.setattr(main, "postgres_db", db)
+        monkeypatch.setattr(orchestrator.main, "postgres_db", db)
         conclude = AsyncMock()
-        monkeypatch.setattr(main, "_conclude_conference_if_any", conclude)
+        monkeypatch.setattr(orchestrator.main, "_conclude_conference_if_any", conclude)
 
-        await main._officer_watchdog_check_one(held, SimpleNamespace())
+        await orchestrator.main._officer_watchdog_check_one(held, SimpleNamespace())
         conclude.assert_awaited_once_with(ended_conf)
 
     @pytest.mark.asyncio
@@ -227,11 +239,11 @@ class TestWatchdogHold:
         suspended = _conference_row(status="suspended")
         db = SimpleNamespace()
         db.get_thread = AsyncMock(return_value=suspended)
-        monkeypatch.setattr(main, "postgres_db", db)
+        monkeypatch.setattr(orchestrator.main, "postgres_db", db)
         conclude = AsyncMock()
-        monkeypatch.setattr(main, "_conclude_conference_if_any", conclude)
+        monkeypatch.setattr(orchestrator.main, "_conclude_conference_if_any", conclude)
 
-        await main._officer_watchdog_check_one(held, SimpleNamespace())
+        await orchestrator.main._officer_watchdog_check_one(held, SimpleNamespace())
         conclude.assert_awaited_once_with(suspended)
 
     @pytest.mark.asyncio
@@ -242,9 +254,9 @@ class TestWatchdogHold:
         db.set_project_officer_hold = AsyncMock(
             return_value={"thread": _officer_row(), "routes": []}
         )
-        monkeypatch.setattr(main, "postgres_db", db)
+        monkeypatch.setattr(orchestrator.main, "postgres_db", db)
 
-        await main._officer_watchdog_check_one(held, SimpleNamespace())
+        await orchestrator.main._officer_watchdog_check_one(held, SimpleNamespace())
         db.set_project_officer_hold.assert_awaited_once_with(
             PROJECT_ID,
             expected_thread_id=OFFICER_TID,
@@ -259,16 +271,16 @@ class TestReasoningLevelBridge:
 
     def test_accepts_known_levels(self):
         for level in ("low", "medium", "high", "xhigh", "max", "none"):
-            assert main._validated_reasoning_level(level) == level
+            assert orchestrator.main._validated_reasoning_level(level) == level
 
     def test_normalizes_case_and_whitespace(self):
-        assert main._validated_reasoning_level("  XHigh ") == "xhigh"
+        assert orchestrator.main._validated_reasoning_level("  XHigh ") == "xhigh"
 
     def test_rejects_garbage(self):
         from fastapi import HTTPException
 
         with pytest.raises(HTTPException):
-            main._validated_reasoning_level("ultra")
+            orchestrator.main._validated_reasoning_level("ultra")
 
 
 def _with_correctness_health(db):
@@ -306,17 +318,21 @@ class TestOfficerSummaryEndpoint:
         )
         db.get_project_officer_lineage = AsyncMock(return_value=[])
         db.get_user_role_in_project = AsyncMock(return_value=role)
-        monkeypatch.setattr(main, "postgres_db", db)
+        monkeypatch.setattr(orchestrator.main, "postgres_db", db)
         monkeypatch.setattr(
-            main,
+            orchestrator.main,
             "require_project_member",
             AsyncMock(return_value=({"id": "user-1", "is_admin": is_admin}, {})),
         )
         monkeypatch.setattr(
-            main, "_find_open_conference_thread", AsyncMock(return_value=None)
+            orchestrator.main,
+            "_find_open_conference_thread",
+            AsyncMock(return_value=None),
         )
 
-        out = await main.get_project_officer_summary(MagicMock(), PROJECT_ID)
+        out = await orchestrator.main.get_project_officer_summary(
+            MagicMock(), PROJECT_ID
+        )
 
         assert out["can_manage"] is expected
         if is_admin:
@@ -329,13 +345,7 @@ class TestOfficerSummaryEndpoint:
         from datetime import datetime, timezone
 
         today = datetime.now(timezone.utc).date().isoformat()
-        officer = _officer_row(
-            officer_state={
-                "pages": {"date": today, "count": 2},
-                "digest": [{"at": "t", "subject": "s", "message": "m"}] * 12,
-                "ceiling_notice": today,
-            }
-        )
+        officer = _officer_row(officer_state={"ceiling_notice": today})
 
         class _Acq:
             async def __aenter__(self):
@@ -373,28 +383,35 @@ class TestOfficerSummaryEndpoint:
             return_value={"fire_at": "2026-07-30T05:00:00Z"}
         )
         db.acquire = lambda: _Acq()
-        monkeypatch.setattr(main, "postgres_db", db)
+        monkeypatch.setattr(orchestrator.main, "postgres_db", db)
         monkeypatch.setattr(
-            main, "require_approved_user", AsyncMock(return_value={"id": "u"})
+            orchestrator.main,
+            "require_approved_user",
+            AsyncMock(return_value={"id": "u"}),
         )
         monkeypatch.setattr(
-            main,
+            orchestrator.main,
             "require_project_member",
             AsyncMock(return_value=({"id": "u", "is_admin": True}, {})),
         )
         monkeypatch.setattr(
-            main,
+            orchestrator.main,
             "_find_open_conference_thread",
             AsyncMock(return_value=_conference_row()),
         )
 
-        out = await main.get_project_officer_summary(MagicMock(), PROJECT_ID)
+        out = await orchestrator.main.get_project_officer_summary(
+            MagicMock(), PROJECT_ID
+        )
         assert out["officer"]["thread_id"] == OFFICER_TID
         assert out["next_wake_at"] == "2026-07-30T05:00:00Z"
         assert out["pending_events"] == 4
-        assert out["pages_today"] == {"used": 2, "budget": 3}
         assert out["token_ceiling"]["deferred_today"] is True
-        assert len(out["digest"]) == 10  # capped
+        # Pages and digests are feed rows now (unified notification system):
+        # the card lists them via GET /api/notifications?source_kind=thread,
+        # so the summary carries neither a page budget nor a digest ring.
+        assert "pages_today" not in out
+        assert "digest" not in out
         assert out["conference"]["thread_id"] == CONF_TID
         # The post block (officer_post.md §8, partial O2 shape).
         assert out["commissioned"] is True
@@ -425,19 +442,25 @@ class TestOfficerSummaryEndpoint:
             }
         )
         db.get_project_officer_lineage = AsyncMock(return_value=[])
-        monkeypatch.setattr(main, "postgres_db", db)
+        monkeypatch.setattr(orchestrator.main, "postgres_db", db)
         monkeypatch.setattr(
-            main, "require_approved_user", AsyncMock(return_value={"id": "u"})
+            orchestrator.main,
+            "require_approved_user",
+            AsyncMock(return_value={"id": "u"}),
         )
         monkeypatch.setattr(
-            main,
+            orchestrator.main,
             "require_project_member",
             AsyncMock(return_value=({"id": "u", "is_admin": True}, {})),
         )
         monkeypatch.setattr(
-            main, "_find_open_conference_thread", AsyncMock(return_value=None)
+            orchestrator.main,
+            "_find_open_conference_thread",
+            AsyncMock(return_value=None),
         )
-        out = await main.get_project_officer_summary(MagicMock(), PROJECT_ID)
+        out = await orchestrator.main.get_project_officer_summary(
+            MagicMock(), PROJECT_ID
+        )
         # Vacancy keys off commissioned: false (O5 card contract); the officer
         # block is still present so the vacant editor seeds from the row —
         # live-only fields are null.
@@ -486,22 +509,130 @@ class TestOfficerSummaryEndpoint:
             }
         )
         db.get_project_officer_lineage = AsyncMock(return_value=[])
-        monkeypatch.setattr(main, "postgres_db", db)
+        monkeypatch.setattr(orchestrator.main, "postgres_db", db)
         monkeypatch.setattr(
-            main, "require_approved_user", AsyncMock(return_value={"id": "u"})
+            orchestrator.main,
+            "require_approved_user",
+            AsyncMock(return_value={"id": "u"}),
         )
         monkeypatch.setattr(
-            main,
+            orchestrator.main,
             "require_project_member",
             AsyncMock(return_value=({"id": "u", "is_admin": True}, {})),
         )
         monkeypatch.setattr(
-            main, "_find_open_conference_thread", AsyncMock(return_value=None)
+            orchestrator.main,
+            "_find_open_conference_thread",
+            AsyncMock(return_value=None),
         )
-        out = await main.get_project_officer_summary(MagicMock(), PROJECT_ID)
+        out = await orchestrator.main.get_project_officer_summary(
+            MagicMock(), PROJECT_ID
+        )
         assert out["commissioned"] is False
         # And it renders as ordinary vacancy — editor seeded from the row,
         # live-only fields null — not as some third state.
         assert out["officer"]["thread_id"] is None
         assert out["officer"]["status"] is None
         assert out["kit"] == {"line": {"count": 2, "in_flight": 0}}
+
+
+class TestConferenceBrainInheritance:
+    """A conference is the officer's embodiment: it thinks with his model and
+    effort unless the request says otherwise (officer_visibility_streamline.md
+    §3.1 — closes conference live-fire F2)."""
+
+    @staticmethod
+    def _officer(llm, *, as_string=False):
+        meta = {"config_override": {"officer": {"enabled": True}, "llm": llm}}
+        return {"id": "off-1", "metadata": json.dumps(meta) if as_string else meta}
+
+    def test_fills_model_and_reasoning_from_the_standing_officer(self):
+        override = {"officer": {"conference": True}}
+        got = orchestrator.main._inherit_conference_brain(
+            override, self._officer({"model": "gpt-5.6-sol", "reasoning_level": "high"})
+        )
+        assert got == ["model", "reasoning_level"]
+        assert override["llm"] == {"model": "gpt-5.6-sol", "reasoning_level": "high"}
+        assert override["officer"] == {"conference": True}
+
+    def test_request_provided_values_win(self):
+        override = {"llm": {"model": "MiniMax-M3"}}
+        got = orchestrator.main._inherit_conference_brain(
+            override, self._officer({"model": "gpt-5.6-sol", "reasoning_level": "high"})
+        )
+        assert got == ["reasoning_level"]
+        assert override["llm"] == {"model": "MiniMax-M3", "reasoning_level": "high"}
+
+    def test_reads_jsonb_metadata_delivered_as_a_string(self):
+        override = {}
+        got = orchestrator.main._inherit_conference_brain(
+            override, self._officer({"model": "gpt-5.6-sol"}, as_string=True)
+        )
+        assert got == ["model"]
+        assert override["llm"]["model"] == "gpt-5.6-sol"
+
+    def test_no_officer_or_brainless_officer_leaves_the_override_alone(self):
+        override = {"officer": {"conference": True}}
+        assert orchestrator.main._inherit_conference_brain(override, None) == []
+        assert (
+            orchestrator.main._inherit_conference_brain(
+                override, {"id": "x", "metadata": {}}
+            )
+            == []
+        )
+        assert (
+            orchestrator.main._inherit_conference_brain(
+                override, {"id": "x", "metadata": "{not json"}
+            )
+            == []
+        )
+        assert "llm" not in override
+
+    def test_ignores_blank_or_non_string_values(self):
+        override = {}
+        got = orchestrator.main._inherit_conference_brain(
+            override, self._officer({"model": "   ", "reasoning_level": 3})
+        )
+        assert got == []
+        assert "llm" not in override
+
+
+class TestOpenConferenceAction:
+    """The notification's `open_conference` action lands in a conference —
+    via the cockpit launcher route that owns create-or-resume
+    (officer_visibility_streamline.md §3.5). Before this it navigated to the
+    project page with a `hint` nothing read."""
+
+    @staticmethod
+    async def _run(category, params):
+        from orchestrator.services.notification_catalog import (
+            ActionContext,
+            action_handler,
+        )
+
+        orchestrator.main._register_notification_actions()
+        handler = action_handler(category, "open_conference")
+        assert handler is not None, f"{category} lost its open_conference action"
+        return await handler(
+            ActionContext(notification={}, user={"id": "u1"}, params=params)
+        )
+
+    @pytest.mark.asyncio
+    async def test_navigates_to_the_launcher_when_the_project_is_known(self):
+        result = await self._run(
+            "officer_question", {"project_id": "p1", "thread_id": "t1"}
+        )
+        assert result.result["navigate"] == "/projects/p1/officer/conference"
+        assert "hint" not in result.result
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_the_session_without_a_project(self):
+        result = await self._run("officer_question", {"thread_id": "t1"})
+        assert result.result["navigate"] == "/sessions/t1"
+
+    @pytest.mark.asyncio
+    async def test_officer_runtime_shares_the_handler(self):
+        result = await self._run(
+            "officer_runtime", {"project_id": "p2", "thread_id": "t2"}
+        )
+        assert result.result["navigate"] == "/projects/p2/officer/conference"

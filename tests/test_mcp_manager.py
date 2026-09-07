@@ -11,7 +11,7 @@ import textwrap
 
 import pytest
 
-from src.tools.mcp.manager import MCPManager, parse_mcp_config
+from agent.tools.mcp.manager import MCPManager, parse_mcp_config
 
 ECHO_SERVER = textwrap.dedent(
     """

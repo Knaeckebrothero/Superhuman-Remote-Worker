@@ -24,8 +24,8 @@ import {JobToolCardPanelComponent} from './job-tool-card-panel.component';
  * The mockup shows per-agent role, step counts, token counts and elapsed time.
  * None of those exist for a worker job — `GET /api/jobs/{id}` gives status,
  * description, `freeze_data.summary` and `diff_status` — so the row carries what
- * is real rather than inventing metrics. It was also drawn for `delegate_work`,
- * where sub-agents have roles; these are peer jobs.
+ * is real rather than inventing metrics. It was also drawn for `delegate_agent`,
+ * whose subagents have roles; these are peer jobs.
  *
  * It also shows *collapsed* as the resting state. This defaults to **open**: a
  * fan-out is usually 2–3 jobs, the rows are actionable, and auto-collapsing

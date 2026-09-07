@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import io
 import subprocess
 import tempfile
 import threading
@@ -34,11 +35,71 @@ def _host_key_scan_process() -> tuple[MagicMock, str]:
         "ascii"
     ).rstrip("=")
     process = MagicMock()
-    process.communicate = AsyncMock(
-        return_value=(f"10.0.0.5 ssh-ed25519 {encoded}\n".encode(), b"")
+    process.stdout.read = AsyncMock(
+        side_effect=[f"10.0.0.5 ssh-ed25519 {encoded}\n".encode(), b""]
     )
+    process.stderr.read = AsyncMock(side_effect=[b""])
+    process.wait = AsyncMock(return_value=0)
     process.returncode = 0
     return process, fingerprint
+
+
+@pytest.mark.asyncio
+async def test_capture_revalidates_authority_before_context_and_ssh() -> None:
+    service = SnapshotService()
+    service._available = True
+    service._snapshot_is_available = AsyncMock(return_value=False)
+    service._set_snapshot_context = AsyncMock()
+    service.upload_snapshot = AsyncMock(return_value=True)
+    authority = AsyncMock(side_effect=[True, True, False])
+    create = AsyncMock(side_effect=AssertionError("lost authority must precede SSH"))
+
+    with patch(
+        "orchestrator.services.snapshot_service.asyncio.create_subprocess_exec",
+        new=create,
+    ):
+        captured = await service.capture_vm_snapshot(
+            job_id="job-authority",
+            ssh_host="10.0.0.5",
+            ssh_port=22,
+            capture_authority=authority,
+        )
+
+    assert captured is False
+    assert authority.await_count == 3
+    service._set_snapshot_context.assert_awaited_once_with(
+        "job-authority", {"status": "capturing"}, entity_type="jobs"
+    )
+    create.assert_not_awaited()
+    service.upload_snapshot.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_environment_probes_revalidate_before_each_ssh_connection() -> None:
+    service = SnapshotService()
+    authority = AsyncMock(side_effect=[True, False])
+    process = MagicMock(returncode=0)
+    spawn = AsyncMock(return_value=process)
+
+    with (
+        patch(
+            "orchestrator.services.snapshot_service.create_owned_subprocess_exec",
+            new=spawn,
+        ),
+        patch(
+            "orchestrator.services.snapshot_service.communicate_bounded",
+            new=AsyncMock(return_value=(b"package==1\n", b"")),
+        ),
+    ):
+        info = await service._collect_environment_info(
+            "10.0.0.5",
+            22,
+            capture_authority=authority,
+        )
+
+    assert info == {"pip_freeze": ["package==1"]}
+    assert authority.await_count == 2
+    assert spawn.await_count == 1
 
 
 def test_orchestrator_runtime_images_include_snapshot_validator() -> None:
@@ -191,7 +252,7 @@ def test_strict_archive_round_trip_preserves_git_objects_and_repo_state(
     # /tmp, so create this fixture under the repository instead of pytest's
     # default /tmp base.
     with tempfile.TemporaryDirectory(
-        prefix="snapshot-roundtrip-", dir=Path.cwd()
+        prefix="snapshot-roundtrip-", dir=Path.home()
     ) as root:
         source = Path(root) / "workspace"
         git_object = source / ".git" / "objects" / "aa" / "object"
@@ -254,9 +315,7 @@ async def test_strict_download_rejects_manifest_downgrade(
     service._available = True
     service._bucket = "snapshots"
     service._s3 = MagicMock()
-    service._s3.download_file.side_effect = lambda _bucket, _key, path: Path(
-        path
-    ).write_bytes(payload)
+    service._s3.get_object.return_value = {"Body": io.BytesIO(payload)}
     service.get_manifest = AsyncMock(return_value=manifest)
 
     restored = await service.download_snapshot(
@@ -277,9 +336,7 @@ async def test_strict_download_accepts_only_matching_digest(tmp_path: Path) -> N
     service._available = True
     service._bucket = "snapshots"
     service._s3 = MagicMock()
-    service._s3.download_file.side_effect = lambda _bucket, _key, path: Path(
-        path
-    ).write_bytes(payload)
+    service._s3.get_object.return_value = {"Body": io.BytesIO(payload)}
     service.get_manifest = AsyncMock(
         return_value={
             "strict_terminal": True,
@@ -305,6 +362,7 @@ async def test_cancelled_capture_kills_and_reaps_child() -> None:
     process.stderr.read = AsyncMock(side_effect=[b""])
     process.wait = AsyncMock(return_value=0)
     process.kill = MagicMock()
+    process.terminate = MagicMock()
     scan, fingerprint = _host_key_scan_process()
 
     with patch(
@@ -322,8 +380,9 @@ async def test_cancelled_capture_kills_and_reaps_child() -> None:
                 strict_terminal=True,
             )
 
-    process.kill.assert_called_once_with()
-    process.wait.assert_awaited_once()
+    process.terminate.assert_called_once_with()
+    process.kill.assert_not_called()
+    assert process.wait.await_count >= 1
 
 
 @pytest.mark.asyncio
@@ -339,6 +398,7 @@ async def test_strict_capture_timeout_kills_and_reaps_child(monkeypatch) -> None
     process.stderr.read = AsyncMock(side_effect=[b""])
     process.wait = AsyncMock(return_value=0)
     process.kill = MagicMock()
+    process.terminate = MagicMock()
     scan, fingerprint = _host_key_scan_process()
     monkeypatch.setenv("STATELESS_TERMINAL_SNAPSHOT_TIMEOUT_S", "0.01")
 
@@ -357,8 +417,41 @@ async def test_strict_capture_timeout_kills_and_reaps_child(monkeypatch) -> None
         )
 
     assert captured is False
-    process.kill.assert_called_once_with()
-    process.wait.assert_awaited_once()
+    process.terminate.assert_called_once_with()
+    process.kill.assert_not_called()
+    assert process.wait.await_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_regular_capture_has_timeout_and_reaps_child(monkeypatch) -> None:
+    async def _blocked_read(_size):
+        await asyncio.sleep(3600)
+
+    service = SnapshotService()
+    service._available = True
+    process = MagicMock()
+    process.returncode = None
+    process.stdout.read = AsyncMock(side_effect=_blocked_read)
+    process.stderr.read = AsyncMock(side_effect=[b""])
+    process.wait = AsyncMock(return_value=0)
+    process.terminate = MagicMock()
+    process.kill = MagicMock()
+    monkeypatch.setenv("SNAPSHOT_CAPTURE_TIMEOUT_S", "0.01")
+
+    with patch(
+        "orchestrator.services.snapshot_service.asyncio.create_subprocess_exec",
+        new=AsyncMock(return_value=process),
+    ):
+        captured = await service.capture_vm_snapshot(
+            job_id="ordinary-job",
+            ssh_host="10.0.0.5",
+            ssh_port=22,
+        )
+
+    assert captured is False
+    process.terminate.assert_called_once_with()
+    process.kill.assert_not_called()
+    assert process.wait.await_count >= 1
 
 
 @pytest.mark.asyncio

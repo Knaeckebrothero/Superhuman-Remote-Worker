@@ -4,12 +4,21 @@ from __future__ import annotations
 
 from typing import Any
 
-from ...expert_reference import ExpertReferenceConflict, resolve_expert_selection
-from .. import formatters as fmt
-from ..client import AsyncCockpitClient
-from ._utils import format_action_error, resolve_job_id, short_id, transport_key_paths
-from .descriptors import CallerCtx, descriptor
-from .envelope import friendly_reason, http_status_of, response_detail
+from shared.expert_reference import ExpertReferenceConflict, resolve_expert_selection
+from shared.orch_surface import formatters as fmt
+from shared.orch_surface.client import AsyncCockpitClient
+from shared.orch_surface.jobs._utils import (
+    format_action_error,
+    resolve_job_id,
+    short_id,
+    transport_key_paths,
+)
+from shared.orch_surface.jobs.descriptors import CallerCtx, descriptor
+from shared.orch_surface.jobs.envelope import (
+    friendly_reason,
+    http_status_of,
+    response_detail,
+)
 
 _ALL = frozenset({"mcp", "session", "officer"})
 _MCP = frozenset({"mcp"})

@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.persistent_graph import PermissionOutcome
+from agent.persistent_graph import PermissionOutcome
 
 
 # ---------------------------------------------------------------------------
@@ -75,10 +75,14 @@ def _make_db(*, fetchval=None, fetchrow=None, fetch=None, execute=None):
 
 
 def _reset_agent_globals():
-    import src.api.persistent_app as mod
+    import agent.api.persistent_app as mod
 
     mod._session = None
     mod._thread_id = None
+    mod._pinned_status_identity_enabled = False
+    mod._pinned_runtime_generation_enabled = False
+    mod._session_runtime_generation = None
+    mod._session_runtime_attach_token = None
     mod._orchestrator_client = None
     mod._subscribers.clear()
     mod._loop_user_queue = None
@@ -86,7 +90,7 @@ def _reset_agent_globals():
 
 def _install_agent_session(*, turn_count: int = 0):
     """Minimal session + orchestrator_client wiring for transition tests."""
-    import src.api.persistent_app as mod
+    import agent.api.persistent_app as mod
 
     session = MagicMock()
     session.turn_count = turn_count
@@ -113,7 +117,7 @@ class TestSubscribeRevertsAwaitingUser:
 
     @pytest.mark.asyncio
     async def test_first_subscriber_schedules_revert(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         _install_agent_session(turn_count=2)
 
@@ -127,7 +131,7 @@ class TestSubscribeRevertsAwaitingUser:
 
     @pytest.mark.asyncio
     async def test_second_subscriber_does_not_schedule_revert(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         _install_agent_session(turn_count=2)
         _ = mod._subscribe("client-1")
@@ -148,7 +152,7 @@ class TestLoopGetUserInputAwaitingUserFlip:
 
     @pytest.mark.asyncio
     async def test_flips_when_untethered_after_turn(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         _, client = _install_agent_session(turn_count=3)
         mod._loop_user_queue.put_nowait("hi")  # unblock the get()
@@ -163,7 +167,7 @@ class TestLoopGetUserInputAwaitingUserFlip:
 
     @pytest.mark.asyncio
     async def test_skips_flip_on_first_call_before_any_turn(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         _, client = _install_agent_session(turn_count=0)
         mod._loop_user_queue.put_nowait("hi")
@@ -175,7 +179,7 @@ class TestLoopGetUserInputAwaitingUserFlip:
 
     @pytest.mark.asyncio
     async def test_skips_flip_when_subscriber_present(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         _, client = _install_agent_session(turn_count=3)
         mod._subscribers["ws-client"] = asyncio.Queue()
@@ -193,8 +197,8 @@ class TestLoopGetUserInputAwaitingUserFlip:
 
     @pytest.mark.asyncio
     async def test_stateless_eager_uses_durable_presence_oracle(self, monkeypatch):
-        import src.api.persistent_app as mod
-        from src.api.lease_context import LeaseHandle
+        import agent.api.persistent_app as mod
+        from agent.api.lease_context import LeaseHandle
 
         session, client = _install_agent_session(turn_count=3)
         session.postgres_conn = MagicMock()
@@ -240,7 +244,7 @@ class TestPermissionCheckWakePathGuard:
 
     @pytest.mark.asyncio
     async def test_reuses_prior_approved_decision(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         session, _ = _install_agent_session(turn_count=1)
         db = _make_db(fetchrow={"status": "approved"})
@@ -255,7 +259,7 @@ class TestPermissionCheckWakePathGuard:
 
     @pytest.mark.asyncio
     async def test_reuses_prior_denied_decision(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         session, _ = _install_agent_session(turn_count=1)
         db = _make_db(fetchrow={"status": "denied"})
@@ -269,7 +273,7 @@ class TestPermissionCheckWakePathGuard:
 
     @pytest.mark.asyncio
     async def test_no_prior_decision_falls_through_to_insert(self):
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         session, _ = _install_agent_session(turn_count=1)
         # fetchrow=None means no prior decision; fetchval drives INSERT/SELECT.

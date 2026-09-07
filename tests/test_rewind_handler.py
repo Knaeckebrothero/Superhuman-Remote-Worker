@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from langchain_core.messages import AIMessage, HumanMessage
 
-from src.persistent_graph import PersistentLoopCallbacks
+from agent.persistent_graph import PersistentLoopCallbacks
 
 
 def _minimal_callbacks(**overrides):
@@ -34,7 +34,7 @@ def test_on_workspace_commit_defaults_none():
 
 
 def test_loop_on_workspace_commit_records_via_conn(monkeypatch):
-    from src.api import persistent_app as app_mod
+    from agent.api import persistent_app as app_mod
 
     conn = MagicMock()
     conn.record_turn_commit = AsyncMock()
@@ -48,7 +48,7 @@ def test_loop_on_workspace_commit_records_via_conn(monkeypatch):
 
 
 def test_loop_on_workspace_commit_tolerates_no_session(monkeypatch):
-    from src.api import persistent_app as app_mod
+    from agent.api import persistent_app as app_mod
 
     monkeypatch.setattr(app_mod, "_session", None)
     asyncio.run(app_mod._loop_on_workspace_commit("sha42"))  # must not raise
@@ -89,7 +89,7 @@ def _run_rewind(app_mod, ws, data):
 
 
 def _patched_app(monkeypatch, session, *, turn_open=False):
-    from src.api import persistent_app as app_mod
+    from agent.api import persistent_app as app_mod
 
     monkeypatch.setattr(app_mod, "_session", session)
     monkeypatch.setattr(app_mod, "_thread_id", "tid-1")
@@ -204,7 +204,7 @@ def test_rewind_validates_target_before_interrupting(monkeypatch):
     session, conn, _ = _mk_session([_human("m", "x")])
     conn.get_live_message.return_value = None  # invalid target
     app_mod, ws_sent = _patched_app(monkeypatch, session, turn_open=True)
-    from src.api import persistent_app as pa
+    from agent.api import persistent_app as pa
 
     pa._loop_user_queue.put_nowait("queued-input")
 
@@ -298,7 +298,7 @@ def test_rewind_drains_pending_queue(monkeypatch):
     session, conn, _ = _mk_session([target])
     conn.get_live_message.return_value = {"seq": 3, "role": "human", "content": "x"}
     app_mod, ws_sent = _patched_app(monkeypatch, session)
-    from src.api import persistent_app as pa
+    from agent.api import persistent_app as pa
 
     pa._loop_user_queue.put_nowait("queued-input")
 
@@ -385,7 +385,7 @@ def test_rewind_resweep_logs_warning_when_it_catches_strays(monkeypatch, caplog)
     conn.resweep_rewind = AsyncMock(return_value=2)
     app_mod, ws_sent = _patched_app(monkeypatch, session)
 
-    with caplog.at_level(logging.WARNING, logger="src.api.persistent_app"):
+    with caplog.at_level(logging.WARNING, logger="agent.api.persistent_app"):
         _run_rewind(
             app_mod,
             MagicMock(),
@@ -400,7 +400,7 @@ def test_compact_refuses_while_rewind_lock_held(monkeypatch):
     interleave with a rewind — it refuses immediately while the shared
     _rewind_lock is held rather than racing the same in-memory message list
     and seq-keyed rows a rewind sweeps/truncates."""
-    from src.api import persistent_app as app_mod
+    from agent.api import persistent_app as app_mod
 
     ws_sent = []
 
@@ -423,7 +423,7 @@ def test_compact_refuses_while_rewind_lock_held(monkeypatch):
 def test_compact_boundary_maps_to_keep_recent(monkeypatch):
     """boundary_message_id=X → keep_recent_override counts non-injection
     messages from X (inclusive) to the end."""
-    from src.api import persistent_app as app_mod
+    from agent.api import persistent_app as app_mod
 
     target = _human("msg_b", "keep from here")
     msgs = [
@@ -467,7 +467,7 @@ def test_compact_boundary_maps_to_keep_recent(monkeypatch):
 
 
 def test_compact_boundary_unknown_id_errors(monkeypatch):
-    from src.api import persistent_app as app_mod
+    from agent.api import persistent_app as app_mod
 
     ctx_mgr = MagicMock()
     ctx_mgr.summarize_and_compact = AsyncMock()
@@ -499,8 +499,8 @@ def test_compact_boundary_unknown_id_errors(monkeypatch):
 
 def test_compact_boundary_excludes_injections_from_keep_count(monkeypatch):
     """Workspace injection messages must not be counted in keep_recent_override."""
-    from src.api import persistent_app as app_mod
-    from src.core.workspace_injection import create_instruction_tool_messages
+    from agent.api import persistent_app as app_mod
+    from shared.runtime.core.workspace_injection import create_instruction_tool_messages
 
     # Create real instruction injection messages (AIMessage + ToolMessage pair)
     pre_injection_ai, pre_injection_tool = create_instruction_tool_messages(

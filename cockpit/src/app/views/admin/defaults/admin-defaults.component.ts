@@ -36,7 +36,11 @@ import {AppFormFieldComponent} from '../../../ui/form-field';
                   [value]="admin.defaults()[kind] ?? ''"
                   (changed)="setDefault(kind, $event ?? '')"
                 >
-                  <option value="">{{ 'admin.providers.defaults.unset' | transloco }}</option>
+                  <option value="">
+                    {{ (kind === 'search_fallback'
+                      ? 'admin.providers.defaults.none'
+                      : 'admin.providers.defaults.unset') | transloco }}
+                  </option>
                   @if (kind === 'embedding') {
                     @for (m of modelService.embeddingModels(); track m.id) {
                       <option [value]="m.id">{{ m.label }}</option>
@@ -61,6 +65,14 @@ import {AppFormFieldComponent} from '../../../ui/form-field';
                     @for (m of modelService.auxiliaryModels(); track m.id) {
                       <option [value]="m.id">{{ m.label }}</option>
                     }
+                  } @else if (kind === 'search' || kind === 'search_fallback') {
+                    @for (m of modelService.searchModels(); track m.id) {
+                      <option [value]="m.id">{{ m.label }}</option>
+                    }
+                  } @else if (kind === 'fetch') {
+                    @for (m of modelService.fetchModels(); track m.id) {
+                      <option [value]="m.id">{{ m.label }}</option>
+                    }
                   } @else {
                     <!-- Chat-slot kinds (chat/browser/citation):
                          strict filter by 'chat' capability via the
@@ -74,6 +86,11 @@ import {AppFormFieldComponent} from '../../../ui/form-field';
                     }
                   }
                 </app-select>
+                @if (kind === 'search_fallback' && searchFallbackMatchesPrimary()) {
+                  <p class="default-warning">
+                    {{ 'admin.providers.defaults.sameSearchWarning' | transloco }}
+                  </p>
+                }
               </app-form-field>
             }
           </div>
@@ -116,6 +133,11 @@ import {AppFormFieldComponent} from '../../../ui/form-field';
       flex-direction: column;
       gap: 12px;
     }
+    .default-warning {
+      color: var(--color-warning, #b45309);
+      font-size: 12px;
+      margin: 6px 0 0;
+    }
   `],
 })
 export class AdminDefaultsComponent implements OnInit {
@@ -123,7 +145,20 @@ export class AdminDefaultsComponent implements OnInit {
   readonly modelService = inject(ModelService);
 
   readonly defaultKinds: DefaultModelKind[] = DEFAULT_MODEL_KINDS;
-  readonly catalogEmpty = computed(() => this.modelService.models().length === 0);
+  readonly catalogEmpty = computed(() =>
+    this.modelService.models().length === 0 &&
+    this.modelService.auxiliaryModels().length === 0 &&
+    this.modelService.embeddingModels().length === 0 &&
+    this.modelService.visionModels().length === 0 &&
+    this.modelService.whisperModels().length === 0 &&
+    this.modelService.ttsModels().length === 0 &&
+    this.modelService.searchModels().length === 0 &&
+    this.modelService.fetchModels().length === 0,
+  );
+  readonly searchFallbackMatchesPrimary = computed(() => {
+    const primary = this.admin.defaults().search;
+    return !!primary && primary === this.admin.defaults().search_fallback;
+  });
 
   ngOnInit(): void {
     this.admin.loadDefaults();

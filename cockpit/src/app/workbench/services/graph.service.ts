@@ -1,3 +1,4 @@
+import { debugLog } from '../debug-log';
 import { Injectable, inject, signal, computed } from '@angular/core';
 import { ApiService } from '../../core/services/api.service';
 import { DataService } from '../../core/services/data.service';
@@ -150,7 +151,7 @@ export class GraphService {
 
     this.api.getGraphChanges(jobId).subscribe({
       next: (response) => {
-        console.log('[GraphService] Loaded changes:', {
+        debugLog('[GraphService] Loaded changes:', {
           deltas: response.deltas.length,
           snapshots: response.snapshots.length,
           summary: response.summary,

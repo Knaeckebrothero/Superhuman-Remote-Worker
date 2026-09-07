@@ -25,7 +25,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.services.knowledge_store import (
+from shared.runtime.services.knowledge_store import (
     NOTE_ID_MAX,
     KbWatermark,
     KnowledgeChunk,
@@ -35,7 +35,7 @@ from src.services.knowledge_store import (
 
 STATUS_MIGRATION = (
     Path(__file__).parents[1]
-    / "orchestrator/database/migrations/vector/0011_kb_watermark_status.sql"
+    / "src/orchestrator/database/migrations/vector/0011_kb_watermark_status.sql"
 )
 
 

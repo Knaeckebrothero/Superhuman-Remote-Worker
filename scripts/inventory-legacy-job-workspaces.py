@@ -11,21 +11,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sys
-from pathlib import Path
 
-_ROOT = Path(__file__).resolve().parent.parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-_ORCH = _ROOT / "orchestrator"
-if _ORCH.is_dir() and str(_ORCH) not in sys.path:
-    sys.path.insert(0, str(_ORCH))
 
-from database.postgres import PostgresDB  # noqa: E402
-from services.job_workspace_adoption import (  # noqa: E402
+from orchestrator.database.postgres import PostgresDB
+from orchestrator.services.job_workspace_adoption import (
     legacy_k8s_job_runtime_adoption_candidate,
 )
-from src.shared.workspace_contract import WorkspaceContractError  # noqa: E402
+from shared.workspace_contract import WorkspaceContractError
 
 
 async def main() -> int:

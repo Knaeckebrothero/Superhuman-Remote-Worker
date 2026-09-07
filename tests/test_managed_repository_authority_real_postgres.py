@@ -14,7 +14,7 @@ import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
 from orchestrator.database.postgres import PostgresDB
-from security import crypto
+from orchestrator.security import crypto
 from orchestrator.services.managed_repository_authority import (
     ManagedRepositoryAuthorityError,
     _deploy_keypair,
@@ -29,9 +29,14 @@ from orchestrator.services.managed_repository_authority import (
     revoke_and_delete_managed_repository,
     rotate_project_repository_authority,
 )
+from tests._previous_release_seed import (
+    PINNED_BINDING_AUTHORITY_TRIGGERS,
+    previous_release_writer,
+)
 
 SCHEMA_FILE = (
     Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "schema_current.sql"
@@ -173,6 +178,13 @@ async def test_genuine_legacy_admin_url_scrubs_only_after_key_is_proven(db):
     assert exc.value.code == "repository_key_unproven"
     unchanged = await db.get_job(str(job_id))
     assert _json(unchanged["context"])["git_remote_url"] == legacy_url
+    async with db.acquire() as conn:
+        unproven = await conn.fetchrow(
+            "SELECT status, forge_key_id FROM managed_repository_authorities "
+            "WHERE authority_kind='job' AND authority_id=$1",
+            job_id,
+        )
+    assert dict(unproven) == {"status": "provisioning", "forge_key_id": 91}
 
     accepted = _gitea(probe=True)
     authority = await prepare_job_repository_authority(
@@ -269,18 +281,25 @@ async def test_legacy_thread_can_detach_but_cannot_reattach_before_adoption(db):
             "'persistent')",
             old_agent_id,
         )
-        async with conn.transaction():
-            await conn.execute(
-                "UPDATE threads SET agent_id=$2, runtime_attach_token=$3 WHERE id=$1",
-                UUID(thread_id),
-                old_agent_id,
-                old_attach_token,
-            )
-            await conn.execute(
-                "UPDATE agents SET thread_id=$2 WHERE id=$1",
-                old_agent_id,
-                UUID(thread_id),
-            )
+        # A pinned thread that was already attached when 0200 landed. Its
+        # planned -> protected bind edge did not exist when this row was
+        # written, and the subject here is repository authority above it.
+        async with previous_release_writer(
+            conn, "threads", *PINNED_BINDING_AUTHORITY_TRIGGERS
+        ):
+            async with conn.transaction():
+                await conn.execute(
+                    "UPDATE threads SET agent_id=$2, runtime_attach_token=$3 "
+                    "WHERE id=$1",
+                    UUID(thread_id),
+                    old_agent_id,
+                    old_attach_token,
+                )
+                await conn.execute(
+                    "UPDATE agents SET thread_id=$2 WHERE id=$1",
+                    old_agent_id,
+                    UUID(thread_id),
+                )
         # Exact pre-0176 durable shape: an already-attached persistent thread
         # held the administrator-bearing clone URL in workspace_container.
         await conn.execute(
@@ -355,25 +374,31 @@ async def test_legacy_thread_can_detach_but_cannot_reattach_before_adoption(db):
         db, _gitea(probe=True), await db.get_thread(thread_id)
     )
     async with db.acquire() as conn:
-        async with conn.transaction():
-            assert (
-                await conn.execute(
-                    "UPDATE threads SET agent_id=$2, runtime_attach_token=$3 "
-                    "WHERE id=$1",
-                    UUID(thread_id),
-                    replacement_agent_id,
-                    replacement_attach_token,
+        # 0176's repository fence is the subject; 0200's separate pinned
+        # protection edge has its own proofs and is not what this rebind is
+        # demonstrating.
+        async with previous_release_writer(
+            conn, "threads", *PINNED_BINDING_AUTHORITY_TRIGGERS
+        ):
+            async with conn.transaction():
+                assert (
+                    await conn.execute(
+                        "UPDATE threads SET agent_id=$2, runtime_attach_token=$3 "
+                        "WHERE id=$1",
+                        UUID(thread_id),
+                        replacement_agent_id,
+                        replacement_attach_token,
+                    )
+                    == "UPDATE 1"
                 )
-                == "UPDATE 1"
-            )
-            assert (
-                await conn.execute(
-                    "UPDATE agents SET thread_id=$2 WHERE id=$1",
-                    replacement_agent_id,
-                    UUID(thread_id),
+                assert (
+                    await conn.execute(
+                        "UPDATE agents SET thread_id=$2 WHERE id=$1",
+                        replacement_agent_id,
+                        UUID(thread_id),
+                    )
+                    == "UPDATE 1"
                 )
-                == "UPDATE 1"
-            )
         clean_url = await conn.fetchval(
             "SELECT metadata->'workspace_container'->>'git_remote_url' "
             "FROM threads WHERE id=$1",
@@ -1362,23 +1387,29 @@ async def test_previous_release_thread_write_is_stripped_and_attach_fenced(db):
     assert adopted_workspace["git_remote_url"] == clean_url
     assert "_managed_repository_authority_pending" not in adopted_workspace
     async with db.acquire() as conn:
-        async with conn.transaction():
-            assert (
-                await conn.execute(
-                    "UPDATE threads SET agent_id=$2 WHERE id=$1",
-                    UUID(thread_id),
-                    agent_id,
+        # 0176's repository fence is the subject; 0200's separate pinned
+        # protection edge has its own proofs and is not what this bind is
+        # demonstrating.
+        async with previous_release_writer(
+            conn, "threads", *PINNED_BINDING_AUTHORITY_TRIGGERS
+        ):
+            async with conn.transaction():
+                assert (
+                    await conn.execute(
+                        "UPDATE threads SET agent_id=$2 WHERE id=$1",
+                        UUID(thread_id),
+                        agent_id,
+                    )
+                    == "UPDATE 1"
                 )
-                == "UPDATE 1"
-            )
-            assert (
-                await conn.execute(
-                    "UPDATE agents SET thread_id=$2 WHERE id=$1",
-                    agent_id,
-                    UUID(thread_id),
+                assert (
+                    await conn.execute(
+                        "UPDATE agents SET thread_id=$2 WHERE id=$1",
+                        agent_id,
+                        UUID(thread_id),
+                    )
+                    == "UPDATE 1"
                 )
-                == "UPDATE 1"
-            )
 
 
 @pytest.mark.asyncio

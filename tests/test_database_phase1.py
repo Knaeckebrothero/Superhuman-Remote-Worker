@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.database import PostgresDB, Neo4jDB
+from agent.database import PostgresDB, Neo4jDB
 
 
 class TestPostgresDB:
@@ -72,7 +72,7 @@ class TestPostgresDB:
         pool.close = AsyncMock()
         create_pool = AsyncMock(return_value=pool)
 
-        with patch("src.database.postgres_db.asyncpg.create_pool", create_pool):
+        with patch("agent.database.postgres_db.asyncpg.create_pool", create_pool):
             db = PostgresDB(connection_string="postgresql://test")
             await db.connect()
             assert db.is_connected
@@ -118,7 +118,7 @@ class TestNeo4jDB:
         graph_database = MagicMock()
         graph_database.driver.side_effect = RuntimeError("service unavailable")
 
-        with patch("src.database.neo4j_db.GraphDatabase", graph_database):
+        with patch("shared.runtime.database.neo4j_db.GraphDatabase", graph_database):
             db = Neo4jDB(uri="bolt://nonexistent", username="neo4j", password="test")
             # Should return False if connection fails.
             result = db.connect()
@@ -150,14 +150,14 @@ class TestBackwardCompatibility:
 
     def test_old_imports_work(self):
         """Test that canonical classes can be imported."""
-        from src.database import PostgresDB, Neo4jDB
+        from agent.database import PostgresDB, Neo4jDB
 
         assert PostgresDB is not None
         assert Neo4jDB is not None
 
     def test_old_functions_work(self):
         """Test that database classes have core methods."""
-        from src.database import PostgresDB, Neo4jDB
+        from agent.database import PostgresDB, Neo4jDB
 
         # PostgresDB core methods
         assert hasattr(PostgresDB, "connect")

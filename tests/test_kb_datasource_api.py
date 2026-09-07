@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import HTTPException
 
-from main import (
+from orchestrator.main import (
     DatasourceCreate,
     DatasourceUpdate,
     ThreadCreateRequest,
@@ -36,7 +36,7 @@ from orchestrator.services.kb_datasources import (
     reindex_kb_datasource,
     test_kb_datasource as probe_kb_datasource,
 )
-from src.services.knowledge_store import KbWatermark
+from shared.runtime.services.knowledge_store import KbWatermark
 
 
 @pytest.fixture(autouse=True)
@@ -201,9 +201,9 @@ async def test_status_endpoint_uses_normal_visibility_gate():
     get_watermark = AsyncMock(return_value=None)
 
     with (
-        patch("main.require_datasource_access", gate),
+        patch("orchestrator.main.require_datasource_access", gate),
         patch(
-            "src.services.knowledge_store.KnowledgeStore.get_watermark",
+            "shared.runtime.services.knowledge_store.KnowledgeStore.get_watermark",
             get_watermark,
         ),
     ):
@@ -217,6 +217,44 @@ async def test_status_endpoint_uses_normal_visibility_gate():
 
 
 @pytest.mark.asyncio
+async def test_status_endpoint_resolves_native_connector_to_project_watermark():
+    datasource_id = "11111111-2222-3333-4444-555555555555"
+    project_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    request = object()
+    gate = AsyncMock(
+        return_value=(
+            {},
+            {
+                "id": datasource_id,
+                "type": "kb",
+                "config": {"native_project_id": project_id},
+            },
+        )
+    )
+    watermark = KbWatermark(
+        kb_id=UUID(project_id),
+        indexed_commit="a" * 40,
+        status="ready",
+    )
+    get_watermark = AsyncMock(return_value=watermark)
+
+    with (
+        patch("orchestrator.main.require_datasource_access", gate),
+        patch(
+            "shared.runtime.services.knowledge_store.KnowledgeStore.get_watermark",
+            get_watermark,
+        ),
+    ):
+        result = await get_datasource_index_status(request, datasource_id)
+
+    assert result["datasource_id"] == datasource_id
+    assert result["status"] == "ready"
+    assert result["indexed_commit"] == "a" * 40
+    gate.assert_awaited_once()
+    get_watermark.assert_awaited_once_with(UUID(project_id))
+
+
+@pytest.mark.asyncio
 async def test_manual_reindex_is_owner_gated_and_uses_stored_datasource():
     datasource_id = "11111111-2222-3333-4444-555555555555"
     datasource = {"id": datasource_id, "type": "kb"}
@@ -224,8 +262,8 @@ async def test_manual_reindex_is_owner_gated_and_uses_stored_datasource():
     run = AsyncMock(return_value={"status": "completed", "upserted": 2})
 
     with (
-        patch("main.require_datasource_owner", gate),
-        patch("main._reindex_kb_datasource_now", run),
+        patch("orchestrator.main.require_datasource_owner", gate),
+        patch("orchestrator.main._reindex_kb_datasource_now", run),
     ):
         result = await reindex_datasource_knowledge(object(), datasource_id, full=True)
 
@@ -258,11 +296,12 @@ async def test_create_marks_pending_and_schedules_initial_full_index():
 
     with (
         patch(
-            "main.require_approved_user", AsyncMock(return_value={"id": UUID(int=1)})
+            "orchestrator.main.require_approved_user",
+            AsyncMock(return_value={"id": UUID(int=1)}),
         ),
-        patch("main.postgres_db", db),
-        patch("main._mark_kb_datasource_pending", pending),
-        patch("main._schedule_kb_datasource_reindex", schedule),
+        patch("orchestrator.main.postgres_db", db),
+        patch("orchestrator.main._mark_kb_datasource_pending", pending),
+        patch("orchestrator.main._schedule_kb_datasource_reindex", schedule),
     ):
         result = await create_datasource(body, object())
 
@@ -285,10 +324,10 @@ async def test_kb_create_rejects_legacy_job_id_auto_attachment():
 
     with (
         patch(
-            "main.require_approved_user",
+            "orchestrator.main.require_approved_user",
             AsyncMock(side_effect=AssertionError("auth ran past shape validation")),
         ),
-        patch("main.postgres_db", db),
+        patch("orchestrator.main.postgres_db", db),
         pytest.raises(HTTPException) as exc,
     ):
         await create_datasource(body, object())
@@ -313,9 +352,10 @@ async def test_non_kb_create_rejects_non_secret_config_surface():
 
     with (
         patch(
-            "main.require_approved_user", AsyncMock(return_value={"id": UUID(int=1)})
+            "orchestrator.main.require_approved_user",
+            AsyncMock(return_value={"id": UUID(int=1)}),
         ),
-        patch("main.postgres_db", db),
+        patch("orchestrator.main.postgres_db", db),
         pytest.raises(HTTPException) as exc,
     ):
         await create_datasource(body, object())
@@ -338,9 +378,10 @@ async def test_create_rejects_token_over_plain_http_before_persistence():
 
     with (
         patch(
-            "main.require_approved_user", AsyncMock(return_value={"id": UUID(int=1)})
+            "orchestrator.main.require_approved_user",
+            AsyncMock(return_value={"id": UUID(int=1)}),
         ),
-        patch("main.postgres_db", db),
+        patch("orchestrator.main.postgres_db", db),
         pytest.raises(HTTPException) as exc,
     ):
         await create_datasource(body, object())
@@ -362,9 +403,10 @@ async def test_create_rejects_untrusted_git_host_before_persistence():
 
     with (
         patch(
-            "main.require_approved_user", AsyncMock(return_value={"id": UUID(int=1)})
+            "orchestrator.main.require_approved_user",
+            AsyncMock(return_value={"id": UUID(int=1)}),
         ),
-        patch("main.postgres_db", db),
+        patch("orchestrator.main.postgres_db", db),
         pytest.raises(HTTPException) as exc,
     ):
         await create_datasource(body, object())
@@ -382,8 +424,11 @@ async def test_non_kb_update_rejects_non_secret_config_surface():
     db.update_datasource = AsyncMock()
 
     with (
-        patch("main.require_datasource_owner", AsyncMock(return_value=({}, existing))),
-        patch("main.postgres_db", db),
+        patch(
+            "orchestrator.main.require_datasource_owner",
+            AsyncMock(return_value=({}, existing)),
+        ),
+        patch("orchestrator.main.postgres_db", db),
         pytest.raises(HTTPException) as exc,
     ):
         await update_datasource(
@@ -410,8 +455,11 @@ async def test_update_validates_preserved_token_against_changed_transport():
     db.update_datasource = AsyncMock()
 
     with (
-        patch("main.require_datasource_owner", AsyncMock(return_value=({}, existing))),
-        patch("main.postgres_db", db),
+        patch(
+            "orchestrator.main.require_datasource_owner",
+            AsyncMock(return_value=({}, existing)),
+        ),
+        patch("orchestrator.main.postgres_db", db),
         pytest.raises(HTTPException) as exc,
     ):
         await update_datasource(
@@ -440,8 +488,11 @@ async def test_update_validates_new_token_against_preserved_plain_http_url():
     db.update_datasource = AsyncMock()
 
     with (
-        patch("main.require_datasource_owner", AsyncMock(return_value=({}, existing))),
-        patch("main.postgres_db", db),
+        patch(
+            "orchestrator.main.require_datasource_owner",
+            AsyncMock(return_value=({}, existing)),
+        ),
+        patch("orchestrator.main.postgres_db", db),
         pytest.raises(HTTPException) as exc,
     ):
         await update_datasource(
@@ -468,9 +519,9 @@ async def test_delete_uses_coordinated_kb_index_and_app_row_cleanup():
     )
 
     with (
-        patch("main.require_datasource_owner", gate),
-        patch("main.postgres_db", db),
-        patch("main._delete_kb_datasource_with_index", cleanup),
+        patch("orchestrator.main.require_datasource_owner", gate),
+        patch("orchestrator.main.postgres_db", db),
+        patch("orchestrator.main._delete_kb_datasource_with_index", cleanup),
     ):
         result = await delete_datasource(object(), datasource_id)
 
@@ -612,6 +663,7 @@ async def test_source_construction_failure_is_recorded_on_watermark():
         "upserted": 0,
         "deleted": 0,
         "skipped": 0,
+        "skipped_duplicates": 0,
         "errors": 1,
     }
     runner.assert_not_awaited()
@@ -622,6 +674,7 @@ async def test_source_construction_failure_is_recorded_on_watermark():
         last_error="Token/password authentication requires an HTTPS URL",
         repo_name=f"datasource:{datasource_id}",
         branch="main",
+        error_fingerprint=None,
     )
 
 
@@ -709,7 +762,7 @@ async def test_thread_attachment_rejects_an_inaccessible_private_kb():
     )
 
     with (
-        patch("main.postgres_db", db),
+        patch("orchestrator.main.postgres_db", db),
         pytest.raises(HTTPException) as exc,
     ):
         await _authorize_thread_datasource_ids(
@@ -740,7 +793,7 @@ async def test_thread_attachment_allows_kb_but_not_clone_repo_on_lite_tier():
     )
     db.get_datasource_policy_rows = AsyncMock(side_effect=lambda _ids: [policy_row])
 
-    with patch("main.postgres_db", db):
+    with patch("orchestrator.main.postgres_db", db):
         selected = await _authorize_thread_datasource_ids(
             {"id": owner_id},
             [str(datasource_id), str(datasource_id)],
@@ -781,8 +834,8 @@ async def test_persisted_thread_datasource_is_denied_after_access_revocation():
     )
 
     with (
-        patch("main.postgres_db", db),
-        patch("main._thread_project_ids", AsyncMock(return_value=[])),
+        patch("orchestrator.main.postgres_db", db),
+        patch("orchestrator.main._thread_project_ids", AsyncMock(return_value=[])),
         pytest.raises(HTTPException) as exc,
     ):
         await _revalidate_thread_datasource_selection(
@@ -817,8 +870,8 @@ async def test_persisted_thread_revalidation_preserves_global_and_system_semanti
     )
 
     with (
-        patch("main.postgres_db", db),
-        patch("main._thread_project_ids", AsyncMock(return_value=[])),
+        patch("orchestrator.main.postgres_db", db),
+        patch("orchestrator.main._thread_project_ids", AsyncMock(return_value=[])),
     ):
         (
             global_selection,
@@ -853,7 +906,7 @@ async def test_persisted_thread_project_scope_is_denied_after_membership_revocat
     db.get_user_role_in_project = AsyncMock(return_value=None)
 
     with (
-        patch("main.postgres_db", db),
+        patch("orchestrator.main.postgres_db", db),
         pytest.raises(HTTPException) as exc,
     ):
         await _revalidate_thread_project_ids(
@@ -878,9 +931,11 @@ async def test_thread_creation_rejects_unavailable_project_without_enumeration()
     db.create_thread = AsyncMock()
 
     with (
-        patch("main.require_approved_user", AsyncMock(return_value=user)),
-        patch("main.postgres_db", db),
-        patch("main._enforce_readiness_gate", AsyncMock(return_value=None)),
+        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user)),
+        patch("orchestrator.main.postgres_db", db),
+        patch(
+            "orchestrator.main._enforce_readiness_gate", AsyncMock(return_value=None)
+        ),
         pytest.raises(HTTPException) as exc,
     ):
         await create_thread(
@@ -948,7 +1003,7 @@ async def test_thread_project_authorization_preserves_admin_access():
     db.get_project = AsyncMock(return_value={"id": project_id})
     db.get_user_role_in_project = AsyncMock()
 
-    with patch("main.postgres_db", db):
+    with patch("orchestrator.main.postgres_db", db):
         selected = await _authorize_thread_project_ids(
             {"id": UUID(int=1), "is_admin": True},
             [str(project_id), str(project_id)],
@@ -1003,9 +1058,12 @@ async def test_resume_revalidates_datasources_before_mutating_thread_status():
     drift = [DriftItem(f"connector:{datasource_id}", "connector", "deleted", "gone")]
 
     with (
-        patch("main.require_thread_owner", AsyncMock(return_value=(user, thread))),
-        patch("main.postgres_db", db),
-        patch("main._thread_config_drift", AsyncMock(return_value=drift)),
+        patch(
+            "orchestrator.main.require_thread_owner",
+            AsyncMock(return_value=(user, thread)),
+        ),
+        patch("orchestrator.main.postgres_db", db),
+        patch("orchestrator.main._thread_config_drift", AsyncMock(return_value=drift)),
         pytest.raises(HTTPException) as exc,
     ):
         await resume_thread("thread-1", object())
@@ -1049,9 +1107,12 @@ async def test_resume_blocks_revoked_native_project_scope_before_status_mutation
     drift = [DriftItem(f"project:{project_id}", "project", "revoked", "gone")]
 
     with (
-        patch("main.require_thread_owner", AsyncMock(return_value=(user, thread))),
-        patch("main.postgres_db", db),
-        patch("main._thread_config_drift", AsyncMock(return_value=drift)),
+        patch(
+            "orchestrator.main.require_thread_owner",
+            AsyncMock(return_value=(user, thread)),
+        ),
+        patch("orchestrator.main.postgres_db", db),
+        patch("orchestrator.main._thread_config_drift", AsyncMock(return_value=drift)),
         pytest.raises(HTTPException) as exc,
     ):
         await resume_thread("thread-1", object())
@@ -1071,7 +1132,7 @@ async def test_thread_kb_credential_gate_is_narrow():
         ]
     )
 
-    with patch("main.postgres_db", db):
+    with patch("orchestrator.main.postgres_db", db):
         assert not await _thread_has_knowledge_scope(
             project_ids=[], datasource_ids=[str(UUID(int=1))]
         )
@@ -1106,10 +1167,13 @@ async def test_metadata_only_kb_edit_does_not_schedule_full_rebuild():
     schedule = MagicMock()
 
     with (
-        patch("main.require_datasource_owner", AsyncMock(return_value=({}, existing))),
-        patch("main.postgres_db", db),
-        patch("main._mark_kb_datasource_pending", pending),
-        patch("main._schedule_kb_datasource_reindex", schedule),
+        patch(
+            "orchestrator.main.require_datasource_owner",
+            AsyncMock(return_value=({}, existing)),
+        ),
+        patch("orchestrator.main.postgres_db", db),
+        patch("orchestrator.main._mark_kb_datasource_pending", pending),
+        patch("orchestrator.main._schedule_kb_datasource_reindex", schedule),
     ):
         result = await update_datasource(
             object(),
@@ -1146,10 +1210,13 @@ async def test_root_change_schedules_full_rebuild():
     schedule = MagicMock()
 
     with (
-        patch("main.require_datasource_owner", AsyncMock(return_value=({}, existing))),
-        patch("main.postgres_db", db),
-        patch("main._mark_kb_datasource_pending", pending),
-        patch("main._schedule_kb_datasource_reindex", schedule),
+        patch(
+            "orchestrator.main.require_datasource_owner",
+            AsyncMock(return_value=({}, existing)),
+        ),
+        patch("orchestrator.main.postgres_db", db),
+        patch("orchestrator.main._mark_kb_datasource_pending", pending),
+        patch("orchestrator.main._schedule_kb_datasource_reindex", schedule),
     ):
         await update_datasource(
             object(),

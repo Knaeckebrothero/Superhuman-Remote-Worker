@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from database.postgres import PostgresDB
+from orchestrator.database.postgres import PostgresDB
 
 pytestmark = pytest.mark.asyncio
 
@@ -147,7 +147,7 @@ class TestUnmergedPrBlockReason:
     async def test_configured_gitea_public_url_matches_internal_connector(
         self, monkeypatch
     ):
-        from services import job_delivery
+        from orchestrator.services import job_delivery
 
         monkeypatch.setenv("GITEA_INTERNAL_URL", "http://srw-gitea:3000")
         monkeypatch.setenv("GITEA_URL", "https://git.srw.works")
@@ -180,7 +180,7 @@ class TestUnmergedPrBlockReason:
     async def test_global_gitea_public_url_cannot_alias_a_foreign_connector(
         self, monkeypatch
     ):
-        from services import job_delivery
+        from orchestrator.services import job_delivery
 
         monkeypatch.setenv("GITEA_INTERNAL_URL", "http://srw-gitea:3000")
         monkeypatch.setenv("GITEA_URL", "https://git.srw.works")
@@ -211,7 +211,7 @@ class TestUnmergedPrBlockReason:
     async def test_job_without_a_pull_request_is_never_blocked(self, monkeypatch):
         """The accepted hole, pinned so it stays deliberate: a job that never
         opened a PR must approve exactly as it does today."""
-        from services import job_delivery
+        from orchestrator.services import job_delivery
 
         called = []
         monkeypatch.setattr(
@@ -228,7 +228,7 @@ class TestUnmergedPrBlockReason:
         assert not called
 
     async def test_merged_pull_request_does_not_block(self, monkeypatch):
-        from services import job_delivery
+        from orchestrator.services import job_delivery
 
         monkeypatch.setattr(
             job_delivery,
@@ -243,7 +243,7 @@ class TestUnmergedPrBlockReason:
         )
 
     async def test_open_pull_request_blocks_and_names_the_state(self, monkeypatch):
-        from services import job_delivery
+        from orchestrator.services import job_delivery
 
         monkeypatch.setattr(
             job_delivery,
@@ -258,7 +258,7 @@ class TestUnmergedPrBlockReason:
         assert "#1" in reason
 
     async def test_closed_unmerged_pull_request_blocks(self, monkeypatch):
-        from services import job_delivery
+        from orchestrator.services import job_delivery
 
         monkeypatch.setattr(
             job_delivery,
@@ -273,9 +273,9 @@ class TestUnmergedPrBlockReason:
 
     async def test_unreachable_forge_blocks_fail_closed(self, monkeypatch):
         """A state that cannot be read is not a merged state."""
-        from src.services.forge import ForgeError
+        from shared.runtime.services.forge import ForgeError
 
-        from services import job_delivery
+        from orchestrator.services import job_delivery
 
         monkeypatch.setattr(
             job_delivery,
@@ -290,7 +290,7 @@ class TestUnmergedPrBlockReason:
     async def test_detached_repository_blocks_fail_closed(self, monkeypatch):
         """The PR is recorded but its connector is gone — the state cannot be
         confirmed, so it must not pass."""
-        from services import job_delivery
+        from orchestrator.services import job_delivery
 
         monkeypatch.setattr(
             job_delivery, "get_pull_request_status", AsyncMock(return_value=None)
@@ -304,7 +304,7 @@ class TestUnmergedPrBlockReason:
 from contextlib import ExitStack  # noqa: E402
 from unittest.mock import MagicMock, patch  # noqa: E402
 
-import main  # noqa: E402
+import orchestrator.main  # noqa: E402
 from fastapi import HTTPException  # noqa: E402
 
 OWNER_ID = "33333333-3333-3333-3333-333333333333"
@@ -328,8 +328,8 @@ class TestUnmergedPrGateReason:
     async def test_job_without_a_pull_request_costs_no_io(self):
         """No PR record means no grant read and no forge call at all."""
         db = _fake_db()
-        with patch("main.postgres_db", db):
-            reason = await main._unmerged_pr_gate_reason(
+        with patch("orchestrator.main.postgres_db", db):
+            reason = await orchestrator.main._unmerged_pr_gate_reason(
                 _job(pull_request=False), user={"id": OWNER_ID, "is_admin": False}
             )
         assert reason is None
@@ -339,14 +339,14 @@ class TestUnmergedPrGateReason:
     async def test_principal_with_the_grant_is_not_blocked(self):
         db = _fake_db(can_complete=True)
         with ExitStack() as stack:
-            stack.enter_context(patch("main.postgres_db", db))
+            stack.enter_context(patch("orchestrator.main.postgres_db", db))
             stack.enter_context(
                 patch(
-                    "services.job_delivery.unmerged_pr_block_reason",
+                    "orchestrator.services.job_delivery.unmerged_pr_block_reason",
                     AsyncMock(return_value="pull request #1 (x/y) is open, not merged"),
                 )
             )
-            reason = await main._unmerged_pr_gate_reason(
+            reason = await orchestrator.main._unmerged_pr_gate_reason(
                 _pending_job(), user={"id": OWNER_ID, "is_admin": False}
             )
         assert reason is None
@@ -354,14 +354,14 @@ class TestUnmergedPrGateReason:
     async def test_principal_without_the_grant_is_blocked(self):
         db = _fake_db(can_complete=False)
         with ExitStack() as stack:
-            stack.enter_context(patch("main.postgres_db", db))
+            stack.enter_context(patch("orchestrator.main.postgres_db", db))
             stack.enter_context(
                 patch(
-                    "services.job_delivery.unmerged_pr_block_reason",
+                    "orchestrator.services.job_delivery.unmerged_pr_block_reason",
                     AsyncMock(return_value="pull request #1 (x/y) is open, not merged"),
                 )
             )
-            reason = await main._unmerged_pr_gate_reason(
+            reason = await orchestrator.main._unmerged_pr_gate_reason(
                 _pending_job(), user={"id": OWNER_ID, "is_admin": False}
             )
         assert reason is not None
@@ -371,28 +371,28 @@ class TestUnmergedPrGateReason:
         """user=None is the agent/autonomous path; the owner's grants decide."""
         db = _fake_db(can_complete=False)
         with ExitStack() as stack:
-            stack.enter_context(patch("main.postgres_db", db))
+            stack.enter_context(patch("orchestrator.main.postgres_db", db))
             stack.enter_context(
                 patch(
-                    "services.job_delivery.unmerged_pr_block_reason",
+                    "orchestrator.services.job_delivery.unmerged_pr_block_reason",
                     AsyncMock(return_value="pull request #1 (x/y) is open, not merged"),
                 )
             )
-            await main._unmerged_pr_gate_reason(_pending_job(), user=None)
+            await orchestrator.main._unmerged_pr_gate_reason(_pending_job(), user=None)
         db.get_user.assert_awaited_once_with(OWNER_ID)
         assert db.user_can_complete_unmerged_pr.await_args.args[0]["id"] == OWNER_ID
 
     async def test_the_jobs_project_reaches_the_capability_read(self):
         db = _fake_db(can_complete=False)
         with ExitStack() as stack:
-            stack.enter_context(patch("main.postgres_db", db))
+            stack.enter_context(patch("orchestrator.main.postgres_db", db))
             stack.enter_context(
                 patch(
-                    "services.job_delivery.unmerged_pr_block_reason",
+                    "orchestrator.services.job_delivery.unmerged_pr_block_reason",
                     AsyncMock(return_value="blocked"),
                 )
             )
-            await main._unmerged_pr_gate_reason(
+            await orchestrator.main._unmerged_pr_gate_reason(
                 _pending_job(), user={"id": OWNER_ID, "is_admin": False}
             )
         assert db.user_can_complete_unmerged_pr.await_args.args[1] == PROJECT_ID
@@ -402,12 +402,14 @@ class TestApproveJobGate:
     def _patch(self, stack, job, db):
         stack.enter_context(
             patch(
-                "main.require_internal_or_job_access",
+                "orchestrator.main.require_internal_or_job_access",
                 AsyncMock(return_value=({"id": OWNER_ID, "is_admin": False}, job)),
             )
         )
-        stack.enter_context(patch("main._guard_completion_control", AsyncMock()))
-        stack.enter_context(patch("main.postgres_db", db))
+        stack.enter_context(
+            patch("orchestrator.main._guard_completion_control", AsyncMock())
+        )
+        stack.enter_context(patch("orchestrator.main.postgres_db", db))
 
     async def test_unmerged_pull_request_refuses_with_403(self):
         job = _pending_job()
@@ -416,12 +418,12 @@ class TestApproveJobGate:
             self._patch(stack, job, db)
             stack.enter_context(
                 patch(
-                    "services.job_delivery.unmerged_pr_block_reason",
+                    "orchestrator.services.job_delivery.unmerged_pr_block_reason",
                     AsyncMock(return_value="pull request #1 (x/y) is open, not merged"),
                 )
             )
             with pytest.raises(HTTPException) as excinfo:
-                await main.approve_job(MagicMock(), "job-1", None)
+                await orchestrator.main.approve_job(MagicMock(), "job-1", None)
         assert excinfo.value.status_code == 403
         assert "not merged" in str(excinfo.value.detail)
 
@@ -433,15 +435,15 @@ class TestApproveJobGate:
             self._patch(stack, job, db)
             proof = stack.enter_context(
                 patch(
-                    "services.deliverable_gate.explicit_pr_delivery_block_reason",
+                    "orchestrator.services.deliverable_gate.explicit_pr_delivery_block_reason",
                     AsyncMock(return_value="the recorded PR is missing"),
                 )
             )
             merge_policy = stack.enter_context(
-                patch("main._unmerged_pr_gate_reason", AsyncMock())
+                patch("orchestrator.main._unmerged_pr_gate_reason", AsyncMock())
             )
             with pytest.raises(HTTPException) as excinfo:
-                await main.approve_job(MagicMock(), "job-1", None)
+                await orchestrator.main.approve_job(MagicMock(), "job-1", None)
 
         assert excinfo.value.status_code == 409
         assert excinfo.value.detail["code"] == "pr_deliverable_unverified"
@@ -456,18 +458,18 @@ class TestApproveJobGate:
             self._patch(stack, job, db)
             stack.enter_context(
                 patch(
-                    "services.deliverable_gate.explicit_pr_delivery_block_reason",
+                    "orchestrator.services.deliverable_gate.explicit_pr_delivery_block_reason",
                     AsyncMock(return_value=None),
                 )
             )
             stack.enter_context(
                 patch(
-                    "main._unmerged_pr_gate_reason",
+                    "orchestrator.main._unmerged_pr_gate_reason",
                     AsyncMock(return_value="pull request #1 is open, not merged"),
                 )
             )
             with pytest.raises(HTTPException) as excinfo:
-                await main.approve_job(MagicMock(), "job-1", None)
+                await orchestrator.main.approve_job(MagicMock(), "job-1", None)
 
         assert excinfo.value.status_code == 403
         assert "not merged" in str(excinfo.value.detail)
@@ -482,12 +484,12 @@ class TestApproveJobGate:
             self._patch(stack, job, db)
             stack.enter_context(
                 patch(
-                    "main._claim_completion_control",
+                    "orchestrator.main._claim_completion_control",
                     AsyncMock(side_effect=RuntimeError("past the gate")),
                 )
             )
             with pytest.raises(HTTPException) as excinfo:
-                await main.approve_job(MagicMock(), "job-1", None)
+                await orchestrator.main.approve_job(MagicMock(), "job-1", None)
         # The sentinel fires only if execution reached _claim_completion_control,
         # which is past the gate. What matters is that the refusal is not ours.
         assert excinfo.value.status_code != 403
@@ -504,7 +506,7 @@ class TestUnmergedPrSealStatus:
     """
 
     async def test_completed_with_an_unmerged_pr_becomes_pending_review(self):
-        from services.completion import unmerged_pr_seal_status
+        from orchestrator.services.completion import unmerged_pr_seal_status
 
         status, action = unmerged_pr_seal_status(
             "completed", loop_id=None, reason="pull request #1 (x/y) is open"
@@ -514,7 +516,7 @@ class TestUnmergedPrSealStatus:
         assert "pending_review" in action
 
     async def test_no_reason_leaves_the_status_alone(self):
-        from services.completion import unmerged_pr_seal_status
+        from orchestrator.services.completion import unmerged_pr_seal_status
 
         assert unmerged_pr_seal_status("completed", loop_id=None, reason=None) == (
             "completed",
@@ -522,7 +524,7 @@ class TestUnmergedPrSealStatus:
         )
 
     async def test_a_non_terminal_status_is_never_touched(self):
-        from services.completion import unmerged_pr_seal_status
+        from orchestrator.services.completion import unmerged_pr_seal_status
 
         assert unmerged_pr_seal_status(
             "pending_review", loop_id=None, reason="blocked"
@@ -536,7 +538,7 @@ class TestUnmergedPrSealStatus:
         """Mirrors the cloud-diff downgrade, which excludes loop jobs via
         `not _completion_loop_id`. A loop that stalls produces nothing and
         nobody is watching to unstick it; the loop owns its own delivery."""
-        from services.completion import unmerged_pr_seal_status
+        from orchestrator.services.completion import unmerged_pr_seal_status
 
         assert unmerged_pr_seal_status(
             "completed", loop_id="loop-1", reason="pull request #1 is open"

@@ -9,8 +9,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from src.llm.exceptions import ContextOverflowError
-from src.llm.reasoning_chat import (
+from shared.runtime.llm.exceptions import ContextOverflowError
+from shared.runtime.llm.reasoning_chat import (
     count_request_tokens,
     _extract_reasoning_from_delta,
     _extract_reasoning_from_response,

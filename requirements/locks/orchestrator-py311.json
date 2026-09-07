@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "role": "orchestrator",
+  "python": "3.11",
+  "platform": "linux/amd64",
+  "inputs": {
+    "requirements/constraints.txt": "4743d447d0a6fbceec4c8edef0409c3bd8d38e7337fbbf9d1a3b1ed7a4b12135",
+    "requirements/lock-tools.txt": "9219192bf61e8af976d040e208d364dbfa6cf2758d8724ff9fe02672e9c4d7d7",
+    "scripts/lock_dependencies.py": "7056c7d9add464d8e8004f2436b38aa882ded8da212a574c120d8bcfb352a4ca",
+    "src/orchestrator/requirements.txt": "0c52e713d0705fd06028116d82f62621b704e76209a1204c03483f5161cfec5e"
+  },
+  "lock_sha256": "8eea5ff6687751dab3a48bdac9337eb14252185cde409c3aa28db29b586a491e"
+}

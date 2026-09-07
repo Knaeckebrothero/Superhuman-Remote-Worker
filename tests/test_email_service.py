@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-import services.email as email_mod
+import orchestrator.services.email as email_mod
 
 
 # =============================================================================

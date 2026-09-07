@@ -6,10 +6,10 @@ import logging
 from typing import Any
 from uuid import UUID
 
-from .. import formatters as fmt
-from ..client import AsyncCockpitClient, MutationOutcomeUnknown
-from .descriptors import CallerCtx
-from .envelope import friendly_reason, http_status_of
+from shared.orch_surface import formatters as fmt
+from shared.orch_surface.client import AsyncCockpitClient, MutationOutcomeUnknown
+from shared.orch_surface.jobs.descriptors import CallerCtx
+from shared.orch_surface.jobs.envelope import friendly_reason, http_status_of
 
 logger = logging.getLogger(__name__)
 

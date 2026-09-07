@@ -20,7 +20,7 @@ from orchestrator.main import (
     _read_archived_agent_log,
     _scope_archived_lines,
 )
-from src.shared.orch_surface.formatters import format_job_log, format_thread_log
+from shared.orch_surface.formatters import format_job_log, format_thread_log
 
 JOB_ID = "11111111-2222-3333-4444-555555555555"
 OTHER_ID = "99999999-8888-7777-6666-555555555555"

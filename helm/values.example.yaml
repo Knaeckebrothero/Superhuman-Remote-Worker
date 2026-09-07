@@ -191,10 +191,10 @@ ingress:
 # gateway can be fronted three ways: the optional chart Ingress below
 # (viewer.ingress, wildcard host + cert-manager DNS-01), a Cloudflare tunnel
 # entry pointing at the gateway Service, or an operator-owned edge. Ordinary
-# normalizing proxies are supported (see
-# knowledge-base/knowledge/issues/canvas_hosted_edge_use_cloudflare_tunnel.md). An enabled
-# production viewer must reference a separately provisioned, least-privilege
-# database credential Secret.
+# normalizing proxies are supported. An enabled production viewer must
+# reference a separately provisioned, least-privilege database credential. A
+# chart-owned CNPG database can provision that identity declaratively during
+# the same Helm install; external Postgres remains an operator-owned setup.
 canvas:
   livePreview:
     enabled: false
@@ -220,12 +220,19 @@ canvas:
       database:
         username: "srw_canvas_gateway"
         credentials:
+          # Set true with provisionRole on chart-owned CNPG to keep the whole
+          # Canvas database setup inside this Helm release.
           create: false
           existingSecret: ""
+          # Required only when an existing Secret is used with automatic CNPG
+          # provisioning; asserts basic-auth keys + cnpg.io/reload metadata.
+          existingSecretCnpgCompatible: false
           # Alternatively, set a Vault path while using externalSecrets; it is
           # synced only after viewer.enabled becomes true.
           vaultPath: ""
           passwordKey: "CANVAS_VIEWER_POSTGRES_PASSWORD"
+        # With engine=cnpg, CNPG 1.30+ owns the role/password and a normal
+        # revision Job owns the object grants. No pre-install role step.
         provisionRole: false
         pool:
           min: 1
@@ -239,8 +246,50 @@ canvas:
         extraEgress: []
 
 # -----------------------------------------------------------------------------
+# SSH gateway — user-facing `ssh s-<handle>@<hostname>` into session workspaces
+#
+# Off by default. Enabling it requires TWO operator-provided Secrets (the chart
+# never generates key material; a template-time key would rotate on every sync
+# and break every user's known_hosts) plus an origin allow-list and the trusted
+# proxy hop — the gateway's load_config fails closed on all of them.
+#
+#   ssh-keygen -t ed25519 -N "" -f ./ssh_host_ed25519_key      # Ed25519 ONLY
+#   ssh-keygen -t ed25519 -N "" -f ./user-ca
+#   kubectl -n <ns> create secret generic srw-ssh-gateway-hostkey \
+#     --from-file=ssh_host_ed25519_key --from-file=ssh_host_ed25519_key.pub
+#   kubectl -n <ns> create secret generic srw-ssh-gateway-ca \
+#     --from-file=user-ca --from-file=user-ca.pub
+#
+# The `.pub` host-key halves are NOT optional: the orchestrator mounts them to
+# serve GET /api/ssh/host-keys, and without them every pinning client silently
+# falls back to trust-on-first-use.
+#
+# A THIRD step is easy to miss: `user-ca.pub` must also land in the vm-ssh-key
+# Secret, which is where the workspace provisioner projects it from. See the
+# "SSH gateway" section of helm/README.md.
+#
+# The gateway also REQUIRES a sessionRouter JWT secret (see below): it is the
+# HMAC key it verifies the attach token with. The chart refuses to render
+# without one rather than shipping a pod that crash-loops.
+#
+# Every abuse cap the gateway enforces is per POD, so `replicas` multiplies
+# all of them — including `max_attachments_per_workspace`, a security cap.
+# Leave it at 1 unless you have read helm/values.yaml's note on it.
+# -----------------------------------------------------------------------------
+# sshGateway:
+#   enabled: true
+#   hostname: "ssh.example.com"
+#   allowedOrigins: ["https://app.example.com"]
+#   trustedProxies: "10.42.0.0/16"     # every proxy hop (ingress + tunnel connector), or the literal "none"
+#   hostKeySecret: "srw-ssh-gateway-hostkey"
+#   userCaSecret: "srw-ssh-gateway-ca"
+#   tcp:
+#     enabled: true                    # raw :2222 door via MetalLB
+#     allowedClientCIDRs: ["10.0.0.0/8"]
+#     externalTrafficPolicy: Local     # required for the CIDR rules to match
+
+# -----------------------------------------------------------------------------
 # Session router — Direct Session WebSockets
-# (knowledge-base/knowledge/features/direct_session_websockets.md)
 #
 # Generate a strong key with:  openssl rand -hex 32
 # Then pass at install time so it never lives in the repo:

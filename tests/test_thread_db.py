@@ -412,6 +412,28 @@ class TestCreateThread:
         assert call_args[0][8] == "pinned"  # execution_lane
 
     @pytest.mark.asyncio
+    async def test_process_zero_receipt_is_stripped_at_common_create_funnel(self):
+        conn = _mock_conn()
+        conn.fetchrow = AsyncMock(
+            return_value={"id": UUID("aaaaaaaa-1111-2222-3333-444444444444")}
+        )
+        db = _make_db_with_conn(conn)
+
+        await db.create_thread(
+            execution_lane="stateless",
+            initial_metadata={
+                "config_override": {"workspace": {"backend": "virtual"}},
+                "_stateless_workspace_process_zero_observation": {
+                    "runtime_incarnation": ("22222222-2222-4222-8222-222222222222"),
+                    "observed_at": "2026-08-26T12:00:00+00:00",
+                },
+            },
+        )
+
+        stored = json.loads(conn.fetchrow.await_args.args[7])
+        assert "_stateless_workspace_process_zero_observation" not in stored
+
+    @pytest.mark.asyncio
     async def test_explicit_stateless_lane_is_written_in_creation_insert(self):
         conn = _mock_conn()
         conn.fetchrow = AsyncMock(
@@ -439,7 +461,7 @@ class TestCreateThread:
             "workspace_container": {
                 "status": "pending",
                 "provisioner": "k8s",
-                "_stateless_runtime_creation": {
+                "_runtime_creation": {
                     "generation": generation,
                     "mode": "create",
                     "attempted": False,
@@ -459,7 +481,25 @@ class TestCreateThread:
         )
 
         stored = json.loads(conn.fetchrow.await_args.args[7])
-        assert stored["workspace_container"] == initial_metadata["workspace_container"]
+        # The creation generation is server-owned: a caller-supplied value is
+        # replaced with a fresh nonce in the same insert, and nothing else in
+        # the projection moves.
+        stored_workspace = stored["workspace_container"]
+        stored_marker = stored_workspace["_runtime_creation"]
+        assert stored_marker["generation"] != generation
+        assert str(UUID(stored_marker["generation"])) == stored_marker["generation"]
+        assert {k: v for k, v in stored_marker.items() if k != "generation"} == {
+            "mode": "create",
+            "attempted": False,
+            "replaces_uid": None,
+        }
+        assert {
+            k: v for k, v in stored_workspace.items() if k != "_runtime_creation"
+        } == {
+            k: v
+            for k, v in initial_metadata["workspace_container"].items()
+            if k != "_runtime_creation"
+        }
         assert stored["datasource_ids"] == []
 
     @pytest.mark.asyncio
@@ -566,9 +606,11 @@ class TestListThreads:
 
         result = await db.list_threads()
         assert len(result) == 2
-        # SQL should have no WHERE clause
+        # No caller filter — only the always-on session gate (0206: subagent
+        # child rows share the table and must never reach the sessions page).
         sql = " ".join(conn.fetch.call_args[0][0].split())
-        assert "WHERE" not in sql
+        assert "WHERE kind = 'session' ORDER BY" in sql
+        assert conn.fetch.call_args[0][1:] == ()
         assert "ORDER BY created_at DESC" in sql
         assert "LIMIT 50" in sql
 
@@ -687,6 +729,9 @@ class TestStatelessWorkspaceCreationAuthority:
             return_value={
                 "status": "created",
                 "execution_lane": "stateless",
+                # 0197/0198 canonicalise the thread's own runtime generation
+                # before any creation authority is considered.
+                "runtime_generation": self.GENERATION,
                 "metadata": {
                     "workspace_container": {
                         "status": "pending",
@@ -723,11 +768,12 @@ class TestStatelessWorkspaceCreationAuthority:
             return_value={
                 "status": "created",
                 "execution_lane": "stateless",
+                "runtime_generation": self.GENERATION,
                 "metadata": {
                     "workspace_container": {
                         "status": "pending",
                         "provisioner": "k8s",
-                        "_stateless_runtime_creation": marker,
+                        "_runtime_creation": marker,
                     }
                 },
             }
@@ -811,8 +857,10 @@ class TestEndThread:
                 },
                 queue,
                 {"lease_token": 1, "attempts_since_completion": 0},
+                {"id": "tid-1", "kind": "session", "execution_lane": "stateless"},
             ]
         )
+        conn.fetch = AsyncMock(return_value=[])
         conn.fetchval = AsyncMock(side_effect=[False, False, 1, "tid-1"])
         db = _make_db_with_conn(conn)
 
@@ -853,8 +901,14 @@ class TestEndThread:
                         "state": "done",
                         "lease_token": 1,
                     },
+                    {
+                        "id": "tid-1",
+                        "kind": "session",
+                        "execution_lane": "stateless",
+                    },
                 ]
             )
+            finish_conn.fetch = AsyncMock(return_value=[])
             finish_conn.fetchval = AsyncMock(return_value="tid-1")
             finish_db = _make_db_with_conn(finish_conn)
 
@@ -874,7 +928,7 @@ class TestEndThread:
     async def test_force_end_token_zero_retires_legacy_unbound_permission(
         self, monkeypatch
     ):
-        from src.shared import session_permission_retirement
+        from shared import session_permission_retirement
 
         metadata = {
             "config_override": {"workspace": {"backend": "virtual"}},
@@ -912,8 +966,10 @@ class TestEndThread:
                 },
                 queue,
                 {"lease_token": 1, "attempts_since_completion": 0},
+                {"id": "tid-1", "kind": "session", "execution_lane": "stateless"},
             ]
         )
+        conn.fetch = AsyncMock(return_value=[])
         conn.fetchval = AsyncMock(side_effect=[False, True, 1, "tid-1"])
         retirement = MagicMock(epoch_bumped=True, count=1)
         retire = AsyncMock(return_value=retirement)
@@ -988,8 +1044,10 @@ class TestEndThread:
                 None,
                 synthetic,
                 {"lease_token": 1, "attempts_since_completion": 0},
+                {"id": "tid-1", "kind": "session", "execution_lane": "stateless"},
             ]
         )
+        conn.fetch = AsyncMock(return_value=[])
         conn.fetchval = AsyncMock(side_effect=[False, False, 1, "tid-1"])
         db = _make_db_with_conn(conn)
 
@@ -1144,14 +1202,16 @@ class TestEndThread:
                 {"unit_kind": "session_turn"},
             ]
         )
-        conn.fetchval = AsyncMock(side_effect=["tid-1", "tid-1"])
+        conn.fetchval = AsyncMock(side_effect=[12, "tid-1", "tid-1"])
         db = _make_db_with_conn(conn)
 
         assert await db.resume_thread("tid-1") is True
-        queue_sql = " ".join(conn.fetchval.await_args_list[0].args[0].split())
+        pending_sql = " ".join(conn.fetchval.await_args_list[0].args[0].split())
+        assert "FROM thread_input_deliveries" in pending_sql
+        queue_sql = " ".join(conn.fetchval.await_args_list[1].args[0].split())
         assert "input_seq > COALESCE(consumed_seq, -1)" in queue_sql
         assert "THEN 'queued' ELSE 'done'" in queue_sql
-        assert conn.fetchval.await_args_list[0].args[1:] == ("tid-1",)
+        assert conn.fetchval.await_args_list[1].args[1:] == ("tid-1", 12)
 
     @pytest.mark.asyncio
     async def test_resume_clears_agent_and_control_capability(self):
@@ -1214,7 +1274,7 @@ class TestEndThread:
                 {"unit_kind": "session_turn"},
             ]
         )
-        settled_conn.fetchval = AsyncMock(side_effect=["tid-1", "tid-1"])
+        settled_conn.fetchval = AsyncMock(side_effect=[None, "tid-1", "tid-1"])
         settled_db = _make_db_with_conn(settled_conn)
 
         assert await settled_db.resume_thread("tid-1") is True
@@ -1302,8 +1362,10 @@ class TestEndThread:
                     "metadata": _proven_soft_retirement_metadata(retain_runtime=False),
                 },
                 {"unit_kind": "session_turn", "state": "done", "lease_token": 8},
+                {"id": "tid-1", "kind": "session", "execution_lane": "stateless"},
             ]
         )
+        conn.fetch = AsyncMock(return_value=[])
         conn.fetchval = AsyncMock(return_value="tid-1")
         db = _make_db_with_conn(conn)
 
@@ -1317,7 +1379,7 @@ class TestEndThread:
     @pytest.mark.asyncio
     async def test_finish_refuses_to_erase_in_progress_creation_authority(self):
         metadata = _proven_soft_retirement_metadata(retain_runtime=False)
-        metadata["workspace_container"]["_stateless_runtime_creation"] = {
+        metadata["workspace_container"]["_runtime_creation"] = {
             "generation": "33333333-3333-4333-8333-333333333333",
             "mode": "restore",
             "attempted": True,
@@ -1381,14 +1443,20 @@ class TestEndThread:
                 {"unit_kind": "session_turn"},
             ]
         )
-        conn.fetchval = AsyncMock(side_effect=["tid-1", "tid-1"])
+        # Resume rotates the generation, then binds the creation marker to that
+        # exact generation in a second statement (0197/0198).
+        resumed_generation = "33333333-3333-4333-8333-333333333333"
+        conn.fetchval = AsyncMock(
+            side_effect=[None, "tid-1", resumed_generation, "tid-1"]
+        )
         db = _make_db_with_conn(conn)
 
         assert await db.resume_thread("tid-1")
 
         stored = json.loads(conn.fetchval.await_args_list[-1].args[2])
         assert "_stateless_workspace_retirement_settled" not in stored
-        marker = stored["workspace_container"]["_stateless_runtime_creation"]
+        marker = stored["workspace_container"]["_runtime_creation"]
+        assert marker["generation"] == resumed_generation
         assert marker["mode"] == mode
         assert marker["attempted"] is False
         assert marker["replaces_uid"] is None
@@ -1984,6 +2052,95 @@ class TestMergeThreadWorkspaceContext:
         # First param is the JSON-serialized updates
         json_param = conn.execute.call_args[0][1]
         assert json.loads(json_param) == {"status": "ready"}
+
+
+class TestStatelessWorkspaceProcessZeroObservation:
+    THREAD_ID = "aaaaaaaa-1111-4222-8333-444444444444"
+    RUNTIME = "22222222-2222-4222-8222-222222222222"
+
+    @staticmethod
+    def _row(*, runtime: str, observation=None):
+        metadata = {
+            "workspace_container": {
+                "provisioner": "k8s",
+                "_runtime_incarnation": runtime,
+            }
+        }
+        if observation is not None:
+            metadata["_stateless_workspace_process_zero_observation"] = observation
+        return {"execution_lane": "stateless", "metadata": metadata}
+
+    @pytest.mark.asyncio
+    async def test_record_is_exact_uid_bound_and_idempotent(self):
+        conn = _mock_conn()
+        conn.fetchrow = AsyncMock(return_value=self._row(runtime=self.RUNTIME))
+        conn.execute = AsyncMock(side_effect=["UPDATE 1", "INSERT 0 1"])
+        db = _make_db_with_conn(conn)
+
+        assert await db.record_stateless_thread_workspace_process_zero(
+            self.THREAD_ID,
+            runtime_incarnation=self.RUNTIME,
+        )
+        payload = json.loads(conn.execute.await_args_list[0].args[2])
+        assert payload["workspace_container"]["status"] == "retiring_process_zero"
+        receipt_insert = conn.execute.await_args_list[1]
+        assert receipt_insert.args[2] == self.RUNTIME
+
+        conn.reset_mock()
+        conn.fetchrow = AsyncMock(return_value=self._row(runtime=self.RUNTIME))
+        conn.execute = AsyncMock(side_effect=["UPDATE 1", "INSERT 0 0"])
+        assert await db.record_stateless_thread_workspace_process_zero(
+            self.THREAD_ID,
+            runtime_incarnation=self.RUNTIME,
+        )
+        assert conn.execute.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_record_refuses_runtime_drift(self):
+        conn = _mock_conn()
+        conn.fetchrow = AsyncMock(
+            return_value=self._row(runtime="33333333-3333-4333-8333-333333333333")
+        )
+        db = _make_db_with_conn(conn)
+
+        assert not await db.record_stateless_thread_workspace_process_zero(
+            self.THREAD_ID,
+            runtime_incarnation=self.RUNTIME,
+        )
+        conn.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_read_requires_receipt_and_current_runtime_match(self):
+        receipt = {
+            "runtime_incarnation": self.RUNTIME,
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        conn = _mock_conn()
+        conn.fetchrow = AsyncMock(
+            return_value=self._row(runtime=self.RUNTIME, observation=receipt)
+        )
+        conn.fetchval = AsyncMock(
+            side_effect=lambda _query, _thread_id, runtime: runtime == self.RUNTIME
+        )
+        db = _make_db_with_conn(conn)
+
+        assert (
+            await db.get_stateless_thread_workspace_process_zero(
+                self.THREAD_ID,
+                expected_runtime_incarnation=self.RUNTIME,
+            )
+            == self.RUNTIME
+        )
+
+        conn.fetchrow = AsyncMock(
+            return_value=self._row(
+                runtime="33333333-3333-4333-8333-333333333333",
+                observation=receipt,
+            )
+        )
+        assert (
+            await db.get_stateless_thread_workspace_process_zero(self.THREAD_ID) is None
+        )
 
 
 class TestMergeThreadVmContext:

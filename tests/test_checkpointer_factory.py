@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.utils.db_url import (
+from shared.db_url import (
     checkpointer_backend,
     resolve_checkpoint_url,
     resolve_fenced_checkpoint_url,

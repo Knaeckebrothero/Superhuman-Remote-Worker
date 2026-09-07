@@ -108,7 +108,7 @@ export interface JobSummary {
   description: string;
   status: string;
   completion_outcome_kind?: 'blocked_undelivered' | null;
-  config_name?: string;
+  config_name?: string | null;
   user_id?: string | null;
   project_id?: string | null;
   project_name?: string | null;
@@ -173,10 +173,11 @@ export interface JobSummary {
 /**
  * One page of `/api/jobs`, matching the server envelope.
  *
- * `total` is exact up to a server-side cap and `null` when the caller opted
- * out with `include_total=false`; `total_is_capped` says which. `has_more` is
- * exact either way — the server fetches one row past the page rather than
- * comparing against `total`.
+ * Counts, limit and offset refer to display roots. Matching children accompany
+ * their root, so jobs.length can exceed limit. `total` is null when counting was
+ * skipped; `total_is_capped=true` makes a numeric total a lower bound. `has_more`
+ * is independent of the count. See orchestrator.schemas.job_list; wire coverage
+ * shares fixtures/job-list-page.json with the mounted backend route.
  */
 export interface JobListPage {
   jobs: JobSummary[];
@@ -186,20 +187,22 @@ export interface JobListPage {
   limit: number;
   offset: number;
   /**
-   * Creation-time watermark that froze this result window. Pass it back on
-   * later pages, or rows inserted meanwhile shift the offset underneath the
-   * user and rows are skipped or repeated.
+   * Creation-time watermark: pass it back to exclude newer inserts on later
+   * pages. Status changes and deletions can still change the matching set.
+   * Always present on current server success; optional for older metadata and
+   * the synthetic error fallback below.
    */
   as_of?: string;
   /**
-   * What the server actually applied, including its own defaults. Drives the
-   * applied-filter tokens, so a hidden row is never hidden silently.
+   * What the server applied, including its defaults. Always present on current
+   * server success; optional for older metadata and the synthetic fallback.
    */
   filters?: JobListFilters;
 }
 
 export interface JobListFilters {
   status?: string[];
+  origin?: string[];
   project_id?: string[];
   has_project?: boolean | null;
   include_archived_projects?: boolean;

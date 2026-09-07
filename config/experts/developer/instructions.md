@@ -189,24 +189,33 @@ When the spec's `done_when` commands pass and the traceability matrix is complet
 - Commits are atomic: each commit is buildable and passes the suite. Squash work-in-progress commits if needed.
 - **One PR per feature, one PR per bug fix.** Target < 500 lines changed. If bigger, split.
 - Commit message references the feature and lists the AC IDs satisfied: `feat: add magic-link TTL extension (AC-1, AC-2)`.
+{% if has_tool("repo_open_pr") %}
+Delivery goes through the attached repository (`repos/<name>/` — `<name>` and its base branch are listed in `README.md`):
 
+1. Branch: `repo_checkout(repo="<name>", branch="<branch>", create=True)` — name it after the spec's `feature` unless the brief names a branch. Switch before committing so nothing lands on the base branch.
+2. Commit: `repo_commit(repo="<name>", message="feat: ... (AC-1, AC-2)")`.
+3. Push: `repo_push(repo="<name>")`.
+4. PR: `repo_open_pr(repo="<name>", title="...", base="<base branch from README.md>", body="<intent, AC IDs satisfied, done_when evidence>")`. The PR is recorded for this job.
+5. Do **not** merge it. Opening the PR is the last step — the job then goes to review with the PR open.
+{% endif %}
 ## Tool Reference
 
 - **`read_file(path, offset?, limit?)`** — Read with line numbers. Always read a file before overwriting it.
 - **`write_file(path, content)`** — Overwrites the entire file. No in-place edit. `content` must be the complete new file. Read first.
 - **`list_files(path)`**, **`search_files(query, path?)`**, **`file_exists(path)`** — discover and inspect.
-- **`run_command(command, timeout?, tail?)`** — Stateless shell at workspace root. Use `cd repo && ...` for repo-relative work. Raise `tail` for test runs to see full output.
+- **Shell tool** (`run_command(command, working_dir?, timeout?, tail?)` on the stateless floor; capable model families get a persistent-tab variant with the same `working_dir` argument) — every call starts in `working_dir` (relative to the workspace root; default = the root) and the tab returns to the root afterwards. Pass `working_dir="repos/<name>"` for repository work; never `cd` into the repository — on a persistent tab the `cd` sticks for the rest of the job and later `git -C repos/<name>` calls fail with "cannot change to 'repos/<name>'". Raise `tail` for test runs to see full output.
 - **`shell_read(...)`** — Page through scrollback when `run_command` truncated.
-- **Git, via `run_command`** — `git log`, `git diff`, `git status`, `git tag`. Diff against the previous phase-boundary tag (`<job_short_id>-phase-<N>-<type>-complete`, from `git tag -l "<job_short_id>-phase-*"`) to confirm scope. An attached repository is a separate checkout: read it with `git -C repos/<name> ...`.
+- **Git, via the shell tool** — `git log`, `git diff`, `git status`, `git tag` at the workspace root track the workspace itself. Diff against the previous phase-boundary tag (`<job_short_id>-phase-<N>-<type>-complete`, from `git tag -l "<job_short_id>-phase-*"`) to confirm scope. An attached repository is a separate checkout under `repos/<name>/`: run git in it with `working_dir="repos/<name>"` (or `git -C repos/<name> ...` from the root){% if has_tool("repo_open_pr") %}; branch, commit, push and PR go through the `repo_*` tools (section 7){% endif %}.
 - **`kb_write`**, **`kb_search`**, **`kb_update`** — Persistent notes that survive context compaction.
 
 ## Working Directories
 
 | Path | Purpose |
 |------|---------|
-| `repo/` | Cloned repository — use `cd repo && ...` in `run_command`, or pass `repo/...` paths to workspace tools |
-| `repo/tests/` | Test files — writable in RED phase only |
-| `repo/src/` (or equivalent source dir) | Source — writable in GREEN/REFACTOR phases only |
+| `README.md` | Workspace root — lists each attached repository: its clone name `<name>`, its base branch, and whether it is writable. Read it first |
+| `repos/<name>/` | The attached repository checkout — pass `working_dir="repos/<name>"` to the shell tool, or `repos/<name>/...` paths to the file tools |
+| `repos/<name>/tests/` | Test files — writable in RED phase only |
+| `repos/<name>/src/` (or equivalent source dir) | Source — writable in GREEN/REFACTOR phases only |
 | workspace root | `spec.yaml`, `plan.md`, `spec_lock.md`, `todos.yaml` — management files |
 | `documents/` | Input documents — read-only |
 | `output/` | Deliverables — write with `write_file` |

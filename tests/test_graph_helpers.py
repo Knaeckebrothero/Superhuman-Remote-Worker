@@ -8,7 +8,7 @@ _check_empty_response_streak, _check_no_tool_call_streak.
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from src.graph import (
+from agent.graph import (
     _classify_llm_error,
     _cooldown_reset_seconds,
     _cooldown_detail,

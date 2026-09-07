@@ -21,13 +21,13 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
-from src.core.context import ContextConfig, ContextManager
-from src.core.image_tokens import (
+from agent.core.context import ContextConfig, ContextManager
+from shared.runtime.core.image_tokens import (
     DEFAULT_IMAGE_TOKENS,
     content_to_summary_text,
     has_image_content,
 )
-from src.core.summarizer import _describe_exc
+from agent.core.summarizer import _describe_exc
 
 _B64 = "Z" * 400_000  # a base64 blob big enough to dominate if stringified
 

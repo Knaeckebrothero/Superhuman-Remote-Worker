@@ -9,7 +9,7 @@ markup):
 * strip_tool_call_markup — content cleanup after recovery
 """
 
-from src.core.toolcall_recovery import (
+from agent.core.toolcall_recovery import (
     has_leaked_tool_call_markup,
     parse_leaked_tool_calls,
     strip_tool_call_markup,

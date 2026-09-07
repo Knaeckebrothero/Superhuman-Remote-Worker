@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from src.services.cloud_mount import RcloneMountManager
-from src.services.cloud_overlay.overlay_mount import (
+from shared.runtime.services.cloud_mount import RcloneMountManager
+from shared.runtime.services.cloud_overlay.overlay_mount import (
     OverlayMountError,
     OverlayMountManager,
 )

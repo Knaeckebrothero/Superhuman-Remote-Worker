@@ -4,11 +4,13 @@ from copy import deepcopy
 
 import pytest
 
-import main
-from services.cloud.protected_reader_authority import (
+import orchestrator.main
+from orchestrator.services.cloud.protected_reader_authority import (
     ProtectedNextcloudReaderGrantPlan,
 )
-from services.cloud_staging.source_identity import ProtectedMountSourceIdentity
+from orchestrator.services.cloud_staging.source_identity import (
+    ProtectedMountSourceIdentity,
+)
 
 
 _THREAD = "11111111-1111-4111-8111-111111111111"
@@ -103,7 +105,9 @@ def _receipt_fixture():
 def test_retirement_stage_receipt_accepts_exact_immutable_source():
     retirement, thread, row = _receipt_fixture()
 
-    valid, event = main._retirement_stage_event_from_receipt(retirement, thread, row)
+    valid, event = orchestrator.main._retirement_stage_event_from_receipt(
+        retirement, thread, row
+    )
 
     assert valid is True
     assert event == {
@@ -134,7 +138,9 @@ def test_retirement_stage_receipt_rejects_source_identity_drift(mutate):
     retirement, thread, row = deepcopy(_receipt_fixture())
     mutate(retirement, thread, row)
 
-    assert main._retirement_stage_event_from_receipt(retirement, thread, row) == (
+    assert orchestrator.main._retirement_stage_event_from_receipt(
+        retirement, thread, row
+    ) == (
         False,
         None,
     )

@@ -22,6 +22,7 @@ assert the mock. What is actually at stake:
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import asyncpg
@@ -30,10 +31,11 @@ import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
 from orchestrator.database.postgres import PostgresDB
-from security import crypto
+from orchestrator.security import crypto
 
 SCHEMA_FILE = (
     Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "schema_current.sql"
@@ -89,6 +91,7 @@ async def _job(
     parent: str | None = None,
     status: str = "completed",
     config_name: str | None = None,
+    created_at: datetime | None = None,
 ) -> str:
     job_id = uuid.uuid4()
     async with db.acquire() as conn:
@@ -96,7 +99,7 @@ async def _job(
             """
             INSERT INTO jobs (id, description, status, origin, parent_job_id,
                               config_name, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, NOW())
+            VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, NOW()))
             """,
             job_id,
             description,
@@ -104,6 +107,7 @@ async def _job(
             origin,
             uuid.UUID(parent) if parent else None,
             config_name,
+            created_at,
         )
     return str(job_id)
 
@@ -272,3 +276,119 @@ class TestCyclesTerminate:
         # infinite. Asserting DISTINCT is what matters: without it the same two
         # jobs would be counted once per lap, up to the depth cap.
         assert rows.jobs[0]["subjob_count"] == 2
+
+
+@pytest_asyncio.fixture
+async def list_client(db, monkeypatch):
+    """Mounted public list route with real SQL and no background application."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    import httpx
+    from fastapi import FastAPI
+    from orchestrator import main
+
+    monkeypatch.setattr(main, "postgres_db", db)
+    monkeypatch.setattr(
+        main,
+        "require_approved_user",
+        AsyncMock(return_value={"id": str(uuid.uuid4()), "is_admin": True}),
+    )
+    monkeypatch.setattr(main, "audit_reader", SimpleNamespace(is_available=False))
+    route = next(
+        r
+        for r in main.app.routes
+        if getattr(r, "path", None) == "/api/jobs"
+        and "GET" in getattr(r, "methods", ())
+    )
+    app = FastAPI()
+    app.router.routes.append(route)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://list.test"
+    ) as client:
+        yield client
+
+
+class TestListWirePagination:
+    @pytest.mark.asyncio
+    async def test_tied_roots_keep_children_and_watermark_excludes_new_insert(
+        self, db, list_client
+    ):
+        from orchestrator.schemas.job_list import PublicJobListPage
+
+        stamp = datetime(2026, 9, 6, 8, tzinfo=timezone.utc)
+        a = await _job(db, description="a", created_at=stamp)
+        b = await _job(db, description="b", created_at=stamp)
+        first_root, second_root = sorted([a, b], reverse=True)
+        child = await _job(
+            db,
+            description="child",
+            parent=first_root,
+            origin="subjob",
+            created_at=stamp,
+        )
+        # Real SQL must discard its private workspace join columns before the
+        # public model sees them. Synthetic data only; no provider/workspace.
+        async with db.acquire() as conn:
+            await conn.execute(
+                """UPDATE jobs SET context = '{"vm":{"ssh_host":"synthetic-private"}}',
+                   config_override = '{"llm":{"api_key":"synthetic-private"}}'
+                   WHERE id = $1""",
+                uuid.UUID(first_root),
+            )
+        query = [
+            ("origin", "user"),
+            ("origin", "subjob"),
+            ("status", "completed"),
+            ("limit", "1"),
+        ]
+        first = await list_client.get("/api/jobs", params=query)
+        assert first.status_code == 200, first.text
+        page = first.json()
+        PublicJobListPage.model_validate_json(first.text, strict=True)
+        assert [j["id"] for j in page["jobs"]] == [first_root, child]
+        assert page["limit"] == 1 and page["total"] == 2 and page["has_more"] is True
+        assert page["jobs"][0]["config_name"] is None
+        for private in (
+            "synthetic-private",
+            "_workspace_context",
+            "_workspace_config_override",
+            "project_has_cloud_folder",
+        ):
+            assert private not in first.text
+
+        watermark = datetime.fromisoformat(page["as_of"])
+        await _job(
+            db, description="newer insert", created_at=watermark + timedelta(seconds=1)
+        )
+        frozen = query + [("as_of", page["as_of"]), ("include_total", "false")]
+        second = await list_client.get("/api/jobs", params=frozen + [("offset", "1")])
+        assert second.status_code == 200, second.text
+        next_page = second.json()
+        PublicJobListPage.model_validate_json(second.text, strict=True)
+        assert [j["id"] for j in next_page["jobs"]] == [second_root]
+        assert next_page["total"] is None and next_page["total_is_capped"] is False
+        assert next_page["has_more"] is False and next_page["as_of"] == page["as_of"]
+        repeated = await list_client.get("/api/jobs", params=frozen)
+        assert [j["id"] for j in repeated.json()["jobs"]] == [first_root, child]
+        empty = await list_client.get("/api/jobs", params=frozen + [("offset", "2")])
+        assert empty.json()["jobs"] == [] and empty.json()["has_more"] is False
+
+    @pytest.mark.asyncio
+    async def test_real_capped_count_is_independent_of_has_more(
+        self, db, list_client, monkeypatch
+    ):
+        monkeypatch.setattr("orchestrator.database.postgres.JOB_COUNT_CAP", 1)
+        for name in ("a", "b", "c"):
+            await _job(db, description=name)
+        first = await list_client.get("/api/jobs", params={"limit": 2})
+        assert first.status_code == 200, first.text
+        assert first.json()["total"] == 1 and first.json()["total_is_capped"] is True
+        assert first.json()["has_more"] is True
+        last = await list_client.get(
+            "/api/jobs",
+            params={"limit": 2, "offset": 2, "as_of": first.json()["as_of"]},
+        )
+        assert last.status_code == 200, last.text
+        assert last.json()["total"] == 1 and last.json()["total_is_capped"] is True
+        assert last.json()["has_more"] is False

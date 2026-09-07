@@ -1,18 +1,13 @@
 """Unit tests for GiteaClient.change_files and get_commits."""
 
 import os
-import sys
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-_orch_dir = str(Path(__file__).parent.parent / "orchestrator")
-if _orch_dir not in sys.path:
-    sys.path.insert(0, _orch_dir)
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
-from services import gitea as gitea_mod  # noqa: E402
+from orchestrator.services import gitea as gitea_mod  # noqa: E402
 
 
 @pytest.mark.asyncio

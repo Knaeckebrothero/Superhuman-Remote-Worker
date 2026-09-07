@@ -20,6 +20,7 @@ from orchestrator.services.job_completion_commands import accept_completion_comm
 
 SCHEMA_FILE = (
     Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "schema_current.sql"

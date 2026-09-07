@@ -35,6 +35,7 @@ import {
     ExpertCreateRequest,
     ExpertDetail,
     ExpertDuplicateResult,
+    ExpertRole,
     ExpertUpdateRequest,
     Skill,
     SkillCreateRequest,
@@ -53,6 +54,7 @@ import {
     JobDiffSummary,
     JobProgress,
     JobUsage,
+    JobSubagentRoster,
     JobSubjobRoster,
     JobRejectResult,
     JobReviewSessionResult,
@@ -92,6 +94,8 @@ import {
     ThreadCloudRejectResult,
     ThreadCloudDiffFile,
     ThreadCloudDiffSummary,
+    PersistentThreadHistory,
+    SshGatewayHostKeysResponse,
     User,
     UserCapabilities,
     VoiceCapabilities,
@@ -114,7 +118,7 @@ import {
 import {LLMRequest} from '../../workbench/request.model';
 import {GraphChangeResponse} from '../../workbench/graph.model';
 import {ChatEntry, ChatHistoryResponse} from '../models/chat.model';
-import {PendingActionCounts, ThreadDetail} from '../models/action.model';
+import {ThreadDetail} from '../models/action.model';
 import {
   TtsVoicesResponse,
   TtsLibraryResponse,
@@ -177,6 +181,8 @@ export interface IdeSessionStatus {
   source?: string;
   restore_type?: 'vm' | 'container' | 'k8s_container';
   error?: string;
+  /** Typed refusal code when the orchestrator withheld the IDE URL. */
+  code?: string;
 }
 
 /**
@@ -653,9 +659,17 @@ export class ApiService {
 
   /**
    * Get list of available expert configurations.
+   *
+   * `expertType` filters server-side on `expert_type || tags` (a session row
+   * tagged `worker` lists under `worker`); `subagent` lists the
+   * `config/subagents/*` library (rows with `name = subagents/<id>`, the
+   * roster `$ref` spelling) plus every expert tagged `subagent`. `showAll`
+   * drops the role filter — the "Show all experts" toggle of the pickers and
+   * the roster reference picker; the server accepts a cross-role pick.
    */
-  getExperts(expertType?: 'worker' | 'session'): Observable<Expert[]> {
-    const params = expertType ? new HttpParams().set('type', expertType) : undefined;
+  getExperts(expertType?: ExpertRole, opts?: {showAll?: boolean}): Observable<Expert[]> {
+    const type = opts?.showAll ? undefined : expertType;
+    const params = type ? new HttpParams().set('type', type) : undefined;
     return this.http.get<Expert[]>(`${this.baseUrl}/experts`, {params}).pipe(
       catchError(() => of([])),
     );
@@ -716,12 +730,19 @@ export class ApiService {
    * actually boots `virtual`, which used to leave repository connectors
    * selectable and 400 every create). The expert editor must NOT pass it: its
    * diff baseline has to stay the pure framework base.
+   *
+   * `role` resolves the expert in that role (`?role=worker|session|subagent`,
+   * cross-role allowed — a session expert previewed as a subagent); the
+   * payload keeps `expert_type` and adds `resolved_role`.
    */
   getExpertDetail(
     expertId: string,
-    opts?: {accountDefaults?: boolean},
+    opts?: {accountDefaults?: boolean; role?: ExpertRole},
   ): Observable<ExpertDetail | null> {
-    const qs = opts?.accountDefaults ? '?account_defaults=true' : '';
+    const parts: string[] = [];
+    if (opts?.accountDefaults) parts.push('account_defaults=true');
+    if (opts?.role) parts.push(`role=${opts.role}`);
+    const qs = parts.length ? `?${parts.join('&')}` : '';
     return this.http.get<ExpertDetail>(`${this.baseUrl}/experts/${expertId}${qs}`).pipe(
       catchError(() => of(null)),
     );
@@ -1894,6 +1915,21 @@ export class ApiService {
             );
     }
 
+    /** Read a persistent thread's durable transcript without attaching its
+     * runtime transport. This is the only history path used for child agents. */
+    getPersistentThreadHistory(threadId: string): Observable<PersistentThreadHistory | null> {
+        return this.http
+            .get<PersistentThreadHistory>(
+                `${this.baseUrl}/persistent/threads/${threadId}/messages`,
+            )
+            .pipe(
+                catchError((error) => {
+                    console.error(`Failed to get transcript for thread ${threadId}:`, error);
+                    return of(null);
+                }),
+            );
+    }
+
     /**
      * The session's resolved toolset: what the running agent actually bound,
      * or a labelled prediction when there is no agent to ask.
@@ -2110,18 +2146,6 @@ export class ApiService {
   }
 
   /**
-   * Get pending action counts across all types.
-   */
-  getPendingActions(): Observable<PendingActionCounts | null> {
-    return this.http.get<PendingActionCounts>(`${this.baseUrl}/actions/pending`).pipe(
-      catchError((error) => {
-        console.error('Failed to fetch pending actions:', error);
-        return of(null);
-      }),
-    );
-  }
-
-  /**
    * Assign a job to an agent.
    */
   assignJob(jobId: string, agentId: string): Observable<{ status: string; agent_id: string; job_id: string } | null> {
@@ -2190,6 +2214,20 @@ export class ApiService {
     return this.http.get<JobSubjobRoster>(`${this.baseUrl}/jobs/${jobId}/subjobs`).pipe(
       catchError((error) => {
         console.error(`Failed to fetch subjobs for job ${jobId}:`, error);
+        return of(null);
+      }),
+    );
+  }
+
+  /**
+   * The in-process child agents a job ran, including their transcript ids.
+   * Degrades independently so a roster outage never blanks the rest of the
+   * job detail panel.
+   */
+  getJobSubagents(jobId: string): Observable<JobSubagentRoster | null> {
+    return this.http.get<JobSubagentRoster>(`${this.baseUrl}/jobs/${jobId}/subagents`).pipe(
+      catchError((error) => {
+        console.error(`Failed to fetch subagents for job ${jobId}:`, error);
         return of(null);
       }),
     );
@@ -2337,6 +2375,31 @@ export class ApiService {
     );
   }
 
+  /**
+   * `getProject` with the failure reason preserved.
+   *
+   * `getProject` collapses every failure into `null`, which is right for the
+   * dozen callers that just render nothing. It is wrong for the route guard,
+   * which turns the failure into a *sentence shown to the user*: a 500 from
+   * the orchestrator was reported as "you don't have access to that project",
+   * which is not merely vague but the opposite of true — the membership check
+   * had already passed. Callers that diagnose need the status; callers that
+   * only render should keep using `getProject`.
+   */
+  getProjectOrError(
+    id: string,
+  ): Observable<{project: Project | null; status: number | null}> {
+    return this.http.get<Project>(`${this.baseUrl}/projects/${id}`).pipe(
+      map((project) => ({project, status: 200})),
+      catchError((err: unknown) =>
+        of({
+          project: null,
+          status: err instanceof HttpErrorResponse ? err.status : null,
+        }),
+      ),
+    );
+  }
+
   /** Current user's resolved capabilities + the catalog (drives editor greying). */
   getMyCapabilities(): Observable<UserCapabilities | null> {
     return this.http
@@ -2351,6 +2414,16 @@ export class ApiService {
   getVoiceCapabilities(): Observable<VoiceCapabilities | null> {
     return this.http
       .get<VoiceCapabilities>(`${this.baseUrl}/voice/capabilities`)
+      .pipe(catchError(() => of(null)));
+  }
+
+  /** The SSH gateway's hostname and public host keys, unauthenticated by
+   * design (host keys are public material). Returns `{host_keys: [],
+   * hostname: ...}` — never an error — on a deployment with no gateway
+   * configured; `null` only on a transport failure. */
+  getSshHostKeys(): Observable<SshGatewayHostKeysResponse | null> {
+    return this.http
+      .get<SshGatewayHostKeysResponse>(`${this.baseUrl}/ssh/host-keys`)
       .pipe(catchError(() => of(null)));
   }
 

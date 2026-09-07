@@ -36,6 +36,8 @@ die()  { printf 'ERROR %s\n' "$*" >&2; exit 1; }
 
 command -v kubectl >/dev/null || die "kubectl not found"
 command -v docker  >/dev/null || warn "docker not found — cannot inspect the k3d node for /dev/kvm"
+[ "$KUBE_CONTEXT" = "k3d-$CLUSTER_NAME" ] \
+  || die "local bootstrap requires context k3d-$CLUSTER_NAME (got $KUBE_CONTEXT)"
 
 # --- 0. cluster + version ---------------------------------------------------------------------
 step "cluster $KUBE_CONTEXT"
@@ -101,8 +103,24 @@ cdi_base="https://github.com/kubevirt/containerized-data-importer/releases/downl
 # server-side apply: the CDI CRDs exceed the last-applied annotation limit of client-side apply
 $KCTL apply --server-side --force-conflicts -f "${cdi_base}/cdi-operator.yaml" >/dev/null
 $KCTL apply --server-side --force-conflicts -f "${cdi_base}/cdi-cr.yaml" >/dev/null
-$KCTL patch cdi cdi --type merge -p "{\"spec\":{\"config\":{\"featureGates\":[\"HonorWaitForFirstConsumer\"],\"scratchSpaceStorageClass\":\"${VM_STORAGE_CLASS}\"}}}" >/dev/null
-ok "CDI CR patched (HonorWaitForFirstConsumer, scratchSpaceStorageClass=$VM_STORAGE_CLASS)"
+# CDI pulls containerDisks with its own client; k3d's containerd registry
+# configuration does not apply. Trust HTTP only for this cluster's local
+# registry, preserving any other registry entries already configured in CDI.
+cdi_patch=$($KCTL get cdi cdi -o json | python3 -c '
+import json, sys
+config = json.load(sys.stdin).get("spec", {}).get("config", {}) or {}
+registries = list(config.get("insecureRegistries") or [])
+registry = sys.argv[2]
+if registry not in registries:
+    registries.append(registry)
+print(json.dumps({"spec": {"config": {
+    "featureGates": ["HonorWaitForFirstConsumer"],
+    "scratchSpaceStorageClass": sys.argv[1],
+    "insecureRegistries": registries,
+}}}))
+' "$VM_STORAGE_CLASS" "${CLUSTER_NAME}-registry:5000")
+$KCTL patch cdi cdi --type merge -p "$cdi_patch" >/dev/null
+ok "CDI CR patched (HonorWaitForFirstConsumer, scratchSpaceStorageClass=$VM_STORAGE_CLASS, HTTP registry=${CLUSTER_NAME}-registry:5000)"
 step "waiting for CDI to become Available (<= $WAIT_CDI)"
 $KCTL wait cdi cdi --for condition=Available --timeout="$WAIT_CDI" >/dev/null \
   || die "CDI did not become Available: $($KCTL get cdi cdi -o jsonpath='{.status.conditions}')"

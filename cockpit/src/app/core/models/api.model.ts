@@ -44,26 +44,82 @@ export interface PaginationState {
 // =============================================================================
 
 /**
+ * The roles an expert can run in (universal_experts_and_subagents.md §0 D4).
+ * One schema, one role overlay each; every expert stays usable in every role.
+ */
+export type ExpertRole = 'worker' | 'session' | 'subagent';
+
+export const EXPERT_ROLES: readonly ExpertRole[] = ['worker', 'session', 'subagent'];
+
+/**
  * Expert configuration for discovery and selection.
  */
 export interface Expert {
   id: string;
   /** Slug used to reference the expert by name (e.g. a loop's role_sequence).
-   *  For bundled experts this equals `id`; for DB experts it's the name column. */
+   *  For bundled experts this equals `id`; for DB experts it's the name column.
+   *  Subagent-library entries (`config/subagents/*`) carry `subagents/<id>`
+   *  here — the unambiguous `$ref` spelling for a roster entry. */
   name?: string;
   display_name: string;
   description: string;
   icon: string;
   color: string;
+  /** Additive metadata — a soft UI filter, never read for behaviour. Every
+   *  listed expert carries its role tag(s) (`worker` / `session` /
+   *  `subagent`) next to whatever free-text tags the author added; the list
+   *  filters and the pickers match on `expert_type || tags`. */
   tags: string[];
-  /** 'bundled' (disk config) | 'user' | 'global' | 'managed' (DB-backed). DB experts are
-   *  selected via expert_id; bundled experts via config_name. */
+  /** 'bundled' (disk config) | 'library' (config/subagents/*) | 'user' |
+   *  'global' | 'managed' (DB-backed). DB experts are selected via expert_id;
+   *  bundled experts via config_name. */
   source?: string;
-  storage_kind?: 'bundled' | 'db';
+  storage_kind?: 'bundled' | 'library' | 'db';
   owner_id?: string | null;
   managed_key?: string | null;
-  /** 'worker' | 'session'. */
+  /** 'worker' | 'session' — the expert's identity role (a library entry
+   *  reports its `$extends` chain root, `worker` by default). */
   expert_type?: string;
+}
+
+// ---- Subagent roster (`config.subagents`, universal_experts_and_subagents.md §1.1) ----
+
+export type SubagentIsolation = 'shared' | 'worktree';
+export type SubagentWritePolicy = 'none' | 'scratch_only' | 'owned_paths' | 'full';
+export type SubagentReturnKind = 'summary' | 'structured' | 'evidence' | 'diff';
+
+/** The `llm.model` value that means "run on the parent's model". */
+export const SUBAGENT_INHERIT_MODEL = 'inherit';
+
+/**
+ * One `subagents.roster` entry. Inline: any expert-schema key (resolved on the
+ * subagent overlay). Reference: `$ref` — a bundled expert dir name (`critic`),
+ * a library entry (`subagents/explorer`) or a DB expert id — plus optional
+ * sibling keys deep-merged over the referenced expert. `isolation`,
+ * `write_policy`, `limits.*` budgets and `return` are U3 runtime keys carried
+ * verbatim in U1.
+ */
+export interface SubagentRosterEntry {
+  $ref?: string;
+  description?: string;
+  /** `{model: 'inherit' | <catalog model>, ...provider/transport/params}`. */
+  llm?: Record<string, unknown>;
+  tools?: Record<string, unknown>;
+  prompts?: Record<string, string | null>;
+  isolation?: SubagentIsolation;
+  write_policy?: SubagentWritePolicy;
+  limits?: Record<string, unknown>;
+  return?: SubagentReturnKind;
+  [key: string]: unknown;
+}
+
+/** The expert's `subagents` block. `llm` is the roster-wide model default
+ *  (the "Subagent model" picker); `default` names the entry `delegate_agent`
+ *  falls back to when a call passes no `subagent_type`. */
+export interface SubagentsConfig {
+  default?: string | null;
+  llm?: Record<string, unknown>;
+  roster?: Record<string, SubagentRosterEntry>;
 }
 
 export interface ExpertDefaultSlot {
@@ -102,13 +158,20 @@ export interface EffectiveModelSlot {
  * precedence dispatch uses. Lets the picker show the model that will actually
  * run if the user makes no change. See Layer 3 in the issue doc
  * loop_ran_codex_spark_not_selected_model_then_hung_on_cooldown.md.
+ *
+ * Since U1 an expert has ONE model (`llm.model`): `model` is what the picker's
+ * unset "Default" option names in both the job and the session form
+ * (`session` is kept equal to it); `subagent` is the roster-wide
+ * `subagents.llm.model` when pinned to a real model, else `model` (`inherit`
+ * IS the parent's model). The per-phase `strategic` / `tactical` slots are
+ * gone on both sides.
  */
 export interface EffectiveModels {
-  strategic: EffectiveModelSlot;
-  tactical: EffectiveModelSlot;
-  /** Reader model for spawn_subagent delegation. Resolves subagent → tactical →
-   *  base server-side, mirroring the agent's reader-model fallback. */
+  model: EffectiveModelSlot;
+  /** Roster-wide subagent model (`subagents.llm.model`), falling back to
+   *  `model` — mirrors the resolver's `inherit` handling. */
   subagent: EffectiveModelSlot;
+  /** Always equal to `model`; kept for readers of the session detail. */
   session: EffectiveModelSlot;
 }
 
@@ -126,6 +189,9 @@ export interface ExpertDetail extends Expert {
   settings_matrix?: Record<string, Record<string, unknown>>;
   /** Effective model + provenance per slot (server-resolved). */
   effective_models?: EffectiveModels | null;
+  /** The role the detail was resolved in (`GET /api/experts/{id}?role=`);
+   *  `expert_type` stays the expert's identity. */
+  resolved_role?: ExpertRole;
   /** DB-backed experts only — present on create/update responses + detail. */
   name?: string;
   owner_id?: string;
@@ -183,7 +249,10 @@ export interface ExpertCreateRequest {
   description?: string | null;
   icon?: string;
   color?: string;
+  /** Role tags (`worker` / `session` / `subagent`) + free-text tags. The
+   *  server always adds the `expert_type` role tag on write. */
   tags?: string[];
+  /** May carry a `subagents` roster — validated server-side (422/400). */
   config?: Record<string, unknown>;
   prompts?: Record<string, unknown>;
 }
@@ -611,7 +680,9 @@ export type LlmModelCapability =
   | 'embedding'
   | 'auxiliary'
   | 'whisper'
-  | 'tts';
+  | 'tts'
+  | 'search'
+  | 'fetch';
 
 /**
  * A user-registered OpenAI-compatible LLM endpoint. Models attached to this
@@ -721,13 +792,21 @@ export interface DiscoveryResponse {
 // =============================================================================
 
 /** Locked enum for catalog rows. Adding a capability requires schema + resolver work. */
-export type CatalogCapability = 'chat' | 'auxiliary' | 'embedding' | 'vision' | 'whisper' | 'tts';
+export type CatalogCapability =
+  | 'chat'
+  | 'auxiliary'
+  | 'embedding'
+  | 'vision'
+  | 'whisper'
+  | 'tts'
+  | 'search'
+  | 'fetch';
 
 /** Provider anchor for a catalog row. */
 export type CatalogProviderKind = 'system' | 'endpoint';
 
 export const CATALOG_CAPABILITIES: CatalogCapability[] = [
-  'chat', 'auxiliary', 'embedding', 'vision', 'whisper', 'tts',
+  'chat', 'auxiliary', 'embedding', 'vision', 'whisper', 'tts', 'search', 'fetch',
 ];
 
 /**
@@ -820,7 +899,6 @@ export interface ResolvedDefaults {
     model?: string;
     permission_mode?: string;
     idle_timeout_minutes?: number;
-    config_name?: string;
     workspace_backend?: string;
   };
 }
@@ -838,7 +916,6 @@ export interface UserSettings {
   default_tts_model?: string | null;
   /** User's chosen read-aloud voice (overrides the admin/per-language default). */
   default_tts_voice?: string | null;
-  default_session_model?: string | null;
   default_embedding_model?: string | null;
   embedding_provider?: string | null;
   language?: 'en' | 'de-DE' | null;
@@ -875,16 +952,12 @@ export interface PersistentAgentSettings {
     permission_mode?: string | null;
     /** Default session workspace tier; null tracks the system default (virtual). */
     workspace_backend?: 'virtual' | 'sandbox' | 'none' | null;
-    config_name?: string | null;
-    greeting?: string | null;
     idle_timeout_minutes?: number | null;
-    command_allowlist?: string[] | null;
-    // Phase 6 headless controls. Backend reads these as direct children of
-    // users.settings.persistent_agent (see orchestrator/main.py create_thread
+    // Headless controls. The backend reads these as direct children of
+    // users.settings.persistent_agent (orchestrator/main.py create_thread
     // merge + attention_sleep_sweeper COALESCE).
     headless_mode?: 'eager' | 'polite' | null;
     headless_attention_sleep_minutes?: number | null;
-    notification_channels?: string[] | null;
 }
 
 /**
@@ -955,22 +1028,6 @@ export interface CommunicationSettings {
     end?: string;
     timezone?: string;
   };
-}
-
-/**
- * A notification entry from the orchestrator.
- */
-export interface AppNotification {
-  id: string;
-  job_id: string | null;
-  thread_id: string | null;
-  subject: string;
-  message: string;
-  job_description: string | null;
-  config_name: string | null;
-  status: string;
-  read_at: string | null;
-  created_at: string;
 }
 
 /**
@@ -1336,6 +1393,12 @@ export interface OfficerFloorWakeOutcome {
 /** Backlog-pool policy state: what the tick enforces, made visible (§6). */
 export interface OfficerBacklogState {
   auto_pull: boolean;
+  /** Deployment-owned release fence for the unattended enable transition. */
+  auto_pull_control?: {
+    enable_available: boolean;
+    source: 'deployment_policy';
+    reason?: 'release_gate_closed' | null;
+  };
   breakers: Record<string, OfficerPoolBreaker>;
   stale_claims: OfficerStaleClaim[];
   stale_claim_policy?: {
@@ -1366,9 +1429,7 @@ export interface OfficerLive {
   sleep_minutes?: {min: number; max: number} | null;
   next_wake_at?: string | null;
   pending_events?: number;
-  pages_today?: {used: number; budget: number} | null;
   token_ceiling?: {daily: number; deferred_today?: boolean} | null;
-  digest?: {at: string; subject: string; message: string}[] | null;
   conference?: {thread_id: string; status?: string | null} | null;
   /** Not yet in the O1–O4 contract; optional so the editor seeds them when the backend adds them. */
   max_actions_per_wake?: number | null;
@@ -1461,7 +1522,6 @@ export interface OfficerPostPatch {
   /** Optional century-wide daily USD ceiling on worker spend. */
   worker_spend_ceiling_daily?: number | null;
   max_concurrent_workers?: number | null;
-  max_pages_per_day?: number | null;
   max_actions_per_wake?: number | null;
   daily_token_ceiling?: number | null;
   sleep_min_minutes?: number | null;
@@ -1679,6 +1739,8 @@ export interface Thread {
   id: string;
   title: string;
   status: ThreadStatus;
+  /** Absent on orchestrators predating child threads. */
+  kind?: 'session' | 'subagent';
   config_name: string;
   permission_mode: string;
   user_id?: string | null;
@@ -1696,12 +1758,51 @@ export interface Thread {
   nc_session_folder?: string | null;
   nc_share_id?: number | null;
   cloud_session_url?: string | null;
+  /** Short handle used as the SSH username: `ssh s-7f3a91c2@ssh.<domain>`.
+   *  Minted once at creation; null on threads predating migration 0202. */
+  ssh_handle?: string | null;
   metadata?: Record<string, unknown>;
   /** Attached remote folders, ordered by `target_path`. Absent on the list
    *  endpoint's projection and on older orchestrators. */
   mounts?: ThreadMount[];
   /** Derived: `source_ref` of every `mount_kind === 'project'` row. */
   project_ids?: string[];
+  /** Child-thread identity. All fields are absent on ordinary sessions and on
+   *  orchestrators predating U3. */
+  parent_job_id?: string | null;
+  /** Session parent for U5 children. Exactly one parent id is set on a child. */
+  parent_thread_id?: string | null;
+  subagent_handle?: string | null;
+  subagent_type?: string | null;
+  subagent_status?: JobSubagentStatus | null;
+  subagent_outcome?: string | null;
+  subagent_error?: string | null;
+  report_path?: string | null;
+}
+
+/** One row from the persistent thread transcript endpoint. */
+export interface PersistentThreadMessage {
+  id: string;
+  role: string;
+  content: string | null;
+  tool_calls: Array<{
+    name: string;
+    args: Record<string, unknown>;
+    id: string;
+    decision?: string;
+    category?: string;
+  }> | null;
+  turn_number: number | null;
+  tool_call_id?: string | null;
+  thinking?: string | null;
+  created_at: string | null;
+}
+
+export interface PersistentThreadHistory {
+  thread_id: string;
+  messages: PersistentThreadMessage[];
+  total: number;
+  has_more: boolean;
 }
 
 // =============================================================================
@@ -1926,10 +2027,11 @@ export interface WorkspaceContractProjection {
 export interface Job {
   id: string;
   description: string;
-  document_path?: string;
-  config_name: string;
-  config_override?: Record<string, unknown>;
-  assigned_agent_id?: string;
+  document_path?: string | null;
+  config_name: string | null;
+  /** JSONB can arrive as JSON text; normalize before reading its fields. */
+  config_override?: Record<string, unknown> | string | null;
+  assigned_agent_id?: string | null;
   user_id?: string | null;
   project_id?: string | null;
   parent_job_id?: string | null;
@@ -1947,10 +2049,10 @@ export interface Job {
   status: JobStatus;
   completion_outcome_kind?: 'blocked_undelivered' | null;
   created_at: string;
-  updated_at?: string;
-  completed_at?: string;
-  error_message?: string;
-  audit_count?: number;
+  updated_at?: string | null;
+  completed_at?: string | null;
+  error_message?: string | null;
+  audit_count?: number | null;
   /**
    * JSONB — **may arrive as a raw JSON STRING, not an object.** asyncpg hands
    * JSONB back as text and the orchestrator passes it through, so indexing
@@ -2001,7 +2103,8 @@ export interface Job {
 }
 
 /**
- * Request body for creating a new job.
+ * Public job-create projection owned by orchestrator.schemas.job_create.
+ * Keep view state and internal delegation/identity commands outside this type.
  */
 export interface JobCreateRequest {
   description: string;
@@ -2010,19 +2113,28 @@ export interface JobCreateRequest {
   instructions_upload_id?: string;
   document_path?: string;
   document_dir?: string;
+  /** Unified selector: bundled expert ID or DB expert UUID; omission uses the server default. */
+  expert?: string;
+  /** Legacy bundled/deployment-config alias. Conflicting expert selectors are refused. */
   config_name?: string;
-  /** DB-backed expert UUID. Preferred over config_name for expert selection;
-   *  the orchestrator resolves it into the job config. config_name stays base. */
+  /** Legacy DB-expert UUID alias; resolves over worker_base, not another bundled expert. */
   expert_id?: string;
   config_override?: Record<string, unknown>;
   context?: Record<string, unknown>;
   instructions?: string;
   kickoff_message?: string;
+  /** Immutable artifact/knowledge/PR contract, validated against authorized repositories. */
+  required_deliverables?: string[];
+  /** Explicit [] opts out; omission follows the deployment's defaults policy. Null is invalid. */
   datasource_ids?: string[];
-  builder_session_id?: string;
+  /** Mutually exclusive with datasource_ids, including an explicit empty array. */
+  use_datasource_defaults?: boolean;
+  /** Ignored compatibility input; the server derives ownership from the authenticated caller. */
   user_id?: string;
   project_id?: string;
   priority?: number;
+  /** Deployment-gated execution selection; stateless requires a supported workspace. */
+  execution_lane?: 'pinned' | 'stateless';
 }
 
 /**
@@ -2324,6 +2436,48 @@ export interface JobSubjobRoster {
   subjobs: JobSubjob[];
 }
 
+export type JobSubagentStatus =
+  | 'queued'
+  | 'running'
+  | 'completed'
+  | 'parked'
+  | 'interrupted'
+  | 'capped'
+  | 'error'
+  | 'cancelled';
+
+/** One child thread published by `GET /api/jobs/{job_id}/subagents`. */
+export interface JobSubagent {
+  thread_id: string;
+  /** Durable run claim used to fence lifecycle writes; null on older rows. */
+  runtime_generation: string | null;
+  handle: string;
+  subagent_type: string;
+  status: JobSubagentStatus;
+  thread_status: ThreadStatus;
+  outcome: string | null;
+  error: string | null;
+  turns: number;
+  tokens: number;
+  report_path: string | null;
+  parent_tool_call_id: string | null;
+  parent_thread_id: string | null;
+  description: string;
+  isolation: string | null;
+  write_policy: string | null;
+  parent_iteration: number | null;
+  fork: boolean;
+  started_at: string;
+  ended_at: string | null;
+  last_activity: string | null;
+}
+
+export interface JobSubagentRoster {
+  job_id: string;
+  count: number;
+  subagents: JobSubagent[];
+}
+
 export type JobUsageState = 'measured' | 'no_usage' | 'predates_ledger' | 'unavailable';
 
 /** `GET /api/jobs/{job_id}/usage` — see per_job_cost_and_token_accounting.md §7. */
@@ -2496,6 +2650,23 @@ export interface UserCapabilities {
   grants: Record<string, unknown> | null; // null ⇒ admin (unrestricted)
   catalog: GrantCatalog;
   features?: UserCapabilityFeatures;
+}
+
+/** One SSH gateway host key, as published by GET /api/ssh/host-keys — public
+ *  material only, safe for client-side pinning. */
+export interface SshHostKeyEntry {
+  type: string;
+  public_key: string;
+  fingerprint: string;
+}
+
+/** GET /api/ssh/host-keys — unauthenticated by design. Returns
+ * `{host_keys: [], hostname: ...}` on a deployment with no gateway
+ * configured, never an error; `CapabilitiesService.sshGateway` folds that
+ * shape down to `null` so the UI can hide the connect panel entirely. */
+export interface SshGatewayHostKeysResponse {
+  host_keys: SshHostKeyEntry[];
+  hostname: string;
 }
 
 /** GET /api/voice/capabilities — whether a usable TTS/STT model is configured

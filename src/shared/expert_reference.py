@@ -9,7 +9,7 @@ the single place that inference lives, shared by the agent/MCP job tool and by
 the REST funnel. See
 knowledge-base/knowledge/issues/experts_one_catalogue_two_selection_paths.md.
 
-Stdlib-only on purpose: ``src.shared.orch_surface`` may import nothing but the
+Stdlib-only on purpose: ``shared.orch_surface`` may import nothing but the
 standard library, httpx and its own package (relatively), and this is one of
 the things it needs.
 """

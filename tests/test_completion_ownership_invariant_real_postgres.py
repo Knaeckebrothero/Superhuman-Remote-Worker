@@ -41,11 +41,12 @@ from orchestrator.services.job_completion_commands import (
     accept_completion_command,
 )
 from orchestrator.services.project_loop_sweeper import _heal_wedged_loop
-from src.shared.worker_queue import claim_worker_batch
+from shared.worker_queue import claim_worker_batch
 
 
 SCHEMA_FILE = (
     Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "schema_current.sql"

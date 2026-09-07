@@ -27,10 +27,10 @@ from pathlib import Path
 import pytest
 import yaml
 
-from src.core.datasource_setup import DATASOURCE_TOOL_MAP
-from src.core.session_tool_overrides import SESSION_TOOL_OVERRIDE_NAMES
-from src.shared.orch_surface.jobs import JOB_DESCRIPTORS
-from src.tools.registry import (
+from agent.core.datasource_setup import DATASOURCE_TOOL_MAP
+from shared.runtime.core.session_tool_overrides import SESSION_TOOL_OVERRIDE_NAMES
+from shared.orch_surface.jobs import JOB_DESCRIPTORS
+from agent.tools.registry import (
     CODE_GRANTED_CATEGORIES,
     TOOL_REGISTRY,
     get_tools_by_category,
@@ -260,8 +260,10 @@ class TestCodeGrants:
         assert any(f.startswith("config/experts/") for f in sources), (
             f"expert configs missing from the scan: {sorted(sources)}"
         )
-        assert "config/session_base.yaml" in sources
-        assert "config/worker_base.yaml" in sources
+        assert "config/expert_base.yaml" in sources
+        assert "config/overlays/worker.yaml" in sources
+        assert "config/overlays/session.yaml" in sources
+        assert "config/overlays/subagent.yaml" in sources
 
 
 class TestNotClassified:
@@ -306,11 +308,16 @@ class TestExplicitGrants:
             item.name for item in JOB_DESCRIPTORS if item.grant == "explicit"
         }
         assert _classified("explicit") == descriptor_explicit | {
-            # Heavy delegation: no config has granted these since 57430a2a and
-            # whether to restore them is an open decision. `delegation: true`
-            # must not be what takes it.
-            "delegate_work",
-            "resume_delegation_child",
+            # Built-in subagents (U3/U4): each name is written outright in
+            # tools.delegation AND gated on delegation.enabled; legacy
+            # `delegation: true` expands only to delegate_agent, never the U4
+            # controls. (The heavy pair delegate_work /
+            # resume_delegation_child was deleted in U3 WP4.)
+            "delegate_agent",
+            "wait_agent",
+            "message_agent",
+            "stop_agent",
+            "list_agents",
         }
         assert {"steer_job", "get_stuck_jobs"} <= descriptor_explicit
         # The six `*_bundle` tools left this tier on 2026-08-03. They did not
@@ -395,12 +402,20 @@ class TestTrueExpansionIsSafe:
         membership at all, and ``product_help`` / ``session_task`` do not even
         have a ``ToolsConfig`` field to name.
         """
+        from shared.runtime.core.tool_policy import ENUMERATE_ONLY_CATEGORIES
+
         empty = {
             category
             for category in {meta["category"] for meta in TOOL_REGISTRY.values()}
             if not expand_true(category)
         }
-        assert empty == set(CODE_GRANTED_CATEGORIES)
+        # `delegation` (U3 WP4) holds one `grant: explicit` tool, so its
+        # `true` expansion is empty by design — and the category refuses
+        # `true` outright (enumerate-only, like `shell`), so "on" is still
+        # expressible: `{only: [delegate_agent]}`, served by
+        # `enumerate_only_members`.
+        assert empty - ENUMERATE_ONLY_CATEGORIES == set(CODE_GRANTED_CATEGORIES)
+        assert empty & ENUMERATE_ONLY_CATEGORIES == {"delegation"}
 
 
 class TestMcp:

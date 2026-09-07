@@ -24,6 +24,7 @@ import {
     NEAR_BOTTOM_PX,
     pinTarget,
     pickCodeServerUrlToOpen,
+    sshWorkspaceReachable,
     pickCurrentStartupStep,
     pickRewindCandidates,
     pickRunningCommandCard,
@@ -516,6 +517,43 @@ describe('pickCodeServerUrlToOpen', () => {
         // getThreadIdeStatus swallows a 401 to null *after* the auth interceptor
         // has kicked off re-login; the button must not open a tab in that case.
         expect(pickCodeServerUrlToOpen(null)).toBeNull();
+    });
+});
+
+describe('sshWorkspaceReachable', () => {
+    // The SSH button used to render off capabilities.sshGateway() alone, so it
+    // appeared on sessions whose workspace SSH cannot reach (a virtual-tier
+    // session answers `srw: this session has no workspace yet`). The gate is
+    // the same signal the IDE button uses: does this session have a
+    // container-backed workspace right now?
+    it('is reachable when the workspace is active', () => {
+        expect(sshWorkspaceReachable({status: 'active', code_server_url: 'https://api/x/proxy/'})).toBe(true);
+    });
+
+    it('is reachable while the workspace is restoring', () => {
+        expect(sshWorkspaceReachable({status: 'restoring', code_server_url: null})).toBe(true);
+    });
+
+    it('is reachable when the IDE is withheld but the workspace exists (typed refusal code)', () => {
+        // contain_ide_status_for only downgrades payloads that were about to
+        // advertise a code-server URL — i.e. the pod is ready. SSH is exactly
+        // the working fallback there (ide_credential_key_unconfigured,
+        // ide_remote_transport_unavailable).
+        expect(
+            sshWorkspaceReachable({
+                status: 'unavailable',
+                code_server_url: null,
+                code: 'ide_remote_transport_unavailable',
+            }),
+        ).toBe(true);
+    });
+
+    it('is NOT reachable on a plain unavailable (no container-backed workspace)', () => {
+        expect(sshWorkspaceReachable({status: 'unavailable', code_server_url: null})).toBe(false);
+    });
+
+    it('is NOT reachable before the first IDE-status poll lands', () => {
+        expect(sshWorkspaceReachable(null)).toBe(false);
     });
 });
 

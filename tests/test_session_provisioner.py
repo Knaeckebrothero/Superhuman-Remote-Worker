@@ -1,22 +1,15 @@
 import asyncio
-import sys
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 import pytest
 
-project_root = Path(__file__).parent.parent
-for p in (str(project_root), str(project_root / "orchestrator")):
-    if p not in sys.path:
-        sys.path.insert(0, p)
-
 from unittest.mock import AsyncMock  # noqa: E402
 
-from services.session_provisioner import (  # noqa: E402
+from orchestrator.services.session_provisioner import (  # noqa: E402
     ensure_session_workspace,
     reconcile_session_workspaces,
 )
-from services.workspace_lifecycle import EnsureOutcome, WorkspaceOwner  # noqa: E402
+from orchestrator.services.workspace_lifecycle import EnsureOutcome, WorkspaceOwner  # noqa: E402
 
 
 PINNED_THREAD_ID = "11111111-1111-4111-8111-111111111111"
@@ -588,7 +581,7 @@ def _stateless_sandbox_thread(status: str, *, restore_required: bool = False):
             {"provisioner": "docker"}
         ),
         lambda thread: thread["metadata"]["workspace_container"].update(
-            {"_stateless_runtime_creation": None}
+            {"_runtime_creation": None}
         ),
     ],
     ids=[
@@ -726,7 +719,7 @@ async def test_stateless_create_gives_up_when_thread_ends_during_actuation():
     before_workspace = before["metadata"]["workspace_container"]
     before_workspace.pop("_runtime_incarnation")
     generation = "33333333-3333-4333-8333-333333333333"
-    before_workspace["_stateless_runtime_creation"] = {
+    before_workspace["_runtime_creation"] = {
         "generation": generation,
         "mode": "create",
         "attempted": False,

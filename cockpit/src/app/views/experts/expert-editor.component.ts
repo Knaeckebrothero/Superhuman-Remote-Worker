@@ -5,8 +5,17 @@ import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ApiService} from '../../core/services/api.service';
 import type {SessionToolGroupsResponse} from '../../core/services/api.service';
 import {ModelService} from '../../core/services/model.service';
-import type {EffectiveModels, ExpertCreateRequest, ExpertUpdateRequest, GrantCatalog} from '../../core/models/api.model';
+import type {
+  EffectiveModels,
+  ExpertCreateRequest,
+  ExpertRole,
+  ExpertUpdateRequest,
+  GrantCatalog,
+  SubagentsConfig,
+} from '../../core/models/api.model';
+import {EXPERT_ROLES, SUBAGENT_INHERIT_MODEL} from '../../core/models/api.model';
 import {AppButtonComponent} from '../../ui/button';
+import {AppChipComponent} from '../../ui/chip';
 import {AppInputComponent} from '../../ui/input';
 import {AppTextareaComponent} from '../../ui/textarea';
 import {AppSelectComponent} from '../../ui/select';
@@ -17,7 +26,8 @@ import {ExecutionGroupComponent} from '../agent-settings/execution-group.compone
 import {ToolsGroupComponent} from '../agent-settings/tools-group.component';
 import {AdvancedAccordionComponent} from '../agent-settings/advanced-accordion.component';
 import {deepMergeConfig} from '../agent-settings/config-merge';
-import {assembleExpertConfig, splitExpertConfig} from './expert-config';
+import {assembleExpertConfig, liftLegacyTiers, splitExpertConfig} from './expert-config';
+import {SubagentsEditorComponent} from './subagents-editor.component';
 import {isModelAllowed} from '../agent-settings/capability-gates';
 import {defaultModelOptionLabel} from '../agent-settings/agent-settings.types';
 
@@ -132,6 +142,78 @@ export function buildPromptsPayload(
 }
 
 /**
+ * The `tags` save payload: role tags first (the expert's own type always on,
+ * in canonical role order), then the free-text tags — de-duplicated, order
+ * kept. Tags are additive metadata (U1 D4): a soft UI filter, never read for
+ * behaviour, and the server adds the `expert_type` role tag on write anyway.
+ */
+export function buildTagsPayload(
+  expertType: 'worker' | 'session',
+  roleTags: readonly string[],
+  freeText: string,
+): string[] {
+  const roles = EXPERT_ROLES.filter((r) => r === expertType || roleTags.includes(r));
+  const free = freeText
+    .split(',')
+    .map((t) => t.trim())
+    .filter(Boolean);
+  return Array.from(new Set<string>([...roles, ...free]));
+}
+
+/** Split stored tags into the role chips and the free-text field. */
+export function splitTags(tags: readonly string[]): {roles: ExpertRole[]; free: string} {
+  const roleSet = new Set<string>(EXPERT_ROLES);
+  return {
+    roles: EXPERT_ROLES.filter((r) => tags.includes(r)),
+    free: tags.filter((t) => !roleSet.has(t)).join(', '),
+  };
+}
+
+/**
+ * The model-select fragment: ONE model (`llm.model`) since U1 — the same key
+ * for worker and session experts. Empty ⇒ inherit (no key).
+ */
+export function buildModelFragment(model: string): Record<string, unknown> {
+  return model ? {llm: {model}} : {};
+}
+
+/**
+ * The `subagents` block to persist: the roster editor's `{default?, roster?}`
+ * (plus its passthrough keys) with the roster-wide model from the Subagent
+ * model select merged into `llm` — `''` clears `llm.model` and drops an
+ * `llm` that has nothing else left. ALWAYS returned (possibly `{}`) so the
+ * host replaces the stored block wholesale; a deep-merge would resurrect
+ * every entry the author removed. An empty block is stripped after assembly.
+ */
+export function buildSubagentsFragment(
+  editorValue: SubagentsConfig | null,
+  subagentModel: string,
+): Record<string, unknown> {
+  const block: Record<string, unknown> = {...(editorValue ?? {})};
+  const existing = block['llm'];
+  const llm: Record<string, unknown> =
+    typeof existing === 'object' && existing !== null && !Array.isArray(existing)
+      ? {...(existing as Record<string, unknown>)}
+      : {};
+  if (subagentModel) llm['model'] = subagentModel;
+  else delete llm['model'];
+  if (Object.keys(llm).length) block['llm'] = llm;
+  else delete block['llm'];
+  return block;
+}
+
+/** Drop a `subagents: {}` left behind by a cleared roster. */
+export function stripEmptySubagents(config: Record<string, unknown>): Record<string, unknown> {
+  const sub = config['subagents'];
+  if (typeof sub === 'object' && sub !== null && !Array.isArray(sub) && Object.keys(sub).length === 0) {
+    const rest = {...config};
+    delete rest['subagents'];
+    return rest;
+  }
+  return config;
+}
+
+/**
  * Router state `settings.component.ts`'s `customizeDefaultExpert` attaches to
  * the `/experts/{id}/edit` navigation it makes right after a successful
  * `POST /api/expert-defaults/{type}/fork` (task 4, 2026-08-04 plan). That
@@ -173,6 +255,7 @@ interface EditorForm {
   description: string;
   icon: string;
   color: string;
+  /** Free-text tags (comma separated); the role chips live in `roleTags`. */
   tags: string;
   expert_type: 'worker' | 'session';
   persona: string;
@@ -180,10 +263,10 @@ interface EditorForm {
   strategic: string;
   tactical: string;
   summarization: string;
-  strategicModel: string;
-  tacticalModel: string;
+  /** The one model (`llm.model`); '' = inherit the base default. */
+  model: string;
+  /** The roster-wide subagent model (`subagents.llm.model`); '' = inherit. */
   subagentModel: string;
-  sessionModel: string;
   configText: string;
 }
 
@@ -194,6 +277,7 @@ interface EditorForm {
     FormsModule,
     TranslocoPipe,
     AppButtonComponent,
+    AppChipComponent,
     AppInputComponent,
     AppTextareaComponent,
     AppSelectComponent,
@@ -203,6 +287,7 @@ interface EditorForm {
     ExecutionGroupComponent,
     ToolsGroupComponent,
     AdvancedAccordionComponent,
+    SubagentsEditorComponent,
   ],
   template: `
     <div class="editor">
@@ -243,8 +328,31 @@ interface EditorForm {
             <app-input [value]="form.color" (valueChange)="form.color = $event" placeholder="#6B7280" />
           </app-form-field>
         </div>
-        <app-form-field label="Tags (comma separated)">
-          <app-input [value]="form.tags" (valueChange)="form.tags = $event" />
+      </section>
+
+      <!-- Tags: role chips (the expert's own type locked on) + free text. A
+           soft UI filter — every expert stays usable in every role (U1 D4). -->
+      <section class="card">
+        <h2>{{ 'experts.tags.title' | transloco }}</h2>
+        <p class="hint">{{ 'experts.tags.hint' | transloco }}</p>
+        <app-form-field [label]="'experts.tags.roles' | transloco">
+          <div class="role-chips">
+            @for (role of expertRoles; track role) {
+              <app-chip
+                [selected]="hasRoleTag(role)"
+                [disabled]="role === form.expert_type"
+                [ariaLabel]="role === form.expert_type ? ('experts.tags.roleLocked' | transloco: {role}) : role"
+                (clicked)="toggleRoleTag(role)"
+              >{{ role }}</app-chip>
+            }
+          </div>
+        </app-form-field>
+        <app-form-field [label]="'experts.tags.free' | transloco">
+          <app-input
+            [value]="form.tags"
+            [placeholder]="'experts.tags.freePlaceholder' | transloco"
+            (valueChange)="form.tags = $event"
+          />
         </app-form-field>
       </section>
 
@@ -307,30 +415,22 @@ interface EditorForm {
         />
       </section>
 
+      <!-- ONE model since U1 (llm.model, worker and session alike) plus, for a
+           worker expert, the roster-wide subagent model (subagents.llm.model). -->
       <section class="card">
-        <h2>Model</h2>
+        <h2>{{ 'experts.model.title' | transloco }}</h2>
+        <label class="ml">{{ 'experts.model.model' | transloco }}
+          <select class="model-select" [disabled]="isModelGated()" [ngModel]="form.model" (ngModelChange)="form.model = $event">
+            <option [ngValue]="''">{{ baseDefaultLabel('model') }}</option>
+            @for (g of models(); track g.group) {
+              <optgroup [label]="g.group">
+                @for (m of g.models; track m) { <option [ngValue]="m" [disabled]="!modelAllowed(m)">{{ m }}</option> }
+              </optgroup>
+            }
+          </select>
+        </label>
         @if (mode() === 'job') {
-          <label class="ml">Strategic model
-            <select class="model-select" [disabled]="isModelGated()" [ngModel]="form.strategicModel" (ngModelChange)="form.strategicModel = $event">
-              <option [ngValue]="''">{{ baseDefaultLabel('strategic') }}</option>
-              @for (g of models(); track g.group) {
-                <optgroup [label]="g.group">
-                  @for (m of g.models; track m) { <option [ngValue]="m" [disabled]="!modelAllowed(m)">{{ m }}</option> }
-                </optgroup>
-              }
-            </select>
-          </label>
-          <label class="ml">Tactical model
-            <select class="model-select" [disabled]="isModelGated()" [ngModel]="form.tacticalModel" (ngModelChange)="form.tacticalModel = $event">
-              <option [ngValue]="''">{{ baseDefaultLabel('tactical') }}</option>
-              @for (g of models(); track g.group) {
-                <optgroup [label]="g.group">
-                  @for (m of g.models; track m) { <option [ngValue]="m" [disabled]="!modelAllowed(m)">{{ m }}</option> }
-                </optgroup>
-              }
-            </select>
-          </label>
-          <label class="ml">Subagent model
+          <label class="ml">{{ 'experts.model.subagent' | transloco }}
             <select class="model-select" [disabled]="isModelGated()" [ngModel]="form.subagentModel" (ngModelChange)="form.subagentModel = $event">
               <option [ngValue]="''">{{ baseDefaultLabel('subagent') }}</option>
               @for (g of models(); track g.group) {
@@ -340,21 +440,22 @@ interface EditorForm {
               }
             </select>
           </label>
-        } @else {
-          <label class="ml">Model
-            <select class="model-select" [disabled]="isModelGated()" [ngModel]="form.sessionModel" (ngModelChange)="form.sessionModel = $event">
-              <option [ngValue]="''">{{ baseDefaultLabel('session') }}</option>
-              @for (g of models(); track g.group) {
-                <optgroup [label]="g.group">
-                  @for (m of g.models; track m) { <option [ngValue]="m" [disabled]="!modelAllowed(m)">{{ m }}</option> }
-                </optgroup>
-              }
-            </select>
-          </label>
+          <p class="hint">{{ 'experts.model.subagentHint' | transloco }}</p>
         }
         @if (isModelGated()) {
           <small class="lock-hint">🔒 {{ 'grants.locked.model_selection' | transloco }}</small>
         }
+      </section>
+
+      <!-- The subagent roster (config.subagents.default / .roster). -->
+      <section class="card">
+        <h2>{{ 'experts.subagents.title' | transloco }}</h2>
+        <p class="hint">{{ 'experts.subagents.hint' | transloco }}</p>
+        <app-subagents-editor
+          [models]="models()"
+          [modelGated]="isModelGated()"
+          [modelAllowed]="modelAllowed"
+        />
       </section>
 
       <section class="card">
@@ -377,9 +478,7 @@ interface EditorForm {
           [mode]="mode()"
           [disabled]="false"
           [settingsMatrix]="settingsMatrix()"
-          [strategicModelOverride]="form.strategicModel || null"
-          [tacticalModelOverride]="form.tacticalModel || null"
-          [sessionModelOverride]="form.sessionModel || null"
+          [modelOverride]="form.model || null"
           [backendOverride]="execBackendOverride()"
         />
       </section>
@@ -451,6 +550,11 @@ interface EditorForm {
         gap: 1rem;
         align-items: flex-end;
       }
+      .role-chips {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+      }
       .ml {
         display: flex;
         flex-direction: column;
@@ -513,6 +617,7 @@ export class ExpertEditorComponent implements OnInit {
   private execGroup = viewChild(ExecutionGroupComponent);
   private toolsGroup = viewChild(ToolsGroupComponent);
   private advancedGroup = viewChild(AdvancedAccordionComponent);
+  private subagentsEditor = viewChild(SubagentsEditorComponent);
 
   /** The backend picked in the Execution card, fed to the Advanced accordion so
    *  it greys the tools a lite tier cannot run. The selector is a level-1
@@ -539,7 +644,9 @@ export class ExpertEditorComponent implements OnInit {
    *  every expert detail; without it the Shell tick writes an expert fragment
    *  the loader refuses. */
   enumerateOnly = signal<Record<string, string[]> | null>(null);
-  /** The expert's stored config fragment (the save baseline). {} on create. */
+  /** The expert's stored config fragment (the save baseline) — read through
+   *  the legacy-tier lift, so a pre-U1 fragment is saved back in the new
+   *  shape. {} on create. */
   rawFragment = signal<Record<string, unknown>>({});
   private prefillDone = false;
 
@@ -564,6 +671,11 @@ export class ExpertEditorComponent implements OnInit {
   private resolvedAnchorApplied = false;
 
   readonly models = this.modelService.models;
+  readonly expertRoles = EXPERT_ROLES;
+
+  /** Role tags (`worker` / `session` / `subagent`); the expert's own type is
+   *  always among them. */
+  readonly roleTags = signal<ExpertRole[]>(['worker']);
 
   // Capability grants → editor control-greying. undefined = loading; null = admin
   // (unrestricted, no gating). A resolved record gates per the deny-default PDP.
@@ -580,8 +692,22 @@ export class ExpertEditorComponent implements OnInit {
 
   /** "(base default)" option label, naming the model the unpinned slot inherits
    *  from the framework base (account/system chat pin) when known. */
-  baseDefaultLabel(slot: 'strategic' | 'tactical' | 'subagent' | 'session'): string {
-    return defaultModelOptionLabel('Base default', this.frameworkEffectiveModels()?.[slot]?.model);
+  baseDefaultLabel(slot: 'model' | 'subagent'): string {
+    return defaultModelOptionLabel(
+      this.transloco.translate('experts.model.baseDefault'),
+      this.frameworkEffectiveModels()?.[slot]?.model,
+    );
+  }
+
+  hasRoleTag(role: ExpertRole): boolean {
+    return role === this.form.expert_type || this.roleTags().includes(role);
+  }
+
+  toggleRoleTag(role: ExpertRole): void {
+    if (role === this.form.expert_type) return; // locked on
+    this.roleTags.update((tags) =>
+      tags.includes(role) ? tags.filter((t) => t !== role) : [...tags, role],
+    );
   }
 
   form: EditorForm = {
@@ -597,10 +723,8 @@ export class ExpertEditorComponent implements OnInit {
     strategic: '',
     tactical: '',
     summarization: '',
-    strategicModel: '',
-    tacticalModel: '',
+    model: '',
     subagentModel: '',
-    sessionModel: '',
     configText: '',
   };
 
@@ -630,7 +754,8 @@ export class ExpertEditorComponent implements OnInit {
     // view-children exist (defeats the ViewChild-null race on fast responses).
     effect(() => {
       const frag = this.rawFragment();
-      const ready = this.execGroup() && this.toolsGroup() && this.advancedGroup();
+      const ready =
+        this.execGroup() && this.toolsGroup() && this.advancedGroup() && this.subagentsEditor();
       if (!this.prefillDone && ready && Object.keys(frag).length) {
         this.prefillDone = true;
         this.applyPrefill(frag);
@@ -667,7 +792,9 @@ export class ExpertEditorComponent implements OnInit {
       this.form.description = (b['description'] as string) ?? '';
       this.form.icon = (b['icon'] as string) ?? 'smart_toy';
       this.form.color = (b['color'] as string) ?? '#6B7280';
-      this.form.tags = Array.isArray(b['tags']) ? (b['tags'] as string[]).join(', ') : '';
+      const {roles, free} = splitTags(Array.isArray(b['tags']) ? (b['tags'] as string[]) : []);
+      this.form.tags = free;
+      this.roleTags.set(roles);
       this.form.expert_type = b['expert_type'] === 'session' ? 'session' : 'worker';
       this.expertType.set(this.form.expert_type);
       this.loadFrameworkDefaults(this.form.expert_type);
@@ -677,7 +804,11 @@ export class ExpertEditorComponent implements OnInit {
       this.form.strategic = (prompts['strategic'] as string) ?? '';
       this.form.tactical = (prompts['tactical'] as string) ?? '';
       this.form.summarization = (prompts['summarization'] as string) ?? '';
-      const cfg = (b['config'] ?? {}) as Record<string, unknown>;
+      // A pre-U1 fragment's per-phase tiers are lifted onto llm.model /
+      // subagents.llm here, once, layer-locally (an explicit llm.model wins) —
+      // the same mapping the loader applies — so the controls prefill from
+      // the single-model shape and the save writes it back that way.
+      const cfg = liftLegacyTiers((b['config'] ?? {}) as Record<string, unknown>);
       // Raw flap shows only the keys the structured controls don't own.
       const {rawRemainderText} = splitExpertConfig(cfg);
       this.form.configText = rawRemainderText;
@@ -688,17 +819,15 @@ export class ExpertEditorComponent implements OnInit {
     });
   }
 
-  /** Seed the structured controls + model selects from the stored fragment. */
+  /** Seed the structured controls + model selects from the (lifted) fragment. */
   private applyPrefill(frag: Record<string, unknown>): void {
     const llm = (frag['llm'] ?? {}) as Record<string, unknown>;
-    const strat = (llm['strategic'] ?? {}) as Record<string, unknown>;
-    const tact = (llm['tactical'] ?? {}) as Record<string, unknown>;
-    const sub = (llm['subagent'] ?? {}) as Record<string, unknown>;
-    const baseModel = (llm['model'] as string) ?? '';
-    this.form.strategicModel = (strat['model'] as string) ?? baseModel ?? '';
-    this.form.tacticalModel = (tact['model'] as string) ?? baseModel ?? '';
-    this.form.subagentModel = (sub['model'] as string) ?? baseModel ?? '';
-    this.form.sessionModel = baseModel;
+    this.form.model = (llm['model'] as string) ?? '';
+    const subagents = frag['subagents'] as SubagentsConfig | undefined;
+    const rosterModel = subagents?.llm?.['model'];
+    this.form.subagentModel =
+      typeof rosterModel === 'string' && rosterModel !== SUBAGENT_INHERIT_MODEL ? rosterModel : '';
+    this.subagentsEditor()?.prefill(subagents ?? null);
 
     // Skipped once the server has answered: see `resolvedAnchorApplied`. The
     // fragment still drives every other control here — only the tool switches
@@ -749,10 +878,10 @@ export class ExpertEditorComponent implements OnInit {
     // free to re-anchor them.
     this.resolvedAnchorApplied = false;
     this.loadToolPreview();
-    this.form.strategicModel = '';
-    this.form.tacticalModel = '';
+    this.form.model = '';
     this.form.subagentModel = '';
-    this.form.sessionModel = '';
+    // The new type's role chip locks on; whatever else was ticked stays.
+    if (!this.roleTags().includes(v)) this.roleTags.update((tags) => [...tags, v]);
     // Phase-prompt overrides are mode-specific (strategic/tactical are worker-
     // only) — clear them so a worker→session switch on CREATE doesn't carry over.
     this.form.strategic = '';
@@ -810,19 +939,6 @@ export class ExpertEditorComponent implements OnInit {
     return buildPromptsPayload(this.form, this.mode());
   }
 
-  /** Build the model-select config fragment for the current mode. */
-  private modelOverride(): Record<string, unknown> {
-    const llm: Record<string, unknown> = {};
-    if (this.mode() === 'job') {
-      if (this.form.strategicModel) llm['strategic'] = {model: this.form.strategicModel};
-      if (this.form.tacticalModel) llm['tactical'] = {model: this.form.tacticalModel};
-      if (this.form.subagentModel) llm['subagent'] = {model: this.form.subagentModel};
-    } else if (this.form.sessionModel) {
-      llm['model'] = this.form.sessionModel;
-    }
-    return Object.keys(llm).length ? {llm} : {};
-  }
-
   save(): void {
     this.errorMessage.set('');
     const parsed = parseConfigText(this.form.configText);
@@ -830,15 +946,25 @@ export class ExpertEditorComponent implements OnInit {
       this.errorMessage.set(`Config: ${parsed.error}`);
       return;
     }
-    // Merge the structured controls' fragments + the model selects.
+    const roster = this.subagentsEditor();
+    if (roster?.hasErrors()) {
+      this.errorMessage.set(this.transloco.translate('experts.subagents.invalid'));
+      return;
+    }
+    // Merge the structured controls' fragments + the model selects. The
+    // subagents block is emitted whole (replaced, not merged — see
+    // REPLACED_CONFIG_KEYS) so a removed roster entry stays removed.
     const groupOverrides = [
       this.execGroup()?.getOverrides() ?? {},
       this.toolsGroup()?.getOverrides() ?? {},
       this.advancedGroup()?.getOverrides() ?? {},
-      this.modelOverride(),
+      buildModelFragment(this.form.model),
+      {subagents: buildSubagentsFragment(roster?.getValue() ?? null, this.form.subagentModel)},
     ].reduce((acc, frag) => deepMergeConfig(acc, frag), {} as Record<string, unknown>);
 
-    const config = assembleExpertConfig(this.rawFragment(), groupOverrides, parsed.config ?? {});
+    const config = stripEmptySubagents(
+      assembleExpertConfig(this.rawFragment(), groupOverrides, parsed.config ?? {}),
+    );
 
     const payload: ExpertCreateRequest = {
       name: this.form.name,
@@ -847,10 +973,7 @@ export class ExpertEditorComponent implements OnInit {
       description: this.form.description || null,
       icon: this.form.icon,
       color: this.form.color,
-      tags: this.form.tags
-        .split(',')
-        .map((t) => t.trim())
-        .filter(Boolean),
+      tags: buildTagsPayload(this.form.expert_type, this.roleTags(), this.form.tags),
       config,
       prompts: this.buildPrompts(),
     };

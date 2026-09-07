@@ -130,7 +130,6 @@ sudo eatmydata apt-get install -y \
     python3-dev \
     python3-pip \
     podman \
-    podman-docker \
     podman-compose \
     uidmap \
     slirp4netns \
@@ -173,11 +172,89 @@ if ! grep -qs '^unqualified-search-registries' /etc/containers/registries.conf 2
         | sudo tee -a /etc/containers/registries.conf > /dev/null
 fi
 
-# podman-docker installs a /usr/bin/docker shim, which by default prints
-# "Emulate Docker CLI using podman..." to stderr on EVERY invocation. Agents
-# read stderr as evidence, so silence it rather than teaching every worker to
-# ignore a banner.
-sudo touch /etc/containers/nodocker
+# NOTE: `podman-docker` (the /usr/bin/docker shim) is deliberately NOT
+# installed: /usr/bin/docker is the real Docker CLI from section 2b below.
+# An agent following the public k3d guide expects Docker Engine, and the shim
+# plus a DOCKER_HOST export pointing at podman cost probe 1 (2026-09-04) twenty
+# minutes and a root-owned profile edit. Rootless podman stays available as
+# `podman` / `podman-compose`.
+
+# -----------------------------------------------------------------------------
+# 2b. Docker Engine + local-Kubernetes tooling
+#     Baked in so a worker can run the repository's own k3d guide, a k3d/k3s
+#     cluster, Tilt, or any customer's compose/k8s workflow without the
+#     install-from-scratch step every job. Explicitly a stopgap until VM
+#     software profiles exist (knowledge-base: vm_fleet_software_profiles);
+#     versions are pinned with checksums so image builds are reproducible.
+# -----------------------------------------------------------------------------
+
+_section "Installing Docker Engine + kubectl/helm/k3d/tilt/mkcert"
+
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+    | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+sudo chmod a+r /etc/apt/keyrings/docker.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+    | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+sudo apt-get update -y
+sudo eatmydata apt-get install -y \
+    docker-ce \
+    docker-ce-cli \
+    containerd.io \
+    docker-buildx-plugin \
+    docker-compose-plugin
+# Rootful daemon on boot; agent-host joins the `docker` group in stage 2.
+sudo systemctl enable docker.service containerd.service
+# Docker's default FORWARD DROP policy is fine for k3d (it adds its own rules)
+# but keep the socket group-readable rather than world-writable.
+sudo mkdir -p /etc/docker
+[ -f /etc/docker/daemon.json ] || echo '{}' | sudo tee /etc/docker/daemon.json > /dev/null
+
+# kubectl — pinned upstream binary + published checksum (dl.k8s.io).
+SRW_KUBECTL_VERSION=v1.33.13
+SRW_KUBECTL_SHA256=316d712726d857c20744c57cb36aa47cfc79bc0af7e82cebf3780244b654c073
+curl -fsSL "https://dl.k8s.io/release/${SRW_KUBECTL_VERSION}/bin/linux/amd64/kubectl" -o /tmp/kubectl
+echo "${SRW_KUBECTL_SHA256}  /tmp/kubectl" | sha256sum -c -
+sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl && rm -f /tmp/kubectl
+
+# helm — Helm 3 line (the guide requires 3.12+; Helm 4 is not yet validated
+# against this chart). Checksum from get.helm.sh/<asset>.sha256sum.
+SRW_HELM_VERSION=v3.21.4
+SRW_HELM_SHA256=61f88ab166748cb19604d7884cb100ae9ccb13804ddeb98e08af167eacbb6a14
+curl -fsSL "https://get.helm.sh/helm-${SRW_HELM_VERSION}-linux-amd64.tar.gz" -o /tmp/helm.tgz
+echo "${SRW_HELM_SHA256}  /tmp/helm.tgz" | sha256sum -c -
+tar -xzf /tmp/helm.tgz -C /tmp linux-amd64/helm
+sudo install -m 0755 /tmp/linux-amd64/helm /usr/local/bin/helm && rm -rf /tmp/helm.tgz /tmp/linux-amd64
+
+# k3d — pinned GitHub release binary.
+SRW_K3D_VERSION=v5.9.0
+SRW_K3D_SHA256=06d8f25bc3a971c4eb29e0ff08429b180402db0f4dec838c9eac427e296800a0
+curl -fsSL "https://github.com/k3d-io/k3d/releases/download/${SRW_K3D_VERSION}/k3d-linux-amd64" -o /tmp/k3d
+echo "${SRW_K3D_SHA256}  /tmp/k3d" | sha256sum -c -
+sudo install -m 0755 /tmp/k3d /usr/local/bin/k3d && rm -f /tmp/k3d
+
+# tilt — pinned GitHub release tarball.
+SRW_TILT_VERSION=0.37.7
+SRW_TILT_SHA256=b695193fab68def8310cb971fa60bbe47ba0a782e24f54ebad287c13316a61b0
+curl -fsSL "https://github.com/tilt-dev/tilt/releases/download/v${SRW_TILT_VERSION}/tilt.${SRW_TILT_VERSION}.linux.x86_64.tar.gz" -o /tmp/tilt.tgz
+echo "${SRW_TILT_SHA256}  /tmp/tilt.tgz" | sha256sum -c -
+tar -xzf /tmp/tilt.tgz -C /tmp tilt
+sudo install -m 0755 /tmp/tilt /usr/local/bin/tilt && rm -f /tmp/tilt.tgz /tmp/tilt
+
+# mkcert — pinned GitHub release binary (the guide's local CA). `mkcert
+# -install` is per-user and runs at job time; libnss3-tools lets it reach
+# Chromium's trust store.
+SRW_MKCERT_VERSION=v1.4.4
+SRW_MKCERT_SHA256=6d31c65b03972c6dc4a14ab429f2928300518b26503f58723e532d1b0a3bbb52
+curl -fsSL "https://github.com/FiloSottile/mkcert/releases/download/${SRW_MKCERT_VERSION}/mkcert-${SRW_MKCERT_VERSION}-linux-amd64" -o /tmp/mkcert
+echo "${SRW_MKCERT_SHA256}  /tmp/mkcert" | sha256sum -c -
+sudo install -m 0755 /tmp/mkcert /usr/local/bin/mkcert && rm -f /tmp/mkcert
+sudo eatmydata apt-get install -y libnss3-tools
+
+for bin in docker kubectl helm k3d tilt mkcert; do
+    command -v "$bin" >/dev/null || { echo "ERROR: $bin missing after install" >&2; exit 1; }
+done
+docker --version; kubectl version --client; helm version --short; k3d version; tilt version; mkcert -version
 
 # -----------------------------------------------------------------------------
 # 3. Datasource CLI clients (psql, mongosh, cypher-shell)

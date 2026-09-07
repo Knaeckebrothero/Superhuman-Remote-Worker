@@ -7,23 +7,17 @@ config so it stays decoupled from the loader dataclass — the factory only need
 be exercised end-to-end here without rclone or a network.
 """
 
-import sys
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-
-from src.core.backends.factory import (  # noqa: E402
+from agent.core.backends.factory import (  # noqa: E402
     LITE_BACKENDS,
     create_lite_backend,
     is_lite_backend,
 )
-from src.core.backends.scratch import ScratchBackend  # noqa: E402
-from src.core.backends.virtual import VirtualWorkspaceBackend  # noqa: E402
+from agent.core.backends.scratch import ScratchBackend  # noqa: E402
+from agent.core.backends.virtual import VirtualWorkspaceBackend  # noqa: E402
 
 
 class TestLiteBackendSet:

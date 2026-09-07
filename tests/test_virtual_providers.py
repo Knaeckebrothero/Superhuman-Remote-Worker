@@ -1,13 +1,13 @@
 import pytest
 
-from src.core.virtual_dirs import (
+from agent.core.virtual_dirs import (
     ContactsProvider,
     SingleFileProvider,
     ToolsProvider,
     build_instruction_providers,
 )
-from src.core.virtual_dirs import contacts_provider as contacts_provider_module
-from src.tools.description_manager import generate_tool_index
+from agent.core.virtual_dirs import contacts_provider as contacts_provider_module
+from agent.tools.description_manager import generate_tool_index
 
 
 class FakeTool:
@@ -253,7 +253,7 @@ def test_repeated_reads_during_an_outage_attempt_only_one_fetch_per_window(
 
 
 def _real_tool_names(count=10):
-    from src.tools.registry import TOOL_REGISTRY
+    from agent.tools.registry import TOOL_REGISTRY
 
     return sorted(TOOL_REGISTRY)[:count]
 
@@ -269,8 +269,8 @@ def test_root_search_renders_each_tool_doc_once(tmp_path, monkeypatch):
     At the production tool count (~40) that is ~1,700 ``generate_tool_description``
     invocations for a single ``search_files`` on the agent's request path.
     """
-    from src.core.backends.overlay import VirtualOverlayBackend
-    from src.tools.description_manager import DescriptionManager
+    from agent.core.backends.overlay import VirtualOverlayBackend
+    from agent.tools.description_manager import DescriptionManager
     from tests._fs_backend import FilesystemTestBackend
 
     rendered = []
@@ -296,7 +296,7 @@ def test_root_search_renders_each_tool_doc_once(tmp_path, monkeypatch):
 
 def test_root_search_reflects_a_tool_list_changed_since_the_last_search(tmp_path):
     """The one-pass optimization must not memoize across calls."""
-    from src.core.backends.overlay import VirtualOverlayBackend
+    from agent.core.backends.overlay import VirtualOverlayBackend
     from tests._fs_backend import FilesystemTestBackend
 
     first, second = _REAL_TOOL_NAMES[0], _REAL_TOOL_NAMES[1]

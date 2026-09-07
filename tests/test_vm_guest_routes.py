@@ -12,8 +12,8 @@ from tests._route_inventory import mounted_routes
 from orchestrator.security.vm_guest import VmGuestIdentity
 from orchestrator.database.postgres import PostgresDB
 from orchestrator.services.vm_guest_events import record_heartbeat, record_register
-from routers import vm_guest
-from services.sudo_gate import (
+from orchestrator.routers import vm_guest
+from orchestrator.services.sudo_gate import (
     SudoEntityUnavailable,
     SudoOpenResult,
     SudoRequestConflict,
@@ -321,7 +321,7 @@ async def test_heartbeat_ide_merge_failure_is_non_fatal():
 
 
 async def test_main_app_registers_all_vm_guest_routes():
-    from main import app
+    from orchestrator.main import app
 
     # mounted_routes, not a comprehension over app.routes: FastAPI >= 0.139
     # keeps included routers behind a wrapper, and the guest bridge is a

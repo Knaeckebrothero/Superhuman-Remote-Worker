@@ -15,16 +15,10 @@ write races. knowledge-base/knowledge/features/llm_outage_subjob_resilience.md (
 rebase semantics).
 """
 
-import sys
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
-project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
 
 import tests.conftest  # noqa: E402,F401 — applies license/crypto/env shims + sys.path
 import orchestrator.main as main  # noqa: E402

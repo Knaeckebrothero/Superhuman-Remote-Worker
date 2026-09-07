@@ -8,7 +8,7 @@ hashed the last 20 lines (so output scrolling above the visible tail was
 mistaken for a stall).
 """
 
-from src.tools.shell.shell_manager import (
+from agent.tools.shell.shell_manager import (
     NO_CHANGE_TIMEOUT_SECONDS,
     compute_no_change_state,
 )

@@ -10,7 +10,6 @@ Functions under test are replicated here to avoid importing orchestrator.main
 import json
 import os
 import re
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -588,7 +587,7 @@ class TestInjectTypedEnvVars:
                 os.environ[k] = saved[k]
 
     def _get_inject_fn(self):
-        from src.agent import UniversalAgent
+        from agent.agent import UniversalAgent
 
         agent = UniversalAgent.__new__(UniversalAgent)
         return agent._inject_typed_env_vars
@@ -647,112 +646,11 @@ class TestInjectTypedEnvVars:
         )
 
 
-# =============================================================================
-# Agent-side: Datasource Index for workspace.md
-# =============================================================================
-
-
-class TestDatasourceIndex:
-    """Tests for Agent._inject_datasource_index (workspace.md injection)."""
-
-    def _make_agent(self):
-        from src.agent import UniversalAgent
-
-        agent = UniversalAgent.__new__(UniversalAgent)
-        ws = MagicMock()
-        ws.read_file.return_value = "# Workspace\n\nExisting content."
-        agent._workspace_manager = ws
-        return agent, ws
-
-    def test_index_contains_all_types(self):
-        agent, ws = self._make_agent()
-        configs = [
-            {"type": "generic", "name": "API Gateway", "cli_hint": "curl $API_URL"},
-            {"type": "repository", "name": "Frontend App"},
-            {"type": "postgresql", "name": "Analytics", "project_read_only": False},
-            {"type": "neo4j", "name": "Graph DB", "project_read_only": True},
-            {"type": "webdav", "name": "Files", "project_read_only": False},
-        ]
-        agent._inject_datasource_index(configs)
-        written = ws.write_file.call_args[0][1]
-
-        assert "## Available Connectors" in written
-        assert "Available Datasources" not in written
-        assert "**API Gateway** (generic)" in written
-        assert "**Frontend App** (repository)" in written
-        assert "./repos/frontend-app/" in written
-        assert "**Analytics** (postgresql, read-write)" in written
-        assert "`psql`" in written
-        assert "**Graph DB** (neo4j, read-only)" in written
-        assert "**Files** (webdav, read-write tools)" in written
-
-    def test_preserves_existing_content(self):
-        agent, ws = self._make_agent()
-        agent._inject_datasource_index([{"type": "generic", "name": "X"}])
-        written = ws.write_file.call_args[0][1]
-        assert "Existing content." in written
-
-    def test_workspace_read_failure_handled(self):
-        agent, ws = self._make_agent()
-        ws.read_file.side_effect = FileNotFoundError("no workspace.md")
-        # Should not raise
-        agent._inject_datasource_index([{"type": "generic", "name": "X"}])
-
-    def test_rw_postgresql_expanded_block(self):
-        agent, ws = self._make_agent()
-        configs = [
-            {"type": "postgresql", "name": "Main DB", "project_read_only": False},
-        ]
-        agent._inject_datasource_index(configs)
-        written = ws.write_file.call_args[0][1]
-
-        assert "**Main DB** (postgresql, read-write)" in written
-        assert "run_command" in written
-        assert "psql -c" in written
-        assert "Credentials are pre-configured" in written
-        assert "do NOT pass connection flags" in written
-
-    def test_rw_neo4j_expanded_block(self):
-        agent, ws = self._make_agent()
-        configs = [
-            {"type": "neo4j", "name": "Graph", "project_read_only": False},
-        ]
-        agent._inject_datasource_index(configs)
-        written = ws.write_file.call_args[0][1]
-
-        assert "cypher-shell --format plain" in written
-        assert "run_command" in written
-        assert "Credentials are pre-configured" in written
-
-    def test_rw_mongodb_expanded_block(self):
-        agent, ws = self._make_agent()
-        configs = [
-            {"type": "mongodb", "name": "Docs", "project_read_only": False},
-        ]
-        agent._inject_datasource_index(configs)
-        written = ws.write_file.call_args[0][1]
-
-        assert "mongosh --quiet --eval" in written
-        assert "run_command" in written
-        assert "Credentials are pre-configured" in written
-
-    def test_readonly_not_expanded(self):
-        agent, ws = self._make_agent()
-        configs = [
-            {"type": "postgresql", "name": "ReadOnly DB", "project_read_only": True},
-        ]
-        agent._inject_datasource_index(configs)
-        written = ws.write_file.call_args[0][1]
-
-        assert "query tools" in written
-        assert "run_command" not in written
-
-
 class TestRenderInstructionContentCLI:
     """Tests for cli_datasources support in render_instruction_content."""
 
     def test_cli_datasources_conditional(self):
-        from src.core.loader import render_instruction_content
+        from shared.runtime.core.loader import render_instruction_content
 
         template = "{% if cli_datasources %}HAS_CLI{% endif %}"
         result = render_instruction_content(
@@ -761,14 +659,14 @@ class TestRenderInstructionContentCLI:
         assert "HAS_CLI" in result
 
     def test_no_cli_datasources_omits_block(self):
-        from src.core.loader import render_instruction_content
+        from shared.runtime.core.loader import render_instruction_content
 
         template = "{% if cli_datasources %}HAS_CLI{% endif %}"
         result = render_instruction_content(template, [], cli_datasources=[])
         assert "HAS_CLI" not in result
 
     def test_has_cli_datasource_check(self):
-        from src.core.loader import render_instruction_content
+        from shared.runtime.core.loader import render_instruction_content
 
         template = (
             '{% if has_cli_datasource("postgresql") %}PG{% endif %}'
@@ -781,7 +679,7 @@ class TestRenderInstructionContentCLI:
         assert "NEO" not in result
 
     def test_default_none_cli_datasources(self):
-        from src.core.loader import render_instruction_content
+        from shared.runtime.core.loader import render_instruction_content
 
         template = "{% if cli_datasources %}HAS_CLI{% endif %}"
         result = render_instruction_content(template, [])
@@ -809,7 +707,7 @@ class TestRenderInstructionContentProtectedCloud:
     )
 
     def test_protected_block_rendered_when_flag_true(self):
-        from src.core.loader import render_instruction_content
+        from shared.runtime.core.loader import render_instruction_content
 
         result = render_instruction_content(
             self.PROTECTED_BLOCK_TEMPLATE, [], protected_cloud=True
@@ -819,7 +717,7 @@ class TestRenderInstructionContentProtectedCloud:
         assert "{}" not in result
 
     def test_protected_block_absent_when_flag_false(self):
-        from src.core.loader import render_instruction_content
+        from shared.runtime.core.loader import render_instruction_content
 
         result = render_instruction_content(
             self.PROTECTED_BLOCK_TEMPLATE, [], protected_cloud=False
@@ -828,7 +726,7 @@ class TestRenderInstructionContentProtectedCloud:
         assert "{%" not in result
 
     def test_protected_block_absent_by_default(self):
-        from src.core.loader import render_instruction_content
+        from shared.runtime.core.loader import render_instruction_content
 
         result = render_instruction_content(self.PROTECTED_BLOCK_TEMPLATE, [])
         assert "staged for your review" not in result

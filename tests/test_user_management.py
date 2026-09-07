@@ -8,17 +8,11 @@ Covers:
 """
 
 import os
-import sys
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import pytest
-
-# Add orchestrator to path so we can import its modules
-_orchestrator_dir = os.path.join(os.path.dirname(__file__), "..", "orchestrator")
-if _orchestrator_dir not in sys.path:
-    sys.path.insert(0, os.path.abspath(_orchestrator_dir))
 
 
 # ============================================================================
@@ -73,7 +67,7 @@ class TestPostgresDBUserOps:
     def _make_db(self):
         """Create a PostgresDB instance with a mocked pool."""
         with patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}):
-            from database import PostgresDB
+            from orchestrator.database import PostgresDB
 
             db = PostgresDB()
         db._pool = MagicMock()
@@ -347,7 +341,7 @@ class TestAppSideAdmission:
 
     @pytest.mark.asyncio
     async def test_write_through_migrates_legacy_role_holder(self):
-        from security.auth import _resolve_user_from_claims
+        from orchestrator.security.auth import _resolve_user_from_claims
 
         db, conn = self._db_with_user(self._user_row(is_approved=False))
         result = await _resolve_user_from_claims(self._claims(["user"]), db)
@@ -359,7 +353,7 @@ class TestAppSideAdmission:
 
     @pytest.mark.asyncio
     async def test_pending_when_no_role_and_db_false(self):
-        from security.auth import _resolve_user_from_claims
+        from orchestrator.security.auth import _resolve_user_from_claims
 
         db, _ = self._db_with_user(self._user_row(is_approved=False))
         result = await _resolve_user_from_claims(self._claims([]), db)
@@ -369,7 +363,7 @@ class TestAppSideAdmission:
 
     @pytest.mark.asyncio
     async def test_db_approved_survives_absent_role(self):
-        from security.auth import _resolve_user_from_claims
+        from orchestrator.security.auth import _resolve_user_from_claims
 
         db, _ = self._db_with_user(self._user_row(is_approved=True))
         result = await _resolve_user_from_claims(self._claims([]), db)
@@ -380,7 +374,7 @@ class TestAppSideAdmission:
 
     @pytest.mark.asyncio
     async def test_resolve_pat_no_longer_forces_approval(self):
-        from security.auth import _resolve_pat
+        from orchestrator.security.auth import _resolve_pat
 
         db = MagicMock()
         db.get_auth_token_by_hash = AsyncMock(
@@ -405,7 +399,7 @@ class TestAppSideAdmission:
 
     @pytest.mark.asyncio
     async def test_resolve_pat_approved_user_passes(self):
-        from security.auth import _resolve_pat
+        from orchestrator.security.auth import _resolve_pat
 
         db = MagicMock()
         db.get_auth_token_by_hash = AsyncMock(
@@ -431,7 +425,7 @@ class TestAppSideAdmission:
     async def test_ensure_user_provisioned_skips_without_sub(self):
         # Admin-created / pre-OIDC rows have no keycloak_sub → no provisioning
         # (they provision on their owner's first real OIDC login).
-        from security import auth
+        from orchestrator.security import auth
 
         with (
             patch.object(auth, "_ensure_cloud_user", new=AsyncMock()) as ec,
@@ -445,7 +439,7 @@ class TestAppSideAdmission:
     async def test_ensure_user_provisioned_fires_both_ensures(self):
         import asyncio
 
-        from security import auth
+        from orchestrator.security import auth
 
         with (
             patch.object(auth, "_ensure_cloud_user", new=AsyncMock()) as ec,
@@ -465,59 +459,64 @@ class TestAppSideAdmission:
             eg.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_notify_admins_fans_out_sse_and_email(self):
-        from services.notification_service import NotificationService
+    async def test_record_user_registered_fans_out_one_row_per_admin(self):
+        """App-side admission: every admin gets a `user_registered` feed row
+        about the new user (one dedup key, so approving resolves them all),
+        and the legacy `user_registered` SSE frame keeps flowing — it is the
+        admin Users page's refresh signal, not a notification."""
+        from orchestrator.services.notification_service import (
+            NotificationService,
+            RecordResult,
+        )
 
         svc = NotificationService()
         feed = MagicMock()  # broadcast is sync
-        email = MagicMock()
-        email.send_system_notification = AsyncMock(return_value=True)
         db = MagicMock()
         admin1, admin2 = str(uuid4()), str(uuid4())
         db.list_admin_user_ids = AsyncMock(return_value=[admin1, admin2])
-        db.get_user = AsyncMock(
-            side_effect=lambda uid: {
-                "id": uid,
-                "email": f"{uid}@x.com",
-                "display_name": "Admin",
-            }
+        svc.connect(db, MagicMock(), feed)
+        svc.record = AsyncMock(
+            side_effect=lambda **kw: RecordResult(
+                f"n-{kw['recipient_id'][:4]}", True, {"in_app": True}
+            )
         )
-        svc.connect(db, email, feed)
-        svc._get_user_channels = AsyncMock(return_value={"email": True})
-        svc._get_user_settings = AsyncMock(return_value={})
-        svc._is_in_quiet_hours = MagicMock(return_value=False)
 
-        res = await svc.notify_admins_user_registered(
-            "new-user-id", display_name="New", email="new@x.com"
+        res = await svc.record_user_registered(
+            new_user_id="new-user-id", display_name="New", email="new@x.com"
         )
-        assert res["notified"] == 2
+        assert res["notified"] == 2 and len(res["notification_ids"]) == 2
+        calls = [c.kwargs for c in svc.record.await_args_list]
+        assert {c["recipient_id"] for c in calls} == {admin1, admin2}
+        for c in calls:
+            assert c["category"] == "user_registered"
+            assert c["dedup_key"] == "user_registered:new-user-id"
+            assert (c["source_kind"], c["source_id"]) == ("user", "new-user-id")
+            assert c["action_params"] == {"user_id": "new-user-id"}
+            assert "new@x.com" in c["body"]
         assert feed.broadcast.call_count == 2
-        assert email.send_system_notification.call_count == 2
         assert feed.broadcast.call_args.kwargs["event_type"] == "user_registered"
 
     @pytest.mark.asyncio
-    async def test_notify_admins_skips_email_in_quiet_hours(self):
-        from services.notification_service import NotificationService
+    async def test_record_user_registered_skips_the_registrant_and_survives_a_bad_row(
+        self,
+    ):
+        from orchestrator.services.notification_service import NotificationService
 
         svc = NotificationService()
         feed = MagicMock()
-        email = MagicMock()
-        email.send_system_notification = AsyncMock(return_value=True)
         db = MagicMock()
         admin1 = str(uuid4())
-        db.list_admin_user_ids = AsyncMock(return_value=[admin1])
-        db.get_user = AsyncMock(
-            return_value={"id": admin1, "email": "a@x.com", "display_name": "A"}
-        )
-        svc.connect(db, email, feed)
-        svc._get_user_channels = AsyncMock(return_value={"email": True})
-        svc._get_user_settings = AsyncMock(return_value={})
-        svc._is_in_quiet_hours = MagicMock(return_value=True)  # in quiet hours
+        db.list_admin_user_ids = AsyncMock(return_value=["new-user-id", admin1])
+        svc.connect(db, MagicMock(), feed)
+        svc.record = AsyncMock(side_effect=RuntimeError("feed down"))
 
-        await svc.notify_admins_user_registered("new-user-id", display_name="New")
-        # SSE still fires (in-app isn't quiet-houred); email is suppressed.
+        res = await svc.record_user_registered(new_user_id="new-user-id")
+        # A self-registered admin is not pending; the failed row is logged,
+        # not raised, and the refresh frame still goes to the real admin.
+        assert res["notified"] == 0
+        svc.record.assert_awaited_once()
         assert feed.broadcast.call_count == 1
-        email.send_system_notification.assert_not_called()
+        assert feed.broadcast.call_args.kwargs["user_id"] == admin1
 
 
 # ============================================================================
@@ -530,7 +529,7 @@ class TestPostgresDBMcpTokens:
 
     def _make_db(self):
         with patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}):
-            from database import PostgresDB
+            from orchestrator.database import PostgresDB
 
             db = PostgresDB()
         db._pool = MagicMock()
@@ -770,7 +769,12 @@ class TestSchemaContainsIsAdmin:
 
     def test_schema_has_is_admin_migration(self):
         schema_path = os.path.join(
-            os.path.dirname(__file__), "..", "orchestrator", "database", "schema.sql"
+            os.path.dirname(__file__),
+            "..",
+            "src",
+            "orchestrator",
+            "database",
+            "schema.sql",
         )
         with open(schema_path) as f:
             content = f.read()
@@ -779,7 +783,12 @@ class TestSchemaContainsIsAdmin:
 
     def test_schema_has_mcp_tokens_table(self):
         schema_path = os.path.join(
-            os.path.dirname(__file__), "..", "orchestrator", "database", "schema.sql"
+            os.path.dirname(__file__),
+            "..",
+            "src",
+            "orchestrator",
+            "database",
+            "schema.sql",
         )
         with open(schema_path) as f:
             content = f.read()
@@ -802,18 +811,6 @@ class TestConfigFiles:
 
     def test_env_example_has_admin_vars(self):
         content = self._read_file(".env.example")
-        assert "ADMIN_EMAIL" in content
-        assert "ADMIN_DISPLAY_NAME" in content
-        assert "ADMIN_PASSWORD" in content
-
-    def test_docker_compose_has_admin_vars(self):
-        content = self._read_file("docker-compose.yaml")
-        assert "ADMIN_EMAIL" in content
-        assert "ADMIN_DISPLAY_NAME" in content
-        assert "ADMIN_PASSWORD" in content
-
-    def test_docker_compose_local_has_admin_vars(self):
-        content = self._read_file("docker-compose.local.yaml")
         assert "ADMIN_EMAIL" in content
         assert "ADMIN_DISPLAY_NAME" in content
         assert "ADMIN_PASSWORD" in content

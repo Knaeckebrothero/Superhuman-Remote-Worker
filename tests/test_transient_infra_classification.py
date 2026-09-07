@@ -16,7 +16,7 @@ infinite retry.
 
 import pytest
 
-from src.core.workspace_backend import (
+from shared.runtime.core.workspace_backend import (
     WorkspaceUnavailableError,
     completion_error_payload,
     is_transient_infra_error,

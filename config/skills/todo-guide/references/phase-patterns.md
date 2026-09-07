@@ -5,11 +5,10 @@ type, plus a full multi-phase worked example. Read this when you want a concrete
 model to copy while planning a phase.
 
 > Where a step says `kb_write`, use the knowledge base if you have it; otherwise
-> record to `notes/` (e.g. `notes/research_notes.md`). The Delegation pattern
-> applies only if you have the `delegate_work` tool.
+> record to `notes/` (e.g. `notes/research_notes.md`).
 
 ## Contents
-- Phase patterns: Research · Elaboration · Execution · Batch · Integration · Verification · Delegation
+- Phase patterns: Research · Elaboration · Execution · Batch · Integration · Verification
 - Worked example: a multi-phase research paper
 
 ## Phase patterns
@@ -56,14 +55,6 @@ produce evidence; these are the todos that schedule it.
 - "Verify `output/report.md` §1–3: every required topic covered per `instructions.md`"
 - "Run the tests from `instructions.md`; record pass/fail to `output/test_results.md`"
 - "Check every citation resolves to a real source in the library"
-
-### 7. Delegation — parallel independent subtasks
-Only if you have `delegate_work`. Split independent work across child agents.
-- "Delegate parallel research: `delegate_work` with 3 tasks — topics A, B, C (scholar)"
-- "Review delegation results: check each child's diff, approve or send feedback"
-- "Merge and reconcile: resolve conflicts between child outputs, update `plan.md`"
-
-The review + merge step is always its own todo — you must inspect each child's work.
 
 ## Worked example: a multi-phase research paper
 

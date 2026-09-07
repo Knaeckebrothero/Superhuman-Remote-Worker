@@ -52,12 +52,16 @@ export function isLoopWindingDown(
 
 /**
  * Experts eligible to fill a loop rotation slot. Loops run worker jobs; bundled
- * experts carry no `expert_type`, and DB session experts are excluded.
+ * experts carry no `expert_type`, and DB session experts are excluded — unless
+ * they are tagged `worker` (U1: tags are additive role metadata, and every
+ * expert stays usable in every role).
  */
-export function workerExpertsOnly<T extends {expert_type?: string}>(
+export function workerExpertsOnly<T extends {expert_type?: string; tags?: string[]}>(
   experts: T[],
 ): T[] {
-  return experts.filter((e) => !e.expert_type || e.expert_type === 'worker');
+  return experts.filter(
+    (e) => !e.expert_type || e.expert_type === 'worker' || (e.tags ?? []).includes('worker'),
+  );
 }
 
 /**

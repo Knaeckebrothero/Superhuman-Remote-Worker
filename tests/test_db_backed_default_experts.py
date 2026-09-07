@@ -10,7 +10,7 @@ from orchestrator.services.default_experts import (
     resolve_root_expert,
     seed_managed_default_experts,
 )
-from src.core.loader import canonical_config_name, resolve_config_path
+from shared.runtime.core.loader import canonical_config_name, resolve_config_path
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -84,12 +84,19 @@ async def test_personal_default_is_dormant_when_grant_is_revoked():
 
 
 def test_legacy_base_names_resolve_to_canonical_files():
+    """The public root names survive the U1 split: aliases canonicalise to
+    ``worker_base``/``session_base`` (never to the overlay files), and the
+    names resolve to the role overlays that replaced the old base files."""
     assert canonical_config_name("defaults") == "worker_base"
     assert canonical_config_name("persistent_defaults") == "session_base"
+    assert canonical_config_name("worker_base") == "worker_base"
+    assert canonical_config_name("overlays/session") == "session_base"
     worker, _ = resolve_config_path("defaults")
     session, _ = resolve_config_path("persistent_defaults")
-    assert Path(worker).name == "worker_base.yaml"
-    assert Path(session).name == "session_base.yaml"
+    assert Path(worker).parts[-2:] == ("overlays", "worker.yaml")
+    assert Path(session).parts[-2:] == ("overlays", "session.yaml")
+    assert resolve_config_path("worker_base")[0] == worker
+    assert resolve_config_path("session_base")[0] == session
 
 
 def test_managed_seed_bundles_are_raw_typed_overlays():
@@ -138,7 +145,7 @@ async def test_managed_seed_is_idempotent_and_insert_only():
 
 
 def test_default_expert_migration_shape():
-    migration_dir = ROOT / "orchestrator/database/migrations/app"
+    migration_dir = ROOT / "src" / "orchestrator" / "database" / "migrations" / "app"
     sql = "\n".join(
         path.read_text() for path in sorted(migration_dir.glob("006[4-8]_*.sql"))
     )
@@ -155,13 +162,13 @@ def test_default_assistant_runtime_control_groups_are_really_off():
     """The resolved policy must reach the runtime gates, not stop at YAML."""
     from orchestrator import main as orchestrator_main
     from orchestrator.services.config_resolver import resolve_config
-    from src.api.persistent_session import (
+    from agent.api.persistent_session import (
         _agent_catalog_enabled,
         _canvas_enabled,
         _fleet_management_enabled,
         _workflows_enabled,
     )
-    from src.core.loader import load_config_from_resolved
+    from shared.runtime.core.loader import load_config_from_resolved
 
     assistant = load_seed_bundle(
         ROOT / "config", directory="assistant", expert_type="session"
@@ -227,3 +234,80 @@ async def test_account_reasoning_is_a_floor_below_the_expert(monkeypatch):
     )
     assert resolved["agent"]["llm"]["model"] == "account-model"
     assert resolved["agent"]["llm"]["reasoning_level"] == "high"
+
+
+# --- U1 WP4: universal experts (D4) and role tags on the seeds ---------------
+
+
+@pytest.mark.asyncio
+async def test_explicit_cross_role_selection_is_allowed(caplog):
+    """Every expert is usable in every role: an explicit session expert picked
+    for a worker root is accepted (`resolve_config` re-roots it onto the worker
+    overlay at dispatch) and logged, never refused. Invisible stays refused;
+    the default SLOTS stay per role (checked at their endpoints)."""
+    import logging
+
+    from orchestrator.services.default_experts import ExpertSelectionError
+
+    db = SelectionDB()
+    db.explicit = {"id": "explicit", "expert_type": "session", "owner_id": "u1"}
+    with caplog.at_level(logging.INFO, logger="orchestrator.services.default_experts"):
+        chosen = await resolve_root_expert(
+            db, expert_type="worker", user_id="u1", explicit_expert_id="explicit"
+        )
+    assert chosen.source == "explicit"
+    assert chosen.expert["expert_type"] == "session"
+    assert any(
+        "session" in r.getMessage() and "worker" in r.getMessage()
+        for r in caplog.records
+    )
+    with pytest.raises(ExpertSelectionError):
+        await resolve_root_expert(
+            db, expert_type="worker", user_id="u1", explicit_expert_id="missing"
+        )
+
+
+def test_seed_bundles_carry_the_role_tag():
+    worker = load_seed_bundle(
+        ROOT / "config", directory="general-worker", expert_type="worker"
+    )
+    session = load_seed_bundle(
+        ROOT / "config", directory="assistant", expert_type="session"
+    )
+    # general-worker authors its role tag already: kept in place, not doubled.
+    assert worker["tags"] == ["general", "worker", "safe-default"]
+    assert session["tags"][-1] == "session" and session["tags"].count("session") == 1
+
+
+def test_seed_bundle_reads_expert_local_phase_skill_bodies(tmp_path):
+    """U2: the managed seed's prompts.strategic/tactical come from the
+    expert-local phase skills (body only)."""
+    expert_dir = tmp_path / "experts" / "seeded"
+    (expert_dir / "skills" / "strategic-phase").mkdir(parents=True)
+    (expert_dir / "skills" / "tactical-phase").mkdir(parents=True)
+    (expert_dir / "config.yaml").write_text(
+        "$extends: worker_base\nagent_id: seeded\ndisplay_name: Seeded\n"
+    )
+    (expert_dir / "persona.txt").write_text("I am seeded.\n")
+    (expert_dir / "skills" / "strategic-phase" / "SKILL.md").write_text(
+        "---\nname: strategic-phase\ndescription: d\ncatalog: hidden\n---\n\n"
+        "# Strategic phase\n\nSEEDED STRATEGIC BODY\n"
+    )
+    (expert_dir / "skills" / "tactical-phase" / "SKILL.md").write_text(
+        "---\nname: tactical-phase\ndescription: d\ncatalog: hidden\n---\n\n"
+        "# Tactical phase\n\nSEEDED TACTICAL BODY\n"
+    )
+
+    bundle = load_seed_bundle(tmp_path, directory="seeded", expert_type="worker")
+
+    assert bundle["prompts"]["persona"] == "I am seeded.\n"
+    assert (
+        bundle["prompts"]["strategic"] == "# Strategic phase\n\nSEEDED STRATEGIC BODY\n"
+    )
+    assert "catalog: hidden" not in bundle["prompts"]["strategic"]
+    assert bundle["prompts"]["tactical"] == "# Tactical phase\n\nSEEDED TACTICAL BODY\n"
+    # The bundled worker seed itself ships no phase prompt of its own.
+    seed = load_seed_bundle(
+        ROOT / "config", directory="general-worker", expert_type="worker"
+    )
+    assert "strategic" not in seed["prompts"] and "tactical" not in seed["prompts"]

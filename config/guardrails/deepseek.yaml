@@ -5,7 +5,7 @@
 # use standard OpenAI parens-form serialization — everything in `default.yaml`
 # applies as-is. Reasoning is returned out-of-band (DeepSeek `reasoning_content`,
 # OpenRouter `reasoning`/`reasoning_details`) and captured by
-# src/llm/reasoning_chat.py, so it never needs to appear in tool examples.
+# src/shared/runtime/llm/reasoning_chat.py, so it never needs to appear in tool examples.
 #
 # This file exists so the matrix has a guardrails entry for `deepseek` and any
 # future drift (e.g. a tool-format quirk surfaced by real runs) can be added

@@ -35,7 +35,11 @@ data:
       "duplicateEmailsAllowed": false,
       "resetPasswordAllowed": true,
       "editUsernameAllowed": false,
-      "sslRequired": "none",
+      {{- /* TLS terminates at the ingress, so "all" would reject in-cluster
+           plaintext traffic. "external" is Keycloak's own default: HTTPS
+           required for external addresses, plaintext from private IPs. */}}
+      "sslRequired": "external",
+      "passwordPolicy": "length(16) and notUsername(undefined)",
       "bruteForceProtected": true,
       "permanentLockout": false,
       "maxFailureWaitSeconds": 900,
@@ -354,6 +358,30 @@ data:
             }
           ]
         }
+        {{- if .Values.keycloak.devUsers.enabled }}
+        {{- range .Values.keycloak.devUsers.users }},
+        {
+          "username": {{ .username | quote }},
+          "email": {{ printf "%s@%s" .username $.Values.global.domain | quote }},
+          "emailVerified": true,
+          "enabled": true,
+          "realmRoles": [
+            {{- if .admin }}
+            "admin",
+            {{- end }}
+            "user",
+            "default-roles-{{ $.Values.keycloak.realm }}"
+          ],
+          "credentials": [
+            {
+              "type": "password",
+              "value": {{ .password | quote }},
+              "temporary": false
+            }
+          ]
+        }
+        {{- end }}
+        {{- end }}
       ],
       "scopeMappings": [
         {
@@ -799,8 +827,7 @@ spec:
                     # subsequent pod start the realm already exists, so any
                     # secret rotation in Vault/ESO must be propagated via
                     # kcadm here. The hook also ensures the OpenCloud client
-                    # set + groups exist (idempotent, mirrors
-                    # setup-opencloud-client.sh).
+                    # set + groups exist (idempotent).
                     KC="/opt/keycloak/bin/kcadm.sh"
                     until (echo > /dev/tcp/localhost/9000) 2>/dev/null; do sleep 3; done
                     $KC config credentials --server http://localhost:8080 \
@@ -959,10 +986,12 @@ spec:
                       -s "ssoSessionIdleTimeoutRememberMe={{ .Values.keycloak.session.ssoSessionIdleTimeoutRememberMe }}" \
                       -s "ssoSessionMaxLifespanRememberMe={{ .Values.keycloak.session.ssoSessionMaxLifespanRememberMe }}" \
                       -s "accessTokenLifespan={{ .Values.keycloak.session.accessTokenLifespan }}" \
-                      -s "offlineSessionIdleTimeout={{ .Values.keycloak.session.offlineSessionIdleTimeout }}" 2>/dev/null
+                      -s "offlineSessionIdleTimeout={{ .Values.keycloak.session.offlineSessionIdleTimeout }}" \
+                      -s "sslRequired=external" \
+                      -s "passwordPolicy=length(16) and notUsername(undefined)" 2>/dev/null
                     {{- if .Values.opencloud.enabled }}
                     # --- Ensure OpenCloud clients + group ---
-                    # Idempotent: creates only if missing. Mirrors setup-opencloud-client.sh.
+                    # Idempotent: creates only if missing.
                     # Helm-gated on opencloud.enabled: the runtime `-n` guard alone was
                     # not enough, because OPENCLOUD_KEYCLOAK_CLIENT_SECRET outlives the
                     # backend in Vault. A cluster migrated off OpenCloud would otherwise

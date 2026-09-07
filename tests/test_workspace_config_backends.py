@@ -6,16 +6,9 @@ alongside ``sandbox``/``vm``, legacy aliases still map, bogus values still
 raise, and the object-store ``mounts`` payload survives parsing.
 """
 
-import sys
-from pathlib import Path
-
 import pytest
 
-project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-
-from src.core.loader import WorkspaceConfig, load_agent_config_from_dict  # noqa: E402
+from shared.runtime.core.loader import WorkspaceConfig, load_agent_config_from_dict  # noqa: E402
 
 _BASE = {"agent_id": "a", "display_name": "A"}
 

@@ -17,16 +17,20 @@ from langgraph.graph.message import add_messages
 import pytest
 from typing_extensions import TypedDict
 
-import src.api.persistent_app as pa
-import src.api.turn_executor as turn_executor
-from src.api.orchestrator_client import CompletionNonTerminalReportError
-from src.agent import UniversalAgent, _stateless_worker_remote_authority
-from src.core.workspace_backend import WorkspaceUnavailableError
-from src.core.backends.remote import RemoteBackend
-from src.graph import route_entry
-from src.shared.run_queue import ClaimedUnit, EnqueueResult
-from src.shared.job_steering import CheckpointSteeringAcker, context_delivery_key
-from src.shared.worker_queue import (
+import agent.api.persistent_app as pa
+import agent.api.turn_executor as turn_executor
+from agent.api.orchestrator_client import CompletionNonTerminalReportError
+from agent.agent import UniversalAgent, _stateless_worker_remote_authority
+from shared.runtime.core.workspace_backend import WorkspaceUnavailableError
+from shared.runtime.core.backends.remote import RemoteBackend
+from agent.graph import route_entry
+from shared.run_queue import ClaimedUnit, EnqueueResult
+from shared.subagent_lifecycle import (
+    SubagentLifecycleError,
+    SubagentQuiescenceError,
+)
+from shared.job_steering import CheckpointSteeringAcker, context_delivery_key
+from shared.worker_queue import (
     WorkerClaim,
     WorkerCompletionAcceptance,
     WorkerRenewal,
@@ -233,6 +237,7 @@ def test_worker_bundle_rejects_missing_or_malformed_workspace_authority(
 
 def test_agent_worker_authority_maps_all_remote_backend_fields():
     metadata = {
+        "workspace_provisioner": "k8s",
         "workspace_generation": WORKSPACE_GENERATION,
         "workspace_runtime_incarnation": WORKSPACE_RUNTIME,
         "workspace_ssh_host_key_fingerprint": WORKSPACE_FINGERPRINT,
@@ -246,6 +251,7 @@ def test_agent_worker_authority_maps_all_remote_backend_fields():
         "expected_host_key_fingerprint": WORKSPACE_FINGERPRINT,
         "workspace_owner_kind": "job",
         "workspace_owner_id": "33333333-3333-4333-8333-333333333333",
+        "require_host_key_fingerprint": True,
     }
     assert _stateless_worker_remote_authority({}, None) == {}
 
@@ -262,6 +268,7 @@ def test_agent_worker_authority_maps_all_remote_backend_fields():
 )
 def test_agent_worker_authority_fails_closed_on_incomplete_or_non_job_owner(mutation):
     metadata = {
+        "workspace_provisioner": "k8s",
         "workspace_generation": WORKSPACE_GENERATION,
         "workspace_runtime_incarnation": WORKSPACE_RUNTIME,
         "workspace_ssh_host_key_fingerprint": WORKSPACE_FINGERPRINT,
@@ -621,6 +628,99 @@ async def test_terminal_reports_once_then_closes_exact_watermark(
     rotate.assert_not_awaited()
     release.assert_not_awaited()
     assert agent.cleanup_calls == [False]
+
+
+@pytest.mark.asyncio
+async def test_terminal_report_waits_for_stream_generator_close(
+    worker_runtime, monkeypatch
+):
+    claim = _claim(input_seq=32, prior="processing")
+    final = {
+        "should_stop": True,
+        "goal_achieved": True,
+        "freeze_data": None,
+        "error": None,
+    }
+    executor, agent, client, _, _, _, _ = _install(monkeypatch, claim, final)
+    events = []
+
+    async def stream():
+        try:
+            yield final
+        finally:
+            events.append("stream_closed")
+
+    async def report(*args, **kwargs):
+        del args, kwargs
+        events.append("reported")
+        return True
+
+    agent.process_job = AsyncMock(return_value=stream())
+    client.report_completion.side_effect = report
+
+    await executor._serve_worker_claim(claim)
+
+    assert events[:2] == ["stream_closed", "reported"]
+
+
+@pytest.mark.asyncio
+async def test_child_quiescence_failure_retries_cleanup_then_releases_without_report(
+    worker_runtime, monkeypatch
+):
+    claim = _claim(input_seq=33, prior="processing", attempts=5, max_attempts=5)
+    final = {
+        "should_stop": True,
+        "goal_achieved": True,
+        "freeze_data": None,
+        "error": None,
+    }
+    executor, agent, client, _, _, _, release = _install(monkeypatch, claim, final)
+
+    async def stream():
+        yield final
+        raise SubagentQuiescenceError("terminal delivery unavailable")
+
+    agent.process_job = AsyncMock(return_value=stream())
+
+    await executor._serve_worker_claim(claim)
+
+    client.report_completion.assert_not_awaited()
+    assert agent.cleanup_calls == [True]
+    release.assert_awaited_once_with(
+        executor._db,
+        unit_id=claim.unit_id,
+        lease_token=claim.lease_token,
+        park_on_exhaustion=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_repeated_child_quiescence_failure_escapes_without_report_or_release(
+    worker_runtime, monkeypatch
+):
+    claim = _claim(input_seq=34, prior="processing", attempts=5, max_attempts=5)
+    final = {
+        "should_stop": True,
+        "goal_achieved": True,
+        "freeze_data": None,
+        "error": None,
+    }
+    executor, agent, client, _, _, _, release = _install(monkeypatch, claim, final)
+
+    async def stream():
+        yield final
+        raise SubagentQuiescenceError("first failure")
+
+    agent.process_job = AsyncMock(return_value=stream())
+    agent.cleanup_worker_claim = AsyncMock(
+        side_effect=SubagentQuiescenceError("retry failure")
+    )
+
+    with pytest.raises(SubagentLifecycleError, match="did not fully clean"):
+        await executor._serve_worker_claim(claim)
+
+    client.report_completion.assert_not_awaited()
+    release.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -2051,37 +2151,6 @@ class TestWorkerBatchArming:
         )
 
     @pytest.mark.asyncio
-    async def test_fresh_stateless_resume_injects_delegation_before_checkpoint(self):
-        graph = SimpleNamespace(aupdate_state=AsyncMock())
-        agent = UniversalAgent.__new__(UniversalAgent)
-        agent._graph = graph
-        graph_input = {"messages": []}
-        checkpoint_values = {}
-        results = [{"job_id": "child-1", "status": "completed"}]
-        delivery_id = "ee8193cc-bc57-49e6-978c-622f47d0a462"
-
-        await agent._inject_delegation_results(
-            job_id=str(uuid4()),
-            stateless_worker=True,
-            graph_input=graph_input,
-            thread_config={"configurable": {"thread_id": "job"}},
-            checkpoint_values=checkpoint_values,
-            delegation_results=results,
-            metadata={"delegation_results_delivery_id": delivery_id},
-        )
-
-        expected_key = context_delivery_key(
-            "delegation",
-            results,
-            delivery_id=delivery_id,
-        )
-        assert graph_input["delivered_delegation_keys"] == [expected_key]
-        assert len(graph_input["messages"]) == 1
-        assert "child-1" in graph_input["messages"][0].content
-        assert checkpoint_values["delivered_delegation_keys"] == [expected_key]
-        graph.aupdate_state.assert_not_awaited()
-
-    @pytest.mark.asyncio
     async def test_mid_loop_update_preserves_pending_frontier(self):
         graph = SimpleNamespace(
             aget_state=AsyncMock(
@@ -2354,155 +2423,6 @@ class TestWorkerBatchArming:
             "checkpoint_completion_report",
         ]
         assert armed_targets == [60.0]
-
-    @pytest.mark.asyncio
-    async def test_delegation_crash_reclaim_arms_without_consuming_frontier(self):
-        app, ran, armed_targets = _build_worker_frontier_graph()
-        config = {"configurable": {"thread_id": "delegation-reclaim"}}
-        await app.ainvoke(
-            {
-                "initialized": False,
-                "messages": [],
-                "should_stop": False,
-                "iteration": 0,
-            },
-            config,
-        )
-        agent = UniversalAgent.__new__(UniversalAgent)
-        agent._graph = app
-        delivery_id = "ee8193cc-bc57-49e6-978c-622f47d0a462"
-        results = [{"job_id": "child-1", "status": "completed"}]
-        checkpoint_values = dict((await app.aget_state(config)).values)
-        resume_updates = {}
-
-        resume_as_node = await agent._inject_delegation_results(
-            job_id=str(uuid4()),
-            stateless_worker=True,
-            graph_input=None,
-            thread_config=config,
-            checkpoint_values=checkpoint_values,
-            delegation_results=results,
-            metadata={"delegation_results_delivery_id": delivery_id},
-            deferred_updates=resume_updates,
-        )
-        assert resume_as_node == "restore_todo_state"
-        await agent._arm_worker_batch(
-            job_id=str(uuid4()),
-            graph_input=None,
-            thread_config=config,
-            target_wall_seconds=60,
-            min_wall_seconds=0,
-            iteration_cap=10,
-            resume_updates=resume_updates,
-            resume_as_node=resume_as_node,
-        )
-        routed = await app.aget_state(config)
-        assert routed.next == ("execute",)
-        assert routed.metadata["source"] == "update"
-
-        successor_updates = {}
-        await agent._inject_delegation_results(
-            job_id=str(uuid4()),
-            stateless_worker=True,
-            graph_input=None,
-            thread_config=config,
-            checkpoint_values=dict(routed.values),
-            delegation_results=results,
-            metadata={"delegation_results_delivery_id": delivery_id},
-            deferred_updates=successor_updates,
-        )
-        assert successor_updates == {}
-
-        terminal = await agent._arm_worker_batch(
-            job_id=str(uuid4()),
-            graph_input=None,
-            thread_config=config,
-            target_wall_seconds=60,
-            min_wall_seconds=0,
-            iteration_cap=10,
-            resume_updates=successor_updates,
-        )
-        assert terminal is None
-        assert (await app.aget_state(config)).metadata["step"] == routed.metadata[
-            "step"
-        ]
-        assert (await app.aget_state(config)).next == ("execute",)
-
-        ran.clear()
-        armed_targets.clear()
-        await app.ainvoke(None, config)
-        assert ran == ["execute", "checkpoint_completion_report"]
-        assert armed_targets == [60.0]
-
-    @pytest.mark.asyncio
-    async def test_combined_feedback_delegation_retains_reducer_messages(self):
-        from langchain_core.messages import HumanMessage
-
-        app, _, _ = _build_worker_frontier_graph()
-        config = {"configurable": {"thread_id": "combined-steering"}}
-        await app.ainvoke(
-            {
-                "initialized": False,
-                "messages": [HumanMessage(content="prior durable context")],
-                "should_stop": False,
-                "iteration": 0,
-            },
-            config,
-        )
-        agent = UniversalAgent.__new__(UniversalAgent)
-        agent._graph = app
-        checkpoint_values = dict((await app.aget_state(config)).values)
-        resume_updates = {}
-
-        feedback_node = await agent._inject_resume_feedback(
-            job_id=str(uuid4()),
-            stateless_worker=True,
-            graph_input=None,
-            thread_config=config,
-            checkpoint_values=checkpoint_values,
-            feedback="apply the review",
-            feedback_reason="reviewer resumed",
-            metadata={
-                "queued_feedback_delivery_id": ("b5426cab-66d-48e6-bf30-9027fe4602b4")
-            },
-            deferred_updates=resume_updates,
-        )
-        delegation_node = await agent._inject_delegation_results(
-            job_id=str(uuid4()),
-            stateless_worker=True,
-            graph_input=None,
-            thread_config=config,
-            checkpoint_values=checkpoint_values,
-            delegation_results=[{"job_id": "child-1", "status": "completed"}],
-            metadata={
-                "delegation_results_delivery_id": (
-                    "ee8193cc-bc57-49e6-978c-622f47d0a462"
-                )
-            },
-            deferred_updates=resume_updates,
-        )
-
-        assert feedback_node == "__start__"
-        assert delegation_node == "restore_todo_state"
-        await agent._arm_worker_batch(
-            job_id=str(uuid4()),
-            graph_input=None,
-            thread_config=config,
-            target_wall_seconds=60,
-            min_wall_seconds=0,
-            iteration_cap=10,
-            resume_updates=resume_updates,
-            resume_as_node=delegation_node,
-        )
-
-        routed = await app.aget_state(config)
-        contents = [message.content for message in routed.values["messages"]]
-        assert contents[0] == "prior durable context"
-        assert any("child-1" in content for content in contents[1:])
-        assert routed.values["resume_feedback"] == "apply the review"
-        assert routed.values["delivered_feedback_keys"]
-        assert routed.values["delivered_delegation_keys"]
-        assert routed.next == ("execute",)
 
     @pytest.mark.asyncio
     async def test_recoverable_end_reenters_through_start_and_clears_error(self):

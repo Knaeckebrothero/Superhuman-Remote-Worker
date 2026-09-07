@@ -16,7 +16,7 @@ host-rewrite is a no-op (env unset, or an external source repo).
 
 import pytest
 
-from security import access
+from orchestrator.security import access
 
 INTERNAL = "http://srw-gitea:3000"
 EXTERNAL = "https://git.h4ll.net"

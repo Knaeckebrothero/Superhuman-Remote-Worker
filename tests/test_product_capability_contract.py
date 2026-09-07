@@ -12,7 +12,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from src.core.product_capabilities import (
+from shared.runtime.core.product_capabilities import (
     AgentAction,
     BuildEvaluation,
     BuildState,

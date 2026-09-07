@@ -29,6 +29,7 @@ import {AppSpinnerComponent} from '../../ui/spinner';
 import {AppIconComponent} from '../../ui/icon';
 import {AppIconButtonComponent} from '../../ui/icon-button';
 import {AppDialogComponent} from '../../ui/dialog';
+import {AppToastService} from '../../ui/toast';
 import {AppMenuComponent, AppMenuItemComponent, AppMenuTriggerDirective} from '../../ui/menu';
 import {ViewportService} from '../../core/services/viewport.service';
 import {
@@ -1298,6 +1299,7 @@ export class JobListComponent implements OnInit, OnDestroy {
   private readonly route = inject(ActivatedRoute);
   private readonly destroyRef = inject(DestroyRef);
   private readonly pageSizePreference = inject(JobPageSizePreference);
+  private readonly toast = inject(AppToastService);
 
   /** Guards against a slow earlier response overwriting a newer one. */
   private requestSerial = 0;
@@ -1828,6 +1830,7 @@ export class JobListComponent implements OnInit, OnDestroy {
         loadingSubtree: false,
         subtreeAttempted: false,
         subjobs: null,
+        subagents: null,
       },
     }));
     forkJoin({
@@ -1840,6 +1843,7 @@ export class JobListComponent implements OnInit, OnDestroy {
       // to ask for it, and for a `waiting` parent it is the single thing that
       // explains the status they opened the panel to understand.
       subjobs: this.api.getJobSubjobs(jobId),
+      subagents: this.api.getJobSubagents(jobId),
     })
       .pipe(takeUntilDestroyed(this.destroyRef))
       .subscribe((result) => {
@@ -1849,11 +1853,16 @@ export class JobListComponent implements OnInit, OnDestroy {
             ...cache[jobId],
             loading: false,
             error:
-              !result.detail && !result.usage && !result.progress && !result.subjobs,
+              !result.detail &&
+              !result.usage &&
+              !result.progress &&
+              !result.subjobs &&
+              !result.subagents,
             detail: result.detail,
             usage: result.usage,
             progress: result.progress,
             subjobs: result.subjobs?.subjobs ?? null,
+            subagents: result.subagents?.subagents ?? null,
           },
         }));
       });
@@ -1949,6 +1958,7 @@ export class JobListComponent implements OnInit, OnDestroy {
         this.api.startIdeSession(jobId).subscribe((startResult) => {
           if (!startResult || startResult.status === 'unavailable' || startResult.status === 'failed') {
             this.removeIdeLoading(jobId);
+            if (startResult?.error) this.toast.warning(startResult.error);
             return;
           }
           // Poll until active
@@ -1963,8 +1973,10 @@ export class JobListComponent implements OnInit, OnDestroy {
         return;
       }
 
-      // unavailable or other — stop loading
+      // unavailable or other — stop loading. Say why when the orchestrator
+      // told us; a button that silently does nothing reads as a broken page.
       this.removeIdeLoading(jobId);
+      if (result.error) this.toast.warning(result.error);
     });
   }
 
@@ -1988,6 +2000,7 @@ export class JobListComponent implements OnInit, OnDestroy {
           clearInterval(interval);
           this.idePollingIntervals.delete(jobId);
           this.removeIdeLoading(jobId);
+          if (result.error) this.toast.warning(result.error);
         }
         // else 'restoring' — keep polling
       });

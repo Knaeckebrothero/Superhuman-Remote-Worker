@@ -32,6 +32,9 @@ proof-match booleans. It never records synthetic credential values. The suite
 exercises:
 
 - the authenticated full-window Canvas wrapper with production-hashed assets;
+- file-backed static and interactive HTML through the production nested-iframe
+  renderer, including native fragments, script capability, opaque storage/DOM
+  isolation, and wrapper-blocked self-navigation/meta refresh;
 - exact parent attachment Fetch Metadata and cookie-BFF requests;
 - challenge, parent authorization, one-time exchange, and application
   navigation in a sandboxed cross-origin iframe;

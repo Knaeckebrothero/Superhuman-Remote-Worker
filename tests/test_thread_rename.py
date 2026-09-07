@@ -20,22 +20,22 @@ from fastapi import HTTPException
 def _patch_caller_and_db(user: dict, db):
     stack = ExitStack()
     stack.enter_context(
-        patch("main.require_approved_user", AsyncMock(return_value=user))
+        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user))
     )
     stack.enter_context(
         patch(
-            "security.access.require_approved_user",
+            "orchestrator.security.access.require_approved_user",
             AsyncMock(return_value=user),
         )
     )
-    stack.enter_context(patch("main.postgres_db", db))
+    stack.enter_context(patch("orchestrator.main.postgres_db", db))
     return stack
 
 
 class TestUpdateThread:
     @pytest.mark.asyncio
     async def test_owner_can_rename(self, user_a, thread_a, fake_db, fake_request):
-        from main import ThreadUpdateRequest, update_thread
+        from orchestrator.main import ThreadUpdateRequest, update_thread
 
         with _patch_caller_and_db(user_a, fake_db):
             result = await update_thread(
@@ -51,7 +51,7 @@ class TestUpdateThread:
 
     @pytest.mark.asyncio
     async def test_title_is_trimmed(self, user_a, thread_a, fake_db, fake_request):
-        from main import ThreadUpdateRequest, update_thread
+        from orchestrator.main import ThreadUpdateRequest, update_thread
 
         with _patch_caller_and_db(user_a, fake_db):
             result = await update_thread(
@@ -66,7 +66,7 @@ class TestUpdateThread:
 
     @pytest.mark.asyncio
     async def test_empty_title_rejected(self, user_a, thread_a, fake_db, fake_request):
-        from main import ThreadUpdateRequest, update_thread
+        from orchestrator.main import ThreadUpdateRequest, update_thread
 
         with _patch_caller_and_db(user_a, fake_db):
             with pytest.raises(HTTPException) as exc:
@@ -82,7 +82,7 @@ class TestUpdateThread:
     async def test_too_long_title_rejected(
         self, user_a, thread_a, fake_db, fake_request
     ):
-        from main import ThreadUpdateRequest, update_thread
+        from orchestrator.main import ThreadUpdateRequest, update_thread
 
         with _patch_caller_and_db(user_a, fake_db):
             with pytest.raises(HTTPException) as exc:
@@ -98,7 +98,7 @@ class TestUpdateThread:
     async def test_cross_user_rename_forbidden(
         self, user_b, thread_a, fake_db, fake_request
     ):
-        from main import ThreadUpdateRequest, update_thread
+        from orchestrator.main import ThreadUpdateRequest, update_thread
 
         with _patch_caller_and_db(user_b, fake_db):
             with pytest.raises(HTTPException) as exc:
@@ -112,7 +112,7 @@ class TestUpdateThread:
 
     @pytest.mark.asyncio
     async def test_missing_thread_404(self, user_a, fake_db, fake_request):
-        from main import ThreadUpdateRequest, update_thread
+        from orchestrator.main import ThreadUpdateRequest, update_thread
 
         with _patch_caller_and_db(user_a, fake_db):
             with pytest.raises(HTTPException) as exc:

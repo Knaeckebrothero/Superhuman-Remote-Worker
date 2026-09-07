@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from src.llm.key_ring import (
+from shared.runtime.llm.key_ring import (
     KeyRing,
     clear_registry,
     get_or_create_key_ring,

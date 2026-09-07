@@ -107,7 +107,7 @@ def _freeze_lines(job: dict[str, Any]) -> list[str]:
 
 def format_job_list_item(job: dict[str, Any]) -> list[str]:
     """Rich per-job list rendering (F5) — description, lineage, freeze, error."""
-    from ..job_outcome import effective_job_status
+    from shared.job_outcome import effective_job_status
 
     job_id = job.get("id", "unknown")
     lines = [
@@ -233,7 +233,7 @@ def format_job_detail(job: dict[str, Any]) -> str:
     'Config: N/A' forever), and supervision needs lineage, owner, priority,
     agent, repo/branch, and the freeze type/reason/requires-review facts.
     """
-    from ..job_outcome import effective_job_status
+    from shared.job_outcome import effective_job_status
 
     job_id = job.get("id", "unknown")
     lines = [
@@ -412,6 +412,11 @@ def _context_label(msg: dict[str, Any]) -> str | None:
         content = msg.get("content_preview") or msg.get("content") or ""
         if isinstance(content, str) and content.startswith("<active_tasks>"):
             return "todos"
+        # Persistent phase instruction block (src/core/message_markers.py):
+        # newer archivers store it as type="context" kind="phase_instruction";
+        # this prefix catches a row stored verbatim by an older writer.
+        if isinstance(content, str) and content.startswith("[phase: "):
+            return "phase_instruction"
     if msg.get("type") == "tool":
         tcid = msg.get("tool_call_id") or ""
         for prefix, k in _INJECT_KIND_BY_PREFIX:
@@ -581,7 +586,7 @@ def format_job_summary(job_id: str, envelope: dict[str, Any]) -> str:
     if note:
         lines.append(note)
     elif job:
-        from ..job_outcome import effective_job_status
+        from shared.job_outcome import effective_job_status
 
         display_status = effective_job_status(job)
         status_icon = {
@@ -3261,14 +3266,21 @@ def format_officer_roster(data: dict[str, Any]) -> str:
         detail = [
             f"thread {_short_id(row.get('thread_id'))}",
             str(row.get("model") or "model ?"),
-            "auto-pull on" if row.get("auto_pull") else "auto-pull off",
+            (
+                "auto-pull on"
+                if row.get("auto_pull")
+                and row.get("auto_pull_enable_available") is True
+                else (
+                    "auto-pull configured — deployment release fenced"
+                    if row.get("auto_pull")
+                    else "auto-pull off"
+                )
+            ),
         ]
         lines.append(f"    {' | '.join(detail)}")
         counts = [
             f"{int(row.get('in_flight_jobs') or 0)} job(s) in flight",
             f"{int(row.get('pending_events') or 0)} event(s) pending on him",
-            f"pages today {int(row.get('pages_today') or 0)}",
-            f"digest {int(row.get('digest_waiting') or 0)}",
         ]
         lines.append(f"    {' | '.join(counts)}")
         if row.get("last_activity_at"):
@@ -3332,12 +3344,18 @@ def format_officer_post(
         f"Next wake: {data.get('next_wake_at') or 'not scheduled'} | "
         f"Pending events: {int(data.get('pending_events') or 0)}"
     )
-    pages = data.get("pages_today") or {}
     backlog = data.get("backlog") or {}
-    lines.append(
-        f"Pages today: {pages.get('used', 0)}/{pages.get('budget', '?')} | "
-        f"Backlog auto-pull: {'on' if backlog.get('auto_pull') else 'off'}"
-    )
+    auto_pull_control = backlog.get("auto_pull_control") or {}
+    if backlog.get("auto_pull") and auto_pull_control.get("enable_available") is False:
+        auto_pull_label = "configured on — deployment release fenced"
+    else:
+        auto_pull_label = "on" if backlog.get("auto_pull") else "off"
+    lines.append(f"Backlog auto-pull: {auto_pull_label}")
+    if backlog.get("worker_spend_ceiling_daily") is not None:
+        lines.append(
+            "Worker spend ceiling: "
+            f"${backlog['worker_spend_ceiling_daily']}/day across the century"
+        )
     spend = data.get("spend_today") or {}
     if spend.get("tokens") is not None:
         ceiling = spend.get("ceiling")
@@ -3359,16 +3377,9 @@ def format_officer_post(
                 line += f" | ready {entry['ready_depth']}"
                 if entry.get("below_floor"):
                     line += " — BELOW FLOOR"
+            if entry.get("spend_ceiling_daily") is not None:
+                line += f" | ${entry['spend_ceiling_daily']}/day ceiling"
             lines.append(line)
-
-    digest = data.get("digest") or []
-    if digest:
-        lines.append(f"Digest ({len(digest)} waiting):")
-        for item in digest[-5:]:
-            subject = item.get("subject") or ""
-            message = (item.get("message") or "").replace("\n", " ")
-            stamp = item.get("at") or ""
-            lines.append(f"  - {stamp} {subject}: {message}"[:400])
 
     if recent and recent.get("messages"):
         lines.append("")

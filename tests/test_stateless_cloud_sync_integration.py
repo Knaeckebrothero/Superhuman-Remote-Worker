@@ -15,16 +15,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import HTTPException
 
-import src.api.persistent_app as papp
-from src.api.lease_context import LeaseHandle, current_lease
-from src.api.turn_executor import StatelessTurnExecutor
-from src.persistent_graph import PersistentLoopCallbacks, run_persistent_loop
-from src.services.cloud_sync.coordinator import (
+import agent.api.persistent_app as papp
+from agent.api.lease_context import LeaseHandle, current_lease
+from agent.api.turn_executor import StatelessTurnExecutor
+from agent.persistent_graph import PersistentLoopCallbacks, run_persistent_loop
+from agent.services.cloud_sync.coordinator import (
     CloudSyncGenerationError,
     MountSync,
     WorkspaceSyncCoordinator,
 )
-from src.shared.cloud_sync_generations import (
+from shared.cloud_sync_generations import (
     EMPTY_BASELINE_SHA256,
     CloudSyncRequirement,
 )
@@ -144,15 +144,15 @@ async def test_stateless_start_recovers_then_strict_pulls_then_arms(monkeypatch)
             patch.object(papp, "_session", session),
             patch.object(papp, "_thread_id", THREAD_ID),
             patch(
-                "src.shared.cloud_sync_generations.cloud_sync_lease_is_current",
+                "shared.cloud_sync_generations.cloud_sync_lease_is_current",
                 AsyncMock(return_value=True),
             ),
             patch(
-                "src.shared.cloud_sync_generations.load_cloud_sync_requirements",
+                "shared.cloud_sync_generations.load_cloud_sync_requirements",
                 AsyncMock(return_value={}),
             ),
             patch(
-                "src.shared.cloud_sync_generations.arm_cloud_sync_generations",
+                "shared.cloud_sync_generations.arm_cloud_sync_generations",
                 AsyncMock(side_effect=arm),
             ),
             patch.object(papp, "_broadcast"),
@@ -199,14 +199,14 @@ async def test_stateless_pull_failure_blocks_arm_and_turn_start(monkeypatch):
             patch.object(papp, "_session", session),
             patch.object(papp, "_thread_id", THREAD_ID),
             patch(
-                "src.shared.cloud_sync_generations.cloud_sync_lease_is_current",
+                "shared.cloud_sync_generations.cloud_sync_lease_is_current",
                 AsyncMock(return_value=True),
             ),
             patch(
-                "src.shared.cloud_sync_generations.load_cloud_sync_requirements",
+                "shared.cloud_sync_generations.load_cloud_sync_requirements",
                 AsyncMock(return_value={}),
             ),
-            patch("src.shared.cloud_sync_generations.arm_cloud_sync_generations", arm),
+            patch("shared.cloud_sync_generations.arm_cloud_sync_generations", arm),
             patch.object(papp.asyncio, "sleep", AsyncMock()),
             patch.object(papp, "_broadcast"),
         ):
@@ -969,26 +969,49 @@ async def test_internal_workspace_nonready_claim_restarts_reconcile_without_endp
 
 
 @pytest.mark.asyncio
-async def test_internal_workspace_pinned_sandbox_keeps_historical_ready_contract():
+async def test_internal_workspace_pinned_sandbox_requires_exact_live_authority():
     import orchestrator.main as orch_main
 
     thread = _stateless_sandbox_thread()
     thread["execution_lane"] = "pinned"
     probe = AsyncMock(side_effect=AssertionError("pinned route must not attest UID"))
+    attestation = orch_main.WorkspaceRuntimeAttestation(
+        backing_id="k8s-pvc:agent-workspaces:pvc-uid",
+        workspace_generation=WORKSPACE_GENERATION,
+        runtime_incarnation=WORKSPACE_RUNTIME_INCARNATION,
+        ssh_host_key_fingerprint=WORKSPACE_SSH_HOST_KEY_FINGERPRINT,
+        host="ws-thread-111111111111.agent-workspaces.svc.cluster.local",
+        pod_ip="10.42.0.25",
+        port=30022,
+    )
+    attest = AsyncMock(return_value=attestation)
     schedule = MagicMock()
     with (
         patch.object(orch_main.container_provisioner, "workspace_pod_live", probe),
+        patch.object(
+            orch_main.container_provisioner,
+            "attest_workspace_runtime",
+            attest,
+        ),
         patch.object(orch_main, "_schedule_stateless_workspace_ensure", schedule),
     ):
         response = await _internal_workspace_response_for_lite_thread(thread)
 
     probe.assert_not_awaited()
+    assert attest.await_count == 2
+    assert all(
+        call.args == (orch_main.WorkspaceOwner.session(THREAD_ID),)
+        for call in attest.await_args_list
+    )
     schedule.assert_not_called()
     assert response["status"] == "ready"
     assert response["pod_ip"] == "10.42.0.25"
     assert response["workspace_generation"] == WORKSPACE_GENERATION
     assert response["workspace_runtime_incarnation"] == WORKSPACE_RUNTIME_INCARNATION
-    assert response["workspace_ssh_host_key_fingerprint"] is None
+    assert (
+        response["workspace_ssh_host_key_fingerprint"]
+        == WORKSPACE_SSH_HOST_KEY_FINGERPRINT
+    )
 
 
 @pytest.mark.asyncio
@@ -1144,12 +1167,14 @@ async def test_stateless_virtual_workspace_exact_backing_exposes_generation():
 async def test_none_agent_cloud_suppression_is_stateless_only(
     monkeypatch, stateless: bool, expects_sync: bool
 ):
-    """Pinned ScratchBackend keeps the pre-S2 legacy sync construction path."""
+    """Pinned ScratchBackend keeps its sync and pinned-inbox attach paths."""
 
     if stateless:
         monkeypatch.setenv("STATELESS_EXECUTOR", "1")
     else:
         monkeypatch.delenv("STATELESS_EXECUTOR", raising=False)
+
+    postgres = MagicMock(name="non_null_pool_connection")
 
     class FakeSession:
         def __init__(self, *args, **kwargs):
@@ -1162,11 +1187,17 @@ async def test_none_agent_cloud_suppression_is_stateless_only(
             )
             self.workspace_sync = None
             self.cloud_sync_workspace_generation = ""
-            self.postgres_conn = None
+            self.postgres_conn = postgres
             self.tool_context = None
 
         async def setup(self, **kwargs):
             return None
+
+        async def cleanup(self, **kwargs):
+            return None
+
+        async def recover_subagents(self):
+            return []
 
     cloud_sync = {"backend": "nextcloud", "webdav_url": "http://historical"}
     workspace_payload = {
@@ -1178,14 +1209,15 @@ async def test_none_agent_cloud_suppression_is_stateless_only(
         "datasources": None,
     }
     client = SimpleNamespace(
-        get_thread_workspace=AsyncMock(return_value=workspace_payload)
+        get_thread_workspace=AsyncMock(return_value=workspace_payload),
+        agent_id=None,
     )
     agent = SimpleNamespace(
         config=SimpleNamespace(workspace=SimpleNamespace(backend="none")),
         _tactical_llm=None,
         _llm=object(),
         _auxiliary_llm=None,
-        postgres_conn=None,
+        postgres_conn=postgres,
         vector_conn=None,
     )
     workspace_sync = MagicMock()
@@ -1204,14 +1236,28 @@ async def test_none_agent_cloud_suppression_is_stateless_only(
             papp, "_build_sync_coordinator", return_value=workspace_sync
         ) as build_sync,
         patch.object(papp, "_restore_session_messages", AsyncMock()),
+        patch.object(
+            papp,
+            "_reclaim_pending_pinned_inputs",
+            AsyncMock(return_value=set()),
+        ) as reclaim_pinned,
+        patch.object(
+            papp, "_resolve_event_journal_epoch", AsyncMock(return_value=(1, 0))
+        ),
+        patch.object(papp, "_OrderedPersistentEventWriter") as writer_cls,
         patch.object(papp, "_update_thread_status", AsyncMock()),
         patch.object(papp, "_start_watchdogs"),
         patch.object(papp, "_officer_cfg", return_value=None),
         patch.object(papp, "_apply_session_embedding_env"),
     ):
+        lease_reset = None
         try:
+            if stateless:
+                _, lease_reset = _install_lease()
             await papp._attach_session(THREAD_ID, config_override={})
         finally:
+            if lease_reset is not None:
+                current_lease.reset(lease_reset)
             papp._session = None
             papp._thread_id = None
 
@@ -1222,6 +1268,11 @@ async def test_none_agent_cloud_suppression_is_stateless_only(
     else:
         build_sync.assert_not_called()
         workspace_sync.pull_all.assert_not_awaited()
+    if stateless:
+        reclaim_pinned.assert_not_awaited()
+    else:
+        reclaim_pinned.assert_awaited_once_with()
+    writer_cls.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -1247,6 +1298,9 @@ async def test_late_workspace_fetch_retains_generation_without_coordinator():
 
         async def setup(self, **kwargs):
             return None
+
+        async def recover_subagents(self):
+            return []
 
     # The readiness response has no generation. The first metadata hydration
     # fetch also lacks it; only the later cloud-config fetch carries the binding

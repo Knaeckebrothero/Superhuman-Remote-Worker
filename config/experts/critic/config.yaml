@@ -15,15 +15,29 @@ tags:
   - quality
   - gating
 
-# Light subagent delegation: throwaway in-process evidence gatherers via
-# spawn_subagent. Verification fan-out is the driving use case — subagents
-# gather evidence, the critic renders the verdict. Reader model = llm.subagent
-# tier (falls back to llm.tactical).
+# Built-in subagents (delegate_agent): evidence gatherers fanned out per
+# verification stream — subagents gather evidence, the critic renders the
+# verdict. `enabled` gates the tool binding; the children and their model live
+# in `subagents.roster` (model defaults to the parent's).
 delegation:
   enabled: true
-  mode: light
+  max_concurrent: 4
+
+subagents:
+  default: verifier
+  roster:
+    explorer: {$ref: subagents/explorer}
+    verifier: {$ref: subagents/verifier}
 
 workspace:
+  # Pinned: this expert's role needs a shell, and a session's account layer
+  # overrides expert_base's `sandbox` with the owner's default (platform
+  # default `virtual`, which strips shell/browser/git). Declaring it HERE
+  # sits above that layer; the New Session form shows it and the user may
+  # still change it. Jobs ignore this key (the workspace contract stamps
+  # the job tier from config_override). See tests/test_expert_defaults.py
+  # ::TestShellBoundBundledExpertsPinTheirTier.
+  backend: sandbox
   structure:
     - archive/
     - documents/
@@ -52,12 +66,16 @@ tools:
     - cancel_command
   # evaluation: injected via config_override for verification subjobs only
   # git: intentionally absent. This agent has shell tools, and
-  # ToolsConfig.__post_init__ (src/core/loader.py) suppresses the git_* group
+  # ToolsConfig.__post_init__ (src/shared/runtime/core/loader.py) suppresses the git_* group
   # whenever shell is present — a shell can run git against ANY repository in
   # the workspace, including repos/<name>/, which git_* cannot. Declaring them
   # here would advertise tools the pod never binds.
   delegation:
-    - spawn_subagent
+    - delegate_agent
+    - wait_agent
+    - message_agent
+    - stop_agent
+    - list_agents
   # SQL injected when system datasource attached (for querying job data)
   sql: []
   # Not needed

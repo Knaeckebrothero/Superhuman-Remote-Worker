@@ -12,7 +12,7 @@ from uuid import UUID
 
 import pytest
 
-from database.postgres import PostgresDB
+from orchestrator.database.postgres import PostgresDB
 
 
 JOB_A = "11111111-1111-4111-8111-111111111111"
@@ -35,6 +35,7 @@ class _InventoryConnection:
         self.threads: dict[str, dict[str, Any]] = {}
         self.authorized_thread_deletes: set[str] = set()
         self.inventory: dict[tuple[str, int], dict[str, Any]] = {}
+        self.process_zero_receipts: set[tuple[str, str, str]] = set()
         self.lock = asyncio.Lock()
         self.fail_owner_update_once = False
 
@@ -45,11 +46,17 @@ class _InventoryConnection:
                 copy.deepcopy(self.jobs),
                 copy.deepcopy(self.threads),
                 copy.deepcopy(self.inventory),
+                copy.deepcopy(self.process_zero_receipts),
             )
             try:
                 yield
             except BaseException:
-                self.jobs, self.threads, self.inventory = before
+                (
+                    self.jobs,
+                    self.threads,
+                    self.inventory,
+                    self.process_zero_receipts,
+                ) = before
                 raise
 
     async def fetchrow(self, query: str, *args):
@@ -189,6 +196,11 @@ class _InventoryConnection:
 
     async def fetchval(self, query: str, *args):
         sql = _compact(query)
+        if "FROM managed_repository_process_zero_receipts" in sql:
+            kind, owner_id, lease_id = args
+            return (str(kind), str(owner_id), str(lease_id)) in (
+                self.process_zero_receipts
+            )
         if sql.startswith("UPDATE officer_ticket_claims"):
             # No represented job holds a durable backlog-ticket claim, so the
             # deletion audit stamps nothing and retains nothing.
@@ -226,6 +238,13 @@ class _InventoryConnection:
                 "quarantine_reason": reason,
             }
             return "INSERT 0 1"
+
+        if sql.startswith("INSERT INTO managed_repository_process_zero_receipts"):
+            kind, owner_id, lease_id = args
+            receipt = (str(kind), str(owner_id), str(lease_id))
+            existed = receipt in self.process_zero_receipts
+            self.process_zero_receipts.add(receipt)
+            return "INSERT 0 0" if existed else "INSERT 0 1"
 
         if sql.startswith("UPDATE docker_workspace_leases"):
             if "SET status = 'ready'" in sql:
@@ -310,6 +329,9 @@ class _InventoryConnection:
             # This seam models only workspace ownership. No represented job is
             # a session wake, but permanent thread deletion still issues the
             # production atomic wake-retirement statement.
+            return "UPDATE 0"
+        if sql.startswith("UPDATE threads") and "kind = 'subagent'" in sql:
+            # 0206: delete_job ends subagent children before the jobs DELETE.
             return "UPDATE 0"
         if sql.startswith("UPDATE threads") and "workspace_container" in sql:
             if self.fail_owner_update_once:
@@ -608,7 +630,15 @@ async def test_stale_lease_cannot_mutate_reassigned_inventory() -> None:
         owner_id=JOB_A,
         expected_lease_id=first["_docker_workspace_lease_id"],
         expected_statuses={"ready"},
-        updates={"status": "releasing"},
+        updates={
+            "status": "releasing",
+            "quarantine_reason": "managed_repository_agent_retirement_claimed",
+        },
+    )
+    assert await db.record_docker_workspace_process_zero(
+        JOB_A,
+        owner_kind="job",
+        lease_id=first["_docker_workspace_lease_id"],
     )
     released = await db.transition_docker_workspace_lease(
         owner_kind="job",
@@ -821,7 +851,15 @@ async def test_dev_provenance_cannot_be_consumed_or_promoted_by_default_mode() -
         owner_id=JOB_A,
         expected_lease_id=dev["_docker_workspace_lease_id"],
         expected_statuses={"ready"},
-        updates={"status": "releasing"},
+        updates={
+            "status": "releasing",
+            "quarantine_reason": "managed_repository_agent_retirement_claimed",
+        },
+    )
+    assert await db.record_docker_workspace_process_zero(
+        JOB_A,
+        owner_kind="job",
+        lease_id=dev["_docker_workspace_lease_id"],
     )
     await db.transition_docker_workspace_lease(
         owner_kind="job",
@@ -902,7 +940,7 @@ async def test_transition_rejects_cleanup_bypassing_lifecycle_edges() -> None:
 
 def test_inventory_migration_is_owner_independent_and_conservative() -> None:
     migration = Path(
-        "orchestrator/database/migrations/app/0059_docker_workspace_leases.sql"
+        "src/orchestrator/database/migrations/app/0059_docker_workspace_leases.sql"
     ).read_text()
 
     assert "PRIMARY KEY (host, port)" in migration

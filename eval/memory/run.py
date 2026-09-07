@@ -6,7 +6,7 @@
         --limit 20 --init-db
 
 Environment (see eval/memory/README.md):
-    EVAL_VECTOR_DSN   pgvector DSN (default: dev-compose, db srw_eval)
+    EVAL_VECTOR_DSN   pgvector DSN (default: localhost:5433, db srw_eval)
     EMBEDDING_*       real embedding endpoint (required)
     <arm api_key_env> auxiliary-LLM key for seam-mode arms
 
@@ -28,13 +28,13 @@ import uuid
 from pathlib import Path
 from typing import List, Optional, Set
 
-from . import arms as arms_mod
-from . import infra
-from .datasets import load_longmemeval, subset_questions
-from .ingest import HarnessHandles, ingest_question
-from .metrics import aggregate
-from .query import answer_retrieval
-from .report import render_markdown
+from eval.memory import arms as arms_mod
+from eval.memory import infra
+from eval.memory.datasets import load_longmemeval, subset_questions
+from eval.memory.ingest import HarnessHandles, ingest_question
+from eval.memory.metrics import aggregate
+from eval.memory.query import answer_retrieval
+from eval.memory.report import render_markdown
 
 logger = logging.getLogger(__name__)
 

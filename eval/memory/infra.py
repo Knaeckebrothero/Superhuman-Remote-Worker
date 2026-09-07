@@ -3,7 +3,7 @@
 Everything here mirrors a production construction site so the harness
 measures the real system:
 
-- vector DB: src.database.postgres_db.PostgresDB (pgvector codec) against
+- vector DB: agent.database.postgres_db.PostgresDB (pgvector codec) against
   a dedicated eval database, schema applied via the production migrations
   runner (orchestrator.database.migrate) over migrations/vector/.
 - embeddings: the real EmbeddingService singleton (EMBEDDING_* env vars),
@@ -29,10 +29,11 @@ logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 VECTOR_MIGRATIONS_DIR = (
-    REPO_ROOT / "orchestrator" / "database" / "migrations" / "vector"
+    REPO_ROOT / "src" / "orchestrator" / "database" / "migrations" / "vector"
 )
 
-#: docker-compose.dev.yaml postgres-vector, eval-dedicated database name.
+#: Cluster pgvector reached over `scripts/port-forward-dbs.sh` (VECTOR_PG_PORT),
+#: eval-dedicated database name. Override with EVAL_VECTOR_DSN.
 DEFAULT_DSN = "postgresql://srw:srw_password@localhost:5433/srw_eval"
 
 _EVAL_NS = uuid.uuid5(uuid.NAMESPACE_URL, "srw://eval/memory")
@@ -65,8 +66,8 @@ async def ensure_database(dsn: str) -> None:
     """Create the eval database (and the vector extension) if missing.
 
     Connects to the server's maintenance database with the same
-    credentials; the dev-compose bootstrap user is superuser, so both
-    CREATE DATABASE and CREATE EXTENSION are available.
+    credentials, so the DSN's role must be allowed to CREATE DATABASE and
+    CREATE EXTENSION (use the pgvector cluster's superuser/owner role).
     """
     import asyncpg
 
@@ -95,15 +96,6 @@ async def apply_migrations(dsn: str) -> None:
     """Apply migrations/vector/ with the production runner (idempotent)."""
     import asyncpg
 
-    # migrate.py uses orchestrator-rooted bare imports (`from utils...`) —
-    # the container flattens orchestrator/ to /app; tests/conftest.py adds
-    # the same path entry.
-    import sys
-
-    orch_path = str(REPO_ROOT / "orchestrator")
-    if orch_path not in sys.path:
-        sys.path.insert(0, orch_path)
-
     from orchestrator.database.migrate import run_migrations
 
     pool = await asyncpg.create_pool(dsn, min_size=1, max_size=2)
@@ -115,7 +107,7 @@ async def apply_migrations(dsn: str) -> None:
 
 async def connect_vector_db(dsn: str) -> Any:
     """Agent-side PostgresDB (registers the pgvector codec per connection)."""
-    from src.database.postgres_db import PostgresDB
+    from agent.database.postgres_db import PostgresDB
 
     db = PostgresDB(connection_string=dsn, min_connections=1, max_connections=8)
     await db.connect()
@@ -128,7 +120,7 @@ async def require_embedding_service() -> Any:
     Every metric downstream depends on real embeddings — a missing key or
     wrong-dimension endpoint must kill the run here, not produce rows.
     """
-    from src.services.embedding_service import get_embedding_service
+    from shared.runtime.services.embedding_service import get_embedding_service
 
     service = get_embedding_service()
     if not service.api_key:
@@ -151,8 +143,8 @@ async def require_embedding_service() -> Any:
 
 def build_auxiliary_llm(config: Any) -> Any:
     """Session-scoped AuxiliaryLLM, exactly like persistent_app's rebuild."""
-    from src.core.loader import LLMConfig, create_llm, resolve_model_settings
-    from src.services.auxiliary import AuxiliaryLLM
+    from shared.runtime.core.loader import LLMConfig, create_llm, resolve_model_settings
+    from shared.runtime.services.auxiliary import AuxiliaryLLM
 
     aux_cfg = config.auxiliary
     if not aux_cfg.model:
@@ -186,7 +178,7 @@ def resolve_extraction_prompt(config: Any) -> str:
     with an empty extraction prompt would silently measure the wrong
     system — so this raises.
     """
-    from src.core.loader import load_auxiliary_prompt
+    from shared.runtime.core.loader import load_auxiliary_prompt
 
     aux_model = (
         config.auxiliary.model
@@ -207,7 +199,7 @@ def make_recall_store(
     project_id: uuid.UUID,
 ) -> Any:
     """Scope-bound RecallStore (persistent_session._setup_memory shape)."""
-    from src.services.recall_store import RecallStore
+    from shared.runtime.services.recall_store import RecallStore
 
     return RecallStore(
         db=db,
@@ -237,8 +229,8 @@ def build_manager(
     so the kb_notes retriever binds inert (same as a session without
     Neo4j). retrieval_timeout=None per the module docstring.
     """
-    from src.services.memory import MemoryManager, MemoryRuntime
-    from src.services.memory.ingestion import maybe_attach_ingestion_verdict
+    from agent.services.memory import MemoryManager, MemoryRuntime
+    from shared.runtime.services.memory.ingestion import maybe_attach_ingestion_verdict
 
     # Ingestion verdicts + bi-temporal supersede (overhaul Phase 4) — attach to
     # the store the capture writers use, so a seam ingest exercises supersede.

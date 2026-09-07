@@ -10,11 +10,11 @@ from pathlib import Path
 import subprocess
 import sys
 
-from orchestrator.mcp.capabilities import TOOL_CAPABILITIES, WORKFLOW_DECISIONS
-from src.shared.orch_surface.jobs import JOB_DESCRIPTORS
+from mcp_server.capabilities import TOOL_CAPABILITIES, WORKFLOW_DECISIONS
+from shared.orch_surface.jobs import JOB_DESCRIPTORS
 
 ROOT = Path(__file__).parent.parent
-SERVER_PATH = ROOT / "orchestrator" / "mcp" / "server.py"
+SERVER_PATH = ROOT / "src" / "mcp_server" / "server.py"
 
 
 def _registered_tool_names() -> set[str]:
@@ -40,7 +40,7 @@ def _source_schema() -> dict:
     script = """
 import asyncio
 import json
-from orchestrator.mcp.server import canonical_tool_schema
+from mcp_server.server import canonical_tool_schema
 
 async def main():
     tools, digest = await canonical_tool_schema()
@@ -65,7 +65,7 @@ def _build_info(schema_artifact: Path) -> dict:
     script = """
 import asyncio
 import json
-from orchestrator.mcp.server import _mcp_build_info
+from mcp_server.server import _mcp_build_info
 
 async def main():
     print(json.dumps(await _mcp_build_info(), sort_keys=True))

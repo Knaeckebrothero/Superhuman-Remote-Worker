@@ -19,15 +19,15 @@ import asyncio
 
 import pytest
 
-import main
+import orchestrator.main
 
 
 @pytest.fixture(autouse=True)
 def _clear_registry():
     """The registry is module-level; don't leak tasks between tests."""
-    main._late_cloud_setup_tasks.clear()
+    orchestrator.main._late_cloud_setup_tasks.clear()
     yield
-    main._late_cloud_setup_tasks.clear()
+    orchestrator.main._late_cloud_setup_tasks.clear()
 
 
 class TestAwaitLateCloudSetup:
@@ -35,7 +35,9 @@ class TestAwaitLateCloudSetup:
     async def test_noop_when_nothing_registered(self):
         """Nothing in flight for this thread (already done, never needed, or
         scheduled on the other HA replica) — the attach must not stall."""
-        await asyncio.wait_for(main._await_late_cloud_setup("t-unknown"), timeout=1)
+        await asyncio.wait_for(
+            orchestrator.main._await_late_cloud_setup("t-unknown"), timeout=1
+        )
 
     @pytest.mark.asyncio
     async def test_attach_observes_the_handle_the_task_persists(self):
@@ -48,10 +50,12 @@ class TestAwaitLateCloudSetup:
             await asyncio.sleep(0.05)  # stands in for the WebDAV round-trips
             persisted["nc_session_folder"] = "sessions/t1"
 
-        main._register_late_cloud_setup("t1", asyncio.create_task(_provision()))
+        orchestrator.main._register_late_cloud_setup(
+            "t1", asyncio.create_task(_provision())
+        )
 
         # The attach path reads only after the gate.
-        await main._await_late_cloud_setup("t1")
+        await orchestrator.main._await_late_cloud_setup("t1")
         assert persisted == {"nc_session_folder": "sessions/t1"}
 
     @pytest.mark.asyncio
@@ -64,7 +68,9 @@ class TestAwaitLateCloudSetup:
             await asyncio.sleep(0.05)
             persisted["nc_session_folder"] = "sessions/t1"
 
-        main._register_late_cloud_setup("t1", asyncio.create_task(_provision()))
+        orchestrator.main._register_late_cloud_setup(
+            "t1", asyncio.create_task(_provision())
+        )
 
         await asyncio.sleep(0)  # yield once, as a fast attach would
         assert persisted == {}
@@ -78,9 +84,13 @@ class TestAwaitLateCloudSetup:
         async def _provision() -> None:
             raise RuntimeError("webdav exploded")
 
-        main._register_late_cloud_setup("t1", asyncio.create_task(_provision()))
+        orchestrator.main._register_late_cloud_setup(
+            "t1", asyncio.create_task(_provision())
+        )
 
-        await asyncio.wait_for(main._await_late_cloud_setup("t1"), timeout=1)
+        await asyncio.wait_for(
+            orchestrator.main._await_late_cloud_setup("t1"), timeout=1
+        )
 
     @pytest.mark.asyncio
     async def test_wedged_provisioning_times_out_instead_of_hanging_resume(
@@ -89,12 +99,16 @@ class TestAwaitLateCloudSetup:
         """A cloud that never answers must delay the resume, not hang it. On
         timeout we fall through to the pre-fix behaviour (attach, possibly
         degraded) rather than stranding the user on a spinner."""
-        monkeypatch.setattr(main, "LATE_CLOUD_SETUP_ATTACH_TIMEOUT_S", 0.05)
+        monkeypatch.setattr(
+            orchestrator.main, "LATE_CLOUD_SETUP_ATTACH_TIMEOUT_S", 0.05
+        )
 
         task = asyncio.create_task(asyncio.sleep(30))
-        main._register_late_cloud_setup("t1", task)
+        orchestrator.main._register_late_cloud_setup("t1", task)
         try:
-            await asyncio.wait_for(main._await_late_cloud_setup("t1"), timeout=2)
+            await asyncio.wait_for(
+                orchestrator.main._await_late_cloud_setup("t1"), timeout=2
+            )
         finally:
             task.cancel()
 
@@ -104,7 +118,9 @@ class TestAwaitLateCloudSetup:
         provisioning running, so the handle still lands for the NEXT resume.
         A bare ``wait_for(task)`` would cancel it and keep the thread broken
         forever."""
-        monkeypatch.setattr(main, "LATE_CLOUD_SETUP_ATTACH_TIMEOUT_S", 0.02)
+        monkeypatch.setattr(
+            orchestrator.main, "LATE_CLOUD_SETUP_ATTACH_TIMEOUT_S", 0.02
+        )
         persisted: dict[str, str] = {}
 
         async def _provision() -> None:
@@ -112,9 +128,9 @@ class TestAwaitLateCloudSetup:
             persisted["nc_session_folder"] = "sessions/t1"
 
         task = asyncio.create_task(_provision())
-        main._register_late_cloud_setup("t1", task)
+        orchestrator.main._register_late_cloud_setup("t1", task)
 
-        await main._await_late_cloud_setup("t1")  # gives up early
+        await orchestrator.main._await_late_cloud_setup("t1")  # gives up early
         assert persisted == {}
         assert not task.cancelled()
 
@@ -131,12 +147,12 @@ class TestRegistrySlotDiscipline:
             return None
 
         task = asyncio.create_task(_provision())
-        main._register_late_cloud_setup("t1", task)
-        assert "t1" in main._late_cloud_setup_tasks
+        orchestrator.main._register_late_cloud_setup("t1", task)
+        assert "t1" in orchestrator.main._late_cloud_setup_tasks
 
         await task
         await asyncio.sleep(0)  # let the done-callback run
-        assert "t1" not in main._late_cloud_setup_tasks
+        assert "t1" not in orchestrator.main._late_cloud_setup_tasks
 
     @pytest.mark.asyncio
     async def test_stale_callback_does_not_clobber_a_newer_registration(self):
@@ -152,14 +168,14 @@ class TestRegistrySlotDiscipline:
             await asyncio.sleep(0.05)
 
         first = asyncio.create_task(_first())
-        main._register_late_cloud_setup("t1", first)
+        orchestrator.main._register_late_cloud_setup("t1", first)
 
         second = asyncio.create_task(_second())
-        main._register_late_cloud_setup("t1", second)
+        orchestrator.main._register_late_cloud_setup("t1", second)
 
         first_done.set()
         await first
         await asyncio.sleep(0)  # first's done-callback fires here
 
-        assert main._late_cloud_setup_tasks.get("t1") is second
+        assert orchestrator.main._late_cloud_setup_tasks.get("t1") is second
         await second

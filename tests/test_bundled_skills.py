@@ -5,8 +5,8 @@ from pathlib import Path
 
 import yaml
 
-from src.core.loader import render_instruction_content
-from src.core.skill_format import parse_skill_md, skill_identity
+from shared.runtime.core.loader import render_instruction_content
+from shared.runtime.core.skill_format import parse_skill_md, skill_identity
 
 _SKILLS = Path(__file__).resolve().parents[1] / "config" / "skills"
 
@@ -128,7 +128,7 @@ def test_bundled_project_onboarding_skill_is_valid_and_on_topic():
     # Generalized past a codebase: the body must treat a project as a connector
     # bundle, not assume a repo.
     assert "connector" in body.lower()
-    assert "datasource" not in body.replace("`datasources.md`", "").lower()
+    assert "datasource" not in body.lower()
     # Body carries the two load-bearing halves: the source-of-truth/provenance
     # honesty move and an explicit termination rule (orientation must stop).
     assert "source of truth" in body.lower()
@@ -176,3 +176,42 @@ def test_bundled_tdd_skill_is_valid_and_on_topic():
     assert "refactor" in body.lower()
     # The honest boundary section — TDD is not for every task.
     assert "skip it" in body.lower()
+
+
+def test_phase_skills_are_catalog_hidden_and_bound():
+    """U2: the worker's phase guidance is two bundled skills that never enter a
+    catalog (``catalog: hidden``) and reach the worker only through the
+    ``phase_start`` bindings of the worker overlay."""
+    from shared.runtime.core.loader import PHASE_SKILLS, load_role_base
+    from shared.runtime.core.skill_format import is_catalog_hidden
+
+    bindings = {
+        e["skill"]: e
+        for e in load_role_base("worker")["instruction_files"]
+        if e.get("skill") in PHASE_SKILLS.values()
+    }
+    for phase, skill in PHASE_SKILLS.items():
+        md = (_SKILLS / skill / "SKILL.md").read_text(encoding="utf-8")
+        fm, body = parse_skill_md(md)
+        name, desc = skill_identity(fm)
+        assert name == skill
+        assert is_catalog_hidden(fm), f"{skill} must be catalog: hidden"
+        assert {"phase", "worker"} <= set(fm.get("tags", [])), skill
+        assert fm.get("display_name"), skill
+        assert "phase_start" in desc, skill
+        # Family-agnostic body: the family variants and the {phase_number}
+        # placeholder are gone; the Jinja conditionals stay.
+        assert "{phase_number}" not in body, skill
+        assert f"You are in {phase.upper()} mode." in body, skill
+        assert "whole" in body and "[PHASE_TRANSITION]" in body, skill
+        # The block factory adds the "[phase: X] ..." header — the body must not.
+        assert "[phase:" not in body, skill
+        binding = bindings[skill]
+        assert binding["trigger"] == f"phase_start:{phase}"
+        assert binding["enforce"] is False
+    assert "{% if has_shell" in (_SKILLS / "tactical-phase" / "SKILL.md").read_text()
+    # The heavy-path delegation paragraph left with delegate_work (U3 WP4);
+    # the generic delegation rules are a tool-gated runtime floor, not skill
+    # prose, and the per-expert stance lives in the expert's own phase skills.
+    strategic = (_SKILLS / "strategic-phase" / "SKILL.md").read_text()
+    assert "delegate_work" not in strategic and "has_tool(" not in strategic

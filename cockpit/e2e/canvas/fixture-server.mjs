@@ -17,9 +17,41 @@ const CANVAS_PATH = `/api/persistent/threads/${THREAD_ID}/canvases/main`;
 const BROWSER_CAPABILITY_PATH = `/api/persistent/threads/${THREAD_ID}/browser/capability`;
 const BROWSER_OPEN_PATH = `/api/persistent/threads/${THREAD_ID}/browser/open`;
 const STATE_ETAG_DIGEST = 'a'.repeat(64);
+const FILE_SOURCE_FINGERPRINT = 'f'.repeat(64);
+const FILE_SOURCE_VERSION = `sha256:${'d'.repeat(64)}`;
 const CHALLENGE = 'c'.repeat(43);
 const READY_RECEIPT = 'r'.repeat(43);
 const EXCHANGE_CODE = 'e'.repeat(43);
+
+const STATIC_HTML_FILE = `<!doctype html>
+<html><head><base href="https://canvas-base-probe.invalid/" target="_top"></head>
+<body>
+  <a id="static-jump" href="#static-target">Jump to target</a>
+  <button id="static-script-control" onclick="document.body.dataset.scriptRan='yes'">Run</button>
+  <div id="static-marker" style="background-color:rgb(18,52,86);color:white">Static Canvas ready</div>
+  <section id="static-target" style="margin-top:1200px">Static fragment target</section>
+  <script>document.body.dataset.scriptRan='yes'</script>
+</body></html>`;
+
+const INTERACTIVE_HTML_FILE = `<!doctype html>
+<html>
+  <head>
+    <base href="https://canvas-base-probe.invalid/" target="_top">
+    <style>
+      html,body { background:rgb(18,52,86); color:white; }
+      #interactive-target { margin-top:1200px; }
+    </style>
+  </head>
+  <body>
+    <a id="interactive-jump" href="#interactive-target">Jump to target</a>
+    <button id="interactive-action"
+            onclick="document.getElementById('interactive-result').textContent='clicked'">Act</button>
+    <div id="interactive-result">cold</div>
+    <section id="interactive-target">Interactive fragment target</section>
+    <div id="interactive-marker">Interactive Canvas ready</div>
+    <script>document.body.dataset.scriptReady='yes'; window.canvasProbe='ready';</script>
+  </body>
+</html>`;
 
 const COCKPIT_CSP = "frame-ancestors 'none'; img-src 'self' blob: data:";
 const X_FRAME_OPTIONS = 'DENY';
@@ -87,6 +119,8 @@ function stateEtag() {
 
 function canvasState() {
   if (state.scenario === 'shared-browser') return browserCanvasState();
+  if (state.scenario === 'file-static') return fileCanvasState('html');
+  if (state.scenario === 'file-interactive') return fileCanvasState('html-interactive');
   const cleared = state.revoked;
   return {
     canvas_id: 'main',
@@ -110,6 +144,43 @@ function canvasState() {
       can_take_control: false,
       can_create_viewer_session: !cleared,
       can_reset_origin: !cleared,
+    },
+    updated_at: new Date().toISOString(),
+  };
+}
+
+function fileCanvasState(renderer) {
+  const cleared = state.revoked;
+  const query = new URLSearchParams({
+    presentation_revision: String(state.presentationRevision),
+    source_fingerprint: FILE_SOURCE_FINGERPRINT,
+    source_version: FILE_SOURCE_VERSION,
+    'ngsw-bypass': 'true',
+  });
+  return {
+    canvas_id: 'main',
+    source: cleared
+      ? null
+      : {
+          type: 'workspace_file',
+          path: renderer === 'html' ? 'canvas/static.html' : 'canvas/interactive.html',
+        },
+    title: cleared
+      ? null
+      : renderer === 'html'
+        ? 'Static HTML conformance'
+        : 'Interactive HTML conformance',
+    renderer: cleared ? 'auto' : renderer,
+    editable: false,
+    alt_text: null,
+    presentation_revision: state.presentationRevision,
+    source_version: cleared ? null : FILE_SOURCE_VERSION,
+    content_url: cleared ? null : `${CANVAS_PATH}/content?${query}`,
+    status: cleared ? 'cleared' : 'ready',
+    capabilities: {
+      can_edit: false,
+      can_pop_out: false,
+      can_take_control: false,
     },
     updated_at: new Date().toISOString(),
   };
@@ -411,6 +482,32 @@ const server = createServer(async (req, res) => {
         return res.end();
       }
       return json(res, 200, canvasState(), {ETag: stateEtag()});
+    }
+
+    if (pathname === `${CANVAS_PATH}/content` && req.method === 'GET') {
+      record(req, pathname);
+      const content = state.scenario === 'file-static'
+        ? STATIC_HTML_FILE
+        : state.scenario === 'file-interactive'
+          ? INTERACTIVE_HTML_FILE
+          : null;
+      if (content === null) {
+        return json(res, 404, {detail: {code: 'fixture_content_missing'}});
+      }
+      res.writeHead(200, {
+        'Cache-Control': 'private, no-store',
+        'Content-Type': 'text/html; charset=utf-8',
+        'Content-Length': Buffer.byteLength(content),
+        'Content-Disposition': 'attachment; filename="canvas.html"',
+        'Content-Security-Policy':
+          "default-src 'none'; script-src 'none'; style-src 'none'; " +
+          "img-src 'none'; connect-src 'none'; form-action 'none'; " +
+          "base-uri 'none'; object-src 'none'; sandbox",
+        'Referrer-Policy': 'no-referrer',
+        'X-Content-Type-Options': 'nosniff',
+        ETag: `"${FILE_SOURCE_VERSION}"`,
+      });
+      return res.end(content);
     }
 
     if (pathname === BROWSER_CAPABILITY_PATH && req.method === 'GET') {

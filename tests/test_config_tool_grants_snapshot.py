@@ -41,21 +41,29 @@ from pathlib import Path
 
 import pytest
 
-from src.core.loader import (
+from shared.runtime.core.loader import (
     ToolsConfig,
     get_all_tool_names,
     load_agent_config,
     load_and_merge_config,
     resolve_config_path,
 )
-from src.tools.registry import expand_tool_wildcards
+from agent.tools.registry import expand_tool_wildcards
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _CONFIG_DIR = _REPO_ROOT / "config"
 _SNAPSHOT = Path(__file__).parent / "fixtures" / "config_tool_grants.json"
 
-# Bases plus the one standalone session profile. Experts are discovered.
-_STANDALONE_CONFIGS = ["session_base", "worker_base", "interactive"]
+# The chain roots (the shared expert_base and the three role overlays, by
+# their public names) plus the one standalone session profile. Experts are
+# discovered.
+_STANDALONE_CONFIGS = [
+    "expert_base",
+    "session_base",
+    "subagent_base",
+    "worker_base",
+    "interactive",
+]
 
 _UPDATE = os.environ.get("UPDATE_TOOL_GRANTS_SNAPSHOT") == "1"
 
@@ -74,8 +82,19 @@ def _expert_config_names() -> list[str]:
     )
 
 
+def _library_config_names() -> list[str]:
+    """Every subagent-library entry, discovered, keyed by its ``$ref`` spelling
+    (``subagents/<name>``; ``resolve_config_path`` finds it through the
+    directory branch, so the bare name never shadows a bundled expert)."""
+    return sorted(
+        f"subagents/{p.parent.name}"
+        for p in _CONFIG_DIR.glob("subagents/*/config.yaml")
+        if p.parent.name != "__pycache__"
+    )
+
+
 def _all_config_names() -> list[str]:
-    return _STANDALONE_CONFIGS + _expert_config_names()
+    return _STANDALONE_CONFIGS + _expert_config_names() + _library_config_names()
 
 
 def _resolved_tool_grants(config_name: str) -> list[str]:

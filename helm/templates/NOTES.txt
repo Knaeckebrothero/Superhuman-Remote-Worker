@@ -65,7 +65,7 @@ in the Vault path `{{ .Values.externalSecrets.vaultPath }}` — the
 orchestrator will refuse to start without it.
 {{- end }}
 
-{{- if .Values.nextcloud.protectedEffect.enabled }}
+{{- if (eq (include "srw.nextcloudProtectedEffectEnabled" .) "true") }}
 
 Protected Nextcloud effects
 ===========================

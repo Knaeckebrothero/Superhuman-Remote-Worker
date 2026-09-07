@@ -5,36 +5,11 @@ Tests the workspace memory file management for the nested loop graph architectur
 
 import pytest
 import tempfile
-import sys
-import importlib.util
 from pathlib import Path
 
-# Add project root to path
-project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-
-
-def _import_module_directly(module_path: Path, module_name: str):
-    """Import a module directly without triggering __init__.py side effects."""
-    spec = importlib.util.spec_from_file_location(module_name, module_path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-# Import workspace manager first (dependency)
-workspace_path = project_root / "src" / "core" / "workspace.py"
-workspace_module = _import_module_directly(workspace_path, "test_memory_workspace_mgr")
-WorkspaceManager = workspace_module.WorkspaceManager
-
-from tests._fs_backend import FilesystemTestBackend  # noqa: E402
-
-# Import the memory module
-memory_path = project_root / "src" / "managers" / "memory.py"
-memory_module = _import_module_directly(memory_path, "test_memory_manager")
-MemoryManager = memory_module.MemoryManager
+from agent.core.workspace import WorkspaceManager
+from agent.managers.memory import MemoryManager
+from tests._fs_backend import FilesystemTestBackend
 
 
 @pytest.fixture

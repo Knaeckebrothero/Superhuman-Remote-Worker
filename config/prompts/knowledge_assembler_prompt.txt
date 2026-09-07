@@ -12,9 +12,9 @@ For EACH note in the stale queue, take exactly one action:
   - **Keep** — the note is still accurate and useful. Do nothing; it will be refreshed automatically. This is the right default when unsure.
   - **Supersede** — a newer note already says this better or more correctly. `kb_update(note, status="superseded")`, and add a `SUPERSEDES` link from the newer note to this one.
   - **Merge** — this note duplicates or overlaps another. Fold the unique content into the single best note with `kb_update(canonical, content=...)`, then `kb_update` each duplicate with `status="superseded"` + a `SUPERSEDES` link to the canonical note.
-  - **Archive** — the note described a moving target that has moved on (an old "current state", an obsolete acceptance criterion, a resolved question with no lasting value) and nothing replaced it. `kb_update(note, status="archived")`.
+  - **Retire** — the note described a moving target that has moved on (an old "current state", an obsolete acceptance criterion, a resolved question with no lasting value), or it is a learning/retrospective nobody links to any more, and nothing replaced it. `kb_delete(note, reason="...")` — this archives the note with your reason written into it. It is reversible and hides the note from search; the file is only removed later, after a grace period, by the system.
 
-**3. Act** — Apply the decision with `kb_update`. Only touch notes in the stale queue (and, for merge, the canonical note you fold into). Never touch unrelated notes.
+**3. Act** — Apply the decision with `kb_update` / `kb_delete`. Only touch notes in the stale queue (and, for merge, the canonical note you fold into). Never touch unrelated notes. The system refuses to retire the charter, tickets, pinned/ready notes, notes an active decision/goal/plan/ticket links to, and notes younger than a day — a refusal names the rule; do not work around it, keep the note and move on.
 
 ## What to converge
 
@@ -25,7 +25,7 @@ For EACH note in the stale queue, take exactly one action:
 ## Judgment
 
 - **Conservative by default**: if you cannot find a clear replacement or evidence the note is wrong, **keep it**. Re-verification confirms good notes as much as it retires bad ones.
-- **Never delete.** Superseding and archiving are reversible and auditable; deletion is not. Status changes are always the right tool.
+- **Nothing you do removes bytes.** Superseding and retiring are reversible status changes with an audit trail; physical removal is a separate system lane with its own grace period. So retire what earned it, and never hesitate on a note a human can restore with one status flip — but never retire what another active note still relies on.
 - **Durable knowledge is not stale by age.** A `decision` with its reasoning, a `learning`, a `code` pattern — these stay valid until an explicit newer note replaces them. If one of these is in the queue, keep it unless you find a direct replacement.
 - **Quality over volume**: a few correct retirements beat many speculative ones. Making zero changes is a valid outcome if the queue is all still-valid notes.
 

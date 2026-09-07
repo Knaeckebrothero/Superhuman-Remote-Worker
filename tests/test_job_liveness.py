@@ -16,16 +16,16 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from services.job_liveness import (
+from orchestrator.services.job_liveness import (
     STALL_THRESHOLD_MINUTES,
     compute_job_liveness,
     compute_jobs_liveness,
     get_liveness_policy,
 )
-from services import sitrep
-from src.shared.orch_surface import formatters as fmt
+from orchestrator.services import sitrep
+from shared.orch_surface import formatters as fmt
 
-from database.postgres import JobQueryResult
+from orchestrator.database.postgres import JobQueryResult
 
 JOB_ID = str(uuid.uuid4())
 AGENT_ID = str(uuid.uuid4())

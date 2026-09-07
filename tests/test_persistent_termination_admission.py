@@ -12,22 +12,22 @@ import pytest
 from fastapi import WebSocketDisconnect
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from services import session_lifecycle, session_wake, sitrep
-from src.api import persistent_app, persistent_termination
-from src.api.persistent_session import PersistentSession
-from src.persistent_graph import (
+from orchestrator.services import session_lifecycle, session_wake, sitrep
+from agent.api import persistent_app, persistent_termination
+from agent.api.persistent_session import PersistentSession
+from agent.persistent_graph import (
     PersistentLoopCallbacks,
     _execute_turn,
     run_persistent_loop,
 )
-from src.services.auxiliary import (
+from shared.runtime.services.auxiliary import (
     AuxiliaryLLM,
     AuxiliaryProviderAdmissionClosed,
 )
-from src.services.memory import CaptureEvent
-from src.services.memory.manager import MemoryManager
-from src.core.workspace_backend import WorkspaceUnavailableError
-from src.shared.pinned_session_identity import PinnedSessionBinding
+from agent.services.memory import CaptureEvent
+from agent.services.memory.manager import MemoryManager
+from shared.runtime.core.workspace_backend import WorkspaceUnavailableError
+from shared.pinned_session_identity import PinnedSessionBinding
 
 
 def _config() -> MagicMock:
@@ -177,10 +177,11 @@ def _wire_input_runtime(monkeypatch, tmp_path, db, *, turn_count: int = 5):
         "_orchestrator_client",
         SimpleNamespace(agent_id=str(uuid4())),
     )
-    runtime_generation = str(uuid4())
-    monkeypatch.setattr(persistent_app, "_input_runtime_generation", runtime_generation)
+    process_generation = str(uuid4())
+    session_generation = str(uuid4())
+    monkeypatch.setattr(persistent_app, "_input_runtime_generation", process_generation)
     monkeypatch.setattr(
-        persistent_app, "_session_runtime_generation", runtime_generation
+        persistent_app, "_session_runtime_generation", session_generation
     )
     monkeypatch.setattr(persistent_app, "_session_runtime_attach_token", str(uuid4()))
     monkeypatch.setattr(persistent_app, "_pinned_runtime_generation_enabled", False)
@@ -911,7 +912,7 @@ async def test_authorized_retirement_fences_provider_and_tool_before_effect(
         thread_id=persistent_app._thread_id,
         agent_id=persistent_app._orchestrator_client.agent_id,
         pod_uid="pod-uid-test",
-        runtime_generation=persistent_app._input_runtime_generation,
+        session_runtime_generation=persistent_app._session_runtime_generation,
         runtime_attach_token=persistent_app._session_runtime_attach_token,
     )
 
@@ -921,6 +922,99 @@ async def test_authorized_retirement_fences_provider_and_tool_before_effect(
     ):
         await persistent_app._loop_on_tool_execution_start("shell", "call-after-end")
     assert persistent_app._tool_inflight is False
+
+
+@pytest.mark.asyncio
+async def test_stateless_effect_boundary_awaits_exact_queue_lease(monkeypatch):
+    from agent.api.lease_context import LeaseHandle, current_lease
+
+    thread_id = str(uuid4())
+    lease = LeaseHandle()
+    lease.update(
+        thread_id,
+        17,
+        executor_id="executor-a",
+        pod_uid="pod-a",
+    )
+    probe = AsyncMock(return_value=False)
+    token = current_lease.set(lease)
+    try:
+        monkeypatch.setenv("STATELESS_EXECUTOR", "1")
+        monkeypatch.setattr(persistent_app, "_thread_id", thread_id)
+        monkeypatch.setattr(
+            persistent_app,
+            "_session",
+            SimpleNamespace(
+                postgres_conn=SimpleNamespace(
+                    session_parent_authority_current=probe,
+                ),
+                protected_cloud_required=False,
+            ),
+        )
+        monkeypatch.setattr(persistent_app, "_runtime_admission_closed", lambda: False)
+
+        assert await persistent_app._loop_runtime_effect_authority_current() is False
+
+        authority = probe.await_args.args[0]
+        assert authority.model_dump(exclude_none=True, mode="json") == {
+            "version": 1,
+            "execution_lane": "stateless",
+            "parent_thread_id": thread_id,
+            "lease_token": 17,
+            "executor_id": "executor-a",
+            "executor_pod_uid": "pod-a",
+        }
+        assert lease.lost.is_set()
+    finally:
+        current_lease.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_stateless_effect_boundary_rechecks_local_life_after_db_await(
+    monkeypatch,
+):
+    from agent.api.lease_context import LeaseHandle, current_lease
+
+    thread_id = str(uuid4())
+    lease = LeaseHandle()
+    lease.update(
+        thread_id,
+        17,
+        executor_id="executor-a",
+        pod_uid="pod-a",
+    )
+
+    async def rotate_while_proving(_authority):
+        lease.update(
+            thread_id,
+            18,
+            executor_id="executor-a",
+            pod_uid="pod-a",
+        )
+        return True
+
+    probe = AsyncMock(side_effect=rotate_while_proving)
+    token = current_lease.set(lease)
+    try:
+        monkeypatch.setenv("STATELESS_EXECUTOR", "1")
+        monkeypatch.setattr(persistent_app, "_thread_id", thread_id)
+        monkeypatch.setattr(
+            persistent_app,
+            "_session",
+            SimpleNamespace(
+                postgres_conn=SimpleNamespace(
+                    session_parent_authority_current=probe,
+                ),
+                protected_cloud_required=False,
+            ),
+        )
+        monkeypatch.setattr(persistent_app, "_runtime_admission_closed", lambda: False)
+
+        assert await persistent_app._loop_runtime_effect_authority_current() is False
+        assert lease.lease_token == 18
+        assert not lease.lost.is_set()
+    finally:
+        current_lease.reset(token)
 
 
 @pytest.mark.asyncio
@@ -1510,7 +1604,7 @@ async def test_stateless_event_without_delivery_metadata_keeps_legacy_stop_bound
 @pytest.mark.asyncio
 async def test_late_turn_n_interrupt_clears_before_durable_a_and_b_execute(monkeypatch):
     """Terminal-edge Stop cannot jump from completed N onto queued A."""
-    from src.api import persistent_app as pa
+    from agent.api import persistent_app as pa
 
     a_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
     b_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
@@ -2439,10 +2533,10 @@ async def test_callback_absence_preserves_ordinary_persistent_behavior():
 
 
 @pytest.mark.asyncio
-async def test_terminating_wake_rejection_and_response_loss_retry_once(
+async def test_deferred_durable_wake_retry_settles_once(
     monkeypatch,
 ):
-    """A 503/lost response leaves the durable row claimable with one id."""
+    """Persistence without admission defers one stable identity until settled."""
 
     thread_id = str(uuid4())
     event_id = 41
@@ -2474,15 +2568,23 @@ async def test_terminating_wake_rejection_and_response_loss_retry_once(
         finish_session_wake_events=AsyncMock(),
         release_session_wake_events=AsyncMock(),
         defer_session_wake_events=AsyncMock(),
+        defer_session_wake_events_for_input=AsyncMock(),
+        persist_thread_input_delivery=AsyncMock(
+            side_effect=[
+                {
+                    "thread_id": thread_id,
+                    "state": "persisted",
+                    "transcript_inserted": True,
+                },
+                {
+                    "thread_id": thread_id,
+                    "state": "settled",
+                    "transcript_inserted": False,
+                },
+            ]
+        ),
         merge_thread_officer_state=AsyncMock(),
     )
-    monkeypatch.setattr(
-        session_wake,
-        "_resolve_live_agent",
-        AsyncMock(return_value={"pod_ip": "127.0.0.1", "pod_port": 8001}),
-    )
-    inject = AsyncMock(side_effect=[False, True])
-    monkeypatch.setattr(session_wake, "_inject_live", inject)
     monkeypatch.setattr(
         session_wake,
         "_officer_ceiling_deferral",
@@ -2495,14 +2597,16 @@ async def test_terminating_wake_rejection_and_response_loss_retry_once(
     )
 
     assert await session_wake.drain_pending_event_wakes(db) == 0
-    db.release_session_wake_events.assert_awaited_once_with(
-        [event_id], max_attempts=session_wake._OFFICER_MAX_ATTEMPTS
-    )
+    assert db.defer_session_wake_events_for_input.await_args.args[0] == [event_id]
+    db.release_session_wake_events.assert_not_awaited()
     db.finish_session_wake_events.assert_not_awaited()
 
     assert await session_wake.drain_pending_event_wakes(db) == 1
     db.finish_session_wake_events.assert_awaited_once_with([event_id])
-    assert [call.kwargs["delivery_id"] for call in inject.await_args_list] == [
+    assert [
+        call.kwargs["delivery_id"]
+        for call in db.persist_thread_input_delivery.await_args_list
+    ] == [
         delivery_id,
         delivery_id,
     ]
@@ -2544,6 +2648,7 @@ async def test_orchestrator_surfaces_terminating_direct_input_as_retryable(
         agent_id="33333333-3333-4333-8333-333333333333",
         runtime_attach_token="44444444-4444-4444-8444-444444444444",
         agent_hostname="persistent-thread-a",
+        pod_namespace="srw",
         pod_uid="pod-uid-a",
         pod_ip="127.0.0.1",
         pod_port=8001,

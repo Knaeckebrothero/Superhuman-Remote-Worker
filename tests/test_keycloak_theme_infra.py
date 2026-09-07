@@ -162,7 +162,7 @@ def test_light_tokens_match_the_shared_brand_palette() -> None:
     ties the Keycloak CSS to brand.py, so all three move together or a test
     fails. Without it the login page is exactly the surface that silently rots.
     """
-    from services import brand
+    from orchestrator.services import brand
 
     css = LOGIN_CSS.read_text()
     rules = _css_rules(css)
@@ -198,7 +198,7 @@ def test_dark_tokens_match_the_shared_senate_palette() -> None:
     Scoped to the .pf-v5-theme-dark block: a whole-file search would match the
     :root declarations of the very same token names.
     """
-    from services import brand
+    from orchestrator.services import brand
 
     scss = (ROOT / brand.SCSS_TOKEN_SOURCE).read_text()
     start = scss.index("$senate-theme: (")
@@ -306,6 +306,125 @@ def _render_theme_configmap_data() -> dict[str, str]:
     return _render_theme_docs()[0]
 
 
+@functools.lru_cache(maxsize=1)
+def _render_realm() -> dict:
+    """The realm JSON the Keycloak container imports, as a parsed object.
+
+    Same reasoning as _render_theme_docs: the realm is Helm-templated inside
+    a ConfigMap, so only the rendered output is the artifact under test.
+    """
+    result = subprocess.run(
+        [
+            "helm",
+            "template",
+            "srw",
+            str(ROOT / "helm"),
+            "-f",
+            str(ROOT / "helm/ci/test-values.yaml"),
+            "--set",
+            "keycloak.enabled=true",
+            "--set",
+            "keycloak.internal=true",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, f"helm template failed:\n{result.stderr}"
+
+    for doc in yaml.safe_load_all(result.stdout):
+        if not doc:
+            continue
+        if doc.get("kind") != "ConfigMap":
+            continue
+        if not doc.get("metadata", {}).get("name", "").endswith("-keycloak-realm"):
+            continue
+        return json.loads((doc.get("data") or {})["srw-realm.json"])
+    raise AssertionError("no keycloak-realm ConfigMap in the render")
+
+
+@functools.lru_cache(maxsize=2)
+def _render_realm_with(*overrides: str) -> dict:
+    """`_render_realm` with extra `--set` overrides, for flag-gated blocks."""
+    cmd = [
+        "helm",
+        "template",
+        "srw",
+        str(ROOT / "helm"),
+        "-f",
+        str(ROOT / "helm/ci/test-values.yaml"),
+        "--set",
+        "keycloak.enabled=true",
+        "--set",
+        "keycloak.internal=true",
+    ]
+    for o in overrides:
+        cmd += ["--set", o]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, f"helm template failed:\n{result.stderr}"
+    for doc in yaml.safe_load_all(result.stdout):
+        if not doc or doc.get("kind") != "ConfigMap":
+            continue
+        if not doc.get("metadata", {}).get("name", "").endswith("-keycloak-realm"):
+            continue
+        return json.loads((doc.get("data") or {})["srw-realm.json"])
+    raise AssertionError("no keycloak-realm ConfigMap in the render")
+
+
+def test_dev_users_are_off_by_default_in_values() -> None:
+    """The published passwords in README only stay harmless while this is false.
+
+    Asserted against values.yaml rather than a render so it fails even if the
+    template stops consuming the flag.
+    """
+    values = yaml.safe_load((ROOT / "helm/values.yaml").read_text())
+    assert values["keycloak"]["devUsers"]["enabled"] is False
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm binary not installed")
+def test_shipped_realm_seeds_only_the_bootstrap_admin() -> None:
+    """A default install must not carry the documented dev credentials."""
+    users = _render_realm().get("users", [])
+    assert [u["username"] for u in users] == ["test"]
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm binary not installed")
+def test_dev_users_render_and_satisfy_the_password_policy() -> None:
+    """Enabled, they must clear the realm's own length(16)/notUsername policy —
+    otherwise Keycloak rejects them and the seeding silently half-works."""
+    realm = _render_realm_with("keycloak.devUsers.enabled=true")
+    users = {u["username"]: u for u in realm.get("users", [])}
+    assert "test" in users
+    for name in ("dev-admin-1", "dev-admin-2", "dev-user-1", "dev-user-4"):
+        assert name in users, f"{name} missing from the enabled render"
+        pw = users[name]["credentials"][0]["value"]
+        assert len(pw) >= 16, f"{name} password is {len(pw)} chars, policy needs 16"
+        assert pw != name, f"{name} password equals its username (notUsername)"
+    assert "admin" in users["dev-admin-1"]["realmRoles"]
+    assert "admin" not in users["dev-user-1"]["realmRoles"]
+
+
+def test_local_kubernetes_dev_credentials_match_the_chart() -> None:
+    """The local guide publishes these passwords; a drifted table sends
+    developers to a login that fails, or understates which accounts exist."""
+    values = yaml.safe_load((ROOT / "helm/values.yaml").read_text())
+    chart = {
+        u["username"]: u["password"] for u in values["keycloak"]["devUsers"]["users"]
+    }
+    guide = dict(
+        re.findall(
+            r"^\|\s*`(dev-[a-z0-9-]+)`\s*\|\s*`([^`]+)`",
+            (ROOT / "docs/local-kubernetes.md").read_text(),
+            re.M,
+        )
+    )
+    assert guide == chart, (
+        "Local Kubernetes dev-credentials table is out of sync with "
+        "keycloak.devUsers in helm/values.yaml.\n"
+        f"  guide: {guide}\n  chart:  {chart}"
+    )
+
+
 @pytest.mark.skipif(shutil.which("helm") is None, reason="helm binary not installed")
 def test_configmap_keys_have_no_slashes() -> None:
     """A real API server rejects a ConfigMap key containing '/'. Assert on the
@@ -363,23 +482,14 @@ def test_pod_template_has_a_theme_checksum_annotation() -> None:
     assert "keycloak-theme-configmap.yaml" in kc
 
 
-def test_compose_bind_mounts_the_same_source() -> None:
-    compose = (ROOT / "docker-compose.yaml").read_text()
-    assert "./helm/keycloak-theme/srw:/opt/keycloak/themes/srw" in compose
-
-
-def test_both_realms_use_the_srw_login_theme() -> None:
+def test_realm_import_uses_the_srw_login_theme() -> None:
     assert '"loginTheme": "srw"' in KC.read_text()
-    export = json.loads((ROOT / "docker/keycloak/realm-export.json").read_text())
-    assert export["loginTheme"] == "srw"
 
 
 def test_display_name_html_carries_the_logo_hook() -> None:
     """--keycloak-logo-url only renders if displayNameHtml provides
     .kc-logo-text for the stylesheet to turn into a background image."""
     assert "kc-logo-text" in KC.read_text()
-    export = json.loads((ROOT / "docker/keycloak/realm-export.json").read_text())
-    assert "kc-logo-text" in export["displayNameHtml"]
 
 
 def test_email_theme_parents_base_not_keycloak() -> None:
@@ -438,7 +548,7 @@ def test_email_wrapper_uses_no_unmanaged_colours() -> None:
     everywhere else. Judges directives, not raw text: the header comment must
     stay free to name a colour it explains (see _ftl_directives).
     """
-    from services import brand
+    from orchestrator.services import brand
 
     ftl = _ftl_directives((THEME / "email/html/template.ftl").read_text())
     managed = {brand.normalize_hex(v) for v in brand.TRAVERTINE.values()}
@@ -461,7 +571,7 @@ def test_email_wrapper_never_uses_text_muted() -> None:
     tests/test_email_layout.py::test_footer_note_uses_text_secondary for the
     same ban on the Python-rendered side.
     """
-    from services import brand
+    from orchestrator.services import brand
 
     ftl = _ftl_directives((THEME / "email/html/template.ftl").read_text())
     used = {brand.normalize_hex(h) for h in re.findall(r"#[0-9a-fA-F]{3,6}\b", ftl)}
@@ -472,10 +582,28 @@ def test_email_wrapper_never_uses_text_muted() -> None:
     )
 
 
-def test_both_realms_use_the_srw_email_theme() -> None:
+def test_realm_import_uses_the_srw_email_theme() -> None:
     assert '"emailTheme": "srw"' in KC.read_text()
-    export = json.loads((ROOT / "docker/keycloak/realm-export.json").read_text())
-    assert export["emailTheme"] == "srw"
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm binary not installed")
+def test_rendered_realm_selects_both_themes_and_the_logo_hook() -> None:
+    """The three assertions above read the TEMPLATE; this one reads what
+    Keycloak actually imports.
+
+    The realm lives inside a Helm-templated ConfigMap, so a raw substring
+    match cannot tell a live JSON value from one stranded inside a
+    `{{- if }}` that never renders, and cannot prove the block is still
+    parseable JSON at all. Parsing the rendered `srw-realm.json` does both.
+    This replaced a second copy of the realm that used to ship as
+    docker/keycloak/realm-export.json for the Compose stack (retired with
+    Compose itself) -- that file seeded a `test`/`test` admin user with a
+    non-temporary password, so the chart's realm is now the only realm.
+    """
+    realm = _render_realm()
+    assert realm["loginTheme"] == "srw"
+    assert realm["emailTheme"] == "srw"
+    assert "kc-logo-text" in realm["displayNameHtml"]
 
 
 HELPERS = ROOT / "helm/templates/_helpers.tpl"

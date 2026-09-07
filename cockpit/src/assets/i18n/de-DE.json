@@ -62,7 +62,11 @@
       "todo_complete": "Aufgabe abschließen",
       "cite_document": "Dokument zitieren",
       "send_message": "Nachricht senden",
-      "delegate_work": "Arbeit delegieren",
+      "delegate_agent": "An Subagent delegieren",
+      "wait_agent": "Auf Subagent warten",
+      "message_agent": "Subagent Nachricht senden",
+      "stop_agent": "Subagent stoppen",
+      "list_agents": "Subagents auflisten",
       "job_complete": "Job abschließen",
       "mark_complete": "Als erledigt markieren",
       "set_canvas": "In Canvas präsentieren",
@@ -450,7 +454,8 @@
       "unarchive": "Dieses Projekt wieder aktivieren, damit neue Aufträge und Sitzungen darauf laufen können"
     },
     "error": {
-      "noAccess": "Sie haben keinen Zugriff auf dieses Projekt."
+      "noAccess": "Sie haben keinen Zugriff auf dieses Projekt.",
+      "loadFailed": "Das Projekt konnte nicht geladen werden — Serverfehler. Bitte erneut versuchen."
     },
     "externalKb": {
       "toggle": "Externes Wissens-Repository verwenden",
@@ -551,7 +556,8 @@
     "tooltip": {
       "sessionFiles": "Sitzungsdateien",
       "resume": "Fortsetzen",
-      "delete": "Löschen"
+      "delete": "Löschen",
+      "talk": "Mit dem Offizier sprechen"
     },
     "create": {
       "title": "Neue Sitzung",
@@ -844,6 +850,21 @@
       "showSubjobRows": "{{count}} ausgeblendete als Zeilen anzeigen",
       "showSubjobRowsHint": "Fügt Unteraufträge zum Herkunftsfilter hinzu, damit sie in der Liste erscheinen.",
       "subjobs": "Unteraufträge ({{count}})",
+      "subagents": "Subagenten ({{count}})",
+      "subagentsError": "Fehler: {{error}}",
+      "subagentsMetrics": "{{turns}} Züge · {{tokens}} Tokens",
+      "subagentsOutcome": "Ergebnis: {{outcome}}",
+      "subagentsTranscript": "Transkript",
+      "subagentsStatuses": {
+        "queued": "In Warteschlange",
+        "running": "Läuft",
+        "completed": "Abgeschlossen",
+        "parked": "Geparkt",
+        "interrupted": "Unterbrochen",
+        "capped": "Begrenzt",
+        "error": "Fehler",
+        "cancelled": "Abgebrochen"
+      },
       "tokens": "Tokens",
       "unknown": "Unbekannt",
       "usage": "Verbrauch",
@@ -946,6 +967,8 @@
         "title": "Standardmodelle",
         "desc": "Welches Modell verwendet wird, wenn ein Job oder Tool keines vorgibt. Jeder Typ trifft andere Workloads.",
         "unset": "— nicht gesetzt —",
+        "none": "Keine",
+        "sameSearchWarning": "Dies entspricht dem primären Suchanbieter; deshalb wird der Laufzeit-Fallback unterdrückt.",
         "emptyCatalog": "Der Modellkatalog ist leer. Füge oben einen Anbieter-Key oder Endpunkt hinzu, danach einen Standard auswählen.",
         "auxiliaryGroup": "Hilfsmodelle",
         "kind": {
@@ -957,7 +980,10 @@
           "vision": "Vision (Bildbeschreibung)",
           "auxiliary": "Hilfsmodell (Memory-Extraktion / Kuration / Titel)",
           "whisper": "Whisper (Spracherkennung)",
-          "tts": "Sprachsynthese"
+          "tts": "Sprachsynthese",
+          "search": "Suche (primär)",
+          "fetch": "Web-Abruf",
+          "search_fallback": "Such-Fallback"
         }
       }
     },
@@ -1076,6 +1102,34 @@
       "usageTitle": "Verwendung",
       "usageDesc": "Übergib das Token in einem Authorization-Header. n8n's Header-Auth-Credential funktioniert direkt damit."
     },
+    "sshKeys": {
+      "linkTitle": "SSH-Schlüssel",
+      "linkDesc": "Öffentliche Schlüssel, mit denen du dich per SSH mit deinen Sitzungs-Workspaces verbindest.",
+      "linkManage": "SSH-Schlüssel verwalten",
+      "back": "Zurück",
+      "title": "SSH-Schlüssel",
+      "desc": "Öffentliche Schlüssel, die deine SSH-Verbindungen zu Sitzungs-Workspaces authentifizieren. Ein Schlüssel bestätigt deine Identität erst, wenn du nachgewiesen hast, dass du den passenden privaten Schlüssel besitzt.",
+      "existingTitle": "Deine Schlüssel",
+      "colName": "Name",
+      "colType": "Typ",
+      "colFingerprint": "Fingerabdruck",
+      "colCreated": "Hinzugefügt",
+      "colLastUsed": "Zuletzt verwendet",
+      "disabledBadge": "Deaktiviert",
+      "empty": "Noch keine SSH-Schlüssel. Füge unten einen hinzu, um dich per SSH zu verbinden.",
+      "addTitle": "Schlüssel hinzufügen",
+      "addDesc": "Die Registrierung eines Schlüssels erfolgt in zwei Schritten: Zuerst weist du nach, dass du den privaten Schlüssel besitzt, dann fügst du den öffentlichen Schlüssel und die daraus erzeugte Signatur ein.",
+      "addButton": "SSH-Schlüssel hinzufügen",
+      "requestingChallenge": "Challenge wird angefordert…",
+      "step1Title": "Schritt 1 — Nachweisen, dass du den privaten Schlüssel besitzt",
+      "step1Desc": "Führe diesen Befehl mit dem privaten Schlüssel aus, den du registrieren möchtest, und kopiere anschließend den öffentlichen Schlüssel sowie die erzeugte Signatur.",
+      "step2Title": "Schritt 2 — Schlüssel registrieren",
+      "namePlaceholder": "Schlüsselname (z. B. Arbeitslaptop)",
+      "publicKeyPlaceholder": "Öffentlichen Schlüssel einfügen (z. B. Inhalt von ~/.ssh/id_ed25519.pub)",
+      "signaturePlaceholder": "Signatur einfügen (beginnt mit -----BEGIN SSH SIGNATURE-----)",
+      "submit": "Schlüssel registrieren",
+      "submitting": "Wird registriert…"
+    },
     "preferences": {
       "title": "Voreinstellungen",
       "desc": "Standardwerte für neue Aufträge. Können pro Auftrag überschrieben werden.",
@@ -1130,12 +1184,7 @@
       "modelPlaceholder": "z. B. claude-sonnet-4-6",
       "defaultPrefix": "Standard:",
       "permissionMode": "Berechtigungsmodus",
-      "config": "Konfiguration",
-      "greeting": "Begrüßung",
-      "greetingPlaceholder": "Hallo! Ich bin bereit zu helfen.",
       "idleTimeout": "Leerlauf-Timeout (Minuten)",
-      "commandAllowlist": "Befehls-Allowlist",
-      "commandAllowlistPlaceholder": "pytest*, npm test, git status",
       "permissionSupervised": "Beaufsichtigt",
       "permissionAutoAccept": "Auto-akzeptieren",
       "permissionAutonomous": "Autonom",
@@ -1144,17 +1193,12 @@
       "workspaceVirtual": "Virtuell — sofort, Dateien im Cloud-Speicher",
       "workspaceSandbox": "Container — volle Shell & Git, langsamerer Start",
       "workspaceNone": "Ohne — nur Chat, keine Dateien",
-      "configDefault": "Standard",
-      "configDeveloper": "Entwickler",
-      "configScholar": "Forscher",
       "headlessMode": "Headless-Verhalten",
       "headlessModeDefault": "Standard (Eifrig)",
       "headlessModeEager": "Eifrig — arbeitet weiter, auch ohne offene Sitzung",
       "headlessModePolite": "Höflich — pausiert zwischen Runden bis zur Rückkehr",
       "attentionSleep": "Aufmerksamkeits-Timeout (Minuten)",
       "attentionSleepHint": "Wie lange der Arbeitsbereich warm bleibt, nachdem der Agent eine natürliche Pause erreicht hat und niemand zuschaut. Leer lassen für den Systemstandard (60 Min).",
-      "notificationChannels": "Benachrichtigungskanäle",
-      "notificationChannelEmail": "Per E-Mail benachrichtigen, wenn der Agent Aufmerksamkeit benötigt",
       "save": "Einstellungen für persistenten Agent speichern"
     },
     "communication": {
@@ -1493,6 +1537,22 @@
   },
   "chat": {
     "defaultTitle": "Persistenter Agent",
+    "subagent": {
+      "banner": "Subagent-Transkript · {{handle}} · {{type}} · {{status}}",
+      "parentJob": "Übergeordneter Job {{id}}",
+      "parentSession": "Übergeordnete Sitzung {{id}}",
+      "loading": "Transkript wird geladen…",
+      "loadFailed": "Das Transkript konnte nicht geladen werden.",
+      "empty": "Noch keine Transkript-Nachrichten.",
+      "turn": "Zug {{count}}",
+      "thinking": "Reasoning",
+      "roles": {
+        "user": "Auftrag",
+        "assistant": "Subagent",
+        "tool": "Werkzeug",
+        "system": "Ereignis"
+      }
+    },
     "connection": {
       "connected": "Verbunden",
       "connecting": "Verbinde...",
@@ -1522,9 +1582,30 @@
       "citationsTooltip": "Quellen dieser Sitzung anzeigen",
       "moreActions": "Weitere Aktionen",
       "disconnect": "Trennen",
+      "disconnecting": "Wird getrennt…",
       "projectFilesButton": "Projektdateien",
       "projectFilesTooltip": "Projektordner {{name}} in Ihrer Cloud öffnen",
-      "sessionFilesButton": "Sitzungsdateien"
+      "sessionFilesButton": "Sitzungsdateien",
+      "sshButton": "SSH",
+      "sshTooltip": "Über SSH mit dem Arbeitsbereich dieser Sitzung verbinden"
+    },
+    "ssh": {
+      "intro": "Verbinden Sie sich mit dem Arbeitsbereich dieser Sitzung über Ihr eigenes Terminal, Ihren Editor oder Ihre IDE.",
+      "prereqs": "Zum Verbinden benötigen Sie außerdem ein Personal Access Token aus Einstellungen → API-Schlüssel, gespeichert unter ~/.config/srw/token, sowie den srw-ssh-proxy-Helfer in Ihrem PATH.",
+      "prereqsLink": "Vollständige Anleitung",
+      "configTitle": "SSH-Konfiguration",
+      "configHint": "Fügen Sie dies zu ~/.ssh/config hinzu und verbinden Sie sich anschließend mit ssh srw-<handle>.",
+      "identityHint": "Setzt voraus, dass sich Ihr privater Schlüssel unter ~/.ssh/id_ed25519 befindet. Liegt Ihrer woanders, passen Sie IdentityFile oben entsprechend an.",
+      "handleLabel": "Sitzungs-Handle",
+      "hostKeyLabel": "Fingerabdruck des Gateway-Hostschlüssels",
+      "hostKeyHint": "Überprüfen Sie diesen Fingerabdruck bei der ersten Verbindung.",
+      "jetBrainsTitle": "JetBrains Gateway",
+      "jetBrainsDesc": "Gateway kann den obigen Konfigurationsblock nicht verwenden. Führen Sie diesen Befehl lokal aus und richten Sie Gateway anschließend bei deaktiviertem \"Parse config file\" auf 127.0.0.1:2222 aus.",
+      "unavailable": "SSH-Zugriff ist für diese Sitzung noch nicht verfügbar.",
+      "seams": {
+        "rewindWarning": "Änderungen über SSH landen im nächsten Commit des Agenten und erscheinen in der Überprüfung als Änderungen des Agenten — ein Sitzungs-Rewind verwirft sie.",
+        "refused": "Remote-Portweiterleitung (ssh -R), Agent-Weiterleitung und Jump-Hosts (ssh -J) werden vom Gateway allesamt abgelehnt."
+      }
     },
     "citations": {
       "title": "Quellen",
@@ -1651,7 +1732,13 @@
       "textSize": "Textgröße",
       "textSmall": "Klein",
       "textMedium": "Mittel",
-      "textLarge": "Groß"
+      "textLarge": "Groß",
+      "officerLens": "Offiziers-Log",
+      "officerLensFolded": "Ruhige Wachen einklappen",
+      "officerLensAll": "Alles anzeigen",
+      "wakeLine": "Wache · {{time}} · geschlafen ~{{minutes}} Min — {{reason}}",
+      "wakeNoReason": "kein Grund angegeben",
+      "wakeSleepLine": "Schlaf · ~{{minutes}} Min — {{reason}}"
     },
     "tasks": {
       "header": "Aufgaben {{done}}/{{total}}",
@@ -1936,7 +2023,11 @@
       "list_sources": "Listet Quellen",
       "search_library": "Sucht in Bibliothek",
       "send_message": "Sendet Nachricht",
-      "delegate_work": "Delegiert Arbeit",
+      "delegate_agent": "Delegiert an Subagent",
+      "wait_agent": "Wartet auf Subagent",
+      "message_agent": "Sendet Subagent eine Nachricht",
+      "stop_agent": "Stoppt Subagent",
+      "list_agents": "Listet Subagents auf",
       "mark_complete": "Markiert als abgeschlossen",
       "job_complete": "Schließt Auftrag ab"
     },
@@ -2018,6 +2109,8 @@
     "filterAll": "Alle",
     "filterWorker": "Worker",
     "filterSession": "Sitzung",
+    "filterSubagent": "Subagent",
+    "showAll": "Alle Experten anzeigen",
     "colName": "Name",
     "colType": "Typ",
     "colSource": "Quelle",
@@ -2039,7 +2132,63 @@
     "imported": "Experte importiert",
     "inUse": "Experte wird von {{count}} Aufträgen verwendet",
     "saveFailed": "Speichern fehlgeschlagen",
-    "invalidJson": "Ungültige JSON-Datei"
+    "invalidJson": "Ungültige JSON-Datei",
+    "model": {
+      "title": "Modell",
+      "model": "Modell",
+      "baseDefault": "Basis-Standard",
+      "subagent": "Subagent-Modell",
+      "subagentHint": "Standard für alle Subagenten — jeder Eintrag ohne eigenes Modell läuft darauf; ohne Auswahl übernehmen sie das Modell dieses Experten."
+    },
+    "tags": {
+      "title": "Tags",
+      "hint": "Rollen-Tags bestimmen, in welchen Auswahllisten dieser Experte erscheint — jeder Experte bleibt in jeder Rolle nutzbar. Weitere Tags sind Freitext zum eigenen Filtern.",
+      "roles": "Rollen",
+      "roleLocked": "{{role}} — Typ dieses Experten, immer aktiv",
+      "free": "Weitere Tags (durch Komma getrennt)",
+      "freePlaceholder": "research, academic"
+    },
+    "subagents": {
+      "title": "Subagenten",
+      "hint": "Die Riege, an die dieser Experte delegieren darf: kleine Inline-Experten oder Verweise auf beliebige andere Experten (Workspace-, Autonomie- und Prüfeinstellungen eines verwiesenen Experten werden als Subagent ignoriert). Der Name ist der subagent_type, den der Eltern-Agent an delegate_agent übergibt.",
+      "empty": "Noch keine Einträge.",
+      "add": "Subagent hinzufügen",
+      "remove": "Subagent entfernen",
+      "name": "Name",
+      "nameHint": "Buchstaben, Ziffern, _ und - (muss mit Buchstabe oder Ziffer beginnen)",
+      "nameInvalid": "Der Name muss mit einem Buchstaben oder einer Ziffer beginnen und darf nur Buchstaben, Ziffern, _ und - enthalten",
+      "nameDuplicate": "Ein anderer Eintrag verwendet diesen Namen bereits",
+      "kind": "Art",
+      "kindInline": "Inline (kleiner Experte)",
+      "kindReference": "Verweis (anderer Experte)",
+      "reference": "Verwiesener Experte",
+      "referenceNone": "— Experten wählen —",
+      "referenceLoading": "Experten werden geladen…",
+      "referenceRequired": "Wähle den Experten, auf den dieser Eintrag verweist",
+      "referenceHint": "Die Einstellungen darunter überschreiben den verwiesenen Experten.",
+      "description": "Beschreibung",
+      "descriptionHint": "Was das Eltern-Modell neben dem subagent_type sieht.",
+      "model": "Modell",
+      "modelInherit": "Modell des Eltern-Agenten übernehmen",
+      "isolation": "Isolation",
+      "isolationDefault": "Standard",
+      "isolationShared": "Geteilt — der Baum des Eltern-Agenten",
+      "isolationWorktree": "Worktree — eigener Git-Worktree",
+      "writePolicy": "Schreibrichtlinie",
+      "writePolicyDefault": "Standard",
+      "writePolicyNone": "Keine (nur lesen)",
+      "writePolicyScratchOnly": "Nur Scratch",
+      "writePolicyOwnedPaths": "Zugewiesene Pfade (aus dem Auftrag)",
+      "writePolicyFull": "Voll",
+      "extra": "Tools, Limits, Rückgabe — JSON",
+      "extraHint": "Jeder weitere Schlüssel des Eintrags (tools, limits, return, prompts, weitere llm-Einstellungen), unverändert übernommen.",
+      "extraInvalid": "Ungültiges JSON",
+      "extraNotObject": "Muss ein JSON-Objekt sein",
+      "default": "Standard-Subagent",
+      "defaultHint": "Worauf ein delegate_agent-Aufruf ohne subagent_type zurückfällt.",
+      "defaultNone": "Keiner",
+      "invalid": "Die Subagenten-Riege enthält Fehler — bitte vor dem Speichern beheben."
+    }
   },
   "skills": {
     "title": "Skills",
@@ -2431,23 +2580,12 @@
     "refresh": "Aktualisieren",
     "listAriaLabel": "Einträge im Aktionszentrum",
     "filters": {
-      "all": "Alle",
-      "messages": "Nachrichten",
-      "sudo": "Sudo",
-      "reviews": "Reviews",
-      "sessions": "Sitzungen"
+      "all": "Alle"
     },
     "list": {
-      "empty": {
-        "message": "Keine Nachrichten",
-        "sudo": "Keine Sudo-Anfragen",
-        "review": "Keine Reviews",
-        "session": "Keine Sitzungen"
-      },
+      "emptyCategory": "Nichts in dieser Kategorie",
       "emptyAll": "Alles erledigt — keine Einträge erfordern Ihre Aufmerksamkeit",
-      "resolved": "erledigt",
-      "modeBlocking": "blockierend",
-      "modeAsync": "asynchron"
+      "resolved": "erledigt"
     },
     "time": {
       "now": "jetzt"
@@ -2456,81 +2594,7 @@
       "emptyText": "Wählen Sie einen Eintrag, um Details anzuzeigen",
       "hintUse": "Mit",
       "hintToNavigate": "navigieren,",
-      "hintToSelect": "zum Auswählen",
-      "jobId": "Job-ID",
-      "requestId": "Anfrage-ID",
-      "threadId": "Thread-ID",
-      "sessionId": "Sitzungs-ID",
-      "eventId": "Ereignis-ID"
-    },
-    "sudoDetail": {
-      "vmUpgradeRequest": "VM-Upgrade-Anfrage",
-      "sudoRequest": "Sudo-Anfrage",
-      "secondsRemaining": "{{seconds}}s verbleibend",
-      "user": "Benutzer",
-      "vm": "VM",
-      "cwd": "CWD",
-      "workspace": "Arbeitsbereich",
-      "upgradeHint": "Der Agent hat Sudo in einem Container-Arbeitsbereich versucht. Für vollen Sudo-Zugriff zu einer VM upgraden oder den Job ohne VM fortsetzen.",
-      "upgradeToVm": "Auf VM upgraden",
-      "resumeWithoutVm": "Ohne VM fortsetzen",
-      "approve": "Genehmigen",
-      "deny": "Verweigern",
-      "reason": "Begründung",
-      "rulesToggle": "Auto-Genehmigungsregeln ({{count}})",
-      "rulePatternPlaceholder": "Muster (z. B. apt-get install *)",
-      "ruleActionApprove": "Genehmigen",
-      "ruleActionDeny": "Verweigern",
-      "ruleAdd": "Hinzufügen"
-    },
-    "messageDetail": {
-      "messageLabel": "Nachricht",
-      "modeBlocking": "blockierend",
-      "modeAsync": "asynchron",
-      "sessionPage": "Sitzungsmeldung",
-      "openSessionLog": "Sitzungsprotokoll öffnen",
-      "defaultAgent": "Agent",
-      "threadLoading": "Thread wird geladen …",
-      "noMessagesLoaded": "Keine Nachrichten geladen",
-      "senderAgent": "Agent",
-      "senderYou": "Sie",
-      "replyPlaceholder": "Antwort eingeben …",
-      "markUrgent": "Als dringend markieren",
-      "send": "Senden"
-    },
-    "reviewDetail": {
-      "jobReview": "Job-Review",
-      "freezePhase": "Phasengrenze",
-      "freezeUpgrade": "Sudo erforderlich",
-      "freezeComplete": "Job abgeschlossen",
-      "defaultAgent": "Agent",
-      "phase": "Phase {{number}}",
-      "loadingFrozen": "Eingefrorene Daten werden geladen …",
-      "summary": "Zusammenfassung",
-      "confidence": "Konfidenz",
-      "deliverables": "Ergebnisse",
-      "upgradeHint": "Für Sudo-Zugriff zu einer VM upgraden oder ohne VM fortsetzen.",
-      "upgradeToVm": "Auf VM upgraden",
-      "resumeWithoutVm": "Ohne VM fortsetzen",
-      "notesPlaceholder": "Optionale Notizen …",
-      "approve": "Genehmigen",
-      "feedbackPlaceholder": "Feedback für die nächste Phase …",
-      "resumeWithFeedback": "Mit Feedback fortsetzen"
-    },
-    "sessionDetail": {
-      "agentSession": "Agent-Sitzung",
-      "needsAttention": "erfordert Aufmerksamkeit",
-      "tool": "Tool",
-      "arguments": "Argumente",
-      "command": "Befehl",
-      "reason": "Grund",
-      "goToSession": "Zur Sitzung"
-    },
-    "denyDialog": {
-      "titlePrefix": "Verweigern:",
-      "reasonPlaceholder": "Begründung für Verweigerung (erforderlich)",
-      "cancel": "Abbrechen",
-      "deny": "Verweigern"
+      "hintToSelect": "zum Auswählen"
     },
     "shortcuts": {
       "title": "Tastaturkürzel",
@@ -2538,13 +2602,7 @@
       "prevItem": "Vorheriger Eintrag",
       "selectItem": "Eintrag auswählen",
       "deselect": "Abwählen / schließen",
-      "approveSudoReview": "Genehmigen (Sudo / Review)",
-      "denySudo": "Verweigern (Sudo)",
-      "focusReply": "Antwort fokussieren (Nachricht)",
-      "sendReply": "Antwort senden",
-      "filterMessages": "Filter: Nachrichten",
-      "filterSudo": "Filter: Sudo",
-      "filterReviews": "Filter: Reviews",
+      "filterCategory": "Filter: n-te Kategorie",
       "clearFilter": "Filter zurücksetzen",
       "toggleOverlay": "Dieses Overlay umschalten",
       "close": "Schließen"
@@ -2595,13 +2653,9 @@
       "context": "Kontextverwaltung",
       "workspace": "Arbeitsbereich",
       "shell": "Shell",
-      "research": "Recherche & Browser",
+      "research": "Recherche",
       "auxiliary": "Hilfs-LLM",
       "session": "Sitzung"
-    },
-    "phases": {
-      "strategic": "Strategisch",
-      "tactical": "Taktisch"
     },
     "labels": {
       "reasoning": "Reasoning",
@@ -2622,6 +2676,7 @@
       "keepRecentMessages": "Letzte Nachrichten behalten",
       "vmCpuCores": "VM-CPU-Kerne",
       "vmMemory": "VM-Arbeitsspeicher",
+      "vmDiskSize": "VM-Festplatte",
       "maxReadWords": "Max. Lese-Wörter",
       "maxWriteWords": "Max. Schreib-Wörter",
       "gitVersioning": "Git-Versionierung",
@@ -2630,12 +2685,9 @@
       "defaultTimeout": "Standard-Timeout (Sekunden)",
       "sudoAction": "Sudo-Aktion",
       "proxyEnabled": "Proxy aktiviert",
-      "browserHeadless": "Browser headless",
-      "browserVision": "Browser verwendet Vision",
       "auxEnabled": "Hilfs-LLM aktiviert",
       "model": "Modell",
-      "idleTimeout": "Leerlauf-Timeout (Minuten)",
-      "greeting": "Begrüßung"
+      "idleTimeout": "Leerlauf-Timeout (Minuten)"
     },
     "options": {
       "container": "Container",
@@ -3058,14 +3110,13 @@
       "countBound": "{{n}} gebunden",
       "countPredicted": "{{n}} vorhergesagt",
       "group": "Werkzeuge",
-      "maxDepth": "Max. Tiefe",
+      "maxConcurrent": "Max. gleichzeitig",
       "provenance": {
         "measured": "Live vom laufenden Agenten",
         "measured_partial": "Live vom laufenden Agenten — unvollständige Antwort",
         "predicted": "Vorhergesagt, nicht gemessen",
         "unknown": "Der aufgelöste Werkzeugsatz konnte nicht gelesen werden"
       },
-      "timeout": "Timeout (Sek.)",
       "unknownCategory": "Dieser Cockpit-Build hat keine Beschreibung für diese Kategorie."
     },
     "toolCategories": {
@@ -3099,7 +3150,7 @@
       },
       "delegation": {
         "label": "Delegation",
-        "description": "Kann Subagenten starten, die parallel arbeiten"
+        "description": "Kann Subagenten im Vorder- oder Hintergrund starten und steuern"
       },
       "email": {
         "label": "E-Mail",
@@ -3189,9 +3240,8 @@
     "model": {
       "group": "Modell",
       "preset": "Voreinstellung",
-      "strategic": "Strategisch",
-      "tactical": "Taktisch",
-      "subagent": "Subagent",
+      "subagent": "Subagent-Modell",
+      "subagentRoster": "Standard für alle Subagenten — ohne Auswahl übernehmen sie das Modell oben.",
       "single": "Modell",
       "reasoning": "Reasoning",
       "reasoningDefaultOption": "{{label}} (Standard)",
@@ -3207,8 +3257,6 @@
       },
       "presetUnconfigured": "Mindestens einem Modell fehlt ein API-Schlüssel",
       "providerNoKey": "{{provider}} (kein API-Schlüssel)",
-      "mismatchWindow": "Diese Modelle haben unterschiedliche Kontextfenster — sie teilen sich einen Verlauf und werden auf das kleinere begrenzt (~{{min}}).",
-      "mismatchMultimodal": "Eines dieser Modelle kann keine Bilder lesen — die Bildeingabe wird für beide Phasen deaktiviert.",
       "temperature": "Temperatur"
     },
     "narrationModes": {
@@ -3335,13 +3383,10 @@
   },
   "notificationBell": {
     "title": "Aktionszentrum",
-    "messagesSingle": "{{n}} Nachricht",
-    "messagesPlural": "{{n}} Nachrichten",
-    "sudo": "{{n}} Sudo",
-    "reviewsSingle": "{{n}} Review",
-    "reviewsPlural": "{{n}} Reviews",
-    "sessionsSingle": "{{n}} Sitzung",
-    "sessionsPlural": "{{n}} Sitzungen"
+    "unseenSingle": "{{n}} neue Benachrichtigung",
+    "unseenPlural": "{{n}} neue Benachrichtigungen",
+    "pendingSingle": "{{n}} Eintrag braucht Sie",
+    "pendingPlural": "{{n}} Einträge brauchen Sie"
   },
   "todoList": {
     "phaseSelector": {
@@ -3477,6 +3522,13 @@
     "deliveryFailed": "Zustellung fehlgeschlagen; Wiederholungsstatus beibehalten",
     "notQueued": "nicht eingereiht"
   },
+  "conferenceLauncher": {
+    "missingProject": "Die Adresse nennt kein Projekt.",
+    "opening": "Konferenz wird geöffnet …",
+    "error": "Konferenz konnte nicht geöffnet werden:",
+    "back": "Zurück zum Projekt",
+    "unreachable": "Der Server war nicht erreichbar."
+  },
   "officerCard": {
     "title": "Centurio",
     "intro": "Ein ständiger Offizier für dieses Projekt: Er führt den Auftrag, überwacht Jobs und Flotte, entsendet Arbeiter aus seiner Ausrüstung und meldet sich nur, wenn du wirklich gebraucht wirst. In einer Konferenz sprichst du mit ihm; sein Hintergrundprotokoll ist das Sitzungsprotokoll. Der Posten überdauert ihn — Ausrüstung, Budgets und Gedächtnis bleiben zwischen Inkarnationen erhalten.",
@@ -3497,10 +3549,12 @@
       "slotModel": "Modell von Platz {{index}}",
       "slotWorkspace": "Arbeitsbereich von Platz {{index}}",
       "slotPool": "Pool von Platz {{index}}",
+      "slotSpendCeiling": "Tägliche Ausgabenobergrenze von Platz {{index}} in USD",
       "removeSlot": "Platz {{name}} entfernen",
+      "autoPull": "Unbeaufsichtigtes Auto-Pull aktivieren",
+      "workerSpendCeiling": "Tägliche Arbeiter-Ausgabenobergrenze der Centurie in USD",
       "maxWorkers": "Maximale Arbeiterzahl",
       "tokenCeiling": "Tägliche Token-Obergrenze",
-      "pagesPerDay": "Maximale Meldungen pro Tag",
       "sleepMin": "Minimale Schlafdauer in Minuten",
       "sleepMax": "Maximale Schlafdauer in Minuten",
       "holdNote": "Notiz zur Aussetzung des Offiziers",
@@ -3528,6 +3582,8 @@
       "autoPull": "Auto-Pull",
       "on": "an — bereite Tickets werden freien Pool-Plätzen zugeteilt",
       "off": "aus — Pools bleiben untätig, bis er manuell entsendet",
+      "centurySpendCeiling": "Arbeiter-Obergrenze ${{amount}}/Tag",
+      "releaseClosed": "Aktivierung durch Deployment-Freigaberichtlinie gesperrt",
       "stalled": "Festgefahren",
       "stalledDetail": "{{count}} beanspruchte(s) Ticket(s) seit mehr als {{threshold}} Std. ohne Fortschritt ({{source}}) — sie werden nie automatisch freigegeben; Job fortsetzen oder abbrechen, dann Ticket schließen oder erneut bereitstellen.",
       "thresholdSource": {
@@ -3545,10 +3601,16 @@
       "reasoningLabel": "Denkaufwand"
     },
     "budgets": {
-      "pages": "Meldungen pro Tag",
-      "pagesHint": "Wie oft er dich benachrichtigen darf (Standard 3).",
       "tokenCeiling": "Tägliche Token-Obergrenze",
-      "tokenCeilingHint": "Für sein gesamtes Kommando. Leer bedeutet ohne Obergrenze."
+      "tokenCeilingHint": "Für sein gesamtes Kommando. Leer bedeutet ohne Obergrenze.",
+      "workerSpendCeiling": "Arbeiter-Ausgaben / Tag (USD)",
+      "workerSpendCeilingHint": "Optional über alle automatisch gefüllten Pools. Leer bedeutet keine mechanische Ausgabenbremse."
+    },
+    "autoPull": {
+      "label": "Kategorisierte Pools automatisch füllen",
+      "releaseClosed": "Die Aktivierung ist nicht verfügbar, bis die Gates für unbeaufsichtigten Betrieb dieses Deployments abgeschlossen sind. Aus und alle Ausgabenobergrenzen bleiben bearbeitbar.",
+      "confirmation": "Die Aktivierung startet beim nächsten Takt unbeaufsichtigte Arbeiter-Entsendung und Ausgaben aus bereiten Projekttickets. Erst nach Prüfung von Aufstellung, Kategorien und Ausgabenobergrenzen bestätigen.",
+      "confirmEnable": "Unbeaufsichtigtes Auto-Pull aktivieren"
     },
     "category": {
       "none": "Kein Pool — der Offizier entsendet manuell",
@@ -3557,7 +3619,7 @@
       "executor": "Ausführung — Ergebnis sind ausgelieferte Dateien"
     },
     "decommission": {
-      "hint": "Ausrüstung, Budgets, Digest und SITREP-Fingerabdrücke bleiben am Posten; eine erneute Einsetzung stellt sie mit einer Kontinuitätsnotiz wieder her.",
+      "hint": "Ausrüstung, Budgets und SITREP-Fingerabdrücke bleiben am Posten; eine erneute Einsetzung stellt sie mit einer Kontinuitätsnotiz wieder her.",
       "inFlightWarning": "Er hat {{count}} laufende(n) Job(s). Die Abberufung lässt sie weiterlaufen — ihre Abschlüsse landen im Posten-Ledger für seinen Nachfolger."
     },
     "defaults": {
@@ -3566,9 +3628,6 @@
       "session": "Sitzungsstandard",
       "unlimited": "unbegrenzt",
       "worker": "Arbeiterstandard"
-    },
-    "digest": {
-      "title": "Digest — was er für dich vorgemerkt hat"
     },
     "errors": {
       "commission": "Einsetzung fehlgeschlagen",
@@ -3599,7 +3658,8 @@
     "kit": {
       "breakerOpen": "SCHUTZSCHALTER OFFEN",
       "ready": "bereit {{count}}",
-      "readyBelowFloor": "bereit {{count}} — UNTER MINDESTBESTAND"
+      "readyBelowFloor": "bereit {{count}} — UNTER MINDESTBESTAND",
+      "spendCeiling": "${{amount}}/Tag"
     },
     "machineState": {
       "not-attempted": "nicht versucht",
@@ -3688,11 +3748,14 @@
       "maxWorkersHint": "Flache Parallelitätsgrenze. Ohne Ausrüstung ist sie die einzige Schranke (Standard 3).",
       "model": "Modell",
       "pool": "Pool",
+      "spendCeiling": "Ausgaben / Tag (USD)",
+      "spendCeilingHint": "Optionale Obergrenze für diesen Pool; leer bedeutet keine pool-spezifische Bremse.",
       "slot": "Platz",
       "slotPlaceholder": "Linie",
       "workspace": "Arbeitsbereich"
     },
     "sections": {
+      "autoPull": "Unbeaufsichtigte Entsendung",
       "brain": "Sein Modell",
       "budgets": "Budgets",
       "kit": "Ausrüstung",
@@ -3723,7 +3786,6 @@
       "ceilingReached": "— Obergrenze erreicht; schläft bis zum Zurücksetzen",
       "model": "Sein Modell",
       "nextWake": "Nächster Weckruf",
-      "pagesToday": "Meldungen heute",
       "queuedEvents": "Wartende Ereignisse",
       "spendToday": "Verbrauch heute",
       "tokens": "Token"
@@ -3750,6 +3812,9 @@
       "virtual": "virtuell",
       "none": "keiner",
       "vmRoot": "VM (Root)"
+    },
+    "recentNotifications": {
+      "title": "Letzte Benachrichtigungen dieses Offiziers"
     }
   },
   "statistics": {
@@ -3808,6 +3873,157 @@
       "empty": "Keine passenden Optionen",
       "selectedCount": "{{count}} ausgewählt",
       "clear": "Zurücksetzen"
+    }
+  },
+  "notifications": {
+    "category": {
+      "review_queue": "Review",
+      "vm_upgrade": "VM-Upgrade",
+      "budget_exceeded": "Budget überschritten",
+      "incident": "Vorfall",
+      "officer_question": "Offizier",
+      "officer_runtime": "Offizier-Laufzeit",
+      "agent_message": "Agentennachricht",
+      "session_wake": "Sitzung",
+      "loop_event": "Loop",
+      "automation_disabled": "Automation",
+      "user_registered": "Neuer Benutzer",
+      "session_permission": "Berechtigung",
+      "sudo_request": "Sudo",
+      "ssh_key_added": "SSH-Schlüssel hinzugefügt"
+    },
+    "severity": {
+      "low": "Niedrig",
+      "normal": "Normal",
+      "high": "Hoch",
+      "critical": "Kritisch"
+    },
+    "status": {
+      "unseen": "Neu",
+      "seen": "Gesehen",
+      "read": "Gelesen",
+      "resolved": "Erledigt",
+      "archived": "Archiviert"
+    },
+    "actions": {
+      "approve": "Genehmigen",
+      "resumeWithFeedback": "Mit Feedback fortsetzen",
+      "resume": "Fortsetzen",
+      "deny": "Ablehnen",
+      "upgradeToVm": "Auf VM upgraden",
+      "resumeWithoutVm": "Ohne VM fortsetzen",
+      "reply": "Antworten",
+      "openConference": "Offizier öffnen",
+      "open": "Öffnen",
+      "openJob": "Job öffnen",
+      "openThread": "Thread öffnen",
+      "openSession": "Sitzung öffnen",
+      "openProject": "Projekt öffnen",
+      "openAutomations": "Automationen öffnen",
+      "openAdminUsers": "Benutzer öffnen"
+    },
+    "inputs": {
+      "feedback": "Feedback für den Agenten…",
+      "reason": "Begründung…",
+      "message": "Ihre Anweisungen an den Offizier…",
+      "notes": "Notizen des Reviewers (optional)…",
+      "value": "…"
+    },
+    "source": {
+      "job": "Job",
+      "sudo_request": "Sudo-Anfrage",
+      "thread": "Sitzung",
+      "message_thread": "Thread",
+      "loop": "Loop",
+      "automation": "Automation",
+      "user": "Benutzer",
+      "permission_request": "Berechtigungsanfrage",
+      "ssh_key": "SSH-Schlüssel"
+    },
+    "detail": {
+      "noActions": "Keine Aktionen verfügbar",
+      "source": "Quelle",
+      "loadingSource": "Wird geladen…",
+      "jobStatus": "Status",
+      "jobDescription": "Beschreibung",
+      "command": "Befehl",
+      "requestStatus": "Anfragestatus",
+      "session": "Sitzung",
+      "timeline": "Verlauf",
+      "created": "Erstellt",
+      "seen": "Gesehen",
+      "read": "Gelesen",
+      "resolved": "Erledigt",
+      "actionFailed": "Die Aktion ist fehlgeschlagen",
+      "jobId": "Job-ID",
+      "configName": "Agent",
+      "freezeType": "Freeze",
+      "phase": "Phase",
+      "error": "Fehler",
+      "summary": "Zusammenfassung",
+      "requestType": "Anfrage",
+      "vm": "VM",
+      "user": "Benutzer",
+      "cwd": "CWD",
+      "reason": "Begründung",
+      "secondsRemaining": "{{seconds}}s verbleibend",
+      "senderAgent": "Agent",
+      "senderYou": "Sie",
+      "modeBlocking": "blockierend",
+      "noMessages": "Keine Nachrichten",
+      "status": "Status",
+      "tool": "Tool",
+      "arguments": "Argumente",
+      "requestedAt": "Angefragt",
+      "decidedBy": "Entschieden von",
+      "loop": "Loop",
+      "automation": "Automation",
+      "enabled": "aktiv",
+      "disabled": "deaktiviert",
+      "userName": "Name",
+      "email": "E-Mail",
+      "approved": "freigegeben",
+      "pendingApproval": "wartet auf Freigabe",
+      "sourceMissing": "Die Quelle ist nicht mehr verfügbar",
+      "steps": "Geplante Zustellungen",
+      "stepUnless": "außer {{conditions}}"
+    },
+    "empty": "Keine Benachrichtigungen",
+    "loadMore": "Mehr laden",
+    "deepLinkMissing": "Diese Benachrichtigung wurde nicht gefunden",
+    "sudo": {
+      "rulesToggle": "Auto-Genehmigungsregeln ({{count}})",
+      "rulePatternPlaceholder": "Muster (z. B. apt-get install *)",
+      "ruleActionApprove": "Genehmigen",
+      "ruleActionDeny": "Verweigern",
+      "ruleAdd": "Hinzufügen",
+      "ruleDelete": "Regel löschen"
+    },
+    "risk": {
+      "low": "Geringes Risiko",
+      "medium": "Mittleres Risiko",
+      "high": "Hohes Risiko",
+      "critical": "Kritisch"
+    },
+    "channel": {
+      "in_app": "In-App",
+      "email": "E-Mail",
+      "ntfy": "ntfy",
+      "slack_webhook": "Slack",
+      "discord_webhook": "Discord",
+      "push": "Push"
+    },
+    "stepState": {
+      "pending": "ausstehend",
+      "done": "gesendet",
+      "skipped": "übersprungen",
+      "cancelled": "abgebrochen",
+      "failed": "fehlgeschlagen"
+    },
+    "condition": {
+      "not_seen": "gesehen",
+      "not_read": "gelesen",
+      "not_resolved": "erledigt"
     }
   }
 }

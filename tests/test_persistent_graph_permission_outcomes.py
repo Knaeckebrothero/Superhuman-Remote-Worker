@@ -27,7 +27,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 
-from src.persistent_graph import (
+from agent.persistent_graph import (
     PermissionOutcome,
     PersistentLoopCallbacks,
     run_persistent_loop,

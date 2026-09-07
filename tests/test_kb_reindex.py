@@ -14,9 +14,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.services.knowledge_store import KbWatermark
-from src.tools.knowledge.chunker import CHUNKER_VERSION, note_centroid
-from src.tools.knowledge.gardener import parse_note_md
+from shared.runtime.services.knowledge_store import KbWatermark
+from shared.runtime.knowledge.chunker import CHUNKER_VERSION, note_centroid
+from shared.runtime.knowledge.gardener import parse_note_md
 
 from orchestrator.services.kb_reindex import (
     FIRST_SWEEP_DELAY_SECONDS,
@@ -39,6 +39,13 @@ CURRENT_VERSION = reindex_pipeline_version(EMBEDDING_VERSION, "knowledge")
 def _note_md(slug: str, body: str = "the body", note_type: str = "learning") -> str:
     return (
         f"---\nid: {slug}\ntype: {note_type}\nstatus: active\n---\n# {slug}\n\n{body}\n"
+    )
+
+
+def _dup_exc(note_id):
+    return RuntimeError(
+        f'duplicate key value violates unique constraint "uq_knowledge_project_note" '
+        f"DETAIL: Key (project_id, note_id)=(x, {note_id}) already exists."
     )
 
 
@@ -853,7 +860,7 @@ class TestReindexKbIncremental:
 
         import httpx
 
-        from src.services.forge import ForgeRepo, GitHubClient
+        from shared.runtime.services.forge import ForgeRepo, GitHubClient
 
         note = (
             "---\nid: note\ntype: learning\nstatus: active\n---\n"
@@ -890,7 +897,7 @@ class TestReindexKbIncremental:
             raise AssertionError(f"unexpected GitHub request: {request.method} {path}")
 
         monkeypatch.setattr(
-            "src.services.forge._transport",
+            "shared.runtime.services.forge._transport",
             httpx.MockTransport(handler),
             raising=False,
         )
@@ -1301,6 +1308,9 @@ class TestReindexKbIncremental:
         # The real unique (project_id, note_id) constraint rejects the second
         # identity. Crucially, adoption was not authorized to move the existing
         # row because its canonical path remains in the current tree.
+        # This message does NOT name uq_knowledge_project_note, so it stays on
+        # the generic-error path (not the skip-with-advisory path below) —
+        # errors == 1 / status == "partial" is correct here, do not "fix" it.
         store.upsert_kb_note.side_effect = RuntimeError("duplicate note id")
 
         result = await reindex_kb(
@@ -1318,6 +1328,71 @@ class TestReindexKbIncremental:
             kb, "stable-id", duplicate, movable_paths=[]
         )
         store.upsert_watermark.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_duplicate_note_id_is_skipped_with_advisory_and_kb_reaches_ready(
+        self,
+    ):
+        kb = uuid.uuid4()
+        wm = KbWatermark(
+            kb_id=kb, indexed_commit="old", pipeline_version=CURRENT_VERSION
+        )
+        holder = "knowledge/research/single_cluster_vm/README.md"
+        loser = "knowledge/research/kb_gardening/README.md"
+        gitea, store, svc = _make_deps(
+            head="headsha",
+            watermark=wm,
+            tree=[
+                {"path": holder, "type": "blob", "sha": "same"},
+                {"path": loser, "type": "blob", "sha": "new"},
+            ],
+            indexed={holder: "same"},
+            contents={loser: _note_md("README")},
+        )
+        store.upsert_kb_note.side_effect = _dup_exc("README")
+        store.find_note_id_owner.return_value = {"path": holder, "id": "README"}
+
+        result = await reindex_kb(
+            gitea_client=gitea,
+            store=store,
+            embedding_service=svc,
+            kb_id=kb,
+            repo_name="r",
+        )
+
+        assert result["status"] == "completed"
+        assert result["errors"] == 0
+        assert result["skipped_duplicates"] == 1
+        assert result["indexed_commit"] == "headsha"
+        kwargs = store.upsert_watermark.await_args_list[-1].kwargs
+        assert kwargs["status"] == "ready"
+        assert (
+            "README" in kwargs["advisory"]
+            and loser in kwargs["advisory"]
+            and holder in kwargs["advisory"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_clean_run_clears_advisory(self):
+        kb = uuid.uuid4()
+        wm = KbWatermark(
+            kb_id=kb, indexed_commit="old", pipeline_version=CURRENT_VERSION
+        )
+        gitea, store, svc = _make_deps(
+            head="h2",
+            watermark=wm,
+            tree=[{"path": "knowledge/a.md", "type": "blob", "sha": "s"}],
+            contents={"knowledge/a.md": _note_md("a")},
+        )
+        result = await reindex_kb(
+            gitea_client=gitea,
+            store=store,
+            embedding_service=svc,
+            kb_id=kb,
+            repo_name="r",
+        )
+        assert result["skipped_duplicates"] == 0
+        assert store.upsert_watermark.await_args_list[-1].kwargs["advisory"] is None
 
     @pytest.mark.asyncio
     async def test_history_rewrite_reconciles_directly_from_current_tree(self):
@@ -1738,6 +1813,107 @@ class TestReindexKbFailureHonesty:
         assert result["status"] == "partial"
         assert result["errors"] == 1
         assert "headsha" not in _watermark_commits(store)
+
+
+class TestReindexKbWedgeWarning:
+    @pytest.mark.asyncio
+    async def test_same_failure_four_sweeps_warns_exactly_once(self, caplog):
+        kb = uuid.uuid4()
+        wm = KbWatermark(
+            kb_id=kb, indexed_commit="old", pipeline_version=CURRENT_VERSION
+        )
+        gitea, store, svc = _make_deps(
+            head="h",
+            watermark=wm,
+            tree=[{"path": "knowledge/bad.md", "type": "blob", "sha": "s"}],
+            contents={"knowledge/bad.md": _note_md("bad")},
+        )
+        store.upsert_kb_note.side_effect = RuntimeError("boom")  # generic, persistent
+
+        warned = 0
+        for streak in (1, 2, 3, 4, 5):
+            # S0 computes the streak in SQL; the mock store reports it back.
+            store.get_watermark.return_value = KbWatermark(
+                kb_id=kb,
+                indexed_commit="old",
+                pipeline_version=CURRENT_VERSION,
+                status="partial",
+                error_streak=streak,
+            )
+            with caplog.at_level("WARNING", logger="orchestrator.services.kb_reindex"):
+                caplog.clear()
+                await reindex_kb(
+                    gitea_client=gitea,
+                    store=store,
+                    embedding_service=svc,
+                    kb_id=kb,
+                    repo_name="r",
+                )
+            warned += sum("WEDGED" in r.message for r in caplog.records)
+            fp = store.set_watermark_status.await_args.kwargs["error_fingerprint"]
+            assert fp and len(fp) == 16
+        assert warned == 1
+
+    @pytest.mark.asyncio
+    async def test_watermark_readback_failure_does_not_raise(self):
+        """_warn_if_wedged's own get_watermark read-back is advisory-only —
+        a DB blip there must not turn an otherwise-normal partial run into an
+        unhandled exception. The run's *first* get_watermark call (line ~996,
+        pre-existing and unrelated to the wedge check) still has to succeed
+        or the run never reaches the partial branch at all, so only the
+        second call — the wedge check's own — is made to fail."""
+        kb = uuid.uuid4()
+        wm = KbWatermark(
+            kb_id=kb, indexed_commit="old", pipeline_version=CURRENT_VERSION
+        )
+        gitea, store, svc = _make_deps(
+            head="h",
+            watermark=wm,
+            tree=[{"path": "knowledge/bad.md", "type": "blob", "sha": "s"}],
+            contents={},  # fetch failure -> partial, errors=1
+        )
+        store.get_watermark.side_effect = [wm, RuntimeError("db down")]
+
+        result = await reindex_kb(
+            gitea_client=gitea,
+            store=store,
+            embedding_service=svc,
+            kb_id=kb,
+            repo_name="r",
+        )
+
+        assert result["status"] == "partial"
+        assert result["errors"] == 1
+
+    @pytest.mark.asyncio
+    async def test_delete_only_failure_still_fingerprints(self):
+        """A run whose only failure is in the delete loop must still feed
+        the fingerprint — otherwise a delete-only wedge would never
+        accumulate a streak worth warning about."""
+        kb = uuid.uuid4()
+        wm = KbWatermark(
+            kb_id=kb, indexed_commit="old", pipeline_version=CURRENT_VERSION
+        )
+        gitea, store, svc = _make_deps(
+            head="h",
+            watermark=wm,
+            tree=[],  # nothing in the tree now — knowledge/old.md was deleted
+            indexed={"knowledge/old.md": "sha-1"},
+            contents={},
+        )
+        store.delete_kb_note.side_effect = RuntimeError("locked")
+
+        result = await reindex_kb(
+            gitea_client=gitea,
+            store=store,
+            embedding_service=svc,
+            kb_id=kb,
+            repo_name="r",
+        )
+
+        assert result["status"] == "partial"
+        fp = store.set_watermark_status.await_args.kwargs["error_fingerprint"]
+        assert fp is not None and len(fp) == 16
 
 
 # =============================================================================
@@ -2556,7 +2732,10 @@ class TestPostJobReindexTriggerResolvesItsOwnRepo:
         import pathlib
 
         return (
-            pathlib.Path(__file__).resolve().parents[1] / "orchestrator" / "main.py"
+            pathlib.Path(__file__).resolve().parents[1]
+            / "src"
+            / "orchestrator"
+            / "main.py"
         ).read_text(encoding="utf-8")
 
     def test_trigger_does_not_pin_repo_name(self):
@@ -2593,20 +2772,20 @@ class TestManualReindexProjectionSettlement:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("status", ["completed", "up-to-date"])
     async def test_success_settles_latest_canonical_intents(self, status):
-        from main import _reindex_project_kb
+        from orchestrator.main import _reindex_project_kb
 
         project_id = str(uuid.uuid4())
         db = AsyncMock()
         db.mark_knowledge_projections_synced.return_value = 2
         reindex = AsyncMock(return_value={"status": status, "upserted": 1})
         with (
-            patch("main.postgres_db", db),
-            patch("main.vector_db", MagicMock()),
+            patch("orchestrator.main.postgres_db", db),
+            patch("orchestrator.main.vector_db", MagicMock()),
             patch(
-                "main._build_kb_embedding_service",
+                "orchestrator.main._build_kb_embedding_service",
                 AsyncMock(return_value=MagicMock()),
             ),
-            patch("services.kb_reindex.reindex_kb", reindex),
+            patch("orchestrator.services.kb_reindex.reindex_kb", reindex),
         ):
             result = await _reindex_project_kb(
                 project_id,
@@ -2620,19 +2799,19 @@ class TestManualReindexProjectionSettlement:
 
     @pytest.mark.asyncio
     async def test_partial_reindex_does_not_claim_projection_convergence(self):
-        from main import _reindex_project_kb
+        from orchestrator.main import _reindex_project_kb
 
         project_id = str(uuid.uuid4())
         db = AsyncMock()
         with (
-            patch("main.postgres_db", db),
-            patch("main.vector_db", MagicMock()),
+            patch("orchestrator.main.postgres_db", db),
+            patch("orchestrator.main.vector_db", MagicMock()),
             patch(
-                "main._build_kb_embedding_service",
+                "orchestrator.main._build_kb_embedding_service",
                 AsyncMock(return_value=MagicMock()),
             ),
             patch(
-                "services.kb_reindex.reindex_kb",
+                "orchestrator.services.kb_reindex.reindex_kb",
                 AsyncMock(return_value={"status": "partial", "errors": 1}),
             ),
         ):

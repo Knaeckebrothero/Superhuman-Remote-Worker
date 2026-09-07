@@ -1,0 +1,172 @@
+"""Build failures and missing reused images must prevent chart publication."""
+
+import importlib.util
+import json
+from pathlib import Path
+import subprocess
+
+import pytest
+import yaml
+
+
+SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "verify_chart_images.py"
+SPEC = importlib.util.spec_from_file_location("verify_chart_images", SCRIPT)
+assert SPEC and SPEC.loader
+gate = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(gate)
+
+
+def needs(*, changed="true", result="success"):
+    return {
+        "architecture": {"result": "success"},
+        "changes": {
+            "result": "success",
+            "outputs": {
+                key: value
+                for component in gate.COMPONENTS
+                for key, value in ((component, changed), (component + "-sha", "a" * 40))
+            },
+        },
+        **{"build-" + component: {"result": result} for component in gate.COMPONENTS},
+    }
+
+
+@pytest.mark.parametrize("result", ["failure", "cancelled", "skipped", None])
+def test_changed_image_requires_a_successful_build(result):
+    state = needs()
+    state["build-agent"]["result"] = result
+    with pytest.raises(ValueError, match="agent: rebuild=true"):
+        gate.expected_images(state, "ghcr.io/example/srw")
+
+
+def test_verified_unchanged_images_may_be_reused():
+    refs = gate.expected_images(
+        needs(changed="false", result="skipped"), "ghcr.io/example/srw"
+    )
+    observed = []
+
+    def inspect(ref):
+        observed.append(ref)
+        return "sha256:" + "b" * 64
+
+    verified = gate.verify_images(refs, inspect)
+    assert set(verified) == set(gate.COMPONENTS)
+    assert observed == list(refs.values())
+    assert all(ref.endswith(":sha-aaaaaaa") for ref in observed)
+
+
+@pytest.mark.parametrize("digest", ["", "sha256:bad", "sha256:" + "b" * 64 + "\nBAD=1"])
+def test_registry_digest_must_be_valid(digest):
+    refs = gate.expected_images(needs(), "ghcr.io/example/srw")
+    with pytest.raises(ValueError, match="valid digest"):
+        gate.verify_images(refs, lambda ref: digest)
+
+
+def test_missing_registry_image_is_a_failure_even_when_build_was_skipped():
+    refs = gate.expected_images(
+        needs(changed="false", result="skipped"), "ghcr.io/example/srw"
+    )
+
+    def missing(ref):
+        raise subprocess.CalledProcessError(1, ["inspect", ref])
+
+    with pytest.raises(subprocess.CalledProcessError):
+        gate.verify_images(refs, missing)
+
+
+@pytest.mark.parametrize("sha", ["", "latest", "a" * 7, None])
+def test_component_revision_has_no_run_sha_fallback(sha):
+    state = needs()
+    state["changes"]["outputs"]["mcp-sha"] = sha
+    with pytest.raises(ValueError, match="mcp: missing or invalid"):
+        gate.expected_images(state, "ghcr.io/example/srw")
+
+
+@pytest.mark.parametrize("job", ["architecture", "changes"])
+def test_missing_or_failed_prerequisite_refuses_publication(job):
+    state = needs()
+    state[job]["result"] = "failure"
+    with pytest.raises(ValueError, match="did not succeed"):
+        gate.expected_images(state, "ghcr.io/example/srw")
+
+
+def test_release_requires_all_builds_at_the_release_revision():
+    state = needs()
+    del state["changes"]
+    refs = gate.expected_images(state, "ghcr.io/example/srw", "c" * 40)
+    assert all(ref.endswith(":sha-ccccccc") for ref in refs.values())
+    state["build-vm-controller"]["result"] = "skipped"
+    with pytest.raises(ValueError, match="vm-controller: rebuild=true"):
+        gate.expected_images(state, "ghcr.io/example/srw", "c" * 40)
+
+
+def test_cli_writes_no_partial_outputs_when_the_last_registry_image_is_missing(
+    tmp_path, monkeypatch
+):
+    output = tmp_path / "github.env"
+    output.write_text("EXISTING=value\n")
+    inventory = tmp_path / "images.json"
+    monkeypatch.setenv("NEEDS_JSON", json.dumps(needs()))
+    monkeypatch.setenv("GITHUB_ENV", str(output))
+    observed = []
+
+    def inspect(args, **kwargs):
+        observed.append(args[4])
+        if len(observed) == len(gate.COMPONENTS):
+            raise subprocess.CalledProcessError(1, args)
+        return subprocess.CompletedProcess(args, 0, "sha256:" + "b" * 64 + "\n")
+
+    monkeypatch.setattr(gate.subprocess, "run", inspect)
+    result = gate.main(
+        ["--repository", "ghcr.io/example/srw", "--inventory", str(inventory)]
+    )
+    assert result == 1
+    assert len(observed) == len(gate.COMPONENTS)
+    assert output.read_text() == "EXISTING=value\n"
+    assert not inventory.exists()
+
+
+@pytest.mark.parametrize(
+    ("workflow", "publication"),
+    [("develop", "deploy-experimental"), ("main", "release-chart")],
+)
+def test_architecture_and_verified_images_gate_publication_on_the_tested_revision(
+    workflow, publication
+):
+    path = SCRIPT.parents[1] / ".github" / "workflows" / f"{workflow}.yml"
+    jobs = yaml.safe_load(path.read_text())["jobs"]
+    architecture = jobs["architecture"]
+    assert not architecture.get("continue-on-error", False)
+    checks = [
+        step for step in architecture["steps"] if "lint-imports" in step.get("run", "")
+    ]
+    assert checks and all(not step.get("continue-on-error", False) for step in checks)
+
+    for name, job in jobs.items():
+        for step in job.get("steps", []):
+            if step.get("uses", "").startswith("actions/checkout@"):
+                assert step.get("with", {}).get("ref") == "${{ github.sha }}", name
+        if name.startswith("build-") or name == publication:
+            assert "architecture" in job["needs"], name
+            assert "needs.architecture.result == 'success'" in job["if"], name
+
+    publish = jobs[publication]
+    assert all(
+        "build-" + component in publish["needs"] for component in gate.COMPONENTS
+    )
+    steps = publish["steps"]
+    verification_index = next(
+        i
+        for i, step in enumerate(steps)
+        if "scripts/verify_chart_images.py" in step.get("run", "")
+    )
+    package_index = next(
+        i for i, step in enumerate(steps) if "helm package" in step.get("run", "")
+    )
+    verification = steps[verification_index]
+    assert verification_index < package_index
+    assert verification["env"]["NEEDS_JSON"] == "${{ toJSON(needs) }}"
+    assert not verification.get("continue-on-error", False)
+    assert all(
+        step.get("if", "") != "always()" for step in steps[verification_index + 1 :]
+    )

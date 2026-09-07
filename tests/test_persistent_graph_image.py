@@ -25,13 +25,13 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
-from src.persistent_graph import (
+from agent.persistent_graph import (
     PersistentLoopCallbacks,
     run_persistent_loop,
 )
-from src.services.image_content import IMAGE_DATA_TAG_TEMPLATE
-from src.shared.orch_surface.jobs import JobToolResult, ToolImageAttachment
-from src.tools.orchestrator.jobs import _agent_tool_result
+from agent.services.image_content import IMAGE_DATA_TAG_TEMPLATE
+from shared.orch_surface.jobs import JobToolResult, ToolImageAttachment
+from agent.tools.orchestrator.jobs import _agent_tool_result
 
 
 # =============================================================================

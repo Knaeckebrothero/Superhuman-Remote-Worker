@@ -21,7 +21,7 @@ Contract summary (full invariants on the functions in ``queries.py``):
   :func:`unpark_unit`.
 """
 
-from .queries import (
+from shared.run_queue.queries import (
     AFFINITY_GRACE_SECONDS,
     ENQUEUE_DEDUPED,
     ENQUEUE_INPUT_RECORDED,
@@ -58,7 +58,12 @@ from .queries import (
     release_unit,
     unpark_unit,
 )
-from .types import ClaimedUnit, EnqueueResult, QueueWatermarks, StolenUnit
+from shared.run_queue.types import (
+    ClaimedUnit,
+    EnqueueResult,
+    QueueWatermarks,
+    StolenUnit,
+)
 
 __all__ = [
     "AFFINITY_GRACE_SECONDS",

@@ -60,13 +60,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.core.session_tool_overrides import SESSION_TOOL_OVERRIDE_NAMES
-from src.core.tool_policy import (
+from shared.runtime.core.session_tool_overrides import SESSION_TOOL_OVERRIDE_NAMES
+from shared.runtime.core.tool_policy import (
     MCP_WILDCARD,
     ToolPolicyError,
     validate_tool_override_fragment,
 )
-from src.tools.registry import TOOL_REGISTRY, get_tools_by_category
+from agent.tools.registry import TOOL_REGISTRY, get_tools_by_category
 
 #: The categories the cockpit's New Session form renders as checkboxes, in
 #: order. Mirror of SESSION_TOOL_CATEGORIES in
@@ -139,7 +139,10 @@ class TestEveryRenderedCategoryIsHonoured:
         they are in-category, so assert it against the registry rather than
         trusting it.
         """
-        from src.core.loader import load_and_merge_config, resolve_config_path
+        from shared.runtime.core.loader import (
+            load_and_merge_config,
+            resolve_config_path,
+        )
 
         for base in ("session_base", "worker_base"):
             path, _ = resolve_config_path(base)
@@ -167,7 +170,7 @@ class TestCrossCategorySmuggling:
             ("citation", "run_command"),
             ("knowledge", "browser_navigate"),
             ("git", "kb_write"),
-            ("research", "spawn_subagent"),
+            ("research", "delegate_agent"),
             # And the ones no surface ever checked.
             ("workspace", "run_command"),
             ("core", "web_search"),
@@ -382,7 +385,7 @@ class TestTheGateIsNotThePDP:
         ) == {"shell": ["run_command"], "browser_direct": ["browser_click"]}
 
     def test_the_pdp_still_sees_what_this_lets_through(self):
-        from src.core.capability_grants import evaluate
+        from shared.runtime.core.capability_grants import evaluate
 
         fragment = {
             "tools": validate_tool_override_fragment(
@@ -464,26 +467,47 @@ def job_db():
 
 
 async def _create_job(db, request, body):
-    import security.access as access_module
-    from main import create_job
+    import orchestrator.security.access as access_module
+    from orchestrator.main import create_job
 
     user = {"id": USER_ID, "is_admin": False}
     patches = [
         patch.object(access_module, "_INTERNAL_KEY", "secret"),
-        patch("main.require_approved_user", AsyncMock(return_value=user)),
-        patch("security.access.require_approved_user", AsyncMock(return_value=user)),
-        patch("main.postgres_db", db),
-        patch("main._enforce_readiness_gate", AsyncMock(return_value=None)),
-        patch("main._thread_project_ids", AsyncMock(return_value=[])),
-        patch("main._revalidate_thread_project_ids", AsyncMock(return_value=[])),
-        patch("main._require_job_project_access", AsyncMock(return_value=None)),
-        patch("main._is_experts_db_enabled", MagicMock(return_value=False)),
-        patch("main._inherit_parent_datasource_ids", AsyncMock(return_value=[])),
-        patch("main._authorize_thread_datasource_ids", AsyncMock(return_value=[])),
-        patch("main._enforce_job_create_grants", AsyncMock(return_value=None)),
-        patch("services.job_provisioning.provision_job_repo", AsyncMock()),
-        patch("main._spawn_scholar_subjob", AsyncMock(return_value=None)),
-        patch("main._trigger_dispatch", MagicMock()),
+        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user)),
+        patch(
+            "orchestrator.security.access.require_approved_user",
+            AsyncMock(return_value=user),
+        ),
+        patch("orchestrator.main.postgres_db", db),
+        patch(
+            "orchestrator.main._enforce_readiness_gate", AsyncMock(return_value=None)
+        ),
+        patch("orchestrator.main._thread_project_ids", AsyncMock(return_value=[])),
+        patch(
+            "orchestrator.main._revalidate_thread_project_ids",
+            AsyncMock(return_value=[]),
+        ),
+        patch(
+            "orchestrator.main._require_job_project_access",
+            AsyncMock(return_value=None),
+        ),
+        patch(
+            "orchestrator.main._is_experts_db_enabled", MagicMock(return_value=False)
+        ),
+        patch(
+            "orchestrator.main._inherit_parent_datasource_ids",
+            AsyncMock(return_value=[]),
+        ),
+        patch(
+            "orchestrator.main._authorize_thread_datasource_ids",
+            AsyncMock(return_value=[]),
+        ),
+        patch(
+            "orchestrator.main._enforce_job_create_grants", AsyncMock(return_value=None)
+        ),
+        patch("orchestrator.services.job_provisioning.provision_job_repo", AsyncMock()),
+        patch("orchestrator.main._spawn_scholar_subjob", AsyncMock(return_value=None)),
+        patch("orchestrator.main._trigger_dispatch", MagicMock()),
     ]
     with ExitStack() as stack:
         for p in patches:
@@ -500,7 +524,7 @@ class TestJobCreateBoundary:
         ``tools.<anything>: [<any registered name>]`` straight through, with
         only a dispatch PDP that keys off the CATEGORY behind it."""
         from fastapi import HTTPException
-        from main import JobCreate
+        from orchestrator.main import JobCreate
 
         with pytest.raises(HTTPException) as exc:
             await _create_job(
@@ -521,7 +545,7 @@ class TestJobCreateBoundary:
         and ``create_job`` forwards a MODEL-AUTHORED config_override
         verbatim — which is precisely a caller that can write this fragment."""
         from fastapi import HTTPException
-        from main import JobCreate
+        from orchestrator.main import JobCreate
 
         parent = str(uuid.uuid4())
         job_db.get_job = AsyncMock(
@@ -548,7 +572,7 @@ class TestJobCreateBoundary:
     async def test_a_legitimate_fragment_is_persisted_normalised(
         self, job_db, job_request
     ):
-        from main import JobCreate
+        from orchestrator.main import JobCreate
 
         await _create_job(
             job_db,
@@ -572,7 +596,7 @@ class TestJobCreateBoundary:
         """``src/api/orchestrator_client.py`` POSTs this exact fragment for
         every self-verifying job — the one real internal caller with a
         ``tools`` block on this endpoint."""
-        from main import JobCreate
+        from orchestrator.main import JobCreate
 
         await _create_job(
             job_db,
@@ -594,7 +618,7 @@ class TestJobCreateBoundary:
 
     @pytest.mark.asyncio
     async def test_a_job_without_tools_is_untouched(self, job_db, job_request):
-        from main import JobCreate
+        from orchestrator.main import JobCreate
 
         await _create_job(
             job_db,
@@ -612,7 +636,7 @@ class TestJobCreateBoundary:
 
 class TestLiveSessionSanitiser:
     def test_every_category_survives_the_agent_side_sanitiser(self):
-        from src.api.persistent_app import _sanitize_live_session_config_override
+        from agent.api.persistent_app import _sanitize_live_session_config_override
 
         result = _sanitize_live_session_config_override(
             {"tools": {"canvas": [], "research": [], "shell": ["run_command"]}}
@@ -624,7 +648,7 @@ class TestLiveSessionSanitiser:
         }
 
     def test_a_smuggle_raises_rather_than_being_filtered_out(self):
-        from src.api.persistent_app import _sanitize_live_session_config_override
+        from agent.api.persistent_app import _sanitize_live_session_config_override
 
         with pytest.raises(ValueError, match="run_command"):
             _sanitize_live_session_config_override(
@@ -632,7 +656,7 @@ class TestLiveSessionSanitiser:
             )
 
     def test_the_caller_owned_payload_is_not_mutated(self):
-        from src.api.persistent_app import _sanitize_live_session_config_override
+        from agent.api.persistent_app import _sanitize_live_session_config_override
 
         payload = {"tools": {"canvas": True}}
         _sanitize_live_session_config_override(payload)
@@ -749,6 +773,139 @@ def _persisted_thread_override(conn) -> dict:
 
 class TestSessionCreateBoundary:
     @pytest.mark.asyncio
+    async def test_create_skips_optional_cloud_without_active_instance_authority(
+        self, session_create_env, monkeypatch
+    ):
+        main, _, _, _ = session_create_env
+        for_owner = MagicMock(
+            side_effect=AssertionError(
+                "an unavailable optional cloud must not be resolved"
+            )
+        )
+        monkeypatch.setattr(
+            main,
+            "main_cloud_router",
+            SimpleNamespace(active_instance_id=None, for_owner=for_owner),
+        )
+
+        result = await main.create_thread(
+            main.ThreadCreateRequest(title="session without main cloud"),
+            MagicMock(),
+        )
+
+        assert result == {"thread_id": SESSION_THREAD_ID, "status": "created"}
+        for_owner.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "officer",
+        [
+            {"enabled": True, "auto_pull": False},
+            {"enabled": True, "worker_spend_ceiling_daily": 5.0},
+            {
+                "enabled": True,
+                "slots": {"line": {"count": 1, "spend_ceiling_daily": 2.0}},
+            },
+        ],
+    )
+    async def test_generic_create_rejects_post_owned_authority_even_with_capability(
+        self, session_create_env, officer
+    ):
+        main, db, _, grants = session_create_env
+
+        with pytest.raises(main.HTTPException) as exc:
+            await main.create_thread(
+                main.ThreadCreateRequest(
+                    title="hand-rolled officer",
+                    project_id=SESSION_THREAD_ID,
+                    config_override={"officer": officer},
+                ),
+                MagicMock(),
+            )
+
+        assert exc.value.status_code == 400
+        db.create_thread.assert_not_awaited()
+        grants.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_hand_rolled_officer_requires_owner_not_only_capability(
+        self, session_create_env
+    ):
+        main, db, _, grants = session_create_env
+        db.get_user_role_in_project = AsyncMock(return_value="editor")
+
+        with pytest.raises(main.HTTPException) as exc:
+            await main.create_thread(
+                main.ThreadCreateRequest(
+                    title="hand-rolled officer",
+                    project_id=SESSION_THREAD_ID,
+                    config_override={"officer": {"enabled": True}},
+                ),
+                MagicMock(),
+            )
+
+        assert exc.value.status_code == 403
+        assert "Project owner" in exc.value.detail
+        db.create_thread.assert_not_awaited()
+        grants.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "release_enabled,expected_status", [(False, 409), (True, 400)]
+    )
+    async def test_effective_account_auto_pull_cannot_bypass_release_or_post_owner(
+        self, session_create_env, monkeypatch, release_enabled, expected_status
+    ):
+        main, db, _, _ = session_create_env
+        monkeypatch.setattr(main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", release_enabled)
+        monkeypatch.setattr(
+            main,
+            "_resolve_session_account_defaults",
+            AsyncMock(return_value={"officer": {"enabled": True, "auto_pull": True}}),
+        )
+
+        with pytest.raises(main.HTTPException) as exc:
+            await main.create_thread(
+                main.ThreadCreateRequest(
+                    title="default-derived officer", project_id=SESSION_THREAD_ID
+                ),
+                MagicMock(),
+            )
+
+        assert exc.value.status_code == expected_status
+        db.create_thread.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "post_owned",
+        [
+            {"worker_spend_ceiling_daily": 7.0},
+            {"slots": {"line": {"count": 1, "spend_ceiling_daily": 3.0}}},
+        ],
+    )
+    async def test_effective_account_spend_cannot_rehydrate_into_an_officer(
+        self, session_create_env, monkeypatch, post_owned
+    ):
+        main, db, _, _ = session_create_env
+        monkeypatch.setattr(
+            main,
+            "_resolve_session_account_defaults",
+            AsyncMock(return_value={"officer": {"enabled": True, **post_owned}}),
+        )
+
+        with pytest.raises(
+            main.HTTPException, match="owned by the durable Officer Post"
+        ):
+            await main.create_thread(
+                main.ThreadCreateRequest(
+                    title="default-derived officer", project_id=SESSION_THREAD_ID
+                ),
+                MagicMock(),
+            )
+
+        db.create_thread.assert_not_awaited()
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("role", ["editor", "viewer"])
     async def test_officer_conference_requires_current_management_authority(
         self, session_create_env, monkeypatch, role
@@ -804,7 +961,8 @@ class TestSessionCreateBoundary:
         pinned_provision = AsyncMock()
 
         with patch(
-            "services.provision_or_assign.provision_or_assign", pinned_provision
+            "orchestrator.services.provision_or_assign.provision_or_assign",
+            pinned_provision,
         ):
             result = await main.create_thread(
                 main.ThreadCreateRequest(
@@ -822,7 +980,7 @@ class TestSessionCreateBoundary:
             "enabled": False,
             "conference": False,
         }
-        creation = initial["workspace_container"]["_stateless_runtime_creation"]
+        creation = initial["workspace_container"]["_runtime_creation"]
         assert creation["mode"] == "create"
         assert creation["attempted"] is False
         assert creation["replaces_uid"] is None
@@ -895,7 +1053,8 @@ class TestSessionCreateBoundary:
         pinned_provision = AsyncMock()
 
         with patch(
-            "services.provision_or_assign.provision_or_assign", pinned_provision
+            "orchestrator.services.provision_or_assign.provision_or_assign",
+            pinned_provision,
         ):
             await main.create_thread(
                 main.ThreadCreateRequest(
@@ -965,7 +1124,8 @@ class TestSessionCreateBoundary:
 
         pinned_provision = AsyncMock()
         with patch(
-            "services.provision_or_assign.provision_or_assign", pinned_provision
+            "orchestrator.services.provision_or_assign.provision_or_assign",
+            pinned_provision,
         ):
             await main.create_thread(
                 main.ThreadCreateRequest(title=f"{class_source} officer"),
@@ -975,8 +1135,92 @@ class TestSessionCreateBoundary:
 
         assert db.create_thread.await_args.kwargs["execution_lane"] == "pinned"
         persisted = _persisted_thread_override(conn)
-        assert persisted["officer"] == {"enabled": True, "conference": False}
+        assert persisted["officer"] == {
+            "enabled": True,
+            "conference": False,
+            "auto_pull": False,
+        }
         pinned_provision.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_explicit_post_commission_uses_dedicated_lifecycle_substrate(
+        self, session_create_env, monkeypatch
+    ):
+        """A background Officer must be born on the Pod its recycler owns.
+
+        Ordinary pinned sessions may use the warm-pool fast path. A durable
+        Post commission may not: the Officer lifecycle scanner intentionally
+        owns only finalizer-protected ``persistent-agent`` Pods, so a warm
+        binding would be held as ``unsupported_pod_authority`` on its first
+        reconciliation pass.
+        """
+        import asyncio
+
+        main, db, _, _ = session_create_env
+        db.get_officer_thread_for_project = AsyncMock(return_value=None)
+        db.get_user_role_in_project = AsyncMock(return_value="owner")
+        db.register_project_officer_thread = AsyncMock(
+            return_value={
+                "commission_continuity": {"brief_enqueued": True},
+            }
+        )
+        dedicated_create = AsyncMock(
+            return_value=SimpleNamespace(
+                usable=True,
+                status=SimpleNamespace(value="created"),
+                failure_class=None,
+            )
+        )
+        monkeypatch.setattr(
+            main,
+            "persistent_provisioner",
+            SimpleNamespace(is_available=True, create_agent_pod=dedicated_create),
+        )
+        monkeypatch.setattr(
+            main,
+            "agent_provisioner",
+            SimpleNamespace(is_available=True, in_cluster=True),
+        )
+        monkeypatch.setattr(main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", True)
+        monkeypatch.setattr(
+            main, "ensure_virtual_thread_workspace_binding", AsyncMock()
+        )
+        warm_provision = AsyncMock()
+        request = main.ThreadCreateRequest(
+            title="commissioned officer",
+            project_id=SESSION_THREAD_ID,
+            config_name="centurion",
+            config_override={"workspace": {"backend": "virtual"}},
+        )
+        request._officer_post_config_snapshot = {
+            "officer": {
+                "enabled": True,
+                "auto_pull": True,
+                "slots": {
+                    "test": {
+                        "count": 0,
+                        "category": "tester",
+                        "model": "MiniMax-M3",
+                        "backend": "sandbox",
+                    }
+                },
+            },
+            "workspace": {"backend": "virtual"},
+        }
+
+        with patch(
+            "orchestrator.services.provision_or_assign.provision_or_assign",
+            warm_provision,
+        ):
+            await main.create_thread(request, MagicMock())
+            await asyncio.sleep(0)
+
+        dedicated_create.assert_awaited_once_with(
+            SESSION_THREAD_ID,
+            config_name="centurion",
+            expected_runtime_generation=SESSION_RUNTIME_GENERATION,
+        )
+        warm_provision.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_explicit_default_request_materializes_policy_selection(
@@ -990,7 +1234,10 @@ class TestSessionCreateBoundary:
             )
         )
 
-        with patch("services.datasource_policy.default_datasource_selection", resolver):
+        with patch(
+            "orchestrator.services.datasource_policy.default_datasource_selection",
+            resolver,
+        ):
             await main.create_thread(
                 main.ThreadCreateRequest(
                     title="t",
@@ -1295,7 +1542,7 @@ class TestAutomationBoundary:
         )
         # The router late-imports `from main import postgres_db`, which
         # resolves sys.modules["main"] — patching orchestrator.main misses it.
-        monkeypatch.setattr("main.postgres_db", db)
+        monkeypatch.setattr("orchestrator.main.postgres_db", db)
         monkeypatch.setattr(
             mod, "require_approved_user", AsyncMock(return_value=caller)
         )
@@ -1524,7 +1771,8 @@ class TestNoModelAuthoredPathReachesSessionCreate:
 
     The property that does is that **no model-authored path reaches session
     create's `config_override`**: the MCP `create_persistent_thread` tool
-    exposes no such parameter, and `spawn_subagent` uses a fixed environment.
+    exposes no such parameter, and `delegate_agent` builds its child from the
+    expert's roster, never from a model-authored config.
     That is load-bearing and otherwise invisible — adding the parameter would
     silently dissolve the mitigation. So it is pinned here.
     """
@@ -1536,7 +1784,7 @@ class TestNoModelAuthoredPathReachesSessionCreate:
         import ast
         from pathlib import Path
 
-        tree = ast.parse(Path("orchestrator/mcp/server.py").read_text())
+        tree = ast.parse(Path("src/mcp_server/server.py").read_text())
         fns = [
             n
             for n in ast.walk(tree)
@@ -1848,7 +2096,7 @@ class TestExpertWriteBoundary:
         `enumerate_only` enumeration for a category that refuses `true`. All
         three have to survive this gate."""
         main, db = expert_env
-        from src.core.tool_policy import enumerate_only_members
+        from shared.runtime.core.tool_policy import enumerate_only_members
 
         payload = {
             "tools": {

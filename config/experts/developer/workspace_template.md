@@ -49,12 +49,13 @@ Rules:
 ## Repository
 
 Framework, conventions, and key paths discovered during exploration:
+- **Repository**: (clone name from README.md → repos/<name>/, and its base branch)
 - **Stack**: (language, framework, version)
 - **Test framework**: (pytest, vitest, jest, etc.)
 - **Test command**: (e.g., pytest tests/ -x -v, npm test)
 - **Lint command**: (e.g., ruff check, eslint)
-- **Source dir**: (e.g., repo/src/, repo/app/)
-- **Test dir**: (e.g., repo/tests/, repo/test/)
+- **Source dir**: (e.g., repos/<name>/src/, repos/<name>/app/)
+- **Test dir**: (e.g., repos/<name>/tests/, repos/<name>/test/)
 - **Entry points**: (key files relevant to the task)
 - **Conventions**: (naming, patterns, style observed)
 
@@ -73,7 +74,7 @@ Current position (update each strategic phase):
 - **Phase**: (name from plan.md)
 - **tdd_phase**: (spec / red / green / refactor / integration — current or next)
 - **TDD cycle position**: (e.g., "AC-1, AC-2 at red; AC-3 not_started")
-- **Branch**: (current working branch)
+- **Branch**: (in repos/<name>/ — current working branch, and the base branch from README.md the PR targets)
 - **Blocked**: (active blockers, or "none")
 
 (This section can be freely rewritten during strategic phases.)

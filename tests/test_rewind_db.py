@@ -5,8 +5,8 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from src.api.lease_context import LeaseLostError
-from src.database.postgres_db import PostgresDB
+from agent.api.lease_context import LeaseLostError
+from agent.database.postgres_db import PostgresDB
 
 
 class _FakeTxn:
@@ -302,11 +302,11 @@ def test_record_turn_commit_stateless_fence_is_first_statement():
 
     with (
         patch(
-            "src.database.postgres_db._active_run_queue_lease",
+            "agent.database.postgres_db._active_run_queue_lease",
             return_value=lease,
         ),
         patch(
-            "src.database.postgres_db._require_run_queue_fence",
+            "agent.database.postgres_db._require_run_queue_fence",
             side_effect=fence,
         ),
     ):
@@ -324,11 +324,11 @@ def test_record_turn_commit_stale_lease_writes_nothing():
     db = _db_with(conn)
     with (
         patch(
-            "src.database.postgres_db._active_run_queue_lease",
+            "agent.database.postgres_db._active_run_queue_lease",
             return_value=("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 17),
         ),
         patch(
-            "src.database.postgres_db._require_run_queue_fence",
+            "agent.database.postgres_db._require_run_queue_fence",
             new=AsyncMock(side_effect=LeaseLostError("stale")),
         ),
         pytest.raises(LeaseLostError, match="stale"),
@@ -361,11 +361,11 @@ def test_list_workspace_turn_commits_is_fenced_before_complete_ordered_read():
 
     with (
         patch(
-            "src.database.postgres_db._active_run_queue_lease",
+            "agent.database.postgres_db._active_run_queue_lease",
             return_value=lease,
         ),
         patch(
-            "src.database.postgres_db._require_run_queue_fence",
+            "agent.database.postgres_db._require_run_queue_fence",
             side_effect=fence,
         ),
     ):
@@ -397,7 +397,7 @@ def test_live_readers_filter_tombstones():
     """The three agent-side conversation reads must exclude rewound rows."""
     import inspect
 
-    from src.database import postgres_db as mod
+    from agent.database import postgres_db as mod
 
     hist_src = inspect.getsource(mod.PostgresDB.get_thread_messages_history)
     ckpt_src = inspect.getsource(mod.PostgresDB.get_latest_compaction_checkpoint)

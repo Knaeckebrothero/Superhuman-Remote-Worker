@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from services.canvas_proxy_policy import (
+from orchestrator.services.canvas_proxy_policy import (
     CanvasProxyError,
     CanvasProxyLimits,
     CanvasPublicOrigin,

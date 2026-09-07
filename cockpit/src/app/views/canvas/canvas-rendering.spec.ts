@@ -1,6 +1,7 @@
 import {describe, expect, it} from 'vitest';
 import {CanvasState} from '../../core/models/canvas.model';
 import {
+  CANVAS_FRAME_WRAPPER_MAX_OUTPUT_CHARS,
   CANVAS_MARKDOWN_MAX_SOURCE_CHARS,
   CANVAS_MARKDOWN_MAX_TOKENS,
   CANVAS_MATH_MAX_EXPRESSIONS,
@@ -247,6 +248,8 @@ describe('Dynamic Canvas rendering trust boundary', () => {
       <form action="https://evil.test/"><input name="secret"><button>Send</button></form>
       <a id="outside" href="https://evil.test/" onclick="steal()">outside</a>
       <a id="inside" href="#section">inside</a>
+      <a id="dangling" href="#missing">missing</a>
+      <section id="section">target</section>
       <img id="remote" src="https://tracker.test/pixel.png" onerror="steal()">
       <img id="inline" alt="chart" src="data:image/png;base64,iVBORw0KGgo=">
       <style>@import 'https://evil.test/x.css'; .x { background:url(https://evil.test/x) }</style>
@@ -256,15 +259,25 @@ describe('Dynamic Canvas rendering trust boundary', () => {
     const srcdoc = result.html;
 
     expect(srcdoc).toContain(STATIC_HTML_CSP.replace(/'/g, '&#39;'));
-    expect(srcdoc).not.toMatch(/<script|<form|<input|<button|<base/i);
+    expect(srcdoc).not.toMatch(/<script|<form|<input|<button/i);
     expect(srcdoc).not.toMatch(/onerror|onclick|https:\/\/evil\.test|tracker\.test|@import/i);
     const parsed = new DOMParser().parseFromString(srcdoc, 'text/html');
+    const headElements = Array.from(parsed.head.children);
+    expect(headElements[0]?.getAttribute('http-equiv')).toBe('Content-Security-Policy');
+    expect(headElements[1]?.tagName).toBe('BASE');
+    expect(headElements[1]?.getAttribute('href')).toBe('about:srcdoc');
+    expect(headElements[1]?.getAttribute('target')).toBe('_self');
+    expect(parsed.querySelectorAll('base')).toHaveLength(1);
     const outside = parsed.querySelector('#user-content-outside');
     const inside = parsed.querySelector('#user-content-inside');
+    const missing = parsed.querySelector('#user-content-dangling');
+    const section = parsed.querySelector('#user-content-section');
     const remote = parsed.querySelector('#user-content-remote');
     const inline = parsed.querySelector('#user-content-inline');
     expect(outside?.hasAttribute('href')).toBe(false);
-    expect(inside?.getAttribute('href')).toBe('#section');
+    expect(inside?.getAttribute('href')).toBe('#user-content-section');
+    expect(missing?.hasAttribute('href')).toBe(false);
+    expect(section?.textContent).toBe('target');
     expect(remote?.hasAttribute('src')).toBe(false);
     expect(inline?.hasAttribute('src')).toBe(false);
     const content = parsed.querySelector('.x');
@@ -278,6 +291,7 @@ describe('Dynamic Canvas rendering trust boundary', () => {
       <!doctype html>
       <html>
         <head>
+          <base href="https://evil.test/" target="_top">
           <style>:root { --accent: green } .card { color: var(--accent) }</style>
         </head>
         <body>
@@ -292,33 +306,72 @@ describe('Dynamic Canvas rendering trust boundary', () => {
     const firstHeadElement = parsed.head.firstElementChild;
     expect(firstHeadElement?.getAttribute('http-equiv')).toBe('Content-Security-Policy');
     expect(firstHeadElement?.getAttribute('content')).toBe(INTERACTIVE_HTML_CSP);
+    const bases = parsed.querySelectorAll('base');
+    expect(bases).toHaveLength(2);
+    expect(bases[0].getAttribute('href')).toBe('about:srcdoc');
+    expect(bases[0].getAttribute('target')).toBe('_self');
+    expect(bases[1].getAttribute('href')).toBe('https://evil.test/');
     expect(parsed.querySelector('style')?.textContent).toContain('var(--accent)');
     expect(parsed.querySelector('script')?.textContent).toContain('dataset.ready');
     expect(parsed.querySelector('a')?.getAttribute('href')).toBe('#dashboard');
   });
 
-  it('loads Canvas documents from Blob URLs inside a navigation-blocking wrapper', () => {
-    const staticWrapper = new DOMParser().parseFromString(
-      buildCanvasFrameWrapper('blob:https://cockpit.test/static', 'Static preview', false),
-      'text/html',
-    );
+  it('nests Canvas srcdoc documents inside renderer-specific navigation ceilings', () => {
+    const staticContent = '<!doctype html><html><body>Static</body></html>';
+    const staticResult = buildCanvasFrameWrapper(staticContent, 'Static preview', false);
+    expect(staticResult.errorCode).toBeNull();
+    const staticWrapper = new DOMParser().parseFromString(staticResult.html, 'text/html');
     const staticFrame = staticWrapper.querySelector('iframe');
-    expect(staticFrame?.getAttribute('src')).toBe('blob:https://cockpit.test/static');
+    expect(staticFrame?.hasAttribute('src')).toBe(false);
+    expect(staticFrame?.getAttribute('srcdoc')).toBe(staticContent);
     expect(staticFrame?.getAttribute('sandbox')).toBe('');
     expect(staticWrapper.querySelector('meta[http-equiv="Content-Security-Policy"]')
-      ?.getAttribute('content')).toContain('frame-src blob:');
+      ?.getAttribute('content')).toBe(STATIC_HTML_CSP);
 
+    const interactiveContent =
+      '<!doctype html><html><body><button onclick="run()">Run</button></body></html>';
+    const interactiveResult = buildCanvasFrameWrapper(
+      interactiveContent,
+      'Interactive preview',
+      true,
+    );
+    expect(interactiveResult.errorCode).toBeNull();
     const interactiveWrapper = new DOMParser().parseFromString(
-      buildCanvasFrameWrapper(
-        'blob:https://cockpit.test/interactive',
-        'Interactive preview',
-        true,
-      ),
+      interactiveResult.html,
       'text/html',
     );
     const interactiveFrame = interactiveWrapper.querySelector('iframe');
+    expect(interactiveFrame?.getAttribute('srcdoc')).toBe(interactiveContent);
     expect(interactiveFrame?.getAttribute('sandbox')).toBe('allow-scripts');
     expect(interactiveFrame?.getAttribute('allow')).toContain("camera 'none'");
+    expect(interactiveWrapper.querySelector('meta[http-equiv="Content-Security-Policy"]')
+      ?.getAttribute('content')).toBe(INTERACTIVE_HTML_CSP);
+    expect(interactiveResult.html.length).toBeLessThan(
+      CANVAS_FRAME_WRAPPER_MAX_OUTPUT_CHARS,
+    );
+  });
+
+  it('attribute-serializes adversarial srcdoc bytes without escaping the wrapper', () => {
+    const content =
+      '<!doctype html><html><body data-value="&quot;">' +
+      '</iframe><script>document.body.dataset.ready="yes"</script>&amp;</body></html>';
+    const result = buildCanvasFrameWrapper(content, '"<& preview', true);
+    expect(result.errorCode).toBeNull();
+
+    const wrapper = new DOMParser().parseFromString(result.html, 'text/html');
+    const frames = wrapper.querySelectorAll('iframe');
+    expect(frames).toHaveLength(1);
+    expect(frames[0].getAttribute('srcdoc')).toBe(content);
+    expect(frames[0].getAttribute('title')).toBe('"<& preview');
+    expect(wrapper.body.querySelector('script')).toBeNull();
+  });
+
+  it('rejects a wrapper input that bypasses the inner-document output ceiling', () => {
+    expect(buildCanvasFrameWrapper(
+      'x'.repeat(CANVAS_RENDER_MAX_OUTPUT_CHARS + 1),
+      'Oversized',
+      true,
+    )).toEqual({html: '', errorCode: 'canvas_content_too_complex'});
   });
 
   it('rejects Markdown token bombs before lexing while accepting plain text at the file ceiling', () => {

@@ -14,9 +14,9 @@ from uuid import UUID
 
 import pytest
 
-import src.api.persistent_app as pa
-from src.api.lease_context import LeaseHandle, current_lease
-from src.shared.thread_controls import ControlReceipt, ControlRequest
+import agent.api.persistent_app as pa
+from agent.api.lease_context import LeaseHandle, current_lease
+from shared.thread_controls import ControlReceipt, ControlRequest
 
 
 THREAD_ID = UUID("11111111-1111-4111-8111-111111111111")
@@ -183,10 +183,10 @@ async def test_drain_journals_and_finalizes_before_synchronous_ram_apply(
     apply_mock = MagicMock(side_effect=apply)
 
     with (
-        patch("src.shared.thread_controls.owner_fence_current", owner_fence),
-        patch("src.shared.thread_controls.adopt_next_pinned_control_request", adopt),
-        patch("src.shared.thread_controls.fetch_next_control_request", fetch_next),
-        patch("src.shared.thread_controls.fetch_control_receipt", fetch_receipt),
+        patch("shared.thread_controls.owner_fence_current", owner_fence),
+        patch("shared.thread_controls.adopt_next_pinned_control_request", adopt),
+        patch("shared.thread_controls.fetch_next_control_request", fetch_next),
+        patch("shared.thread_controls.fetch_control_receipt", fetch_receipt),
         patch.object(pa, "_describe_control_request", describe_mock),
         patch.object(pa, "_broadcast_durable", journal_mock),
         patch.object(pa, "_finalize_durable_control", finalize_mock),
@@ -245,16 +245,16 @@ async def test_workspace_undo_effect_precedes_owner_fenced_journal_and_finalize(
     finalize_mock = AsyncMock(side_effect=finalize)
     with (
         patch(
-            "src.shared.thread_controls.owner_fence_current",
+            "shared.thread_controls.owner_fence_current",
             AsyncMock(return_value=True),
         ),
         patch(
-            "src.shared.thread_controls.adopt_next_pinned_control_request",
+            "shared.thread_controls.adopt_next_pinned_control_request",
             AsyncMock(return_value=False),
         ),
-        patch("src.shared.thread_controls.fetch_next_control_request", fetch_next),
+        patch("shared.thread_controls.fetch_next_control_request", fetch_next),
         patch(
-            "src.shared.thread_controls.fetch_control_receipt",
+            "shared.thread_controls.fetch_control_receipt",
             AsyncMock(return_value=None),
         ),
         patch.object(pa, "_broadcast_durable", journal_mock),
@@ -298,19 +298,19 @@ async def test_workspace_undo_receipt_recovery_never_repeats_git_effect(
     receipt = _undo_receipt(request)
     with (
         patch(
-            "src.shared.thread_controls.owner_fence_current",
+            "shared.thread_controls.owner_fence_current",
             AsyncMock(return_value=True),
         ),
         patch(
-            "src.shared.thread_controls.adopt_next_pinned_control_request",
+            "shared.thread_controls.adopt_next_pinned_control_request",
             AsyncMock(return_value=False),
         ),
         patch(
-            "src.shared.thread_controls.fetch_next_control_request",
+            "shared.thread_controls.fetch_next_control_request",
             AsyncMock(side_effect=[request, None]),
         ),
         patch(
-            "src.shared.thread_controls.fetch_control_receipt",
+            "shared.thread_controls.fetch_control_receipt",
             AsyncMock(return_value=receipt),
         ),
         patch.object(pa, "_broadcast_durable", AsyncMock()) as journal,
@@ -333,19 +333,19 @@ async def test_workspace_undo_retryable_effect_is_not_journaled(stateless_owner)
     journal = AsyncMock()
     with (
         patch(
-            "src.shared.thread_controls.owner_fence_current",
+            "shared.thread_controls.owner_fence_current",
             AsyncMock(return_value=True),
         ),
         patch(
-            "src.shared.thread_controls.adopt_next_pinned_control_request",
+            "shared.thread_controls.adopt_next_pinned_control_request",
             AsyncMock(return_value=False),
         ),
         patch(
-            "src.shared.thread_controls.fetch_next_control_request",
+            "shared.thread_controls.fetch_next_control_request",
             AsyncMock(return_value=request),
         ),
         patch(
-            "src.shared.thread_controls.fetch_control_receipt",
+            "shared.thread_controls.fetch_control_receipt",
             AsyncMock(return_value=None),
         ),
         patch.object(pa, "_broadcast_durable", journal),
@@ -367,19 +367,19 @@ async def test_journal_failure_blocks_without_ram_or_permission_side_effects(
 
     with (
         patch(
-            "src.shared.thread_controls.owner_fence_current",
+            "shared.thread_controls.owner_fence_current",
             AsyncMock(return_value=True),
         ),
         patch(
-            "src.shared.thread_controls.adopt_next_pinned_control_request",
+            "shared.thread_controls.adopt_next_pinned_control_request",
             AsyncMock(return_value=False),
         ),
         patch(
-            "src.shared.thread_controls.fetch_next_control_request",
+            "shared.thread_controls.fetch_next_control_request",
             AsyncMock(return_value=request),
         ),
         patch(
-            "src.shared.thread_controls.fetch_control_receipt",
+            "shared.thread_controls.fetch_control_receipt",
             AsyncMock(return_value=None),
         ),
         patch.object(
@@ -410,19 +410,19 @@ async def test_finalize_failure_blocks_without_ram_or_permission_side_effects(
 
     with (
         patch(
-            "src.shared.thread_controls.owner_fence_current",
+            "shared.thread_controls.owner_fence_current",
             AsyncMock(return_value=True),
         ),
         patch(
-            "src.shared.thread_controls.adopt_next_pinned_control_request",
+            "shared.thread_controls.adopt_next_pinned_control_request",
             AsyncMock(return_value=False),
         ),
         patch(
-            "src.shared.thread_controls.fetch_next_control_request",
+            "shared.thread_controls.fetch_next_control_request",
             AsyncMock(return_value=request),
         ),
         patch(
-            "src.shared.thread_controls.fetch_control_receipt",
+            "shared.thread_controls.fetch_control_receipt",
             AsyncMock(return_value=None),
         ),
         patch.object(pa, "_broadcast_durable", AsyncMock(return_value=(4, 10))),
@@ -463,19 +463,19 @@ async def test_full_receipt_mismatch_blocks_before_finalize_or_apply(
 
     with (
         patch(
-            "src.shared.thread_controls.owner_fence_current",
+            "shared.thread_controls.owner_fence_current",
             AsyncMock(return_value=True),
         ),
         patch(
-            "src.shared.thread_controls.adopt_next_pinned_control_request",
+            "shared.thread_controls.adopt_next_pinned_control_request",
             AsyncMock(return_value=False),
         ),
         patch(
-            "src.shared.thread_controls.fetch_next_control_request",
+            "shared.thread_controls.fetch_next_control_request",
             AsyncMock(return_value=request),
         ),
         patch(
-            "src.shared.thread_controls.fetch_control_receipt",
+            "shared.thread_controls.fetch_control_receipt",
             AsyncMock(return_value=receipt),
         ),
         patch.object(pa, "_broadcast_durable", journal),
@@ -514,14 +514,14 @@ async def test_receipt_recovery_finalizes_then_converges_ram_without_rejournal(
     finalize_mock = AsyncMock(side_effect=finalize)
     apply_mock = MagicMock(side_effect=converge)
     with (
-        patch("src.shared.thread_controls.owner_fence_current", owner_fence),
+        patch("shared.thread_controls.owner_fence_current", owner_fence),
         patch(
-            "src.shared.thread_controls.adopt_next_pinned_control_request",
+            "shared.thread_controls.adopt_next_pinned_control_request",
             AsyncMock(return_value=False),
         ),
-        patch("src.shared.thread_controls.fetch_next_control_request", fetch_next),
+        patch("shared.thread_controls.fetch_next_control_request", fetch_next),
         patch(
-            "src.shared.thread_controls.fetch_control_receipt",
+            "shared.thread_controls.fetch_control_receipt",
             AsyncMock(return_value=receipt),
         ),
         patch.object(pa, "_broadcast_durable", journal),
@@ -578,11 +578,11 @@ async def test_pinned_drain_adopts_then_passes_immutable_agent_owner(
     with (
         patch.object(pa, "_session_runtime_generation", str(RUNTIME_GENERATION)),
         patch.object(pa, "_session_runtime_attach_token", str(RUNTIME_ATTACH_TOKEN)),
-        patch("src.shared.thread_controls.owner_fence_current", owner_fence),
-        patch("src.shared.thread_controls.adopt_next_pinned_control_request", adopt),
-        patch("src.shared.thread_controls.fetch_next_control_request", fetch_next),
+        patch("shared.thread_controls.owner_fence_current", owner_fence),
+        patch("shared.thread_controls.adopt_next_pinned_control_request", adopt),
+        patch("shared.thread_controls.fetch_next_control_request", fetch_next),
         patch(
-            "src.shared.thread_controls.fetch_control_receipt",
+            "shared.thread_controls.fetch_control_receipt",
             AsyncMock(return_value=None),
         ),
         patch.object(pa, "_broadcast_durable", journal),

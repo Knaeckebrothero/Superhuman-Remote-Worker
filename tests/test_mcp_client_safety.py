@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
+from types import SimpleNamespace
 
 import httpx
 import pytest
 
-from src.shared.orch_surface.client import AsyncCockpitClient, MutationOutcomeUnknown
-from src.shared.orch_surface.jobs import CallerCtx, get_descriptor, make_bound_handler
+from shared.orch_surface.client import AsyncCockpitClient, MutationOutcomeUnknown
+from shared.orch_surface import client as client_module
+from shared.orch_surface.jobs import CallerCtx, get_descriptor, make_bound_handler
 
 
 @pytest.mark.asyncio
@@ -235,28 +236,132 @@ async def test_non_get_read_is_single_attempt_without_mutation_ambiguity() -> No
     assert attempts == 1
 
 
-def test_mutation_methods_do_not_use_the_read_retry_decorator() -> None:
-    """Guard every mutation wrapper against accidentally restoring retries."""
-    class_source = inspect.getsource(AsyncCockpitClient)
-    for verb in ("post", "put", "patch", "delete"):
-        assert f"self._client.{verb}(" not in class_source
+@pytest.fixture
+def retry_delays(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Skip retry backoff without replacing the event loop's own sleep."""
+    delays: list[float] = []
 
-    mutation_methods = {
-        name
-        for name, method in inspect.getmembers(
-            AsyncCockpitClient, inspect.iscoroutinefunction
-        )
-        if "self._mutation_request(" in inspect.getsource(method)
-    }
+    async def sleep(delay: float) -> None:
+        delays.append(delay)
+        await asyncio.sleep(0)
 
-    assert {
-        "create_job",
-        "delete_job",
-        "create_project",
-        "create_datasource",
-        "create_persistent_thread",
-    } <= mutation_methods
+    monkeypatch.setattr(client_module, "asyncio", SimpleNamespace(sleep=sleep))
+    return delays
 
-    for method_name in mutation_methods:
-        method = getattr(AsyncCockpitClient, method_name)
-        assert not hasattr(method, "retry"), method_name
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [httpx.ReadTimeout, httpx.ConnectError])
+@pytest.mark.parametrize(
+    "operation,arguments,method,path",
+    [
+        pytest.param(
+            "create_job",
+            {"description": "test job"},
+            "POST",
+            "/api/jobs",
+            id="create-job",
+        ),
+        pytest.param(
+            "delete_job",
+            {"job_id": "job-1"},
+            "DELETE",
+            "/api/jobs/job-1",
+            id="delete-job",
+        ),
+        pytest.param(
+            "cancel_job",
+            {"job_id": "job-1"},
+            "PUT",
+            "/api/jobs/job-1/cancel",
+            id="cancel-job",
+        ),
+        pytest.param(
+            "create_project",
+            {"name": "test project", "user_id": "user-1"},
+            "POST",
+            "/api/projects",
+            id="create-project",
+        ),
+        pytest.param(
+            "update_project",
+            {"project_id": "project-1", "name": "updated"},
+            "PATCH",
+            "/api/projects/project-1",
+            id="update-project",
+        ),
+        pytest.param(
+            "create_datasource",
+            {"name": "test connector", "ds_type": "generic"},
+            "POST",
+            "/api/datasources",
+            id="create-datasource",
+        ),
+        pytest.param(
+            "create_persistent_thread",
+            {},
+            "POST",
+            "/api/persistent/threads",
+            id="create-thread",
+        ),
+        pytest.param(
+            "end_persistent_thread",
+            {"thread_id": "thread-1"},
+            "DELETE",
+            "/api/persistent/threads/thread-1",
+            id="end-thread",
+        ),
+    ],
+)
+async def test_public_mutations_send_once_on_transport_failure(
+    operation, arguments, method, path, failure, retry_delays
+) -> None:
+    """Public operations must not inherit the safe-read retry policy."""
+    attempts: list[tuple[str, str]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append((request.method, request.url.path))
+        raise failure("transport failure", request=request)
+
+    expected_error = (
+        MutationOutcomeUnknown if failure is httpx.ReadTimeout else httpx.ConnectError
+    )
+    async with AsyncCockpitClient(
+        base_url="http://orchestrator.test",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        with pytest.raises(expected_error) as exc_info:
+            await asyncio.wait_for(getattr(client, operation)(**arguments), timeout=1)
+
+    assert attempts == [(method, path)]
+    assert retry_delays == []
+    if failure is httpx.ReadTimeout:
+        assert exc_info.value.method == method
+        assert exc_info.value.path == path
+        assert isinstance(exc_info.value.__cause__, httpx.ReadTimeout)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [httpx.ReadTimeout, httpx.ConnectError])
+@pytest.mark.parametrize("recovers", [True, False], ids=["recovers", "exhausted"])
+async def test_safe_get_retries_are_bounded(failure, recovers, retry_delays) -> None:
+    attempts: list[tuple[str, str]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append((request.method, request.url.path))
+        if recovers and len(attempts) == 3:
+            return httpx.Response(200, json={"id": "job-1"})
+        raise failure("temporary failure", request=request)
+
+    async with AsyncCockpitClient(
+        base_url="http://orchestrator.test",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        if recovers:
+            result = await asyncio.wait_for(client.get_job("job-1"), timeout=1)
+            assert result == {"id": "job-1"}
+        else:
+            with pytest.raises(failure):
+                await asyncio.wait_for(client.get_job("job-1"), timeout=1)
+
+    assert attempts == [("GET", "/api/jobs/job-1")] * 3
+    assert len(retry_delays) == 2

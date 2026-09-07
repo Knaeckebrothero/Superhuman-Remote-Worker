@@ -13,8 +13,8 @@
 #   - All credentials are stub/dev passwords (NOT for production)
 #   - APP_ENCRYPTION_KEY is a fixed dev key — local DB only, regenerate with
 #     `openssl rand -base64 32` if you want a unique one per machine
-#   - The Keycloak realm ships with a pre-seeded `test`/`test` user that has
-#     `admin` + `user` roles — log into the cockpit straight away with that
+#   - The Keycloak realm ships with a pre-seeded local admin user — log into
+#     the cockpit as `test` / `srw-k3d-dev-test`
 #   - TLS via mkcert + cert-manager CAIssuer (set up out of band; see README)
 #   - Agent pool: no warm/buffer slots (spin up on demand)
 #   - Database storage trimmed for a single-dev cluster
@@ -31,22 +31,15 @@ global:
   # imagePullSecrets:
   #   - name: ghcr-pull-secret
 
-# Image override — use ONLY when GHCR `:latest` is older than the chart on
-# `develop` HEAD (rare; CI rebuilds on every push). The README troubleshooting
-# section has the docker build + k3d image import commands.
-# image:
-#   orchestrator:
-#     repository: docker.io/library/srw-orchestrator
-#     tag: local-fix
-#     pullPolicy: IfNotPresent
-#   cockpit:
-#     repository: docker.io/library/srw-cockpit
-#     tag: local-fix
-#     pullPolicy: IfNotPresent
-#   agent:
-#     repository: docker.io/library/srw-agent
-#     tag: local-fix
-#     pullPolicy: IfNotPresent
+# Component image tags: do NOT set them here. The chart defaults to `:latest`,
+# which is built from `main`; a `develop` checkout's chart can be ahead of it.
+# `scripts/local-dev-up.sh` writes `deployment/values-local-images.yaml` with
+# every component pinned to the newest image built from THIS checkout's
+# history — pass it after this file on every install/upgrade:
+#   helm install srw ./helm -n srw --kube-context k3d-srw \
+#     -f deployment/values-local.yaml -f deployment/values-local-images.yaml
+# To run locally built images instead, override `image.<component>` in that
+# generated file (it is gitignored and regenerated on every bootstrap run).
 
 # -----------------------------------------------------------------------------
 # Cockpit BFF — HTTPS via mkcert CAIssuer, cookies are Secure. Domain left
@@ -93,8 +86,8 @@ secrets:
     # expressive voices + Voice Library). One account per deployment; the key
     # stays orchestrator-side (TTS is orchestrator-only, never fanned out to
     # agents). Leave blank to skip — Kokoro/OpenAI still work. Get a key at
-    # https://elevenlabs.io, then `helm upgrade`. See
-    # knowledge-base/knowledge/features/tts_vendor_providers.md for registering the voice model row.
+    # https://elevenlabs.io, then `helm upgrade`. Register the corresponding
+    # voice model through the administrator Settings page.
     ELEVENLABS_API_KEY: ""
 
     # App DBs (dev passwords, never rotate locally)
@@ -107,15 +100,17 @@ secrets:
     NEO4J_USERNAME: "neo4j"
     NEO4J_PASSWORD: "dev_neo4j_password_noslash"
 
-    # Keycloak — KC_REALM_ADMIN_PASSWORD is set as the `test` user's password
-    # on every pod restart by the chart's postStart hook. Keeping it as "test"
-    # gives you the test/test login.
+    # Keycloak — KC_REALM_ADMIN_PASSWORD is set as the `test` bootstrap admin's
+    # password on every pod restart by the chart's postStart hook. It must be at
+    # least 16 characters or the realm password policy rejects the reset (and the
+    # hook swallows the error), so the old 4-character "test" no longer works.
+    # The shared dev accounts live behind keycloak.devUsers — see README.
     KEYCLOAK_ADMIN_USER: "admin"
     KEYCLOAK_ADMIN_PASSWORD: "dev_kc_admin"
     KC_ADMIN_USER: "admin"
     KC_ADMIN_PASSWORD: "dev_kc_admin"
     KC_DB_PASSWORD: "dev_kc_db_password"
-    KC_REALM_ADMIN_PASSWORD: "test"
+    KC_REALM_ADMIN_PASSWORD: "srw-k3d-dev-test"
     KC_CLIENT_SECRET: "dev_kc_client_secret"
 
     # Gitea bootstrap admin
@@ -211,6 +206,7 @@ canvas:
           # viewer may set create=true together with provisionRole=true.
           create: false
           existingSecret: ""
+          existingSecretCnpgCompatible: false
           vaultPath: ""
           passwordKey: "CANVAS_VIEWER_POSTGRES_PASSWORD"
         provisionRole: false
@@ -264,6 +260,9 @@ orchestrator:
       cpu: "500m"
 
 databases:
+  # Non-HA local default. All five PostgreSQL engines continue to inherit
+  # `statefulset`; no CloudNativePG operator is needed for this overlay.
+  profile: single
   postgres:
     storageSize: "5Gi"
   vector:
@@ -354,8 +353,7 @@ workspace:
 # the agent pod. Without a SESSION_JWT_SECRET, /connection 500s and sessions
 # never come up.
 #
-#   kubectl -n srw create secret generic srw-session-jwt \
-#     --from-literal=jwt-secret="$(openssl rand -base64 48 | tr -d '\n' | head -c 64)"
+#   scripts/local-dev-up.sh creates this Secret idempotently.
 #
 # `ingressHost: localhost` keeps the WS same-origin with the cockpit (matches
 # the `/p` route already in the cockpit ingress).
@@ -400,17 +398,17 @@ opencloud:
   enabled: false
 
 logLevel: "DEBUG"
-# Local k3d keeps human-readable logs ("json" once Loki lands — see
-# knowledge-base/knowledge/features/centralized_logging.md).
+# Local k3d keeps human-readable logs; production log aggregation generally
+# prefers `json`.
 logFormat: "text"
 
 # --- VM workspaces on the local k3d cluster (optional) -----------------------
 # Run `scripts/local-kubevirt-up.sh` first (KubeVirt + CDI on k3d, KVM passthrough,
 # smoke test), create the two Secrets below, then uncomment. Tilt applies values
-# on the next image rebuild, not on save (see tilt_inner_loop_dev.md).
+# on the next image rebuild, not on save (see docs/development.md).
 #
 #   kubectl -n srw create secret generic srw-vm-lifecycle-hmac \
-#     --from-literal=VM_LIFECYCLE_HMAC_SECRET="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+#     --from-literal=VM_LIFECYCLE_HMAC_SECRET="$(openssl rand -hex 32)"
 #   # srw-vm-ssh-key is minted by scripts/local-dev-up.sh
 #
 # vm:
@@ -432,3 +430,18 @@ logFormat: "text"
 # agent:
 #   tailscale:
 #     enabled: false
+
+# Shared k3d test accounts — 2 admins + 4 regular users, fixed passwords
+# documented in README.md. Dev overlay only; the chart default is false.
+keycloak:
+  devUsers:
+    enabled: true
+
+# -----------------------------------------------------------------------------
+# Research-provider seed hook: a fresh single-node install pulls every image
+# and walks Keycloak -> Gitea -> orchestrator before the hook can succeed; the
+# chart default of 300 s failed revision 1 of a clean install on 2026-09-04.
+# -----------------------------------------------------------------------------
+llm:
+  seed:
+    researchProviderWaitSeconds: 900

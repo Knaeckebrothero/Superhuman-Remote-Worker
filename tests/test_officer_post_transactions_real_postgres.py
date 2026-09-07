@@ -28,9 +28,9 @@ import pytest
 import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
-import main as orch_main
+import orchestrator.main as orch_main
 from orchestrator.database.postgres import OfficerPostLifecycleConflict, PostgresDB
-from services.officer_admission import (
+from orchestrator.services.officer_admission import (
     OfficerAdmissionConflict,
     SlotAdmissionError,
     admit_and_create_job,
@@ -38,27 +38,32 @@ from services.officer_admission import (
     count_in_flight_by_slot,
     prepare_officer_admission,
 )
-from src.shared.persistent_input_delivery import (
+from shared.persistent_input_delivery import (
     mark_input_delivery_queued,
     persist_input_delivery,
     transition_input_delivery,
 )
-from src.shared.workspace_contract import (
+from shared.workspace_contract import (
     LEGACY_K8S_RUNTIME_ADOPTION_KEY,
     WORKSPACE_CONTRACT_CONTEXT_KEY,
     WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY,
     resolve_workspace_runtime,
 )
-from src.shared.worker_queue import claim_worker_batch
+from shared.worker_queue import claim_worker_batch
+from tests._previous_release_seed import (
+    seed_previous_release_row as _seed_previous_release_row,
+)
 
 SCHEMA_FILE = (
     Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "schema_current.sql"
 )
 CLAIM_MIGRATION_FILE = (
     Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "migrations"
@@ -67,6 +72,7 @@ CLAIM_MIGRATION_FILE = (
 )
 DELIVERABLE_MIGRATION_FILE = (
     Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "migrations"
@@ -75,6 +81,7 @@ DELIVERABLE_MIGRATION_FILE = (
 )
 RUNTIME_AUTHORITY_MIGRATION_FILE = (
     Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "migrations"
@@ -457,8 +464,9 @@ async def test_opposite_tier_callbacks_cannot_change_effective_backend(db):
         requested_workspace_backend="vm",
         workspace_assignment_source="request",
     )
-    await db.merge_workspace_container_context(
-        str(vm_job["id"]),
+    await _merge_previous_release_workspace(
+        db,
+        vm_job["id"],
         {
             "status": "ready",
             "host": "stale-container.internal",
@@ -496,8 +504,9 @@ async def test_opposite_tier_callbacks_cannot_change_effective_backend(db):
                 "provision_generation": str(uuid4()),
             },
         ),
-        db.merge_workspace_container_context(
-            str(sandbox_job["id"]),
+        _merge_previous_release_workspace(
+            db,
+            sandbox_job["id"],
             {
                 "status": "ready",
                 "host": "current-container.internal",
@@ -519,8 +528,9 @@ async def test_stateless_admission_cannot_claim_vm_or_ambiguous_legacy_job(db):
         workspace_assignment_source="request",
         execution_lane="stateless",
     )
-    await db.merge_workspace_container_context(
-        str(vm_job["id"]),
+    await _merge_previous_release_workspace(
+        db,
+        vm_job["id"],
         {
             "status": "ready",
             "provisioner": "k8s",
@@ -538,7 +548,9 @@ async def test_stateless_admission_cannot_claim_vm_or_ambiguous_legacy_job(db):
         execution_lane="stateless",
     )
     async with db.acquire() as conn:
-        await conn.execute(
+        await _seed_previous_release_row(
+            conn,
+            "jobs",
             """
             UPDATE jobs
                SET context = (context - '_workspace_contract')
@@ -576,8 +588,9 @@ async def test_stateless_claim_is_bound_to_exact_queue_lease_and_tier(db):
         workspace_assignment_source="request",
         execution_lane="stateless",
     )
-    await db.merge_workspace_container_context(
-        str(job["id"]),
+    await _merge_previous_release_workspace(
+        db,
+        job["id"],
         {
             "status": "ready",
             "provisioner": "k8s",
@@ -858,6 +871,39 @@ async def test_legacy_workspace_claim_is_conservative_and_fenced(db):
     assert marker["assigned_backend"] == "sandbox"
 
 
+# 0197/0198 fence a *writer* that publishes Kubernetes runtime authority with
+# no durable reservation behind it.  Rows written by the previous release were
+# never subject to that fence -- the trigger did not exist yet.  Reproducing
+# that ordering means seeding with the exact named trigger absent and then
+# putting it back, which is also the proof that installing the migration over
+# historical data is accepted.  This is deliberately not
+# `session_replication_role = replica`: that would silently drop foreign keys
+# and every other trigger in the statement, including the ones these tests are
+# about.
+
+
+async def _merge_previous_release_workspace(db, job_id, payload):
+    """Land a workspace_container callback the way the previous release did.
+
+    0198 now requires exact creation-reservation authority behind any Pod UID
+    a writer publishes.  The tier-resolution and stateless-admission proofs
+    below are about what the *reader* concludes from such a projection, not
+    about how it came to exist, so they install it as a pre-tranche writer.
+    """
+
+    async with db.acquire() as conn:
+        await _seed_previous_release_row(
+            conn,
+            "jobs",
+            "UPDATE jobs SET context = jsonb_set("
+            "COALESCE(context, '{}'::jsonb), '{workspace_container}', "
+            "COALESCE(context->'workspace_container', '{}'::jsonb) "
+            "|| $2::jsonb, true) WHERE id = $1",
+            job_id if not isinstance(job_id, str) else UUID(job_id),
+            json.dumps(payload),
+        )
+
+
 async def _seed_exact_pre_0175_k8s_job(db, *, status="created"):
     """Persist the exact K8s job-runtime JSON emitted by the prior release."""
 
@@ -875,7 +921,9 @@ async def _seed_exact_pre_0175_k8s_job(db, *, status="created"):
         }
     }
     async with db.acquire() as conn:
-        await conn.execute(
+        await _seed_previous_release_row(
+            conn,
+            "jobs",
             """
             UPDATE jobs
                SET status=$2,
@@ -898,7 +946,7 @@ def _k8s_job_attestation(
     host="workspace-job.internal",
     pod_ip="10.42.1.17",
 ):
-    from services.container_provisioner import WorkspaceRuntimeAttestation
+    from orchestrator.services.container_provisioner import WorkspaceRuntimeAttestation
 
     backing = str(uuid4())
     return WorkspaceRuntimeAttestation(
@@ -915,7 +963,7 @@ def _k8s_job_attestation(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["created", "paused"])
 async def test_pre_0175_k8s_job_runtime_adopts_after_live_attestation(db, status):
-    from services.job_workspace_adoption import (
+    from orchestrator.services.job_workspace_adoption import (
         LegacyK8sAdoptionOutcome,
         ensure_legacy_k8s_job_runtime_authority,
     )
@@ -943,7 +991,7 @@ async def test_pre_0175_k8s_job_runtime_adopts_after_live_attestation(db, status
 
 @pytest.mark.asyncio
 async def test_pre_0175_k8s_adoption_is_one_cas_and_claim_marker_is_preserved(db):
-    from services.job_workspace_adoption import (
+    from orchestrator.services.job_workspace_adoption import (
         LegacyK8sAdoptionOutcome,
         ensure_legacy_k8s_job_runtime_authority,
     )
@@ -961,10 +1009,16 @@ async def test_pre_0175_k8s_adoption_is_one_cas_and_claim_marker_is_preserved(db
         ensure_legacy_k8s_job_runtime_authority(db, provisioner, job),
     )
 
-    assert {outcome.outcome for outcome in outcomes} == {
-        LegacyK8sAdoptionOutcome.ADOPTED,
-        LegacyK8sAdoptionOutcome.CONVERGED,
-    }
+    observed = [outcome.outcome for outcome in outcomes]
+    assert observed.count(LegacyK8sAdoptionOutcome.ADOPTED) == 1
+    assert set(observed).issubset(
+        {
+            LegacyK8sAdoptionOutcome.ADOPTED,
+            LegacyK8sAdoptionOutcome.CONVERGED,
+        }
+    )
+    converged = await ensure_legacy_k8s_job_runtime_authority(db, provisioner, job)
+    assert converged.outcome is LegacyK8sAdoptionOutcome.CONVERGED
     assert await db.list_uidless_k8s_job_workspace_rows() == []
 
     agent_id = uuid4()
@@ -993,7 +1047,7 @@ async def test_pre_0175_k8s_adoption_is_one_cas_and_claim_marker_is_preserved(db
 
 @pytest.mark.asyncio
 async def test_pre_0175_adoption_cas_yields_to_concurrent_tier_transition(db):
-    from services.job_workspace_adoption import (
+    from orchestrator.services.job_workspace_adoption import (
         LegacyK8sAdoptionOutcome,
         ensure_legacy_k8s_job_runtime_authority,
     )
@@ -1015,7 +1069,13 @@ async def test_pre_0175_adoption_cas_yields_to_concurrent_tier_transition(db):
     await asyncio.wait_for(started.wait(), timeout=2)
     vm_generation = str(uuid4())
     async with db.acquire() as conn:
-        await conn.execute(
+        # The racing writer is the previous release's tier transition: it
+        # abandons a UID-less Kubernetes projection wholesale, which 0198 now
+        # governs.  The subject here is the adoption CAS yielding to it, so
+        # seed it the way the migration met such a writer.
+        await _seed_previous_release_row(
+            conn,
+            "jobs",
             """
             UPDATE jobs
                SET config_override='{"workspace":{"backend":"vm"}}'::jsonb,
@@ -1052,7 +1112,7 @@ async def test_pre_0175_adoption_cas_yields_to_concurrent_tier_transition(db):
 
 @pytest.mark.asyncio
 async def test_pre_0175_post_cas_pod_replacement_reverts_tentative_stamp(db):
-    from services.job_workspace_adoption import (
+    from orchestrator.services.job_workspace_adoption import (
         LegacyK8sAdoptionOutcome,
         ensure_legacy_k8s_job_runtime_authority,
     )
@@ -1086,8 +1146,18 @@ async def test_pre_0175_post_cas_pod_replacement_reverts_tentative_stamp(db):
 
 
 @pytest.mark.asyncio
-async def test_adopted_deleted_runtime_reprovisions_and_refreshes_exact_cas(db):
-    from services.job_workspace_adoption import (
+async def test_adoption_is_one_shot_and_a_replacement_needs_creation_authority(db):
+    """Adoption converts one historical row once, and never reopens it.
+
+    The previous release could hand the same deterministic name to a fresh
+    Pod, so re-adoption used to be the recovery path for a replaced runtime.
+    Once a row carries a durable reservation and a proven Pod UID it is no
+    longer historical: a replacement is an ordinary creation and must present
+    exact creation authority.  Adoption must not remain available as a second,
+    evidence-lighter door onto the same row.
+    """
+
+    from orchestrator.services.job_workspace_adoption import (
         LegacyK8sAdoptionOutcome,
         ensure_legacy_k8s_job_runtime_authority,
     )
@@ -1100,48 +1170,83 @@ async def test_adopted_deleted_runtime_reprovisions_and_refreshes_exact_cas(db):
     adopted = await ensure_legacy_k8s_job_runtime_authority(db, provisioner, job)
     assert adopted.outcome is LegacyK8sAdoptionOutcome.ADOPTED
 
-    assert await db.merge_workspace_container_context(
-        str(job["id"]), {"status": "deleted"}
-    )
-    provisioner.attest_workspace_runtime.reset_mock()
-    deleted = await ensure_legacy_k8s_job_runtime_authority(
-        db, provisioner, await db.get_job(str(job["id"]))
-    )
-    assert deleted.outcome is LegacyK8sAdoptionOutcome.NOT_NEEDED
-    provisioner.attest_workspace_runtime.assert_not_awaited()
+    # Leaving the adopted runtime is the cleanup fence's business now.
+    with pytest.raises(asyncpg.CheckViolationError):
+        await db.merge_workspace_container_context(
+            str(job["id"]), {"status": "deleted"}
+        )
 
+    # A replacement Pod UID is a creation, and creations need a reservation.
     replacement = _k8s_job_attestation(
         host="workspace-replacement.internal", pod_ip="10.42.2.19"
     )
-    assert await db.merge_workspace_container_context(
-        str(job["id"]),
-        {
-            "status": "ready",
-            "provisioner": "k8s",
-            "host": replacement.host,
-            "pod_ip": replacement.pod_ip,
-            "port": replacement.port,
-            "_runtime_incarnation": replacement.runtime_incarnation,
-        },
-    )
+    with pytest.raises(asyncpg.CheckViolationError):
+        await db.merge_workspace_container_context(
+            str(job["id"]),
+            {
+                "status": "ready",
+                "provisioner": "k8s",
+                "host": replacement.host,
+                "pod_ip": replacement.pod_ip,
+                "port": replacement.port,
+                "_runtime_incarnation": replacement.runtime_incarnation,
+            },
+        )
+
+    # And the bridge itself refuses to open a second generation over a row
+    # that is no longer the exact UID-less historical shape.
     provisioner.attest_workspace_runtime.return_value = replacement
-    refreshed = await ensure_legacy_k8s_job_runtime_authority(
+    again = await ensure_legacy_k8s_job_runtime_authority(
         db, provisioner, await db.get_job(str(job["id"]))
     )
+    assert again.outcome is LegacyK8sAdoptionOutcome.RETRY
+    assert again.reason == "adoption_reservation_unavailable"
 
-    assert refreshed.outcome is LegacyK8sAdoptionOutcome.ADOPTED
     stored = await db.get_job(str(job["id"]))
     runtime = _json(stored["context"])["workspace_container"]
-    assert runtime["_runtime_incarnation"] == replacement.runtime_incarnation
+    assert runtime["_runtime_incarnation"] == predecessor.runtime_incarnation
     assert runtime[LEGACY_K8S_RUNTIME_ADOPTION_KEY]["workspace_generation"] == (
-        replacement.workspace_generation
+        predecessor.workspace_generation
     )
     assert resolve_workspace_runtime(stored).ready
 
 
 @pytest.mark.asyncio
+async def test_historical_non_ready_k8s_job_is_never_adopted(db):
+    """A previous-release row that is not ready is not an adoption candidate.
+
+    Ordinary workspace recovery must stay free to delete and recreate it
+    rather than wait for an attestation that cannot succeed, so the bridge
+    refuses before it reads Kubernetes at all.
+    """
+
+    from orchestrator.services.job_workspace_adoption import (
+        LegacyK8sAdoptionOutcome,
+        ensure_legacy_k8s_job_runtime_authority,
+    )
+
+    job = await _seed_exact_pre_0175_k8s_job(db, status="paused")
+    async with db.acquire() as conn:
+        await _seed_previous_release_row(
+            conn,
+            "jobs",
+            "UPDATE jobs SET context = jsonb_set(context, "
+            "'{workspace_container,status}', '\"deleted\"'::jsonb) WHERE id = $1",
+            job["id"],
+        )
+    provisioner = SimpleNamespace(attest_workspace_runtime=AsyncMock())
+
+    outcome = await ensure_legacy_k8s_job_runtime_authority(
+        db, provisioner, await db.get_job(str(job["id"]))
+    )
+
+    assert outcome.outcome is LegacyK8sAdoptionOutcome.NOT_NEEDED
+    provisioner.attest_workspace_runtime.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_stamped_sandbox_residue_adopts_but_unstamped_both_tier_refuses(db):
-    from services.job_workspace_adoption import (
+    from orchestrator.services.job_workspace_adoption import (
         LegacyK8sAdoptionOutcome,
         ensure_legacy_k8s_job_runtime_authority,
     )
@@ -1151,24 +1256,31 @@ async def test_stamped_sandbox_residue_adopts_but_unstamped_both_tier_refuses(db
         config_override={"workspace": {"backend": "sandbox"}},
     )
     vm_generation = str(uuid4())
-    await db.merge_job_context(
-        str(stamped["id"]),
-        {
-            "workspace_container": {
-                "status": "ready",
-                "provisioner": "k8s",
-                "pod_ip": "10.42.1.17",
-                "port": 30022,
-                "host": "workspace-job.internal",
-            },
-            "vm": {
-                "status": "ready",
-                "ssh_host": "stale-vm.internal",
-                "ssh_port": 22,
-                "provision_generation": vm_generation,
-            },
-        },
-    )
+    async with db.acquire() as conn:
+        await _seed_previous_release_row(
+            conn,
+            "jobs",
+            "UPDATE jobs SET context = COALESCE(context, '{}'::jsonb) "
+            "|| $2::jsonb WHERE id = $1",
+            stamped["id"],
+            json.dumps(
+                {
+                    "workspace_container": {
+                        "status": "ready",
+                        "provisioner": "k8s",
+                        "pod_ip": "10.42.1.17",
+                        "port": 30022,
+                        "host": "workspace-job.internal",
+                    },
+                    "vm": {
+                        "status": "ready",
+                        "ssh_host": "stale-vm.internal",
+                        "ssh_port": 22,
+                        "provision_generation": vm_generation,
+                    },
+                }
+            ),
+        )
     ambiguous = await _seed_exact_pre_0175_k8s_job(db)
     await db.merge_job_context(
         str(ambiguous["id"]),
@@ -1203,7 +1315,7 @@ async def test_stamped_sandbox_residue_adopts_but_unstamped_both_tier_refuses(db
 
 @pytest.mark.asyncio
 async def test_bp07_strict_job_is_parked_then_concurrently_activated_once(db):
-    from services.officer_preflight import ensure_officer_job_activated
+    from orchestrator.services.officer_preflight import ensure_officer_job_activated
 
     seed = await _seed_post(db)
     job = await admit_and_create_job(
@@ -1241,8 +1353,8 @@ async def test_bp07_strict_job_is_parked_then_concurrently_activated_once(db):
 
 @pytest.mark.asyncio
 async def test_bp07_repository_and_cloud_preflights_never_enter_breaker_history(db):
-    from services.job_provisioning import JobProvisioningError
-    from services.officer_preflight import ensure_officer_job_activated
+    from orchestrator.services.job_provisioning import JobProvisioningError
+    from orchestrator.services.officer_preflight import ensure_officer_job_activated
 
     seed = await _seed_post(db, count=2)
     jobs = []
@@ -1276,7 +1388,7 @@ async def test_bp07_repository_and_cloud_preflights_never_enter_breaker_history(
 
 @pytest.mark.asyncio
 async def test_bp07_real_pg_faults_before_and_after_activation_are_recoverable(db):
-    from services.officer_preflight import ensure_officer_job_activated
+    from orchestrator.services.officer_preflight import ensure_officer_job_activated
 
     seed = await _seed_post(db, count=2)
     durable_resources: set[str] = set()
@@ -1386,6 +1498,53 @@ async def test_bp08_materialization_lease_and_projection_converge_once(db):
 
 
 @pytest.mark.asyncio
+async def test_bp08_in_flight_lease_is_not_superseded_by_a_concurrent_writer(db):
+    """kb_gardening E4 S2: two writers with different bytes for one note.
+    The second `begin` must not steal the first's unexpired lease — that made
+    the first writer report `intent-lease-lost` after its commit had landed.
+    Only an expired (crashed) attempt is superseded by a newer write."""
+    seed = await _seed_post(db)
+    base = {
+        "project_id": seed["project_id"],
+        "note_id": "bp08-race",
+    }
+    first = await db.begin_knowledge_materialization(
+        **base, content="v1", content_hash="race-v1"
+    )
+    assert first["attempt_claimed"] is True
+    second = await db.begin_knowledge_materialization(
+        **base, content="v2", content_hash="race-v2"
+    )
+    assert second["attempt_claimed"] is True
+
+    # The first writer's lease survives, so its own finish still lands.
+    finished = await db.finish_knowledge_materialization(
+        str(first["id"]),
+        canonical=True,
+        attempt_token=str(first["attempt_token"]),
+        path="knowledge/bp08-race.md",
+    )
+    assert finished is not None
+    assert finished["canonical_state"] == "canonical"
+
+    # An expired lease IS superseded by the next write (crash recovery).
+    third = await db.begin_knowledge_materialization(
+        **base, content="v3", content_hash="race-v3", lease_seconds=0
+    )
+    assert third["attempt_claimed"] is True
+    fourth = await db.begin_knowledge_materialization(
+        **base, content="v4", content_hash="race-v4"
+    )
+    assert fourth["attempt_claimed"] is True
+    stolen = await db.finish_knowledge_materialization(
+        str(third["id"]),
+        canonical=True,
+        attempt_token=str(third["attempt_token"]),
+    )
+    assert stolen is None  # third's attempt was superseded; its lease is gone
+
+
+@pytest.mark.asyncio
 async def test_bp08_a_prior_canonical_payload_can_become_current_again(db):
     seed = await _seed_post(db)
 
@@ -1418,7 +1577,7 @@ async def test_bp08_a_prior_canonical_payload_can_become_current_again(db):
 
 @pytest.mark.asyncio
 async def test_bp10_duplicate_floor_ticks_queue_one_durable_wake(db):
-    from services.session_wake import notify_officer
+    from orchestrator.services.session_wake import notify_officer
 
     seed = await _seed_post(db)
     kwargs = {
@@ -1448,7 +1607,7 @@ async def test_bp10_duplicate_floor_ticks_queue_one_durable_wake(db):
 
 @pytest.mark.asyncio
 async def test_bp10_outbox_rollback_retries_without_consuming_policy_debounce(db):
-    from services.session_wake import notify_officer
+    from orchestrator.services.session_wake import notify_officer
 
     seed = await _seed_post(db)
     now = datetime.now(timezone.utc)
@@ -1530,7 +1689,7 @@ async def test_bp10_notifier_failures_do_not_queue_or_debounce(db, mode):
 
 @pytest.mark.asyncio
 async def test_bp10_delivery_updates_the_same_durable_episode(db):
-    from services.session_wake import notify_officer
+    from orchestrator.services.session_wake import notify_officer
 
     seed = await _seed_post(db)
     queued = await db.queue_officer_floor_wake(
@@ -1562,6 +1721,10 @@ async def test_bp10_delivery_updates_the_same_durable_episode(db):
                 "SELECT runtime_generation FROM threads WHERE id=$1 FOR UPDATE",
                 UUID(seed["thread_id"]),
             )
+            process_generation = uuid4()
+            # A pinned binding already live when 0200 landed; the subject here
+            # is Officer Post transaction behaviour, not the bind authority.
+            await conn.execute("SET LOCAL session_replication_role = 'replica'")
             await conn.execute(
                 "UPDATE threads SET agent_id=$2, control_admission_agent_id=$2, "
                 "runtime_attach_token=$3 WHERE id=$1",
@@ -1584,7 +1747,8 @@ async def test_bp10_delivery_updates_the_same_durable_episode(db):
                 turn_number=1,
                 agent_id=agent_id,
                 pod_uid="bp10-pod",
-                runtime_generation=runtime_generation,
+                runtime_generation=process_generation,
+                session_runtime_generation=runtime_generation,
                 runtime_attach_token=attach_token,
             )
             assert await mark_input_delivery_queued(
@@ -1592,7 +1756,8 @@ async def test_bp10_delivery_updates_the_same_durable_episode(db):
                 delivery_id=assigned[0]["delivery_id"],
                 agent_id=agent_id,
                 pod_uid="bp10-pod",
-                runtime_generation=runtime_generation,
+                runtime_generation=process_generation,
+                session_runtime_generation=runtime_generation,
                 runtime_attach_token=attach_token,
                 claim_generation=int(delivery["claim_generation"]),
             )
@@ -1601,7 +1766,8 @@ async def test_bp10_delivery_updates_the_same_durable_episode(db):
                 delivery_id=assigned[0]["delivery_id"],
                 agent_id=agent_id,
                 pod_uid="bp10-pod",
-                runtime_generation=runtime_generation,
+                runtime_generation=process_generation,
+                session_runtime_generation=runtime_generation,
                 runtime_attach_token=attach_token,
                 claim_generation=int(delivery["claim_generation"]),
                 transition="admitted",
@@ -1618,7 +1784,7 @@ async def test_bp10_delivery_updates_the_same_durable_episode(db):
 
 @pytest.mark.asyncio
 async def test_bp10_durable_intent_survives_hold_and_decommission_supersedes_it(db):
-    from services.session_wake import notify_officer
+    from orchestrator.services.session_wake import notify_officer
 
     seed = await _seed_post(db)
     queued = await db.queue_officer_floor_wake(
@@ -1653,7 +1819,7 @@ async def test_bp10_durable_intent_survives_hold_and_decommission_supersedes_it(
 
 @pytest.mark.asyncio
 async def test_bp10_decommission_racing_queue_leaves_no_orphaned_wake(db):
-    from services.session_wake import notify_officer
+    from orchestrator.services.session_wake import notify_officer
 
     seed = await _seed_post(db)
     queued, decommissioned = await asyncio.gather(
@@ -1682,7 +1848,7 @@ async def test_bp10_decommission_racing_queue_leaves_no_orphaned_wake(db):
 
 @pytest.mark.asyncio
 async def test_bp10_hold_racing_queue_preserves_or_refuses_one_durable_intent(db):
-    from services.session_wake import notify_officer
+    from orchestrator.services.session_wake import notify_officer
 
     seed = await _seed_post(db)
     queued, held = await asyncio.gather(
@@ -2970,8 +3136,8 @@ async def test_database_funnel_strips_raw_claim_context_from_ordinary_jobs(db):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("internal", [False, True], ids=["public", "internal"])
 async def test_http_creation_paths_cannot_persist_raw_claim_context(db, internal):
-    import security.access as access_module
-    from main import JobCreate, create_job
+    import orchestrator.security.access as access_module
+    from orchestrator.main import JobCreate, create_job
 
     user_id = uuid4()
     async with db.acquire() as conn:
@@ -3008,17 +3174,34 @@ async def test_http_creation_paths_cannot_persist_raw_claim_context(db, internal
     )
     principal = {"id": user_id, "is_admin": False}
     patches = (
-        patch("main.postgres_db", db),
-        patch("main.require_approved_user", AsyncMock(return_value=principal)),
-        patch("main._enforce_readiness_gate", AsyncMock(return_value=None)),
-        patch("main._require_job_project_access", AsyncMock(return_value=None)),
-        patch("main._is_experts_db_enabled", MagicMock(return_value=False)),
-        patch("main._inherit_parent_datasource_ids", AsyncMock(return_value=[])),
-        patch("main._authorize_thread_datasource_ids", AsyncMock(return_value=[])),
-        patch("main._enforce_job_create_grants", AsyncMock(return_value=None)),
-        patch("services.job_provisioning.provision_job_repo", AsyncMock()),
-        patch("main._spawn_scholar_subjob", AsyncMock(return_value=None)),
-        patch("main._trigger_dispatch", MagicMock()),
+        patch("orchestrator.main.postgres_db", db),
+        patch(
+            "orchestrator.main.require_approved_user", AsyncMock(return_value=principal)
+        ),
+        patch(
+            "orchestrator.main._enforce_readiness_gate", AsyncMock(return_value=None)
+        ),
+        patch(
+            "orchestrator.main._require_job_project_access",
+            AsyncMock(return_value=None),
+        ),
+        patch(
+            "orchestrator.main._is_experts_db_enabled", MagicMock(return_value=False)
+        ),
+        patch(
+            "orchestrator.main._inherit_parent_datasource_ids",
+            AsyncMock(return_value=[]),
+        ),
+        patch(
+            "orchestrator.main._authorize_thread_datasource_ids",
+            AsyncMock(return_value=[]),
+        ),
+        patch(
+            "orchestrator.main._enforce_job_create_grants", AsyncMock(return_value=None)
+        ),
+        patch("orchestrator.services.job_provisioning.provision_job_repo", AsyncMock()),
+        patch("orchestrator.main._spawn_scholar_subjob", AsyncMock(return_value=None)),
+        patch("orchestrator.main._trigger_dispatch", MagicMock()),
     )
     with ExitStack() as stack:
         stack.enter_context(
@@ -3066,7 +3249,7 @@ async def test_completion_merge_can_record_server_owned_evidence_manifest(db):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("claimed", [False, True], ids=["ordinary", "claimed"])
 async def test_delete_response_reports_only_an_actual_durable_claim(db, claimed):
-    from main import delete_job
+    from orchestrator.main import delete_job
 
     seed = await _seed_post(db)
     if claimed:
@@ -3096,13 +3279,18 @@ async def test_delete_response_reports_only_an_actual_durable_claim(db, claimed)
     )
 
     with (
-        patch("main.postgres_db", db),
+        patch("orchestrator.main.postgres_db", db),
         patch.object(db, "job_has_durable_ticket_claim", post_commit_lookup),
-        patch("main.require_job_access", AsyncMock(return_value=(admin, job))),
-        patch("main._archive_and_cleanup_workspace", AsyncMock(return_value=[])),
-        patch("main.gitea_client", gitea),
-        patch("main.snapshot_service", snapshots),
-        patch("main.vector_db", vector),
+        patch(
+            "orchestrator.main.require_job_access", AsyncMock(return_value=(admin, job))
+        ),
+        patch(
+            "orchestrator.main._archive_and_cleanup_workspace",
+            AsyncMock(return_value=[]),
+        ),
+        patch("orchestrator.main.gitea_client", gitea),
+        patch("orchestrator.main.snapshot_service", snapshots),
+        patch("orchestrator.main.vector_db", vector),
     ):
         result = await delete_job(
             SimpleNamespace(headers={}, query_params={}), str(created["id"])
@@ -3166,11 +3354,22 @@ async def test_backlog_query_and_admission_reject_enabled_thread_not_holding_pos
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "mutation",
-    ["hold", "disable", "roster", "decommission", "recommission"],
+    [
+        "hold",
+        "disable",
+        "auto_pull_disable",
+        "roster",
+        "decommission",
+        "recommission",
+    ],
 )
 async def test_final_boundary_rejects_lifecycle_or_roster_change(db, mutation):
-    seed = await _seed_post(db)
-    preparation = await _prepare(db, seed)
+    # Tick-shaped optimistic read: every preparation saw auto_pull=true.
+    # The lifecycle/config writer commits before the final transaction; the
+    # shared Post lock must make the stale tick lose with no job or BP-05
+    # claim, regardless of which authority changed.
+    seed = await _seed_post(db, auto_pull=True)
+    preparation = await _prepare(db, seed, auto_pull=True)
 
     if mutation == "hold":
         await db.set_project_officer_hold(
@@ -3182,6 +3381,11 @@ async def test_final_boundary_rejects_lifecycle_or_roster_change(db, mutation):
         await db.update_project_officer_post(
             seed["project_id"],
             config_updates={"officer": {"enabled": False}},
+        )
+    elif mutation == "auto_pull_disable":
+        await db.update_project_officer_post(
+            seed["project_id"],
+            config_updates={"officer": {"auto_pull": False}},
         )
     elif mutation == "roster":
         await db.update_project_officer_post(
@@ -3205,8 +3409,132 @@ async def test_final_boundary_rejects_lifecycle_or_roster_change(db, mutation):
             job_kwargs=_job_kwargs(mutation),
             ticket_note_id=f"ticket-{mutation}",
             ticket_ready_at=READY_GENERATION,
+            ticket_claim_source="tick",
         )
     assert await _job_count(db) == 0
+    assert await _claim_rows(db, seed["project_id"]) == []
+
+
+@pytest.mark.asyncio
+async def test_bp01_controls_round_trip_and_survive_recommission(db, monkeypatch):
+    seed = await _seed_post(db)
+    monkeypatch.setattr(orch_main, "postgres_db", db)
+    monkeypatch.setattr(orch_main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", True)
+    monkeypatch.setattr(
+        orch_main,
+        "require_project_owner",
+        AsyncMock(
+            return_value=({"id": str(uuid4()), "is_admin": True}, {"name": "proof"})
+        ),
+    )
+    monkeypatch.setattr(
+        orch_main,
+        "require_project_member",
+        AsyncMock(
+            return_value=({"id": str(uuid4()), "is_admin": True}, {"name": "proof"})
+        ),
+    )
+    monkeypatch.setattr(
+        orch_main, "_inject_officer_notice", AsyncMock(return_value=False)
+    )
+    roster = {
+        "research": {
+            "count": 1,
+            "category": "researcher",
+            "model": "MiniMax-M3",
+            "backend": "sandbox",
+            "spend_ceiling_daily": 7.25,
+        }
+    }
+
+    updated = await orch_main.patch_project_officer(
+        MagicMock(),
+        seed["project_id"],
+        {
+            "auto_pull": True,
+            "worker_spend_ceiling_daily": 19.5,
+            "slots": roster,
+        },
+    )
+    summary = await orch_main.get_project_officer_summary(
+        MagicMock(), seed["project_id"]
+    )
+    post = await db.get_project_officer(seed["project_id"])
+    thread = await db.get_thread(seed["thread_id"])
+    expected = {
+        "auto_pull": True,
+        "worker_spend_ceiling_daily": 19.5,
+        "slots": roster,
+    }
+
+    assert updated["config_override"]["officer"] == expected
+    assert post["config_override"]["officer"] == expected
+    assert _json(thread["metadata"])["config_override"]["officer"] == {
+        **expected,
+        "enabled": True,
+    }
+    assert summary["backlog"]["auto_pull"] is True
+    assert summary["backlog"]["worker_spend_ceiling_daily"] == 19.5
+    assert summary["backlog"]["auto_pull_control"] == {
+        "enable_available": True,
+        "source": "deployment_policy",
+        "reason": None,
+    }
+    assert summary["kit"]["research"] == {**roster["research"], "in_flight": 0}
+
+    prepared = await prepare_officer_admission(
+        db,
+        project_id=seed["project_id"],
+        thread_id=seed["thread_id"],
+        requested_slot="research",
+        require_auto_pull=True,
+        expected_category="researcher",
+    )
+    await orch_main.patch_project_officer(
+        MagicMock(), seed["project_id"], {"auto_pull": False}
+    )
+    with pytest.raises(OfficerAdmissionConflict) as exc:
+        await admit_and_create_job(
+            db,
+            preparation=prepared,
+            job_kwargs=_job_kwargs("BP-01 disable fence"),
+            ticket_note_id="bp01-disabled",
+            ticket_ready_at=READY_GENERATION,
+        )
+    assert exc.value.code == "auto_pull_disabled"
+    assert await _job_count(db) == 0
+
+    await orch_main.patch_project_officer(
+        MagicMock(), seed["project_id"], {"auto_pull": True}
+    )
+    await db.decommission_project_officer(
+        seed["project_id"], seed["thread_id"], reason="BP-01 recommission"
+    )
+    durable = (await db.get_project_officer(seed["project_id"]))["config_override"]
+    assert durable["officer"] == expected
+    successor_id = uuid4()
+    successor_config = json.loads(json.dumps(durable))
+    successor_config["officer"]["enabled"] = True
+    async with db.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO threads (id, project_id, status, metadata)
+            VALUES ($1, $2, 'active', $3::jsonb)
+            """,
+            successor_id,
+            UUID(seed["project_id"]),
+            json.dumps({"config_override": successor_config}),
+        )
+    assert await db.register_project_officer_thread(
+        seed["project_id"],
+        str(successor_id),
+        expected_post_config_override=durable,
+    )
+    successor = await db.get_thread(str(successor_id))
+    assert _json(successor["metadata"])["config_override"]["officer"] == {
+        **expected,
+        "enabled": True,
+    }
 
 
 @pytest.mark.asyncio
@@ -3470,6 +3798,68 @@ async def test_bp11_concurrent_whole_roster_writes_never_form_a_union(db):
     assert (
         _json(thread["metadata"])["config_override"]["officer"]["slots"] == final_slots
     )
+
+
+@pytest.mark.asyncio
+async def test_bp01_concurrent_enable_disable_writes_never_form_a_hybrid(db):
+    seed = await _seed_post(db)
+    enabled = {
+        "auto_pull": True,
+        "worker_spend_ceiling_daily": 25.0,
+        "slots": {
+            "research": {
+                "count": 2,
+                "category": "researcher",
+                "backend": "sandbox",
+                "spend_ceiling_daily": 8.0,
+            }
+        },
+    }
+    disabled = {
+        "auto_pull": False,
+        "worker_spend_ceiling_daily": None,
+        "slots": {
+            "test": {
+                "count": 1,
+                "category": "tester",
+                "backend": "sandbox",
+                "spend_ceiling_daily": 3.0,
+            }
+        },
+    }
+
+    async with db.acquire() as blocker:
+        transaction = blocker.transaction()
+        await transaction.start()
+        await blocker.fetchrow(
+            "SELECT project_id FROM project_officers WHERE project_id=$1 FOR UPDATE",
+            UUID(seed["project_id"]),
+        )
+        write_enabled = asyncio.create_task(
+            db.update_project_officer_post(
+                seed["project_id"], config_updates={"officer": enabled}
+            )
+        )
+        write_disabled = asyncio.create_task(
+            db.update_project_officer_post(
+                seed["project_id"], config_updates={"officer": disabled}
+            )
+        )
+        await asyncio.sleep(0.1)
+        assert not write_enabled.done() and not write_disabled.done()
+        await transaction.commit()
+
+    results = await asyncio.gather(write_enabled, write_disabled)
+    observed = [result["post"]["config_override"]["officer"] for result in results]
+    assert enabled in observed and disabled in observed
+    post = await db.get_project_officer(seed["project_id"])
+    thread = await db.get_thread(seed["thread_id"])
+    final = post["config_override"]["officer"]
+    assert final in (enabled, disabled)
+    assert _json(thread["metadata"])["config_override"]["officer"] == {
+        **final,
+        "enabled": True,
+    }
 
 
 @pytest.mark.asyncio
@@ -4350,3 +4740,61 @@ async def test_blocking_route_snapshot_cannot_land_after_decommission(db):
     assert stored_job["status"] == "processing"
     assert stored_job["freeze_data"] is None
     assert routes == wakes == messages == 0
+
+
+@pytest.mark.asyncio
+async def test_hold_with_route_reason_escalates_blocking_routes(db):
+    """A hold that carries a ``route_reason`` must reach PostgreSQL.
+
+    The route-escalation branch only runs when a hold is stamped *and* the
+    caller names a reason — the shape every real caller uses (conference
+    open, the maintenance-hold endpoint, archive quiesce) and the one shape
+    no other proof in this module exercised. Its ``jsonb_build_object``
+    arguments carry no inferable type, so an uncast parameter makes asyncpg
+    fail at PREPARE with ``IndeterminateDatatypeError`` — a failure the
+    conference path swallows as non-fatal and the endpoint returns as a 500.
+    """
+    seed = await _seed_post(db)
+    job = await _seed_officer_job(
+        db,
+        seed,
+        thread_id=seed["thread_id"],
+        status="processing",
+        label="hold route proof",
+    )
+    async with db.acquire() as conn:
+        route_id = await conn.fetchval(
+            """
+            INSERT INTO job_message_routes (
+                job_id, project_id, thread_id, officer_thread_id,
+                state, blocking
+            ) VALUES ($1, $2, $3, $4, 'pending_officer', TRUE)
+            RETURNING route_id
+            """,
+            job["id"],
+            UUID(seed["project_id"]),
+            seed["thread_id"],
+            UUID(seed["thread_id"]),
+        )
+
+    result = await db.set_project_officer_hold(
+        seed["project_id"],
+        expected_thread_id=seed["thread_id"],
+        hold={"kind": "conference", "since": "now", "thread_id": str(uuid4())},
+        route_reason="officer_hold",
+    )
+
+    metadata = _json(result["thread"]["metadata"])
+    assert metadata["config_override"]["officer"]["hold"]["kind"] == "conference"
+    assert [str(r["route_id"]) for r in result["routes"]] == [str(route_id)]
+
+    async with db.acquire() as conn:
+        stored = await conn.fetchrow(
+            "SELECT state, transitions FROM job_message_routes WHERE route_id=$1",
+            route_id,
+        )
+    assert stored["state"] == "escalated_to_user"
+    transition = _json(stored["transitions"])[-1]
+    assert transition["to"] == "escalated_to_user"
+    assert transition["note"] == "officer_hold"
+    assert transition["actor_id"] == "drain:officer_hold"

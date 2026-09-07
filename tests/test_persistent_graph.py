@@ -23,9 +23,9 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
-from src.core.workspace_backend import WorkspaceUnavailableError
+from shared.runtime.core.workspace_backend import WorkspaceUnavailableError
 
-from src.persistent_graph import (
+from agent.persistent_graph import (
     APPROVE_SENTINEL,
     DENY_SENTINEL,
     INTERRUPT_SENTINEL,
@@ -84,7 +84,7 @@ def _no_retry_backoff(monkeypatch):
     Retry timing itself is covered in test_session_transient_llm_retry.py; this
     module tests turn outcomes, fallback routing, and callback ordering.
     """
-    monkeypatch.setattr("src.persistent_graph._SESSION_LLM_RETRY_BASE_DELAY", 0.0)
+    monkeypatch.setattr("agent.persistent_graph._SESSION_LLM_RETRY_BASE_DELAY", 0.0)
 
 
 def _make_config(**overrides):
@@ -846,7 +846,7 @@ class TestMemoryExtractionTrigger:
         mock_aux = MagicMock()
 
         with patch(
-            "src.services.auxiliary.extract_and_store_memories",
+            "shared.runtime.services.auxiliary.extract_and_store_memories",
             new_callable=AsyncMock,
         ) as extract:
             await run_persistent_loop(
@@ -962,7 +962,7 @@ class TestMemoryExtractionTrigger:
         config = _make_config(observer_interval=5)
         llm = _make_streaming_llm(_make_llm_response("ok"))
 
-        with patch("src.persistent_graph.asyncio.create_task") as mock_task:
+        with patch("agent.persistent_graph.asyncio.create_task") as mock_task:
             await run_persistent_loop(
                 llm_with_tools=llm,
                 tools=[],
@@ -995,7 +995,7 @@ class TestMemoryExtractionTrigger:
         config = _make_config(observer_interval=5)
         llm = _make_streaming_llm(_make_llm_response("ok"))
 
-        with patch("src.persistent_graph.asyncio.create_task") as mock_task:
+        with patch("agent.persistent_graph.asyncio.create_task") as mock_task:
             await run_persistent_loop(
                 llm_with_tools=llm,
                 tools=[],
@@ -1028,7 +1028,7 @@ class TestMemoryExtractionTrigger:
         config = _make_config(observer_interval=0)
         llm = _make_streaming_llm(_make_llm_response("ok"))
 
-        with patch("src.persistent_graph.asyncio.create_task") as mock_task:
+        with patch("agent.persistent_graph.asyncio.create_task") as mock_task:
             await run_persistent_loop(
                 llm_with_tools=llm,
                 tools=[],
@@ -1066,7 +1066,7 @@ class TestMemoryExtractionTrigger:
         mock_recall.retrieve = AsyncMock(return_value=[])
 
         with patch(
-            "src.persistent_graph.asyncio.create_task",
+            "agent.persistent_graph.asyncio.create_task",
             side_effect=RuntimeError("task creation failed"),
         ):
             # Should not raise
@@ -1872,7 +1872,7 @@ class TestExecuteTurnMemoryRetrieval:
         memory followed the current product question and caused the model to
         reuse an earlier answer without calling the current guide.
         """
-        from src.core.skill_resolution import (
+        from shared.runtime.core.skill_resolution import (
             APP_GUIDE_LOADER_TOOL,
             APP_GUIDE_SKILL,
             add_persistent_system_skills,
@@ -1893,7 +1893,7 @@ class TestExecuteTurnMemoryRetrieval:
         captured = []
 
         with patch(
-            "src.services.recall_store.RecallStore.assemble_memory_block",
+            "shared.runtime.services.recall_store.RecallStore.assemble_memory_block",
             return_value="HISTORICAL WORKSPACE MEMORY",
         ):
             await _execute_turn(
@@ -1945,8 +1945,8 @@ class TestExecuteTurnKnowledgeRetrieval:
         import uuid
         from types import SimpleNamespace
 
-        from src.services.knowledge.bindings import KnowledgeBinding
-        from src.services.knowledge_store import KnowledgeRecord
+        from agent.services.knowledge.bindings import KnowledgeBinding
+        from shared.runtime.services.knowledge_store import KnowledgeRecord
 
         native = KnowledgeBinding(
             kb_id=uuid.uuid4(),
@@ -2234,7 +2234,7 @@ class TestCitationFeedbackInjectionUnit:
     """Pure _inject_context_pairs coverage for the citation-feedback block."""
 
     def test_injects_citation_feedback_pair_after_other_context(self):
-        from src.core.citation_feedback_injection import (
+        from agent.core.citation_feedback_injection import (
             is_citation_feedback_injection_message,
         )
 
@@ -2264,7 +2264,7 @@ class TestExecuteTurnCitationFeedback:
     async def test_failed_citations_surfaced_to_llm(self):
         """A still-failed citation is queried once per turn and injected into the
         LLM input as a synthetic check_citation_verification pair."""
-        from src.core.citation_feedback_injection import (
+        from agent.core.citation_feedback_injection import (
             is_citation_feedback_injection_message,
         )
 
@@ -2300,7 +2300,7 @@ class TestExecuteTurnCitationFeedback:
     @pytest.mark.asyncio
     async def test_no_engine_skips_query_and_injection(self):
         """No citation engine on the context → no query, no injection, no error."""
-        from src.core.citation_feedback_injection import (
+        from agent.core.citation_feedback_injection import (
             is_citation_feedback_injection_message,
         )
 
@@ -2331,7 +2331,7 @@ class TestExecuteTurnCitationFeedback:
     @pytest.mark.asyncio
     async def test_no_failed_citations_no_injection(self):
         """Engine present but nothing failed → no feedback pair."""
-        from src.core.citation_feedback_injection import (
+        from agent.core.citation_feedback_injection import (
             is_citation_feedback_injection_message,
         )
 
@@ -2410,6 +2410,42 @@ def _make_compacting_ctx_mgr(result_fn):
 
 
 class TestContextCompaction:
+    @pytest.mark.asyncio
+    async def test_turn_messages_are_stamped_and_survive_input_eviction(self):
+        """Every message the turn appends carries its membership stamp, so a
+        compaction that summarises the turn's own input away still leaves the
+        turn's rows selectable for the turn-end reconcile (the crash in
+        stateless_turn_settlement_crashes_after_midturn_compaction.md)."""
+        from shared.runtime.core.message_markers import turn_membership
+
+        def _drop_input(msgs):
+            return [msgs[0], SystemMessage(content="[Summary of prior work]\nrecap")]
+
+        ctx_mgr = _make_compacting_ctx_mgr(_drop_input)
+        messages = [
+            SystemMessage(content="sys"),
+            HumanMessage(content="question", id="input-4"),
+        ]
+        callbacks = _make_callbacks()
+
+        result = await _execute_turn(
+            llm_with_tools=_make_streaming_llm(_make_llm_response("ok")),
+            tool_map={},
+            context_manager=ctx_mgr,
+            messages=messages,
+            callbacks=callbacks,
+            llm_timeout=600,
+            auxiliary_llm=None,
+            config=_make_config(),
+            turn_id=4,
+        )
+
+        assert result.error is None
+        assert not any(getattr(m, "id", None) == "input-4" for m in messages)
+        ai = [m for m in messages if isinstance(m, AIMessage)]
+        assert ai and all(turn_membership(m) == 4 for m in ai)
+        assert turn_membership(messages[0]) is None  # system prompt is not a turn row
+
     @pytest.mark.asyncio
     async def test_compaction_triggers_git_commit_and_push(self):
         """When compaction actually ran (run counter), git commit + push fires."""
@@ -2891,7 +2927,7 @@ _PLACEHOLDER = (
 def _drive_reasoning_then_empty(reasoning_text="dead-end reasoning"):
     """An astream that surfaces a reasoning delta (sets reasoning_streamed=True
     via the live sink) and then yields an empty answer — the slow-empty mode."""
-    from src.llm.reasoning_chat import _STREAM_REASONING_SINK
+    from shared.runtime.llm.reasoning_chat import _STREAM_REASONING_SINK
 
     async def _astream(messages, **kw):
         sink = _STREAM_REASONING_SINK.get()
@@ -3409,7 +3445,7 @@ class TestToolExecutionLoop:
         may follow.
         """
 
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         generation = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         attach_token = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
@@ -3531,7 +3567,7 @@ class TestToolExecutionLoop:
 
     @pytest.mark.asyncio
     async def test_protected_loss_at_execution_gate_never_latches_tool_inflight(self):
-        from src.api import persistent_app as pa
+        from agent.api import persistent_app as pa
 
         response_with_tool = AIMessage(
             content="",
@@ -3588,8 +3624,8 @@ class TestToolExecutionLoop:
 
     @pytest.mark.asyncio
     async def test_malformed_stateless_identity_never_invokes_tool(self):
-        from src.api import persistent_app as pa
-        from src.api.lease_context import LeaseHandle, current_lease
+        from agent.api import persistent_app as pa
+        from agent.api.lease_context import LeaseHandle, current_lease
 
         response_with_tool = AIMessage(
             content="",
@@ -3641,8 +3677,8 @@ class TestToolExecutionLoop:
 
     @pytest.mark.asyncio
     async def test_stateless_identity_without_executor_handoff_never_invokes_tool(self):
-        from src.api import persistent_app as pa
-        from src.api.lease_context import LeaseHandle, current_lease
+        from agent.api import persistent_app as pa
+        from agent.api.lease_context import LeaseHandle, current_lease
 
         response_with_tool = AIMessage(
             content="",
@@ -3695,8 +3731,8 @@ class TestToolExecutionLoop:
 
     @pytest.mark.asyncio
     async def test_pinned_tool_executes_without_queue_identity(self):
-        from src.api import persistent_app as pa
-        from src.api.lease_context import current_lease
+        from agent.api import persistent_app as pa
+        from agent.api.lease_context import current_lease
 
         response_with_tool = AIMessage(
             content="",
@@ -4520,7 +4556,7 @@ class TestHardInterruptHelpers:
 
     @pytest.mark.asyncio
     async def test_await_passthrough_when_no_event(self):
-        from src.persistent_graph import _await_or_hard_interrupt
+        from agent.persistent_graph import _await_or_hard_interrupt
 
         async def quick():
             return "done"
@@ -4531,7 +4567,7 @@ class TestHardInterruptHelpers:
 
     @pytest.mark.asyncio
     async def test_await_completes_when_event_idle(self):
-        from src.persistent_graph import _await_or_hard_interrupt
+        from agent.persistent_graph import _await_or_hard_interrupt
 
         async def quick():
             return 42
@@ -4542,7 +4578,7 @@ class TestHardInterruptHelpers:
 
     @pytest.mark.asyncio
     async def test_await_cancels_blocked_coro_on_event(self):
-        from src.persistent_graph import _await_or_hard_interrupt
+        from agent.persistent_graph import _await_or_hard_interrupt
 
         event = asyncio.Event()
         cancelled = {"v": False}
@@ -4570,7 +4606,7 @@ class TestHardInterruptHelpers:
 
     @pytest.mark.asyncio
     async def test_await_propagates_coro_exception(self):
-        from src.persistent_graph import _await_or_hard_interrupt
+        from agent.persistent_graph import _await_or_hard_interrupt
 
         async def boom():
             raise ValueError("kaboom")
@@ -4580,7 +4616,7 @@ class TestHardInterruptHelpers:
 
     @pytest.mark.asyncio
     async def test_stream_yields_chunks_then_stop(self):
-        from src.persistent_graph import _stream_next_or_hard_interrupt
+        from agent.persistent_graph import _stream_next_or_hard_interrupt
 
         async def gen():
             yield "a"
@@ -4594,7 +4630,7 @@ class TestHardInterruptHelpers:
 
     @pytest.mark.asyncio
     async def test_stream_passthrough_when_no_event(self):
-        from src.persistent_graph import _stream_next_or_hard_interrupt
+        from agent.persistent_graph import _stream_next_or_hard_interrupt
 
         async def gen():
             yield "only"
@@ -4605,7 +4641,7 @@ class TestHardInterruptHelpers:
 
     @pytest.mark.asyncio
     async def test_stream_interrupts_hung_read(self):
-        from src.persistent_graph import _stream_next_or_hard_interrupt
+        from agent.persistent_graph import _stream_next_or_hard_interrupt
 
         started = asyncio.Event()
 
@@ -4680,7 +4716,7 @@ class TestExecuteTurnReasoning:
     async def test_live_streamed_reasoning_skips_post_stream_fallback(self):
         """When the SSE tap surfaces reasoning live (sink fired), the post-stream
         fallback does not re-broadcast it — exactly one emission."""
-        from src.llm.reasoning_chat import _STREAM_REASONING_SINK
+        from shared.runtime.llm.reasoning_chat import _STREAM_REASONING_SINK
 
         response = AIMessage(content="Answer.")
         response.additional_kwargs = {"reasoning_content": "live reasoning"}
@@ -4729,7 +4765,7 @@ class TestExecuteTurnReasoning:
     @pytest.mark.asyncio
     async def test_sink_is_cleared_after_turn(self):
         """The reasoning sink contextvar must not leak past the turn."""
-        from src.llm.reasoning_chat import _STREAM_REASONING_SINK
+        from shared.runtime.llm.reasoning_chat import _STREAM_REASONING_SINK
 
         callbacks = _make_callbacks()
         messages = [SystemMessage(content="sys"), HumanMessage(content="go")]
@@ -4872,7 +4908,7 @@ def _is_tool_call_ai(m) -> bool:
 
 def _memory_pair(content: str):
     """A real (AIMessage(tool_call), ToolMessage) pair, as the seam produces."""
-    from src.core.memory_injection import create_memory_injection_messages
+    from agent.core.memory_injection import create_memory_injection_messages
 
     return list(create_memory_injection_messages(content))
 
@@ -5107,3 +5143,17 @@ class TestMaybeEstimateReasoningTokens:
         _maybe_estimate_reasoning_tokens(tm, "")
         assert "reasoning_tokens" not in tm
         assert "reasoning_estimated" not in tm
+
+
+# =============================================================================
+# PERSIST_ROLE_KEY import path (re-exported from src.core.message_markers)
+# =============================================================================
+
+
+class TestPersistRoleKeyReexport:
+    def test_persist_role_key_is_the_message_markers_constant(self):
+        from shared.runtime.core.message_markers import PERSIST_ROLE_KEY as canonical
+        from agent.persistent_graph import PERSIST_ROLE_KEY
+
+        assert PERSIST_ROLE_KEY is canonical
+        assert PERSIST_ROLE_KEY == "_srw_persist_role"

@@ -59,7 +59,7 @@ _check() {
 echo "Asserting workspace browser stack:"
 
 # The only sanctioned browser entry point. The agent invokes it over SSH
-# (src/tools/context.py) and has no local fallback by design — the in-pod
+# (src/agent/tools/context.py) and has no local fallback by design — the in-pod
 # browser was removed deliberately (knowledge-base/knowledge/issues/remove_local_browser_fallback.md).
 # If browser-exec is absent the tool returns an opaque empty-stdout error and the
 # agent concludes no renderer exists anywhere.

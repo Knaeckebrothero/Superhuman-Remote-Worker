@@ -20,7 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from src.shared.event_journal import append_system_frame, bump_epoch
+from shared.event_journal import append_system_frame, bump_epoch
 
 _RETIRE_REASONS = {"lease_expired", "force_end"}
 

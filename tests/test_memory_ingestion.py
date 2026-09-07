@@ -10,9 +10,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from src.core.loader import IngestionConfig, _parse_memory_config
-from src.services.auxiliary import IngestionVerdict, IngestionVerdictTask
-from src.services.memory.ingestion import (
+from shared.runtime.core.loader import IngestionConfig, _parse_memory_config
+from shared.runtime.services.auxiliary import IngestionVerdict, IngestionVerdictTask
+from shared.runtime.services.memory.ingestion import (
     IngestionVerdictService,
     maybe_attach_ingestion_verdict,
 )

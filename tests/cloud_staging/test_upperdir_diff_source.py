@@ -20,6 +20,7 @@ orchestrator replicas racing the same thread's staging.
 import hashlib
 import io
 import json
+from pathlib import Path
 import tarfile
 from unittest.mock import AsyncMock, MagicMock
 
@@ -85,10 +86,21 @@ def _manifest(
 def _snapshot_service(blobs: dict[str, bytes]):
     svc = MagicMock()
 
-    async def _get_blob(key):
-        return blobs.get(key)
+    async def _get_blob(key, *, max_bytes=None):
+        blob = blobs.get(key)
+        if blob is not None and max_bytes is not None and len(blob) > max_bytes:
+            return None
+        return blob
+
+    async def _download_blob_file(key, local_path, *, max_bytes):
+        blob = blobs.get(key)
+        if blob is None or len(blob) > max_bytes:
+            return False
+        Path(local_path).write_bytes(blob)
+        return True
 
     svc.get_blob = AsyncMock(side_effect=_get_blob)
+    svc.download_blob_file = AsyncMock(side_effect=_download_blob_file)
     return svc
 
 

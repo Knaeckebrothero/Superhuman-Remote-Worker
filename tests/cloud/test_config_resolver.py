@@ -137,12 +137,12 @@ class TestLoadMainCloudConfigResolverOrder:
 
 class TestOpenCloudZeroConfigDefaults:
     """A fresh `.env` with no OPENCLOUD_* variables set MUST still
-    produce a valid OpenCloudSettings — the defaults match the bundled
-    docker-compose dev stack. This is the contract the user relies on
-    when copying ``.env.example`` and only filling in API keys.
+    produce a valid OpenCloudSettings — the defaults target a locally
+    reachable OpenCloud. This is the contract the user relies on when
+    copying ``.env.example`` and only filling in API keys.
     """
 
-    def test_zero_config_loads_with_compose_defaults(
+    def test_zero_config_loads_with_builtin_defaults(
         self, monkeypatch: pytest.MonkeyPatch
     ):
         _clear_cloud_env(monkeypatch)

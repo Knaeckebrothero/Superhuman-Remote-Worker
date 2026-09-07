@@ -525,7 +525,9 @@ async def test_exact_attach_abort_strongly_owns_successor_provisioning():
             "_thread_project_ids",
             AsyncMock(return_value=["project-a"]),
         ),
-        patch("services.provision_or_assign.provision_or_assign", provision),
+        patch(
+            "orchestrator.services.provision_or_assign.provision_or_assign", provision
+        ),
     ):
         task = main._schedule_attach_abort_successor(
             THREAD_ID,
@@ -611,7 +613,9 @@ async def test_workspace_zero_abort_recreates_exact_pod_and_health_checks_ide(
         ),
         patch.object(main, "ensure_session_workspace", ensure_workspace),
         patch.object(main, "_thread_project_ids", AsyncMock(return_value=[])),
-        patch("services.provision_or_assign.provision_or_assign", provision),
+        patch(
+            "orchestrator.services.provision_or_assign.provision_or_assign", provision
+        ),
     ):
         assert (
             await main._reconcile_attach_abort_successor(_workspace_zero_candidate())
@@ -681,7 +685,9 @@ async def test_workspace_zero_health_failure_keeps_successor_unbound_and_retryab
             "wait_for_workspace_code_server",
             AsyncMock(return_value=False),
         ) as health,
-        patch("services.provision_or_assign.provision_or_assign", provision),
+        patch(
+            "orchestrator.services.provision_or_assign.provision_or_assign", provision
+        ),
     ):
         assert (
             await main._reconcile_attach_abort_successor(_workspace_zero_candidate())
@@ -708,7 +714,9 @@ async def test_workspace_zero_abort_fails_closed_for_static_docker_workspace():
             "delete_workspace",
             AsyncMock(),
         ) as delete_workspace,
-        patch("services.provision_or_assign.provision_or_assign", provision),
+        patch(
+            "orchestrator.services.provision_or_assign.provision_or_assign", provision
+        ),
     ):
         assert (
             await main._reconcile_attach_abort_successor(_workspace_zero_candidate())
@@ -748,7 +756,9 @@ async def test_workspace_zero_delete_cas_loss_never_recreates_or_touches_u2():
             delete_workspace,
         ),
         patch.object(main, "ensure_session_workspace", ensure_workspace),
-        patch("services.provision_or_assign.provision_or_assign", provision),
+        patch(
+            "orchestrator.services.provision_or_assign.provision_or_assign", provision
+        ),
     ):
         assert (
             await main._reconcile_attach_abort_successor(_workspace_zero_candidate())
@@ -803,7 +813,9 @@ async def test_attach_abort_successor_owner_never_adopts_a_later_generation():
             "try_thread_advisory_lock",
             side_effect=_owned_lifecycle_lock,
         ),
-        patch("services.provision_or_assign.provision_or_assign", provision),
+        patch(
+            "orchestrator.services.provision_or_assign.provision_or_assign", provision
+        ),
     ):
         await main._schedule_attach_abort_successor(
             THREAD_ID,
@@ -845,7 +857,9 @@ async def test_durable_successor_candidate_retries_after_transient_failure():
             side_effect=_owned_lifecycle_lock,
         ),
         patch.object(main, "_thread_project_ids", AsyncMock(return_value=[])),
-        patch("services.provision_or_assign.provision_or_assign", provision),
+        patch(
+            "orchestrator.services.provision_or_assign.provision_or_assign", provision
+        ),
     ):
         with pytest.raises(RuntimeError, match="transient"):
             await main._reconcile_attach_abort_successor(candidate)

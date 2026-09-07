@@ -62,7 +62,11 @@
       "todo_complete": "Complete todo",
       "cite_document": "Cite document",
       "send_message": "Send message",
-      "delegate_work": "Delegate work",
+      "delegate_agent": "Delegate to subagent",
+      "wait_agent": "Wait for subagent",
+      "message_agent": "Message subagent",
+      "stop_agent": "Stop subagent",
+      "list_agents": "List subagents",
       "job_complete": "Complete job",
       "mark_complete": "Mark complete",
       "set_canvas": "Present in Canvas",
@@ -450,7 +454,8 @@
       "unarchive": "Make this project active again so new jobs and sessions can target it"
     },
     "error": {
-      "noAccess": "You don't have access to that project."
+      "noAccess": "You don't have access to that project.",
+      "loadFailed": "Couldn’t load that project — the server returned an error. Please try again."
     },
     "externalKb": {
       "toggle": "Use an external knowledge repository",
@@ -551,7 +556,8 @@
     "tooltip": {
       "sessionFiles": "Session Files",
       "resume": "Resume",
-      "delete": "Delete"
+      "delete": "Delete",
+      "talk": "Talk to the officer"
     },
     "create": {
       "title": "New Session",
@@ -844,6 +850,21 @@
       "showSubjobRows": "Show {{count}} hidden as rows",
       "showSubjobRowsHint": "Adds sub-jobs to the origin filter, so they appear in the list.",
       "subjobs": "Sub-jobs ({{count}})",
+      "subagents": "Subagents ({{count}})",
+      "subagentsError": "Error: {{error}}",
+      "subagentsMetrics": "{{turns}} turns · {{tokens}} tokens",
+      "subagentsOutcome": "Outcome: {{outcome}}",
+      "subagentsTranscript": "Transcript",
+      "subagentsStatuses": {
+        "queued": "Queued",
+        "running": "Running",
+        "completed": "Completed",
+        "parked": "Parked",
+        "interrupted": "Interrupted",
+        "capped": "Capped",
+        "error": "Error",
+        "cancelled": "Cancelled"
+      },
       "tokens": "Tokens",
       "unknown": "Unknown",
       "usage": "Usage",
@@ -946,6 +967,8 @@
         "title": "Default Models",
         "desc": "Which model to use when a job or tool doesn't specify one. Each kind applies to a different workload.",
         "unset": "— not set —",
+        "none": "None",
+        "sameSearchWarning": "This matches the primary search provider, so runtime failover is suppressed.",
         "emptyCatalog": "No models in the catalog yet. Add a provider key or endpoint above, then pick a default.",
         "auxiliaryGroup": "Auxiliary (helper)",
         "kind": {
@@ -957,7 +980,10 @@
           "vision": "Vision (image description)",
           "auxiliary": "Auxiliary (memory extraction / curation / titles)",
           "whisper": "Whisper (speech-to-text)",
-          "tts": "Text-to-speech"
+          "tts": "Text-to-speech",
+          "search": "Search (primary)",
+          "fetch": "Web fetch",
+          "search_fallback": "Search fallback"
         }
       }
     },
@@ -1076,6 +1102,34 @@
       "usageTitle": "How to use",
       "usageDesc": "Pass the token in an Authorization header. n8n's Header Auth credential type works out of the box."
     },
+    "sshKeys": {
+      "linkTitle": "SSH Keys",
+      "linkDesc": "Public keys that let you connect to your session workspaces over SSH.",
+      "linkManage": "Manage SSH Keys",
+      "back": "Back",
+      "title": "SSH Keys",
+      "desc": "Public keys that authenticate your SSH connections into session workspaces. A key only proves who you are once you've shown you hold the matching private key.",
+      "existingTitle": "Your keys",
+      "colName": "Name",
+      "colType": "Type",
+      "colFingerprint": "Fingerprint",
+      "colCreated": "Added",
+      "colLastUsed": "Last used",
+      "disabledBadge": "Disabled",
+      "empty": "No SSH keys yet. Add one below to connect over SSH.",
+      "addTitle": "Add a key",
+      "addDesc": "Registering a key takes two steps: prove you hold the private key, then paste the public key and the resulting signature.",
+      "addButton": "Add SSH key",
+      "requestingChallenge": "Requesting challenge…",
+      "step1Title": "Step 1 — Prove you own the private key",
+      "step1Desc": "Run this command with the private key you want to register, then copy the public key and the signature it produces.",
+      "step2Title": "Step 2 — Register the key",
+      "namePlaceholder": "Key name (e.g. work laptop)",
+      "publicKeyPlaceholder": "Paste the public key (e.g. the contents of ~/.ssh/id_ed25519.pub)",
+      "signaturePlaceholder": "Paste the signature (starts with -----BEGIN SSH SIGNATURE-----)",
+      "submit": "Register key",
+      "submitting": "Registering…"
+    },
     "preferences": {
       "title": "Preferences",
       "desc": "Default settings applied when creating new jobs. Can be overridden per-job.",
@@ -1130,12 +1184,7 @@
       "modelPlaceholder": "e.g. claude-sonnet-4-6",
       "defaultPrefix": "Default:",
       "permissionMode": "Permission Mode",
-      "config": "Config",
-      "greeting": "Greeting",
-      "greetingPlaceholder": "Hello! I'm ready to help.",
       "idleTimeout": "Idle Timeout (minutes)",
-      "commandAllowlist": "Command Allowlist",
-      "commandAllowlistPlaceholder": "pytest*, npm test, git status",
       "permissionSupervised": "Supervised",
       "permissionAutoAccept": "Auto-accept",
       "permissionAutonomous": "Autonomous",
@@ -1144,17 +1193,12 @@
       "workspaceVirtual": "Virtual — instant, cloud file storage",
       "workspaceSandbox": "Container — full shell & git, slower start",
       "workspaceNone": "None — chat only, no files",
-      "configDefault": "Default",
-      "configDeveloper": "Developer",
-      "configScholar": "Scholar",
       "headlessMode": "Headless Behavior",
       "headlessModeDefault": "Default (Eager)",
       "headlessModeEager": "Eager — keep working while untethered",
       "headlessModePolite": "Polite — park between turns until you return",
       "attentionSleep": "Attention Sleep (minutes)",
       "attentionSleepHint": "How long to keep the workspace warm after the agent reaches a natural pause and no one is watching. Leave blank for the system default (60 min).",
-      "notificationChannels": "Notification Channels",
-      "notificationChannelEmail": "Email me when the agent needs my attention",
       "save": "Save Persistent Agent Settings"
     },
     "communication": {
@@ -1493,6 +1537,22 @@
   },
   "chat": {
     "defaultTitle": "Persistent Agent",
+    "subagent": {
+      "banner": "Subagent transcript · {{handle}} · {{type}} · {{status}}",
+      "parentJob": "Parent job {{id}}",
+      "parentSession": "Parent session {{id}}",
+      "loading": "Loading transcript…",
+      "loadFailed": "The transcript could not be loaded.",
+      "empty": "No transcript messages yet.",
+      "turn": "Turn {{count}}",
+      "thinking": "Reasoning",
+      "roles": {
+        "user": "Brief",
+        "assistant": "Subagent",
+        "tool": "Tool",
+        "system": "Event"
+      }
+    },
     "connection": {
       "connected": "Connected",
       "connecting": "Connecting...",
@@ -1522,9 +1582,30 @@
       "citationsTooltip": "Show this session's citations",
       "moreActions": "More actions",
       "disconnect": "Disconnect",
+      "disconnecting": "Disconnecting…",
       "projectFilesButton": "Project files",
       "projectFilesTooltip": "Open the {{name}} project folder in your cloud",
-      "sessionFilesButton": "Session files"
+      "sessionFilesButton": "Session files",
+      "sshButton": "SSH",
+      "sshTooltip": "Connect to this session's workspace over SSH"
+    },
+    "ssh": {
+      "intro": "Connect to this session's workspace with your own terminal, editor or IDE.",
+      "prereqs": "Connecting also needs a Personal Access Token from Settings → API Keys, saved to ~/.config/srw/token, and the srw-ssh-proxy helper on your PATH.",
+      "prereqsLink": "Full setup guide",
+      "configTitle": "SSH config",
+      "configHint": "Add this to ~/.ssh/config, then connect with ssh srw-<handle>.",
+      "identityHint": "Assumes your private key is at ~/.ssh/id_ed25519. If yours lives elsewhere, edit IdentityFile above to match.",
+      "handleLabel": "Session handle",
+      "hostKeyLabel": "Gateway host key fingerprint",
+      "hostKeyHint": "Verify this fingerprint the first time you connect.",
+      "jetBrainsTitle": "JetBrains Gateway",
+      "jetBrainsDesc": "Gateway can't use the config block above. Run this command locally, then point Gateway at 127.0.0.1:2222 with \"Parse config file\" off.",
+      "unavailable": "SSH access isn't available for this session yet.",
+      "seams": {
+        "rewindWarning": "Edits made over SSH land in the agent's next commit and show as agent changes in review — a session rewind discards them.",
+        "refused": "Remote port forwarding (ssh -R), agent forwarding, and jump hosts (ssh -J) are all refused by the gateway."
+      }
     },
     "citations": {
       "title": "Citations",
@@ -1651,7 +1732,13 @@
       "textSize": "Text size",
       "textSmall": "Small",
       "textMedium": "Medium",
-      "textLarge": "Large"
+      "textLarge": "Large",
+      "officerLens": "Officer log",
+      "officerLensFolded": "Fold quiet wakes",
+      "officerLensAll": "Show everything",
+      "wakeLine": "wake · {{time}} · slept ~{{minutes}} min — {{reason}}",
+      "wakeNoReason": "no reason given",
+      "wakeSleepLine": "sleep · ~{{minutes}} min — {{reason}}"
     },
     "tasks": {
       "header": "Tasks {{done}}/{{total}}",
@@ -1936,7 +2023,11 @@
       "list_sources": "Listing sources",
       "search_library": "Searching library",
       "send_message": "Sending message",
-      "delegate_work": "Delegating work",
+      "delegate_agent": "Delegating to subagent",
+      "wait_agent": "Waiting for subagent",
+      "message_agent": "Messaging subagent",
+      "stop_agent": "Stopping subagent",
+      "list_agents": "Listing subagents",
       "mark_complete": "Marking complete",
       "job_complete": "Completing job"
     },
@@ -2018,6 +2109,8 @@
     "filterAll": "All",
     "filterWorker": "Worker",
     "filterSession": "Session",
+    "filterSubagent": "Subagent",
+    "showAll": "Show all experts",
     "colName": "Name",
     "colType": "Type",
     "colSource": "Source",
@@ -2039,7 +2132,63 @@
     "imported": "Expert imported",
     "inUse": "Expert is in use by {{count}} job(s)",
     "saveFailed": "Save failed",
-    "invalidJson": "Invalid JSON file"
+    "invalidJson": "Invalid JSON file",
+    "model": {
+      "title": "Model",
+      "model": "Model",
+      "baseDefault": "Base default",
+      "subagent": "Subagent model",
+      "subagentHint": "Roster-wide default for subagents — every entry without a model of its own runs on it; unset means they inherit this expert's model."
+    },
+    "tags": {
+      "title": "Tags",
+      "hint": "Role tags decide which pickers list this expert — every expert stays usable in every role. Other tags are free text for your own filtering.",
+      "roles": "Roles",
+      "roleLocked": "{{role}} — this expert's type, always on",
+      "free": "Other tags (comma separated)",
+      "freePlaceholder": "research, academic"
+    },
+    "subagents": {
+      "title": "Subagents",
+      "hint": "The roster this expert may delegate to: small inline experts, or references to any other expert (a referenced expert's workspace, autonomy and verification settings are ignored when it runs as a subagent). The name is the subagent_type the parent passes to delegate_agent.",
+      "empty": "No roster entries yet.",
+      "add": "Add subagent",
+      "remove": "Remove subagent",
+      "name": "Name",
+      "nameHint": "Letters, digits, _ and - (must start with a letter or digit)",
+      "nameInvalid": "The name must start with a letter or digit and contain only letters, digits, _ and -",
+      "nameDuplicate": "Another entry already uses this name",
+      "kind": "Kind",
+      "kindInline": "Inline (small expert)",
+      "kindReference": "Reference (another expert)",
+      "reference": "Referenced expert",
+      "referenceNone": "— pick an expert —",
+      "referenceLoading": "Loading experts…",
+      "referenceRequired": "Pick the expert this entry references",
+      "referenceHint": "The settings below override the referenced expert.",
+      "description": "Description",
+      "descriptionHint": "What the parent model sees next to the subagent_type.",
+      "model": "Model",
+      "modelInherit": "Inherit the parent's model",
+      "isolation": "Isolation",
+      "isolationDefault": "Default",
+      "isolationShared": "Shared — the parent's tree",
+      "isolationWorktree": "Worktree — its own git worktree",
+      "writePolicy": "Write policy",
+      "writePolicyDefault": "Default",
+      "writePolicyNone": "None (read-only)",
+      "writePolicyScratchOnly": "Scratch only",
+      "writePolicyOwnedPaths": "Owned paths (from the brief)",
+      "writePolicyFull": "Full",
+      "extra": "Tools, limits, return — JSON",
+      "extraHint": "Any other entry key (tools, limits, return, prompts, further llm settings), kept verbatim.",
+      "extraInvalid": "Invalid JSON",
+      "extraNotObject": "Must be a JSON object",
+      "default": "Default subagent",
+      "defaultHint": "What a delegate_agent call falls back to when it names no subagent_type.",
+      "defaultNone": "None",
+      "invalid": "The subagent roster has errors — fix them before saving."
+    }
   },
   "skills": {
     "title": "Skills",
@@ -2431,23 +2580,12 @@
     "refresh": "Refresh",
     "listAriaLabel": "Action center items",
     "filters": {
-      "all": "All",
-      "messages": "Messages",
-      "sudo": "Sudo",
-      "reviews": "Reviews",
-      "sessions": "Sessions"
+      "all": "All"
     },
     "list": {
-      "empty": {
-        "message": "No message items",
-        "sudo": "No sudo items",
-        "review": "No review items",
-        "session": "No session items"
-      },
+      "emptyCategory": "Nothing in this category",
       "emptyAll": "All clear — no items need your attention",
-      "resolved": "resolved",
-      "modeBlocking": "blocking",
-      "modeAsync": "async"
+      "resolved": "resolved"
     },
     "time": {
       "now": "now"
@@ -2456,81 +2594,7 @@
       "emptyText": "Select an item to view details",
       "hintUse": "Use",
       "hintToNavigate": "to navigate,",
-      "hintToSelect": "to select",
-      "jobId": "Job ID",
-      "requestId": "Request ID",
-      "threadId": "Thread ID",
-      "sessionId": "Session ID",
-      "eventId": "Event ID"
-    },
-    "sudoDetail": {
-      "vmUpgradeRequest": "VM Upgrade Request",
-      "sudoRequest": "Sudo Request",
-      "secondsRemaining": "{{seconds}}s remaining",
-      "user": "User",
-      "vm": "VM",
-      "cwd": "CWD",
-      "workspace": "Workspace",
-      "upgradeHint": "Agent attempted sudo in a container workspace. Upgrade to a VM for full sudo access, or resume the job without a VM.",
-      "upgradeToVm": "Upgrade to VM",
-      "resumeWithoutVm": "Resume without VM",
-      "approve": "Approve",
-      "deny": "Deny",
-      "reason": "Reason",
-      "rulesToggle": "Auto-Approval Rules ({{count}})",
-      "rulePatternPlaceholder": "Pattern (e.g. apt-get install *)",
-      "ruleActionApprove": "Approve",
-      "ruleActionDeny": "Deny",
-      "ruleAdd": "Add"
-    },
-    "messageDetail": {
-      "messageLabel": "Message",
-      "modeBlocking": "blocking",
-      "modeAsync": "async",
-      "sessionPage": "Session page",
-      "openSessionLog": "Open session log",
-      "defaultAgent": "agent",
-      "threadLoading": "Loading thread...",
-      "noMessagesLoaded": "No messages loaded",
-      "senderAgent": "Agent",
-      "senderYou": "You",
-      "replyPlaceholder": "Type a reply...",
-      "markUrgent": "Mark as urgent",
-      "send": "Send"
-    },
-    "reviewDetail": {
-      "jobReview": "Job Review",
-      "freezePhase": "Phase Boundary",
-      "freezeUpgrade": "Sudo Required",
-      "freezeComplete": "Job Complete",
-      "defaultAgent": "agent",
-      "phase": "Phase {{number}}",
-      "loadingFrozen": "Loading frozen data...",
-      "summary": "Summary",
-      "confidence": "Confidence",
-      "deliverables": "Deliverables",
-      "upgradeHint": "Upgrade to a VM for sudo access, or resume without a VM.",
-      "upgradeToVm": "Upgrade to VM",
-      "resumeWithoutVm": "Resume without VM",
-      "notesPlaceholder": "Optional notes...",
-      "approve": "Approve",
-      "feedbackPlaceholder": "Feedback for next phase...",
-      "resumeWithFeedback": "Resume with Feedback"
-    },
-    "sessionDetail": {
-      "agentSession": "Agent Session",
-      "needsAttention": "needs attention",
-      "tool": "Tool",
-      "arguments": "Arguments",
-      "command": "Command",
-      "reason": "Reason",
-      "goToSession": "Go to Session"
-    },
-    "denyDialog": {
-      "titlePrefix": "Deny:",
-      "reasonPlaceholder": "Reason for denial (required)",
-      "cancel": "Cancel",
-      "deny": "Deny"
+      "hintToSelect": "to select"
     },
     "shortcuts": {
       "title": "Keyboard Shortcuts",
@@ -2538,13 +2602,7 @@
       "prevItem": "Previous item",
       "selectItem": "Select item",
       "deselect": "Deselect / close",
-      "approveSudoReview": "Approve (sudo / review)",
-      "denySudo": "Deny (sudo)",
-      "focusReply": "Focus reply (message)",
-      "sendReply": "Send reply",
-      "filterMessages": "Filter: Messages",
-      "filterSudo": "Filter: Sudo",
-      "filterReviews": "Filter: Reviews",
+      "filterCategory": "Filter: n-th category",
       "clearFilter": "Clear filter",
       "toggleOverlay": "Toggle this overlay",
       "close": "Close"
@@ -2595,13 +2653,9 @@
       "context": "Context Management",
       "workspace": "Workspace",
       "shell": "Shell",
-      "research": "Research & Browser",
+      "research": "Research",
       "auxiliary": "Auxiliary LLM",
       "session": "Session"
-    },
-    "phases": {
-      "strategic": "Strategic",
-      "tactical": "Tactical"
     },
     "labels": {
       "reasoning": "Reasoning",
@@ -2622,6 +2676,7 @@
       "keepRecentMessages": "Keep recent messages",
       "vmCpuCores": "VM CPU cores",
       "vmMemory": "VM memory",
+      "vmDiskSize": "VM disk",
       "maxReadWords": "Max read words",
       "maxWriteWords": "Max write words",
       "gitVersioning": "Git versioning",
@@ -2630,12 +2685,9 @@
       "defaultTimeout": "Default timeout (seconds)",
       "sudoAction": "Sudo action",
       "proxyEnabled": "Proxy enabled",
-      "browserHeadless": "Browser headless",
-      "browserVision": "Browser use vision",
       "auxEnabled": "Auxiliary LLM enabled",
       "model": "Model",
-      "idleTimeout": "Idle timeout (minutes)",
-      "greeting": "Greeting"
+      "idleTimeout": "Idle timeout (minutes)"
     },
     "options": {
       "container": "Container",
@@ -3067,14 +3119,13 @@
       "countBound": "{{n}} bound",
       "countPredicted": "{{n}} predicted",
       "group": "Tools",
-      "maxDepth": "Max depth",
+      "maxConcurrent": "Max concurrent",
       "provenance": {
         "measured": "Live from the running agent",
         "measured_partial": "Live from the running agent — partial answer",
         "predicted": "Predicted, not measured",
         "unknown": "The resolved toolset could not be read"
       },
-      "timeout": "Timeout (sec)",
       "unknownCategory": "This cockpit build has no description for this category."
     },
     "toolCategories": {
@@ -3108,7 +3159,7 @@
       },
       "delegation": {
         "label": "Delegation",
-        "description": "Ability to spawn subagents that work in parallel"
+        "description": "Ability to spawn and control foreground or background subagents"
       },
       "email": {
         "label": "Email",
@@ -3198,9 +3249,8 @@
     "model": {
       "group": "Model",
       "preset": "Preset",
-      "strategic": "Strategic",
-      "tactical": "Tactical",
-      "subagent": "Subagent",
+      "subagent": "Subagent model",
+      "subagentRoster": "Roster-wide default for subagents — unset means they inherit the model above.",
       "single": "Model",
       "temperature": "Temperature",
       "reasoning": "Reasoning",
@@ -3216,9 +3266,7 @@
         "project": "project default"
       },
       "presetUnconfigured": "One or both models lack an API key",
-      "providerNoKey": "{{provider}} (no API key)",
-      "mismatchWindow": "These models have different context windows — they share one history, so it's capped to the smaller (~{{min}}).",
-      "mismatchMultimodal": "One of these models can't read images — image input will be disabled for both phases."
+      "providerNoKey": "{{provider}} (no API key)"
     }
   },
   "agentList": {
@@ -3335,13 +3383,10 @@
   },
   "notificationBell": {
     "title": "Action Center",
-    "messagesSingle": "{{n}} message",
-    "messagesPlural": "{{n}} messages",
-    "sudo": "{{n}} sudo",
-    "reviewsSingle": "{{n}} review",
-    "reviewsPlural": "{{n}} reviews",
-    "sessionsSingle": "{{n}} session",
-    "sessionsPlural": "{{n}} sessions"
+    "unseenSingle": "{{n}} new notification",
+    "unseenPlural": "{{n}} new notifications",
+    "pendingSingle": "{{n}} item needs you",
+    "pendingPlural": "{{n}} items need you"
   },
   "todoList": {
     "phaseSelector": {
@@ -3477,6 +3522,13 @@
     "deliveryFailed": "delivery failed; retry state retained",
     "notQueued": "not queued"
   },
+  "conferenceLauncher": {
+    "missingProject": "The address names no project.",
+    "opening": "Opening the conference…",
+    "error": "Could not open the conference:",
+    "back": "Back to the project",
+    "unreachable": "The server could not be reached."
+  },
   "officerCard": {
     "title": "Centurion",
     "intro": "A standing officer for this project: he holds the charge, watches jobs and fleet, dispatches workers from his kit, and pages you only when something genuinely needs you. You talk to him in a conference; his background log is the session transcript. The post outlives him — kit, budgets, and memory stay with it between incarnations.",
@@ -3497,10 +3549,12 @@
       "slotModel": "Slot {{index}} model",
       "slotWorkspace": "Slot {{index}} workspace",
       "slotPool": "Slot {{index}} pool",
+      "slotSpendCeiling": "Slot {{index}} daily spend ceiling in USD",
       "removeSlot": "Remove slot {{name}}",
+      "autoPull": "Enable unattended auto-pull",
+      "workerSpendCeiling": "Century-wide daily worker spend ceiling in USD",
       "maxWorkers": "Maximum workers",
       "tokenCeiling": "Daily token ceiling",
-      "pagesPerDay": "Maximum pages per day",
       "sleepMin": "Minimum sleep in minutes",
       "sleepMax": "Maximum sleep in minutes",
       "holdNote": "Officer hold note",
@@ -3528,6 +3582,8 @@
       "autoPull": "Auto-pull",
       "on": "on — ready tickets are dispatched into free pool slots",
       "off": "off — pools stay idle until he dispatches by hand",
+      "centurySpendCeiling": "worker ceiling ${{amount}}/day",
+      "releaseClosed": "enable transition held by deployment release policy",
       "stalled": "Stalled",
       "stalledDetail": "{{count}} claimed ticket(s) not moving beyond {{threshold}} h ({{source}}) — these are never released automatically; resume or cancel the job, then close or re-ready the ticket.",
       "thresholdSource": {
@@ -3545,10 +3601,16 @@
       "reasoningLabel": "Reasoning"
     },
     "budgets": {
-      "pages": "Pages per day",
-      "pagesHint": "How often he may page you (default 3).",
       "tokenCeiling": "Daily token ceiling",
-      "tokenCeilingHint": "Across his whole command. Blank means no ceiling."
+      "tokenCeilingHint": "Across his whole command. Blank means no ceiling.",
+      "workerSpendCeiling": "Worker spend / day (USD)",
+      "workerSpendCeilingHint": "Optional across every auto-pulled pool. Blank means no mechanical spend brake."
+    },
+    "autoPull": {
+      "label": "Fill categorized pools automatically",
+      "releaseClosed": "Enabling is unavailable until this deployment's unattended-operation gates are complete. Off and all spend ceilings remain editable.",
+      "confirmation": "Enabling starts unattended worker dispatch and spend from ready project tickets at the next tick. Confirm only after reviewing the roster, categories, and spend ceilings.",
+      "confirmEnable": "Enable unattended auto-pull"
     },
     "category": {
       "none": "No pool — officer dispatches by hand",
@@ -3557,7 +3619,7 @@
       "executor": "Executor — deliverable is shipped files"
     },
     "decommission": {
-      "hint": "His kit, budgets, digest, and sitrep fingerprints stay on the post; recommissioning restores them with a continuity brief.",
+      "hint": "His kit, budgets, and sitrep fingerprints stay on the post; recommissioning restores them with a continuity brief.",
       "inFlightWarning": "He has {{count}} job(s) in flight. Decommissioning leaves them running — their completions land on the post's ledger for his successor."
     },
     "defaults": {
@@ -3566,9 +3628,6 @@
       "session": "session default",
       "unlimited": "unlimited",
       "worker": "worker default"
-    },
-    "digest": {
-      "title": "Digest — what he queued for you"
     },
     "errors": {
       "commission": "Commission failed",
@@ -3599,7 +3658,8 @@
     "kit": {
       "breakerOpen": "BREAKER OPEN",
       "ready": "ready {{count}}",
-      "readyBelowFloor": "ready {{count}} — BELOW FLOOR"
+      "readyBelowFloor": "ready {{count}} — BELOW FLOOR",
+      "spendCeiling": "${{amount}}/day"
     },
     "machineState": {
       "not-attempted": "not attempted",
@@ -3688,11 +3748,14 @@
       "maxWorkersHint": "Flat concurrency cap. Without a kit it is the only gate (default 3).",
       "model": "Model",
       "pool": "Pool",
+      "spendCeiling": "Spend / day (USD)",
+      "spendCeilingHint": "Optional ceiling for this pool; blank means no pool-specific brake.",
       "slot": "Slot",
       "slotPlaceholder": "line",
       "workspace": "Workspace"
     },
     "sections": {
+      "autoPull": "Unattended dispatch",
       "brain": "His brain",
       "budgets": "Budgets",
       "kit": "Kit",
@@ -3723,7 +3786,6 @@
       "ceilingReached": "— ceiling reached; sleeping until reset",
       "model": "His model",
       "nextWake": "Next wake",
-      "pagesToday": "Pages today",
       "queuedEvents": "Queued events",
       "spendToday": "Spend today",
       "tokens": "tokens"
@@ -3750,6 +3812,9 @@
       "virtual": "virtual",
       "none": "none",
       "vmRoot": "VM (root)"
+    },
+    "recentNotifications": {
+      "title": "Recent notifications from this officer"
     }
   },
   "statistics": {
@@ -3808,6 +3873,157 @@
       "empty": "No matching options",
       "selectedCount": "{{count}} selected",
       "clear": "Clear"
+    }
+  },
+  "notifications": {
+    "category": {
+      "review_queue": "Review",
+      "vm_upgrade": "VM upgrade",
+      "budget_exceeded": "Budget exceeded",
+      "incident": "Incident",
+      "officer_question": "Officer",
+      "officer_runtime": "Officer runtime",
+      "agent_message": "Agent message",
+      "session_wake": "Session",
+      "loop_event": "Loop",
+      "automation_disabled": "Automation",
+      "user_registered": "New user",
+      "session_permission": "Permission",
+      "sudo_request": "Sudo",
+      "ssh_key_added": "SSH key added"
+    },
+    "severity": {
+      "low": "Low",
+      "normal": "Normal",
+      "high": "High",
+      "critical": "Critical"
+    },
+    "status": {
+      "unseen": "New",
+      "seen": "Seen",
+      "read": "Read",
+      "resolved": "Resolved",
+      "archived": "Archived"
+    },
+    "actions": {
+      "approve": "Approve",
+      "resumeWithFeedback": "Resume with feedback",
+      "resume": "Resume",
+      "deny": "Deny",
+      "upgradeToVm": "Upgrade to VM",
+      "resumeWithoutVm": "Resume without VM",
+      "reply": "Reply",
+      "openConference": "Open officer",
+      "open": "Open",
+      "openJob": "Open job",
+      "openThread": "Open thread",
+      "openSession": "Open session",
+      "openProject": "Open project",
+      "openAutomations": "Open automations",
+      "openAdminUsers": "Open users"
+    },
+    "inputs": {
+      "feedback": "Feedback for the agent…",
+      "reason": "Reason…",
+      "message": "Your orders for the officer…",
+      "notes": "Reviewer notes (optional)…",
+      "value": "…"
+    },
+    "source": {
+      "job": "Job",
+      "sudo_request": "Sudo request",
+      "thread": "Session",
+      "message_thread": "Thread",
+      "loop": "Loop",
+      "automation": "Automation",
+      "user": "User",
+      "permission_request": "Permission request",
+      "ssh_key": "SSH key"
+    },
+    "detail": {
+      "noActions": "No actions available",
+      "source": "Source",
+      "loadingSource": "Loading…",
+      "jobStatus": "Status",
+      "jobDescription": "Description",
+      "command": "Command",
+      "requestStatus": "Request status",
+      "session": "Session",
+      "timeline": "Timeline",
+      "created": "Created",
+      "seen": "Seen",
+      "read": "Read",
+      "resolved": "Resolved",
+      "actionFailed": "The action failed",
+      "jobId": "Job ID",
+      "configName": "Agent",
+      "freezeType": "Freeze",
+      "phase": "Phase",
+      "error": "Error",
+      "summary": "Summary",
+      "requestType": "Request",
+      "vm": "VM",
+      "user": "User",
+      "cwd": "CWD",
+      "reason": "Reason",
+      "secondsRemaining": "{{seconds}}s remaining",
+      "senderAgent": "Agent",
+      "senderYou": "You",
+      "modeBlocking": "blocking",
+      "noMessages": "No messages",
+      "status": "Status",
+      "tool": "Tool",
+      "arguments": "Arguments",
+      "requestedAt": "Requested",
+      "decidedBy": "Decided by",
+      "loop": "Loop",
+      "automation": "Automation",
+      "enabled": "enabled",
+      "disabled": "disabled",
+      "userName": "Name",
+      "email": "Email",
+      "approved": "approved",
+      "pendingApproval": "pending approval",
+      "sourceMissing": "The source is no longer available",
+      "steps": "Scheduled deliveries",
+      "stepUnless": "unless {{conditions}}"
+    },
+    "empty": "No notifications",
+    "loadMore": "Load more",
+    "deepLinkMissing": "That notification could not be found",
+    "sudo": {
+      "rulesToggle": "Auto-approval rules ({{count}})",
+      "rulePatternPlaceholder": "Pattern (e.g. apt-get install *)",
+      "ruleActionApprove": "Approve",
+      "ruleActionDeny": "Deny",
+      "ruleAdd": "Add",
+      "ruleDelete": "Delete rule"
+    },
+    "risk": {
+      "low": "Low risk",
+      "medium": "Medium risk",
+      "high": "High risk",
+      "critical": "Critical"
+    },
+    "channel": {
+      "in_app": "In-app",
+      "email": "Email",
+      "ntfy": "ntfy",
+      "slack_webhook": "Slack",
+      "discord_webhook": "Discord",
+      "push": "Push"
+    },
+    "stepState": {
+      "pending": "pending",
+      "done": "sent",
+      "skipped": "skipped",
+      "cancelled": "cancelled",
+      "failed": "failed"
+    },
+    "condition": {
+      "not_seen": "seen",
+      "not_read": "read",
+      "not_resolved": "settled"
     }
   }
 }

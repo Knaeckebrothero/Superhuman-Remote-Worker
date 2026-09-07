@@ -16,7 +16,7 @@ from orchestrator.services.thread_interrupt_inbox import (
     admit_thread_interrupt,
     find_existing_thread_interrupt,
 )
-from src.shared.session_retirement import STATELESS_STOP_KEYS
+from shared.session_retirement import STATELESS_STOP_KEYS
 
 
 THREAD_ID = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")

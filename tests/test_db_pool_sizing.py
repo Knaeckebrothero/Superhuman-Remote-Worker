@@ -12,8 +12,11 @@ These assert construction-time state only (``_min_connections`` /
 ``_max_connections``) — no pool is opened, so no live Postgres is required.
 """
 
+from unittest.mock import AsyncMock
+
 import pytest
 
+import orchestrator.database.postgres as postgres_module
 from orchestrator.database.postgres import PostgresDB
 
 # Never connected — the constructor only parses config; connect() is separate.
@@ -114,3 +117,23 @@ class TestStoreIsolation:
             default_max_connections=4,
         )
         assert (db._min_connections, db._max_connections) == (1, 4)
+
+
+@pytest.mark.asyncio
+async def test_server_settings_are_copied_and_applied_to_every_pool_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool = AsyncMock()
+    create_pool = AsyncMock(return_value=pool)
+    monkeypatch.setattr(postgres_module.asyncpg, "create_pool", create_pool)
+    settings = {"search_path": "pg_catalog, public, pg_temp"}
+    database = PostgresDB(connection_string=_DSN, server_settings=settings)
+    settings["search_path"] = "public"
+
+    await database.connect()
+    await database.disconnect()
+
+    assert create_pool.await_args.kwargs["server_settings"] == {
+        "search_path": "pg_catalog, public, pg_temp"
+    }
+    pool.close.assert_awaited_once_with()

@@ -118,7 +118,7 @@ async def test_enforce_dispatch_grants_allows_when_granted(monkeypatch):
     )
     # Granted shell + delegation -> the worker-base-shaped fragment passes.
     await m._enforce_dispatch_grants(
-        {"tools": {"shell": ["ls"], "delegation": ["delegate_work"]}},
+        {"tools": {"shell": ["ls"], "delegation": ["delegate_agent"]}},
         runner_user_id=_UID,
         project_ids=[],
     )
@@ -486,7 +486,7 @@ async def test_duplicate_expert_safety_recheck_fires_when_the_strip_map_misses(
     violation. This is what makes an incomplete strip map merely a false
     refusal, never a permitted escape.
     """
-    import src.core.capability_grants as capability_grants
+    import shared.runtime.core.capability_grants as capability_grants
 
     monkeypatch.setattr(
         capability_grants,
@@ -554,25 +554,26 @@ async def test_duplicate_expert_scholar_end_to_end_for_a_default_grants_user(
     assert "shell" not in stored.get("tools", {})
     assert "delegation" not in stored.get("tools", {})
     assert "enabled" not in stored.get("delegation", {})
-    # Scholar's delegation.mode is not the violation (only .enabled is) and
-    # must survive — proof the strip did not take the whole settings dict.
-    assert stored["delegation"]["mode"] == "light"
+    # Scholar's delegation.max_concurrent is not the violation (only .enabled
+    # is) and must survive — proof the strip did not take the whole settings
+    # dict.
+    assert stored["delegation"]["max_concurrent"] == 4
 
 
 # The brief's own measurement: default grants (shell_tools=False,
 # delegation=False) refuse 7 of the 11 shipped experts before task 3 —
-# scholar, developer, critic (shell + delegation) and bughunter, designer,
-# designer-interactive, product-qa (shell). This is the after: every one
+# scholar, developer, critic, bughunter and product-qa (shell + delegation),
+# plus designer and designer-interactive (shell). This is the after: every one
 # forks (200) for the same default-grants non-admin, and drops exactly the
 # grants the brief measured, no more and no less.
 _PREVIOUSLY_REFUSED_SHIPPED_EXPERTS = {
     "scholar": {"shell_tools", "delegation"},
     "developer": {"shell_tools", "delegation"},
     "critic": {"shell_tools", "delegation"},
-    "bughunter": {"shell_tools"},
+    "bughunter": {"shell_tools", "delegation"},
     "designer": {"shell_tools"},
     "designer-interactive": {"shell_tools"},
-    "product-qa": {"shell_tools"},
+    "product-qa": {"shell_tools", "delegation"},
 }
 
 
@@ -610,7 +611,7 @@ async def test_previously_refused_shipped_experts_now_fork_for_default_grants(
     stored = fake.create_expert.await_args.kwargs["config"]
     # The stored config must actually be clean against the same default
     # grants, not merely have a `dropped` list that claims so.
-    from src.core.capability_grants import CATALOG, evaluate
+    from shared.runtime.core.capability_grants import CATALOG, evaluate
 
     default_grants = {k: v["default"] for k, v in CATALOG.items()}
     assert evaluate(stored, default_grants) == []
@@ -731,9 +732,9 @@ async def test_fork_my_expert_default_strips_a_bundled_source_and_reports_it(
     assert "shell" not in stored.get("tools", {})
     assert "delegation" not in stored.get("tools", {})
     assert "enabled" not in stored.get("delegation", {})
-    # delegation.mode is not the violation (only .enabled is) and must survive
-    # — proof the strip did not take the whole settings dict.
-    assert stored["delegation"]["mode"] == "light"
+    # delegation.max_concurrent is not the violation (only .enabled is) and
+    # must survive — proof the strip did not take the whole settings dict.
+    assert stored["delegation"]["max_concurrent"] == 4
 
 
 @pytest.mark.asyncio
@@ -862,7 +863,7 @@ async def test_fork_my_expert_default_safety_recheck_fires_when_the_strip_map_mi
     `evaluate` on whatever comes back and refuse (422) rather than let the
     route persist a config its own grants forbid.
     """
-    import src.core.capability_grants as capability_grants
+    import shared.runtime.core.capability_grants as capability_grants
 
     monkeypatch.setattr(
         capability_grants,
@@ -991,7 +992,7 @@ async def test_previously_refused_shipped_experts_now_fork_as_default(
 
     assert set(result["dropped"]) == _PREVIOUSLY_REFUSED_SHIPPED_EXPERTS[expert_id]
     stored = fake.fork_and_set_user_expert_default.await_args.kwargs["source"]["config"]
-    from src.core.capability_grants import CATALOG, evaluate
+    from shared.runtime.core.capability_grants import CATALOG, evaluate
 
     default_grants = {k: v["default"] for k, v in CATALOG.items()}
     assert evaluate(stored, default_grants) == []

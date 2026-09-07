@@ -17,9 +17,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from src.graph import create_check_todos_node, create_handle_transition_node
-from src.managers.todo import TodoManager
-from src.tools.context import ToolContext
+from agent.graph import create_check_todos_node, create_handle_transition_node
+from agent.managers.todo import TodoManager
+from agent.tools.context import ToolContext
 
 
 def make_config():
@@ -48,7 +48,7 @@ def make_context(todo_mgr):
 
 
 def get_tool(context):
-    from src.tools.core.todo import create_todo_tools
+    from agent.tools.core.todo import create_todo_tools
 
     return next(t for t in create_todo_tools(context) if t.name == "request_replan")
 
@@ -228,11 +228,11 @@ class TestTransitionCarriesTheReason:
 
 class TestRegistration:
     def test_tool_is_tactical_only(self):
-        from src.tools.core.todo import TODO_TOOLS_METADATA
+        from agent.tools.core.todo import TODO_TOOLS_METADATA
 
         assert TODO_TOOLS_METADATA["request_replan"]["phases"] == ["tactical"]
 
     def test_old_name_is_gone(self):
-        from src.tools.core.todo import TODO_TOOLS_METADATA
+        from agent.tools.core.todo import TODO_TOOLS_METADATA
 
         assert "todo_rewind" not in TODO_TOOLS_METADATA

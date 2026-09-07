@@ -25,7 +25,7 @@ from pathlib import Path
 
 import yaml
 
-from src.shared.orch_surface.jobs import caller_default_names
+from shared.orch_surface.jobs import caller_default_names
 
 _CONFIG = (
     Path(__file__).resolve().parents[1]
@@ -71,7 +71,7 @@ class TestCenturionJobGrantMirrorsOfficerDefaults:
     def test_no_declared_job_tool_is_workspace_plane(self):
         """Belt to the ceiling's braces: the reviewed claim itself must never
         name an object-plane job read (officer_supervision_surface §3.4)."""
-        from src.tools.registry import TOOL_REGISTRY
+        from agent.tools.registry import TOOL_REGISTRY
 
         declared = _declared("job_control") + _declared("job_inspection")
         offenders = sorted(

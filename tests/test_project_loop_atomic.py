@@ -11,7 +11,7 @@ from uuid import uuid4
 
 import pytest
 
-from services.project_loop_atomic import (
+from orchestrator.services.project_loop_atomic import (
     LoopAdvanceExpectation,
     LoopAdvanceMutation,
     materialize_loop_advance_atomic,
@@ -320,11 +320,13 @@ def test_oversized_member_error_is_bounded_with_audit_count():
 
 def test_vector_idempotency_ledgers_are_current_and_in_generated_snapshot():
     migrations = sorted(
-        (REPO_ROOT / "orchestrator/database/migrations/vector").glob("*.sql")
+        (
+            REPO_ROOT / "src" / "orchestrator" / "database" / "migrations" / "vector"
+        ).glob("*.sql")
     )
-    assert migrations[-1].name == "0021_kb_backlog_keyset_index.notx.sql"
+    assert migrations[-1].name == "0026_job_vector_retirement.sql"
     snapshot = (
-        REPO_ROOT / "orchestrator/database/vector_schema_current.sql"
+        REPO_ROOT / "src/orchestrator/database/vector_schema_current.sql"
     ).read_text()
     assert "CREATE TABLE public.project_loop_ttl_effects" in snapshot
     assert "project_loop_ttl_effects_pkey" in snapshot
@@ -333,3 +335,10 @@ def test_vector_idempotency_ledgers_are_current_and_in_generated_snapshot():
     # 0020 (B2): ready authorization for backlog tickets. 0021 (BP-06):
     # stable keyset ordering for exhaustive Officer scans.
     assert "ready_at timestamp with time zone" in snapshot
+    # 0022 (WP3/H3): wedge detector streak columns on the watermark row.
+    assert "error_streak integer DEFAULT 0 NOT NULL" in snapshot
+    # 0024 (S1): the trigram index kb_grep's ILIKE path plans against — a
+    # regenerated snapshot missing it means `.notx.sql` migrations were skipped.
+    assert "idx_knowledge_content_trgm" in snapshot
+    # 0025: the multi-angle ranking function search_chunks dispatches to.
+    assert "knowledge_chunk_multi_angle_search" in snapshot

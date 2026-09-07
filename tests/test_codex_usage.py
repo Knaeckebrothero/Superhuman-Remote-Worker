@@ -11,7 +11,7 @@ from __future__ import annotations
 import base64
 import json
 
-from main import (
+from orchestrator.main import (
     _chatgpt_account_id,
     _codex_usage_window,
     _decode_jwt_claims,

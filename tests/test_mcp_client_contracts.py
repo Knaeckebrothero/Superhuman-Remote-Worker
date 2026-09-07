@@ -8,8 +8,8 @@ from typing import Any
 import httpx
 import pytest
 
-from src.shared.orch_surface.client import AsyncCockpitClient, CockpitClient
-from src.shared.orch_surface.formatters import (
+from shared.orch_surface.client import AsyncCockpitClient, CockpitClient
+from shared.orch_surface.formatters import (
     format_created_datasource,
     format_datasource_detail,
     format_datasources,

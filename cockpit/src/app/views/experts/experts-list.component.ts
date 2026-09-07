@@ -2,7 +2,7 @@ import {Component, computed, inject, OnInit, signal} from '@angular/core';
 import {Router} from '@angular/router';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ApiService} from '../../core/services/api.service';
-import type {Expert, ExpertCreateRequest} from '../../core/models/api.model';
+import type {Expert, ExpertCreateRequest, ExpertRole} from '../../core/models/api.model';
 import {AppButtonComponent} from '../../ui/button';
 import {AppIconButtonComponent} from '../../ui/icon-button';
 import {AppBadgeComponent} from '../../ui/badge';
@@ -14,16 +14,30 @@ import {AppMenuComponent, AppMenuItemComponent, AppMenuTriggerDirective} from '.
 import {ViewportService} from '../../core/services/viewport.service';
 import {UserService} from '../../core/services/user.service';
 
-export type ExpertTypeFilter = 'all' | 'worker' | 'session';
+export type ExpertTypeFilter = 'all' | ExpertRole;
 
-/** Pure list filter — exported for unit tests. */
+/**
+ * Pure list filter — exported for unit tests. Matches `expert_type || tags`
+ * (U1: tags are additive role metadata — a session expert tagged `worker`
+ * lists under Worker, and `subagent` only ever exists as a tag).
+ */
 export function filterExperts(rows: Expert[], f: ExpertTypeFilter): Expert[] {
-  return f === 'all' ? rows : rows.filter((r) => r.expert_type === f);
+  if (f === 'all') return rows;
+  return rows.filter((r) => r.expert_type === f || (r.tags ?? []).includes(f));
 }
 
-/** Bundled (disk) experts are read-only; absence of a source means bundled. */
+/** Role tags worth showing next to the type column: the ones that are not
+ *  simply the expert's own type. */
+export function extraRoleTags(e: Expert): string[] {
+  const roles: string[] = ['worker', 'session', 'subagent'];
+  return (e.tags ?? []).filter((t) => roles.includes(t) && t !== e.expert_type);
+}
+
+/** Bundled (disk) and subagent-library experts are read-only; absence of a
+ *  source means bundled. */
 export function isBundled(e: Expert): boolean {
-  return (e.source ?? 'bundled') === 'bundled';
+  const source = e.source ?? 'bundled';
+  return source === 'bundled' || source === 'library';
 }
 
 /**
@@ -112,7 +126,12 @@ export function duplicateResultTranslationArgs(
                     <span>{{ e.display_name }}</span>
                   </span>
                 </td>
-                <td>{{ e.expert_type || '—' }}</td>
+                <td>
+                  {{ e.expert_type || '—' }}
+                  @for (role of extraRoles(e); track role) {
+                    <app-badge tone="neutral" size="xs">{{ role }}</app-badge>
+                  }
+                </td>
                 <td>
                   <app-badge [tone]="bundled(e) ? 'neutral' : 'info'">{{ e.source || 'bundled' }}</app-badge>
                   @if (bundled(e)) {
@@ -312,6 +331,7 @@ export class ExpertsListComponent implements OnInit {
     {value: 'all', key: 'experts.filterAll'},
     {value: 'worker', key: 'experts.filterWorker'},
     {value: 'session', key: 'experts.filterSession'},
+    {value: 'subagent', key: 'experts.filterSubagent'},
   ];
   typeFilter = signal<ExpertTypeFilter>('all');
   rows = signal<Expert[]>([]);
@@ -323,6 +343,7 @@ export class ExpertsListComponent implements OnInit {
 
   filtered = computed(() => filterExperts(this.rows(), this.typeFilter()));
   bundled = isBundled;
+  extraRoles = extraRoleTags;
 
   canEdit(e: Expert): boolean {
     if (isBundled(e)) return false;

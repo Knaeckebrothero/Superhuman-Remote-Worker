@@ -9,21 +9,15 @@ paramiko-mock approach in test_workspace_backends.py.
 """
 
 import subprocess
-import sys
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
-project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-
-from src.core.backends.object_store import (  # noqa: E402
+from shared.runtime.core.backends.object_store import (  # noqa: E402
     InMemoryObjectStore,
     ObjectStoreError,
 )
-from src.core.backends.rclone import (  # noqa: E402
+from shared.runtime.core.backends.rclone import (  # noqa: E402
     RcloneObjectStore,
     object_store_from_spec,
 )
@@ -51,7 +45,7 @@ def store() -> RcloneObjectStore:
 
 @pytest.fixture
 def run_mock():
-    with patch("src.core.backends.rclone.subprocess.run") as m:
+    with patch("shared.runtime.core.backends.rclone.subprocess.run") as m:
         yield m
 
 
@@ -246,12 +240,15 @@ class TestRunErrors:
 class TestConnect:
     def test_connect_ok_when_binary_present(self, store):
         with patch(
-            "src.core.backends.rclone.shutil.which", return_value="/usr/bin/rclone"
+            "shared.runtime.core.backends.rclone.shutil.which",
+            return_value="/usr/bin/rclone",
         ):
             store.connect()  # must not raise
 
     def test_connect_raises_when_binary_missing(self, store):
-        with patch("src.core.backends.rclone.shutil.which", return_value=None):
+        with patch(
+            "shared.runtime.core.backends.rclone.shutil.which", return_value=None
+        ):
             with pytest.raises(ObjectStoreError, match="not found on PATH"):
                 store.connect()
 

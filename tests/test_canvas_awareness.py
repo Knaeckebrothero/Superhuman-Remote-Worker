@@ -9,8 +9,8 @@ from unittest.mock import AsyncMock, MagicMock
 from fastapi import HTTPException
 import pytest
 
-from routers import canvases
-from services.canvas_awareness import (
+from orchestrator.routers import canvases
+from orchestrator.services.canvas_awareness import (
     CanvasAwarenessConflict,
     CanvasAwarenessEditor,
     CanvasAwarenessMutation,
@@ -242,7 +242,7 @@ async def test_stream_closes_when_periodic_owner_check_fails(monkeypatch) -> Non
 
 
 def test_awareness_modules_have_no_journal_allocator_or_lane_branch() -> None:
-    from services import canvas_awareness
+    from orchestrator.services import canvas_awareness
 
     source = inspect.getsource(canvas_awareness)
     route_source = inspect.getsource(canvases.stream_main_canvas_awareness)

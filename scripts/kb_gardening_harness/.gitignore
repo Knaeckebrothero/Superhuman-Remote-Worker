@@ -1,0 +1,4 @@
+emb_cache.npz
+*.json
+*.log
+__pycache__/

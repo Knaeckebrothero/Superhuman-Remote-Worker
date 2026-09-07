@@ -382,7 +382,7 @@ async def test_blocking_message_loser_has_zero_notification_side_effects():
     db.create_routed_blocking_freeze = AsyncMock(return_value=None)
     db.log_message = AsyncMock()
     notifier = MagicMock()
-    notifier.dispatch = AsyncMock()
+    notifier.record_agent_message = AsyncMock()
     body = main.MessageSendRequest(
         to="user",
         subject="Need input",
@@ -400,7 +400,7 @@ async def test_blocking_message_loser_has_zero_notification_side_effects():
             await main.send_agent_message(MagicMock(), job_id, body)
 
     assert exc.value.status_code == 409
-    notifier.dispatch.assert_not_awaited()
+    notifier.record_agent_message.assert_not_awaited()
     db.log_message.assert_not_awaited()
 
 

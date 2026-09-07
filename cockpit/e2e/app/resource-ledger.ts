@@ -1,12 +1,15 @@
 import { existsSync, readFileSync } from 'node:fs';
-import type { APIRequestContext } from '@playwright/test';
-import { requireJson } from './api';
+import type { APIRequestContext, APIResponse } from '@playwright/test';
 import { privateOutputPath, writePrivateJsonFile } from './environment';
 
 const THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // Normal graceful retirement gets the full documented cleanup budget. Force
 // is an exact-id fallback only after that window, never an early fast path.
-const CLEANUP_WINDOW_MS = 180_000;
+// A forced stateless retirement may itself return a retryable 409/503 after it
+// has closed admission but while final-memory/runtime cleanup converges, so it
+// receives a separate bounded continuation window.
+const GRACEFUL_CLEANUP_WINDOW_MS = 180_000;
+const FORCED_CLEANUP_WINDOW_MS = 60_000;
 const MUTATION_HEADERS = { 'X-CSRF': '1' };
 
 interface ThreadResource {
@@ -36,6 +39,10 @@ export interface ThreadEvidence {
 
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds));
+}
+
+export function remainingCleanupRequestTimeout(deadline: number, now: number): number {
+  return Math.max(1, deadline - now);
 }
 
 export class ResourceLedger {
@@ -160,54 +167,80 @@ export class ResourceLedger {
     }
 
     const pathname = `/api/persistent/threads/${encodeURIComponent(threadId)}`;
-    const deadline = Date.now() + CLEANUP_WINDOW_MS;
+    const deletionConfirmed = async (response: APIResponse, deadline: number): Promise<boolean> => {
+      if (response.status() === 404) return true;
+      if (!response.ok()) return false;
+      // Pinned retirement can acknowledge End with 200 {status: "ending"}.
+      // Only exact absence proves deletion; keep its accepted work inside the
+      // same graceful budget before considering the existing force fallback.
+      const exact = await request.get(pathname, {
+        timeout: Math.min(15_000, remainingCleanupRequestTimeout(deadline, Date.now())),
+      });
+      if (exact.status() === 404) return true;
+      if (exact.status() === 200) return false;
+      throw new Error(
+        `Deletion verification for exact thread ${threadId} returned HTTP ${exact.status()}.`,
+      );
+    };
+    const gracefulDeadline = Date.now() + GRACEFUL_CLEANUP_WINDOW_MS;
     let backoff = 250;
     let deleted = false;
 
-    while (Date.now() < deadline) {
+    while (true) {
+      const now = Date.now();
+      if (now >= gracefulDeadline) break;
       const response = await request.delete(`${pathname}?permanent=true`, {
         headers: MUTATION_HEADERS,
-        timeout: 20_000,
+        // Stateless End is one synchronous, acknowledged lifecycle protocol:
+        // resident drain, shell retirement, then exact Kubernetes cleanup.
+        // A short transport timeout abandons that operation while it still
+        // holds the retirement authority. Bound the request by this phase's
+        // existing deadline instead of imposing an unrelated UI-sized cap.
+        timeout: remainingCleanupRequestTimeout(gracefulDeadline, now),
       });
-      if (response.ok() || response.status() === 404) {
+      if (await deletionConfirmed(response, gracefulDeadline)) {
         deleted = true;
         break;
       }
-      if (response.status() !== 409 && response.status() !== 503) {
+      if (!response.ok() && response.status() !== 409 && response.status() !== 503) {
         throw new Error(
           `Permanent delete for exact thread ${threadId} returned HTTP ${response.status()}.`,
         );
       }
-      await delay(Math.min(backoff, Math.max(0, deadline - Date.now())));
+      await delay(Math.min(backoff, Math.max(0, gracefulDeadline - Date.now())));
       backoff = Math.min(backoff * 2, 2_000);
     }
 
     if (!deleted) {
-      const forced = await request.delete(`${pathname}?permanent=true&force=true`, {
-        headers: MUTATION_HEADERS,
-        timeout: 30_000,
-      });
-      if (!forced.ok() && forced.status() !== 404) {
+      const forcedDeadline = Date.now() + FORCED_CLEANUP_WINDOW_MS;
+      backoff = 250;
+      let lastStatus = 0;
+      while (true) {
+        const now = Date.now();
+        if (now >= forcedDeadline) break;
+        const forced = await request.delete(`${pathname}?permanent=true&force=true`, {
+          headers: MUTATION_HEADERS,
+          timeout: remainingCleanupRequestTimeout(forcedDeadline, now),
+        });
+        lastStatus = forced.status();
+        if (await deletionConfirmed(forced, forcedDeadline)) {
+          deleted = true;
+          break;
+        }
+        if (!forced.ok() && lastStatus !== 409 && lastStatus !== 503) {
+          throw new Error(
+            `Bounded force delete for exact thread ${threadId} returned HTTP ${lastStatus}.`,
+          );
+        }
+        await delay(Math.min(backoff, Math.max(0, forcedDeadline - Date.now())));
+        backoff = Math.min(backoff * 2, 2_000);
+      }
+      if (!deleted) {
         throw new Error(
-          `Bounded force delete for exact thread ${threadId} returned HTTP ${forced.status()}.`,
+          `Bounded force delete for exact thread ${threadId} did not settle ` +
+            `(last HTTP ${lastStatus}).`,
         );
       }
-    }
-
-    const exact = await request.get(pathname, { timeout: 15_000 });
-    if (exact.status() === 404) return;
-    if (exact.status() === 401 || exact.status() === 403 || exact.status() >= 500) {
-      throw new Error(
-        `Deletion verification for exact thread ${threadId} returned HTTP ${exact.status()}.`,
-      );
-    }
-
-    const listed = await requireJson<{ threads: Array<{ id: string }> }>(
-      await request.get('/api/persistent/threads', { timeout: 15_000 }),
-      'thread-list deletion verification',
-    );
-    if (listed.threads.some(({ id }) => id === threadId)) {
-      throw new Error(`Exact thread ${threadId} still exists after permanent cleanup.`);
     }
   }
 }

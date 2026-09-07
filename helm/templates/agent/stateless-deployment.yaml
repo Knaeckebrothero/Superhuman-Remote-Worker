@@ -5,7 +5,7 @@
 #
 # A static pool of generic agent processes that PULL work units from the
 # run_queue instead of being provisioned per job/session. Mirrors the
-# AgentProvisioner pod manifest (orchestrator/services/agent_provisioner.py::
+# AgentProvisioner pod manifest (src/orchestrator/services/agent_provisioner.py::
 # _build_pod_manifest) so the process boots identically, with these deliberate
 # deltas:
 #
@@ -107,7 +107,7 @@ spec:
             - sh
             - -c
             - >-
-              exec python agent.py
+              exec python -m agent
               --mode stateless
               --config {{ .Values.agent.stateless.config }}
               --port {{ .Values.agent.port }}

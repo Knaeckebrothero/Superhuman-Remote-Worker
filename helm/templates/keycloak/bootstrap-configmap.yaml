@@ -145,7 +145,7 @@ data:
     # Skipped when KC_CLIENT_SECRET is unset (pre-BFF deployments). When
     # set, registers the orchestrator's /auth/callback as a redirect URI
     # and the /auth/backchannel-logout endpoint. The cockpit SPA never
-    # uses this client — it's only consumed by orchestrator/auth/bff.py.
+    # uses this client — it's only consumed by src/orchestrator/auth/bff.py.
     if [ -n "${KC_CLIENT_SECRET:-}" ] && [ -n "${API_HOST:-}" ]; then
       BFF_CID="${BFF_CLIENT_ID:-cockpit-bff}"
       echo "[bootstrap] === $BFF_CID (confidential BFF on https://$API_HOST) ==="

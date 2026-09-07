@@ -1,11 +1,12 @@
 """Tests for prompt matrix resolution: family_of + PromptMatrixResolver."""
 
 import textwrap
+from dataclasses import replace
 from unittest.mock import patch
 
 import pytest
 
-from src.core.loader import (
+from shared.runtime.core.loader import (
     AgentConfig,
     LLMConfig,
     PhaseLLMOverride,
@@ -14,10 +15,11 @@ from src.core.loader import (
     detect_reasoning_method,
     get_phase_system_prompt,
     load_base_system_prompt,
-    load_phase_component,
     render_placeholders,
+    load_agent_config_from_dict,
+    serialize_resolved_config,
 )
-from src.core.model_registry import family_of
+from shared.runtime.core.model_registry import family_of
 
 
 # =============================================================================
@@ -153,9 +155,9 @@ class TestPromptMatrixResolver:
             model_family="claude-opus",
         )
         assert resolver.resolve_filename("systemprompt") == "systemprompt.txt"
-        assert resolver.resolve_filename("strategic") == "strategic.txt"
-        assert resolver.resolve_filename("tactical") == "tactical.txt"
         assert resolver.resolve_filename("summarization") == "summarization_prompt.txt"
+        assert "strategic" not in PromptMatrixResolver.HARDCODED_DEFAULTS
+        assert "tactical" not in PromptMatrixResolver.HARDCODED_DEFAULTS
         # Note: "instructions" moved to InstructionMatrixResolver
 
     def test_base_matrix_default_resolution(self, tmp_path):
@@ -168,7 +170,7 @@ class TestPromptMatrixResolver:
             default:
               prompts:
                 systemprompt: custom_systemprompt.txt
-                strategic: custom_strategic.txt
+                persona: custom_persona.txt
         """)
         )
 
@@ -185,9 +187,8 @@ class TestPromptMatrixResolver:
             )
 
         assert resolver.resolve_filename("systemprompt") == "custom_systemprompt.txt"
-        assert resolver.resolve_filename("strategic") == "custom_strategic.txt"
-        # Tactical not in matrix, falls to hardcoded default
-        assert resolver.resolve_filename("tactical") == "tactical.txt"
+        assert resolver.resolve_filename("persona") == "custom_persona.txt"
+        assert resolver.resolve_filename("summarization") == "summarization_prompt.txt"
 
     def test_expert_override(self, tmp_path):
         """Expert matrix entries override base matrix entries."""
@@ -198,7 +199,7 @@ class TestPromptMatrixResolver:
             default:
               prompts:
                 systemprompt: base_system.txt
-                strategic: base_strategic.txt
+                persona: base_persona.txt
         """)
         )
 
@@ -208,7 +209,7 @@ class TestPromptMatrixResolver:
             textwrap.dedent("""\
             default:
               prompts:
-                strategic: expert_strategic.txt
+                persona: expert_persona.txt
         """)
         )
 
@@ -226,8 +227,8 @@ class TestPromptMatrixResolver:
                 base_matrix_path
             )
 
-        # Expert overrides strategic
-        assert resolver.resolve_filename("strategic") == "expert_strategic.txt"
+        # Expert overrides persona
+        assert resolver.resolve_filename("persona") == "expert_persona.txt"
         # Base provides systemprompt (expert doesn't override it)
         assert resolver.resolve_filename("systemprompt") == "base_system.txt"
 
@@ -239,7 +240,7 @@ class TestPromptMatrixResolver:
             default:
               prompts:
                 systemprompt: systemprompt.txt
-                strategic: strategic.txt
+                persona: persona.txt
             claude-opus:
               prompts:
                 systemprompt: systemprompt_claude_opus.txt
@@ -262,8 +263,8 @@ class TestPromptMatrixResolver:
         assert (
             resolver.resolve_filename("systemprompt") == "systemprompt_claude_opus.txt"
         )
-        # Falls back to default for strategic (no model-specific entry)
-        assert resolver.resolve_filename("strategic") == "strategic.txt"
+        # Falls back to default for persona (no model-specific entry)
+        assert resolver.resolve_filename("persona") == "persona.txt"
 
     def test_full_chain_4_levels(self, tmp_path):
         """Exercise the full 4-level fallback chain."""
@@ -273,12 +274,12 @@ class TestPromptMatrixResolver:
             default:
               prompts:
                 systemprompt: base_default_system.txt
-                strategic: base_default_strategic.txt
-                tactical: base_default_tactical.txt
+                persona: base_default_persona.txt
                 summarization: base_default_summarization.txt
+                citation_verification: base_default_citation.txt
             claude-opus:
               prompts:
-                tactical: base_claude_tactical.txt
+                summarization: base_claude_summarization.txt
         """)
         )
 
@@ -287,7 +288,7 @@ class TestPromptMatrixResolver:
             textwrap.dedent("""\
             default:
               prompts:
-                strategic: expert_default_strategic.txt
+                persona: expert_default_persona.txt
             claude-opus:
               prompts:
                 systemprompt: expert_claude_system.txt
@@ -311,13 +312,16 @@ class TestPromptMatrixResolver:
         # Level 1: Expert model-specific
         assert resolver.resolve_filename("systemprompt") == "expert_claude_system.txt"
         # Level 2: Expert default
-        assert resolver.resolve_filename("strategic") == "expert_default_strategic.txt"
+        assert resolver.resolve_filename("persona") == "expert_default_persona.txt"
         # Level 3: Base model-specific
-        assert resolver.resolve_filename("tactical") == "base_claude_tactical.txt"
-        # Level 4: Base default
         assert (
             resolver.resolve_filename("summarization")
-            == "base_default_summarization.txt"
+            == "base_claude_summarization.txt"
+        )
+        # Level 4: Base default
+        assert (
+            resolver.resolve_filename("citation_verification")
+            == "base_default_citation.txt"
         )
 
     def test_load_matrix_invalid_yaml(self, tmp_path):
@@ -326,7 +330,7 @@ class TestPromptMatrixResolver:
         matrix_path.write_text(":{invalid yaml")
 
         # Bypass the per-path cache so the malformed write is actually parsed.
-        from src.core import loader as _loader
+        from shared.runtime.core import loader as _loader
 
         _loader._model_config_matrix_cache.pop(matrix_path, None)
         result = PromptMatrixResolver._load_matrix_from_path(matrix_path)
@@ -337,7 +341,7 @@ class TestPromptMatrixResolver:
         matrix_path = tmp_path / "model_config_matrix.yaml"
         matrix_path.write_text("- just\n- a\n- list\n")
 
-        from src.core import loader as _loader
+        from shared.runtime.core import loader as _loader
 
         _loader._model_config_matrix_cache.pop(matrix_path, None)
         result = PromptMatrixResolver._load_matrix_from_path(matrix_path)
@@ -345,7 +349,7 @@ class TestPromptMatrixResolver:
 
     def test_load_matrix_nonexistent(self, tmp_path):
         """Non-existent matrix file returns empty dict."""
-        from src.core import loader as _loader
+        from shared.runtime.core import loader as _loader
 
         _loader._model_config_matrix_cache.pop(tmp_path / "nope.yaml", None)
         result = PromptMatrixResolver._load_matrix_from_path(tmp_path / "nope.yaml")
@@ -400,7 +404,9 @@ class TestDefaultResolution:
 
     def test_load_base_system_prompt_with_resolver(self, tmp_path):
         """load_base_system_prompt uses PromptMatrixResolver."""
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+        with patch(
+            "shared.runtime.core.loader.get_project_root", return_value=tmp_path
+        ):
             config_prompts = tmp_path / "config" / "prompts"
             config_prompts.mkdir(parents=True)
             (config_prompts / "systemprompt.txt").write_text(
@@ -411,19 +417,6 @@ class TestDefaultResolution:
             result = load_base_system_prompt(resolver)
             assert "base template" in result
 
-    def test_load_phase_component_with_resolver(self, tmp_path):
-        """load_phase_component uses PromptMatrixResolver."""
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
-            config_prompts = tmp_path / "config" / "prompts"
-            config_prompts.mkdir(parents=True)
-            (config_prompts / "strategic.txt").write_text(
-                "strategic phase {phase_number}"
-            )
-
-            resolver = PromptMatrixResolver(model_family="default")
-            result = load_phase_component(is_strategic=True, matrix_resolver=resolver)
-            assert "strategic phase" in result
-
     def test_get_phase_system_prompt_no_model(self, tmp_path):
         """Without model param, default model family is used."""
         config = AgentConfig(
@@ -431,13 +424,14 @@ class TestDefaultResolution:
             display_name="Test Agent",
         )
 
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+        with patch(
+            "shared.runtime.core.loader.get_project_root", return_value=tmp_path
+        ):
             config_prompts = tmp_path / "config" / "prompts"
             config_prompts.mkdir(parents=True)
             (config_prompts / "systemprompt.txt").write_text(
-                "{agent_display_name} {prompt_content}"
+                "{agent_display_name} phase-agnostic"
             )
-            (config_prompts / "strategic.txt").write_text("phase {phase_number}")
 
             result = get_phase_system_prompt(
                 config=config,
@@ -445,7 +439,7 @@ class TestDefaultResolution:
                 phase_number=1,
             )
             assert "Test Agent" in result
-            assert "phase 1" in result
+            assert "phase-agnostic" in result
 
     def test_get_phase_system_prompt_with_model(self, tmp_path):
         """With model param, model family is detected and used."""
@@ -454,13 +448,14 @@ class TestDefaultResolution:
             display_name="Test Agent",
         )
 
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+        with patch(
+            "shared.runtime.core.loader.get_project_root", return_value=tmp_path
+        ):
             config_prompts = tmp_path / "config" / "prompts"
             config_prompts.mkdir(parents=True)
             (config_prompts / "systemprompt.txt").write_text(
-                "{agent_display_name} {prompt_content}"
+                "{agent_display_name} phase-agnostic"
             )
-            (config_prompts / "strategic.txt").write_text("phase {phase_number}")
 
             result = get_phase_system_prompt(
                 config=config,
@@ -469,14 +464,14 @@ class TestDefaultResolution:
                 model="claude-opus-4-6",
             )
             assert "Test Agent" in result
-            assert "phase 1" in result
+            assert "phase-agnostic" in result
             # Claude models should not have reasoning directive injected
             assert "Reasoning:" not in result
 
 
 # =============================================================================
 # render_placeholders: literal braces in trusted prose must survive render
-# (regression: product-qa tactical.txt `{py,sh,md}` hard-failed jobs via
+# (regression: the former product-qa tactical prompt's `{py,sh,md}` hard-failed via
 #  str.format KeyError at phase render — vault issues/ brace-format crash)
 # =============================================================================
 
@@ -521,30 +516,26 @@ class TestRenderPlaceholders:
     def test_non_allowlisted_token_always_literal(self):
         assert render_placeholders("{tool_name} x", phase_number="1") == "{tool_name} x"
 
-    def test_end_to_end_tactical_prompt_with_literal_braces(self, tmp_path):
-        """get_phase_system_prompt renders a tactical prompt whose prose holds a
-        literal `{py,sh,md}` AND a guardrail-style `{phase_number}` — the token
-        substitutes, the literal brace survives, and nothing raises."""
+    def test_frozen_legacy_prompt_with_literal_braces(self):
+        """The one-release frozen-config compatibility render remains
+        brace-safe while substituting its old phase placeholders."""
         config = AgentConfig(agent_id="test", display_name="QA Agent")
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
-            config_prompts = tmp_path / "config" / "prompts"
-            config_prompts.mkdir(parents=True)
-            (config_prompts / "systemprompt.txt").write_text(
-                "{agent_display_name}\n{prompt_content}"
-            )
-            (config_prompts / "tactical.txt").write_text(
+        config.extra["_resolved_prompts"] = {
+            "systemprompt": "{agent_display_name}\n{prompt_content}",
+            "tactical": (
                 "Tactical phase {phase_number}. "
                 "Save a repro under output/repros/NNN_slug.{py,sh,md}."
-            )
+            ),
+        }
 
-            result = get_phase_system_prompt(
-                config=config,
-                is_strategic=False,
-                phase_number=2,
-            )
-            assert "QA Agent" in result
-            assert "Tactical phase 2." in result  # {phase_number} substituted
-            assert "{py,sh,md}" in result  # literal brace survived
+        result = get_phase_system_prompt(
+            config=config,
+            is_strategic=False,
+            phase_number=2,
+        )
+        assert "QA Agent" in result
+        assert "Tactical phase 2." in result  # {phase_number} substituted
+        assert "{py,sh,md}" in result  # literal brace survived
 
 
 # =============================================================================
@@ -560,35 +551,39 @@ class TestPromptMatrixResolverLoad:
         # Create expert directory with custom file
         expert_dir = tmp_path / "expert"
         expert_dir.mkdir()
-        (expert_dir / "strategic.txt").write_text("expert strategic content")
+        (expert_dir / "persona.txt").write_text("expert persona content")
         (expert_dir / "model_config_matrix.yaml").write_text(
             textwrap.dedent("""\
             default:
               prompts:
-                strategic: strategic.txt
+                persona: persona.txt
         """)
         )
 
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+        with patch(
+            "shared.runtime.core.loader.get_project_root", return_value=tmp_path
+        ):
             # Also create base files
             config_prompts = tmp_path / "config" / "prompts"
             config_prompts.mkdir(parents=True)
-            (config_prompts / "strategic.txt").write_text("base strategic content")
+            (config_prompts / "persona.txt").write_text("base persona content")
 
             resolver = PromptMatrixResolver(
                 deployment_dir=str(expert_dir),
                 model_family="default",
             )
-            result = resolver.load("strategic")
-            assert result == "expert strategic content"
+            result = resolver.load("persona")
+            assert result == "expert persona content"
 
     def test_load_falls_through_to_framework(self, tmp_path):
         """When expert dir doesn't have the file, framework dir is used."""
         expert_dir = tmp_path / "expert"
         expert_dir.mkdir()
-        # No strategic.txt in expert dir, but matrix references it
+        # No systemprompt.txt in expert dir, but the framework provides it.
 
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+        with patch(
+            "shared.runtime.core.loader.get_project_root", return_value=tmp_path
+        ):
             config_prompts = tmp_path / "config" / "prompts"
             config_prompts.mkdir(parents=True)
             (config_prompts / "systemprompt.txt").write_text("framework systemprompt")
@@ -603,7 +598,9 @@ class TestPromptMatrixResolverLoad:
 
     def test_exists_returns_true_for_resolvable(self, tmp_path):
         """exists() returns True when the file can be found."""
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+        with patch(
+            "shared.runtime.core.loader.get_project_root", return_value=tmp_path
+        ):
             config_prompts = tmp_path / "config" / "prompts"
             config_prompts.mkdir(parents=True)
             (config_prompts / "systemprompt.txt").write_text("exists")
@@ -613,7 +610,9 @@ class TestPromptMatrixResolverLoad:
 
     def test_exists_returns_false_for_missing(self, tmp_path):
         """exists() returns False when file cannot be found."""
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+        with patch(
+            "shared.runtime.core.loader.get_project_root", return_value=tmp_path
+        ):
             config_prompts = tmp_path / "config" / "prompts"
             config_prompts.mkdir(parents=True)
 
@@ -637,11 +636,9 @@ class TestLocationPrimaryResolution:
         gemma:
           prompts:
             persona: persona_gemma.txt
-            strategic: strategic_gemma.txt
-            tactical: tactical_gemma.txt
     """)
 
-    @pytest.mark.parametrize("entry_type", ["persona", "strategic", "tactical"])
+    @pytest.mark.parametrize("entry_type", ["persona"])
     def test_expert_base_beats_framework_family_variant(self, tmp_path, entry_type):
         """THE bug: expert ships only <type>.txt; base matrix maps the family to
         <type>_gemma.txt which exists in the framework dir. The expert's base
@@ -650,7 +647,9 @@ class TestLocationPrimaryResolution:
         expert_dir.mkdir()
         (expert_dir / f"{entry_type}.txt").write_text(f"expert base {entry_type}")
 
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+        with patch(
+            "shared.runtime.core.loader.get_project_root", return_value=tmp_path
+        ):
             config_dir = tmp_path / "config"
             prompts = config_dir / "prompts"
             prompts.mkdir(parents=True)
@@ -672,7 +671,9 @@ class TestLocationPrimaryResolution:
         (expert_dir / "persona.txt").write_text("expert base")
         (expert_dir / "persona_gemma.txt").write_text("expert gemma")
 
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+        with patch(
+            "shared.runtime.core.loader.get_project_root", return_value=tmp_path
+        ):
             config_dir = tmp_path / "config"
             prompts = config_dir / "prompts"
             prompts.mkdir(parents=True)
@@ -689,7 +690,9 @@ class TestLocationPrimaryResolution:
         expert_dir = tmp_path / "expert"
         expert_dir.mkdir()
 
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+        with patch(
+            "shared.runtime.core.loader.get_project_root", return_value=tmp_path
+        ):
             config_dir = tmp_path / "config"
             prompts = config_dir / "prompts"
             prompts.mkdir(parents=True)
@@ -704,7 +707,9 @@ class TestLocationPrimaryResolution:
 
     def test_no_family_variant_uses_framework_base_rank4(self, tmp_path):
         """Family with no variant -> framework base (rank 4)."""
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+        with patch(
+            "shared.runtime.core.loader.get_project_root", return_value=tmp_path
+        ):
             prompts = tmp_path / "config" / "prompts"
             prompts.mkdir(parents=True)
             (prompts / "persona.txt").write_text("framework base")
@@ -726,7 +731,9 @@ class TestLocationPrimaryResolution:
         """)
         )
 
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+        with patch(
+            "shared.runtime.core.loader.get_project_root", return_value=tmp_path
+        ):
             config_dir = tmp_path / "config"
             prompts = config_dir / "prompts"
             prompts.mkdir(parents=True)
@@ -740,7 +747,9 @@ class TestLocationPrimaryResolution:
 
     def test_deployment_dir_none_is_framework_only(self, tmp_path):
         """deployment_dir=None (sessions/admin) -> framework chain, no crash."""
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+        with patch(
+            "shared.runtime.core.loader.get_project_root", return_value=tmp_path
+        ):
             config_dir = tmp_path / "config"
             prompts = config_dir / "prompts"
             prompts.mkdir(parents=True)
@@ -758,12 +767,16 @@ class TestLocationPrimaryResolution:
         expert_dir.mkdir()
         (expert_dir / "persona.txt").write_text("expert base persona")
 
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+        with patch(
+            "shared.runtime.core.loader.get_project_root", return_value=tmp_path
+        ):
             (tmp_path / "config" / "prompts").mkdir(parents=True)
             resolver = PromptMatrixResolver(
                 deployment_dir=str(expert_dir), model_family="default"
             )
-            with patch("src.core.loader._db_lookup", return_value="DB OVERRIDE"):
+            with patch(
+                "shared.runtime.core.loader._db_lookup", return_value="DB OVERRIDE"
+            ):
                 assert resolver.load("persona") == "DB OVERRIDE"
                 assert (
                     resolver.load("persona", bundled_only=True) == "expert base persona"
@@ -776,7 +789,9 @@ class TestLocationPrimaryResolution:
         expert_dir.mkdir()
         (expert_dir / "persona.txt").write_text("expert base")
 
-        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+        with patch(
+            "shared.runtime.core.loader.get_project_root", return_value=tmp_path
+        ):
             config_dir = tmp_path / "config"
             (config_dir / "prompts").mkdir(parents=True)
             (config_dir / "model_config_matrix.yaml").write_text(self.GEMMA_MATRIX)
@@ -793,24 +808,28 @@ class TestLocationPrimaryResolution:
 
 
 class TestPhaseConfigContextTokens:
-    """Tests for model_max_context_tokens merge in get_phase_config()."""
+    """Tests for model_max_context_tokens merge in get_phase_config().
+
+    Since U1 ``summarization`` is the only override slot; the legacy phase
+    names resolve to the single model (identity).
+    """
 
     def test_base_value_inherited_when_no_override(self):
-        """Phase config inherits base model_max_context_tokens when override omits it."""
+        """Resolved config inherits base model_max_context_tokens when unset."""
         config = LLMConfig(model="gpt-4o", model_max_context_tokens=128000)
-        phase = config.get_phase_config("strategic")
+        phase = config.get_phase_config("summarization")
         assert phase.model_max_context_tokens == 128000
 
     def test_override_replaces_base(self):
-        """Phase override's model_max_context_tokens replaces base value."""
+        """The override's model_max_context_tokens replaces the base value."""
         config = LLMConfig(
             model="gpt-4o",
             model_max_context_tokens=128000,
-            tactical=PhaseLLMOverride(
+            summarization=PhaseLLMOverride(
                 model="gpt-4o-mini", model_max_context_tokens=32000
             ),
         )
-        phase = config.get_phase_config("tactical")
+        phase = config.get_phase_config("summarization")
         assert phase.model_max_context_tokens == 32000
         assert phase.model == "gpt-4o-mini"
 
@@ -819,9 +838,9 @@ class TestPhaseConfigContextTokens:
         config = LLMConfig(
             model="gpt-4o",
             model_max_context_tokens=128000,
-            strategic=PhaseLLMOverride(temperature=0.5),
+            summarization=PhaseLLMOverride(temperature=0.5),
         )
-        phase = config.get_phase_config("strategic")
+        phase = config.get_phase_config("summarization")
         assert phase.model_max_context_tokens == 128000
         assert phase.temperature == 0.5
 
@@ -829,29 +848,30 @@ class TestPhaseConfigContextTokens:
         """When base has no model_max_context_tokens, override can set it."""
         config = LLMConfig(
             model="gpt-4o",
-            tactical=PhaseLLMOverride(model_max_context_tokens=32000),
+            summarization=PhaseLLMOverride(model_max_context_tokens=32000),
         )
         assert config.model_max_context_tokens is None
-        phase = config.get_phase_config("tactical")
+        phase = config.get_phase_config("summarization")
         assert phase.model_max_context_tokens == 32000
 
     def test_no_override_returns_self(self):
-        """Phase without override returns self (identity)."""
+        """No override returns self (identity) — and so do the legacy names."""
         config = LLMConfig(model="gpt-4o", model_max_context_tokens=128000)
-        phase = config.get_phase_config("tactical")
-        assert phase is config
+        assert config.get_phase_config("summarization") is config
+        assert config.get_phase_config("strategic") is config
+        assert config.get_phase_config("tactical") is config
 
     def test_resolved_config_has_no_phase_fields(self):
-        """Resolved phase config has strategic/tactical/summarization=None."""
+        """Resolved config carries no override of its own (and no tier fields)."""
         config = LLMConfig(
             model="gpt-4o",
             model_max_context_tokens=128000,
-            strategic=PhaseLLMOverride(model_max_context_tokens=200000),
+            summarization=PhaseLLMOverride(model_max_context_tokens=200000),
         )
-        phase = config.get_phase_config("strategic")
-        assert phase.strategic is None
-        assert phase.tactical is None
+        phase = config.get_phase_config("summarization")
         assert phase.summarization is None
+        assert not hasattr(phase, "strategic")
+        assert not hasattr(phase, "tactical")
 
 
 # =============================================================================
@@ -860,45 +880,137 @@ class TestPhaseConfigContextTokens:
 
 
 class TestLLMReuseEquality:
-    """Tests that LLM reuse compares full config, not just model name."""
+    """LLM reuse compares the full resolved config, not just the model name.
+
+    ``_create_phase_llms`` reuses the main client for summarization when the
+    resolved override equals ``replace(llm, summarization=None)``.
+    """
+
+    @staticmethod
+    def _main(config):
+        return replace(config, summarization=None)
 
     def test_same_model_same_settings_are_equal(self):
-        """Identical configs should be equal (enabling reuse)."""
+        """An override that resolves to the main config is equal (reuse)."""
         config = LLMConfig(
-            model="gpt-4o", temperature=0.3, model_max_context_tokens=128000
+            model="gpt-4o",
+            temperature=0.3,
+            model_max_context_tokens=128000,
+            summarization=PhaseLLMOverride(model="gpt-4o"),
         )
-        strategic = config.get_phase_config("strategic")
-        tactical = config.get_phase_config("tactical")
-        assert strategic == tactical
+        assert config.get_phase_config("summarization") == self._main(config)
 
     def test_same_model_different_context_tokens_not_equal(self):
         """Same model but different context tokens should NOT be equal."""
         config = LLMConfig(
             model="gpt-4o",
             model_max_context_tokens=128000,
-            tactical=PhaseLLMOverride(model_max_context_tokens=32000),
+            summarization=PhaseLLMOverride(model_max_context_tokens=32000),
         )
-        strategic = config.get_phase_config("strategic")
-        tactical = config.get_phase_config("tactical")
-        assert strategic != tactical
+        assert config.get_phase_config("summarization") != self._main(config)
 
     def test_same_model_different_temperature_not_equal(self):
         """Same model but different temperature should NOT be equal."""
         config = LLMConfig(
             model="gpt-4o",
             temperature=0.3,
-            tactical=PhaseLLMOverride(temperature=0.0),
+            summarization=PhaseLLMOverride(temperature=0.0),
         )
-        strategic = config.get_phase_config("strategic")
-        tactical = config.get_phase_config("tactical")
-        assert strategic != tactical
+        assert config.get_phase_config("summarization") != self._main(config)
 
     def test_different_models_not_equal(self):
         """Different models are obviously not equal."""
         config = LLMConfig(
             model="gpt-4o",
-            tactical=PhaseLLMOverride(model="gpt-4o-mini"),
+            summarization=PhaseLLMOverride(model="gpt-4o-mini"),
         )
-        strategic = config.get_phase_config("strategic")
-        tactical = config.get_phase_config("tactical")
-        assert strategic != tactical
+        assert config.get_phase_config("summarization") != self._main(config)
+
+
+# =============================================================================
+# U2 WP6: one phase-agnostic prompt, with frozen pre-U2 resume compatibility
+# =============================================================================
+
+
+class TestSingleWorkerPrompt:
+    """``get_system_prompt`` is the worker's one prompt; ``get_phase_system_prompt``
+    delegates to it unless the frozen template is a pre-U2 one with the bare
+    ``{prompt_content}`` slot."""
+
+    _TEMPLATE = (
+        "{agent_display_name}\n<phase_model>alternating phases</phase_model>\nEND"
+    )
+
+    def _write(self, tmp_path):
+        config_prompts = tmp_path / "config" / "prompts"
+        config_prompts.mkdir(parents=True)
+        (config_prompts / "systemprompt.txt").write_text(self._TEMPLATE)
+
+    def test_get_system_prompt_is_phase_agnostic(self, tmp_path):
+        from shared.runtime.core.loader import get_system_prompt
+
+        config = AgentConfig(agent_id="test", display_name="Test Agent")
+        with patch(
+            "shared.runtime.core.loader.get_project_root", return_value=tmp_path
+        ):
+            self._write(tmp_path)
+            one = get_system_prompt(config, tool_names=[])
+            strategic = get_phase_system_prompt(
+                config, is_strategic=True, phase_number=1, tool_names=[]
+            )
+            tactical = get_phase_system_prompt(
+                config, is_strategic=False, phase_number=2, tool_names=[]
+            )
+        assert "Test Agent" in one
+        assert "<phase_model>alternating phases</phase_model>" in one
+        assert "phase_directive" not in one and "{prompt_content}" not in one
+        assert "strategic phase" not in one and "tactical phase" not in one
+        assert "{%" not in one and "legacy_phase_prompt" not in one
+        assert one == strategic == tactical  # the swap is gone
+
+    def test_frozen_legacy_config_still_renders(self):
+        config = AgentConfig(agent_id="test", display_name="Test Agent")
+        config.extra["_resolved_prompts"] = {
+            "systemprompt": (
+                "OLD {agent_display_name}\n"
+                "<phase_directive>{prompt_content}</phase_directive>"
+            ),
+            "strategic": "strategic phase {phase_number}",
+            "tactical": "tactical phase {phase_number}",
+        }
+        strategic = get_phase_system_prompt(
+            config, is_strategic=True, phase_number=1, tool_names=[]
+        )
+        tactical = get_phase_system_prompt(
+            config, is_strategic=False, phase_number=2, tool_names=[]
+        )
+        assert "<phase_directive>strategic phase 1</phase_directive>" in strategic
+        assert "<phase_directive>tactical phase 2</phase_directive>" in tactical
+        assert all("{prompt_content}" not in out for out in (strategic, tactical))
+
+    def test_removed_mode_keys_in_old_snapshots_are_ignored(self):
+        config = load_agent_config_from_dict(
+            {
+                "agent_id": "test",
+                "display_name": "Test Agent",
+                "phase_settings": {
+                    "min_todos": 2,
+                    "max_todos": 7,
+                    "prompt_mode": "legacy",
+                    "tool_binding_mode": "filtered",
+                },
+            }
+        )
+        assert config.phase_settings.min_todos == 2
+        assert config.phase_settings.max_todos == 7
+        assert not hasattr(config.phase_settings, "prompt_mode")
+        assert not hasattr(config.phase_settings, "tool_binding_mode")
+
+    def test_new_frozen_blob_has_no_phase_prompt_or_mode_keys(self):
+        config = load_agent_config_from_dict(
+            {"agent_id": "test", "display_name": "Test Agent"}
+        )
+        blob = serialize_resolved_config(config)
+        assert "strategic" not in blob["prompts"]
+        assert "tactical" not in blob["prompts"]
+        assert set(blob["agent"]["phase_settings"]) == {"min_todos", "max_todos"}

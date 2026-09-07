@@ -115,6 +115,9 @@ provenance:
     workspace:
       sourceRevision: ""
       releaseVersion: ""
+    vmController:
+      sourceRevision: ""
+      releaseVersion: ""
 
 # =============================================================================
 # Orchestrator
@@ -140,6 +143,34 @@ orchestrator:
   # Helm --atomic or roll back to an old image after 0185 commits. Clear this
   # value again on the next all-new-version rollout.
   runtimeAuthorityMigrationMaintenanceAck: false
+  # -- Reconcile already-durable workspace cleanup generations after process
+  # restarts. Ship dark; explicit callers remain available while false, and a
+  # generation admitted before the flag closes may finish without stranding
+  # its process-zero/maintenance fence.
+  workspaceCleanupReconciliationEnabled: false
+  # -- One-release coordinated cutover for the 0197/0198 workspace lifecycle
+  # authority epoch. Keep true while advancing the ServiceAccount generation:
+  # the namespace RoleBinding revokes the predecessor account and Recreate
+  # terminates every old orchestrator before the new owner starts. Automatic
+  # reconciliation remains independently dark until inventory is clean.
+  # Before this cutover, stop new workspace admission and wait for already-
+  # accepted Kubernetes create/delete calls to quiesce: Recreate/RBAC cannot
+  # revoke a request the API server already accepted. Set false only on a later
+  # all-new-version rollout after the cutover and residue gates.
+  workspaceLifecycleProtocolCutoverEnabled: true
+  # -- Kubernetes mutation authority epoch for the 0197/0198 non-pinned
+  # workspace lifecycle protocol. The RoleBinding names only this generation's
+  # ServiceAccount, so predecessor Pods lose create/delete authority before
+  # replacement code can mutate the same deterministic resources.
+  workspaceLifecycleServiceAccountGeneration: "0197"
+  # -- Enable exact, renewable v1 receipts for orchestrator-originated VM
+  # SSH/SFTP. Enabling switches the orchestrator to Recreate so no pre-v1
+  # replica overlaps activation. Keep false until migration 0199 is present;
+  # after activation never roll back to an image without v1 support. The dark
+  # value intentionally retains same-cluster TCP/22 for existing/read-only VM
+  # paths; mutation admission is fenced by the application + database gate.
+  vmRemoteOperationProtocol:
+    enabled: false
   resources:
     requests:
       memory: "256Mi"
@@ -171,6 +202,10 @@ orchestrator:
   # deployed-test seam, never an Officer/model capability; every profile ships
   # disabled and a bounded gate enables it only for the test interval.
   officerRuntimeVerificationEnabled: false
+  # -- Owner-facing Officer auto-pull release fence. Keep false until the
+  # unattended-operation deployment gates are complete; false always permits
+  # disabling an already configured century and suppresses new tick admission.
+  officerAutoPullReleaseEnabled: false
   # -- Additional exact Git host or host:port endpoints trusted for external
   # OKF KB datasources. The built-in public-provider set remains enabled.
   # Wildcards, IP literals, and localhost are rejected. Example:
@@ -450,6 +485,13 @@ agent:
   # cutover rather than a mixed-version reader-first rollout, so this remains
   # true after the cutover and must never be disabled while 0185 is installed.
   requirePinnedStatusIdentity: "true"
+  # -- Explicit prior namespaces searched while 0200 adopts pre-finalizer
+  # pinned Pods/PVCs. The active namespace is always this Helm release's
+  # namespace and must not be listed. Keep only namespaces that may still hold
+  # live 0185 agent authority; remove each entry after adoption has converged.
+  # Each entry also grants this release's orchestrator bounded Pod/PVC lifecycle
+  # authority in that namespace so exact End/recycle can finish there.
+  pinnedLegacyNamespaces: []
   # -- Effective context ceiling (tokens) for models routed via the system codex
   # proxy, whose ChatGPT-OAuth backend caps context ~400K regardless of the
   # model's true API window. Compaction fires at 80% of this. Set 0 to disable
@@ -698,24 +740,36 @@ canvas:
       # database credential. It connects with a dedicated login whose grants
       # are limited to the viewer/session query surface.
       database:
-        # -- Dedicated PostgreSQL login. Chart-managed development credentials
-        # use this fixed name so an uninstall/reinstall cannot strand older
-        # privileged roles under operator-selected names.
+        # -- Dedicated PostgreSQL login. Automatic provisioning uses this fixed
+        # name so an uninstall/reinstall cannot strand older privileged roles
+        # under operator-selected names.
         username: "srw_canvas_gateway"
         credentials:
-          # -- Generate a dedicated Secret. Development/internal-Postgres only;
-          # production must reference an operator-managed Secret instead.
+          # -- Generate a dedicated gateway Secret. With automatic CNPG role
+          # provisioning, the chart also creates a CNPG basic-auth projection
+          # from the same password; no pre-install role or Secret is required.
+          # Values and Helm release storage must receive normal Secret-grade
+          # access controls.
           create: false
-          # -- Existing Secret containing only the gateway DB credential.
+          # -- Existing Secret containing the gateway DB credential.
           existingSecret: ""
-          # -- Vault KV path containing exactly `username` and `password`.
-          # This selects a chart-rendered ExternalSecret instead of a
-          # pre-created Kubernetes Secret and requires externalSecrets.enabled.
+          # -- Explicit assertion for automatic CNPG role management: the
+          # existing Secret is kubernetes.io/basic-auth, has username/password,
+          # carries cnpg.io/reload=true, and passwordKey resolves to the same
+          # password. Helm cannot inspect it during an offline/Fleet render.
+          existingSecretCnpgCompatible: false
+          # -- Vault KV path containing the property named by passwordKey. The
+          # chart projects that one property into the gateway Secret and, when
+          # CNPG role provisioning is enabled, a separate CNPG basic-auth
+          # Secret. No second Vault entry is required. This selects
+          # chart-rendered ExternalSecrets instead of a pre-created Kubernetes
+          # Secret and requires externalSecrets.enabled.
           # The path is inert while viewer.enabled=false: no provider lookup or
           # credential requirement is created until the gateway is enabled.
           vaultPath: ""
           passwordKey: "CANVAS_VIEWER_POSTGRES_PASSWORD"
-        # -- Reconcile the restricted login/grants with a bounded one-shot Job.
+        # -- Reconcile the restricted login and grants. CNPG owns identity and
+        # password through DatabaseRole; a bounded normal Job owns object ACLs.
         # Allowed only for bundled Postgres and required with credentials.create.
         provisionRole: false
         pool:
@@ -876,6 +930,135 @@ auth:
     accessTokenRefreshSkewSeconds: 60
 
 # =============================================================================
+# SSH Gateway — user-facing SSH into session workspaces
+# =============================================================================
+# Runs on the orchestrator image with a different command (the canvas-gateway
+# pattern) and reads its configuration from its own ConfigMap through
+# `envFrom`. Off by default. `services/ssh_gateway_config.load_config` fails
+# closed on every value below that has no safe default, so the chart refuses
+# to render rather than letting the operator find out as a crash-loop.
+sshGateway:
+  enabled: false
+  # -- Gateway pods. EVERY abuse cap the gateway enforces is PER POD, so this
+  # value multiplies all of them.
+  #
+  # `GatewayLimiter` is constructed once per process (ssh_gateway.py) with no
+  # shared store, and the WSS ingress has no session affinity, so at
+  # `replicas: 2` the effective caps are 128 concurrent SSH connections, 32
+  # per source, and — this is the one that matters — 8 attachments per
+  # workspace instead of 4. That last one is a SECURITY cap on how many people
+  # can be attached to a single workspace at once, not a capacity cap, and
+  # none of the five has an environment lever to compensate with (they are
+  # `GatewayConfig` dataclass defaults; `load_config` reads none of them).
+  #
+  # Raise this only with that understood.
+  replicas: 1
+  # -- Public hostname users put in `HostName`. Published verbatim by the
+  # orchestrator's unauthenticated `GET /api/ssh/host-keys` document and used
+  # by the config snippet Cockpit generates. The gateway process itself never
+  # reads it.
+  hostname: ""
+  # -- Origins permitted to open the WSS attach socket
+  # (`SSH_GATEWAY_ALLOWED_ORIGINS`). Empty fails closed: an empty allow-list
+  # would accept cross-site WebSocket handshakes, so `load_config` refuses to
+  # boot and this chart refuses to render.
+  #
+  # MUST contain the exact origin cockpit is served from (scheme + host +
+  # port, matched exactly — no wildcards, no path). On this chart's DEFAULT
+  # topology that is the APEX domain, `https://<global.domain>` — NOT
+  # `https://cockpit.<global.domain>` — because `global.hostnames.cockpit`
+  # above defaults to "" (the bare domain), while `hostnames.api` defaults to
+  # `api.<domain>`. A value that guesses the `cockpit.` subdomain is wrong out
+  # of the box and every client gets a bare 403 at the WebSocket upgrade with
+  # nothing in the gateway pod's logs to explain why (ssh-access.md
+  # §7 Troubleshooting; this is also the trap behind srw-ssh-proxy's own
+  # `--origin` default guess).
+  allowedOrigins: []
+  # -- Source addresses whose `X-Forwarded-For` header the gateway may believe
+  # — the ingress hop, as a comma-separated IP/CIDR list. Set it to the string
+  # `none` when nothing proxies the gateway; it then trusts the socket peer.
+  #
+  # There is deliberately no default in EITHER direction. Left unset behind an
+  # ingress, every WSS client presents the *ingress's* address, so all of them
+  # share one source's 16-slot concurrency bucket and the seventeenth
+  # concurrent user is refused; defaulting the other way is the spoofable
+  # header the setting exists to prevent.
+  trustedProxies: ""
+  # -- Operator-provided, exactly like `vm-ssh-key`. The chart NEVER generates
+  # key material: template-time `genPrivateKey` guarded by `lookup` silently
+  # returns empty under `helm template` and `--dry-run`, which would rotate the
+  # host key on every Argo sync and break every user's known_hosts.
+  #
+  # This Secret must carry, for every name in `hostKeyNames` below, BOTH the
+  # private half (`<name>`, mounted into the gateway) and its public half
+  # (`<name>.pub`, mounted into the ORCHESTRATOR, which is where
+  # `GET /api/ssh/host-keys` runs). Without the `.pub` halves that endpoint
+  # answers 200 with an empty list forever and pinning clients silently
+  # degrade to trust-on-first-use.
+  hostKeySecret: ""
+  # -- Host-key names inside `hostKeySecret`. ONE list drives all four
+  # derived things — the gateway's `SSH_GATEWAY_HOST_KEYS`, the orchestrator's
+  # `SSH_GATEWAY_PUBLIC_HOST_KEYS`, and both pods' projected `items` — because
+  # when the served and the published key sets drift, clients see a host-key
+  # mismatch indistinguishable from an active MITM.
+  #
+  # Ed25519 ONLY. `_require_ed25519_host_key` (ssh_gateway_config.py) raises on
+  # any algorithm that is not `ssh-ed25519` at `load_config`, so an RSA host
+  # key means the gateway refuses to start; a server's advertised host-key
+  # algorithms come straight from the loaded key material, and an RSA key drags
+  # in legacy SHA-1 `ssh-rsa`.
+  hostKeyNames:
+    - ssh_host_ed25519_key
+  # -- Operator-provided Secret holding the user CA the gateway mints
+  # inner-hop certificates with. Key `user-ca` (the private half) is what the
+  # gateway mounts.
+  #
+  # The matching PUBLIC half must ALSO reach every workspace, and it does NOT
+  # travel through this Secret: `container_provisioner` projects `user-ca.pub`
+  # out of the `vm-ssh-key` Secret (`WORKSPACE_SSH_SECRET`). See
+  # `externalSecrets` below and helm/README.md — without that copy, sshd never
+  # gets `TrustedUserCAKeys` and every attach ends in PermissionDenied.
+  userCaSecret: ""
+  # -- Raw TCP listener. The gateway ALWAYS listens on 2222 inside the pod
+  # (`/healthz` reports 503 while that accept loop is down), and the ClusterIP
+  # Service always carries it. This block only opens the external door.
+  tcp:
+    enabled: false
+    port: 2222
+    # -- Required when `tcp.enabled` — mirrors `databases.neo4j.loadBalancer`'s
+    # `allowedClientCIDRs`. An unrestricted SSH LoadBalancer is not a default.
+    allowedClientCIDRs: []
+    # -- MetalLB pool / pinned address, and the k3s servicelb suppression the
+    # neo4j Bolt LoadBalancer uses.
+    ipAddressPool: ""
+    loadBalancerIP: ""
+    # -- `Local` preserves the real client source IP so the NetworkPolicy's
+    # ipBlock rules can match it (`Cluster` SNATs it to a node IP).
+    externalTrafficPolicy: ""
+  networkPolicy:
+    enabled: true
+    # -- Whatever fronts the WSS door: the ingress controller pods. Defaults to
+    # the chart's supported Traefik, matching the selectors
+    # workspace-network-policy.yaml already uses for code-server.
+    edgeNamespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: traefik
+    edgePodSelector:
+      matchLabels:
+        app.kubernetes.io/name: traefik
+    # -- Additive rules for deployment-specific edges (a cloudflared namespace,
+    # a dedicated LB subnet). Name the narrowest possible selector.
+    extraIngress: []
+    extraEgress: []
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+# =============================================================================
 # MCP Server (Claude Code / AI platform integration)
 # =============================================================================
 mcp:
@@ -1024,26 +1207,15 @@ llmOutage:
   ceilingSeconds: 43200
 
 databases:
-  # -- CloudNativePG operator. The chart can install it as a subchart for a
-  #    batteries-included self-host, or defer to one the cluster already runs
-  #    (one operator serving many namespaces is the normal deployment, and is
-  #    how the dev cluster is set up — cnpg-system, cluster-wide).
+  # -- Externally managed CloudNativePG operator integration. The application
+  #    chart deliberately does not install, upgrade, or uninstall the
+  #    cluster-scoped operator/CRDs. Install CNPG first when any database uses
+  #    `engine: migrating|cnpg`; the default StatefulSet engine needs none.
   operator:
-    # -- Install the CloudNativePG operator as a subchart. OFF while every
-    #    database still runs on `engine: statefulset` — an operator with no
-    #    Cluster to reconcile is pure risk, and one operator serving many
-    #    namespaces is the normal deployment (the dev cluster is set up that
-    #    way: cnpg-system, cluster-wide, installed out of band).
-    #    Turn it on for a self-host whose cluster has no operator yet.
-    #    NOTE: Helm does not upgrade CRDs installed by a subchart, and
-    #    `helm uninstall` does not remove them, so this is close to a one-way
-    #    door. A cluster that already runs CloudNativePG must leave it off, or
-    #    the two installs fight over the same cluster-scoped CRDs.
-    install: false
-    # -- Namespace the CloudNativePG operator runs in. The database
-    #    NetworkPolicies allow it in so it can poll instance health and
-    #    orchestrate failover; without this the operator is silently locked
-    #    out and a failover simply never happens. Dev: cnpg-system.
+    # -- Namespace the separately installed CloudNativePG operator runs in.
+    #    The database NetworkPolicies allow it in so it can poll instance
+    #    health and orchestrate failover; without this the operator is silently
+    #    locked out and a failover simply never happens. Dev: cnpg-system.
     namespace: "cnpg-system"
 
   # -- Seconds Postgres spends in SMART shutdown before CloudNativePG escalates
@@ -1088,6 +1260,8 @@ databases:
   credentialsPreCreated: false
 
   # -- Replica profile. Resolves DEFAULT instance counts and nothing else.
+  #    `single` is the non-HA default and all database engines independently
+  #    default to `statefulset`, so it requires no CNPG operator.
   #    single -> 1 each.  ha -> 2 each.  Per-database `instances` overrides it.
   #    Anti-affinity, PDBs and topology all derive from the RESOLVED count, so
   #    an explicit `instances: 3` behaves correctly without naming a profile.
@@ -2008,6 +2182,37 @@ keycloak:
   # without a DB wipe. Defaults to 2h idle / 24h max with a 3-day "remember me"
   # checkbox enabled — matches the homelab profile and avoids the 30-min
   # re-login that Keycloak's built-in defaults impose.
+  # -- Seed a fixed set of test accounts into the realm. LOCAL DEVELOPMENT ONLY.
+  # Passwords here are FIXED and PUBLISHED in docs/local-kubernetes.md so every
+  # k3d developer shares one known set instead of hand-rolling accounts.
+  # Enabling this on any reachable deployment hands anyone who has read the
+  # repo full admin access.
+  # The bootstrap `test` admin is separate and always created; its password
+  # comes from the required KC_REALM_ADMIN_PASSWORD secret, never from here.
+  devUsers:
+    enabled: false
+    # All passwords are 16 characters to satisfy the realm password policy
+    # (length(16) and notUsername). Keep the local Kubernetes guide's table in
+    # sync with this list.
+    users:
+      - username: dev-admin-1
+        password: srw-k3d-dev-adm1
+        admin: true
+      - username: dev-admin-2
+        password: srw-k3d-dev-adm2
+        admin: true
+      - username: dev-user-1
+        password: srw-k3d-dev-usr1
+        admin: false
+      - username: dev-user-2
+        password: srw-k3d-dev-usr2
+        admin: false
+      - username: dev-user-3
+        password: srw-k3d-dev-usr3
+        admin: false
+      - username: dev-user-4
+        password: srw-k3d-dev-usr4
+        admin: false
   session:
     rememberMe: true
     ssoSessionIdleTimeout: 7200              # 2 hours
@@ -2015,7 +2220,7 @@ keycloak:
     ssoSessionIdleTimeoutRememberMe: 259200  # 3 days
     ssoSessionMaxLifespanRememberMe: 259200  # 3 days
     accessTokenLifespan: 900                 # 15 minutes
-    offlineSessionIdleTimeout: 2592000       # 30 days
+    offlineSessionIdleTimeout: 259200        # 3 days
   resources:
     requests:
       memory: "512Mi"
@@ -2157,7 +2362,13 @@ nextcloud:
   # External Nextcloud installations are deliberately ineligible unless they
   # deploy and attest an equivalent server-side lane.
   protectedEffect:
-    enabled: false
+    # Tri-state. Unset (the default) derives the lane from
+    # agent.protectedCloudModeEnabled on a bundled, internal Nextcloud —
+    # protected cloud mode is inert without it, so there is nothing to decide
+    # separately. Set `true` to stage the lane (and its adoption-once HMAC
+    # root) ahead of the feature flag; `false` refuses it outright and makes
+    # protectedCloudModeEnabled=true a render-time contradiction.
+    enabled: null
     # The HMAC root must never live in the shared application Secret: dynamic
     # agent Pods consume that bundle via envFrom. ESO therefore reads a
     # dedicated Vault path, while pre-created-secret users name a dedicated
@@ -2339,7 +2550,7 @@ workspace:
   # -- Kill-switch for the discard-and-recover fallback above (the only data-
   # destructive recovery path). false → a wedged reattach stays in recovery until
   # the node returns or the recovery cap fails it loud, never discarding.
-  freshFallback: true
+  freshFallback: false
   # -- Reclaim-on-idle (Task 7). On a session's idle-suspend, once the S3
   # snapshot is confirmed restorable (verify_snapshot), drop its workspace
   # PVC instead of retaining it — the next touch extracts from S3 like any
@@ -2456,6 +2667,47 @@ workspace:
     pauseImage: "registry.k8s.io/pause:3.10"
 
 # =============================================================================
+# Self-hosted Web Research Providers
+# =============================================================================
+searxng:
+  # -- Keyless metasearch for a working fresh-install search default. This
+  # references the unmodified upstream AGPL image as a separate service.
+  enabled: true
+  image: ghcr.io/searxng/searxng:2026.8.20-8d3dd0cd4
+  service:
+    port: 8080
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "100m"
+    limits:
+      memory: "2Gi"
+      cpu: "1000m"
+
+crawl4ai:
+  # -- Default-off because the browser service needs about 4 GiB at its
+  # supported ceiling. Enabling this deploys the fixed-destination service;
+  # catalog/provider registration remains an explicit admin action.
+  enabled: false
+  image: docker.io/unclecode/crawl4ai:0.9.2
+  service:
+    port: 11235
+  # -- High-entropy bearer/JWT signing token required by the Crawl4AI API. The
+  # Secret defaults to the chart's application Secret; set name to use a
+  # dedicated Secret. The key must exist and contain at least 32 characters
+  # before enabling the component.
+  apiTokenSecret:
+    name: ""
+    key: CRAWL4AI_API_TOKEN
+  resources:
+    requests:
+      memory: "1Gi"
+      cpu: "500m"
+    limits:
+      memory: "4Gi"
+      cpu: "2000m"
+
+# =============================================================================
 # Optional Admin UIs
 # =============================================================================
 pgadmin:
@@ -2567,6 +2819,12 @@ test:
 # =============================================================================
 reloader:
   enabled: true
+  # -- Watch every namespace in the cluster (ClusterRole) instead of only the
+  # release namespace (Role). Reloader only ever acts on workloads in this
+  # release, so the default is the narrow one: on a shared cluster a
+  # ClusterRole would hand this pod read access to every other tenant's
+  # Secrets. Verified on k3d that a namespaced Role still triggers reloads.
+  watchGlobally: false
   image: stakater/reloader:v1.3.0
   resources:
     requests:
@@ -2620,6 +2878,15 @@ llm:
   seed:
     # -- Enable the seed Job. Missing/false leaves system tables untouched.
     enabled: false
+
+    # -- How long the research-provider seed hook (post-install/post-upgrade,
+    # always rendered while the orchestrator has replicas) waits for the
+    # orchestrator's health endpoint before failing the release. 300 s suits a
+    # warm cluster; a fresh single-node install that pulls every image and
+    # walks Keycloak -> Gitea -> orchestrator needs 900+ (probe 1, 2026-09-04
+    # failed revision 1 on exactly this). The Job's activeDeadlineSeconds is
+    # this value plus 300.
+    researchProviderWaitSeconds: 300
 
     # -- Optional: system API keys keyed by provider. Each entry references
     # an existing Secret in the release namespace — plaintext keys must never
@@ -3051,7 +3318,7 @@ vmController:
 # =============================================================================
 # Logging
 # =============================================================================
-logLevel: "DEBUG"
+logLevel: "INFO"
 # Log output format: "json" (structured, for the Alloy -> Loki pipeline) or
 # "text" (human-readable). See knowledge-base/knowledge/features/centralized_logging.md.
 logFormat: "json"

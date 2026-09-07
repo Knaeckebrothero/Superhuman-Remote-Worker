@@ -15,8 +15,8 @@ from pathlib import Path
 
 import pytest
 
-from src.tools.context import ToolContext
-from src.tools.workspace.files import create_file_tools
+from agent.tools.context import ToolContext
+from agent.tools.workspace.files import create_file_tools
 
 
 class FakeWorkspace:

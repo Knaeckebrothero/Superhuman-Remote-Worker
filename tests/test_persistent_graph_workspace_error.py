@@ -8,8 +8,8 @@ import pytest
 from langchain_core.messages import AIMessage
 from langchain_core.tools import tool
 
-from src.core.workspace_backend import WorkspaceUnavailableError
-from src.persistent_graph import (
+from shared.runtime.core.workspace_backend import WorkspaceUnavailableError
+from agent.persistent_graph import (
     PersistentLoopCallbacks,
     _user_facing_turn_error,
     run_persistent_loop,

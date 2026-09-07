@@ -23,8 +23,8 @@ from eval.app_guide.run import (
     score_capability_case,
     validate_capability_corpus,
 )
-from src.core.product_capabilities import AgentAction, SessionState
-from src.tools.product_capabilities import CapabilityToolStatus
+from shared.runtime.core.product_capabilities import AgentAction, SessionState
+from agent.tools.product_capabilities import CapabilityToolStatus
 
 
 @pytest.fixture

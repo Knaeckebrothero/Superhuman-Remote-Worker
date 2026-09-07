@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from services import brand
+from orchestrator.services import brand
 
 ROOT = Path(__file__).resolve().parents[1]
 

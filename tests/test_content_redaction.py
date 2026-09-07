@@ -7,7 +7,7 @@ cannot correlate is evidence he cannot use. The false-positive cases here are
 as load-bearing as the true-positive ones.
 """
 
-from src.shared.content_redaction import REDACTED, sanitize, sanitize_text
+from shared.content_redaction import REDACTED, sanitize, sanitize_text
 
 
 class TestSecretShapes:

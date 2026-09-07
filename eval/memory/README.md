@@ -6,7 +6,7 @@ Offline evaluation of the agent memory subsystem against
 Research grounding: `knowledge-base/knowledge/research/ai_memory/results/05_lifecycle_eval_report.md`.
 
 The harness drives the production seam directly — `MemoryManager.assemble()`
-and `capture()` from `src/services/memory/` — with the production loader,
+and `capture()` from `src/agent/services/memory/` — with the production loader,
 stores, embedding service, and prompts. No graph spin-up, no orchestrator.
 What an arm measures is what a real session with that YAML would do.
 
@@ -46,9 +46,9 @@ aggregates (they return with the end-task slice).
 #    https://github.com/xiaowu0162/LongMemEval (HF: xiaowu0162/longmemeval)
 #    Put longmemeval_s.json under eval/memory/data/.
 
-# 2. A pgvector server. Dev-compose:
-podman-compose -f docker-compose.dev.yaml up -d postgres-vector
-export EVAL_VECTOR_DSN='postgresql://srw:srw_password@localhost:5433/srw_eval'
+# 2. A pgvector server. Tunnel the cluster's pgvector to localhost:5433:
+scripts/port-forward-dbs.sh &
+export EVAL_VECTOR_DSN='postgresql://<user>:<password>@localhost:5433/srw_eval'
 # (defaults to exactly that DSN; the runner creates the srw_eval database
 #  and applies migrations/vector/ with --init-db)
 

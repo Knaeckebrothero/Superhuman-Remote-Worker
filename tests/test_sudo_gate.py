@@ -16,19 +16,12 @@ Tests cover:
 
 import asyncio
 import json
-import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
-# Add project root to path
-project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
 
 from orchestrator.services.sudo_gate import SudoGateService, _SHELL_META_RE  # noqa: E402
 from orchestrator.services.sudo_gate import (  # noqa: E402

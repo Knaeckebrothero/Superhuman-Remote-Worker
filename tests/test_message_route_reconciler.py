@@ -17,8 +17,8 @@ from uuid import uuid4
 
 import pytest
 
-from services import message_route_reconciler as reconciler
-from services import message_routing as routing
+from orchestrator.services import message_route_reconciler as reconciler
+from orchestrator.services import message_routing as routing
 
 
 NOW = datetime(2026, 8, 14, 12, 0, tzinfo=timezone.utc)

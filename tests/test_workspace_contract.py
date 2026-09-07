@@ -7,7 +7,7 @@ from uuid import uuid4
 
 import pytest
 
-from src.shared.workspace_contract import (
+from shared.workspace_contract import (
     LEGACY_K8S_RUNTIME_ADOPTION_KEY,
     WORKSPACE_CONTRACT_CONTEXT_KEY,
     WorkspaceContractError,
@@ -55,7 +55,7 @@ def _runtime_attestation(
     host: str = "workspace-job.internal",
     pod_ip: str = "10.42.1.17",
 ):
-    from services.container_provisioner import WorkspaceRuntimeAttestation
+    from orchestrator.services.container_provisioner import WorkspaceRuntimeAttestation
 
     backing = str(uuid4())
     return WorkspaceRuntimeAttestation(
@@ -87,14 +87,159 @@ def _adopted_k8s_runtime(attestation, *, status: str = "ready") -> dict:
 
 
 class _LegacyAdoptionDB:
+    """The owner rows plus the exact slice of the 0198 ledger adoption uses.
+
+    Adoption has no authorised transition into the new protocol without a
+    durable `adopt` generation, so a double that omitted the ledger would let
+    the bridge look like it still writes the owner row on its own.
+    """
+
     def __init__(self, *jobs: dict) -> None:
         self.jobs = {str(job["id"]): deepcopy(job) for job in jobs}
         self.adoption_calls: list[dict] = []
         self.before_cas = None
+        self.reservations: dict[str, dict] = {}
+        self.reservation_calls: list[dict] = []
+        self._next_generation = 1
 
     async def get_job(self, job_id: str):
         job = self.jobs.get(str(job_id))
         return deepcopy(job) if job is not None else None
+
+    def _key(self, owner_id, owner_kind, scope):
+        return (str(owner_id), owner_kind, scope)
+
+    async def reserve_managed_repository_workspace_creation(
+        self,
+        owner_id: str,
+        *,
+        owner_kind: str,
+        scope: str,
+        claimant: str,
+        operation_kind: str = "create",
+        desired_manifest_digest: str,
+        lease_seconds: int = 1800,
+    ):
+        self.reservation_calls.append(
+            {
+                "owner_id": str(owner_id),
+                "owner_kind": owner_kind,
+                "scope": scope,
+                "operation_kind": operation_kind,
+                "digest": desired_manifest_digest,
+            }
+        )
+        job = self.jobs.get(str(owner_id))
+        if job is None:
+            return None
+        workspace = (job.get("context") or {}).get("workspace_container") or {}
+        # The production reserve refuses `adopt` over anything but the exact
+        # historical shape; reproduce that here so a test can never adopt a row
+        # that already carries authority.
+        if operation_kind == "adopt" and not (
+            scope == "workspace_container"
+            and workspace
+            and workspace.get("provisioner") == "k8s"
+            and str(workspace.get("status") or "") == "ready"
+            and "_runtime_incarnation" not in workspace
+            and "_creation_reservation_id" not in workspace
+            and "_creation_claim_token" not in workspace
+        ):
+            return None
+        key = self._key(owner_id, owner_kind, scope)
+        existing = self.reservations.get(key)
+        if existing is not None and existing.get("settled_at") is None:
+            if (
+                existing["claimed_by"] != claimant
+                or existing["operation_kind"] != operation_kind
+                or existing["desired_manifest_digest"] != desired_manifest_digest
+            ):
+                return None
+            return deepcopy(existing)
+        record = {
+            "id": f"reservation-{self._next_generation}",
+            "reservation_generation": self._next_generation,
+            "claim_token": self._next_generation,
+            "claimed_by": claimant,
+            "operation_kind": operation_kind,
+            "desired_manifest_digest": desired_manifest_digest,
+            "phase": "reserved",
+            "runtime_incarnation": None,
+            "settled_at": None,
+            "external_mutation_started_at": None,
+        }
+        self._next_generation += 1
+        self.reservations[key] = record
+        return deepcopy(record)
+
+    async def authorize_managed_repository_workspace_creation_runtime(
+        self,
+        owner_id: str,
+        *,
+        owner_kind: str,
+        scope: str,
+        reservation_generation: int,
+        claimant: str,
+        claim_token: int,
+        runtime_incarnation: str,
+    ) -> bool:
+        record = self.reservations.get(self._key(owner_id, owner_kind, scope))
+        if record is None or record["settled_at"] is not None:
+            return False
+        if (
+            record["reservation_generation"] != reservation_generation
+            or record["claim_token"] != claim_token
+            or record["claimed_by"] != claimant
+        ):
+            return False
+        if record["runtime_incarnation"] not in (None, runtime_incarnation):
+            return False
+        record["runtime_incarnation"] = runtime_incarnation
+        record["phase"] = "runtime_bound"
+        return True
+
+    async def settle_managed_repository_workspace_creation_reservation(
+        self,
+        owner_id: str,
+        *,
+        owner_kind: str,
+        scope: str,
+        reservation_generation: int,
+        claimant: str,
+        claim_token: int,
+        runtime_incarnation: str | None,
+    ) -> bool:
+        record = self.reservations.get(self._key(owner_id, owner_kind, scope))
+        if record is None or record["settled_at"] is not None:
+            return False
+        if record["runtime_incarnation"] != runtime_incarnation:
+            return False
+        record["settled_at"] = "settled"
+        record["phase"] = "settled"
+        record["result_kind"] = "settled"
+        return True
+
+    async def abort_managed_repository_workspace_creation_reservation(
+        self,
+        owner_id: str,
+        *,
+        owner_kind: str,
+        scope: str,
+        reservation_generation: int,
+        claimant: str,
+        claim_token: int,
+    ) -> bool:
+        record = self.reservations.get(self._key(owner_id, owner_kind, scope))
+        if record is None or record["settled_at"] is not None:
+            return False
+        job = self.jobs.get(str(owner_id))
+        workspace = ((job or {}).get("context") or {}).get("workspace_container") or {}
+        if workspace.get("_creation_reservation_id") == record["id"]:
+            return False
+        record["settled_at"] = "aborted"
+        record["phase"] = "aborted"
+        record["result_kind"] = "aborted"
+        return True
 
     async def adopt_legacy_k8s_job_workspace_runtime(
         self, job_id: str, **kwargs
@@ -349,7 +494,7 @@ def test_stamped_ready_runtime_without_provenance_fails_closed() -> None:
 async def test_exact_previous_release_k8s_job_runtime_is_live_attested_and_adopted(
     status: str,
 ) -> None:
-    from services.job_workspace_adoption import (
+    from orchestrator.services.job_workspace_adoption import (
         LegacyK8sAdoptionOutcome,
         ensure_legacy_k8s_job_runtime_authority,
     )
@@ -385,7 +530,7 @@ async def test_exact_previous_release_k8s_job_runtime_is_live_attested_and_adopt
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["completed", "cancelled"])
 async def test_terminal_legacy_k8s_runtime_is_never_adopted(status: str) -> None:
-    from services.job_workspace_adoption import (
+    from orchestrator.services.job_workspace_adoption import (
         LegacyK8sAdoptionOutcome,
         ensure_legacy_k8s_job_runtime_authority,
     )
@@ -412,7 +557,7 @@ async def test_terminal_legacy_k8s_runtime_is_never_adopted(status: str) -> None
 async def test_legacy_k8s_adoption_refuses_missing_or_replaced_pod(
     failure: str,
 ) -> None:
-    from services.job_workspace_adoption import (
+    from orchestrator.services.job_workspace_adoption import (
         LegacyK8sAdoptionOutcome,
         ensure_legacy_k8s_job_runtime_authority,
     )
@@ -448,7 +593,7 @@ async def test_legacy_k8s_adoption_refuses_missing_or_replaced_pod(
 async def test_pod_replacement_between_attestation_and_persistence_is_reverted() -> (
     None
 ):
-    from services.job_workspace_adoption import (
+    from orchestrator.services.job_workspace_adoption import (
         LegacyK8sAdoptionOutcome,
         ensure_legacy_k8s_job_runtime_authority,
     )
@@ -484,7 +629,7 @@ async def test_pod_replacement_between_attestation_and_persistence_is_reverted()
 async def test_old_callback_can_adopt_runtime_for_new_stamped_sandbox_contract() -> (
     None
 ):
-    from services.job_workspace_adoption import (
+    from orchestrator.services.job_workspace_adoption import (
         LegacyK8sAdoptionOutcome,
         ensure_legacy_k8s_job_runtime_authority,
     )
@@ -511,7 +656,7 @@ async def test_old_callback_can_adopt_runtime_for_new_stamped_sandbox_contract()
 async def test_stamped_sandbox_adoption_ignores_opposite_tier_diagnostic_residue() -> (
     None
 ):
-    from services.job_workspace_adoption import (
+    from orchestrator.services.job_workspace_adoption import (
         LegacyK8sAdoptionOutcome,
         ensure_legacy_k8s_job_runtime_authority,
     )
@@ -542,7 +687,7 @@ async def test_stamped_sandbox_adoption_ignores_opposite_tier_diagnostic_residue
 
 @pytest.mark.asyncio
 async def test_unstamped_both_tier_legacy_row_remains_ambiguous() -> None:
-    from services.job_workspace_adoption import (
+    from orchestrator.services.job_workspace_adoption import (
         LegacyK8sAdoptionOutcome,
         ensure_legacy_k8s_job_runtime_authority,
     )
@@ -583,7 +728,7 @@ async def test_unstamped_both_tier_legacy_row_remains_ambiguous() -> None:
 async def test_nonready_adoption_marker_defers_to_workspace_lifecycle(
     workspace_update: dict,
 ) -> None:
-    from services.job_workspace_adoption import (
+    from orchestrator.services.job_workspace_adoption import (
         LegacyK8sAdoptionOutcome,
         ensure_legacy_k8s_job_runtime_authority,
     )
@@ -608,11 +753,11 @@ async def test_nonready_adoption_marker_defers_to_workspace_lifecycle(
 
 
 @pytest.mark.asyncio
-async def test_completion_recovery_reprovisions_and_re_adopts_replacement(
+async def test_completion_recovery_reprovisions_and_retires_the_stale_marker(
     monkeypatch,
 ) -> None:
     from orchestrator import main as orch_main
-    from services.job_workspace_adoption import (
+    from orchestrator.services.job_workspace_adoption import (
         LegacyK8sAdoptionOutcome,
         ensure_legacy_k8s_job_runtime_authority,
     )
@@ -692,26 +837,27 @@ async def test_completion_recovery_reprovisions_and_re_adopts_replacement(
     db.admit_stateless_worker_job.assert_not_awaited()
 
     # The replacement callback left the predecessor marker beside its new UID.
-    # The next dispatcher pass live-attests and exact-CAS refreshes that marker
-    # before admitting the resumed job exactly once.
+    # That successor was created by this server under a durable reservation, so
+    # it is not an adopted runtime: the next dispatcher pass retires the stale
+    # marker by exact snapshot CAS and admits the resumed job exactly once.
+    # Refreshing the marker instead would be a second adoption of a Pod nobody
+    # adopted, and leaving it would make every later pre-network check
+    # re-attest the vanished predecessor and refuse delivery for good.
     await orch_main._try_dispatch_pending_jobs()
 
     resumed = await db.get_job(job["id"])
     runtime = resumed["context"]["workspace_container"]
     assert runtime["_runtime_incarnation"] == replacement.runtime_incarnation
-    assert runtime[LEGACY_K8S_RUNTIME_ADOPTION_KEY]["workspace_generation"] == (
-        replacement.workspace_generation
-    )
+    assert LEGACY_K8S_RUNTIME_ADOPTION_KEY not in runtime
     assert resolve_workspace_runtime(resumed).ready
     assert orch_main._resume_missing_workspace(resumed) is None
-    assert live_attestation.await_count == 3
     db.admit_stateless_worker_job.assert_awaited_once()
     db.update_job_status.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_ready_adopted_runtime_control_plane_failure_remains_retryable() -> None:
-    from services.job_workspace_adoption import (
+    from orchestrator.services.job_workspace_adoption import (
         LegacyK8sAdoptionOutcome,
         ensure_legacy_k8s_job_runtime_authority,
     )
@@ -738,7 +884,7 @@ async def test_ready_adopted_runtime_control_plane_failure_remains_retryable() -
 
 @pytest.mark.asyncio
 async def test_inherited_legacy_runtime_is_attested_as_parent_owner() -> None:
-    from services.job_workspace_adoption import (
+    from orchestrator.services.job_workspace_adoption import (
         LegacyK8sAdoptionOutcome,
         ensure_legacy_k8s_job_runtime_authority,
     )
@@ -782,7 +928,7 @@ async def test_inherited_legacy_runtime_is_attested_as_parent_owner() -> None:
 
 @pytest.mark.asyncio
 async def test_concurrent_tier_transition_wins_legacy_adoption_cas() -> None:
-    from services.job_workspace_adoption import (
+    from orchestrator.services.job_workspace_adoption import (
         LegacyK8sAdoptionOutcome,
         ensure_legacy_k8s_job_runtime_authority,
     )
@@ -822,7 +968,7 @@ async def test_concurrent_tier_transition_wins_legacy_adoption_cas() -> None:
 
 @pytest.mark.asyncio
 async def test_adopted_runtime_is_live_revalidated_at_network_boundary() -> None:
-    from services.job_workspace_adoption import (
+    from orchestrator.services.job_workspace_adoption import (
         ensure_legacy_k8s_job_runtime_authority,
         verify_adopted_k8s_runtime_before_delivery,
     )
@@ -987,7 +1133,7 @@ def test_worker_recipient_accepts_exact_server_tier_projection() -> None:
 
 def test_job_start_workspace_authority_survives_producer_consumer_round_trip() -> None:
     from orchestrator.main import JobStartRequest as ProducerJobStartRequest
-    from src.api.models import JobStartRequest as ConsumerJobStartRequest
+    from agent.api.models import JobStartRequest as ConsumerJobStartRequest
 
     runtime = {
         "requested_backend": None,

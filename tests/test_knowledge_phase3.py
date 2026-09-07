@@ -4,7 +4,6 @@ Tests the orchestrator API endpoints (via direct function calls),
 workspace converter, memory migrator, and Angular model contracts.
 """
 
-import sys
 import uuid
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -12,11 +11,6 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 project_root = Path(__file__).parent.parent
-src_path = project_root / "src"
-if str(src_path) not in sys.path:
-    sys.path.insert(0, str(src_path))
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
 
 
 # =========================================================================
@@ -28,13 +22,13 @@ class TestWorkspaceConverter:
     """Tests for workspace.md → knowledge notes conversion."""
 
     def test_convert_empty_content(self):
-        from src.tools.knowledge.workspace_converter import convert_workspace
+        from agent.tools.knowledge.workspace_converter import convert_workspace
 
         assert convert_workspace("") == []
         assert convert_workspace("   \n  ") == []
 
     def test_convert_no_headings(self):
-        from src.tools.knowledge.workspace_converter import convert_workspace
+        from agent.tools.knowledge.workspace_converter import convert_workspace
 
         notes = convert_workspace("Some text without any headings at all.")
         assert len(notes) == 1
@@ -42,7 +36,7 @@ class TestWorkspaceConverter:
         assert "Some text without any headings" in notes[0]["content"]
 
     def test_convert_single_section(self):
-        from src.tools.knowledge.workspace_converter import convert_workspace
+        from agent.tools.knowledge.workspace_converter import convert_workspace
 
         content = "## Authentication Decision\nWe chose JWT over OAuth for simplicity."
         notes = convert_workspace(content)
@@ -53,7 +47,7 @@ class TestWorkspaceConverter:
         assert "JWT" in notes[0]["content"] or "chose" in notes[0]["content"]
 
     def test_convert_multiple_sections(self):
-        from src.tools.knowledge.workspace_converter import convert_workspace
+        from agent.tools.knowledge.workspace_converter import convert_workspace
 
         content = """## Architecture Decision
 We chose PostgreSQL for the database.
@@ -73,7 +67,7 @@ We need to investigate caching strategy.
         assert "question" in types
 
     def test_convert_with_job_id(self):
-        from src.tools.knowledge.workspace_converter import convert_workspace
+        from agent.tools.knowledge.workspace_converter import convert_workspace
 
         content = "## Some Finding\nWe discovered a performance issue."
         notes = convert_workspace(
@@ -84,7 +78,7 @@ We need to investigate caching strategy.
         assert "agent-developer" in notes[0]["tags"]
 
     def test_cross_references_detected(self):
-        from src.tools.knowledge.workspace_converter import convert_workspace
+        from agent.tools.knowledge.workspace_converter import convert_workspace
 
         content = """## Database Choice
 We selected PostgreSQL for ACID compliance.
@@ -102,7 +96,7 @@ Based on the Database Choice, we benchmarked queries.
         assert perf_note["links"][0]["type"] == "REFERENCES"
 
     def test_slug_collision_handling(self):
-        from src.tools.knowledge.workspace_converter import convert_workspace
+        from agent.tools.knowledge.workspace_converter import convert_workspace
 
         content = """## Status
 First status section.
@@ -116,7 +110,7 @@ Second status section with same heading.
         assert len(slugs) == 2  # Should have unique slugs
 
     def test_tag_extraction(self):
-        from src.tools.knowledge.workspace_converter import convert_workspace
+        from agent.tools.knowledge.workspace_converter import convert_workspace
 
         content = (
             "## Code Module\nImplemented `AuthController` using JWT tokens via Express."
@@ -129,7 +123,7 @@ Second status section with same heading.
 
     @pytest.mark.asyncio
     async def test_convert_and_write(self):
-        from src.tools.knowledge.workspace_converter import convert_and_write
+        from agent.tools.knowledge.workspace_converter import convert_and_write
 
         mock_kg = MagicMock()
         mock_kg.create_note = MagicMock(return_value="test-slug")
@@ -159,28 +153,19 @@ class TestKnowledgeAPIModels:
     """Tests for the Pydantic models used by knowledge API endpoints."""
 
     def test_search_request_model(self):
-        # Import from orchestrator
-        sys.path.insert(0, str(project_root / "orchestrator"))
-        try:
-            from main import KnowledgeSearchRequest
+        from orchestrator.main import KnowledgeSearchRequest
 
-            req = KnowledgeSearchRequest(query="test query", limit=5)
-            assert req.query == "test query"
-            assert req.limit == 5
-        finally:
-            sys.path.pop(0)
+        req = KnowledgeSearchRequest(query="test query", limit=5)
+        assert req.query == "test query"
+        assert req.limit == 5
 
     def test_note_update_model(self):
-        sys.path.insert(0, str(project_root / "orchestrator"))
-        try:
-            from main import KnowledgeNoteUpdate
+        from orchestrator.main import KnowledgeNoteUpdate
 
-            update = KnowledgeNoteUpdate(status="superseded", add_tags=["deprecated"])
-            assert update.status == "superseded"
-            assert update.add_tags == ["deprecated"]
-            assert update.remove_tags is None
-        finally:
-            sys.path.pop(0)
+        update = KnowledgeNoteUpdate(status="superseded", add_tags=["deprecated"])
+        assert update.status == "superseded"
+        assert update.add_tags == ["deprecated"]
+        assert update.remove_tags is None
 
 
 # =========================================================================
@@ -192,7 +177,7 @@ class TestPhase3Integration:
     """Smoke tests verifying the Phase 3 components wire together."""
 
     def test_workspace_converter_importable(self):
-        from src.tools.knowledge.workspace_converter import (
+        from agent.tools.knowledge.workspace_converter import (
             convert_workspace,
             convert_and_write,
         )
@@ -202,7 +187,7 @@ class TestPhase3Integration:
 
     def test_knowledge_note_type_coverage(self):
         """Verify converter can classify into all expected note types."""
-        from src.tools.knowledge.workspace_converter import convert_workspace
+        from agent.tools.knowledge.workspace_converter import convert_workspace
 
         test_cases = [
             ("## Goal Setting\nOur objective is to ship by Q2.", "goal"),

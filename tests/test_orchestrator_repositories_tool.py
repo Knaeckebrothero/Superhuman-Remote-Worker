@@ -4,18 +4,13 @@ from __future__ import annotations
 
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-
-from src.tools.context import ToolContext  # noqa: E402
-from src.tools.orchestrator import create_orchestrator_tools  # noqa: E402
+from agent.tools.context import ToolContext  # noqa: E402
+from agent.tools.orchestrator import create_orchestrator_tools  # noqa: E402
 
 
 def _tool_by_name(tools, name):
@@ -98,7 +93,7 @@ async def test_list_project_repositories_defaults_to_context_project(monkeypatch
     )
 
     monkeypatch.setattr(
-        "src.tools.orchestrator.repositories._get_client", lambda **kw: cap
+        "agent.tools.orchestrator.repositories._get_client", lambda **kw: cap
     )
 
     tools = create_orchestrator_tools(
@@ -145,7 +140,7 @@ async def test_get_default_project_repository_prefers_source_role(monkeypatch):
     )
 
     monkeypatch.setattr(
-        "src.tools.orchestrator.repositories._get_client", lambda **kw: cap
+        "agent.tools.orchestrator.repositories._get_client", lambda **kw: cap
     )
 
     tools = create_orchestrator_tools(
@@ -181,7 +176,7 @@ async def test_managed_knowledge_repo_is_not_mistaken_for_default_source(monkeyp
         }
     )
     monkeypatch.setattr(
-        "src.tools.orchestrator.repositories._get_client", lambda **kw: cap
+        "agent.tools.orchestrator.repositories._get_client", lambda **kw: cap
     )
 
     tools = create_orchestrator_tools(
@@ -215,7 +210,7 @@ async def test_legacy_jobs_repo_is_not_a_default_or_checkout_fallback(monkeypatc
         {public_url: [legacy], internal_url: {"repositories": [legacy]}}
     )
     monkeypatch.setattr(
-        "src.tools.orchestrator.repositories._get_client", lambda **kw: cap
+        "agent.tools.orchestrator.repositories._get_client", lambda **kw: cap
     )
 
     tools = create_orchestrator_tools(
@@ -256,7 +251,7 @@ async def test_managed_repository_cannot_be_checked_out_by_explicit_id(monkeypat
         }
     )
     monkeypatch.setattr(
-        "src.tools.orchestrator.repositories._get_client", lambda **kw: cap
+        "agent.tools.orchestrator.repositories._get_client", lambda **kw: cap
     )
     workspace = _workspace_manager()
     tools = create_orchestrator_tools(
@@ -269,7 +264,7 @@ async def test_managed_repository_cannot_be_checked_out_by_explicit_id(monkeypat
     )
     checkout = _tool_by_name(tools, "checkout_project_repository")
 
-    with patch("src.managers.git_manager.GitManager.clone") as mock_clone:
+    with patch("agent.managers.git_manager.GitManager.clone") as mock_clone:
         result = await checkout.ainvoke({"repo_id": "knowledge-repo"})
 
     mock_clone.assert_not_called()
@@ -323,7 +318,7 @@ async def test_checkout_project_repository_clones_internal_repo_without_printing
     git_mgr = MagicMock()
 
     monkeypatch.setattr(
-        "src.tools.orchestrator.repositories._get_client", lambda **kw: cap
+        "agent.tools.orchestrator.repositories._get_client", lambda **kw: cap
     )
 
     tools = create_orchestrator_tools(
@@ -337,7 +332,7 @@ async def test_checkout_project_repository_clones_internal_repo_without_printing
     checkout = _tool_by_name(tools, "checkout_project_repository")
 
     with patch(
-        "src.managers.git_manager.GitManager.clone", return_value=git_mgr
+        "agent.managers.git_manager.GitManager.clone", return_value=git_mgr
     ) as mock_clone:
         result = await checkout.ainvoke({})
 
@@ -384,7 +379,7 @@ async def test_checkout_project_repository_refuses_workspace_root(monkeypatch):
     )
 
     monkeypatch.setattr(
-        "src.tools.orchestrator.repositories._get_client", lambda **kw: cap
+        "agent.tools.orchestrator.repositories._get_client", lambda **kw: cap
     )
 
     tools = create_orchestrator_tools(
@@ -397,7 +392,7 @@ async def test_checkout_project_repository_refuses_workspace_root(monkeypatch):
     )
     checkout = _tool_by_name(tools, "checkout_project_repository")
 
-    with patch("src.managers.git_manager.GitManager.clone") as mock_clone:
+    with patch("agent.managers.git_manager.GitManager.clone") as mock_clone:
         result = await checkout.ainvoke({"target_path": "."})
 
     mock_clone.assert_not_called()
@@ -440,7 +435,7 @@ async def test_checkout_project_repository_creates_gitignore_when_absent(monkeyp
     workspace = _workspace_manager()
 
     monkeypatch.setattr(
-        "src.tools.orchestrator.repositories._get_client", lambda **kw: cap
+        "agent.tools.orchestrator.repositories._get_client", lambda **kw: cap
     )
 
     tools = create_orchestrator_tools(
@@ -453,7 +448,7 @@ async def test_checkout_project_repository_creates_gitignore_when_absent(monkeyp
     )
     checkout = _tool_by_name(tools, "checkout_project_repository")
 
-    with patch("src.managers.git_manager.GitManager.clone", return_value=MagicMock()):
+    with patch("agent.managers.git_manager.GitManager.clone", return_value=MagicMock()):
         result = await checkout.ainvoke({})
 
     workspace.backend.write_file.assert_called_once()
@@ -475,7 +470,7 @@ async def test_checkout_project_repository_appends_gitignore_entry_when_file_exi
     workspace = _workspace_manager(gitignore_exists=True, gitignore_content="*.log\n")
 
     monkeypatch.setattr(
-        "src.tools.orchestrator.repositories._get_client", lambda **kw: cap
+        "agent.tools.orchestrator.repositories._get_client", lambda **kw: cap
     )
 
     tools = create_orchestrator_tools(
@@ -488,7 +483,7 @@ async def test_checkout_project_repository_appends_gitignore_entry_when_file_exi
     )
     checkout = _tool_by_name(tools, "checkout_project_repository")
 
-    with patch("src.managers.git_manager.GitManager.clone", return_value=MagicMock()):
+    with patch("agent.managers.git_manager.GitManager.clone", return_value=MagicMock()):
         result = await checkout.ainvoke({})
 
     workspace.backend.append_file.assert_called_once()
@@ -510,7 +505,7 @@ async def test_checkout_project_repository_gitignore_entry_is_idempotent(monkeyp
     )
 
     monkeypatch.setattr(
-        "src.tools.orchestrator.repositories._get_client", lambda **kw: cap
+        "agent.tools.orchestrator.repositories._get_client", lambda **kw: cap
     )
 
     tools = create_orchestrator_tools(
@@ -523,7 +518,7 @@ async def test_checkout_project_repository_gitignore_entry_is_idempotent(monkeyp
     )
     checkout = _tool_by_name(tools, "checkout_project_repository")
 
-    with patch("src.managers.git_manager.GitManager.clone", return_value=MagicMock()):
+    with patch("agent.managers.git_manager.GitManager.clone", return_value=MagicMock()):
         result = await checkout.ainvoke({})
 
     workspace.backend.write_file.assert_not_called()
@@ -542,7 +537,7 @@ async def test_checkout_project_repository_gitignore_uses_custom_target_path(
     workspace = _workspace_manager()
 
     monkeypatch.setattr(
-        "src.tools.orchestrator.repositories._get_client", lambda **kw: cap
+        "agent.tools.orchestrator.repositories._get_client", lambda **kw: cap
     )
 
     tools = create_orchestrator_tools(
@@ -555,7 +550,7 @@ async def test_checkout_project_repository_gitignore_uses_custom_target_path(
     )
     checkout = _tool_by_name(tools, "checkout_project_repository")
 
-    with patch("src.managers.git_manager.GitManager.clone", return_value=MagicMock()):
+    with patch("agent.managers.git_manager.GitManager.clone", return_value=MagicMock()):
         result = await checkout.ainvoke({"target_path": "vendor/lib"})
 
     workspace.backend.write_file.assert_called_once()
@@ -578,7 +573,7 @@ async def test_checkout_project_repository_gitignore_failure_does_not_fail_check
     workspace.backend.append_file.side_effect = OSError("disk full")
 
     monkeypatch.setattr(
-        "src.tools.orchestrator.repositories._get_client", lambda **kw: cap
+        "agent.tools.orchestrator.repositories._get_client", lambda **kw: cap
     )
 
     tools = create_orchestrator_tools(
@@ -591,7 +586,7 @@ async def test_checkout_project_repository_gitignore_failure_does_not_fail_check
     )
     checkout = _tool_by_name(tools, "checkout_project_repository")
 
-    with patch("src.managers.git_manager.GitManager.clone", return_value=MagicMock()):
+    with patch("agent.managers.git_manager.GitManager.clone", return_value=MagicMock()):
         result = await checkout.ainvoke({})
 
     assert "Repository checked out." in result

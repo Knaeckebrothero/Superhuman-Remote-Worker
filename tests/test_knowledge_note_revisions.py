@@ -34,11 +34,11 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 
-from src.services.knowledge_store import KnowledgeStore
+from shared.runtime.services.knowledge_store import KnowledgeStore
 
 MIGRATION = (
     Path(__file__).resolve().parents[1]
-    / "orchestrator/database/migrations/vector/0016_knowledge_note_revisions.sql"
+    / "src/orchestrator/database/migrations/vector/0016_knowledge_note_revisions.sql"
 )
 
 
@@ -225,6 +225,7 @@ from orchestrator.database.postgres import PostgresDB  # noqa: E402
 PG_IMAGE = "pgvector/pgvector:pg15"
 VECTOR_MIGRATIONS = (
     Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "migrations"

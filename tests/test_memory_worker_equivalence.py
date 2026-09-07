@@ -19,25 +19,25 @@ from unittest.mock import call
 import pytest
 from langchain_core.messages import ToolMessage
 
-from src.core.knowledge_injection import (
+from agent.core.knowledge_injection import (
     KNOWLEDGE_TOOL_CALL_ID_PREFIX,
     create_knowledge_injection_messages,
 )
-from src.core.loader import MemoryConfig, MemoryPipelineConfig
-from src.core.memory_injection import (
+from shared.runtime.core.loader import MemoryConfig, MemoryPipelineConfig
+from agent.core.memory_injection import (
     MEMORY_TOOL_CALL_ID_PREFIX,
     create_memory_injection_messages,
 )
-from src.services.knowledge_store import KnowledgeStore
-from src.services.memory import (
+from shared.runtime.services.knowledge_store import KnowledgeStore
+from agent.services.memory import (
     AssembleRequest,
     MemoryManager,
     MemoryRuntime,
     TaskFrame,
     available_memory_plugins,
 )
-from src.services.memory.plugins.legacy import build_worker_query_text
-from src.services.recall_store import RecallStore
+from agent.services.memory.plugins.legacy import build_worker_query_text
+from shared.runtime.services.recall_store import RecallStore
 from tests._memory_fixtures import (
     GOLDEN_KNOWLEDGE_BLOCK,
     GOLDEN_MEMORY_BLOCK,

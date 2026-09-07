@@ -1,0 +1,121 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "superhuman-remote-worker"
+version = "0.0.0"
+description = "Superhuman Remote Worker application packages"
+requires-python = ">=3.11"
+# Images install their existing, separate requirements before --no-deps -e .
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = [
+  "agent", "agent.*",
+  "orchestrator", "orchestrator.*",
+  "mcp_server", "mcp_server.*",
+  "vm_controller", "vm_controller.*",
+  "shared", "shared.*",
+]
+namespaces = false
+
+[tool.setuptools.package-data]
+orchestrator = [
+  "database/*.sql",
+  "database/migrations/*/*.sql",
+  "database/queries/*.sql",
+  "database/queries/**/*.sql",
+  "config/*.yaml",
+  "config/prompts/*.md",
+]
+mcp_server = ["templates/*.html"]
+shared = ["**/*.sql"]
+
+[tool.ruff]
+# Preserve the formatter/linter target used before packaging metadata existed.
+target-version = "py310"
+
+[tool.importlinter]
+root_packages = ["agent", "orchestrator", "mcp_server", "vm_controller", "shared"]
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "Applications and shared code use canonical package names"
+type = "forbidden"
+source_modules = ["agent", "orchestrator", "mcp_server", "vm_controller", "shared"]
+forbidden_modules = [
+  "src", "database", "services", "security", "models", "main", "auth",
+  "routers", "utils", "graph_routes", "logging_config", "uploads", "seed",
+  "operator_cli", "ssh_gateway", "canvas_gateway", "controller",
+  "headscale_client", "lifecycle_auth",
+]
+
+[[tool.importlinter.contracts]]
+name = "Applications are independent"
+type = "independence"
+modules = ["agent", "orchestrator", "mcp_server", "vm_controller"]
+
+[[tool.importlinter.contracts]]
+name = "Shared code does not depend on applications"
+type = "forbidden"
+source_modules = ["shared"]
+forbidden_modules = ["agent", "orchestrator", "mcp_server", "vm_controller"]
+
+[[tool.importlinter.contracts]]
+name = "Lightweight shared modules do not depend on shared runtime"
+type = "forbidden"
+# Import Linter 2.13 skips the overlapping shared.runtime source/target pair.
+# Every other current or future shared child remains covered as a package.
+source_modules = ["shared.*"]
+forbidden_modules = ["shared.runtime"]
+
+[[tool.importlinter.contracts]]
+name = "Contacts router does not import application startup"
+type = "forbidden"
+source_modules = ["orchestrator.routers.contacts"]
+forbidden_modules = ["orchestrator.main"]
+# Legacy security helpers still resolve some app services through main. This
+# pilot protects the extracted router's direct boundary while those are migrated.
+allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
+name = "Tables router does not import application startup"
+type = "forbidden"
+source_modules = ["orchestrator.routers.tables"]
+forbidden_modules = ["orchestrator.main"]
+# Existing auth helpers retain indirect composition lookups, as for contacts.
+allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
+name = "Preferences domain does not import application startup"
+type = "forbidden"
+source_modules = [
+    "orchestrator.routers.preferences",
+    "orchestrator.services.preference_defaults",
+    "orchestrator.services.session_workspace_policy",
+]
+forbidden_modules = ["orchestrator.main"]
+# Existing auth helpers retain indirect composition lookups, as for contacts.
+allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
+name = "Job creation schemas and ingress policy do not import application startup"
+type = "forbidden"
+source_modules = ["orchestrator.schemas.job_create", "orchestrator.services.job_create_ingress", "orchestrator.services.job_admission_scope", "orchestrator.services.job_admission_config"]
+forbidden_modules = ["orchestrator.main"]
+
+[[tool.importlinter.contracts]]
+name = "Shared initializer stays lightweight"
+type = "forbidden"
+# Check the root initializer separately without including its child packages.
+source_modules = ["shared"]
+forbidden_modules = ["shared.runtime", "shared.runtime.**"]
+as_packages = false
+
+[[tool.importlinter.contracts]]
+name = "MCP and VM controller do not depend on shared runtime"
+type = "forbidden"
+source_modules = ["mcp_server", "vm_controller"]
+forbidden_modules = ["shared.runtime"]

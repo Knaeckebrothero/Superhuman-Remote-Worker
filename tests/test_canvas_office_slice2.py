@@ -15,7 +15,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from services.canvas import (
+from orchestrator.services.canvas import (
     CanvasEditError,
     CanvasMutation,
     CanvasRecord,
@@ -24,13 +24,13 @@ from services.canvas import (
     WorkspaceFileSource,
     canonical_source_fingerprint,
 )
-from services.canvas_files import (
+from orchestrator.services.canvas_files import (
     CanvasFileError,
     RawWorkspaceFile,
     ThreadWorkspaceFileGateway,
     ValidatedCanvasFile,
 )
-from services.canvas_office import (
+from orchestrator.services.canvas_office import (
     CanvasOfficeError,
     CollaboraConfig,
     WopiAccess,
@@ -327,7 +327,7 @@ class _RouteCanvasService:
 
 
 def _wopi_client(monkeypatch, *, write_flag: bool = True):
-    from routers import wopi
+    from orchestrator.routers import wopi
 
     tokens = _RouteTokens(write_flag=write_flag)
     gateway = _RouteGateway()
@@ -421,7 +421,7 @@ def test_putfile_rejects_read_token_and_office_oversize_before_write(
     assert gateway.writes == []
     assert service.edit_calls == 0
 
-    from routers import wopi
+    from orchestrator.routers import wopi
 
     write_client, _, write_gateway, write_service = _wopi_client(monkeypatch)
     monkeypatch.setattr(wopi, "MAX_OFFICE_BYTES", 16)
@@ -435,7 +435,7 @@ def test_putfile_rejects_read_token_and_office_oversize_before_write(
 async def test_binary_gateway_rechecks_hash_writes_and_magic_validates_readback(
     monkeypatch,
 ) -> None:
-    from services import canvas_files
+    from orchestrator.services import canvas_files
 
     monkeypatch.setattr(canvas_files, "magic", _OfficeMagic)
     storage = {PATH: RawWorkspaceFile(OLD_BYTES, NOW)}
@@ -617,7 +617,7 @@ async def test_office_writer_uses_edit_file_serialization_and_bumps_revision() -
 async def test_four_editable_gates_agree_for_writable_office_and_reject_memory(
     monkeypatch,
 ) -> None:
-    from services import canvas_files
+    from orchestrator.services import canvas_files
 
     monkeypatch.setattr(canvas_files, "magic", _OfficeMagic)
     record = _record()

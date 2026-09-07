@@ -20,25 +20,37 @@ tags:
 llm:
   reasoning_level: high
 
-# Subagent delegation — light in-process subagents for parallel EXPLORATION,
-# research, and prototyping/experiments. They inherit the full toolset (including
-# writes) so they can run tests/spikes; the guardrail that the *production*
-# implementation stays single-threaded and yours is by PROMPT, not tool-stripping
-# (allow_writes stays true — we monitor rather than lock down). Reader MODEL comes
-# from the llm.subagent tier (falls back to llm.tactical; per-job override via
-# config_override.llm.subagent).
+# Built-in subagents (delegate_agent) — parallel EXPLORATION, research and
+# bounded implementation work fanned out to the roster children; the parent
+# owns the code that lands. `enabled` gates the tool binding; which children
+# exist, their tools, write policy and budgets live in `subagents.roster`
+# (their model defaults to the parent's; per-job override via
+# config_override.subagents.llm).
 delegation:
   enabled: true
-  mode: light
-  light:
-    allow_writes: true
+  max_concurrent: 4
+
+subagents:
+  default: explorer
+  roster:
+    explorer: {$ref: subagents/explorer}
+    implementer: {$ref: subagents/implementer}
+    tester: {$ref: subagents/tester}
+    reviewer: {$ref: subagents/reviewer}
 
 workspace:
+  # Pinned: this expert's role needs a shell, and a session's account layer
+  # overrides expert_base's `sandbox` with the owner's default (platform
+  # default `virtual`, which strips shell/browser/git). Declaring it HERE
+  # sits above that layer; the New Session form shows it and the user may
+  # still change it. Jobs ignore this key (the workspace contract stamps
+  # the job tier from config_override). See tests/test_expert_defaults.py
+  # ::TestShellBoundBundledExpertsPinTheirTier.
+  backend: sandbox
   structure:
     - archive/
     - documents/
     - output/
-    - repo/
   git_versioning: true
 
 tools:
@@ -60,7 +72,7 @@ tools:
     - mark_complete
     - job_complete
   # git: intentionally absent. This agent has shell tools, and
-  # ToolsConfig.__post_init__ (src/core/loader.py) suppresses the git_* group
+  # ToolsConfig.__post_init__ (src/shared/runtime/core/loader.py) suppresses the git_* group
   # whenever shell is present — a shell can run git against ANY repository in
   # the workspace, including repos/<name>/, which git_* cannot. Declaring them
   # here would advertise tools the pod never binds.
@@ -72,10 +84,13 @@ tools:
     - crawl_website
     - map_website
     - research_topic
-  # Light subagent delegation via spawn_subagent (replaces the inherited heavy
-  # delegate_work / resume_delegation_child grant from the former broad base).
+  # Spawn + background controls (each bound only with delegation.enabled).
   delegation:
-    - spawn_subagent
+    - delegate_agent
+    - wait_agent
+    - message_agent
+    - stop_agent
+    - list_agents
   # Disable unused tool categories
   citation: []
   graph: []

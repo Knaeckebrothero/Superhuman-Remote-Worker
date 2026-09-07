@@ -12,10 +12,10 @@ import pytest
 import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
-import src.api.persistent_app as persistent_app
+import agent.api.persistent_app as persistent_app
 from orchestrator.services.run_queue_reaper import retry_stale_permission_requests
-from src.api.lease_context import LeaseHandle, current_lease
-from src.shared.session_permission_retirement import (
+from agent.api.lease_context import LeaseHandle, current_lease
+from shared.session_permission_retirement import (
     retire_stale_stateless_permissions,
 )
 

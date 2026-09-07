@@ -7,7 +7,7 @@ MatrixResolver.load hook.
 
 import pytest
 
-import src.core.loader as loader
+import shared.runtime.core.loader as loader
 
 
 def _reset():
@@ -81,7 +81,7 @@ def test_clear_overrides(monkeypatch):
 def test_matrix_load_prefers_override_then_bundled(monkeypatch, tmp_path):
     _reset()
     monkeypatch.setenv("CONFIG_DB_OVERRIDES_ENABLED", "true")
-    from src.core.loader import PromptMatrixResolver
+    from shared.runtime.core.loader import PromptMatrixResolver
 
     resolver = PromptMatrixResolver(None, "gemma")
     # Stub the bundled path so the test doesn't depend on real config files.
@@ -112,7 +112,7 @@ def test_matrix_load_prefers_override_then_bundled(monkeypatch, tmp_path):
 async def test_config_overrides_namespace_lists_family_and_global():
     from unittest.mock import AsyncMock, MagicMock
 
-    from src.database.postgres_db import ConfigOverridesNamespace
+    from agent.database.postgres_db import ConfigOverridesNamespace
 
     fake_db = MagicMock()
     fake_db.fetch = AsyncMock(
@@ -294,7 +294,7 @@ def test_resolve_guardrails_applies_override(monkeypatch):
 def test_apply_settings_overrides_mutates_config(monkeypatch):
     _reset()
     monkeypatch.setenv("CONFIG_DB_OVERRIDES_ENABLED", "true")
-    from src.core.loader import (
+    from shared.runtime.core.loader import (
         AgentConfig,
         LimitsConfig,
         LLMConfig,
@@ -331,7 +331,7 @@ def test_apply_settings_overrides_mutates_config(monkeypatch):
 def test_apply_settings_overrides_noop_without_rows(monkeypatch):
     _reset()
     monkeypatch.setenv("CONFIG_DB_OVERRIDES_ENABLED", "true")
-    from src.core.loader import (
+    from shared.runtime.core.loader import (
         AgentConfig,
         LimitsConfig,
         LLMConfig,

@@ -13,9 +13,9 @@ from typing import Any, Type
 import pytest
 from pydantic import BaseModel
 
-from src.core.context import ConversationSummary
-from src.services.auxiliary import AuxTask
-import src.services.auxiliary as auxiliary
+from agent.core.context import ConversationSummary
+from shared.runtime.services.auxiliary import AuxTask
+import shared.runtime.services.auxiliary as auxiliary
 
 try:  # pragma: no cover - compatibility for older/openai-less envs
     from openai.lib._pydantic import to_strict_json_schema

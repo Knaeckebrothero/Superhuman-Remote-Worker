@@ -24,16 +24,16 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
-from src.core.knowledge_injection import create_knowledge_injection_messages
-from src.core.loader import MemoryConfig, MemoryPipelineConfig
-from src.core.memory_injection import create_memory_injection_messages
-from src.services.knowledge_store import KnowledgeStore
-from src.services.memory import AssembleRequest, MemoryManager, MemoryRuntime
-from src.services.memory.plugins.legacy import (
+from agent.core.knowledge_injection import create_knowledge_injection_messages
+from shared.runtime.core.loader import MemoryConfig, MemoryPipelineConfig
+from agent.core.memory_injection import create_memory_injection_messages
+from shared.runtime.services.knowledge_store import KnowledgeStore
+from agent.services.memory import AssembleRequest, MemoryManager, MemoryRuntime
+from agent.services.memory.plugins.legacy import (
     _bounded,
     build_persistent_query_text,
 )
-from src.services.recall_store import RecallStore
+from shared.runtime.services.recall_store import RecallStore
 from tests._memory_fixtures import (
     PROJECT_ID,
     make_kb_mock,

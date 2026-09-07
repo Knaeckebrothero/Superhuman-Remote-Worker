@@ -167,7 +167,7 @@ A reader's `tools/` should reflect the **reader's own** tool subset, not the
 parent's. The binding is a one-line closure in
 `src/tools/delegation/reader_env.py` over a local that is never rebound, verified
 by reading the code and by the final review — but no automated test drives
-`spawn_subagent` and inspects the reader's overlay.
+`delegate_agent` (a worktree child) and inspects the child's overlay.
 
 **How to close.** Spawn a light subagent whose tool set differs from the parent's
 and assert its `tools/README.md` lists only its own tools.

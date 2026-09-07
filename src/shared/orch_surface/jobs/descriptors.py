@@ -8,8 +8,8 @@ import functools
 import inspect
 from typing import Any, Awaitable, Callable, Literal
 
-from ..client import AsyncCockpitClient
-from ...runtime_actor import RuntimeActorContext
+from shared.orch_surface.client import AsyncCockpitClient
+from shared.runtime_actor import RuntimeActorContext
 
 JobGroup = Literal["job_control", "job_inspection"]
 #: officer_supervision_surface §3 capability taxonomy. ``job_inspection`` stays

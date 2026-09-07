@@ -13,7 +13,7 @@ future edit that quietly restores test-worship should fail a test, not ship.
 
 import pytest
 
-from services.work_categories import (
+from orchestrator.services.work_categories import (
     CATEGORY_DEFAULT_EXPERT,
     CATEGORY_EXPERTS,
     EXECUTOR,
@@ -32,7 +32,7 @@ from services.work_categories import (
     resolve_expert,
     role_to_category,
 )
-from src.shared.backlog_tags import (
+from shared.backlog_tags import (
     CATEGORY_PREFIX,
     EXPERT_PREFIX,
     OFFICER_ONLY_TAGS,
@@ -229,7 +229,7 @@ class TestLegacyRoleBridge:
         # against generalizing the name-based checks in place, so the gap is
         # pinned rather than closed here. If someone fixes LOOP_ANALYSIS_ROLES,
         # this test should be deleted, not worked around.
-        from services.project_loops import LOOP_ANALYSIS_ROLES
+        from orchestrator.services.project_loops import LOOP_ANALYSIS_ROLES
 
         assert role_to_category("bughunter") == TESTER
         assert "bughunter" not in LOOP_ANALYSIS_ROLES

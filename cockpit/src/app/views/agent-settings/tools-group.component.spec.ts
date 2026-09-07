@@ -1,6 +1,7 @@
 import {describe, expect, it} from 'vitest';
 import {
   allToolCategoriesSelected,
+  delegationOverride,
   disabledToolCategoriesFromConfig,
 } from './tools-group.component';
 
@@ -53,5 +54,22 @@ describe('resolved tool config', () => {
       'agent_catalog',
       'workflows',
     ]));
+  });
+});
+
+describe('delegation override', () => {
+  it('emits only max_concurrent for an inline parameter edit', () => {
+    expect(delegationOverride(true, true, 6)).toEqual({max_concurrent: 6});
+  });
+
+  it('keeps enabled synchronization and omits the retired keys', () => {
+    const override = delegationOverride(false, true, 3);
+    expect(override).toEqual({enabled: false, max_concurrent: 3});
+    expect(override).not.toHaveProperty('max_depth');
+    expect(override).not.toHaveProperty('default_timeout');
+  });
+
+  it('emits nothing when delegation still matches its baseline', () => {
+    expect(delegationOverride(true, true, null)).toBeNull();
   });
 });

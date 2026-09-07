@@ -32,8 +32,8 @@ import httpx
 import pytest
 from fastapi import HTTPException
 
-from security.auth import _resolve_from_cookie, resolve_ws_user
-from security.kc_client import KeycloakBFFClient, KeycloakClientError
+from orchestrator.security.auth import _resolve_from_cookie, resolve_ws_user
+from orchestrator.security.kc_client import KeycloakBFFClient, KeycloakClientError
 
 SESSION_ID = "sess-123"
 SENTINEL_USER = {"id": "user-1", "display_name": "Tester", "is_approved": True}
@@ -122,17 +122,23 @@ def _auth_patches(
             )
         )
         m_validate = stack.enter_context(
-            patch("security.auth.oidc_validator.validate_token", return_value=claims)
+            patch(
+                "orchestrator.security.auth.oidc_validator.validate_token",
+                return_value=claims,
+            )
         )
         m_decode = stack.enter_context(
             patch(
-                "security.auth.oidc_validator.decode_id_token", return_value=id_claims
+                "orchestrator.security.auth.oidc_validator.decode_id_token",
+                return_value=id_claims,
             )
         )
-        stack.enter_context(patch("security.auth.kc_bff_client.refresh", refresh_mock))
+        stack.enter_context(
+            patch("orchestrator.security.auth.kc_bff_client.refresh", refresh_mock)
+        )
         m_resolve = stack.enter_context(
             patch(
-                "security.auth._resolve_user_from_claims",
+                "orchestrator.security.auth._resolve_user_from_claims",
                 AsyncMock(return_value=dict(SENTINEL_USER)),
             )
         )
@@ -427,7 +433,9 @@ class TestPostTokenErrorTagging:
     @pytest.mark.asyncio
     async def test_network_error_carries_no_status_code(self):
         ctx = self._client_ctx(post_side_effect=httpx.ConnectError("boom"))
-        with patch("security.kc_client.httpx.AsyncClient", return_value=ctx):
+        with patch(
+            "orchestrator.security.kc_client.httpx.AsyncClient", return_value=ctx
+        ):
             with pytest.raises(KeycloakClientError) as exc_info:
                 await self._kc().refresh("rt")
         assert exc_info.value.status_code is None
@@ -443,7 +451,9 @@ class TestPostTokenErrorTagging:
             }
         )
         ctx = self._client_ctx(response=resp)
-        with patch("security.kc_client.httpx.AsyncClient", return_value=ctx):
+        with patch(
+            "orchestrator.security.kc_client.httpx.AsyncClient", return_value=ctx
+        ):
             with pytest.raises(KeycloakClientError) as exc_info:
                 await self._kc().refresh("rt")
         assert exc_info.value.status_code == 400
@@ -455,7 +465,9 @@ class TestPostTokenErrorTagging:
         resp = Mock(status_code=502, text="<html>bad gateway</html>")
         resp.json = Mock(side_effect=ValueError("not json"))
         ctx = self._client_ctx(response=resp)
-        with patch("security.kc_client.httpx.AsyncClient", return_value=ctx):
+        with patch(
+            "orchestrator.security.kc_client.httpx.AsyncClient", return_value=ctx
+        ):
             with pytest.raises(KeycloakClientError) as exc_info:
                 await self._kc().refresh("rt")
         assert exc_info.value.status_code == 502

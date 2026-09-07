@@ -90,7 +90,16 @@ async def test_each_catalog_capability_resolves_independently():
         pin=None,
         alphabetical=[{"model_id": "alpha", "display_label": "Alpha"}],
     )
-    for capability in ("chat", "auxiliary", "embedding", "vision", "whisper", "tts"):
+    for capability in (
+        "chat",
+        "auxiliary",
+        "embedding",
+        "vision",
+        "whisper",
+        "tts",
+        "search",
+        "fetch",
+    ):
         assert await db.resolve_default_for_capability(capability) == "alpha"
         db.list_models_by_capability_alphabetical.assert_awaited_with(capability)
 

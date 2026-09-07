@@ -18,8 +18,9 @@ import pytest
 from fastapi import HTTPException
 
 import orchestrator.main as main
-from services import message_routing as routing
-from src.shared.runtime_actor import RuntimeActorContext
+from orchestrator.services import message_routing as routing
+from orchestrator.services.notification_service import RecordResult
+from shared.runtime_actor import RuntimeActorContext
 
 
 OFFICER_TID = str(uuid4())
@@ -317,9 +318,15 @@ def _send_db(job, policy, *, officer=True, held=False):
 
 
 def _notifier(email=True):
+    """The notification system's agent-message seam. The durable feed row is
+    itself an accepted delivery (``in_app``); an immediate email rides along
+    with its Message-ID when the row's severity mails now."""
     notifier = MagicMock()
-    notifier.dispatch = AsyncMock(
-        return_value={"email": email, "email_message_id": "<m1@x>", "queued": False}
+    deliveries = {"in_app": True, "email": email}
+    if email:
+        deliveries["email_message_id"] = "<m1@x>"
+    notifier.record_agent_message = AsyncMock(
+        return_value=RecordResult("n-1", True, deliveries)
     )
     return notifier
 
@@ -392,7 +399,7 @@ class TestOfficerFirstBlockingSend:
         assert result["routing"]["state"] == "pending_officer"
 
         # Acceptance 1: no user notification for blocking officer_first.
-        notifier.dispatch.assert_not_awaited()
+        notifier.record_agent_message.assert_not_awaited()
         # The unit is the transaction — no separate log_message call.
         db.log_message.assert_not_awaited()
         db.publish_blocking_message.assert_not_awaited()
@@ -436,7 +443,7 @@ class TestOfficerFirstBlockingSend:
                     MagicMock(), job["id"], _body(agent_id=job["assigned_agent_id"])
                 )
         assert exc.value.status_code == 409
-        notifier.dispatch.assert_not_awaited()
+        notifier.record_agent_message.assert_not_awaited()
         db.log_message.assert_not_awaited()
         db.publish_blocking_message.assert_not_awaited()
 
@@ -468,7 +475,7 @@ class TestOfficerFirstBlockingSend:
         assert result["status"] == "sent"
         assert result["routing"]["applied"] == "user_direct"
         assert result["routing"]["reason"] == "officer_route_failed"
-        notifier.dispatch.assert_awaited_once()
+        notifier.record_agent_message.assert_awaited_once()
         # The direct retry is the same transactional unit without the wake,
         # which also logs the message — hence no separate log_message call.
         assert db.create_routed_blocking_freeze.await_args.kwargs["wake"] is None
@@ -495,7 +502,7 @@ class TestOfficerFirstBlockingSend:
         kwargs = db.create_routed_blocking_freeze.await_args.kwargs
         assert kwargs["wake"] is None
         assert kwargs["route"]["state"] == "user_direct"
-        notifier.dispatch.assert_awaited_once()
+        notifier.record_agent_message.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_vacant_post_routes_blocking_to_user_immediately(self):
@@ -512,7 +519,7 @@ class TestOfficerFirstBlockingSend:
         kwargs = db.create_routed_blocking_freeze.await_args.kwargs
         assert kwargs["wake"] is None
         assert kwargs["route"]["state"] == "user_direct"
-        notifier.dispatch.assert_awaited_once()
+        notifier.record_agent_message.assert_awaited_once()
 
 
 class TestOfficerAndUserSend:
@@ -533,7 +540,7 @@ class TestOfficerAndUserSend:
         # pending_both carries no officer SLA — the user already has it.
         assert kwargs["route"]["officer_deadline"] is None
         assert kwargs["wake"] is not None
-        notifier.dispatch.assert_awaited_once()
+        notifier.record_agent_message.assert_awaited_once()
         db.mark_route_user_delivery.assert_awaited_once()
         db.settle_outbound_message_log.assert_awaited_once()
         quota = db.reserve_message_delivery_intent.await_args.kwargs
@@ -554,7 +561,7 @@ class TestOfficerAndUserSend:
         # Acceptance 9: async does not freeze and coalesces into the sitrep.
         db.create_routed_blocking_freeze.assert_not_awaited()
         db.publish_blocking_message.assert_not_awaited()
-        notifier.dispatch.assert_not_awaited()
+        notifier.record_agent_message.assert_not_awaited()
         route = db.create_message_route.await_args.args[0]
         assert route["state"] == "pending_officer"
         assert route["blocking"] is False
@@ -595,7 +602,23 @@ class TestUserDirectByteCompat:
         db.publish_blocking_message.assert_not_awaited()
         db.create_message_route.assert_not_awaited()
         db.log_message.assert_not_awaited()
-        notifier.dispatch.assert_awaited_once()
+        notifier.record_agent_message.assert_awaited_once()
+        # The user leg is a feed row (unified notification system): owner,
+        # job, thread, the worker's text verbatim, and the ledger row id from
+        # the transaction so a deferred email's Message-ID can be stamped
+        # onto message_log for reply routing.
+        recorded = notifier.record_agent_message.await_args.kwargs
+        assert recorded["user_id"] == job["user_id"]
+        assert recorded["job_id"] == job["id"]
+        assert recorded["thread_id"] == route["thread_id"]
+        assert recorded["blocking"] is True
+        assert recorded["subject"] == "Need input"
+        assert recorded["message_md"] == "Please answer"
+        assert (
+            recorded["message_log_id"]
+            == (db.create_routed_blocking_freeze.return_value["originating_message_id"])
+        )
+        assert recorded["deliver_to"] == ("owner@example.com", "Owner")
         quota = db.reserve_message_delivery_intent.await_args.kwargs
         assert quota["bucket"] == "human"
         assert quota["effective_audience"] == "human"
@@ -642,7 +665,7 @@ class TestUserDirectByteCompat:
                     MagicMock(), job["id"], _body(mode="async")
                 )
         assert exc.value.status_code == 503
-        notifier.dispatch.assert_not_awaited()
+        notifier.record_agent_message.assert_not_awaited()
         assert (
             db.settle_message_delivery_attempt.await_args.kwargs["failure_class"]
             == "message_log_failed"
@@ -695,7 +718,7 @@ class TestUserDirectByteCompat:
                 MagicMock(), job["id"], _body(mode="async")
             )
         assert result.status_code == 429
-        notifier.dispatch.assert_not_awaited()
+        notifier.record_agent_message.assert_not_awaited()
         assert db.log_message.await_args.kwargs["effective_audience"] == "officer"
 
 
@@ -765,7 +788,7 @@ class TestDrains:
             patch.object(main, "postgres_db", db),
             patch.object(main, "_inject_officer_notice", AsyncMock(return_value=True)),
             patch(
-                "services.message_routing.deliver_route_to_user",
+                "orchestrator.services.message_routing.deliver_route_to_user",
                 AsyncMock(return_value=True),
             ) as deliver,
         ):
@@ -1008,7 +1031,7 @@ class TestOfficerActionFlows:
         with (
             patch.object(main, "require_internal", AsyncMock()),
             patch.object(main, "postgres_db", db),
-            patch("services.message_routing.escalate_route", escalate),
+            patch("orchestrator.services.message_routing.escalate_route", escalate),
             _authorized_officer(),
         ):
             result = await main.officer_escalate_worker_message(
@@ -1041,7 +1064,7 @@ class TestOfficerActionFlows:
             patch.object(main, "require_internal", AsyncMock()),
             patch.object(main, "postgres_db", db),
             patch(
-                "services.message_routing.escalate_route",
+                "orchestrator.services.message_routing.escalate_route",
                 AsyncMock(return_value={"escalated": False, "delivered": False}),
             ),
             _authorized_officer(),
@@ -1175,7 +1198,7 @@ class TestInboundReplyRouteIntegration:
         with (
             patch.object(main, "COMPLETION_COMMANDS_ENABLED", False),
             patch.object(main, "postgres_db", db),
-            patch("services.session_wake.notify_officer", wake),
+            patch("orchestrator.services.session_wake.notify_officer", wake),
             patch.object(main, "_kick_officer_event_drain", MagicMock()),
         ):
             strategy, _seq = await main._route_inbound_reply(
@@ -1209,7 +1232,7 @@ class TestInboundReplyRouteIntegration:
 
 class TestWakeAndToolPlumbing:
     def test_worker_message_wake_bypasses_debounce(self):
-        from services import session_wake
+        from orchestrator.services import session_wake
 
         assert session_wake.OFFICER_DEBOUNCE_BY_SOURCE["worker_message"] == 0
 
@@ -1218,7 +1241,7 @@ class TestWakeAndToolPlumbing:
         five-argument call shape still binds."""
         import inspect
 
-        from src.tools.communication.messaging import create_communication_tools
+        from agent.tools.communication.messaging import create_communication_tools
 
         context = MagicMock()
         context.job_id = "j"
@@ -1233,7 +1256,7 @@ class TestWakeAndToolPlumbing:
 
     @pytest.mark.asyncio
     async def test_sitrep_worker_messages_section_lists_open_routes(self):
-        from services.sitrep import _worker_messages_section
+        from orchestrator.services.sitrep import _worker_messages_section
 
         now = datetime.now(timezone.utc)
         db = MagicMock()
@@ -1260,7 +1283,7 @@ class TestWakeAndToolPlumbing:
 
     @pytest.mark.asyncio
     async def test_sitrep_section_is_silent_when_empty(self):
-        from services.sitrep import _worker_messages_section
+        from orchestrator.services.sitrep import _worker_messages_section
 
         db = MagicMock()
         db.list_open_worker_message_routes = AsyncMock(return_value=[])
@@ -1336,7 +1359,7 @@ class TestDeliveryOutcomeClassification:
     and log decision now derives from one normalized outcome instead."""
 
     def test_provider_acceptance_is_accepted(self):
-        from services.message_routing import classify_dispatch
+        from orchestrator.services.message_routing import classify_dispatch
 
         assert classify_dispatch(
             {"email": True, "email_message_id": "<m@x>", "queued": False}
@@ -1345,29 +1368,29 @@ class TestDeliveryOutcomeClassification:
     def test_queued_for_digest_is_accepted(self):
         # Quiet-hours queueing is durable and genuinely accepted; retrying it
         # would double-send once the window closes.
-        from services.message_routing import classify_dispatch
+        from orchestrator.services.message_routing import classify_dispatch
 
         assert classify_dispatch({"queued": True}).accepted
 
     def test_an_uninitialized_service_is_retryable_not_delivered(self):
-        from services.message_routing import classify_dispatch
+        from orchestrator.services.message_routing import classify_dispatch
 
         out = classify_dispatch({"error": "NotificationService not initialized"})
         assert not out.accepted and "not initialized" in out.detail
 
     def test_empty_and_all_false_results_are_retryable(self):
-        from services.message_routing import classify_dispatch
+        from orchestrator.services.message_routing import classify_dispatch
 
         assert not classify_dispatch({}).accepted
         assert not classify_dispatch({"email": False, "ntfy": False}).accepted
 
     def test_a_non_dict_result_is_retryable_rather_than_crashing(self):
-        from services.message_routing import classify_dispatch
+        from orchestrator.services.message_routing import classify_dispatch
 
         assert not classify_dispatch(None).accepted
 
     def test_log_status_derives_from_the_same_outcome(self):
-        from services.message_routing import classify_dispatch
+        from orchestrator.services.message_routing import classify_dispatch
 
         assert classify_dispatch({"email": True}).log_status == "sent"
         assert classify_dispatch({"error": "x"}).log_status == "failed"
@@ -1380,12 +1403,12 @@ class TestFailedDeliveryStaysRetryable:
 
     @pytest.mark.asyncio
     async def test_a_failed_dispatch_does_not_stamp_delivery(self):
-        from services import message_routing
+        from orchestrator.services import message_routing
 
         db = _send_db(_job(), "user_direct")
         notifier = MagicMock()
-        notifier.dispatch = AsyncMock(
-            return_value={"error": "NotificationService not initialized"}
+        notifier.record_agent_message = AsyncMock(
+            side_effect=RuntimeError("NotificationService not initialized")
         )
         route = {
             "route_id": str(uuid4()),
@@ -1400,19 +1423,43 @@ class TestFailedDeliveryStaysRetryable:
 
     @pytest.mark.asyncio
     async def test_an_accepted_dispatch_stamps_exactly_once(self):
-        from services import message_routing
+        from orchestrator.services import message_routing
 
-        db = _send_db(_job(), "user_direct")
+        job = _job()
+        db = _send_db(job, "user_direct")
+        notifier = _notifier()
         route = {
             "route_id": str(uuid4()),
             "job_id": str(uuid4()),
             "thread_id": str(uuid4()),
         }
         ok = await message_routing.deliver_route_to_user(
-            db, route, reason="officer_escalated", notifier=_notifier()
+            db, route, reason="officer_escalated", notifier=notifier
         )
         assert ok is True
         db.mark_route_user_delivery.assert_awaited_once()
+        # Ledger first, feed row second: the escalation is logged ``pending``
+        # BEFORE the notification is recorded (so a deferred mail can stamp
+        # its Message-ID onto that row), then settled from the outcome.
+        assert db.log_message.await_args.kwargs["status"] == "pending"
+        log_id = db.log_message.return_value["id"]
+        recorded = notifier.record_agent_message.await_args.kwargs
+        assert recorded["user_id"] == job["user_id"]
+        assert recorded["job_id"] == route["job_id"]
+        assert recorded["thread_id"] == route["thread_id"]
+        assert recorded["sequence"] is None
+        # The automated tier already failed the user: high, so the mail goes now.
+        assert recorded["severity"] == "high"
+        assert recorded["dedup_key"] == (
+            f"route_escalation:{route['route_id']}:officer_escalated"
+        )
+        assert recorded["message_log_id"] == log_id
+        db.settle_outbound_message_log.assert_awaited_once_with(
+            log_id,
+            accepted=True,
+            error_message="provider accepted",
+            email_message_id="<m1@x>",
+        )
 
 
 class TestRoutedWorkerTextIsSanitized:
@@ -1421,7 +1468,7 @@ class TestRoutedWorkerTextIsSanitized:
 
     @pytest.mark.asyncio
     async def test_a_credential_in_worker_text_never_reaches_the_user(self):
-        from services import message_routing
+        from orchestrator.services import message_routing
 
         db = _send_db(_job(), "user_direct")
         db.get_thread_messages = AsyncMock(
@@ -1445,7 +1492,7 @@ class TestRoutedWorkerTextIsSanitized:
         await message_routing.deliver_route_to_user(
             db, route, reason="officer_escalated", notifier=notifier
         )
-        sent = notifier.dispatch.await_args.kwargs["message_md"]
+        sent = notifier.record_agent_message.await_args.kwargs["message_md"]
         assert "sk-abcdefghijklmnopqrstuvwxyz012345" not in sent
         # The reader is told text was withheld rather than shown a quiet edit.
         assert "redacted" in sent.lower()

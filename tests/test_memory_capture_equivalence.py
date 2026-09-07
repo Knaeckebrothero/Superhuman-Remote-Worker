@@ -22,24 +22,24 @@ from unittest.mock import AsyncMock
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
-import src.services.auxiliary as auxiliary_module
-from src.core.loader import (
+import shared.runtime.services.auxiliary as auxiliary_module
+from shared.runtime.core.loader import (
     AuxiliaryConfig,
     AuxiliaryTaskConfig,
     MemoryConfig,
     MemoryPipelineConfig,
 )
-from src.services.auxiliary import (
+from shared.runtime.services.auxiliary import (
     _should_assemble_memories,
     _should_extract_memories,
 )
-from src.services.memory import (
+from agent.services.memory import (
     CaptureEvent,
     MemoryManager,
     MemoryRuntime,
     available_memory_plugins,
 )
-from src.services.memory.plugins.legacy_writers import (
+from agent.services.memory.plugins.legacy_writers import (
     CompactionMemoryWriter,
     MemoryAssembler,
     PersistentIntervalExtractor,
@@ -654,7 +654,7 @@ class _EngineSpy:
 
 @pytest.fixture
 def engine_spy(monkeypatch):
-    import src.services.memory.extraction_engine as ee
+    import agent.services.memory.extraction_engine as ee
 
     _EngineSpy.instances = []
     monkeypatch.setattr(ee, "MemoryExtractionEngine", _EngineSpy)

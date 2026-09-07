@@ -23,8 +23,8 @@ from pathlib import Path
 
 import pytest
 
-from src.agent import DEFAULT_JOB_BRANCH, ensure_job_branch
-from src.managers.git_manager import GitManager
+from agent.agent import DEFAULT_JOB_BRANCH, ensure_job_branch
+from agent.managers.git_manager import GitManager
 
 SUBJOB_BRANCH = "subjob/50dee4ae/critic"
 

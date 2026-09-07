@@ -8,7 +8,7 @@ from typing import Awaitable, Callable, Optional
 
 import pytest
 
-from src.services.cloud_sync.base import WorkspaceSyncBase, _should_ignore
+from agent.services.cloud_sync.base import WorkspaceSyncBase, _should_ignore
 
 
 class FakeSync(WorkspaceSyncBase):
@@ -200,7 +200,7 @@ class _FakeContactsProvider:
     writable = False
 
     def entries(self):
-        from src.core.backends.overlay import EntryMeta
+        from agent.core.backends.overlay import EntryMeta
 
         return {
             "README.md": EntryMeta(size=10),
@@ -212,7 +212,7 @@ class _FakeContactsProvider:
 
 
 def _overlay_backend(tmp_path: Path):
-    from src.core.backends.overlay import VirtualOverlayBackend
+    from agent.core.backends.overlay import VirtualOverlayBackend
     from tests._fs_backend import FilesystemTestBackend
 
     overlay = VirtualOverlayBackend(FilesystemTestBackend(tmp_path))

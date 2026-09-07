@@ -13,7 +13,7 @@ Covers section 14 of persistent_agent_tests.md:
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
-from src.tools.knowledge.workspace_converter import (
+from agent.tools.knowledge.workspace_converter import (
     _slugify,
     _classify_section,
     _extract_tags,

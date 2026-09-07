@@ -103,6 +103,57 @@ describe('buildToolCardView', () => {
         expect(v.details).toContainEqual({label: 'Exit code', value: '0', tone: 'ok'});
     });
 
+    it('delegate_agent shows its type, brief, and text envelope', () => {
+        const v = buildToolCardView(norm({
+            tool: 'delegate_agent',
+            args: {subagent_type: 'tester', description: 'Run the focused suite'},
+            result: '[subagent tester-7f3a · tester · completed]',
+        }));
+
+        expect(v.title).toBe('Delegate to subagent');
+        expect(v.icon).toBe('group_work');
+        expect(v.subtitle).toBe('tester: Run the focused suite');
+        expect(v.params).toEqual([
+            {label: 'Subagent', value: 'tester', kind: 'text'},
+            {label: 'Brief', value: 'Run the focused suite', kind: 'text'},
+        ]);
+        expect(v.result?.kind).toBe('text');
+    });
+
+    it('delegate_agent subtitle falls back to whichever field is present', () => {
+        expect(buildToolCardView(norm({
+            tool: 'delegate_agent',
+            args: {subagent_type: 'reviewer'},
+        })).subtitle).toBe('reviewer');
+        expect(buildToolCardView(norm({
+            tool: 'delegate_agent',
+            args: {description: 'Review the diff'},
+        })).subtitle).toBe('Review the diff');
+    });
+
+    it.each([
+        ['wait_agent', 'Wait for subagent', 'hourglass_top', {handle: 'probe-7f3a', timeout_s: 120}],
+        ['message_agent', 'Message subagent', 'forum', {handle: 'probe-7f3a', message: 'Check the retry path'}],
+        ['stop_agent', 'Stop subagent', 'stop_circle', {handle: 'probe-7f3a', grace_s: 30}],
+    ])('%s renders as an addressable subagent control', (tool, title, icon, args) => {
+        const v = buildToolCardView(norm({tool, args, result: '{"accepted":true}'}));
+        expect(v.title).toBe(title);
+        expect(v.icon).toBe(icon);
+        expect(v.subtitle).toBe('probe-7f3a');
+        expect(v.result?.kind).toBe('json');
+    });
+
+    it('list_agents is a bounded roster card with no invented parameters', () => {
+        const v = buildToolCardView(norm({
+            tool: 'list_agents',
+            result: '[{"handle":"probe-7f3a","status":"running"}]',
+        }));
+        expect(v.title).toBe('List subagents');
+        expect(v.icon).toBe('groups');
+        expect(v.params).toEqual([]);
+        expect(v.result?.kind).toBe('json');
+    });
+
     it('edit_file replace → a real old→new diff', () => {
         const v = buildToolCardView(
             norm({tool: 'edit_file', args: {path: 'a.ts', old_string: 'foo', new_string: 'bar'}}),

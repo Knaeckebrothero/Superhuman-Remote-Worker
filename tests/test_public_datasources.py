@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from fastapi import HTTPException
 
-from database.postgres import PostgresDB
+from orchestrator.database.postgres import PostgresDB
 
 # Every test in this module is async (endpoint + helper coverage).
 pytestmark = pytest.mark.asyncio
@@ -24,15 +24,15 @@ def _patch_caller_and_db(user: dict, db):
     """
     stack = ExitStack()
     stack.enter_context(
-        patch("main.require_approved_user", AsyncMock(return_value=user))
+        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user))
     )
     stack.enter_context(
         patch(
-            "security.access.require_approved_user",
+            "orchestrator.security.access.require_approved_user",
             AsyncMock(return_value=user),
         )
     )
-    stack.enter_context(patch("main.postgres_db", db))
+    stack.enter_context(patch("orchestrator.main.postgres_db", db))
     return stack
 
 
@@ -107,7 +107,7 @@ def _created_row(**overrides):
 
 class TestCreatePublishGate:
     async def test_publish_without_grant_403(self, user_a, fake_db, fake_request):
-        from main import DatasourceCreate, create_datasource
+        from orchestrator.main import DatasourceCreate, create_datasource
 
         fake_db.user_can_publish_datasource = AsyncMock(return_value=False)
         fake_db.create_datasource = AsyncMock()
@@ -129,7 +129,7 @@ class TestCreatePublishGate:
     async def test_publish_with_grant_defaults_read_only_true(
         self, user_a, fake_db, fake_request
     ):
-        from main import DatasourceCreate, create_datasource
+        from orchestrator.main import DatasourceCreate, create_datasource
 
         fake_db.user_can_publish_datasource = AsyncMock(return_value=True)
         fake_db.create_datasource = AsyncMock(return_value=_created_row())
@@ -151,7 +151,7 @@ class TestCreatePublishGate:
     async def test_publish_read_write_with_grant_keeps_false(
         self, user_a, fake_db, fake_request
     ):
-        from main import DatasourceCreate, create_datasource
+        from orchestrator.main import DatasourceCreate, create_datasource
 
         fake_db.user_can_publish_datasource = AsyncMock(return_value=True)
         fake_db.create_datasource = AsyncMock(
@@ -171,7 +171,7 @@ class TestCreatePublishGate:
         assert fake_db.create_datasource.await_args.kwargs["read_only"] is False
 
     async def test_private_create_never_calls_gate(self, user_a, fake_db, fake_request):
-        from main import DatasourceCreate, create_datasource
+        from orchestrator.main import DatasourceCreate, create_datasource
 
         fake_db.user_can_publish_datasource = AsyncMock(return_value=False)
         fake_db.create_datasource = AsyncMock(
@@ -190,7 +190,7 @@ class TestCreatePublishGate:
         assert fake_db.create_datasource.await_args.kwargs["read_only"] is None
 
     async def test_kb_read_write_flag_400(self, user_a, fake_db, fake_request):
-        from main import DatasourceCreate, create_datasource
+        from orchestrator.main import DatasourceCreate, create_datasource
 
         fake_db.user_can_publish_datasource = AsyncMock(return_value=True)
         fake_db.create_datasource = AsyncMock()
@@ -230,7 +230,7 @@ def _wire_owner_update(fake_db, user, existing):
 
 class TestUpdatePublishGate:
     async def test_publish_flip_without_grant_403(self, user_a, fake_db, fake_request):
-        from main import DatasourceUpdate, update_datasource
+        from orchestrator.main import DatasourceUpdate, update_datasource
 
         existing = _wire_owner_update(fake_db, user_a, _existing_private())
         fake_db.user_can_publish_datasource = AsyncMock(return_value=False)
@@ -245,7 +245,7 @@ class TestUpdatePublishGate:
     async def test_publish_flip_with_grant_defaults_read_only(
         self, user_a, fake_db, fake_request
     ):
-        from main import DatasourceUpdate, update_datasource
+        from orchestrator.main import DatasourceUpdate, update_datasource
 
         existing = _wire_owner_update(fake_db, user_a, _existing_private())
         fake_db.user_can_publish_datasource = AsyncMock(return_value=True)
@@ -259,7 +259,7 @@ class TestUpdatePublishGate:
         assert kwargs["read_only"] is True
 
     async def test_unpublish_needs_no_grant(self, user_a, fake_db, fake_request):
-        from main import DatasourceUpdate, update_datasource
+        from orchestrator.main import DatasourceUpdate, update_datasource
 
         existing = _wire_owner_update(fake_db, user_a, _existing_public())
         fake_db.user_can_publish_datasource = AsyncMock(return_value=False)
@@ -274,7 +274,7 @@ class TestUpdatePublishGate:
     async def test_ro_to_rw_flip_needs_no_grant(self, user_a, fake_db, fake_request):
         # Spec: friction for RO→RW is the client-side typed confirmation;
         # the server gate is only on the publish transition.
-        from main import DatasourceUpdate, update_datasource
+        from orchestrator.main import DatasourceUpdate, update_datasource
 
         existing = _wire_owner_update(fake_db, user_a, _existing_public())
         fake_db.user_can_publish_datasource = AsyncMock(return_value=False)
@@ -287,7 +287,7 @@ class TestUpdatePublishGate:
         assert fake_db.update_datasource.await_args.kwargs["read_only"] is False
 
     async def test_kb_read_write_flag_400(self, user_a, fake_db, fake_request):
-        from main import DatasourceUpdate, update_datasource
+        from orchestrator.main import DatasourceUpdate, update_datasource
 
         existing = _wire_owner_update(
             fake_db, user_a, _created_row(type="kb", is_global=True)

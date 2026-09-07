@@ -25,13 +25,14 @@ from fastapi import HTTPException
 pytest.importorskip("testcontainers.postgres")
 
 from orchestrator.database.migrate import run_migrations  # noqa: E402
-from services.kb_materialize import retry_knowledge_materialization_intent  # noqa: E402
-from services.kb_reindex import KbRepoRef  # noqa: E402
-from src.tools.knowledge.gardener import parse_note_md  # noqa: E402
+from orchestrator.services.kb_materialize import retry_knowledge_materialization_intent  # noqa: E402
+from orchestrator.services.kb_reindex import KbRepoRef  # noqa: E402
+from shared.runtime.knowledge.gardener import parse_note_md  # noqa: E402
 
 PG_IMAGE = "pgvector/pgvector:pg15"
 VECTOR_MIGRATIONS = (
     Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "migrations"
@@ -188,7 +189,7 @@ def _repo_ref() -> KbRepoRef:
 
 @pytest.mark.asyncio
 async def test_first_ready_update_commits_and_projects_typed_timestamp(vector_pool):
-    from main import KnowledgeNoteUpdate, update_knowledge_note
+    from orchestrator.main import KnowledgeNoteUpdate, update_knowledge_note
 
     project_id = uuid.uuid4()
     initial = (
@@ -200,13 +201,13 @@ async def test_first_ready_update_commits_and_projects_typed_timestamp(vector_po
     gitea, git = _stateful_gitea(initial)
 
     with (
-        patch("main.require_project_member", AsyncMock()),
-        patch("main.vector_db", vector_pool),
-        patch("main.postgres_db", ledger),
-        patch("main.gitea_client", gitea),
-        patch("main._get_knowledge_graph", return_value=None),
+        patch("orchestrator.main.require_project_member", AsyncMock()),
+        patch("orchestrator.main.vector_db", vector_pool),
+        patch("orchestrator.main.postgres_db", ledger),
+        patch("orchestrator.main.gitea_client", gitea),
+        patch("orchestrator.main._get_knowledge_graph", return_value=None),
         patch(
-            "services.kb_materialize.resolve_kb_repo",
+            "orchestrator.services.kb_materialize.resolve_kb_repo",
             AsyncMock(return_value=_repo_ref()),
         ),
     ):
@@ -235,7 +236,7 @@ async def test_first_ready_update_commits_and_projects_typed_timestamp(vector_po
 async def test_sweeper_wins_retry_then_client_preserves_exact_canonical_snapshot(
     vector_pool,
 ):
-    from main import KnowledgeNoteUpdate, update_knowledge_note
+    from orchestrator.main import KnowledgeNoteUpdate, update_knowledge_note
 
     project_id = uuid.uuid4()
     initial = (
@@ -247,13 +248,13 @@ async def test_sweeper_wins_retry_then_client_preserves_exact_canonical_snapshot
     gitea, git = _stateful_gitea(initial, fail_first=True)
 
     with (
-        patch("main.require_project_member", AsyncMock()),
-        patch("main.vector_db", vector_pool),
-        patch("main.postgres_db", ledger),
-        patch("main.gitea_client", gitea),
-        patch("main._get_knowledge_graph", return_value=None),
+        patch("orchestrator.main.require_project_member", AsyncMock()),
+        patch("orchestrator.main.vector_db", vector_pool),
+        patch("orchestrator.main.postgres_db", ledger),
+        patch("orchestrator.main.gitea_client", gitea),
+        patch("orchestrator.main._get_knowledge_graph", return_value=None),
         patch(
-            "services.kb_materialize.resolve_kb_repo",
+            "orchestrator.services.kb_materialize.resolve_kb_repo",
             AsyncMock(return_value=_repo_ref()),
         ),
     ):

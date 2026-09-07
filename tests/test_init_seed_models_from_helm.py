@@ -85,13 +85,12 @@ def _patch_helm_values(monkeypatch, tmp_path):
     real_resolve = Path.resolve
 
     def fake_resolve(self, *args, **kwargs):
-        # The function calls Path(__file__).resolve().parent.parent / "helm" / "values.yaml".
+        # The function resolves the repository root above src/orchestrator/.
         # Hijack any resolve() call on the init.py module file so the
-        # subsequent .parent.parent / "helm" / "values.yaml" lands at our
-        # temp tree.
+        # subsequent .parents[2] / "helm" / "values.yaml" lands at our temp tree.
         out = real_resolve(self, *args, **kwargs)
         if str(out).endswith("/orchestrator/init.py"):
-            return tmp_path / "orchestrator" / "init.py"
+            return tmp_path / "src" / "orchestrator" / "init.py"
         return out
 
     monkeypatch.setattr(Path, "resolve", fake_resolve)

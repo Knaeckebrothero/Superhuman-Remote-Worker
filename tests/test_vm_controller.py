@@ -22,31 +22,17 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import yaml
+from cryptography.hazmat.primitives.serialization import (
+    Encoding,
+    PublicFormat,
+    load_ssh_private_key,
+)
 
-from vm.controller.lifecycle_auth import sign_payload
+from vm_controller.lifecycle_auth import sign_payload
 
-# ---------------------------------------------------------------------------
-# Project root on sys.path (conftest.py also does this, belt-and-suspenders)
-# ---------------------------------------------------------------------------
+# Repository assets are separate from the installed application packages.
 project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-
-# ---------------------------------------------------------------------------
-# Mock external dependencies that are unavailable in the test environment.
-#
-# The controller module (vm/controller/controller.py) does:
-#   from headscale_client import HeadscaleClient
-# This only works inside the vm/controller/ directory.  We inject a mock
-# module into sys.modules BEFORE importing the controller so the import
-# succeeds.  Similarly we pre-seed kubernetes and nats stubs.
-# ---------------------------------------------------------------------------
-
-# --- headscale_client -------------------------------------------------------
-_mock_headscale_module = types.ModuleType("headscale_client")
-_MockHeadscaleClient = MagicMock
-_mock_headscale_module.HeadscaleClient = _MockHeadscaleClient  # type: ignore[attr-defined]
-sys.modules.setdefault("headscale_client", _mock_headscale_module)
 
 # --- kubernetes (only needed at import-time for type hints / constants) ------
 _mock_k8s = types.ModuleType("kubernetes")
@@ -56,12 +42,16 @@ _mock_k8s_exc = types.ModuleType("kubernetes.client.exceptions")
 
 LIFECYCLE_SECRET = b"controller-test-lifecycle-secret-at-least-32-bytes"
 PROVISION_GENERATION = "00000000-0000-4000-8000-000000000001"
+TEST_HOST_KEY_FINGERPRINT = "SHA256:" + ("A" * 43)
+EXISTING_HOST_KEY_FINGERPRINT = "SHA256:" + ("B" * 43)
 
 
 def test_controller_dockerfile_packages_lifecycle_auth_module() -> None:
-    dockerfile = (project_root / "vm/controller/Dockerfile").read_text(encoding="utf-8")
+    dockerfile = (project_root / "docker/Dockerfile.vm-controller").read_text(
+        encoding="utf-8"
+    )
 
-    assert "COPY controller.py headscale_client.py lifecycle_auth.py ./" in dockerfile
+    assert "COPY src/vm_controller/ ./src/vm_controller/" in dockerfile
 
 
 class _FakeApiException(Exception):
@@ -115,7 +105,7 @@ sys.modules.setdefault("nats", _mock_nats)
 # ---------------------------------------------------------------------------
 # NOW import the controller — the mocked modules make this succeed
 # ---------------------------------------------------------------------------
-from vm.controller.controller import (  # noqa: E402
+from vm_controller.controller import (  # noqa: E402
     CDI_PLURAL,
     KUBEVIRT_GROUP,
     KUBEVIRT_PLURAL,
@@ -123,21 +113,80 @@ from vm.controller.controller import (  # noqa: E402
     LIFECYCLE_NONCE_GC_PAGE_LIMIT,
     VM_NAMESPACE,
     VMController,
+    _generate_ssh_host_key,
+    _openssh_sha256_fingerprint,
 )
 
 _restore_k8s_modules()
 
 
 class TestSameClusterContracts:
+    def test_generated_host_key_fingerprint_round_trip(self):
+        material = _generate_ssh_host_key()
+
+        private_key = load_ssh_private_key(material.private_key.encode("ascii"), None)
+        derived_public = (
+            private_key.public_key()
+            .public_bytes(
+                Encoding.OpenSSH,
+                PublicFormat.OpenSSH,
+            )
+            .decode("ascii")
+        )
+
+        assert material.public_key == derived_public
+        assert material.fingerprint == _openssh_sha256_fingerprint(derived_public)
+        assert material.fingerprint.startswith("SHA256:")
+
+    def test_secret_backed_render_injects_host_key_only_into_user_data(self):
+        ctrl = _make_controller(headscale_available=False)
+        ctrl.cloud_init_text = "#cloud-config\nruncmd:\n  - systemctl restart ssh\n"
+        ctrl.template_text = """\
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: agent-vm-${JOB_ID}
+spec:
+  dataVolumeTemplates: []
+  template:
+    spec:
+      domain: {}
+      volumes:
+        - name: cloud-init
+          cloudInitNoCloud:
+            secretRef:
+              name: agent-vm-${JOB_ID}-cloudinit
+"""
+
+        manifest = ctrl.render_template(SAMPLE_JOB_CONFIG)
+        user_data = manifest.pop("_srwCloudInitUserData")
+        fingerprint = manifest.pop("_srwSSHHostKeyFingerprint")
+        cloud_config = yaml.safe_load(user_data)
+
+        assert cloud_config["ssh_deletekeys"] is True
+        assert cloud_config["ssh_genkeytypes"] == []
+        assert cloud_config["ssh_keys"]["ed25519_private"].startswith(
+            "-----BEGIN OPENSSH PRIVATE KEY-----"
+        )
+        public_key = cloud_config["ssh_keys"]["ed25519_public"]
+        assert fingerprint == _openssh_sha256_fingerprint(public_key)
+        cloud_init = manifest["spec"]["template"]["spec"]["volumes"][0][
+            "cloudInitNoCloud"
+        ]
+        assert cloud_init == {
+            "secretRef": {"name": f"agent-vm-{SAMPLE_JOB_CONFIG['job_id']}-cloudinit"}
+        }
+        assert "PRIVATE KEY" not in yaml.safe_dump(manifest)
+
     def test_render_injects_placement_after_yaml_parse(self):
         ctrl = _make_controller(headscale_available=False)
         with (
             patch(
-                "vm.controller.controller.VM_NODE_SELECTOR",
+                "vm_controller.controller.VM_NODE_SELECTOR",
                 {"srw.io/vm-node": "true"},
             ),
             patch(
-                "vm.controller.controller.VM_TOLERATIONS",
+                "vm_controller.controller.VM_TOLERATIONS",
                 [{"key": "srw.io/vm-node", "operator": "Exists"}],
             ),
         ):
@@ -152,31 +201,34 @@ class TestSameClusterContracts:
     def test_payload_network_tier_overrides_env_default(self):
         """The per-project tier sent by the orchestrator beats the chart default."""
         ctrl = _make_controller(headscale_available=False)
-        ctrl.cloud_init_text = "tier=${NETWORK_TIER}\n"
+        ctrl.cloud_init_text = "#cloud-config\ntier: ${NETWORK_TIER}\n"
         config = {**SAMPLE_JOB_CONFIG, "network_tier": "home-allowed"}
-        with patch("vm.controller.controller.VM_DEFAULT_NETWORK_TIER", "internet-only"):
+        with patch("vm_controller.controller.VM_DEFAULT_NETWORK_TIER", "internet-only"):
             manifest = ctrl.render_template(config)
-        assert manifest.pop("_srwCloudInitUserData") == "tier=home-allowed\n"
+        rendered = yaml.safe_load(manifest.pop("_srwCloudInitUserData"))
+        assert rendered["tier"] == "home-allowed"
 
     def test_env_default_network_tier_applies_when_payload_omits_it(self):
         ctrl = _make_controller(headscale_available=False)
-        ctrl.cloud_init_text = "tier=${NETWORK_TIER}\n"
+        ctrl.cloud_init_text = "#cloud-config\ntier: ${NETWORK_TIER}\n"
         config = {k: v for k, v in SAMPLE_JOB_CONFIG.items() if k != "network_tier"}
-        with patch("vm.controller.controller.VM_DEFAULT_NETWORK_TIER", "internet-only"):
+        with patch("vm_controller.controller.VM_DEFAULT_NETWORK_TIER", "internet-only"):
             manifest = ctrl.render_template(config)
-        assert manifest.pop("_srwCloudInitUserData") == "tier=internet-only\n"
+        rendered = yaml.safe_load(manifest.pop("_srwCloudInitUserData"))
+        assert rendered["tier"] == "internet-only"
 
     def test_payload_network_tier_is_validated_when_env_default_is_empty(self):
         ctrl = _make_controller(headscale_available=False)
         config = {**SAMPLE_JOB_CONFIG, "network_tier": "NOT_VALID"}
-        with patch("vm.controller.controller.VM_DEFAULT_NETWORK_TIER", ""):
+        with patch("vm_controller.controller.VM_DEFAULT_NETWORK_TIER", ""):
             with pytest.raises(ValueError, match="network_tier"):
                 ctrl.render_template(config)
 
     def test_cloud_init_receives_guest_token_url_and_tier(self):
         ctrl = _make_controller(headscale_available=False)
         ctrl.cloud_init_text = (
-            "token=${VM_AUTH_TOKEN}\nurl=${ORCHESTRATOR_URL}\ntier=${NETWORK_TIER}\n"
+            "#cloud-config\ntoken: ${VM_AUTH_TOKEN}\n"
+            "url: ${ORCHESTRATOR_URL}\ntier: ${NETWORK_TIER}\n"
         )
         config = {
             **SAMPLE_JOB_CONFIG,
@@ -185,17 +237,16 @@ class TestSameClusterContracts:
             "network_tier": "home-allowed",
         }
         with (
-            patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET),
-            patch("vm.controller.controller.ORCHESTRATOR_URL", ""),
-            patch("vm.controller.controller.VM_DEFAULT_NETWORK_TIER", ""),
+            patch("vm_controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET),
+            patch("vm_controller.controller.ORCHESTRATOR_URL", ""),
+            patch("vm_controller.controller.VM_DEFAULT_NETWORK_TIER", ""),
         ):
             manifest = ctrl.render_template(config)
 
-        rendered = manifest.pop("_srwCloudInitUserData")
-        assert "url=http://payload-orchestrator:8085" in rendered
-        assert "tier=home-allowed" in rendered
-        assert "token=" in rendered
-        assert len(rendered.splitlines()[0].removeprefix("token=")) == 64
+        rendered = yaml.safe_load(manifest.pop("_srwCloudInitUserData"))
+        assert rendered["url"] == "http://payload-orchestrator:8085"
+        assert rendered["tier"] == "home-allowed"
+        assert len(rendered["token"]) == 64
 
     @pytest.mark.asyncio
     async def test_capacity_gate_reports_live_vm_count(self):
@@ -212,7 +263,7 @@ class TestSameClusterContracts:
                 },
             ]
         }
-        with patch("vm.controller.controller.VM_MAX_CONCURRENT", 1):
+        with patch("vm_controller.controller.VM_MAX_CONCURRENT", 1):
             result = await ctrl._capacity_wait("agent-vm-two")
 
         assert result == {
@@ -243,7 +294,7 @@ class TestSameClusterContracts:
         monkeypatch.setattr(asyncio, "to_thread", _interleaving_to_thread)
         first = {**SAMPLE_JOB_CONFIG, "job_id": "capacity-one"}
         second = {**SAMPLE_JOB_CONFIG, "job_id": "capacity-two"}
-        with patch("vm.controller.controller.VM_MAX_CONCURRENT", 1):
+        with patch("vm_controller.controller.VM_MAX_CONCURRENT", 1):
             results = await asyncio.gather(
                 ctrl._do_create(first), ctrl._do_create(second)
             )
@@ -262,6 +313,7 @@ class TestSameClusterContracts:
             owner_kind="job",
             generation=PROVISION_GENERATION,
             user_data="#cloud-config\n",
+            host_key_fingerprint=TEST_HOST_KEY_FINGERPRINT,
         )
         body = ctrl.core_api.create_namespaced_secret.call_args.kwargs["body"]
         assert body["stringData"] == {"userdata": "#cloud-config\n"}
@@ -301,7 +353,38 @@ class TestSameClusterContracts:
                 owner_kind="job",
                 generation=PROVISION_GENERATION,
                 user_data="#cloud-config\n",
+                host_key_fingerprint=TEST_HOST_KEY_FINGERPRINT,
             )
+
+    @pytest.mark.asyncio
+    async def test_cloud_init_secret_retry_returns_existing_generation_pin(self):
+        ctrl = _make_controller(headscale_available=False)
+        ctrl.core_api.create_namespaced_secret.side_effect = _FakeApiException(
+            status=409, body="already exists"
+        )
+        ctrl.core_api.read_namespaced_secret.return_value = types.SimpleNamespace(
+            metadata=types.SimpleNamespace(
+                labels={
+                    "srw.io/owner-kind": "job",
+                    "srw.io/owner-id": SAMPLE_JOB_CONFIG["job_id"],
+                },
+                annotations={
+                    "srw.io/provision-generation": PROVISION_GENERATION,
+                    "srw.io/ssh-host-key-fingerprint": (EXISTING_HOST_KEY_FINGERPRINT),
+                },
+            )
+        )
+
+        created, fingerprint = await ctrl._ensure_cloud_init_secret(
+            job_id=SAMPLE_JOB_CONFIG["job_id"],
+            owner_kind="job",
+            generation=PROVISION_GENERATION,
+            user_data="#cloud-config\n",
+            host_key_fingerprint=TEST_HOST_KEY_FINGERPRINT,
+        )
+
+        assert created is False
+        assert fingerprint == EXISTING_HOST_KEY_FINGERPRINT
 
     @pytest.mark.asyncio
     async def test_cloud_init_secret_is_created_before_vm_and_owned_after_admission(
@@ -309,7 +392,8 @@ class TestSameClusterContracts:
     ):
         ctrl = _make_controller(headscale_available=False)
         ctrl.cloud_init_text = (
-            "#cloud-config\nssh=${SSH_AUTHORIZED_KEY}\ntoken=${VM_AUTH_TOKEN}\n"
+            "#cloud-config\nssh_authorized_key: ${SSH_AUTHORIZED_KEY}\n"
+            "vm_auth_token: ${VM_AUTH_TOKEN}\n"
         )
         events: list[str] = []
         original_admit = ctrl.k8s_client.create_namespaced_custom_object.side_effect
@@ -333,21 +417,34 @@ class TestSameClusterContracts:
         }
 
         with (
-            patch("vm.controller.controller.VM_MAX_CONCURRENT", 0),
-            patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET),
+            patch("vm_controller.controller.VM_MAX_CONCURRENT", 0),
+            patch("vm_controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET),
             patch.dict(
-                "vm.controller.controller.os.environ",
+                "vm_controller.controller.os.environ",
                 {"SSH_AUTHORIZED_KEY": "ssh-ed25519 AAAAtest"},
             ),
         ):
             result = await ctrl._do_create(config)
 
         assert result["status"] == "created"
+        assert result["ssh_host_key_fingerprint"].startswith("SHA256:")
         assert events == ["secret-create", "vm-create", "secret-owner-patch"]
         vm_body = ctrl.k8s_client.create_namespaced_custom_object.call_args.kwargs[
             "body"
         ]
         assert "_srwCloudInitUserData" not in vm_body
+        assert "_srwSSHHostKeyFingerprint" not in vm_body
+        assert "PRIVATE KEY" not in yaml.safe_dump(vm_body)
+        assert "PRIVATE KEY" not in yaml.safe_dump(result)
+        secret_body = ctrl.core_api.create_namespaced_secret.call_args.kwargs["body"]
+        secret_cloud_config = yaml.safe_load(secret_body["stringData"]["userdata"])
+        assert secret_cloud_config["ssh_keys"]["ed25519_private"].startswith(
+            "-----BEGIN OPENSSH PRIVATE KEY-----"
+        )
+        assert (
+            secret_body["metadata"]["annotations"]["srw.io/ssh-host-key-fingerprint"]
+            == result["ssh_host_key_fingerprint"]
+        )
         owner = ctrl.core_api.patch_namespaced_secret.call_args.kwargs["body"][
             "metadata"
         ]["ownerReferences"][0]
@@ -363,11 +460,11 @@ class TestSameClusterContracts:
     @pytest.mark.asyncio
     async def test_create_rejects_empty_rendered_ssh_authorized_key(self):
         ctrl = _make_controller(headscale_available=False)
-        ctrl.cloud_init_text = "key=${SSH_AUTHORIZED_KEY}\n"
+        ctrl.cloud_init_text = "#cloud-config\nkey: ${SSH_AUTHORIZED_KEY}\n"
         with (
-            patch("vm.controller.controller.VM_MAX_CONCURRENT", 0),
+            patch("vm_controller.controller.VM_MAX_CONCURRENT", 0),
             patch.dict(
-                "vm.controller.controller.os.environ",
+                "vm_controller.controller.os.environ",
                 {"SSH_AUTHORIZED_KEY": ""},
             ),
             pytest.raises(ValueError, match="SSH_AUTHORIZED_KEY must be non-empty"),
@@ -381,7 +478,8 @@ class TestSameClusterContracts:
     async def test_exhausted_vm_create_deletes_new_cloud_init_secret(self):
         ctrl = _make_controller(headscale_available=False)
         ctrl.cloud_init_text = (
-            "#cloud-config\nssh=${SSH_AUTHORIZED_KEY}\ntoken=${VM_AUTH_TOKEN}\n"
+            "#cloud-config\nssh_authorized_key: ${SSH_AUTHORIZED_KEY}\n"
+            "vm_auth_token: ${VM_AUTH_TOKEN}\n"
         )
         ctrl.k8s_client.create_namespaced_custom_object.side_effect = _FakeApiException(
             status=409, body="VirtualMachine is being deleted"
@@ -392,10 +490,10 @@ class TestSameClusterContracts:
         }
 
         with (
-            patch("vm.controller.controller.VM_MAX_CONCURRENT", 0),
-            patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET),
+            patch("vm_controller.controller.VM_MAX_CONCURRENT", 0),
+            patch("vm_controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET),
             patch.dict(
-                "vm.controller.controller.os.environ",
+                "vm_controller.controller.os.environ",
                 {"SSH_AUTHORIZED_KEY": "ssh-ed25519 AAAAtest"},
             ),
             patch("asyncio.sleep", new_callable=AsyncMock),
@@ -431,8 +529,8 @@ class TestSameClusterContracts:
         }
 
         with (
-            patch("vm.controller.controller.VM_MAX_CONCURRENT", 0),
-            patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET),
+            patch("vm_controller.controller.VM_MAX_CONCURRENT", 0),
+            patch("vm_controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET),
             pytest.raises(RuntimeError, match="another provision generation"),
         ):
             await ctrl._do_create(config)
@@ -654,7 +752,7 @@ def _scoped_orchestrator_id():
     keep working with a stable "test-oid" suffix. The dedicated
     TestOrchestratorIdRequired class below opts out by patching to "".
     """
-    with patch("vm.controller.controller.ORCHESTRATOR_ID", "test-oid"):
+    with patch("vm_controller.controller.ORCHESTRATOR_ID", "test-oid"):
         yield
 
 
@@ -692,7 +790,7 @@ class TestLoadTemplate:
         template_path.write_text(SAMPLE_TEMPLATE)
 
         ctrl = _make_controller()
-        with patch("vm.controller.controller.VM_TEMPLATE_PATH", str(template_path)):
+        with patch("vm_controller.controller.VM_TEMPLATE_PATH", str(template_path)):
             ctrl.load_template()
 
         assert ctrl.template_text == SAMPLE_TEMPLATE
@@ -702,7 +800,7 @@ class TestLoadTemplate:
         """Loading a non-existent template calls sys.exit(1)."""
         ctrl = _make_controller()
         with patch(
-            "vm.controller.controller.VM_TEMPLATE_PATH",
+            "vm_controller.controller.VM_TEMPLATE_PATH",
             str(tmp_path / "nonexistent.yaml"),
         ):
             with pytest.raises(SystemExit) as exc_info:
@@ -715,7 +813,7 @@ class TestLoadTemplate:
         template_path.write_text("")
 
         ctrl = _make_controller()
-        with patch("vm.controller.controller.VM_TEMPLATE_PATH", str(template_path)):
+        with patch("vm_controller.controller.VM_TEMPLATE_PATH", str(template_path)):
             ctrl.load_template()
 
         assert ctrl.template_text == ""
@@ -727,7 +825,7 @@ class TestLoadTemplate:
         template_path.write_text(content)
 
         ctrl = _make_controller()
-        with patch("vm.controller.controller.VM_TEMPLATE_PATH", str(template_path)):
+        with patch("vm_controller.controller.VM_TEMPLATE_PATH", str(template_path)):
             ctrl.load_template()
 
         assert ctrl.template_text == content
@@ -782,9 +880,9 @@ class TestRenderTemplate:
         minimal_config = {"job_id": "minimal-job-id"}
 
         with (
-            patch("vm.controller.controller.DEFAULT_VM_IMAGE", "default-image:v1"),
-            patch("vm.controller.controller.DEFAULT_CPU", 2),
-            patch("vm.controller.controller.DEFAULT_MEMORY", "4Gi"),
+            patch("vm_controller.controller.DEFAULT_VM_IMAGE", "default-image:v1"),
+            patch("vm_controller.controller.DEFAULT_CPU", 2),
+            patch("vm_controller.controller.DEFAULT_MEMORY", "4Gi"),
         ):
             result = controller.render_template(minimal_config)
 
@@ -849,7 +947,7 @@ class TestRenderTemplate:
             "nats_url": "nats://remote-orchestrator:4222",
         }
 
-        with patch("vm.controller.controller.NATS_URL", "nats://local-leaf:4222"):
+        with patch("vm_controller.controller.NATS_URL", "nats://local-leaf:4222"):
             result = controller.render_template(config)
 
         user_data = result["spec"]["template"]["spec"]["volumes"][1][
@@ -1043,7 +1141,7 @@ class TestConnectNats:
         mock_nats_mod.connect = AsyncMock(return_value=AsyncMock())
 
         with (
-            patch("vm.controller.controller.NATS_URL", "nats://custom:4222"),
+            patch("vm_controller.controller.NATS_URL", "nats://custom:4222"),
             patch.dict("sys.modules", {"nats": mock_nats_mod}),
         ):
             await ctrl.connect_nats()
@@ -1128,7 +1226,7 @@ class TestHandleCreate:
         )
         controller.core_api.read_namespaced_persistent_volume_claim.side_effect = None
 
-        with patch("vm.controller.controller.VM_ROOTDISK_PVC_UID_ATTEMPTS", 1):
+        with patch("vm_controller.controller.VM_ROOTDISK_PVC_UID_ATTEMPTS", 1):
             result = await controller._do_create(SAMPLE_JOB_CONFIG)
 
         assert result["status"] == "created"
@@ -1207,7 +1305,7 @@ class TestHandleCreate:
     async def test_create_vm_uses_correct_namespace(self, controller):
         """VM is created in the configured namespace."""
         msg = make_nats_msg(SAMPLE_JOB_CONFIG)
-        with patch("vm.controller.controller.VM_NAMESPACE", "test-namespace"):
+        with patch("vm_controller.controller.VM_NAMESPACE", "test-namespace"):
             await controller.handle_create(msg)
 
         kw = controller.k8s_client.create_namespaced_custom_object.call_args[1]
@@ -1350,7 +1448,7 @@ class TestHandleCreate:
     async def test_create_vm_status_includes_namespace(self, controller):
         """Published status includes the VM namespace."""
         msg = make_nats_msg(SAMPLE_JOB_CONFIG)
-        with patch("vm.controller.controller.VM_NAMESPACE", "custom-ns"):
+        with patch("vm_controller.controller.VM_NAMESPACE", "custom-ns"):
             await controller.handle_create(msg)
 
         payload = json.loads(controller.nc.publish.call_args[0][1].decode())
@@ -1506,7 +1604,7 @@ class TestHandleDelete:
     async def test_delete_vm_uses_correct_namespace(self, controller):
         """VM deletion uses the configured namespace."""
         msg = make_nats_msg({"job_id": "ns-test"})
-        with patch("vm.controller.controller.VM_NAMESPACE", "my-namespace"):
+        with patch("vm_controller.controller.VM_NAMESPACE", "my-namespace"):
             await controller.handle_delete(msg)
 
         kw = controller.k8s_client.delete_namespaced_custom_object.call_args[1]
@@ -2116,7 +2214,7 @@ class TestOrchestratorIdRequired:
     async def test_run_exits_when_orchestrator_id_unset(self, controller):
         controller._shutdown.set()
         with (
-            patch("vm.controller.controller.ORCHESTRATOR_ID", ""),
+            patch("vm_controller.controller.ORCHESTRATOR_ID", ""),
             patch.object(controller, "load_template"),
             patch.object(controller, "init_k8s"),
             patch.object(controller, "connect_nats", new_callable=AsyncMock),
@@ -2129,7 +2227,7 @@ class TestOrchestratorIdRequired:
     async def test_run_does_not_subscribe_when_orchestrator_id_unset(self, controller):
         controller._shutdown.set()
         with (
-            patch("vm.controller.controller.ORCHESTRATOR_ID", ""),
+            patch("vm_controller.controller.ORCHESTRATOR_ID", ""),
             patch.object(controller, "load_template"),
             patch.object(controller, "init_k8s"),
             patch.object(controller, "connect_nats", new_callable=AsyncMock),
@@ -2151,16 +2249,16 @@ class TestMain:
     def test_main_registers_signal_handlers(self):
         """main() registers SIGTERM and SIGINT handlers."""
         import signal as signal_module
-        from vm.controller.controller import main
+        from vm_controller.controller import main
 
         registered = {}
         with (
-            patch("vm.controller.controller.VMController") as mock_cls,
+            patch("vm_controller.controller.VMController") as mock_cls,
             patch(
-                "vm.controller.controller.signal.signal",
+                "vm_controller.controller.signal.signal",
                 side_effect=lambda s, h: registered.update({s: h}),
             ),
-            patch("vm.controller.controller.asyncio.run"),
+            patch("vm_controller.controller.asyncio.run"),
         ):
             mock_cls.return_value = MagicMock()
             main()
@@ -2170,16 +2268,16 @@ class TestMain:
 
     def test_main_calls_asyncio_run(self):
         """main() calls asyncio.run with controller.run()."""
-        from vm.controller.controller import main
+        from vm_controller.controller import main
 
         mock_ctrl = MagicMock()
         mock_coro = MagicMock()
         mock_ctrl.run.return_value = mock_coro
 
         with (
-            patch("vm.controller.controller.VMController", return_value=mock_ctrl),
-            patch("vm.controller.controller.signal.signal"),
-            patch("vm.controller.controller.asyncio.run") as mock_arun,
+            patch("vm_controller.controller.VMController", return_value=mock_ctrl),
+            patch("vm_controller.controller.signal.signal"),
+            patch("vm_controller.controller.asyncio.run") as mock_arun,
         ):
             main()
 
@@ -2188,16 +2286,16 @@ class TestMain:
     def test_signal_handler_calls_request_shutdown(self):
         """Signal handler invokes request_shutdown on the controller."""
         import signal as signal_module
-        from vm.controller.controller import main
+        from vm_controller.controller import main
 
         handlers = {}
         with (
-            patch("vm.controller.controller.VMController") as mock_cls,
+            patch("vm_controller.controller.VMController") as mock_cls,
             patch(
-                "vm.controller.controller.signal.signal",
+                "vm_controller.controller.signal.signal",
                 side_effect=lambda s, h: handlers.update({s: h}),
             ),
-            patch("vm.controller.controller.asyncio.run"),
+            patch("vm_controller.controller.asyncio.run"),
         ):
             mock_ctrl = MagicMock()
             mock_cls.return_value = mock_ctrl
@@ -2358,7 +2456,7 @@ class TestModuleConstants:
 
     def test_default_config_values(self):
         """Default configuration values are sensible."""
-        from vm.controller.controller import DEFAULT_CPU, DEFAULT_MEMORY, VM_NAMESPACE
+        from vm_controller.controller import DEFAULT_CPU, DEFAULT_MEMORY, VM_NAMESPACE
 
         assert isinstance(DEFAULT_CPU, int)
         assert DEFAULT_CPU > 0
@@ -2367,7 +2465,7 @@ class TestModuleConstants:
 
     def test_nats_url_has_nats_scheme(self):
         """NATS_URL has the nats:// scheme."""
-        from vm.controller.controller import NATS_URL
+        from vm_controller.controller import NATS_URL
 
         assert "nats://" in NATS_URL
 
@@ -2377,7 +2475,7 @@ class TestModuleConstants:
 # (knowledge-base/knowledge/features/vm_golden_image_boot_acceleration.md)
 # =============================================================================
 
-from vm.controller.controller import _golden_name  # noqa: E402
+from vm_controller.controller import _golden_name  # noqa: E402
 
 
 class TestGoldenName:
@@ -2443,8 +2541,13 @@ class TestEnsureGolden:
         assert kwargs["plural"] == "datavolumes"
         # golden manifest: explicit spec.pvc + Filesystem + bind-immediate + keep-handle
         body = kwargs["body"]
-        assert body["spec"]["pvc"]["volumeMode"] == "Filesystem"
-        assert body["spec"]["pvc"]["accessModes"] == ["ReadWriteOnce"]
+        # spec.storage, never spec.pvc: only the storage form is inflated by
+        # CDI's filesystemOverhead, and a literal 20Gi filesystem cannot hold a
+        # 20 GiB image on a real CSI (DataVolume too small to contain image).
+        assert "pvc" not in body["spec"]
+        assert body["spec"]["storage"]["volumeMode"] == "Filesystem"
+        assert body["spec"]["storage"]["accessModes"] == ["ReadWriteOnce"]
+        assert body["spec"]["storage"]["resources"]["requests"]["storage"]
         ann = body["metadata"]["annotations"]
         assert ann["cdi.kubevirt.io/storage.bind.immediate.requested"] == "true"
         assert ann["cdi.kubevirt.io/storage.deleteAfterCompletion"] == "false"
@@ -2578,7 +2681,7 @@ class TestDoCreateWaitingGolden:
             "status": {"phase": "ImportInProgress", "progress": "42.0%"}
         }
         msg = make_nats_msg(SAMPLE_JOB_CONFIG)
-        with patch("vm.controller.controller.VM_GOLDEN_IMAGE_ENABLED", True):
+        with patch("vm_controller.controller.VM_GOLDEN_IMAGE_ENABLED", True):
             await controller.handle_create(msg)
 
         # No VM object, no Headscale key minted per poll
@@ -2598,8 +2701,8 @@ class TestDoCreateWaitingGolden:
         }
         msg = make_nats_msg(SAMPLE_JOB_CONFIG)
         with (
-            patch("vm.controller.controller.VM_GOLDEN_IMAGE_ENABLED", True),
-            patch("vm.controller.controller.VM_GOLDEN_GC_ENABLED", False),
+            patch("vm_controller.controller.VM_GOLDEN_IMAGE_ENABLED", True),
+            patch("vm_controller.controller.VM_GOLDEN_GC_ENABLED", False),
         ):
             await controller.handle_create(msg)
 
@@ -2629,7 +2732,7 @@ class TestDoCreateWaitingGolden:
             },
         ]
         msg = make_nats_msg(SAMPLE_JOB_CONFIG)
-        with patch("vm.controller.controller.VM_GOLDEN_IMAGE_ENABLED", True):
+        with patch("vm_controller.controller.VM_GOLDEN_IMAGE_ENABLED", True):
             await controller.handle_create(msg)
 
         payload = json.loads(controller.nc.publish.call_args[0][1].decode())
@@ -2677,8 +2780,8 @@ class TestGcGoldens:
         }
         controller.k8s_client.list_namespaced_custom_object.side_effect = [goldens, vms]
         with (
-            patch("vm.controller.controller.VM_GOLDEN_KEEP", 1),
-            patch("vm.controller.controller.VM_GOLDEN_GC_MIN_AGE_MINUTES", 0),
+            patch("vm_controller.controller.VM_GOLDEN_KEEP", 1),
+            patch("vm_controller.controller.VM_GOLDEN_GC_MIN_AGE_MINUTES", 0),
         ):
             await controller._gc_goldens(imgs["c"])  # current image = c
         deletes = controller.k8s_client.delete_namespaced_custom_object
@@ -2699,7 +2802,7 @@ class TestGcGoldens:
             ]
         }
         controller.k8s_client.list_namespaced_custom_object.side_effect = [goldens]
-        with patch("vm.controller.controller.VM_GOLDEN_KEEP", 3):
+        with patch("vm_controller.controller.VM_GOLDEN_KEEP", 3):
             await controller._gc_goldens("img:sha-a")
         controller.k8s_client.delete_namespaced_custom_object.assert_not_called()
 
@@ -2713,8 +2816,8 @@ class TestDoCreateGoldenIntegration:
             return_value=("agent-vm-golden-abc123def456", None)
         )
         with (
-            patch("vm.controller.controller.VM_GOLDEN_IMAGE_ENABLED", True),
-            patch("vm.controller.controller.VM_GOLDEN_GC_ENABLED", False),
+            patch("vm_controller.controller.VM_GOLDEN_IMAGE_ENABLED", True),
+            patch("vm_controller.controller.VM_GOLDEN_GC_ENABLED", False),
         ):
             await controller._do_create(SAMPLE_JOB_CONFIG)
         body = controller.k8s_client.create_namespaced_custom_object.call_args.kwargs[
@@ -2725,7 +2828,7 @@ class TestDoCreateGoldenIntegration:
 
     @pytest.mark.asyncio
     async def test_disabled_keeps_registry_source(self, controller):
-        with patch("vm.controller.controller.VM_GOLDEN_IMAGE_ENABLED", False):
+        with patch("vm_controller.controller.VM_GOLDEN_IMAGE_ENABLED", False):
             await controller._do_create(SAMPLE_JOB_CONFIG)
         body = controller.k8s_client.create_namespaced_custom_object.call_args.kwargs[
             "body"
@@ -2737,7 +2840,7 @@ class TestDoCreateGoldenIntegration:
     @pytest.mark.asyncio
     async def test_golden_failure_falls_back_to_registry(self, controller):
         controller._golden_state_nowait = AsyncMock(return_value=(None, None))
-        with patch("vm.controller.controller.VM_GOLDEN_IMAGE_ENABLED", True):
+        with patch("vm_controller.controller.VM_GOLDEN_IMAGE_ENABLED", True):
             await controller._do_create(SAMPLE_JOB_CONFIG)
         body = controller.k8s_client.create_namespaced_custom_object.call_args.kwargs[
             "body"
@@ -2752,7 +2855,7 @@ class TestDoCreateGoldenIntegration:
 # (knowledge-base/knowledge/features/vm_persistent_rootdisk.md D1 + D2's controller half)
 # =============================================================================
 
-from vm.controller.controller import _rootdisk_name  # noqa: E402
+from vm_controller.controller import _rootdisk_name  # noqa: E402
 
 
 def _calls_for(mock, plural: str) -> list:
@@ -2819,7 +2922,7 @@ class TestPersistentRootdiskDisabled:
 
     @pytest.mark.asyncio
     async def test_manifest_keeps_data_volume_templates(self, controller):
-        with patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", False):
+        with patch("vm_controller.controller.VM_PERSISTENT_ROOTDISK", False):
             await controller._do_create(SAMPLE_JOB_CONFIG)
         body = _vm_create_body(controller)
         assert "dataVolumeTemplates" in body["spec"]
@@ -2835,7 +2938,7 @@ class TestPersistentRootdiskEnabled:
     @pytest.mark.asyncio
     async def test_data_volume_templates_popped_volumes_untouched(self, controller):
         controller.k8s_client.get_namespaced_custom_object.side_effect = _dv_phase(None)
-        with patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True):
+        with patch("vm_controller.controller.VM_PERSISTENT_ROOTDISK", True):
             await controller._do_create(SAMPLE_JOB_CONFIG)
 
         body = _vm_create_body(controller)
@@ -2850,7 +2953,7 @@ class TestPersistentRootdiskEnabled:
     @pytest.mark.asyncio
     async def test_standalone_dv_created_with_the_template_spec(self, controller):
         controller.k8s_client.get_namespaced_custom_object.side_effect = _dv_phase(None)
-        with patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True):
+        with patch("vm_controller.controller.VM_PERSISTENT_ROOTDISK", True):
             await controller._do_create(SAMPLE_JOB_CONFIG)
 
         dv = _dv_create_body(controller)
@@ -2876,7 +2979,7 @@ class TestPersistentRootdiskEnabled:
     async def test_thread_rootdisk_carries_thread_owner_identity(self, controller):
         controller.k8s_client.get_namespaced_custom_object.side_effect = _dv_phase(None)
         config = {**SAMPLE_JOB_CONFIG, "job_id": "thread-123", "entity_type": "thread"}
-        with patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True):
+        with patch("vm_controller.controller.VM_PERSISTENT_ROOTDISK", True):
             await controller._do_create(config)
 
         labels = _dv_create_body(controller)["metadata"]["labels"]
@@ -2892,9 +2995,9 @@ class TestPersistentRootdiskEnabled:
         )
         controller.k8s_client.get_namespaced_custom_object.side_effect = _dv_phase(None)
         with (
-            patch("vm.controller.controller.VM_GOLDEN_IMAGE_ENABLED", True),
-            patch("vm.controller.controller.VM_GOLDEN_GC_ENABLED", False),
-            patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True),
+            patch("vm_controller.controller.VM_GOLDEN_IMAGE_ENABLED", True),
+            patch("vm_controller.controller.VM_GOLDEN_GC_ENABLED", False),
+            patch("vm_controller.controller.VM_PERSISTENT_ROOTDISK", True),
         ):
             await controller._do_create(SAMPLE_JOB_CONFIG)
 
@@ -2909,7 +3012,7 @@ class TestPersistentRootdiskEnabled:
         controller.k8s_client.get_namespaced_custom_object.side_effect = _dv_phase(
             "Succeeded"
         )
-        with patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True):
+        with patch("vm_controller.controller.VM_PERSISTENT_ROOTDISK", True):
             await controller._do_create(SAMPLE_JOB_CONFIG)
 
         assert not _calls_for(
@@ -2924,7 +3027,7 @@ class TestPersistentRootdiskEnabled:
         controller.k8s_client.get_namespaced_custom_object.side_effect = _dv_phase(
             "Failed"
         )
-        with patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True):
+        with patch("vm_controller.controller.VM_PERSISTENT_ROOTDISK", True):
             await controller._do_create(SAMPLE_JOB_CONFIG)
 
         deletes = _calls_for(
@@ -2944,7 +3047,7 @@ class TestPersistentRootdiskEnabled:
         controller.k8s_client.get_namespaced_custom_object.side_effect = _dv_phase(
             "CloneScheduled"
         )
-        with patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True):
+        with patch("vm_controller.controller.VM_PERSISTENT_ROOTDISK", True):
             await controller._do_create(SAMPLE_JOB_CONFIG)
 
         assert not _calls_for(
@@ -2965,7 +3068,7 @@ class TestPersistentRootdiskEnabled:
             return MagicMock()
 
         controller.k8s_client.create_namespaced_custom_object.side_effect = _create
-        with patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True):
+        with patch("vm_controller.controller.VM_PERSISTENT_ROOTDISK", True):
             result = await controller._do_create(SAMPLE_JOB_CONFIG)
 
         assert result["status"] == "created"
@@ -2982,7 +3085,7 @@ class TestPersistentRootdiskEnabled:
             return MagicMock()
 
         controller.k8s_client.create_namespaced_custom_object.side_effect = _create
-        with patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True):
+        with patch("vm_controller.controller.VM_PERSISTENT_ROOTDISK", True):
             with pytest.raises(_FakeApiException):
                 await controller._do_create(SAMPLE_JOB_CONFIG)
 
@@ -2995,7 +3098,7 @@ class TestPersistentRootdiskEnabled:
         controller.template_text = SAMPLE_TEMPLATE.replace(
             "  dataVolumeTemplates:", "  x-dataVolumeTemplates:"
         )
-        with patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True):
+        with patch("vm_controller.controller.VM_PERSISTENT_ROOTDISK", True):
             with pytest.raises(RuntimeError, match="no dataVolumeTemplates"):
                 await controller._do_create(SAMPLE_JOB_CONFIG)
 
@@ -3119,7 +3222,7 @@ class TestGcRootdisks:
     @pytest.mark.asyncio
     async def test_old_orphan_is_deleted(self, controller):
         self._wire(controller, [self._dv("agent-vm-j1-rootdisk", 100)], [])
-        with patch("vm.controller.controller.VM_ROOTDISK_ORPHAN_HOURS", 72):
+        with patch("vm_controller.controller.VM_ROOTDISK_ORPHAN_HOURS", 72):
             await controller._gc_rootdisks()
 
         deletes = _calls_for(
@@ -3131,7 +3234,7 @@ class TestGcRootdisks:
     async def test_disk_with_a_live_vm_is_spared(self, controller):
         """A recovery in flight: the disk is old, but its VM is back."""
         self._wire(controller, [self._dv("agent-vm-j1-rootdisk", 100)], ["agent-vm-j1"])
-        with patch("vm.controller.controller.VM_ROOTDISK_ORPHAN_HOURS", 72):
+        with patch("vm_controller.controller.VM_ROOTDISK_ORPHAN_HOURS", 72):
             await controller._gc_rootdisks()
 
         assert not _calls_for(
@@ -3142,7 +3245,7 @@ class TestGcRootdisks:
     async def test_young_orphan_is_spared(self, controller):
         """A kept disk is SUPPOSED to outlive its VM during a recovery."""
         self._wire(controller, [self._dv("agent-vm-j1-rootdisk", 1)], [])
-        with patch("vm.controller.controller.VM_ROOTDISK_ORPHAN_HOURS", 72):
+        with patch("vm_controller.controller.VM_ROOTDISK_ORPHAN_HOURS", 72):
             await controller._gc_rootdisks()
 
         assert not _calls_for(
@@ -3159,7 +3262,7 @@ class TestGcRootdisks:
             raise _FakeApiException(status=500)
 
         controller.k8s_client.list_namespaced_custom_object.side_effect = _list
-        with patch("vm.controller.controller.VM_ROOTDISK_ORPHAN_HOURS", 72):
+        with patch("vm_controller.controller.VM_ROOTDISK_ORPHAN_HOURS", 72):
             await controller._gc_rootdisks()
 
         assert not _calls_for(
@@ -3171,8 +3274,8 @@ class TestGcRootdisks:
         controller._gc_rootdisks_safe = AsyncMock()
         controller.k8s_client.get_namespaced_custom_object.side_effect = _dv_phase(None)
         with (
-            patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True),
-            patch("vm.controller.controller.VM_ROOTDISK_GC_ENABLED", False),
+            patch("vm_controller.controller.VM_PERSISTENT_ROOTDISK", True),
+            patch("vm_controller.controller.VM_ROOTDISK_GC_ENABLED", False),
         ):
             await controller._do_create(SAMPLE_JOB_CONFIG)
 
@@ -3196,9 +3299,9 @@ class TestRootdiskCloneSourceNamespace:
         )
         controller.k8s_client.get_namespaced_custom_object.side_effect = _dv_phase(None)
         with (
-            patch("vm.controller.controller.VM_GOLDEN_IMAGE_ENABLED", True),
-            patch("vm.controller.controller.VM_GOLDEN_GC_ENABLED", False),
-            patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True),
+            patch("vm_controller.controller.VM_GOLDEN_IMAGE_ENABLED", True),
+            patch("vm_controller.controller.VM_GOLDEN_GC_ENABLED", False),
+            patch("vm_controller.controller.VM_PERSISTENT_ROOTDISK", True),
         ):
             await controller._do_create(SAMPLE_JOB_CONFIG)
 
@@ -3218,7 +3321,7 @@ class TestRootdiskCloneSourceNamespace:
             "        source:\n          pvc:\n            name: some-golden\n"
             "            namespace: other-ns",
         )
-        with patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True):
+        with patch("vm_controller.controller.VM_PERSISTENT_ROOTDISK", True):
             await controller._do_create(SAMPLE_JOB_CONFIG)
 
         dv = _dv_create_body(controller)
@@ -3228,7 +3331,7 @@ class TestRootdiskCloneSourceNamespace:
     async def test_registry_source_is_untouched(self, controller):
         """No golden → registry import, which has no namespace concept."""
         controller.k8s_client.get_namespaced_custom_object.side_effect = _dv_phase(None)
-        with patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True):
+        with patch("vm_controller.controller.VM_PERSISTENT_ROOTDISK", True):
             await controller._do_create(SAMPLE_JOB_CONFIG)
 
         dv = _dv_create_body(controller)
@@ -3258,7 +3361,7 @@ class TestLifecycleAuthenticationReplayGuard:
         )
         msg = MagicMock(data=json.dumps(payload).encode())
 
-        with patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET):
+        with patch("vm_controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET):
             await controller.handle_create(msg)
             await controller.handle_create(msg)
 
@@ -3302,7 +3405,7 @@ class TestLifecycleAuthenticationReplayGuard:
             secret=LIFECYCLE_SECRET,
         )
 
-        with patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET):
+        with patch("vm_controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET):
             await controller.handle_create(
                 MagicMock(data=json.dumps(create_payload).encode())
             )
@@ -3351,7 +3454,7 @@ class TestLifecycleAuthenticationReplayGuard:
         )
         message = MagicMock(data=json.dumps(payload).encode())
 
-        with patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET):
+        with patch("vm_controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET):
             await first.handle_create(message)
             await restarted.handle_create(message)
 
@@ -3376,7 +3479,7 @@ class TestLifecycleAuthenticationReplayGuard:
             secret=LIFECYCLE_SECRET,
         )
 
-        with patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET):
+        with patch("vm_controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET):
             await controller.handle_delete(MagicMock(data=json.dumps(payload).encode()))
 
         controller._do_delete.assert_not_awaited()
@@ -3435,8 +3538,8 @@ class TestLifecycleAuthenticationReplayGuard:
         }
 
         with (
-            patch("vm.controller.controller.LIFECYCLE_NONCE_GC_PAGE_LIMIT", 3),
-            patch("vm.controller.controller.LIFECYCLE_NONCE_GC_DELETE_LIMIT", 2),
+            patch("vm_controller.controller.LIFECYCLE_NONCE_GC_PAGE_LIMIT", 3),
+            patch("vm_controller.controller.LIFECYCLE_NONCE_GC_DELETE_LIMIT", 2),
         ):
             assert await controller._gc_expired_lifecycle_nonces(now=now)
 
@@ -3520,8 +3623,8 @@ class TestLifecycleAuthenticationReplayGuard:
         )
 
         with (
-            patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET),
-            patch("vm.controller.controller.LIFECYCLE_NONCE_GC_INTERVAL", 1),
+            patch("vm_controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET),
+            patch("vm_controller.controller.LIFECYCLE_NONCE_GC_INTERVAL", 1),
         ):
             assert not await controller._verify_lifecycle_request(
                 first, "create", mutating=True
@@ -3551,8 +3654,8 @@ class TestLifecycleIdentityGeneration:
         )
 
         with (
-            patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET),
-            patch("vm.controller.controller.VM_ROOTDISK_PVC_UID_ATTEMPTS", 1),
+            patch("vm_controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET),
+            patch("vm_controller.controller.VM_ROOTDISK_PVC_UID_ATTEMPTS", 1),
         ):
             created = await controller._do_create(config)
 
@@ -3624,7 +3727,7 @@ class TestLifecycleIdentityGeneration:
             }
         }
 
-        with patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET):
+        with patch("vm_controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET):
             result = await controller._do_delete(
                 job_id, provision_generation=PROVISION_GENERATION
             )
@@ -3655,7 +3758,7 @@ class TestLifecycleIdentityGeneration:
         }
 
         with (
-            patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET),
+            patch("vm_controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET),
             pytest.raises(RuntimeError, match="another provision generation"),
         ):
             await controller._do_delete(
@@ -3676,7 +3779,7 @@ class TestLifecycleIdentityGeneration:
             _FakeApiException(status=404, body="gone")
         )
 
-        with patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET):
+        with patch("vm_controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET):
             result = await controller._do_delete(
                 "response-lost",
                 provision_generation=PROVISION_GENERATION,
@@ -3713,7 +3816,7 @@ class TestLifecycleIdentityGeneration:
         controller.core_api.read_namespaced_persistent_volume_claim.side_effect = None
 
         with (
-            patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET),
+            patch("vm_controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET),
             pytest.raises(RuntimeError, match="superseded rootdisk PVC UID"),
         ):
             await controller._do_delete(
@@ -3744,7 +3847,7 @@ class TestLifecycleIdentityGeneration:
         )
 
         with (
-            patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET),
+            patch("vm_controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET),
             pytest.raises(_FakeApiException),
         ):
             await controller._do_delete(
@@ -3781,3 +3884,42 @@ class TestLifecycleIdentityGeneration:
         release_create.set()
         await asyncio.gather(create_task, delete_task)
         assert delete_entered.is_set()
+
+
+class TestRenderDiskSize:
+    """Per-job rootdisk size — ``job_config["disk_size"]`` overrides the
+    controller-wide ``VM_DISK_SIZE`` and lands in the DataVolume template."""
+
+    @staticmethod
+    def _dv_storage(result):
+        return result["spec"]["dataVolumeTemplates"][0]["spec"]["storage"]["resources"][
+            "requests"
+        ]["storage"]
+
+    def test_render_disk_size_default_when_absent(self, controller):
+        with patch("vm_controller.controller.VM_DISK_SIZE", "20Gi"):
+            result = controller.render_template({"job_id": "test-id"})
+        assert self._dv_storage(result) == "20Gi"
+
+    def test_render_disk_size_from_job_config(self, controller):
+        with patch("vm_controller.controller.VM_DISK_SIZE", "20Gi"):
+            result = controller.render_template(
+                {"job_id": "test-id", "disk_size": "120Gi"}
+            )
+        assert self._dv_storage(result) == "120Gi"
+
+    def test_render_disk_size_never_below_controller_default(self, controller):
+        """A clone target smaller than the golden source fails in CDI, and the
+        default is the golden floor by construction — so never shrink."""
+        with patch("vm_controller.controller.VM_DISK_SIZE", "20Gi"):
+            result = controller.render_template(
+                {"job_id": "test-id", "disk_size": "5Gi"}
+            )
+        assert self._dv_storage(result) == "20Gi"
+
+    def test_render_disk_size_invalid_falls_back(self, controller):
+        with patch("vm_controller.controller.VM_DISK_SIZE", "20Gi"):
+            result = controller.render_template(
+                {"job_id": "test-id", "disk_size": "lots; rm -rf /"}
+            )
+        assert self._dv_storage(result) == "20Gi"

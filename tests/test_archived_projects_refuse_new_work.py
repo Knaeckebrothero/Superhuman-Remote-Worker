@@ -43,7 +43,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import HTTPException
 
-from security import access as access_module
+from orchestrator.security import access as access_module
 
 
 PROJECT_ID = "68137e29-6b1f-4f1b-a0c1-4e6dc2be3f9a"  # the pre-split archive
@@ -54,12 +54,15 @@ def _patch_caller_and_db(user: dict, db):
     """Stack the patches every endpoint test needs (see test_project_access)."""
     stack = ExitStack()
     stack.enter_context(
-        patch("main.require_approved_user", AsyncMock(return_value=user))
+        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user))
     )
     stack.enter_context(
-        patch("security.access.require_approved_user", AsyncMock(return_value=user))
+        patch(
+            "orchestrator.security.access.require_approved_user",
+            AsyncMock(return_value=user),
+        )
     )
-    stack.enter_context(patch("main.postgres_db", db))
+    stack.enter_context(patch("orchestrator.main.postgres_db", db))
     return stack
 
 
@@ -80,7 +83,7 @@ class TestOfficerCannotBeCommissionedOntoAnArchive:
 
     @pytest.mark.asyncio
     async def test_commission_is_refused(self, user_a, archived, fake_db, fake_request):
-        from main import commission_project_officer
+        from orchestrator.main import commission_project_officer
 
         with _patch_caller_and_db(user_a, fake_db):
             with pytest.raises(HTTPException) as exc:
@@ -100,7 +103,7 @@ class TestOfficerCannotBeCommissionedOntoAnArchive:
         self, user_a, project_a, fake_db, fake_request
     ):
         """The refusal must be about the archive, not about the endpoint."""
-        from main import commission_project_officer
+        from orchestrator.main import commission_project_officer
 
         fake_db.user_can_run_unattended_operations = AsyncMock(return_value=False)
         with _patch_caller_and_db(user_a, fake_db):
@@ -126,7 +129,7 @@ class TestOfficerTickSkipsAnArchivedProject:
 
     @pytest.mark.asyncio
     async def test_tick_skips_and_logs(self, caplog):
-        from services.officer_backlog import tick_officer
+        from orchestrator.services.officer_backlog import tick_officer
 
         db = MagicMock()
         db.get_project = AsyncMock(
@@ -134,7 +137,9 @@ class TestOfficerTickSkipsAnArchivedProject:
         )
         vector_db = MagicMock()
 
-        with caplog.at_level(logging.INFO, logger="services.officer_backlog"):
+        with caplog.at_level(
+            logging.INFO, logger="orchestrator.services.officer_backlog"
+        ):
             counts = await tick_officer(db, vector_db, self._officer_row())
 
         assert counts["dispatched"] == 0
@@ -151,7 +156,7 @@ class TestOfficerTickSkipsAnArchivedProject:
     @pytest.mark.asyncio
     async def test_tick_proceeds_on_a_live_project(self):
         """The skip must be about the archive, not about the tick."""
-        from services.officer_backlog import tick_officer
+        from orchestrator.services.officer_backlog import tick_officer
 
         db = MagicMock()
         db.get_project = AsyncMock(return_value={"id": PROJECT_ID, "status": "active"})
@@ -167,7 +172,7 @@ class TestOfficerTickSkipsAnArchivedProject:
 
     @pytest.mark.asyncio
     async def test_a_null_status_project_is_not_treated_as_archived(self):
-        from services.officer_backlog import tick_officer
+        from orchestrator.services.officer_backlog import tick_officer
 
         db = MagicMock()
         db.get_project = AsyncMock(return_value={"id": PROJECT_ID, "status": None})
@@ -190,7 +195,7 @@ class TestCreateJobRefusesArchivedProjects:
     ):
         """This is the path that matters: MCP and agent delegation live here,
         and they skip ``require_project_member`` entirely."""
-        from main import JobCreate, create_job
+        from orchestrator.main import JobCreate, create_job
 
         fake_request.headers = {
             "X-Internal-Key": "secret",
@@ -202,11 +207,17 @@ class TestCreateJobRefusesArchivedProjects:
 
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
-            patch("main.postgres_db", fake_db),
-            patch("main.require_approved_user", AsyncMock(return_value=user_a)),
-            patch("main._enforce_readiness_gate", AsyncMock(return_value=None)),
+            patch("orchestrator.main.postgres_db", fake_db),
             patch(
-                "main.require_project_member",
+                "orchestrator.main.require_approved_user",
+                AsyncMock(return_value=user_a),
+            ),
+            patch(
+                "orchestrator.main._enforce_readiness_gate",
+                AsyncMock(return_value=None),
+            ),
+            patch(
+                "orchestrator.main.require_project_member",
                 AsyncMock(side_effect=AssertionError("the guard is skipped here")),
             ),
             pytest.raises(HTTPException) as exc,
@@ -221,7 +232,7 @@ class TestCreateJobRefusesArchivedProjects:
     async def test_cockpit_caller_gets_the_same_refusal(
         self, user_a, archived, fake_db, fake_request
     ):
-        from main import JobCreate, create_job
+        from orchestrator.main import JobCreate, create_job
 
         fake_request.headers = {}
         body = JobCreate(
@@ -230,13 +241,19 @@ class TestCreateJobRefusesArchivedProjects:
 
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
-            patch("main.postgres_db", fake_db),
-            patch("main.require_approved_user", AsyncMock(return_value=user_a)),
+            patch("orchestrator.main.postgres_db", fake_db),
             patch(
-                "security.access.require_approved_user",
+                "orchestrator.main.require_approved_user",
                 AsyncMock(return_value=user_a),
             ),
-            patch("main._enforce_readiness_gate", AsyncMock(return_value=None)),
+            patch(
+                "orchestrator.security.access.require_approved_user",
+                AsyncMock(return_value=user_a),
+            ),
+            patch(
+                "orchestrator.main._enforce_readiness_gate",
+                AsyncMock(return_value=None),
+            ),
             pytest.raises(HTTPException) as exc,
         ):
             await create_job(fake_request, body)
@@ -248,7 +265,7 @@ class TestCreateJobRefusesArchivedProjects:
     @pytest.mark.asyncio
     async def test_a_projectless_job_is_unaffected(self, user_a, fake_db, fake_request):
         """No project, no lifecycle question — and no extra DB round-trip."""
-        from main import JobCreate, create_job
+        from orchestrator.main import JobCreate, create_job
 
         fake_request.headers = {}
         user = dict(user_a)
@@ -269,10 +286,15 @@ class TestCreateJobRefusesArchivedProjects:
         body = JobCreate(description="personal job")
 
         with (
-            patch("main.postgres_db", fake_db),
-            patch("main.require_approved_user", AsyncMock(return_value=user)),
-            patch("main._enforce_readiness_gate", AsyncMock(return_value=None)),
-            patch("main._is_experts_db_enabled", lambda: False),
+            patch("orchestrator.main.postgres_db", fake_db),
+            patch(
+                "orchestrator.main.require_approved_user", AsyncMock(return_value=user)
+            ),
+            patch(
+                "orchestrator.main._enforce_readiness_gate",
+                AsyncMock(return_value=None),
+            ),
+            patch("orchestrator.main._is_experts_db_enabled", lambda: False),
         ):
             await create_job(fake_request, body)
 
@@ -302,7 +324,7 @@ def _automation_row(project_id: str | None = PROJECT_ID) -> dict:
 class TestAutomationFireOnAnArchivedProject:
     @pytest.mark.asyncio
     async def test_service_skips_and_logs_rather_than_raising(self, caplog):
-        from services.automations import create_job_from_automation
+        from orchestrator.services.automations import create_job_from_automation
 
         db = MagicMock()
         db.create_job = AsyncMock()
@@ -310,7 +332,7 @@ class TestAutomationFireOnAnArchivedProject:
             return_value={"id": PROJECT_ID, "status": "archived"}
         )
 
-        with caplog.at_level(logging.INFO, logger="services.automations"):
+        with caplog.at_level(logging.INFO, logger="orchestrator.services.automations"):
             job = await create_job_from_automation(db, _automation_row())
 
         assert job is None
@@ -322,7 +344,7 @@ class TestAutomationFireOnAnArchivedProject:
         """The service can't raise (its other caller is a cron tick with
         nobody to answer), but an owner clicking a button that silently does
         nothing is worse than a 409 naming the one lever that fixes it."""
-        from routers.automations import run_now
+        from orchestrator.routers.automations import run_now
 
         db = MagicMock()
         db.get_project = AsyncMock(
@@ -331,18 +353,20 @@ class TestAutomationFireOnAnArchivedProject:
         request = MagicMock()
 
         with (
-            patch("routers.automations.require_approved_user", AsyncMock()),
             patch(
-                "routers.automations._resolve_automation_or_404",
+                "orchestrator.routers.automations.require_approved_user", AsyncMock()
+            ),
+            patch(
+                "orchestrator.routers.automations._resolve_automation_or_404",
                 AsyncMock(return_value=_automation_row()),
             ),
             patch(
-                "routers.automations.create_job_from_automation",
+                "orchestrator.routers.automations.create_job_from_automation",
                 AsyncMock(return_value=None),
             ),
             patch.dict(
                 "sys.modules",
-                {"main": MagicMock(postgres_db=db)},
+                {"orchestrator.main": MagicMock(postgres_db=db)},
             ),
             pytest.raises(HTTPException) as exc,
         ):
@@ -371,7 +395,7 @@ class TestLoopMaterializationOnAnArchivedProject:
 
     @pytest.mark.asyncio
     async def test_create_loop_job_skips_and_logs(self, caplog):
-        from services.project_loops import create_loop_job
+        from orchestrator.services.project_loops import create_loop_job
 
         db = MagicMock()
         db.create_job = AsyncMock()
@@ -379,7 +403,9 @@ class TestLoopMaterializationOnAnArchivedProject:
             return_value={"id": PROJECT_ID, "status": "archived"}
         )
 
-        with caplog.at_level(logging.WARNING, logger="services.project_loops"):
+        with caplog.at_level(
+            logging.WARNING, logger="orchestrator.services.project_loops"
+        ):
             job = await create_loop_job(db, self._loop(), role="scholar", iteration=1)
 
         assert job is None
@@ -439,7 +465,7 @@ class TestParkProjectJobsForArchive:
     async def test_the_freeze_type_is_in_no_auto_redispatch_set(self):
         """Unarchive must not auto-resume: implicitly re-animating automation
         is where the surprises live."""
-        from src.shared.job_freeze_types import (
+        from shared.job_freeze_types import (
             AUTO_CONTINUE_FREEZE_TYPES,
             AUTO_REDISPATCH_FREEZE_TYPES,
             ERROR_IMMUNE_FREEZE_TYPES,
@@ -470,7 +496,7 @@ class TestAgentSubjobFromAThreadOnAnArchivedProject:
     async def test_the_archived_409_is_not_flattened_into_the_generic_403(
         self, user_a, archived, fake_db, fake_request, thread_a
     ):
-        from main import JobCreate, create_job
+        from orchestrator.main import JobCreate, create_job
 
         fake_request.headers = {"X-Internal-Key": "secret"}
         thread_a["user_id"] = user_a["id"]
@@ -483,10 +509,13 @@ class TestAgentSubjobFromAThreadOnAnArchivedProject:
 
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
-            patch("main.postgres_db", fake_db),
-            patch("main._enforce_readiness_gate", AsyncMock(return_value=None)),
+            patch("orchestrator.main.postgres_db", fake_db),
             patch(
-                "main._thread_project_ids",
+                "orchestrator.main._enforce_readiness_gate",
+                AsyncMock(return_value=None),
+            ),
+            patch(
+                "orchestrator.main._thread_project_ids",
                 AsyncMock(return_value=[str(archived["id"])]),
             ),
             pytest.raises(HTTPException) as exc,
@@ -502,15 +531,18 @@ class TestAgentSubjobFromAThreadOnAnArchivedProject:
         self, fake_db, fake_request
     ):
         """The non-disclosure the wrapper exists for must survive intact."""
-        from main import JobCreate, create_job
+        from orchestrator.main import JobCreate, create_job
 
         fake_request.headers = {"X-Internal-Key": "secret"}
         body = JobCreate(description="originless internal attempt")
 
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
-            patch("main.postgres_db", fake_db),
-            patch("main._enforce_readiness_gate", AsyncMock(return_value=None)),
+            patch("orchestrator.main.postgres_db", fake_db),
+            patch(
+                "orchestrator.main._enforce_readiness_gate",
+                AsyncMock(return_value=None),
+            ),
             pytest.raises(HTTPException) as exc,
         ):
             await create_job(fake_request, body)

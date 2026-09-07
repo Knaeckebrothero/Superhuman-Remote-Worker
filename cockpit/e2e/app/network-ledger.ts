@@ -26,7 +26,7 @@ interface FailureEntry {
   pathname: string;
   phase: JourneyPhase;
   failure: string;
-  classification: 'expected-navigation-cancellation' | 'unexpected';
+  classification: 'expected-navigation-cancellation' | 'expected-warmup-reconnect' | 'unexpected';
 }
 
 interface PageErrorEntry {
@@ -52,6 +52,8 @@ const CONNECTION = /^\/api\/sessions\/([^/]+)\/connection$/;
 const CONTROL_WEBSOCKET = /^\/p\/([^/]+)\/ws$/;
 const GLOBAL_SSE = new Set(['/api/notifications/events', '/api/sudo/events']);
 const ABORT_REASON = /(ERR_ABORTED|NS_BINDING_ABORTED|cancelled|canceled|Target .*closed)/i;
+const WARMUP_RECONNECT_WARNING =
+  '[persistent-chat] no SSE data within 5000ms of send — forcing reconnect';
 const WARM_PHASES = new Set<JourneyPhase>(['creating', 'turn', 'reload']);
 const CONTROL_SOCKET_PHASES = new Set<JourneyPhase>([
   'creating',
@@ -103,6 +105,7 @@ export class NetworkLedger {
   private readonly started = new WeakMap<Request, { at: number; phase: JourneyPhase }>();
   private readonly ownedThreadIds = new Set<string>();
   private readonly records: NetworkEntry[] = [];
+  private pendingWarmupStreamReconnects = 0;
 
   constructor(
     page: Page,
@@ -175,29 +178,45 @@ export class NetworkLedger {
     const pathname = safePathname(request.url());
     if (!pathname) return;
     const reason = sanitizedDiagnostic(request.failure()?.errorText ?? 'unknown network failure');
-    const expected = this.isExpectedCancellation(request.method(), pathname, reason);
+    const classification = this.cancellationClassification(request.method(), pathname, reason);
     this.records.push({
       kind: 'requestfailed',
       method: request.method(),
       pathname,
       phase: this.phase,
       failure: reason,
-      classification: expected ? 'expected-navigation-cancellation' : 'unexpected',
+      classification,
     });
   }
 
-  private isExpectedCancellation(method: string, pathname: string, reason: string): boolean {
-    if (method !== 'GET' || !ABORT_REASON.test(reason)) return false;
+  private cancellationClassification(
+    method: string,
+    pathname: string,
+    reason: string,
+  ): FailureEntry['classification'] {
+    if (method !== 'GET' || !ABORT_REASON.test(reason)) return 'unexpected';
 
     const threadMatch = pathname.match(THREAD_STREAM);
     const ownedThreadStream =
       threadMatch !== null && this.ownedThreadIds.has(decodeURIComponent(threadMatch[1]));
 
-    if (this.phase === 'list-navigation') return ownedThreadStream;
-    if (this.phase === 'reload' || this.phase === 'closing') {
-      return ownedThreadStream || GLOBAL_SSE.has(pathname);
+    if (
+      ownedThreadStream &&
+      (this.phase === 'creating' || this.phase === 'turn') &&
+      this.pendingWarmupStreamReconnects > 0
+    ) {
+      this.pendingWarmupStreamReconnects -= 1;
+      return 'expected-warmup-reconnect';
     }
-    return false;
+    if (this.phase === 'list-navigation' && ownedThreadStream) {
+      return 'expected-navigation-cancellation';
+    }
+    if (this.phase === 'reload' || this.phase === 'closing') {
+      if (ownedThreadStream || GLOBAL_SSE.has(pathname)) {
+        return 'expected-navigation-cancellation';
+      }
+    }
+    return 'unexpected';
   }
 
   private onConsole(message: ConsoleMessage): void {
@@ -213,6 +232,13 @@ export class NetworkLedger {
     }
     const diagnosticLocation = messageUrl ?? locationUrl;
     const pathname = diagnosticLocation?.pathname ?? null;
+    if (
+      message.type() === 'warning' &&
+      (this.phase === 'creating' || this.phase === 'turn') &&
+      rawMessage === WARMUP_RECONNECT_WARNING
+    ) {
+      this.pendingWarmupStreamReconnects += 1;
+    }
     this.records.push({
       kind: 'console',
       level: message.type() === 'error' ? 'error' : 'warning',
@@ -230,6 +256,12 @@ export class NetworkLedger {
     pathname: string | null,
     location: URL | null,
   ): boolean {
+    if (
+      (this.phase === 'creating' || this.phase === 'turn') &&
+      message === WARMUP_RECONNECT_WARNING
+    ) {
+      return true;
+    }
     if (!pathname || !location) return false;
     const applicationUrl = new URL(this.applicationOrigin);
     const connectionMatch = pathname.match(CONNECTION);

@@ -167,7 +167,7 @@ TOOL_PROMPT = (
 # OpenAI `tools=[]` envelope. Mirrors how an agent harness might present
 # tools when it doesn't structure the call (or when tool-binding is
 # bypassed).  The format anchor here is intentionally close to what
-# `tactical_gemma.txt` ships, so any drift the model exhibits is
+# the tactical phase skill ships, so any drift the model exhibits is
 # attributable to the same prompt class our agent emits.
 TOOL_IN_PROMPT_SYSTEM = """You are a helpful assistant with one tool available.
 
@@ -223,7 +223,7 @@ WEATHER_TOOL = {
 # Scenario F — production-shape replay of job 3c30d72e mid-job conditions.
 # The system prompt mirrors `config/prompts/systemprompt_gemma.txt` rendered
 # with realistic worker placeholders (scholar role, has_tool("kb_write")
-# branch). Phase directive mirrors `config/prompts/tactical_gemma.txt`. The
+# branch). Phase guidance mirrors `config/skills/tactical-phase/SKILL.md`. The
 # recovery nudge is the verbatim format-neutral output of
 # `format_nudge("todo_action", model="gemma-4-moe", todo_id="todo_1")` (see
 # `config/guardrails/gemma.yaml`) plus the pending-todos suffix wired in
@@ -585,13 +585,14 @@ def _build_prod_tools() -> list[dict[str, Any]]:
         ["branch"],
     )
     t(
-        "delegate_work",
-        "Spawn subagents to handle parallel tasks.",
+        "delegate_agent",
+        "Delegate one bounded brief to a roster subagent; returns its report.",
         {
-            "tasks": {"type": "array", "items": {"type": "object"}},
-            "context": _arg_str(),
+            "description": _arg_str(),
+            "prompt": _arg_str(),
+            "subagent_type": _arg_str(),
         },
-        ["tasks"],
+        ["description", "prompt", "subagent_type"],
     )
     t(
         "todo_complete",

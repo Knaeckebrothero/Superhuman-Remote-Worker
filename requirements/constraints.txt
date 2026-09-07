@@ -1,0 +1,6 @@
+# Shared compatibility decisions, consumed by role declarations and the combined
+# Python 3.12 CI environment. This is not a combined runtime lock.
+# 36.0.1 fixed config loading; 36.0.2 restored legacy auth lookup compatibility.
+# 36.0.3 is checked by scripts/check_kubernetes_sdk_auth.py in both image roles.
+# https://raw.githubusercontent.com/kubernetes-client/python/v36.0.3/CHANGELOG.md
+kubernetes==36.0.3

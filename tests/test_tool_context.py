@@ -6,12 +6,13 @@ and async job status updates.
 """
 
 from dataclasses import dataclass
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.core.loader import InstructionFileEntry
-from src.tools.context import ToolContext
+from shared.runtime.core.loader import InstructionFileEntry
+from shared.runtime_actor import RuntimeActorContext
+from agent.tools.context import ToolContext
 
 
 # =============================================================================
@@ -80,6 +81,22 @@ class TestToolContextConstruction:
         """None workspace_manager is fine (tools that don't need workspace)."""
         ctx = ToolContext(workspace_manager=None)
         assert ctx.workspace_manager is None
+
+    def test_worker_user_id_is_derived_from_trusted_runtime_actor(self):
+        """Worker application calls inherit the durable job owner's identity."""
+        actor = RuntimeActorContext(caller_kind="worker", user_id="user-123")
+
+        ctx = ToolContext(runtime_actor=actor)
+
+        assert ctx.user_id == "user-123"
+
+    def test_explicit_user_id_is_not_replaced_by_actor_without_user(self):
+        """A system worker actor must not erase an explicitly bound session user."""
+        actor = RuntimeActorContext(caller_kind="worker")
+
+        ctx = ToolContext(runtime_actor=actor, user_id="session-user")
+
+        assert ctx.user_id == "session-user"
 
     def test_accepts_all_optional_fields(self):
         """All optional fields should accept values."""
@@ -681,17 +698,16 @@ class TestPhaseAndMultimodal:
         assert ctx._current_phase == "strategic"
 
     def test_get_phase_multimodal_with_llm_config(self):
-        """With llm_config and phase, should use phase-specific config."""
+        """With llm_config and a phase set, reads the single model's flag (U1:
+        one model runs every phase, so no per-phase resolution happens)."""
         llm_config = MagicMock()
-        phase_cfg = MagicMock()
-        phase_cfg.multimodal = True
-        llm_config.get_phase_config.return_value = phase_cfg
+        llm_config.multimodal = True
 
         ctx = ToolContext()
         ctx._llm_config = llm_config
         ctx.set_current_phase("tactical")
         assert ctx.get_phase_multimodal() is True
-        llm_config.get_phase_config.assert_called_once_with("tactical")
+        llm_config.get_phase_config.assert_not_called()
 
     def test_get_phase_multimodal_fallback_config(self):
         """Without llm_config, should fall back to config['multimodal']."""
@@ -708,6 +724,62 @@ class TestPhaseAndMultimodal:
         ctx = ToolContext(config={"multimodal": True})
         ctx._llm_config = MagicMock()  # has llm_config but _current_phase is None
         assert ctx.get_phase_multimodal() is True
+
+
+# =============================================================================
+# Web source registration
+# =============================================================================
+
+
+class TestWebSourceRegistration:
+    """Provider content must archive without making the URL a request origin."""
+
+    @pytest.mark.asyncio
+    async def test_tool_context_passes_provider_content_to_citation_engine(self):
+        source = MagicMock(id=7, metadata={"content_source": "provider"})
+        engine = MagicMock()
+        engine.add_web_source = AsyncMock(return_value=source)
+        ctx = ToolContext(citation_engine=engine)
+
+        result = await ctx.get_or_register_web_source(
+            "https://result.example/page",
+            name="Result",
+            content="Provider-returned snippet",
+        )
+
+        assert result == (7, None)
+        engine.add_web_source.assert_awaited_once_with(
+            "https://result.example/page",
+            name="Result",
+            content="Provider-returned snippet",
+        )
+
+    @pytest.mark.asyncio
+    async def test_citation_engine_does_not_fetch_when_content_is_supplied(self):
+        from agent.citation_engine import CitationEngine
+
+        source = MagicMock()
+        engine = CitationEngine(db=MagicMock())
+        engine._fetch_web_content = MagicMock(
+            side_effect=AssertionError("provider URL must not be fetched in-process")
+        )
+        engine._register_source = AsyncMock(return_value=source)
+
+        result = await engine.add_web_source(
+            "https://result.example/page",
+            name="Result",
+            content="Provider-returned snippet",
+        )
+
+        assert result is source
+        engine._fetch_web_content.assert_not_called()
+        assert engine._register_source.await_args.kwargs["content"] == (
+            "Provider-returned snippet"
+        )
+        assert (
+            engine._register_source.await_args.kwargs["metadata"]["content_source"]
+            == "provider"
+        )
 
 
 # =============================================================================
@@ -825,3 +897,58 @@ class TestCitationEngine:
         assert ctx.citation_engine is None
         assert ctx._source_registry == {}
         engine.close.assert_not_called()
+
+
+# =============================================================================
+# Built-in subagents (U3 WP2): the fields the runtime and the host read
+# =============================================================================
+
+
+class TestSubagentFields:
+    """The parent-side stashes ``delegate_agent`` / ``src.subagents`` read
+    lazily: all optional, all None until agent.py / the graph set them."""
+
+    FIELDS = (
+        "subagent_runtime",
+        "_parent_host",
+        "_subagent_parent_kind",
+        "_session_parent_authority_provider",
+        "_session_parent_authority",
+        "parent_context_probe",
+        "auxiliary_llm",
+        "provider_admission",
+        "_fork_source",
+        "_parent_audit_metadata",
+    )
+
+    def test_defaults_are_none(self):
+        ctx = ToolContext()
+        for name in self.FIELDS:
+            assert getattr(ctx, name) is None, name
+
+    def test_fields_are_plain_assignable_stashes(self):
+        ctx = ToolContext()
+        runtime = object()
+        messages = [object()]
+        ctx.subagent_runtime = runtime
+        ctx.parent_context_probe = lambda: "probe"
+        ctx.provider_admission = lambda: False
+        ctx._fork_source = messages
+        ctx._parent_audit_metadata = {"job_id": "j"}
+        assert ctx.subagent_runtime is runtime
+        assert ctx.parent_context_probe() == "probe"
+        assert ctx.provider_admission() is False
+        assert ctx._fork_source is messages
+        assert ctx._parent_audit_metadata == {"job_id": "j"}
+
+    def test_a_shallow_copy_shares_the_stashes_until_the_child_build_resets_them(
+        self,
+    ):
+        import copy
+
+        ctx = ToolContext()
+        ctx.subagent_runtime = object()
+        ctx._fork_source = [1]
+        child = copy.copy(ctx)
+        assert child.subagent_runtime is ctx.subagent_runtime
+        assert child._fork_source is ctx._fork_source

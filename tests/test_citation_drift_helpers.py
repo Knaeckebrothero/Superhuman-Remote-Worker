@@ -12,7 +12,7 @@ license/credential gates); skip cleanly if that env isn't available.
 
 import pytest
 
-main = pytest.importorskip("main")
+main = pytest.importorskip("orchestrator.main")
 
 
 # ---------------------------------------------------------------------------

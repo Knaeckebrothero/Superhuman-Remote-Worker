@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.utils.git_url import repo_name_from_url
+from agent.utils.git_url import repo_name_from_url
 
 
 @pytest.mark.parametrize(

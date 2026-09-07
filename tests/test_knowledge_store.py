@@ -20,7 +20,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.services.knowledge_store import KnowledgeRecord, KnowledgeStore
+from shared.runtime.services.knowledge_store import KnowledgeRecord, KnowledgeStore
 
 
 # =============================================================================
@@ -1075,6 +1075,253 @@ class TestGetNoteBySlug:
         store, mock_db, _ = _make_store()
         mock_db.fetchrow.return_value = None
         assert await store.get_note_by_slug(uuid.uuid4(), "nope") is None
+
+    @pytest.mark.asyncio
+    async def test_exposes_the_blob_sha_as_the_cas_token(self):
+        # kb_gardening G3: kb_update/kb_delete send this back as
+        # expected_blob_sha so a concurrent rewrite fails loudly.
+        store, mock_db, _ = _make_store()
+        mock_db.fetchrow.return_value = {
+            "note_id": "n1",
+            "title": "N1",
+            "note_type": "state",
+            "status": "active",
+            "content": "body",
+            "blob_sha": "a" * 40,
+        }
+        out = await store.get_note_by_slug(uuid.uuid4(), "n1")
+        assert out["blob_sha"] == "a" * 40
+        assert "blob_sha" in mock_db.fetchrow.call_args[0][0]
+
+
+# =============================================================================
+# get_inbound_links() — the retirement guard's evidence (kb_gardening G5)
+# =============================================================================
+
+
+class TestGardeningHealth:
+    @pytest.mark.asyncio
+    async def test_counters_are_scoped_and_typed(self):
+        from datetime import timedelta
+
+        store, mock_db, _ = _make_store()
+        mock_db.fetchrow.return_value = {
+            "active": 120,
+            "retired": 40,
+            "retired_past_grace": 12,
+            "nursery_active": 80,
+            "nursery_orphans": 30,
+            "oldest_retired_days": 41.7,
+        }
+        kb = uuid.uuid4()
+        out = await store.get_gardening_health(kb, grace=timedelta(days=7))
+        sql, *params = mock_db.fetchrow.call_args[0]
+        flat = " ".join(sql.split())
+        assert "WHERE kb_id = $1 AND path IS NOT NULL" in flat
+        assert "status IN ('archived', 'superseded')" in flat
+        assert "note_type IN ('learning', 'retrospective', 'state')" in flat
+        assert params == [kb, timedelta(days=7)]
+        assert out == {
+            "active": 120,
+            "retired": 40,
+            "retired_past_grace": 12,
+            "nursery_active": 80,
+            "nursery_orphans": 30,
+            "oldest_retired_days": 41.7,
+            "grace_days": 7,
+        }
+
+    @pytest.mark.asyncio
+    async def test_empty_kb_is_all_zero(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetchrow.return_value = None
+        out = await store.get_gardening_health(uuid.uuid4())
+        assert out["active"] == 0 and out["retired"] == 0
+        assert out["oldest_retired_days"] is None
+        assert out["grace_days"] == 14
+
+
+class TestListUnreachableNursery:
+    """kb_gardening G7 R4 — GC mark-and-sweep as one recursive query."""
+
+    @pytest.mark.asyncio
+    async def test_query_marks_from_active_roots_through_active_links(self):
+        from datetime import timedelta
+
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = [
+            {"note_id": "orphan-retro", "note_type": "retrospective"}
+        ]
+        kb = uuid.uuid4()
+        out = await store.list_unreachable_nursery(
+            kb,
+            root_types=["decision", "goal"],
+            nursery_types=["learning", "retrospective", "state"],
+            protected_tags=["pinned", "ready"],
+            min_age=timedelta(days=7),
+            limit=25,
+        )
+        sql, *params = mock_db.fetch.call_args[0]
+        flat = " ".join(sql.split())
+        assert "WITH RECURSIVE roots AS" in flat
+        assert "note_type = ANY($2::text[])" in flat  # roots
+        assert "JOIN reach r ON r.note_id = kl.source_id" in flat
+        assert "src.status = 'active'" in flat  # marking follows active sources only
+        assert "ki.note_type = ANY($3::text[])" in flat  # nursery
+        assert "&& $4::text[]" in flat  # protected tags
+        assert "ki.ready_at IS NULL" in flat
+        assert "< now() - $5::interval" in flat
+        assert "NOT EXISTS (SELECT 1 FROM reach r WHERE r.note_id = ki.note_id)" in flat
+        assert "LIMIT $6" in flat
+        assert params == [
+            kb,
+            ["decision", "goal"],
+            ["learning", "retrospective", "state"],
+            ["pinned", "ready"],
+            timedelta(days=7),
+            25,
+        ]
+        assert out[0]["note_id"] == "orphan-retro"
+
+
+class TestSetNoteStatus:
+    @pytest.mark.asyncio
+    async def test_flips_status_and_stamps_invalidated_at(self):
+        store, mock_db, _ = _make_store()
+        mock_db.execute.return_value = "UPDATE 1"
+        kb = uuid.uuid4()
+        assert (
+            await store.set_note_status(kb, "n1", "archived", invalidated=True) is True
+        )
+        sql, *params = mock_db.execute.call_args[0]
+        flat = " ".join(sql.split())
+        assert "SET status = $3" in flat
+        assert (
+            "invalidated_at = CASE WHEN $4 THEN now() ELSE invalidated_at END" in flat
+        )
+        assert "AND status <> $3" in flat
+        assert params == [kb, "n1", "archived", True]
+
+    @pytest.mark.asyncio
+    async def test_no_change_reports_false(self):
+        store, mock_db, _ = _make_store()
+        mock_db.execute.return_value = "UPDATE 0"
+        assert await store.set_note_status(uuid.uuid4(), "n1", "archived") is False
+
+
+class TestListPurgeCandidates:
+    """kb_gardening G2: the three-signal purge rule lives in one query."""
+
+    @pytest.mark.asyncio
+    async def test_query_encodes_the_three_signals_and_the_cap(self):
+        from datetime import timedelta
+
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = [
+            {
+                "note_id": "old",
+                "path": "knowledge/old.md",
+                "blob_sha": "a" * 40,
+                "status": "archived",
+                "note_type": "learning",
+                "retired_at": None,
+            }
+        ]
+        kb = uuid.uuid4()
+        out = await store.list_purge_candidates(
+            kb, grace=timedelta(days=14), limit=7, excluded_types=["charter", "issue"]
+        )
+        sql, *params = mock_db.fetch.call_args[0]
+        flat = " ".join(sql.split())
+        assert "ki.status IN ('archived', 'superseded')" in flat
+        assert "ki.path IS NOT NULL" in flat
+        assert "NOT (ki.note_type = ANY($2::text[]))" in flat
+        assert (
+            "COALESCE(ki.invalidated_at, ki.modified_at, ki.indexed_at) < now() - $3::interval"
+            in flat
+        )
+        assert "NOT EXISTS" in flat and "src.status = 'active'" in flat
+        assert "LIMIT $4" in flat
+        assert params == [kb, ["charter", "issue"], timedelta(days=14), 7]
+        assert out[0]["note_id"] == "old"
+
+
+class TestTryConvergeLock:
+    @pytest.mark.asyncio
+    async def test_claims_a_distinct_key_and_releases_it(self):
+        store, mock_db, _ = _make_store()
+        conn = AsyncMock()
+        conn.fetchval = AsyncMock(side_effect=[True, True])
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=conn)
+        cm.__aexit__ = AsyncMock(return_value=False)
+        mock_db.acquire = MagicMock(return_value=cm)
+        kb = uuid.uuid4()
+        async with store.try_converge_lock(kb) as claimed:
+            assert claimed is True
+        calls = [c.args for c in conn.fetchval.await_args_list]
+        assert calls[0][0] == "SELECT pg_try_advisory_lock($1)"
+        assert calls[1][0] == "SELECT pg_advisory_unlock($1)"
+        key = calls[0][1]
+        assert key == calls[1][1]
+        # never the reindex key: holding that for a minutes-long LLM pass
+        # would defer every inline index in the project
+        assert key != store._reindex_lock_key(kb)
+
+    @pytest.mark.asyncio
+    async def test_lost_claim_does_not_unlock(self):
+        store, mock_db, _ = _make_store()
+        conn = AsyncMock()
+        conn.fetchval = AsyncMock(return_value=False)
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=conn)
+        cm.__aexit__ = AsyncMock(return_value=False)
+        mock_db.acquire = MagicMock(return_value=cm)
+        async with store.try_converge_lock(uuid.uuid4()) as claimed:
+            assert claimed is False
+        assert conn.fetchval.await_count == 1
+
+
+class TestGetInboundLinks:
+    @pytest.mark.asyncio
+    async def test_filters_active_sources_of_the_given_types(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = [
+            {
+                "id": "chose-jwt",
+                "title": "Chose JWT",
+                "type": "decision",
+                "status": "active",
+            }
+        ]
+        kb = uuid.uuid4()
+        out = await store.get_inbound_links(
+            kb, "old-state", active_only=True, note_types=["decision", "goal"]
+        )
+        sql, *params = mock_db.fetch.call_args[0]
+        assert "kl.target_id = $2" in sql
+        assert "ki.note_id = kl.source_id" in sql
+        assert "ki.status = 'active'" in sql
+        assert "ki.note_type = ANY($3::text[])" in sql
+        assert params == [kb, "old-state", ["decision", "goal"]]
+        assert out == [
+            {
+                "id": "chose-jwt",
+                "title": "Chose JWT",
+                "type": "decision",
+                "status": "active",
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_unfiltered_variant_has_no_status_or_type_clause(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = []
+        await store.get_inbound_links(uuid.uuid4(), "n", active_only=False)
+        sql, *params = mock_db.fetch.call_args[0]
+        assert "ki.status = 'active'" not in sql
+        assert "ANY(" not in sql
+        assert len(params) == 2
 
 
 # =============================================================================

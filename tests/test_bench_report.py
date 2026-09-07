@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from services.bench import (
+from orchestrator.services.bench import (
     analyze_job_metrics,
     build_aggregates,
     compute_bench_report,

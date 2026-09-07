@@ -22,16 +22,16 @@ from uuid import uuid4
 
 import pytest
 
-import src.api.persistent_app as pa
-import src.api.turn_executor as te
-from src.api.lease_context import (
+import agent.api.persistent_app as pa
+import agent.api.turn_executor as te
+from agent.api.lease_context import (
     LeaseHandle,
     LeaseLostError,
     current_lease,
     get_current_lease,
 )
-from src.api.orchestrator_client import ClaimBundleError
-from src.shared.run_queue import ClaimedUnit
+from agent.api.orchestrator_client import ClaimBundleError
+from shared.run_queue import ClaimedUnit
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +68,10 @@ class FakeDB:
     def __init__(self, pending_rows: Optional[List[Dict[str, Any]]] = None):
         self.pending_rows = list(pending_rows or [])
         self.fetch_calls: List[tuple] = []
+        self.refreshed_consumed_seq: Optional[int] = None
+        # Transcript leg of skip-if-answered: the seq the transcript proves
+        # answered, or None (the ordinary claim path).
+        self.transcript_answered_seq: Optional[int] = None
 
     async def fetch(self, sql: str, *args):
         self.fetch_calls.append((sql, args))
@@ -76,6 +80,20 @@ class FakeDB:
             {**row, "turn_number": row.get("turn_number", next_turn)}
             for row in self.pending_rows
         ]
+
+    async def fetchval(self, sql: str, *args):
+        self.fetch_calls.append((sql, args))
+        if sql == te._EXACT_CONSUMED_SEQ_AFTER_ATTACH_SQL:
+            return (
+                self.refreshed_consumed_seq
+                if self.refreshed_consumed_seq is not None
+                else int(args[3])
+            )
+        if sql == te._PENDING_EVENT_EXISTS_SQL:
+            return any(row.get("delivery_id") for row in self.pending_rows)
+        if sql == te._ANSWERED_BY_TRANSCRIPT_SQL:
+            return self.transcript_answered_seq
+        return None
 
 
 class FakeSession:
@@ -91,6 +109,7 @@ class FakeSession:
         self.shell_owner_tokens: List[int] = []
         self.stateless_warm_reuse_safe = stateless_warm_reuse_safe
         self.turn_count = 0
+        self.tool_context = SimpleNamespace(_stateless_subagent_recovery_active=False)
 
     def set_shell_owner_token(self, token: int) -> None:
         self.shell_owner_tokens.append(token)
@@ -377,6 +396,10 @@ class Harness:
                 "project_ids": [],
                 "datasources": None,
                 "config_name": "session_base",
+                # Production claim bundles always carry this explicit pair.
+                # Keep the executor fake honest even for no-workspace tests.
+                "workspace_generation": None,
+                "workspace_runtime_incarnation": None,
             },
         )
 
@@ -565,6 +588,96 @@ class TestHappyPath:
         ]
 
     @pytest.mark.asyncio
+    async def test_event_input_keeps_role_and_stable_delivery_identity(self, harness):
+        unit = uuid4()
+        row_id = str(uuid4())
+        delivery_id = str(uuid4())
+        harness.db.pending_rows = [
+            {
+                "id": row_id,
+                "seq": 5,
+                "content": "[wake] inspect the job",
+                "turn_number": 1,
+                "role": "event",
+                "delivery_id": delivery_id,
+            }
+        ]
+        claim_delivery = AsyncMock(
+            return_value={
+                "message_id": row_id,
+                "seq": 5,
+                "claim_generation": 9,
+            }
+        )
+        harness.db.claim_stateless_input_delivery = claim_delivery
+
+        await harness.executor._serve_claim(
+            # A pre-0185 wake can sit below the old human-only watermark. The
+            # ledger identity, not seq>consumed alone, keeps it executable.
+            make_claim(unit_id=unit, token=7, input_seq=5, consumed_seq=5)
+        )
+        await _finish(harness)
+
+        claim_delivery.assert_awaited_once_with(
+            thread_id=str(unit),
+            delivery_id=delivery_id,
+            lease_token=7,
+            executor_id="test-pod",
+            pod_uid=harness.executor._pod_uid,
+        )
+        assert harness.consumed == [
+            {
+                "content": "[wake] inspect the job",
+                "id": row_id,
+                "role": "event",
+                "delivery_id": delivery_id,
+                "claim_generation": 9,
+            }
+        ]
+        assert harness.calls["complete"] == [
+            {"unit_id": unit, "lease_token": 7, "consumed_seq": 5}
+        ]
+
+    @pytest.mark.asyncio
+    async def test_subagent_recovery_reuses_abandoned_turn_and_watermark(self, harness):
+        unit = uuid4()
+        row_id = str(uuid4())
+        delivery_id = str(uuid4())
+        harness.db.pending_rows = [
+            {
+                "id": row_id,
+                "seq": 9,
+                "content": "[subagent recovery] use durable evidence",
+                "turn_number": 3,
+                "role": "event",
+                "delivery_id": delivery_id,
+                "supersedes_input_seq": 5,
+            }
+        ]
+        harness.restored_turn_count = 4
+        harness.db.claim_stateless_input_delivery = AsyncMock(
+            return_value={
+                "message_id": row_id,
+                "seq": 9,
+                "claim_generation": 4,
+            }
+        )
+
+        await harness.executor._serve_claim(
+            make_claim(unit_id=unit, token=12, input_seq=9, consumed_seq=5)
+        )
+        await _finish(harness)
+
+        assert harness.sessions[0].turn_count == 3
+        assert (
+            harness.sessions[0].tool_context._stateless_subagent_recovery_active
+            is False
+        )
+        assert harness.calls["complete"] == [
+            {"unit_id": unit, "lease_token": 12, "consumed_seq": 5}
+        ]
+
+    @pytest.mark.asyncio
     async def test_recovered_interrupted_input_is_never_injected(self, harness):
         unit = uuid4()
         stopped_id = str(uuid4())
@@ -591,6 +704,38 @@ class TestHappyPath:
         assert all(item["id"] != stopped_id for item in harness.consumed)
         assert harness.calls["complete"] == [
             {"unit_id": unit, "lease_token": 10, "consumed_seq": 9}
+        ]
+
+    @pytest.mark.asyncio
+    async def test_attach_recovery_refreshes_consumed_watermark_before_selection(
+        self, harness
+    ):
+        unit = uuid4()
+        later_id = str(uuid4())
+        # Foreground recovery during fresh attach proves input 5 already has a
+        # final response and advances the DB watermark without an event.
+        harness.db.refreshed_consumed_seq = 5
+        fetch_pending = AsyncMock(
+            return_value=[
+                {
+                    "id": later_id,
+                    "seq": 9,
+                    "content": "later input",
+                    "turn_number": 2,
+                }
+            ]
+        )
+
+        with patch.object(harness.executor, "_fetch_pending_rows", fetch_pending):
+            await harness.executor._serve_claim(
+                make_claim(unit_id=unit, token=11, input_seq=9, consumed_seq=4)
+            )
+        await _finish(harness)
+
+        fetch_pending.assert_awaited_once_with(str(unit), 5)
+        assert harness.consumed == [{"content": "later input", "id": later_id}]
+        assert harness.calls["complete"] == [
+            {"unit_id": unit, "lease_token": 11, "consumed_seq": 9}
         ]
 
     @pytest.mark.asyncio
@@ -709,6 +854,61 @@ class TestSkipIfAnswered:
         assert not harness.consumed
         # There is no attached session to keep warm on this no-LLM path.
         assert harness.executor._prefer_unit_id is None
+
+    @pytest.mark.asyncio
+    async def test_transcript_final_answer_completes_without_reanswering(self, harness):
+        """consumed_seq < input_seq, but the transcript already holds the
+        final answer for the pending input (a predecessor died in its
+        turn-complete hook — the compaction crash): advance the watermark to
+        that input and complete. No bundle, no attach, no LLM."""
+        unit = uuid4()
+        harness.db.transcript_answered_seq = 72204
+        claim = make_claim(unit_id=unit, token=4, input_seq=72204, consumed_seq=72200)
+
+        await harness.executor._serve_claim(claim)
+        await _finish(harness)
+
+        assert harness.calls["complete"] == [
+            {"unit_id": unit, "lease_token": 4, "consumed_seq": 72204}
+        ]
+        assert not harness.calls["bundle"]
+        assert not harness.calls["attach"]
+        assert not harness.consumed
+
+    @pytest.mark.asyncio
+    async def test_transcript_unanswered_keeps_the_ordinary_claim_path(self, harness):
+        unit = uuid4()
+        harness.db.transcript_answered_seq = None
+        claim = make_claim(unit_id=unit, token=4, input_seq=72204, consumed_seq=72200)
+
+        await harness.executor._serve_claim(claim)
+        await _finish(harness)
+
+        assert harness.calls["bundle"]
+        assert harness.calls["attach"]
+
+    @pytest.mark.asyncio
+    async def test_transcript_answer_with_pending_event_keeps_the_claim(self, harness):
+        """A pending event delivery must still run: the transcript leg never
+        completes a unit that has one waiting."""
+        unit = uuid4()
+        harness.db.transcript_answered_seq = 72204
+        harness.db.pending_rows = [
+            {
+                "id": "evt-1",
+                "seq": 72205,
+                "content": "notice",
+                "role": "event",
+                "delivery_id": "d-1",
+            }
+        ]
+        claim = make_claim(unit_id=unit, token=4, input_seq=72205, consumed_seq=72200)
+
+        await harness.executor._serve_claim(claim)
+        await _finish(harness)
+
+        assert harness.calls["bundle"]
+        assert harness.calls["attach"]
 
     @pytest.mark.asyncio
     async def test_pending_control_bypasses_skip_and_claims_without_human_input(
@@ -1937,20 +2137,27 @@ class TestStripRestoredPending:
         assert removed == 0
         assert len(msgs) == 2
 
-    def test_stops_at_unmatched_trailing_human(self):
+    def test_pending_event_excluded_from_restore_does_not_block_human_strip(self):
         from langchain_core.messages import HumanMessage
 
-        # An unanswered role='event' row restores as a HumanMessage but is
-        # never in pending_rows (orchestrator enqueues role='human' only) —
-        # it stays, and pending humans BELOW it also stay (documented).
-        msgs = [
-            HumanMessage(content="pending-1", id="p1"),
-            HumanMessage(content="[wake] job finished", id="ev"),
+        # Unadmitted ledger rows are excluded from passive restore. The event
+        # still appears in the executor's merged pending query after the human;
+        # it must not become an unmatched tail sentinel that leaves the human
+        # duplicated in memory when the executor injects it.
+        msgs = [HumanMessage(content="pending-1", id="p1")]
+        pending = [
+            {"id": "row-1", "seq": 10, "content": "pending-1", "role": "human"},
+            {
+                "id": "event-row",
+                "seq": 11,
+                "content": "[wake] job finished",
+                "role": "event",
+                "delivery_id": "delivery",
+            },
         ]
-        pending = [{"id": "row-1", "seq": 10, "content": "pending-1"}]
         removed = te.strip_restored_pending_humans(msgs, pending)
-        assert removed == 0
-        assert len(msgs) == 2
+        assert removed == 1
+        assert msgs == []
 
     def test_empty_inputs_are_noops(self):
         assert te.strip_restored_pending_humans([], [{"id": "a"}]) == 0
@@ -1968,7 +2175,7 @@ class TestStripRestoredPending:
 
 class TestScrubOnClaim:
     def test_tenant_a_then_no_env_keys_leaves_no_residue(self, monkeypatch):
-        from src.services import embedding_service as emb
+        from shared.runtime.services import embedding_service as emb
 
         # Tenant A attach: env keys land, singleton would be rebuilt lazily.
         pa._apply_session_embedding_env(
@@ -1998,7 +2205,7 @@ class TestScrubOnClaim:
         # Cleanup safety: nothing to restore — the helper popped everything.
 
     def test_partial_override_replaces_not_merges(self, monkeypatch):
-        from src.services import embedding_service as emb
+        from shared.runtime.services import embedding_service as emb
 
         pa._apply_session_embedding_env(
             {"EMBEDDING_MODEL": "a-model", "EMBEDDING_API_KEY": "sk-a"}
@@ -2011,7 +2218,7 @@ class TestScrubOnClaim:
         pa._apply_session_embedding_env(None)  # cleanup
 
     def test_executor_scrub_clears_dual_inboxes(self, harness):
-        import src.api.dual_app as dual_app
+        import agent.api.dual_app as dual_app
 
         dual_app._guidance_inbox["job-1"] = [{"id": "g1"}]
         dual_app._reply_inbox["job-1"] = [{"id": "r1"}]
@@ -2033,7 +2240,7 @@ class TestAffinity:
     def test_persistent_session_reuse_capability_follows_backend(
         self, supports_shell, expected
     ):
-        from src.api.persistent_session import PersistentSession
+        from agent.api.persistent_session import PersistentSession
 
         session = object.__new__(PersistentSession)
         session.workspace_manager = SimpleNamespace(
@@ -2111,6 +2318,43 @@ class TestAffinity:
         }
         assert te.attach_fingerprint(first) == te.attach_fingerprint(second)
 
+    def test_fingerprint_ignores_rotating_runtime_actor_credentials_only(self):
+        first = {
+            "thread_id": "t1",
+            "runtime_actor": {
+                "caller_kind": "human",
+                "user_id": "u1",
+                "project_id": "p1",
+                "project_role": "member",
+                "thread_id": "t1",
+                "officer_incarnation": None,
+                "access_credential": "access-a",
+                "refresh_credential": "refresh-a",
+                "access_expires_at": "2026-09-02T18:00:00Z",
+                "refresh_expires_at": "2026-09-03T18:00:00Z",
+            },
+        }
+        rotated = {
+            "thread_id": "t1",
+            "runtime_actor": {
+                **first["runtime_actor"],
+                "access_credential": "access-b",
+                "refresh_credential": "refresh-b",
+                "access_expires_at": "2026-09-02T18:05:00Z",
+                "refresh_expires_at": "2026-09-03T18:05:00Z",
+            },
+        }
+        changed_identity = {
+            "thread_id": "t1",
+            "runtime_actor": {
+                **rotated["runtime_actor"],
+                "project_role": "admin",
+            },
+        }
+
+        assert te.attach_fingerprint(first) == te.attach_fingerprint(rotated)
+        assert te.attach_fingerprint(first) != te.attach_fingerprint(changed_identity)
+
     @pytest.mark.asyncio
     async def test_lite_same_thread_same_fingerprint_skips_reattach(self, harness):
         unit = uuid4()
@@ -2138,6 +2382,49 @@ class TestAffinity:
             1,
             2,
         ]
+
+    @pytest.mark.asyncio
+    async def test_warm_attach_consumes_event_once_under_new_lease(self, harness):
+        unit = uuid4()
+        harness.db.pending_rows = [
+            {"id": str(uuid4()), "seq": 1, "content": "human", "turn_number": 1}
+        ]
+        await harness.executor._serve_claim(
+            make_claim(unit_id=unit, token=1, input_seq=1)
+        )
+
+        row_id = str(uuid4())
+        delivery_id = str(uuid4())
+        harness.db.pending_rows = [
+            {
+                "id": row_id,
+                "seq": 2,
+                "content": "event",
+                "turn_number": 2,
+                "role": "event",
+                "delivery_id": delivery_id,
+            }
+        ]
+        claim_delivery = AsyncMock(
+            return_value={
+                "message_id": row_id,
+                "seq": 2,
+                "claim_generation": 4,
+            }
+        )
+        harness.db.claim_stateless_input_delivery = claim_delivery
+        await harness.executor._serve_claim(
+            make_claim(unit_id=unit, token=2, input_seq=2, consumed_seq=1)
+        )
+        await _finish(harness)
+
+        assert len(harness.calls["attach"]) == 1
+        assert [item.get("role", "human") for item in harness.consumed] == [
+            "human",
+            "event",
+        ]
+        claim_delivery.assert_awaited_once()
+        assert harness.calls["complete"][-1]["consumed_seq"] == 2
 
     @pytest.mark.asyncio
     async def test_warm_reuse_refuses_divergent_durable_turn_identity(self, harness):
@@ -2345,7 +2632,7 @@ class _FenceConn:
 
 
 def _db_with_conn(conn):
-    from src.database.postgres_db import PostgresDB
+    from agent.database.postgres_db import PostgresDB
 
     db = PostgresDB(connection_string="postgresql://t:t@localhost:1/t")
 
@@ -2358,6 +2645,45 @@ def _db_with_conn(conn):
 
 
 class TestFencedPersistence:
+    @pytest.mark.asyncio
+    async def test_provider_delivery_callback_uses_exact_stateless_owner(
+        self, monkeypatch
+    ):
+        transition = AsyncMock(return_value=True)
+        db = SimpleNamespace(transition_stateless_input_delivery=transition)
+        thread_id = str(uuid4())
+        monkeypatch.setattr(pa, "_session", SimpleNamespace(postgres_conn=db))
+        monkeypatch.setattr(pa, "_thread_id", thread_id)
+        handle = LeaseHandle()
+        handle.update(
+            thread_id,
+            17,
+            executor_id="executor-a",
+            pod_uid="pod-a",
+        )
+        token = current_lease.set(handle)
+        try:
+            assert await pa._transition_claimed_input(
+                "0d8a40c3-8f0f-4f2b-acab-8a07660ecf5d",
+                3,
+                "admitted",
+                turn_number=8,
+            )
+        finally:
+            current_lease.reset(token)
+
+        transition.assert_awaited_once_with(
+            thread_id=thread_id,
+            delivery_id="0d8a40c3-8f0f-4f2b-acab-8a07660ecf5d",
+            lease_token=17,
+            executor_id="executor-a",
+            pod_uid="pod-a",
+            claim_generation=3,
+            transition="admitted",
+            turn_number=8,
+            reason=None,
+        )
+
     @pytest.mark.asyncio
     async def test_fence_rejection_raises_and_marks_lost(self):
         conn = _FenceConn(fence_row=None)

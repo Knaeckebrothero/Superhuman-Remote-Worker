@@ -11,23 +11,6 @@ import {
   shouldResetCanvasImageZoom,
 } from './canvas-rendering';
 
-const CANVAS_DOCUMENT_BLOB_TYPE = 'text/html;charset=utf-8';
-
-function createCanvasDocumentUrl(html: string): string | null {
-  if (
-    typeof Blob === 'undefined' ||
-    typeof URL === 'undefined' ||
-    typeof URL.createObjectURL !== 'function'
-  ) {
-    return null;
-  }
-  return URL.createObjectURL(new Blob([html], {type: CANVAS_DOCUMENT_BLOB_TYPE}));
-}
-
-function revokeCanvasDocumentUrl(url: string): void {
-  if (typeof URL.revokeObjectURL === 'function') URL.revokeObjectURL(url);
-}
-
 @Component({
   selector: 'app-canvas-markdown-renderer',
   standalone: true,
@@ -176,32 +159,18 @@ export class CanvasHtmlRendererComponent {
   readonly content = input('');
   readonly title = input('');
   private readonly sanitizer = inject(DomSanitizer);
-  readonly rendered = computed(() => renderCanvasStaticHtml(this.content()));
-  readonly srcdoc = signal<SafeHtml | null>(null);
-
-  constructor() {
-    effect(onCleanup => {
-      const rendered = this.rendered();
-      const title = this.title();
-      if (rendered.errorCode) {
-        this.srcdoc.set(null);
-        return;
-      }
-      const contentUrl = createCanvasDocumentUrl(rendered.html);
-      if (!contentUrl) {
-        this.srcdoc.set(null);
-        return;
-      }
-      const wrapper = buildCanvasFrameWrapper(contentUrl, title, false);
-      if (!wrapper) {
-        revokeCanvasDocumentUrl(contentUrl);
-        this.srcdoc.set(null);
-        return;
-      }
-      this.srcdoc.set(this.sanitizer.bypassSecurityTrustHtml(wrapper));
-      onCleanup(() => revokeCanvasDocumentUrl(contentUrl));
-    });
-  }
+  readonly rendered = computed(() => {
+    const content = renderCanvasStaticHtml(this.content());
+    return content.errorCode
+      ? content
+      : buildCanvasFrameWrapper(content.html, this.title(), false);
+  });
+  readonly srcdoc = computed<SafeHtml | null>(() => {
+    const rendered = this.rendered();
+    return rendered.errorCode
+      ? null
+      : this.sanitizer.bypassSecurityTrustHtml(rendered.html);
+  });
 }
 
 @Component({
@@ -229,30 +198,16 @@ export class CanvasInteractiveHtmlRendererComponent {
   readonly content = input('');
   readonly title = input('');
   private readonly sanitizer = inject(DomSanitizer);
-  readonly rendered = computed(() => renderCanvasInteractiveHtml(this.content()));
-  readonly srcdoc = signal<SafeHtml | null>(null);
-
-  constructor() {
-    effect(onCleanup => {
-      const rendered = this.rendered();
-      const title = this.title();
-      if (rendered.errorCode) {
-        this.srcdoc.set(null);
-        return;
-      }
-      const contentUrl = createCanvasDocumentUrl(rendered.html);
-      if (!contentUrl) {
-        this.srcdoc.set(null);
-        return;
-      }
-      const wrapper = buildCanvasFrameWrapper(contentUrl, title, true);
-      if (!wrapper) {
-        revokeCanvasDocumentUrl(contentUrl);
-        this.srcdoc.set(null);
-        return;
-      }
-      this.srcdoc.set(this.sanitizer.bypassSecurityTrustHtml(wrapper));
-      onCleanup(() => revokeCanvasDocumentUrl(contentUrl));
-    });
-  }
+  readonly rendered = computed(() => {
+    const content = renderCanvasInteractiveHtml(this.content());
+    return content.errorCode
+      ? content
+      : buildCanvasFrameWrapper(content.html, this.title(), true);
+  });
+  readonly srcdoc = computed<SafeHtml | null>(() => {
+    const rendered = this.rendered();
+    return rendered.errorCode
+      ? null
+      : this.sanitizer.bypassSecurityTrustHtml(rendered.html);
+  });
 }

@@ -26,11 +26,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from services.completion_effect_reconciliation import (
+from orchestrator.services.completion_effect_reconciliation import (
     completion_pr_body,
     completion_pr_title,
 )
-from services.project_loops import (
+from orchestrator.services.project_loops import (
     TerminalMergeReconciliationError,
     merge_loop_job_branch,
     merge_loop_job_contribution,

@@ -21,8 +21,8 @@ import pytest
 
 from tests._tool_invoke import invoke_tool
 
-from src.core.workspace_backend import WorkspaceUnavailableError
-from src.tools.core.job import _final_phase_data, create_job_tools
+from shared.runtime.core.workspace_backend import WorkspaceUnavailableError
+from agent.tools.core.job import _final_phase_data, create_job_tools
 
 
 @pytest.fixture(autouse=True)
@@ -41,6 +41,9 @@ def _tools(workspace, job_id="job-under-test"):
     context.has_workspace.return_value = True
     context.workspace_manager = workspace
     context.has_todo.return_value = False
+    # These tests isolate workspace failure propagation.  Do not let
+    # MagicMock fabricate a truthy background-child completion blocker.
+    context.subagent_runtime = None
     return create_job_tools(context)
 
 

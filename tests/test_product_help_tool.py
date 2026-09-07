@@ -2,16 +2,16 @@
 
 from types import SimpleNamespace
 
-from src.core.skill_resolution import (
+from shared.runtime.core.skill_resolution import (
     APP_GUIDE_BREAK_GLASS_ENV,
     APP_GUIDE_LOADER_TOOL,
     APP_GUIDE_SKILL,
     add_persistent_system_skills,
     skill_bundle_digest,
 )
-from src.tools.context import ToolContext
-from src.tools.product_help import create_product_help_tools
-from src.tools.registry import filter_tools_by_backend, load_tools
+from agent.tools.context import ToolContext
+from agent.tools.product_help import create_product_help_tools
+from agent.tools.registry import filter_tools_by_backend, load_tools
 
 
 def _context(files: dict[str, str] | None = None) -> ToolContext:

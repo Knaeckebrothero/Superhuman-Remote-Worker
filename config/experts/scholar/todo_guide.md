@@ -19,7 +19,7 @@ Each tactical phase ends with a strategic review where you assess coverage:
 - Are you going deep on one thing instead of scanning broadly?
 
 A phase should represent one coherent exploration sweep — "scan web for caching patterns,"
-"audit error handling in src/tools/," "run latency benchmark" — not an entire research program.
+"audit error handling in src/agent/tools/," "run latency benchmark" — not an entire research program.
 
 ---
 
@@ -32,7 +32,7 @@ Every todo must be specific enough that you know *exactly* when it's done.
 | Vague (fails) | Specific (works) |
 |---|---|
 | "Research caching" | "Web search for 'Redis vs in-memory caching Python LangGraph', summarize top 5 approaches to notes/caching_research.md" |
-| "Look at the codebase" | "Read src/tools/research/ and search_files for 'retry' to find error handling patterns. Write idea if gaps found." |
+| "Look at the codebase" | "Read src/agent/tools/research/ and search_files for 'retry' to find error handling patterns. Write idea if gaps found." |
 | "Check performance" | "Run shell benchmark: time python -c 'from src.core.loader import load_config; load_config(\"defaults\")' — record result in output/experiments/003_config_load/" |
 | "Explore logging" | "Query job audit trail via curl to orchestrator API for jobs with status=failed, look for common error patterns" |
 | "Write up findings" | "Write output/ideas/007_retry_backoff.md with Problem, Proposal, Evidence, Effort from retry pattern analysis" |
@@ -54,9 +54,9 @@ Every todo must be specific enough that you know *exactly* when it's done.
 Before finalizing each todo, ask: "What artifact does this produce?"
 - "Research error handling" → No artifact named. Too vague.
 {% if has_tool("kb_write") -%}
-- "Search for error handling patterns in src/tools/, write idea to output/ideas/005_error_patterns.md if gaps found, or record dead end via the kb_write tool (type=learning, tag=dead-end)" → Clear artifact. Specific.
+- "Search for error handling patterns in src/agent/tools/, write idea to output/ideas/005_error_patterns.md if gaps found, or record dead end via the kb_write tool (type=learning, tag=dead-end)" → Clear artifact. Specific.
 {% else -%}
-- "Search for error handling patterns in src/tools/, write idea to output/ideas/005_error_patterns.md if gaps found, or record dead end to notes/dead_ends.md" → Clear artifact. Specific.
+- "Search for error handling patterns in src/agent/tools/, write idea to output/ideas/005_error_patterns.md if gaps found, or record dead end to notes/dead_ends.md" → Clear artifact. Specific.
 {% endif -%}
 
 ---
@@ -84,9 +84,9 @@ Example todos:
 Purpose: Dig through the repository for patterns, gaps, and improvement opportunities.
 
 Example todos:
-- "Map directory structure of src/tools/ — read each __init__.py to understand tool categories"
+- "Map directory structure of src/agent/tools/ — read each __init__.py to understand tool categories"
 - "Search for 'except Exception' across src/ — catalog overly broad exception handling"
-- "Read src/core/context.py and src/core/workspace_injection.py — look for optimization opportunities"
+- "Read src/agent/core/context.py and src/shared/runtime/core/workspace_injection.py — look for optimization opportunities"
 - "Run `git log -n 30` via run_command to identify most frequently changed files — check for code churn patterns"
 - "Run shell: ruff check src/ 2>&1 | head -50 — catalog lint issues by category"
 - "Write idea artifacts for each finding with specific file:line references"
@@ -117,22 +117,22 @@ Example todos:
 - "Document results with actual numbers — include commands.sh for reproducibility"
 - "Write idea artifact if experiment supports the hypothesis, or note dead end if not"
 
-{% if has_tool("spawn_subagent") -%}
-### 5. Fan-Out Research Phase (subagents)
+{% if has_tool("delegate_agent") -%}
+### 5. Fan-Out Research Phase (`reader` children)
 
-Purpose: Fan independent research threads out to subagents; keep your own context for synthesis.
+Purpose: Fan independent research threads out to `reader` children; keep your own context for synthesis.
 
 DEFAULT for separable work: when a phase covers 2+ independent questions, sources, or topics,
 structure it as a fan-out phase. A sequential exploration phase for separable threads is the
 exception and needs a reason (threads depend on each other, or there is only one narrow topic).
 
 Structure: 1-2 fan-out todos followed by 2-3 synthesis todos that process the returned results.
-A fan-out todo means calling `spawn_subagent` several times in a SINGLE turn — one call per
-thread; the calls run in parallel. Subagents return result STRINGS directly to you — they do
-not write files. You author every artifact and knowledge note yourself.
+A fan-out todo means calling `delegate_agent` several times in a SINGLE turn — one `reader`
+per question; the calls run in parallel. Readers return compact evidence-backed answers and
+do not write files. You author every artifact and knowledge note yourself.
 
 Example fan-out todo:
-- "Fan out 3 subagents in ONE turn: (1) web research on Redis caching patterns in Python agent systems, (2) web research on in-memory caching with LRU/TTL strategies, (3) codebase search for existing caching in src/. Each task self-contained, each returns 3-5 findings with cited sources"
+- "Fan out 3 `reader` children in ONE turn: (1) web research on Redis caching patterns in Python agent systems, (2) web research on in-memory caching with LRU/TTL strategies, (3) codebase search for existing caching in src/. Each brief is self-contained and returns 3-5 findings with citations"
 
 Example synthesis todos (executed after the results return):
 - "Cross-compare the three subagent result sets — identify overlapping recommendations and contradictions"
@@ -143,7 +143,7 @@ Example synthesis todos (executed after the results return):
 Rules for fan-out todos:
 - Each spawned task needs: specific question, where to look (sources + exploration mode), expected return format
 - Tasks must be independent — no task should need another task's results
-- 2-5 subagents per fan-out turn (never 1 — just do it yourself)
+- 2-5 `reader` children per fan-out turn (never 1 — just do it yourself)
 - Write the fan-out todo FIRST in the phase, synthesis todos AFTER
 
 When NOT to use a fan-out phase:
@@ -152,7 +152,7 @@ When NOT to use a fan-out phase:
 - You need to experiment iteratively (fan-out is for parallel reading/research, not sequential experimentation)
 {% endif -%}
 
-### {% if has_tool("spawn_subagent") %}6{% else %}5{% endif %}. Synthesis Phase
+### {% if has_tool("delegate_agent") %}6{% else %}5{% endif %}. Synthesis Phase
 
 Purpose: Review accumulated findings and generate remaining idea artifacts.
 
@@ -190,7 +190,7 @@ Every factual claim in an idea artifact must cite a source:
 | Codebase Archaeology | 5-7 | Examining repository for patterns and gaps |
 | Log & Data Analysis | 4-6 | Mining execution data for operational insights |
 | Experiment | 3-5 | Validating a hypothesis with a benchmark or PoC |
-{% if has_tool("spawn_subagent") -%}
+{% if has_tool("delegate_agent") -%}
 | Fan-Out Research | 1-2 fan-out + 2-3 synthesis | 2+ independent topics/sources — the DEFAULT for separable research |
 {% endif -%}
 | Synthesis | 4-6 | Reviewing findings, writing remaining ideas |

@@ -9,7 +9,6 @@ import type {
 import {
     ALL_TOOL_CATEGORIES,
     JOB_TOOL_CATEGORIES,
-    pinResolvedValue,
     readConfigPath,
     SESSION_TOOL_CATEGORIES,
     SettingsMode,
@@ -25,7 +24,6 @@ import {
     toolsFragment,
     type ResolvedToolRow,
 } from './resolved-toolset';
-import {PinOnInteractDirective} from './pin-on-interact.directive';
 
 /** True when every selectable category key is enabled (none in the disabled set). */
 export function allToolCategoriesSelected(
@@ -50,6 +48,19 @@ export function disabledToolCategoriesFromConfig(
   return disabled;
 }
 
+/** The only live delegation knobs after the U3 runtime replacement. */
+export function delegationOverride(
+  enabled: boolean,
+  baselineEnabled: boolean,
+  maxConcurrent: number | null,
+): Record<string, unknown> | null {
+  if (enabled === baselineEnabled && maxConcurrent === null) return null;
+  const result: Record<string, unknown> = {};
+  if (enabled !== baselineEnabled) result['enabled'] = enabled;
+  if (maxConcurrent !== null) result['max_concurrent'] = maxConcurrent;
+  return result;
+}
+
 /**
  * Tool category controls — three states, not two.
  *
@@ -68,7 +79,7 @@ export function disabledToolCategoriesFromConfig(
 @Component({
   selector: 'app-tools-group',
   standalone: true,
-  imports: [FormsModule, TranslocoPipe, AppIconComponent, PinOnInteractDirective],
+  imports: [FormsModule, TranslocoPipe, AppIconComponent],
   template: `
     <div class="settings-group">
       <div class="group-header">
@@ -166,29 +177,14 @@ export function disabledToolCategoriesFromConfig(
           }
           @if (row.key === 'delegation' && rowState(row) === 'on') {
             <div class="inline-params">
-              <div class="inline-field" [class.modified]="delegationMaxDepth() !== null">
-                <label class="inline-label">{{ 'agentSettings.tools.maxDepth' | transloco }}</label>
-                <select class="inline-input"
-                  [ngModel]="delegationMaxDepth() ?? resolvedDelegationMaxDepth()"
-              appPinOnInteract (pin)="pinValue(delegationMaxDepth, resolvedDelegationMaxDepth())"
-                  (ngModelChange)="onDelegationMaxDepthChange($event)"
+              <div class="inline-field" [class.modified]="delegationMaxConcurrent() !== null">
+                <label class="inline-label">{{ 'agentSettings.tools.maxConcurrent' | transloco }}</label>
+                <input type="number" class="inline-input number-input" min="1" step="1"
+                  [ngModel]="delegationMaxConcurrent() ?? resolvedDelegationMaxConcurrent()"
+                  (ngModelChange)="onDelegationMaxConcurrentChange($event)"
                   [disabled]="disabled()">
-                  <option [ngValue]="1">1</option>
-                  <option [ngValue]="2">2</option>
-                  <option [ngValue]="3">3</option>
-                </select>
-                @if (delegationMaxDepth() !== null) {
-                  <button type="button" class="reset-btn" (click)="delegationMaxDepth.set(null); change.emit()">close</button>
-                }
-              </div>
-              <div class="inline-field" [class.modified]="delegationTimeout() !== null">
-                <label class="inline-label">{{ 'agentSettings.tools.timeout' | transloco }}</label>
-                <input type="number" class="inline-input number-input" min="60" step="60"
-                  [ngModel]="delegationTimeout() ?? resolvedDelegationTimeout()"
-                  (ngModelChange)="onDelegationTimeoutChange($event)"
-                  [disabled]="disabled()">
-                @if (delegationTimeout() !== null) {
-                  <button type="button" class="reset-btn" (click)="delegationTimeout.set(null); change.emit()">close</button>
+                @if (delegationMaxConcurrent() !== null) {
+                  <button type="button" class="reset-btn" (click)="delegationMaxConcurrent.set(null); change.emit()">close</button>
                 }
               </div>
             </div>
@@ -506,8 +502,7 @@ export class ToolsGroupComponent {
   private readonly anchoredBaseline = signal<Set<string> | null>(null);
 
   /** Delegation inline params. */
-  readonly delegationMaxDepth = signal<number | null>(null);
-  readonly delegationTimeout = signal<number | null>(null);
+  readonly delegationMaxConcurrent = signal<number | null>(null);
 
   /** The categories from the server's answer, or null when there is none. */
   private readonly serverCategories = computed<Record<string, SessionToolCategory> | null>(
@@ -769,8 +764,7 @@ export class ToolsGroupComponent {
     // a pending addition is invisible to the line above and would otherwise
     // not be counted as the edit it is.
     count += this.requestedAdditions().size;
-    if (this.delegationMaxDepth() !== null) count++;
-    if (this.delegationTimeout() !== null) count++;
+    if (this.delegationMaxConcurrent() !== null) count++;
     return count;
   });
 
@@ -786,16 +780,9 @@ export class ToolsGroupComponent {
   // --- Resolved defaults ---
   private r(path: string): unknown { return readConfigPath(this.config(), path); }
 
-  readonly resolvedDelegationMaxDepth = computed(() => (this.r('delegation.max_depth') ?? 1) as number);
-  readonly resolvedDelegationTimeout = computed(() => (this.r('delegation.default_timeout') ?? 7200) as number);
-
-  /** Commit a displayed-but-inherited value on deliberate interaction.
-   *  See PinOnInteractDirective — a <select> emits no change event when the
-   *  option already showing is re-picked, so without this the resolved default
-   *  is the one value the form cannot express. */
-  pinValue<T>(target: {(): T | null; set(value: T | null): void}, resolved: T): void {
-    if (pinResolvedValue(target, resolved)) this.change.emit();
-  }
+  readonly resolvedDelegationMaxConcurrent = computed(
+    () => (this.r('delegation.max_concurrent') ?? 4) as number,
+  );
 
   isCategoryEnabled(key: string): boolean {
     return !this.disabledCategories().has(key);
@@ -838,14 +825,15 @@ export class ToolsGroupComponent {
     else next.delete(key);
     this.userDisabled.set(next);
     if (key === 'delegation') {
-      this.delegationMaxDepth.set(null);
-      this.delegationTimeout.set(null);
+      this.delegationMaxConcurrent.set(null);
     }
     this.change.emit();
   }
 
-  onDelegationMaxDepthChange(v: number): void { this.delegationMaxDepth.set(v); this.change.emit(); }
-  onDelegationTimeoutChange(v: number): void { this.delegationTimeout.set(v); this.change.emit(); }
+  onDelegationMaxConcurrentChange(v: number): void {
+    this.delegationMaxConcurrent.set(v);
+    this.change.emit();
+  }
 
   /**
    * Build the tools + delegation config_override fragment.
@@ -885,15 +873,12 @@ export class ToolsGroupComponent {
     // and include inline param overrides
     const delegationEnabled = this.isCategoryEnabled('delegation');
     const wasEnabledByExpert = !this.expertDisabledCategories().has('delegation');
-    const hasParamOverrides = this.delegationMaxDepth() !== null || this.delegationTimeout() !== null;
-
-    if (delegationEnabled !== wasEnabledByExpert || hasParamOverrides) {
-      const d: Record<string, unknown> = {};
-      if (delegationEnabled !== wasEnabledByExpert) d['enabled'] = delegationEnabled;
-      if (this.delegationMaxDepth() !== null) d['max_depth'] = this.delegationMaxDepth();
-      if (this.delegationTimeout() !== null) d['default_timeout'] = this.delegationTimeout();
-      result['delegation'] = d;
-    }
+    const delegation = delegationOverride(
+      delegationEnabled,
+      wasEnabledByExpert,
+      this.delegationMaxConcurrent(),
+    );
+    if (delegation) result['delegation'] = delegation;
 
     return result;
   }
@@ -929,8 +914,7 @@ export class ToolsGroupComponent {
     this.anchoredBaseline.set(new Set(disabled));
 
     // Reset delegation inline params on expert change
-    this.delegationMaxDepth.set(null);
-    this.delegationTimeout.set(null);
+    this.delegationMaxConcurrent.set(null);
     // A re-anchor is a new baseline, so a request made against the old one is
     // no longer meaningful. Hosts guard this with `hasToolEdits()`.
     this.requestedAdditions.set(new Set());
@@ -938,8 +922,7 @@ export class ToolsGroupComponent {
 
   resetAll(): void {
     this.userDisabled.set(new Set(this.expertDisabledCategories()));
-    this.delegationMaxDepth.set(null);
-    this.delegationTimeout.set(null);
+    this.delegationMaxConcurrent.set(null);
     this.requestedAdditions.set(new Set());
   }
 }

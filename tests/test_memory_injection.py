@@ -7,12 +7,12 @@ via is_workspace_injection_message().
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from src.core.memory_injection import (
+from agent.core.memory_injection import (
     MEMORY_TOOL_CALL_ID_PREFIX,
     create_memory_injection_messages,
     is_memory_injection_message,
 )
-from src.core.workspace_injection import is_workspace_injection_message
+from shared.runtime.core.workspace_injection import is_workspace_injection_message
 
 
 class TestCreateMemoryInjectionMessages:
@@ -90,7 +90,9 @@ class TestSummarizationExclusion:
         assert is_workspace_injection_message(ai_msg) is True
 
     def test_workspace_injection_still_catches_instruction_messages(self):
-        from src.core.workspace_injection import create_instruction_tool_messages
+        from shared.runtime.core.workspace_injection import (
+            create_instruction_tool_messages,
+        )
 
         ai_msg, tool_msg = create_instruction_tool_messages("guide.md", "content")
         assert is_workspace_injection_message(ai_msg) is True

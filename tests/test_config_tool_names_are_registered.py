@@ -20,15 +20,17 @@ from pathlib import Path
 
 import pytest
 
-from src.core.loader import load_and_merge_config, resolve_config_path
-from src.tools.registry import TOOL_REGISTRY
+from shared.runtime.core.loader import load_and_merge_config, resolve_config_path
+from agent.tools.registry import TOOL_REGISTRY
 
 # Wildcards are expanded at load time against the live registry, not looked up.
 _WILDCARDS = {"*"}
 
 _CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
 
-_BASE_CONFIGS = ["session_base", "worker_base"]
+# The chain roots by their public names: the shared root and the three role
+# overlays (each checked MERGED, i.e. expert_base + overlay).
+_BASE_CONFIGS = ["expert_base", "session_base", "subagent_base", "worker_base"]
 
 
 def _expert_config_names() -> list[str]:
@@ -36,6 +38,15 @@ def _expert_config_names() -> list[str]:
     return sorted(
         p.parent.name
         for p in _CONFIG_DIR.glob("experts/*/config.yaml")
+        if p.parent.name != "__pycache__"
+    )
+
+
+def _library_config_names() -> list[str]:
+    """Every subagent-library entry (``config/subagents/<name>``), discovered."""
+    return sorted(
+        f"subagents/{p.parent.name}"
+        for p in _CONFIG_DIR.glob("subagents/*/config.yaml")
         if p.parent.name != "__pycache__"
     )
 
@@ -52,7 +63,9 @@ def _config_tool_names(config_name: str) -> list[tuple[str, str]]:
     ]
 
 
-@pytest.mark.parametrize("config_name", _BASE_CONFIGS + _expert_config_names())
+@pytest.mark.parametrize(
+    "config_name", _BASE_CONFIGS + _expert_config_names() + _library_config_names()
+)
 def test_config_tool_names_all_exist_in_registry(config_name):
     unknown = [
         f"tools.{category}: {name}"

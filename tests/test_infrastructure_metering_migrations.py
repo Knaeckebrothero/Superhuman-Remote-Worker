@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -51,84 +52,89 @@ from orchestrator.services.infrastructure_metering.sealer import (
     InfrastructureUsageDaySealer,
 )
 from orchestrator.services.usage_ledger import StrictUsagePublishResult
+from shared.persistent_input_delivery import message_row_id, persist_input_delivery
 
 
 ROOT = Path(__file__).parents[1]
 APP_MIGRATION = (
     ROOT
-    / "orchestrator/database/migrations/app/0086_infrastructure_metering_foundations.sql"
+    / "src/orchestrator/database/migrations/app/0086_infrastructure_metering_foundations.sql"
 )
 APP_INGESTION_MIGRATION = (
     ROOT
-    / "orchestrator/database/migrations/app/0087_inventory_ingestion_foundations.sql"
+    / "src/orchestrator/database/migrations/app/0087_inventory_ingestion_foundations.sql"
 )
 APP_INGESTION_SIZE_FIX = (
     ROOT
-    / "orchestrator/database/migrations/app/0088_inventory_ingestion_logical_size.sql"
+    / "src/orchestrator/database/migrations/app/0088_inventory_ingestion_logical_size.sql"
 )
 APP_PLAN_PERIOD_INDEX = (
     ROOT
-    / "orchestrator/database/migrations/app/0089_infrastructure_plan_period_idx.notx.sql"
+    / "src/orchestrator/database/migrations/app/0089_infrastructure_plan_period_idx.notx.sql"
 )
 APP_INTERVAL_OVERLAP_INDEX = (
     ROOT
-    / "orchestrator/database/migrations/app/0090_infrastructure_interval_overlap_idx.notx.sql"
+    / "src/orchestrator/database/migrations/app/0090_infrastructure_interval_overlap_idx.notx.sql"
 )
 APP_COMPLETE_SNAPSHOT_RECEIVED_INDEX = (
     ROOT
-    / "orchestrator/database/migrations/app/0091_inventory_complete_received_idx.notx.sql"
+    / "src/orchestrator/database/migrations/app/0091_inventory_complete_received_idx.notx.sql"
 )
 APP_INVALID_WATCH_RECEIVED_INDEX = (
     ROOT
-    / "orchestrator/database/migrations/app/0092_inventory_invalid_watch_received_idx.notx.sql"
+    / "src/orchestrator/database/migrations/app/0092_inventory_invalid_watch_received_idx.notx.sql"
 )
 APP_DAY_SEQUENCE_BACKFILL_PREP = (
     ROOT
-    / "orchestrator/database/migrations/app/0092z_infrastructure_day_sequence_backfill_prep.sql"
+    / "src/orchestrator/database/migrations/app/0092z_infrastructure_day_sequence_backfill_prep.sql"
 )
 APP_TERMINAL_EVIDENCE_MIGRATION = (
     ROOT
-    / "orchestrator/database/migrations/app/0100_infrastructure_terminal_evidence_single_boundary.sql"
+    / "src/orchestrator/database/migrations/app/0100_infrastructure_terminal_evidence_single_boundary.sql"
 )
 APP_REFERENCED_RATE_GUARD_MIGRATION = (
     ROOT
-    / "orchestrator/database/migrations/app/0101_usage_rates_v2_referenced_range_guard.sql"
+    / "src/orchestrator/database/migrations/app/0101_usage_rates_v2_referenced_range_guard.sql"
 )
 APP_STORAGE_FOUNDATION_MIGRATION = (
-    ROOT / "orchestrator/database/migrations/app/0102_storage_asset_foundations.sql"
+    ROOT / "src/orchestrator/database/migrations/app/0102_storage_asset_foundations.sql"
 )
 APP_COMPUTE_FOUNDATION_MIGRATION = (
-    ROOT / "orchestrator/database/migrations/app/0103_compute_metering_foundations.sql"
+    ROOT
+    / "src/orchestrator/database/migrations/app/0103_compute_metering_foundations.sql"
 )
 APP_AGENT_METERING_LOCK_ORDER_MIGRATION = (
-    ROOT / "orchestrator/database/migrations/app/0104_agent_metering_lock_order.sql"
+    ROOT / "src/orchestrator/database/migrations/app/0104_agent_metering_lock_order.sql"
 )
 APP_STORAGE_SOURCE_ACTIVATION_MIGRATION = (
-    ROOT / "orchestrator/database/migrations/app/0105_storage_source_activation.sql"
+    ROOT / "src/orchestrator/database/migrations/app/0105_storage_source_activation.sql"
 )
 APP_COMPUTE_SCOPE_EPOCH_GUARD_MIGRATION = (
-    ROOT / "orchestrator/database/migrations/app/0106_compute_scope_epoch_guard.sql"
+    ROOT / "src/orchestrator/database/migrations/app/0106_compute_scope_epoch_guard.sql"
 )
 APP_COMPUTE_SCOPE_AUTHORIZATION_MIGRATION = (
-    ROOT / "orchestrator/database/migrations/app/0107_compute_scope_authorization.sql"
+    ROOT
+    / "src/orchestrator/database/migrations/app/0107_compute_scope_authorization.sql"
 )
 APP_COMPUTE_EXACT_EPOCH_AUTHORITY_MIGRATION = (
-    ROOT / "orchestrator/database/migrations/app/0108_compute_exact_epoch_authority.sql"
+    ROOT
+    / "src/orchestrator/database/migrations/app/0108_compute_exact_epoch_authority.sql"
 )
 APP_COMPUTE_EXACT_EPOCH_LIFECYCLE_MIGRATION = (
-    ROOT / "orchestrator/database/migrations/app/0109_compute_exact_epoch_lifecycle.sql"
+    ROOT
+    / "src/orchestrator/database/migrations/app/0109_compute_exact_epoch_lifecycle.sql"
 )
 APP_COMPUTE_EPOCH_ROLLOVER_MIGRATION = (
     ROOT
-    / "orchestrator/database/migrations/app/0112_compute_epoch_rollover_authority.sql"
+    / "src/orchestrator/database/migrations/app/0112_compute_epoch_rollover_authority.sql"
 )
 APP_COMPUTE_AUTHORITY_CONFIRMATION_GAP_MIGRATION = (
     ROOT
-    / "orchestrator/database/migrations/app/0113_compute_authority_confirmation_gap.sql"
+    / "src/orchestrator/database/migrations/app/0113_compute_authority_confirmation_gap.sql"
 )
 APP_COMPUTE_INTERVAL_EPOCH_SHAPE_REPAIR_MIGRATION = (
     ROOT
-    / "orchestrator/database/migrations/app/0114_compute_interval_epoch_shape_repair.sql"
+    / "src/orchestrator/database/migrations/app/0114_compute_interval_epoch_shape_repair.sql"
 )
 # Bump this whenever a new app migration lands — the assertion below is the
 # tripwire that says "a migration was added; check the snapshot was regenerated
@@ -142,135 +148,248 @@ APP_COMPUTE_INTERVAL_EPOCH_SHAPE_REPAIR_MIGRATION = (
 # completion command substrate (0140; 0134-0139 are reserved), and the routed
 # completion-sweep substrate (0141).
 APP_DATASOURCE_TOMBSTONES_MIGRATION = (
-    ROOT / "orchestrator/database/migrations/app/0115_datasource_tombstones.sql"
+    ROOT / "src/orchestrator/database/migrations/app/0115_datasource_tombstones.sql"
 )
 APP_JOBS_EXECUTION_LANE_MIGRATION = (
-    ROOT / "orchestrator/database/migrations/app/0118_jobs_execution_lane.sql"
+    ROOT / "src/orchestrator/database/migrations/app/0118_jobs_execution_lane.sql"
 )
 APP_THREAD_CONTROL_INBOX_MIGRATION = (
-    ROOT / "orchestrator/database/migrations/app/0119_thread_control_inbox.sql"
+    ROOT / "src/orchestrator/database/migrations/app/0119_thread_control_inbox.sql"
 )
 APP_THREAD_CONTROL_RECEIPT_INDEX = (
     ROOT
-    / "orchestrator/database/migrations/app/0120_thread_control_receipt_idx.notx.sql"
+    / "src/orchestrator/database/migrations/app/0120_thread_control_receipt_idx.notx.sql"
 )
 APP_THREAD_CONTROL_VALIDATION = (
     ROOT
-    / "orchestrator/database/migrations/app/0121_thread_control_validate_constraints.sql"
+    / "src/orchestrator/database/migrations/app/0121_thread_control_validate_constraints.sql"
 )
 APP_THREAD_CLOUD_SYNC_GENERATIONS = (
-    ROOT / "orchestrator/database/migrations/app/0122_thread_cloud_sync_generations.sql"
+    ROOT
+    / "src/orchestrator/database/migrations/app/0122_thread_cloud_sync_generations.sql"
 )
 APP_THREAD_CLOUD_SYNC_BASELINES = (
-    ROOT / "orchestrator/database/migrations/app/0123_thread_cloud_sync_baselines.sql"
+    ROOT
+    / "src/orchestrator/database/migrations/app/0123_thread_cloud_sync_baselines.sql"
 )
 APP_CLOUD_SYNC_MARKER_COMMENT = (
-    ROOT / "orchestrator/database/migrations/app/0124_cloud_sync_marker_comment.sql"
+    ROOT / "src/orchestrator/database/migrations/app/0124_cloud_sync_marker_comment.sql"
 )
 APP_THREAD_CLIENT_PRESENCE = (
-    ROOT / "orchestrator/database/migrations/app/0125_thread_client_presence.sql"
+    ROOT / "src/orchestrator/database/migrations/app/0125_thread_client_presence.sql"
 )
 APP_CANVAS_EDITOR_AWARENESS = (
-    ROOT / "orchestrator/database/migrations/app/0126_canvas_editor_awareness.sql"
+    ROOT / "src/orchestrator/database/migrations/app/0126_canvas_editor_awareness.sql"
 )
 APP_THREAD_INTERRUPT_INBOX = (
-    ROOT / "orchestrator/database/migrations/app/0127_thread_interrupt_inbox.sql"
+    ROOT / "src/orchestrator/database/migrations/app/0127_thread_interrupt_inbox.sql"
 )
 APP_THREAD_INTERRUPT_RECEIPT_INDEX = (
     ROOT
-    / "orchestrator/database/migrations/app/0128_thread_interrupt_receipt_idx.notx.sql"
+    / "src/orchestrator/database/migrations/app/0128_thread_interrupt_receipt_idx.notx.sql"
 )
 APP_THREAD_INTERRUPT_VALIDATION = (
     ROOT
-    / "orchestrator/database/migrations/app/0129_thread_interrupt_validate_constraints.sql"
+    / "src/orchestrator/database/migrations/app/0129_thread_interrupt_validate_constraints.sql"
 )
 APP_JOBS_VERIFICATION_DEDUPE = (
-    ROOT / "orchestrator/database/migrations/app/0130_jobs_verification_dedupe.sql"
+    ROOT / "src/orchestrator/database/migrations/app/0130_jobs_verification_dedupe.sql"
 )
 APP_JOBS_VERIFICATION_DROP_INDEX = (
     ROOT
-    / "orchestrator/database/migrations/app/0131_drop_jobs_verification_uniq.notx.sql"
+    / "src/orchestrator/database/migrations/app/0131_drop_jobs_verification_uniq.notx.sql"
 )
 APP_JOBS_VERIFICATION_INDEX = (
-    ROOT / "orchestrator/database/migrations/app/0132_jobs_verification_uniq.notx.sql"
+    ROOT
+    / "src/orchestrator/database/migrations/app/0132_jobs_verification_uniq.notx.sql"
 )
 APP_THREAD_SESSION_DURABLE_STATE = (
-    ROOT / "orchestrator/database/migrations/app/0133_thread_session_durable_state.sql"
+    ROOT
+    / "src/orchestrator/database/migrations/app/0133_thread_session_durable_state.sql"
 )
 APP_JOB_COMPLETION_COMMANDS = (
-    ROOT / "orchestrator/database/migrations/app/0140_job_completion_commands.sql"
+    ROOT / "src/orchestrator/database/migrations/app/0140_job_completion_commands.sql"
 )
 APP_JOB_COMPLETION_SWEEP_ROUTING = (
-    ROOT / "orchestrator/database/migrations/app/0141_job_completion_sweep_routing.sql"
+    ROOT
+    / "src/orchestrator/database/migrations/app/0141_job_completion_sweep_routing.sql"
 )
 APP_JOB_COMPLETION_SWEEP_ROUTE_PRECEDENCE = (
     ROOT
-    / "orchestrator/database/migrations/app/0142_job_completion_sweep_route_precedence.sql"
+    / "src/orchestrator/database/migrations/app/0142_job_completion_sweep_route_precedence.sql"
 )
 APP_JOB_COMPLETION_ACCEPT_STATUS = (
-    ROOT / "orchestrator/database/migrations/app/0143_job_completion_accept_status.sql"
+    ROOT
+    / "src/orchestrator/database/migrations/app/0143_job_completion_accept_status.sql"
 )
 APP_JOB_COMPLETION_STATUS_REORDER = (
-    ROOT / "orchestrator/database/migrations/app/0144_job_completion_status_reorder.sql"
+    ROOT
+    / "src/orchestrator/database/migrations/app/0144_job_completion_status_reorder.sql"
 )
 APP_MANAGED_REPOSITORY_AUTHORITIES = (
     ROOT
-    / "orchestrator/database/migrations/app/0176_managed_repository_authorities.sql"
+    / "src/orchestrator/database/migrations/app/0176_managed_repository_authorities.sql"
 )
 APP_MANAGED_REPOSITORY_THREAD_DETACH = (
     ROOT
-    / "orchestrator/database/migrations/app/0177_managed_repository_thread_detach.sql"
+    / "src/orchestrator/database/migrations/app/0177_managed_repository_thread_detach.sql"
 )
 APP_SUDO_REQUESTS_THREAD_SCOPE = (
-    ROOT / "orchestrator/database/migrations/app/0178_sudo_requests_thread_scope.sql"
+    ROOT
+    / "src/orchestrator/database/migrations/app/0178_sudo_requests_thread_scope.sql"
 )
 APP_SUDO_REQUESTS_ENTITY_CHECK = (
-    ROOT / "orchestrator/database/migrations/app/0179_sudo_requests_entity_check.sql"
+    ROOT
+    / "src/orchestrator/database/migrations/app/0179_sudo_requests_entity_check.sql"
 )
 APP_SUDO_REQUESTS_THREAD_INDEX = (
-    ROOT / "orchestrator/database/migrations/app/0180_sudo_requests_thread_idx.notx.sql"
+    ROOT
+    / "src/orchestrator/database/migrations/app/0180_sudo_requests_thread_idx.notx.sql"
 )
 APP_SUDO_REQUESTS_VALIDATE_CONSTRAINTS = (
     ROOT
-    / "orchestrator/database/migrations/app/0181_sudo_requests_validate_constraints.sql"
+    / "src/orchestrator/database/migrations/app/0181_sudo_requests_validate_constraints.sql"
 )
 APP_DELIVERABLE_CONTRACT_AUTHORITY = (
     ROOT
-    / "orchestrator/database/migrations/app/0182_deliverable_contract_authority.sql"
+    / "src/orchestrator/database/migrations/app/0182_deliverable_contract_authority.sql"
 )
 APP_PERSISTENT_INPUT_DELIVERY_CANCELLATION = (
     ROOT
-    / "orchestrator/database/migrations/app/0183_persistent_input_delivery_cancellation.sql"
+    / "src/orchestrator/database/migrations/app/0183_persistent_input_delivery_cancellation.sql"
 )
 APP_THREAD_ENDED_TRANSITION_FENCE = (
-    ROOT / "orchestrator/database/migrations/app/0184_thread_ended_transition_fence.sql"
+    ROOT
+    / "src/orchestrator/database/migrations/app/0184_thread_ended_transition_fence.sql"
 )
 APP_THREAD_RUNTIME_GENERATION_RETIREMENT = (
     ROOT
-    / "orchestrator/database/migrations/app/0185_thread_runtime_generation_retirement.sql"
+    / "src/orchestrator/database/migrations/app/0185_thread_runtime_generation_retirement.sql"
 )
 APP_PROTECTED_CLOUD_INSTANCE_AUTHORITY = (
     ROOT
-    / "orchestrator/database/migrations/app/0186_protected_cloud_instance_authority.sql"
+    / "src/orchestrator/database/migrations/app/0186_protected_cloud_instance_authority.sql"
 )
-APP_PRE_REGISTRATION_SANDBOX_ZERO = (
-    ROOT / "orchestrator/database/migrations/app/0187_pre_registration_sandbox_zero.sql"
-)
-APP_PRE_REGISTRATION_DELETE_SANDBOX_ZERO = (
+APP_DEPLOYED_PRE_REGISTRATION_SANDBOX_ZERO = (
     ROOT
-    / "orchestrator/database/migrations/app/0188_pre_registration_delete_sandbox_zero.sql"
+    / "src/orchestrator/database/migrations/app/0187_pre_registration_sandbox_zero.sql"
 )
-APP_CURRENT_MIGRATION_HEAD = APP_PRE_REGISTRATION_DELETE_SANDBOX_ZERO
+APP_DEPLOYED_PRE_REGISTRATION_DELETE_SANDBOX_ZERO = (
+    ROOT
+    / "src/orchestrator/database/migrations/app/0188_pre_registration_delete_sandbox_zero.sql"
+)
+APP_COMPUTE_INITIAL_RECOVERY_AUTHORITY = (
+    ROOT
+    / "src/orchestrator/database/migrations/app/0189_compute_initial_recovery_epoch_authority.sql"
+)
+APP_MANAGED_REPOSITORY_LEGACY_RECONCILIATION = (
+    ROOT
+    / "src/orchestrator/database/migrations/app/0190_managed_repository_legacy_reconciliation.sql"
+)
+APP_STATELESS_INPUT_DELIVERIES = (
+    ROOT
+    / "src/orchestrator/database/migrations/app/0191_stateless_input_deliveries.sql"
+)
+APP_STATELESS_INPUT_DELIVERY_VALIDATION = (
+    ROOT
+    / "src/orchestrator/database/migrations/app/0192_stateless_input_delivery_validate.sql"
+)
+APP_MANAGED_REPOSITORY_PROCESS_ZERO_AUTHORITY = (
+    ROOT
+    / "src/orchestrator/database/migrations/app/0193_managed_repository_process_zero_authority.sql"
+)
+APP_NOTIFICATIONS_MIGRATION = (
+    ROOT / "src/orchestrator/database/migrations/app/0194_notifications.sql"
+)
+APP_NOTIFICATION_STEPS_MIGRATION = (
+    ROOT / "src/orchestrator/database/migrations/app/0195_notification_steps.sql"
+)
+APP_NOTIFICATIONS_CUTOVER_MIGRATION = (
+    ROOT / "src/orchestrator/database/migrations/app/0196_notifications_cutover.sql"
+)
+# Unified notification feed (slice 3: the cutover backfill) — the head after
+# the 0184-0192 managed-repository / stateless-input lane and the slice-1/2
+# feed tables; bump when the next lands.
+APP_PINNED_RECYCLE_AUTHORITY_MIGRATION = (
+    ROOT
+    / "src/orchestrator/database/migrations/app/0200_pinned_agent_recycle_authority.sql"
+)
+APP_USER_SSH_KEYS = (
+    ROOT / "src/orchestrator/database/migrations/app/0201_user_ssh_keys.sql"
+)
+APP_THREADS_SSH_HANDLE = (
+    ROOT / "src/orchestrator/database/migrations/app/0202_threads_ssh_handle.sql"
+)
+APP_THREADS_SSH_HANDLE_IDX = (
+    ROOT
+    / "src/orchestrator/database/migrations/app/0203_threads_ssh_handle_idx.notx.sql"
+)
+APP_SSH_ATTACHMENTS = (
+    ROOT / "src/orchestrator/database/migrations/app/0204_ssh_attachments.sql"
+)
+# U1 config unification: the experts.tags role backfill (data only) — the head
+# after the 0201-0204 SSH lane; bump when the next lands.
+APP_EXPERTS_ROLE_TAGS_BACKFILL = (
+    ROOT
+    / "src/orchestrator/database/migrations/app/0205_experts_role_tags_backfill.sql"
+)
+# U3 subagents (WP3): the threads kind / parent / subagent columns, their
+# partial parent-job index and the validation of the NOT VALID constraints —
+# the head after the 0205 role-tag backfill; bump when the next lands.
+APP_THREADS_SUBAGENT_KIND = (
+    ROOT / "src/orchestrator/database/migrations/app/0206_threads_subagent_kind.sql"
+)
+APP_THREADS_PARENT_JOB_IDX = (
+    ROOT
+    / "src/orchestrator/database/migrations/app/0207_threads_parent_job_idx.notx.sql"
+)
+APP_THREADS_SUBAGENT_VALIDATE = (
+    ROOT / "src/orchestrator/database/migrations/app/0208_threads_subagent_validate.sql"
+)
+APP_EXPERT_PERSONA_IDENTITY_BACKFILL = (
+    ROOT
+    / "src/orchestrator/database/migrations/app/0209_expert_persona_identity_backfill.sql"
+)
+APP_THREAD_TERMINAL_RECLAIM_PROJECTION = (
+    ROOT
+    / "src/orchestrator/database/migrations/app/0210_thread_terminal_reclaim_projection.sql"
+)
+APP_IMAGE_DELIVERY_ROWS_EVENT_ROLE = (
+    ROOT
+    / "src/orchestrator/database/migrations/app/0211_image_delivery_rows_event_role.sql"
+)
+# Research search/fetch capability resolution. Renumbered twice: 0205 -> 0210 during
+# the 2026-08-30 rebase (0205 was taken by 0205_experts_role_tags_backfill.sql), then
+# 0210 -> 0212 during the 2026-09-01 rebase onto the rewritten develop, where 0210 and
+# 0211 had both been taken upstream. Two migrations sharing a prefix hard-fails the
+# duplicate-prefix check and the runner.
+APP_SEARCH_FETCH_CAPABILITIES = (
+    ROOT / "src/orchestrator/database/migrations/app/0212_search_fetch_capabilities.sql"
+)
+# Supersedes 0183's constraint shape without editing 0183. Renumbered 0206 -> 0211
+# during the 2026-08-30 rebase onto develop: 0206 was already taken by
+# 0206_threads_subagent_kind.sql, which landed first.
+# Renumbered 0211 -> 0213 during the 2026-09-01 rebase onto the rewritten develop:
+# 0211 was taken upstream by 0211_image_delivery_rows_event_role.sql.
+APP_INPUT_DELIVERY_CONSTRAINTS_NOT_VALID = (
+    ROOT
+    / "src/orchestrator/database/migrations/app/0213_input_delivery_constraints_not_valid.sql"
+)
+APP_CURRENT_MIGRATION_HEAD = (
+    ROOT
+    / "src/orchestrator/database/migrations/app/0225_settled_virtual_actor_exit.sql"
+)
 AUDIT_EXPANSION = (
     ROOT
-    / "orchestrator/database/migrations/audit/0003_infrastructure_usage_events_v2.sql"
+    / "src/orchestrator/database/migrations/audit/0003_infrastructure_usage_events_v2.sql"
 )
 AUDIT_VALIDATION = (
     ROOT
-    / "orchestrator/database/migrations/audit/0004_validate_and_seed_infrastructure_usage_v2.sql"
+    / "src/orchestrator/database/migrations/audit/0004_validate_and_seed_infrastructure_usage_v2.sql"
 )
 AUDIT_PROJECT_INDEX = (
-    ROOT / "orchestrator/database/migrations/audit/0005_usage_events_project_ts_idx.sql"
+    ROOT
+    / "src/orchestrator/database/migrations/audit/0005_usage_events_project_ts_idx.sql"
 )
 
 
@@ -322,8 +441,8 @@ def test_migration_discovery_rejects_duplicate_interstitial_version(
 @pytest.fixture(scope="module")
 def app_pg_dsn() -> str:
     testcontainers = pytest.importorskip("testcontainers.postgres")
-    container = testcontainers.PostgresContainer("postgres:16")
     try:
+        container = testcontainers.PostgresContainer("postgres:16")
         container.start()
     except Exception as exc:
         pytest.skip(f"no container runtime for app migration test: {exc}")
@@ -773,8 +892,12 @@ def test_audit_project_window_index_documents_partitioned_build() -> None:
 
 
 def test_migration_heads_are_unique_and_snapshots_are_not_the_contract() -> None:
-    app_files = discover(ROOT / "orchestrator/database/migrations/app")
-    audit_files = discover(ROOT / "orchestrator/database/migrations/audit")
+    app_files = discover(
+        ROOT / "src" / "orchestrator" / "database" / "migrations" / "app"
+    )
+    audit_files = discover(
+        ROOT / "src" / "orchestrator" / "database" / "migrations" / "audit"
+    )
 
     for files in (app_files, audit_files):
         prefixes = [path.name.split("_", 1)[0] for path in files]
@@ -804,6 +927,7 @@ def test_migration_heads_are_unique_and_snapshots_are_not_the_contract() -> None
         "schema_current" not in APP_COMPUTE_EXACT_EPOCH_LIFECYCLE_MIGRATION.read_text()
     )
     assert "schema_current" not in APP_COMPUTE_EPOCH_ROLLOVER_MIGRATION.read_text()
+    assert "schema_current" not in APP_COMPUTE_INITIAL_RECOVERY_AUTHORITY.read_text()
     assert (
         "schema_current"
         not in APP_COMPUTE_AUTHORITY_CONFIRMATION_GAP_MIGRATION.read_text()
@@ -854,7 +978,7 @@ def test_0184_ended_transition_fence_is_mixed_version_compatible() -> None:
     assert "BEFORE UPDATE OF status ON public.threads" in sql
     assert "srw.explicit_thread_resume" not in raw
 
-    snapshot = (ROOT / "orchestrator/database/schema_current.sql").read_text()
+    snapshot = (ROOT / "src/orchestrator/database/schema_current.sql").read_text()
     assert "CREATE FUNCTION public.enforce_thread_ended_transition()" in snapshot
     assert "CREATE TRIGGER threads_ended_transition_fence BEFORE UPDATE OF" in snapshot
 
@@ -931,7 +1055,7 @@ def test_0185_runtime_generation_and_retirement_authority_contract() -> None:
     assert "agent_runtime_zero_v1" in sql
     assert "workspace_actuator_zero_v1" in sql
 
-    snapshot = (ROOT / "orchestrator/database/schema_current.sql").read_text()
+    snapshot = (ROOT / "src/orchestrator/database/schema_current.sql").read_text()
     assert "runtime_generation uuid" in snapshot
     assert "runtime_retirement_token uuid" in snapshot
     assert "runtime_retirement_authorized_at timestamp with time zone" in snapshot
@@ -974,38 +1098,570 @@ def test_0186_protected_cloud_instance_and_attempt_authority_contract() -> None:
     assert "effect.safe_after > clock_timestamp()" in sql
 
 
-def test_0187_pre_registration_sandbox_zero_is_bounded_and_forward_only() -> None:
-    raw = APP_PRE_REGISTRATION_SANDBOX_ZERO.read_text()
+def test_managed_repository_legacy_reconciliation_migration_is_additive() -> None:
+    raw = APP_MANAGED_REPOSITORY_LEGACY_RECONCILIATION.read_text()
     sql = _compact(raw)
 
-    assert "-- migration:     0187_pre_registration_sandbox_zero.sql" in raw
-    assert "-- depends-on:    0186_protected_cloud_instance_authority.sql" in raw
-    assert "-- expected:      < 1s. Replace one trigger function" in raw
-    assert "-- locks:         Brief function-catalog lock" in raw
-    assert "-- transactional: yes" in raw
-    assert "pg_get_functiondef" in sql
-    assert "occurrence_count <> 1" in sql
-    assert "'sandbox_actuator_zero_v1'" in sql
-    assert "EXECUTE patched_definition" in sql
-    assert "0185_thread_runtime_generation_retirement.sql" not in sql
+    assert "depends-on:    0189_compute_initial_recovery_epoch_authority.sql" in raw
+    assert "transactional: yes" in raw
+    assert "SET LOCAL lock_timeout = '2s'" in sql
+    assert "CREATE TABLE public.managed_repository_legacy_reconciliations" in sql
+    assert "CREATE SEQUENCE public.managed_repository_legacy_reconcile_claim_seq" in sql
+    assert "managed_repository_legacy_source_unique" in sql
+    assert "managed_repository_legacy_claim_shape_check" in sql
+    assert "managed_repository_legacy_completion_shape_check" in sql
+    assert "UPDATE jobs" not in sql
+    assert "UPDATE threads" not in sql
+    assert "UPDATE project_repositories" not in sql
 
 
-def test_0188_pre_registration_delete_sandbox_zero_is_bounded_and_forward_only() -> (
-    None
-):
-    raw = APP_PRE_REGISTRATION_DELETE_SANDBOX_ZERO.read_text()
+def test_stateless_input_delivery_migration_fences_lane_and_old_claims() -> None:
+    raw = APP_STATELESS_INPUT_DELIVERIES.read_text()
     sql = _compact(raw)
 
-    assert "-- migration:     0188_pre_registration_delete_sandbox_zero.sql" in raw
-    assert "-- depends-on:    0187_pre_registration_sandbox_zero.sql" in raw
-    assert "-- expected:      < 1s. Replace one trigger function" in raw
-    assert "-- locks:         Brief function-catalog lock" in raw
-    assert "-- transactional: yes" in raw
-    assert "enforce_pinned_thread_delete_authority" in sql
-    assert "occurrence_count <> 1" in sql
-    assert "IS DISTINCT FROM expected_protocol" in sql
-    assert "EXECUTE patched_definition" in sql
-    assert "0185_thread_runtime_generation_retirement.sql" not in sql
+    assert "depends-on:    0190_managed_repository_legacy_reconciliation.sql" in raw
+    assert "transactional: yes" in raw
+    assert "SET LOCAL lock_timeout = '2s'" in sql
+    thread_lock = "LOCK TABLE public.threads IN SHARE ROW EXCLUSIVE MODE"
+    queue_lock = "LOCK TABLE public.run_queue IN SHARE ROW EXCLUSIVE MODE"
+    delivery_lock = (
+        "LOCK TABLE public.thread_input_deliveries IN SHARE ROW EXCLUSIVE MODE"
+    )
+    assert thread_lock in sql
+    assert queue_lock in sql
+    assert delivery_lock in sql
+    assert sql.index(thread_lock) < sql.index(queue_lock) < sql.index(delivery_lock)
+    assert "ADD COLUMN execution_lane TEXT NOT NULL DEFAULT 'pinned'" in sql
+    assert "stateless_input_delivery_history_ambiguous" in sql
+    assert "SET execution_lane = thread.execution_lane" not in sql
+    assert "SET execution_lane = 'stateless'" in sql
+    assert "delivery.state = 'persisted'" in sql
+    assert "delivery.claim_generation = 0" in sql
+    assert sql.count("message.turn_number IS NULL") == 3
+    assert (
+        "SET turn_number = (eligible.base_turn + eligible.turn_offset)::integer" in sql
+    )
+    assert sql.count("NOT VALID") == 3
+    assert "ADD COLUMN input_delivery_capable_lease_token BIGINT" in sql
+    assert "trg_input_delivery_lane_authority" in sql
+    assert "trg_stateless_input_delivery_claim" in sql
+    assert "stateless_input_delivery_requires_capable_claim" in sql
+    assert "stateless_input_delivery_requires_admission" in sql
+
+    validation = _compact(APP_STATELESS_INPUT_DELIVERY_VALIDATION.read_text())
+    assert "depends-on:    0191_stateless_input_deliveries.sql" in (
+        APP_STATELESS_INPUT_DELIVERY_VALIDATION.read_text()
+    )
+    assert validation.count("VALIDATE CONSTRAINT thread_input_deliveries_") == 3
+
+
+@pytest.mark.asyncio
+async def test_0185_serializes_real_predecessor_rows_with_lane_changes(
+    app_pg_dsn: str,
+    tmp_path: Path,
+) -> None:
+    """Genuine 0184 pending and terminal history keep distinct authority."""
+
+    dbname = f"stateless_delivery_0185_{uuid4().hex[:12]}"
+    admin = await asyncpg.connect(app_pg_dsn)
+    try:
+        await admin.execute(f'CREATE DATABASE "{dbname}"')
+    finally:
+        await admin.close()
+
+    dsn = _swap_db(app_pg_dsn, dbname)
+    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=4)
+    through_0184 = tmp_path / "through-0184"
+    through_0184.mkdir()
+    blocker = updater = observer = None
+    migration_task = update_task = None
+    try:
+        for path in discover(
+            ROOT / "src" / "orchestrator" / "database" / "migrations" / "app"
+        ):
+            if path.name >= APP_STATELESS_INPUT_DELIVERIES.name:
+                break
+            (through_0184 / path.name).write_bytes(path.read_bytes())
+        await run_migrations(pool, through_0184)
+
+        thread_id = uuid4()
+        delivery_id = uuid4()
+        message_id = message_row_id(delivery_id)
+        terminal_thread_id = uuid4()
+        terminal_message_id = uuid4()
+        terminal_delivery_id = uuid4()
+        terminal_agent_id = uuid4()
+        terminal_runtime_generation = uuid4()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO threads (id,status,execution_lane,config_name) "
+                "VALUES ($1,'active','stateless','default')",
+                thread_id,
+            )
+            await conn.execute(
+                "INSERT INTO thread_messages "
+                "(id,thread_id,role,content,turn_number) "
+                "VALUES ($1,$2,'event','genuine pre-0185 wake',NULL)",
+                message_id,
+                thread_id,
+            )
+            # This is the exact shape the preceding release produced: 0174's
+            # pinned-only ledger had no lane column, while orchestrator-side
+            # wake persistence could still target a stateless thread.
+            await conn.execute(
+                "INSERT INTO thread_input_deliveries "
+                "(delivery_id,thread_id,message_id,source,state) "
+                "VALUES ($1,$2,$3,'officer_wake','persisted')",
+                delivery_id,
+                thread_id,
+                message_id,
+            )
+            # This is the other genuine predecessor shape: a pinned runtime
+            # admitted and settled its delivery, after which the detached
+            # thread moved to stateless. The current thread lane must never
+            # rewrite that immutable pinned execution receipt.
+            await conn.execute(
+                "INSERT INTO threads "
+                "(id,status,execution_lane,config_name,total_turns) "
+                "VALUES ($1,'active','pinned','default',2)",
+                terminal_thread_id,
+            )
+            await conn.execute(
+                "INSERT INTO thread_messages "
+                "(id,thread_id,role,content,turn_number) "
+                "VALUES ($1,$2,'event','settled pinned wake',2)",
+                terminal_message_id,
+                terminal_thread_id,
+            )
+            await conn.execute(
+                "INSERT INTO thread_input_deliveries "
+                "(delivery_id,thread_id,message_id,source,state,claim_generation,"
+                " owner_agent_id,owner_pod_uid,owner_runtime_generation,"
+                " admitted_turn_number,admitted_at,settled_at) "
+                "VALUES ($1,$2,$3,'officer_wake','settled',1,$4,'old-pod',$5,"
+                " 2,now(),now())",
+                terminal_delivery_id,
+                terminal_thread_id,
+                terminal_message_id,
+                terminal_agent_id,
+                terminal_runtime_generation,
+            )
+            await conn.execute(
+                "UPDATE threads SET execution_lane='stateless' WHERE id=$1",
+                terminal_thread_id,
+            )
+
+        blocker = await asyncpg.connect(dsn)
+        updater = await asyncpg.connect(dsn)
+        observer = await asyncpg.connect(dsn)
+        await blocker.execute("BEGIN")
+        # Hold the migration after it takes the thread/run_queue prefix but
+        # before it can alter/backfill the delivery table.
+        await blocker.execute(
+            "LOCK TABLE thread_input_deliveries IN ACCESS EXCLUSIVE MODE"
+        )
+        # LOAD-BEARING: replay the LIVE migrations directory, not a bounded
+        # copy. This test seeds threads rows and then replays a real upgrade
+        # span, which is the only condition in the suite that reproduces a
+        # migration whose DDL collides with deferred trigger events queued by
+        # an earlier migration in the same transactional pass (they share one
+        # transaction). 0202 hit exactly that and would have shipped a boot
+        # hard-fail had this replay been narrowed to dodge it. Narrowing it
+        # again removes the coverage; fix the migration instead.
+        migration_task = asyncio.create_task(
+            run_migrations(
+                pool, ROOT / "src" / "orchestrator" / "database" / "migrations" / "app"
+            )
+        )
+
+        for _ in range(100):
+            migration_holds_thread = await observer.fetchval(
+                "SELECT EXISTS ("
+                "SELECT 1 FROM pg_locks "
+                "WHERE database=(SELECT oid FROM pg_database "
+                "WHERE datname=current_database()) "
+                "AND relation='public.threads'::regclass "
+                "AND mode='ShareRowExclusiveLock' AND granted)"
+            )
+            if migration_holds_thread:
+                break
+            await asyncio.sleep(0.005)
+        assert migration_holds_thread
+
+        update_task = asyncio.create_task(
+            updater.execute(
+                "UPDATE threads SET execution_lane='pinned' WHERE id=$1",
+                thread_id,
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert not update_task.done()
+
+        await blocker.execute("COMMIT")
+        await asyncio.wait_for(migration_task, timeout=15)
+        with pytest.raises(asyncpg.CheckViolationError, match="durable input"):
+            await asyncio.wait_for(update_task, timeout=5)
+
+        row = await observer.fetchrow(
+            "SELECT thread.execution_lane AS thread_lane, "
+            "delivery.execution_lane AS delivery_lane, delivery.state, "
+            "message.turn_number, thread.total_turns "
+            "FROM threads AS thread "
+            "JOIN thread_input_deliveries AS delivery "
+            "ON delivery.thread_id=thread.id "
+            "JOIN thread_messages AS message ON message.id=delivery.message_id "
+            "WHERE delivery.delivery_id=$1",
+            delivery_id,
+        )
+        assert dict(row) == {
+            "thread_lane": "stateless",
+            "delivery_lane": "stateless",
+            "state": "persisted",
+            "turn_number": 1,
+            "total_turns": 1,
+        }
+        async with observer.transaction():
+            replay = await persist_input_delivery(
+                observer,
+                thread_id=thread_id,
+                delivery_id=delivery_id,
+                role="event",
+                content="genuine pre-0185 wake",
+                source="officer_wake",
+                turn_number=None,
+            )
+        assert replay["transcript_inserted"] is False
+        assert replay["execution_lane"] == "stateless"
+        assert replay["state"] == "queued"
+        assert replay["turn_number"] == 1
+        assert (
+            await observer.fetchval(
+                "SELECT state FROM run_queue WHERE unit_id=$1", thread_id
+            )
+            == "queued"
+        )
+        terminal = await observer.fetchrow(
+            "SELECT thread.execution_lane AS thread_lane, "
+            "delivery.execution_lane AS delivery_lane, delivery.state, "
+            "delivery.claim_generation, delivery.owner_agent_id, "
+            "message.turn_number, thread.total_turns "
+            "FROM threads AS thread "
+            "JOIN thread_input_deliveries AS delivery "
+            "ON delivery.thread_id=thread.id "
+            "JOIN thread_messages AS message ON message.id=delivery.message_id "
+            "WHERE delivery.delivery_id=$1",
+            terminal_delivery_id,
+        )
+        assert dict(terminal) == {
+            "thread_lane": "stateless",
+            "delivery_lane": "pinned",
+            "state": "settled",
+            "claim_generation": 1,
+            "owner_agent_id": terminal_agent_id,
+            "turn_number": 2,
+            "total_turns": 2,
+        }
+        assert await observer.fetchval(
+            "SELECT success FROM schema_migrations WHERE filename=$1",
+            APP_STATELESS_INPUT_DELIVERIES.name,
+        )
+        assert await observer.fetchval(
+            "SELECT success FROM schema_migrations WHERE filename=$1",
+            APP_STATELESS_INPUT_DELIVERY_VALIDATION.name,
+        )
+        assert (
+            await observer.fetchval(
+                "SELECT count(*) FROM pg_constraint "
+                "WHERE conname = ANY($1::text[]) AND convalidated",
+                [
+                    "thread_input_deliveries_lane_check",
+                    "thread_input_deliveries_owner_shape",
+                    "thread_input_deliveries_claim_shape",
+                ],
+            )
+            == 3
+        )
+    finally:
+        if migration_task is not None and not migration_task.done():
+            migration_task.cancel()
+        if update_task is not None and not update_task.done():
+            update_task.cancel()
+        if blocker is not None:
+            await blocker.close()
+        if updater is not None:
+            await updater.close()
+        if observer is not None:
+            await observer.close()
+        await pool.close()
+        admin = await asyncpg.connect(app_pg_dsn)
+        try:
+            await admin.execute(f'DROP DATABASE "{dbname}" WITH (FORCE)')
+        finally:
+            await admin.close()
+
+
+@pytest.mark.asyncio
+async def test_0185_refuses_claimed_pending_history_on_stateless_thread(
+    app_pg_dsn: str,
+    tmp_path: Path,
+) -> None:
+    """Do not guess that a pinned predecessor claim became stateless work."""
+
+    dbname = f"stateless_delivery_0185_ambiguous_{uuid4().hex[:8]}"
+    admin = await asyncpg.connect(app_pg_dsn)
+    try:
+        await admin.execute(f'CREATE DATABASE "{dbname}"')
+    finally:
+        await admin.close()
+
+    dsn = _swap_db(app_pg_dsn, dbname)
+    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=3)
+    through_0184 = tmp_path / "ambiguous-through-0184"
+    through_0184.mkdir()
+    try:
+        for path in discover(
+            ROOT / "src" / "orchestrator" / "database" / "migrations" / "app"
+        ):
+            if path.name >= APP_STATELESS_INPUT_DELIVERIES.name:
+                break
+            (through_0184 / path.name).write_bytes(path.read_bytes())
+        await run_migrations(pool, through_0184)
+
+        thread_id = uuid4()
+        message_id = uuid4()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO threads (id,status,execution_lane,config_name) "
+                "VALUES ($1,'active','stateless','default')",
+                thread_id,
+            )
+            await conn.execute(
+                "INSERT INTO thread_messages "
+                "(id,thread_id,role,content,turn_number) "
+                "VALUES ($1,$2,'event','claimed predecessor wake',NULL)",
+                message_id,
+                thread_id,
+            )
+            await conn.execute(
+                "INSERT INTO thread_input_deliveries "
+                "(delivery_id,thread_id,message_id,source,state,claim_generation,"
+                " owner_agent_id,owner_pod_uid,owner_runtime_generation) "
+                "VALUES ($1,$2,$3,'officer_wake','owned',1,$4,'old-pod',$5)",
+                uuid4(),
+                thread_id,
+                message_id,
+                uuid4(),
+                uuid4(),
+            )
+
+        with pytest.raises(
+            asyncpg.CheckViolationError,
+            match="Pre-0191 stateless input history is ambiguous",
+        ):
+            await run_migrations(
+                pool, ROOT / "src" / "orchestrator" / "database" / "migrations" / "app"
+            )
+
+        async with pool.acquire() as conn:
+            # Transactional failure rolls every 0185 catalog mutation back.
+            assert not await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.columns "
+                "WHERE table_schema='public' "
+                "AND table_name='thread_input_deliveries' "
+                "AND column_name='execution_lane')"
+            )
+            failure = await conn.fetchrow(
+                "SELECT success, error FROM schema_migrations WHERE filename=$1",
+                APP_STATELESS_INPUT_DELIVERIES.name,
+            )
+            assert failure is not None
+            assert failure["success"] is False
+            assert (
+                "stateless input history is ambiguous" in str(failure["error"]).lower()
+            )
+            assert not await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE filename=$1)",
+                APP_STATELESS_INPUT_DELIVERY_VALIDATION.name,
+            )
+    finally:
+        await pool.close()
+        admin = await asyncpg.connect(app_pg_dsn)
+        try:
+            await admin.execute(f'DROP DATABASE "{dbname}" WITH (FORCE)')
+        finally:
+            await admin.close()
+
+
+@pytest.mark.asyncio
+async def test_0185_refuses_numbered_pending_history_on_stateless_thread(
+    app_pg_dsn: str,
+    tmp_path: Path,
+) -> None:
+    """A numbered predecessor input is not the known durable-wake shape."""
+
+    dbname = f"stateless_delivery_0185_numbered_{uuid4().hex[:8]}"
+    admin = await asyncpg.connect(app_pg_dsn)
+    try:
+        await admin.execute(f'CREATE DATABASE "{dbname}"')
+    finally:
+        await admin.close()
+
+    dsn = _swap_db(app_pg_dsn, dbname)
+    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=3)
+    through_0184 = tmp_path / "numbered-through-0184"
+    through_0184.mkdir()
+    try:
+        for path in discover(
+            ROOT / "src" / "orchestrator" / "database" / "migrations" / "app"
+        ):
+            if path.name >= APP_STATELESS_INPUT_DELIVERIES.name:
+                break
+            (through_0184 / path.name).write_bytes(path.read_bytes())
+        await run_migrations(pool, through_0184)
+
+        thread_id = uuid4()
+        message_id = uuid4()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO threads "
+                "(id,status,execution_lane,config_name,total_turns) "
+                "VALUES ($1,'active','stateless','default',7)",
+                thread_id,
+            )
+            await conn.execute(
+                "INSERT INTO thread_messages "
+                "(id,thread_id,role,content,turn_number) "
+                "VALUES ($1,$2,'event','numbered predecessor wake',7)",
+                message_id,
+                thread_id,
+            )
+            await conn.execute(
+                "INSERT INTO thread_input_deliveries "
+                "(delivery_id,thread_id,message_id,source,state,claim_generation) "
+                "VALUES ($1,$2,$3,'officer_wake','persisted',0)",
+                uuid4(),
+                thread_id,
+                message_id,
+            )
+
+        with pytest.raises(
+            asyncpg.CheckViolationError,
+            match="Pre-0191 stateless input history is ambiguous",
+        ):
+            await run_migrations(
+                pool, ROOT / "src" / "orchestrator" / "database" / "migrations" / "app"
+            )
+
+        async with pool.acquire() as conn:
+            assert not await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.columns "
+                "WHERE table_schema='public' "
+                "AND table_name='thread_input_deliveries' "
+                "AND column_name='execution_lane')"
+            )
+    finally:
+        await pool.close()
+        admin = await asyncpg.connect(app_pg_dsn)
+        try:
+            await admin.execute(f'DROP DATABASE "{dbname}" WITH (FORCE)')
+        finally:
+            await admin.close()
+
+
+def test_deployed_pre_registration_migration_history_is_immutable() -> None:
+    assert hashlib.sha256(
+        APP_DEPLOYED_PRE_REGISTRATION_SANDBOX_ZERO.read_bytes()
+    ).hexdigest() == (
+        "433c41d5e575d8d9da93dde29218a24bd7d3fb57c99e99e9dedcd46d35f22de2"
+    )
+    assert hashlib.sha256(
+        APP_DEPLOYED_PRE_REGISTRATION_DELETE_SANDBOX_ZERO.read_bytes()
+    ).hexdigest() == (
+        "6f0ed6731a055d9795ef69e07147a7c8931efeff77ef6b25e7f38808b540bb7d"
+    )
+    assert (
+        "-- depends-on:    0186_protected_cloud_instance_authority.sql"
+        in APP_DEPLOYED_PRE_REGISTRATION_SANDBOX_ZERO.read_text()
+    )
+    assert (
+        "-- depends-on:    0187_pre_registration_sandbox_zero.sql"
+        in APP_DEPLOYED_PRE_REGISTRATION_DELETE_SANDBOX_ZERO.read_text()
+    )
+
+
+@pytest.mark.asyncio
+async def test_deployed_0188_history_upgrades_to_current_head(
+    app_pg_dsn: str,
+    tmp_path: Path,
+) -> None:
+    """The exact main-dev ledger advances without renaming applied files."""
+
+    dbname = f"deployed_0188_upgrade_{uuid4().hex[:12]}"
+    admin = await asyncpg.connect(app_pg_dsn)
+    try:
+        await admin.execute(f'CREATE DATABASE "{dbname}"')
+    finally:
+        await admin.close()
+
+    dsn = _swap_db(app_pg_dsn, dbname)
+    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=4)
+    deployed = tmp_path / "deployed-through-0188"
+    deployed.mkdir()
+    try:
+        for path in discover(
+            ROOT / "src" / "orchestrator" / "database" / "migrations" / "app"
+        ):
+            if path.name > APP_DEPLOYED_PRE_REGISTRATION_DELETE_SANDBOX_ZERO.name:
+                break
+            (deployed / path.name).write_bytes(path.read_bytes())
+
+        await run_migrations(pool, deployed)
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT filename, checksum FROM schema_migrations "
+                "WHERE filename IN ($1,$2) ORDER BY filename",
+                APP_DEPLOYED_PRE_REGISTRATION_SANDBOX_ZERO.name,
+                APP_DEPLOYED_PRE_REGISTRATION_DELETE_SANDBOX_ZERO.name,
+            )
+            assert [(row["filename"], row["checksum"]) for row in rows] == [
+                (
+                    APP_DEPLOYED_PRE_REGISTRATION_SANDBOX_ZERO.name,
+                    "433c41d5e575d8d9da93dde29218a24bd7d3fb57c99e99e9dedcd46d35f22de2",
+                ),
+                (
+                    APP_DEPLOYED_PRE_REGISTRATION_DELETE_SANDBOX_ZERO.name,
+                    "6f0ed6731a055d9795ef69e07147a7c8931efeff77ef6b25e7f38808b540bb7d",
+                ),
+            ]
+
+        await run_migrations(
+            pool, ROOT / "src" / "orchestrator" / "database" / "migrations" / "app"
+        )
+        async with pool.acquire() as conn:
+            assert await conn.fetchval(
+                "SELECT success FROM schema_migrations WHERE filename=$1",
+                APP_CURRENT_MIGRATION_HEAD.name,
+            )
+            assert not await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE success=FALSE)"
+            )
+            ended_definition = await conn.fetchval(
+                "SELECT pg_get_functiondef("
+                "'public.enforce_thread_ended_transition()'::regprocedure)"
+            )
+            delete_definition = await conn.fetchval(
+                "SELECT pg_get_functiondef("
+                "'public.enforce_pinned_thread_delete_authority()'::regprocedure)"
+            )
+            assert "sandbox_actuator_zero_v1" in ended_definition
+            assert "IS DISTINCT FROM expected_protocol" in delete_definition
+    finally:
+        await pool.close()
+        admin = await asyncpg.connect(app_pg_dsn)
+        try:
+            await admin.execute(f'DROP DATABASE "{dbname}" WITH (FORCE)')
+        finally:
+            await admin.close()
 
 
 def test_0177_is_bounded_thread_only_and_keeps_0176_immutable() -> None:
@@ -1057,7 +1713,9 @@ async def test_0177_repairs_deployed_legacy_thread_detach_without_opening_attach
     through_0176.mkdir()
     through_0177.mkdir()
     try:
-        for path in discover(ROOT / "orchestrator/database/migrations/app"):
+        for path in discover(
+            ROOT / "src" / "orchestrator" / "database" / "migrations" / "app"
+        ):
             if path.name < APP_MANAGED_REPOSITORY_AUTHORITIES.name:
                 (through_0175 / path.name).write_bytes(path.read_bytes())
             if path.name <= APP_MANAGED_REPOSITORY_AUTHORITIES.name:
@@ -1374,6 +2032,27 @@ def test_compute_epoch_rollover_is_audited_append_only_and_directly_bound() -> N
     )
 
 
+def test_initial_compute_authority_accepts_only_proven_recovery_coverage() -> None:
+    raw = APP_COMPUTE_INITIAL_RECOVERY_AUTHORITY.read_text()
+    sql = _compact(raw)
+
+    assert "depends-on:    0188_pre_registration_delete_sandbox_zero.sql" in raw
+    assert (
+        "CREATE OR REPLACE FUNCTION public."
+        "protect_compute_metering_epoch_authority()" in sql
+    )
+    assert "epoch_continuity_health IS DISTINCT FROM 'healthy'" in sql
+    assert "epoch_reliable_from IS NULL" in sql
+    assert "epoch_reliable_from > NEW.effective_from" in sql
+    assert "epoch_continuous_since IS NULL" in sql
+    assert "epoch_continuous_since > NEW.effective_from" in sql
+    assert "FROM public.resource_inventory_coverage_gaps AS gap" in sql
+    assert "gap.resolution = 'unresolved'" in sql
+    assert "epoch_recovery_from IS NOT NULL" in sql
+    assert "DROP TRIGGER" not in raw
+    assert "CREATE TABLE" not in raw
+
+
 def test_compute_authority_confirmation_gap_supersedes_deployed_rollover() -> None:
     sql = APP_COMPUTE_AUTHORITY_CONFIRMATION_GAP_MIGRATION.read_text()
     compact = _compact(sql)
@@ -1431,7 +2110,9 @@ async def test_compute_shape_repair_upgrades_deployed_0112_and_0113_checksums(
     staged_dir.mkdir()
     repaired_dir.mkdir()
     try:
-        for path in discover(ROOT / "orchestrator/database/migrations/app"):
+        for path in discover(
+            ROOT / "src" / "orchestrator" / "database" / "migrations" / "app"
+        ):
             if path.name <= APP_COMPUTE_AUTHORITY_CONFIRMATION_GAP_MIGRATION.name:
                 (staged_dir / path.name).write_bytes(path.read_bytes())
             if path.name <= APP_COMPUTE_INTERVAL_EPOCH_SHAPE_REPAIR_MIGRATION.name:

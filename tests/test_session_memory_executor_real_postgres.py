@@ -30,11 +30,12 @@ from orchestrator.services.session_memory_effects import (  # noqa: E402
 from orchestrator.services.session_memory_executor import (  # noqa: E402
     SessionMemoryEffectExecutor,
 )
-from src.database.postgres_db import PostgresDB  # noqa: E402
+from agent.database.postgres_db import PostgresDB  # noqa: E402
 
 PG_IMAGE = "pgvector/pgvector:pg15"
 VECTOR_MIGRATIONS = (
     Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "migrations"

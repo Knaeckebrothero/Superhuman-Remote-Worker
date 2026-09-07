@@ -23,11 +23,12 @@ from orchestrator.services.completion_sweep_router import (
     _ClaimedAction,
 )
 from orchestrator.database.postgres import PostgresDB
-from src.shared.worker_queue import claim_worker_batch
+from shared.worker_queue import claim_worker_batch
 
 
 SCHEMA_FILE = (
     Path(__file__).resolve().parents[1]
+    / "src"
     / "orchestrator"
     / "database"
     / "schema_current.sql"

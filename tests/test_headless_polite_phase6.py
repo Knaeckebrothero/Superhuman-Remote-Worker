@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.core.loader import (
+from shared.runtime.core.loader import (
     AgentConfig,
     HeadlessConfig,
     load_agent_config_from_dict,
@@ -30,15 +30,6 @@ class TestHeadlessConfigDefaults:
     def test_attention_sleep_minutes_defaults_to_60(self):
         assert HeadlessConfig().attention_sleep_minutes == 60
 
-    def test_notification_channels_defaults_to_email(self):
-        assert HeadlessConfig().notification_channels == ["email"]
-
-    def test_notification_channels_default_is_fresh_list(self):
-        """Two instances must not share the default list (mutability hazard)."""
-        a, b = HeadlessConfig(), HeadlessConfig()
-        a.notification_channels.append("sms")
-        assert b.notification_channels == ["email"]
-
     def test_agent_config_has_headless_field(self):
         ac = AgentConfig(agent_id="x", display_name="X")
         assert isinstance(ac.headless, HeadlessConfig)
@@ -56,7 +47,6 @@ class TestHeadlessConfigParsing:
         cfg = load_agent_config_from_dict(_minimal())
         assert cfg.headless.mode == "eager"
         assert cfg.headless.attention_sleep_minutes == 60
-        assert cfg.headless.notification_channels == ["email"]
 
     def test_explicit_polite_mode(self):
         cfg = load_agent_config_from_dict(_minimal(headless={"mode": "polite"}))
@@ -67,12 +57,6 @@ class TestHeadlessConfigParsing:
             _minimal(headless={"attention_sleep_minutes": 15})
         )
         assert cfg.headless.attention_sleep_minutes == 15
-
-    def test_notification_channels_override(self):
-        cfg = load_agent_config_from_dict(
-            _minimal(headless={"notification_channels": ["email", "sms"]})
-        )
-        assert cfg.headless.notification_channels == ["email", "sms"]
 
     def test_headless_not_in_extra(self):
         """headless is a known field and must not leak into AgentConfig.extra."""
@@ -99,10 +83,14 @@ class TestHeadlessConfigParsing:
 
 
 def _reset_agent_globals():
-    import src.api.persistent_app as mod
+    import agent.api.persistent_app as mod
 
     mod._session = None
     mod._thread_id = None
+    mod._pinned_status_identity_enabled = False
+    mod._pinned_runtime_generation_enabled = False
+    mod._session_runtime_generation = None
+    mod._session_runtime_attach_token = None
     mod._orchestrator_client = None
     mod._subscribers.clear()
     mod._loop_user_queue = None
@@ -110,7 +98,7 @@ def _reset_agent_globals():
 
 def _install_session(*, turn_count: int, headless_mode: str = "eager"):
     """Install a fake _session with a HeadlessConfig-shaped config.headless."""
-    import src.api.persistent_app as mod
+    import agent.api.persistent_app as mod
 
     session = MagicMock()
     session.turn_count = turn_count
@@ -129,6 +117,22 @@ def _install_session(*, turn_count: int, headless_mode: str = "eager"):
     return session, client
 
 
+def test_reset_agent_globals_clears_pinned_identity_protocol() -> None:
+    import agent.api.persistent_app as mod
+
+    mod._pinned_status_identity_enabled = True
+    mod._pinned_runtime_generation_enabled = True
+    mod._session_runtime_generation = "leaked-generation"
+    mod._session_runtime_attach_token = "leaked-attach"
+
+    _reset_agent_globals()
+
+    assert mod._pinned_status_identity_enabled is False
+    assert mod._pinned_runtime_generation_enabled is False
+    assert mod._session_runtime_generation is None
+    assert mod._session_runtime_attach_token is None
+
+
 class TestPoliteModeFlip:
     def setup_method(self):
         _reset_agent_globals()
@@ -140,7 +144,7 @@ class TestPoliteModeFlip:
     async def test_polite_flips_with_subscribers_attached(self):
         """Polite mode flips awaiting_user even when a subscriber is present —
         this is the core Phase 6 behavioral change."""
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         _, client = _install_session(turn_count=2, headless_mode="polite")
         mod._subscribers["ws-1"] = asyncio.Queue()
@@ -159,7 +163,7 @@ class TestPoliteModeFlip:
     async def test_polite_still_skips_when_turn_count_is_zero(self):
         """Polite still respects the first-boot guard — flipping on the boot
         wait would email the user before they've sent a single message."""
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         _, client = _install_session(turn_count=0, headless_mode="polite")
         mod._loop_user_queue.put_nowait("hi")
@@ -172,7 +176,7 @@ class TestPoliteModeFlip:
     @pytest.mark.asyncio
     async def test_eager_with_subscribers_does_not_flip(self):
         """Phase 5 regression: eager mode + subscribers attached → no flip."""
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         _, client = _install_session(turn_count=2, headless_mode="eager")
         mod._subscribers["ws-1"] = asyncio.Queue()
@@ -189,7 +193,7 @@ class TestPoliteModeFlip:
     @pytest.mark.asyncio
     async def test_eager_untethered_still_flips(self):
         """Phase 5 regression: eager + no subs → flip awaiting_user."""
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         _, client = _install_session(turn_count=2, headless_mode="eager")
         mod._loop_user_queue.put_nowait("hi")
@@ -205,7 +209,7 @@ class TestPoliteModeFlip:
     async def test_missing_headless_attr_defaults_to_eager(self):
         """Defensive: a session whose config has no headless attribute (legacy
         config or test mock) must not crash the loop — fall back to eager."""
-        import src.api.persistent_app as mod
+        import agent.api.persistent_app as mod
 
         _, client = _install_session(turn_count=2, headless_mode="eager")
         # Strip only the headless attribute; keep interactive intact so

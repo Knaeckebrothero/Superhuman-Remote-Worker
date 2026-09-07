@@ -6,8 +6,9 @@ name: develop
 #   - Lint is non-blocking — ruff format auto-commits fixes on push
 #   - Tests and builds are change-based (only run when relevant files change)
 #   - Images get SHA + :experimental tags (no version tags)
-#   - Helm chart published as "srw-dev" with 0.0.0-dev.sha-<hash> versions
-#   - deploy-experimental updates fleet.yaml chart version + image tags
+#   - Helm chart published as "srw-dev" with monotonic 0.0.<run_number> versions
+#   - Publishing the versioned dev chart deploys it through Fleet resolution;
+#     all required image builds and registry identities gate publication
 #   - Container image tags are per-component identities: sha of the newest
 #     commit that touched the component's build inputs (NOT the push HEAD),
 #     so a push that doesn't change a component never moves its tag and the
@@ -20,7 +21,7 @@ name: develop
 #     caught before merge instead of after. Docs-only PRs still pay nothing
 #     since change-detection skips the build jobs entirely.
 #   - Push to develop: same change-based builds, but `push: true` with
-#     SHA + :experimental tags, followed by deploy-experimental.
+#     SHA + :experimental tags, followed by verified chart publication.
 
 on:
   push:
@@ -34,6 +35,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  PYTHONSAFEPATH: "1"
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
   # Lowercased repo path for GHCR cache refs. github.repository preserves
@@ -41,12 +43,69 @@ env:
   # but GHCR rejects uppercase image paths. docker/metadata-action handles
   # this for production tags; YAML expressions can't lowercase, so we hardcode.
   # Update this if the repo is renamed.
-  REPO_LOWER: knaeckebrothero/uni-projekt-graph-rag
+  REPO_LOWER: knaeckebrothero/superhuman-remote-worker
   SRW_SOURCE_URL: https://github.com/knaeckebrothero/Superhuman-Remote-Worker
-  SRW_DOCUMENTATION_URL: https://github.com/knaeckebrothero/Superhuman-Remote-Worker/tree/main/docs
+  SRW_DOCUMENTATION_URL: https://github.com/knaeckebrothero/Superhuman-Remote-Worker
   SRW_RELEASE_VERSION: 0.0.0-dev.sha-${{ github.sha }}
 
 jobs:
+  # These are separate runtime environments; the combined unit environment below
+  # cannot validate either image's dependency closure/Python target.
+  dependency-locks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - role: orchestrator
+            python: "3.11"
+            lock: requirements/locks/orchestrator-py311.txt
+          - role: vm-controller
+            python: "3.12"
+            lock: requirements/locks/vm-controller-py312.txt
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Check dependency input and lock drift
+        run: python scripts/lock_dependencies.py check
+      - name: Install the role in a clean environment
+        run: |
+          python -m venv .role-venv
+          .role-venv/bin/python -m pip install --require-hashes -r ${{ matrix.lock }}
+          .role-venv/bin/python -m pip check
+      - name: Verify installed pins and SDK authentication
+        run: |
+          .role-venv/bin/python scripts/lock_dependencies.py check ${{ matrix.role }} --installed
+          .role-venv/bin/python -I scripts/check_kubernetes_sdk_auth.py
+
+  # Package boundaries are checked on the exact revision used by builds/tests.
+  architecture:
+    needs: [dependency-locks]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install architecture tooling and editable packages
+        run: |
+          pip install import-linter==2.13
+          pip install --no-deps -e .
+      - name: Enforce application dependency boundaries
+        run: lint-imports --verbose
+
   # ---------------------------------------------------------------------------
   # Auto-format + lint (non-blocking — failures don't gate builds)
   # On push: auto-commits ruff format fixes so develop stays clean.
@@ -59,7 +118,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: develop
+          ref: ${{ github.sha }}
 
       - uses: actions/setup-python@v5
         with:
@@ -68,24 +127,12 @@ jobs:
       - name: Install ruff
         run: pip install ruff==0.14.10
 
-      - name: Auto-format and commit
-        if: github.event_name == 'push'
-        run: |
-          ruff format src/ orchestrator/ tests/
-          if ! git diff --quiet; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add src/ orchestrator/ tests/
-            git commit -m "style: ruff auto-format"
-            git push
-          fi
-
       - name: Ruff lint check
-        run: ruff check src/ orchestrator/ tests/
+        run: ruff check src/ tests/
         continue-on-error: true
 
       - name: Ruff format check
-        run: ruff format --check src/ orchestrator/ tests/
+        run: ruff format --check src/ tests/
         continue-on-error: true
 
       - name: Verify Playwright pin consistency
@@ -100,6 +147,19 @@ jobs:
           grep -q "^PLAYWRIGHT_VERSION=${PIN}$" .env.example \
             || { echo "::error::PLAYWRIGHT_VERSION in .env.example does not match .playwright-version (${PIN})"; exit 1; }
         continue-on-error: true
+
+      - name: Auto-format and commit
+        if: github.event_name == 'push'
+        continue-on-error: true
+        run: |
+          ruff format src/ tests/
+          if ! git diff --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add src/ tests/
+            git commit -m "style: ruff auto-format"
+            git push origin HEAD:develop
+          fi
 
   # ---------------------------------------------------------------------------
   # Chart correctness gates (Phase 1) — render matrix + schema validation.
@@ -135,6 +195,8 @@ jobs:
           - installer-production-vms
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
 
       - name: Install Helm
         uses: azure/setup-helm@v4
@@ -144,7 +206,6 @@ jobs:
       - name: Build Helm dependencies
         run: |
           helm repo add collabora https://collaboraonline.github.io/online --force-update
-          helm repo add cloudnative-pg https://cloudnative-pg.github.io/charts --force-update
           helm dependency build helm/
 
       - name: Install kubeconform
@@ -184,6 +245,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
 
       - name: Install Helm
         uses: azure/setup-helm@v4
@@ -193,7 +256,6 @@ jobs:
       - name: Build Helm dependencies
         run: |
           helm repo add collabora https://collaboraonline.github.io/online --force-update
-          helm repo add cloudnative-pg https://cloudnative-pg.github.io/charts --force-update
           helm dependency build helm/
 
       - name: Assert invalid values are rejected by the schema
@@ -211,6 +273,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     continue-on-error: true
+    env:
+      # CodeQL's bundled Python scripts import helpers beside their entrypoints.
+      PYTHONSAFEPATH: ""
     permissions:
       security-events: write
       contents: read
@@ -220,6 +285,8 @@ jobs:
         language: [python, javascript-typescript]
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: github/codeql-action/init@v3
         with:
           languages: ${{ matrix.language }}
@@ -234,6 +301,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -245,11 +314,25 @@ jobs:
           node-version: "22"
           cache: npm
           cache-dependency-path: cockpit/package-lock.json
-      - name: Upgrade pip
-        # CVE-2026-6357: pip < 26.1 runs self-update import after wheel install
-        run: uv pip install --system --upgrade 'pip>=26.1'
+      - name: Upgrade packaging toolchain
+        # CVE-2026-6357: pip < 26.1 runs self-update import after wheel install.
+        # setup-python currently carries setuptools 78.1.0; upgrade it before
+        # auditing so the runner itself is not the only vulnerable package.
+        run: >-
+          uv pip install --system --upgrade
+          'pip>=26.1' 'setuptools>=83.0.0'
       - name: Install pip-audit
         run: uv pip install --system pip-audit
+      # Mirror docker/Dockerfile.agent: the shipped agent image installs
+      # CPU-only PyTorch BEFORE requirements.txt, so the ~18 proprietary
+      # nvidia-*/cuda-* CUDA wheels that a bare `pip install -r
+      # requirements.txt` drags in via sentence-transformers -> torch are never
+      # conveyed. Install them here and this job audits (and license-gates) a
+      # dependency set that does not match the artifact we ship.
+      - name: Install CPU-only PyTorch (matches the agent image)
+        run: >-
+          uv pip install --system torch
+          --index-url https://download.pytorch.org/whl/cpu
       - name: Install Python dependencies
         run: uv pip install --system -r requirements.txt
       - name: Audit Python dependencies
@@ -386,19 +469,30 @@ jobs:
       # this already-required job so it gates every build without per-job edits.
       # Source of truth: scripts/check_licenses.py.
       - name: Install license tooling + full bundled dep set
+        # Name all three runtime requirements files. pip-licenses reads
+        # *installed* metadata, so a file nobody installed is invisible to the
+        # gate; the root requirements.txt (the agent image's dep set, where the
+        # AGPL pymupdf lived) reached this env only as a side effect of the
+        # pip-audit step above, which is not a dependency worth relying on.
+        # The gate's actual blind spot was in scripts/check_licenses.py: its
+        # pip-licenses call passed --no-license-path/--with-notice-file without
+        # --with-license-file, so pip-licenses exited 2, the collector returned
+        # [], and the gate scanned ZERO Python packages while reporting a pass.
         run: >-
           uv pip install --system pip-licenses
-          -r orchestrator/requirements.txt
-          -r orchestrator/mcp/requirements.txt
+          -r requirements.txt
+          -r src/orchestrator/requirements.txt
+          -r src/mcp_server/requirements.txt
       - name: Check third-party licenses
         # Python: installed metadata via pip-licenses. Frontend: read straight
         # from cockpit/package-lock.json (no npm install / node_modules needed).
         run: python scripts/check_licenses.py --check
 
   # ---------------------------------------------------------------------------
-  # Regenerate THIRD_PARTY_LICENSES.md and auto-commit on develop (mirrors the
-  # lint job's ruff auto-format-and-commit). Non-blocking — the dependency-audit
-  # job is the blocking gate. Push-only; PRs are covered by that gate.
+  # Regenerate THIRD_PARTY_LICENSES.md as a reviewable observation artifact.
+  # Branch protection requires changes through a PR, so CI must never try to
+  # push this generated documentation directly to develop. The dependency-
+  # audit job above remains the blocking policy gate.
   # ---------------------------------------------------------------------------
   license-inventory:
     needs: [lint]
@@ -406,40 +500,69 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 12
     permissions:
-      contents: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: develop
+          ref: ${{ github.sha }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
+      # Same reason as in dependency-audit: without this, the generated
+      # inventory attributes ~18 proprietary nvidia-*/cuda-* CUDA wheels that
+      # the agent image never installs. See docker/Dockerfile.agent.
+      - name: Install CPU-only PyTorch (matches the agent image)
+        run: >-
+          uv pip install --system torch
+          --index-url https://download.pytorch.org/whl/cpu
       - name: Install dependencies + license tooling
         # No Node step / npm ci: backend needs the installed Python deps for
         # pip-licenses; the frontend inventory is read from package-lock.json.
         run: >-
           uv pip install --system pip-licenses
           -r requirements.txt
-          -r orchestrator/requirements.txt
-          -r orchestrator/mcp/requirements.txt
+          -r src/orchestrator/requirements.txt
+          -r src/mcp_server/requirements.txt
       - name: Regenerate THIRD_PARTY_LICENSES.md
-        # --write also runs the gate; never block the docs commit here (the
-        # dependency-audit job blocks the build), so swallow a nonzero exit.
-        run: python scripts/check_licenses.py --write || true
-      - name: Commit if changed
+        # --write also runs the gate. A *policy* failure (exit 1, a denied
+        # license) must not block the docs commit — the dependency-audit job is
+        # the blocking gate for that. A *generation* failure (exit 2: the
+        # collector produced nothing, e.g. pip-licenses itself errored) MUST
+        # fail here: swallowing it is how an empty backend inventory got
+        # committed as authoritative for months.
+        run: |
+          set +e
+          python scripts/check_licenses.py --write
+          status=$?
+          set -e
+          if [ "$status" -ge 2 ]; then
+            echo "::error::license inventory generation failed (exit $status)"
+            exit "$status"
+          fi
+          echo "Inventory regenerated (gate exit $status)."
+      - name: Record inventory drift
+        id: inventory
         run: |
           if git diff --quiet THIRD_PARTY_LICENSES.md; then
             echo "THIRD_PARTY_LICENSES.md unchanged"
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
             exit 0
           fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add THIRD_PARTY_LICENSES.md
-          git commit -m "docs: regenerate THIRD_PARTY_LICENSES.md [skip ci]"
-          git push
+          echo "changed=true" >> "${GITHUB_OUTPUT}"
+          git diff --binary -- THIRD_PARTY_LICENSES.md > THIRD_PARTY_LICENSES.patch
+          echo "::warning::THIRD_PARTY_LICENSES.md drifted; download the generated inventory artifact and review it through a PR"
+      - name: Upload generated license inventory
+        if: steps.inventory.outputs.changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: third-party-license-inventory-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 7
+          path: |
+            THIRD_PARTY_LICENSES.md
+            THIRD_PARTY_LICENSES.patch
 
   # ---------------------------------------------------------------------------
   # Detect which components changed — build jobs only run when needed
@@ -447,6 +570,13 @@ jobs:
   changes:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # packages: read — the rebuild predicate asks the registry whether a
+    # component's image already exists. The component packages may be
+    # private, so this is not optional. On a fork PR where the token cannot read
+    # them, the predicate fails open and everything builds (PRs never push).
+    permissions:
+      contents: read
+      packages: read
     outputs:
       agent: ${{ steps.check.outputs.agent }}
       orchestrator: ${{ steps.check.outputs.orchestrator }}
@@ -455,17 +585,19 @@ jobs:
       vm-base: ${{ steps.check.outputs.vm-base }}
       vm-base-stage1: ${{ steps.check.outputs.vm-base-stage1 }}
       vm-controller: ${{ steps.check.outputs.vm-controller }}
-      sudo-gate: ${{ steps.check.outputs.sudo-gate }}
       workspace: ${{ steps.check.outputs.workspace }}
       # Per-component image identity: full sha of the newest commit that
       # touched the component's build inputs. Consumed by the build jobs
       # (image tag + baked BUILD_SHA/provenance) and deploy-experimental
-      # (values-experimental.yaml tag + provenance identity).
+      # (baked chart tags + provenance identity).
       agent-sha: ${{ steps.check.outputs.agent-sha }}
       orchestrator-sha: ${{ steps.check.outputs.orchestrator-sha }}
       cockpit-sha: ${{ steps.check.outputs.cockpit-sha }}
       mcp-sha: ${{ steps.check.outputs.mcp-sha }}
       workspace-sha: ${{ steps.check.outputs.workspace-sha }}
+      vm-controller-sha: ${{ steps.check.outputs.vm-controller-sha }}
+      vm-base-sha: ${{ steps.check.outputs.vm-base-sha }}
+      vm-base-stage1-sha: ${{ steps.check.outputs.vm-base-stage1-sha }}
       chart: ${{ steps.check.outputs.chart }}
       python-changed: ${{ steps.test-paths.outputs.python }}
       cockpit-changed: ${{ steps.test-paths.outputs.cockpit }}
@@ -474,6 +606,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
 
       - name: Detect test-relevant changes
@@ -563,10 +696,11 @@ jobs:
           echo "Test path detection: diffing $BASE..HEAD ($(git rev-list --count "$BASE..HEAD") commit(s))"
 
           if git diff --name-only "$BASE" HEAD -- \
-            'src/' 'orchestrator/' 'tests/' 'config/' 'agent.py' \
+            'src/' 'tests/' 'config/' 'init.py' 'scripts/' 'policy/' '.github/workflows/' \
+            'docker/prepare-tokenizer-cache.py' \
             'cockpit/angular.json' 'docker/cockpit-nginx.conf' \
             'docker/Dockerfile.cockpit' \
-            'requirements.txt' 'orchestrator/requirements.txt' 'requirements-dev.txt' \
+            'requirements.txt' 'requirements-dev.txt' 'requirements/' 'pyproject.toml' '.squawk.toml' \
             | grep -q .; then
             echo "python=true" >> "$GITHUB_OUTPUT"
           else
@@ -633,99 +767,83 @@ jobs:
           printf '  %s\n' "${picked[@]}"
           echo "pytest-target=${picked[*]}" >> "$GITHUB_OUTPUT"
 
-      - name: Detect changes against last deployed SHA per component
+      # Non-fatal on purpose: the rebuild predicate below fails open towards
+      # building, so a failed login costs redundant builds rather than a broken
+      # run. Fork PRs land here.
+      - name: Log in to GHCR (for the rebuild predicate)
+        continue-on-error: true
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Detect changes against what is already built
         id: check
         run: |
-          extract_sha() {
-            local component="$1"
-            grep -A1 "^  ${component}:" deployment/values-experimental.yaml 2>/dev/null \
-              | grep -oP 'tag:\s*sha-\K[0-9a-f]{7}' | head -1 || echo ""
+          # Rebuild predicate: does an image for this component's identity
+          # already exist in the registry?
+          #
+          # This replaces reading the last-deployed tag out of
+          # deployment/values-experimental.yaml. That file was the de-facto
+          # ledger of "what is built", but the DEPLOY job wrote it, so it only
+          # advanced when a deploy happened. Commit 8611183c removed the deploy
+          # push, the ledger froze at its 2026-08-28 values, and every component
+          # began diffing against a stale sha and rebuilding on every push —
+          # correct images, silently wasted CI. The registry is the honest
+          # ledger: it records what was actually BUILT, not what was last
+          # deployed, and nothing has to write to git to maintain it.
+          #
+          # It preserves the catch-up property the old predicate existed for. A
+          # build blocked by failing tests pushes no image, so a later run still
+          # finds nothing for that identity and rebuilds it — even when that push
+          # touched only unrelated paths.
+          #
+          # FAIL OPEN TOWARDS BUILDING: only a positive "it exists" skips. A
+          # registry hiccup, an auth failure or a missing tool costs one
+          # redundant build. The opposite would ship a commit with no image.
+          image_missing() {
+            local component="$1" sha="$2"
+            local ref="ghcr.io/knaeckebrothero/superhuman-remote-worker-${component}:sha-${sha:0:7}"
+            if docker buildx imagetools inspect "$ref" >/dev/null 2>&1; then
+              echo "false"
+            else
+              echo "true"
+            fi
           }
 
-          has_changes() {
-            local sha="$1"
-            shift
-            local paths=("$@")
-            if [ -z "$sha" ]; then
-              echo "true"
-              return
-            fi
-            if ! git cat-file -t "$sha" &>/dev/null; then
-              echo "true"
-              return
-            fi
-            for path in "${paths[@]}"; do
-              if [ -n "$(git diff --name-only "$sha" HEAD -- "$path")" ]; then
-                echo "true"
-                return
-              fi
-            done
-            echo "false"
-          }
 
           # Newest commit that touched a component's build inputs — the
           # component's image identity (tag + provenance), instead of the
           # push HEAD. A rebuild from unchanged inputs (catch-up after a
           # blocked run, or a batched push whose HEAD is unrelated — e.g.
-          # docs) reproduces the SAME identity, so values-experimental.yaml
-          # only moves — and the lifecycle reconciler only drains agent pods
-          # — when the component's content actually changed.
+          # docs) reproduces the SAME identity, so the tags baked into the
+          # chart only move — and the lifecycle reconciler only drains agent
+          # pods — when the component's content actually changed.
           last_input_sha() {
             local sha
             sha=$(git log -1 --format=%H HEAD -- "$@")
             echo "${sha:-$GITHUB_SHA}"
           }
 
-          SHA_AGENT=$(extract_sha agent)
-          SHA_ORCHESTRATOR=$(extract_sha orchestrator)
-          SHA_COCKPIT=$(extract_sha cockpit)
-          SHA_MCP=$(extract_sha mcp)
-          SHA_WORKSPACE=$(extract_sha workspace)
-          # VM image SHAs live in fleet.yaml — vmController as a bare tag
-          # (image.vmController.tag), agent-vm-base embedded in the
-          # defaultVmImage URL (vmController.defaultVmImage).
-          #
-          # An EMPTY result is fail-open on purpose: it means nothing is deployed
-          # yet, and has_changes correctly treats that as "rebuild". A MISSING
-          # TOOL is not the same thing, but `yq ... 2>/dev/null` makes the two
-          # indistinguishable — so on a runner without yq, every VM job would
-          # rebuild on every run, silently and expensively. yq is preinstalled on
-          # ubuntu-latest and baked into the self-hosted runner image
-          # (docker/Dockerfile.ci-runner); if it is absent, something is broken
-          # and we want to hear about it rather than pay for it.
-          command -v yq >/dev/null 2>&1 || {
-            echo "::error::yq not found on this runner. It is preinstalled on ubuntu-latest and baked into docker/Dockerfile.ci-runner — if you see this, the runner image is broken."
-            exit 1
-          }
-          VM_FLEET=deployment-vms/srw-vm-controller/fleet.yaml
-          test -f "$VM_FLEET" || {
-            echo "::error::$VM_FLEET is missing — cannot resolve deployed VM SHAs."
-            exit 1
-          }
-          SHA_VM_CONTROLLER=$(yq '.helm.values.image.vmController.tag' "$VM_FLEET" | grep -oP 'sha-\K[0-9a-f]{7}' | head -1)
-          SHA_VM_BASE=$(yq '.helm.values.vmController.defaultVmImage' "$VM_FLEET" | grep -oP 'sha-\K[0-9a-f]{7}' | head -1)
-
-          echo "Deployed SHAs:"
-          echo "  agent=$SHA_AGENT  orchestrator=$SHA_ORCHESTRATOR  cockpit=$SHA_COCKPIT"
-          echo "  mcp=$SHA_MCP  workspace=$SHA_WORKSPACE"
-          echo "  vm-controller=$SHA_VM_CONTROLLER  vm-base=$SHA_VM_BASE"
-
           # Build-input path lists — single source for BOTH the rebuild
-          # predicate (has_changes) and the image identity (last_input_sha),
+          # predicate (image_missing) and the image identity (last_input_sha),
           # so a component's tag can only ever move to a commit that touched
-          # its inputs. Lists mirror the Dockerfiles' COPY statements:
-          # Dockerfile.orchestrator copies src/, Dockerfile.cockpit copies
-          # docker/cockpit-canvas-env.sh, Dockerfile.mcp copies
-          # orchestrator/security/__init__.py — keep them in sync.
-          AGENT_PATHS=(src/ config/ agent.py requirements.txt
-            docker/Dockerfile.agent)
-          ORCHESTRATOR_PATHS=(orchestrator/ src/ config/
-            docker/Dockerfile.orchestrator)
-          COCKPIT_PATHS=(cockpit/ docker/Dockerfile.cockpit
+          # its inputs. Lists mirror each Dockerfile's COPY inputs, including
+          # packaging metadata and the context-wide .dockerignore filter.
+          AGENT_PATHS=(src/agent/ src/shared/ config/ requirements.txt pyproject.toml
+            .dockerignore docker/Dockerfile.agent docker/prepare-tokenizer-cache.py)
+          ORCHESTRATOR_PATHS=(src/orchestrator/ src/shared/ config/ pyproject.toml
+            .dockerignore docker/Dockerfile.orchestrator
+            scripts/check_kubernetes_sdk_auth.py requirements/ scripts/lock_dependencies.py)
+          COCKPIT_PATHS=(cockpit/ .dockerignore docker/Dockerfile.cockpit
             docker/cockpit-nginx.conf docker/cockpit-canvas-env.sh)
-          MCP_PATHS=(orchestrator/mcp/ src/shared/
-            orchestrator/security/__init__.py
-            orchestrator/security/anti_framing.py docker/Dockerfile.mcp)
+          MCP_PATHS=(src/mcp_server/ src/shared/ pyproject.toml
+            .dockerignore docker/Dockerfile.mcp)
+          VM_CONTROLLER_PATHS=(src/vm_controller/ src/shared/__init__.py
+            src/shared/vm_lifecycle_auth.py pyproject.toml
+            .dockerignore docker/Dockerfile.vm-controller
+            scripts/check_kubernetes_sdk_auth.py requirements/ scripts/lock_dependencies.py)
           # docker/browser-exec is COPY'd into the workspace image at build time
           # (see Dockerfile.workspace §2c), so changes to it must rebuild the
           # workspace image. Missing this path caused a0ce92d2's browser-exec
@@ -735,25 +853,25 @@ jobs:
             docker/workspace-entrypoint.sh
             docker/browser-exec docker/check-browser-stream.py
             docker/assert-browser-stack.sh
-            .playwright-version)
+            .playwright-version .dockerignore)
 
-          AGENT=$(has_changes "$SHA_AGENT" "${AGENT_PATHS[@]}")
           AGENT_SHA=$(last_input_sha "${AGENT_PATHS[@]}")
+          AGENT=$(image_missing agent "$AGENT_SHA")
 
-          ORCHESTRATOR=$(has_changes "$SHA_ORCHESTRATOR" "${ORCHESTRATOR_PATHS[@]}")
           ORCHESTRATOR_SHA=$(last_input_sha "${ORCHESTRATOR_PATHS[@]}")
+          ORCHESTRATOR=$(image_missing orchestrator "$ORCHESTRATOR_SHA")
 
-          COCKPIT=$(has_changes "$SHA_COCKPIT" "${COCKPIT_PATHS[@]}")
           COCKPIT_SHA=$(last_input_sha "${COCKPIT_PATHS[@]}")
+          COCKPIT=$(image_missing cockpit "$COCKPIT_SHA")
 
-          MCP=$(has_changes "$SHA_MCP" "${MCP_PATHS[@]}")
           MCP_SHA=$(last_input_sha "${MCP_PATHS[@]}")
+          MCP=$(image_missing mcp "$MCP_SHA")
 
-          WORKSPACE=$(has_changes "$SHA_WORKSPACE" "${WORKSPACE_PATHS[@]}")
           WORKSPACE_SHA=$(last_input_sha "${WORKSPACE_PATHS[@]}")
+          WORKSPACE=$(image_missing workspace "$WORKSPACE_SHA")
 
-          VM_CONTROLLER=$(has_changes "$SHA_VM_CONTROLLER" \
-            vm/controller/)
+          VM_CONTROLLER_SHA=$(last_input_sha "${VM_CONTROLLER_PATHS[@]}")
+          VM_CONTROLLER=$(image_missing vm-controller "$VM_CONTROLLER_SHA")
 
           # Stage1 rebuilds on changes to the heavy provisioning script, the
           # Packer template that drives it, .playwright-version, the cloud-init
@@ -769,22 +887,26 @@ jobs:
           # and fails every build. That is exactly what happened when 9fe74797
           # added the browser_use requirement: stage1 was never rebuilt (VM jobs
           # were skipped on the red-test-python runs), so stage2's gate rejected
-          # the pre-browser_use stage1. Since stage2 also rebuilds whenever stage1
-          # does (VM_BASE_STAGE1 is an OR-trigger for build-agent-vm-base), gate
+          # the pre-browser_use stage1. Since stage1's paths are part of stage2's
+          # identity below, stage2 also rebuilds whenever stage1 does — gate
           # requirements that are actually stage2-side stay covered too.
-          VM_BASE_STAGE1=$(has_changes "$SHA_VM_BASE" \
-            docker/agent-vm-base/scripts/provision-stage1.sh \
-            docker/agent-vm-base/scripts/cleanup-stage1.sh \
-            docker/agent-vm-base/stage1.pkr.hcl \
-            docker/agent-vm-base/Dockerfile.containerDisk-stage1 \
-            docker/agent-vm-base/cloud-init/ \
-            docker/assert-browser-stack.sh \
+          VM_BASE_STAGE1_PATHS=(docker/agent-vm-base/scripts/provision-stage1.sh
+            docker/agent-vm-base/scripts/cleanup-stage1.sh
+            docker/agent-vm-base/stage1.pkr.hcl
+            docker/agent-vm-base/Dockerfile.containerDisk-stage1
+            docker/agent-vm-base/cloud-init/
+            docker/assert-browser-stack.sh
             .playwright-version)
+          VM_BASE_STAGE1_SHA=$(last_input_sha "${VM_BASE_STAGE1_PATHS[@]}")
+          VM_BASE_STAGE1=$(image_missing agent-vm-base-stage1 "$VM_BASE_STAGE1_SHA")
 
           # Stage2 (the per-commit image) rebuilds on changes to its provisioning
           # script, Packer template, cleanup script, daemon/sudo-gate config
-          # files, or the containerDisk wrapper. Sudo-gate binary changes also
-          # trigger this via SUDO_GATE below.
+          # files, or the containerDisk wrapper. Its identity spans its own
+          # inputs PLUS stage1's PLUS the sudo-gate sources (vm/sudo-daemon/,
+          # vm/sudo-plugin/ — build-sudo-gate's binaries are baked into the
+          # image via files/), so a change to any of them mints a new stage2
+          # image and `vm-base` alone answers "must stage2 be (re)built".
           #
           # docker/browser-exec is uploaded (stage2.pkr.hcl, `../browser-exec`)
           # and installed into the stage2 layer by provision-stage2.sh, so a
@@ -793,29 +915,27 @@ jobs:
           # it here would let a browser-exec fix sit unbuilt in the VM image while
           # the container image shipped it, the same silent-drift bug the
           # WORKSPACE comment records for a0ce92d2.
-          VM_BASE=$(has_changes "$SHA_VM_BASE" \
-            docker/agent-vm-base/scripts/provision-stage2.sh \
-            docker/agent-vm-base/scripts/cleanup.sh \
-            docker/agent-vm-base/stage2.pkr.hcl \
-            docker/agent-vm-base/Dockerfile.containerDisk \
-            docker/agent-vm-base/files/ \
-            docker/browser-exec docker/check-browser-stream.py)
+          VM_BASE_PATHS=(docker/agent-vm-base/scripts/provision-stage2.sh
+            docker/agent-vm-base/scripts/cleanup.sh
+            docker/agent-vm-base/stage2.pkr.hcl
+            docker/agent-vm-base/Dockerfile.containerDisk
+            docker/agent-vm-base/files/
+            docker/browser-exec docker/check-browser-stream.py
+            vm/sudo-daemon/ vm/sudo-plugin/
+            "${VM_BASE_STAGE1_PATHS[@]}")
+          VM_BASE_SHA=$(last_input_sha "${VM_BASE_PATHS[@]}")
+          VM_BASE=$(image_missing agent-vm-base "$VM_BASE_SHA")
 
-          SUDO_GATE=$(has_changes "$SHA_VM_BASE" \
-            vm/sudo-daemon/ vm/sudo-plugin/)
-
-          # Chart changes (helm/ = main chart, helm-vm-cluster/ = vm-cluster
-          # chart). Watch the chart-created Secret verifier too so changes to
-          # that CI contract cannot skip the job that executes it. Both charts
-          # must remain watched: a helm-vm-cluster/-only change otherwise skips
-          # the vm-cluster chart publish + fleet bump.
+          # Chart changes (helm/ — the separate vm-cluster chart left with the
+          # dedicated vm cluster). Watch the chart-created Secret verifier too
+          # so changes to that CI contract cannot skip the job that executes it.
           # Same push-range base the test-path step resolved (RANGE_BASE), so a
           # chart edit five commits below the tip is not missed. This one is
           # sharper than the test case: a false negative here skips the chart
           # PUBLISH and the fleet bump, so dev keeps running the old chart with
           # a green tick. Empty means "no usable range" and falls open below.
           CHART_BASE="${RANGE_BASE:-}"
-          if [ -z "$CHART_BASE" ] || [ -n "$(git diff --name-only "$CHART_BASE" HEAD -- 'helm/' 'helm-vm-cluster/' 'scripts/check-chart-created-secret.sh')" ]; then
+          if [ -z "$CHART_BASE" ] || [ -n "$(git diff --name-only "$CHART_BASE" HEAD -- 'helm/' 'scripts/check-chart-created-secret.sh')" ]; then
             CHART="true"
           else
             CHART="false"
@@ -825,7 +945,8 @@ jobs:
           echo "Change detection results:"
           echo "  agent=$AGENT  orchestrator=$ORCHESTRATOR  cockpit=$COCKPIT"
           echo "  mcp=$MCP  workspace=$WORKSPACE"
-          echo "  vm-controller=$VM_CONTROLLER  vm-base=$VM_BASE  vm-base-stage1=$VM_BASE_STAGE1  sudo-gate=$SUDO_GATE"
+          echo "  vm-controller=$VM_CONTROLLER  vm-base=$VM_BASE  vm-base-stage1=$VM_BASE_STAGE1"
+          echo "  vm input shas: vm-controller=${VM_CONTROLLER_SHA::7} vm-base=${VM_BASE_SHA::7} vm-base-stage1=${VM_BASE_STAGE1_SHA::7}"
           echo "  chart=$CHART"
           echo "  input shas: agent=${AGENT_SHA::7} orchestrator=${ORCHESTRATOR_SHA::7} cockpit=${COCKPIT_SHA::7} mcp=${MCP_SHA::7} workspace=${WORKSPACE_SHA::7}"
 
@@ -841,9 +962,11 @@ jobs:
             echo "mcp-sha=$MCP_SHA"
             echo "workspace-sha=$WORKSPACE_SHA"
             echo "vm-controller=$VM_CONTROLLER"
+            echo "vm-controller-sha=$VM_CONTROLLER_SHA"
             echo "vm-base=$VM_BASE"
+            echo "vm-base-sha=$VM_BASE_SHA"
             echo "vm-base-stage1=$VM_BASE_STAGE1"
-            echo "sudo-gate=$SUDO_GATE"
+            echo "vm-base-stage1-sha=$VM_BASE_STAGE1_SHA"
             echo "chart=$CHART"
           } >> "$GITHUB_OUTPUT"
 
@@ -854,9 +977,17 @@ jobs:
     needs: [changes]
     if: needs.changes.outputs.python-changed == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 25, not 15: the suite is ~22.6k tests and takes ~14 min of test time on
+    # ubuntu-latest plus ~2 min of job setup. At 15 the 2026-09-02 develop run
+    # was killed at 91% while still progressing at full speed (46 progress
+    # marks in its final two minutes, largest single gap 62 s: no hang), and
+    # a timed-out job reports as 'cancelled', which the build jobs treat as a
+    # failure: nothing built and no chart published for that push.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -874,10 +1005,13 @@ jobs:
       - name: Build Helm dependencies
         run: |
           helm repo add collabora https://collaboraonline.github.io/online --force-update
-          helm repo add cloudnative-pg https://cloudnative-pg.github.io/charts --force-update
           helm dependency build helm/
       - name: Install dependencies
-        run: uv pip install --system -r requirements.txt -r orchestrator/requirements.txt -r orchestrator/mcp/requirements.txt -r requirements-dev.txt pytest pytest-asyncio
+        run: uv pip install --system -r requirements.txt -r src/orchestrator/requirements.txt -r src/mcp_server/requirements.txt -r requirements-dev.txt pytest pytest-asyncio
+      - name: Install editable application packages
+        run: pip install --no-deps -e .
+      - name: Check combined test environment compatibility
+        run: python -m pip check
       # `changes` narrowed this to the test files the diff can reach; the fallback
       # covers a dispatch, where selection is skipped on purpose, and any path
       # where the output is unset. loadfile keeps each selected file on one worker.
@@ -915,6 +1049,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       # The image ships Node 24; pin to 22 so unit tests, the production build,
       # and the conformance run all use the same Node as every other job.
       - uses: actions/setup-node@v4
@@ -975,8 +1111,9 @@ jobs:
   # Lint is NOT required (non-blocking on develop).
   # ---------------------------------------------------------------------------
   build-agent:
-    needs: [changes, dependency-audit, test-python, test-cockpit]
+    needs: [architecture, changes, dependency-audit, test-python, test-cockpit]
     if: >-
+      needs.architecture.result == 'success' &&
       always() && !cancelled() &&
       (needs.changes.outputs.agent == 'true' || github.event_name == 'workflow_dispatch') &&
       needs.dependency-audit.result == 'success' &&
@@ -989,6 +1126,8 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - name: Free disk space
         # Hosted runners have ~14 GiB free and these jobs need more. Self-hosted
         # runners do not need it, and the heavy variants below delete
@@ -1019,7 +1158,7 @@ jobs:
         id: ident
         run: |
           FULL="${{ needs.changes.outputs.agent-sha }}"
-          : "${FULL:=$GITHUB_SHA}"
+          : "${FULL:?component identity is required}"
           {
             echo "full=$FULL"
             echo "short=${FULL::7}"
@@ -1058,8 +1197,9 @@ jobs:
             SRW_DOCUMENTATION_URL=${{ env.SRW_DOCUMENTATION_URL }}
 
   build-orchestrator:
-    needs: [changes, dependency-audit, test-python, test-cockpit]
+    needs: [architecture, changes, dependency-audit, test-python, test-cockpit]
     if: >-
+      needs.architecture.result == 'success' &&
       always() && !cancelled() &&
       (needs.changes.outputs.orchestrator == 'true' || github.event_name == 'workflow_dispatch') &&
       needs.dependency-audit.result == 'success' &&
@@ -1072,6 +1212,8 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: docker/setup-buildx-action@v3
         with:
           buildkitd-config-inline: |
@@ -1088,7 +1230,7 @@ jobs:
         id: ident
         run: |
           FULL="${{ needs.changes.outputs.orchestrator-sha }}"
-          : "${FULL:=$GITHUB_SHA}"
+          : "${FULL:?component identity is required}"
           {
             echo "full=$FULL"
             echo "short=${FULL::7}"
@@ -1126,8 +1268,9 @@ jobs:
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-orchestrator:buildcache-develop,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
   build-cockpit:
-    needs: [changes, dependency-audit, test-python, test-cockpit]
+    needs: [architecture, changes, dependency-audit, test-python, test-cockpit]
     if: >-
+      needs.architecture.result == 'success' &&
       always() && !cancelled() &&
       (needs.changes.outputs.cockpit == 'true' || github.event_name == 'workflow_dispatch') &&
       needs.dependency-audit.result == 'success' &&
@@ -1140,6 +1283,8 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: docker/setup-buildx-action@v3
         with:
           buildkitd-config-inline: |
@@ -1156,7 +1301,7 @@ jobs:
         id: ident
         run: |
           FULL="${{ needs.changes.outputs.cockpit-sha }}"
-          : "${FULL:=$GITHUB_SHA}"
+          : "${FULL:?component identity is required}"
           {
             echo "full=$FULL"
             echo "short=${FULL::7}"
@@ -1194,8 +1339,9 @@ jobs:
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-cockpit:buildcache-develop,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
   build-mcp:
-    needs: [changes, dependency-audit, test-python, test-cockpit]
+    needs: [architecture, changes, dependency-audit, test-python, test-cockpit]
     if: >-
+      needs.architecture.result == 'success' &&
       always() && !cancelled() &&
       (needs.changes.outputs.mcp == 'true' || github.event_name == 'workflow_dispatch') &&
       needs.dependency-audit.result == 'success' &&
@@ -1210,6 +1356,8 @@ jobs:
       digest: ${{ steps.build.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: docker/setup-buildx-action@v3
         with:
           buildkitd-config-inline: |
@@ -1226,7 +1374,7 @@ jobs:
         id: ident
         run: |
           FULL="${{ needs.changes.outputs.mcp-sha }}"
-          : "${FULL:=$GITHUB_SHA}"
+          : "${FULL:?component identity is required}"
           {
             echo "full=$FULL"
             echo "short=${FULL::7}"
@@ -1265,8 +1413,9 @@ jobs:
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-mcp:buildcache-develop,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
   build-workspace:
-    needs: [changes, dependency-audit, test-python, test-cockpit]
+    needs: [architecture, changes, dependency-audit, test-python, test-cockpit]
     if: >-
+      needs.architecture.result == 'success' &&
       always() && !cancelled() &&
       (needs.changes.outputs.workspace == 'true' || github.event_name == 'workflow_dispatch') &&
       needs.dependency-audit.result == 'success' &&
@@ -1279,6 +1428,8 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: docker/setup-buildx-action@v3
         with:
           buildkitd-config-inline: |
@@ -1295,7 +1446,7 @@ jobs:
         id: ident
         run: |
           FULL="${{ needs.changes.outputs.workspace-sha }}"
-          : "${FULL:=$GITHUB_SHA}"
+          : "${FULL:?component identity is required}"
           {
             echo "full=$FULL"
             echo "short=${FULL::7}"
@@ -1337,10 +1488,11 @@ jobs:
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-workspace:buildcache-develop,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
   build-sudo-gate:
-    needs: [changes, dependency-audit, test-python, test-cockpit]
+    needs: [architecture, changes, dependency-audit, test-python, test-cockpit]
     if: >-
+      needs.architecture.result == 'success' &&
       always() && !cancelled() &&
-      (needs.changes.outputs.sudo-gate == 'true' || needs.changes.outputs.vm-base == 'true' || needs.changes.outputs.vm-base-stage1 == 'true' || github.event_name == 'workflow_dispatch') &&
+      (needs.changes.outputs.vm-base == 'true' || github.event_name == 'workflow_dispatch') &&
       needs.dependency-audit.result == 'success' &&
       needs.test-python.result != 'failure' && needs.test-python.result != 'cancelled' &&
       needs.test-cockpit.result != 'failure' && needs.test-cockpit.result != 'cancelled'
@@ -1348,6 +1500,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: actions/setup-go@v5
         with:
           go-version: '1.22'
@@ -1382,8 +1536,9 @@ jobs:
   # ghcr.io/<repo>-agent-vm-base-stage1; stage2 pulls and layers on top.
   # ---------------------------------------------------------------------------
   build-agent-vm-base-stage1:
-    needs: [changes, dependency-audit, test-python, test-cockpit]
+    needs: [architecture, changes, dependency-audit, test-python, test-cockpit]
     if: >-
+      needs.architecture.result == 'success' &&
       always() && !cancelled() &&
       (needs.changes.outputs.vm-base-stage1 == 'true' || github.event_name == 'workflow_dispatch') &&
       needs.dependency-audit.result == 'success' &&
@@ -1396,6 +1551,8 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - name: Free disk space
         # Hosted runners have ~14 GiB free and these jobs need more. Self-hosted
         # runners do not need it, and the heavy variants below delete
@@ -1487,6 +1644,10 @@ jobs:
         working-directory: docker/agent-vm-base
         run: |
           IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-agent-vm-base-stage1" | tr '[:upper:]' '[:lower:]')
+          # Image identity = newest input commit, not push HEAD (see build-agent).
+          # The registry predicate in the changes job checks exactly this tag.
+          IDENT="${{ needs.changes.outputs.vm-base-stage1-sha }}"
+          : "${IDENT:=$GITHUB_SHA}"
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             TAGS=("${IMAGE}:pr-validate-${GITHUB_SHA::7}")
           else
@@ -1495,7 +1656,7 @@ jobs:
             # would clobber main's prod base image, and — worse — a main-built
             # :latest that lacks develop-only base changes (e.g. browser_use)
             # would then fail develop's own stage2 gate.
-            TAGS=("${IMAGE}:sha-${GITHUB_SHA::7}" "${IMAGE}:experimental")
+            TAGS=("${IMAGE}:sha-${IDENT::7}" "${IMAGE}:experimental")
           fi
           BUILD_ARGS=(
             --build-arg "SRW_SOURCE_REVISION=${GITHUB_SHA}"
@@ -1518,10 +1679,11 @@ jobs:
   # stage2 on top via stage2.pkr.hcl. Should finish in ~5-10 min.
   # ---------------------------------------------------------------------------
   build-agent-vm-base:
-    needs: [changes, dependency-audit, test-python, test-cockpit, build-sudo-gate, build-agent-vm-base-stage1]
+    needs: [architecture, changes, dependency-audit, test-python, test-cockpit, build-sudo-gate, build-agent-vm-base-stage1]
     if: >-
+      needs.architecture.result == 'success' &&
       always() && !cancelled() &&
-      (needs.changes.outputs.vm-base == 'true' || needs.changes.outputs.vm-base-stage1 == 'true' || needs.changes.outputs.sudo-gate == 'true' || github.event_name == 'workflow_dispatch') &&
+      (needs.changes.outputs.vm-base == 'true' || github.event_name == 'workflow_dispatch') &&
       needs.dependency-audit.result == 'success' &&
       needs.test-python.result != 'failure' && needs.test-python.result != 'cancelled' &&
       needs.test-cockpit.result != 'failure' && needs.test-cockpit.result != 'cancelled' &&
@@ -1539,6 +1701,8 @@ jobs:
           echo "::error::build-sudo-gate failed — refusing to build VM image without gate binaries"
           exit 1
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - name: Download sudo gate artifacts
         uses: actions/download-artifact@v4
         with:
@@ -1646,11 +1810,15 @@ jobs:
         working-directory: docker/agent-vm-base
         run: |
           IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-agent-vm-base" | tr '[:upper:]' '[:lower:]')
+          # Image identity = newest input commit, not push HEAD (see build-agent).
+          # The registry predicate in the changes job checks exactly this tag.
+          IDENT="${{ needs.changes.outputs.vm-base-sha }}"
+          : "${IDENT:=$GITHUB_SHA}"
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             # PR validation: build with a single throwaway tag, no push.
             TAGS=("${IMAGE}:pr-validate-${GITHUB_SHA::7}")
           else
-            TAGS=("${IMAGE}:sha-${GITHUB_SHA::7}" "${IMAGE}:experimental")
+            TAGS=("${IMAGE}:sha-${IDENT::7}" "${IMAGE}:experimental")
           fi
           BUILD_ARGS=(
             --build-arg "SRW_SOURCE_REVISION=${GITHUB_SHA}"
@@ -1668,8 +1836,9 @@ jobs:
           fi
 
   build-vm-controller:
-    needs: [changes, dependency-audit, test-python, test-cockpit]
+    needs: [architecture, changes, dependency-audit, test-python, test-cockpit]
     if: >-
+      needs.architecture.result == 'success' &&
       always() && !cancelled() &&
       (needs.changes.outputs.vm-controller == 'true' || github.event_name == 'workflow_dispatch') &&
       needs.dependency-audit.result == 'success' &&
@@ -1682,6 +1851,8 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: docker/setup-buildx-action@v3
         with:
           buildkitd-config-inline: |
@@ -1693,46 +1864,57 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # Image identity = newest input commit, not push HEAD (see build-agent).
+      - name: Resolve component identity
+        id: ident
+        run: |
+          FULL="${{ needs.changes.outputs.vm-controller-sha }}"
+          : "${FULL:?component identity is required}"
+          {
+            echo "full=$FULL"
+            echo "short=${FULL::7}"
+            echo "version=0.0.0-dev.sha-${FULL}"
+          } >> "$GITHUB_OUTPUT"
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-vm-controller
           tags: |
-            type=sha,format=short,prefix=sha-
+            type=raw,value=sha-${{ steps.ident.outputs.short }}
             type=raw,value=experimental,enable=${{ github.event_name != 'pull_request' }}
       - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
         uses: docker/build-push-action@v5
         with:
-          context: ./vm/controller
-          file: ./vm/controller/Dockerfile
+          context: .
+          file: ./docker/Dockerfile.vm-controller
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: |
             ${{ steps.meta.outputs.labels }}
             org.opencontainers.image.source=${{ env.SRW_SOURCE_URL }}
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ env.SRW_RELEASE_VERSION }}
+            org.opencontainers.image.revision=${{ steps.ident.outputs.full }}
+            org.opencontainers.image.version=${{ steps.ident.outputs.version }}
             org.opencontainers.image.documentation=${{ env.SRW_DOCUMENTATION_URL }}
             io.srw.component=vm-controller
           provenance: false
           build-args: |
-            SRW_SOURCE_REVISION=${{ github.sha }}
+            SRW_SOURCE_REVISION=${{ steps.ident.outputs.full }}
             SRW_SOURCE_URL=${{ env.SRW_SOURCE_URL }}
-            SRW_RELEASE_VERSION=${{ env.SRW_RELEASE_VERSION }}
+            SRW_RELEASE_VERSION=${{ steps.ident.outputs.version }}
             SRW_DOCUMENTATION_URL=${{ env.SRW_DOCUMENTATION_URL }}
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-vm-controller:buildcache-develop
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-vm-controller:buildcache-develop,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
   # ---------------------------------------------------------------------------
-  # Publish dev Helm chart + update deployment config for Fleet.
-  #
-  # Publishes the chart as "srw-dev" with a semver pre-release version
-  # (0.0.0-dev.sha-<hash>), then updates fleet.yaml with the chart version
-  # and values-experimental.yaml with the new image tags, all in one commit.
+  # Publish the dev Helm chart. The chart version (monotonic 0.0.<run_number>)
+  # plus the baked image tags fully determine what the dev cluster runs — the
+  # Fleet HelmOp on the rancher cluster resolves ">=0.0.911" from GHCR on its
+  # own, so a publish IS the deploy. Nothing writes back to git.
   # ---------------------------------------------------------------------------
   deploy-experimental:
     needs:
+      - architecture
       - changes
       - dependency-audit
       - test-python
@@ -1743,25 +1925,28 @@ jobs:
       - build-mcp
       - build-workspace
       - build-vm-controller
-      - build-agent-vm-base
       - chart-test
+      - chart-schema-negative
     if: >-
       always() && !cancelled() &&
       github.event_name == 'push' &&
+      needs.architecture.result == 'success' &&
+      needs.changes.result == 'success' &&
       needs.dependency-audit.result == 'success' &&
       needs.test-python.result != 'failure' && needs.test-python.result != 'cancelled' &&
       needs.test-cockpit.result != 'failure' && needs.test-cockpit.result != 'cancelled' &&
-      needs.chart-test.result != 'failure' && needs.chart-test.result != 'cancelled'
+      needs.chart-test.result != 'failure' && needs.chart-test.result != 'cancelled' &&
+      needs.chart-schema-negative.result != 'failure' && needs.chart-schema-negative.result != 'cancelled'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      contents: write
+      contents: read
       packages: write
 
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: develop
+          ref: ${{ github.sha }}
           # Full history: the staleness guard below compares commit ancestry.
           fetch-depth: 0
 
@@ -1782,14 +1967,36 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Verify every chart image before publication
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: >-
+          python3 scripts/verify_chart_images.py
+          --repository "${{ env.REGISTRY }}/${{ env.REPO_LOWER }}"
+          --inventory /tmp/verified-chart-images.json
+
       - name: Compute tags
         id: tag
         run: |
           echo "sha=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
-          # Note: hyphen (not dot) before the SHA so the segment stays
-          # alphanumeric — a purely-numeric segment like "0439848" would be
-          # rejected by semver as a numeric identifier with a leading zero.
-          echo "chart_version=0.0.0-dev.sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          # The chart version MUST be monotonic: Fleet resolves an OCI chart by
+          # semver constraint, and semver compares prerelease identifiers
+          # LEXICALLY. The old "0.0.0-dev.sha-<short>" scheme therefore ordered
+          # charts alphabetically by sha rather than chronologically. Measured
+          # against the live 557-tag srw-dev package on 2026-08-30, a
+          # ">=0.0.0-0" constraint selected a chart three days stale and would
+          # not have moved again for ~407 builds, with every status green.
+          #
+          # Build metadata is NOT an escape hatch: "0.0.N+sha.x" is pushed as OCI
+          # tag "0.0.N_sha.x" (a "+" is illegal in a tag) and Fleet never maps it
+          # back, so such charts are invisible to resolution entirely. Verified
+          # on the rancher cluster, same date.
+          #
+          # GITHUB_RUN_NUMBER is monotonic and never reused. The sha is not lost:
+          # it ships as --app-version below. Note "0.0.<N>" outranks every
+          # existing "0.0.0-dev.sha-*" tag, since a release beats any prerelease
+          # of the same core version — so the cutover needs no tag cleanup.
+          echo "chart_version=0.0.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
 
       # -- Publish dev chart (only when helm/ changed or any build succeeded) --
       - name: Package and push dev chart
@@ -1798,13 +2005,94 @@ jobs:
           needs.build-agent.result == 'success' ||
           needs.build-orchestrator.result == 'success' ||
           needs.build-cockpit.result == 'success' ||
-          needs.build-mcp.result == 'success'
+          needs.build-mcp.result == 'success' ||
+          needs.build-workspace.result == 'success' ||
+          needs.build-vm-controller.result == 'success'
+        env:
+          SHA_ORCHESTRATOR: ${{ needs.changes.outputs.orchestrator-sha }}
+          SHA_AGENT: ${{ needs.changes.outputs.agent-sha }}
+          SHA_COCKPIT: ${{ needs.changes.outputs.cockpit-sha }}
+          SHA_MCP: ${{ needs.changes.outputs.mcp-sha }}
+          SHA_WORKSPACE: ${{ needs.changes.outputs.workspace-sha }}
+          SHA_VMCONTROLLER: ${{ needs.changes.outputs.vm-controller-sha }}
         run: |
           helm repo add collabora https://collaboraonline.github.io/online --force-update
-          helm repo add cloudnative-pg https://cloudnative-pg.github.io/charts --force-update
           helm dependency build helm/
           # Override chart name for dev channel
           yq -i '.name = "srw-dev"' helm/Chart.yaml
+
+          # -- Bake component image tags into the chart itself --
+          # The chart version has to fully determine which images run: a Fleet
+          # HelmOp resolves a chart from the registry and has no git-read values
+          # overlay to carry tags alongside it. Baking them here is a build step,
+          # not a commit — helm/values.yaml is restored below and never staged.
+          #
+          # These are the SAME per-component identities the deployment overlay
+          # uses: the newest commit that touched each component's build inputs,
+          # never the push HEAD. So a component whose inputs did not change keeps
+          # its existing tag across runs and does not provoke a needless rollout
+          # (which for the agent means a fleet drain). The changes job emits all
+          # six unconditionally, so this is correct whether or not that
+          # component rebuilt in this run.
+          : "${SHA_ORCHESTRATOR:?verified component identity is required}"
+          : "${SHA_AGENT:?verified component identity is required}"
+          : "${SHA_COCKPIT:?verified component identity is required}"
+          : "${SHA_MCP:?verified component identity is required}"
+          : "${SHA_WORKSPACE:?verified component identity is required}"
+          : "${SHA_VMCONTROLLER:?verified component identity is required}"
+          export TAG_ORCHESTRATOR="sha-${SHA_ORCHESTRATOR::7}"
+          export TAG_AGENT="sha-${SHA_AGENT::7}"
+          export TAG_COCKPIT="sha-${SHA_COCKPIT::7}"
+          export TAG_MCP="sha-${SHA_MCP::7}"
+          export TAG_WORKSPACE="sha-${SHA_WORKSPACE::7}"
+          export TAG_VMCONTROLLER="sha-${SHA_VMCONTROLLER::7}"
+          export REV_ORCHESTRATOR="$SHA_ORCHESTRATOR"
+          export REV_AGENT="$SHA_AGENT"
+          export REV_COCKPIT="$SHA_COCKPIT"
+          export REV_MCP="$SHA_MCP"
+          export REV_WORKSPACE="$SHA_WORKSPACE"
+          export REV_VMCONTROLLER="$SHA_VMCONTROLLER"
+          export CHART_VERSION="${{ steps.tag.outputs.chart_version }}"
+
+          # The prior gate verified every expected image, including reused ones.
+          : "${MCP_DIGEST:?verified MCP image digest is required}"
+
+          yq -i '
+            .image.orchestrator.tag = strenv(TAG_ORCHESTRATOR) |
+            .image.agent.tag        = strenv(TAG_AGENT) |
+            .image.cockpit.tag      = strenv(TAG_COCKPIT) |
+            .image.mcp.tag          = strenv(TAG_MCP) |
+            .image.mcp.digest       = strenv(MCP_DIGEST) |
+            .image.workspace.tag    = strenv(TAG_WORKSPACE) |
+            .vmController.image.tag = strenv(TAG_VMCONTROLLER) |
+            .provenance.releaseVersion = strenv(CHART_VERSION) |
+            .provenance.components.orchestrator.sourceRevision = strenv(REV_ORCHESTRATOR) |
+            .provenance.components.agent.sourceRevision        = strenv(REV_AGENT) |
+            .provenance.components.cockpit.sourceRevision      = strenv(REV_COCKPIT) |
+            .provenance.components.mcp.sourceRevision          = strenv(REV_MCP) |
+            .provenance.components.workspace.sourceRevision    = strenv(REV_WORKSPACE) |
+            .provenance.components.vmController.sourceRevision = strenv(REV_VMCONTROLLER)
+          ' helm/values.yaml
+
+          # Fail closed: a silently-unstamped chart would deploy ":latest" to
+          # every component — the exact failure this step exists to prevent, and
+          # invisible until pods started rolling. Checked structurally and scoped
+          # to .image.*; vmController.image.tag lives outside that map and is
+          # checked on its own right below.
+          UNSTAMPED=$(yq '[.image[] | select(.tag == "latest")] | length' helm/values.yaml)
+          if [ "$UNSTAMPED" != "0" ]; then
+            echo "::error::${UNSTAMPED} image tag(s) under .image are still 'latest' in helm/values.yaml; refusing to publish a chart that would deploy :latest"
+            exit 1
+          fi
+          # The controller was the one component this step used to leave at
+          # "latest" — and only main.yml ever pushes that tag, so dev ran a
+          # main-released controller beside develop-built everything else until
+          # 2026-09-02 (design note single_cluster_vm_deployment.md §11.15).
+          if [ "$(yq '.vmController.image.tag' helm/values.yaml)" = "latest" ]; then
+            echo "::error::vmController.image.tag is still 'latest' in helm/values.yaml; refusing to publish a chart that would deploy an unpinned VM controller"
+            exit 1
+          fi
+
           mkdir -p dist
           helm package helm/ \
             --version "${{ steps.tag.outputs.chart_version }}" \
@@ -1812,226 +2100,5 @@ jobs:
             --destination ./dist
           helm push ./dist/srw-dev-${{ steps.tag.outputs.chart_version }}.tgz \
             oci://ghcr.io/knaeckebrothero/charts
-          # Restore Chart.yaml (don't commit the name override)
-          git checkout helm/Chart.yaml
-
-      # -- Publish dev VM-cluster chart (parallel to srw-dev). Re-publish for
-      # chart sources or any image consumed by this chart, including the
-      # independently versioned orchestrator image used by remote collectors. --
-      - name: Package and push dev vm-cluster chart
-        if: >-
-          needs.changes.outputs.chart == 'true' ||
-          needs.build-orchestrator.result == 'success' ||
-          needs.build-vm-controller.result == 'success' ||
-          needs.build-agent-vm-base.result == 'success'
-        run: |
-          # Override chart name for dev channel
-          yq -i '.name = "srw-dev-vm-cluster"' helm-vm-cluster/Chart.yaml
-          mkdir -p dist
-          helm package helm-vm-cluster/ \
-            --version "${{ steps.tag.outputs.chart_version }}" \
-            --app-version "${{ steps.tag.outputs.sha }}" \
-            --destination ./dist
-          helm push ./dist/srw-dev-vm-cluster-${{ steps.tag.outputs.chart_version }}.tgz \
-            oci://ghcr.io/knaeckebrothero/charts
-          git checkout helm-vm-cluster/Chart.yaml
-
-      # -- Update fleet.yaml chart version (orchestrator chart) --
-      - name: Update fleet.yaml chart version
-        if: >-
-          needs.changes.outputs.chart == 'true' ||
-          needs.build-agent.result == 'success' ||
-          needs.build-orchestrator.result == 'success' ||
-          needs.build-cockpit.result == 'success' ||
-          needs.build-mcp.result == 'success'
-        run: >-
-          yq -i '.helm.version = "${{ steps.tag.outputs.chart_version }}"'
-          deployment/fleet.yaml
-
-      # -- Update vm-cluster bundle's chart version --
-      - name: Update vm-cluster fleet.yaml chart version
-        if: >-
-          needs.changes.outputs.chart == 'true' ||
-          needs.build-orchestrator.result == 'success' ||
-          needs.build-vm-controller.result == 'success' ||
-          needs.build-agent-vm-base.result == 'success'
-        run: >-
-          yq -i '.helm.version = "${{ steps.tag.outputs.chart_version }}"'
-          deployment-vms/srw-vm-controller/fleet.yaml
-
-      # -- Update image tags in values-experimental.yaml --
-      # Each component is stamped with ITS OWN identity (newest commit that
-      # touched its build inputs, from the changes job) — never the push
-      # HEAD. Rebuilds from unchanged inputs rewrite identical values, the
-      # final git-diff gate sees no delta, and no deploy commit — so no
-      # stale-image drain of the agent fleet — happens without a real
-      # content change. Fallback to GITHUB_SHA mirrors the build jobs.
-      - name: Update orchestrator tag
-        if: needs.build-orchestrator.result == 'success'
-        env:
-          COMPONENT_SHA: ${{ needs.changes.outputs.orchestrator-sha }}
-        run: |
-          : "${COMPONENT_SHA:=$GITHUB_SHA}"
-          # Staleness guard — knowledge-base/knowledge/issues/ci_deploy_race_reverts_image_tags.md.
-          # Overlapping runs each derive this identity from their own checkout, so
-          # the run that finishes LAST can otherwise write an older sha over a
-          # newer one and silently revert a verified deploy. Skip only when the
-          # recorded revision is known AND is not an ancestor of ours; an unknown
-          # revision (this branch is rebased often) falls through and writes.
-          CURRENT_SHA=$(yq -r '.provenance.components.orchestrator.sourceRevision // ""' \
-            deployment/values-experimental.yaml)
-          if [ -n "$CURRENT_SHA" ] \
-             && git cat-file -e "${CURRENT_SHA}^{commit}" 2>/dev/null \
-             && ! git merge-base --is-ancestor "$CURRENT_SHA" "$COMPONENT_SHA"; then
-            echo "::notice::skipping stale orchestrator tag: deployed $CURRENT_SHA is not an ancestor of $COMPONENT_SHA"
-            exit 0
-          fi
-          export COMPONENT_TAG="sha-${COMPONENT_SHA::7}"
-          export COMPONENT_VERSION="0.0.0-dev.sha-${COMPONENT_SHA}"
-          yq -i '
-            .image.orchestrator.tag = strenv(COMPONENT_TAG) |
-            .provenance.releaseVersion = strenv(COMPONENT_VERSION) |
-            .provenance.components.orchestrator.sourceRevision = strenv(COMPONENT_SHA) |
-            .provenance.components.orchestrator.releaseVersion = strenv(COMPONENT_VERSION)
-          ' deployment/values-experimental.yaml
-          yq -i '
-            .helm.values.image.orchestrator.tag = strenv(COMPONENT_TAG) |
-            .helm.values.image.orchestrator.digest = ""
-          ' deployment-vms/srw-vm-controller/fleet.yaml
-
-      - name: Update agent tag
-        if: needs.build-agent.result == 'success'
-        env:
-          COMPONENT_SHA: ${{ needs.changes.outputs.agent-sha }}
-        run: |
-          : "${COMPONENT_SHA:=$GITHUB_SHA}"
-          # Staleness guard — knowledge-base/knowledge/issues/ci_deploy_race_reverts_image_tags.md.
-          # Overlapping runs each derive this identity from their own checkout, so
-          # the run that finishes LAST can otherwise write an older sha over a
-          # newer one and silently revert a verified deploy. Skip only when the
-          # recorded revision is known AND is not an ancestor of ours; an unknown
-          # revision (this branch is rebased often) falls through and writes.
-          CURRENT_SHA=$(yq -r '.provenance.components.agent.sourceRevision // ""' \
-            deployment/values-experimental.yaml)
-          if [ -n "$CURRENT_SHA" ] \
-             && git cat-file -e "${CURRENT_SHA}^{commit}" 2>/dev/null \
-             && ! git merge-base --is-ancestor "$CURRENT_SHA" "$COMPONENT_SHA"; then
-            echo "::notice::skipping stale agent tag: deployed $CURRENT_SHA is not an ancestor of $COMPONENT_SHA"
-            exit 0
-          fi
-          export COMPONENT_TAG="sha-${COMPONENT_SHA::7}"
-          export COMPONENT_VERSION="0.0.0-dev.sha-${COMPONENT_SHA}"
-          yq -i '
-            .image.agent.tag = strenv(COMPONENT_TAG) |
-            .provenance.components.agent.sourceRevision = strenv(COMPONENT_SHA) |
-            .provenance.components.agent.releaseVersion = strenv(COMPONENT_VERSION)
-          ' deployment/values-experimental.yaml
-
-      - name: Update cockpit tag
-        if: needs.build-cockpit.result == 'success'
-        env:
-          COMPONENT_SHA: ${{ needs.changes.outputs.cockpit-sha }}
-        run: |
-          : "${COMPONENT_SHA:=$GITHUB_SHA}"
-          # Staleness guard — knowledge-base/knowledge/issues/ci_deploy_race_reverts_image_tags.md.
-          # Overlapping runs each derive this identity from their own checkout, so
-          # the run that finishes LAST can otherwise write an older sha over a
-          # newer one and silently revert a verified deploy. Skip only when the
-          # recorded revision is known AND is not an ancestor of ours; an unknown
-          # revision (this branch is rebased often) falls through and writes.
-          CURRENT_SHA=$(yq -r '.provenance.components.cockpit.sourceRevision // ""' \
-            deployment/values-experimental.yaml)
-          if [ -n "$CURRENT_SHA" ] \
-             && git cat-file -e "${CURRENT_SHA}^{commit}" 2>/dev/null \
-             && ! git merge-base --is-ancestor "$CURRENT_SHA" "$COMPONENT_SHA"; then
-            echo "::notice::skipping stale cockpit tag: deployed $CURRENT_SHA is not an ancestor of $COMPONENT_SHA"
-            exit 0
-          fi
-          export COMPONENT_TAG="sha-${COMPONENT_SHA::7}"
-          export COMPONENT_VERSION="0.0.0-dev.sha-${COMPONENT_SHA}"
-          yq -i '
-            .image.cockpit.tag = strenv(COMPONENT_TAG) |
-            .provenance.components.cockpit.sourceRevision = strenv(COMPONENT_SHA) |
-            .provenance.components.cockpit.releaseVersion = strenv(COMPONENT_VERSION)
-          ' deployment/values-experimental.yaml
-
-      - name: Update MCP tag
-        if: needs.build-mcp.result == 'success'
-        env:
-          COMPONENT_SHA: ${{ needs.changes.outputs.mcp-sha }}
-          COMPONENT_DIGEST: ${{ needs.build-mcp.outputs.digest }}
-        run: |
-          : "${COMPONENT_SHA:=$GITHUB_SHA}"
-          # Staleness guard — knowledge-base/knowledge/issues/ci_deploy_race_reverts_image_tags.md.
-          # Overlapping runs each derive this identity from their own checkout, so
-          # the run that finishes LAST can otherwise write an older sha over a
-          # newer one and silently revert a verified deploy. Skip only when the
-          # recorded revision is known AND is not an ancestor of ours; an unknown
-          # revision (this branch is rebased often) falls through and writes.
-          CURRENT_SHA=$(yq -r '.provenance.components.mcp.sourceRevision // ""' \
-            deployment/values-experimental.yaml)
-          if [ -n "$CURRENT_SHA" ] \
-             && git cat-file -e "${CURRENT_SHA}^{commit}" 2>/dev/null \
-             && ! git merge-base --is-ancestor "$CURRENT_SHA" "$COMPONENT_SHA"; then
-            echo "::notice::skipping stale mcp tag: deployed $CURRENT_SHA is not an ancestor of $COMPONENT_SHA"
-            exit 0
-          fi
-          test -n "$COMPONENT_DIGEST"
-          case "$COMPONENT_DIGEST" in sha256:*) ;; *) exit 1 ;; esac
-          export COMPONENT_TAG="sha-${COMPONENT_SHA::7}"
-          export COMPONENT_VERSION="0.0.0-dev.sha-${COMPONENT_SHA}"
-          yq -i '
-            .image.mcp.tag = strenv(COMPONENT_TAG) |
-            .image.mcp.digest = strenv(COMPONENT_DIGEST) |
-            .provenance.components.mcp.sourceRevision = strenv(COMPONENT_SHA) |
-            .provenance.components.mcp.releaseVersion = strenv(COMPONENT_VERSION)
-          ' deployment/values-experimental.yaml
-
-      - name: Update workspace tag
-        if: needs.build-workspace.result == 'success'
-        env:
-          COMPONENT_SHA: ${{ needs.changes.outputs.workspace-sha }}
-        run: |
-          : "${COMPONENT_SHA:=$GITHUB_SHA}"
-          # Staleness guard — knowledge-base/knowledge/issues/ci_deploy_race_reverts_image_tags.md.
-          # Overlapping runs each derive this identity from their own checkout, so
-          # the run that finishes LAST can otherwise write an older sha over a
-          # newer one and silently revert a verified deploy. Skip only when the
-          # recorded revision is known AND is not an ancestor of ours; an unknown
-          # revision (this branch is rebased often) falls through and writes.
-          CURRENT_SHA=$(yq -r '.provenance.components.workspace.sourceRevision // ""' \
-            deployment/values-experimental.yaml)
-          if [ -n "$CURRENT_SHA" ] \
-             && git cat-file -e "${CURRENT_SHA}^{commit}" 2>/dev/null \
-             && ! git merge-base --is-ancestor "$CURRENT_SHA" "$COMPONENT_SHA"; then
-            echo "::notice::skipping stale workspace tag: deployed $CURRENT_SHA is not an ancestor of $COMPONENT_SHA"
-            exit 0
-          fi
-          export COMPONENT_TAG="sha-${COMPONENT_SHA::7}"
-          export COMPONENT_VERSION="0.0.0-dev.sha-${COMPONENT_SHA}"
-          yq -i '
-            .image.workspace.tag = strenv(COMPONENT_TAG) |
-            .provenance.components.workspace.sourceRevision = strenv(COMPONENT_SHA) |
-            .provenance.components.workspace.releaseVersion = strenv(COMPONENT_VERSION)
-          ' deployment/values-experimental.yaml
-
-      - name: Update VM controller image tag
-        if: needs.build-vm-controller.result == 'success'
-        run: >-
-          yq -i '.helm.values.image.vmController.tag = "${{ steps.tag.outputs.sha }}"'
-          deployment-vms/srw-vm-controller/fleet.yaml
-
-      - name: Update agent VM base image tag
-        if: needs.build-agent-vm-base.result == 'success'
-        run: >-
-          yq -i '.helm.values.vmController.defaultVmImage = "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:${{ steps.tag.outputs.sha }}"'
-          deployment-vms/srw-vm-controller/fleet.yaml
-
-      - name: Commit and push
-        run: |
-          git diff --quiet && { echo "No changes to commit"; exit 0; }
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add deployment/fleet.yaml deployment/values-experimental.yaml deployment-vms/ || true
-          git commit -m "deploy: update image tags to ${{ steps.tag.outputs.sha }}"
-          git push
+          # Restore working copy (never commit the name override or baked tags)
+          git checkout helm/Chart.yaml helm/values.yaml
