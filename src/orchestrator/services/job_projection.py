@@ -26,7 +26,9 @@ class JobCloudBackend(Protocol):
     @property
     def is_initialized(self) -> bool: ...
 
-    def get_session_folder_browser_url(self, handle: SessionFolderHandle) -> str: ...
+    def get_session_folder_browser_url(
+        self, handle: SessionFolderHandle
+    ) -> str | None: ...
 
 
 def redact_job_config_override(
