@@ -5,9 +5,15 @@ components — SearXNG for the search slot, Crawl4AI for the fetch slot — and 
 legacy TAVILY_API_KEY must be promoted even when the operator intentionally
 disabled custom LLM catalog seeding.
 
-The Job is the only runtime consumer of TAVILY_API_KEY. It runs Tavily first
-(it serves both slots), then SearXNG, then Crawl4AI, and exits; neither the
-orchestrator Deployment nor agent pods receive the deployment-wide key.
+The Job is the only runtime *consumer* of TAVILY_API_KEY: it promotes the key
+into an encrypted endpoint row and exits, and every later use goes through the
+per-dispatch injection, never the env. It runs Tavily first (it serves both
+slots), then SearXNG, then Crawl4AI. Note this is not containment — agent pods
+take `envFrom` the whole application Secret, so every key in that Secret is
+present in their environment (verified on k3d 2026-09-07). Put a credential in
+a dedicated Secret when it must not reach them; crawl4ai.apiTokenSecret.name
+exists for exactly that.
+
 CRAWL4AI_API_TOKEN is optional here on purpose: the same value is required by
 the Crawl4AI Deployment, and a missing key must degrade to an unregistered
 provider rather than wedge the release on a failed hook. Like the LLM seed
