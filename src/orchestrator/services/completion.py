@@ -452,6 +452,7 @@ async def handle_pod_workspace_recovery(
     probe: Callable[..., Any] = probe_workspace_ssh,
     completion_command_id: str | None = None,
     completion_finalizing_by: str | None = None,
+    expected_status: str | None = None,
 ) -> dict[str, Any]:
     """G1 pod (sandbox/PVC) workspace recovery — the ``workspace_unavailable``
     arm of the completion endpoint, extracted for testability.
@@ -468,6 +469,10 @@ async def handle_pod_workspace_recovery(
     increments either way so a pathological report-loop stays bounded.
     See knowledge-base/knowledge/features/workspace_pvc_branch_a_implementation.md (G1) and
     knowledge-base/knowledge/issues/maxsessions_parallel_tools_false_workspace_death.md (D).
+
+    ``expected_status`` fences legacy pinned completion against cancellation
+    after its entry read. A lost disposition returns ``paused=False`` so the
+    caller stops before reporting recovery or continuing completion effects.
     """
     container_ctx = _get_ctx(job)
 
@@ -550,6 +555,8 @@ async def handle_pod_workspace_recovery(
             ],
         }
         update_kwargs: dict[str, Any] = {}
+        if expected_status is not None:
+            update_kwargs["expected_status"] = expected_status
         if completion_command_id is not None:
             update_kwargs = {
                 "expected_status": str(job.get("status") or "processing"),
@@ -578,6 +585,8 @@ async def handle_pod_workspace_recovery(
         )
         if completion_command_id is not None and not updated:
             raise RuntimeError("workspace recovery lost its finalizer disposition term")
+        if expected_status is not None and not updated:
+            return {**outcome, "paused": False}
         # No leak on fail-loud: the pod provisioned by the previous attempt
         # would otherwise run orphaned forever (PVC is never touched here).
         try:
@@ -598,8 +607,12 @@ async def handle_pod_workspace_recovery(
     port = int(container_ctx.get("port") or 30022)
     pod_alive = bool(host) and await probe(host, port)
 
-    if completion_command_id is not None:
-        if not pod_alive and not container_ctx.get("_runtime_incarnation"):
+    if completion_command_id is not None or expected_status is not None:
+        if (
+            completion_command_id is not None
+            and not pod_alive
+            and not container_ctx.get("_runtime_incarnation")
+        ):
             raise RuntimeError(
                 "durable workspace recovery is missing the captured Pod UID"
             )
@@ -612,8 +625,6 @@ async def handle_pod_workspace_recovery(
             container_updates = {
                 "recovery_attempts": attempts,
                 "previous_error": error.get("message") or "workspace_unavailable",
-                "recovery_attempt_command_id": completion_command_id,
-                "recovery_delete_pending": False,
             }
             action = (
                 f"workspace recovery: pod alive on probe — kept, re-dispatch "
@@ -629,8 +640,6 @@ async def handle_pod_workspace_recovery(
                 "pod_ip": None,
                 "recovery_attempts": attempts,
                 "previous_error": error.get("message") or "workspace_unavailable",
-                "recovery_attempt_command_id": completion_command_id,
-                "recovery_delete_pending": True,
             }
             action = (
                 f"workspace recovery: dead pod deleted (PVC kept), "
@@ -644,31 +653,53 @@ async def handle_pod_workspace_recovery(
             "actions": [action],
             "paused": True,
         }
+        pause_kwargs: dict[str, Any] = {}
+        if completion_command_id is not None:
+            container_updates.update(
+                {
+                    "recovery_attempt_command_id": completion_command_id,
+                    "recovery_delete_pending": not pod_alive,
+                    "recovery_completion_command_id": completion_command_id,
+                    "recovery_completion_outcome": outcome,
+                }
+            )
+            pause_kwargs = {
+                "completion_command_id": completion_command_id,
+                "completion_finalizing_by": completion_finalizing_by,
+            }
+        # The same processing->paused CAS must win before either mode can
+        # invalidate runtime context or retire the captured pod. The legacy
+        # completion has no durable command and must not write its markers.
         paused = await db.pause_job_shed_freeze(
             job_id,
-            completion_command_id=completion_command_id,
-            completion_finalizing_by=completion_finalizing_by,
-            workspace_context_updates={
-                **container_updates,
-                "recovery_completion_command_id": completion_command_id,
-                "recovery_completion_outcome": outcome,
-            },
+            workspace_context_updates=container_updates,
+            **pause_kwargs,
         )
         if not paused:
             outcome["paused"] = False
             return outcome
 
         if not pod_alive:
-            await _delete_for_recovery()
-            cleared = await db.merge_workspace_container_context(
-                job_id,
-                {"recovery_delete_pending": False},
-                completion_command_id=completion_command_id,
-                completion_finalizing_by=completion_finalizing_by,
-            )
-            if not cleared:
-                raise RuntimeError("workspace recovery lost its delete-complete term")
+            try:
+                await _delete_for_recovery()
+            except Exception:
+                logger.exception("Job %s: error deleting dead workspace pod", job_id)
+                if completion_command_id is not None:
+                    raise
+            if completion_command_id is not None:
+                cleared = await db.merge_workspace_container_context(
+                    job_id,
+                    {"recovery_delete_pending": False},
+                    completion_command_id=completion_command_id,
+                    completion_finalizing_by=completion_finalizing_by,
+                )
+                if not cleared:
+                    raise RuntimeError(
+                        "workspace recovery lost its delete-complete term"
+                    )
         trigger_dispatch()
+        if completion_command_id is None:
+            outcome.pop("paused")
         return outcome
 
     if pod_alive:

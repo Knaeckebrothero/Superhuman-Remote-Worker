@@ -8188,15 +8188,20 @@ class PostgresDB:
 
         return int(row["delegation_depth"]) if row else 0
 
-    async def get_descendant_jobs(self, job_id: str) -> List[Dict[str, Any]]:
+    async def get_descendant_jobs(
+        self, job_id: str, *, include_cancelled: bool = False
+    ) -> List[Dict[str, Any]]:
         """Get all non-terminal descendant jobs (recursive).
 
         Walks the parent_job_id tree downward and returns every descendant
         whose status is not yet terminal (completed/failed/cancelled).
         Includes all subjob types: scholar, critic, curator, delegation.
+        Cancellation retries include cancelled rows whose external retirement
+        may still be incomplete; other callers retain the active-only view.
 
         Args:
             job_id: Root job UUID as string
+            include_cancelled: Include durable cancellation cleanup retry owners.
 
         Returns:
             List of job dicts for active descendants (may be empty)
@@ -8226,8 +8231,10 @@ class PostgresDB:
                 SELECT *
                 FROM descendants
                 WHERE status NOT IN ('completed', 'failed', 'cancelled')
+                   OR ($2::boolean AND status = 'cancelled')
                 """,
                 uuid_val,
+                include_cancelled,
             )
 
         return [dict(row) for row in rows]

@@ -1350,6 +1350,9 @@ async def test_cancel_retries_pinned_verb_after_vm_lane_repair(monkeypatch):
     monkeypatch.setattr(main.postgres_db, "get_job", AsyncMock(return_value=pinned))
     pinned_cancel = AsyncMock(return_value=True)
     monkeypatch.setattr(main.postgres_db, "cancel_job", pinned_cancel)
+    linearize = AsyncMock(return_value=True)
+    monkeypatch.setattr(main.postgres_db, "linearize_pinned_cancel", linearize)
+    monkeypatch.setattr(main.postgres_db, "delete_checkpoint_thread", AsyncMock())
     monkeypatch.setattr(main, "_archive_and_cleanup_workspace", AsyncMock())
     monkeypatch.setattr(
         main,
@@ -1364,11 +1367,18 @@ async def test_cancel_retries_pinned_verb_after_vm_lane_repair(monkeypatch):
     assert await main.cancel_job(MagicMock(), JOB_ID) == {"status": "cancelled"}
 
     pinned_cancel.assert_awaited_once_with(JOB_ID)
+    linearize.assert_awaited_once_with(
+        JOB_ID,
+        expected_status="created",
+        completion_commands_enabled=main.COMPLETION_COMMANDS_ENABLED,
+    )
 
 
 @pytest.mark.asyncio
-async def test_flag_on_pinned_cancel_linearizes_before_agent_post_and_prunes_after(
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_pinned_cancel_linearizes_before_agent_post_and_prunes_after(
     monkeypatch,
+    enabled,
 ):
     from orchestrator import main
 
@@ -1381,7 +1391,7 @@ async def test_flag_on_pinned_cancel_linearizes_before_agent_post_and_prunes_aft
         "context": {},
     }
     order = []
-    monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", True)
+    monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", enabled)
     monkeypatch.setattr(
         main,
         "require_internal_or_job_access",

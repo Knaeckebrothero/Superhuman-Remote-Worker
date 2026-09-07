@@ -19336,12 +19336,12 @@ async def subjob_merge(request: Request, job_id: str) -> dict[str, Any]:
 
 
 async def _cascade_cancel_to_children(job_id: str) -> bool:
-    """Cancel all non-terminal descendant jobs of a parent.
+    """Cancel descendant jobs and finish previously cancelled child retirement.
 
     Fetches the full descendant tree (recursive), signals processing agents
-    to stop, cleans up VMs/containers, and bulk-updates DB status.
+    to stop, publishes cancellation, and cleans up VMs/containers.
     """
-    children = await postgres_db.get_descendant_jobs(job_id)
+    children = await postgres_db.get_descendant_jobs(job_id, include_cancelled=True)
     if not children:
         return True
 
@@ -19390,68 +19390,56 @@ async def _cascade_cancel_to_children(job_id: str) -> bool:
     stateless_children = [c for c in children if c.get("execution_lane") == "stateless"]
 
     pinned_settled = True
-    if COMPLETION_COMMANDS_ENABLED:
 
-        async def _cancel_pinned_child(child: dict) -> bool:
-            child_id = str(child["id"])
-            won = await postgres_db.linearize_pinned_cancel(
+    async def _cancel_pinned_child(child: dict) -> bool:
+        child_id = str(child["id"])
+        won = await postgres_db.linearize_pinned_cancel(
+            child_id,
+            expected_status=str(child.get("status") or ""),
+            completion_commands_enabled=COMPLETION_COMMANDS_ENABLED,
+        )
+        if not won:
+            refreshed = await postgres_db.get_job(child_id)
+            if not refreshed or refreshed.get("status") in (
+                "completed",
+                "failed",
+            ):
+                return True
+            if refreshed.get("status") != "cancelled":
+                return False
+            # A previous caller may have committed cancellation and died
+            # before external retirement.  The terminal row remains the
+            # retry owner; never treat status alone as cleanup success.
+            return await _cleanup_child(refreshed)
+        signal_result, cleanup_result = await asyncio.gather(
+            _signal_cancel(child),
+            _cleanup_child(child),
+            return_exceptions=True,
+        )
+        if isinstance(signal_result, BaseException):
+            logger.warning(
+                "Cascade cancellation signal raised for child %s",
                 child_id,
-                expected_status=str(child.get("status") or ""),
-                completion_commands_enabled=True,
+                exc_info=(
+                    type(signal_result),
+                    signal_result,
+                    signal_result.__traceback__,
+                ),
             )
-            if not won:
-                refreshed = await postgres_db.get_job(child_id)
-                if not refreshed or refreshed.get("status") in (
-                    "completed",
-                    "failed",
-                ):
-                    return True
-                if refreshed.get("status") != "cancelled":
-                    return False
-                # A previous caller may have committed cancellation and died
-                # before external retirement.  The terminal row remains the
-                # retry owner; never treat status alone as cleanup success.
-                return await _cleanup_child(refreshed)
-            signal_result, cleanup_result = await asyncio.gather(
-                _signal_cancel(child),
-                _cleanup_child(child),
-                return_exceptions=True,
-            )
-            if isinstance(signal_result, BaseException):
-                logger.warning(
-                    "Cascade cancellation signal raised for child %s",
-                    child_id,
-                    exc_info=(
-                        type(signal_result),
-                        signal_result,
-                        signal_result.__traceback__,
-                    ),
-                )
-            return signal_result is True and cleanup_result is True
+        return signal_result is True and cleanup_result is True
 
-        pinned_results = await asyncio.gather(
-            *[_cancel_pinned_child(c) for c in pinned_children],
-            return_exceptions=True,
-        )
-        for child, result in zip(pinned_children, pinned_results, strict=True):
-            if result is True:
-                continue
-            pinned_settled = False
-            logger.error(
-                "Cascade cancellation stood down for pinned child %s because "
-                "another completion/control owner won",
-                child.get("id"),
-            )
-    else:
-        legacy_results = await asyncio.gather(
-            *[_signal_cancel(c) for c in pinned_children],
-            *[_cleanup_child(c) for c in pinned_children],
-            return_exceptions=True,
-        )
-        signal_results = legacy_results[: len(pinned_children)]
-        cleanup_results = legacy_results[len(pinned_children) :]
-        pinned_settled = all(result is True for result in signal_results) and all(
-            result is True for result in cleanup_results
+    pinned_results = await asyncio.gather(
+        *[_cancel_pinned_child(c) for c in pinned_children],
+        return_exceptions=True,
+    )
+    for child, result in zip(pinned_children, pinned_results, strict=True):
+        if result is True:
+            continue
+        pinned_settled = False
+        logger.error(
+            "Cascade cancellation stood down for pinned child %s because "
+            "another completion/control owner won",
+            child.get("id"),
         )
 
     async def _cancel_stateless_child(child: dict) -> bool:
@@ -19497,22 +19485,6 @@ async def _cascade_cancel_to_children(job_id: str) -> bool:
             logger.error(
                 "Cascade cancellation timed out with stateless child %s still live",
                 child.get("id"),
-            )
-
-    # Bulk cancel in DB
-    pinned_ids = [str(c["id"]) for c in pinned_children]
-    if pinned_ids and not COMPLETION_COMMANDS_ENABLED and pinned_settled:
-        async with postgres_db.acquire() as conn:
-            await conn.execute(
-                """
-                UPDATE jobs
-                SET status = 'cancelled',
-                    assigned_agent_id = NULL,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = ANY($1::uuid[])
-                  AND status NOT IN ('completed', 'cancelled')
-                """,
-                pinned_ids,
             )
 
     logger.info(f"Cascade-cancelled {len(children)} descendant(s) of job {job_id}")
@@ -19736,7 +19708,7 @@ async def cancel_job(request: Request, job_id: str) -> dict[str, str]:
     to the agent pod.
     """
     _, job = await require_internal_or_job_access(request, postgres_db, job_id)
-    early_pinned_cancel = False
+    pinned_cancel_committed = False
 
     try:
         if job.get("execution_lane") == "stateless":
@@ -19824,20 +19796,21 @@ async def cancel_job(request: Request, job_id: str) -> dict[str, str]:
                 await _resolve_job_notifications(job_id, user=None, hook="cancel")
                 return {"status": "cancelled"}
 
-        if COMPLETION_COMMANDS_ENABLED and job.get("execution_lane") == "pinned":
+        if job.get("execution_lane") == "pinned":
             # Linearize the user's cancellation before agent/VM/workspace I/O.
-            # The finalizer's expected-status CAS must observe this terminal
-            # control even if external quiescence takes minutes.  Checkpoint
-            # pruning stays after quiescence below.
-            early_pinned_cancel = await postgres_db.linearize_pinned_cancel(
+            # Terminal workspace retirement requires this status in both
+            # completion-command modes. The finalizer must also observe it
+            # before external quiescence. Checkpoint pruning stays below.
+            pinned_cancel_committed = await postgres_db.linearize_pinned_cancel(
                 job_id,
                 expected_status=str(job.get("status") or ""),
-                completion_commands_enabled=True,
+                completion_commands_enabled=COMPLETION_COMMANDS_ENABLED,
             )
-            if not early_pinned_cancel:
+            if not pinned_cancel_committed:
                 refreshed = await postgres_db.get_job(job_id)
                 if (
-                    refreshed
+                    COMPLETION_COMMANDS_ENABLED
+                    and refreshed
                     and refreshed.get("status") not in ("completed", "cancelled")
                     and _active_completion_control_claim(refreshed)
                 ):
@@ -19850,6 +19823,10 @@ async def cancel_job(request: Request, job_id: str) -> dict[str, str]:
                         status_code=400,
                         detail="Job cannot be cancelled (already completed or cancelled)",
                     )
+
+                # A prior cancellation may have committed before cleanup
+                # failed. Its retry still owns the deferred checkpoint prune.
+                pinned_cancel_committed = True
 
         # If job is assigned to an agent, send cancel request to agent pod
         assigned_agent_id = job.get("assigned_agent_id")
@@ -19935,7 +19912,7 @@ async def cancel_job(request: Request, job_id: str) -> dict[str, str]:
                     status_code=400,
                     detail="Job cannot be cancelled (already completed or cancelled)",
                 )
-        if early_pinned_cancel:
+        if pinned_cancel_committed:
             try:
                 await postgres_db.delete_checkpoint_thread(job_id)
             except Exception as exc:
@@ -31739,6 +31716,7 @@ async def _complete_job_legacy(
             if resolved_entry_status:
                 completion_entry_status = resolved_entry_status
         stateless_completion = job.get("execution_lane", "pinned") == "stateless"
+        legacy_pinned_completion = _effect_runner is None and not stateless_completion
         completion_result = body.model_dump(
             exclude={"lease_token", "agent_id", "client_report_id"},
         )
@@ -32256,6 +32234,8 @@ async def _complete_job_legacy(
 
                 async def _give_up_infra_transient() -> dict[str, Any]:
                     update_kwargs: dict[str, Any] = {}
+                    if legacy_pinned_completion:
+                        update_kwargs["expected_status"] = completion_entry_status
                     if _effect_runner is not None:
                         update_kwargs = {
                             "expected_status": completion_entry_status,
@@ -32274,7 +32254,9 @@ async def _complete_job_legacy(
                         },
                         **update_kwargs,
                     )
-                    if _effect_runner is not None and not disposition_updated:
+                    if (
+                        legacy_pinned_completion or _effect_runner is not None
+                    ) and not disposition_updated:
                         await _raise_completion_control_race()
                     return {
                         "status": "handled",
@@ -32342,6 +32324,8 @@ async def _complete_job_legacy(
                     )
                     return None
                 if _effect_runner is None and not await postgres_db.pause_job(job_id):
+                    if legacy_pinned_completion:
+                        await _raise_completion_control_race()
                     return None
                 logger.warning(
                     "Job %s: paused for transient infrastructure failure "
@@ -32441,6 +32425,11 @@ async def _complete_job_legacy(
                         completion_finalizing_by=(
                             _effect_runner.owner if _effect_runner is not None else None
                         ),
+                        **(
+                            {"expected_status": completion_entry_status}
+                            if legacy_pinned_completion
+                            else {}
+                        ),
                     )
 
                 pod_recovery = await _run_completion_effect(
@@ -32449,14 +32438,17 @@ async def _complete_job_legacy(
                     "recovery",
                     _recover_pod_workspace,
                 )
-                if _effect_runner is not None and not pod_recovery.get("paused", True):
+                if (
+                    legacy_pinned_completion or _effect_runner is not None
+                ) and not pod_recovery.get("paused", True):
                     await _raise_completion_control_race()
                 return pod_recovery
 
-            # --- VM recovery (legacy path, unchanged) -------------------------
+            # --- VM recovery (legacy path) ------------------------------------
             # VM finalization is explicitly outside this Gate-3 milestone. Keep
-            # the historical duplicate guard and best-effort sequence intact;
-            # unlike Kubernetes recovery, this branch is not journaled tonight.
+            # the historical duplicate guard and best-effort retirement. Publish
+            # its pause before external I/O so an already-cancelled job cannot
+            # enter recovery. This branch remains unjournaled.
             vm_ctx = _get_vm_context(job)
             if vm_ctx and vm_ctx.get("recovering"):
                 logger.info(
@@ -32473,9 +32465,14 @@ async def _complete_job_legacy(
                 logger.warning(
                     f"Job {job_id}: workspace unavailable — attempting VM recovery"
                 )
-                if COMPLETION_COMMANDS_ENABLED:
+                if COMPLETION_COMMANDS_ENABLED or legacy_pinned_completion:
                     paused = await postgres_db.pause_job(
-                        job_id, completion_commands_enabled=True
+                        job_id,
+                        **(
+                            {"completion_commands_enabled": True}
+                            if COMPLETION_COMMANDS_ENABLED
+                            else {}
+                        ),
                     )
                     if not paused:
                         await _raise_completion_control_race()
@@ -32528,7 +32525,7 @@ async def _complete_job_legacy(
                             }
                         },
                     )
-                if not COMPLETION_COMMANDS_ENABLED:
+                if not COMPLETION_COMMANDS_ENABLED and not legacy_pinned_completion:
                     await postgres_db.pause_job(job_id)
                 if vm_deleted:
                     _trigger_dispatch()
@@ -32652,6 +32649,8 @@ async def _complete_job_legacy(
                     retry_count = await postgres_db.increment_job_memory_retry(job_id)
                     if _effect_runner is None:
                         paused = bool(await postgres_db.pause_job(job_id))
+                        if legacy_pinned_completion and not paused:
+                            await _raise_completion_control_race()
                     if paused and _effect_runner is None:
                         _trigger_dispatch()
                     return {"paused": paused, "retry_count": retry_count}
@@ -32781,6 +32780,8 @@ async def _complete_job_legacy(
                         )
                     if _effect_runner is None:
                         paused = bool(await postgres_db.pause_job(job_id))
+                        if legacy_pinned_completion and not paused:
+                            await _raise_completion_control_race()
                     return {
                         "paused": paused,
                         "attempt": attempt,
@@ -32871,20 +32872,19 @@ async def _complete_job_legacy(
         # knowledge-base/knowledge/issues/officer_blind_reads_and_worker_bureaucracy.md §4 P1-C.
         from orchestrator.services.completion import apply_deliverable_gate
 
+        legacy_resume_control_lost = False
+
         async def _queue_deliverable_gate_resume(
             resume_job_id: str,
             feedback: str,
             reason: str | None = None,
         ) -> None:
-            await _internal_resume_job(
+            nonlocal legacy_resume_control_lost
+            resumed = await _internal_resume_job(
                 resume_job_id,
                 feedback,
                 reason,
-                expected_status=(
-                    completion_entry_status
-                    if stateless_completion or _effect_runner is not None
-                    else None
-                ),
+                expected_status=completion_entry_status,
                 completion_owner_command_id=(
                     str(_effect_runner.command_id)
                     if _effect_runner is not None
@@ -32894,6 +32894,9 @@ async def _complete_job_legacy(
                     str(_effect_runner.owner) if _effect_runner is not None else None
                 ),
             )
+            if legacy_pinned_completion and not resumed:
+                legacy_resume_control_lost = True
+                await _raise_completion_control_race()
 
         async def _apply_completion_deliverable_gate() -> dict[str, Any]:
             gate_decision = await apply_deliverable_gate(
@@ -32905,6 +32908,11 @@ async def _complete_job_legacy(
                 queue_resume=_queue_deliverable_gate_resume,
                 vector_db=vector_db,
             )
+            # The gate catches queue failures to retain its historical fallback
+            # policy. A cancelled legacy job must stop outside that catch before
+            # evidence, delivery, or any further completion disposition.
+            if legacy_resume_control_lost:
+                await _raise_completion_control_race()
             status, gate_actions, bounced = gate_decision
             return {
                 "new_status": status,
@@ -33402,8 +33410,11 @@ async def _complete_job_legacy(
                         kwargs["stash_and_clear_freeze"] = True
                         kwargs["freeze_data"] = fd_row
 
-            if stateless_completion or _effect_runner is not None:
-                kwargs["expected_status"] = completion_entry_status
+            # A pinned cancel now publishes terminal authority before external
+            # cleanup in either mode. An already-running legacy callback must
+            # lose the same status CAS as a stateless/durable completion, or it
+            # could resurrect the job while cancellation retires its workspace.
+            kwargs["expected_status"] = completion_entry_status
             if _effect_runner is not None:
                 kwargs["completion_command_id"] = _effect_runner.command_id
                 kwargs["completion_finalizing_by"] = _effect_runner.owner
@@ -33426,13 +33437,11 @@ async def _complete_job_legacy(
                 disposition_updated = await postgres_db.update_job_status(
                     job_id, **kwargs
                 )
-                if (
-                    stateless_completion or _effect_runner is not None
-                ) and not disposition_updated:
+                if not disposition_updated:
                     current = await postgres_db.get_job(job_id)
                     current_status = str((current or {}).get("status") or "unknown")
                     logger.warning(
-                        "Durable completion disposition lost control race "
+                        "Completion disposition lost control race "
                         "job=%s lease_token=%s entry_status=%s current_status=%s",
                         job_id,
                         body.lease_token,
