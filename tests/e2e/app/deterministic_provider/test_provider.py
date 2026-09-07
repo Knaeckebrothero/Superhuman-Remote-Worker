@@ -456,6 +456,111 @@ async def test_tool_call_scenario_requires_tool_result_before_final_response(
     assert final_state["remaining_required_responses"] == 0
 
 
+async def test_worker_job_scenario_completes_without_any_off_pod_tool(
+    control: httpx.AsyncClient,
+    inference: httpx.AsyncClient,
+) -> None:
+    """The hermetic sibling of search-job/fetch-job.
+
+    Those two require a live third-party provider by design. This one must
+    reach `job_complete` binding only core tools, so a worker job can be
+    accepted in a profile that deliberately has no research or fetch provider.
+    """
+    run_id = "worker-job-001"
+    await arm(control, run_id, scenario="worker-job", required_responses=1)
+
+    # Tool-phase calls deliberately do not consume a required response, so the
+    # armed budget is settled by one ordinary reply, as in the sibling tests.
+    incidental = await inference.post("/v1/chat/completions", json=chat_request(run_id))
+    assert incidental.status_code == 200
+    assert incidental.json()["choices"][0]["message"]["content"] == (
+        f"E2E_REPLY:{run_id}"
+    )
+
+    def tools(*names: str) -> list[dict]:
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": "test",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+            for name in names
+        ]
+
+    async def next_function(*names: str) -> dict:
+        response = await inference.post(
+            "/v1/chat/completions",
+            json=chat_request(run_id, extra={"tools": tools(*names)}),
+        )
+        assert response.status_code == 200
+        return response.json()["choices"][0]["message"]["tool_calls"][0]["function"]
+
+    bound = ("read_file", "todo_complete", "next_phase_todos", "job_complete")
+
+    guide = await next_function(*bound)
+    assert guide == {
+        "name": "read_file",
+        "arguments": '{"path":"skills/todo-guide/SKILL.md"}',
+    }
+    for _ in range(4):
+        assert (await next_function(*bound))["name"] == "todo_complete"
+
+    staged = await next_function(*bound)
+    assert staged["name"] == "next_phase_todos"
+    assert json.loads(staged["arguments"])["phase_name"] == "Hermetic worker-job gate"
+
+    for _ in range(2):
+        assert (await next_function(*bound))["name"] == "todo_complete"
+
+    verify = await next_function(*bound)
+    assert verify == {
+        "name": "read_file",
+        "arguments": '{"path":"skills/verify-before-done/SKILL.md"}',
+    }
+
+    completion = await next_function(*bound)
+    assert completion["name"] == "job_complete"
+    assert json.loads(completion["arguments"])["summary"] == (
+        f"Completed the hermetic worker gate for E2E-{run_id}."
+    )
+
+    # No step in the machine may require an off-pod tool.
+    state = (await control.get(f"/control/scenarios/{run_id}")).json()
+    assert state["worker_job_tool_steps"] == 10
+    assert state["remaining_required_responses"] == 0
+
+
+async def test_worker_job_scenario_fails_closed_without_a_required_tool(
+    control: httpx.AsyncClient,
+    inference: httpx.AsyncClient,
+) -> None:
+    run_id = "worker-job-gap-001"
+    await arm(control, run_id, scenario="worker-job")
+    response = await inference.post(
+        "/v1/chat/completions",
+        json=chat_request(
+            run_id,
+            extra={
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "todo_complete",
+                            "description": "test",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ]
+            },
+        ),
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["type"] == "required_tool_missing"
+
+
 async def test_search_job_scenario_drives_search_completion_and_todos(
     control: httpx.AsyncClient,
     inference: httpx.AsyncClient,

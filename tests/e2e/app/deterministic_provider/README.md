@@ -45,6 +45,18 @@ todo guide required by the enforced staging contract before staging, and reads t
 verification guide at each completion boundary. Tool results still pass through SRW
 normally and are never retained by the fixture.
 
+The `worker-job` scenario is the hermetic sibling of the two below. `search-job`
+and `fetch-job` are deliberately *live-gate* drivers: each requires a real
+third-party provider (SearXNG, Crawl4AI) so it can exercise the off-pod
+boundary. A profile that has neither — the owned minimal profile does not, and
+adding one breaks its "exactly one endpoint, exactly two models" determinism
+contract — cannot complete a worker job with either. `worker-job` binds only
+`read_file`, `todo_complete`, `next_phase_todos` and `job_complete`: it reads
+the todo guide the staging contract requires, runs the strategic todos, stages
+a two-todo tactical phase, reads the verification guide at the completion
+boundary, then returns through `job_complete`. It fails closed the same way when
+a required tool is not bound.
+
 The `fetch-job` scenario follows the same fail-closed pattern for the off-pod fetch
 boundary. It calls `extract_webpage` and `crawl_website` against `example.com` before
 completing the job. It reads both guides required by the runtime's enforced staging and

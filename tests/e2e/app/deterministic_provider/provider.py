@@ -41,6 +41,7 @@ SUPPORTED_SCENARIOS = frozenset(
         "numbered-stream",
         "search-job",
         "fetch-job",
+        "worker-job",
     }
 )
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,127}$")
@@ -63,6 +64,7 @@ class ArmScenarioRequest(BaseModel):
         "numbered-stream",
         "search-job",
         "fetch-job",
+        "worker-job",
     ] = "reply"
     required_responses: int = Field(default=1, ge=1, le=100)
     chunk_delay_ms: int = Field(default=100, ge=0, le=2_000)
@@ -106,6 +108,7 @@ class RunState:
     error_once_emitted: bool = False
     search_job_tool_steps: int = 0
     fetch_job_tool_steps: int = 0
+    worker_job_tool_steps: int = 0
     next_sequence: int = 1
     counters: Counter[tuple[str, str, bool, str]] = field(default_factory=Counter)
     calls: list[dict[str, Any]] = field(default_factory=list)
@@ -409,6 +412,12 @@ class ScenarioStore:
                 and decision.tool_phase
             ):
                 state.fetch_job_tool_steps += 1
+            if (
+                outcome == "success"
+                and decision.scenario == "worker-job"
+                and decision.tool_phase
+            ):
+                state.worker_job_tool_steps += 1
             if outcome != "success":
                 state.unexpected_calls += 1
             duration_ms = max(0, int((time.monotonic() - pending.started_at) * 1000))
@@ -480,6 +489,7 @@ class ScenarioStore:
             "remaining_required_responses": state.remaining_required_responses,
             "search_job_tool_steps": state.search_job_tool_steps,
             "fetch_job_tool_steps": state.fetch_job_tool_steps,
+            "worker_job_tool_steps": state.worker_job_tool_steps,
             "unexpected_count": state.unexpected_calls,
             "pending_calls": len(state.pending),
             "counters": counters,
@@ -636,6 +646,31 @@ def create_inference_app(
                         422,
                         "required_tool_missing",
                         "The search-job scenario requires a tool that was not bound.",
+                    )
+            elif structured_name is None and state["scenario"] == "worker-job":
+                tool_names = _tool_names(payload)
+                if tool_names & {
+                    "read_file",
+                    "todo_complete",
+                    "next_phase_todos",
+                    "job_complete",
+                }:
+                    tool_call = _worker_job_tool_call(
+                        state["worker_job_tool_steps"], run_id
+                    )
+                if tool_call is not None and tool_call.name not in tool_names:
+                    await _account_rejection(
+                        store,
+                        run_id=run_id,
+                        endpoint="chat.completions",
+                        model=model,
+                        stream=stream,
+                        outcome="unexpected_required_tool_missing",
+                    )
+                    raise ScenarioError(
+                        422,
+                        "required_tool_missing",
+                        "The worker-job scenario requires a tool that was not bound.",
                     )
             elif structured_name is None and state["scenario"] == "fetch-job":
                 tool_names = _tool_names(payload)
@@ -1317,6 +1352,86 @@ def _search_job_tool_call(step: int, run_id: str) -> ToolCallSpec:
         name="todo_complete",
         arguments=json.dumps(
             {"completion_note": "PASS: SearXNG live search gate completed."},
+            separators=(",", ":"),
+        ),
+    )
+
+
+def _worker_job_tool_call(step: int, run_id: str) -> ToolCallSpec:
+    """Drive the real phased agent to completion without any off-pod tool.
+
+    `search-job` and `fetch-job` are deliberately *live-gate* drivers: each
+    requires a third-party provider (SearXNG, Crawl4AI) so it can exercise the
+    off-pod boundary. The owned minimal profile has neither, and adding one
+    breaks its determinism contract ("exactly one endpoint, exactly two
+    models"). This scenario covers the case those two cannot: a real worker
+    job reaching `job_complete` using only core, in-workspace tools.
+
+    Same shape as its siblings — read the todo guide the staging contract
+    requires, run the strategic todos, stage a tactical phase, read the
+    verification guide at the completion boundary, then complete.
+    """
+
+    if step == 0:
+        return ToolCallSpec(
+            name="read_file",
+            arguments=json.dumps(
+                {"path": "skills/todo-guide/SKILL.md"}, separators=(",", ":")
+            ),
+        )
+    if step < 5:
+        return ToolCallSpec(
+            name="todo_complete",
+            arguments=json.dumps(
+                {"completion_note": "PASS: hermetic strategic setup step."},
+                separators=(",", ":"),
+            ),
+        )
+    if step == 5:
+        return ToolCallSpec(
+            name="next_phase_todos",
+            arguments=json.dumps(
+                {
+                    "todos": [
+                        "Record the hermetic worker-job acceptance marker.",
+                        "Verify the marker and close the phase.",
+                    ],
+                    "phase_name": "Hermetic worker-job gate",
+                },
+                separators=(",", ":"),
+            ),
+        )
+    if step in {6, 7}:
+        return ToolCallSpec(
+            name="todo_complete",
+            arguments=json.dumps(
+                {"completion_note": "PASS: hermetic tactical step."},
+                separators=(",", ":"),
+            ),
+        )
+    if step == 8:
+        return ToolCallSpec(
+            name="read_file",
+            arguments=json.dumps(
+                {"path": "skills/verify-before-done/SKILL.md"}, separators=(",", ":")
+            ),
+        )
+    if step == 9:
+        return ToolCallSpec(
+            name="job_complete",
+            arguments=json.dumps(
+                {
+                    "summary": f"Completed the hermetic worker gate for E2E-{run_id}.",
+                    "deliverables": [],
+                    "confidence": 1.0,
+                },
+                separators=(",", ":"),
+            ),
+        )
+    return ToolCallSpec(
+        name="todo_complete",
+        arguments=json.dumps(
+            {"completion_note": "PASS: hermetic worker-job gate completed."},
             separators=(",", ":"),
         ),
     )
