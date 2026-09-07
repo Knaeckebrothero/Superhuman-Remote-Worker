@@ -113,7 +113,19 @@ async function bootstrapCatalogAndReadiness(
     'fixture model catalog',
   );
   const enabledModels = models.filter(({ enabled }) => enabled);
-  expect(enabledModels.map(({ model_id }) => model_id).sort()).toEqual(
+  // Scoped to inference capabilities on purpose. What this gate protects is
+  // "the deterministic stack cannot reach a real model" — and the absence of
+  // real credentials is already asserted above. The chart also registers the
+  // bundled keyless research provider (SearXNG seeds one row with
+  // capabilities ["search"]), which runs inside the owned cluster, bills
+  // nothing and cannot serve inference. Failing the gate on it would be a
+  // false positive; a stray chat/embedding/auxiliary/vision/rerank row still
+  // fails it, which is the case that matters.
+  const INFERENCE_CAPABILITIES = ['chat', 'embedding', 'auxiliary', 'vision', 'rerank'];
+  const enabledInferenceModels = enabledModels.filter(({ capabilities }) =>
+    capabilities.some((capability) => INFERENCE_CAPABILITIES.includes(capability)),
+  );
+  expect(enabledInferenceModels.map(({ model_id }) => model_id).sort()).toEqual(
     [environment.chatModel, environment.embeddingModel].sort(),
   );
 
