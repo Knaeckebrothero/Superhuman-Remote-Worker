@@ -12,11 +12,22 @@
 
 [![SRW — Stop building agents. Start delegating work.](docs/assets/readme-hero.png)](https://superhuman-remote-worker.com/)
 
-Superhuman Remote Worker (SRW) is a self-hosted platform for agents that need
-more than a chat window. It combines a web cockpit, a Kubernetes control plane,
-durable project context, configurable autonomy, and isolated workspaces where
-agents can research, edit files, run commands, use browsers, and work with
-external systems.
+Superhuman Remote Worker (SRW) is a self-hosted runtime for AI work, from a
+help-desk assistant with no tools to a week-long autonomous project. It has
+three building bricks and an engine that puts them together:
+
+- an **expert** — who the agent is: a prompt, a model and a set of tools, in one
+  YAML file;
+- a **workspace** — where the work happens: none, files in your object store, a
+  throwaway pod, or a VM with its own kernel;
+- a **connector** — what it can reach: a repository, a database, a cloud folder,
+  a mailbox, an MCP server. A knowledge base is a connector too.
+
+A job is an expert plus a workspace plus connectors. The runtime is the engine,
+not a brick: it queues the job, issues the credentials, runs the workspace,
+keeps the audit trail, and hands back a reviewable result and a receipt.
+Sessions, projects, officers and subagents are the same three bricks,
+combined.
 
 The model is replaceable. The execution, memory, permissions, observability,
 and recovery layers around it are the product.
@@ -29,7 +40,11 @@ and recovery layers around it are the product.
 
 ## The mental model
 
-SRW organizes work around three concepts:
+SRW organizes work around three concepts, each a combination of the bricks
+above: a session is an expert you talk to, a job is an expert working
+unattended in a workspace, and a project is a saved recipe of experts,
+workspace tier and connectors.
+
 
 | Concept | Use it for | What persists |
 |---|---|---|
