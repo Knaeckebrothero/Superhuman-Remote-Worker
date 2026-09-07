@@ -147,10 +147,17 @@ dozzle:
 codexProxy:
   enabled: false
 
-# Keep the session journey's catalogue exclusive to its deterministic fixture.
-# The chart normally enables and registers SearXNG as a search provider.
+# Enabled so the provider fixture's `search-job` scenario has a real
+# `web_search` tool to drive at its tactical step; without it that scenario
+# fails closed with `required_tool_missing` and no worker job can complete in
+# this profile. The chart normally enables and registers SearXNG anyway.
+#
+# This adds a research provider to the catalogue, which the session journey
+# previously kept exclusive to its deterministic fixture. The journey pins
+# `e2e-chat` and asserts on chat, not on catalogue contents, and is re-run
+# after this change to prove it still passes.
 searxng:
-  enabled: false
+  enabled: true
 
 nats:
   internal: false
