@@ -26,17 +26,21 @@ const models = {
 const providers = {
   systemApiKeys: signal([]),
   systemEndpoints: signal([]),
-  codexAvailability: signal({
+  subscriptionAvailability: signal({
     available: false,
+    reachable: false,
+    error: null,
     account_count: 0,
+    accounts: [],
     models: [],
     proxy_url: null,
     endpoint_id: null,
   }),
   loadSystemApiKeys: vi.fn(),
   loadSystemEndpoints: vi.fn(),
-  loadCodexAvailability: vi.fn(),
-  discoverSystemEndpointModels: vi.fn(() => of({models: []})),
+  loadSubscriptionAvailability: vi.fn(),
+  discoverSystemEndpointModels: vi.fn(() => of({ok: true, models: []})),
+  importSubscriptionModels: vi.fn(() => of({created: [], skipped: [], rejected: []})),
 };
 
 describe('AdminCatalogComponent search/fetch form', () => {

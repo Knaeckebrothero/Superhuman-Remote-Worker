@@ -14,6 +14,10 @@ Harness mirrors tests/test_dispatch_phase_credentials.py.
 
 from __future__ import annotations
 
+from tests._expert_catalog import patch_service_method
+from orchestrator.services import expert_catalog as expert_catalog_module
+
+
 import json
 import os
 from unittest.mock import AsyncMock, MagicMock
@@ -224,11 +228,11 @@ async def test_resolved_session_uses_canonical_mount_projects_for_kb_gate(monkey
         AsyncMock(return_value={}),
         raising=True,
     )
-    monkeypatch.setattr(
-        orchestrator.main,
-        "_gather_in_scope_skills",
+    patch_service_method(
+        monkeypatch,
+        expert_catalog_module.ExpertCatalogService,
+        "gather_in_scope_skills",
         AsyncMock(return_value=[]),
-        raising=True,
     )
     monkeypatch.setattr(
         orchestrator.main,

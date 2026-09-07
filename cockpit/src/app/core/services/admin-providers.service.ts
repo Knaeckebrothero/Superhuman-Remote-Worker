@@ -10,6 +10,9 @@ import {
   LlmEndpointDiscoveryResult,
   LlmEndpointTestResult,
   LlmEndpointUpdateRequest,
+  SubscriptionAccount,
+  SubscriptionDiscoveryResult,
+  SubscriptionImportResult,
 } from '../models/api.model';
 import {environment} from '../environment';
 import {ModelService} from './model.service';
@@ -79,21 +82,29 @@ const EMPTY_DEFAULTS: Record<DefaultModelKind, string | null> = {
 };
 
 /**
- * Reported by `GET /api/admin/providers/codex/availability`. Used by Admin →
- * Models to decide whether the seeded `codex-proxy` system endpoint is usable
- * right now (proxy reachable + at least one active subscription).
+ * Reported by `GET /api/admin/providers/subscriptions/availability`. Used by
+ * Admin → Models to decide whether the seeded subscription-proxy endpoint is
+ * usable right now (proxy reachable + at least one healthy account).
  */
-export interface CodexAvailability {
+export interface SubscriptionAvailability {
   available: boolean;
+  /** False when the proxy itself cannot be reached — distinct from signed-out. */
+  reachable: boolean;
+  error: string | null;
   account_count: number;
+  accounts: SubscriptionAccount[];
   models: string[];
   proxy_url: string | null;
   endpoint_id: string | null;
+  transport_kind?: string;
 }
 
-const EMPTY_CODEX_AVAILABILITY: CodexAvailability = {
+const EMPTY_SUBSCRIPTION_AVAILABILITY: SubscriptionAvailability = {
   available: false,
+  reachable: false,
+  error: null,
   account_count: 0,
+  accounts: [],
   models: [],
   proxy_url: null,
   endpoint_id: null,
@@ -113,7 +124,9 @@ export class AdminProvidersService {
   readonly systemApiKeys = signal<SystemApiKeyEntry[]>([]);
   readonly systemEndpoints = signal<LlmEndpoint[]>([]);
   readonly defaults = signal<Record<DefaultModelKind, string | null>>({...EMPTY_DEFAULTS});
-  readonly codexAvailability = signal<CodexAvailability>({...EMPTY_CODEX_AVAILABILITY});
+  readonly subscriptionAvailability = signal<SubscriptionAvailability>({
+    ...EMPTY_SUBSCRIPTION_AVAILABILITY,
+  });
 
   // ── System API Keys ───────────────────────────────────────────────
 
@@ -238,9 +251,15 @@ export class AdminProvidersService {
   /**
    * Read-only probe of `GET {base_url}/models`. Admin → Models uses this as
    * a quick-fill helper after the admin picks an endpoint provider.
+   *
+   * The subscription proxy answers the enriched shape (`subscription: true`)
+   * from the same route; discriminate on that field rather than on the
+   * endpoint's label.
    */
-  discoverSystemEndpointModels(endpointId: string): Observable<LlmEndpointDiscoveryResult> {
-    return this.http.post<LlmEndpointDiscoveryResult>(
+  discoverSystemEndpointModels(
+    endpointId: string,
+  ): Observable<LlmEndpointDiscoveryResult | SubscriptionDiscoveryResult> {
+    return this.http.post<LlmEndpointDiscoveryResult | SubscriptionDiscoveryResult>(
       `${this.baseUrl}/admin/providers/endpoints/${endpointId}/discover`,
       {},
     );
@@ -269,17 +288,40 @@ export class AdminProvidersService {
       );
   }
 
-  // ── Codex Proxy Availability ──────────────────────────────────────
+  // ── Subscription Proxy ────────────────────────────────────────
 
   /**
-   * Refresh the codex-proxy availability signal. Admin → Models reads this
-   * to decide whether to surface a "log in via Settings → Codex" hint when
-   * the user picks the codex-proxy endpoint without an active subscription.
+   * Refresh the subscription-proxy availability signal. Admin → Models reads
+   * this to decide whether to surface a "connect one in Settings → AI
+   * Subscriptions" hint when the admin picks the proxy with nothing signed in.
    */
-  loadCodexAvailability(): void {
+  loadSubscriptionAvailability(): void {
     this.http
-      .get<CodexAvailability>(`${this.baseUrl}/admin/providers/codex/availability`)
-      .pipe(catchError(() => of({...EMPTY_CODEX_AVAILABILITY})))
-      .subscribe((info) => this.codexAvailability.set(info));
+      .get<SubscriptionAvailability>(`${this.baseUrl}/admin/providers/subscriptions/availability`)
+      .pipe(catchError(() => of({...EMPTY_SUBSCRIPTION_AVAILABILITY})))
+      .subscribe((info) => this.subscriptionAvailability.set(info));
+  }
+
+  /**
+   * Bulk-register discovered models. Omit `modelIds` for "add all supported
+   * models". Idempotent — already-registered rows are skipped, never rewritten,
+   * so manual catalog edits survive a rediscovery.
+   */
+  importSubscriptionModels(
+    endpointId: string,
+    modelIds?: string[],
+    includeNeedsReview = false,
+  ): Observable<SubscriptionImportResult> {
+    return this.http
+      .post<SubscriptionImportResult>(
+        `${this.baseUrl}/admin/providers/endpoints/${endpointId}/models/import`,
+        {model_ids: modelIds ?? null, include_needs_review: includeNeedsReview},
+      )
+      .pipe(
+        tap(() => {
+          this.readiness.load();
+          this.modelService.load(undefined, true);
+        }),
+      );
   }
 }

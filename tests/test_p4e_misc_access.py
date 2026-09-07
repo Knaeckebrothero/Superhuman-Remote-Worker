@@ -15,6 +15,10 @@ and that the gated endpoints actually run the gate (otherwise the
 downstream service mock would explode).
 """
 
+from tests._expert_catalog import catalogue_route
+from orchestrator.routers import expert_catalog as expert_routes
+
+
 from contextlib import ExitStack
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -43,7 +47,6 @@ class TestExpertsGated:
         """The gate fires before the global cache is touched. We patch
         ``require_approved_user`` to make it raise, then assert the call
         bubbles 403."""
-        from orchestrator.main import list_experts
 
         async def _denied(*_a, **_kw):
             raise HTTPException(status_code=403, detail="denied")
@@ -52,13 +55,11 @@ class TestExpertsGated:
             "orchestrator.main.require_approved_user", AsyncMock(side_effect=_denied)
         ):
             with pytest.raises(HTTPException) as exc:
-                await list_experts(fake_request)
+                await catalogue_route(expert_routes.list_experts)(fake_request)
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
     async def test_get_expert_runs_gate(self, user_a, fake_db, fake_request):
-        from orchestrator.main import get_expert
-
         async def _denied(*_a, **_kw):
             raise HTTPException(status_code=403, detail="denied")
 
@@ -66,7 +67,7 @@ class TestExpertsGated:
             "orchestrator.main.require_approved_user", AsyncMock(side_effect=_denied)
         ):
             with pytest.raises(HTTPException) as exc:
-                await get_expert(fake_request, "scholar")
+                await catalogue_route(expert_routes.get_expert)(fake_request, "scholar")
         assert exc.value.status_code == 403
 
 

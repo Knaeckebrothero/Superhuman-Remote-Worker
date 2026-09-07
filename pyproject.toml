@@ -109,7 +109,12 @@ forbidden_modules = ["orchestrator.main"]
 [[tool.importlinter.contracts]]
 name = "Job read router does not import application startup"
 type = "forbidden"
-source_modules = ["orchestrator.routers.job_reads"]
+source_modules = [
+    "orchestrator.routers.job_reads",
+    "orchestrator.routers.job_inspection",
+    "orchestrator.routers.job_audit",
+    "orchestrator.routers.job_artifacts",
+]
 forbidden_modules = ["orchestrator.main"]
 # Existing authorization helpers retain indirect composition lookups.
 allow_indirect_imports = true
@@ -121,6 +126,31 @@ source_modules = [
     "orchestrator.services.job_queries",
     "orchestrator.services.job_projection",
     "orchestrator.services.job_reads",
+]
+forbidden_modules = ["orchestrator.main"]
+
+[[tool.importlinter.contracts]]
+name = "Catalogue and inspection operations and schemas do not import application startup"
+type = "forbidden"
+source_modules = [
+    "orchestrator.schemas",
+    "orchestrator.services.catalogue_resources",
+    "orchestrator.services.expert_catalog_contracts",
+    "orchestrator.services.expert_catalog",
+    "orchestrator.services.expert_authoring",
+    "orchestrator.services.provider_catalog",
+    "orchestrator.services.model_catalog",
+    "orchestrator.services.config_catalog",
+    "orchestrator.services.job_inspection",
+    "orchestrator.services.job_audit",
+    "orchestrator.services.job_artifacts",
+    "orchestrator.services.diagnostics",
+    "orchestrator.services.subagent_projection",
+    "orchestrator.routers.expert_catalog",
+    "orchestrator.routers.provider_catalog",
+    "orchestrator.routers.model_catalog",
+    "orchestrator.routers.config_catalog",
+    "orchestrator.routers.diagnostics",
 ]
 forbidden_modules = ["orchestrator.main"]
 

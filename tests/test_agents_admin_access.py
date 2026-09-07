@@ -167,7 +167,8 @@ class TestListMyActiveJobs:
     async def test_non_admin_filters_to_active_statuses(
         self, user_a, fake_db, fake_request
     ):
-        from orchestrator.main import list_my_active_jobs
+        from orchestrator.main import _job_inspection_dependencies
+        from orchestrator.routers.job_inspection import list_my_active_jobs
 
         # Mix of in-flight and terminal — gate should drop completed/failed.
         rows = [
@@ -180,7 +181,9 @@ class TestListMyActiveJobs:
         ]
         fake_db.query_jobs = AsyncMock(return_value=JobQueryResult(jobs=rows))
         with _patch_caller_and_db(user_a, fake_db):
-            result = await list_my_active_jobs(fake_request, limit=100)
+            result = await list_my_active_jobs(
+                fake_request, limit=100, dependencies=_job_inspection_dependencies()
+            )
         kept_ids = {r["id"] for r in result}
         assert kept_ids == {"j1", "j3", "j5", "j6"}
 
@@ -188,11 +191,14 @@ class TestListMyActiveJobs:
     async def test_non_admin_uses_visibility_or_clause(
         self, user_a, fake_db, fake_request
     ):
-        from orchestrator.main import list_my_active_jobs
+        from orchestrator.main import _job_inspection_dependencies
+        from orchestrator.routers.job_inspection import list_my_active_jobs
 
         fake_db.query_jobs = AsyncMock(return_value=JobQueryResult(jobs=[]))
         with _patch_caller_and_db(user_a, fake_db):
-            await list_my_active_jobs(fake_request, limit=100)
+            await list_my_active_jobs(
+                fake_request, limit=100, dependencies=_job_inspection_dependencies()
+            )
         kwargs = fake_db.query_jobs.call_args.kwargs
         assert kwargs["owner_user_id"] == str(user_a["id"])
         # user_a owns project_a → that one project_id appears.
@@ -204,11 +210,14 @@ class TestListMyActiveJobs:
         self, user_admin, fake_db, fake_request
     ):
         """Admin gets their personal active set (not the full fleet) — for that they use /api/agents."""
-        from orchestrator.main import list_my_active_jobs
+        from orchestrator.main import _job_inspection_dependencies
+        from orchestrator.routers.job_inspection import list_my_active_jobs
 
         fake_db.query_jobs = AsyncMock(return_value=JobQueryResult(jobs=[]))
         with _patch_caller_and_db(user_admin, fake_db):
-            await list_my_active_jobs(fake_request, limit=100)
+            await list_my_active_jobs(
+                fake_request, limit=100, dependencies=_job_inspection_dependencies()
+            )
         fake_db.query_jobs.assert_awaited_once()
         kwargs = fake_db.query_jobs.call_args.kwargs
         assert kwargs["user_id"] == str(user_admin["id"])
@@ -217,7 +226,8 @@ class TestListMyActiveJobs:
 
     @pytest.mark.asyncio
     async def test_unauthenticated_baseline(self, fake_db, fake_request):
-        from orchestrator.main import list_my_active_jobs
+        from orchestrator.main import _job_inspection_dependencies
+        from orchestrator.routers.job_inspection import list_my_active_jobs
 
         with (
             patch(
@@ -227,19 +237,24 @@ class TestListMyActiveJobs:
             patch("orchestrator.main.postgres_db", fake_db),
         ):
             with pytest.raises(HTTPException) as exc:
-                await list_my_active_jobs(fake_request, limit=100)
+                await list_my_active_jobs(
+                    fake_request, limit=100, dependencies=_job_inspection_dependencies()
+                )
         assert exc.value.status_code == 401
 
     @pytest.mark.asyncio
     async def test_mcp_project_scope_narrows(
         self, user_a, project_a, fake_db, fake_request
     ):
-        from orchestrator.main import list_my_active_jobs
+        from orchestrator.main import _job_inspection_dependencies
+        from orchestrator.routers.job_inspection import list_my_active_jobs
 
         scoped = _scoped(user_a, f"project:{project_a['id']}")
         fake_db.query_jobs = AsyncMock(return_value=JobQueryResult(jobs=[]))
         with _patch_caller_and_db(scoped, fake_db):
-            await list_my_active_jobs(fake_request, limit=100)
+            await list_my_active_jobs(
+                fake_request, limit=100, dependencies=_job_inspection_dependencies()
+            )
         kwargs = fake_db.query_jobs.call_args.kwargs
         assert kwargs["scope_project_id"] == str(project_a["id"])
 
@@ -248,11 +263,14 @@ class TestListMyActiveJobs:
         self, user_admin, project_a, fake_db, fake_request
     ):
         """Admin with MCP scope keeps the admin path but gains scope_project_id."""
-        from orchestrator.main import list_my_active_jobs
+        from orchestrator.main import _job_inspection_dependencies
+        from orchestrator.routers.job_inspection import list_my_active_jobs
 
         scoped = _scoped(user_admin, f"project:{project_a['id']}")
         fake_db.query_jobs = AsyncMock(return_value=JobQueryResult(jobs=[]))
         with _patch_caller_and_db(scoped, fake_db):
-            await list_my_active_jobs(fake_request, limit=100)
+            await list_my_active_jobs(
+                fake_request, limit=100, dependencies=_job_inspection_dependencies()
+            )
         kwargs = fake_db.query_jobs.call_args.kwargs
         assert kwargs["scope_project_id"] == str(project_a["id"])

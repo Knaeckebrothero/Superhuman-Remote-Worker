@@ -25,6 +25,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import orchestrator.main as m
+from orchestrator.routers import job_inspection as job_inspection_routes
 
 UTC = timezone.utc
 NOW = datetime(2026, 8, 29, 12, 0, 0, tzinfo=UTC)
@@ -462,7 +463,9 @@ def roster_env(monkeypatch):
     monkeypatch.setattr(m, "require_job_access", guard)
 
     async def call():
-        return await m.get_job_subagents(SimpleNamespace(), job_id)
+        return await job_inspection_routes.get_job_subagents(
+            SimpleNamespace(), job_id, dependencies=m._job_inspection_dependencies()
+        )
 
     return SimpleNamespace(job_id=job_id, db=db, guard=guard, call=call)
 
@@ -471,8 +474,10 @@ class TestRosterShape:
     def test_the_route_takes_no_filter_parameters(self):
         """The roster is a property of the job, not of the caller's view —
         pinned on the signature exactly as the subjobs roster is."""
-        params = set(inspect.signature(m.get_job_subagents).parameters)
-        assert params == {"request", "job_id"}
+        params = set(
+            inspect.signature(job_inspection_routes.get_job_subagents).parameters
+        )
+        assert params == {"request", "job_id", "dependencies"}
 
     @pytest.mark.asyncio
     async def test_it_reads_the_job_walk_not_the_sessions_list(self, roster_env):
@@ -603,7 +608,9 @@ class TestRosterAuthorization:
             ),
             patch.object(m, "postgres_db", db),
         ):
-            return await m.get_job_subagents(MagicMock(), job_id)
+            return await job_inspection_routes.get_job_subagents(
+                MagicMock(), job_id, dependencies=m._job_inspection_dependencies()
+            )
 
     @pytest.mark.asyncio
     async def test_the_job_owner_reads_the_roster(self, user_a, job_a, fake_db):

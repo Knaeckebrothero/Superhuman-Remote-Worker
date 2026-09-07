@@ -43,13 +43,35 @@ MANAGED_SEEDS: tuple[dict[str, Any], ...] = (
         "managed_key": "application-default-session-seed",
         "directory": "assistant",
         "expert_type": "session",
-        # 2: the assistant gained its `subagents` roster (2026-09-07). Bump
-        # this whenever the bundle gains a NEW top-level config key that a
-        # seeded row should pick up; `upgrade_managed_seed` copies only keys
-        # the row does not carry, so operator edits are never overwritten.
-        "seed_version": 2,
+        # 2: the assistant gained its roster. 3 repairs only that exact
+        # managed v2 roster's shell-enabled implementer; an operator's own
+        # roster remains authoritative. Other upgrades remain additive.
+        "seed_version": 3,
     },
 )
+
+
+# Exact historical seed content, independent of future bundle edits. Comparing
+# the whole subtree preserves even small operator changes to a roster entry.
+_ASSISTANT_V2_SUBAGENTS = {
+    "default": "explorer",
+    "roster": {
+        "explorer": {"$ref": "subagents/explorer"},
+        "reader": {"$ref": "subagents/reader"},
+        "implementer": {"$ref": "subagents/implementer"},
+    },
+}
+_ASSISTANT_V3_SUBAGENTS = {
+    "default": "explorer",
+    "roster": {
+        "explorer": {"$ref": "subagents/explorer"},
+        "reader": {"$ref": "subagents/reader"},
+        "implementer": {
+            "$ref": "subagents/implementer",
+            "tools": {"shell": []},
+        },
+    },
+}
 
 
 class DefaultExpertUnavailable(RuntimeError):
@@ -127,14 +149,17 @@ def load_seed_bundle(
 async def upgrade_managed_seed(
     db, *, spec: dict[str, Any], bundle: dict[str, Any], row: dict[str, Any]
 ) -> dict[str, Any] | None:
-    """Additive seed upgrade for a row behind ``spec["seed_version"]``.
+    """Upgrade a managed seed while preserving operator-owned content.
 
     Copies only the bundle's top-level ``config`` keys the row does NOT carry
     and stamps the new version; a key the row has — whatever its value — is
     the operator's and stays. Returns the updated row, or ``None`` when the
     row is current. This is how a seeded row gains a block the bundle grew
     later (the assistant's ``subagents`` roster: every deployment seeded before
-    2026-09-07 bound ``delegate_agent`` with nothing to delegate to).
+    2026-09-07 bound ``delegate_agent`` with nothing to delegate to). The exact
+    managed v2 assistant roster is the one repair exception: the SQL compares
+    its version and whole subtree again before replacing it, so a concurrent
+    operator edit cannot be overwritten using this earlier read.
     """
     current = int(row.get("seed_version") or 0)
     target = int(spec["seed_version"])
@@ -146,10 +171,25 @@ async def upgrade_managed_seed(
         for key, value in (bundle.get("config") or {}).items()
         if key not in existing
     }
+    repair = {}
+    if (
+        spec["managed_key"] == "application-default-session-seed"
+        and current == 2
+        and target >= 3
+        and existing.get("subagents") == _ASSISTANT_V2_SUBAGENTS
+    ):
+        repair = {
+            "expected_seed_version": 2,
+            "expected_subagents": _ASSISTANT_V2_SUBAGENTS,
+            # A future bundle may carry unrelated roster changes. A v2 row
+            # still gets this historical repair, never those newer values.
+            "replacement_subagents": _ASSISTANT_V3_SUBAGENTS,
+        }
     updated = await db.upgrade_managed_expert_seed(
         managed_key=spec["managed_key"],
         seed_version=target,
         config_additions=additions,
+        **repair,
     )
     if updated:
         logger.info(
@@ -168,8 +208,9 @@ async def seed_managed_default_experts(db, config_dir: Path) -> dict[str, str]:
     Both operations are insert-only.  Existing expert content and an operator's
     current application pointer are preserved across restarts and upgrades.
     The one exception is :func:`upgrade_managed_seed`: a row behind the
-    bundle's ``seed_version`` gains the top-level config keys it lacks — never
-    a different value for a key it has.
+    bundle's ``seed_version`` gains the top-level config keys it lacks. Only
+    the exact managed v2 assistant roster receives a conditional repair;
+    operator variants and unrelated content remain unchanged.
     """
     seeded: dict[str, str] = {}
     for spec in MANAGED_SEEDS:

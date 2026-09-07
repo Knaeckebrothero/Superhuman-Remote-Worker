@@ -1429,11 +1429,17 @@ spec:
                   key: HEADSCALE_URL
                   optional: true
             {{- end }}
-            # Codex OAuth Proxy
+            # AI Subscriptions proxy (CLIProxyAPI).
+            #
+            # The Service, the Secret keys and the auth PVC keep their
+            # historical CODEX_* names deliberately: the display rename to
+            # "Subscription proxy" does not rename storage or Kubernetes
+            # objects, so an upgrade needs no credential migration. See
+            # knowledge-base/knowledge/features/subscription_proxy.md §8.5.
             - name: CODEX_PROXY_URL
               value: "http://{{ include "srw.fullname" . }}-codex-proxy:8317"
             # CODEX_BASE_URL removed in chunk 7 of models_yaml_removal —
-            # the codex transport is a system endpoint catalog row now,
+            # the subscription transport is a system endpoint catalog row now,
             # not an env-var-injected base URL.
             - name: CODEX_MANAGEMENT_KEY
               valueFrom:
@@ -1441,6 +1447,19 @@ spec:
                   name: {{ include "srw.secretName" . }}
                   key: CODEX_MANAGEMENT_KEY
                   optional: true
+            {{- if .Values.codexProxy.inferenceApiKeySecret.name }}
+            # Optional: a credential distinct from the management key, sent on
+            # /v1/* inference calls only. Management and inference auth are
+            # separate concerns on CLIProxyAPI; without this the seeder keeps
+            # storing the management key as the endpoint credential, which is
+            # what every existing deployment does.
+            - name: SUBSCRIPTION_PROXY_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.codexProxy.inferenceApiKeySecret.name }}
+                  key: {{ .Values.codexProxy.inferenceApiKeySecret.key }}
+                  optional: true
+            {{- end }}
             # Orchestrator settings
             - name: AUTO_ASSIGN_ENABLED
               valueFrom:

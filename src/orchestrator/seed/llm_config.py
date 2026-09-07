@@ -88,15 +88,30 @@ from typing import Any, Iterable
 import yaml
 
 from orchestrator.database.postgres import PostgresDB
+from shared.subscription_routing import (
+    LEGACY_CODEX_PROXY_ENDPOINT_LABEL,
+    SUBSCRIPTION_PROXY_TRANSPORT,
+)
+from shared.subscription_routing import (
+    SUBSCRIPTION_PROXY_ENDPOINT_LABEL as SUBSCRIPTION_PROXY_LABEL,
+)
+from shared.subscription_routing import (
+    is_subscription_endpoint,
+)
 
 logger = logging.getLogger("orchestrator.seed.llm_config")
 
 SEEDED_FROM_TAG = "helm:llm.seed"
 
-# Well-known label for the codex-proxy system endpoint. Anything that wants
-# to locate the row (admin availability probe, runtime resolver, init seeder)
-# matches on this exact string.
-CODEX_PROXY_ENDPOINT_LABEL = "codex-proxy"
+# The shared CLIProxyAPI subscription proxy. Identity is the stable
+# ``llm_endpoints.transport_kind`` marker, NOT the label — the row was renamed
+# from ``codex-proxy`` to ``subscription-proxy`` by app migration 0228 and both
+# spellings must keep resolving to the same row so an upgrade (or a rollback)
+# cannot end up with two proxies. See
+# knowledge-base/knowledge/features/subscription_proxy.md §8.
+SUBSCRIPTION_PROXY_ENDPOINT_LABEL = SUBSCRIPTION_PROXY_LABEL
+# Back-compat alias: callers and tests written against the Codex-only era.
+CODEX_PROXY_ENDPOINT_LABEL = LEGACY_CODEX_PROXY_ENDPOINT_LABEL
 
 # ElevenLabs TTS provider, auto-wired from the deployment-wide ELEVENLABS_API_KEY
 # secret (see knowledge-base/knowledge/features/tts_vendor_providers.md). Like the codex proxy, the
@@ -307,6 +322,22 @@ async def _seed_endpoints(
 ) -> None:
     existing_rows = await db.list_system_llm_endpoints()
     by_label = {row["label"]: row for row in existing_rows}
+    # The subscription proxy is matched by its stable transport marker (or
+    # either well-known label) rather than by label alone, so a payload that
+    # still says ``codex-proxy`` finds the renamed row instead of inserting a
+    # second proxy endpoint next to it.
+    subscription_row = next(
+        (
+            row
+            for row in existing_rows
+            if is_subscription_endpoint(
+                transport_kind=row.get("transport_kind"),
+                label=row.get("label"),
+                base_url=row.get("base_url"),
+            )
+        ),
+        None,
+    )
 
     for entry in entries:
         label = entry.get("label")
@@ -316,6 +347,7 @@ async def _seed_endpoints(
                 "skipping systemEndpoints entry — label or baseUrl missing: %r", entry
             )
             continue
+        transport_kind = entry.get("transportKind") or entry.get("transport_kind")
 
         models = entry.get("models") or []
         if not isinstance(models, list):
@@ -325,6 +357,8 @@ async def _seed_endpoints(
             continue
 
         existing = by_label.get(label)
+        if existing is None and transport_kind == SUBSCRIPTION_PROXY_TRANSPORT:
+            existing = subscription_row
         if existing is None:
             api_key = _resolve_secret_value(entry, context=f"systemEndpoints[{label}]")
             created = await db.create_system_llm_endpoint(
@@ -332,13 +366,32 @@ async def _seed_endpoints(
                 base_url=base_url,
                 api_key=api_key,
                 key_prefix=(api_key[:8] if api_key else None),
+                transport_kind=transport_kind,
             )
             endpoint_id = str(created["id"])
+            if transport_kind == SUBSCRIPTION_PROXY_TRANSPORT:
+                subscription_row = created
             report.endpoints_seeded.append(label)
             logger.info("seeded system endpoint %s (%s)", label, base_url)
         else:
             endpoint_id = str(existing["id"])
-            report.endpoints_skipped.append(label)
+            # Self-heal a pre-migration row (or one an operator created by hand
+            # against the proxy) so identity stops depending on the label. This
+            # is the only field the seeder ever writes onto an existing row —
+            # URL, credential and models stay untouched.
+            if transport_kind and not existing.get("transport_kind"):
+                try:
+                    await db.update_system_llm_endpoint(
+                        endpoint_id=endpoint_id, transport_kind=transport_kind
+                    )
+                    existing["transport_kind"] = transport_kind
+                except Exception:
+                    logger.warning(
+                        "could not stamp transport_kind on endpoint %s",
+                        label,
+                        exc_info=True,
+                    )
+            report.endpoints_skipped.append(existing.get("label") or label)
             logger.info("endpoint %s already present — leaving untouched", label)
 
         # Per-endpoint model entries become catalog rows with
@@ -531,32 +584,71 @@ async def seed(db: PostgresDB, payload: dict[str, Any]) -> SeedReport:
     return report
 
 
-async def ensure_codex_proxy_endpoint(
-    db: PostgresDB, *, proxy_url: str | None = None
-) -> bool:
-    """Ensure a system-scoped ``codex-proxy`` row exists in ``llm_endpoints``.
+def subscription_proxy_base_url(proxy_url: str | None = None) -> str:
+    """Inference base URL for the subscription proxy (always ``…/v1``).
 
-    Called from runtime paths (the OAuth callback, the admin availability
-    probe) so that connecting a ChatGPT subscription via the cockpit wires
-    the proxy as a provider without requiring an init re-run or the
-    ``CODEX_PROXY_URL`` env var to be set. Idempotent: re-runs short-circuit
-    on label match inside :func:`seed`.
-
-    Returns True if a new row was created, False otherwise (already
-    present, or the seed run failed). Failures are logged but never raised
-    — callers should never 500 on a transport-row wiring hiccup.
+    ``SUBSCRIPTION_PROXY_URL`` is the new name; ``CODEX_PROXY_URL`` remains
+    honoured because it is what every deployed values file and Secret sets
+    today (feature doc §8.5 — a display rename does not rename storage).
     """
-    url = proxy_url or os.environ.get("CODEX_PROXY_URL") or _DEFAULT_CODEX_PROXY_URL
+    url = (
+        proxy_url
+        or os.environ.get("SUBSCRIPTION_PROXY_URL")
+        or os.environ.get("CODEX_PROXY_URL")
+        or _DEFAULT_CODEX_PROXY_URL
+    )
     base_url = url.rstrip("/")
     if not base_url.endswith("/v1"):
         base_url = f"{base_url}/v1"
+    return base_url
 
+
+def subscription_proxy_inference_key_env() -> str:
+    """Env var holding the credential SRW sends on *inference* calls.
+
+    Management and inference authentication are separate concerns on
+    CLIProxyAPI: ``MANAGEMENT_PASSWORD`` guards ``/v0/management/*`` while
+    ``/v1/*`` is guarded by the access manager's configured API keys. The
+    seeder historically stored ``CODEX_MANAGEMENT_KEY`` as the endpoint
+    credential, which conflated the two. Prefer a dedicated inference key when
+    the operator supplies one, and keep falling back to the management key so
+    an existing deployment's dispatch keeps working untouched.
+    """
+    for name in ("SUBSCRIPTION_PROXY_API_KEY", "CODEX_PROXY_API_KEY"):
+        if os.environ.get(name):
+            return name
+    return "CODEX_MANAGEMENT_KEY"
+
+
+async def ensure_subscription_proxy_endpoint(
+    db: PostgresDB, *, proxy_url: str | None = None
+) -> bool:
+    """Ensure the system-scoped subscription-proxy row exists in ``llm_endpoints``.
+
+    Called from runtime paths (an OAuth callback, the admin availability probe)
+    so that connecting a subscription via the cockpit wires the proxy as a
+    provider without requiring an init re-run or the ``CODEX_PROXY_URL`` env var
+    to be set.
+
+    Idempotent *by transport marker*, not by label: an installation upgraded
+    from the Codex-only era already has this row under the old ``codex-proxy``
+    label (migration 0228 renames it and stamps the marker), and a stack whose
+    migration has not run yet still matches on either label. Either way the
+    existing row — its id, its attached catalog rows, its credential — is
+    reused. Inserting a second proxy endpoint here would strand every
+    registered model on the old one.
+
+    Returns True if a new row was created, False otherwise (already present, or
+    the seed run failed). Failures are logged but never raised — callers should
+    never 500 on a transport-row wiring hiccup.
+    """
     payload = {
         "systemEndpoints": [
             {
-                "label": CODEX_PROXY_ENDPOINT_LABEL,
-                "baseUrl": base_url,
-                "apiKeyEnv": "CODEX_MANAGEMENT_KEY",
+                "label": SUBSCRIPTION_PROXY_ENDPOINT_LABEL,
+                "baseUrl": subscription_proxy_base_url(proxy_url),
+                "apiKeyEnv": subscription_proxy_inference_key_env(),
+                "transportKind": SUBSCRIPTION_PROXY_TRANSPORT,
                 "models": [],
             }
         ]
@@ -564,9 +656,13 @@ async def ensure_codex_proxy_endpoint(
     try:
         report = await seed(db, payload)
     except Exception:
-        logger.exception("ensure_codex_proxy_endpoint: seed run failed")
+        logger.exception("ensure_subscription_proxy_endpoint: seed run failed")
         return False
-    return CODEX_PROXY_ENDPOINT_LABEL in report.endpoints_seeded
+    return SUBSCRIPTION_PROXY_ENDPOINT_LABEL in report.endpoints_seeded
+
+
+# Back-compat alias for callers/tests written against the Codex-only name.
+ensure_codex_proxy_endpoint = ensure_subscription_proxy_endpoint
 
 
 async def ensure_elevenlabs_tts_endpoint(db: PostgresDB) -> bool:

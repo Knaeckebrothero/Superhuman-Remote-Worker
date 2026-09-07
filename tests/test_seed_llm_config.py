@@ -18,6 +18,7 @@ from orchestrator.seed.llm_config import (
     load_payload,
     seed,
 )
+from shared.subscription_routing import SUBSCRIPTION_PROXY_TRANSPORT
 
 
 def _fake_db(
@@ -39,13 +40,16 @@ def _fake_db(
     )
     db.upsert_system_api_key = AsyncMock()
 
-    async def _create_endpoint(*, label, base_url, api_key, key_prefix):
+    async def _create_endpoint(
+        *, label, base_url, api_key, key_prefix, transport_kind=None
+    ):
         new_id = f"endpoint-{label}"
         return {
             "id": new_id,
             "label": label,
             "base_url": base_url,
             "key_prefix": key_prefix,
+            "transport_kind": transport_kind,
         }
 
     catalog_keys = set(existing_catalog_keys or set())
@@ -215,6 +219,7 @@ class TestSeedEndpoints:
             base_url="http://vllm.svc/v1",
             api_key=None,
             key_prefix=None,
+            transport_kind=None,
         )
         # Model entries become catalog rows now (provider_kind='endpoint').
         # The seed pipeline always emits the array spelling — passing the
@@ -237,6 +242,41 @@ class TestSeedEndpoints:
         assert report.models_seeded == [
             ("Local Gemma", "RedHatAI/gemma-4-31B-it-FP8-Dynamic")
         ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("transport_field", ["transportKind", "transport_kind"])
+    async def test_transport_marker_reuses_new_proxy_under_another_label(
+        self, transport_field
+    ):
+        db = _fake_db()
+        payload = {
+            "systemEndpoints": [
+                {
+                    "label": label,
+                    "baseUrl": "http://proxy.svc/v1",
+                    transport_field: SUBSCRIPTION_PROXY_TRANSPORT,
+                    "models": [{"id": model_id}],
+                }
+                for label, model_id in [("Primary", "m1"), ("Alias", "m2")]
+            ]
+        }
+
+        report = await seed(db, payload)
+
+        db.create_system_llm_endpoint.assert_awaited_once_with(
+            label="Primary",
+            base_url="http://proxy.svc/v1",
+            api_key=None,
+            key_prefix=None,
+            transport_kind=SUBSCRIPTION_PROXY_TRANSPORT,
+        )
+        db.update_system_llm_endpoint.assert_not_called()
+        assert report.endpoints_seeded == ["Primary"]
+        assert report.endpoints_skipped == ["Primary"]
+        assert [
+            call.kwargs["provider_ref"] for call in db.create_model.await_args_list
+        ] == ["endpoint-Primary", "endpoint-Primary"]
+        assert report.models_seeded == [("Primary", "m1"), ("Alias", "m2")]
 
     @pytest.mark.asyncio
     async def test_endpoint_with_api_key_captures_prefix(self):

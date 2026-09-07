@@ -541,7 +541,12 @@ without this policy.
 - `NTFY_URL`, `NTFY_TOPIC`, `NTFY_TOKEN` (push notifications)
 - `DISCORD_WEBHOOK_URL`, `SLACK_WEBHOOK_URL` (chat notifications)
 - `TAILSCALE_AUTH_KEY` (when `agent.tailscale.enabled`)
-- `CODEX_MANAGEMENT_KEY` (when `codexProxy.enabled`)
+- `CODEX_MANAGEMENT_KEY` (when `codexProxy.enabled`) — the AI Subscriptions
+  proxy's management credential. The Secret key, the Service name and the auth
+  PVC keep their historical `codex` names on purpose: the surface was renamed
+  to "Subscription proxy" without renaming storage, so an upgrade needs no
+  credential migration. Optionally set `codexProxy.inferenceApiKeySecret.name`
+  to supply a separate *inference* credential.
 - `CRAWL4AI_API_TOKEN` (required when `crawl4ai.enabled`; use a long random
   bearer token)
 - `MCP_INTERNAL_KEY` (when `mcp.enabled` or delegated Dynamic Canvas tools are

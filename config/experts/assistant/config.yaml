@@ -43,11 +43,16 @@ instruction_files:
 # off to; probe/tester/reviewer are worker-shaped and stay on their experts.
 # Delegation itself stays OFF until a session ticks it (tools.delegation +
 # delegation.enabled) — the roster only decides what that tick can reach. A
-# child's tools are capped by the parent's (a no-shell session yields a
-# no-shell implementer); the Delegation row shows the roster either way.
+# child's tools are capped by the parent's; declared child tools must also
+# pass capability admission before delegation is enabled. The safe default's
+# implementer uses file tools without shell verification. An explicitly
+# shell-enabled roster requires the shell_tools grant like any other expert.
+# The Delegation row shows the roster either way.
 subagents:
   default: explorer
   roster:
     explorer: {$ref: subagents/explorer}
     reader: {$ref: subagents/reader}
-    implementer: {$ref: subagents/implementer}
+    implementer:
+      $ref: subagents/implementer
+      tools: {shell: []}

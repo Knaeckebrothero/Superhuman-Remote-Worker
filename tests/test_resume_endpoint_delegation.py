@@ -16,6 +16,10 @@ See knowledge-base/knowledge/issues/job_resume_direct_path_skips_credential_inje
 
 from __future__ import annotations
 
+from tests._expert_catalog import patch_service_method
+from orchestrator.services import expert_catalog as expert_catalog_module
+
+
 import json
 import os
 from contextlib import asynccontextmanager
@@ -390,8 +394,11 @@ class TestResumeJobOnAgentInjection:
         monkeypatch.setattr(
             orchestrator.main, "_resolve_default_models", AsyncMock(return_value={})
         )
-        monkeypatch.setattr(
-            orchestrator.main, "_gather_in_scope_skills", AsyncMock(return_value=[])
+        patch_service_method(
+            monkeypatch,
+            expert_catalog_module.ExpertCatalogService,
+            "gather_in_scope_skills",
+            AsyncMock(return_value=[]),
         )
         monkeypatch.setattr(
             orchestrator.main,
@@ -436,8 +443,11 @@ class TestResumeJobOnAgentInjection:
         monkeypatch.setattr(
             orchestrator.main, "_resolve_default_models", AsyncMock(return_value={})
         )
-        monkeypatch.setattr(
-            orchestrator.main, "_gather_in_scope_skills", AsyncMock(return_value=[])
+        patch_service_method(
+            monkeypatch,
+            expert_catalog_module.ExpertCatalogService,
+            "gather_in_scope_skills",
+            AsyncMock(return_value=[]),
         )
         monkeypatch.setattr(
             orchestrator.main,
@@ -480,8 +490,11 @@ class TestResumeJobOnAgentInjection:
         monkeypatch.setattr(
             orchestrator.main, "_resolve_default_models", AsyncMock(return_value={})
         )
-        monkeypatch.setattr(
-            orchestrator.main, "_gather_in_scope_skills", AsyncMock(return_value=[])
+        patch_service_method(
+            monkeypatch,
+            expert_catalog_module.ExpertCatalogService,
+            "gather_in_scope_skills",
+            AsyncMock(return_value=[]),
         )
         monkeypatch.setattr(
             orchestrator.main,

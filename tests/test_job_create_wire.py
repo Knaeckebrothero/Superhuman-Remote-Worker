@@ -5,6 +5,10 @@ actual routes, Pydantic ingress, scope resolution and response redaction run.
 No application startup, dispatch, provider or database connection is started.
 """
 
+from tests._expert_catalog import catalogue_state, patch_service_method
+from orchestrator.services import expert_catalog as expert_catalog_module
+
+
 import copy
 import logging
 from contextlib import asynccontextmanager
@@ -95,7 +99,7 @@ def wire(monkeypatch):
     monkeypatch.setattr(main, "_is_experts_db_enabled", lambda: True)
     monkeypatch.setattr(main, "_user_experts_enabled", AsyncMock(return_value=True))
     monkeypatch.setattr(main, "resolve_root_expert", expert)
-    monkeypatch.setattr(main, "_experts_cache", [SimpleNamespace(id="developer")])
+    monkeypatch.setattr(catalogue_state(), "experts", [SimpleNamespace(id="developer")])
     monkeypatch.setattr(main, "_authorize_thread_datasource_selection", authorize)
     monkeypatch.setattr(main, "_datasource_defaults_on_omission", lambda: False)
     monkeypatch.setattr(main, "_enforce_job_create_grants", AsyncMock())
@@ -1148,8 +1152,10 @@ async def test_catalogue_stays_application_owned_and_only_scans_for_explicit_slu
     wire, monkeypatch
 ):
     scan = Mock(return_value=[SimpleNamespace(id="developer")])
-    monkeypatch.setattr(main, "_experts_cache", None)
-    monkeypatch.setattr(main, "_scan_experts", scan)
+    monkeypatch.setattr(catalogue_state(), "experts", None)
+    patch_service_method(
+        monkeypatch, expert_catalog_module.ExpertCatalogService, "scan_experts", scan
+    )
     main._job_admission_config_dependencies()
     scan.assert_not_called()
     assert (

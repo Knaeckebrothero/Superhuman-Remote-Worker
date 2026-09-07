@@ -43987,7 +43987,7 @@ class PostgresDB:
         """
         query = """
             SELECT id, user_id, label, base_url, api_key, key_prefix,
-                   created_at, updated_at
+                   transport_kind, created_at, updated_at
             FROM llm_endpoints
             WHERE id = $1
         """
@@ -44269,6 +44269,9 @@ class PostgresDB:
         managed_key: str,
         seed_version: int,
         config_additions: Dict[str, Any],
+        expected_seed_version: int | None = None,
+        expected_subagents: Dict[str, Any] | None = None,
+        replacement_subagents: Dict[str, Any] | None = None,
     ) -> Dict[str, Any] | None:
         """Additive seed upgrade (services.default_experts.upgrade_managed_seed).
 
@@ -44276,7 +44279,36 @@ class PostgresDB:
         lets the row win every key it already has — and stamps
         ``seed_version``. A no-op (``None``) for a row already at or past the
         version, so a rolled-back orchestrator never re-runs an upgrade.
+        The optional repair triplet replaces only a matching roster subtree
+        at the exact expected seed version. PostgreSQL rechecks both after
+        waiting for a concurrent update; operator edits therefore win.
         """
+        repair = (expected_seed_version, expected_subagents, replacement_subagents)
+        if any(value is not None for value in repair):
+            if any(value is None for value in repair):
+                raise ValueError(
+                    "Managed seed repair requires version and both rosters"
+                )
+            row = await self.fetchrow(
+                """
+                UPDATE experts
+                SET config = jsonb_set($2::jsonb || config, '{subagents}', $6::jsonb),
+                    seed_version = $3,
+                    version = version + 1,
+                    updated_at = NOW()
+                WHERE managed_key = $1
+                  AND seed_version = $4 AND seed_version < $3
+                  AND config->'subagents' = $5::jsonb
+                RETURNING *
+                """,
+                managed_key,
+                json.dumps(config_additions or {}),
+                seed_version,
+                expected_seed_version,
+                json.dumps(expected_subagents),
+                json.dumps(replacement_subagents),
+            )
+            return dict(row) if row else None
         row = await self.fetchrow(
             """
             UPDATE experts
@@ -45163,7 +45195,8 @@ class PostgresDB:
         async with self.acquire() as conn:
             endpoint_rows = await conn.fetch(
                 """
-                SELECT id, label, base_url, key_prefix, created_at, updated_at
+                SELECT id, label, base_url, key_prefix, transport_kind,
+                       created_at, updated_at
                 FROM llm_endpoints
                 WHERE user_id IS NULL
                 ORDER BY label
@@ -45180,7 +45213,7 @@ class PostgresDB:
             row = await conn.fetchrow(
                 """
                 SELECT id, label, base_url, api_key, key_prefix,
-                       created_at, updated_at
+                       transport_kind, created_at, updated_at
                 FROM llm_endpoints
                 WHERE id = $1 AND user_id IS NULL
                 """,
@@ -45201,20 +45234,28 @@ class PostgresDB:
         base_url: str,
         api_key: str | None,
         key_prefix: str | None,
+        transport_kind: str | None = None,
     ) -> Dict[str, Any]:
-        """Create a new system-scoped LLM endpoint. Label must be globally unique."""
+        """Create a new system-scoped LLM endpoint. Label must be globally unique.
+
+        ``transport_kind`` is the stable routing marker (see
+        ``shared.subscription_routing``); NULL for an ordinary
+        OpenAI-compatible endpoint.
+        """
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
                 INSERT INTO llm_endpoints
-                    (user_id, label, base_url, api_key, key_prefix)
-                VALUES (NULL, $1, $2, $3, $4)
-                RETURNING id, label, base_url, key_prefix, created_at, updated_at
+                    (user_id, label, base_url, api_key, key_prefix, transport_kind)
+                VALUES (NULL, $1, $2, $3, $4, $5)
+                RETURNING id, label, base_url, key_prefix, transport_kind,
+                          created_at, updated_at
                 """,
                 label,
                 base_url,
                 _encrypt_optional(api_key),
                 key_prefix,
+                transport_kind,
             )
             return dict(row)
 
@@ -45226,6 +45267,7 @@ class PostgresDB:
         api_key: str | None = None,
         key_prefix: str | None = None,
         clear_api_key: bool = False,
+        transport_kind: str | None = None,
     ) -> Dict[str, Any] | None:
         """Patch a system endpoint. Only non-None fields are updated.
 
@@ -45241,6 +45283,10 @@ class PostgresDB:
         if base_url is not None:
             sets.append(f"base_url = ${param_idx}")
             args.append(base_url)
+            param_idx += 1
+        if transport_kind is not None:
+            sets.append(f"transport_kind = ${param_idx}")
+            args.append(transport_kind)
             param_idx += 1
         if clear_api_key:
             sets.append("api_key = NULL")
@@ -45259,7 +45305,8 @@ class PostgresDB:
             async with self.acquire() as conn:
                 row = await conn.fetchrow(
                     """
-                    SELECT id, label, base_url, key_prefix, created_at, updated_at
+                    SELECT id, label, base_url, key_prefix, transport_kind,
+                           created_at, updated_at
                     FROM llm_endpoints
                     WHERE id = $1 AND user_id IS NULL
                     """,
@@ -45272,7 +45319,8 @@ class PostgresDB:
             UPDATE llm_endpoints
             SET {", ".join(sets)}
             WHERE id = $1 AND user_id IS NULL
-            RETURNING id, label, base_url, key_prefix, created_at, updated_at
+            RETURNING id, label, base_url, key_prefix, transport_kind,
+                      created_at, updated_at
         """
         async with self.acquire() as conn:
             row = await conn.fetchrow(query, *args)
@@ -45584,7 +45632,8 @@ class PostgresDB:
                     ule.id       AS endpoint_id,
                     ule.label    AS endpoint_label,
                     ule.base_url AS endpoint_base_url,
-                    ule.api_key  AS endpoint_api_key
+                    ule.api_key  AS endpoint_api_key,
+                    ule.transport_kind AS endpoint_transport_kind
                 FROM models m
                 LEFT JOIN system_api_keys ska
                     ON m.provider_kind = 'system' AND m.provider_ref = ska.provider

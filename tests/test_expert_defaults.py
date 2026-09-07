@@ -1,18 +1,23 @@
 """Mode-specific virtual framework-default expert details."""
 
+from tests._expert_catalog import catalogue_service
+
+
 from unittest.mock import AsyncMock
 
 import pytest
 import yaml
 
 import orchestrator.main as orchestrator_main
-from orchestrator.main import _load_expert_detail
+
 from shared.runtime.core.tool_policy import enumerate_only_members
 
 
 @pytest.mark.asyncio
 async def test_session_defaults_use_persistent_base():
-    detail = await _load_expert_detail("defaults", defaults_type="session")
+    detail = await catalogue_service().load_expert_detail(
+        "defaults", defaults_type="session"
+    )
 
     config = detail["config"]
     assert config["agent_id"] == "session_base"
@@ -23,7 +28,7 @@ async def test_session_defaults_use_persistent_base():
 
 @pytest.mark.asyncio
 async def test_unspecified_defaults_type_remains_worker_for_compatibility():
-    detail = await _load_expert_detail("defaults")
+    detail = await catalogue_service().load_expert_detail("defaults")
 
     config = detail["config"]
     assert config["agent_id"] == "worker_base"
@@ -66,7 +71,7 @@ async def test_db_expert_detail_includes_settings_matrix_and_no_defaults_tools(
         ),
     )
 
-    detail = await _load_expert_detail(expert_id)
+    detail = await catalogue_service().load_expert_detail(expert_id)
 
     assert "defaults_tools" not in detail
     assert "gpt-5.6" in detail["settings_matrix"]
@@ -88,7 +93,7 @@ async def test_bundled_expert_detail_serves_the_write_vocabulary_too():
     entirely independent of expert type, so serving it costs nothing and is
     correct on both.
     """
-    detail = await _load_expert_detail("worker_base")
+    detail = await catalogue_service().load_expert_detail("worker_base")
 
     assert detail["enumerate_only"] == enumerate_only_members()
     assert detail["enumerate_only"]["shell"]
@@ -99,7 +104,7 @@ async def test_the_served_vocabulary_is_what_the_write_boundary_accepts():
     """The round trip the forms actually perform."""
     from shared.runtime.core.tool_policy import validate_tool_override_fragment
 
-    detail = await _load_expert_detail("worker_base")
+    detail = await catalogue_service().load_expert_detail("worker_base")
     for category, names in detail["enumerate_only"].items():
         accepted = validate_tool_override_fragment(
             {"tools": {category: {"only": names}}}
@@ -135,7 +140,9 @@ class TestAccountDefaultsLayer:
 
     @pytest.mark.asyncio
     async def test_session_detail_off_by_default_reports_base_backend(self):
-        detail = await _load_expert_detail("defaults", defaults_type="session")
+        detail = await catalogue_service().load_expert_detail(
+            "defaults", defaults_type="session"
+        )
 
         assert detail["config"]["workspace"]["backend"] == "sandbox"
 
@@ -143,7 +150,7 @@ class TestAccountDefaultsLayer:
     async def test_session_detail_reports_the_backend_create_will_resolve(
         self, account_user
     ):
-        detail = await _load_expert_detail(
+        detail = await catalogue_service().load_expert_detail(
             "defaults",
             defaults_type="session",
             user_id=account_user,
@@ -167,7 +174,7 @@ class TestAccountDefaultsLayer:
             ),
         )
 
-        detail = await _load_expert_detail(
+        detail = await catalogue_service().load_expert_detail(
             "defaults",
             defaults_type="session",
             user_id=account_user,
@@ -180,7 +187,7 @@ class TestAccountDefaultsLayer:
     async def test_worker_detail_gets_the_model_floor_but_no_session_tier(
         self, account_user
     ):
-        detail = await _load_expert_detail(
+        detail = await catalogue_service().load_expert_detail(
             "defaults", user_id=account_user, include_account_defaults=True
         )
 
@@ -216,7 +223,7 @@ class TestAccountDefaultsLayer:
             ),
         )
 
-        detail = await _load_expert_detail(
+        detail = await catalogue_service().load_expert_detail(
             expert_id, user_id=account_user, include_account_defaults=True
         )
 
@@ -225,7 +232,7 @@ class TestAccountDefaultsLayer:
 
     @pytest.mark.asyncio
     async def test_anonymous_caller_has_no_account_layer(self):
-        detail = await _load_expert_detail(
+        detail = await catalogue_service().load_expert_detail(
             "defaults", defaults_type="session", include_account_defaults=True
         )
 
@@ -259,7 +266,9 @@ class TestPublicBaseIdsAfterTheRootSplit:
     ):
         from shared.runtime.core.loader import ROLE_ROOTS, load_role_base
 
-        detail = await _load_expert_detail(expert_id, defaults_type=defaults_type)
+        detail = await catalogue_service().load_expert_detail(
+            expert_id, defaults_type=defaults_type
+        )
 
         expected = dict(load_role_base(role))
         expected.pop("connections", None)
@@ -286,7 +295,7 @@ class TestPublicBaseIdsAfterTheRootSplit:
             "resolve_default_for_capability",
             AsyncMock(return_value=None),
         )
-        detail = await _load_expert_detail(
+        detail = await catalogue_service().load_expert_detail(
             "session_base",
             defaults_type="session",
             user_id="11111111-1111-4111-8111-111111111111",
@@ -307,7 +316,7 @@ class TestPublicBaseIdsAfterTheRootSplit:
             resolve_config_path,
         )
 
-        detail = await _load_expert_detail(expert_id)
+        detail = await catalogue_service().load_expert_detail(expert_id)
 
         path, _ = resolve_config_path(expert_id)
         expected = load_and_merge_config(path)
@@ -318,7 +327,7 @@ class TestPublicBaseIdsAfterTheRootSplit:
 def test_scan_experts_lists_exactly_the_bundled_experts_with_unchanged_roles():
     """The listing the cockpit filters by id: only ``config/experts/*``, with
     the role inferred from the chain root — never the roots themselves."""
-    experts = orchestrator_main._scan_experts()
+    experts = catalogue_service().scan_experts()
     listed = {e.id: e.expert_type for e in experts}
     assert listed == {
         "assistant": "session",
@@ -355,7 +364,7 @@ def test_scan_experts_lists_exactly_the_bundled_experts_with_unchanged_roles():
 def test_scan_experts_adds_the_role_tag():
     """`tags ∪ {chain-root role}` on every bundled entry, once, after the
     authored tags (an authored role tag is kept where it is)."""
-    experts = orchestrator_main._scan_experts()
+    experts = catalogue_service().scan_experts()
     for e in experts:
         assert e.tags.count(e.expert_type) == 1, e.id
     by_id = {e.id: e for e in experts}
@@ -377,20 +386,20 @@ def test_scan_experts_adds_the_role_tag():
 
 
 def test_subagent_library_is_scanned_separately_and_tagged():
-    library = orchestrator_main._scan_subagent_library()
+    library = catalogue_service().scan_subagent_library()
     ids = {e.id for e in library}
     assert "explorer" in ids
-    assert ids.isdisjoint({e.id for e in orchestrator_main._scan_experts()})
+    assert ids.isdisjoint({e.id for e in catalogue_service().scan_experts()})
     explorer = next(e for e in library if e.id == "explorer")
     assert "subagent" in explorer.tags and explorer.tags.count("subagent") == 1
     assert explorer.expert_type == "worker"  # chain-root fallback; never lists by it
     assert explorer.description and explorer.display_name == "Explorer"
     # Detail lookup: bundled first, then the library, else nothing.
-    assert orchestrator_main._listed_expert("developer").expert_type == "worker"
-    assert orchestrator_main._listed_expert("explorer") is explorer or (
-        orchestrator_main._listed_expert("explorer").id == "explorer"
+    assert catalogue_service().listed_expert("developer").expert_type == "worker"
+    assert catalogue_service().listed_expert("explorer") is explorer or (
+        catalogue_service().listed_expert("explorer").id == "explorer"
     )
-    assert orchestrator_main._listed_expert("no-such-expert") is None
+    assert catalogue_service().listed_expert("no-such-expert") is None
 
 
 class TestRoleParameter:
@@ -399,7 +408,9 @@ class TestRoleParameter:
 
     @pytest.mark.asyncio
     async def test_bundled_worker_resolved_in_the_session_role(self):
-        detail = await _load_expert_detail("developer", role="session")
+        detail = await catalogue_service().load_expert_detail(
+            "developer", role="session"
+        )
 
         cfg = detail["config"]
         assert detail["resolved_role"] == "session"
@@ -408,13 +419,15 @@ class TestRoleParameter:
         assert (
             cfg["tools"]["shell"] and cfg["delegation"]["enabled"] is True
         )  # expert wins
-        own = await _load_expert_detail("developer")
+        own = await catalogue_service().load_expert_detail("developer")
         assert own["resolved_role"] == "worker"
         assert own["config"]["llm"]["max_retries"] == 0
 
     @pytest.mark.asyncio
     async def test_session_expert_resolved_in_the_worker_role(self):
-        detail = await _load_expert_detail("assistant", role="worker")
+        detail = await catalogue_service().load_expert_detail(
+            "assistant", role="worker"
+        )
 
         cfg = detail["config"]
         assert detail["resolved_role"] == "worker"
@@ -424,16 +437,20 @@ class TestRoleParameter:
 
     @pytest.mark.asyncio
     async def test_role_wins_over_a_base_id(self):
-        detail = await _load_expert_detail("session_base", role="worker")
+        detail = await catalogue_service().load_expert_detail(
+            "session_base", role="worker"
+        )
         assert detail["config"]["agent_id"] == "worker_base"
         assert detail["resolved_role"] == "worker"
-        detail = await _load_expert_detail("worker_base", role="subagent")
+        detail = await catalogue_service().load_expert_detail(
+            "worker_base", role="subagent"
+        )
         assert detail["config"]["agent_id"] == "subagent_base"
         assert "autonomy" not in detail["config"]
 
     @pytest.mark.asyncio
     async def test_library_entry_detail_defaults_to_the_subagent_role(self):
-        detail = await _load_expert_detail("explorer")
+        detail = await catalogue_service().load_expert_detail("explorer")
 
         cfg = detail["config"]
         assert detail["resolved_role"] == "subagent"
@@ -452,7 +469,9 @@ class TestRoleParameter:
         assert cfg["interactive"]["permission_mode"] == "autonomous"
         assert detail["enumerate_only"] == enumerate_only_members()
         # …and in another role on request.
-        as_worker = await _load_expert_detail("explorer", role="worker")
+        as_worker = await catalogue_service().load_expert_detail(
+            "explorer", role="worker"
+        )
         assert as_worker["resolved_role"] == "worker"
         assert as_worker["config"]["phase_settings"]["min_todos"] == 2
 
@@ -482,7 +501,7 @@ class TestRoleParameter:
             ),
         )
 
-        detail = await _load_expert_detail(expert_id, role="worker")
+        detail = await catalogue_service().load_expert_detail(expert_id, role="worker")
 
         assert detail["expert_type"] == "session"  # identity: the row's own role
         assert detail["resolved_role"] == "worker"
@@ -526,7 +545,7 @@ class TestRoleParameter:
             AsyncMock(return_value=None),
         )
 
-        detail = await _load_expert_detail(
+        detail = await catalogue_service().load_expert_detail(
             expert_id, user_id="11111111-1111-4111-8111-111111111111"
         )
 
@@ -592,7 +611,7 @@ class TestShellBoundBundledExpertsPinTheirTier:
     async def test_shell_bound_expert_starts_a_session_on_sandbox(
         self, expert_id, virtual_default_user
     ):
-        detail = await _load_expert_detail(
+        detail = await catalogue_service().load_expert_detail(
             expert_id,
             user_id=virtual_default_user,
             include_account_defaults=True,
@@ -606,7 +625,7 @@ class TestShellBoundBundledExpertsPinTheirTier:
     async def test_upgrade_on_demand_expert_follows_the_account_default(
         self, expert_id, virtual_default_user
     ):
-        detail = await _load_expert_detail(
+        detail = await catalogue_service().load_expert_detail(
             expert_id,
             user_id=virtual_default_user,
             include_account_defaults=True,

@@ -22,7 +22,7 @@ import unicodedata
 from contextlib import asynccontextmanager
 from pathlib import Path
 import urllib.parse
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 from dotenv import find_dotenv, load_dotenv
 
@@ -65,7 +65,6 @@ from typing import Any, Literal, NamedTuple, Optional  # noqa: E402
 from uuid import UUID, uuid4  # noqa: E402
 
 import asyncpg  # noqa: E402
-import yaml  # noqa: E402
 from fastapi import (  # noqa: E402
     Body,
     FastAPI,
@@ -92,7 +91,6 @@ from pydantic import (  # noqa: E402
     ConfigDict,
     Field,
     PrivateAttr,
-    SecretStr,
     StrictBool,
     field_validator,
     model_validator,
@@ -101,7 +99,6 @@ from pydantic import (  # noqa: E402
 from orchestrator.database import (  # noqa: E402
     PostgresDB,
     AuditStore,
-    FilterCategory,
     MIGRATIONS_VECTOR_DIR,
     MIGRATIONS_AUDIT_DIR,
 )
@@ -187,6 +184,98 @@ from orchestrator.routers.sessions import router as sessions_router  # noqa: E40
 from orchestrator.routers.contacts import ContactsDependencies  # noqa: E402
 from orchestrator.routers import job_reads as job_reads_routes  # noqa: E402
 from orchestrator.services import job_projection, job_queries, job_reads  # noqa: E402
+from orchestrator.routers import provider_catalog as provider_catalog_routes  # noqa: E402
+from orchestrator.routers import model_catalog as model_catalog_routes  # noqa: E402
+from orchestrator.routers import config_catalog as config_catalog_routes  # noqa: E402
+from orchestrator.services.provider_catalog import (  # noqa: E402
+    ProviderCatalogService,
+    _endpoint_is_subscription_proxy,  # genuine remaining B02 availability caller
+)
+from orchestrator.services.model_catalog import ModelCatalogService  # noqa: E402
+from orchestrator.services.config_catalog import ConfigCatalogService  # noqa: E402
+from orchestrator.schemas.subscriptions import (  # noqa: E402
+    CodexCallbackRequest,
+    SubscriptionLoginStart,
+    SubscriptionCallbackSubmit,
+)
+from orchestrator.routers import diagnostics as diagnostics_routes  # noqa: E402
+from orchestrator.routers import job_artifacts as job_artifacts_routes  # noqa: E402
+from orchestrator.routers import job_audit as job_audit_routes  # noqa: E402
+from orchestrator.routers import job_inspection as job_inspection_routes  # noqa: E402
+from orchestrator.services import diagnostics as diagnostics_operations  # noqa: E402
+from orchestrator.services import job_artifacts as job_artifacts_operations  # noqa: E402
+from orchestrator.services import job_evidence as job_evidence_operations  # noqa: E402
+from orchestrator.services import job_inspection as job_inspection_operations  # noqa: E402
+from orchestrator.services.subagent_projection import (  # noqa: E402
+    subagent_thread_payload as _subagent_thread_payload,
+)
+from orchestrator.routers import expert_catalog as expert_catalog_routes  # noqa: E402
+from orchestrator.services.expert_catalog import (  # noqa: E402
+    ExpertCatalogService,
+    role_base_or_empty as _role_base_or_empty,
+)
+from orchestrator.services.expert_authoring import ExpertAuthoringService  # noqa: E402
+from orchestrator.services.expert_catalog_contracts import (  # noqa: E402
+    ExpertCatalogDependencies,
+    ExpertCatalogState,
+    ExpertWritePolicy,
+)
+from orchestrator.services.catalogue_resources import (  # noqa: E402
+    CatalogueResources,
+    resolve_config_dir,
+)
+from orchestrator.schemas.datasources import (  # noqa: E402
+    DatasourceCreate,
+    DatasourceUpdate,
+    SSHKeyGenerateRequest,
+    SSHKeyGenerateResponse,
+    ProjectDatasourceSettings,
+)
+from orchestrator.schemas.agent_runtime import (  # noqa: E402
+    AgentRegistration,
+    AgentRegistrationResponse,
+    AgentHeartbeat,
+)
+from orchestrator.schemas.job_runtime import (  # noqa: E402
+    JobStartRequest,
+    JobCompleteRequest,
+)
+from orchestrator.schemas.workspaces import (  # noqa: E402
+    VMCreateRequest,
+)
+from orchestrator.schemas.users import (  # noqa: E402
+    UserCreate,
+    UserUpdate,
+    AdminUserUpdate,
+    AdminBulkApprove,
+)
+from orchestrator.schemas.tokens import (  # noqa: E402
+    McpTokenCreate,
+    McpTokenVerifyRequest,
+    McpTokenCreateInternal,
+    VALID_PAT_SCOPES,
+    ApiKeyCreate,
+)
+from orchestrator.schemas.provider_catalog import (  # noqa: E402
+    VALID_API_KEY_PROVIDERS,
+    ApiKeySet,
+)
+from orchestrator.schemas.projects import (  # noqa: E402
+    ExternalKnowledgeBase,
+    ProjectCreate,
+    ProjectUpdate,
+    ProjectMemberAdd,
+    ProjectMemberUpdate,
+    ProjectRepositoryCreate,
+    ProjectRepositoryUpdate,
+    PromoteRequest,
+)
+from orchestrator.schemas.knowledge import (  # noqa: E402
+    KnowledgeSearchRequest,
+    KnowledgeNoteUpdate,
+    KnowledgeMaterializeRequest,
+    KnowledgeProjectionRequest,
+)
 from orchestrator.services.job_queries import (  # noqa: E402
     JOBS_MAX_OFFSET as JOBS_MAX_OFFSET,
     JOBS_MAX_PROJECT_FILTERS as JOBS_MAX_PROJECT_FILTERS,
@@ -408,11 +497,6 @@ from orchestrator.services.session_runtime_admission import (  # noqa: E402
     thread_runtime_is_preparable,
     thread_runtime_refusal_detail,
 )
-from orchestrator.services.job_todos import (  # noqa: E402
-    build_archive_listing,
-    parse_archived_todos,
-    parse_current_todos,
-)
 from orchestrator.services.gitea import (  # noqa: E402
     GiteaClient,
     GiteaPathError,
@@ -502,17 +586,28 @@ from orchestrator.services.canvas_ssh import (  # noqa: E402
     remote_target_is_vm_backed,
     resolve_remote_workspace_target,
 )
-from orchestrator.seed.llm_config import ensure_codex_proxy_endpoint  # noqa: E402
+from orchestrator.seed.llm_config import (  # noqa: E402
+    ensure_subscription_proxy_endpoint,
+)
+from orchestrator.services import subscription_discovery  # noqa: E402
+from orchestrator.services import subscriptions  # noqa: E402
+from orchestrator.services.subscriptions import (  # noqa: E402
+    SubscriptionProxyError,
+)
+from shared.subscription_routing import (  # noqa: E402
+    CHANNEL_CODEX,
+    SUBSCRIPTION_PROXY_TRANSPORT,
+)
+
+# SRW provider key of the ChatGPT/Codex connection — the one the legacy
+# ``/api/codex/*`` wrappers are scoped to.
+CODEX_PROVIDER_KEY = "openai-codex"
 
 # Registry helpers live in src/ and stay there — the orchestrator imports
 # them here so callers don't each do lazy imports.
 from shared.runtime.core.model_registry import (  # noqa: E402
     UnknownModelError,
     resolve_model as _resolve_model,
-)
-from shared.runtime.core.product_capabilities import (  # noqa: E402
-    ComponentProvenance,
-    ProvenanceStatus,
 )
 from shared.pinned_session_identity import (  # noqa: E402
     PinnedJobRecipient,
@@ -546,7 +641,6 @@ from shared.workspace_contract import (  # noqa: E402
 # Datasource type → tool-category map, shared with the agent's session attach
 # path so the two boundaries can't drift (live_session_settings.md P0.2).
 from shared.runtime.core.datasource_catalog import (  # noqa: E402
-    DATASOURCE_TYPE_IDS,
     DATASOURCE_TYPES,
 )
 from shared.datasource_policy import datasource_tool_categories  # noqa: E402
@@ -640,10 +734,8 @@ from orchestrator.services.config_resolver import (  # noqa: E402
     unrouted_model_slots,
 )
 from orchestrator.services.default_experts import (  # noqa: E402
-    BASE_CONFIG_NAMES,
     DefaultExpertUnavailable,
     ExpertSelectionError,
-    personal_defaults_allowed,
     resolve_root_expert,
     seed_managed_default_experts,
 )
@@ -651,13 +743,7 @@ from shared.runtime.core.loader import (  # noqa: E402
     INHERIT_MODEL,
     ROLE_ROOTS,
     canonical_config_name,
-    expert_phase_prompt_bodies,
-    chain_root,
     load_and_merge_config,
-    load_role_base,
-    normalize_llm_tiers,
-    prune_ignored_keys,
-    reroot_extends,
     resolve_config_path,
 )
 from orchestrator.services.session_router import SessionRouterService  # noqa: E402
@@ -15223,277 +15309,6 @@ def _trigger_dispatch() -> None:
 
 
 # =============================================================================
-# Pydantic Models for Agent Orchestration
-# =============================================================================
-
-
-class CodexCallbackRequest(BaseModel):
-    """Request body for manually completing a Codex OAuth callback."""
-
-    url: str | None = Field(
-        None, description="Full callback URL from browser address bar"
-    )
-    code: str | None = Field(None, description="OAuth authorization code")
-    state: str | None = Field(None, description="OAuth state parameter")
-
-
-class DatasourceCreate(BaseModel):
-    """Request body for creating a connector through the datasource API."""
-
-    name: str = Field(..., description="User-provided label")
-    type: str = Field(
-        ...,
-        description=f"Connector type: {', '.join(DATASOURCE_TYPE_IDS)}",
-    )
-    connection_url: str | None = Field(
-        None, description="Connection string (nullable for generic)"
-    )
-    description: str | None = Field(None, description="What this connector contains")
-    credentials: dict[str, Any] | None = Field(
-        None,
-        description="Auth details (env_vars for generic, auth_method+token/ssh_key for repository, type-specific for managed)",
-    )
-    job_id: str | None = Field(None, description="Job UUID (null for global)")
-    scope_mode: Literal["all", "projects"] = Field(
-        "all",
-        description="Execution availability: everywhere or selected projects",
-    )
-    project_ids: list[str] | None = Field(
-        None,
-        description="Full project scope when scope_mode is 'projects'",
-    )
-    auto_attach: bool = Field(
-        False,
-        description="Select this connector by default in the owner's new work",
-    )
-    cli_hint: str | None = Field(
-        None, description="Suggested CLI command (e.g. 'psql $DATABASE_URL')"
-    )
-    default_branch: str | None = Field(
-        None, description="Branch to read/clone (repository and kb types)"
-    )
-    config: dict[str, Any] | None = Field(
-        None,
-        description=(
-            "Non-secret type-specific config (kb: root_path; email: access/"
-            "folders/drafts_folder/from_address/recipient_allowlist/"
-            "unattended_send)"
-        ),
-    )
-    is_global: bool = Field(
-        False, description="Whether this connector is visible to all users"
-    )
-    read_only: bool | None = Field(
-        None,
-        description=(
-            "Declared read-only flag for public connectors (defaults to true "
-            "on publish; kb is always read-only). Declarative — credentials "
-            "are the enforcement boundary."
-        ),
-    )
-
-    @model_validator(mode="after")
-    def validate_availability_policy(self) -> "DatasourceCreate":
-        if "project_ids" in self.model_fields_set and self.project_ids is None:
-            raise ValueError("project_ids may be omitted or an array, not null")
-        if self.scope_mode == "projects" and not self.project_ids:
-            raise ValueError("project_ids is required for project-scoped connectors")
-        if self.scope_mode == "all" and self.project_ids:
-            raise ValueError("project_ids requires scope_mode='projects'")
-        return self
-
-
-class DatasourceUpdate(BaseModel):
-    """Request body for updating a connector through the datasource API."""
-
-    name: str | None = Field(None, description="New label")
-    description: str | None = Field(None, description="New description")
-    connection_url: str | None = Field(None, description="New connection string")
-    credentials: dict[str, Any] | None = Field(None, description="New auth details")
-    cli_hint: str | None = Field(None, description="New CLI hint")
-    default_branch: str | None = Field(None, description="New default branch")
-    config: dict[str, Any] | None = Field(
-        None,
-        description=(
-            "New non-secret type-specific config (kb: root_path; email: "
-            "access/folders/drafts_folder/from_address/recipient_allowlist/"
-            "unattended_send)"
-        ),
-    )
-    is_global: bool | None = Field(
-        None,
-        description=(
-            "Publish (true) or unpublish (false). Publishing requires the "
-            "'public_datasources' capability; unpublishing needs only "
-            "creator/admin."
-        ),
-    )
-    read_only: bool | None = Field(
-        None,
-        description="Declared read-only flag (kb: always true; declarative only)",
-    )
-    scope_mode: Literal["all", "projects"] | None = Field(
-        None, description="New execution availability mode"
-    )
-    project_ids: list[str] | None = Field(
-        None, description="Desired full project scope; omission preserves links"
-    )
-    auto_attach: bool | None = Field(
-        None, description="New owner-specific default-selection preference"
-    )
-    policy_revision: int | None = Field(
-        None, ge=1, description="Optimistic concurrency token for policy edits"
-    )
-
-    @model_validator(mode="after")
-    def validate_availability_policy(self) -> "DatasourceUpdate":
-        policy_fields = {"scope_mode", "project_ids", "auto_attach"}
-        changed = policy_fields.intersection(self.model_fields_set)
-        for field_name in changed | ({"policy_revision"} & self.model_fields_set):
-            if getattr(self, field_name) is None:
-                raise ValueError(f"{field_name} may be omitted, but not null")
-        if changed and self.policy_revision is None:
-            raise ValueError("policy_revision is required for availability changes")
-        return self
-
-
-class SSHKeyGenerateRequest(BaseModel):
-    """Request body for generating an SSH keypair for a repository connector."""
-
-    comment: str | None = Field(
-        None,
-        description="Optional comment to embed in the public key (e.g. connector name)",
-        max_length=200,
-    )
-
-
-class SSHKeyGenerateResponse(BaseModel):
-    """Response containing a freshly generated ed25519 SSH keypair."""
-
-    private_key: str = Field(..., description="OpenSSH PEM private key (no passphrase)")
-    public_key: str = Field(
-        ..., description="Single-line OpenSSH public key for the deploy-keys field"
-    )
-
-
-class ProjectDatasourceSettings(BaseModel):
-    """Project-level settings when linking a connector."""
-
-    read_only: bool | None = Field(
-        None,
-        description="Managed connectors: true = read-only tools, false/null = CLI mode",
-    )
-    description: str | None = Field(None, description="Project-specific usage context")
-
-
-class AgentRegistration(BaseModel):
-    """Request body for agent registration."""
-
-    config_name: str = Field(..., description="Agent configuration name")
-    pod_ip: str = Field(..., description="Agent IP address for receiving commands")
-    hostname: str | None = Field(None, description="Pod/host name")
-    pod_port: int = Field(8001, description="Agent API port")
-    pid: int | None = Field(None, description="Process ID")
-    agent_mode: str = Field(
-        "worker", description="Agent mode: 'worker' or 'persistent'"
-    )
-    thread_id: str | None = Field(None, description="Thread UUID for persistent agents")
-    session_runtime_generation: UUID | None = Field(
-        None,
-        description=(
-            "Exact pinned runtime generation injected into a dedicated pod. "
-            "Protected runtimes must present it at registration."
-        ),
-    )
-    build_sha: str | None = Field(
-        None, description="Build commit SHA baked into the agent image"
-    )
-    product_provenance: ComponentProvenance = Field(
-        default_factory=lambda: ComponentProvenance(
-            provenance_status=ProvenanceStatus.UNAVAILABLE
-        ),
-        description="Bounded declared provenance for the registering agent image",
-    )
-    pod_uid: str | None = Field(
-        None,
-        description=(
-            "K8s-assigned metadata.uid of the agent pod, self-reported via "
-            "the Kubernetes downward API. Used by the session router to "
-            "stamp ownerReferences on per-session Service/Ingress resources."
-        ),
-    )
-
-    @field_validator("product_provenance")
-    @classmethod
-    def reject_self_verified_provenance(
-        cls,
-        value: ComponentProvenance,
-    ) -> ComponentProvenance:
-        if value.provenance_status is ProvenanceStatus.VERIFIED:
-            raise ValueError(
-                "agent registration may not self-assert verified provenance"
-            )
-        return value
-
-
-class AgentRegistrationResponse(BaseModel):
-    """Response from agent registration."""
-
-    agent_id: str
-    heartbeat_interval_seconds: int
-    dispatch_process_generation: str = Field(
-        ...,
-        description=(
-            "Server-minted exact process generation required on every pinned "
-            "job mutation"
-        ),
-    )
-    pinned_runtime_generation_contract: int = 1
-    session_runtime_generation: str | None = None
-    session_runtime_attach_token: str | None = Field(
-        None,
-        description=(
-            "Per-process pinned-runtime authority minted by the final "
-            "registration bind and echoed on maintenance requests"
-        ),
-    )
-    runtime_actor: dict[str, Any] | None = Field(
-        None,
-        description=(
-            "Hidden server-derived actor context returned only after a "
-            "thread-bound pod proves its provision-time bootstrap credential"
-        ),
-    )
-
-
-class AgentHeartbeat(BaseModel):
-    """Request body for agent heartbeat."""
-
-    status: str = Field(
-        ...,
-        description="Agent status",
-        pattern="^(booting|available|ready|working|session|draining|completed|failed)$",
-    )
-    current_job_id: str | None = Field(None, description="Current job UUID if working")
-    metrics: dict[str, Any] | None = Field(
-        None,
-        description="Optional metrics (memory_mb, cpu_percent, tokens_processed)",
-    )
-    graph_progress: int | None = Field(
-        None,
-        description="Monotonic graph-progress marker from worker heartbeat path",
-    )
-    session_runtime_generation: UUID | None = Field(
-        None,
-        description="Exact generation of a bound pinned session runtime",
-    )
-    session_runtime_attach_token: UUID | None = Field(
-        None,
-        description="Exact warm-attach attempt for a bound pinned runtime",
-    )
-
-
-# =============================================================================
 # Pydantic Models for Job Management
 # =============================================================================
 
@@ -15502,705 +15317,6 @@ from orchestrator.schemas.job_create import (  # noqa: E402
     JobCreate,
     PublicJobCreateBody,
 )
-
-
-class JobStartRequest(BaseModel):
-    """Request sent to agent to start a job."""
-
-    # This is an internal wire contract.  Silently ignoring an undeclared
-    # constructor kwarg can make the producer appear to populate a required
-    # field while model_dump() drops it before delivery.
-    model_config = ConfigDict(extra="forbid")
-
-    job_id: str
-    description: str
-    upload_id: str | None = None
-    config_upload_id: str | None = None
-    instructions_upload_id: str | None = None
-    document_path: str | None = None
-    document_dir: str | None = None
-    config_name: str = "worker_base"
-    config_override: dict[str, Any] | None = None
-    resolved_config: dict[str, Any] | None = Field(
-        default=None,
-        description=(
-            "Orchestrator-resolved config blob (serialize_resolved_config shape). "
-            "Delivered instead of config_override when EXPERTS_DB_ENABLED; the "
-            "agent hydrates it. The orchestrator owns resolution and the freeze."
-        ),
-    )
-    context: dict[str, Any] | None = None
-    instructions: str | None = None
-    git_remote_url: str | None = None
-    datasources: list[dict[str, Any]] | None = None
-    repositories: list[dict[str, Any]] | None = Field(
-        default=None,
-        description="Project repositories for workspace setup",
-    )
-    managed_repository_credentials: list[dict[str, Any]] | None = Field(
-        default=None,
-        repr=False,
-        description="Hidden server-owned repository authority transport",
-    )
-    branch_name: str | None = Field(
-        default=None,
-        description="Git branch name for this job's workspace",
-    )
-    project_id: str | None = Field(
-        default=None,
-        description="Project ID for connector resolution",
-    )
-    runtime_actor: dict[str, Any] | None = Field(
-        default=None,
-        description="Hidden server-derived runtime actor context",
-    )
-    workspace_runtime: dict[str, Any] | None = Field(
-        default=None,
-        description="Safe server-owned workspace runtime authority projection",
-    )
-    workspace_provisioner: str | None = Field(
-        default=None,
-        description="Server-derived physical workspace provisioner",
-    )
-    delegation_context: str | None = Field(
-        default=None,
-        description="Shared context from parent delegation",
-    )
-    workspace_generation: str | None = Field(
-        default=None,
-        description="Control-plane-attested Kubernetes backing UID",
-    )
-    workspace_runtime_incarnation: str | None = Field(
-        default=None,
-        description="Control-plane-attested current workspace Pod UID",
-    )
-    workspace_ssh_host_key_fingerprint: str | None = Field(
-        default=None,
-        description="Control-plane-attested SSH host-key fingerprint",
-    )
-    workspace_owner_kind: Literal["job", "session"] | None = Field(
-        default=None,
-        description="Kind used by the workspace entrypoint process tag",
-    )
-    workspace_owner_id: str | None = Field(
-        default=None,
-        description="Owner UUID used by the workspace entrypoint process tag",
-    )
-    recipient: PinnedJobRecipient | None = Field(
-        default=None,
-        repr=False,
-        description="Hidden server-owned pinned runtime recipient authority",
-    )
-
-
-class JobCompleteRequest(BaseModel):
-    """Result payload sent by the agent after a job finishes processing."""
-
-    should_stop: bool = Field(False, description="Whether the graph stopped")
-    goal_achieved: bool = Field(False, description="Whether the goal was achieved")
-    error: dict[str, Any] | None = Field(None, description="Error dict if job failed")
-    freeze_data: dict[str, Any] | None = Field(
-        None, description="Freeze data from the graph state"
-    )
-    lease_token: int | None = Field(
-        None,
-        ge=1,
-        description=(
-            "Current worker_batch fencing token. Required only for stateless jobs."
-        ),
-    )
-    agent_id: UUID | None = Field(
-        None,
-        description=(
-            "Registered agent UUID. Required only for pinned jobs when the "
-            "durable completion-command gate is enabled."
-        ),
-    )
-    client_report_id: UUID | None = Field(
-        None,
-        description=(
-            "Per-stop UUID idempotency key. Optional during rolling upgrades; "
-            "new agents persist and resend it with the exact completion body."
-        ),
-    )
-
-
-class VMCreateRequest(BaseModel):
-    """Request body for creating a VM for a job."""
-
-    job_id: str
-    agent_config: str = "worker_base"
-    vm_image: str | None = None
-    cpu_cores: int = Field(8, ge=1, le=16)
-    memory: str = "16Gi"
-    description: str = ""
-
-
-class UserCreate(BaseModel):
-    """Request body for creating a user."""
-
-    display_name: str = Field(..., description="Display name")
-    avatar_color: str = Field("#89b4fa", description="Hex color for avatar")
-    email: str | None = Field(None, description="Email address")
-
-
-class UserUpdate(BaseModel):
-    """Request body for updating a user."""
-
-    display_name: str | None = None
-    avatar_color: str | None = None
-    email: str | None = None
-
-
-class AdminUserUpdate(BaseModel):
-    """Admin-only update body for toggling privileged user flags.
-
-    Admin status is intentionally NOT settable here. It is derived from the
-    Keycloak ``admin`` realm role and reconciled onto ``users.is_admin`` on
-    every request (orchestrator/security/auth.py) — a write here would be
-    silently clobbered on the user's next request. Admin is therefore granted
-    in Keycloak, not the app; the cockpit users page shows it read-only.
-    """
-
-    can_use_vm: bool | None = None
-    is_approved: bool | None = None
-
-
-class AdminBulkApprove(BaseModel):
-    """Admin-only body for bulk-approving pending users."""
-
-    user_ids: list[str] = Field(..., min_length=1, description="User UUIDs to approve")
-
-
-class McpTokenCreate(BaseModel):
-    """Request body for creating an MCP API token."""
-
-    name: str = Field(..., min_length=1, max_length=100, description="Token label")
-    scope: str = Field(default="user", description="'user', 'project:<uuid>', or 'all'")
-    expires_in_days: int | None = Field(
-        None, description="Days until expiry (null = never)"
-    )
-
-
-class McpTokenVerifyRequest(BaseModel):
-    """Internal request from MCP server to verify a token hash."""
-
-    token_hash: str
-
-
-class McpTokenCreateInternal(BaseModel):
-    """Internal request from OAuth bridge to create an srw_* token."""
-
-    user_sub: str = Field(..., description="Keycloak subject ID")
-    user_email: str = Field(default="", description="User email for JIT user creation")
-    name: str = Field(..., min_length=1, max_length=200)
-    token_hash: str
-    token_prefix: str
-    scope: str = Field(default="user")
-    origin: str | None = None
-    expires_at: str | None = Field(None, description="ISO 8601 datetime")
-
-
-# ----- API keys (Personal Access Tokens) -----
-# Distinct from `/api/settings/api-keys` (LLM provider keys). PATs are
-# Bearer-auth credentials for n8n / scripts hitting the orchestrator API
-# directly. See knowledge-base/knowledge/features/auth_bff_and_api_tokens.md §3.
-
-VALID_PAT_SCOPES = {
-    "jobs:read",
-    "jobs:write",
-    "chat:read",
-    "chat:write",
-    "knowledge:read",
-    "knowledge:write",
-    "admin",
-}
-
-
-class ApiKeyCreate(BaseModel):
-    """Request body for creating a Personal Access Token."""
-
-    name: str = Field(..., min_length=1, max_length=100, description="Display name")
-    scopes: list[str] = Field(
-        default_factory=lambda: ["jobs:read", "chat:read"],
-        description="Action scopes — see VALID_PAT_SCOPES",
-    )
-    expires_in_days: int | None = Field(
-        365,
-        ge=1,
-        le=3650,
-        description="Days until expiry (null = never). Default 1 year per design.",
-    )
-
-
-VALID_API_KEY_PROVIDERS = {
-    "openai",
-    "anthropic",
-    "google",
-    "groq",
-    "openrouter",
-    "mistral",
-    "codex",
-    "vision",
-}
-
-
-class ApiKeySet(BaseModel):
-    """Request body for setting an API key for a provider."""
-
-    api_key: str = Field(..., min_length=1, description="The API key value")
-    label: str | None = Field(
-        None, description="Optional label (e.g. 'team key', 'personal')"
-    )
-
-
-class LlmEndpointCreate(BaseModel):
-    """Request body for registering a new LLM endpoint.
-
-    The endpoint must be OpenAI-compatible (vLLM, Ollama, private gateway).
-    ``base_url`` should be the full OpenAI path prefix, e.g.
-    ``https://my-vllm.example/v1``. ``api_key`` is optional — some local
-    servers don't require auth.
-    """
-
-    label: str = Field(..., min_length=1, max_length=200)
-    base_url: str = Field(..., min_length=1)
-    api_key: str | None = None
-    allow_insecure: bool = Field(
-        False,
-        description=(
-            "Opt-in for http:// URLs. Default rejects non-HTTPS to guard "
-            "against copy-paste accidents."
-        ),
-    )
-
-
-class LlmEndpointUpdate(BaseModel):
-    """Partial update — only non-None fields are applied.
-
-    ``clear_api_key=True`` nulls the stored key (for endpoints that
-    transition from authenticated to anonymous). Ignored when ``api_key``
-    is also set.
-    """
-
-    label: str | None = None
-    base_url: str | None = None
-    api_key: str | None = None
-    clear_api_key: bool = False
-    allow_insecure: bool = False
-
-
-class ConfigOverrideCreate(BaseModel):
-    """Request body for creating or replacing a config override.
-
-    ``kind`` selects the config subsection. Text kinds (prompts, instructions)
-    populate ``content``; structured kinds (settings, guardrails) populate
-    ``value_json``. ``name`` is the resolver entry_type / settings leaf (dotted
-    for limits, e.g. 'limits.context_threshold_tokens'). ``family=None`` means a
-    global default.
-    """
-
-    family: str | None = Field(None, max_length=64)
-    kind: Literal["prompts", "instructions", "settings", "guardrails"]
-    name: str = Field(..., min_length=1, max_length=128)
-    content: str | None = Field(None, min_length=1)
-    content_format: Literal["text", "markdown", "jinja", "yaml"] = "text"
-    value_json: Any = None
-    notes: str | None = None
-
-    @model_validator(mode="after")
-    def _check_payload(self) -> "ConfigOverrideCreate":
-        """Enforce the content/value_json XOR by kind (mirrors the DB check)."""
-        if self.kind in ("prompts", "instructions"):
-            if self.content is None:
-                raise ValueError(f"{self.kind} override requires 'content'")
-            if self.value_json is not None:
-                raise ValueError(f"{self.kind} override must not set 'value_json'")
-        else:  # settings, guardrails
-            if self.value_json is None:
-                raise ValueError(f"{self.kind} override requires 'value_json'")
-            if self.content is not None:
-                raise ValueError(f"{self.kind} override must not set 'content'")
-        return self
-
-
-class ConfigOverrideUpdate(BaseModel):
-    """Update an existing override's payload; family/kind/name are immutable.
-
-    The acting kind is taken from the stored row, so the route picks ``content``
-    (text kinds) or ``value_json`` (structured kinds).
-    """
-
-    content: str | None = Field(None, min_length=1)
-    content_format: Literal["text", "markdown", "jinja", "yaml"] = "text"
-    value_json: Any = None
-    notes: str | None = None
-
-
-LLM_MODEL_CAPABILITIES = (
-    "chat",
-    "vision",
-    "embedding",
-    "auxiliary",
-    "whisper",
-    "tts",
-    "search",
-    "fetch",
-)
-
-
-class AdminDefaultModelSet(BaseModel):
-    """Request body for setting a default LLM model on the system.
-
-    ``model`` is the model ID to resolve via the registry (e.g.
-    ``RedHatAI/gemma-4-31B-it-FP8-Dynamic``, ``gpt-4o``). Pass an empty
-    string to clear the default.
-    """
-
-    model: str = Field(..., description="Model ID; empty string clears the default")
-
-
-# Locked enum for the admin-curated catalog. Adding a new capability requires
-# touching every consumer (resolver, dispatcher, default-model fallback),
-# so the schema-level CHECK constraint and this Literal are kept in sync.
-VALID_CATALOG_CAPABILITIES = (
-    "chat",
-    "auxiliary",
-    "embedding",
-    "vision",
-    "whisper",
-    "tts",
-    "search",
-    "fetch",
-)
-VALID_CATALOG_PROVIDER_KINDS = ("system", "endpoint")
-
-
-CatalogCapabilityLiteral = Literal[
-    "chat", "auxiliary", "embedding", "vision", "whisper", "tts", "search", "fetch"
-]
-
-
-class CatalogModelCreate(BaseModel):
-    """Request body for inserting a catalog row (Admin → Models).
-
-    ``capabilities`` is the source of truth — one row can serve multiple
-    roles (e.g. ``['chat', 'auxiliary']`` for a chat-capable LLM,
-    ``['chat', 'auxiliary', 'vision']`` for a multimodal one). The legacy
-    singular ``capability`` form is no longer accepted; clients post the
-    array directly.
-    """
-
-    provider_kind: Literal["system", "endpoint"]
-    provider_ref: str = Field(
-        ...,
-        min_length=1,
-        description=(
-            "system_api_keys.provider slug for provider_kind='system' "
-            "(e.g. 'anthropic'); llm_endpoints.id (UUID as text) for "
-            "provider_kind='endpoint'."
-        ),
-    )
-    model_id: str = Field(..., min_length=1, max_length=500)
-    display_label: str = Field(..., min_length=1, max_length=200)
-    capabilities: list[CatalogCapabilityLiteral] = Field(
-        ...,
-        min_length=1,
-        description=(
-            "The set of capabilities this model row claims. One row can "
-            "serve multiple roles (e.g. ['chat', 'auxiliary'] for a "
-            "chat-capable LLM, ['chat', 'auxiliary', 'vision'] for a "
-            "multimodal one). Must be non-empty."
-        ),
-    )
-    family: str = Field(
-        ...,
-        min_length=1,
-        description="model_config_matrix.yaml key (e.g. 'claude-opus', 'gemini').",
-    )
-    context_window: int | None = Field(
-        None,
-        description=(
-            "Optional override; falls back to model_config_matrix family "
-            "default. Pass null (the default) to use the matrix; pass an "
-            "explicit int to override (zero is allowed and round-trips as "
-            "zero)."
-        ),
-    )
-    reasoning_level: str | None = None
-    params_json: dict[str, Any] | None = Field(
-        None,
-        description=(
-            "Optional inference param overrides (e.g. {'temperature': 0.0}). "
-            "Null means 'use family defaults'; explicit zero/false values "
-            "round-trip as themselves (create_model accessor regression guard)."
-        ),
-    )
-    enabled: bool = True
-    notes: str | None = None
-
-
-class CatalogModelUpdate(BaseModel):
-    """Partial update — only fields explicitly set in the request body are
-    applied. Pass ``null`` to clear an optional column to NULL.
-    """
-
-    provider_kind: Literal["system", "endpoint"] | None = None
-    provider_ref: str | None = Field(None, min_length=1)
-    model_id: str | None = Field(None, min_length=1, max_length=500)
-    display_label: str | None = Field(None, min_length=1, max_length=200)
-    capabilities: list[CatalogCapabilityLiteral] | None = Field(None, min_length=1)
-    family: str | None = Field(None, min_length=1)
-    context_window: int | None = None
-    reasoning_level: str | None = None
-    params_json: dict[str, Any] | None = None
-    enabled: bool | None = None
-    notes: str | None = None
-
-
-# Slots admins can pin cluster-wide via Admin → Providers → Defaults. The
-# system_settings key pattern is ``llm.default_<kind>_model``. ``tts`` is
-# present even without a current consumer in src/services/ — landing the
-# plumbing keeps the registry path uniform across audio capabilities.
-#
-# The ``chat`` slot is the cluster-wide chat default — used by the
-# orchestrator dispatcher when a job/session doesn't carry its own model
-# override (see resolve_default_for_capability("chat") at the dispatch
-# call sites). Surfacing it in the cockpit's Defaults panel lets the
-# readiness gate's ``Pin a default for: chat`` requirement actually have
-# a UI to fulfill (it was previously phantom — the gate asked but the
-# panel didn't render the dropdown).
-VALID_DEFAULT_MODEL_KINDS = {
-    "chat",
-    "browser",
-    "citation",
-    "embedding",
-    "vision",
-    "auxiliary",
-    "whisper",
-    "tts",
-    "search",
-    "fetch",
-    "search_fallback",
-}
-
-# System-scoped API keys only cover shared providers. Codex auth is
-# user-bound through the proxy and isn't appropriate for a system key.
-VALID_SYSTEM_API_KEY_PROVIDERS = {
-    "openai",
-    "anthropic",
-    "google",
-    "groq",
-    "openrouter",
-    "vision",
-}
-
-
-class ExternalKnowledgeBase(BaseModel):
-    """An existing private GitHub repo to use as a project's live vault.
-
-    Two ways to name that repo, and exactly one per request:
-
-    * ``datasource_id`` — adopt a ``kb`` connector created earlier, which
-      already holds the URL, branch and encrypted PAT. This is the cockpit's
-      only path: a connector is created first, then attached here.
-    * ``repo_url`` + ``token`` — the inline form, kept for MCP and other API
-      callers that have no connector to point at.
-    """
-
-    datasource_id: str | None = Field(
-        None,
-        description="Existing OKF Knowledge Base connector to adopt as the vault",
-    )
-    repo_url: str | None = Field(None, description="Existing GitHub repository URL")
-    branch: str = Field("main", description="Writable vault branch")
-    token: SecretStr | None = Field(
-        None, description="Fine-grained GitHub contents PAT"
-    )
-    forge: Literal["github"] | None = Field(
-        None,
-        description="Required for GitHub Enterprise; github.com is inferred",
-    )
-
-    @field_validator("branch")
-    @classmethod
-    def _valid_branch(cls, value: str) -> str:
-        branch = str(value or "").strip()
-        if (
-            not branch
-            or branch.startswith("-")
-            or any(char in branch for char in ("\x00", "\n", "\r"))
-        ):
-            raise ValueError("branch must be a non-empty Git ref")
-        return branch
-
-    @field_validator("token")
-    @classmethod
-    def _valid_token(cls, value: SecretStr | None) -> SecretStr | None:
-        if value is not None and not value.get_secret_value().strip():
-            raise ValueError("token must not be empty")
-        return value
-
-    @model_validator(mode="after")
-    def _exactly_one_source(self) -> "ExternalKnowledgeBase":
-        """One vault, named one way.
-
-        A connector already carries branch, forge and credentials, so an inline
-        field alongside it is ambiguous rather than additive — the request is
-        rejected instead of silently preferring one side.
-        """
-        if self.datasource_id is not None:
-            conflicting = sorted(
-                {"repo_url", "token", "branch", "forge"} & self.model_fields_set
-            )
-            if conflicting:
-                raise ValueError(
-                    "datasource_id already carries the vault settings; remove "
-                    + ", ".join(conflicting)
-                )
-        elif not (self.repo_url and self.token):
-            raise ValueError("supply datasource_id, or both repo_url and token")
-        return self
-
-
-class ProjectCreate(BaseModel):
-    """Request body for creating a project."""
-
-    name: str = Field(..., description="Project name")
-    description: str | None = Field(None, description="Project description")
-    goal: str | None = Field(None, description="Project goal statement")
-    default_config_name: str | None = Field(
-        None, description="Default agent config for new jobs"
-    )
-    default_config_override: dict[str, Any] | None = Field(
-        None, description="Default config overrides"
-    )
-    user_id: str = Field(..., description="Owner user UUID")
-    external_kb: ExternalKnowledgeBase | None = Field(
-        None,
-        description="Existing private GitHub repo for the writable project KB",
-    )
-
-
-class ProjectUpdate(BaseModel):
-    """Request body for updating a project."""
-
-    name: str | None = None
-    description: str | None = None
-    goal: str | None = None
-    # One vocabulary, validated here rather than only at the DB CHECK (§4.1 of
-    # knowledge-base/knowledge/features/project_and_job_list_filtering.md).
-    # `paused`/`completed` are still permitted by the constraint but nothing
-    # has ever written them, and the cockpit's `deleted` was always rejected
-    # by it — a 422 naming the field beats a 500 out of asyncpg. Tightening
-    # the constraint itself (and sweeping NULL rows) is phase 1b.
-    status: Literal["active", "archived"] | None = None
-    default_config_name: str | None = None
-    default_config_override: dict[str, Any] | None = None
-    cloud_storage_read_only: bool | None = None
-    # Workspace egress tier. Admin-only — see PATCH /api/projects/{id}.
-    network_tier: str | None = None
-
-
-class ProjectMemberAdd(BaseModel):
-    """Request body for adding a project member."""
-
-    user_id: str = Field(..., description="User UUID to add")
-    role: str = Field("editor", description="Member role: owner, editor, viewer")
-
-
-class ProjectMemberUpdate(BaseModel):
-    """Request body for updating a project member's role."""
-
-    role: str = Field(..., description="New role: owner, editor, viewer")
-
-
-class ProjectRepositoryCreate(BaseModel):
-    """Request body for attaching a repository to a project."""
-
-    name: str = Field(..., description="Repository display name")
-    description: str | None = Field(None, description="Repository description")
-    repo_url: str | None = Field(None, description="Repository URL (external repos)")
-    role: str = Field(
-        "source",
-        description="Repository role: source or reference",
-        pattern="^(source|reference)$",
-    )
-    read_only: bool = Field(False, description="Whether this repo is read-only")
-    branch: str = Field("main", description="Default branch")
-    clone_path: str | None = Field(None, description="Local clone path")
-    create_managed: bool = Field(False, description="Create a managed Gitea repo")
-
-
-class ProjectRepositoryUpdate(BaseModel):
-    """Request body for updating a project repository."""
-
-    name: str | None = None
-    description: str | None = None
-    read_only: bool | None = None
-    branch: str | None = None
-    clone_path: str | None = None
-
-
-class PromoteRequest(BaseModel):
-    """Request body for promoting a job into a dedicated project."""
-
-    name: str = Field(..., description="Name for the new project")
-    description: str | None = Field(None, description="Project description")
-    goal: str | None = Field(None, description="Project goal")
-    user_id: str = Field(..., description="User UUID who owns the new project")
-
-
-class KnowledgeSearchRequest(BaseModel):
-    """Request body for hybrid knowledge search."""
-
-    query: str = Field(..., description="Search query text")
-    limit: int = Field(10, ge=1, le=50, description="Max results to return")
-
-
-class KnowledgeNoteUpdate(BaseModel):
-    """Request body for updating a knowledge note."""
-
-    status: str | None = Field(
-        None, description="New status: active, resolved, superseded, archived"
-    )
-    add_tags: list[str] | None = Field(None, description="Tags to add")
-    remove_tags: list[str] | None = Field(None, description="Tags to remove")
-
-
-class KnowledgeMaterializeRequest(BaseModel):
-    """Request body for materialising one note into the project's KB repo."""
-
-    slug: str = Field(
-        ..., description="Note id — becomes knowledge/<slug>.md in the KB repo"
-    )
-    content: str = Field(..., description="Fully rendered OKF note markdown")
-    job_id: str | None = Field(
-        None, description="Writing job UUID, for per-job commit attribution"
-    )
-    expected_blob_sha: str | None = Field(
-        None,
-        description=(
-            "Compare-and-swap token: the note's blob SHA as the caller read it. "
-            "When set, the write is refused (failed/precondition-failed) if the "
-            "KB repo holds a different blob — or none — at the path."
-        ),
-    )
-    retrieval_messages: list[str] | None = Field(
-        None,
-        description=(
-            "Synthetic retrieval queries for this note. Omitted/None leaves "
-            "any already-indexed value alone — OKF frontmatter carries no "
-            "such field, so only an explicit caller has an opinion."
-        ),
-    )
-
-
-class KnowledgeProjectionRequest(BaseModel):
-    """Internal report of the projection leg of a canonical mutation."""
-
-    synced: bool
-    error: str | None = None
 
 
 class CustomJSONEncoder(json.JSONEncoder):
@@ -17901,8 +17017,21 @@ app = FastAPI(
     lifespan=lifespan,
     default_response_class=CustomJSONResponse,
 )
+
+app.state.catalogue_resources = CatalogueResources(config_dir=lambda: _get_config_dir())
 app.state.contacts_dependencies = ContactsDependencies(db=postgres_db)
 app.state.job_reads_dependencies_factory = lambda: _job_reads_dependencies()
+app.state.provider_catalog_dependencies_factory = (
+    lambda: _provider_catalog_dependencies()
+)
+app.state.model_catalog_dependencies_factory = lambda: _model_catalog_dependencies()
+app.state.config_catalog_dependencies_factory = lambda: _config_catalog_dependencies()
+app.state.job_inspection_dependencies_factory = lambda: _job_inspection_dependencies()
+app.state.job_audit_dependencies_factory = lambda: _job_audit_dependencies()
+app.state.job_artifacts_dependencies_factory = lambda: _job_artifacts_dependencies()
+app.state.diagnostics_dependencies_factory = lambda: _diagnostics_dependencies()
+app.state.expert_catalog_state = ExpertCatalogState()
+app.state.expert_catalog_dependencies_factory = lambda: _expert_catalog_dependencies()
 app.state.tables_dependencies = TablesDependencies(db=postgres_db)
 app.state.preferences_dependencies = PreferencesDependencies(
     db=postgres_db,
@@ -18149,152 +17278,14 @@ app.include_router(contacts_project_router)
 app.include_router(tables_router)
 app.include_router(preferences_router)
 app.include_router(job_reads_routes.router)
-
-
-# nosec: public k8s-liveness-probe
-@app.get("/api/health")
-async def health_check() -> dict[str, str]:
-    """Health check endpoint."""
-    return {"status": "ok"}
-
-
-@app.get("/debug/emails", response_class=HTMLResponse)
-async def debug_email_index() -> str:
-    """Dev-only index of rendered transactional emails (Zulip's /emails idea).
-
-    Calls the real builders with fixture data — never fixtures rendered
-    independently of the code that ships — so this page cannot drift from
-    the emails users actually receive.
-
-    Gated by ``EMAIL_PREVIEW_ENABLED`` (default off, same as
-    ``CANVAS_LIVE_PREVIEW_ENABLED`` / ``COLLABORA_ENABLED``): disabled, it
-    raises a bare 404 with no detail, matching FastAPI's own default response
-    for an unmapped route exactly — not the ``"unknown email preview"`` detail
-    used below for a bad name, which would leak that the route exists.
-    """
-    if os.getenv("EMAIL_PREVIEW_ENABLED", "").strip().lower() not in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
-        raise HTTPException(status_code=404)
-    links = "".join(
-        f'<li><a href="/debug/emails/{n}">{n}</a></li>'
-        for n in ("system", "agent", "permission")
-    )
-    return f"<!DOCTYPE html><html><body><h1>Email previews</h1><ul>{links}</ul></body></html>"
-
-
-@app.get("/debug/emails/{name}", response_class=HTMLResponse)
-async def debug_email_preview(name: str) -> str:
-    """Render one transactional email through its real builder for inspection.
-
-    Gated by ``EMAIL_PREVIEW_ENABLED`` — see ``debug_email_index`` for why
-    the disabled-state 404 has no detail.
-    """
-    if os.getenv("EMAIL_PREVIEW_ENABLED", "").strip().lower() not in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
-        raise HTTPException(status_code=404)
-    link = "https://cockpit.example/preview"
-    if name == "system":
-        return email_service._build_system_notification_html(
-            to_name="Ada Lovelace",
-            body_md=(
-                "Your automation **Nightly ledger sync** was disabled after "
-                "3 consecutive failures.\n\n"
-                "The last run failed in `reconcile.py` with:\n\n"
-                "```\nValueError: unbalanced ledger (delta 4.20)\n```\n\n"
-                "Re-enable it from [Automations](https://cockpit.example/automations) "
-                "once the job is fixed."
-            ),
-            cockpit_link=link,
-        )
-    if name == "agent":
-        # The fixture deliberately exercises the markdown subset (headings,
-        # emphasis, code, lists, tables, quotes) — this page is the only place
-        # the rendering is looked at with human eyes before it reaches an inbox.
-        return email_service._build_agent_message_html(
-            message_md=(
-                "**Job `5706c684`** (`developer`) has completed and is "
-                "awaiting review.\n\n"
-                "## Summary\n\n"
-                "Migrated the billing schema to the new ledger format. The "
-                "`amount_cents` column is now `NOT NULL`, and every historical "
-                "row was backfilled from `legacy_amount`.\n\n"
-                "> One caveat: 14 rows in 2019 had no legacy value and were "
-                "left at zero.\n\n"
-                "**Deliverables:**\n\n"
-                "- `migrations/app/0163_billing_ledger.sql`\n"
-                "- `orchestrator/services/billing.py`\n"
-                "  - new `LedgerEntry` dataclass\n"
-                "  - `reconcile()` now returns a diff\n\n"
-                "| Check | Result |\n"
-                "| --- | --- |\n"
-                "| `pytest tests/test_billing.py` | 42 passed |\n"
-                "| `ruff check` | clean |\n\n"
-                "Full diff: https://git.example/srw/compare/main...ledger\n\n"
-                "---\n\n"
-                "*Confidence: 92%*"
-            ),
-            job_description="Migrate the billing schema to the new ledger format",
-            config_name="developer",
-            phase_str="phase 2",
-            cockpit_link=link,
-            reply_to_addr="reply@example.com",
-        )
-    if name == "permission":
-        # A permission gate is a feed notification now; its mail is the
-        # notification template with the magic links as labeled bare URLs.
-        body = (
-            "**run_command** is waiting for your approval in session "
-            "**Nightly build** (requested 4 min ago).\n\n"
-            '```\n{"command": "rm -rf ./build"}\n```\n\n'
-            f"Approve: {link}/magic/approve/preview-approve\n"
-            f"Deny: {link}/magic/approve/preview-deny\n\n"
-            "These links need no sign-in and expire in 30 minutes. "
-            f"Session: {link}/sessions/preview"
-        )
-        return email_service.render_notification_html(body, f"{link}/inbox?n=preview")
-    raise HTTPException(status_code=404, detail="unknown email preview")
-
-
-@app.get("/api/workspace/status")
-async def workspace_status(request: Request) -> dict[str, Any]:
-    """Get workspace configuration status for debugging.
-
-    **Admin only** (P4a): leaks job UUIDs, filesystem paths, and env-var
-    values, so it shouldn't be anonymous. No callers currently rely on it.
-
-    Returns:
-        Dict with workspace path, availability, and sample job directories
-    """
-    await _require_admin(request)
-
-    import os
-
-    base_path = workspace_service.base_path
-    is_available = workspace_service.is_available
-
-    # List top-level entries (workspace is a flat directory now, no job_* subdirs)
-    entries = []
-    if is_available:
-        try:
-            entries = [d.name for d in base_path.iterdir()][:20]
-        except Exception:
-            pass
-
-    return {
-        "configured_path": str(base_path),
-        "resolved_path": str(base_path.resolve()) if base_path.exists() else None,
-        "is_available": is_available,
-        "env_workspace_path": os.environ.get("WORKSPACE_PATH"),
-        "entries": entries,
-    }
+app.include_router(provider_catalog_routes.router)
+app.include_router(model_catalog_routes.router)
+app.include_router(config_catalog_routes.router)
+app.include_router(job_inspection_routes.router)
+app.include_router(job_audit_routes.router)
+app.include_router(job_artifacts_routes.router)
+app.include_router(diagnostics_routes.router)
+app.include_router(expert_catalog_routes.router)
 
 
 def _resolve_submitted_job_origin(
@@ -18327,6 +17318,57 @@ def _resolve_submitted_job_origin(
     if thread_id:
         return "session"
     return "user"
+
+
+def _job_inspection_dependencies() -> job_inspection_routes.JobInspectionDependencies:
+    return job_inspection_routes.JobInspectionDependencies(
+        store=postgres_db,
+        inspections=job_inspection_operations.JobInspectionDependencies(
+            store=postgres_db,
+            audit_reader=audit_reader,
+            user_visible_project_ids=user_visible_project_ids,
+            mcp_scope_project_id=mcp_scope_project_id,
+            active_job_statuses=job_inspection_operations.ME_ACTIVE_JOB_STATUSES,
+        ),
+        require_approved_user=require_approved_user,
+        require_job_access=require_job_access,
+        require_thread_owner=require_thread_owner,
+        require_internal=require_internal,
+    )
+
+
+def _job_audit_dependencies() -> job_audit_routes.JobAuditDependencies:
+    return job_audit_routes.JobAuditDependencies(
+        store=postgres_db,
+        audit_reader=audit_reader,
+        require_admin=_require_admin,
+        require_approved_user=require_approved_user,
+        require_job_access=require_job_access,
+    )
+
+
+def _job_artifacts_dependencies() -> job_artifacts_routes.JobArtifactDependencies:
+    return job_artifacts_routes.JobArtifactDependencies(
+        store=postgres_db,
+        artifacts=job_artifacts_operations.JobArtifactDependencies(
+            store=postgres_db,
+            forge=gitea_client,
+            resolve_job_repo=resolve_job_repo,
+            evidence=job_evidence_operations,
+        ),
+        require_job_access=require_job_access,
+    )
+
+
+def _diagnostics_dependencies() -> diagnostics_routes.DiagnosticsDependencies:
+    return diagnostics_routes.DiagnosticsDependencies(
+        operations=diagnostics_operations.DiagnosticDependencies(
+            workspace=workspace_service,
+            email_renderer=email_service,
+            getenv=os.getenv,
+        ),
+        require_admin=_require_admin,
+    )
 
 
 def _job_reads_dependencies() -> job_reads_routes.JobReadsDependencies:
@@ -18494,10 +17536,10 @@ def _job_admission_scope_dependencies(
 
 def _bundled_job_expert_exists(config_name: str) -> bool:
     """Read the application-owned catalogue only when an explicit slug needs it."""
-    global _experts_cache
-    if _experts_cache is None:
-        _experts_cache = _scan_experts()
-    return any(e.id == config_name for e in _experts_cache)
+    catalog = _expert_catalog_service()
+    if catalog.state.experts is None:
+        catalog.state.experts = catalog.scan_experts()
+    return any(e.id == config_name for e in catalog.state.experts)
 
 
 def _job_admission_config_dependencies() -> JobAdmissionConfigDependencies:
@@ -34786,33 +33828,6 @@ async def ensure_workspace_access(request: Request, job_id: str) -> dict[str, An
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
-@app.get("/api/jobs/{job_id}/progress")
-async def get_job_progress(request: Request, job_id: str) -> dict[str, Any]:
-    """Get honest job liveness (E1/E3, officer_supervision_surface §4–§5).
-
-    Composes the control-row basis with the one shared liveness computation
-    (audit movement → agent heartbeat, ``updated_at`` never consulted).
-    ``progress_percent``/``eta_seconds`` are kept in the payload for shape
-    compatibility but are honest ``null`` — no percentage telemetry exists
-    and none is fabricated.
-    """
-    _, job = await require_job_access(request, postgres_db, job_id)
-    from orchestrator.services.job_liveness import compute_job_liveness
-
-    try:
-        progress = await postgres_db.get_job_progress(job_id)
-        if not progress:
-            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
-        liveness = await compute_job_liveness(
-            job, audit_reader=audit_reader, db=postgres_db
-        )
-        return {**progress, **liveness}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
-
-
 # =============================================================================
 # Job evidence manifest (E4 — officer_supervision_surface §3.3)
 # =============================================================================
@@ -34821,99 +33836,6 @@ async def get_job_progress(request: Request, job_id: str) -> dict[str, Any]:
 # user visibility AND the MCP/officer `project:<uuid>` scope
 # (_scope_permits_project) — an opaque evidence ID alone conveys no access,
 # and a guessed ID from another project 403s before the manifest is touched.
-
-
-@app.get("/api/jobs/{job_id}/evidence")
-async def list_job_evidence_route(request: Request, job_id: str) -> dict[str, Any]:
-    """List the typed evidence manifest recorded at completion."""
-    _, job = await require_job_access(request, postgres_db, job_id)
-    from orchestrator.services.job_evidence import parse_manifest, public_manifest
-
-    manifest = parse_manifest(job)
-    if manifest is None:
-        return {"job_id": job_id, "recorded_at": None, "entries": []}
-    return public_manifest(manifest)
-
-
-@app.get("/api/jobs/{job_id}/completion-report")
-async def get_job_completion_report_route(
-    request: Request, job_id: str
-) -> dict[str, Any]:
-    """The server-recorded completion report entry (404 when none exists)."""
-    _, job = await require_job_access(request, postgres_db, job_id)
-    from orchestrator.services.job_evidence import parse_manifest
-
-    manifest = parse_manifest(job)
-    entry = next(
-        (
-            candidate
-            for candidate in (manifest or {}).get("entries") or []
-            if candidate.get("kind") == "completion_report"
-        ),
-        None,
-    )
-    if not entry:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No completion report recorded for job '{job_id}'",
-        )
-    try:
-        report = json.loads(entry.get("inline_content") or "{}")
-    except (json.JSONDecodeError, TypeError):
-        report = {}
-    return {
-        "job_id": job_id,
-        "recorded_at": manifest.get("recorded_at"),
-        "source_revision": (entry.get("source") or {}).get("revision"),
-        "report": report,
-    }
-
-
-@app.get("/api/jobs/{job_id}/evidence/{evidence_id}")
-async def read_job_evidence_route(
-    request: Request,
-    job_id: str,
-    evidence_id: str,
-    offset: int = Query(default=0, ge=0),
-) -> dict[str, Any]:
-    """Read one evidence entry by opaque ID, resolved at its pinned revision.
-
-    The ID is authorized against (caller project, job project, evidence job)
-    on every read; the server never accepts a model-supplied path and never
-    reads a revision other than the one pinned in the manifest.
-    """
-    _, job = await require_job_access(request, postgres_db, job_id)
-    from orchestrator.services.job_evidence import (
-        find_entry,
-        parse_manifest,
-        read_evidence_entry,
-    )
-
-    manifest = parse_manifest(job)
-    entry = find_entry(manifest, evidence_id) if manifest else None
-    if not entry:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Evidence '{evidence_id}' not found for job '{job_id}'",
-        )
-    try:
-        return await read_evidence_entry(
-            job,
-            entry,
-            offset=offset,
-            db=postgres_db,
-            gitea=gitea_client,
-        )
-    except Exception:  # noqa: BLE001 -- never expose private object coordinates
-        logger.warning(
-            "Evidence read failed safely for job %s evidence %s",
-            str(job_id)[:8],
-            str(evidence_id)[:20],
-        )
-        raise HTTPException(
-            status_code=500,
-            detail="Evidence read failed without exposing private object details",
-        ) from None
 
 
 # Lead-in slack for a per-job usage window: absorbs clock skew between the
@@ -35144,395 +34066,6 @@ async def get_job_usage(
         ],
         **_fold_job_usage(rows),
     }
-
-
-@app.get("/api/jobs/{job_id}/subjobs")
-async def get_job_subjobs(request: Request, job_id: str) -> dict[str, Any]:
-    """The subjob roster for one job — what it spawned, and where each stands.
-
-    Exists because a parent's own status is not self-explanatory. ``waiting``
-    means *blocked on a child* (``_spawn_scholar_job`` holds the parent there
-    while the scholar runs), so a reader looking at a ``waiting`` row is looking
-    at the one status that cannot be understood without its children — and the
-    jobs list is exactly where they are missing. Paging is over display roots
-    and children ride along only if they *also* match the filter, so under the
-    default ``origin IN ('user','session')`` a subjob never does. The row shows
-    a parked-looking parent and no children whatsoever.
-
-    So this deliberately does **not** reuse the list's query. It walks the tree
-    (``get_job_subjob_roster``), which makes the answer independent of the
-    caller's filters: the roster of a job is a property of the job, not of the
-    view someone is looking at it through.
-
-    Authorization is the parent's. A subjob inherits its parent's project and
-    owner at creation, so seeing the parent is seeing the family, and every
-    field returned is one ``GET /api/jobs`` already publishes for a child that
-    the filter happened to let through.
-
-    ``count`` is the honest size of the tree — the number the list's own
-    ``childCount`` cannot give, because that one counts what survived filtering.
-    """
-    await require_job_access(request, postgres_db, job_id)
-
-    try:
-        rows = await postgres_db.get_job_subjob_roster(job_id)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
-
-    return {
-        "job_id": job_id,
-        "count": len(rows),
-        "subjobs": [
-            {
-                "id": str(row["id"]),
-                "parent_job_id": str(row["parent_job_id"])
-                if row.get("parent_job_id")
-                else None,
-                # 0 = a direct child. Present so a nested renderer does not have
-                # to rebuild the tree from parent ids it may only partly hold.
-                "depth": row["depth"],
-                "description": row["description"],
-                "status": row["status"],
-                # The role label: 'scholar', 'critic', 'curator'. This is what
-                # makes a roster row readable at a glance, and it is the same
-                # value the list's own child rows badge themselves with.
-                "config_name": row["config_name"],
-                "origin": row["origin"],
-                "error_message": row["error_message"],
-                "created_at": row["created_at"],
-                "completed_at": row["completed_at"],
-                "updated_at": row["updated_at"],
-            }
-            for row in rows
-        ],
-    }
-
-
-def _subagent_thread_payload(row: dict[str, Any]) -> dict[str, Any]:
-    """One ``threads`` row of ``kind='subagent'`` as the roster publishes it.
-
-    ``status`` is the child's lifecycle kind (``subagent_status``: running,
-    completed, parked, interrupted, capped, error, cancelled) — the value a
-    reader wants first; the thread's own ``active``/``ended`` rides along as
-    ``thread_status``. The spawn facts the agent stamped at creation
-    (isolation, write policy, the brief, the parent turn) come out of
-    ``metadata.subagent``; ``metadata`` itself never leaves (it is the
-    thread's internal envelope, redacted elsewhere for a reason).
-    """
-    metadata = row.get("metadata")
-    if isinstance(metadata, str):
-        try:
-            metadata = json.loads(metadata)
-        except (json.JSONDecodeError, TypeError):
-            metadata = {}
-    if not isinstance(metadata, dict):
-        metadata = {}
-    spawn = metadata.get("subagent")
-    if not isinstance(spawn, dict):
-        spawn = {}
-    payload = {
-        "thread_id": str(row["id"]),
-        "parent_job_id": (
-            str(row["parent_job_id"]) if row.get("parent_job_id") else None
-        ),
-        "runtime_generation": (
-            str(row["runtime_generation"])
-            if row.get("runtime_generation") is not None
-            else None
-        ),
-        "handle": row.get("subagent_handle"),
-        "subagent_type": row.get("subagent_type"),
-        "status": row.get("subagent_status"),
-        "thread_status": row.get("status"),
-        "outcome": row.get("subagent_outcome"),
-        "error": row.get("subagent_error"),
-        "turns": int(row.get("total_turns") or 0),
-        "tokens": int(row.get("total_tokens") or 0),
-        "report_path": row.get("report_path"),
-        "parent_tool_call_id": row.get("parent_tool_call_id"),
-        "parent_thread_id": (
-            str(row["parent_thread_id"]) if row.get("parent_thread_id") else None
-        ),
-        "description": spawn.get("brief_description") or "",
-        "isolation": spawn.get("isolation"),
-        "write_policy": spawn.get("write_policy"),
-        "owned_paths": list(spawn.get("owned_paths") or []),
-        "parent_iteration": spawn.get("parent_iteration"),
-        "parent_input_message_id": spawn.get("parent_input_message_id"),
-        "parent_ai_message_id": spawn.get("parent_ai_message_id"),
-        "fork": bool(spawn.get("fork", False)),
-        "run_in_background": bool(spawn.get("run_in_background", False)),
-        "started_at": row.get("created_at"),
-        "ended_at": row.get("ended_at"),
-        "last_activity": row.get("last_activity"),
-    }
-    if row.get("recovery_kind") is not None:
-        payload["recovery_kind"] = row.get("recovery_kind")
-    return payload
-
-
-@app.get("/api/jobs/{job_id}/subagents")
-async def get_job_subagents(request: Request, job_id: str) -> dict[str, Any]:
-    """The subagent roster of one job — every child it delegated to, and
-    where each stands (U3 B.10).
-
-    The sibling of ``GET /api/jobs/{job_id}/subjobs`` for the in-process
-    children: a ``delegate_agent`` call runs a child session inside the
-    parent's pod, and the only durable trace is its ``threads`` row of
-    ``kind='subagent'`` (0206) plus the transcript in ``thread_messages``.
-    Those rows are deliberately kept off the sessions page (``list_threads``
-    filters on kind), so this is the one place a reader sees them — with
-    ``thread_id`` linking to ``/sessions/<thread_id>``, where the ordinary
-    thread endpoints render the transcript read-only.
-
-    Like the subjob roster it takes no filter parameters: the children of a
-    job are a property of the job, not of the view someone reads it through,
-    and terminal children are the ones that explain the parent's diff.
-
-    Authorization is the parent's (``require_job_access``): a child row
-    inherits the job's owner and project at creation, so seeing the job is
-    seeing its children — the same rule that lets the job owner open the
-    child's transcript through ``require_thread_owner``.
-    """
-    await require_job_access(request, postgres_db, job_id)
-
-    try:
-        rows = await postgres_db.list_subagent_threads(job_id)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
-
-    return {
-        "job_id": job_id,
-        "count": len(rows),
-        "subagents": [_subagent_thread_payload(row) for row in rows],
-    }
-
-
-@app.get("/api/persistent/threads/{thread_id}/subagents")
-async def get_session_subagents(request: Request, thread_id: str) -> dict[str, Any]:
-    """Owner-visible roster of children delegated by one session root."""
-
-    _user, parent = await require_thread_owner(request, postgres_db, thread_id)
-    if str(parent.get("kind") or "session") != "session":
-        raise HTTPException(status_code=404, detail="Parent session not found")
-    try:
-        rows = await postgres_db.list_session_subagent_threads(thread_id)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-    return {
-        "parent_thread_id": thread_id,
-        "count": len(rows),
-        "subagents": [_subagent_thread_payload(row) for row in rows],
-    }
-
-
-@app.get("/api/jobs/{job_id}/audit")
-async def get_job_audit(
-    request: Request,
-    job_id: str,
-    page: int = Query(default=1, ge=-1),
-    page_size: int = Query(default=50, ge=1, le=200, alias="pageSize"),
-    offset: Optional[int] = Query(default=None, ge=0),
-    limit: Optional[int] = Query(default=None, ge=1, le=200),
-    order: Literal["asc", "desc"] = Query(default="asc"),
-    filter: FilterCategory = Query(default="all"),
-    lean: bool = Query(default=False),
-) -> dict[str, Any]:
-    """Get paginated audit entries for a job from the audit store.
-
-    Two pagination styles are supported; use whichever you prefer:
-        - offset/limit (REST-style): ?offset=50&limit=50
-        - page/pageSize (legacy):    ?page=2&pageSize=50
-    If both are provided, offset/limit wins. The response echoes both styles.
-
-    Query params:
-        offset: Entries to skip (overrides page if set)
-        limit: Max entries to return, max 200 (overrides pageSize if set)
-        page: 1-indexed page number; -1 = last page
-        pageSize: Entries per page, max 200
-        order: asc (oldest first, default) or desc (newest first)
-        filter: all, messages, tools, or errors
-    """
-    await require_job_access(request, postgres_db, job_id)
-    effective_size = limit if limit is not None else page_size
-    if not audit_reader.is_available:
-        return {
-            "entries": [],
-            "total": 0,
-            "page": page,
-            "pageSize": effective_size,
-            "offset": offset if offset is not None else 0,
-            "limit": effective_size,
-            "hasMore": False,
-            "error": "Audit store not available",
-        }
-
-    try:
-        return await audit_reader.get_job_audit(
-            job_id=job_id,
-            page=page,
-            page_size=page_size,
-            filter_category=filter,
-            offset=offset,
-            limit=limit,
-            order=order,
-            lean=lean,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
-
-
-@app.get("/api/jobs/{job_id}/audit/step/{step_id}")
-async def get_audit_step(request: Request, job_id: str, step_id: int) -> dict[str, Any]:
-    """Full detail for a single audit step (heavy payload + metadata).
-
-    The lean list projection (``/audit?lean=true``) omits per-row arguments,
-    tracebacks, state, and metadata; the debug UI fetches them on demand here when
-    a row is expanded. The distinct ``/step/`` segment avoids colliding with the
-    ``/audit/timerange`` route.
-    """
-    await require_job_access(request, postgres_db, job_id)
-    if not audit_reader.is_available:
-        raise HTTPException(status_code=503, detail="Audit store not available")
-    try:
-        doc = await audit_reader.get_audit_step(job_id, step_id)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
-    if doc is None:
-        raise HTTPException(status_code=404, detail=f"Audit step '{step_id}' not found")
-    return doc
-
-
-@app.get("/api/requests/{doc_id}")
-async def get_request(request: Request, doc_id: str) -> dict[str, Any]:
-    """Get a single LLM request by its audit-store request ID.
-
-    Gated by the caller's access to the request's underlying job — admins
-    pass; otherwise the embedded `job_id` is run through `require_job_access`.
-    Requests without a `job_id` (legacy) are admin-only.
-    """
-    if not audit_reader.is_available:
-        raise HTTPException(
-            status_code=503,
-            detail="Audit store not available",
-        )
-
-    try:
-        llm_doc = await audit_reader.get_request(doc_id)
-        if llm_doc is None:
-            # Auth before disclosing existence: any approved user may probe.
-            await require_approved_user(request, postgres_db)
-            raise HTTPException(
-                status_code=404,
-                detail=f"Request '{doc_id}' not found",
-            )
-        job_id = llm_doc.get("job_id")
-        if job_id:
-            await require_job_access(request, postgres_db, str(job_id))
-        else:
-            await _require_admin(request)
-        return llm_doc
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
-
-
-@app.get("/api/jobs/{job_id}/audit/timerange")
-async def get_audit_time_range(request: Request, job_id: str) -> dict[str, str] | None:
-    """Get first and last timestamps for job audit entries.
-
-    Returns:
-        Dict with 'start' and 'end' ISO timestamps, or null if no entries / audit store unavailable
-    """
-    await require_job_access(request, postgres_db, job_id)
-    if not audit_reader.is_available:
-        return None
-
-    try:
-        return await audit_reader.get_audit_time_range(job_id)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
-
-
-@app.get("/api/jobs/{job_id}/chat")
-async def get_job_chat_history(
-    request: Request,
-    job_id: str,
-    page: int = Query(default=1, ge=-1),
-    page_size: int = Query(default=50, ge=1, le=200, alias="pageSize"),
-    offset: Optional[int] = Query(default=None, ge=0),
-    limit: Optional[int] = Query(default=None, ge=1, le=200),
-    lean: bool = Query(default=False),
-) -> dict[str, Any]:
-    """Get paginated chat history for a job.
-
-    Returns a clean sequential view of conversation turns without duplicates.
-    Each entry contains the input message(s) that triggered an LLM response
-    and the response itself.
-
-    Two pagination styles are supported (mirrors ``/audit``):
-        - offset/limit (REST-style): ?offset=50&limit=50
-        - page/pageSize (legacy):    ?page=2&pageSize=50
-    If both are provided, offset/limit wins. The response echoes both styles.
-
-    Query params:
-        offset: Entries to skip (overrides page if set)
-        limit: Max entries to return, max 200 (overrides pageSize if set)
-        page: Page number (1-indexed). Use -1 to request the last page.
-        pageSize: Number of entries per page (max 200)
-        lean: Strip full message bodies (previews + truncated markers only);
-            hydrate single turns via ``/chat/entry/{entry_id}``.
-    """
-    await require_job_access(request, postgres_db, job_id)
-    effective_size = limit if limit is not None else page_size
-    if not audit_reader.is_available:
-        return {
-            "entries": [],
-            "total": 0,
-            "page": page,
-            "pageSize": effective_size,
-            "offset": offset if offset is not None else 0,
-            "limit": effective_size,
-            "hasMore": False,
-            "error": "Audit store not available",
-        }
-
-    try:
-        return await audit_reader.get_chat_history(
-            job_id=job_id,
-            page=page,
-            page_size=page_size,
-            offset=offset,
-            limit=limit,
-            lean=lean,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
-
-
-@app.get("/api/jobs/{job_id}/chat/entry/{entry_id}")
-async def get_job_chat_entry(
-    request: Request, job_id: str, entry_id: int
-) -> dict[str, Any]:
-    """Full detail for a single chat turn (complete inputs/response bodies).
-
-    The lean listing (``/chat?lean=true``) carries previews only; the debug
-    chat panel hydrates a turn here when the user expands a message or tool
-    result. The distinct ``/entry/`` segment mirrors ``/audit/step/{id}``.
-    """
-    await require_job_access(request, postgres_db, job_id)
-    if not audit_reader.is_available:
-        raise HTTPException(status_code=503, detail="Audit store not available")
-    try:
-        doc = await audit_reader.get_chat_entry(job_id, entry_id)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
-    if doc is None:
-        raise HTTPException(
-            status_code=404, detail=f"Chat entry '{entry_id}' not found"
-        )
-    return doc
 
 
 # =============================================================================
@@ -36545,130 +35078,6 @@ async def export_job_to_shared_folder(request: Request, job_id: str) -> dict[str
     }
 
 
-@app.get("/api/jobs/{job_id}/todos")
-async def get_job_todos(request: Request, job_id: str) -> dict[str, Any]:
-    """Get all todos for a job (current + archives) from its Gitea repo.
-
-    Reads the committed state as of the worker's last phase-boundary push:
-    ``todos.yaml`` at the job branch head plus ``archive/todos_*.md`` phase
-    archives.
-
-    Gracefully degrades — Gitea unavailable or repo/files missing yields the
-    empty shape instead of an error, because the cockpit todo view renders
-    this response directly.
-
-    Returns:
-        Dict with:
-        - job_id: Job UUID
-        - current: Current todos from todos.yaml (if the worker pushed one)
-        - archives: List of archived todo files
-        - has_workspace: Whether the job's Gitea repo was reachable
-    """
-    await require_job_access(request, postgres_db, job_id)
-
-    current: dict[str, Any] | None = None
-    archives: list[dict[str, Any]] = []
-    has_workspace = False
-
-    if gitea_client.is_initialized:
-        repo_name, job_branch = await resolve_job_repo(job_id)
-        root_entries = await gitea_client.list_contents(repo_name, "", ref=job_branch)
-        if root_entries is not None:
-            has_workspace = True
-            content = await gitea_client.get_file_content(
-                repo_name, "todos.yaml", ref=job_branch
-            )
-            if content is not None:
-                current = parse_current_todos(content)
-            archive_entries = await gitea_client.list_contents(
-                repo_name, "archive", ref=job_branch
-            )
-            archives = build_archive_listing(archive_entries)
-
-    return {
-        "job_id": job_id,
-        "current": current,
-        "archives": archives,
-        "has_workspace": has_workspace,
-    }
-
-
-@app.get("/api/jobs/{job_id}/todos/current")
-async def get_current_todos(request: Request, job_id: str) -> dict[str, Any]:
-    """Get current active todos from todos.yaml in the job's Gitea repo.
-
-    Committed state as of the worker's last phase-boundary push.
-
-    Returns:
-        Dict with todos list and metadata, or 404 if not found
-    """
-    await require_job_access(request, postgres_db, job_id)
-    result: dict[str, Any] | None = None
-    if gitea_client.is_initialized:
-        repo_name, job_branch = await resolve_job_repo(job_id)
-        content = await gitea_client.get_file_content(
-            repo_name, "todos.yaml", ref=job_branch
-        )
-        if content is not None:
-            result = parse_current_todos(content)
-    if result is None:
-        raise HTTPException(
-            status_code=404, detail=f"No current todos found for job '{job_id}'"
-        )
-    return result
-
-
-@app.get("/api/jobs/{job_id}/todos/archives")
-async def list_todo_archives(request: Request, job_id: str) -> list[dict[str, Any]]:
-    """List archived todo files from the job repo's ``archive/`` directory.
-
-    Committed state as of the worker's last phase-boundary push. Empty list
-    when Gitea is unavailable or the repo has no archives yet.
-
-    Returns:
-        List of archive metadata (filename, phase_name, timestamp)
-    """
-    await require_job_access(request, postgres_db, job_id)
-    if not gitea_client.is_initialized:
-        return []
-    repo_name, job_branch = await resolve_job_repo(job_id)
-    entries = await gitea_client.list_contents(repo_name, "archive", ref=job_branch)
-    return build_archive_listing(entries)
-
-
-@app.get("/api/jobs/{job_id}/todos/archives/{filename}")
-async def get_archived_todos(
-    request: Request, job_id: str, filename: str
-) -> dict[str, Any]:
-    """Get parsed content of an archived todo file from the job's Gitea repo.
-
-    Committed state as of the worker's last phase-boundary push.
-
-    Args:
-        job_id: Job UUID
-        filename: Archive filename (e.g., "todos_phase1_20260124_183618.md")
-
-    Returns:
-        Dict with parsed todos, summary, and metadata
-    """
-    await require_job_access(request, postgres_db, job_id)
-    result: dict[str, Any] | None = None
-    # Security: same filename sanitation the local-disk route enforced
-    safe = not (".." in filename or "/" in filename or "\\" in filename)
-    if safe and gitea_client.is_initialized:
-        repo_name, job_branch = await resolve_job_repo(job_id)
-        content = await gitea_client.get_file_content(
-            repo_name, f"archive/{filename}", ref=job_branch
-        )
-        if content is not None:
-            result = parse_archived_todos(content, filename)
-    if result is None:
-        raise HTTPException(
-            status_code=404, detail=f"Archive '{filename}' not found for job '{job_id}'"
-        )
-    return result
-
-
 # =============================================================================
 # Bulk Fetch Endpoints for Client-Side Caching
 # =============================================================================
@@ -36684,27 +35093,6 @@ async def get_archived_todos(
 # GET /api/graph/changes/{id} for the graph timeline. See
 # knowledge-base/knowledge/features/debug_audit_view_refactor.md and
 # knowledge-base/knowledge/issues/audit_metadata_config_duplication_ooms_orchestrator.md.
-
-
-@app.get("/api/jobs/{job_id}/version")
-async def get_job_version(request: Request, job_id: str) -> dict[str, Any] | None:
-    """Get job data version info for cache invalidation.
-
-    Returns counts and timestamps that can be compared to cached values
-    to determine if the cache needs to be refreshed.
-
-    Returns:
-        Dict with version, auditEntryCount, chatEntryCount, graphDeltaCount, lastUpdate
-        Returns null if job has no audit data or the audit store is unavailable
-    """
-    await require_job_access(request, postgres_db, job_id)
-    if not audit_reader.is_available:
-        return None
-
-    try:
-        return await audit_reader.get_job_version(job_id)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 # =============================================================================
@@ -48851,35 +47239,6 @@ async def get_job_workspace_status(request: Request, job_id: str) -> dict[str, A
     }
 
 
-@app.get("/api/jobs/{job_id}/brief")
-async def get_job_brief(request: Request, job_id: str) -> dict[str, Any]:
-    """Brief fields for the agent's virtual ``task_brief.md``. **Internal** —
-    requires ``X-Internal-Key``.
-
-    ``JobResumeRequest`` carries no description/deliverables/kickoff, so a
-    resumed job would serve an empty brief for the rest of its life; the agent
-    backfills from here on resume
-    (knowledge-base/knowledge/issues/fresh_job_dispatched_as_resume_skips_seeding.md).
-    """
-    await require_internal(request)
-    job = await postgres_db.get_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    context = job.get("context") or {}
-    if isinstance(context, str):
-        try:
-            context = json.loads(context)
-        except (json.JSONDecodeError, TypeError):
-            context = {}
-
-    return {
-        "description": job.get("description") or "",
-        "required_deliverables": context.get("required_deliverables"),
-        "kickoff_message": context.get("kickoff_message"),
-    }
-
-
 @app.post("/api/agents/threads/{thread_id}/messages")
 async def agent_save_message(
     request: Request,
@@ -60825,2391 +59184,146 @@ async def delete_agent(request: Request, agent_id: str) -> dict[str, str]:
 
 
 # =============================================================================
-# Per-User Projections — safe replacement for non-admin agent visibility (G4)
+# Catalogue composition and remaining configuration callers
 # =============================================================================
-
-
-_ME_ACTIVE_JOB_STATUSES = {"created", "processing", "paused", "pending_review"}
-
-
-@app.get("/api/me/active-jobs")
-async def list_my_active_jobs(
-    request: Request,
-    limit: int = Query(default=100, ge=1, le=500),
-) -> list[dict[str, Any]]:
-    """Caller's in-flight jobs — the non-admin replacement for `/api/agents`.
-
-    Returns jobs visible to the caller (G1 visibility OR — own jobs OR
-    project-member jobs) in any of the active statuses (created,
-    processing, paused, pending_review). The underlying ``query_jobs``
-    SELECT already excludes pod IPs and hostnames, so this is safe to
-    expose to non-admins. Admins still get the full fleet via
-    `/api/agents`; they can use this endpoint too if they want a personal
-    in-flight summary.
-
-    Respects MCP ``project:<uuid>`` scope narrowing.
-    """
-    user = await require_approved_user(request, postgres_db)
-    is_admin = bool(user.get("is_admin"))
-    scope_pid = mcp_scope_project_id(user)
-    try:
-        if is_admin:
-            # Admins get their own in-flight jobs here, not the fleet — the
-            # fleet view is /api/agents. Expressed as an owner filter rather
-            # than the visibility OR so it stays own-jobs-only.
-            owner_user_id = None
-            project_ids = None
-            owner_filter = str(user["id"])
-        else:
-            visible = await user_visible_project_ids(user, postgres_db)
-            owner_user_id = str(user["id"])
-            project_ids = [str(p) for p in visible] if visible != "all" else []
-            owner_filter = None
-
-        result = await postgres_db.query_jobs(
-            owner_user_id=owner_user_id,
-            visible_project_ids=project_ids,
-            scope_project_id=str(scope_pid) if scope_pid else None,
-            statuses=sorted(_ME_ACTIVE_JOB_STATUSES),
-            user_id=owner_filter,
-            limit=limit,
-            include_total=False,
-        )
-        # Filtering in SQL is what makes ?limit= mean "up to N active jobs"
-        # rather than "the active ones among the newest N of any status".
-        # The post-filter stays as the gate: it is what a caller-side test
-        # pins, and it costs nothing once the query already narrowed.
-        return [j for j in result.jobs if j.get("status") in _ME_ACTIVE_JOB_STATUSES]
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
-
-
-# =============================================================================
-# Expert Discovery
-# =============================================================================
-
-
-class ExpertInfo(BaseModel):
-    """Expert configuration metadata for discovery."""
-
-    id: str
-    display_name: str
-    description: str
-    icon: str = "psychology"
-    color: str = "#cba6f7"
-    tags: list[str] = []
-    expert_type: Literal["worker", "session"] = "worker"
 
 
 def _get_config_dir() -> Path:
-    """Resolve the config directory path."""
-    config_dir_env = os.environ.get("CONFIG_DIR")
-    if config_dir_env:
-        return Path(config_dir_env)
-    # Orchestrator runs from orchestrator/ or project root
-    candidates = [
-        Path(__file__).resolve().parents[2] / "config",
-        Path("/app/config"),  # in container
-    ]
-    for candidate in candidates:
-        if candidate.is_dir():
-            return candidate
-    return candidates[0]
+    """Compatibility reader for startup and pending configuration callers (B12)."""
+    return resolve_config_dir(__file__)
 
 
-def _role_base_or_empty(role: str) -> dict[str, Any]:
-    """The fully merged role base (``expert_base`` + the role overlay), or
-    ``{}`` with a warning when the bundled files cannot be read — the same
-    tolerance the old raw ``worker_base.yaml`` reads had. Never read a base
-    file directly: an overlay alone is only the role's residue."""
-    try:
-        return load_role_base(role)
-    except Exception as exc:
-        logger.warning("Role base %r unavailable: %s", role, exc)
-        return {}
-
-
-def _expert_info_from_dir(entry: Path, *, library: bool = False) -> ExpertInfo | None:
-    """One ``ExpertInfo`` from ``<entry>/config.yaml``; ``None`` for a
-    non-expert directory or an unreadable file (logged, never fatal).
-
-    The role is the chain's ROOT (expert -> ... -> role overlay), not only
-    the direct ``$extends``; a chain rooted straight on expert_base or one
-    that cannot be followed lists as a worker, as before. ``tags`` is the
-    YAML's ``tags`` ∪ {role tag} (U1 B.4): a bundled expert carries its
-    chain root's role, a subagent-library entry carries ``subagent`` — the
-    directory it lives in IS its authoring. Additive metadata the list
-    filters read alongside ``expert_type``.
-    """
-    from shared.runtime.core.expert_resolution import with_role_tag
-
-    config_path = entry / "config.yaml"
-    if not entry.is_dir() or not config_path.exists():
-        return None
-    try:
-        with open(config_path) as f:
-            data = yaml.safe_load(f) or {}
-
-        root = chain_root(str(config_path)) or canonical_config_name(
-            str(data.get("$extends") or "worker_base")
-        )
-        expert_type: Literal["worker", "session"] = (
-            "session" if root == "session_base" else "worker"
-        )
-
-        description = str(data.get("description") or "").strip()
-        # Summarize tools if no description
-        if not description:
-            tools = data.get("tools") or {}
-            tool_categories = [k for k in tools if tools[k]]
-            description = (
-                f"Agent with {', '.join(tool_categories)} tools."
-                if tool_categories
-                else "Custom agent configuration."
-            )
-
-        return ExpertInfo(
-            id=entry.name,
-            display_name=data.get("display_name", entry.name.replace("_", " ").title()),
-            description=description,
-            icon=data.get("icon", "psychology"),
-            color=data.get("color", "#cba6f7"),
-            tags=with_role_tag(
-                "subagent" if library else expert_type, data.get("tags")
-            ),
-            expert_type=expert_type,
-        )
-    except Exception as e:
-        logger.warning(f"Failed to parse expert config {config_path}: {e}")
-        return None
-
-
-def _scan_experts() -> list[ExpertInfo]:
-    """Scan config/experts/ for expert configurations.
-
-    Only ``config/experts/*/config.yaml`` is listed — the chain roots
-    (``expert_base.yaml``, ``overlays/*.yaml``) are bases, not experts, the
-    public base ids (``worker_base`` / ``session_base``) are served by
-    ``_load_expert_detail`` by name, and the subagent library
-    (``config/subagents/*``) is a separate scan (``_scan_subagent_library``)
-    that only ever lists by tag. Each entry's ``tags`` carries its role.
-    """
-    experts_dir = _get_config_dir() / "experts"
-    if not experts_dir.is_dir():
-        return []
-    experts: list[ExpertInfo] = []
-    for entry in sorted(experts_dir.iterdir()):
-        info = _expert_info_from_dir(entry)
-        if info is not None:
-            experts.append(info)
-    return experts
-
-
-def _scan_subagent_library() -> list[ExpertInfo]:
-    """Scan config/subagents/ — the shared library of small experts a roster
-    references (``{$ref: subagents/<name>}``; universal_experts_and_subagents.md
-    §1.1). Same schema as an expert, same ``ExpertInfo``; ``tags`` always
-    carries ``subagent`` (the directory is the authoring), ``expert_type`` is
-    the chain root's role (``worker`` for a chain on ``expert_base``) and is
-    never what lists them: ``list_experts`` includes a library entry only
-    when the requested ``type`` matches one of its tags.
-    """
-    library_dir = _get_config_dir() / "subagents"
-    if not library_dir.is_dir():
-        return []
-    entries: list[ExpertInfo] = []
-    for entry in sorted(library_dir.iterdir()):
-        info = _expert_info_from_dir(entry, library=True)
-        if info is not None:
-            entries.append(info)
-    return entries
-
-
-# Cache experts at startup
-_experts_cache: list[ExpertInfo] | None = None
-_library_cache: list[ExpertInfo] | None = None
-
-
-def _listed_expert(expert_id: str) -> ExpertInfo | None:
-    """The cached listing entry for a bundled expert id, else a subagent-
-    library id — bundled wins on a name clash, exactly like a bare ``$ref``.
-    ``None`` for anything else (DB rows are looked up by UUID elsewhere)."""
-    global _experts_cache, _library_cache
-    if _experts_cache is None:
-        _experts_cache = _scan_experts()
-    info = next((e for e in _experts_cache if e.id == expert_id), None)
-    if info is not None:
-        return info
-    if _library_cache is None:
-        _library_cache = _scan_subagent_library()
-    return next((e for e in _library_cache if e.id == expert_id), None)
-
-
-def _expert_matches_type(
-    type: str | None, expert_type: str, tags: list[str] | None, *, by_role: bool
-) -> bool:
-    """The one list filter (U1 B.4): ``tags ∪ {expert_type}``. A row lists
-    under ``?type=X`` when its role is X or it carries the tag X, so a row is
-    never hidden for lacking a tag and ``?type=subagent`` lists everything
-    tagged for the subagent role. ``by_role=False`` (the subagent library)
-    matches by tag only: those entries never appear in the default listing
-    or under their fallback ``expert_type``."""
-    if type is None:
-        return by_role
-    return (by_role and expert_type == type) or type in (tags or [])
-
-
-@app.get("/api/experts")
-async def list_experts(
-    request: Request, type: str | None = None
-) -> list[dict[str, Any]]:
-    """List experts: bundled (disk) + DB rows visible to the caller (owned +
-    project-linked + global), each tagged with ``source``. **P4e** — approved
-    users only.
-
-    ``type`` narrows by ROLE OR TAG (``expert_type == type or type in tags``,
-    U1 B.4) — ``?type=worker`` / ``?type=session`` list as before plus any
-    row tagged for that role; ``?type=subagent`` lists the subagent library
-    (``config/subagents/*``, ``source: library``) and every expert tagged
-    ``subagent``. Without ``type`` the listing is unchanged: bundled experts
-    + DB rows, never the library. A bundled expert's role is inferred from
-    its chain root; every entry's ``tags`` includes its role.
-    """
-    user = await require_approved_user(request, postgres_db)
-    global _experts_cache, _library_cache
-    if _experts_cache is None:
-        _experts_cache = _scan_experts()
-    if _library_cache is None:
-        _library_cache = _scan_subagent_library()
-    # ``name`` is the slug callers use to reference an expert by name (e.g. the
-    # project loop's role_sequence, a roster ``$ref``). For bundled experts the
-    # id IS the slug; for library entries it is the unambiguous
-    # ``subagents/<id>`` spelling; for DB rows it's the separate name column
-    # (id is a UUID).
-    result = [
-        {
-            **e.model_dump(),
-            "source": "bundled",
-            "storage_kind": "bundled",
-            "name": e.id,
-        }
-        for e in _experts_cache
-        if _expert_matches_type(type, e.expert_type, e.tags, by_role=True)
-    ]
-    result += [
-        {
-            **e.model_dump(),
-            "source": "library",
-            "storage_kind": "library",
-            "name": f"subagents/{e.id}",
-        }
-        for e in _library_cache
-        if _expert_matches_type(type, e.expert_type, e.tags, by_role=False)
-    ]
-    if _is_experts_db_enabled():
-        visible = await user_visible_project_ids(user, postgres_db)
-        pids = [] if visible == "all" else [str(p) for p in visible]
-        # Fetched without the SQL role filter: the filter reads tags too, and
-        # a row tagged for another role must list under that role as well.
-        rows = await postgres_db.list_experts_visible(
-            user_id=str(user["id"]), project_ids=pids, expert_type=None
-        )
-        rows = [
-            r
-            for r in rows
-            if _expert_matches_type(
-                type, r["expert_type"], list(r.get("tags") or []), by_role=True
-            )
-        ]
-        managed_names = {r["name"] for r in rows if r.get("managed_key")}
-        if managed_names:
-            # Assistant/General Worker remain on disk as bootstrap templates,
-            # but their managed DB copies are the selectable runtime entries.
-            result = [r for r in result if r.get("name") not in managed_names]
-        result += [
-            {
-                "id": str(r["id"]),
-                "name": r["name"],
-                "display_name": r["display_name"],
-                "description": r.get("description") or "",
-                "icon": r["icon"],
-                "color": r["color"],
-                "tags": r.get("tags") or [],
-                "expert_type": r["expert_type"],
-                "source": (
-                    "managed"
-                    if r.get("managed_key")
-                    else ("global" if r["is_global"] else "user")
-                ),
-                "storage_kind": "db",
-                "managed_key": r.get("managed_key"),
-                "owner_id": str(r["owner_id"]) if r.get("owner_id") else None,
-            }
-            for r in rows
-        ]
-    return result
-
-
-@app.post("/api/experts/reload")
-async def reload_experts(request: Request) -> dict[str, Any]:
-    """Force reload of expert configurations cache. **Admin only** (P4d) —
-    reloads expert YAML from disk."""
-    await _require_admin(request)
-    global _experts_cache, _library_cache
-    _experts_cache = _scan_experts()
-    _library_cache = _scan_subagent_library()
-    return {"status": "reloaded", "count": len(_experts_cache)}
-
-
-def _deep_merge(base: dict, override: dict) -> dict:
-    """Deep merge two dictionaries (objects merge, arrays replace, None clears)."""
-    result = base.copy()
-    for key, value in override.items():
-        if value is None:
-            result.pop(key, None)
-        elif isinstance(value, dict) and isinstance(result.get(key), dict):
-            result[key] = _deep_merge(result[key], value)
-        else:
-            result[key] = value
-    return result
-
-
-_settings_matrix_cache: dict[str, Any] | None = None
-
-
-def _project_settings_subsection(parsed: dict[str, Any]) -> dict[str, Any]:
-    """Project a parsed model_config_matrix to the legacy settings shape.
-
-    Returns ``{family: settings_dict}`` (drops families without a settings
-    block) so callers that pre-date the unified file see the same shape
-    they used to read from ``settings_matrix.yaml``.
-    """
-    out: dict[str, Any] = {}
-    for family, sections in (parsed or {}).items():
-        if not isinstance(sections, dict):
-            continue
-        # Tolerate both legacy flat shape and unified subsection shape — the
-        # unified loader downstream is the source of truth, but per-expert
-        # files written before chunk 1 may still arrive flat in tests.
-        if "settings" in sections and isinstance(sections["settings"], dict):
-            out[family] = sections["settings"]
-        elif {"prompts", "instructions"}.isdisjoint(sections.keys()):
-            # Pure legacy settings-only block (no `settings:` wrapper) — keep
-            # whatever scalar/dict children it carries.
-            out[family] = sections
-    return out
-
-
-def _load_settings_matrix(config_dir: Path) -> dict[str, Any]:
-    """Load and cache the settings subsection of ``model_config_matrix.yaml``.
-
-    Returns the legacy ``{family: settings_dict}`` shape so existing callers
-    (`/api/admin/families`, expert detail endpoints) keep working without
-    rewrites. Per-expert overlays are handled by the callers that need
-    them; this function returns the base file only.
-    """
-    global _settings_matrix_cache
-    if _settings_matrix_cache is None:
-        matrix_path = config_dir / "model_config_matrix.yaml"
-        if matrix_path.exists():
-            with open(matrix_path) as f:
-                parsed = yaml.safe_load(f) or {}
-            _settings_matrix_cache = _project_settings_subsection(parsed)
-        else:
-            _settings_matrix_cache = {}
-    return _settings_matrix_cache
-
-
-def _effective_models_from_layers(
-    expert_llm: dict[str, Any] | None,
-    account_default: str | None,
-    system_default: str | None,
-    expert_subagents: dict[str, Any] | None = None,
-) -> dict[str, dict[str, Any]]:
-    """Per-slot effective model + provenance for the create-form pickers.
-
-    Mirrors the dispatch precedence (most-specific wins) so the UI can show
-    the model the agent will actually run when the picker is left untouched.
-    v1 layers (the project ``default_config_override`` layer is deferred — it
-    is ~always null and would need project context threaded through the
-    forms):
-
-        expert pin  ->  account default_model  ->  system registry default
-
-    ``expert_llm`` is the expert's OWN llm fragment (DB overlay or bundled
-    leaf), NOT the merged config — a bundled, model-agnostic expert has ``{}``
-    here and so resolves to the account/system default, exactly like dispatch
-    (the bundled base's placeholder model is replaced by the default floor
-    before the expert merges). ``expert_subagents`` is the fragment's own
-    ``subagents`` block (the roster-wide ``subagents.llm.model`` is the
-    "subagent model" picker since U1).
-
-    Since U1 an expert has ONE model (``llm.model``): the per-phase tiers are
-    gone, and a legacy fragment is read through the loader's compat mapping
-    first, so a stored ``llm.strategic`` pin surfaces as ``model`` and a stored
-    ``llm.subagent`` as the ``subagent`` slot. Returns
-    ``{slot: {"model": str|None, "source": str}}`` for slots ``model`` (the
-    expert's model), ``subagent`` (``subagents.llm.model`` when pinned to a
-    real model, else ``model`` — ``inherit`` IS the parent's model) and
-    ``session`` (= ``model``). The ``strategic`` / ``tactical`` aliases the
-    cockpit read in between are gone (U1 WP6 switched every reader to
-    ``model``). ``source`` is one of ``expert`` / ``account_default`` /
-    ``system_default``.
-    """
-    fragment: dict[str, Any] = {"llm": dict(expert_llm or {})}
-    if isinstance(expert_subagents, dict):
-        fragment["subagents"] = expert_subagents
-    fragment = normalize_llm_tiers(fragment, source="effective-models")
-    llm = fragment.get("llm") or {}
-    subagents = fragment.get("subagents")
-    roster_llm = subagents.get("llm") if isinstance(subagents, dict) else None
-
-    def _top() -> dict[str, Any]:
-        if llm.get("model"):
-            return {"model": llm["model"], "source": "expert"}
-        if account_default:
-            return {"model": account_default, "source": "account_default"}
-        return {"model": system_default, "source": "system_default"}
-
-    top = _top()
-    subagent_pin = roster_llm.get("model") if isinstance(roster_llm, dict) else None
-    subagent = (
-        {"model": subagent_pin, "source": "expert"}
-        if subagent_pin and subagent_pin != INHERIT_MODEL
-        else dict(top)
-    )
-    return {
-        "model": dict(top),
-        "subagent": subagent,
-        "session": dict(top),
-    }
-
-
-async def _compute_expert_effective_models(
-    expert_llm: dict[str, Any] | None,
-    user_id: str | None,
-    expert_subagents: dict[str, Any] | None = None,
-) -> dict[str, dict[str, Any]]:
-    """Combine the expert's own pins with the user's account default_model and
-    the system registry chat default (``resolve_default_for_capability`` — the
-    same source dispatch uses)."""
-    account_default = None
-    if user_id:
-        settings = await postgres_db.get_user_settings(str(user_id)) or {}
-        account_default = settings.get("default_model")
-    system_default = await postgres_db.resolve_default_for_capability("chat")
-    return _effective_models_from_layers(
-        expert_llm, account_default, system_default, expert_subagents
+def _provider_catalog_dependencies() -> (
+    provider_catalog_routes.ProviderCatalogDependencies
+):
+    return provider_catalog_routes.ProviderCatalogDependencies(
+        service=ProviderCatalogService(
+            store=postgres_db,
+            discovery=discovery_service,
+            probe=probe_endpoint_models,
+            subscriptions=subscription_discovery,
+        ),
+        require_admin=_require_admin,
     )
 
 
-async def _load_expert_detail(
-    expert_id: str,
-    *,
-    user_id: str | None = None,
-    defaults_type: Literal["worker", "session"] | None = None,
-    include_account_defaults: bool = False,
-    role: str | None = None,
-) -> dict[str, Any]:
-    """Load full expert detail: merged config + instructions content. DB-backed
-    experts (UUID) resolve their fragment onto the expert_type base; bundled
-    experts resolve from disk as before; a subagent-library id
-    (``config/subagents/<name>``) resolves on the subagent overlay.
+def _model_catalog_dependencies() -> model_catalog_routes.ModelCatalogDependencies:
+    from shared.runtime.core import loader
 
-    ``role`` (``worker`` / ``session`` / ``subagent``) resolves the expert in
-    THAT role instead of its own — the same re-rooting ``resolve_config``
-    applies when a session expert is dispatched as a worker (U1 D4), so a
-    cross-role picker previews the config the job or session will actually
-    run. The served ``expert_type`` stays the expert's own role (its identity
-    and default slot); ``resolved_role`` names the role the config was
-    resolved for.
+    resources = app.state.catalogue_resources
 
-    When ``user_id`` is provided, attaches ``effective_models`` (per-slot model +
-    provenance) so the create-form picker can show what will actually run if left
-    untouched — see Layer 3 in
-    knowledge-base/knowledge/issues/loop_ran_codex_spark_not_selected_model_then_hung_on_cooldown.md.
+    async def approved_user(request: Request) -> dict[str, Any]:
+        return await require_approved_user(request, postgres_db)
 
-    ``include_account_defaults`` inserts the caller's account layer between the
-    framework base and the expert fragment, exactly where ``resolve_config``
-    puts ``base_defaults``. **Create forms must set it**: without it the form
-    resolves a different config than the one create/dispatch will build, and any
-    control keyed off a resolved value silently disagrees with the server. That
-    is not hypothetical — a New Session form reading ``workspace.backend`` as
-    the base's ``sandbox`` (instead of the account's ``virtual``) left
-    clone-based repository connectors selectable, and every create 400'd on the
-    lite-backend rule. It is deliberately OFF by default so the expert *editor*
-    keeps diffing against the pure framework baseline; folding personal
-    preferences into that baseline would let them be saved into a shared expert.
-    """
-    if _is_experts_db_enabled() and _looks_like_uuid(expert_id):
-        row = await postgres_db.get_expert_by_id(expert_id)
-        if not row:
-            return {}
-        # The role base, fully merged (expert_base + overlay) — the same base
-        # `resolve_config` puts under a DB fragment at dispatch: the row's own
-        # role, or the requested one for a cross-role preview.
-        role_used = role or str(row["expert_type"])
-        base = _role_base_or_empty(role_used)
-        cfg = row.get("config") or {}
-        if isinstance(cfg, str):
-            cfg = json.loads(cfg)
-        account_layer = (
-            await _account_defaults_layer(user_id, role_used)
-            if include_account_defaults
-            else {}
-        )
-        merged = prune_ignored_keys(_deep_merge(_deep_merge(base, account_layer), cfg))
-        for key in ("connections", "$ignore_keys"):
-            merged.pop(key, None)
-        prompts = row.get("prompts") or {}
-        if isinstance(prompts, str):
-            prompts = json.loads(prompts)
-        effective = (
-            await _compute_expert_effective_models(
-                cfg.get("llm") or {}, user_id, cfg.get("subagents")
-            )
-            if user_id
-            else None
-        )
-        # Keep DB-backed detail responses at parity with bundled experts: the
-        # forms resolve model-family defaults client-side from the raw matrix.
-        # `defaults_tools` used to ride here too — the mode base's tool lists,
-        # so the forms could turn an expert-disabled category back on. It is
-        # gone: the base ships `[]` for every category worth re-enabling, so
-        # the payload it produced was empty and the re-enable emitted nothing.
-        # `enumerate_only` replaces it and is a different kind of thing: not a
-        # copy of a config layer that can go stale, but the registry's own
-        # answer to "what must a caller write to turn this category on", for
-        # the one category (`shell`) that refuses `true`. Without it a form
-        # with no resolved read can only send `true`, which 400s naming a rule
-        # the user has no way to satisfy from the form.
-        raw_matrix = _load_settings_matrix(_get_config_dir())
-        return {
-            "id": str(row["id"]),
-            "display_name": row["display_name"],
-            "description": row.get("description") or "",
-            "icon": row["icon"],
-            "color": row["color"],
-            "tags": row.get("tags") or [],
-            "expert_type": row["expert_type"],
-            "source": (
-                "managed"
-                if row.get("managed_key")
-                else ("global" if row.get("is_global") else "user")
-            ),
-            "storage_kind": "db",
-            "managed_key": row.get("managed_key"),
-            "config": merged,
-            "instructions": prompts.get("instructions"),
-            "persona": prompts.get("persona"),
-            "enumerate_only": enumerate_only_members(),
-            "settings_matrix": raw_matrix,
-            "effective_models": effective,
-            "resolved_role": role_used,
-        }
-    config_dir = _get_config_dir()
-
-    # Load expert config
-    if expert_id in {
-        "default",
-        "defaults",
-        "worker_base",
-        "persistent_default",
-        "persistent_defaults",
-        "session_base",
-    }:
-        inferred_type = (
-            "session"
-            if canonical_config_name(expert_id) == "session_base"
-            else defaults_type
-        )
-        # The public base ids resolve to the role base (expert_base + overlay);
-        # `agent_id` stays `worker_base` / `session_base` because the overlay
-        # declares it, so the served detail is unchanged by the split. An
-        # explicit `role` wins over the id (the roots are one thing in
-        # different roles — the same rule `resolve_config` applies).
-        role_used = role or ("session" if inferred_type == "session" else "worker")
-        defaults = _role_base_or_empty(role_used)
-        # `defaults` stays the pristine framework base; the account layer is
-        # merged on top only for `merged`.
-        merged = _deep_merge(
-            defaults,
-            await _account_defaults_layer(user_id, role_used)
-            if include_account_defaults
-            else {},
-        )
-        expert_config_dir = config_dir
-        # The "defaults" virtual expert is model-agnostic — no expert-level model
-        # pin, so its effective model is the account/system default.
-        expert_llm_leaf: dict[str, Any] = {}
-        expert_subagents: dict[str, Any] | None = None
-    else:
-        expert_dir = config_dir / "experts" / expert_id
-        library_entry = False
-        if not (expert_dir / "config.yaml").exists():
-            # The subagent library (config/subagents/<name>): a roster target,
-            # served by its bare name when no bundled expert shadows it — the
-            # precedence a bare `$ref` uses. Its natural role is subagent.
-            expert_dir = config_dir / "subagents" / expert_id
-            library_entry = True
-        config_path = expert_dir / "config.yaml"
-        if not expert_dir.is_dir() or not config_path.exists():
-            return {}
-        with open(config_path) as f:
-            expert_data = yaml.safe_load(f) or {}
-
-        # Resolve $extends to the expert's parent chain — a role overlay on
-        # expert_base for every bundled expert (another expert's chain is
-        # followed the same way). The chain ROOT names the expert's own role;
-        # an unknown parent falls back to the worker base, as before. For a
-        # requested `role` (or a library entry, whose role is subagent) the
-        # link is re-rooted onto that role's overlay exactly as
-        # `resolve_config` re-roots a bundled leaf at dispatch.
-        root = chain_root(str(config_path))
-        own_role = "session" if root == "session_base" else "worker"
-        reroot_role = role or ("subagent" if library_entry else None)
-        role_used = reroot_role or own_role
-        extends_name = str(expert_data.pop("$extends", "worker_base"))
-        parent_name, parent_role = reroot_extends(extends_name, reroot_role)
-        parent_path, _ = resolve_config_path(parent_name)
-        if Path(parent_path).is_file():
-            defaults = load_and_merge_config(parent_path, role=parent_role)
-        else:
-            defaults = _role_base_or_empty(role_used)
-
-        # Account layer sits above the framework base and below the bundled
-        # expert leaf — the same slot `resolve_config` gives `base_defaults`.
-        base_layer = _deep_merge(
-            defaults,
-            await _account_defaults_layer(user_id, role_used)
-            if include_account_defaults
-            else {},
-        )
-        merged = prune_ignored_keys(_deep_merge(base_layer, expert_data))
-        expert_config_dir = expert_dir
-        # The expert's OWN llm fragment (leaf, pre-merge) — a model-agnostic
-        # bundled expert has `llm: {}` here and resolves to the default floor.
-        expert_llm_leaf = expert_data.get("llm") or {}
-        expert_subagents = expert_data.get("subagents")
-
-    # Load the raw settings_matrix for the client to resolve per-model defaults.
-    # Do NOT apply it to merged — the client resolves based on the user's model selection.
-    raw_matrix = _load_settings_matrix(config_dir)
-    if expert_config_dir and expert_config_dir != config_dir:
-        expert_matrix_path = expert_config_dir / "model_config_matrix.yaml"
-        if expert_matrix_path.exists():
-            with open(expert_matrix_path) as f:
-                expert_parsed = yaml.safe_load(f) or {}
-            expert_settings = _project_settings_subsection(expert_parsed)
-            raw_matrix = _deep_merge(raw_matrix, expert_settings)
-
-    # Load instructions content
-    instructions_content = None
-    # Check for expert-specific instructions.md first
-    instr_path = expert_config_dir / "instructions.md"
-    if (
-        expert_id
-        not in {
-            "default",
-            "defaults",
-            "worker_base",
-            "persistent_default",
-            "persistent_defaults",
-            "session_base",
-        }
-        and instr_path.exists()
-    ):
-        instructions_content = instr_path.read_text(encoding="utf-8")
-    else:
-        # Fall back to template referenced in config
-        template_name = merged.get("workspace", {}).get(
-            "instructions_template", "instructions.md"
-        )
-        template_path = config_dir / "prompts" / template_name
-        if template_path.exists():
-            instructions_content = template_path.read_text(encoding="utf-8")
-
-    # Remove internal/sensitive keys from merged config
-    for key in ("$extends", "$ignore_keys", "connections"):
-        merged.pop(key, None)
-
-    effective = (
-        await _compute_expert_effective_models(
-            expert_llm_leaf, user_id, expert_subagents
-        )
-        if user_id
-        else None
-    )
-    return {
-        "config": merged,
-        "instructions": instructions_content,
-        "enumerate_only": enumerate_only_members(),
-        "settings_matrix": raw_matrix,
-        "effective_models": effective,
-        "resolved_role": role_used,
-    }
-
-
-@app.get("/api/experts/{expert_id}")
-async def get_expert(
-    request: Request,
-    expert_id: str,
-    type: Literal["worker", "session"] | None = None,
-    account_defaults: bool = False,
-    role: Literal["worker", "session", "subagent"] | None = None,
-) -> dict[str, Any]:
-    """Get full expert detail including merged config and instructions content.
-
-    **P4e** — gated to approved users (shared catalog metadata, not per-user).
-
-    Returns the expert's configuration (merged with defaults) and the raw
-    instructions.md content, enabling the cockpit to pre-populate the job
-    creation form.
-
-    ``account_defaults=true`` folds the caller's account fallback layer into
-    ``config`` at the precedence ``resolve_config`` uses. The New Session / New
-    Job forms pass it so what they render is what create/dispatch will resolve;
-    the expert editor must NOT, or a personal preference could be saved into a
-    shared expert. See ``_load_expert_detail``.
-
-    ``role`` resolves the expert in that role (a cross-role picker: a session
-    expert previewed as the worker a job will run) — see ``_load_expert_detail``.
-    ``type`` only selects the base behind the public base ids (``defaults`` /
-    ``worker_base`` / ``session_base``); ``role`` wins over it when both are
-    given. A subagent-library id (``config/subagents/<name>``, listed under
-    ``?type=subagent``) is served here too, on the subagent overlay by default.
-    """
-    user = await require_approved_user(request, postgres_db)
-    _uid = str(user["id"])
-
-    # DB-backed expert (UUID): the detail payload is self-contained.
-    if _is_experts_db_enabled() and _looks_like_uuid(expert_id):
-        visible = await user_visible_project_ids(user, postgres_db)
-        row = await postgres_db.get_expert_visible_by_id(
-            expert_id,
-            user_id=_uid,
-            project_ids=[] if visible == "all" else [str(p) for p in visible],
-            is_admin=bool(user.get("is_admin")),
-        )
-        detail = (
-            await _load_expert_detail(
-                expert_id,
-                user_id=_uid,
-                include_account_defaults=account_defaults,
-                role=role,
-            )
-            if row
-            else {}
-        )
-        if not detail:
-            raise HTTPException(
-                status_code=404, detail=f"Expert not found: {expert_id}"
-            )
-        return detail
-
-    if expert_id in {
-        "default",
-        "defaults",
-        "worker_base",
-        "persistent_default",
-        "persistent_defaults",
-        "session_base",
-    }:
-        # "defaults" is a virtual expert representing the framework base for
-        # the requested agent type. Worker remains the backward-compatible
-        # default; session creation explicitly requests session_base.
-        detail = await _load_expert_detail(
-            expert_id,
-            user_id=_uid,
-            defaults_type=type,
-            include_account_defaults=account_defaults,
-            role=role,
-        )
-        if not detail:
-            raise HTTPException(status_code=404, detail="Defaults config not found")
-        return detail
-
-    # Verify the bundled expert (or subagent-library entry) exists.
-    expert_info = _listed_expert(expert_id)
-    if not expert_info:
-        raise HTTPException(status_code=404, detail=f"Expert not found: {expert_id}")
-
-    detail = await _load_expert_detail(
-        expert_id, user_id=_uid, include_account_defaults=account_defaults, role=role
-    )
-    if not detail:
-        raise HTTPException(
-            status_code=404, detail=f"Expert config not found: {expert_id}"
-        )
-
-    return {
-        **expert_info.model_dump(),
-        **detail,
-    }
-
-
-# =============================================================================
-# User-Defined Experts: DB-backed CRUD + import/export (Slice 1)
-# =============================================================================
-# Restored from 8334fb3c (removed by 6f8c635e). WRITE surface only — config
-# resolution stays orchestrator-side in services/config_resolver.py (the agent
-# is a pure executor). The save-time hard-deny scan is the credential boundary;
-# per-user grants are Slice 2. Gated by EXPERTS_DB_ENABLED, which is on by default;
-# false is retained as an emergency compatibility mode.
-
-# Prompt segments a DB expert may carry (mirrors
-# config_resolver._OVERLAY_PROMPT_KEYS). persona+instructions are v1 (migration
-# 0028); strategic/tactical/summarization are Part 2 (full prompt parity). The DB
-# column is open JSONB, so this allow-list is the write-side guard.
-_ALLOWED_EXPERT_PROMPT_KEYS = {
-    "persona",
-    "instructions",
-    "strategic",
-    "tactical",
-    "summarization",
-}
-
-
-def _validate_expert_prompts(v: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Validate the DB-expert prompt boundary (defense-in-depth)."""
-    if v:
-        unknown = set(v) - _ALLOWED_EXPERT_PROMPT_KEYS
-        if unknown:
-            raise ValueError(f"Unknown prompt keys: {sorted(unknown)}")
-    from shared.runtime.core.expert_resolution import (
-        validate_expert_persona_placeholders,
+    return model_catalog_routes.ModelCatalogDependencies(
+        service=ModelCatalogService(
+            store=postgres_db,
+            probe=probe_endpoint_models,
+            get_config_dir=resources.get_config_dir,
+            load_settings_matrix=resources.load_settings_matrix,
+            settings_for_family=loader.bundled_settings_for_family,
+            family_detector=family_matcher.detect_family,
+            reasoning_capability=loader.reasoning_capability,
+        ),
+        require_admin=_require_admin,
+        require_approved_user=approved_user,
     )
 
-    return validate_expert_persona_placeholders(v)
 
+def _config_catalog_dependencies() -> config_catalog_routes.ConfigCatalogDependencies:
+    from shared.runtime.core import loader
 
-def _validate_expert_prompt_source_or_422(
-    prompts: dict[str, Any] | None,
-) -> dict[str, Any] | None:
-    """Reject an invalid stored/bundled copy source as an authoring error."""
-    try:
-        return _validate_expert_prompts(prompts)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-
-class ExpertCreate(BaseModel):
-    """Create a DB-backed expert (Slice 1: hard-deny validated; grants in S2)."""
-
-    name: str = Field(..., pattern=r"^[a-z][a-z0-9_-]*$", max_length=100)
-    display_name: str = Field(..., min_length=1, max_length=200)
-    expert_type: Literal["worker", "session"]
-    description: str | None = None
-    icon: str = "smart_toy"
-    color: str = Field("#6B7280", pattern=r"^#[0-9A-Fa-f]{6}$")
-    tags: list[str] = []
-    config: dict[str, Any] = {}
-    prompts: dict[str, Any] = {}
-
-    @field_validator("prompts")
-    @classmethod
-    def _check_prompts(cls, v: dict[str, Any]) -> dict[str, Any]:
-        return _validate_expert_prompts(v)
-
-
-class ExpertUpdate(BaseModel):
-    """Patch a DB expert; expert_type is immutable (decision 3) so it is absent."""
-
-    display_name: str | None = Field(None, min_length=1, max_length=200)
-    description: str | None = None
-    icon: str | None = None
-    color: str | None = Field(None, pattern=r"^#[0-9A-Fa-f]{6}$")
-    tags: list[str] | None = None
-    config: dict[str, Any] | None = None
-    prompts: dict[str, Any] | None = None
-
-    @field_validator("prompts")
-    @classmethod
-    def _check_prompts(cls, v: dict[str, Any] | None) -> dict[str, Any] | None:
-        return _validate_expert_prompts(v)
-
-
-class SkillInfo(BaseModel):
-    """Skill catalog metadata for discovery (the L1 'menu' entry)."""
-
-    id: str
-    name: str
-    display_name: str
-    description: str
-    icon: str = "extension"
-    color: str = "#6B7280"
-    tags: list[str] = []
-
-
-class SkillCreate(BaseModel):
-    """Create a DB-backed skill from its file tree (must include SKILL.md).
-
-    name + description are parsed from SKILL.md frontmatter, not sent separately."""
-
-    files: dict[str, str]
-    display_name: str | None = Field(None, max_length=200)
-    icon: str = "extension"
-    color: str = Field("#6B7280", pattern=r"^#[0-9A-Fa-f]{6}$")
-    tags: list[str] = []
-
-
-class SkillUpdate(BaseModel):
-    """Patch a DB skill; name is immutable (derived from SKILL.md) so it is absent."""
-
-    files: dict[str, str] | None = None
-    display_name: str | None = Field(None, min_length=1, max_length=200)
-    icon: str | None = None
-    color: str | None = Field(None, pattern=r"^#[0-9A-Fa-f]{6}$")
-    tags: list[str] | None = None
-    is_global: bool | None = None
-
-
-def _require_experts_db() -> None:
-    """The DB-experts feature is fully behind EXPERTS_DB_ENABLED."""
-    if not _is_experts_db_enabled():
-        raise HTTPException(status_code=404, detail="DB-backed experts are not enabled")
-
-
-def _validate_expert_fragment(config: dict[str, Any]) -> dict[str, Any]:
-    """Gate an expert's authored fragment; return it in canonical form.
-
-    Two independent checks, and the second was missing for the whole of this
-    feature's life:
-
-    1. **Credentials** — reject credential sections (decision 10, hard-deny),
-       422 as before.
-    2. **The tools vocabulary** — the same
-       :func:`~src.core.tool_policy.validate_tool_override_fragment` every other
-       write boundary runs, 400 as everywhere else. An expert's ``config`` is an
-       authored config layer merged under every job and session it drives, and
-       the credential scan cannot see a *cross-category smuggle*:
-       ``tools.canvas: ["run_command"]`` was storable by any approved user,
-       invisible to the grants PDP (which keys off the category name) and bound
-       as shell by ``load_tools`` (which regroups by *registry* category).
-
-    It also closes a quieter one: a stored fragment is normalised on the way OUT
-    (``expert_resolution.build_expert_config``), so a shape
-    ``normalize_tool_policy`` refuses — ``tools.shell: true`` — was storable and
-    then made the expert unresolvable. Refusing here turns a later resolve
-    failure into an immediate 400.
-
-    3. **The roster** (U1 WP4) — a ``subagents`` block is checked the way the
-       resolver will read it: the shape, every ``$ref`` (a bundled / library
-       ref must exist on disk and its ``$extends`` chain must be sane; a DB
-       ref is a UUID whose visibility to the author is the async half,
-       :func:`_require_visible_roster_refs`) — 422, an authoring error like
-       the credential scan — and each entry's ``tools`` through the same
-       vocabulary gate as the top level (400). Dispatch never fails a job
-       over a roster; the save is where a broken one is refused.
-
-    Returns the fragment with ``tools`` normalised to ``list[str]`` (at the
-    top level and in every roster entry), so callers persist the canonical
-    form and the save-time PDP (which reads ``_truthy(tools.get(...))``, and
-    gets ``{}`` / ``{only: []}`` backwards) only ever sees a list.
-
-    4. **Legacy delegation** (U3 WP4) — a fragment re-submitted from a row
-       authored before U3 may still grant ``spawn_subagent`` /
-       ``delegate_work`` (mapped to ``delegate_agent`` by the shared tools
-       gate) and carry ``delegation.mode`` / ``.light`` / the heavy-path
-       timeouts (dropped by ``normalize_delegation_block``); the row is
-       persisted canonical, so the managed seed rows never 422 on their next
-       edit.
-    """
-    from shared.runtime.core.expert_resolution import hard_deny_scan
-    from shared.runtime.core.loader import normalize_delegation_block
-    from shared.runtime.core.subagent_roster import (
-        RosterResolutionError,
-        validate_roster_fragment,
+    return config_catalog_routes.ConfigCatalogDependencies(
+        service=ConfigCatalogService(
+            store=postgres_db,
+            # Preserve the original catalogue's loader project-root path;
+            # do not substitute _get_config_dir if its override differs.
+            project_root=loader.get_project_root,
+            settings_for_family=loader.bundled_settings_for_family,
+            guardrails_for_family=loader.bundled_guardrails_for_family,
+            prompt_resolver=loader.PromptMatrixResolver,
+            instruction_resolver=loader.InstructionMatrixResolver,
+        ),
+        require_admin=_require_admin,
     )
 
-    offending = hard_deny_scan(config)
-    if offending:
-        raise HTTPException(
-            status_code=422,
-            detail="config may not set credential sections: "
-            + ", ".join(sorted(offending)),
+
+def _expert_catalog_service() -> ExpertCatalogService:
+    """Bind current stores/policy to this application's shared catalogue state."""
+    resources = app.state.catalogue_resources
+    return ExpertCatalogService(
+        ExpertCatalogDependencies(
+            store=postgres_db,
+            state=app.state.expert_catalog_state,
+            get_config_dir=resources.get_config_dir,
+            load_settings_matrix=resources.load_settings_matrix,
+            experts_enabled=_is_experts_db_enabled,
+            skills_enabled=_is_skills_db_enabled,
+            account_defaults_layer=_account_defaults_layer,
+            visible_project_ids=user_visible_project_ids,
+            with_validated_tool_overrides=_with_validated_tool_overrides,
+            looks_like_uuid=_looks_like_uuid,
+            forge=gitea_client,
         )
-    validated = (
-        normalize_delegation_block(
-            _with_validated_tool_overrides(config), source="expert-save"
-        )
-        or {}
-    )
-    subagents = validated.get("subagents")
-    if subagents is None:
-        return validated
-    try:
-        validate_roster_fragment(subagents)
-    except RosterResolutionError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    if "roster" not in subagents:
-        return validated
-    canonical_roster: dict[str, Any] = {}
-    for name, entry in (subagents.get("roster") or {}).items():
-        try:
-            canonical_roster[str(name)] = _with_validated_tool_overrides(entry)
-        except HTTPException as exc:
-            raise HTTPException(
-                status_code=exc.status_code,
-                detail=f"subagents.roster.{name}: {exc.detail}",
-            ) from exc
-    return {**validated, "subagents": {**subagents, "roster": canonical_roster}}
-
-
-async def _require_visible_roster_refs(
-    config: dict[str, Any] | None, *, user: dict[str, Any]
-) -> None:
-    """The async half of the roster ``$ref`` check (U1 B.3): every DB expert
-    a fragment's ``subagents.roster`` names must be visible to the AUTHOR
-    (owned, global, or linked to one of the author's projects) — 422
-    otherwise. A ref that passes here is materialised at dispatch by id
-    (``_prefetch_roster_refs``); one the author cannot see is refused at
-    save rather than silently dropped later. Runs on create / update /
-    import (the authored writes); no database call when the roster names no
-    DB ref."""
-    from shared.runtime.core.subagent_roster import collect_roster_db_refs
-
-    refs = collect_roster_db_refs(config or {})
-    if not refs:
-        return
-    visible = await user_visible_project_ids(user, postgres_db)
-    pids = [] if visible == "all" else [str(p) for p in visible]
-    for ref in sorted(refs):
-        row = await postgres_db.get_expert_visible_by_id(
-            ref,
-            user_id=str(user["id"]),
-            project_ids=pids,
-            is_admin=bool(user.get("is_admin")),
-        )
-        if not row:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    f"subagents.roster: $ref {ref!r} is not an expert visible to "
-                    "you (own it, or select a global / project-linked expert)"
-                ),
-            )
-
-
-# ── Skills (Agent Skills, Slice 1) ────────────────────────────────────────
-# Cache bundled skills at startup (mirrors _experts_cache).
-_skills_cache: list[SkillInfo] | None = None
-
-
-def _require_skills_db() -> None:
-    """The DB-skills feature is fully behind SKILLS_DB_ENABLED."""
-    if not _is_skills_db_enabled():
-        raise HTTPException(status_code=404, detail="DB-backed skills are not enabled")
-
-
-def _validate_skill_frontmatter(frontmatter: dict[str, Any]) -> None:
-    """Reject credential sections in SKILL.md frontmatter (reuses expert deny-scan)."""
-    from shared.runtime.core.expert_resolution import hard_deny_scan
-
-    offending = hard_deny_scan(frontmatter)
-    if offending:
-        raise HTTPException(
-            status_code=422,
-            detail="SKILL.md frontmatter may not set credential sections: "
-            + ", ".join(sorted(offending)),
-        )
-
-
-def _parse_skill_bundle(files: dict[str, str]) -> tuple[str, str, dict[str, str]]:
-    """Validate paths, parse SKILL.md, deny-scan. Returns (name, description, files)."""
-    from shared.runtime.core.skill_resolution import is_reserved_system_skill_name
-    from shared.runtime.core.skill_format import (
-        SkillFormatError,
-        parse_skill_md,
-        skill_identity,
-        validate_skill_files,
     )
 
-    try:
-        validate_skill_files(files)
-        fm, _body = parse_skill_md(files["SKILL.md"])
-        name, description = skill_identity(fm)
-    except SkillFormatError as e:
-        raise HTTPException(status_code=422, detail=str(e)) from e
-    if is_reserved_system_skill_name(name):
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"Skill name '{name}' is reserved for a managed SRW product "
-                "artifact; use a distinct name for extensions"
-            ),
+
+def _expert_catalog_dependencies() -> (
+    expert_catalog_routes.ExpertCatalogRouteDependencies
+):
+    """Compose catalogue HTTP guards and request-bound canonical save policy."""
+    from functools import partial
+
+    catalog = _expert_catalog_service()
+    authoring = ExpertAuthoringService(
+        store=postgres_db,
+        catalog=catalog,
+        resolve_default_models=_resolve_default_models,
+        prefetch_roster_refs=_prefetch_roster_refs,
+    )
+
+    async def approved_user(request: Request) -> dict[str, Any]:
+        return await require_approved_user(request, postgres_db)
+
+    async def project_member(
+        request: Request, project_id: str, *, allow_archived: bool = True
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        return await require_project_member(
+            request, postgres_db, project_id, allow_archived=allow_archived
         )
-    _validate_skill_frontmatter(fm)
-    return name, description, files
 
+    async def project_owner(
+        request: Request, project_id: str, *, allow_archived: bool = True
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        return await require_project_owner(
+            request, postgres_db, project_id, allow_archived=allow_archived
+        )
 
-def _skill_row_to_meta(row: dict[str, Any]) -> dict[str, Any]:
-    """Project a skills row into the catalog metadata shape."""
-    return {
-        "id": str(row["id"]),
-        "name": row["name"],
-        "display_name": row["display_name"],
-        "description": row.get("description") or "",
-        "icon": row["icon"],
-        "color": row["color"],
-        "tags": row.get("tags") or [],
-        "version": row.get("version"),
-        "owner_id": str(row["owner_id"]) if row.get("owner_id") else None,
-    }
-
-
-def _scan_skills() -> list[SkillInfo]:
-    """Scan config/skills/<name>/SKILL.md for bundled skills.
-
-    A skill whose frontmatter says ``catalog: hidden`` (the worker's phase
-    skills, U2) is not a catalog entry: it never enters the model-invoked
-    menu, a session's skill list or the cockpit's bundled list. It still
-    reaches an agent through a deterministic ``instruction_files`` binding
-    (frozen by ``serialize_resolved_config`` straight from disk) and stays
-    readable with ``use_skill`` once materialised.
-    """
-    from shared.runtime.core.skill_format import (
-        SkillFormatError,
-        is_catalog_hidden,
-        parse_skill_md,
-        skill_identity,
+    return expert_catalog_routes.ExpertCatalogRouteDependencies(
+        catalog=catalog,
+        authoring=authoring,
+        require_approved_user=approved_user,
+        require_admin=_require_admin,
+        require_project_member=project_member,
+        require_project_owner=project_owner,
+        write_policy_factory=lambda request: ExpertWritePolicy(
+            enforce_save=partial(_enforce_expert_save, request),
+            enforce_save_prelude=partial(_enforce_expert_save_prelude, request),
+            strip_save_grants=_strip_save_grants,
+        ),
     )
-
-    skills_dir = _get_config_dir() / "skills"
-    skills: list[SkillInfo] = []
-    if not skills_dir.is_dir():
-        return skills
-    for entry in sorted(skills_dir.iterdir()):
-        skill_md = entry / "SKILL.md"
-        if not entry.is_dir() or not skill_md.exists():
-            continue
-        try:
-            fm, _ = parse_skill_md(skill_md.read_text(encoding="utf-8"))
-            if is_catalog_hidden(fm):
-                continue
-            name, description = skill_identity(fm)
-            skills.append(
-                SkillInfo(
-                    id=entry.name,
-                    name=name,
-                    display_name=fm.get("display_name", name.replace("-", " ").title()),
-                    description=description,
-                    icon=fm.get("icon", "extension"),
-                    color=fm.get("color", "#6B7280"),
-                    tags=fm.get("tags", []),
-                )
-            )
-        except (SkillFormatError, OSError, ValueError) as e:
-            logger.warning(f"Failed to parse bundled skill {skill_md}: {e}")
-    return skills
-
-
-def _bundled_skill_bundle(skill_name: str) -> dict[str, Any] | None:
-    """Read a bundled skill's full directory into a metadata + files dict."""
-    from shared.runtime.core.skill_format import (
-        parse_skill_md,
-        skill_identity,
-        validate_skill_path,
-    )
-
-    skill_dir = _get_config_dir() / "skills" / skill_name
-    skill_md = skill_dir / "SKILL.md"
-    if not skill_dir.is_dir() or not skill_md.exists():
-        return None
-    files: dict[str, str] = {}
-    for fp in sorted(skill_dir.rglob("*")):
-        if not fp.is_file():
-            continue
-        rel = str(fp.relative_to(skill_dir))
-        try:
-            validate_skill_path(rel)
-            files[rel] = fp.read_text(encoding="utf-8")
-        except (ValueError, UnicodeDecodeError):
-            continue
-    fm, _ = parse_skill_md(files["SKILL.md"])
-    name, description = skill_identity(fm)
-    return {
-        "id": skill_name,
-        "name": name,
-        "display_name": fm.get("display_name", name.replace("-", " ").title()),
-        "description": description,
-        "icon": fm.get("icon", "extension"),
-        "color": fm.get("color", "#6B7280"),
-        "tags": fm.get("tags", []),
-        "files": files,
-    }
 
 
 async def _gather_in_scope_skills(
     user_id: str | None, project_ids: list[str] | None = None
 ) -> dict[str, Any]:
-    """Build the resolved-blob skills payload: the precedence-deduped menu plus
-    the file tree for each winning skill. Bundled (disk) + DB (owned + global).
-    Returns {} when skills are disabled or there is no user. Slice 2."""
-    from shared.runtime.core.skill_resolution import (
-        is_reserved_system_skill_name,
-        resolve_skill_menu,
-    )
-
-    if not _is_skills_db_enabled() or not user_id:
-        return {}
-
-    global _skills_cache
-    if _skills_cache is None:
-        _skills_cache = _scan_skills()
-
-    rows: list[dict[str, Any]] = []
-    for s in _skills_cache:
-        # Managed system skills are injected only by the persistent-session
-        # runtime. They are intentionally absent from autonomous worker
-        # catalogs and cannot participate in ordinary DB precedence.
-        if is_reserved_system_skill_name(s.name):
-            continue
-        rows.append(
-            {
-                **s.model_dump(),
-                "owner_id": None,
-                "is_global": False,
-                "created_at": "",
-                "_source": "bundled",
-                "_ref": s.id,  # bundled dir name
-            }
-        )
-    for r in await postgres_db.list_skills_visible(user_id=str(user_id)):
-        if is_reserved_system_skill_name(str(r.get("name", ""))):
-            continue
-        rows.append(
-            {
-                **_skill_row_to_meta(r),
-                "owner_id": str(r["owner_id"]) if r.get("owner_id") else None,
-                "is_global": r["is_global"],
-                "created_at": str(r.get("created_at", "")),
-                "_source": "global" if r["is_global"] else "user",
-                "_ref": str(r["id"]),
-            }
-        )
-
-    menu_rows = resolve_skill_menu(
-        rows, user_id=str(user_id), project_ids=set(project_ids or [])
-    )
-
-    menu: list[dict[str, Any]] = []
-    files: dict[str, dict[str, str]] = {}
-    for row in menu_rows:
-        menu.append(
-            {
-                "id": row.get("id"),
-                "name": row["name"],
-                "display_name": row.get("display_name"),
-                "description": row.get("description") or "",
-                "icon": row.get("icon"),
-                "color": row.get("color"),
-                "tags": row.get("tags") or [],
-            }
-        )
-        if row["_source"] == "bundled":
-            bundle = _bundled_skill_bundle(row["_ref"])
-            if bundle:
-                files[row["name"]] = bundle["files"]
-        else:
-            files[row["name"]] = await postgres_db.get_skill_files(row["_ref"])
-
-    return {"menu": menu, "files": files}
-
-
-async def _create_forked_skill(
-    src: dict[str, Any],
-    owner_id: str,
-    suffix: str = "copy",
-    *,
-    prefer_original: bool = False,
-) -> dict[str, Any]:
-    """Create an owned skill from a source dict. ``prefer_original`` (import) tries
-    the source name first and only suffixes on collision, storing the SKILL.md
-    verbatim so a clean import->export round-trips byte-for-byte; duplicate always
-    suffixes ``-copy``. The SKILL.md 'name' is rewritten only when the slug changes."""
-    from shared.runtime.core.skill_format import set_skill_name
-
-    base_name = src["name"]
-    candidates = [base_name] if prefer_original else []
-    candidates.append(f"{base_name}-{suffix}")
-    candidates += [f"{base_name}-{suffix}-{i}" for i in range(2, 8)]
-    for cand in candidates:
-        name = cand[:100]
-        renamed = name != base_name
-        files = dict(src["files"])
-        if renamed:
-            files["SKILL.md"] = set_skill_name(src["files"]["SKILL.md"], name)
-        display = (
-            f"{src['display_name']} ({suffix})" if renamed else src["display_name"]
-        )
-        try:
-            return await postgres_db.create_skill(
-                name=name,
-                display_name=display[:200],
-                description=src.get("description"),
-                icon=src.get("icon", "extension"),
-                color=src.get("color", "#6B7280"),
-                tags=src.get("tags") or [],
-                owner_id=owner_id,
-                files=files,
-            )
-        except HTTPException:
-            raise
-        except Exception as e:
-            if "uq_skills_name_owner" in str(e):
-                continue
-            raise
-    raise HTTPException(status_code=409, detail="No free name for the copy")
+    """B05 compatibility for session preparation, job dispatch and resume."""
+    return await _expert_catalog_service().gather_in_scope_skills(user_id, project_ids)
 
 
 def _bundled_expert_bundle(expert_id: str) -> dict[str, Any] | None:
-    """Portable bundle from a bundled (disk) expert: raw config.yaml fragment
-    (minus $extends/connections) + persona/instructions files + cache metadata.
-    None if not found. expert_type is inferred from $extends."""
-    global _experts_cache
-    if _experts_cache is None:
-        _experts_cache = _scan_experts()
-    info = next((e for e in _experts_cache if e.id == expert_id), None)
-    if not info:
-        return None
-    expert_dir = _get_config_dir() / "experts" / expert_id
-    config_path = expert_dir / "config.yaml"
-    if not config_path.exists():
-        return None
-    raw = yaml.safe_load(config_path.read_text()) or {}
-    extends = canonical_config_name(str(raw.pop("$extends", "worker_base")))
-    raw.pop("connections", None)
-    # Part 2: capture all prompt segments a fork should round-trip.
-    # strategic/tactical come from the expert-local phase skills (U2: the
-    # bodies of skills/<phase>-phase/SKILL.md), keeping the DB shape — at
-    # delivery they are the fenced <expert_workflow> addendum of the phase block.
-    prompts: dict[str, Any] = {}
-    for key, fname in (
-        ("persona", "persona.txt"),
-        ("instructions", "instructions.md"),
-        ("summarization", "summarization_prompt.txt"),
-    ):
-        fp = expert_dir / fname
-        if fp.exists():
-            prompts[key] = fp.read_text(encoding="utf-8")
-    prompts.update(expert_phase_prompt_bodies(expert_dir))
-    return {
-        "name": expert_id,
-        "display_name": info.display_name,
-        "description": info.description,
-        "icon": info.icon,
-        "color": info.color,
-        "tags": info.tags,
-        "expert_type": "session" if extends == "session_base" else "worker",
-        "config": raw,
-        "prompts": prompts,
-    }
-
-
-def _db_expert_to_bundle_src(row: dict[str, Any]) -> dict[str, Any]:
-    """Normalize a DB expert row into the bundle-source shape (JSONB str-tolerant)."""
-    cfg = row.get("config") or {}
-    if isinstance(cfg, str):
-        cfg = json.loads(cfg)
-    prm = row.get("prompts") or {}
-    if isinstance(prm, str):
-        prm = json.loads(prm)
-    return {
-        "name": row["name"],
-        "display_name": row["display_name"],
-        "expert_type": row["expert_type"],
-        "description": row.get("description"),
-        "icon": row["icon"],
-        "color": row["color"],
-        "tags": row.get("tags") or [],
-        "config": cfg,
-        "prompts": prm,
-    }
-
-
-async def _create_forked_expert(
-    src: dict[str, Any], owner_id: str, suffix: str = "copy"
-) -> dict[str, Any]:
-    """Create an owned expert from a bundle dict, suffixing the name on collision
-    (decision 4/27 fork-on-copy)."""
-    from shared.runtime.core.expert_resolution import with_role_tag
-
-    base_name = src["name"]
-    name = f"{base_name}-{suffix}"[:100]
-    prompts = _validate_expert_prompt_source_or_422(src.get("prompts") or {}) or {}
-    for attempt in range(6):
-        try:
-            return await postgres_db.create_expert(
-                name=name,
-                display_name=f"{src['display_name']} ({suffix})"[:200],
-                expert_type=src["expert_type"],
-                owner_id=owner_id,
-                description=src.get("description"),
-                icon=src.get("icon", "smart_toy"),
-                color=src.get("color", "#6B7280"),
-                tags=with_role_tag(src["expert_type"], src.get("tags")),
-                config=src.get("config") or {},
-                prompts=prompts,
-            )
-        except HTTPException:
-            raise
-        except Exception as e:
-            if "uq_experts_name_owner" in str(e):
-                name = f"{base_name}-{suffix}-{attempt + 1}"[:100]
-                continue
-            raise
-    raise HTTPException(status_code=409, detail="No free name for the copy")
-
-
-@app.post("/api/experts")
-async def create_expert(request: Request, body: ExpertCreate) -> dict[str, Any]:
-    """Create an owned DB expert. Slice 1: hard-deny validated, no grants yet.
-    The stored ``tags`` always carry the role (``tags ∪ {expert_type}``, U1)."""
-    from shared.runtime.core.expert_resolution import with_role_tag
-
-    _require_experts_db()
-    user = await require_approved_user(request, postgres_db)
-    if body.config:
-        body.config = _validate_expert_fragment(body.config)
-        await _require_visible_roster_refs(body.config, user=user)
-    await _enforce_expert_save(request, body.config or {}, user=user)
-    try:
-        return await postgres_db.create_expert(
-            name=body.name,
-            display_name=body.display_name,
-            expert_type=body.expert_type,
-            owner_id=str(user["id"]),
-            description=body.description,
-            icon=body.icon,
-            color=body.color,
-            tags=with_role_tag(body.expert_type, body.tags),
-            config=body.config,
-            prompts=body.prompts,
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        if "uq_experts_name_owner" in str(e):
-            raise HTTPException(
-                status_code=409,
-                detail=f"You already have an expert named '{body.name}'",
-            ) from e
-        raise
-
-
-@app.put("/api/experts/{expert_id}")
-async def update_expert(
-    request: Request, expert_id: str, body: ExpertUpdate
-) -> dict[str, Any]:
-    """Update an owned DB expert (owner or admin). Bundled experts have no row."""
-    _require_experts_db()
-    user = await require_approved_user(request, postgres_db)
-    if not _looks_like_uuid(expert_id):
-        raise HTTPException(status_code=403, detail="Bundled experts are read-only")
-    existing = await postgres_db.get_expert_by_id(expert_id)
-    if not existing:
-        raise HTTPException(status_code=404, detail="Expert not found")
-    if str(existing["owner_id"]) != str(user["id"]) and not user.get("is_admin"):
-        raise HTTPException(
-            status_code=403, detail="Only the owner may edit this expert"
-        )
-    if body.config is not None:
-        body.config = _validate_expert_fragment(body.config)
-        await _require_visible_roster_refs(body.config, user=user)
-    await _enforce_expert_save(request, body.config or {}, user=user)
-    fields = body.model_dump(exclude_unset=True)
-    if "tags" in fields:
-        # tags ∪ {role}: the row's role tag survives every tag edit (U1 B.4).
-        from shared.runtime.core.expert_resolution import with_role_tag
-
-        fields["tags"] = with_role_tag(existing["expert_type"], fields["tags"])
-    updated = await postgres_db.update_expert(
-        expert_id, updated_by=str(user["id"]), **fields
-    )
-    if updated and existing.get("managed_key"):
-        await postgres_db.record_managed_expert_update(
-            expert_id=expert_id,
-            expert_type=existing["expert_type"],
-            actor_user_id=str(user["id"]),
-        )
-    return updated
-
-
-@app.delete("/api/experts/{expert_id}")
-async def delete_expert(request: Request, expert_id: str) -> dict[str, Any]:
-    """Delete an owned DB expert (owner or admin). Blocks (409) while
-    live-referenced (decision 15)."""
-    _require_experts_db()
-    user = await require_approved_user(request, postgres_db)
-    if not _looks_like_uuid(expert_id):
-        raise HTTPException(status_code=403, detail="Bundled experts cannot be deleted")
-    existing = await postgres_db.get_expert_by_id(expert_id)
-    if not existing:
-        raise HTTPException(status_code=404, detail="Expert not found")
-    if existing.get("managed_key"):
-        raise HTTPException(
-            status_code=409,
-            detail="Managed platform experts cannot be deleted; change the application default instead",
-        )
-    if str(existing["owner_id"]) != str(user["id"]) and not user.get("is_admin"):
-        raise HTTPException(
-            status_code=403, detail="Only the owner may delete this expert"
-        )
-    blockers = await postgres_db.expert_delete_blockers(expert_id)
-    if blockers:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "message": "Expert is in use; repoint or remove these first",
-                "blockers": blockers,
-            },
-        )
-    await postgres_db.delete_expert(expert_id)
-    return {"deleted": True}
-
-
-@app.post("/api/experts/{expert_id}/duplicate")
-async def duplicate_expert(request: Request, expert_id: str) -> dict[str, Any]:
-    """Fork any visible expert (bundled or DB) into an owned copy — 'start from
-    scholar' (decision 4: copy, not live link)."""
-    _require_experts_db()
-    user = await require_approved_user(request, postgres_db)
-    if _looks_like_uuid(expert_id):
-        visible = await user_visible_project_ids(user, postgres_db)
-        row = await postgres_db.get_expert_visible_by_id(
-            expert_id,
-            user_id=str(user["id"]),
-            project_ids=[] if visible == "all" else [str(p) for p in visible],
-            is_admin=bool(user.get("is_admin")),
-        )
-        if not row:
-            raise HTTPException(status_code=404, detail="Expert not found")
-        src = _db_expert_to_bundle_src(row)
-    else:
-        src = _bundled_expert_bundle(expert_id)
-        if not src:
-            raise HTTPException(status_code=404, detail="Expert not found")
-    # A fork is a new write by a new principal, and the source row may be
-    # someone else's (visibility, not ownership, is the test above). Validating
-    # here is what stops a legacy smuggled fragment being copied forward — the
-    # same reason `fork_my_expert_default` validates its source. Both
-    # `_bundled_expert_bundle` and `_db_expert_to_bundle_src` build a fresh
-    # dict, so assigning into `src` cannot corrupt a cache or the source row.
-    src["config"] = _validate_expert_fragment(src.get("config") or {})
-    # Fifth of five expert-write routes. The other four call
-    # _enforce_expert_save right after validating theirs — the kill-switch
-    # half of that is NOT optional here just because the row already existed:
-    # without it, a user can mint an owned DB expert by copying any VISIBLE
-    # expert (not necessarily their own) while the administrator has
-    # user_experts disabled. Grants are a different story on this one route
-    # (2026-08-04 decision): the source config may be another principal's and
-    # commonly needs a grant the copier does not hold and should not have to
-    # ask for — measured, that refused 7 of the 11 shipped experts, including
-    # `scholar`, this route's own advertised use ("start from scholar"). So
-    # this strips what the copier's grants forbid and reports it, instead of
-    # refusing outright the way the other four routes still do.
-    await _enforce_expert_save_prelude(request)
-    src["config"], dropped = await _strip_save_grants(src["config"], user=user)
-    forked = await _create_forked_expert(src, str(user["id"]), suffix="copy")
-    return {**forked, "dropped": dropped}
-
-
-@app.get("/api/experts/{expert_id}/export")
-async def export_expert(request: Request, expert_id: str) -> dict[str, Any]:
-    """Serialize an expert to a portable bundle (decision 27). DB experts export
-    their raw fragment; bundled experts export their on-disk config."""
-    from shared.runtime.core.expert_resolution import to_export_bundle
-
-    _require_experts_db()
-    user = await require_approved_user(request, postgres_db)
-    if _looks_like_uuid(expert_id):
-        visible = await user_visible_project_ids(user, postgres_db)
-        row = await postgres_db.get_expert_visible_by_id(
-            expert_id,
-            user_id=str(user["id"]),
-            project_ids=[] if visible == "all" else [str(p) for p in visible],
-            is_admin=bool(user.get("is_admin")),
-        )
-        if not row:
-            raise HTTPException(status_code=404, detail="Expert not found")
-        return to_export_bundle(_db_expert_to_bundle_src(row))
-    bundle = _bundled_expert_bundle(expert_id)
-    if not bundle:
-        raise HTTPException(status_code=404, detail="Expert not found")
-    return to_export_bundle(bundle)
-
-
-@app.post("/api/experts/import")
-async def import_expert(request: Request, body: ExpertCreate) -> dict[str, Any]:
-    """Create an owned expert from a posted bundle (decision 27). Same validation
-    as create; fork-on-import (name collision -> suffix)."""
-    from shared.runtime.core.expert_resolution import with_role_tag
-
-    _require_experts_db()
-    user = await require_approved_user(request, postgres_db)
-    if body.config:
-        body.config = _validate_expert_fragment(body.config)
-        await _require_visible_roster_refs(body.config, user=user)
-    await _enforce_expert_save(request, body.config or {}, user=user)
-    name = body.name
-    for attempt in range(6):
-        try:
-            return await postgres_db.create_expert(
-                name=name,
-                display_name=body.display_name,
-                expert_type=body.expert_type,
-                owner_id=str(user["id"]),
-                description=body.description,
-                icon=body.icon,
-                color=body.color,
-                tags=with_role_tag(body.expert_type, body.tags),
-                config=body.config,
-                prompts=body.prompts,
-            )
-        except HTTPException:
-            raise
-        except Exception as e:
-            if "uq_experts_name_owner" in str(e):
-                name = (
-                    f"{body.name}-import"
-                    if attempt == 0
-                    else f"{body.name}-import-{attempt}"
-                )
-                continue
-            raise
-    raise HTTPException(status_code=409, detail="No free name for the import")
-
-
-# =============================================================================
-# DB-backed application / personal / project expert defaults
-# =============================================================================
-
-
-class ExpertDefaultSetRequest(BaseModel):
-    expert_id: str
-
-
-class ExpertDefaultForkRequest(BaseModel):
-    expert_id: str | None = None
-
-
-def _default_expert_summary(row: dict[str, Any] | None) -> dict[str, Any] | None:
-    if not row:
-        return None
-    return {
-        "id": str(row["id"]),
-        "name": row["name"],
-        "display_name": row["display_name"],
-        "description": row.get("description") or "",
-        "icon": row.get("icon") or "smart_toy",
-        "color": row.get("color") or "#6B7280",
-        "tags": row.get("tags") or [],
-        "expert_type": row["expert_type"],
-        "owner_id": str(row["owner_id"]) if row.get("owner_id") else None,
-        "is_global": bool(row.get("is_global")),
-        "managed_key": row.get("managed_key"),
-        "storage_kind": "db",
-    }
-
-
-@app.get("/api/expert-defaults")
-async def get_my_expert_defaults(
-    request: Request, project_id: str | None = None
-) -> dict[str, Any]:
-    """Effective and editable personal defaults for the current user."""
-    _require_experts_db()
-    user = await require_approved_user(request, postgres_db)
-    uid = str(user["id"])
-    if project_id:
-        await require_project_member(request, postgres_db, project_id)
-    allowed = await personal_defaults_allowed(
-        postgres_db,
-        user_id=uid,
-        project_ids=[project_id] if project_id else [],
-        is_admin=bool(user.get("is_admin")),
-    )
-    slots: dict[str, Any] = {}
-    for expert_type in ("worker", "session"):
-        application = await postgres_db.get_application_expert_default(expert_type)
-        personal = await postgres_db.get_user_expert_default(
-            user_id=uid, expert_type=expert_type
-        )
-        try:
-            selection = await resolve_root_expert(
-                postgres_db,
-                expert_type=expert_type,
-                user_id=uid,
-                project_id=project_id,
-                is_admin=bool(user.get("is_admin")),
-            )
-            effective = selection.expert
-            effective_source = selection.source
-        except DefaultExpertUnavailable:
-            effective = None
-            effective_source = "application"
-        slots[expert_type] = {
-            "application": _default_expert_summary(application),
-            "personal": _default_expert_summary(personal),
-            "effective": _default_expert_summary(effective),
-            "source": effective_source,
-        }
-    return {"personal_defaults_allowed": allowed, "defaults": slots}
-
-
-@app.put("/api/expert-defaults/{expert_type}")
-async def set_my_expert_default(
-    request: Request,
-    expert_type: Literal["worker", "session"],
-    body: ExpertDefaultSetRequest,
-) -> dict[str, Any]:
-    _require_experts_db()
-    user = await require_approved_user(request, postgres_db)
-    uid = str(user["id"])
-    if not await personal_defaults_allowed(
-        postgres_db, user_id=uid, is_admin=bool(user.get("is_admin"))
-    ):
-        raise HTTPException(
-            status_code=403,
-            detail="Your administrator has disabled personal default experts",
-        )
-    try:
-        await postgres_db.set_user_expert_default(
-            user_id=uid, expert_type=expert_type, expert_id=body.expert_id
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    row = await postgres_db.get_user_expert_default(
-        user_id=uid, expert_type=expert_type
-    )
-    return {"default": _default_expert_summary(row), "source": "user"}
-
-
-@app.delete("/api/expert-defaults/{expert_type}")
-async def clear_my_expert_default(
-    request: Request, expert_type: Literal["worker", "session"]
-) -> dict[str, Any]:
-    """Clear is intentionally allowed even after the grant is revoked."""
-    _require_experts_db()
-    user = await require_approved_user(request, postgres_db)
-    deleted = await postgres_db.clear_user_expert_default(
-        user_id=str(user["id"]), expert_type=expert_type
-    )
-    application = await postgres_db.get_application_expert_default(expert_type)
-    return {
-        "deleted": deleted,
-        "default": _default_expert_summary(application),
-        "source": "application",
-    }
-
-
-@app.post("/api/expert-defaults/{expert_type}/fork")
-async def fork_my_expert_default(
-    request: Request,
-    expert_type: Literal["worker", "session"],
-    body: ExpertDefaultForkRequest,
-) -> dict[str, Any]:
-    """Atomically copy a visible expert and select the owned copy as default.
-
-    Two independent 403 gates precede any write, and neither is optional:
-    `personal_defaults_allowed` (this route's own switch — a personal default
-    may be disabled while user-defined experts generally are not) and then
-    the `user_experts` kill switch inside `_enforce_expert_save_prelude` (the
-    same switch every expert-write route shares). Do not reorder or merge
-    them.
-    """
-    _require_experts_db()
-    user = await require_approved_user(request, postgres_db)
-    uid = str(user["id"])
-    if not await personal_defaults_allowed(
-        postgres_db, user_id=uid, is_admin=bool(user.get("is_admin"))
-    ):
-        raise HTTPException(
-            status_code=403,
-            detail="Your administrator has disabled personal default experts",
-        )
-
-    if body.expert_id and not _looks_like_uuid(body.expert_id):
-        source = _bundled_expert_bundle(body.expert_id)
-        if not source:
-            raise HTTPException(status_code=404, detail="Expert not found")
-        if source["expert_type"] != expert_type:
-            raise HTTPException(status_code=422, detail="Expert type does not match")
-    else:
-        try:
-            selection = await resolve_root_expert(
-                postgres_db,
-                expert_type=expert_type,
-                user_id=uid,
-                explicit_expert_id=body.expert_id,
-                is_admin=bool(user.get("is_admin")),
-            )
-        except ExpertSelectionError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        except DefaultExpertUnavailable as exc:
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
-        source = _db_expert_to_bundle_src(selection.expert)
-
-    source["config"] = _validate_expert_fragment(source.get("config") or {})
-    source["prompts"] = (
-        _validate_expert_prompt_source_or_422(source.get("prompts") or {}) or {}
-    )
-    # Same 2026-08-04 decision as duplicate_expert (task 3 of the plan above):
-    # this is `duplicate` plus "select the copy as my default", and its source
-    # config carries the identical 7-of-11 exposure — a bundled expert or
-    # another principal's DB row commonly needs a grant this caller does not
-    # hold (measured, this blocked `scholar`, the one this route's set-default
-    # UI actually offers to fork from). Strip what the caller's grants forbid
-    # and report it, instead of refusing outright. `_enforce_expert_save_prelude`
-    # still runs first (kill-switch + raw scan), unconditionally, before either
-    # gate below — `_strip_save_grants` re-runs `evaluate` on the STRIPPED
-    # result and 422s if anything survives, so an incomplete strip map can only
-    # ever produce a false refusal here, never a permitted escape.
-    await _enforce_expert_save_prelude(request)
-    # A default SLOT is per role, so a DB source must match it too (the
-    # bundled branch above refuses the same way) — even though an explicit
-    # cross-role pick is allowed for a root job or session since U1 (D4:
-    # `validate_explicit_expert` logs, not refuses). After the shared gates,
-    # like every other route-local check.
-    if source.get("expert_type") != expert_type:
-        raise HTTPException(status_code=422, detail="Expert type does not match")
-    from shared.runtime.core.expert_resolution import with_role_tag
-
-    source["tags"] = with_role_tag(expert_type, source.get("tags"))
-    source["config"], dropped = await _strip_save_grants(source["config"], user=user)
-    try:
-        row = await postgres_db.fork_and_set_user_expert_default(
-            user_id=uid, expert_type=expert_type, source=source
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    return {
-        "default": _default_expert_summary(row),
-        "source": "user",
-        "dropped": dropped,
-    }
-
-
-@app.get("/api/admin/expert-defaults")
-async def get_application_expert_defaults(request: Request) -> dict[str, Any]:
-    _require_experts_db()
-    await _require_admin(request)
-    rows = await postgres_db.list_application_expert_defaults()
-    by_type = {row["expert_type"]: _default_expert_summary(row) for row in rows}
-    return {"defaults": by_type}
-
-
-@app.put("/api/admin/expert-defaults/{expert_type}")
-async def set_application_expert_default(
-    request: Request,
-    expert_type: Literal["worker", "session"],
-    body: ExpertDefaultSetRequest,
-) -> dict[str, Any]:
-    _require_experts_db()
-    admin = await _require_admin(request)
-    target = await postgres_db.get_expert_by_id(body.expert_id)
-    if not target:
-        raise HTTPException(status_code=404, detail="Expert not found")
-    if target.get("expert_type") != expert_type:
-        raise HTTPException(
-            status_code=422, detail="Expert type does not match default slot"
-        )
-    if not target.get("is_global"):
-        raise HTTPException(
-            status_code=422, detail="Application defaults must be global experts"
-        )
-
-    # Admins may author broader profiles, but an application default must fit
-    # the deployment-wide grant floor or ordinary users could be assigned a
-    # profile that can never dispatch. User/project restrictions are still
-    # evaluated later for the actual runner.
-    from orchestrator.services.grants_service import resolve_grants_for
-    from shared.runtime.core.capability_grants import evaluate
-
-    capture: dict[str, Any] = {}
-    resolve_config(
-        base_config_name=BASE_CONFIG_NAMES[expert_type],
-        base_defaults=await _resolve_default_models(None),
-        expert_row=target,
-        expert_type=expert_type,
-        capture=capture,
-        db_refs=await _prefetch_roster_refs(expert_row=target),
-    )
-    global_grants = await resolve_grants_for(postgres_db, user_id=None, project_ids=[])
-    violations = evaluate(capture["merged_fragment"], global_grants)
-    if violations:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "Application default exceeds the deployment capability floor: "
-                + "; ".join(violations)
-            ),
-        )
-    try:
-        await postgres_db.set_application_expert_default(
-            expert_type=expert_type,
-            expert_id=body.expert_id,
-            actor_user_id=str(admin["id"]),
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    row = await postgres_db.get_application_expert_default(expert_type)
-    return {"default": _default_expert_summary(row)}
-
-
-@app.put("/api/projects/{project_id}/expert-defaults/{expert_type}")
-async def set_project_expert_default(
-    request: Request,
-    project_id: str,
-    expert_type: Literal["worker", "session"],
-    body: ExpertDefaultSetRequest,
-) -> dict[str, Any]:
-    _require_experts_db()
-    user, _project = await require_project_owner(
-        request, postgres_db, project_id, allow_archived=False
-    )
-    visible = await postgres_db.get_expert_visible_by_id(
-        body.expert_id,
-        user_id=str(user["id"]),
-        project_ids=[project_id],
-        is_admin=bool(user.get("is_admin")),
-    )
-    if not visible:
-        raise HTTPException(status_code=404, detail="Expert not found")
-    try:
-        await postgres_db.set_project_default_expert(
-            project_id=project_id,
-            expert_type=expert_type,
-            expert_id=body.expert_id,
-            actor_user_id=str(user["id"]),
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    row = await postgres_db.get_project_default_expert(
-        project_id=project_id, expert_type=expert_type
-    )
-    return {"default": _default_expert_summary(row)}
-
-
-@app.delete("/api/projects/{project_id}/expert-defaults/{expert_type}")
-async def clear_project_expert_default(
-    request: Request,
-    project_id: str,
-    expert_type: Literal["worker", "session"],
-) -> dict[str, Any]:
-    _require_experts_db()
-    user, _project = await require_project_owner(request, postgres_db, project_id)
-    return {
-        "deleted": await postgres_db.clear_project_default_expert(
-            project_id=project_id,
-            expert_type=expert_type,
-            actor_user_id=str(user["id"]),
-        )
-    }
-
-
-# =============================================================================
-# Skill Endpoints (Agent Skills, Slice 1)
-# =============================================================================
-
-
-@app.post("/api/skills")
-async def create_skill(request: Request, body: SkillCreate) -> dict[str, Any]:
-    """Create an owned DB skill from its file tree (Slice 1: deny-scan validated)."""
-    _require_skills_db()
-    user = await require_approved_user(request, postgres_db)
-    name, description, files = _parse_skill_bundle(body.files)
-    try:
-        return await postgres_db.create_skill(
-            name=name,
-            display_name=body.display_name or name,
-            description=description,
-            icon=body.icon,
-            color=body.color,
-            tags=body.tags,
-            owner_id=str(user["id"]),
-            files=files,
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        if "uq_skills_name_owner" in str(e):
-            raise HTTPException(
-                status_code=409, detail=f"You already have a skill named '{name}'"
-            ) from e
-        raise
-
-
-@app.get("/api/skills")
-async def list_skills(request: Request) -> list[dict[str, Any]]:
-    """List skills: bundled (disk) + DB rows visible to the caller (owned + global),
-    each tagged with ``source``. Read-only; tags-and-concatenates (precedence is a
-    Slice-2 resolver concern)."""
-    user = await require_approved_user(request, postgres_db)
-    global _skills_cache
-    if _skills_cache is None:
-        _skills_cache = _scan_skills()
-    result = [{**s.model_dump(), "source": "bundled"} for s in _skills_cache]
-    if _is_skills_db_enabled():
-        rows = await postgres_db.list_skills_visible(user_id=str(user["id"]))
-        result += [
-            {
-                **_skill_row_to_meta(r),
-                "source": "global" if r["is_global"] else "user",
-            }
-            for r in rows
-        ]
-    return result
-
-
-@app.post("/api/skills/reload")
-async def reload_skills(request: Request) -> dict[str, Any]:
-    """Force reload of bundled skill cache. **Admin only**."""
-    await _require_admin(request)
-    global _skills_cache
-    _skills_cache = _scan_skills()
-    return {"status": "reloaded", "count": len(_skills_cache)}
-
-
-@app.get("/api/skills/{skill_id}")
-async def get_skill(request: Request, skill_id: str) -> dict[str, Any]:
-    """Full skill detail (metadata + file tree). DB skill by UUID, else bundled."""
-    await require_approved_user(request, postgres_db)
-    if _is_skills_db_enabled() and _looks_like_uuid(skill_id):
-        row = await postgres_db.get_skill_by_id(skill_id)
-        if not row:
-            raise HTTPException(status_code=404, detail=f"Skill not found: {skill_id}")
-        files = await postgres_db.get_skill_files(skill_id)
-        return {
-            **_skill_row_to_meta(row),
-            "source": "global" if row["is_global"] else "user",
-            "files": files,
-        }
-    bundle = _bundled_skill_bundle(skill_id)
-    if not bundle:
-        raise HTTPException(status_code=404, detail=f"Skill not found: {skill_id}")
-    return {**bundle, "source": "bundled"}
-
-
-@app.put("/api/skills/{skill_id}")
-async def update_skill(
-    request: Request, skill_id: str, body: SkillUpdate
-) -> dict[str, Any]:
-    """Update an owned DB skill (owner or admin). Bundled skills are read-only.
-    ``name`` is immutable — an edited SKILL.md whose frontmatter name differs is
-    rejected (rename = create a new skill)."""
-    _require_skills_db()
-    user = await require_approved_user(request, postgres_db)
-    if not _looks_like_uuid(skill_id):
-        raise HTTPException(status_code=403, detail="Bundled skills are read-only")
-    existing = await postgres_db.get_skill_by_id(skill_id)
-    if not existing:
-        raise HTTPException(status_code=404, detail="Skill not found")
-    if str(existing["owner_id"]) != str(user["id"]) and not user.get("is_admin"):
-        raise HTTPException(
-            status_code=403, detail="Only the owner may edit this skill"
-        )
-    from shared.runtime.core.skill_resolution import is_reserved_system_skill_name
-
-    if is_reserved_system_skill_name(str(existing.get("name", ""))):
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"Skill name '{existing['name']}' is reserved for a managed SRW "
-                "product artifact and cannot be updated"
-            ),
-        )
-    fields = body.model_dump(exclude_unset=True, exclude={"files"})
-    files = body.files
-    if files is not None:
-        name, description, files = _parse_skill_bundle(files)
-        if name != existing["name"]:
-            raise HTTPException(
-                status_code=422,
-                detail=f"SKILL.md name '{name}' must match the skill's name "
-                f"'{existing['name']}'; create a new skill to rename",
-            )
-        fields["description"] = description
-    return await postgres_db.update_skill(
-        skill_id, updated_by=str(user["id"]), files=files, **fields
-    )
-
-
-@app.delete("/api/skills/{skill_id}")
-async def delete_skill(request: Request, skill_id: str) -> dict[str, Any]:
-    """Delete an owned DB skill (owner or admin). Files cascade away."""
-    _require_skills_db()
-    user = await require_approved_user(request, postgres_db)
-    if not _looks_like_uuid(skill_id):
-        raise HTTPException(status_code=403, detail="Bundled skills cannot be deleted")
-    existing = await postgres_db.get_skill_by_id(skill_id)
-    if not existing:
-        raise HTTPException(status_code=404, detail="Skill not found")
-    if str(existing["owner_id"]) != str(user["id"]) and not user.get("is_admin"):
-        raise HTTPException(
-            status_code=403, detail="Only the owner may delete this skill"
-        )
-    await postgres_db.delete_skill(skill_id)
-    return {"deleted": True}
-
-
-@app.post("/api/skills/{skill_id}/duplicate")
-async def duplicate_skill(request: Request, skill_id: str) -> dict[str, Any]:
-    """Fork any visible skill (bundled or DB) into an owned copy."""
-    _require_skills_db()
-    user = await require_approved_user(request, postgres_db)
-    if _looks_like_uuid(skill_id):
-        row = await postgres_db.get_skill_by_id(skill_id)
-        if not row:
-            raise HTTPException(status_code=404, detail="Skill not found")
-        src = {
-            **_skill_row_to_meta(row),
-            "files": await postgres_db.get_skill_files(skill_id),
-        }
-    else:
-        src = _bundled_skill_bundle(skill_id)
-        if not src:
-            raise HTTPException(status_code=404, detail="Skill not found")
-    return await _create_forked_skill(src, str(user["id"]))
-
-
-@app.get("/api/skills/{skill_id}/export")
-async def export_skill(request: Request, skill_id: str) -> Response:
-    """Serialize a skill to a native zipped directory (drops into .claude/skills)."""
-    from shared.runtime.core.skill_format import pack_skill_zip
-
-    _require_skills_db()
-    await require_approved_user(request, postgres_db)
-    if _looks_like_uuid(skill_id):
-        row = await postgres_db.get_skill_by_id(skill_id)
-        if not row:
-            raise HTTPException(status_code=404, detail="Skill not found")
-        name, files = row["name"], await postgres_db.get_skill_files(skill_id)
-    else:
-        bundle = _bundled_skill_bundle(skill_id)
-        if not bundle:
-            raise HTTPException(status_code=404, detail="Skill not found")
-        name, files = bundle["name"], bundle["files"]
-    return Response(
-        content=pack_skill_zip(name, files),
-        media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{name}.zip"'},
-    )
-
-
-@app.post("/api/skills/import")
-async def import_skill(
-    request: Request, file: UploadFile = File(...)
-) -> dict[str, Any]:
-    """Create an owned skill from an uploaded skill zip (fork-on-name-collision)."""
-    from shared.runtime.core.skill_format import SkillFormatError, unpack_skill_zip
-
-    _require_skills_db()
-    user = await require_approved_user(request, postgres_db)
-    try:
-        files = unpack_skill_zip(await file.read())
-    except SkillFormatError as e:
-        raise HTTPException(status_code=422, detail=str(e)) from e
-    name, description, files = _parse_skill_bundle(files)
-    src = {
-        "name": name,
-        "display_name": name.replace("-", " ").title(),
-        "description": description,
-        "files": files,
-    }
-    return await _create_forked_skill(
-        src, str(user["id"]), suffix="import", prefer_original=True
-    )
-
-
-# =============================================================================
-# Project Expert Endpoints
-# =============================================================================
-
-
-async def _get_project_jobs_repo(project_id: str) -> str | None:
-    """Get the jobs repo name for a project. Returns None if not found."""
-    repos = await postgres_db.get_project_repositories(project_id, role="jobs")
-    if not repos:
-        return None
-    return repos[0].get("name")
-
-
-@app.get("/api/projects/{project_id}/experts")
-async def list_project_experts(
-    request: Request, project_id: str
-) -> list[dict[str, Any]]:
-    """List DB-backed experts linked to a project.
-
-    During the safe migration, an old project's ``experts/`` directory remains
-    a read-only fallback when it has no structured links yet.
-    """
-    await require_project_member(request, postgres_db, project_id)
-    linked = await postgres_db.list_project_linked_experts(project_id)
-    if linked:
-        return [
-            {
-                "id": str(row["id"]),
-                "name": row["name"],
-                "display_name": row["display_name"],
-                "description": row.get("description") or "",
-                "icon": row.get("icon") or "psychology",
-                "color": row.get("color") or "#cba6f7",
-                "tags": row.get("tags") or [],
-                "expert_type": row.get("expert_type") or "worker",
-                "source": "project",
-                "storage_kind": "db",
-                "default_for": row.get("default_for"),
-            }
-            for row in linked
-        ]
-
-    if not gitea_client.is_initialized:
-        return []
-
-    repo_name = await _get_project_jobs_repo(project_id)
-    if not repo_name:
-        return []
-
-    try:
-        entries = await gitea_client.list_contents(repo_name, "experts")
-    except Exception:
-        return []
-
-    if not entries:
-        return []
-
-    experts: list[dict[str, Any]] = []
-    for entry in entries:
-        if entry.get("type") != "dir":
-            continue
-        name = entry.get("name", "")
-        try:
-            content = await gitea_client.get_file_content(
-                repo_name, f"experts/{name}/config.yaml"
-            )
-            if not content:
-                continue
-            data = yaml.safe_load(content) or {}
-
-            description = data.get("description", "").strip()
-            if not description:
-                tools = data.get("tools", {})
-                tool_categories = [k for k in tools if tools[k]]
-                description = (
-                    f"Agent with {', '.join(tool_categories)} tools."
-                    if tool_categories
-                    else "Custom agent configuration."
-                )
-
-            experts.append(
-                ExpertInfo(
-                    id=name,
-                    display_name=data.get(
-                        "display_name", name.replace("_", " ").title()
-                    ),
-                    description=description,
-                    icon=data.get("icon", "psychology"),
-                    color=data.get("color", "#cba6f7"),
-                    tags=data.get("tags", []),
-                ).model_dump()
-            )
-        except Exception as e:
-            logger.warning(f"Failed to parse project expert {name}: {e}")
-
-    return experts
-
-
-@app.get("/api/projects/{project_id}/experts/{expert_name}")
-async def get_project_expert(
-    request: Request, project_id: str, expert_name: str
-) -> dict[str, Any]:
-    """Get full detail for a linked expert, with a legacy Git fallback."""
-    caller, _ = await require_project_member(request, postgres_db, project_id)
-    linked = await postgres_db.get_project_linked_expert(project_id, expert_name)
-    if linked:
-        detail = await _load_expert_detail(str(linked["id"]), user_id=str(caller["id"]))
-        project_override = linked.get("project_config_override") or {}
-        if isinstance(project_override, str):
-            try:
-                project_override = json.loads(project_override)
-            except (json.JSONDecodeError, TypeError):
-                project_override = {}
-        if isinstance(project_override, dict) and project_override:
-            detail["config"] = _deep_merge(detail.get("config") or {}, project_override)
-        detail["name"] = linked["name"]
-        detail["source"] = "project"
-        detail["default_for"] = linked.get("default_for")
-        return detail
-
-    if not gitea_client.is_initialized:
-        raise HTTPException(status_code=503, detail="Gitea not available")
-
-    repo_name = await _get_project_jobs_repo(project_id)
-    if not repo_name:
-        raise HTTPException(status_code=404, detail="Project expert not found")
-
-    # Read config
-    config_content = await gitea_client.get_file_content(
-        repo_name, f"experts/{expert_name}/config.yaml"
-    )
-    if not config_content:
-        raise HTTPException(status_code=404, detail=f"Expert not found: {expert_name}")
-
-    try:
-        expert_data = yaml.safe_load(config_content) or {}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Invalid YAML: {e}") from e
-
-    # Build info
-    description = expert_data.get("description", "").strip()
-    if not description:
-        tools = expert_data.get("tools", {})
-        tool_categories = [k for k in tools if tools[k]]
-        description = (
-            f"Agent with {', '.join(tool_categories)} tools."
-            if tool_categories
-            else "Custom agent configuration."
-        )
-
-    info = ExpertInfo(
-        id=expert_name,
-        display_name=expert_data.get(
-            "display_name", expert_name.replace("_", " ").title()
-        ),
-        description=description,
-        icon=expert_data.get("icon", "psychology"),
-        color=expert_data.get("color", "#cba6f7"),
-        tags=expert_data.get("tags", []),
-    )
-
-    # Merge with the worker role base (Gitea-stored experts are worker experts)
-    config_dir = _get_config_dir()
-    defaults = _role_base_or_empty("worker")
-
-    expert_data_clean = dict(expert_data)
-    expert_data_clean.pop("$extends", None)
-    merged = prune_ignored_keys(_deep_merge(defaults, expert_data_clean))
-    for key in ("$extends", "$ignore_keys", "connections"):
-        merged.pop(key, None)
-
-    # Load the raw settings_matrix for the client to resolve per-model defaults.
-    # Do NOT apply it to merged — the client resolves based on the user's model selection.
-    raw_matrix = _load_settings_matrix(config_dir)
-
-    # Read instructions
-    instructions_content = await gitea_client.get_file_content(
-        repo_name, f"experts/{expert_name}/instructions.md"
-    )
-
-    return {
-        **info.model_dump(),
-        "config": merged,
-        "instructions": instructions_content,
-        "settings_matrix": raw_matrix,
-    }
+    """B05 compatibility for session configuration review."""
+    return _expert_catalog_service().bundled_expert_bundle(expert_id)
 
 
 # =============================================================================
@@ -64526,1047 +60640,99 @@ async def delete_user_api_key(request: Request, provider: str) -> dict[str, str]
 
 
 # =============================================================================
-# LLM endpoint helpers
-# Shared URL validation + response shaping for the admin provider-endpoint
-# routes below. The former user-facing Settings → LLM Endpoints CRUD was
-# removed: user-scoped endpoints were never resolvable at dispatch (the
-# per-user/system resolver hooks are unregistered and the catalog resolver
-# only joins system-scoped rows), so custom endpoints are admin-only now via
-# Admin → Providers + Admin → Models.
+# Subscription availability probes (remaining B02 transport integration)
 # =============================================================================
 
 
-def _validate_llm_endpoint_url(base_url: str, allow_insecure: bool) -> str:
-    """Basic URL sanity check. Raises HTTPException(400) on malformed input.
+async def _subscription_availability() -> dict[str, Any]:
+    """Shared body for the availability probes.
 
-    Rejects non-http(s) schemes (file://, javascript:), empty hosts, and
-    http:// URLs unless the caller explicitly opts in via allow_insecure.
+    Reports whether the proxy is reachable, how many accounts are healthy per
+    provider, and which endpoint row Discover/Add should target. Self-heals a
+    live subscription with no transport row (a CLI login, or a row an admin
+    deleted) so the next Admin → Models render lists the proxy.
     """
-    from urllib.parse import urlparse
-
-    try:
-        parsed = urlparse(base_url.strip())
-    except Exception:
-        raise HTTPException(status_code=400, detail="Malformed base_url")
-
-    if parsed.scheme not in ("http", "https"):
-        raise HTTPException(
-            status_code=400,
-            detail=f"base_url scheme must be http or https, got {parsed.scheme!r}",
-        )
-    if not parsed.netloc:
-        raise HTTPException(status_code=400, detail="base_url must include a host")
-    if parsed.scheme == "http" and not allow_insecure:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "base_url uses http:// — set allow_insecure=true to override "
-                "(not recommended outside local development)."
-            ),
-        )
-    return parsed.geturl()
-
-
-def _serialize_endpoint(row: dict[str, Any]) -> dict[str, Any]:
-    """Shape an endpoint row for the API response (key_prefix only, no full key).
-
-    The ``models`` key is kept on the response shape for Cockpit
-    compatibility but is always empty after the catalog flip — model
-    offerings live in the admin-curated ``models`` table now.
-    """
-    return {
-        "id": str(row["id"]),
-        "label": row["label"],
-        "base_url": row["base_url"],
-        "key_prefix": row.get("key_prefix"),
-        "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
-        "updated_at": row["updated_at"].isoformat() if row.get("updated_at") else None,
-        "models": [],
-    }
-
-
-# =============================================================================
-# Admin Provider Endpoints
-# System-scoped provider keys, LLM endpoints, and default-model settings.
-# Gated by the srw-admin role via _require_admin.
-# =============================================================================
-
-
-def _serialize_system_api_key(row: dict[str, Any]) -> dict[str, Any]:
-    """Shape a system_api_keys row for API responses (prefix only)."""
-    return {
-        "id": str(row["id"]),
-        "provider": row["provider"],
-        "key_prefix": row.get("key_prefix"),
-        "label": row.get("label"),
-        "seeded_from": row.get("seeded_from"),
-        "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
-        "updated_at": row["updated_at"].isoformat() if row.get("updated_at") else None,
-    }
-
-
-@app.get("/api/admin/providers/keys")
-async def admin_list_provider_keys(request: Request) -> list[dict[str, Any]]:
-    """List system-scoped provider API keys (prefix only, no full keys)."""
-    await _require_admin(request)
-    rows = await postgres_db.list_system_api_keys()
-    return [_serialize_system_api_key(r) for r in rows]
-
-
-@app.put("/api/admin/providers/keys/{provider}")
-async def admin_set_provider_key(
-    request: Request, provider: str, body: ApiKeySet
-) -> dict[str, Any]:
-    """Set or rotate the system-level API key for a provider.
-
-    On success, schedules a non-blocking discovery probe for providers
-    we know how to enumerate (see ``discovery_service.DISCOVERABLE_PROVIDERS``).
-    The discovery cache is cleared inline before the probe fires so the
-    cockpit never shows stale candidates from a previous key. When the
-    ``admin.discovery_enabled`` flag is set to ``false``, no probe runs.
-    """
-    await _require_admin(request)
-    if provider not in VALID_SYSTEM_API_KEY_PROVIDERS:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Invalid provider '{provider}'. Valid: "
-                f"{sorted(VALID_SYSTEM_API_KEY_PROVIDERS)}"
-            ),
-        )
-    row = await postgres_db.upsert_system_api_key(
-        provider=provider,
-        api_key=body.api_key,
-        key_prefix=body.api_key[:8],
-        label=body.label,
-    )
-    await _maybe_schedule_discovery(provider, body.api_key)
-    return _serialize_system_api_key(row)
-
-
-@app.delete("/api/admin/providers/keys/{provider}")
-async def admin_delete_provider_key(request: Request, provider: str) -> dict[str, str]:
-    """Remove the system-level key for a provider."""
-    await _require_admin(request)
-    deleted = await postgres_db.delete_system_api_key(provider)
-    if not deleted:
-        raise HTTPException(
-            status_code=404, detail=f"No system key for provider '{provider}'"
-        )
-    return {"status": "deleted"}
-
-
-@app.get("/api/admin/providers/keys/{provider}/discovery")
-async def admin_get_provider_discovery(
-    request: Request, provider: str
-) -> dict[str, Any]:
-    """Return the cached discovery payload for a provider key.
-
-    Powers the post-save confirmation dialog on Admin → Providers. The
-    response is ``{ready, fresh, payload, cached_at}``:
-
-    - ``ready=False`` when no probe has completed yet (e.g. the async
-      probe scheduled by the PUT side-effect is still running).
-    - ``fresh`` reflects the 24h TTL — the cockpit can prompt for an
-      explicit rediscover when stale.
-    - ``payload`` is the cockpit-ready candidate list shaped by
-      :func:`discovery_service.build_cache_payload`.
-    """
-    await _require_admin(request)
-    if provider not in VALID_SYSTEM_API_KEY_PROVIDERS:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Invalid provider '{provider}'. Valid: "
-                f"{sorted(VALID_SYSTEM_API_KEY_PROVIDERS)}"
-            ),
-        )
-    cached = await postgres_db.get_system_api_key_discovery_cache(provider)
-    if cached is None:
-        return {"ready": False, "fresh": False, "payload": None, "cached_at": None}
-    cached_at_dt = (
-        datetime.fromisoformat(cached["cached_at"]) if cached.get("cached_at") else None
-    )
-    return {
-        "ready": True,
-        "fresh": discovery_service.is_discovery_cache_fresh(cached_at_dt),
-        "payload": cached.get("payload"),
-        "cached_at": cached.get("cached_at"),
-    }
-
-
-@app.post("/api/admin/providers/keys/{provider}/rediscover")
-async def admin_rediscover_provider_models(
-    request: Request, provider: str
-) -> dict[str, Any]:
-    """Force-refresh the discovery cache for a provider key.
-
-    Useful when the provider released new models since the cache was
-    populated, or when the admin wants to retry after a transient probe
-    failure. Returns the freshly-cached payload (synchronous probe — the
-    button blocks until results come back, like an explicit "test" click).
-    """
-    await _require_admin(request)
-    if provider not in VALID_SYSTEM_API_KEY_PROVIDERS:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Invalid provider '{provider}'. Valid: "
-                f"{sorted(VALID_SYSTEM_API_KEY_PROVIDERS)}"
-            ),
-        )
-    if provider not in discovery_service.DISCOVERABLE_PROVIDERS:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Provider '{provider}' has no discovery source. "
-                "Add models manually via Admin → Models."
-            ),
-        )
-    if not await _discovery_enabled():
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "Auto-discovery is disabled "
-                "(admin.discovery_enabled = false in system_settings)."
-            ),
-        )
-    api_key = await postgres_db.get_system_api_key(provider)
-    if not api_key:
-        raise HTTPException(
-            status_code=404, detail=f"No system key for provider '{provider}'"
-        )
-    candidates = await discovery_service.discover_models(provider, api_key)
-    payload = discovery_service.build_cache_payload(provider, candidates)
-    await postgres_db.set_system_api_key_discovery_cache(provider, payload)
-    return {
-        "ready": True,
-        "fresh": True,
-        "payload": payload,
-        "cached_at": payload["fetched_at"],
-    }
-
-
-async def _discovery_enabled() -> bool:
-    """Return whether admin auto-discovery is enabled (system setting,
-    default True). Operators flip this off when they want catalog growth
-    to be a deliberate manual action."""
-    row = await postgres_db.get_system_setting("admin.discovery_enabled")
-    if row is None:
-        return True
-    value = row.get("value")
-    if isinstance(value, dict):
-        return bool(value.get("enabled", True))
-    return bool(value)
-
-
-async def _maybe_schedule_discovery(provider: str, api_key: str) -> None:
-    """Clear the cache for a key and fire an async probe if applicable.
-
-    The probe runs as a fire-and-forget task so the PUT route returns as
-    quickly as today; the cockpit polls ``GET .../discovery`` to render
-    the confirmation dialog when results land. Errors are swallowed by
-    ``discover_models`` so a failed probe never blocks key-save.
-    """
-    if provider not in discovery_service.DISCOVERABLE_PROVIDERS:
-        return
-    if not await _discovery_enabled():
-        return
-    await postgres_db.set_system_api_key_discovery_cache(provider, None)
-
-    async def _probe() -> None:
-        candidates = await discovery_service.discover_models(provider, api_key)
-        payload = discovery_service.build_cache_payload(provider, candidates)
-        await postgres_db.set_system_api_key_discovery_cache(provider, payload)
-
-    asyncio.create_task(_probe())
-
-
-# =============================================================================
-# Admin -> Prompts (DB-backed prompt overrides, v1)
-# =============================================================================
-
-
-def load_config_catalog() -> list[dict[str, Any]]:
-    """Human-facing descriptions for editable prompt keys.
-
-    Read from config/prompts/catalog.yaml (shipped with the image). Missing
-    file -> empty list.
-    """
-    import yaml
-
-    from shared.runtime.core.loader import get_project_root
-
-    path = get_project_root() / "config" / "prompts" / "catalog.yaml"
-    if not path.exists():
-        return []
-    return yaml.safe_load(path.read_text()) or []
-
-
-def _config_catalog_entry(kind: str, name: str) -> dict[str, Any] | None:
-    for entry in load_config_catalog():
-        if entry.get("kind") == kind and entry.get("name") == name:
-            return entry
-    return None
-
-
-def validate_override_value(kind: str, name: str, value: Any) -> None:
-    """Validate a structured (settings/guardrails) override value against the
-    catalog. Raises HTTPException(422) on unknown key, wrong type, or out-of-bounds.
-
-    Text kinds are validated by the Pydantic model (min_length) and are a no-op
-    here. Fail-closed on write; reads stay fail-open (see the loader).
-    """
-    if kind not in ("settings", "guardrails"):
-        return
-    entry = _config_catalog_entry(kind, name)
-    if entry is None:
-        raise HTTPException(status_code=422, detail=f"unknown {kind} key: {name!r}")
-    vtype = entry.get("type")
-    if vtype in ("number", "integer"):
-        # bool is a subclass of int — reject it for numeric leaves.
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise HTTPException(status_code=422, detail=f"{name} must be a {vtype}")
-        if vtype == "integer" and isinstance(value, float) and not value.is_integer():
-            raise HTTPException(status_code=422, detail=f"{name} must be an integer")
-        lo, hi = entry.get("min"), entry.get("max")
-        if lo is not None and value < lo:
-            raise HTTPException(status_code=422, detail=f"{name} must be >= {lo}")
-        if hi is not None and value > hi:
-            raise HTTPException(status_code=422, detail=f"{name} must be <= {hi}")
-    elif vtype == "boolean":
-        if not isinstance(value, bool):
-            raise HTTPException(status_code=422, detail=f"{name} must be a boolean")
-    elif vtype == "enum":
-        choices = entry.get("enum", [])
-        if value not in choices:
-            raise HTTPException(
-                status_code=422, detail=f"{name} must be one of {choices}"
-            )
-    elif vtype == "json":
-        if not isinstance(value, dict):
-            raise HTTPException(status_code=422, detail=f"{name} must be a JSON object")
-    # Unknown/absent type -> accept (forward-compatible with new catalog types).
-
-
-def read_bundled_config(kind: str, family: str | None, name: str) -> Any:
-    """Read the shipped (bundled) value for (kind, family, name), bypassing overrides.
-
-    Returns text for prompts/instructions; the file-resolved value for settings
-    (a single leaf) and guardrails (the {tool_examples, nudges} dict).
-    """
-    from shared.runtime.core.loader import (
-        InstructionMatrixResolver,
-        PromptMatrixResolver,
-        bundled_guardrails_for_family,
-        bundled_settings_for_family,
-    )
-
-    if kind == "settings":
-        return bundled_settings_for_family(family or "default", name)
-    if kind == "guardrails":
-        return bundled_guardrails_for_family(family or "default")
-
-    resolver_cls = {
-        "prompts": PromptMatrixResolver,
-        "instructions": InstructionMatrixResolver,
-    }.get(kind)
-    if resolver_cls is None:
-        raise HTTPException(status_code=400, detail=f"unknown kind: {kind!r}")
-    resolver = resolver_cls(None, family or "default")
-    try:
-        return resolver.load(name, bundled_only=True)
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="no bundled default for that key")
-
-
-@app.get("/api/admin/config/overrides")
-async def admin_list_config_overrides(request: Request) -> list[dict[str, Any]]:
-    """List all prompt overrides (system-wide)."""
-    await _require_admin(request)
-    return await postgres_db.list_config_overrides()
-
-
-@app.get("/api/admin/config/overrides/{override_id}")
-async def admin_get_config_override(
-    request: Request, override_id: str
-) -> dict[str, Any]:
-    """Fetch a single prompt override by id."""
-    await _require_admin(request)
-    row = await postgres_db.get_config_override(override_id)
-    if not row:
-        raise HTTPException(status_code=404, detail="override not found")
-    return row
-
-
-@app.post("/api/admin/config/overrides")
-async def admin_create_config_override(
-    request: Request, body: ConfigOverrideCreate
-) -> dict[str, Any]:
-    """Create or replace the override for (family, kind, name)."""
-    user = await _require_admin(request)
-    is_text = body.kind in ("prompts", "instructions")
-    if not is_text:
-        validate_override_value(body.kind, body.name, body.value_json)
-    return await postgres_db.upsert_config_override(
-        family=body.family,
-        kind=body.kind,
-        name=body.name,
-        content=body.content,
-        content_format=body.content_format if is_text else None,
-        value_json=body.value_json,
-        notes=body.notes,
-        user_id=user.get("id"),
-    )
-
-
-@app.put("/api/admin/config/overrides/{override_id}")
-async def admin_update_config_override(
-    request: Request, override_id: str, body: ConfigOverrideUpdate
-) -> dict[str, Any]:
-    """Update an existing override's payload (family/kind/name are immutable)."""
-    user = await _require_admin(request)
-    existing = await postgres_db.get_config_override(override_id)
-    if not existing:
-        raise HTTPException(status_code=404, detail="override not found")
-    kind = existing["kind"]
-    if kind in ("prompts", "instructions"):
-        if body.content is None:
-            raise HTTPException(
-                status_code=422, detail="content is required for this kind"
-            )
-        content, content_format, value_json = body.content, body.content_format, None
-    else:  # settings, guardrails
-        if body.value_json is None:
-            raise HTTPException(
-                status_code=422, detail="value_json is required for this kind"
-            )
-        validate_override_value(kind, existing["name"], body.value_json)
-        content, content_format, value_json = None, None, body.value_json
-    return await postgres_db.upsert_config_override(
-        family=existing["family"],
-        kind=kind,
-        name=existing["name"],
-        content=content,
-        content_format=content_format,
-        value_json=value_json,
-        notes=body.notes,
-        user_id=user.get("id"),
-    )
-
-
-@app.delete("/api/admin/config/overrides/{override_id}")
-async def admin_delete_config_override(
-    request: Request, override_id: str
-) -> dict[str, Any]:
-    """Delete an override (reset to the bundled default)."""
-    await _require_admin(request)
-    if not await postgres_db.delete_config_override(override_id):
-        raise HTTPException(status_code=404, detail="override not found")
-    return {"deleted": True}
-
-
-@app.get("/api/admin/config/catalog")
-async def admin_config_catalog(request: Request) -> list[dict[str, Any]]:
-    """List the editable prompt keys with human descriptions."""
-    await _require_admin(request)
-    return load_config_catalog()
-
-
-@app.get("/api/admin/config/bundled/{family}/{kind}/{name}")
-async def admin_get_bundled_config(
-    request: Request, family: str, kind: str, name: str
-) -> dict[str, Any]:
-    """Return the bundled (shipped) default for a key, plus its catalog entry.
-
-    ``family='_'`` stands in for the global/default family.
-    """
-    await _require_admin(request)
-    fam = None if family == "_" else family
-    return {
-        "family": fam,
-        "kind": kind,
-        "name": name,
-        "content": read_bundled_config(kind, fam, name),
-        "catalog": _config_catalog_entry(kind, name),
-    }
-
-
-@app.get("/api/admin/providers/endpoints")
-async def admin_list_provider_endpoints(request: Request) -> list[dict[str, Any]]:
-    """List system-scoped LLM endpoints with their models."""
-    await _require_admin(request)
-    rows = await postgres_db.list_system_llm_endpoints()
-    return [_serialize_endpoint(r) for r in rows]
-
-
-@app.post("/api/admin/providers/endpoints")
-async def admin_create_provider_endpoint(
-    request: Request, body: LlmEndpointCreate
-) -> dict[str, Any]:
-    """Create a new system-scoped LLM endpoint (visible to every user)."""
-    await _require_admin(request)
-    base_url = _validate_llm_endpoint_url(body.base_url, body.allow_insecure)
-    key_prefix = body.api_key[:8] if body.api_key else None
-    try:
-        row = await postgres_db.create_system_llm_endpoint(
-            label=body.label,
-            base_url=base_url,
-            api_key=body.api_key,
-            key_prefix=key_prefix,
-        )
-    except Exception as e:
-        if "uq_llm_endpoint_label_system" in str(e):
-            raise HTTPException(
-                status_code=409,
-                detail=f"A system endpoint labeled {body.label!r} already exists.",
-            )
-        raise
-    row["models"] = []
-    return _serialize_endpoint(row)
-
-
-@app.patch("/api/admin/providers/endpoints/{endpoint_id}")
-async def admin_update_provider_endpoint(
-    request: Request, endpoint_id: str, body: LlmEndpointUpdate
-) -> dict[str, Any]:
-    await _require_admin(request)
-    base_url = None
-    if body.base_url is not None:
-        base_url = _validate_llm_endpoint_url(body.base_url, body.allow_insecure)
-    key_prefix = body.api_key[:8] if body.api_key else None
-
-    row = await postgres_db.update_system_llm_endpoint(
-        endpoint_id=endpoint_id,
-        label=body.label,
-        base_url=base_url,
-        api_key=body.api_key,
-        key_prefix=key_prefix,
-        clear_api_key=body.clear_api_key and body.api_key is None,
-    )
-    if row is None:
-        raise HTTPException(status_code=404, detail="System endpoint not found")
-    row["models"] = []
-    return _serialize_endpoint(row)
-
-
-@app.delete("/api/admin/providers/endpoints/{endpoint_id}")
-async def admin_delete_provider_endpoint(
-    request: Request, endpoint_id: str
-) -> dict[str, str]:
-    await _require_admin(request)
-    deleted = await postgres_db.delete_system_llm_endpoint(endpoint_id)
-    if not deleted:
-        raise HTTPException(status_code=404, detail="System endpoint not found")
-    return {"status": "deleted"}
-
-
-@app.post("/api/admin/providers/endpoints/{endpoint_id}/test")
-async def admin_test_provider_endpoint(
-    request: Request, endpoint_id: str
-) -> dict[str, Any]:
-    """Probe a system endpoint by calling ``GET {base_url}/models`` server-side."""
-    await _require_admin(request)
-    endpoint = await postgres_db.get_system_llm_endpoint(endpoint_id)
-    if endpoint is None:
-        raise HTTPException(status_code=404, detail="System endpoint not found")
-
-    result = await probe_endpoint_models(
-        base_url=endpoint["base_url"],
-        api_key=endpoint.get("api_key"),
-    )
-    return {
-        "ok": result.ok,
-        "status": result.status,
-        "error": result.error,
-        "probe_url": result.probe_url,
-    }
-
-
-@app.post("/api/admin/providers/endpoints/{endpoint_id}/discover")
-async def admin_discover_provider_endpoint_models(
-    request: Request, endpoint_id: str
-) -> dict[str, Any]:
-    """Return the model list served by ``GET {base_url}/models`` (admin).
-
-    Discovery is read-only — admins author catalog rows via Admin → Models
-    using the endpoint as the transport reference. The legacy
-    ``already_registered`` field is gone (the endpoint itself no longer
-    owns model rows after the catalog flip).
-    """
-    await _require_admin(request)
-    endpoint = await postgres_db.get_system_llm_endpoint(endpoint_id)
-    if endpoint is None:
-        raise HTTPException(status_code=404, detail="System endpoint not found")
-
-    result = await probe_endpoint_models(
-        base_url=endpoint["base_url"],
-        api_key=endpoint.get("api_key"),
-    )
-
-    return {
-        "ok": result.ok,
-        "status": result.status,
-        "error": result.error,
-        "probe_url": result.probe_url,
-        "models": result.models,
-    }
-
-
-@app.get("/api/admin/providers/codex/availability")
-async def admin_codex_availability(request: Request) -> dict[str, Any]:
-    """Report whether the codex proxy is configured AND has an active account.
-
-    Used by Admin → Models to decide whether to surface "Codex proxy" as a
-    model source. ``available`` is true only when the proxy is reachable
-    AND at least one auth file is active (not disabled, not unavailable).
-    Catalog wiring is deliberate: when ``available`` is true and
-    ``endpoint_id`` is set, the frontend can route Discover/Add flows to
-    the existing /api/admin/providers/endpoints/{id} routes — no codex-
-    specific UI plumbing required.
-    """
-    await _require_admin(request)
-    # Same fallback as _codex_proxy_request and ensure_codex_proxy_endpoint —
-    # a local stack with CODEX_PROXY_URL unset is a fully supported config.
-    proxy_url = os.getenv("CODEX_PROXY_URL", "http://localhost:8317")
-
-    # Locate the seeded codex-proxy endpoint (init.py creates it when
-    # CODEX_PROXY_URL is set; admins may also have deleted it).
     endpoint_id: str | None = None
     for row in await postgres_db.list_system_llm_endpoints():
-        if row.get("label") == CODEX_PROXY_ENDPOINT_LABEL:
+        if _endpoint_is_subscription_proxy(row):
             endpoint_id = str(row["id"])
             break
 
     try:
-        auth_resp = await _codex_proxy_request("GET", "/v0/management/auth-files")
-        auth_files = auth_resp.json()
-    except HTTPException:
+        accounts = await subscriptions.list_accounts(use_cache=False)
+    except SubscriptionProxyError as exc:
         return {
             "available": False,
+            "reachable": False,
+            "error": exc.message,
             "account_count": 0,
+            "accounts": [],
             "models": [],
-            "proxy_url": proxy_url,
+            "proxy_url": subscriptions.proxy_base_url(),
             "endpoint_id": endpoint_id,
         }
 
-    accounts = (
-        auth_files if isinstance(auth_files, list) else auth_files.get("files", [])
-    )
-    active = [a for a in accounts if not a.get("disabled") and not a.get("unavailable")]
-
+    healthy = [a for a in accounts if a.healthy]
     models: list[str] = []
-    if active:
-        try:
-            models_resp = await _codex_proxy_request("GET", "/v1/models")
-            data = models_resp.json()
-            models = [
-                m["id"] if isinstance(m, dict) else m for m in data.get("data", [])
-            ]
-        except HTTPException:
-            pass
-
-    # Self-heal: a live subscription with no transport row means a CLI login
-    # (or a previously-deleted row) bypassed the cockpit's wire-up path.
-    # Create the row now so the next Admin → Models render lists the proxy.
-    if endpoint_id is None and len(active) > 0:
-        await ensure_codex_proxy_endpoint(postgres_db, proxy_url=proxy_url)
-        for row in await postgres_db.list_system_llm_endpoints():
-            if row.get("label") == CODEX_PROXY_ENDPOINT_LABEL:
-                endpoint_id = str(row["id"])
-                break
+    if healthy:
+        models = sorted(await subscription_discovery.advertised_model_ids())
+        if endpoint_id is None:
+            await _wire_subscription_endpoint()
+            for row in await postgres_db.list_system_llm_endpoints():
+                if _endpoint_is_subscription_proxy(row):
+                    endpoint_id = str(row["id"])
+                    break
 
     return {
-        "available": len(active) > 0,
-        "account_count": len(active),
+        "available": bool(healthy),
+        "reachable": True,
+        "error": None,
+        "account_count": len(healthy),
+        "accounts": [a.to_public() for a in healthy],
         "models": models,
-        "proxy_url": proxy_url,
+        "proxy_url": subscriptions.proxy_base_url(),
         "endpoint_id": endpoint_id,
+        "transport_kind": SUBSCRIPTION_PROXY_TRANSPORT,
     }
 
 
-@app.get("/api/admin/providers/defaults")
-async def admin_list_provider_defaults(request: Request) -> dict[str, str | None]:
-    """Return the currently-configured default model IDs for each workload kind."""
+@app.get("/api/admin/providers/subscriptions/availability")
+async def admin_subscriptions_availability(request: Request) -> dict[str, Any]:
+    """Report whether the subscription proxy is usable right now (admin).
+
+    Used by Admin → Models to decide whether to surface "Subscription proxy"
+    as a model source. ``available`` is true only when the proxy is reachable
+    AND at least one credential is healthy.
+    """
     await _require_admin(request)
+    return await _subscription_availability()
+
+
+@app.get("/api/admin/providers/codex/availability")
+async def admin_codex_availability(request: Request) -> dict[str, Any]:
+    """Legacy alias of the subscription availability probe (admin).
+
+    Kept for cockpit builds pinned to the Codex-only surface. The counts it
+    reports now cover every connected subscription, so a client that reads it
+    as "Codex accounts" over-counts in a mixed pool — that is precisely why the
+    cockpit moved to the route above.
+    """
+    await _require_admin(request)
+    info = await _subscription_availability()
+    # The legacy shape carried no `accounts` array; drop it rather than hand a
+    # Codex-named response a mixed-provider account list.
     return {
-        kind: await postgres_db.get_default_llm_model(kind)
-        for kind in sorted(VALID_DEFAULT_MODEL_KINDS)
+        "available": info["available"],
+        "account_count": info["account_count"],
+        "models": info["models"],
+        "proxy_url": info["proxy_url"],
+        "endpoint_id": info["endpoint_id"],
     }
-
-
-@app.put("/api/admin/providers/defaults/{kind}")
-async def admin_set_provider_default(
-    request: Request, kind: str, body: AdminDefaultModelSet
-) -> dict[str, str | None]:
-    """Set or clear (empty string) the default model for a workload kind."""
-    admin = await _require_admin(request)
-    if kind not in VALID_DEFAULT_MODEL_KINDS:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Invalid kind '{kind}'. Valid: {sorted(VALID_DEFAULT_MODEL_KINDS)}"
-            ),
-        )
-    await postgres_db.set_default_llm_model(
-        kind, body.model or None, updated_by=str(admin.get("id"))
-    )
-    return {"kind": kind, "model": await postgres_db.get_default_llm_model(kind)}
 
 
 # =============================================================================
-# Admin Models Catalog API (Admin → Models)
-# Reads/writes the ``models`` table — the curated list of LLMs the application
-# offers. Each row is provider-anchored (system_api_keys or system-scoped
-# llm_endpoints). User authoring is not exposed.
+# System readiness
 # =============================================================================
-
-
-def _serialize_catalog_model(row: dict[str, Any]) -> dict[str, Any]:
-    """Shape a ``models`` row for API responses.
-
-    Single-column source of truth: only the ``capabilities`` array is on
-    the wire. Cockpit clients have been migrated to the array form.
-    """
-    from shared.runtime.core.loader import bundled_settings_for_family
-
-    explicit_window = row.get("context_window")
-    return {
-        "id": str(row["id"]),
-        "provider_kind": row["provider_kind"],
-        "provider_ref": row["provider_ref"],
-        "model_id": row["model_id"],
-        "display_label": row["display_label"],
-        "capabilities": list(row.get("capabilities") or []),
-        "family": row["family"],
-        "context_window": explicit_window,
-        # Effective window for the Admin → Models "Context" column: the explicit
-        # per-model cap when set, else the family default from the config matrix
-        # (bundled_settings_for_family merges default ⊕ family; unknown → 128000).
-        "resolved_context_window": explicit_window
-        or bundled_settings_for_family(row["family"], "model_max_context_tokens"),
-        "context_window_source": "explicit" if explicit_window else "family_default",
-        "reasoning_level": row.get("reasoning_level"),
-        "params_json": row.get("params_json"),
-        "enabled": row.get("enabled", True),
-        "seeded_from": row.get("seeded_from"),
-        "notes": row.get("notes"),
-        "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
-        "updated_at": row["updated_at"].isoformat() if row.get("updated_at") else None,
-    }
-
-
-async def _validate_catalog_provider_ref(provider_kind: str, provider_ref: str) -> None:
-    """Reject catalog inserts/updates pointing at a transport that doesn't
-    exist. Keeps the catalog from referencing stale rows after the admin
-    deletes a provider key or system endpoint.
-    """
-    if provider_kind == "system":
-        if provider_ref not in VALID_SYSTEM_API_KEY_PROVIDERS:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Invalid system provider '{provider_ref}'. Valid: "
-                    f"{sorted(VALID_SYSTEM_API_KEY_PROVIDERS)}"
-                ),
-            )
-        existing = await postgres_db.get_system_api_key(provider_ref)
-        if not existing:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"No system_api_keys row for provider '{provider_ref}'. "
-                    "Configure via Admin → Providers first."
-                ),
-            )
-    elif provider_kind == "endpoint":
-        endpoint = await postgres_db.get_system_llm_endpoint(provider_ref)
-        if endpoint is None:
-            raise HTTPException(
-                status_code=400,
-                detail=f"No system endpoint with id '{provider_ref}'.",
-            )
-    else:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Invalid provider_kind '{provider_kind}'. Valid: "
-                f"{list(VALID_CATALOG_PROVIDER_KINDS)}"
-            ),
-        )
-
-
-def _normalize_catalog_model_id(
-    provider_kind: str, provider_ref: str, model_id: str
-) -> str:
-    """Prepend the ``openrouter/`` routing prefix for system-anchored
-    OpenRouter rows.
-
-    OpenRouter routing in the agent keys off the ``openrouter/`` model-ID
-    prefix: ``_create_openrouter_llm`` strips it back to the gateway slug and
-    targets ``openrouter.ai``. A system-anchored OpenRouter row whose ID lacks
-    the prefix routes to the OpenAI factory default (``api.openai.com``) and
-    rejects the ``sk-or-v1`` key. Mirrors the seed convention
-    (``db_backed_model_catalog.md``) and ``discovery.py``'s auto-prepend.
-    No-op for endpoint rows (routed by their inline base_url) and any
-    non-OpenRouter provider.
-    """
-    if (
-        provider_kind == "system"
-        and provider_ref == "openrouter"
-        and not model_id.lower().startswith("openrouter/")
-    ):
-        return f"openrouter/{model_id}"
-    return model_id
-
-
-@app.get("/api/admin/providers/models")
-async def admin_list_catalog_models(
-    request: Request,
-    capability: str | None = None,
-    provider_kind: str | None = None,
-    provider_ref: str | None = None,
-    enabled_only: bool = False,
-) -> list[dict[str, Any]]:
-    """List catalog rows with optional filters.
-
-    The ``capability`` query param narrows by membership — a row matches
-    iff its ``capabilities[]`` contains the requested value. Returns full
-    row shape.
-    """
-    await _require_admin(request)
-    if capability is not None and capability not in VALID_CATALOG_CAPABILITIES:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Invalid capability '{capability}'. "
-                f"Valid: {list(VALID_CATALOG_CAPABILITIES)}"
-            ),
-        )
-    capability_filter = [capability] if capability else None
-    rows = await postgres_db.list_models(
-        capabilities=capability_filter,
-        provider_kind=provider_kind,
-        provider_ref=provider_ref,
-        enabled_only=enabled_only,
-    )
-    return [_serialize_catalog_model(r) for r in rows]
-
-
-@app.post("/api/admin/providers/models")
-async def admin_create_catalog_model(
-    request: Request, body: CatalogModelCreate
-) -> dict[str, Any]:
-    """Insert a new catalog row.
-
-    Validates that ``provider_ref`` resolves to an existing transport before
-    insert. Returns the created row; raises 409 on
-    ``(provider_kind, provider_ref, model_id, capability)`` collision.
-    """
-    await _require_admin(request)
-    await _validate_catalog_provider_ref(body.provider_kind, body.provider_ref)
-    model_id = _normalize_catalog_model_id(
-        body.provider_kind, body.provider_ref, body.model_id
-    )
-    try:
-        row = await postgres_db.create_model(
-            provider_kind=body.provider_kind,
-            provider_ref=body.provider_ref,
-            model_id=model_id,
-            display_label=body.display_label,
-            capabilities=body.capabilities,
-            family=body.family,
-            context_window=body.context_window,
-            reasoning_level=body.reasoning_level,
-            params_json=body.params_json,
-            enabled=body.enabled,
-            notes=body.notes,
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        if "uq_model_provider" in str(e):
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"Catalog row for ({body.provider_kind}/{body.provider_ref}, "
-                    f"{model_id}) already exists."
-                ),
-            )
-        raise
-    if row is None:
-        raise HTTPException(status_code=500, detail="Catalog insert returned no row.")
-    return _serialize_catalog_model(row)
-
-
-@app.patch("/api/admin/providers/models/{catalog_id}")
-async def admin_update_catalog_model(
-    request: Request, catalog_id: str, body: CatalogModelUpdate
-) -> dict[str, Any]:
-    """Patch a catalog row. Only fields present in the body are written.
-
-    Pass ``null`` to clear an optional column. The validator re-checks the
-    transport when ``provider_kind`` or ``provider_ref`` changes.
-    """
-    await _require_admin(request)
-    fields = body.model_dump(exclude_unset=True)
-    existing = None
-    if "provider_kind" in fields or "provider_ref" in fields:
-        existing = await postgres_db.get_model(catalog_id)
-        if existing is None:
-            raise HTTPException(status_code=404, detail="Catalog row not found")
-        new_kind = fields.get("provider_kind", existing["provider_kind"])
-        new_ref = fields.get("provider_ref", existing["provider_ref"])
-        await _validate_catalog_provider_ref(new_kind, new_ref)
-    # Apply the same openrouter/ prefix normalization as create when the
-    # model_id is being (re)written. The effective provider_kind/ref may come
-    # from this patch or fall back to the existing row.
-    if "model_id" in fields:
-        if existing is None:
-            existing = await postgres_db.get_model(catalog_id)
-            if existing is None:
-                raise HTTPException(status_code=404, detail="Catalog row not found")
-        fields["model_id"] = _normalize_catalog_model_id(
-            fields.get("provider_kind", existing["provider_kind"]),
-            fields.get("provider_ref", existing["provider_ref"]),
-            fields["model_id"],
-        )
-    try:
-        row = await postgres_db.update_model(catalog_id, **fields)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        if "uq_model_provider" in str(e):
-            raise HTTPException(
-                status_code=409,
-                detail="Update would collide with an existing catalog row.",
-            )
-        raise
-    if row is None:
-        raise HTTPException(status_code=404, detail="Catalog row not found")
-    return _serialize_catalog_model(row)
-
-
-@app.delete("/api/admin/providers/models/{catalog_id}")
-async def admin_delete_catalog_model(
-    request: Request, catalog_id: str
-) -> dict[str, Any]:
-    """Hard-delete a catalog row. Returns a warning when the row's model_id
-    is currently referenced by a ``default_llm_models`` pointer (the pin
-    becomes a dangling reference; the resolver's first-enabled-alphabetical
-    fallback handles it gracefully).
-    """
-    await _require_admin(request)
-    existing = await postgres_db.get_model(catalog_id)
-    if existing is None:
-        raise HTTPException(status_code=404, detail="Catalog row not found")
-
-    referencing_kinds: list[str] = []
-    for kind in sorted(VALID_DEFAULT_MODEL_KINDS):
-        pin = await postgres_db.get_default_llm_model(kind)
-        if pin == existing["model_id"]:
-            referencing_kinds.append(kind)
-
-    deleted = await postgres_db.delete_model(catalog_id)
-    if not deleted:
-        raise HTTPException(status_code=404, detail="Catalog row not found")
-    return {
-        "status": "deleted",
-        "id": catalog_id,
-        "warning": (
-            f"Default-model pin(s) referenced this row: {referencing_kinds}. "
-            "Resolver falls back to first-enabled-alphabetical until repinned."
-            if referencing_kinds
-            else None
-        ),
-    }
-
-
-@app.post("/api/admin/providers/models/{catalog_id}/test")
-async def admin_test_catalog_model(request: Request, catalog_id: str) -> dict[str, Any]:
-    """Probe a catalog row's transport.
-
-    For ``provider_kind='endpoint'``, calls ``GET {endpoint.base_url}/models``
-    via the existing endpoint-probe helper. For ``provider_kind='system'``,
-    confirms the ``system_api_keys`` row exists and returns ``ok=True``
-    without round-tripping the provider — vendor-specific health probes
-    are out of scope for v1.
-    """
-    await _require_admin(request)
-    row = await postgres_db.get_model(catalog_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail="Catalog row not found")
-
-    if row["provider_kind"] == "endpoint":
-        endpoint = await postgres_db.get_system_llm_endpoint(row["provider_ref"])
-        if endpoint is None:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Catalog row references missing endpoint "
-                    f"'{row['provider_ref']}' — repoint or delete."
-                ),
-            )
-        result = await probe_endpoint_models(
-            base_url=endpoint["base_url"], api_key=endpoint.get("api_key")
-        )
-        return {
-            "ok": result.ok,
-            "status": result.status,
-            "error": result.error,
-            "probe_url": result.probe_url,
-        }
-
-    key = await postgres_db.get_system_api_key(row["provider_ref"])
-    if not key:
-        return {
-            "ok": False,
-            "status": None,
-            "error": (f"No system_api_keys row for provider '{row['provider_ref']}'."),
-            "probe_url": None,
-        }
-    return {"ok": True, "status": 200, "error": None, "probe_url": None}
-
-
-@app.get("/api/admin/families")
-async def admin_list_families(request: Request) -> dict[str, Any]:
-    """Return the family keys defined in ``model_config_matrix.yaml`` plus each
-    family's default context window.
-
-    Powers the family dropdown on the *Admin → Models* form (so adding a family
-    in the YAML doesn't require a frontend rebuild) and the context-window
-    field's "family default" placeholder.
-    """
-    from shared.runtime.core.loader import bundled_settings_for_family
-
-    await _require_admin(request)
-    matrix = _load_settings_matrix(_get_config_dir())
-    families = sorted(k for k in matrix.keys() if isinstance(k, str))
-    defaults = {
-        fam: bundled_settings_for_family(fam, "model_max_context_tokens")
-        for fam in families
-    }
-    return {"families": families, "defaults": defaults}
-
-
-@app.get("/api/admin/families/detect")
-async def admin_detect_family(request: Request, model_id: str) -> dict[str, str]:
-    """Suggest a family for ``model_id`` via the regex matcher.
-
-    Pre-fills the family dropdown on the *Admin → Models* add form and the
-    discovery confirmation dialog so admins don't have to memorize the
-    mapping. ``source`` is ``"matched"`` for a regex hit and ``"fallback"``
-    when no rule matched (the result is ``default`` — works, but quality is
-    on the model). Admin can override before saving either way.
-    """
-    await _require_admin(request)
-    if not model_id or not model_id.strip():
-        raise HTTPException(status_code=400, detail="model_id is required")
-    detection = family_matcher.detect_family(model_id.strip())
-    return {
-        "family": detection.family,
-        "source": detection.source,
-    }
 
 
 # nosec: public auth-bootstrap (Bearer-required, intentionally pre-approval — onboarding first paint)
@@ -65863,185 +61029,25 @@ def _get_system_providers() -> set[str]:
     return providers
 
 
-# Well-known label for the seeded codex-proxy llm_endpoints row. Kept in sync
-# with orchestrator.init._seed_codex_proxy_endpoint — duplicated here to avoid
-# importing init at runtime.
+# Endpoint identity is the ``transport_kind`` marker now
+# (``shared.subscription_routing``); this label survives only for log lines and
+# for clients that still speak the Codex-era vocabulary.
 CODEX_PROXY_ENDPOINT_LABEL = "codex-proxy"
 
 
-async def _get_codex_subscription_models() -> set[str]:
-    """Fetch model IDs available through the Codex proxy subscription.
-
-    Returns an empty set if the proxy is unreachable or has no active account.
-    Uses a short timeout to avoid slowing down /api/models.
-    """
-    proxy_url = os.getenv("CODEX_PROXY_URL", "http://localhost:8317")
-    try:
-        async with httpx.AsyncClient(timeout=2.0) as client:
-            resp = await client.get(f"{proxy_url}/v1/models")
-        if resp.status_code == 200:
-            data = resp.json()
-            return {m["id"] if isinstance(m, dict) else m for m in data.get("data", [])}
-    except Exception:
-        pass
-    return set()
-
-
-@app.get("/api/models")
-async def list_available_models(
-    request: Request,
-    project_id: str | None = None,
-) -> dict[str, Any]:
-    """List all models from the admin-curated catalog.
-
-    Returns catalog rows grouped by provider/capability:
-
-    - ``groups`` (chat-capability rows, grouped by provider)
-    - ``auxiliary_models`` / ``vision_models`` / ``embedding_models`` /
-      ``whisper_models`` / ``tts_models`` / ``search_models`` /
-      ``fetch_models`` (one helper list per capability)
-
-    Every row carries ``configured: true`` because the catalog only
-    contains rows whose transport (system_api_keys row or system endpoint)
-    is admin-managed. The legacy strategic+tactical preset bundle was
-    removed in chunk 7 of the models_yaml_removal work — the job-create
-    UX picks strategic and tactical models individually now.
-
-    Query params:
-        project_id: kept for backward compatibility — no longer affects the
-            response shape now that the catalog is the source of truth.
-    """
-    await require_approved_user(request, postgres_db)
-    _ = project_id  # accepted but unused post-flip
-
-    # Catalog rows joined to transport (only enabled rows surface).
-    catalog_rows = await postgres_db.list_models(enabled_only=True)
-    system_endpoints = await postgres_db.list_system_llm_endpoints()
-    endpoint_label_by_id: dict[str, str] = {
-        str(e["id"]): e["label"] for e in system_endpoints
-    }
-
-    # Build (provider_kind, provider_ref) → group payload.
-    groups_by_key: dict[tuple[str, str], dict[str, Any]] = {}
-    auxiliary: list[dict[str, Any]] = []
-    vision: list[dict[str, Any]] = []
-    embedding: list[dict[str, Any]] = []
-    whisper: list[dict[str, Any]] = []
-    tts: list[dict[str, Any]] = []
-    search: list[dict[str, Any]] = []
-    fetch: list[dict[str, Any]] = []
-
-    configured_providers: set[str] = set()
-
-    for row in catalog_rows:
-        kind = row["provider_kind"]
-        ref = row["provider_ref"]
-        # Fan-out: under the array model one row contributes to every
-        # capability bucket it claims. A multimodal chat row registered as
-        # ['chat','auxiliary','vision'] surfaces in the chat groups AND
-        # auxiliary_models AND vision_models simultaneously — which is
-        # exactly the operator intent (one physical model serves all three).
-        capabilities_set = set(row.get("capabilities") or [])
-        helper_entry = {
-            "id": row["model_id"],
-            "label": row["display_label"],
-            "configured": True,
-        }
-        if "auxiliary" in capabilities_set:
-            auxiliary.append(helper_entry)
-        if "vision" in capabilities_set:
-            vision.append(helper_entry)
-        if "embedding" in capabilities_set:
-            embedding.append(helper_entry)
-        if "whisper" in capabilities_set:
-            whisper.append(helper_entry)
-        if "tts" in capabilities_set:
-            tts.append(helper_entry)
-        if "search" in capabilities_set:
-            search.append(helper_entry)
-        if "fetch" in capabilities_set:
-            fetch.append(helper_entry)
-        # Chat-only path: register the row in its provider group. Embedding-/
-        # whisper-/tts-only rows skip this path so the chat dropdowns don't
-        # show non-chat models.
-        if "chat" not in capabilities_set:
-            continue
-        key = (kind, ref)
-        group = groups_by_key.get(key)
-        if group is None:
-            if kind == "system":
-                group_name = ref.title() if ref.islower() else ref
-                provider_tag = ref
-                configured_providers.add(ref)
-                group = {
-                    "group": group_name,
-                    "provider": provider_tag,
-                    "configured": True,
-                    "models": [],
-                }
-            else:  # endpoint
-                label = endpoint_label_by_id.get(ref, f"endpoint:{ref[:8]}")
-                group = {
-                    "group": f"System: {label}",
-                    "provider": "system",
-                    "endpoint_id": ref,
-                    "configured": True,
-                    "models": [],
-                }
-            groups_by_key[key] = group
-        group["models"].append(row["model_id"])
-
-    groups = list(groups_by_key.values())
-
-    # Per-model reasoning capability (family-derived) so the Cockpit reasoning
-    # control is driven by the catalog instead of hardcoded client logic. The
-    # single source of truth is config/model_config_matrix.yaml's `reasoning`
-    # block per family. See knowledge-base/knowledge/features/family_centered_reasoning.md.
-    from shared.runtime.core.loader import reasoning_capability
-
-    reasoning_by_model: dict[str, dict[str, Any]] = {}
-    for group in groups:
-        for mid in group["models"]:
-            if mid in reasoning_by_model:
-                continue
-            cap = reasoning_capability(mid)
-            reasoning_by_model[mid] = {
-                "method": cap.get("method", "none"),
-                "default": cap.get("default"),
-                "options": list(cap.get("options") or []),
-            }
-
-    return {
-        "groups": groups,
-        "auxiliary_models": auxiliary,
-        "vision_models": vision,
-        "whisper_models": whisper,
-        "tts_models": tts,
-        "search_models": search,
-        "fetch_models": fetch,
-        "embedding_models": embedding,
-        "configured_providers": sorted(configured_providers),
-        "reasoning_by_model": reasoning_by_model,
-    }
-
-
-@app.post("/api/models/reload")
-async def reload_model_catalog(request: Request) -> dict[str, str]:
-    """No-op kept for backward compat with cockpit clients that still POST.
-
-    Catalog rows live in the DB and ``/api/models`` queries them fresh on
-    every call — there is no cache to invalidate. The YAML fallback
-    registry that this endpoint used to bounce was deleted in chunk 6;
-    the legacy YAML projection cache it then bounced was deleted in
-    chunk 7.
-    """
-    await _require_admin(request)
-    return {"status": "reloaded"}
-
-
 # =============================================================================
-# Codex Proxy Management Endpoints (Admin-only)
+# AI Subscriptions — proxy management surface (Admin-only)
 # =============================================================================
+# Settings → AI Subscriptions and Admin → Models both sit on this surface.
+# Every upstream call goes through orchestrator.services.subscriptions, which
+# owns the management credential; nothing below ever puts a key, an OAuth token
+# or an authorization code into a response body or a log line.
+#
+# The legacy ``/api/codex/*`` routes are kept at the bottom as Codex-scoped
+# compatibility wrappers for clients that have not moved yet. They filter to
+# Codex accounts explicitly — a mixed pool must never leak into a Codex answer.
+#
+# Design: knowledge-base/knowledge/features/subscription_proxy.md §5, §8.
 
 
 async def _require_admin(request: Request) -> dict[str, Any]:
@@ -66054,60 +61060,196 @@ async def _require_admin(request: Request) -> dict[str, Any]:
     )
 
 
-async def _codex_proxy_request(
-    method: str,
-    path: str,
-    **kwargs: Any,
-) -> httpx.Response:
-    """Make a request to the CLIProxyAPI management API.
+def _subscription_http_error(exc: SubscriptionProxyError) -> HTTPException:
+    """Map a service-layer failure onto an HTTP response.
 
-    Reads CODEX_PROXY_URL and CODEX_MANAGEMENT_KEY from environment.
-    Raises HTTPException on connection or upstream errors.
+    The message has already been trimmed and redacted by the service; this only
+    picks the status so an unknown account is a 404 and an unreachable proxy is
+    a 502.
     """
-    proxy_url = os.getenv("CODEX_PROXY_URL", "http://localhost:8317")
-    mgmt_key = os.getenv("CODEX_MANAGEMENT_KEY", "")
+    return HTTPException(status_code=exc.status, detail=exc.message)
 
-    headers = kwargs.pop("headers", {})
-    if mgmt_key:
-        headers["Authorization"] = f"Bearer {mgmt_key}"
 
-    timeout = kwargs.pop("timeout", 10.0)
+async def _wire_subscription_endpoint() -> None:
+    """Best-effort: make sure the transport row exists after a connection.
 
+    A local login completes on the proxy's own callback port, so the
+    orchestrator may never see a callback for it. Calling this whenever we
+    observe a healthy account is what makes the subscription selectable in
+    Admin → Models without an init re-run. Idempotent by transport marker.
+    """
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.request(
-                method,
-                f"{proxy_url}{path}",
-                headers=headers,
-                **kwargs,
-            )
-        if response.status_code >= 400:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Codex proxy returned {response.status_code}: {response.text[:200]}",
-            )
-        return response
-    except HTTPException:
-        raise
-    except httpx.RequestError as e:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Codex proxy unreachable at {proxy_url}: {e}",
-        ) from e
+        await ensure_subscription_proxy_endpoint(postgres_db)
+    except Exception:
+        logger.warning(
+            "subscriptions: ensure_subscription_proxy_endpoint failed", exc_info=True
+        )
+
+
+@app.get("/api/subscriptions/status")
+async def subscriptions_status(request: Request) -> dict[str, Any]:
+    """Proxy reachability, supported providers and connected accounts.
+
+    Reachability is reported separately from authentication: a disabled or
+    down proxy renders as "not enabled", not as "signed out". Provider support
+    comes from the static registry — we never probe an auth-url handler, which
+    would start a real authorization session as a side effect.
+    """
+    await _require_admin(request)
+    status = await subscriptions.proxy_status()
+    if any(
+        account.get("state") == "connected" for account in status.get("accounts", [])
+    ):
+        await _wire_subscription_endpoint()
+    return status
+
+
+@app.get("/api/subscriptions/accounts")
+async def subscriptions_accounts(request: Request) -> dict[str, Any]:
+    """Sanitized inventory of connected subscription accounts."""
+    await _require_admin(request)
+    try:
+        accounts = await subscriptions.list_accounts()
+    except SubscriptionProxyError as exc:
+        raise _subscription_http_error(exc) from exc
+    return {"accounts": [account.to_public() for account in accounts]}
+
+
+@app.delete("/api/subscriptions/accounts/{account_id}")
+async def subscriptions_disconnect_account(
+    account_id: str, request: Request
+) -> dict[str, str]:
+    """Disconnect one account (removes its credential from the proxy)."""
+    await _require_admin(request)
+    try:
+        await subscriptions.delete_account(account_id)
+    except SubscriptionProxyError as exc:
+        raise _subscription_http_error(exc) from exc
+    return {"status": "deleted"}
+
+
+@app.get("/api/subscriptions/accounts/{account_id}/usage")
+async def subscriptions_account_usage(
+    account_id: str, request: Request
+) -> dict[str, Any]:
+    """Provider- and account-scoped usage.
+
+    Only providers with a verified reader return numbers. Everything else
+    reports ``available: false`` with a reason — never a zero, which would read
+    as "no quota consumed". The ChatGPT reader is reachable only for a
+    confirmed Codex credential.
+    """
+    await _require_admin(request)
+    try:
+        return await subscriptions.account_usage(account_id)
+    except SubscriptionProxyError as exc:
+        raise _subscription_http_error(exc) from exc
+
+
+@app.post("/api/subscriptions/logins")
+async def subscriptions_start_login(
+    body: SubscriptionLoginStart, request: Request
+) -> dict[str, Any]:
+    """Start an authorization flow for one provider.
+
+    Returns an SRW login id plus what the chosen flow needs: an authorization
+    URL for a browser flow, or a verification URL + user code + expiry for a
+    device flow. The upstream OAuth state stays server-side.
+    """
+    user = await _require_admin(request)
+    try:
+        session = await subscriptions.start_login(
+            body.provider, user_id=str(user.get("id")) if user.get("id") else None
+        )
+    except SubscriptionProxyError as exc:
+        raise _subscription_http_error(exc) from exc
+    return session.public()
+
+
+@app.get("/api/subscriptions/logins/{login_id}")
+async def subscriptions_poll_login(login_id: str, request: Request) -> dict[str, Any]:
+    """Poll an authorization flow.
+
+    ``connected`` is reported only after the credential has actually been
+    observed in the proxy's inventory. Upstream answering "ok" moves the
+    session to ``verifying``; a callback landing does not move it at all.
+    """
+    user = await _require_admin(request)
+    try:
+        session = subscriptions.get_login(
+            login_id, user_id=str(user.get("id")) if user.get("id") else None
+        )
+        session = await subscriptions.poll_login(session)
+    except SubscriptionProxyError as exc:
+        raise _subscription_http_error(exc) from exc
+    if session.status == "connected":
+        await _wire_subscription_endpoint()
+    return session.public()
+
+
+@app.post("/api/subscriptions/logins/{login_id}/callback")
+async def subscriptions_submit_callback(
+    login_id: str, body: SubscriptionCallbackSubmit, request: Request
+) -> dict[str, Any]:
+    """Relay a browser OAuth callback for a login session.
+
+    The pasted URL is parsed server-side for its ``code``/``state`` only; the
+    orchestrator posts to its configured proxy and never to a URL the browser
+    supplied. A callback whose state belongs to another attempt is rejected.
+    """
+    user = await _require_admin(request)
+    try:
+        session = subscriptions.get_login(
+            login_id, user_id=str(user.get("id")) if user.get("id") else None
+        )
+        session = await subscriptions.submit_callback(
+            session, url=body.url, code=body.code, state=body.state
+        )
+    except SubscriptionProxyError as exc:
+        raise _subscription_http_error(exc) from exc
+    if session.status == "connected":
+        await _wire_subscription_endpoint()
+    return session.public()
+
+
+@app.delete("/api/subscriptions/logins/{login_id}")
+async def subscriptions_cancel_login(login_id: str, request: Request) -> dict[str, Any]:
+    """Cancel an in-flight authorization, upstream and locally."""
+    user = await _require_admin(request)
+    try:
+        session = subscriptions.get_login(
+            login_id, user_id=str(user.get("id")) if user.get("id") else None
+        )
+        session = await subscriptions.cancel_login(session)
+    except SubscriptionProxyError as exc:
+        raise _subscription_http_error(exc) from exc
+    return session.public()
+
+
+# =============================================================================
+# Legacy Codex-only wrappers
+# =============================================================================
+# Kept during rollout for clients pinned to the previous cockpit build. Each
+# one filters the pool to Codex credentials, so an installation that has since
+# connected Claude Code or Grok Build cannot see those accounts, their models
+# or their usage through a Codex-named route.
+
+
+async def _codex_accounts() -> list[subscriptions.SubscriptionAccount]:
+    accounts = await subscriptions.list_accounts()
+    return [a for a in accounts if a.channel == CHANNEL_CODEX]
 
 
 @app.get("/api/codex/status")
 async def codex_status(request: Request) -> dict[str, Any]:
-    """Get Codex proxy health and authentication status (admin-only)."""
+    """Codex proxy health and authentication status (admin-only, legacy)."""
     await _require_admin(request)
-
     try:
-        auth_resp = await _codex_proxy_request("GET", "/v0/management/auth-files")
-        auth_files = auth_resp.json()
-    except HTTPException:
-        # Proxy unreachable — the codex-proxy deployment is disabled or down.
-        # `reachable: False` lets the cockpit show an "enable it" disclaimer
-        # instead of a Connect button that would 502 on /api/codex/login.
+        codex_accounts = await _codex_accounts()
+    except SubscriptionProxyError:
+        # Proxy unreachable — the deployment is disabled or down. `reachable:
+        # False` lets the cockpit show an "enable it" disclaimer instead of a
+        # Connect button that would 502.
         return {
             "connected": False,
             "reachable": False,
@@ -66115,198 +61257,81 @@ async def codex_status(request: Request) -> dict[str, Any]:
             "model_count": 0,
         }
 
-    # Normalize: auth-files may return a list or a dict with a key
-    accounts = (
-        auth_files if isinstance(auth_files, list) else auth_files.get("files", [])
-    )
-    active = [a for a in accounts if not a.get("disabled") and not a.get("unavailable")]
-
     model_count = 0
-    try:
-        models_resp = await _codex_proxy_request("GET", "/v1/models")
-        models_data = models_resp.json()
-        model_count = len(models_data.get("data", []))
-    except HTTPException:
-        pass
-
-    # Wire-up after a local login: the proxy's callback runs on localhost:1455
-    # so the orchestrator never sees /api/codex/callback for this flow. The
-    # cockpit hits /api/codex/status as soon as polling reports success, so
-    # ensure the transport row here when we see ≥1 active subscription.
-    if len(active) > 0:
-        try:
-            await ensure_codex_proxy_endpoint(postgres_db)
-        except Exception:
-            logger.warning(
-                "codex_status: ensure_codex_proxy_endpoint failed", exc_info=True
-            )
+    if codex_accounts:
+        model_count = len(await _codex_model_ids(codex_accounts))
+        await _wire_subscription_endpoint()
 
     return {
-        "connected": len(active) > 0,
+        "connected": any(a.healthy for a in codex_accounts),
         "reachable": True,
         "accounts": [
             {
-                "name": a.get("name", "unknown"),
-                "status": a.get("status", "unknown"),
-                "status_message": a.get("status_message"),
+                "name": a.name,
+                "status": a.state,
+                "status_message": a.state_detail,
             }
-            for a in accounts
+            for a in codex_accounts
         ],
         "model_count": model_count,
     }
 
 
+async def _codex_model_ids(
+    codex_accounts: list[subscriptions.SubscriptionAccount],
+) -> list[str]:
+    """Models served by Codex credentials only.
+
+    Attribution comes from the per-credential inventory. When that read fails
+    we fall back to the advertised list *only* if Codex is the sole connected
+    channel — otherwise another provider's models would surface under a
+    Codex-named route.
+    """
+    if not codex_accounts:
+        return []
+    names = {a.name for a in codex_accounts}
+    try:
+        attribution, unreadable = await subscriptions.account_model_map()
+    except SubscriptionProxyError:
+        attribution, unreadable = {}, [a.account_id for a in codex_accounts]
+    if attribution:
+        return sorted(
+            model_id
+            for model_id, accounts in attribution.items()
+            if any(account.name in names for account in accounts)
+        )
+    if unreadable:
+        try:
+            all_accounts = await subscriptions.list_accounts()
+        except SubscriptionProxyError:
+            return []
+        if any(a.channel != CHANNEL_CODEX for a in all_accounts):
+            return []
+        return sorted(await subscription_discovery.advertised_model_ids())
+    return []
+
+
 @app.get("/api/codex/models")
 async def codex_models(request: Request) -> dict[str, Any]:
-    """List models available through the Codex proxy (admin-only)."""
+    """List models available through Codex credentials (admin-only, legacy)."""
     await _require_admin(request)
-
-    resp = await _codex_proxy_request("GET", "/v1/models")
-    data = resp.json()
-    models = [m.get("id", m) for m in data.get("data", [])]
-    return {"models": models}
-
-
-# ChatGPT backend usage endpoint — the authoritative Codex subscription
-# rate-limit windows (5h + weekly), the same source the codex CLI's /status
-# polls. Not exposed by the proxy (it 404s /wham/usage), so the orchestrator
-# fetches it directly with the account's OAuth token.
-CODEX_WHAM_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
-
-
-def _decode_jwt_claims(token: str) -> dict[str, Any]:
-    """Best-effort decode of a JWT payload (no signature check — we only read
-    the non-secret account-scoping claim from a token we already hold)."""
-    import base64
-
     try:
-        payload = token.split(".")[1]
-        payload += "=" * (-len(payload) % 4)
-        return json.loads(base64.urlsafe_b64decode(payload))
-    except Exception:
-        return {}
-
-
-def _chatgpt_account_id(auth_file: dict[str, Any]) -> Optional[str]:
-    """Pull the ChatGPT account id from a downloaded codex auth file's id_token
-    (``https://api.openai.com/auth.chatgpt_account_id``). wham/usage wants it in
-    the ``ChatGPT-Account-Id`` header."""
-    claims = _decode_jwt_claims(auth_file.get("id_token", "") or "")
-    auth = claims.get("https://api.openai.com/auth", {}) or {}
-    return auth.get("chatgpt_account_id") or claims.get("chatgpt_account_id")
-
-
-def _codex_usage_window(w: Any) -> Optional[dict[str, Any]]:
-    """Normalize a wham/usage rate-limit window to the cockpit's shape."""
-    if not isinstance(w, dict):
-        return None
-    return {
-        "used_percent": w.get("used_percent"),
-        "window_seconds": w.get("limit_window_seconds"),
-        "reset_after_seconds": w.get("reset_after_seconds"),
-        "reset_at": w.get("reset_at"),
-    }
-
-
-async def _fetch_codex_usage() -> Optional[dict[str, Any]]:
-    """Fetch Codex subscription rate-limit windows from the ChatGPT backend.
-
-    Path: management API ``auth-files`` → pick the active account → download its
-    token → call ChatGPT ``wham/usage`` with ``Bearer`` + ``ChatGPT-Account-Id``.
-    The OAuth token never leaves the orchestrator (only the aggregate percentages
-    reach the UI). Returns ``None`` (→ endpoint degrades to ``available: false``)
-    when the proxy is unreachable, no account is active, or the backend call
-    fails — including the case where the orchestrator lacks chatgpt.com egress.
-    """
-    try:
-        auth_resp = await _codex_proxy_request("GET", "/v0/management/auth-files")
-        files = auth_resp.json()
-    except HTTPException:
-        return None
-    accounts = files if isinstance(files, list) else files.get("files", [])
-    active = next(
-        (
-            a
-            for a in accounts
-            if str(a.get("disabled")).lower() != "true"
-            and str(a.get("unavailable")).lower() != "true"
-        ),
-        None,
-    )
-    name = (active or {}).get("name") or (active or {}).get("id")
-    if not name:
-        return None
-
-    try:
-        dl = await _codex_proxy_request(
-            "GET", "/v0/management/auth-files/download", params={"name": name}
-        )
-        token_file = dl.json()
-    except HTTPException:
-        return None
-    access_token = token_file.get("access_token")
-    if not access_token:
-        return None
-    account_id = _chatgpt_account_id(token_file)
-
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "User-Agent": "srw-codex-usage/1.0",
-    }
-    if account_id:
-        headers["ChatGPT-Account-Id"] = account_id
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(CODEX_WHAM_USAGE_URL, headers=headers)
-        if resp.status_code >= 400:
-            logger.warning("codex wham/usage returned HTTP %s", resp.status_code)
-            return None
-        data = resp.json()
-    except Exception:
-        logger.warning("codex wham/usage fetch failed (non-fatal)", exc_info=True)
-        return None
-
-    rl = data.get("rate_limit") or {}
-    per_model = [
-        {
-            "name": extra.get("limit_name"),
-            "primary": _codex_usage_window(
-                (extra.get("rate_limit") or {}).get("primary_window")
-            ),
-            "secondary": _codex_usage_window(
-                (extra.get("rate_limit") or {}).get("secondary_window")
-            ),
-        }
-        for extra in (data.get("additional_rate_limits") or [])
-    ]
-    credits = data.get("credits") or {}
-    return {
-        "account": data.get("email"),
-        "plan_type": data.get("plan_type"),
-        "limit_reached": bool(rl.get("limit_reached")),
-        "primary": _codex_usage_window(rl.get("primary_window")),
-        "secondary": _codex_usage_window(rl.get("secondary_window")),
-        "per_model": per_model,
-        "credits": {
-            "has_credits": bool(credits.get("has_credits")),
-            "unlimited": bool(credits.get("unlimited")),
-            "balance": credits.get("balance"),
-        }
-        if credits
-        else None,
-    }
+        codex_accounts = await _codex_accounts()
+    except SubscriptionProxyError as exc:
+        raise _subscription_http_error(exc) from exc
+    return {"models": await _codex_model_ids(codex_accounts)}
 
 
 @app.get("/api/codex/usage")
 async def codex_usage(request: Request) -> dict[str, Any]:
-    """Codex subscription usage/limits (admin-only): the ChatGPT 5-hour + weekly
-    rate-limit windows behind the codex proxy, for the cockpit capacity bars.
+    """Codex subscription usage/limits (admin-only, legacy).
 
     Non-fatal: returns ``{"available": false}`` when the proxy is disabled/down,
-    no account is connected, or the ChatGPT backend call fails.
+    no Codex account is connected, or the ChatGPT backend call fails. Never
+    falls back to another provider's credential.
     """
     await _require_admin(request)
-    usage = await _fetch_codex_usage()
+    usage = await subscriptions.first_codex_usage()
     if usage is None:
         return {"available": False}
     return {"available": True, **usage}
@@ -66314,58 +61339,60 @@ async def codex_usage(request: Request) -> dict[str, Any]:
 
 @app.post("/api/codex/login")
 async def codex_login(request: Request) -> dict[str, Any]:
-    """Initiate Codex OAuth login flow (admin-only).
+    """Initiate Codex OAuth login (admin-only, legacy).
 
-    Returns an auth URL to open in the browser and a state token for polling.
+    Returns the auth URL plus the upstream ``state`` the legacy cockpit polls
+    with. New clients use ``/api/subscriptions/logins``, which keeps the state
+    server-side and binds the attempt to the initiating admin.
     """
-    await _require_admin(request)
-
-    resp = await _codex_proxy_request(
-        "GET",
-        "/v0/management/codex-auth-url",
-        params={"is_webui": "true"},
-        timeout=15.0,
-    )
-    data = resp.json()
-    # Proxy returns "url"; cockpit expects "auth_url"
-    if "url" in data and "auth_url" not in data:
-        data["auth_url"] = data.pop("url")
-    return data
+    user = await _require_admin(request)
+    try:
+        session = await subscriptions.start_login(
+            CODEX_PROVIDER_KEY,
+            user_id=str(user.get("id")) if user.get("id") else None,
+        )
+    except SubscriptionProxyError as exc:
+        raise _subscription_http_error(exc) from exc
+    return {"status": "ok", "auth_url": session.auth_url, "state": session.state}
 
 
 @app.get("/api/codex/login/poll")
 async def codex_login_poll(request: Request, state: str) -> dict[str, Any]:
-    """Poll Codex OAuth login status (admin-only)."""
+    """Poll a Codex OAuth login by upstream state (admin-only, legacy)."""
     await _require_admin(request)
-
-    resp = await _codex_proxy_request(
-        "GET",
-        "/v0/management/get-auth-status",
-        params={"state": state},
-    )
-    return resp.json()
+    if not state.strip():
+        # Upstream answers a bare {"status":"ok"} for an empty state. Refuse
+        # rather than hand the caller a success it did not earn.
+        raise HTTPException(status_code=422, detail="state is required")
+    try:
+        response = await subscriptions.management_request(
+            "GET", "/v0/management/get-auth-status", params={"state": state}
+        )
+    except SubscriptionProxyError as exc:
+        raise _subscription_http_error(exc) from exc
+    try:
+        return response.json()
+    except ValueError:
+        return {"status": "wait"}
 
 
 @app.post("/api/codex/callback")
 async def codex_callback(
     body: CodexCallbackRequest, request: Request
 ) -> dict[str, Any]:
-    """Relay an OAuth callback to the Codex proxy (admin-only).
+    """Relay a Codex OAuth callback to the proxy (admin-only, legacy).
 
-    Accepts the full localhost callback URL (or explicit code+state).
-    Parses the authorization code and state, then relays the callback
-    to the proxy internally so no port-forward is needed.
+    Accepts the full localhost callback URL (or explicit code+state), parses it
+    server-side and relays through the proxy's shared callback endpoint, which
+    validates the state against a pending Codex session.
     """
     await _require_admin(request)
 
-    code = body.code
-    state = body.state
-
+    code, state = body.code, body.state
     if body.url:
-        parsed = urlparse(body.url)
-        qs = parse_qs(parsed.query)
-        code = code or (qs.get("code", [None])[0])
-        state = state or (qs.get("state", [None])[0])
+        parsed_code, parsed_state, _ = subscriptions.extract_callback_params(body.url)
+        code = code or parsed_code
+        state = state or parsed_state
 
     if not code or not state:
         raise HTTPException(
@@ -66374,38 +61401,49 @@ async def codex_callback(
             "Please paste the complete URL from your browser address bar.",
         )
 
-    resp = await _codex_proxy_request(
-        "GET",
-        "/codex/callback",
-        params={"code": code, "state": state},
-        timeout=15.0,
-    )
-
-    # OAuth completed — wire the codex-proxy as a system endpoint so the
-    # subscription is immediately selectable in Admin → Models. Idempotent;
-    # best-effort: a wiring failure must not block the callback response.
     try:
-        await ensure_codex_proxy_endpoint(postgres_db)
-    except Exception:
-        logger.warning(
-            "codex_callback: ensure_codex_proxy_endpoint failed", exc_info=True
+        await subscriptions.management_request(
+            "POST",
+            "/v0/management/oauth-callback",
+            json={"provider": CHANNEL_CODEX, "code": code, "state": state},
+            timeout=20.0,
         )
+    except SubscriptionProxyError as exc:
+        raise _subscription_http_error(exc) from exc
 
-    if resp.content:
-        return resp.json()
+    subscriptions.invalidate_account_cache()
+    await _wire_subscription_endpoint()
     return {"status": "ok"}
 
 
 @app.delete("/api/codex/credentials/{name}")
 async def codex_delete_credential(name: str, request: Request) -> dict[str, str]:
-    """Remove a Codex proxy credential file (admin-only)."""
-    await _require_admin(request)
+    """Remove a Codex proxy credential file (admin-only, legacy).
 
-    await _codex_proxy_request(
-        "DELETE",
-        "/v0/management/auth-files",
-        params={"name": name},
-    )
+    Scoped: refuses to delete a credential belonging to any other provider, so
+    a legacy client cannot disconnect a Claude Code or Grok Build account
+    through a Codex-named route.
+    """
+    await _require_admin(request)
+    try:
+        accounts = await subscriptions.list_accounts(use_cache=False)
+    except SubscriptionProxyError as exc:
+        raise _subscription_http_error(exc) from exc
+    account = next((a for a in accounts if a.name == name), None)
+    if account is None:
+        raise HTTPException(status_code=404, detail="Unknown subscription account")
+    if account.channel != CHANNEL_CODEX:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "That account is not a Codex subscription. Disconnect it from "
+                "Settings → AI Subscriptions."
+            ),
+        )
+    try:
+        await subscriptions.delete_account(account.account_id)
+    except SubscriptionProxyError as exc:
+        raise _subscription_http_error(exc) from exc
     return {"status": "deleted"}
 
 

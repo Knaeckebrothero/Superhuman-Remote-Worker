@@ -4,6 +4,7 @@ import {
   computed,
   effect,
   inject,
+  OnDestroy,
   OnInit,
   signal,
 } from '@angular/core';
@@ -24,8 +25,9 @@ import { I18nService, SupportedLang } from '../../core/services/i18n.service';
 import type { ExpertEditorNavigationState } from '../experts/expert-editor.component';
 import {
   ApiKeyProvider,
-  CodexStatus,
-  CodexUsage,
+  SubscriptionLogin,
+  SubscriptionsStatus,
+  SubscriptionUsage,
   CommunicationSettings,
   Expert,
   ExpertDefaultsResponse,
@@ -1289,205 +1291,305 @@ const EXPIRY_OPTIONS = [
           </app-button>
         </section>
 
-        <!-- Codex Proxy Section (Admin Only) -->
+        <!-- AI Subscriptions Section (Admin Only) -->
         @if (userService.currentUser()?.is_admin) {
           <section class="settings-section section-spacer">
-            <h2 class="section-title">{{ 'settings.codex.title' | transloco }}</h2>
-            <p class="section-desc">
-              {{ 'settings.codex.desc' | transloco }}
-              (<code>codex/*</code>).
-            </p>
+            <h2 class="section-title">{{ 'settings.subscriptions.title' | transloco }}</h2>
+            <p class="section-desc">{{ 'settings.subscriptions.desc' | transloco }}</p>
 
-            <!-- Status -->
-            <div class="codex-status-card">
-              @if (codexLoading()) {
-                <span class="codex-status-text">{{ 'settings.codex.checking' | transloco }}</span>
+            <!-- Proxy reachability is reported separately from account state:
+                 an unreachable proxy is "not enabled", not "signed out". -->
+            <div class="subs-status-card">
+              @if (subsLoading()) {
+                <span class="subs-status-text">{{
+                  'settings.subscriptions.checking' | transloco
+                }}</span>
               } @else {
-                <span class="codex-status-dot" [class.connected]="codexStatus().connected"></span>
-                <span class="codex-status-text">
-                  @if (!codexStatus().reachable) {
-                    {{ 'settings.codex.notEnabled' | transloco }}
+                <span class="subs-status-dot" [class.connected]="subsStatus().connected"></span>
+                <span class="subs-status-text">
+                  @if (!subsStatus().reachable) {
+                    {{ 'settings.subscriptions.notEnabled' | transloco }}
                   } @else {
                     {{
-                      (codexStatus().connected
-                        ? 'settings.codex.connected'
-                        : 'settings.codex.notConnected'
+                      (subsStatus().connected
+                        ? 'settings.subscriptions.connected'
+                        : 'settings.subscriptions.notConnected'
                       ) | transloco
                     }}
-                    @if (codexStatus().model_count > 0) {
-                      &mdash; {{ codexStatus().model_count }} model(s) available
+                    @if (subsStatus().model_count > 0) {
+                      &mdash;
+                      {{
+                        'settings.subscriptions.modelsAvailable'
+                          | transloco: {count: subsStatus().model_count}
+                      }}
                     }
                   }
                 </span>
                 <app-button
                   variant="ghost"
                   size="sm"
-                  [ariaLabel]="'settings.codex.refreshStatus' | transloco"
-                  (clicked)="loadCodexStatus()"
+                  [ariaLabel]="'settings.subscriptions.refreshStatus' | transloco"
+                  (clicked)="loadSubscriptions()"
                 >
                   <app-icon size="sm">refresh</app-icon>
                 </app-button>
               }
             </div>
 
-            <!-- Accounts -->
-            @if (codexStatus().accounts.length > 0) {
-              <div class="codex-accounts">
-                @for (acct of codexStatus().accounts; track acct.name) {
-                  <div class="codex-account-row">
-                    <span class="mono">{{ acct.name }}</span>
-                    <span class="codex-account-status">{{ acct.status }}</span>
-                    <app-button
-                      variant="danger"
-                      size="sm"
-                      (clicked)="disconnectCodexAccount(acct.name)"
+            <!-- Connected accounts -->
+            @if (subsStatus().accounts.length > 0) {
+              <div class="subs-accounts">
+                @for (acct of subsStatus().accounts; track acct.account_id) {
+                  <div class="subs-account-row">
+                    <span class="subs-account-provider">{{ subscriptionProviderLabel(acct.provider) }}</span>
+                    <span class="mono">{{ acct.email || acct.label || acct.account_id }}</span>
+                    <span
+                      class="subs-account-state"
+                      [class.connected]="acct.state === 'connected'"
+                      [class.warn]="acct.state === 'cooldown' || acct.state === 'disabled'"
+                      [class.bad]="acct.state === 'error'"
+                      [title]="acct.state_detail || ''"
                     >
-                      {{ 'settings.codex.disconnect' | transloco }}
+                      {{ 'settings.subscriptions.states.' + acct.state | transloco }}
+                    </span>
+                    <span class="subs-account-scope">{{
+                      'settings.subscriptions.scope.' + acct.scope | transloco
+                    }}</span>
+                    @if (usageFor(acct.account_id); as usage) {
+                      @if (usage.available) {
+                        <app-button
+                          variant="ghost"
+                          size="sm"
+                          (clicked)="toggleUsage(acct.account_id)"
+                        >
+                          {{ 'settings.subscriptions.usage.toggle' | transloco }}
+                        </app-button>
+                      } @else {
+                        <span class="subs-usage-na">{{
+                          'settings.subscriptions.usage.unavailable' | transloco
+                        }}</span>
+                      }
+                    } @else {
+                      <app-button
+                        variant="ghost"
+                        size="sm"
+                        (clicked)="loadUsage(acct.account_id)"
+                      >
+                        {{ 'settings.subscriptions.usage.check' | transloco }}
+                      </app-button>
+                    }
+                    <app-button
+                      variant="ghost"
+                      size="sm"
+                      (clicked)="disconnectAccount(acct.account_id)"
+                    >
+                      {{ 'settings.subscriptions.disconnect' | transloco }}
                     </app-button>
                   </div>
+
+                  <!-- Usage bars: only for providers with a verified reader. -->
+                  @if (expandedUsage() === acct.account_id && usageFor(acct.account_id); as usage) {
+                    @if (usage.available) {
+                      <div class="subs-usage">
+                        <div class="subs-usage-title">
+                          {{ 'settings.subscriptions.usage.title' | transloco }}
+                          @if (usage.plan_type) {
+                            <span class="subs-usage-plan">{{ usage.plan_type }}</span>
+                          }
+                          @if (usage.limit_reached) {
+                            <span class="subs-usage-limit">{{
+                              'settings.subscriptions.usage.limitReached' | transloco
+                            }}</span>
+                          }
+                        </div>
+                        @if (usage.primary; as w) {
+                          <div class="subs-usage-row">
+                            <div class="subs-usage-meta">
+                              <span class="subs-usage-name">{{
+                                'settings.subscriptions.usage.session' | transloco
+                              }}</span>
+                              @if (w.reset_after_seconds) {
+                                <span class="subs-usage-reset">{{
+                                  'settings.subscriptions.usage.resetsIn'
+                                    | transloco: {time: formatResetIn(w.reset_after_seconds)}
+                                }}</span>
+                              }
+                            </div>
+                            <div class="subs-usage-track">
+                              <div
+                                class="subs-usage-fill"
+                                [class]="usageTone(w.used_percent)"
+                                [style.width.%]="w.used_percent ?? 0"
+                              ></div>
+                            </div>
+                            <span class="subs-usage-pct">{{ w.used_percent ?? 0 }}%</span>
+                          </div>
+                        }
+                        @if (usage.secondary; as w) {
+                          <div class="subs-usage-row">
+                            <div class="subs-usage-meta">
+                              <span class="subs-usage-name">{{
+                                'settings.subscriptions.usage.weekly' | transloco
+                              }}</span>
+                              @if (w.reset_after_seconds) {
+                                <span class="subs-usage-reset">{{
+                                  'settings.subscriptions.usage.resetsIn'
+                                    | transloco: {time: formatResetIn(w.reset_after_seconds)}
+                                }}</span>
+                              }
+                            </div>
+                            <div class="subs-usage-track">
+                              <div
+                                class="subs-usage-fill"
+                                [class]="usageTone(w.used_percent)"
+                                [style.width.%]="w.used_percent ?? 0"
+                              ></div>
+                            </div>
+                            <span class="subs-usage-pct">{{ w.used_percent ?? 0 }}%</span>
+                          </div>
+                        }
+                        <p class="subs-usage-note">
+                          {{ 'settings.subscriptions.usage.disclaimer' | transloco }}
+                        </p>
+                      </div>
+                    }
+                  }
                 }
               </div>
             }
 
-            <!-- Subscription usage capacity (5-hour session + weekly windows) -->
-            @if (codexUsage().available && (codexUsage().primary || codexUsage().secondary)) {
-              <div class="codex-usage">
-                <h3 class="form-title">
-                  {{ 'settings.codex.usage.title' | transloco }}
-                  @if (codexUsage().plan_type) {
-                    <span class="codex-usage-plan">{{ codexUsage().plan_type }}</span>
-                  }
-                  @if (codexUsage().limit_reached) {
-                    <span class="codex-usage-limit">{{
-                      'settings.codex.usage.limitReached' | transloco
-                    }}</span>
-                  }
-                </h3>
-                @if (codexUsage().primary; as w) {
-                  <div class="codex-usage-row">
-                    <div class="codex-usage-meta">
-                      <span class="codex-usage-name">{{
-                        'settings.codex.usage.session' | transloco
-                      }}</span>
-                      @if (w.reset_after_seconds) {
-                        <span class="codex-usage-reset">{{
-                          'settings.codex.usage.resetsIn'
-                            | transloco: { time: formatReset(w.reset_after_seconds) }
-                        }}</span>
+            @if (subsStatus().reachable) {
+              <!-- Provider chooser -->
+              <div class="subs-connect">
+                <h3 class="form-title">{{ 'settings.subscriptions.addTitle' | transloco }}</h3>
+                <div class="subs-provider-grid">
+                  @for (p of subsStatus().providers; track p.key) {
+                    <div class="subs-provider-card" [class.busy]="activeLogin()?.provider === p.key">
+                      <div class="subs-provider-head">
+                        <span class="subs-provider-label">{{ subscriptionProviderLabel(p.key) }}</span>
+                        @if (p.connected_accounts > 0) {
+                          <app-badge tone="success" size="xs">{{
+                            'settings.subscriptions.connectedCount'
+                              | transloco: {count: p.connected_accounts}
+                          }}</app-badge>
+                        }
+                        @if (!p.inference_verified) {
+                          <app-badge tone="warning" size="xs">{{
+                            'settings.subscriptions.unverified' | transloco
+                          }}</app-badge>
+                        }
+                      </div>
+                      <p class="subs-provider-flow">
+                        {{ 'settings.subscriptions.flows.' + p.login_flow | transloco }}
+                      </p>
+                      @for (note of p.notes; track note) {
+                        <p class="subs-provider-note">{{ note }}</p>
                       }
+                      <app-button
+                        variant="secondary"
+                        size="sm"
+                        [loading]="activeLogin()?.provider === p.key && loginBusy()"
+                        [disabled]="!!activeLogin() && activeLogin()?.provider !== p.key"
+                        (clicked)="connectProvider(p.key)"
+                      >
+                        {{ 'settings.subscriptions.connect' | transloco }}
+                      </app-button>
                     </div>
-                    <div class="codex-usage-track">
-                      <div
-                        class="codex-usage-fill"
-                        [class]="usageLevel(w.used_percent)"
-                        [style.width.%]="clampPct(w.used_percent)"
-                      ></div>
-                    </div>
-                    <span class="codex-usage-pct">{{ w.used_percent ?? 0 }}%</span>
-                  </div>
-                }
-                @if (codexUsage().secondary; as w) {
-                  <div class="codex-usage-row">
-                    <div class="codex-usage-meta">
-                      <span class="codex-usage-name">{{
-                        'settings.codex.usage.weekly' | transloco
-                      }}</span>
-                      @if (w.reset_after_seconds) {
-                        <span class="codex-usage-reset">{{
-                          'settings.codex.usage.resetsIn'
-                            | transloco: { time: formatReset(w.reset_after_seconds) }
-                        }}</span>
-                      }
-                    </div>
-                    <div class="codex-usage-track">
-                      <div
-                        class="codex-usage-fill"
-                        [class]="usageLevel(w.used_percent)"
-                        [style.width.%]="clampPct(w.used_percent)"
-                      ></div>
-                    </div>
-                    <span class="codex-usage-pct">{{ w.used_percent ?? 0 }}%</span>
-                  </div>
-                }
-                <p class="codex-usage-note">{{ 'settings.codex.usage.disclaimer' | transloco }}</p>
-              </div>
-            }
-
-            <!-- Models -->
-            @if (codexModels().length > 0) {
-              <div class="codex-models">
-                <h3 class="form-title">{{ 'settings.codex.availableModels' | transloco }}</h3>
-                <div class="codex-model-chips">
-                  @for (m of codexModels(); track m) {
-                    <span class="codex-model-chip">{{ m }}</span>
                   }
                 </div>
               </div>
-            }
 
-            <!-- Connect (only when the proxy is actually reachable) -->
-            @if (codexStatus().reachable) {
-              <div class="create-form">
-                <app-button
-                  variant="primary"
-                  size="md"
-                  [loading]="codexConnecting()"
-                  [disabled]="codexConnecting()"
-                  (clicked)="connectCodexAccount()"
-                >
-                  {{
-                    (codexConnecting() ? 'settings.codex.waiting' : 'settings.codex.connectAccount')
-                      | transloco
-                  }}
-                </app-button>
-                @if (codexConnecting()) {
-                  <div class="codex-callback-help">
-                    <p class="codex-callback-title">
-                      {{ 'settings.codex.completeSignIn' | transloco }}
-                    </p>
-                    <ol class="codex-callback-steps">
-                      <li>{{ 'settings.codex.step1' | transloco }}</li>
-                      <li>{{ 'settings.codex.step2' | transloco }}</li>
-                      <li>{{ 'settings.codex.step3' | transloco }}</li>
-                      <li>{{ 'settings.codex.step4' | transloco }}</li>
-                    </ol>
-                    <div class="codex-callback-input-row">
-                      <app-input
-                        [value]="codexCallbackUrl()"
-                        [placeholder]="'settings.codex.callbackPlaceholder' | transloco"
-                        (changed)="codexCallbackUrl.set($event)"
-                      />
-                      <app-button
-                        variant="primary"
-                        size="md"
-                        [loading]="codexCallbackSubmitting()"
-                        [disabled]="codexCallbackSubmitting()"
-                        (clicked)="submitCodexCallback()"
-                      >
+              <!-- In-flight authorization -->
+              @if (activeLogin(); as login) {
+                <div class="subs-login">
+                  <p class="subs-login-title">
+                    {{
+                      'settings.subscriptions.login.' + login.status
+                        | transloco: {provider: subscriptionProviderLabel(login.provider)}
+                    }}
+                  </p>
+
+                  @if (login.status === 'pending' || login.status === 'verifying') {
+                    @if (login.flow === 'device') {
+                      <ol class="subs-login-steps">
+                        <li>
+                          {{ 'settings.subscriptions.device.step1' | transloco }}
+                          <a [href]="login.auth_url" target="_blank" rel="noopener">{{
+                            login.auth_url
+                          }}</a>
+                        </li>
+                        @if (login.user_code) {
+                          <li>
+                            {{ 'settings.subscriptions.device.step2' | transloco }}
+                            <code class="subs-user-code">{{ login.user_code }}</code>
+                          </li>
+                        }
+                        <li>{{ 'settings.subscriptions.device.step3' | transloco }}</li>
+                      </ol>
+                      <p class="subs-login-hint">
                         {{
-                          (codexCallbackSubmitting()
-                            ? 'settings.codex.submitting'
-                            : 'settings.codex.completeLogin'
-                          ) | transloco
+                          'settings.subscriptions.device.expires'
+                            | transloco: {time: formatExpiry(login.expires_at)}
                         }}
-                      </app-button>
-                    </div>
-                    @if (codexCallbackError()) {
-                      <p class="codex-callback-error">{{ codexCallbackError() }}</p>
+                      </p>
+                    } @else {
+                      <ol class="subs-login-steps">
+                        <li>
+                          {{ 'settings.subscriptions.browser.step1' | transloco }}
+                          <a [href]="login.auth_url" target="_blank" rel="noopener">{{
+                            'settings.subscriptions.browser.openLink' | transloco
+                          }}</a>
+                        </li>
+                        <li>{{ 'settings.subscriptions.browser.step2' | transloco }}</li>
+                        <li>{{ 'settings.subscriptions.browser.step3' | transloco }}</li>
+                      </ol>
+                      <div class="subs-callback-row">
+                        <app-input
+                          [value]="callbackUrl()"
+                          [placeholder]="
+                            'settings.subscriptions.browser.callbackPlaceholder' | transloco
+                          "
+                          (changed)="callbackUrl.set($event)"
+                        />
+                        <app-button
+                          variant="primary"
+                          size="sm"
+                          [loading]="callbackSubmitting()"
+                          [disabled]="callbackSubmitting()"
+                          (clicked)="submitCallback()"
+                        >
+                          {{ 'settings.subscriptions.browser.complete' | transloco }}
+                        </app-button>
+                      </div>
+                      <p class="subs-login-hint">
+                        {{ 'settings.subscriptions.browser.remoteHint' | transloco }}
+                      </p>
                     }
-                    <p class="codex-callback-hint">
-                      {{ 'settings.codex.portForwardHint' | transloco }}
-                    </p>
-                  </div>
-                }
-              </div>
-            } @else if (!codexLoading()) {
-              <!-- Proxy disabled/down: explain how to turn it on instead of
-                   offering a Connect button that 502s on /api/codex/login. -->
-              <div class="codex-disabled-notice">
-                <p class="codex-disabled-title">{{ 'settings.codex.disabledTitle' | transloco }}</p>
-                <p class="codex-disabled-desc">{{ 'settings.codex.disabledDesc' | transloco }}</p>
-                <code class="codex-disabled-code">codexProxy.enabled: true</code>
+                    <app-button variant="ghost" size="sm" (clicked)="cancelLogin()">
+                      {{ 'settings.subscriptions.cancel' | transloco }}
+                    </app-button>
+                  } @else {
+                    <app-button variant="ghost" size="sm" (clicked)="dismissLogin()">
+                      {{ 'settings.subscriptions.dismiss' | transloco }}
+                    </app-button>
+                  }
+
+                  @if (loginError()) {
+                    <p class="subs-login-error">{{ loginError() }}</p>
+                  }
+                </div>
+              }
+            } @else if (!subsLoading()) {
+              <!-- Proxy disabled: explain instead of offering a Connect button
+                   that would 502 on the first login call. -->
+              <div class="subs-disabled-notice">
+                <p class="subs-disabled-title">
+                  {{ 'settings.subscriptions.disabledTitle' | transloco }}
+                </p>
+                <p class="subs-disabled-desc">
+                  {{ 'settings.subscriptions.disabledDesc' | transloco }}
+                </p>
+                <code class="subs-disabled-code">codexProxy.enabled: true</code>
               </div>
             }
           </section>
@@ -1503,12 +1605,12 @@ const EXPIRY_OPTIONS = [
               <p class="section-desc">{{ 'settings.cloud.loading' | transloco }}</p>
             } @else if (cloudSettings(); as s) {
               <!-- Status row -->
-              <div class="codex-status-card">
+              <div class="subs-status-card">
                 <span
-                  class="codex-status-dot"
+                  class="subs-status-dot"
                   [class.connected]="s.effective.is_initialized"
                 ></span>
-                <span class="codex-status-text">
+                <span class="subs-status-text">
                   {{ 'settings.cloud.active' | transloco }}
                   <strong>{{ s.effective.backend_id }}</strong>
                   @if (s.effective.is_initialized) {
@@ -1607,13 +1709,13 @@ const EXPIRY_OPTIONS = [
 
               <!-- Secret provenance -->
               @if (secretProvenanceEntries().length > 0) {
-                <div class="codex-accounts secret-provenance">
+                <div class="subs-accounts secret-provenance">
                   <h3 class="form-title">{{ 'settings.cloud.secretProvenance' | transloco }}</h3>
                   @for (entry of secretProvenanceEntries(); track entry.field) {
-                    <div class="codex-account-row">
+                    <div class="subs-account-row">
                       <span class="mono">{{ entry.field }}</span>
                       <span class="mono">{{ entry.env_var }}</span>
-                      <span class="codex-account-status" [class.connected]="entry.set">
+                      <span class="subs-account-state" [class.connected]="entry.set">
                         {{
                           entry.set
                             ? ('settings.cloud.secretSet' | transloco)
@@ -1665,7 +1767,7 @@ const EXPIRY_OPTIONS = [
               @if (cloudMessage()) {
                 <p
                   class="section-desc cloud-message"
-                  [class.codex-callback-error]="cloudMessageIsError()"
+                  [class.subs-login-error]="cloudMessageIsError()"
                 >
                   {{ cloudMessage() }}
                 </p>
@@ -1962,259 +2064,316 @@ const EXPIRY_OPTIONS = [
         line-height: 1.5;
       }
 
-      /* Codex Proxy */
-      .codex-status-card {
+      /* AI Subscriptions (also reused by the Cloud Storage status/provenance
+         rows — these are section-agnostic status primitives, not provider UI) */
+      .subs-status-card {
         display: flex;
         align-items: center;
         gap: 10px;
         padding: 12px 16px;
         background: var(--surface-0);
         border: 1px solid var(--border-color);
-        border-radius: var(--radius-surface);
+        border-radius: var(--radius-card);
         margin-bottom: 16px;
       }
 
-      .codex-status-dot {
-        width: 10px;
-        height: 10px;
+      .subs-status-dot {
+        width: 8px;
+        height: 8px;
         border-radius: 50%;
-        background: var(--danger);
+        background: var(--text-muted);
         flex-shrink: 0;
       }
 
-      .codex-status-dot.connected {
-        background: var(--success);
+      .subs-status-dot.connected {
+        background: var(--color-success, #10b981);
       }
 
-      .codex-status-text {
+      .subs-status-text {
         font-size: 13px;
         color: var(--text-secondary);
         flex: 1;
       }
 
-      .codex-disabled-notice {
+      .subs-disabled-notice {
         padding: 14px 16px;
         background: var(--surface-0);
-        border: 1px solid var(--border-color);
-        border-radius: var(--radius-surface);
+        border: 1px dashed var(--border-color);
+        border-radius: var(--radius-card);
       }
 
-      .codex-disabled-title {
-        font-size: 14px;
+      .subs-disabled-title {
+        font-size: 13px;
         font-weight: 600;
         color: var(--text-primary);
         margin: 0 0 6px 0;
       }
 
-      .codex-disabled-desc {
-        font-size: 13px;
+      .subs-disabled-desc {
+        font-size: 12px;
         color: var(--text-secondary);
-        line-height: 1.6;
+        margin: 0 0 8px 0;
+        line-height: 1.5;
+      }
+
+      .subs-disabled-code {
+        display: inline-block;
+        background: var(--surface-1);
+        padding: 3px 8px;
+        border-radius: var(--radius-tag);
+        font-size: 11px;
+      }
+
+      .subs-accounts {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        margin-bottom: 16px;
+      }
+
+      .subs-account-row {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 10px 14px;
+        background: var(--surface-0);
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-card);
+        font-size: 13px;
+      }
+
+      .subs-account-row .mono {
+        font-family: var(--font-mono);
+        font-size: 12px;
+        flex: 1;
+      }
+
+      .subs-account-provider {
+        font-weight: 600;
+        color: var(--text-primary);
+      }
+
+      .subs-account-state {
+        font-size: 12px;
+        color: var(--text-muted);
+      }
+
+      .subs-account-state.connected {
+        color: var(--color-success, #10b981);
+      }
+
+      .subs-account-state.warn {
+        color: var(--color-warning, #b45309);
+      }
+
+      .subs-account-state.bad {
+        color: var(--color-danger, #dc2626);
+      }
+
+      .subs-account-scope {
+        font-size: 11px;
+        color: var(--text-muted);
+      }
+
+      .subs-usage-na {
+        font-size: 11px;
+        color: var(--text-muted);
+      }
+
+      /* Provider chooser */
+      .subs-connect {
+        margin-top: 8px;
+      }
+
+      .subs-provider-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+        gap: 12px;
+        margin-bottom: 16px;
+      }
+
+      .subs-provider-card {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        padding: 14px;
+        background: var(--surface-0);
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-card);
+      }
+
+      .subs-provider-card.busy {
+        border-color: var(--color-accent, #6366f1);
+      }
+
+      .subs-provider-head {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+
+      .subs-provider-label {
+        font-size: 13px;
+        font-weight: 600;
+        color: var(--text-primary);
+      }
+
+      .subs-provider-flow,
+      .subs-provider-note {
+        font-size: 12px;
+        color: var(--text-secondary);
+        margin: 0;
+        line-height: 1.5;
+      }
+
+      .subs-provider-note {
+        color: var(--text-muted);
+      }
+
+      /* In-flight authorization */
+      .subs-login {
+        padding: 14px 16px;
+        background: var(--surface-0);
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-card);
+      }
+
+      .subs-login-title {
+        font-size: 13px;
+        font-weight: 600;
+        color: var(--text-primary);
+        margin: 0 0 8px 0;
+      }
+
+      .subs-login-steps {
+        margin: 0 0 10px 0;
+        padding-left: 20px;
+        font-size: 12px;
+        color: var(--text-secondary);
+        line-height: 1.7;
+      }
+
+      .subs-user-code {
+        background: var(--surface-1);
+        padding: 2px 8px;
+        border-radius: var(--radius-tag);
+        font-family: var(--font-mono);
+        font-size: 13px;
+        letter-spacing: 0.08em;
+      }
+
+      .subs-callback-row {
+        display: flex;
+        gap: 8px;
+        align-items: flex-start;
+        margin-bottom: 8px;
+      }
+
+      .subs-callback-row > app-input {
+        flex: 1;
+      }
+
+      .subs-login-hint {
+        font-size: 12px;
+        color: var(--text-muted);
         margin: 0 0 10px 0;
       }
 
-      .codex-disabled-code {
-        display: inline-block;
-        padding: 4px 10px;
-        background: var(--surface-1);
-        border: 1px solid var(--border-color);
-        border-radius: var(--radius-control);
-        font-family: 'JetBrains Mono', 'Fira Code', monospace;
+      .subs-login-error {
         font-size: 12px;
-        color: var(--text-secondary);
+        color: var(--color-danger, #dc2626);
+        margin: 8px 0 0 0;
       }
 
-      .codex-accounts {
-        margin-bottom: 16px;
+      /* Usage bars */
+      .subs-usage {
+        padding: 12px 16px;
+        margin: 0 0 8px 0;
+        background: var(--surface-0);
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-card);
       }
 
-      .secret-provenance {
-        margin-top: 16px;
-      }
-
-      .codex-account-row {
+      .subs-usage-title {
         display: flex;
         align-items: center;
-        gap: 12px;
-        padding: 8px 14px;
-        border: 1px solid var(--border-color);
-        border-radius: var(--radius-surface);
-        margin-bottom: 6px;
-      }
-
-      .codex-account-row .mono {
-        flex: 1;
-      }
-
-      .codex-account-status {
+        gap: 8px;
         font-size: 12px;
-        color: var(--text-muted);
-      }
-      .codex-account-status.connected {
-        color: var(--success);
-      }
-
-      .codex-models {
-        margin-bottom: 16px;
-      }
-
-      .codex-model-chips {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 6px;
-      }
-
-      .codex-model-chip {
-        padding: 4px 10px;
-        background: var(--surface-0);
-        border: 1px solid var(--border-color);
-        border-radius: var(--radius-control);
-        font-family: 'JetBrains Mono', 'Fira Code', monospace;
-        font-size: 12px;
-        color: var(--text-secondary);
-      }
-
-      .codex-usage {
-        display: flex;
-        flex-direction: column;
-        gap: 10px;
-        margin-bottom: 16px;
-      }
-
-      .codex-usage-plan {
-        margin-left: 8px;
-        font-size: 12px;
-        font-weight: 500;
-        color: var(--text-secondary);
-        text-transform: none;
-      }
-
-      .codex-usage-limit {
-        margin-left: 8px;
-        font-size: 12px;
-        color: var(--danger);
-      }
-
-      .codex-usage-row {
-        display: flex;
-        align-items: center;
-        gap: 12px;
-      }
-
-      .codex-usage-meta {
-        display: flex;
-        flex-direction: column;
-        min-width: 132px;
-      }
-
-      .codex-usage-name {
-        font-size: 13px;
-        color: var(--text-primary);
-      }
-      .codex-usage-reset {
-        font-size: 11px;
-        color: var(--text-secondary);
-      }
-
-      .codex-usage-track {
-        flex: 1;
-        height: 8px;
-        border-radius: 4px;
-        background: var(--surface-0);
-        border: 1px solid var(--border-color);
-        overflow: hidden;
-      }
-
-      .codex-usage-fill {
-        height: 100%;
-        border-radius: 4px;
-        transition: width 0.3s ease;
-      }
-
-      .codex-usage-fill.ok {
-        background: var(--accent-color);
-      }
-      .codex-usage-fill.warn {
-        background: #e6a23c;
-      }
-      .codex-usage-fill.crit {
-        background: var(--danger);
-      }
-
-      .codex-usage-pct {
-        min-width: 42px;
-        text-align: right;
-        font-size: 12px;
-        font-variant-numeric: tabular-nums;
-        color: var(--text-secondary);
-      }
-
-      .codex-usage-note {
-        margin: 4px 0 0;
-        font-size: 11px;
-        line-height: 1.45;
-        font-style: italic;
-        color: var(--text-secondary);
-      }
-
-      /* Codex callback paste flow */
-      .codex-callback-help {
-        margin-top: 16px;
-        padding: 16px;
-        background: var(--surface-0);
-        border: 1px solid var(--accent-color);
-        border-radius: var(--radius-surface);
-      }
-
-      .codex-callback-title {
-        font-size: 14px;
         font-weight: 600;
-        color: var(--accent-color);
+        color: var(--text-primary);
         margin-bottom: 10px;
       }
 
-      .codex-callback-steps {
-        font-size: 13px;
-        color: var(--text-secondary);
-        line-height: 1.6;
-        margin: 0 0 14px 0;
-        padding-left: 20px;
-      }
-
-      .codex-callback-steps code {
-        background: var(--surface-0);
-        padding: 2px 6px;
-        border-radius: var(--radius-tag);
-        font-size: 12px;
-      }
-
-      .codex-callback-input-row {
-        display: flex;
-        gap: 8px;
-        margin-bottom: 8px;
-        align-items: stretch;
-      }
-      .codex-callback-input-row > app-input {
-        flex: 1;
-      }
-
-      .codex-callback-error {
-        font-size: 13px;
-        color: var(--danger);
-        margin: 6px 0 0 0;
-      }
-
-      .codex-callback-hint {
-        font-size: 12px;
+      .subs-usage-plan {
+        font-weight: 400;
         color: var(--text-muted);
-        margin: 10px 0 0 0;
+        text-transform: capitalize;
       }
 
-      .codex-callback-hint code {
-        background: var(--surface-0);
-        padding: 2px 6px;
-        border-radius: var(--radius-tag);
+      .subs-usage-limit {
+        color: var(--color-danger, #dc2626);
+        font-weight: 600;
+      }
+
+      .subs-usage-row {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-bottom: 8px;
+      }
+
+      .subs-usage-meta {
+        display: flex;
+        flex-direction: column;
+        min-width: 120px;
+      }
+
+      .subs-usage-name {
+        font-size: 12px;
+        color: var(--text-secondary);
+      }
+
+      .subs-usage-reset {
         font-size: 11px;
+        color: var(--text-muted);
+      }
+
+      .subs-usage-track {
+        flex: 1;
+        height: 6px;
+        background: var(--surface-1);
+        border-radius: 3px;
+        overflow: hidden;
+      }
+
+      .subs-usage-fill {
+        height: 100%;
+        border-radius: 3px;
+        transition: width 0.3s ease;
+      }
+
+      .subs-usage-fill.ok {
+        background: var(--color-success, #10b981);
+      }
+      .subs-usage-fill.warn {
+        background: var(--color-warning, #b45309);
+      }
+      .subs-usage-fill.crit {
+        background: var(--color-danger, #dc2626);
+      }
+
+      .subs-usage-pct {
+        font-size: 12px;
+        color: var(--text-secondary);
+        min-width: 36px;
+        text-align: right;
+      }
+
+      .subs-usage-note {
+        font-size: 11px;
+        color: var(--text-muted);
+        margin: 6px 0 0 0;
       }
 
       /* Cloud Storage */
@@ -2329,16 +2488,16 @@ const EXPIRY_OPTIONS = [
           width: 100%;
         }
 
-        /* Codex accounts & Cloud secret-provenance rows: let the long, unbreakable
+        /* Subscription accounts & Cloud secret-provenance rows: let the long, unbreakable
          mono strings (e.g. OPENCLOUD_KEYCLOAK_CLIENT_SECRET) wrap instead of
          forcing the row -- and the whole page -- to scroll sideways. */
-        .codex-account-row {
+        .subs-account-row {
           flex-wrap: wrap;
         }
-        .codex-account-row > * {
+        .subs-account-row > * {
           min-width: 0;
         }
-        .codex-account-row .mono {
+        .subs-account-row .mono {
           overflow-wrap: anywhere;
         }
       }
@@ -2460,7 +2619,7 @@ const EXPIRY_OPTIONS = [
     `,
   ],
 })
-export class SettingsComponent implements OnInit {
+export class SettingsComponent implements OnInit, OnDestroy {
   readonly tokenService = inject(McpTokenService);
   readonly userService = inject(UserService);
   readonly settingsService = inject(SettingsService);
@@ -2888,21 +3047,27 @@ export class SettingsComponent implements OnInit {
   readonly savingComm = signal(false);
   readonly commSaved = signal(false);
 
-  // Codex proxy state (admin-only)
-  readonly codexStatus = signal<CodexStatus>({
-    connected: false,
+  // AI subscriptions state (admin-only)
+  readonly subsStatus = signal<SubscriptionsStatus>({
     reachable: false,
+    connected: false,
+    proxy_url: null,
+    error: null,
     accounts: [],
     model_count: 0,
+    providers: [],
   });
-  readonly codexModels = signal<string[]>([]);
-  readonly codexUsage = signal<CodexUsage>({ available: false });
-  readonly codexLoading = signal(false);
-  readonly codexConnecting = signal(false);
-  readonly codexCallbackUrl = signal('');
-  readonly codexCallbackSubmitting = signal(false);
-  readonly codexCallbackError = signal('');
-  private codexPollTimer: ReturnType<typeof setInterval> | null = null;
+  readonly subsLoading = signal(false);
+  /** The one in-flight authorization, if any. Only one runs at a time. */
+  readonly activeLogin = signal<SubscriptionLogin | null>(null);
+  readonly loginBusy = signal(false);
+  readonly loginError = signal('');
+  readonly callbackUrl = signal('');
+  readonly callbackSubmitting = signal(false);
+  /** Per-account usage, fetched on demand — never eagerly for every provider. */
+  readonly accountUsage = signal<Record<string, SubscriptionUsage>>({});
+  readonly expandedUsage = signal<string | null>(null);
+  private loginPollTimer: ReturnType<typeof setInterval> | null = null;
 
   // Cloud storage state (admin-only, Phase 4)
   readonly cloudSettings = signal<MainCloudSettingsResponse | null>(null);
@@ -3010,7 +3175,7 @@ export class SettingsComponent implements OnInit {
       const user = this.userService.currentUser();
       if (user?.is_admin) {
         this._adminLoadersFired = true;
-        this.loadCodexStatus();
+        this.loadSubscriptions();
         this.loadCloudSettings();
         // Seed the Voice Library add-gate switch with its persisted state.
         this.apiService.getTtsLibrarySetting().subscribe((row) => {
@@ -3046,9 +3211,14 @@ export class SettingsComponent implements OnInit {
     this.settingsService.loadApiKeys();
     this.settingsService.loadPreferences();
     this.loadExpertDefaults();
-    // Admin-only loaders (codex status + cloud settings) are triggered
+    // Admin-only loaders (subscriptions + cloud settings) are triggered
     // by the effect in the constructor — that path waits for currentUser()
     // to populate, which is the only thing that works on a hard F5 reload.
+  }
+
+  ngOnDestroy(): void {
+    // A login poll started here must not outlive the view.
+    this.stopLoginPoll();
   }
 
   providerLabel(provider: string): string {
@@ -3424,111 +3594,183 @@ export class SettingsComponent implements OnInit {
     });
   }
 
-  // ── Codex Proxy Management ──────────────────────────────────
+  // ── AI Subscriptions ────────────────────────────────────────
+  //
+  // The orchestrator owns the login sessions; the browser holds an SRW login
+  // id and polls it. A poll reporting `verifying` is deliberately NOT rendered
+  // as connected — upstream reporting "ok" is not proof that the credential
+  // was persisted (see the service's poll_login).
 
-  loadCodexStatus(): void {
-    this.codexLoading.set(true);
-    this.settingsService.getCodexStatus().subscribe((status) => {
-      this.codexStatus.set(status);
-      this.codexLoading.set(false);
-    });
-    this.settingsService.getCodexModels().subscribe((res) => {
-      this.codexModels.set(res.models);
-    });
-    this.settingsService.getCodexUsage().subscribe((usage) => {
-      this.codexUsage.set(usage);
+  loadSubscriptions(): void {
+    this.subsLoading.set(true);
+    this.settingsService.getSubscriptionsStatus().subscribe((status) => {
+      this.subsStatus.set(status);
+      this.subsLoading.set(false);
     });
   }
 
-  /** Clamp a used-percent to [0, 100] for the bar width (null → 0). */
-  clampPct(p: number | null | undefined): number {
-    return Math.max(0, Math.min(100, typeof p === 'number' ? p : 0));
+  /** Translated product label, falling back to the server's English string. */
+  subscriptionProviderLabel(key: string | null | undefined): string {
+    if (!key) return '';
+    const translated = this.transloco.translate(`settings.subscriptions.providers.${key}`);
+    if (translated && translated !== `settings.subscriptions.providers.${key}`) {
+      return translated;
+    }
+    return this.subsStatus().providers.find((p) => p.key === key)?.label ?? key;
   }
 
-  /** Bar colour band by fill: ok (blue) < 70 ≤ warn (amber) < 90 ≤ crit (red). */
-  usageLevel(p: number | null | undefined): 'ok' | 'warn' | 'crit' {
-    const n = typeof p === 'number' ? p : 0;
-    if (n >= 90) return 'crit';
-    if (n >= 70) return 'warn';
+  usageFor(accountId: string): SubscriptionUsage | undefined {
+    return this.accountUsage()[accountId];
+  }
+
+  loadUsage(accountId: string): void {
+    this.settingsService.getSubscriptionUsage(accountId).subscribe((usage) => {
+      this.accountUsage.update((current) => ({ ...current, [accountId]: usage }));
+      if (usage.available) this.expandedUsage.set(accountId);
+    });
+  }
+
+  toggleUsage(accountId: string): void {
+    this.expandedUsage.update((current) => (current === accountId ? null : accountId));
+  }
+
+  /** Bar colour band by fill: ok (green) < 70 ≤ warn (amber) < 90 ≤ crit (red). */
+  usageTone(percent: number | null | undefined): 'ok' | 'warn' | 'crit' {
+    const value = typeof percent === 'number' ? percent : 0;
+    if (value >= 90) return 'crit';
+    if (value >= 70) return 'warn';
     return 'ok';
   }
 
   /** Human "2h 32m" / "3d 4h" / "12m" for a reset countdown (seconds). */
-  formatReset(seconds: number | null | undefined): string {
+  formatResetIn(seconds: number | null | undefined): string {
     if (!seconds || seconds <= 0) return '';
-    const h = Math.floor(seconds / 3600);
-    const m = Math.floor((seconds % 3600) / 60);
-    if (h >= 24) return `${Math.floor(h / 24)}d ${h % 24}h`;
-    if (h >= 1) return `${h}h ${m}m`;
-    return `${m}m`;
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    if (hours >= 24) return `${Math.floor(hours / 24)}d ${hours % 24}h`;
+    if (hours >= 1) return `${hours}h ${minutes}m`;
+    return `${minutes}m`;
   }
 
-  connectCodexAccount(): void {
-    this.codexConnecting.set(true);
-    this.settingsService.startCodexLogin().subscribe({
-      next: (res) => {
-        window.open(res.auth_url, '_blank');
-        this.codexPollTimer = setInterval(() => {
-          this.settingsService.pollCodexLogin(res.state).subscribe((poll) => {
-            if (poll.status !== 'wait') {
-              this.stopCodexPoll();
-              this.codexConnecting.set(false);
-              this.loadCodexStatus();
-            }
-          });
-        }, 2000);
-      },
-      error: () => this.codexConnecting.set(false),
-    });
+  /** Local-time expiry for a device-flow verification code. */
+  formatExpiry(isoTimestamp: string): string {
+    const at = new Date(isoTimestamp);
+    return Number.isNaN(at.getTime()) ? '' : at.toLocaleTimeString();
   }
 
-  submitCodexCallback(): void {
-    const url = this.codexCallbackUrl().trim();
-    if (!url) return;
-
-    try {
-      const parsed = new URL(url);
-      if (!parsed.searchParams.get('code') || !parsed.searchParams.get('state')) {
-        this.codexCallbackError.set(
-          this.transloco.translate('settings.codex.errors.urlMissingParams'),
-        );
-        return;
-      }
-    } catch {
-      this.codexCallbackError.set(this.transloco.translate('settings.codex.errors.invalidUrl'));
-      return;
-    }
-
-    this.codexCallbackError.set('');
-    this.codexCallbackSubmitting.set(true);
-
-    this.settingsService.completeCodexLogin(url).subscribe({
-      next: () => {
-        this.codexCallbackSubmitting.set(false);
-        this.codexCallbackUrl.set('');
-        this.stopCodexPoll();
-        this.codexConnecting.set(false);
-        this.loadCodexStatus();
+  connectProvider(providerKey: string): void {
+    if (this.activeLogin()) return;
+    this.loginBusy.set(true);
+    this.loginError.set('');
+    this.callbackUrl.set('');
+    this.settingsService.startSubscriptionLogin(providerKey).subscribe({
+      next: (login) => {
+        this.loginBusy.set(false);
+        this.activeLogin.set(login);
+        // A browser flow needs the authorization page; a device flow shows the
+        // verification URL + code inline instead of hijacking a tab.
+        if (login.flow === 'browser') window.open(login.auth_url, '_blank');
+        this.startLoginPoll(login.login_id);
       },
       error: (err) => {
-        this.codexCallbackSubmitting.set(false);
-        const detail =
-          err?.error?.detail || this.transloco.translate('settings.codex.errors.completeFailed');
-        this.codexCallbackError.set(detail);
+        this.loginBusy.set(false);
+        this.loginError.set(
+          err?.error?.detail ?? this.transloco.translate('settings.subscriptions.errors.startFailed'),
+        );
       },
     });
   }
 
-  disconnectCodexAccount(name: string): void {
-    this.settingsService.deleteCodexCredential(name).subscribe(() => {
-      this.loadCodexStatus();
+  private startLoginPoll(loginId: string): void {
+    this.stopLoginPoll();
+    this.loginPollTimer = setInterval(() => {
+      this.settingsService.pollSubscriptionLogin(loginId).subscribe({
+        next: (login) => {
+          this.activeLogin.set(login);
+          if (login.status === 'connected') {
+            this.stopLoginPoll();
+            this.loadSubscriptions();
+          } else if (login.status === 'failed' || login.status === 'cancelled') {
+            this.stopLoginPoll();
+            if (login.error) {
+              this.loginError.set(
+                this.translateLoginError(login.error),
+              );
+            }
+          }
+        },
+        error: () => this.stopLoginPoll(),
+      });
+    }, 2000);
+  }
+
+  /** Map the service's stable error slugs to copy; pass anything else through. */
+  private translateLoginError(code: string): string {
+    const key = `settings.subscriptions.errors.${code}`;
+    const translated = this.transloco.translate(key);
+    return translated && translated !== key ? translated : code;
+  }
+
+  submitCallback(): void {
+    const login = this.activeLogin();
+    const url = this.callbackUrl().trim();
+    if (!login || !url) return;
+    this.loginError.set('');
+    this.callbackSubmitting.set(true);
+    this.settingsService.submitSubscriptionCallback(login.login_id, url).subscribe({
+      next: (updated) => {
+        this.callbackSubmitting.set(false);
+        this.callbackUrl.set('');
+        this.activeLogin.set(updated);
+        if (updated.status === 'connected') {
+          this.stopLoginPoll();
+          this.loadSubscriptions();
+        }
+      },
+      error: (err) => {
+        this.callbackSubmitting.set(false);
+        this.loginError.set(
+          err?.error?.detail ??
+            this.transloco.translate('settings.subscriptions.errors.completeFailed'),
+        );
+      },
     });
   }
 
-  private stopCodexPoll(): void {
-    if (this.codexPollTimer) {
-      clearInterval(this.codexPollTimer);
-      this.codexPollTimer = null;
+  cancelLogin(): void {
+    const login = this.activeLogin();
+    if (!login) return;
+    this.stopLoginPoll();
+    this.settingsService.cancelSubscriptionLogin(login.login_id).subscribe({
+      next: () => this.activeLogin.set(null),
+      error: () => this.activeLogin.set(null),
+    });
+  }
+
+  dismissLogin(): void {
+    this.stopLoginPoll();
+    this.activeLogin.set(null);
+    this.loginError.set('');
+  }
+
+  disconnectAccount(accountId: string): void {
+    this.settingsService.disconnectSubscriptionAccount(accountId).subscribe({
+      next: () => {
+        this.accountUsage.update((current) => {
+          const next = { ...current };
+          delete next[accountId];
+          return next;
+        });
+        this.loadSubscriptions();
+      },
+      error: (err) => this.loginError.set(err?.error?.detail ?? ''),
+    });
+  }
+
+  private stopLoginPoll(): void {
+    if (this.loginPollTimer) {
+      clearInterval(this.loginPollTimer);
+      this.loginPollTimer = null;
     }
   }
 

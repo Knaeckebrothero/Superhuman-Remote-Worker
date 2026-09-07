@@ -28,6 +28,10 @@ Mutations:
     * MCP `project:<uuid>` scope filters the result post-fetch
 """
 
+from tests._expert_catalog import catalogue_route
+from orchestrator.routers import expert_catalog as expert_routes
+
+
 from contextlib import ExitStack
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID
@@ -342,28 +346,28 @@ class TestProjectReadGates:
     async def test_list_experts_blocked_cross_user(
         self, user_b, project_a, fake_db, fake_request
     ):
-        from orchestrator.main import list_project_experts
-
         with (
             _patch_caller_and_db(user_b, fake_db),
             patch("orchestrator.main.gitea_client", _explode("gitea_client")),
         ):
             with pytest.raises(HTTPException) as exc:
-                await list_project_experts(fake_request, str(project_a["id"]))
+                await catalogue_route(expert_routes.list_project_experts)(
+                    fake_request, str(project_a["id"])
+                )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
     async def test_get_expert_blocked_cross_user(
         self, user_b, project_a, fake_db, fake_request
     ):
-        from orchestrator.main import get_project_expert
-
         with (
             _patch_caller_and_db(user_b, fake_db),
             patch("orchestrator.main.gitea_client", _explode("gitea_client")),
         ):
             with pytest.raises(HTTPException) as exc:
-                await get_project_expert(fake_request, str(project_a["id"]), "scholar")
+                await catalogue_route(expert_routes.get_project_expert)(
+                    fake_request, str(project_a["id"]), "scholar"
+                )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio

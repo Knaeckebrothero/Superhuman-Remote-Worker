@@ -15711,8 +15711,16 @@ CREATE TABLE public.llm_endpoints (
     api_key text,
     key_prefix character varying(12),
     created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
-    updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP
+    updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
+    transport_kind text
 );
+
+
+--
+-- Name: COLUMN llm_endpoints.transport_kind; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.llm_endpoints.transport_kind IS 'Stable transport marker, independent of label/base_url. ''subscription-proxy'' = the shared CLIProxyAPI deployment fronting connected subscription accounts. NULL = an ordinary OpenAI-compatible endpoint.';
 
 
 --

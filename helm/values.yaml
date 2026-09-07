@@ -2777,6 +2777,20 @@ codexProxy:
   # upstream error the status endpoint won't explain, then flip it back.
   requestLog: false
   debug: false
+  # Optional dedicated *inference* credential, distinct from the management
+  # key. CLIProxyAPI guards /v0/management/* with MANAGEMENT_PASSWORD and
+  # /v1/* with its own access-manager API keys; SRW historically stored the
+  # management key as the endpoint credential, conflating the two. Point this
+  # at a Secret holding an inference key and the orchestrator seeds *that* as
+  # the endpoint credential instead.
+  #
+  # Leave the name empty (the default) to keep today's behaviour exactly:
+  # existing deployments must not need a credential migration to upgrade.
+  # Setting it does NOT by itself make the proxy require the key — add the
+  # matching `api-keys` entry to the proxy config when you want /v1/* gated.
+  inferenceApiKeySecret:
+    name: ""
+    key: "SUBSCRIPTION_PROXY_API_KEY"
   # The proxy buffers the full request/response body in memory (Go), so a
   # single multimodal turn (e.g. several multi-MB images base64-inflated to
   # ~30MB each, plus the response) can spike well past a tight limit. The old

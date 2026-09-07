@@ -1245,41 +1245,86 @@
       "webConnectorDesc": "Add this URL as a custom MCP connector. OAuth login is handled automatically — no token or credentials needed.",
       "webConnectorHint": "Works with any MCP client that supports OAuth 2.1 (Authorization Code + PKCE). Leave the Client ID and Client Secret fields empty — the server handles registration automatically."
     },
-    "codex": {
-      "title": "Codex Proxy",
-      "desc": "Manage the Codex OAuth proxy for ChatGPT subscription-backed models",
-      "checking": "Checking proxy...",
+    "subscriptions": {
+      "title": "AI Subscriptions",
+      "desc": "Connect subscription accounts through the shared proxy. Models are registered separately in Admin → Models.",
+      "checking": "Checking proxy…",
       "connected": "Connected",
-      "notConnected": "Not connected",
+      "notConnected": "No account connected",
       "notEnabled": "Proxy not enabled",
-      "disabledTitle": "Codex proxy isn't enabled",
-      "disabledDesc": "This deployment isn't running the Codex OAuth proxy, so ChatGPT subscription-backed models aren't available. To enable it, set the following in your Helm values overlay, redeploy, then reload this page:",
+      "modelsAvailable": "{{count}} model(s) advertised",
       "refreshStatus": "Refresh status",
       "disconnect": "Disconnect",
-      "availableModels": "Available Models",
-      "waiting": "Waiting for OAuth...",
-      "connectAccount": "Connect ChatGPT Account",
-      "completeSignIn": "Complete sign-in",
-      "step1": "Sign in with your OpenAI account in the tab that just opened.",
-      "step2": "After sign-in, the browser will try to redirect to localhost and show an error — this is expected.",
-      "step3": "Copy the full URL from your browser's address bar.",
-      "step4": "Paste it below and click Complete Login.",
-      "callbackPlaceholder": "Paste callback URL here...",
-      "submitting": "Submitting...",
-      "completeLogin": "Complete Login",
-      "portForwardHint": "If you have kubectl port-forward active, login will complete automatically.",
+      "connect": "Connect",
+      "cancel": "Cancel sign-in",
+      "dismiss": "Dismiss",
+      "addTitle": "Add a subscription",
+      "connectedCount": "{{count}} connected",
+      "unverified": "Not live-verified",
+      "disabledTitle": "The subscription proxy isn't enabled",
+      "disabledDesc": "This deployment isn't running the subscription proxy, so subscription-backed models aren't available. To enable it, set the following in your Helm values overlay, redeploy, then reload this page:",
+      "providers": {
+        "openai-codex": "OpenAI · ChatGPT / Codex",
+        "anthropic-claude-code": "Anthropic · Claude Code",
+        "google-antigravity": "Google · Antigravity",
+        "xai-grok-build": "xAI · Grok Build",
+        "kimi-code": "Moonshot · Kimi Code"
+      },
+      "flows": {
+        "browser": "Sign in through your browser, then paste the callback URL if the redirect doesn't reach this server.",
+        "device": "Open the verification link and enter the code shown here."
+      },
+      "states": {
+        "connected": "Connected",
+        "pending": "Awaiting authorization",
+        "refreshing": "Refreshing token",
+        "cooldown": "Temporarily rate-limited",
+        "error": "Error",
+        "disabled": "Disabled",
+        "unknown": "Unknown"
+      },
+      "scope": {
+        "installation": "Shared"
+      },
+      "browser": {
+        "step1": "Sign in with the provider in the tab that just opened:",
+        "openLink": "open the sign-in page",
+        "step2": "After sign-in the browser redirects to localhost and may show an error — that is expected on a remote deployment.",
+        "step3": "Copy the complete URL from the address bar and paste it below.",
+        "callbackPlaceholder": "Paste the callback URL here…",
+        "complete": "Complete sign-in",
+        "remoteHint": "If the redirect reaches the proxy directly, the sign-in completes on its own and you can ignore this field."
+      },
+      "device": {
+        "step1": "Open the verification page:",
+        "step2": "Enter this code:",
+        "step3": "Approve the request, then leave this page open until it reports Connected.",
+        "expires": "The code expires at {{time}}."
+      },
+      "login": {
+        "pending": "Waiting for {{provider}} authorization…",
+        "verifying": "Authorization reported complete — confirming the credential…",
+        "connected": "{{provider}} connected.",
+        "failed": "{{provider}} sign-in failed.",
+        "cancelled": "{{provider}} sign-in cancelled."
+      },
       "usage": {
+        "check": "Check usage",
+        "toggle": "Usage",
+        "unavailable": "Usage unavailable",
         "title": "Usage limits",
         "session": "Current session",
         "weekly": "Weekly limit",
         "resetsIn": "Resets in {{time}}",
         "limitReached": "Limit reached",
-        "disclaimer": "The proxy doesn't expose usage: ChatGPT meters proxy-routed requests as 'extra usage' outside these windows, so these bars don't reflect usage through the proxy yet."
+        "disclaimer": "Reported by the provider for this account. The proxy does not meter usage itself, so requests routed through it may be counted differently."
       },
       "errors": {
-        "urlMissingParams": "URL is missing required parameters. Please paste the complete URL from your browser address bar.",
-        "invalidUrl": "Invalid URL. Please paste the complete URL from your browser address bar.",
-        "completeFailed": "Failed to complete login. Please try again."
+        "startFailed": "Could not start the sign-in. Check that the proxy is reachable.",
+        "completeFailed": "Could not complete the sign-in. Please try again.",
+        "timeout": "The sign-in timed out before it was approved.",
+        "credential_not_persisted": "The provider reported success but no credential was stored. Try connecting again.",
+        "authorization_failed": "The provider rejected the authorization."
       }
     },
     "cloud": {

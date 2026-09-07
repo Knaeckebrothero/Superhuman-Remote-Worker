@@ -31,6 +31,16 @@ import os
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
 
+from shared.subscription_routing import (
+    LEGACY_CODEX_PROXY_ENDPOINT_LABEL,
+    RoutingMetadata,
+    applies_codex_context_cap,
+    factory_provider_for_protocol,
+    is_subscription_endpoint,
+    protocol_for_factory_provider,
+    routing_from_params,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -66,6 +76,15 @@ class ModelMeta:
     origin: str = "catalog"
     endpoint_id: Optional[str] = None
     capability: str = "chat"
+    # Explicit routing metadata (knowledge-base/knowledge/features/subscription_proxy.md
+    # §6). ``transport_kind`` marks the endpoint as the shared subscription
+    # proxy independently of its label/hostname; ``client_protocol`` is the API
+    # schema SRW sends; ``subscription_sources`` is the upstream credential
+    # channel provenance (many-to-many — a pooled model can be served by more
+    # than one connected account).
+    transport_kind: Optional[str] = None
+    client_protocol: Optional[str] = None
+    subscription_sources: tuple[str, ...] = ()
 
 
 _FACTORY_PROVIDERS = {
@@ -94,30 +113,47 @@ def _factory_provider(yaml_provider: Optional[str]) -> str:
     return "openai"
 
 
-# The system-seeded Codex proxy (CLIProxyAPI) is created under this label by
-# ``ensure_codex_proxy_endpoint`` and its base_url points at the
-# ``*-codex-proxy`` service. It speaks ONLY the OpenAI *Responses* API and
-# surfaces model reasoning via ``reasoning.summary`` — which lives in the codex
-# factory (``_create_codex_llm``). Endpoint-backed rows otherwise resolve to the
-# generic ``openai`` (Chat Completions) factory, which forces
-# ``use_responses_api=False`` and never requests a reasoning summary, so gpt-5.x
-# / o-series / codex models wired to this endpoint silently lose their reasoning.
-CODEX_PROXY_ENDPOINT_LABEL = "codex-proxy"
+# Pre-rename label of the seeded subscription-proxy row. Kept as a module
+# constant because callers (and tests) still import it; the *authority* for
+# "is this the subscription proxy" is now ``llm_endpoints.transport_kind``
+# (see shared.subscription_routing). The proxy's Responses path surfaces model
+# reasoning via ``reasoning.summary``, which lives in the codex factory
+# (``_create_codex_llm``); the generic ``openai`` (Chat Completions) factory
+# forces ``use_responses_api=False`` and never requests a reasoning summary, so
+# a mis-resolved row silently loses gpt-5.x reasoning.
+CODEX_PROXY_ENDPOINT_LABEL = LEGACY_CODEX_PROXY_ENDPOINT_LABEL
 
 
 def _endpoint_factory_provider(
-    base_url: Optional[str], label: Optional[str] = None
+    base_url: Optional[str],
+    label: Optional[str] = None,
+    *,
+    transport_kind: Optional[str] = None,
+    routing: Optional[RoutingMetadata] = None,
 ) -> str:
     """Pick the agent-side LLM factory for an endpoint-backed row.
 
-    Defaults to ``openai`` (the wire protocol is OpenAI-compatible) but returns
-    ``codex`` for the system Codex proxy, whose Responses-API + reasoning-summary
-    path lives in ``_create_codex_llm``. Detected by the well-known endpoint
-    identity (label ``codex-proxy`` or a ``codex-proxy`` host in the base_url).
+    Resolution order (knowledge-base/knowledge/features/subscription_proxy.md §6):
+
+    1. **Explicit per-model client protocol.** ``openai-responses`` → the
+       ``codex`` factory, ``openai-chat`` → the generic ``openai`` factory.
+       This is the only rule that can express "Claude Code over Chat
+       Completions on the same endpoint as Codex over Responses".
+    2. **Subscription transport with no explicit protocol.** The pre-feature
+       Codex install: every model on that endpoint went through the Responses
+       factory, so keep doing that. The migration backfills rule 1 onto those
+       rows, and this branch is the safety net for a row created before the
+       backfill (or after a schema rollback).
+    3. Anything else is an ordinary OpenAI-compatible endpoint.
     """
-    if label and label.strip().lower() == CODEX_PROXY_ENDPOINT_LABEL:
-        return "codex"
-    if base_url and CODEX_PROXY_ENDPOINT_LABEL in base_url.lower():
+    protocol_factory = factory_provider_for_protocol(
+        routing.client_protocol if routing else None
+    )
+    if protocol_factory:
+        return protocol_factory
+    if is_subscription_endpoint(
+        transport_kind=transport_kind, label=label, base_url=base_url
+    ):
         return "codex"
     return "openai"
 
@@ -170,18 +206,29 @@ def _family_context_window(model_id: Optional[str]) -> Optional[int]:
 
 
 def _cap_context_window(
-    provider: str, context_window: Optional[int], model_id: Optional[str] = None
+    provider: str,
+    context_window: Optional[int],
+    model_id: Optional[str] = None,
+    subscription_sources: tuple[str, ...] = (),
 ) -> Optional[int]:
-    """Clamp a codex-routed model's working window to the Codex surface cap.
+    """Clamp a Codex-sourced model's working window to the Codex surface cap.
 
-    Non-codex providers pass through untouched (they inherit their family/catalog
-    window as before). For ``codex`` the cap is a **ceiling, never a floor**: the
-    effective window is the admin ``context_window`` when set, else the family
-    matrix's declared true window, and whichever applies is then ``min``'d with
-    the cap. Only when neither is known does the cap itself stand in. Keying on
-    the resolved *provider* (transport), not the family, means gpt-5.x over the
-    real API keeps its full window while the same model over the codex proxy is
-    capped.
+    The clamp belongs to *OpenAI's Codex/ChatGPT-OAuth backend*, not to the
+    Responses API and not to the proxy as a whole. It therefore applies to a
+    route whose ``subscription_sources`` include ``codex``, and to a route with
+    unknown sources that still resolved onto the ``codex`` factory — the
+    pre-feature Codex install, whose behaviour must not change on upgrade.
+    A Grok Build / Kimi / Claude Code / Antigravity route with known sources
+    keeps its own window even though it may share the same proxy endpoint (and,
+    for Grok Build, the same Responses protocol). Everything else passes
+    through untouched.
+
+    Where it does apply the cap is a **ceiling, never a floor**: the effective
+    window is the admin ``context_window`` when set, else the family matrix's
+    declared true window, and whichever applies is then ``min``'d with the cap.
+    Only when neither is known does the cap itself stand in. Keying on the
+    resolved *route*, not the family, means gpt-5.x over the real API keeps its
+    full window while the same model over the subscription proxy is capped.
 
     The family fallback matters for models whose true window is *below* the cap.
     ``gpt-5.3-codex-spark`` is a distilled 128K model: with a NULL catalog row the
@@ -191,7 +238,7 @@ def _cap_context_window(
     The 80% compaction threshold landed at 320K, compaction never fired, and the
     job hard-400'd on ``context_too_large`` (job 9a99f433, 2026-07-23).
     """
-    if provider != "codex":
+    if not applies_codex_context_cap(provider, subscription_sources):
         return context_window
     cap = _codex_context_cap()
     if cap <= 0:
@@ -359,13 +406,22 @@ def _endpoint_row_to_meta(row: dict[str, Any], *, origin: str) -> ModelMeta:
     """Build a ModelMeta from a user/system endpoint lookup row.
 
     Endpoint-backed models route through the openai factory (the wire
-    protocol is OpenAI-compatible) — except the system Codex proxy, which
-    needs the codex factory's Responses-API + reasoning-summary path (see
-    ``_endpoint_factory_provider``). api_key_ref is None because the key
-    travels inline on the endpoint row — the dispatcher fetches it via
-    get_user_llm_endpoint(endpoint_id), not through resolve_api_keys_for_job.
+    protocol is OpenAI-compatible) — except rows carrying an explicit
+    ``openai-responses`` client protocol and rows on the shared subscription
+    proxy with no explicit protocol, which need the codex factory's
+    Responses-API + reasoning-summary path (see ``_endpoint_factory_provider``).
+    api_key_ref is None because the key travels inline on the endpoint row —
+    the dispatcher fetches it via get_user_llm_endpoint(endpoint_id), not
+    through resolve_api_keys_for_job.
     """
-    provider = _endpoint_factory_provider(row.get("base_url"), row.get("label"))
+    routing = routing_from_params(row.get("params_json"))
+    transport_kind = row.get("transport_kind") or row.get("endpoint_transport_kind")
+    provider = _endpoint_factory_provider(
+        row.get("base_url"),
+        row.get("label"),
+        transport_kind=transport_kind,
+        routing=routing,
+    )
     return ModelMeta(
         model_id=row["model_id"],
         provider=provider,
@@ -374,13 +430,20 @@ def _endpoint_row_to_meta(row: dict[str, Any], *, origin: str) -> ModelMeta:
         base_url=row["base_url"],
         api_key_ref=None,
         context_window=_cap_context_window(
-            provider, row.get("context_window"), row["model_id"]
+            provider,
+            row.get("context_window"),
+            row["model_id"],
+            routing.subscription_sources,
         ),
         max_output_tokens=_params_max_output_tokens(row),
         reasoning_level=row.get("reasoning_level"),
         origin=origin,
         endpoint_id=str(row["endpoint_id"]),
         capability=row.get("capability") or "chat",
+        transport_kind=transport_kind,
+        client_protocol=routing.client_protocol
+        or protocol_for_factory_provider(provider),
+        subscription_sources=routing.subscription_sources,
     )
 
 
@@ -395,18 +458,24 @@ def _catalog_row_to_meta(row: dict[str, Any]) -> ModelMeta:
 
     Two shapes:
     - ``provider_kind='endpoint'`` — inherits ``base_url`` + ``api_key``
-      from the joined ``llm_endpoints`` row. Routes through the
-      openai factory (OpenAI-compatible wire protocol).
+      from the joined ``llm_endpoints`` row, and its routing metadata from
+      the row's own ``params_json`` plus the endpoint's ``transport_kind``.
     - ``provider_kind='system'`` — sets ``api_key_ref`` to the provider
       slug so the dispatcher resolves the key via ``system_api_keys``;
       ``base_url`` stays None so the factory uses its hardcoded default.
+      Never a subscription route, so it carries no routing metadata.
     """
     provider_kind = row["provider_kind"]
     provider_ref = row["provider_ref"]
     capability = row.get("capability") or "chat"
     if provider_kind == "endpoint":
+        routing = routing_from_params(row.get("params_json"))
+        transport_kind = row.get("endpoint_transport_kind")
         provider = _endpoint_factory_provider(
-            row.get("endpoint_base_url"), row.get("endpoint_label")
+            row.get("endpoint_base_url"),
+            row.get("endpoint_label"),
+            transport_kind=transport_kind,
+            routing=routing,
         )
         return ModelMeta(
             model_id=row["model_id"],
@@ -416,13 +485,20 @@ def _catalog_row_to_meta(row: dict[str, Any]) -> ModelMeta:
             base_url=row.get("endpoint_base_url"),
             api_key_ref=None,
             context_window=_cap_context_window(
-                provider, row.get("context_window"), row["model_id"]
+                provider,
+                row.get("context_window"),
+                row["model_id"],
+                routing.subscription_sources,
             ),
             max_output_tokens=_params_max_output_tokens(row),
             reasoning_level=row.get("reasoning_level"),
             origin="catalog",
             endpoint_id=str(row["endpoint_id"]) if row.get("endpoint_id") else None,
             capability=capability,
+            transport_kind=transport_kind,
+            client_protocol=routing.client_protocol
+            or protocol_for_factory_provider(provider),
+            subscription_sources=routing.subscription_sources,
         )
     provider = _factory_provider(provider_ref)
     return ModelMeta(

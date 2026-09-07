@@ -7,6 +7,7 @@ from pathlib import Path
 
 import yaml
 
+from orchestrator.schemas.datasources import DatasourceCreate
 from orchestrator.security.credential_files import (
     CREDENTIAL_FILE_TYPES as ORCHESTRATOR_CREDENTIAL_FILE_TYPES,
 )
@@ -59,7 +60,10 @@ def test_orchestrator_validation_consumes_the_catalog():
     )[0]
 
     assert "valid_types = DATASOURCE_TYPES" in create_route
-    assert "description=f\"Connector type: {', '.join(DATASOURCE_TYPE_IDS)}\"" in source
+    assert (
+        DatasourceCreate.model_json_schema()["properties"]["type"]["description"]
+        == f"Connector type: {', '.join(DATASOURCE_TYPE_IDS)}"
+    )
 
 
 def test_datasource_catalog_matches_cockpit_consumers():

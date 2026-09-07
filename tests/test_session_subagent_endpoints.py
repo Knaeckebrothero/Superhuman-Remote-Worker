@@ -16,6 +16,7 @@ import pytest
 from pydantic import ValidationError
 
 import orchestrator.main as m
+from orchestrator.routers import job_inspection as job_inspection_routes
 from shared.persistent_input_delivery import InputDeliveryConflict
 
 
@@ -360,7 +361,9 @@ class TestOwnerRosterRoute:
         monkeypatch.setattr(m, "postgres_db", db)
         monkeypatch.setattr(m, "require_thread_owner", guard)
         request = SimpleNamespace()
-        result = await m.get_session_subagents(request, str(PARENT))
+        result = await job_inspection_routes.get_session_subagents(
+            request, str(PARENT), dependencies=m._job_inspection_dependencies()
+        )
         assert result["parent_thread_id"] == str(PARENT)
         assert result["count"] == 1
         assert result["subagents"][0]["parent_thread_id"] == str(PARENT)
@@ -373,13 +376,21 @@ class TestOwnerRosterRoute:
         monkeypatch.setattr(m, "postgres_db", db)
         monkeypatch.setattr(m, "require_thread_owner", guard)
         with pytest.raises(m.HTTPException) as excinfo:
-            await m.get_session_subagents(SimpleNamespace(), str(PARENT))
+            await job_inspection_routes.get_session_subagents(
+                SimpleNamespace(),
+                str(PARENT),
+                dependencies=m._job_inspection_dependencies(),
+            )
         assert excinfo.value.status_code == 403
         db.list_session_subagent_threads.assert_not_awaited()
 
         guard.side_effect = None
         guard.return_value = ({"id": "owner"}, {"id": PARENT, "kind": "subagent"})
         with pytest.raises(m.HTTPException) as excinfo:
-            await m.get_session_subagents(SimpleNamespace(), str(PARENT))
+            await job_inspection_routes.get_session_subagents(
+                SimpleNamespace(),
+                str(PARENT),
+                dependencies=m._job_inspection_dependencies(),
+            )
         assert excinfo.value.status_code == 404
         db.list_session_subagent_threads.assert_not_awaited()

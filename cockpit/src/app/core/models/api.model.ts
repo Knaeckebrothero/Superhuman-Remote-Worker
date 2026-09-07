@@ -695,6 +695,13 @@ export interface LlmEndpoint {
   label: string;
   base_url: string;
   key_prefix: string | null;
+  /**
+   * Stable routing marker from `llm_endpoints.transport_kind`.
+   * `'subscription-proxy'` marks the shared CLIProxyAPI deployment that fronts
+   * connected subscription accounts. Branch on this — never on `label`, which
+   * an admin may rename, and never on the hostname.
+   */
+  transport_kind: string | null;
   created_at: string | null;
   updated_at: string | null;
   models: never[];
@@ -963,6 +970,144 @@ export interface PersistentAgentSettings {
 /**
  * Codex proxy status (admin-only, from CLIProxyAPI management API).
  */
+/**
+ * Everything Settings → AI Subscriptions renders, from
+ * `GET /api/subscriptions/status`. Reachability and authentication are
+ * separate: an unreachable proxy is "not enabled", not "signed out".
+ */
+export interface SubscriptionsStatus {
+  reachable: boolean;
+  connected: boolean;
+  proxy_url: string | null;
+  error: string | null;
+  accounts: SubscriptionAccount[];
+  model_count: number;
+  providers: SubscriptionProviderInfo[];
+}
+
+/** One connectable subscription product, from the orchestrator's registry. */
+export interface SubscriptionProviderInfo {
+  key: string;
+  label: string;
+  vendor: string;
+  /** `browser` opens an authorization page; `device` shows a code to enter. */
+  login_flow: 'browser' | 'device';
+  channels: string[];
+  client_protocol: string;
+  has_usage_reader: boolean;
+  /** True only where SRW has live-verified inference through this product. */
+  inference_verified: boolean;
+  notes: string[];
+  connected_accounts: number;
+}
+
+/** Connection state of one account. Mirrors what the proxy actually reports. */
+export type SubscriptionAccountState =
+  | 'connected'
+  | 'pending'
+  | 'refreshing'
+  | 'cooldown'
+  | 'error'
+  | 'disabled'
+  | 'unknown';
+
+/** One connected credential, with every secret stripped server-side. */
+export interface SubscriptionAccount {
+  account_id: string;
+  provider: string | null;
+  channel: string | null;
+  label: string | null;
+  email: string | null;
+  account_type: string | null;
+  state: SubscriptionAccountState;
+  state_detail: string | null;
+  next_retry_after: string | null;
+  updated_at: string | null;
+  last_refresh: string | null;
+  /** `installation` — shared, admin-managed. Private accounts are future work. */
+  scope: string;
+}
+
+/** An in-flight authorization attempt. The upstream OAuth state stays server-side. */
+export interface SubscriptionLogin {
+  login_id: string;
+  provider: string;
+  flow: 'browser' | 'device';
+  /**
+   * `verifying` means upstream reported completion but SRW has not yet seen the
+   * credential appear — it is deliberately not shown as success.
+   */
+  status: 'pending' | 'verifying' | 'connected' | 'failed' | 'cancelled';
+  error: string | null;
+  auth_url: string;
+  user_code: string | null;
+  expires_at: string;
+  account_id: string | null;
+  accepts_callback_url: boolean;
+}
+
+/** Per-account usage. `available: false` carries a reason, never a fake zero. */
+export interface SubscriptionUsage {
+  available: boolean;
+  reason?: string;
+  provider?: string | null;
+  account_id?: string;
+  account?: string | null;
+  plan_type?: string | null;
+  limit_reached?: boolean;
+  primary?: CodexUsageWindow | null;
+  secondary?: CodexUsageWindow | null;
+  per_model?: {
+    name: string;
+    primary: CodexUsageWindow | null;
+    secondary: CodexUsageWindow | null;
+  }[];
+  credits?: { has_credits: boolean; unlimited: boolean; balance?: string | null } | null;
+}
+
+/** How much SRW knows about a discovered model. */
+export type SubscriptionModelSupport = 'supported' | 'unsupported_modality' | 'needs_review';
+
+/** One row of the subscription Discover list. */
+export interface SubscriptionDiscoveredModel {
+  id: string;
+  display_label: string;
+  owned_by: string | null;
+  /** Upstream channels that can serve it — the source attribution. */
+  sources: string[];
+  providers: string[];
+  account_ids: string[];
+  client_protocol: string | null;
+  context_window: number | null;
+  max_output_tokens: number | null;
+  family: string | null;
+  capability_hints: string[];
+  support: SubscriptionModelSupport;
+  support_reason: string | null;
+  registered: boolean;
+  catalog_id: string | null;
+  routing_drift: boolean;
+}
+
+/** Result of a subscription-aware endpoint discovery. */
+export interface SubscriptionDiscoveryResult {
+  subscription: true;
+  ok: boolean;
+  probe_url: string;
+  error: string | null;
+  models: SubscriptionDiscoveredModel[];
+  unreadable_account_ids: string[];
+  /** False when enrichment failed — sources are unknown, not absent. */
+  attribution_complete: boolean;
+}
+
+/** Outcome of a bulk catalog import. */
+export interface SubscriptionImportResult {
+  created: string[];
+  skipped: string[];
+  rejected: { id: string; reason: string }[];
+}
+
 export interface CodexStatus {
   connected: boolean;
   /**

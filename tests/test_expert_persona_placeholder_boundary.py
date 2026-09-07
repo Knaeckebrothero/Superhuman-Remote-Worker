@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+from tests._expert_catalog import authoring_service, catalogue_route
+from orchestrator.routers import expert_catalog as expert_routes
+from orchestrator.schemas import expert_catalog as expert_schemas
+from orchestrator.services import expert_authoring as expert_authoring_module
+
+
 import json
 import pathlib
 import re
@@ -65,11 +71,11 @@ def test_reserved_token_inventory_matches_the_assembler_contract():
 @pytest.mark.parametrize("token", ASSEMBLER_OWNED_PROMPT_TOKENS)
 def test_create_and_update_models_reject_every_reserved_persona_token(token: str):
     with pytest.raises(ValidationError, match="reserved prompt placeholders") as create:
-        main.ExpertCreate(**_expert_payload(f"before {token} after"))
+        expert_schemas.ExpertCreate(**_expert_payload(f"before {token} after"))
     assert token in str(create.value)
 
     with pytest.raises(ValidationError, match="reserved prompt placeholders") as update:
-        main.ExpertUpdate(prompts={"persona": f"before {token} after"})
+        expert_schemas.ExpertUpdate(prompts={"persona": f"before {token} after"})
     assert token in str(update.value)
 
 
@@ -81,9 +87,9 @@ def test_persona_validation_allows_non_reserved_braces_and_does_not_mutate():
         "instructions": "Explain {available_skills} literally.",
     }
     assert validate_expert_persona_placeholders(prompts) is prompts
-    assert main.ExpertCreate(**_expert_payload(prompts["persona"])).prompts == {
-        "persona": prompts["persona"]
-    }
+    assert expert_schemas.ExpertCreate(
+        **_expert_payload(prompts["persona"])
+    ).prompts == {"persona": prompts["persona"]}
 
 
 def test_create_update_and_import_http_surfaces_return_clear_422s():
@@ -122,12 +128,14 @@ async def test_copy_boundary_accepts_clean_prompts_and_refuses_legacy_tokens(
         "prompts": {"persona": "Remain a careful analyst."},
     }
 
-    assert await main._create_forked_expert(source, str(uuid4())) == {"id": "copy"}
+    assert await authoring_service().create_forked_expert(source, str(uuid4())) == {
+        "id": "copy"
+    }
     assert created.await_args.kwargs["prompts"] == source["prompts"]
 
     source["prompts"] = {"persona": "You are {agent_display_name}."}
     with pytest.raises(HTTPException, match="reserved prompt placeholders") as exc:
-        await main._create_forked_expert(source, str(uuid4()))
+        await authoring_service().create_forked_expert(source, str(uuid4()))
     assert exc.value.status_code == 422
     created.assert_awaited_once()
 
@@ -160,7 +168,7 @@ async def test_duplicate_route_returns_422_for_a_legacy_source(monkeypatch):
     monkeypatch.setattr(main, "_strip_save_grants", AsyncMock(return_value=({}, [])))
 
     with pytest.raises(HTTPException, match="reserved prompt placeholders") as exc:
-        await main.duplicate_expert(AsyncMock(), source_id)
+        await catalogue_route(expert_routes.duplicate_expert)(AsyncMock(), source_id)
 
     assert exc.value.status_code == 422
     fake.create_expert.assert_not_awaited()
@@ -189,16 +197,20 @@ async def test_personal_default_fork_returns_422_for_a_legacy_source(monkeypatch
         "require_approved_user",
         AsyncMock(return_value={"id": str(uuid4()), "is_admin": False}),
     )
-    monkeypatch.setattr(main, "personal_defaults_allowed", AsyncMock(return_value=True))
     monkeypatch.setattr(
-        main,
+        expert_authoring_module,
+        "personal_defaults_allowed",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
+        expert_authoring_module,
         "resolve_root_expert",
         AsyncMock(return_value=type("Selection", (), {"expert": source})()),
     )
 
     with pytest.raises(HTTPException, match="reserved prompt placeholders") as exc:
-        await main.fork_my_expert_default(
-            AsyncMock(), "worker", main.ExpertDefaultForkRequest()
+        await catalogue_route(expert_routes.fork_my_expert_default)(
+            AsyncMock(), "worker", expert_schemas.ExpertDefaultForkRequest()
         )
 
     assert exc.value.status_code == 422

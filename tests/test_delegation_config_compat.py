@@ -23,6 +23,9 @@ Contract (u3_plan.md B.12, universal_experts_and_subagents.md §0 D1/D2/D7):
 
 from __future__ import annotations
 
+from tests._expert_catalog import catalogue_service
+
+
 import logging
 
 import pytest
@@ -443,9 +446,8 @@ def test_resolve_config_resolves_a_stored_critic_fragment_canonically():
 def test_expert_save_validation_persists_the_stored_fragment_canonical():
     """The save path (``_validate_expert_fragment``) is where a managed seed
     row's next edit would 422/400 on the old shape — it must map instead."""
-    from orchestrator.main import _validate_expert_fragment
 
-    saved = _validate_expert_fragment(dict(_STORED_CRITIC_FRAGMENT))
+    saved = catalogue_service().validate_expert_fragment(dict(_STORED_CRITIC_FRAGMENT))
     assert saved["tools"]["delegation"] == ["delegate_agent"]
     assert saved["tools"]["git"] == ["git_status"]
     assert saved["delegation"] == {"enabled": True}

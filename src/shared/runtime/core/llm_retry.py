@@ -141,27 +141,45 @@ def _request_url_str(exc: BaseException) -> Optional[str]:
     return None
 
 
+# Host tokens that identify the shared subscription proxy when no explicit
+# base-URL env var is set. The Kubernetes Service is still named
+# ``*-codex-proxy`` (the display rename deliberately did not rename storage or
+# Services), and ``subscription-proxy`` / ``cli-proxy`` cover an installation
+# that has since renamed it.
+_PROXY_HOST_TOKENS = ("codex", "subscription-proxy", "cli-proxy")
+
+
 def _is_codex_proxy_url(url: str) -> bool:
-    """True if ``url`` targets the Codex/CLIProxyAPI proxy.
+    """True if ``url`` targets the CLIProxyAPI subscription proxy.
 
-    Codex/ChatGPT-subscription models are reached over an OpenAI-compatible
-    transport (``provider="openai"`` + the proxy's ``base_url``), so the
-    request URL is the only thing that tells a codex-proxy call apart from a
-    real ``api.openai.com`` call. Markers, in order of authority:
+    Subscription models are reached over an OpenAI-compatible transport
+    (``provider="openai"``/``codex"`` + the proxy's ``base_url``), so the
+    request URL is the only thing that tells a proxy call apart from a real
+    ``api.openai.com`` call *at exception-classification time* — the exception
+    carries a URL, not a ModelMeta. Markers, in order of authority:
 
-    * an explicit ``CODEX_BASE_URL`` / ``CODEX_PROXY_URL`` host (operator-set)
-    * a host containing ``codex`` (the in-cluster ``srw-codex-proxy`` service)
+    * an explicit ``SUBSCRIPTION_PROXY_URL`` / ``CODEX_BASE_URL`` /
+      ``CODEX_PROXY_URL`` host (operator-set — the only authoritative one)
+    * a host containing a well-known proxy token — ``codex`` (the in-cluster
+      Service is still ``*-codex-proxy``), ``subscription-proxy`` or
+      ``cli-proxy`` for an installation that has renamed it
     * CLIProxyAPI's default port ``8317`` (the local-dev default base URL,
       see ``loader._create_codex_llm``)
+
+    The behaviour it gates — treat a 401 as a transient token-refresh blip — is
+    a property of the *proxy*, not of the Codex product, so it is correct for
+    every subscription routed through it.
     """
     u = url.lower()
-    for env in ("CODEX_BASE_URL", "CODEX_PROXY_URL"):
+    for env in ("SUBSCRIPTION_PROXY_URL", "CODEX_BASE_URL", "CODEX_PROXY_URL"):
         base = os.environ.get(env)
         if base:
             host = urlsplit(base).netloc.lower()
             if host and host in u:
                 return True
-    return "codex" in u or ":8317" in u
+    if any(token in u for token in _PROXY_HOST_TOKENS):
+        return True
+    return ":8317" in u
 
 
 def _is_codex_proxy_error(exc: BaseException) -> bool:

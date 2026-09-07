@@ -52,6 +52,12 @@ Design: knowledge-base/knowledge/features/tool_config_policy_vs_membership.md.
 
 from __future__ import annotations
 
+from tests._expert_catalog import catalogue_route
+from orchestrator.services import expert_authoring as expert_authoring_module
+from orchestrator.routers import expert_catalog as expert_routes
+from orchestrator.schemas import expert_catalog as expert_schemas
+
+
 import uuid
 from contextlib import ExitStack
 from pathlib import Path
@@ -1906,12 +1912,14 @@ class TestExpertWriteBoundary:
             main, "user_visible_project_ids", AsyncMock(return_value=[])
         )
         monkeypatch.setattr(
-            main, "personal_defaults_allowed", AsyncMock(return_value=True)
+            expert_authoring_module,
+            "personal_defaults_allowed",
+            AsyncMock(return_value=True),
         )
         return main, db
 
     def _create_body(self, main, config):
-        return main.ExpertCreate(
+        return expert_schemas.ExpertCreate(
             name="helper",
             display_name="Helper",
             expert_type="session",
@@ -1925,7 +1933,9 @@ class TestExpertWriteBoundary:
         main, db = expert_env
 
         with pytest.raises(main.HTTPException) as exc:
-            await main.create_expert(MagicMock(), self._create_body(main, self.SMUGGLE))
+            await catalogue_route(expert_routes.create_expert)(
+                MagicMock(), self._create_body(main, self.SMUGGLE)
+            )
 
         assert exc.value.status_code == 400
         assert "run_command" in exc.value.detail
@@ -1936,10 +1946,10 @@ class TestExpertWriteBoundary:
         main, db = expert_env
 
         with pytest.raises(main.HTTPException) as exc:
-            await main.update_expert(
+            await catalogue_route(expert_routes.update_expert)(
                 MagicMock(),
                 str(uuid.uuid4()),
-                main.ExpertUpdate(config=self.SMUGGLE),
+                expert_schemas.ExpertUpdate(config=self.SMUGGLE),
             )
 
         assert exc.value.status_code == 400
@@ -1953,7 +1963,9 @@ class TestExpertWriteBoundary:
         main, db = expert_env
 
         with pytest.raises(main.HTTPException) as exc:
-            await main.import_expert(MagicMock(), self._create_body(main, self.SMUGGLE))
+            await catalogue_route(expert_routes.import_expert)(
+                MagicMock(), self._create_body(main, self.SMUGGLE)
+            )
 
         assert exc.value.status_code == 400
         db.create_expert.assert_not_awaited()
@@ -1972,11 +1984,13 @@ class TestExpertWriteBoundary:
             }
         )
         with patch.object(
-            main, "resolve_root_expert", AsyncMock(return_value=selection)
+            expert_authoring_module,
+            "resolve_root_expert",
+            AsyncMock(return_value=selection),
         ):
             with pytest.raises(main.HTTPException) as exc:
-                await main.fork_my_expert_default(
-                    MagicMock(), "session", main.ExpertDefaultForkRequest()
+                await catalogue_route(expert_routes.fork_my_expert_default)(
+                    MagicMock(), "session", expert_schemas.ExpertDefaultForkRequest()
                 )
 
         assert exc.value.status_code == 400
@@ -1992,7 +2006,9 @@ class TestExpertWriteBoundary:
         main, db = expert_env
 
         with pytest.raises(main.HTTPException) as exc:
-            await main.duplicate_expert(MagicMock(), str(uuid.uuid4()))
+            await catalogue_route(expert_routes.duplicate_expert)(
+                MagicMock(), str(uuid.uuid4())
+            )
 
         assert exc.value.status_code == 400
         db.create_expert.assert_not_awaited()
@@ -2024,7 +2040,9 @@ class TestExpertWriteBoundary:
             }
         )
 
-        result = await main.duplicate_expert(MagicMock(), str(uuid.uuid4()))
+        result = await catalogue_route(expert_routes.duplicate_expert)(
+            MagicMock(), str(uuid.uuid4())
+        )
 
         assert result == {"id": "e1", "dropped": []}
         db.create_expert.assert_awaited_once()
@@ -2039,7 +2057,7 @@ class TestExpertWriteBoundary:
         main, db = expert_env
 
         with pytest.raises(main.HTTPException) as exc:
-            await main.create_expert(
+            await catalogue_route(expert_routes.create_expert)(
                 MagicMock(), self._create_body(main, {"tools": {"shell": True}})
             )
 
@@ -2054,7 +2072,7 @@ class TestExpertWriteBoundary:
         be re-interpreted."""
         main, db = expert_env
 
-        await main.create_expert(
+        await catalogue_route(expert_routes.create_expert)(
             MagicMock(), self._create_body(main, {"tools": {"git": True}})
         )
 
@@ -2071,7 +2089,7 @@ class TestExpertWriteBoundary:
         seen = AsyncMock()
         monkeypatch.setattr(main, "_enforce_expert_save", seen)
 
-        await main.create_expert(
+        await catalogue_route(expert_routes.create_expert)(
             MagicMock(), self._create_body(main, {"tools": {"shell": False}})
         )
 
@@ -2081,7 +2099,7 @@ class TestExpertWriteBoundary:
     async def test_a_config_without_tools_is_untouched(self, expert_env):
         main, db = expert_env
 
-        await main.create_expert(
+        await catalogue_route(expert_routes.create_expert)(
             MagicMock(), self._create_body(main, {"llm": {"model": "gemma-4-moe"}})
         )
 
@@ -2106,7 +2124,9 @@ class TestExpertWriteBoundary:
             },
             "delegation": {"enabled": False},
         }
-        await main.create_expert(MagicMock(), self._create_body(main, payload))
+        await catalogue_route(expert_routes.create_expert)(
+            MagicMock(), self._create_body(main, payload)
+        )
 
         stored = db.create_expert.await_args.kwargs["config"]
         assert stored["tools"]["shell"] == enumerate_only_members()["shell"]
@@ -2189,7 +2209,9 @@ class TestExpertWriteBoundary:
             main, "user_visible_project_ids", AsyncMock(return_value=[])
         )
         monkeypatch.setattr(
-            main, "personal_defaults_allowed", AsyncMock(return_value=True)
+            expert_authoring_module,
+            "personal_defaults_allowed",
+            AsyncMock(return_value=True),
         )
         return main, db
 
@@ -2241,27 +2263,29 @@ class TestExpertWriteBoundary:
                 }
             )
             monkeypatch.setattr(
-                main, "resolve_root_expert", AsyncMock(return_value=selection)
+                expert_authoring_module,
+                "resolve_root_expert",
+                AsyncMock(return_value=selection),
             )
 
         calls = {
-            "POST /api/experts": lambda: main.create_expert(
+            "POST /api/experts": lambda: catalogue_route(expert_routes.create_expert)(
                 MagicMock(), self._create_body(main, {})
             ),
-            "PUT /api/experts/{id}": lambda: main.update_expert(
-                MagicMock(), existing_id, main.ExpertUpdate()
-            ),
-            "POST /api/experts/import": lambda: main.import_expert(
-                MagicMock(), self._create_body(main, {})
-            ),
+            "PUT /api/experts/{id}": lambda: catalogue_route(
+                expert_routes.update_expert
+            )(MagicMock(), existing_id, expert_schemas.ExpertUpdate()),
+            "POST /api/experts/import": lambda: catalogue_route(
+                expert_routes.import_expert
+            )(MagicMock(), self._create_body(main, {})),
             "POST /api/expert-defaults/{expert_type}/fork": (
-                lambda: main.fork_my_expert_default(
-                    MagicMock(), "session", main.ExpertDefaultForkRequest()
+                lambda: catalogue_route(expert_routes.fork_my_expert_default)(
+                    MagicMock(), "session", expert_schemas.ExpertDefaultForkRequest()
                 )
             ),
-            "POST /api/experts/{id}/duplicate": lambda: main.duplicate_expert(
-                MagicMock(), existing_id
-            ),
+            "POST /api/experts/{id}/duplicate": lambda: catalogue_route(
+                expert_routes.duplicate_expert
+            )(MagicMock(), existing_id),
         }
 
         with pytest.raises(main.HTTPException) as exc:

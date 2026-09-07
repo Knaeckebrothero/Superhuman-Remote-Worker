@@ -24,14 +24,16 @@ import pytest
 
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
-from orchestrator.main import (  # noqa: E402
+from orchestrator.schemas.model_catalog import (  # noqa: E402
     VALID_CATALOG_PROVIDER_KINDS,
     VALID_CATALOG_CAPABILITIES,
     CatalogModelCreate,
     CatalogModelUpdate,
-    app,
 )
-import orchestrator.main  # noqa: E402
+from orchestrator.services.model_catalog import (  # noqa: E402
+    ModelCatalogService,
+    _normalize_catalog_model_id,
+)
 from orchestrator.database.postgres import PostgresDB  # noqa: E402
 
 
@@ -52,13 +54,10 @@ CATALOG_ROUTES = {
 
 
 def _registered_routes() -> set[tuple[str, str]]:
-    out: set[tuple[str, str]] = set()
-    for route in app.routes:
-        methods = getattr(route, "methods", None) or set()
-        path = getattr(route, "path", "")
-        for m in methods:
-            out.add((m, path))
-    return out
+    from orchestrator.main import app
+    from tests._route_inventory import mounted_routes
+
+    return mounted_routes(app)
 
 
 class TestCatalogRoutesRegistered:
@@ -383,29 +382,49 @@ class TestCreateModelJsonbHandling:
         assert result["params_json"] == {"top_p": 0.9}
 
 
+@pytest.fixture
+def model_catalog_service():
+    from orchestrator.services.family_matcher import detect_family
+    from shared.runtime.core import loader
+
+    return ModelCatalogService(
+        store=MagicMock(),
+        probe=AsyncMock(),
+        get_config_dir=lambda: loader.get_project_root() / "config",
+        load_settings_matrix=lambda path: {},
+        settings_for_family=loader.bundled_settings_for_family,
+        family_detector=detect_family,
+        reasoning_capability=loader.reasoning_capability,
+    )
+
+
 class TestSerializeCatalogModelContextWindow:
     """`_serialize_catalog_model` surfaces the resolved context window + source
     for the Admin → Models "Context" column: the explicit per-model cap when
     set, else the family default from the model config matrix."""
 
-    def test_explicit_context_window_is_reported_as_explicit(self):
-        out = orchestrator.main._serialize_catalog_model(_row(context_window=262144))
+    def test_explicit_context_window_is_reported_as_explicit(
+        self, model_catalog_service
+    ):
+        out = model_catalog_service._serialize_catalog_model(
+            _row(context_window=262144)
+        )
         assert out["context_window"] == 262144
         assert out["resolved_context_window"] == 262144
         assert out["context_window_source"] == "explicit"
 
-    def test_unset_falls_back_to_family_default(self):
+    def test_unset_falls_back_to_family_default(self, model_catalog_service):
         # claude-opus family default is 1,000,000 (config/model_config_matrix.yaml).
-        out = orchestrator.main._serialize_catalog_model(
+        out = model_catalog_service._serialize_catalog_model(
             _row(context_window=None, family="claude-opus")
         )
         assert out["context_window"] is None
         assert out["resolved_context_window"] == 1_000_000
         assert out["context_window_source"] == "family_default"
 
-    def test_unknown_family_falls_back_to_default_128k(self):
+    def test_unknown_family_falls_back_to_default_128k(self, model_catalog_service):
         # Unknown family → the `default` block's model_max_context_tokens (128000).
-        out = orchestrator.main._serialize_catalog_model(
+        out = model_catalog_service._serialize_catalog_model(
             _row(context_window=None, family="totally-unknown-family")
         )
         assert out["resolved_context_window"] == 128000
@@ -665,15 +684,13 @@ class TestNormalizeCatalogModelId:
 
     def test_prepends_prefix_for_system_openrouter_row(self):
         assert (
-            orchestrator.main._normalize_catalog_model_id(
-                "system", "openrouter", "minimax/minimax-m3"
-            )
+            _normalize_catalog_model_id("system", "openrouter", "minimax/minimax-m3")
             == "openrouter/minimax/minimax-m3"
         )
 
     def test_idempotent_when_prefix_already_present(self):
         assert (
-            orchestrator.main._normalize_catalog_model_id(
+            _normalize_catalog_model_id(
                 "system", "openrouter", "openrouter/minimax/minimax-m3"
             )
             == "openrouter/minimax/minimax-m3"
@@ -681,7 +698,7 @@ class TestNormalizeCatalogModelId:
 
     def test_idempotent_is_case_insensitive(self):
         assert (
-            orchestrator.main._normalize_catalog_model_id(
+            _normalize_catalog_model_id(
                 "system", "openrouter", "OpenRouter/minimax/minimax-m3"
             )
             == "OpenRouter/minimax/minimax-m3"
@@ -689,14 +706,9 @@ class TestNormalizeCatalogModelId:
 
     def test_other_system_providers_untouched(self):
         # openai/anthropic/etc. resolve correctly without a routing prefix.
+        assert _normalize_catalog_model_id("system", "openai", "gpt-5.5") == "gpt-5.5"
         assert (
-            orchestrator.main._normalize_catalog_model_id("system", "openai", "gpt-5.5")
-            == "gpt-5.5"
-        )
-        assert (
-            orchestrator.main._normalize_catalog_model_id(
-                "system", "anthropic", "claude-opus-4-7"
-            )
+            _normalize_catalog_model_id("system", "anthropic", "claude-opus-4-7")
             == "claude-opus-4-7"
         )
 
@@ -704,7 +716,7 @@ class TestNormalizeCatalogModelId:
         # Endpoint rows route via the endpoint's inline base_url; prefixing
         # would be sent verbatim to the gateway and 404.
         assert (
-            orchestrator.main._normalize_catalog_model_id(
+            _normalize_catalog_model_id(
                 "endpoint", "some-endpoint-uuid", "minimax/minimax-m3"
             )
             == "minimax/minimax-m3"

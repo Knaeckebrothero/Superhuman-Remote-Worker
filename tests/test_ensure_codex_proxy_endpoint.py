@@ -1,11 +1,17 @@
-"""Tests for ``orchestrator.seed.llm_config.ensure_codex_proxy_endpoint``.
+"""Tests for ``orchestrator.seed.llm_config.ensure_subscription_proxy_endpoint``.
 
-Runtime helper that wires the codex-proxy as a system endpoint when a user
-connects a ChatGPT subscription via the cockpit, or when the Admin → Models
-availability probe sees an active subscription with no transport row. Unlike
-the boot-time seeder (``orchestrator.init._seed_codex_proxy_endpoint``), this
-helper does not require ``CODEX_PROXY_URL`` to be set — it falls back to the
-same default the runtime resolver uses.
+Runtime helper that wires the subscription proxy as a system endpoint when an
+admin connects a subscription via the cockpit, or when the Admin → Models
+availability probe sees a healthy account with no transport row. Unlike the
+boot-time seeder (``orchestrator.init._seed_subscription_proxy_endpoint``),
+this helper does not require the proxy URL env var to be set — it falls back to
+the same default the runtime resolver uses.
+
+The endpoint was renamed from ``codex-proxy`` to ``subscription-proxy`` by app
+migration 0228. Identity moved to ``llm_endpoints.transport_kind`` at the same
+time, so the crucial property tested here is that an installation upgraded from
+the Codex-only era finds its *existing* row under either label instead of
+getting a second proxy endpoint next to it.
 """
 
 from __future__ import annotations
@@ -16,8 +22,11 @@ import pytest
 
 from orchestrator.seed.llm_config import (
     CODEX_PROXY_ENDPOINT_LABEL,
+    SUBSCRIPTION_PROXY_ENDPOINT_LABEL,
     ensure_codex_proxy_endpoint,
+    ensure_subscription_proxy_endpoint,
 )
+from shared.subscription_routing import SUBSCRIPTION_PROXY_TRANSPORT
 
 
 def _fake_db(*, existing_endpoints: list[dict] | None = None):
@@ -29,6 +38,7 @@ def _fake_db(*, existing_endpoints: list[dict] | None = None):
     db.create_system_llm_endpoint = AsyncMock(
         return_value={"id": "00000000-0000-0000-0000-000000000099"}
     )
+    db.update_system_llm_endpoint = AsyncMock(return_value=None)
     return db
 
 
@@ -44,14 +54,20 @@ async def test_creates_row_when_absent(monkeypatch):
     assert created is True
     db.create_system_llm_endpoint.assert_awaited_once()
     kwargs = db.create_system_llm_endpoint.await_args.kwargs
-    assert kwargs["label"] == CODEX_PROXY_ENDPOINT_LABEL == "codex-proxy"
+    assert kwargs["label"] == SUBSCRIPTION_PROXY_ENDPOINT_LABEL == "subscription-proxy"
     assert kwargs["base_url"] == "http://codex-proxy:8317/v1"
     assert kwargs["api_key"] == "sk-mgmt-test"
+    assert kwargs["transport_kind"] == SUBSCRIPTION_PROXY_TRANSPORT
 
 
 @pytest.mark.asyncio
 async def test_no_op_when_row_already_exists(monkeypatch):
-    """Existing row → helper returns False, no insert. Repeat callback safe."""
+    """Existing legacy row → helper returns False, no insert.
+
+    This is the upgrade case: an installation that connected Codex before the
+    rename still carries ``codex-proxy``. Inserting a second endpoint here
+    would strand every registered model on the old one.
+    """
     monkeypatch.setenv("CODEX_PROXY_URL", "http://codex-proxy:8317")
     monkeypatch.setenv("CODEX_MANAGEMENT_KEY", "sk-mgmt-test")
 
@@ -134,3 +150,77 @@ async def test_seed_failure_returns_false(monkeypatch):
 
     created = await ensure_codex_proxy_endpoint(db)
     assert created is False
+
+
+@pytest.mark.asyncio
+async def test_matches_an_existing_row_by_transport_marker(monkeypatch):
+    """A renamed-by-hand row is still found through its transport marker."""
+    monkeypatch.setenv("CODEX_PROXY_URL", "http://codex-proxy:8317")
+    monkeypatch.setenv("CODEX_MANAGEMENT_KEY", "sk-mgmt-test")
+
+    db = _fake_db(
+        existing_endpoints=[
+            {
+                "id": "00000000-0000-0000-0000-000000000077",
+                "label": "ChatGPT (renamed by an admin)",
+                "base_url": "http://internal-proxy:8317/v1",
+                "transport_kind": SUBSCRIPTION_PROXY_TRANSPORT,
+            }
+        ]
+    )
+    created = await ensure_subscription_proxy_endpoint(db)
+
+    assert created is False
+    db.create_system_llm_endpoint.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stamps_the_marker_on_a_pre_migration_row(monkeypatch):
+    """A legacy row with no marker is self-healed, not duplicated."""
+    monkeypatch.setenv("CODEX_PROXY_URL", "http://codex-proxy:8317")
+    monkeypatch.setenv("CODEX_MANAGEMENT_KEY", "sk-mgmt-test")
+
+    db = _fake_db(
+        existing_endpoints=[
+            {
+                "id": "00000000-0000-0000-0000-000000000077",
+                "label": CODEX_PROXY_ENDPOINT_LABEL,
+                "base_url": "http://codex-proxy:8317/v1",
+                "transport_kind": None,
+            }
+        ]
+    )
+    await ensure_subscription_proxy_endpoint(db)
+
+    db.create_system_llm_endpoint.assert_not_awaited()
+    db.update_system_llm_endpoint.assert_awaited_once()
+    kwargs = db.update_system_llm_endpoint.await_args.kwargs
+    assert kwargs["endpoint_id"] == "00000000-0000-0000-0000-000000000077"
+    assert kwargs["transport_kind"] == SUBSCRIPTION_PROXY_TRANSPORT
+    # Only the marker is written — URL and credential are never touched.
+    assert set(kwargs) == {"endpoint_id", "transport_kind"}
+
+
+@pytest.mark.asyncio
+async def test_prefers_a_dedicated_inference_key(monkeypatch):
+    """Management and inference credentials are separate concerns.
+
+    When the operator supplies a dedicated inference key the endpoint row
+    stores that; without one it keeps falling back to the management key so
+    existing dispatch is untouched.
+    """
+    monkeypatch.setenv("CODEX_PROXY_URL", "http://codex-proxy:8317")
+    monkeypatch.setenv("CODEX_MANAGEMENT_KEY", "sk-mgmt-test")
+    monkeypatch.setenv("SUBSCRIPTION_PROXY_API_KEY", "sk-inference-test")
+
+    db = _fake_db()
+    await ensure_subscription_proxy_endpoint(db)
+
+    kwargs = db.create_system_llm_endpoint.await_args.kwargs
+    assert kwargs["api_key"] == "sk-inference-test"
+
+
+@pytest.mark.asyncio
+async def test_legacy_alias_is_the_same_helper():
+    """``ensure_codex_proxy_endpoint`` survives as an alias for older callers."""
+    assert ensure_codex_proxy_endpoint is ensure_subscription_proxy_endpoint

@@ -7,50 +7,57 @@ mockable here. Local env may be noisy (Py3.14, missing optional deps); CI
 (Py3.12) is the authoritative gate.
 """
 
+from tests._expert_catalog import catalogue_service, catalogue_state, catalogue_route
+from orchestrator.routers import expert_catalog as expert_routes
+from orchestrator.schemas import expert_catalog as expert_schemas
+from orchestrator.services import expert_catalog as expert_catalog_module
+
+
 import pytest
 from fastapi import HTTPException
 
-from orchestrator.main import (
-    ExpertCreate,
-    ExpertUpdate,
-    _bundled_expert_bundle,
-    _db_expert_to_bundle_src,
-    _validate_expert_fragment,
-)
 
 # --- T1: request models + save-time hard-deny gate ---
 
 
 def test_expert_create_rejects_bad_slug():
     with pytest.raises(Exception):
-        ExpertCreate(name="Bad Name", display_name="X", expert_type="worker")
+        expert_schemas.ExpertCreate(
+            name="Bad Name", display_name="X", expert_type="worker"
+        )
 
 
 def test_expert_create_rejects_bad_type():
     with pytest.raises(Exception):
-        ExpertCreate(name="ok", display_name="X", expert_type="orchestrator")
+        expert_schemas.ExpertCreate(
+            name="ok", display_name="X", expert_type="orchestrator"
+        )
 
 
 def test_expert_create_rejects_bad_color():
     with pytest.raises(Exception):
-        ExpertCreate(name="ok", display_name="X", expert_type="worker", color="red")
+        expert_schemas.ExpertCreate(
+            name="ok", display_name="X", expert_type="worker", color="red"
+        )
 
 
 def test_expert_create_minimal_ok():
-    e = ExpertCreate(name="my-helper", display_name="My Helper", expert_type="session")
+    e = expert_schemas.ExpertCreate(
+        name="my-helper", display_name="My Helper", expert_type="session"
+    )
     assert e.config == {} and e.prompts == {} and e.color == "#6B7280"
     assert e.icon == "smart_toy"
 
 
 def test_validate_fragment_blocks_credentials():
     with pytest.raises(HTTPException) as ei:
-        _validate_expert_fragment({"llm": {"api_key": "secret"}})
+        catalogue_service().validate_expert_fragment({"llm": {"api_key": "secret"}})
     assert ei.value.status_code == 422
 
 
 def test_validate_fragment_blocks_connections():
     with pytest.raises(HTTPException) as ei:
-        _validate_expert_fragment({"connections": {"db": "x"}})
+        catalogue_service().validate_expert_fragment({"connections": {"db": "x"}})
     assert ei.value.status_code == 422
 
 
@@ -58,7 +65,7 @@ def test_validate_fragment_allows_clean_config_and_canonicalises_tools():
     """Should not raise, and returns the fragment with `tools` normalised — the
     caller persists what comes back, so a row never holds a policy value the
     save-time PDP would read backwards."""
-    assert _validate_expert_fragment(
+    assert catalogue_service().validate_expert_fragment(
         {
             "llm": {"model": "gemma-4-moe"},
             "tools": {"shell": ["run_command"], "git": []},
@@ -74,11 +81,13 @@ def test_validate_fragment_runs_the_shared_tool_gate():
     (400, not 422): `shell` must enumerate, and a cross-category smuggle is
     refused. See tests/test_tool_override_boundary.py::TestExpertWriteBoundary."""
     with pytest.raises(HTTPException) as ei:
-        _validate_expert_fragment({"tools": {"shell": True}})
+        catalogue_service().validate_expert_fragment({"tools": {"shell": True}})
     assert ei.value.status_code == 400
 
     with pytest.raises(HTTPException) as ei:
-        _validate_expert_fragment({"tools": {"canvas": ["run_command"]}})
+        catalogue_service().validate_expert_fragment(
+            {"tools": {"canvas": ["run_command"]}}
+        )
     assert ei.value.status_code == 400
 
 
@@ -86,15 +95,15 @@ def test_validate_fragment_runs_the_shared_tool_gate():
 
 
 def test_update_excludes_immutable_fields():
-    assert "name" not in ExpertUpdate.model_fields
-    assert "expert_type" not in ExpertUpdate.model_fields
+    assert "name" not in expert_schemas.ExpertUpdate.model_fields
+    assert "expert_type" not in expert_schemas.ExpertUpdate.model_fields
 
 
 # --- Part 2: prompt-key allow-list + fork fidelity ---
 
 
 def test_expert_create_accepts_known_prompt_keys():
-    e = ExpertCreate(
+    e = expert_schemas.ExpertCreate(
         name="coder",
         display_name="Coder",
         expert_type="worker",
@@ -110,7 +119,7 @@ def test_expert_create_accepts_known_prompt_keys():
 
 def test_expert_create_rejects_unknown_prompt_key():
     with pytest.raises(Exception):
-        ExpertCreate(
+        expert_schemas.ExpertCreate(
             name="coder",
             display_name="Coder",
             expert_type="worker",
@@ -120,13 +129,13 @@ def test_expert_create_rejects_unknown_prompt_key():
 
 def test_expert_update_rejects_unknown_prompt_key():
     with pytest.raises(Exception):
-        ExpertUpdate(prompts={"systemprompt": "x"})
+        expert_schemas.ExpertUpdate(prompts={"systemprompt": "x"})
 
 
 def test_bundled_expert_bundle_captures_all_prompt_segments():
     """Fork fidelity: bundling a worker captures strategic/tactical/summarization,
     not just persona+instructions (critic ships all five)."""
-    bundle = _bundled_expert_bundle("critic")
+    bundle = catalogue_service().bundled_expert_bundle("critic")
     if bundle is None:
         pytest.skip("critic bundled expert not found in this env")
     prompts = bundle["prompts"]
@@ -137,7 +146,7 @@ def test_bundled_expert_bundle_captures_all_prompt_segments():
 
 
 def test_update_payload_drops_unset_fields():
-    body = ExpertUpdate(display_name="New Name")
+    body = expert_schemas.ExpertUpdate(display_name="New Name")
     assert body.model_dump(exclude_unset=True) == {"display_name": "New Name"}
 
 
@@ -156,7 +165,7 @@ def test_db_row_to_bundle_src_shape():
         "config": {"llm": {"model": "x"}},
         "prompts": {"persona": "p"},
     }
-    src = _db_expert_to_bundle_src(row)
+    src = expert_catalog_module.db_expert_to_bundle_src(row)
     assert src["name"] == "scholar"
     assert src["expert_type"] == "worker"
     assert src["config"] == {"llm": {"model": "x"}}
@@ -173,7 +182,7 @@ def test_db_row_to_bundle_src_parses_json_strings():
         "config": '{"tools": {"shell": false}}',
         "prompts": '{"persona": "hi"}',
     }
-    src = _db_expert_to_bundle_src(row)
+    src = expert_catalog_module.db_expert_to_bundle_src(row)
     assert src["config"] == {"tools": {"shell": False}}
     assert src["prompts"] == {"persona": "hi"}
 
@@ -192,7 +201,7 @@ import orchestrator.main as main_module  # noqa: E402
 def test_validate_fragment_accepts_a_resolvable_roster_and_canonicalises_entry_tools():
     """Bundled, library and DB `$ref`s pass the sync gate (a DB ref's visibility
     is the async half below); each entry's `tools` comes back canonical."""
-    out = _validate_expert_fragment(
+    out = catalogue_service().validate_expert_fragment(
         {
             "subagents": {
                 "default": "explorer",
@@ -213,7 +222,7 @@ def test_validate_fragment_accepts_a_resolvable_roster_and_canonicalises_entry_t
 
 def test_validate_fragment_422s_an_unknown_ref():
     with pytest.raises(HTTPException) as ei:
-        _validate_expert_fragment(
+        catalogue_service().validate_expert_fragment(
             {"subagents": {"roster": {"x": {"$ref": "no-such-expert"}}}}
         )
     assert ei.value.status_code == 422
@@ -228,7 +237,7 @@ def test_validate_fragment_422s_an_unknown_ref():
         {"llm": "not-a-mapping"},
     ):
         with pytest.raises(HTTPException) as ei:
-            _validate_expert_fragment({"subagents": bad})
+            catalogue_service().validate_expert_fragment({"subagents": bad})
         assert ei.value.status_code == 422, bad
 
 
@@ -236,7 +245,7 @@ def test_validate_fragment_runs_the_tool_gate_on_roster_entries():
     """The same vocabulary gate as the top level (400), naming the entry: a
     cross-category smuggle inside a child is refused like one on the parent."""
     with pytest.raises(HTTPException) as ei:
-        _validate_expert_fragment(
+        catalogue_service().validate_expert_fragment(
             {"subagents": {"roster": {"x": {"tools": {"canvas": ["run_command"]}}}}}
         )
     assert ei.value.status_code == 400
@@ -245,8 +254,6 @@ def test_validate_fragment_runs_the_tool_gate_on_roster_entries():
 
 @pytest.mark.asyncio
 async def test_db_refs_must_be_visible_to_the_author(monkeypatch):
-    from orchestrator.main import _require_visible_roster_refs
-
     visible, hidden = str(uuid.uuid4()), str(uuid.uuid4())
     monkeypatch.setattr(
         main_module, "user_visible_project_ids", AsyncMock(return_value="all")
@@ -261,15 +268,15 @@ async def test_db_refs_must_be_visible_to_the_author(monkeypatch):
     user = {"id": str(uuid.uuid4()), "is_admin": False}
 
     # Visible DB ref + a disk ref: fine (disk refs are the sync gate's job).
-    await _require_visible_roster_refs(
+    await catalogue_service().require_visible_roster_refs(
         {"subagents": {"roster": {"a": {"$ref": visible}, "b": {"$ref": "critic"}}}},
         user=user,
     )
-    await _require_visible_roster_refs({}, user=user)
-    await _require_visible_roster_refs(None, user=user)
+    await catalogue_service().require_visible_roster_refs({}, user=user)
+    await catalogue_service().require_visible_roster_refs(None, user=user)
 
     with pytest.raises(HTTPException) as ei:
-        await _require_visible_roster_refs(
+        await catalogue_service().require_visible_roster_refs(
             {"subagents": {"roster": {"a": {"$ref": hidden}}}}, user=user
         )
     assert ei.value.status_code == 422
@@ -280,7 +287,6 @@ async def test_db_refs_must_be_visible_to_the_author(monkeypatch):
 async def test_create_adds_role_tag(monkeypatch):
     """`tags ∪ {expert_type}` on the way in: the role tag is appended once,
     duplicates and blanks dropped, authored order kept."""
-    from orchestrator.main import create_expert
 
     monkeypatch.setattr(
         main_module, "_is_experts_db_enabled", MagicMock(return_value=True)
@@ -296,9 +302,9 @@ async def test_create_adds_role_tag(monkeypatch):
     created = AsyncMock(side_effect=lambda **kw: {"id": "new", **kw})
     monkeypatch.setattr(main_module.postgres_db, "create_expert", created)
 
-    row = await create_expert(
+    row = await catalogue_route(expert_routes.create_expert)(
         MagicMock(),
-        ExpertCreate(
+        expert_schemas.ExpertCreate(
             name="tagged",
             display_name="Tagged",
             expert_type="session",
@@ -308,17 +314,17 @@ async def test_create_adds_role_tag(monkeypatch):
     assert created.await_args.kwargs["tags"] == ["research", "session"]
     assert row["tags"] == ["research", "session"]
 
-    await create_expert(
+    await catalogue_route(expert_routes.create_expert)(
         MagicMock(),
-        ExpertCreate(name="plain", display_name="Plain", expert_type="worker"),
+        expert_schemas.ExpertCreate(
+            name="plain", display_name="Plain", expert_type="worker"
+        ),
     )
     assert created.await_args.kwargs["tags"] == ["worker"]
 
 
 @pytest.mark.asyncio
 async def test_update_keeps_the_role_tag(monkeypatch):
-    from orchestrator.main import update_expert
-
     expert_id, owner = str(uuid.uuid4()), str(uuid.uuid4())
     monkeypatch.setattr(
         main_module, "_is_experts_db_enabled", MagicMock(return_value=True)
@@ -346,11 +352,15 @@ async def test_update_keeps_the_role_tag(monkeypatch):
     updated = AsyncMock(side_effect=lambda expert_id, **kw: {"id": expert_id, **kw})
     monkeypatch.setattr(main_module.postgres_db, "update_expert", updated)
 
-    await update_expert(MagicMock(), expert_id, ExpertUpdate(tags=["coding"]))
+    await catalogue_route(expert_routes.update_expert)(
+        MagicMock(), expert_id, expert_schemas.ExpertUpdate(tags=["coding"])
+    )
     assert updated.await_args.kwargs["tags"] == ["coding", "worker"]
 
     # An update that does not touch tags leaves the column alone.
-    await update_expert(MagicMock(), expert_id, ExpertUpdate(display_name="Renamed"))
+    await catalogue_route(expert_routes.update_expert)(
+        MagicMock(), expert_id, expert_schemas.ExpertUpdate(display_name="Renamed")
+    )
     assert "tags" not in updated.await_args.kwargs
 
 
@@ -359,10 +369,9 @@ async def test_list_type_filter_matches_tag(monkeypatch):
     """`?type=X` lists a row when its role is X OR it carries the tag X (U1
     B.4). The subagent library lists by tag only (`?type=subagent`), never in
     the default listing; the DB rows are fetched without the SQL role filter."""
-    from orchestrator.main import list_experts
 
-    monkeypatch.setattr(main_module, "_experts_cache", None)
-    monkeypatch.setattr(main_module, "_library_cache", None)
+    monkeypatch.setattr(catalogue_state(), "experts", None)
+    monkeypatch.setattr(catalogue_state(), "library", None)
     monkeypatch.setattr(
         main_module, "_is_experts_db_enabled", MagicMock(return_value=True)
     )
@@ -402,7 +411,9 @@ async def test_list_type_filter_matches_tag(monkeypatch):
     def by_name(result):
         return {r["name"]: r for r in result}
 
-    subagent = by_name(await list_experts(MagicMock(), type="subagent"))
+    subagent = by_name(
+        await catalogue_route(expert_routes.list_experts)(MagicMock(), type="subagent")
+    )
     explorer = subagent["subagents/explorer"]
     assert explorer["id"] == "explorer"
     assert explorer["source"] == "library" and explorer["storage_kind"] == "library"
@@ -411,7 +422,9 @@ async def test_list_type_filter_matches_tag(monkeypatch):
     assert "plain-session" not in subagent and "developer" not in subagent
     assert listed.await_args.kwargs["expert_type"] is None
 
-    worker = by_name(await list_experts(MagicMock(), type="worker"))
+    worker = by_name(
+        await catalogue_route(expert_routes.list_experts)(MagicMock(), type="worker")
+    )
     assert {"developer", "tagged-worker", "dual"} <= set(worker)  # dual: tagged
     assert "plain-session" not in worker and "subagents/explorer" not in worker
     authored = yaml.safe_load(
@@ -422,11 +435,13 @@ async def test_list_type_filter_matches_tag(monkeypatch):
     )["tags"]
     assert worker["developer"]["tags"] == [*authored, "worker"]
 
-    session = by_name(await list_experts(MagicMock(), type="session"))
+    session = by_name(
+        await catalogue_route(expert_routes.list_experts)(MagicMock(), type="session")
+    )
     assert {"assistant", "plain-session", "dual"} <= set(session)
     assert "tagged-worker" not in session
 
-    default = by_name(await list_experts(MagicMock()))
+    default = by_name(await catalogue_route(expert_routes.list_experts)(MagicMock()))
     assert "subagents/explorer" not in default
     assert {"developer", "assistant", "tagged-worker", "plain-session", "dual"} <= set(
         default
@@ -441,7 +456,7 @@ def test_bundled_expert_bundle_reads_the_phase_skill_bodies():
 
     from shared.runtime.core.skill_format import parse_skill_md
 
-    bundle = _bundled_expert_bundle("developer")
+    bundle = catalogue_service().bundled_expert_bundle("developer")
     if bundle is None:
         pytest.skip("developer bundled expert not found in this env")
     prompts = bundle["prompts"]
@@ -456,7 +471,7 @@ def test_bundled_expert_bundle_reads_the_phase_skill_bodies():
         assert f"You are in {phase.upper()} mode." in prompts[phase]
     assert "tdd_phase" in prompts["strategic"]
     # An expert with neither a local phase skill nor the legacy .txt has no key.
-    writer = _bundled_expert_bundle("writer")
+    writer = catalogue_service().bundled_expert_bundle("writer")
     if writer is not None:
         assert "strategic" not in writer["prompts"]
         assert "tactical" not in writer["prompts"]

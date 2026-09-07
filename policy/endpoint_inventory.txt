@@ -43,6 +43,7 @@ POST   /api/admin/providers/endpoints                                           
 DELETE /api/admin/providers/endpoints/{endpoint_id}                                     admin:_require_admin
 PATCH  /api/admin/providers/endpoints/{endpoint_id}                                     admin:_require_admin
 POST   /api/admin/providers/endpoints/{endpoint_id}/discover                            admin:_require_admin
+POST   /api/admin/providers/endpoints/{endpoint_id}/models/import                       admin:_require_admin
 POST   /api/admin/providers/endpoints/{endpoint_id}/test                                admin:_require_admin
 GET    /api/admin/providers/keys                                                        admin:_require_admin
 DELETE /api/admin/providers/keys/{provider}                                             admin:_require_admin
@@ -54,6 +55,7 @@ POST   /api/admin/providers/models                                              
 DELETE /api/admin/providers/models/{catalog_id}                                         admin:_require_admin
 PATCH  /api/admin/providers/models/{catalog_id}                                         admin:_require_admin
 POST   /api/admin/providers/models/{catalog_id}/test                                    admin:_require_admin
+GET    /api/admin/providers/subscriptions/availability                                  admin:_require_admin
 GET    /api/admin/run-queue                                                             admin:_require_admin
 POST   /api/admin/run-queue/{unit_id}/unpark                                            admin:_require_admin
 GET    /api/admin/security-events                                                       admin:_require_admin
@@ -453,6 +455,14 @@ GET    /api/stats/daily                                                         
 GET    /api/stats/jobs                                                                  gated:require_approved_user
 GET    /api/stats/session-wakes                                                         admin:_require_admin
 GET    /api/stats/stuck                                                                 gated:require_approved_user
+GET    /api/subscriptions/accounts                                                      admin:_require_admin
+DELETE /api/subscriptions/accounts/{account_id}                                         admin:_require_admin
+GET    /api/subscriptions/accounts/{account_id}/usage                                   admin:_require_admin
+POST   /api/subscriptions/logins                                                        admin:_require_admin
+DELETE /api/subscriptions/logins/{login_id}                                             admin:_require_admin
+GET    /api/subscriptions/logins/{login_id}                                             admin:_require_admin
+POST   /api/subscriptions/logins/{login_id}/callback                                    admin:_require_admin
+GET    /api/subscriptions/status                                                        admin:_require_admin
 GET    /api/sudo/events                                                                 gated:user_can_access_job_or_thread
 GET    /api/sudo/requests                                                               gated:require_job_access
 GET    /api/sudo/requests/{request_id}                                                  gated:user_can_access_job_or_thread

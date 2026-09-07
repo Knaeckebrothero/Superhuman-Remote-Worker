@@ -192,9 +192,9 @@ async def init_postgres(force_reset: bool = False) -> bool:
         # mirrors the helm seeder Job)
         await _seed_llm_keys_from_env(db)
 
-        # Seed the codex-proxy system endpoint when CODEX_PROXY_URL is set
-        # (idempotent; matched by well-known label)
-        await _seed_codex_proxy_endpoint(db)
+        # Seed the subscription-proxy system endpoint when the proxy URL is set
+        # (idempotent; matched by its stable transport marker)
+        await _seed_subscription_proxy_endpoint(db)
 
         # Promote the legacy deployment-wide Tavily key into the model catalog.
         # This must precede any bundled SearXNG seed so upgrades retain Tavily
@@ -840,33 +840,45 @@ async def _seed_llm_keys_from_env(db) -> None:
 
 from orchestrator.seed.llm_config import (  # noqa: E402, F401
     CODEX_PROXY_ENDPOINT_LABEL,  # re-exported: tests reference init_mod.CODEX_PROXY_ENDPOINT_LABEL
+    SUBSCRIPTION_PROXY_ENDPOINT_LABEL,
     ensure_codex_proxy_endpoint,
     ensure_elevenlabs_tts_endpoint,
     ensure_searxng_search_endpoint,
+    ensure_subscription_proxy_endpoint,
     ensure_tavily_search_endpoint,
 )
 
 
-async def _seed_codex_proxy_endpoint(db) -> None:
-    """Boot-time seed for the system-scoped ``codex-proxy`` llm_endpoints row.
+async def _seed_subscription_proxy_endpoint(db) -> None:
+    """Boot-time seed for the system-scoped subscription-proxy llm_endpoints row.
 
-    Skips when ``CODEX_PROXY_URL`` is unset so a fresh stack with no codex
-    proxy configured doesn't carry a dangling transport row. Runtime paths
-    (OAuth callback, availability probe) call
-    :func:`ensure_codex_proxy_endpoint` directly with a fallback URL so a
-    user who connects a subscription via the cockpit gets wired up without
+    Skips when neither ``SUBSCRIPTION_PROXY_URL`` nor the legacy
+    ``CODEX_PROXY_URL`` is set, so a fresh stack with no proxy configured
+    doesn't carry a dangling transport row. Runtime paths (an OAuth callback,
+    the availability probe) call
+    :func:`ensure_subscription_proxy_endpoint` directly with a fallback URL so
+    a user who connects a subscription via the cockpit gets wired up without
     having to set the env var.
     """
-    proxy_url = os.environ.get("CODEX_PROXY_URL")
+    proxy_url = os.environ.get("SUBSCRIPTION_PROXY_URL") or os.environ.get(
+        "CODEX_PROXY_URL"
+    )
     if not proxy_url:
-        logger.info("  CODEX_PROXY_URL not set — skipping codex-proxy endpoint seed")
+        logger.info(
+            "  SUBSCRIPTION_PROXY_URL/CODEX_PROXY_URL not set — "
+            "skipping subscription-proxy endpoint seed"
+        )
         return
 
-    created = await ensure_codex_proxy_endpoint(db, proxy_url=proxy_url)
+    created = await ensure_subscription_proxy_endpoint(db, proxy_url=proxy_url)
     if created:
-        logger.info(f"  Seeded codex-proxy endpoint at {proxy_url}")
+        logger.info(f"  Seeded subscription-proxy endpoint at {proxy_url}")
     else:
-        logger.info("  codex-proxy endpoint already present — leaving untouched")
+        logger.info("  subscription-proxy endpoint already present — leaving untouched")
+
+
+# Back-compat alias for callers/tests written against the Codex-only name.
+_seed_codex_proxy_endpoint = _seed_subscription_proxy_endpoint
 
 
 async def _seed_models_from_helm(db) -> None:

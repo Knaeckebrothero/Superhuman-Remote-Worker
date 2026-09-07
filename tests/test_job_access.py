@@ -653,14 +653,19 @@ class TestGatedReadEndpoints:
     async def test_get_job_audit_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import get_job_audit
+        from orchestrator.main import _job_audit_dependencies
+        from orchestrator.routers.job_audit import get_job_audit
 
         with (
             _patch_caller_and_db(user_b, fake_db),
             patch("orchestrator.main.audit_reader", _make_dud("audit_reader")),
         ):
             with pytest.raises(HTTPException) as exc:
-                await get_job_audit(fake_request, str(job_a["id"]))
+                await get_job_audit(
+                    fake_request,
+                    str(job_a["id"]),
+                    dependencies=_job_audit_dependencies(),
+                )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
@@ -681,49 +686,65 @@ class TestGatedReadEndpoints:
     async def test_get_job_todos_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import get_job_todos
+        from orchestrator.main import _job_artifacts_dependencies
+        from orchestrator.routers.job_artifacts import get_job_todos
 
         with (
             _patch_caller_and_db(user_b, fake_db),
             patch("orchestrator.main.gitea_client", _make_dud("gitea_client")),
         ):
             with pytest.raises(HTTPException) as exc:
-                await get_job_todos(fake_request, str(job_a["id"]))
+                await get_job_todos(
+                    fake_request,
+                    str(job_a["id"]),
+                    dependencies=_job_artifacts_dependencies(),
+                )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
     async def test_get_current_todos_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import get_current_todos
+        from orchestrator.main import _job_artifacts_dependencies
+        from orchestrator.routers.job_artifacts import get_current_todos
 
         with (
             _patch_caller_and_db(user_b, fake_db),
             patch("orchestrator.main.gitea_client", _make_dud("gitea_client")),
         ):
             with pytest.raises(HTTPException) as exc:
-                await get_current_todos(fake_request, str(job_a["id"]))
+                await get_current_todos(
+                    fake_request,
+                    str(job_a["id"]),
+                    dependencies=_job_artifacts_dependencies(),
+                )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
     async def test_list_todo_archives_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import list_todo_archives
+        from orchestrator.main import _job_artifacts_dependencies
+        from orchestrator.routers.job_artifacts import list_todo_archives
 
         with (
             _patch_caller_and_db(user_b, fake_db),
             patch("orchestrator.main.gitea_client", _make_dud("gitea_client")),
         ):
             with pytest.raises(HTTPException) as exc:
-                await list_todo_archives(fake_request, str(job_a["id"]))
+                await list_todo_archives(
+                    fake_request,
+                    str(job_a["id"]),
+                    dependencies=_job_artifacts_dependencies(),
+                )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
     async def test_get_archived_todos_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import get_archived_todos
+        from orchestrator.main import _job_artifacts_dependencies
+        from orchestrator.routers.job_artifacts import get_archived_todos
 
         with (
             _patch_caller_and_db(user_b, fake_db),
@@ -734,6 +755,7 @@ class TestGatedReadEndpoints:
                     fake_request,
                     str(job_a["id"]),
                     "todos_phase_1_tactical_20260730_120000.md",
+                    dependencies=_job_artifacts_dependencies(),
                 )
         assert exc.value.status_code == 403
 
@@ -907,28 +929,38 @@ class TestGatedReadEndpoints:
     async def test_get_job_progress_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import get_job_progress
+        from orchestrator.main import _job_inspection_dependencies
+        from orchestrator.routers.job_inspection import get_job_progress
 
         fake_db.get_job_progress = AsyncMock(
             side_effect=AssertionError("progress called past the gate")
         )
         with _patch_caller_and_db(user_b, fake_db):
             with pytest.raises(HTTPException) as exc:
-                await get_job_progress(fake_request, str(job_a["id"]))
+                await get_job_progress(
+                    fake_request,
+                    str(job_a["id"]),
+                    dependencies=_job_inspection_dependencies(),
+                )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
     async def test_get_job_version_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import get_job_version
+        from orchestrator.main import _job_audit_dependencies
+        from orchestrator.routers.job_audit import get_job_version
 
         with (
             _patch_caller_and_db(user_b, fake_db),
             patch("orchestrator.main.audit_reader", _make_dud("audit_reader")),
         ):
             with pytest.raises(HTTPException) as exc:
-                await get_job_version(fake_request, str(job_a["id"]))
+                await get_job_version(
+                    fake_request,
+                    str(job_a["id"]),
+                    dependencies=_job_audit_dependencies(),
+                )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
@@ -956,7 +988,8 @@ class TestGatedReadEndpointsHappyPath:
     async def test_get_job_audit_owner_reaches_audit_store(
         self, user_a, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import get_job_audit
+        from orchestrator.main import _job_audit_dependencies
+        from orchestrator.routers.job_audit import get_job_audit
 
         fake_reader = MagicMock()
         fake_reader.is_available = True
@@ -965,7 +998,9 @@ class TestGatedReadEndpointsHappyPath:
             _patch_caller_and_db(user_a, fake_db),
             patch("orchestrator.main.audit_reader", fake_reader),
         ):
-            await get_job_audit(fake_request, str(job_a["id"]))
+            await get_job_audit(
+                fake_request, str(job_a["id"]), dependencies=_job_audit_dependencies()
+            )
         fake_reader.get_job_audit.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -973,7 +1008,8 @@ class TestGatedReadEndpointsHappyPath:
         self, user_a, job_a, fake_db, fake_request
     ):
         """Owner gets the Gitea-backed todo state (todos.yaml + archives)."""
-        from orchestrator.main import get_job_todos
+        from orchestrator.main import _job_artifacts_dependencies
+        from orchestrator.routers.job_artifacts import get_job_todos
 
         # Legacy-fallback repo resolution: no project jobs-repo rows → job-{id}.
         fake_db.get_project_repositories = AsyncMock(return_value=[])
@@ -1005,7 +1041,11 @@ class TestGatedReadEndpointsHappyPath:
             _patch_caller_and_db(user_a, fake_db),
             patch("orchestrator.main.gitea_client", fake_gitea),
         ):
-            result = await get_job_todos(fake_request, str(job_a["id"]))
+            result = await get_job_todos(
+                fake_request,
+                str(job_a["id"]),
+                dependencies=_job_artifacts_dependencies(),
+            )
 
         assert result["has_workspace"] is True
         assert result["current"]["todos"][0]["content"] == "Verify the fix end-to-end"
@@ -1022,7 +1062,8 @@ class TestGatedReadEndpointsHappyPath:
         self, user_a, job_a, fake_db, fake_request
     ):
         """House rule: Gitea being down must never 500 the cockpit todo view."""
-        from orchestrator.main import get_job_todos
+        from orchestrator.main import _job_artifacts_dependencies
+        from orchestrator.routers.job_artifacts import get_job_todos
 
         fake_gitea = MagicMock()
         fake_gitea.is_initialized = False
@@ -1030,7 +1071,11 @@ class TestGatedReadEndpointsHappyPath:
             _patch_caller_and_db(user_a, fake_db),
             patch("orchestrator.main.gitea_client", fake_gitea),
         ):
-            result = await get_job_todos(fake_request, str(job_a["id"]))
+            result = await get_job_todos(
+                fake_request,
+                str(job_a["id"]),
+                dependencies=_job_artifacts_dependencies(),
+            )
         assert result == {
             "job_id": str(job_a["id"]),
             "current": None,
@@ -1045,11 +1090,16 @@ class TestGatedReadEndpointsHappyPath:
         """E1/E3: the route now composes the DB basis with the shared
         liveness verdict — the gate still runs first and the DB payload is
         preserved, with state/reasons/sources merged on top."""
-        from orchestrator.main import get_job_progress
+        from orchestrator.main import _job_inspection_dependencies
+        from orchestrator.routers.job_inspection import get_job_progress
 
         fake_db.get_job_progress = AsyncMock(return_value={"status": "ok"})
         with _patch_caller_and_db(user_admin, fake_db):
-            result = await get_job_progress(fake_request, str(job_a["id"]))
+            result = await get_job_progress(
+                fake_request,
+                str(job_a["id"]),
+                dependencies=_job_inspection_dependencies(),
+            )
         assert result["status"] == "ok"
         # job_a is 'created' → honest waiting verdict, never a fabricated 0%.
         assert result["state"] == "waiting"

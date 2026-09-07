@@ -9,7 +9,12 @@ import {
   CatalogModel,
   CatalogModelTestResult,
   CatalogProviderKind,
+  LlmEndpoint,
   LlmEndpointDiscoveredModel,
+  LlmEndpointDiscoveryResult,
+  SubscriptionDiscoveredModel,
+  SubscriptionDiscoveryResult,
+  SubscriptionImportResult,
 } from '../../../core/models/api.model';
 import {TTS_VOICE_CUSTOM, voicesForModelId} from '../../../core/models/tts-voices';
 import {AppButtonComponent} from '../../../ui/button';
@@ -50,13 +55,31 @@ export const SEARCH_ADAPTER_OPTIONS: ReadonlyArray<{
 ];
 
 /**
- * Well-known label for the seeded codex-proxy llm_endpoints row. The
- * orchestrator's _seed_codex_proxy_endpoint inserts a row with this label
- * when CODEX_PROXY_URL is set; the frontend uses it to detect when the
- * codex source needs the special "subscription" affordance (status banner,
- * deep link to OAuth login).
+ * Stable transport marker on `llm_endpoints.transport_kind` for the shared
+ * CLIProxyAPI deployment that fronts connected subscription accounts. The
+ * frontend branches on this to give that source its subscription affordances
+ * (account banner, per-account attribution, bulk import).
+ *
+ * Never branch on the label: it was renamed `codex-proxy` → `subscription-proxy`
+ * and an admin can rename it again. The labels below are only the fallback for
+ * a backend that predates the marker.
  */
-const CODEX_PROXY_LABEL = 'codex-proxy';
+const SUBSCRIPTION_PROXY_TRANSPORT = 'subscription-proxy';
+const LEGACY_SUBSCRIPTION_LABELS = ['codex-proxy', 'subscription-proxy'];
+
+/** True when an endpoint row is the shared subscription proxy. */
+function isSubscriptionEndpoint(ep: LlmEndpoint | undefined): boolean {
+  if (!ep) return false;
+  if (ep.transport_kind === SUBSCRIPTION_PROXY_TRANSPORT) return true;
+  return LEGACY_SUBSCRIPTION_LABELS.includes(ep.label);
+}
+
+/** The discover route answers one of two shapes; `subscription` picks them apart. */
+function isSubscriptionDiscovery(
+  result: LlmEndpointDiscoveryResult | SubscriptionDiscoveryResult,
+): result is SubscriptionDiscoveryResult {
+  return (result as SubscriptionDiscoveryResult).subscription === true;
+}
 
 /**
  * Build the `capabilities[]` pre-fill from the discovery hint array.
@@ -325,22 +348,29 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
 
             @if (selectedEndpointRef(); as endpointRef) {
               <div class="discover-pane" #discoverPane>
-                @if (selectedIsCodex()) {
-                  @if (providers.codexAvailability(); as codex) {
+                @if (selectedIsSubscription()) {
+                  @if (providers.subscriptionAvailability(); as subs) {
                     <div
-                      class="codex-status"
-                      [class.ok]="codex.available"
-                      [class.warn]="!codex.available"
+                      class="subs-banner"
+                      [class.ok]="subs.available"
+                      [class.warn]="!subs.available"
                     >
-                      @if (codex.available) {
+                      @if (!subs.reachable) {
                         <span>
-                          ✓ Codex proxy active —
-                          {{ codex.account_count }} subscription{{ codex.account_count === 1 ? '' : 's' }} logged in
+                          ⚠ The subscription proxy is not reachable. Enable it in the
+                          deployment before registering models here.
+                        </span>
+                      } @else if (subs.available) {
+                        <span>
+                          ✓ Subscription proxy active —
+                          {{ subs.account_count }} account{{ subs.account_count === 1 ? '' : 's' }}
+                          connected
                         </span>
                       } @else {
                         <span>
-                          ⚠ No active codex subscription. Log in via Settings → Codex
-                          before testing models, otherwise dispatched calls will 401.
+                          ⚠ No connected subscription. Connect one in
+                          Settings → AI Subscriptions before testing models, otherwise
+                          dispatched calls will 401.
                         </span>
                       }
                     </div>
@@ -364,6 +394,8 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
                     </span>
                   }
                 </div>
+
+                <!-- Plain endpoint: unchanged quick-fill chips. -->
                 @if (discoveredModels().length > 0) {
                   <div class="discover-list">
                     @for (m of discoveredModels(); track m.id) {
@@ -377,6 +409,115 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
                           {{ m.capability_hints.join(', ') }}
                         </span>
                       </button>
+                    }
+                  </div>
+                }
+
+                <!-- Subscription proxy: attributed, searchable, bulk-importable. -->
+                @if (subscriptionModels().length > 0) {
+                  @if (!subscriptionAttributionComplete()) {
+                    <p class="subs-incomplete">
+                      ⚠ Source attribution is incomplete — one or more accounts could not
+                      be read. Models below may show no source; that means unknown, not
+                      none.
+                    </p>
+                  }
+                  <div class="subs-toolbar">
+                    <app-input
+                      [value]="modelFilter()"
+                      placeholder="Filter models or sources…"
+                      (changed)="modelFilter.set($event)"
+                    />
+                    <app-button
+                      variant="ghost"
+                      size="sm"
+                      [disabled]="importing()"
+                      (clicked)="selectAllSupported()"
+                    >
+                      Select supported
+                    </app-button>
+                    <app-button
+                      variant="ghost"
+                      size="sm"
+                      [disabled]="importing() || subscriptionSelection().size === 0"
+                      (clicked)="clearSelection()"
+                    >
+                      Clear
+                    </app-button>
+                    <app-button
+                      variant="primary"
+                      size="sm"
+                      [loading]="importing()"
+                      [disabled]="importing() || subscriptionSelection().size === 0"
+                      (clicked)="addSelectedModels()"
+                    >
+                      Add selected ({{ subscriptionSelection().size }})
+                    </app-button>
+                    <app-button
+                      variant="secondary"
+                      size="sm"
+                      [loading]="importing()"
+                      [disabled]="importing() || importableCount() === 0"
+                      (clicked)="addAllSupportedModels()"
+                    >
+                      Add all supported models ({{ importableCount() }})
+                    </app-button>
+                  </div>
+
+                  @if (importResult(); as result) {
+                    <p class="subs-import-result">
+                      Added {{ result.created.length }} · already registered
+                      {{ result.skipped.length }} · not importable
+                      {{ result.rejected.length }}
+                    </p>
+                  }
+
+                  <div class="subs-model-list">
+                    @for (m of filteredSubscriptionModels(); track m.id) {
+                      <div
+                        class="subs-model-row"
+                        [class.registered]="m.registered"
+                        [class.unsupported]="m.support === 'unsupported_modality'"
+                      >
+                        <app-checkbox
+                          size="sm"
+                          [checked]="isSelected(m.id)"
+                          [disabled]="m.registered || m.support === 'unsupported_modality'"
+                          [ariaLabel]="m.id"
+                          (changed)="toggleSelection(m, $event)"
+                        />
+                        <button
+                          type="button"
+                          class="subs-model-id mono"
+                          (click)="applySubscriptionModel(m)"
+                          title="Autofill the form with this model"
+                        >
+                          {{ m.id }}
+                        </button>
+                        <span class="subs-model-sources">
+                          @if (m.sources.length > 0) {
+                            @for (source of m.sources; track source) {
+                              <app-badge tone="neutral" size="xs">{{ source }}</app-badge>
+                            }
+                          } @else {
+                            <span class="muted">source unknown</span>
+                          }
+                        </span>
+                        @if (m.context_window) {
+                          <span class="subs-model-ctx">{{ m.context_window }}</span>
+                        }
+                        @if (m.registered) {
+                          <app-badge tone="success" size="xs">registered</app-badge>
+                        }
+                        @if (m.routing_drift) {
+                          <app-badge tone="warning" size="xs">routing differs</app-badge>
+                        }
+                        @if (m.support === 'unsupported_modality') {
+                          <app-badge tone="danger" size="xs">not a chat model</app-badge>
+                        } @else if (m.support === 'needs_review') {
+                          <app-badge tone="warning" size="xs">needs review</app-badge>
+                        }
+                      </div>
                     }
                   </div>
                 }
@@ -807,20 +948,87 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
       letter-spacing: 0.4px;
       color: var(--text-muted);
     }
-    .codex-status {
+    .subs-banner {
       margin-bottom: 10px;
       padding: 6px 10px;
       border-radius: var(--radius-control);
       font-size: 12px;
       line-height: 1.4;
     }
-    .codex-status.ok {
+    .subs-banner.ok {
       background: var(--success-tint);
       color: var(--success);
     }
-    .codex-status.warn {
+    .subs-banner.warn {
       background: var(--danger-tint);
       color: var(--danger);
+    }
+    .subs-incomplete {
+      margin: 8px 0;
+      font-size: 12px;
+      color: var(--warning, #b45309);
+      line-height: 1.4;
+    }
+    .subs-toolbar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin: 10px 0;
+    }
+    .subs-toolbar > app-input {
+      flex: 1 1 220px;
+    }
+    .subs-import-result {
+      margin: 0 0 10px 0;
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+    .subs-model-list {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      max-height: 320px;
+      overflow-y: auto;
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-card);
+      padding: 8px;
+    }
+    .subs-model-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 4px 6px;
+      border-radius: var(--radius-control);
+      font-size: 12px;
+    }
+    .subs-model-row.registered {
+      opacity: 0.75;
+    }
+    .subs-model-row.unsupported {
+      opacity: 0.6;
+    }
+    .subs-model-id {
+      flex: 1;
+      text-align: left;
+      background: none;
+      border: none;
+      padding: 0;
+      cursor: pointer;
+      color: var(--text-primary);
+      font-size: 12px;
+    }
+    .subs-model-id:hover {
+      text-decoration: underline;
+    }
+    .subs-model-sources {
+      display: flex;
+      gap: 4px;
+      flex-wrap: wrap;
+    }
+    .subs-model-ctx {
+      color: var(--text-muted);
+      font-variant-numeric: tabular-nums;
     }
     @media (max-width: 720px) {
       /* The catalog table is a 7-column grid (1.4fr 2fr 160px 100px 100px 70px
@@ -1047,6 +1255,36 @@ export class AdminCatalogComponent implements OnInit {
   readonly discoveredModels = signal<LlmEndpointDiscoveredModel[]>([]);
   readonly discoverError = signal<string>('');
 
+  // Subscription-proxy discovery: the same probe, enriched server-side with
+  // per-account attribution. Kept in its own signals so the plain-endpoint
+  // quick-fill path stays exactly as it was.
+  readonly subscriptionModels = signal<SubscriptionDiscoveredModel[]>([]);
+  readonly subscriptionSelection = signal<ReadonlySet<string>>(new Set<string>());
+  readonly subscriptionAttributionComplete = signal(true);
+  readonly importing = signal(false);
+  readonly importResult = signal<SubscriptionImportResult | null>(null);
+  readonly modelFilter = signal('');
+
+  /** Candidates matching the search box, unsupported ones sorted last. */
+  readonly filteredSubscriptionModels = computed(() => {
+    const needle = this.modelFilter().trim().toLowerCase();
+    const rows = this.subscriptionModels();
+    if (!needle) return rows;
+    return rows.filter(
+      (m) =>
+        m.id.toLowerCase().includes(needle) ||
+        m.display_label.toLowerCase().includes(needle) ||
+        m.sources.some((source) => source.toLowerCase().includes(needle)),
+    );
+  });
+
+  /** Advertised, supported and not yet in the catalog. */
+  readonly importableCount = computed(
+    () =>
+      this.subscriptionModels().filter((m) => m.support === 'supported' && !m.registered)
+        .length,
+  );
+
   readonly selectedEndpointRef = computed<string | null>(() => {
     const key = this.formProviderKey();
     if (!key.startsWith('endpoint:')) return null;
@@ -1056,9 +1294,8 @@ export class AdminCatalogComponent implements OnInit {
   /** Provider dropdown options sourced from the keys + endpoints lists.
    * Non-LLM providers (`vision`) are filtered out — they live in
    * `system_api_keys` for env injection but can't anchor a catalog row.
-   * The seeded `codex-proxy` endpoint is rendered as a "subscription"
-   * source so admins recognise it as separate from a generic vLLM/Ollama
-   * endpoint. */
+   * The shared subscription proxy is rendered as "Subscription proxy" so
+   * admins recognise it as separate from a generic vLLM/Ollama endpoint. */
   readonly providerOptions = computed<ProviderOption[]>(() => {
     const opts: ProviderOption[] = [];
     for (const key of this.providers.systemApiKeys()) {
@@ -1071,30 +1308,27 @@ export class AdminCatalogComponent implements OnInit {
       });
     }
     for (const ep of this.providers.systemEndpoints()) {
-      const isCodex = ep.label === CODEX_PROXY_LABEL;
       opts.push({
         kind: 'endpoint',
         ref: ep.id,
-        label: isCodex
-          ? `${ep.label} (codex subscription)`
+        label: isSubscriptionEndpoint(ep)
+          ? 'Subscription proxy'
           : `${ep.label} (endpoint)`,
         // Every system endpoint can anchor a catalog row — including the
-        // seeded codex-proxy even without an active subscription (admins may
-        // seed rows ahead of OAuth login; the runtime status banner below
-        // tells them when login is needed).
+        // subscription proxy with nothing signed in (admins may seed rows
+        // ahead of a login; the status banner below says when one is needed).
         available: true,
       });
     }
     return opts;
   });
 
-  /** True when the form provider is the seeded codex-proxy endpoint. */
-  readonly selectedIsCodex = computed(() => {
-    const ref = this.selectedEndpointRef();
-    if (!ref) return false;
-    const ep = this.providers.systemEndpoints().find((e) => e.id === ref);
-    return ep?.label === CODEX_PROXY_LABEL;
-  });
+  /** True when the form provider is the shared subscription proxy. */
+  readonly selectedIsSubscription = computed(() =>
+    isSubscriptionEndpoint(
+      this.providers.systemEndpoints().find((e) => e.id === this.selectedEndpointRef()),
+    ),
+  );
 
   readonly groupedModels = computed(() => {
     const groups = new Map<string, {key: string; label: string; rows: CatalogModel[]}>();
@@ -1132,7 +1366,7 @@ export class AdminCatalogComponent implements OnInit {
     this.models.loadFamilies();
     this.providers.loadSystemApiKeys();
     this.providers.loadSystemEndpoints();
-    this.providers.loadCodexAvailability();
+    this.providers.loadSubscriptionAvailability();
 
     this.coordinator.discoverEndpoint$
       .pipe(takeUntilDestroyed(this.destroyRef))
@@ -1163,7 +1397,8 @@ export class AdminCatalogComponent implements OnInit {
 
   endpointLabel(refId: string): string {
     const ep = this.providers.systemEndpoints().find((e) => e.id === refId);
-    return ep ? `${ep.label} (endpoint)` : `endpoint:${refId}`;
+    if (!ep) return `endpoint:${refId}`;
+    return isSubscriptionEndpoint(ep) ? 'Subscription proxy' : `${ep.label} (endpoint)`;
   }
 
   canSubmit(): boolean {
@@ -1400,11 +1635,21 @@ export class AdminCatalogComponent implements OnInit {
     this.discovering.set(true);
     this.discoverError.set('');
     this.discoveredModels.set([]);
+    this.subscriptionModels.set([]);
+    this.subscriptionSelection.set(new Set<string>());
+    this.importResult.set(null);
     this.providers.discoverSystemEndpointModels(endpointId).subscribe({
       next: (result) => {
         this.discovering.set(false);
         if (!result.ok) {
+          // A failed discovery is not an authoritative empty inventory —
+          // surface the error and leave the previous catalog untouched.
           this.discoverError.set(result.error || 'Discovery failed.');
+          return;
+        }
+        if (isSubscriptionDiscovery(result)) {
+          this.subscriptionModels.set(result.models);
+          this.subscriptionAttributionComplete.set(result.attribution_complete);
           return;
         }
         this.discoveredModels.set(result.models);
@@ -1414,6 +1659,86 @@ export class AdminCatalogComponent implements OnInit {
         this.discoverError.set(err?.error?.detail ?? 'Discovery failed.');
       },
     });
+  }
+
+  // ── Subscription bulk import ──────────────────────────────────
+
+  isSelected(modelId: string): boolean {
+    return this.subscriptionSelection().has(modelId);
+  }
+
+  toggleSelection(model: SubscriptionDiscoveredModel, checked: boolean): void {
+    // Registered rows and unsupported modalities are never selectable — the
+    // backend refuses them anyway, and offering the checkbox would imply the
+    // import could overwrite an admin's edits.
+    if (model.registered || model.support === 'unsupported_modality') return;
+    const next = new Set(this.subscriptionSelection());
+    if (checked) next.add(model.id);
+    else next.delete(model.id);
+    this.subscriptionSelection.set(next);
+  }
+
+  selectAllSupported(): void {
+    this.subscriptionSelection.set(
+      new Set(
+        this.filteredSubscriptionModels()
+          .filter((m) => m.support === 'supported' && !m.registered)
+          .map((m) => m.id),
+      ),
+    );
+  }
+
+  clearSelection(): void {
+    this.subscriptionSelection.set(new Set<string>());
+  }
+
+  /** "Add selected" — registers exactly the checked candidates. */
+  addSelectedModels(): void {
+    const ids = Array.from(this.subscriptionSelection());
+    if (ids.length === 0) return;
+    const includeReview = this.subscriptionModels().some(
+      (m) => ids.includes(m.id) && m.support === 'needs_review',
+    );
+    this.runImport(ids, includeReview);
+  }
+
+  /** "Add all supported models" — server-side selection, never the filter. */
+  addAllSupportedModels(): void {
+    this.runImport(undefined, false);
+  }
+
+  private runImport(modelIds: string[] | undefined, includeReview: boolean): void {
+    const endpointId = this.selectedEndpointRef();
+    if (!endpointId) return;
+    this.importing.set(true);
+    this.importResult.set(null);
+    this.providers.importSubscriptionModels(endpointId, modelIds, includeReview).subscribe({
+      next: (result) => {
+        this.importing.set(false);
+        this.importResult.set(result);
+        this.clearSelection();
+        // Re-run discovery so the registration state (and any drift) is read
+        // back from the catalog rather than assumed from the import result.
+        this.discoverFromEndpoint(endpointId);
+      },
+      error: (err) => {
+        this.importing.set(false);
+        this.discoverError.set(err?.error?.detail ?? 'Import failed.');
+      },
+    });
+  }
+
+  /** Pre-fill the single-model form from a subscription candidate. */
+  applySubscriptionModel(m: SubscriptionDiscoveredModel): void {
+    this.formModelId.set(m.id);
+    this.formDisplayLabel.set(m.display_label || m.id);
+    this.formCapabilities.set(hintsToCapabilities(m.capability_hints));
+    if (m.family) {
+      this.formFamily.set(m.family);
+    } else {
+      this.detectAndSetFamily(m.id);
+    }
+    this.formContextWindow.set(m.context_window ?? null);
   }
 
   applyDiscoveredModel(m: LlmEndpointDiscoveredModel): void {

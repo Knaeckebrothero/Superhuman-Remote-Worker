@@ -1,5 +1,4 @@
 import {Routes} from '@angular/router';
-import {SettingsComponent} from './views/settings/settings.component';
 import {ApiKeysPageComponent} from './views/settings/api-keys/api-keys-page.component';
 import {JobsPageComponent} from './views/jobs/jobs-page.component';
 import {JobReviewPageComponent} from './views/job-review/job-review-page.component';
@@ -75,12 +74,17 @@ export const routes: Routes = [
       import('./views/automations/automations-page.component').then(m => m.AutomationsPageComponent),
     canActivate: [authGuard],
   },
-  { path: 'settings', component: SettingsComponent, canActivate: [authGuard] },
+  // Load account and subscription settings when opened, keeping their controls
+  // out of the initial chat bundle as with the other settings/admin pages.
+  {
+    path: 'settings',
+    loadComponent: () =>
+      import('./views/settings/settings.component').then(m => m.SettingsComponent),
+    canActivate: [authGuard],
+  },
   { path: 'settings/api-keys', component: ApiKeysPageComponent, canActivate: [authGuard] },
-  // Lazy, unlike the PAT route above: the bundle has ~30 KB of headroom
-  // against the hard-fail initial-bundle budget, and this page (plus the
-  // ssh-keygen instructions it renders) is not something every session
-  // visits — see the `automations` route's rationale.
+  // SSH key management also loads on demand; its key-generation instructions
+  // are only needed when this page is opened.
   {
     path: 'settings/ssh-keys',
     loadComponent: () =>

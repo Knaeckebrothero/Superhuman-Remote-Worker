@@ -11,6 +11,8 @@ os.environ.setdefault("VECTOR_DB_URL", "postgresql://localhost/test")
 
 import pytest
 
+from orchestrator.schemas.config_catalog import ConfigOverrideCreate
+
 
 @pytest.mark.asyncio
 async def test_upsert_config_override_uses_on_conflict():
@@ -91,11 +93,9 @@ def _import_main():
 
 
 def _registered_routes(app) -> set:
-    out = set()
-    for route in app.routes:
-        for m in getattr(route, "methods", None) or set():
-            out.add((m, getattr(route, "path", "")))
-    return out
+    from tests._route_inventory import mounted_routes
+
+    return mounted_routes(app)
 
 
 OVERRIDE_ROUTES = {
@@ -114,8 +114,6 @@ def test_config_override_routes_registered():
 
 
 def test_config_override_create_model_validates():
-    ConfigOverrideCreate = _import_main().ConfigOverrideCreate
-
     ok = ConfigOverrideCreate(
         family="gemma", kind="prompts", name="persona", content="x"
     )
@@ -162,7 +160,7 @@ def test_catalog_has_settings_and_guardrails_keys():
 
 
 def test_settings_override_create_model_validates():
-    Create = _import_main().ConfigOverrideCreate
+    Create = ConfigOverrideCreate
 
     ok = Create(family="gemma", kind="settings", name="temperature", value_json=1.0)
     assert ok.value_json == 1.0 and ok.content is None
@@ -175,7 +173,19 @@ def test_settings_override_create_model_validates():
 
 
 def test_validate_override_value_checks_catalog():
-    m = _import_main()
+    from unittest.mock import MagicMock
+
+    from orchestrator.services.config_catalog import ConfigCatalogService
+    from shared.runtime.core import loader
+
+    service = ConfigCatalogService(
+        store=MagicMock(),
+        project_root=loader.get_project_root,
+        settings_for_family=loader.bundled_settings_for_family,
+        guardrails_for_family=loader.bundled_guardrails_for_family,
+        prompt_resolver=loader.PromptMatrixResolver,
+        instruction_resolver=loader.InstructionMatrixResolver,
+    )
     with pytest.raises(Exception):
-        m.validate_override_value("settings", "temperature", 9.0)  # > max
-    m.validate_override_value("settings", "temperature", 1.0)  # ok
+        service.validate_override_value("settings", "temperature", 9.0)  # > max
+    service.validate_override_value("settings", "temperature", 1.0)  # ok

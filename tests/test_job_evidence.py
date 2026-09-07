@@ -874,7 +874,8 @@ class TestEvidenceRouteAuthorization:
     ):
         """A guessed/leaked evidence ID from another project is denied by the
         server scope gate before the manifest is even parsed."""
-        from orchestrator.main import read_job_evidence_route
+        from orchestrator.main import _job_artifacts_dependencies
+        from orchestrator.routers.job_artifacts import read_job_evidence_route
 
         job_a["context"] = {
             "evidence_manifest": {"recorded_at": "t", "entries": [{"id": "ev_1"}]}
@@ -883,7 +884,11 @@ class TestEvidenceRouteAuthorization:
         with _patch_caller_and_db(scoped_user, fake_db):
             with pytest.raises(HTTPException) as excinfo:
                 await read_job_evidence_route(
-                    fake_request, str(job_a["id"]), "ev_1", offset=0
+                    fake_request,
+                    str(job_a["id"]),
+                    "ev_1",
+                    offset=0,
+                    dependencies=_job_artifacts_dependencies(),
                 )
         assert excinfo.value.status_code == 403
 
@@ -891,18 +896,27 @@ class TestEvidenceRouteAuthorization:
     async def test_non_member_denied_listing(
         self, user_b, fake_db, fake_request, job_a
     ):
-        from orchestrator.main import list_job_evidence_route
+        from orchestrator.main import _job_artifacts_dependencies
+        from orchestrator.routers.job_artifacts import list_job_evidence_route
 
         with _patch_caller_and_db(user_b, fake_db):
             with pytest.raises(HTTPException) as excinfo:
-                await list_job_evidence_route(fake_request, str(job_a["id"]))
+                await list_job_evidence_route(
+                    fake_request,
+                    str(job_a["id"]),
+                    dependencies=_job_artifacts_dependencies(),
+                )
         assert excinfo.value.status_code == 403
 
     @pytest.mark.asyncio
     async def test_owner_reads_manifest_and_unknown_id_404s(
         self, user_a, fake_db, fake_request, job_a
     ):
-        from orchestrator.main import list_job_evidence_route, read_job_evidence_route
+        from orchestrator.main import _job_artifacts_dependencies
+        from orchestrator.routers.job_artifacts import (
+            list_job_evidence_route,
+            read_job_evidence_route,
+        )
 
         job_a["context"] = {
             "evidence_manifest": {
@@ -920,12 +934,20 @@ class TestEvidenceRouteAuthorization:
             }
         }
         with _patch_caller_and_db(user_a, fake_db):
-            listing = await list_job_evidence_route(fake_request, str(job_a["id"]))
+            listing = await list_job_evidence_route(
+                fake_request,
+                str(job_a["id"]),
+                dependencies=_job_artifacts_dependencies(),
+            )
             assert [e["id"] for e in listing["entries"]] == ["ev_1"]
             assert "inline_content" not in listing["entries"][0]
             with pytest.raises(HTTPException) as excinfo:
                 await read_job_evidence_route(
-                    fake_request, str(job_a["id"]), "ev_does_not_exist", offset=0
+                    fake_request,
+                    str(job_a["id"]),
+                    "ev_does_not_exist",
+                    offset=0,
+                    dependencies=_job_artifacts_dependencies(),
                 )
         assert excinfo.value.status_code == 404
 
@@ -933,7 +955,8 @@ class TestEvidenceRouteAuthorization:
     async def test_route_failure_never_exposes_private_coordinates(
         self, user_a, fake_db, fake_request, job_a, caplog
     ):
-        from orchestrator.main import read_job_evidence_route
+        from orchestrator.main import _job_artifacts_dependencies
+        from orchestrator.routers.job_artifacts import read_job_evidence_route
 
         job_a["context"] = {
             "evidence_manifest": {
@@ -951,7 +974,11 @@ class TestEvidenceRouteAuthorization:
             ):
                 with pytest.raises(HTTPException) as excinfo:
                     await read_job_evidence_route(
-                        fake_request, str(job_a["id"]), "ev_1", offset=0
+                        fake_request,
+                        str(job_a["id"]),
+                        "ev_1",
+                        offset=0,
+                        dependencies=_job_artifacts_dependencies(),
                     )
         assert excinfo.value.status_code == 500
         assert private_detail not in str(excinfo.value.detail)
@@ -961,9 +988,14 @@ class TestEvidenceRouteAuthorization:
     async def test_completion_report_route_404_when_absent(
         self, user_a, fake_db, fake_request, job_a
     ):
-        from orchestrator.main import get_job_completion_report_route
+        from orchestrator.main import _job_artifacts_dependencies
+        from orchestrator.routers.job_artifacts import get_job_completion_report_route
 
         with _patch_caller_and_db(user_a, fake_db):
             with pytest.raises(HTTPException) as excinfo:
-                await get_job_completion_report_route(fake_request, str(job_a["id"]))
+                await get_job_completion_report_route(
+                    fake_request,
+                    str(job_a["id"]),
+                    dependencies=_job_artifacts_dependencies(),
+                )
         assert excinfo.value.status_code == 404

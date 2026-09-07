@@ -1245,41 +1245,86 @@
       "webConnectorDesc": "Fügen Sie diese URL als benutzerdefinierten MCP-Konnektor hinzu. OAuth-Anmeldung wird automatisch durchgeführt — kein Token oder Anmeldeinformationen erforderlich.",
       "webConnectorHint": "Funktioniert mit jedem MCP-Client, der OAuth 2.1 (Authorization Code + PKCE) unterstützt. Lassen Sie die Felder Client-ID und Client-Secret leer — der Server übernimmt die Registrierung automatisch."
     },
-    "codex": {
-      "title": "Codex-Proxy",
-      "desc": "Verwalten Sie den Codex-OAuth-Proxy für ChatGPT-Abo-basierte Modelle",
+    "subscriptions": {
+      "title": "KI-Abos",
+      "desc": "Verbinden Sie Abo-Konten über den gemeinsamen Proxy. Modelle werden separat unter Admin → Models registriert.",
       "checking": "Proxy wird geprüft…",
       "connected": "Verbunden",
-      "notConnected": "Nicht verbunden",
+      "notConnected": "Kein Konto verbunden",
       "notEnabled": "Proxy nicht aktiviert",
-      "disabledTitle": "Codex-Proxy ist nicht aktiviert",
-      "disabledDesc": "Auf dieser Instanz läuft der Codex-OAuth-Proxy nicht, daher sind ChatGPT-Abo-basierte Modelle nicht verfügbar. Um ihn zu aktivieren, setzen Sie folgenden Wert in Ihrem Helm-Values-Overlay, deployen Sie neu und laden Sie diese Seite neu:",
+      "modelsAvailable": "{{count}} Modell(e) verfügbar",
       "refreshStatus": "Status aktualisieren",
       "disconnect": "Trennen",
-      "availableModels": "Verfügbare Modelle",
-      "waiting": "Warte auf OAuth…",
-      "connectAccount": "ChatGPT-Konto verbinden",
-      "completeSignIn": "Anmeldung abschließen",
-      "step1": "Melden Sie sich mit Ihrem OpenAI-Konto im gerade geöffneten Tab an.",
-      "step2": "Nach der Anmeldung versucht der Browser, auf localhost umzuleiten, und zeigt einen Fehler — das ist erwartet.",
-      "step3": "Kopieren Sie die vollständige URL aus der Adressleiste Ihres Browsers.",
-      "step4": "Fügen Sie sie unten ein und klicken Sie auf „Anmeldung abschließen“.",
-      "callbackPlaceholder": "Callback-URL hier einfügen…",
-      "submitting": "Wird gesendet…",
-      "completeLogin": "Anmeldung abschließen",
-      "portForwardHint": "Wenn kubectl port-forward aktiv ist, wird die Anmeldung automatisch abgeschlossen.",
+      "connect": "Verbinden",
+      "cancel": "Anmeldung abbrechen",
+      "dismiss": "Ausblenden",
+      "addTitle": "Abo hinzufügen",
+      "connectedCount": "{{count}} verbunden",
+      "unverified": "Nicht live verifiziert",
+      "disabledTitle": "Der Subscription-Proxy ist nicht aktiviert",
+      "disabledDesc": "Auf dieser Instanz läuft der Subscription-Proxy nicht, daher sind Abo-basierte Modelle nicht verfügbar. Um ihn zu aktivieren, setzen Sie folgenden Wert in Ihrem Helm-Values-Overlay, deployen Sie neu und laden Sie diese Seite neu:",
+      "providers": {
+        "openai-codex": "OpenAI · ChatGPT / Codex",
+        "anthropic-claude-code": "Anthropic · Claude Code",
+        "google-antigravity": "Google · Antigravity",
+        "xai-grok-build": "xAI · Grok Build",
+        "kimi-code": "Moonshot · Kimi Code"
+      },
+      "flows": {
+        "browser": "Melden Sie sich im Browser an und fügen Sie anschließend die Callback-URL ein, falls der Redirect diesen Server nicht erreicht.",
+        "device": "Öffnen Sie den Verifizierungslink und geben Sie den hier angezeigten Code ein."
+      },
+      "states": {
+        "connected": "Verbunden",
+        "pending": "Wartet auf Autorisierung",
+        "refreshing": "Token wird erneuert",
+        "cooldown": "Vorübergehend gedrosselt",
+        "error": "Fehler",
+        "disabled": "Deaktiviert",
+        "unknown": "Unbekannt"
+      },
+      "scope": {
+        "installation": "Gemeinsam"
+      },
+      "browser": {
+        "step1": "Melden Sie sich beim Anbieter im gerade geöffneten Tab an:",
+        "openLink": "Anmeldeseite öffnen",
+        "step2": "Nach der Anmeldung leitet der Browser auf localhost um und zeigt möglicherweise einen Fehler — das ist bei einem Remote-Deployment erwartet.",
+        "step3": "Kopieren Sie die vollständige URL aus der Adressleiste und fügen Sie sie unten ein.",
+        "callbackPlaceholder": "Callback-URL hier einfügen…",
+        "complete": "Anmeldung abschließen",
+        "remoteHint": "Wenn der Redirect den Proxy direkt erreicht, wird die Anmeldung automatisch abgeschlossen und dieses Feld ist nicht nötig."
+      },
+      "device": {
+        "step1": "Öffnen Sie die Verifizierungsseite:",
+        "step2": "Geben Sie diesen Code ein:",
+        "step3": "Bestätigen Sie die Anfrage und lassen Sie diese Seite offen, bis „Verbunden“ angezeigt wird.",
+        "expires": "Der Code läuft um {{time}} ab."
+      },
+      "login": {
+        "pending": "Warte auf Autorisierung durch {{provider}}…",
+        "verifying": "Autorisierung gemeldet — Credential wird bestätigt…",
+        "connected": "{{provider}} verbunden.",
+        "failed": "Anmeldung bei {{provider}} fehlgeschlagen.",
+        "cancelled": "Anmeldung bei {{provider}} abgebrochen."
+      },
       "usage": {
+        "check": "Nutzung prüfen",
+        "toggle": "Nutzung",
+        "unavailable": "Nutzung nicht verfügbar",
         "title": "Nutzungslimits",
         "session": "Aktuelle Sitzung",
         "weekly": "Wochenlimit",
         "resetsIn": "Zurücksetzung in {{time}}",
         "limitReached": "Limit erreicht",
-        "disclaimer": "Der Proxy stellt keine Nutzungsdaten bereit: ChatGPT erfasst über den Proxy geleitete Anfragen als 'zusätzliche Nutzung' außerhalb dieser Fenster, daher spiegeln diese Balken die Proxy-Nutzung noch nicht wider."
+        "disclaimer": "Vom Anbieter für dieses Konto gemeldet. Der Proxy erfasst selbst keine Nutzung, daher können über ihn geleitete Anfragen abweichend gezählt werden."
       },
       "errors": {
-        "urlMissingParams": "Der URL fehlen erforderliche Parameter. Bitte fügen Sie die vollständige URL aus der Adressleiste Ihres Browsers ein.",
-        "invalidUrl": "Ungültige URL. Bitte fügen Sie die vollständige URL aus der Adressleiste Ihres Browsers ein.",
-        "completeFailed": "Anmeldung konnte nicht abgeschlossen werden. Bitte erneut versuchen."
+        "startFailed": "Anmeldung konnte nicht gestartet werden. Prüfen Sie, ob der Proxy erreichbar ist.",
+        "completeFailed": "Anmeldung konnte nicht abgeschlossen werden. Bitte erneut versuchen.",
+        "timeout": "Die Anmeldung ist abgelaufen, bevor sie bestätigt wurde.",
+        "credential_not_persisted": "Der Anbieter meldete Erfolg, es wurde jedoch kein Credential gespeichert. Bitte erneut verbinden.",
+        "authorization_failed": "Der Anbieter hat die Autorisierung abgelehnt."
       }
     },
     "cloud": {

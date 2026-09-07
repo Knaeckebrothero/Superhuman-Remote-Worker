@@ -15,14 +15,16 @@ and knowledge-base/knowledge/features/universal_experts_and_subagents.md §1.1.
 
 from __future__ import annotations
 
+from orchestrator.services import expert_catalog as expert_catalog_module
+
+
 import copy
 import os
 
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
-import orchestrator.main  # noqa: E402
 
-eff = orchestrator.main._effective_models_from_layers
+eff = expert_catalog_module.effective_models_from_layers
 
 SLOTS = {"model", "subagent", "session"}
 

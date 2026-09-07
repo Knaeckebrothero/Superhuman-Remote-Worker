@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tomllib
 
 import pytest
 
@@ -62,6 +63,19 @@ def boundary_tree(tmp_path):
         "vm_controller/app.py": "from shared.value import VALUE\n",
     }.items():
         (tmp_path / "src" / module).write_text(body)
+    # New extraction boundaries declare their source modules in the manifest.
+    # Seed inert modules for those domains so poisoning exercises the real
+    # contracts without loading the production application's infrastructure.
+    config = tomllib.loads((REPO / "pyproject.toml").read_text())
+    for contract in config["tool"]["importlinter"]["contracts"]:
+        for module in contract.get("source_modules", []):
+            if "*" in module:
+                continue
+            path = tmp_path / "src" / module.replace(".", "/")
+            if path.is_dir() or path.with_suffix(".py").exists():
+                continue
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.with_suffix(".py").write_text("from shared.value import VALUE\n")
     return tmp_path
 
 
@@ -84,7 +98,7 @@ def lint_boundaries(root):
 def test_allowed_runtime_and_lightweight_dependencies_pass(boundary_tree):
     result = lint_boundaries(boundary_tree)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "Contracts: 12 kept, 0 broken" in result.stdout
+    assert "Contracts: 13 kept, 0 broken" in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -108,6 +122,10 @@ def test_allowed_runtime_and_lightweight_dependencies_pass(boundary_tree):
         ("orchestrator/routers/tables.py", "orchestrator.main"),
         ("orchestrator/routers/preferences.py", "orchestrator.main"),
         ("orchestrator/routers/job_reads.py", "orchestrator.main"),
+        ("orchestrator/routers/job_inspection.py", "orchestrator.main"),
+        ("orchestrator/routers/expert_catalog.py", "orchestrator.main"),
+        ("orchestrator/services/provider_catalog.py", "orchestrator.main"),
+        ("orchestrator/schemas/job_runtime.py", "orchestrator.main"),
         ("orchestrator/services/job_queries.py", "orchestrator.main"),
         ("orchestrator/services/job_projection.py", "orchestrator.main"),
         ("orchestrator/services/job_reads.py", "orchestrator.main"),

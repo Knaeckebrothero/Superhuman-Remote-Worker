@@ -18,11 +18,10 @@ import pytest
 
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
-from orchestrator.main import (  # noqa: E402
+from orchestrator.schemas.provider_catalog import (  # noqa: E402
     VALID_DEFAULT_MODEL_KINDS,
     VALID_SYSTEM_API_KEY_PROVIDERS,
     AdminDefaultModelSet,
-    app,
 )
 
 
@@ -49,14 +48,10 @@ ADMIN_ROUTES = {
 
 
 def _registered_routes() -> set[tuple[str, str]]:
-    """(method, path) tuples for every FastAPI route."""
-    out: set[tuple[str, str]] = set()
-    for route in app.routes:
-        methods = getattr(route, "methods", None) or set()
-        path = getattr(route, "path", "")
-        for m in methods:
-            out.add((m, path))
-    return out
+    from orchestrator.main import app
+    from tests._route_inventory import mounted_routes
+
+    return mounted_routes(app)
 
 
 class TestAdminRoutesRegistered:
