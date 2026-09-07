@@ -78,7 +78,7 @@ jobs:
           # at the next bump, and nothing else would notice until a query failed.
           VECTOR=$(docker run --rm "${REPO}:${MAJOR}" sh -c \
             'grep -h default_version /usr/share/postgresql/*/extension/vector.control 2>/dev/null' \
-            | tr -d " '"'"'" | cut -d= -f2 || true)
+            | tr -d " '" | cut -d= -f2 || true)
 
           {
             echo "### Operand freshness — \`${{ matrix.ref }}\`"
