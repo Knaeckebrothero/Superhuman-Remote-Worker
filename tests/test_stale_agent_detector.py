@@ -1019,3 +1019,72 @@ async def test_sweep_reports_unresolved_pinned_retirements(caplog):
     unresolved = [r for r in caplog.records if "remain unresolved" in r.getMessage()]
     assert len(unresolved) == 1
     assert unresolved[0].getMessage().startswith("1 ")
+
+
+@pytest.mark.asyncio
+async def test_pending_retirement_retry_logs_when_recovery_cannot_prove_zero(
+    caplog,
+):
+    """Recovery returning False is a refusal too, and must say so."""
+    retirement, current = _lite_retirement()
+    context = dict(retirement["context"])
+    candidate = {
+        "id": context["thread_id"],
+        "runtime_generation": retirement["generation"],
+        "runtime_retirement_token": retirement["token"],
+        "runtime_retirement_permanent": False,
+        "runtime_retirement_context": context,
+    }
+    db = AsyncMock()
+    db.get_thread = AsyncMock(return_value=current)
+    caplog.set_level(logging.WARNING)
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(
+            main,
+            "_recover_captured_sandbox_process_zero",
+            AsyncMock(return_value=False),
+        ),
+        patch.object(main, "_end_thread_flow", AsyncMock()) as end_flow,
+    ):
+        assert await main._retry_pending_pinned_retirement(candidate) is False
+
+    end_flow.assert_not_awaited()
+    refusals = [
+        r for r in caplog.records if "could not prove process zero" in r.getMessage()
+    ]
+    assert len(refusals) == 1
+    assert context["thread_id"] in refusals[0].getMessage()
+    assert "'none'" in refusals[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_recovery_logs_when_the_receipt_is_refused_after_the_pod_stop(
+    monkeypatch, caplog
+):
+    """The Pod is gone but the DB refused the receipt: name it, don't hide it."""
+    retirement, current = _lite_retirement()
+    db, provisioner = _lite_recovery_mocks(current)
+    db.acknowledge_pinned_thread_local_quiescence = AsyncMock(return_value=None)
+    db.acknowledge_settled_virtual_actor_exit = AsyncMock(return_value=None)
+    original_wait = main._wait_for_captured_agent_pod_retired
+
+    async def immediate_observation(*args, **kwargs):
+        return await original_wait(*args, **kwargs, timeout_s=0)
+
+    monkeypatch.setattr(
+        main, "_wait_for_captured_agent_pod_retired", immediate_observation
+    )
+    caplog.set_level(logging.WARNING)
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "agent_provisioner", provisioner),
+    ):
+        assert not await main._recover_captured_sandbox_process_zero(retirement)
+
+    # Both contracts were consulted for this used-or-created lite life.
+    db.acknowledge_pinned_thread_local_quiescence.assert_awaited_once()
+    db.acknowledge_settled_virtual_actor_exit.assert_awaited_once()
+    refusals = [r for r in caplog.records if "receipt refused" in r.getMessage()]
+    assert len(refusals) == 1
+    assert retirement["context"]["thread_id"] in refusals[0].getMessage()

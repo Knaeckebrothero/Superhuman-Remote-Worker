@@ -25,6 +25,9 @@ import pytest
 
 from orchestrator import main
 from orchestrator.services.agent_provisioner import AgentProvisioner
+from orchestrator.services.pinned_agent_authority import (
+    reserve_pinned_warm_agent_binding,
+)
 from orchestrator.services.session_router import SessionRouterService
 from shared.persistent_input_delivery import (
     mark_input_delivery_queued,
@@ -267,3 +270,173 @@ async def test_lite_actor_exit_lets_the_durable_retry_finish_the_thread(
     assert thread["status"] == "ended"
     assert thread["runtime_retirement_token"] is None
     assert await db.list_retryable_pinned_retirements(grace_seconds=0) == []
+
+
+def _route_died_with_the_pod(monkeypatch, ids):
+    """The captured route is gone; exercise teardown's 404 path via injected APIs."""
+    core_api = MagicMock()
+    networking_api = MagicMock()
+    core_api.read_namespaced_service.side_effect = fixtures._K8sError(404)
+    networking_api.read_namespaced_ingress.side_effect = fixtures._K8sError(404)
+    ids["route_core_api"] = core_api
+    ids["route_networking_api"] = networking_api
+    monkeypatch.setattr(
+        main,
+        "session_router",
+        SessionRouterService(
+            namespace="agents-a",
+            ingress_host="unused.example",
+            core_api=core_api,
+            networking_api=networking_api,
+        ),
+    )
+
+
+async def _retired_warm_lite_actor(
+    db, monkeypatch, *, input_state="settled", vouched=True
+):
+    """A lite actor on a warm-pool Pod bound through the real 0200 protocol.
+
+    This is the shape every conference takes on dev: no provision intent, a
+    ``warm_binding_protection`` marker backed by a ``bound`` row. ``vouched``
+    False re-points the marker at a protection that does not exist before
+    Begin captures it, so only the warm authority can refuse the receipt.
+    """
+    ids = await fixtures._seed_warm_pool_binding(db, bound=False)
+    api = fixtures.StatefulPinnedK8sApi()
+    fixtures._install_warm_pool_pod(api, ids)
+    monkeypatch.setenv("PINNED_LEGACY_AGENT_NAMESPACES", "agents-a")
+    provisioner = fixtures._production_warm_provisioner(db, api)
+    reservation = await reserve_pinned_warm_agent_binding(
+        db,
+        agent_provisioner=provisioner,
+        persistent_provisioner=None,
+        thread_id=ids["thread"],
+        agent_id=ids["agent"],
+        expected_runtime_generation=ids["runtime_generation"],
+    )
+    assert reservation.bound
+    thread = await db.get_thread(ids["thread"])
+    marker = fixtures._json(thread["metadata"])["agent_pod"]
+    assert marker["pod_uid"] == ids["pod_uid"]
+    assert marker["warm_binding_protection"]
+    assert "provision_attempt" not in marker
+    ids["attach_token"] = str(thread["runtime_attach_token"])
+    ids["generation"] = ids["runtime_generation"]
+    ids["process_generation"] = str(uuid4())
+    if not vouched:
+        async with db.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("SET LOCAL session_replication_role='replica'")
+                await conn.execute(
+                    "UPDATE threads SET metadata=jsonb_set(metadata,"
+                    "'{agent_pod,warm_binding_protection}',to_jsonb($2::text)) "
+                    "WHERE id=$1::uuid",
+                    ids["thread"],
+                    str(uuid4()),
+                )
+
+    ids["delivery_id"] = uuid4()
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            authority = dict(
+                agent_id=ids["agent"],
+                pod_uid=ids["pod_uid"],
+                runtime_generation=ids["process_generation"],
+                session_runtime_generation=ids["generation"],
+                runtime_attach_token=ids["attach_token"],
+            )
+            delivery = await persist_input_delivery(
+                conn,
+                thread_id=ids["thread"],
+                delivery_id=ids["delivery_id"],
+                role="human",
+                content="A real admitted conference turn",
+                source="direct_human",
+                turn_number=1,
+                **authority,
+            )
+            args = dict(
+                delivery_id=ids["delivery_id"],
+                claim_generation=int(delivery["claim_generation"]),
+                **authority,
+            )
+            assert await mark_input_delivery_queued(conn, **args)
+            if input_state in {"admitted", "settled"}:
+                assert await transition_input_delivery(
+                    conn, transition="admitted", turn_number=1, **args
+                )
+            if input_state == "settled":
+                assert await transition_input_delivery(
+                    conn, transition="settled", **args
+                )
+
+    api.mark_terminal("agents-a", ids["pod_name"])
+    pod = api.pods[("agents-a", ids["pod_name"])]
+    pod.spec = NS(
+        containers=[NS(name="agent")],
+        init_containers=[],
+        ephemeral_containers=[],
+        volumes=[],
+    )
+    pod.status.container_statuses[0].name = "agent"
+    pod.metadata.deletion_timestamp = "now"
+    monkeypatch.setattr(main, "agent_provisioner", provisioner)
+    monkeypatch.setattr(main, "postgres_db", db)
+    _route_died_with_the_pod(monkeypatch, ids)
+
+    retirement = await db.begin_pinned_thread_retirement(ids["thread"], permanent=False)
+    assert retirement["state"] == "pending"
+    assert await db.authorize_pinned_thread_retirement(
+        ids["thread"],
+        token=retirement["token"],
+        generation=ids["generation"],
+        settle_status="ended",
+    )
+    thread = await db.get_thread(ids["thread"])
+    assert thread["runtime_retirement_local_quiescence"] is None
+    context = fixtures._json(thread["runtime_retirement_context"])
+    assert context["workspace_backend"] == "none"
+    assert context["agent_pod"] == fixtures._json(thread["metadata"])["agent_pod"]
+    return ids, retirement, api
+
+
+@pytest.mark.asyncio
+async def test_used_warm_actor_exit_settles_after_exact_pod_stop(db, monkeypatch):
+    ids, retirement, api = await _retired_warm_lite_actor(db, monkeypatch)
+    assert await main._recover_captured_sandbox_process_zero(retirement)
+    assert ("agents-a", ids["pod_name"]) not in api.pods
+    thread = await db.get_thread(ids["thread"])
+    receipt = _receipt(thread)
+    assert receipt["recovery_protocol"] == "settled_lite_actor_exit_v1"
+    assert receipt["quiescence_protocol"] == "agent_runtime_zero_v1"
+    assert receipt["agent_pod_uid"] == ids["pod_uid"]
+    assert receipt["settled_input_count"] == 1
+    assert main._retirement_has_exact_local_quiescence(retirement, thread)
+    assert await main._recover_captured_sandbox_process_zero(retirement)
+
+
+@pytest.mark.asyncio
+async def test_warm_actor_exit_lets_the_durable_retry_finish_the_thread(
+    db, monkeypatch
+):
+    ids, _, _ = await _retired_warm_lite_actor(db, monkeypatch)
+    await db.execute(
+        "UPDATE agents SET status='offline' WHERE id=$1::uuid", ids["agent"]
+    )
+    candidates = await db.list_retryable_pinned_retirements(grace_seconds=0)
+    assert [str(c["id"]) for c in candidates] == [ids["thread"]]
+    assert await main._retry_pending_pinned_retirement(candidates[0])
+    thread = await db.get_thread(ids["thread"])
+    assert thread["status"] == "ended"
+    assert thread["runtime_retirement_token"] is None
+
+
+@pytest.mark.asyncio
+async def test_warm_actor_exit_requires_the_bound_protection(db, monkeypatch):
+    """A warm marker nobody vouches for is not an exact Pod authority."""
+    ids, retirement, _ = await _retired_warm_lite_actor(db, monkeypatch, vouched=False)
+    assert not await main._recover_captured_sandbox_process_zero(retirement)
+    assert (await db.get_thread(ids["thread"]))[
+        "runtime_retirement_local_quiescence"
+    ] is None

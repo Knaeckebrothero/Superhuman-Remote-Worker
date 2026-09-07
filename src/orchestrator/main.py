@@ -1943,6 +1943,12 @@ async def _retry_pending_pinned_retirement(candidate: Mapping[str, Any]) -> bool
             }
         )
         if not recovered:
+            logger.warning(
+                "Pinned retirement crash recovery could not prove process zero "
+                "for thread %s (backend %r); the durable marker stays pending",
+                thread_id,
+                context.get("workspace_backend"),
+            )
             return False
         thread = await postgres_db.get_thread(thread_id)
         if thread is None:
@@ -12982,7 +12988,18 @@ async def _recover_captured_sandbox_process_zero(
                     attach_token=str(context.get("runtime_attach_token") or ""),
                     stopped_pod_uid=next(iter(captured_pods))[1],
                 )
-            return receipt is not None
+            if receipt is None:
+                # The exact Pod is already stopped; only the settled-work
+                # contract stands between this life and its receipt.
+                logger.warning(
+                    "Pinned retirement receipt refused for thread %s (backend %r): "
+                    "the exact agent Pod is stopped, but the DB found unfinished "
+                    "or unprovable work for this life",
+                    thread_id,
+                    workspace_backend,
+                )
+                return False
+            return True
         workspace_generation = str(binding.get("generation") or "")
         runtime_incarnation = str(
             (

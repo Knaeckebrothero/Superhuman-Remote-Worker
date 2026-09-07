@@ -91,6 +91,8 @@ DECLARE
     marker jsonb;
     binding jsonb;
     backend text;
+    dedicated_authorized boolean;
+    warm_authorized boolean;
     receipt jsonb;
     input_count bigint;
     input_digest text;
@@ -161,19 +163,38 @@ BEGIN
        OR NULLIF(marker->>'namespace', '') IS NULL
        OR NULLIF(marker->>'pod_name', '') IS NULL
        OR context->'agent'->>'hostname' IS DISTINCT FROM marker->>'pod_name'
-       OR context->'agent'->>'pod_uid' IS DISTINCT FROM stopped_pod_uid
-       OR NOT EXISTS (
-           SELECT 1 FROM public.thread_agent_pod_provision_intents intent
-            WHERE intent.thread_id = owner_id
-              AND intent.runtime_generation = generation_id
-              AND intent.attempt_id::text = marker->>'provision_attempt'
-              AND intent.pod_name = marker->>'pod_name'
-              AND intent.pod_uid = stopped_pod_uid
-              AND intent.namespace = marker->>'namespace'
-              AND intent.protection_protocol = 'finalizer_v1'
-              AND intent.status = 'published'
-              AND intent.workspace_claim_id IS NULL
-       ) THEN
+       OR context->'agent'->>'pod_uid' IS DISTINCT FROM stopped_pod_uid THEN
+        RETURN NULL;
+    END IF;
+    -- The same two Pod authorities enforce_pinned_warm_binding_publication
+    -- accepts at bind time. A dedicated Pod carries its provision attempt; a
+    -- warm-pool Pod carries the protection that was bound to this exact
+    -- thread, generation, attach token and actor. Exactly one must vouch.
+    dedicated_authorized := EXISTS (
+        SELECT 1 FROM public.thread_agent_pod_provision_intents intent
+         WHERE intent.thread_id = owner_id
+           AND intent.runtime_generation = generation_id
+           AND intent.attempt_id::text = marker->>'provision_attempt'
+           AND intent.pod_name = marker->>'pod_name'
+           AND intent.pod_uid = stopped_pod_uid
+           AND intent.namespace = marker->>'namespace'
+           AND intent.protection_protocol = 'finalizer_v1'
+           AND intent.status = 'published'
+           AND intent.workspace_claim_id IS NULL
+    );
+    warm_authorized := EXISTS (
+        SELECT 1 FROM public.thread_agent_warm_binding_protections warm
+         WHERE warm.protection_id::text = marker->>'warm_binding_protection'
+           AND warm.thread_id = owner_id
+           AND warm.runtime_generation = generation_id
+           AND warm.runtime_attach_token = attach_id
+           AND warm.agent_id = actor_id
+           AND warm.status = 'bound'
+           AND warm.namespace = marker->>'namespace'
+           AND warm.pod_name = marker->>'pod_name'
+           AND warm.pod_uid = stopped_pod_uid
+    );
+    IF NOT (dedicated_authorized OR warm_authorized) THEN
         RETURN NULL;
     END IF;
     SELECT * INTO actor_row FROM public.agents
