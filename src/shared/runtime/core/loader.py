@@ -3825,7 +3825,11 @@ def _should_use_reasoning_summary(model: str) -> bool:
     model_lower = model.lower()
     if "/" in model_lower:
         return False
-    reasoning_prefixes = ("o1", "o3", "o4", "gpt-5")
+    # gpt-6 (Astra) MUST be here: it serves tool calls only on the Responses
+    # API, and `max` effort exists only there. Without the prefix the codex
+    # factory would fall through to a Chat-Completions `reasoning_effort`,
+    # dropping the reasoning summary and silently degrading `max`.
+    reasoning_prefixes = ("o1", "o3", "o4", "gpt-5", "gpt-6")
     return any(model_lower.startswith(p) for p in reasoning_prefixes)
 
 

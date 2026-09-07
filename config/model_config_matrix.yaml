@@ -371,6 +371,63 @@ gpt-5.6:
     # Same 32px-patch vision scheme as the gpt-5 family.
     image_tokens: { mode: openai_patches, patch_px: 32, budget: 10000, flat: 3000 }
 
+# GPT-6 Astra (GA 2026-09-03) — OpenAI's flagship. ONE API model today,
+# `gpt-6-astra`: no mini/nano/pro/codex tiers, so this family is a single row
+# rather than a tier set like gpt-5.6's Luna/Terra/Sol.
+#
+# Its own family (not a gpt-5.6 alias) because three properties the matrix owns
+# actually differ:
+#   1. 1.05M context (5.6 is 1M), with a 922K max-INPUT sub-cap under it. The
+#      derived compaction threshold is 0.80 x 1.05M = 840K, comfortably below
+#      that 922K input ceiling, so the sub-cap needs no separate knob here.
+#   2. `none` effort is REJECTED (HTTP 400) — 5.6 accepts it. `none` never
+#      reaches the wire anyway: resolve_reasoning_plan() maps it to "inject
+#      nothing" and the provider default applies, so the UI value stays safe.
+#   3. Tool calling requires the RESPONSES API. Chat Completions serves Astra
+#      only WITHOUT tools, so the graph loop must run this family on the
+#      codex/Responses lane — never the `openai` factory, which hard-forces
+#      use_responses_api=False.
+#
+# `max` effort is likewise Responses-API-only. That is why
+# _should_use_reasoning_summary() in loader.py matches gpt-6: without it the
+# codex factory would emit a Chat-Completions-shaped `reasoning_effort` and
+# `max` would silently degrade to the provider default.
+#
+# `reasoning.mode` (standard/pro) exists on Astra as it does on 5.6, and stays
+# deliberately unsupported here — a different API param with a much higher
+# token burn. Same call as the 5.6 block makes for `ultra`.
+gpt-6:
+  reasoning: { method: effort_enum, delivery: native, default: high, options: [low, medium, high, xhigh, max] }
+  prompts:
+    # Aliases the gpt-5 prompt set (identical Responses-API wire format) —
+    # exactly how gpt-5.6 and codex do it. Fork into _gpt_6 files only when
+    # Astra-specific drift actually shows up.
+    systemprompt: systemprompt_gpt_5.txt
+    systemprompt_interactive: systemprompt_interactive_gpt_5.txt
+    persona: persona_gpt_5.txt
+    summarization: summarization_prompt_gpt_5.txt
+    memory_extraction: memory_extraction_prompt_gpt_5.txt
+    memory_assembler: memory_assembler_prompt_gpt_5.txt
+    curation: curation_prompt_gpt_5.txt
+  guardrails:
+    file: gpt_6.yaml
+  settings:
+    shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
+    structured_output_method: json_schema  # Structured Outputs supported (Responses `text.format`)
+    # Astra rejects CUSTOM temperature/top_p (Azure: "doesn't support custom
+    # `temperature` or `top_p` values"); 1.0 IS the default, so it is not a
+    # custom value — same posture as gpt-5/gpt-5.6, which run this exact wire
+    # today. OpenAI's migration note phrases it as "remove temperature", so if a
+    # live call ever 400s on this param, the fix is to stop sending it at all
+    # (loader.py factories pass config.temperature unconditionally).
+    temperature: 1.0
+    multimodal: true  # text + image in, text out (no audio/video)
+    parallel_tool_calls: true
+    model_max_context_tokens: 1050000  # Astra: 1.05M ctx (922K max input, 128K max output)
+    max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
+    # Same 32px-patch vision scheme as the gpt-5 family.
+    image_tokens: { mode: openai_patches, patch_px: 32, budget: 10000, flat: 3000 }
+
 codex:
   reasoning: { method: effort_enum, delivery: native, default: high, options: [low, medium, high] }
   prompts:

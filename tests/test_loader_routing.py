@@ -15,6 +15,7 @@ from shared.runtime.core.loader import (
     _create_codex_llm,
     detect_reasoning_method,
     reasoning_capability,
+    resolve_reasoning_plan,
     supports_parallel_tool_calls,
 )
 
@@ -157,9 +158,15 @@ class TestShouldUseReasoningSummary:
         assert _should_use_reasoning_summary("gpt-5.2-pro") is True
         assert _should_use_reasoning_summary("gpt-5") is True
 
+    def test_gpt6_model(self):
+        # Astra serves tool calls ONLY on the Responses API, and `max` effort
+        # exists only there — so it must take the reasoning-summary path.
+        assert _should_use_reasoning_summary("gpt-6-astra") is True
+
     def test_case_insensitive(self):
         assert _should_use_reasoning_summary("GPT-5.2-pro") is True
         assert _should_use_reasoning_summary("O3-mini") is True
+        assert _should_use_reasoning_summary("GPT-6-Astra") is True
 
     def test_proxy_models_excluded(self):
         """Models with / are proxy models and should not use Responses API."""
@@ -456,6 +463,50 @@ class TestGpt56Reasoning:
 
         call_kwargs = mock_chat.call_args[1]
         assert call_kwargs["reasoning"] == {"effort": "xhigh", "summary": "auto"}
+
+
+class TestGpt6Reasoning:
+    """gpt-6 (Astra): xhigh/max are declared in the matrix and reach the codex
+    (Responses API) path un-clamped, with the reasoning summary requested."""
+
+    def test_capability_lists_xhigh_and_max(self):
+        cap = reasoning_capability("gpt-6-astra")
+        assert cap["method"] == "effort_enum"
+        assert cap["default"] == "high"
+        assert cap["options"] == ["low", "medium", "high", "xhigh", "max"]
+
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_max_reaches_codex_responses_api(self, mock_chat):
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="gpt-6-astra", reasoning_level="max")
+
+        _create_codex_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        # Responses-API shape, NOT a Chat-Completions `reasoning_effort`:
+        # `max` is Responses-only, so the flat form would silently degrade it.
+        assert call_kwargs["reasoning"] == {"effort": "max", "summary": "auto"}
+        assert "model_kwargs" not in call_kwargs or (
+            "reasoning_effort" not in call_kwargs.get("model_kwargs", {})
+        )
+
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_xhigh_reaches_codex_responses_api(self, mock_chat):
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="codex/gpt-6-astra", reasoning_level="xhigh")
+
+        _create_codex_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["reasoning"] == {"effort": "xhigh", "summary": "auto"}
+
+    def test_none_injects_nothing_rather_than_400ing(self):
+        """Astra rejects `none` with HTTP 400 — the plan must inject nothing
+        instead of putting the literal on the wire."""
+        config = _make_config(model="gpt-6-astra", reasoning_level="none")
+        plan = resolve_reasoning_plan(config)
+        assert plan["method"] == "effort_enum"
+        assert plan["value"] is None
 
 
 class TestOpenAIReasoningClamping:

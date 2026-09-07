@@ -322,6 +322,22 @@ class TestFamilyOf:
         # Codex checks keep precedence: a future 5.6 codex variant is `codex`.
         assert family_of("gpt-5.6-codex") == "codex"
 
+    def test_gpt_6_astra(self):
+        assert family_of("gpt-6-astra") == "gpt-6"
+        assert family_of("openai/gpt-6-astra") == "gpt-6"
+        assert family_of("codex/gpt-6-astra") == "gpt-6"
+
+    def test_gpt_6_codex_stays_codex(self):
+        # Codex checks keep precedence for gpt-6 too, so family_of() and
+        # family_matcher.detect_family() agree on a future codex variant.
+        assert family_of("gpt-6-astra-codex") == "codex"
+        assert family_of("gpt-6-codex-spark") == "codex-spark"
+
+    def test_gpt_6_does_not_leak_into_gpt_5(self):
+        # The gpt-5 prefix rules must not swallow gpt-6, and vice versa.
+        assert family_of("gpt-5.6-sol") == "gpt-5.6"
+        assert family_of("gpt-5") == "gpt-5"
+
     def test_gpt_5_5_stays_gpt_5(self):
         assert family_of("gpt-5.5") == "gpt-5"
 

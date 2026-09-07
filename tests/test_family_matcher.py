@@ -33,6 +33,10 @@ from orchestrator.services.family_matcher import detect_family
         ("gpt-5.6-terra", "gpt-5.6"),
         ("openrouter/openai/gpt-5.6-luna", "gpt-5.6"),
         ("gpt-5.6-codex", "codex"),
+        # GPT-6 (Astra) — its own family; codex rules still win on a codex id.
+        ("gpt-6-astra", "gpt-6"),
+        ("openrouter/openai/gpt-6-astra", "gpt-6"),
+        ("gpt-6-astra-codex", "codex"),
         ("o3", "o-series"),
         ("o3-mini", "o-series"),
         ("o4", "o-series"),

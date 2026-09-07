@@ -280,8 +280,14 @@ def family_of(model_id: str, default: str = "default") -> str:
         return "claude-haiku"
     if "codex-spark" in name:
         return "codex-spark"
-    if "codex" in name and name.startswith("gpt-5"):
+    if "codex" in name and name.startswith(("gpt-5", "gpt-6")):
         return "codex"
+    # GPT-6 (Astra) — a single flagship row today, no tier suffixes. Must sit
+    # below the codex checks (which now also cover a future gpt-6 codex
+    # variant) so the two resolvers agree; family_matcher.detect_family orders
+    # its rules the same way.
+    if name.startswith("gpt-6"):
+        return "gpt-6"
     if name.startswith("gpt-5.6"):
         return "gpt-5.6"
     if name.startswith("gpt-5"):

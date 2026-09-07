@@ -29,6 +29,25 @@ describe('detectModelFamily — GPT-5.6', () => {
   });
 });
 
+describe('detectModelFamily — GPT-6', () => {
+  it('maps GPT-6 Astra to the gpt-6 family across transports', () => {
+    expect(detectModelFamily('gpt-6-astra')).toBe('gpt-6');
+    expect(detectModelFamily('openai/gpt-6-astra')).toBe('gpt-6');
+    expect(detectModelFamily('codex/gpt-6-astra')).toBe('gpt-6');
+    expect(detectModelFamily('openrouter/openai/gpt-6-astra')).toBe('gpt-6');
+  });
+
+  it('keeps codex precedence, matching family_of() on the server', () => {
+    expect(detectModelFamily('gpt-6-astra-codex')).toBe('codex');
+    expect(detectModelFamily('gpt-6-codex-spark')).toBe('codex-spark');
+  });
+
+  it('keeps neighbors unaffected', () => {
+    expect(detectModelFamily('gpt-5.6-sol')).toBe('gpt-5.6');
+    expect(detectModelFamily('gpt-5')).toBe('gpt-5');
+  });
+});
+
 describe('detectModelFamily — Mistral', () => {
   it('maps Mistral 3 family + specialists across transports', () => {
     expect(detectModelFamily('mistral-large-latest')).toBe('mistral');
