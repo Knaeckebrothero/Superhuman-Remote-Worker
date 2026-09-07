@@ -18,12 +18,14 @@ retried it every minute in silence.
 """
 
 from types import SimpleNamespace as NS
+from unittest.mock import MagicMock
 from uuid import uuid4
 
 import pytest
 
 from orchestrator import main
 from orchestrator.services.agent_provisioner import AgentProvisioner
+from orchestrator.services.session_router import SessionRouterService
 from shared.persistent_input_delivery import (
     mark_input_delivery_queued,
     persist_input_delivery,
@@ -118,6 +120,25 @@ async def _retired_lite_actor(
     provider._core_api = k8s
     monkeypatch.setattr(main, "agent_provisioner", provider)
     monkeypatch.setattr(main, "postgres_db", db)
+    # The captured route died with the stopped Pod. Exercise the real teardown's
+    # 404 handling through injected APIs -- never the ambient kubeconfig, which
+    # would make this test pass only on a machine with a reachable cluster.
+    core_api = MagicMock()
+    networking_api = MagicMock()
+    core_api.read_namespaced_service.side_effect = fixtures._K8sError(404)
+    networking_api.read_namespaced_ingress.side_effect = fixtures._K8sError(404)
+    ids["route_core_api"] = core_api
+    ids["route_networking_api"] = networking_api
+    monkeypatch.setattr(
+        main,
+        "session_router",
+        SessionRouterService(
+            namespace="agents-a",
+            ingress_host="unused.example",
+            core_api=core_api,
+            networking_api=networking_api,
+        ),
+    )
 
     retirement = await db.begin_pinned_thread_retirement(
         ids["thread"], permanent=permanent
@@ -233,6 +254,15 @@ async def test_lite_actor_exit_lets_the_durable_retry_finish_the_thread(
     candidates = await db.list_retryable_pinned_retirements(grace_seconds=0)
     assert [str(c["id"]) for c in candidates] == [ids["thread"]]
     assert await main._retry_pending_pinned_retirement(candidates[0])
+    for read in (
+        ids["route_core_api"].read_namespaced_service,
+        ids["route_networking_api"].read_namespaced_ingress,
+    ):
+        assert read.call_count == 1
+        assert read.call_args.kwargs["namespace"] == "agents-a"
+        assert read.call_args.kwargs["name"] == f"session-{ids['thread']}"
+    ids["route_core_api"].delete_namespaced_service.assert_not_called()
+    ids["route_networking_api"].delete_namespaced_ingress.assert_not_called()
     thread = await db.get_thread(ids["thread"])
     assert thread["status"] == "ended"
     assert thread["runtime_retirement_token"] is None
