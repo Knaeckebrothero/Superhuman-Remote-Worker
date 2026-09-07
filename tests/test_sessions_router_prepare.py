@@ -1246,6 +1246,8 @@ def test_connection_returns_ws_url_and_token_when_ready(monkeypatch):
     assert body["pinned_runtime_generation_contract"] == 1
     assert body["session_runtime_generation"] == CONNECTION_GENERATION
     assert "execution_lane" not in body
+    assert body["controls"]["config.update"] == "websocket"
+    assert body["controls"]["mode.set"] == "rest"
     assert observed_probe["expected_session_identity_fingerprint"].startswith("sha256:")
     claims = test_tokens.validate(body["token"])
     assert claims["sif"] == observed_probe["expected_session_identity_fingerprint"]
@@ -1537,8 +1539,32 @@ def test_connection_reports_stateless_ready_without_a_socket(monkeypatch):
         "expires_at": None,
         "pinned_runtime_generation_contract": 1,
         "session_runtime_generation": CONNECTION_GENERATION,
+        # Declared per verb, never inferred from the lane: config edits ride
+        # the owner PATCH, the scalars + undo ride the control inbox, and the
+        # verbs with no stateless transport are ABSENT (not mapped to a
+        # socket that will never open).
+        "controls": {
+            "config.update": "rest",
+            "workspace.undo": "rest",
+            "mode.set": "rest",
+            "narration.set": "rest",
+        },
     }
     fake_db.get_pinned_session_binding.assert_not_awaited()
+
+
+def test_stateless_controls_never_advertise_a_socket_verb():
+    """The socket-only verbs must not leak into the stateless declaration —
+    a Cockpit that trusted such an entry would queue into the void again."""
+    from orchestrator.routers.sessions import PINNED_CONTROLS, STATELESS_CONTROLS
+
+    assert "websocket" not in STATELESS_CONTROLS.values()
+    for verb in ("compact", "archive", "rewind", "upgrade-to-workspace"):
+        assert verb not in STATELESS_CONTROLS
+        assert PINNED_CONTROLS[verb] == "websocket"
+    # Both lanes agree on the durable scalars.
+    for verb in ("mode.set", "narration.set"):
+        assert PINNED_CONTROLS[verb] == STATELESS_CONTROLS[verb] == "rest"
 
 
 def test_connection_models_require_their_transport_discriminator_and_socket_shape():

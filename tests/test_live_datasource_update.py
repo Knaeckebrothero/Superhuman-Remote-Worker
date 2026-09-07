@@ -499,7 +499,33 @@ class TestOwnerConfigPatch:
             THREAD_ID, _patch_body(main, {"llm": {"temperature": 0.2}}), MagicMock()
         )
         assert result["status"] == "updated"
+        assert result["effective"] == "next_attach"
         db.merge_thread_config_override.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_active_stateless_thread_is_editable_and_effective_next_turn(
+        self, patched_owner
+    ):
+        """A queue-served session binds no agent, so this endpoint IS its
+        live settings path (the Cockpit routes the pane here when
+        /connection declares config.update: rest). Must persist while the
+        thread is active, and say the change lands at the next turn."""
+        main, db, _ = patched_owner
+        row = _thread_row(backend="virtual")
+        row.update(execution_lane="stateless", agent_id=None, status="active")
+        db.get_thread.return_value = row
+
+        result = await main.update_thread_config(
+            THREAD_ID,
+            _patch_body(main, {"llm": {"reasoning_level": "max"}}),
+            MagicMock(),
+        )
+        assert result["status"] == "updated"
+        assert result["effective"] == "next_turn"
+        assert result["config_override"] == {"llm": {"reasoning_level": "max"}}
+        merged = db.merge_thread_config_override.await_args.args[1]
+        assert merged == {"llm": {"reasoning_level": "max"}}
+        db.record_security_event.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_response_and_persist_redacted_with_transport_sentinels(

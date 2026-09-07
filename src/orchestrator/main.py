@@ -49768,6 +49768,27 @@ async def create_thread(
             config_override.setdefault("llm", {})["reasoning_level"] = (
                 _validated_reasoning_level(request_body.reasoning_level)
             )
+        # The same three LLM keys may arrive NESTED under config_override.llm
+        # — that is how the New Session form sends reasoning_level and
+        # temperature (it lifts only model + permission_mode to top-level
+        # fields), and how API/MCP callers naturally write them. The rebuild
+        # above never read that shape, so a create-time "max" was dropped on
+        # every ordinary session. Top-level fields keep winning; a malformed
+        # nested value is a 400 here, never a silent drop.
+        from orchestrator.services.session_create_overrides import (
+            SessionOverrideError,
+            bridge_nested_llm_override,
+            ignored_override_paths,
+        )
+
+        try:
+            bridge_nested_llm_override(
+                request_body.config_override,
+                config_override,
+                validate_reasoning_level=_validated_reasoning_level,
+            )
+        except SessionOverrideError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         # The agent reads its permission mode from config.interactive.permission_mode
         # (src/api/persistent_session.py), NOT from the threads.permission_mode
         # column — so a per-session choice only reaches the agent if it lands in
@@ -49813,6 +49834,19 @@ async def create_thread(
         req_officer = _validated_session_officer_override(request_body.config_override)
         if req_officer:
             config_override.setdefault("officer", {}).update(req_officer)
+        # Warn phase of a strict contract (KEP-2885 shape: Ignore → Warn →
+        # Strict): every nested key the rebuild above did not carry is named
+        # in the log and echoed on the response, so the next dropped field is
+        # visible on day one instead of found in a session weeks later.
+        ignored_override_keys = ignored_override_paths(
+            request_body.config_override, config_override
+        )
+        if ignored_override_keys:
+            logger.warning(
+                "Thread create ignored config_override keys for user %s: %s",
+                str(user["id"])[:8],
+                ", ".join(ignored_override_keys),
+            )
         trusted_post_officer = _validated_post_owned_officer_create_fragment(
             request_body._officer_post_config_snapshot
         )
@@ -50698,7 +50732,13 @@ async def create_thread(
                 thread_id,
             )
 
-        return {"thread_id": thread_id, "status": "created"}
+        response: dict[str, Any] = {"thread_id": thread_id, "status": "created"}
+        if ignored_override_keys:
+            # Warn phase: the caller learns which of its nested keys the
+            # create rebuild did not carry. Additive — clients that do not
+            # read it are unaffected; the Strict phase turns this into a 400.
+            response["ignored_config_keys"] = ignored_override_keys
+        return response
     except DatasourceMaterializationAuthorizationError as exc:
         raise HTTPException(
             status_code=403,
@@ -52622,11 +52662,20 @@ async def update_thread_config(
     ``datasource_ids`` and injects credentials in-flight, so no enrichment
     round-trip to an agent is needed.
 
-    Refuses threads currently bound to an agent (409) — there is no
+    Refuses PINNED threads currently bound to an agent (409) — there is no
     orchestrator→agent config-push channel, so an edit here would silently go
-    stale on the running session until its next attach; connected sessions
-    edit through the settings pane's ``config.update`` frame instead. Ended
-    threads are editable (they resume via POST .../resume → fresh attach).
+    stale on the running session until its next attach; connected pinned
+    sessions edit through the settings pane's ``config.update`` frame instead.
+    Ended threads are editable (they resume via POST .../resume → fresh attach).
+
+    STATELESS threads bind no agent, so this endpoint IS their live path: the
+    Cockpit routes the pane's ``config.update`` here whenever ``/connection``
+    declares ``controls["config.update"] == "rest"``. The change is persisted
+    at admission and picked up by the next claim, whose attach fingerprint
+    changes with the config (turn_executor.attach_fingerprint) — the same
+    turn-boundary semantics the pane's transcript stamp already promises. A
+    turn already in flight keeps the config it started with. ``effective``
+    on the response says which: ``next_turn`` (stateless) or ``next_attach``.
 
     The response ``config_override`` is the REDACTED accepted fragment — the
     internal endpoint intentionally returns plaintext transport secrets to the
@@ -52660,6 +52709,11 @@ async def update_thread_config(
         "status": "updated",
         "config_override": redact_config_override(config_override),
         "datasource_ids": selected_ds_ids,
+        "effective": (
+            "next_turn"
+            if thread.get("execution_lane") == "stateless"
+            else "next_attach"
+        ),
     }
 
 

@@ -1833,7 +1833,11 @@
     "control": {
       "backpressure": "Too many session setting changes are waiting. Try again shortly.",
       "admissionFailed": "The session setting could not be changed. Try again.",
-      "ownerRejected": "The serving agent rejected this session setting. Reload and try again."
+      "ownerRejected": "The serving agent rejected this session setting. Reload and try again.",
+      "unavailable": "This control is not available in this session.",
+      "applyFailed": "The session settings could not be applied.",
+      "applyTimeout": "The session did not confirm the settings change. Reopen the settings to see what is in effect.",
+      "appliedNextTurn": "Session settings updated: {{summary}} — applies from the next response."
     },
     "workspaceOffer": {
       "title": "Workspace upgrade requested",

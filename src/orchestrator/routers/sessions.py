@@ -704,6 +704,42 @@ async def _provision_agent_for_thread(
 # --------------------------------------------------------------------------- #
 
 
+#: Transport a control verb travels over for THIS session. The Cockpit
+#: dispatches by this declaration and never by inferring a lane from
+#: ``control_socket`` — a verb absent from ``controls`` is unavailable and is
+#: rendered disabled rather than queued for a socket that will never open
+#: (MCP's lifecycle rule: only use capabilities that were negotiated). See
+#: knowledge-base/knowledge/issues/live_settings_silently_dropped_on_stateless_sessions.md.
+ControlTransport = Literal["websocket", "rest"]
+
+#: Pinned sessions: the direct per-session socket carries every session-scoped
+#: verb; the two ordered scalars ride the durable control inbox on both lanes.
+PINNED_CONTROLS: dict[str, ControlTransport] = {
+    "config.update": "websocket",
+    "compact": "websocket",
+    "archive": "websocket",
+    "rewind": "websocket",
+    "undo": "websocket",
+    "upgrade-to-workspace": "websocket",
+    "mode.set": "rest",
+    "narration.set": "rest",
+}
+
+#: Queue-served sessions bind no agent, so nothing rides a socket. Config
+#: edits go through the owner PATCH (persisted at admission, applied by the
+#: next claim's attach — the same turn-boundary semantics the pane already
+#: documents); the scalar verbs and workspace undo ride the control inbox.
+#: ``compact`` / ``archive`` / ``rewind`` / ``upgrade-to-workspace`` have no
+#: stateless transport yet (stateless_agents.md §"Still open after S1/S2")
+#: and are deliberately ABSENT rather than mapped to something that drops them.
+STATELESS_CONTROLS: dict[str, ControlTransport] = {
+    "config.update": "rest",
+    "workspace.undo": "rest",
+    "mode.set": "rest",
+    "narration.set": "rest",
+}
+
+
 class PinnedConnectionResponse(BaseModel):
     """Connection coordinates when a per-session control socket exists."""
 
@@ -714,6 +750,9 @@ class PinnedConnectionResponse(BaseModel):
     expires_at: int
     pinned_runtime_generation_contract: Literal[1] = 1
     session_runtime_generation: str
+    controls: dict[str, ControlTransport] = Field(
+        default_factory=lambda: dict(PINNED_CONTROLS)
+    )
 
 
 class StatelessConnectionResponse(BaseModel):
@@ -726,6 +765,9 @@ class StatelessConnectionResponse(BaseModel):
     expires_at: None
     pinned_runtime_generation_contract: Literal[1] = 1
     session_runtime_generation: str
+    controls: dict[str, ControlTransport] = Field(
+        default_factory=lambda: dict(STATELESS_CONTROLS)
+    )
 
 
 ConnectionResponse = Annotated[

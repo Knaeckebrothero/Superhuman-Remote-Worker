@@ -409,6 +409,62 @@ export interface CompactionProgressState {
   startedAt: number;
 }
 
+/** Transport a control verb travels over for the current session, as
+ *  DECLARED by `/connection` (`controls`). `unavailable` = the server did not
+ *  advertise the verb, so the Cockpit renders it disabled and never queues it.
+ *  Dispatching by declaration rather than by inferring a lane from
+ *  `control_socket` is what stopped `config.update` from vanishing into an
+ *  outbox on queue-served sessions (issue:
+ *  live_settings_silently_dropped_on_stateless_sessions). */
+export type ControlTransport = 'websocket' | 'rest' | 'unavailable';
+type ControlCapabilityMap = Record<string, 'websocket' | 'rest'>;
+
+/** Verbs that have a REST transport on a socketless session under the legacy
+ *  (pre-`controls`) contract: the three durable-inbox verbs, plus
+ *  `config.update`, whose owner PATCH (Slice C) predates `controls` and whose
+ *  connected-gate passes on a session that binds no agent. Only consulted when
+ *  an older orchestrator omits `controls`; a declaration always wins. */
+const LEGACY_SOCKETLESS_REST_VERBS = new Set([
+  'config.update',
+  'mode.set',
+  'narration.set',
+  'workspace.undo',
+]);
+/** Verbs the legacy contract carried over the direct socket on a pinned
+ *  session. Same fallback role as above. */
+const LEGACY_SOCKET_VERBS = new Set([
+  'config.update',
+  'compact',
+  'archive',
+  'rewind',
+  'undo',
+  'upgrade-to-workspace',
+  'approve',
+  'deny',
+]);
+
+/** How long a `config.update` sent over the socket may wait for its
+ *  `config.changed` ack (or matching error frame) before the pane rolls the
+ *  edit back and says so. The agent applies a live update in well under a
+ *  second; a swap that compacts first can take longer, hence the slack. */
+const CONFIG_UPDATE_ACK_TIMEOUT_MS = 30_000;
+
+/** Outcome of one `updateConfig` request — resolved, never rejected, so a
+ *  caller can always settle its own optimistic state. */
+export type ConfigUpdateOutcome =
+  | {
+      ok: true;
+      requestId: string;
+      transport: 'websocket' | 'rest';
+      /** The fragment the server accepted (REST: the redacted persisted
+       *  fragment; socket: the echoed `applied` fragment). */
+      applied: Record<string, unknown>;
+      /** `now` = the running session rebuilt itself; `next_turn` = persisted,
+       *  picked up by the next claim (queue-served sessions). */
+      effective: 'now' | 'next_turn' | 'next_attach';
+    }
+  | { ok: false; requestId: string; transport: ControlTransport; message: string };
+
 /** Lane-free control-socket discovery. The server may carry additional
  * execution details, but the Cockpit discriminates only on transport. */
 type ConnectionPayload =
@@ -420,6 +476,7 @@ type ConnectionPayload =
       expires_at: number;
       pinned_runtime_generation_contract: 1;
       session_runtime_generation: string;
+      controls?: ControlCapabilityMap;
     }
   | {
       state: 'ready';
@@ -429,6 +486,7 @@ type ConnectionPayload =
       expires_at: null;
       pinned_runtime_generation_contract: 1;
       session_runtime_generation: string;
+      controls?: ControlCapabilityMap;
     };
 
 /** Server-aggregated token telemetry riding the durable `session.state`
@@ -1221,6 +1279,23 @@ export class PersistentChatService {
   // ready state, not a failed WebSocket open; remember it so focus/SSE
   // recovery and user actions cannot restart the reconnect ladder.
   private controlSocket: 'unknown' | 'websocket' | 'none' = 'unknown';
+  /** The `/connection` control declaration, stamped with the thread it
+   *  describes so a stale map can never answer for the next session
+   *  (singleton-state rule: stamp, don't just reset). null = not resolved
+   *  yet, or an older orchestrator that omits `controls`. */
+  private controlCapabilities: { threadId: string; controls: ControlCapabilityMap } | null =
+    null;
+  /** Socket-sent config updates awaiting their `config.changed` ack (or a
+   *  matching error frame), keyed by request_id. Settled by the frame
+   *  reducer, by the ack timeout, or by disconnect(). */
+  private readonly pendingConfigUpdates = new Map<
+    string,
+    {
+      threadId: string;
+      resolve: (outcome: ConfigUpdateOutcome) => void;
+      timer: ReturnType<typeof setTimeout>;
+    }
+  >();
   private controlWsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private controlWsReconnectAttempt = 0;
   private controlWsLastMessageAt = 0;
@@ -3128,6 +3203,10 @@ export class PersistentChatService {
     this.sessionRuntimeGeneration = exactRuntimeContract
       ? this._canonicalRuntimeGeneration(connection.session_runtime_generation)
       : null;
+    this.controlCapabilities =
+      connection?.controls && typeof connection.controls === 'object'
+        ? { threadId, controls: { ...connection.controls } }
+        : null;
     if (!this._connectionHasWebSocket(connection)) {
       this.controlSocket = 'none';
       this.controlWsReconnectAttempt = 0;
@@ -3136,10 +3215,84 @@ export class PersistentChatService {
         this.controlWsReconnectTimer = null;
       }
       this._stopControlWsWatchdog();
+      // Anything queued while the transport was still unknown was waiting
+      // for a socket this session will never have. Fail it now, loudly —
+      // the old behaviour left such frames in the outbox forever.
+      this._failQueuedControls(threadId);
       return;
     }
     this.controlSocket = 'websocket';
     this._installControlWs(threadId, connection.ws_url);
+  }
+
+  /** The transport a control verb has on the CURRENT session.
+   *
+   *  Answers from the `/connection` declaration when there is one. Without
+   *  it (an orchestrator predating `controls`) the answer is derived from the
+   *  legacy contract, which is exactly what such a server implements; and
+   *  before `/connection` resolved at all the verb is assumed socket-bound,
+   *  so it queues and is either flushed or failed once the transport is
+   *  known (see `_installControlTransport`). */
+  controlTransport(verb: string): ControlTransport {
+    const threadId = this.threadId();
+    const declared = this.controlCapabilities;
+    if (declared && threadId && declared.threadId === threadId) {
+      return declared.controls[verb] ?? 'unavailable';
+    }
+    if (this.controlSocket === 'none') {
+      return LEGACY_SOCKETLESS_REST_VERBS.has(verb) ? 'rest' : 'unavailable';
+    }
+    // Pinned (or not yet resolved): the scalars ride REST on both lanes;
+    // everything else is a socket verb, including `config.update`, whose
+    // pinned owner PATCH is refused while an agent is bound.
+    if (verb === 'mode.set' || verb === 'narration.set') return 'rest';
+    return 'websocket';
+  }
+
+  /** Drop every control frame queued for `threadId` and tell the user. Runs
+   *  when `/connection` resolves to a socketless session: the frames were
+   *  queued under the pre-resolution assumption of a socket. */
+  private _failQueuedControls(threadId: string): void {
+    const queued = this.controlOutbox.filter((item) => item.threadId === threadId);
+    if (queued.length === 0) return;
+    this.controlOutbox = this.controlOutbox.filter((item) => item.threadId !== threadId);
+    for (const item of queued) {
+      let requestId: string | undefined;
+      try {
+        requestId = JSON.parse(item.frame)?.request_id;
+      } catch {
+        requestId = undefined;
+      }
+      if (requestId) {
+        this._settlePendingConfigUpdate(requestId, {
+          ok: false,
+          requestId,
+          transport: 'unavailable',
+          message: this.transloco.translate('chat.control.unavailable'),
+        });
+      }
+    }
+    this.error.set(this.transloco.translate('chat.control.unavailable'));
+  }
+
+  private _settlePendingConfigUpdate(requestId: string, outcome: ConfigUpdateOutcome): boolean {
+    const pending = this.pendingConfigUpdates.get(requestId);
+    if (!pending) return false;
+    clearTimeout(pending.timer);
+    this.pendingConfigUpdates.delete(requestId);
+    pending.resolve(outcome);
+    return true;
+  }
+
+  private _settleAllPendingConfigUpdates(message: string): void {
+    for (const requestId of Array.from(this.pendingConfigUpdates.keys())) {
+      this._settlePendingConfigUpdate(requestId, {
+        ok: false,
+        requestId,
+        transport: 'websocket',
+        message,
+      });
+    }
   }
 
   private _connectionHasWebSocket(
@@ -3567,16 +3720,29 @@ export class PersistentChatService {
     this.durableControlError = null;
   }
 
-  /** Send a control-plane command. If the WS isn't open, queue the frame and
-   *  open one; the send goes out as soon as the connection establishes. */
-  private _sendControl(data: Record<string, unknown>): void {
+  /** Send a control-plane command over the session socket. If the WS isn't
+   *  open, queue the frame and open one; the send goes out as soon as the
+   *  connection establishes.
+   *
+   *  Returns false — and surfaces an error — when the verb has no socket
+   *  transport on this session. That branch used to queue the frame for a
+   *  socket a queue-served session never opens, which is how every settings
+   *  edit on such a session silently vanished. A verb with no transport is
+   *  refused here, at the one choke point, so a caller nobody rerouted fails
+   *  visibly instead of quietly. */
+  private _sendControl(data: Record<string, unknown>): boolean {
     const threadId = this.threadId();
-    if (!threadId || !this._controlPlaneAllowed(threadId)) return;
+    if (!threadId || !this._controlPlaneAllowed(threadId)) return false;
+    const verb = typeof data['method'] === 'string' ? (data['method'] as string) : '';
+    if (this.controlTransport(verb) !== 'websocket') {
+      this.error.set(this.transloco.translate('chat.control.unavailable'));
+      return false;
+    }
     const frame = JSON.stringify(data);
     if (this.controlWs?.readyState === WebSocket.OPEN) {
       try {
         this.controlWs.send(frame);
-        return;
+        return true;
       } catch {
         // Socket died between the readyState read and the write. Fall
         // through and queue rather than losing the command.
@@ -3595,6 +3761,7 @@ export class PersistentChatService {
       this.controlOutbox.shift();
     }
     this._ensureControlWs();
+    return true;
   }
 
   /** Drain frames queued for `threadId` over a freshly-opened socket.
@@ -3778,6 +3945,11 @@ export class PersistentChatService {
     // (onclose → _scheduleControlWsReconnect) never routes through
     // disconnect(), so an ordinary drop-and-reconnect still delivers.
     this.controlOutbox = [];
+    this.controlCapabilities = null;
+    // A config update still awaiting its socket ack belongs to the thread
+    // being left; settle it as not-applied so the pane can roll back rather
+    // than wait on a frame that will now never arrive here.
+    this._settleAllPendingConfigUpdates(this.transloco.translate('chat.control.applyFailed'));
     // Interrupt retries carry an exact thread + turn target. Never let a
     // pending browser timer cross navigation even though a request that
     // already committed remains safely durable on its original thread.
@@ -4832,8 +5004,12 @@ export class PersistentChatService {
         this._sendControl({ method: 'compact', focus: arg });
         return true;
       case '/done':
-        this._sendControl({ method: 'archive' });
-        this._systemMessage('Ending session...');
+        // _sendControl refuses (and says so) when this session has no
+        // socket transport for the verb — don't announce an end that was
+        // never dispatched.
+        if (this._sendControl({ method: 'archive' })) {
+          this._systemMessage('Ending session...');
+        }
         return true;
       case '/auto':
         this.setMode('auto_accept');
@@ -5212,18 +5388,43 @@ export class PersistentChatService {
     this._sendDurableControl({ method: 'narration.set', mode });
   }
 
-  /** Update session config (model, temperature, etc.) at runtime.
+  /** Update session config (model, temperature, tools, etc.) at runtime.
    *
-   * `datasourceIds` (Slice B) rides the same frame as a sibling key: the
+   * `datasourceIds` (Slice B) rides the same request as a sibling key: the
    * desired FULL datasource selection (undefined = no change, [] = detach
-   * all) — the agent forwards it on the grant-checked internal PATCH and
-   * re-wires connections/tools at the next turn boundary.
+   * all) — authorized and persisted server-side, re-wired at the next turn
+   * boundary.
    *
-   * Returns the request_id sent with the frame; the agent echoes it on
-   * the matching `config.changed` ack (or `error` frame), so callers with
-   * several in-flight updates can correlate outcomes. */
-  updateConfig(config: Record<string, unknown>, datasourceIds?: string[]): string {
+   * Dispatches by the session's declared transport for `config.update`:
+   *
+   * - `websocket` (pinned sessions): the frame goes to the agent, which
+   *   persists through the orchestrator and rebuilds itself live; the
+   *   returned promise settles on the echoed `config.changed` ack, on a
+   *   matching error frame, or on the ack timeout.
+   * - `rest` (queue-served sessions): the owner PATCH persists the fragment
+   *   at admission and the next claim's attach picks it up; the promise
+   *   settles on the HTTP response, and the transcript stamp the socket ack
+   *   would have journaled is written locally.
+   * - `unavailable`: settles `ok: false` immediately and surfaces the error.
+   *
+   * Always resolves (never rejects) so the caller can settle its own
+   * optimistic state either way — Replicache's speculative-then-authoritative
+   * shape: apply locally, confirm or revert on the authoritative answer. */
+  updateConfig(
+    config: Record<string, unknown>,
+    datasourceIds?: string[],
+  ): Promise<ConfigUpdateOutcome> {
     const requestId = crypto.randomUUID();
+    const threadId = this.threadId();
+    const transport = this.controlTransport('config.update');
+    if (!threadId || transport === 'unavailable') {
+      const message = this.transloco.translate('chat.control.unavailable');
+      if (threadId) this.error.set(message);
+      return Promise.resolve({ ok: false, requestId, transport, message });
+    }
+    if (transport === 'rest') {
+      return this._updateConfigOverRest(threadId, requestId, config, datasourceIds);
+    }
     const frame: Record<string, unknown> = {
       method: 'config.update',
       config,
@@ -5232,8 +5433,87 @@ export class PersistentChatService {
     if (datasourceIds !== undefined) {
       frame['datasource_ids'] = datasourceIds;
     }
-    this._sendControl(frame);
-    return requestId;
+    return new Promise<ConfigUpdateOutcome>((resolve) => {
+      const timer = setTimeout(() => {
+        const message = this.transloco.translate('chat.control.applyTimeout');
+        if (this._settlePendingConfigUpdate(requestId, { ok: false, requestId, transport, message })) {
+          if (this.threadId() === threadId) this.error.set(message);
+        }
+      }, CONFIG_UPDATE_ACK_TIMEOUT_MS);
+      this.pendingConfigUpdates.set(requestId, { threadId, resolve, timer });
+      if (!this._sendControl(frame)) {
+        this._settlePendingConfigUpdate(requestId, {
+          ok: false,
+          requestId,
+          transport,
+          message: this.transloco.translate('chat.control.unavailable'),
+        });
+      }
+    });
+  }
+
+  /** The socketless half of `updateConfig`: `PATCH /api/persistent/threads/
+   *  {id}/config` (the Slice C owner endpoint, whose connected-gate passes by
+   *  construction on a session that binds no agent). */
+  private async _updateConfigOverRest(
+    threadId: string,
+    requestId: string,
+    config: Record<string, unknown>,
+    datasourceIds?: string[],
+  ): Promise<ConfigUpdateOutcome> {
+    const body: Record<string, unknown> = { config_override: config };
+    if (datasourceIds !== undefined) body['datasource_ids'] = datasourceIds;
+    try {
+      const response = await firstValueFrom(
+        this.http.patch<{
+          status: string;
+          config_override?: Record<string, unknown>;
+          datasource_ids?: string[] | null;
+          effective?: 'next_turn' | 'next_attach';
+        }>(`${environment.apiUrl}/persistent/threads/${threadId}/config`, body),
+      );
+      if (this.threadId() !== threadId) {
+        // Persisted on the old thread; nothing to paint here.
+        return { ok: true, requestId, transport: 'rest', applied: {}, effective: 'next_turn' };
+      }
+      const applied = (response?.config_override ?? config) as Record<string, unknown>;
+      // Mirror what the socket ack would have done to the live chips.
+      const llm = applied['llm'] as Record<string, unknown> | undefined;
+      if (typeof llm?.['model'] === 'string' && llm['model']) {
+        this.modelName.set(llm['model'] as string);
+      }
+      if (typeof llm?.['temperature'] === 'number') {
+        this.temperature.set(llm['temperature'] as number);
+      }
+      const stamp = describeAppliedConfig(applied);
+      if (datasourceIds !== undefined) stamp.push('connectors updated');
+      if (stamp.length) {
+        this._systemMessage(
+          this.transloco.translate('chat.control.appliedNextTurn', {
+            summary: stamp.join(' · '),
+          }),
+        );
+      }
+      return {
+        ok: true,
+        requestId,
+        transport: 'rest',
+        applied,
+        effective: response?.effective ?? 'next_turn',
+      };
+    } catch (err: any) {
+      const detail = err?.error?.detail;
+      const detailText =
+        typeof detail === 'string'
+          ? detail
+          : typeof detail?.message === 'string'
+            ? detail.message
+            : '';
+      const headline = this.transloco.translate('chat.control.applyFailed');
+      const message = this.sanitizeError(detailText ? `${headline}: ${detailText}` : headline);
+      if (this.threadId() === threadId) this.error.set(message);
+      return { ok: false, requestId, transport: 'rest', message };
+    }
   }
 
   /** Rewind the session to just before an earlier user message.
@@ -5322,6 +5602,12 @@ export class PersistentChatService {
    * is deliberate for the same reason: accepting from the pane while the card
    * is live has to dismiss it too. */
   upgradeWorkspace(tier: 'sandbox' | 'vm', opts: { thenContinue?: boolean } = {}): void {
+    if (this.controlTransport('upgrade-to-workspace') !== 'websocket') {
+      // No transport on this session (queue-served sessions have none yet):
+      // refuse before arming the in-progress state, and say so.
+      this.error.set(this.transloco.translate('chat.control.unavailable'));
+      return;
+    }
     this.pendingWorkspaceOffer.set(null);
     this.continueAfterUpgrade.set(opts.thenContinue === true);
     this._sendControl({ method: 'upgrade-to-workspace', target_tier: tier });
@@ -5936,6 +6222,18 @@ export class PersistentChatService {
             `Session settings updated: ${stamp.join(' · ')} — applies from the next response.`,
           );
         }
+        // The ack the socket path awaits (P0.3 request_id echo) — the
+        // caller's optimistic state is confirmed here, not at send time.
+        const ackRequestId = params['request_id'] as string | undefined;
+        if (ackRequestId) {
+          this._settlePendingConfigUpdate(ackRequestId, {
+            ok: true,
+            requestId: ackRequestId,
+            transport: 'websocket',
+            applied: applied ?? {},
+            effective: 'now',
+          });
+        }
         break;
       }
 
@@ -6369,7 +6667,19 @@ export class PersistentChatService {
         // generic headline.
         const detail = params['detail'] as string | undefined;
         const message = params['message'] as string;
-        this.error.set(this.sanitizeError(detail ? `${message}: ${detail}` : message));
+        const sanitized = this.sanitizeError(detail ? `${message}: ${detail}` : message);
+        this.error.set(sanitized);
+        // A config.update the agent refused (grant denial, fit-ladder
+        // rejection, invalid override) settles its caller so the pane can
+        // roll the edit back instead of showing a value the session never took.
+        if (errorRequestId) {
+          this._settlePendingConfigUpdate(errorRequestId, {
+            ok: false,
+            requestId: errorRequestId,
+            transport: 'websocket',
+            message: sanitized,
+          });
+        }
         break;
       }
     }

@@ -72,7 +72,13 @@ function createPane(options: {
     narrationMode: signal('auto'),
     workspaceTier: signal<string | null>(null),
     workspaceUpgradeInProgress: signal<{tier: string; elapsed?: number} | null>(null),
-    updateConfig: vi.fn().mockReturnValue('req-1'),
+    updateConfig: vi.fn().mockResolvedValue({
+      ok: true,
+      requestId: 'req-1',
+      transport: 'websocket',
+      applied: {},
+      effective: 'now',
+    }),
     setMode: vi.fn(),
     setNarrationMode: vi.fn(),
     upgradeWorkspace: vi.fn(),
@@ -176,7 +182,13 @@ function createPaneWithRealToolsGroup(toolGroups: SessionToolGroupsResponse) {
     narrationMode: signal('auto'),
     workspaceTier: signal<string | null>(null),
     workspaceUpgradeInProgress: signal<{tier: string; elapsed?: number} | null>(null),
-    updateConfig: vi.fn().mockReturnValue('req-1'),
+    updateConfig: vi.fn().mockResolvedValue({
+      ok: true,
+      requestId: 'req-1',
+      transport: 'websocket',
+      applied: {},
+      effective: 'now',
+    }),
     setMode: vi.fn(),
     setNarrationMode: vi.fn(),
     upgradeWorkspace: vi.fn(),
@@ -344,7 +356,13 @@ describe('SettingsPaneComponent locked-on categories, from the DOM', () => {
       narrationMode: signal('auto'),
       workspaceTier: signal<string | null>(null),
       workspaceUpgradeInProgress: signal<{tier: string; elapsed?: number} | null>(null),
-      updateConfig: vi.fn().mockReturnValue('req-1'),
+      updateConfig: vi.fn().mockResolvedValue({
+      ok: true,
+      requestId: 'req-1',
+      transport: 'websocket',
+      applied: {},
+      effective: 'now',
+    }),
       setMode: vi.fn(),
       setNarrationMode: vi.fn(),
       upgradeWorkspace: vi.fn(),
@@ -930,5 +948,109 @@ describe('SettingsPaneComponent tier upgrade confirmation', () => {
 
     expect(component.pendingTier()).toBeNull();
     expect(chat.upgradeWorkspace).not.toHaveBeenCalled();
+  });
+});
+
+describe('SettingsPaneComponent settlement (speculative apply, authoritative settle)', () => {
+  // The pane advances its diff baseline at dispatch so a second edit during
+  // the round trip diffs against what was asked for — and then SETTLES on the
+  // session's answer. A refused or unanswered update rolls the pane back to
+  // the effective config; a REST-confirmed one (queue-served sessions) folds
+  // the accepted fragment into the durable overlay, because no
+  // `config.changed` ack will do it. Before this, the baseline advanced and
+  // nobody looked again: a session with no control socket showed `max`
+  // reasoning it never took (live_settings_silently_dropped_on_stateless_sessions).
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => {
+    vi.useRealTimers();
+    TestBed.resetTestingModule();
+  });
+
+  async function flushOutcome() {
+    // Let the resolved updateConfig promise settle (two hops: then + void).
+    await Promise.resolve();
+    await Promise.resolve();
+  }
+
+  it('a refused update rolls the sub-groups back to the effective config', async () => {
+    const {component, chat, fakeSettings} = createPane({});
+    chat.updateConfig.mockResolvedValue({
+      ok: false,
+      requestId: 'req-x',
+      transport: 'rest',
+      message: 'denied',
+    });
+    expect(fakeSettings.prefillFromConfig).toHaveBeenCalledTimes(1); // load
+
+    fakeSettings.getOverrides.mockReturnValue({llm: {reasoning_level: 'max'}});
+    component.onSettingsChange();
+    vi.runAllTimers();
+    expect(chat.updateConfig).toHaveBeenCalledExactlyOnceWith({llm: {reasoning_level: 'max'}});
+
+    await flushOutcome();
+    // Rolled back: the controls are re-seeded from the effective config and
+    // the selection is reset — the pin the session refused is gone.
+    expect(fakeSettings.prefillFromConfig).toHaveBeenCalledTimes(2);
+    expect(fakeSettings.resetDatasourceSelection).toHaveBeenCalledTimes(2);
+
+    // And the baseline went back with it: the same pin re-dispatches.
+    component.onSettingsChange();
+    vi.runAllTimers();
+    expect(chat.updateConfig).toHaveBeenCalledTimes(2);
+  });
+
+  it('a confirmed update does not re-prefill, and the same value is not re-sent', async () => {
+    const {component, chat, fakeSettings} = createPane({});
+    fakeSettings.getOverrides.mockReturnValue({llm: {reasoning_level: 'max'}});
+    component.onSettingsChange();
+    vi.runAllTimers();
+    await flushOutcome();
+
+    expect(fakeSettings.prefillFromConfig).toHaveBeenCalledTimes(1);
+    component.onSettingsChange();
+    vi.runAllTimers();
+    expect(chat.updateConfig).toHaveBeenCalledTimes(1);
+  });
+
+  it('a REST-confirmed update folds the accepted fragment into the durable overlay', async () => {
+    const {component, chat, fakeSettings} = createPane({});
+    chat.updateConfig.mockResolvedValue({
+      ok: true,
+      requestId: 'req-r',
+      transport: 'rest',
+      applied: {llm: {reasoning_level: 'max'}},
+      effective: 'next_turn',
+    });
+    fakeSettings.getOverrides.mockReturnValue({llm: {reasoning_level: 'max'}});
+    component.onSettingsChange();
+    vi.runAllTimers();
+    await flushOutcome();
+
+    // The overlay now carries the accepted value, so liveConfig() reports it
+    // without a pane reopen — exactly what the socket ack does for pinned
+    // sessions via the live signals.
+    expect((component.liveConfig()['llm'] as Record<string, unknown>)['reasoning_level']).toBe('max');
+    // A later un-pinned edit therefore diffs against `max`, not the old value.
+    fakeSettings.getOverrides.mockReturnValue({});
+    component.onSettingsChange();
+    vi.runAllTimers();
+    expect(chat.updateConfig).toHaveBeenCalledTimes(1);
+  });
+
+  it('a late answer for a session the pane has left does not touch the pane', async () => {
+    const {component, chat, fakeSettings} = createPane({});
+    let settle!: (o: unknown) => void;
+    chat.updateConfig.mockReturnValue(new Promise((resolve) => (settle = resolve)));
+    fakeSettings.getOverrides.mockReturnValue({llm: {reasoning_level: 'max'}});
+    component.onSettingsChange();
+    vi.runAllTimers();
+
+    // Switch sessions while the answer is in flight.
+    chat.threadId.set('thread-2');
+    TestBed.tick();
+    const prefills = fakeSettings.prefillFromConfig.mock.calls.length;
+    settle({ok: false, requestId: 'req-l', transport: 'rest', message: 'late'});
+    await flushOutcome();
+    expect(fakeSettings.prefillFromConfig).toHaveBeenCalledTimes(prefills);
   });
 });

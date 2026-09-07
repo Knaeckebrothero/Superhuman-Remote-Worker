@@ -19,7 +19,12 @@ import {
     toolsFragment,
 } from '../agent-settings/resolved-toolset';
 import {deepMergeConfig} from '../agent-settings/config-merge';
-import {PersistentChatService, NarrationMode, PermissionMode} from '../../core/services/persistent-chat.service';
+import {
+    ConfigUpdateOutcome,
+    PersistentChatService,
+    NarrationMode,
+    PermissionMode,
+} from '../../core/services/persistent-chat.service';
 import {ApiService, SessionToolGroupsResponse} from '../../core/services/api.service';
 import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {ModelService} from '../../core/services/model.service';
@@ -633,15 +638,64 @@ export class SettingsPaneComponent {
             datasourceIds = dsDesired === '' ? [] : dsDesired.split(',');
         }
 
+        // Speculative apply, authoritative settle (the Replicache shape):
+        // the baseline and the attached-ids mirror advance NOW so a second
+        // edit during the round trip diffs against what was asked for, and
+        // the outcome either confirms that or rolls it back. The old code
+        // advanced the baseline and never looked again, which is how a
+        // queue-served session showed values it never took.
+        const previousAttached = this.attachedIds();
+        const threadId = this.chat.threadId();
+        let outcome: Promise<ConfigUpdateOutcome> | null = null;
         if (datasourceIds !== undefined) {
-            this.chat.updateConfig(fragment, datasourceIds);
-            // Advance the durable-selection mirror optimistically (same
-            // policy as lastApplied); a rejection error frame leaves the
-            // server state unchanged and a pane reopen re-syncs.
+            outcome = this.chat.updateConfig(fragment, datasourceIds);
             this.attachedIds.set(datasourceIds);
         } else if (Object.keys(fragment).length) {
-            this.chat.updateConfig(fragment);
+            outcome = this.chat.updateConfig(fragment);
         }
         this.lastApplied = desired;
+        if (outcome && threadId) {
+            void outcome.then((result) =>
+                this.settleConfigUpdate(result, threadId, previous, previousAttached),
+            );
+        }
+    }
+
+    /** Confirm or revert one dispatched batch once the session has answered.
+     *
+     *  Rejected (or unanswered) edits are rolled back to the state the diff
+     *  was taken against — baseline, attached-ids mirror AND the sub-groups'
+     *  pins, re-prefilled from the effective config so the controls show what
+     *  is actually in effect. A REST-confirmed edit folds the accepted
+     *  fragment into the durable overlay: there is no `config.changed` ack to
+     *  move the live signals for it, and the next pane open would otherwise
+     *  read stale thread metadata until the claim lands. */
+    private settleConfigUpdate(
+        outcome: ConfigUpdateOutcome,
+        threadId: string,
+        previous: Record<string, unknown>,
+        previousAttached: string[],
+    ): void {
+        // A late answer for a session the pane has already left must not
+        // touch the pane now showing another session.
+        if (this.chat.threadId() !== threadId || this.prefilledThread !== threadId) return;
+        if (outcome.ok) {
+            if (outcome.transport === 'rest' && Object.keys(outcome.applied).length) {
+                this.threadOverride.update((current) =>
+                    deepMergeConfig(current, outcome.applied),
+                );
+            }
+            return;
+        }
+        this.attachedIds.set(previousAttached);
+        this.settings()?.prefillFromConfig(this.liveConfig());
+        const categories = this.resolvedCategories();
+        if (categories) this.settings()?.prefillFromResolvedToolset(categories);
+        this.settings()?.resetDatasourceSelection();
+        // Re-anchor to the config-only state (as loadThread does) rather than
+        // to `previous`: a concurrent ack may have moved the live signals in
+        // between, and the sub-groups were just reset to exactly this.
+        this.lastApplied = this.desiredState({});
+        void previous;
     }
 }
