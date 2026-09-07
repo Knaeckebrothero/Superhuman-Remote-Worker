@@ -433,6 +433,27 @@ describe('ModelGroupComponent', () => {
       expect(component.getOverrides()).toEqual({llm: {model: 'gemma-4-moe'}});
     });
 
+    it('the "(default)" marker stays on the family default while a pin selects another value', () => {
+      // A session pin of `low` on gpt-5.4 (family default `high`): the select
+      // preselects `low` (what is in effect), but `high` keeps the marker.
+      // The marker used to follow the resolved value, so pinning max
+      // re-labelled max as "(default)" — the family had not changed.
+      const pinned = createComponent().component;
+      inMode(pinned, 'live');
+      Object.defineProperty(pinned, 'config', {
+        value: () => ({llm: {model: 'gpt-5.4', reasoning_level: 'low'}}),
+      });
+      expect(pinned.resolvedSessionReasoning()).toBe('low');
+      expect(pinned.familyReasoningDefault()).toBe('high');
+
+      // No pin: both coincide, as before.
+      const unpinned = createComponent().component;
+      inMode(unpinned, 'live');
+      Object.defineProperty(unpinned, 'config', {value: () => ({llm: {model: 'gpt-5.4'}})});
+      expect(unpinned.resolvedSessionReasoning()).toBe('high');
+      expect(unpinned.familyReasoningDefault()).toBe('high');
+    });
+
     it('offers nothing for a model without a selectable capability (field hidden)', () => {
       const {component} = createComponent();
       component.model.set('gpt-4o');
