@@ -185,6 +185,14 @@ from orchestrator.routers import shared_browser_router  # noqa: E402
 from orchestrator.routers import vm_guest_router  # noqa: E402
 from orchestrator.routers.sessions import router as sessions_router  # noqa: E402
 from orchestrator.routers.contacts import ContactsDependencies  # noqa: E402
+from orchestrator.routers import job_reads as job_reads_routes  # noqa: E402
+from orchestrator.services import job_projection, job_queries, job_reads  # noqa: E402
+from orchestrator.services.job_queries import (  # noqa: E402
+    JOBS_MAX_OFFSET as JOBS_MAX_OFFSET,
+    JOBS_MAX_PROJECT_FILTERS as JOBS_MAX_PROJECT_FILTERS,
+    JobProjectFilters as _JobProjectFilters,  # noqa: F401 - compatibility export
+    parse_job_project_filters as _parse_job_project_filters,  # noqa: F401 - compatibility export
+)
 from orchestrator.routers.preferences import (  # noqa: E402
     PreferencesDependencies,
     UserSettingsUpdate as UserSettingsUpdate,
@@ -525,14 +533,13 @@ from shared.session_subagent_authority import (  # noqa: E402
 # backend modules are lazy-imported inside the factory's functions.
 from shared.backend_kinds import LITE_BACKENDS  # noqa: E402
 from shared.workspace_contract import (  # noqa: E402
-    WORKSPACE_CONTRACT_CONTEXT_KEY,
-    WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY,
+    WORKSPACE_CONTRACT_CONTEXT_KEY as WORKSPACE_CONTRACT_CONTEXT_KEY,
+    WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY as WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY,
     WORKSPACE_RUNTIME_CONTEXT_KEY,
     WorkspaceContractError,
     configured_workspace_backend,
     resolve_workspace_contract,
     resolve_workspace_runtime,
-    workspace_contract_projection,
     workspace_runtime_authority_digest,
 )
 
@@ -15435,7 +15442,6 @@ from orchestrator.schemas.job_create import (  # noqa: E402
     JobCreate,
     PublicJobCreateBody,
 )
-from orchestrator.schemas.job_list import JOB_LIST_RESPONSES  # noqa: E402
 
 
 class JobStartRequest(BaseModel):
@@ -17836,6 +17842,7 @@ app = FastAPI(
     default_response_class=CustomJSONResponse,
 )
 app.state.contacts_dependencies = ContactsDependencies(db=postgres_db)
+app.state.job_reads_dependencies_factory = lambda: _job_reads_dependencies()
 app.state.tables_dependencies = TablesDependencies(db=postgres_db)
 app.state.preferences_dependencies = PreferencesDependencies(
     db=postgres_db,
@@ -18081,6 +18088,7 @@ app.include_router(contacts_router)
 app.include_router(contacts_project_router)
 app.include_router(tables_router)
 app.include_router(preferences_router)
+app.include_router(job_reads_routes.router)
 
 
 # nosec: public k8s-liveness-probe
@@ -18229,11 +18237,6 @@ async def workspace_status(request: Request) -> dict[str, Any]:
     }
 
 
-#: Beyond this the list is not a list any more, it is a table scan wearing a
-#: page number. Elasticsearch's ``max_result_window`` draws the same line.
-JOBS_MAX_OFFSET = 50_000
-
-
 def _resolve_submitted_job_origin(
     *,
     context: dict[str, Any] | None,
@@ -18266,113 +18269,47 @@ def _resolve_submitted_job_origin(
     return "user"
 
 
-@dataclass(frozen=True)
-class _JobProjectFilters:
-    """Parsed ``?project_id=`` for the jobs list and its facet counts."""
+def _job_reads_dependencies() -> job_reads_routes.JobReadsDependencies:
+    """Compose read/auth ports without evaluating store methods before auth.
 
-    project_ids: list[str]
-    has_project: bool | None
-
-
-def _parse_job_project_filters(
-    *,
-    project_id: list[str] | None,
-    has_project: bool | None,
-    is_admin: bool,
-    visible_project_ids: list[str] | None,
-    scope_project_id: str | None,
-) -> _JobProjectFilters:
-    """Validate and authorize the project filter for both jobs endpoints.
-
-    Shared so ``GET /api/jobs`` and ``GET /api/stats/jobs`` reject the same
-    inputs with the same status codes. Chip counts that accepted a filter the
-    list refuses (or vice versa) would disagree with each other in a way no
-    test of either endpoint alone would catch.
-
-    ``visible_project_ids`` is the caller's already-resolved membership set;
-    pass ``None`` for admins, who may filter by any project in the fleet.
+    Main's legacy direct callers patch these application collaborators. Resolve
+    them per invocation; independently mounted routers supply their own factory.
+    Store lifecycle, canonical filter vocabularies and cloud/workspace authority
+    remain owned by this application.
     """
-    # 'none' is the project-less bucket. A model will guess it, so accept it
-    # rather than treating it as a malformed uuid.
-    raw = list(dict.fromkeys(str(value) for value in (project_id or [])))
-    wants_projectless = any(value.lower() in ("none", "null") for value in raw)
-    ids = sorted(value for value in raw if value.lower() not in ("none", "null"))
-
-    if len(ids) > JOBS_MAX_PROJECT_FILTERS:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"Too many project_id values ({len(ids)}); "
-                f"the maximum is {JOBS_MAX_PROJECT_FILTERS}."
-            ),
-        )
-    for value in ids:
-        try:
-            UUID(value)
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=422,
-                detail=f"project_id is not a uuid: {value}",
-            ) from exc
-
-    effective_has_project = has_project
-    if wants_projectless and not ids:
-        effective_has_project = False
-    elif wants_projectless and ids:
-        # "these projects OR no project" is a union the AND-composed filter
-        # set cannot express; say so instead of quietly returning one arm.
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "project_id=none cannot be combined with specific project "
-                "ids; issue them as separate queries."
-            ),
-        )
-
-    if scope_project_id is not None and ids and ids != [str(scope_project_id)]:
-        # A project-scoped MCP token cannot widen itself by asking for another
-        # project. The AND-combined scope would already return zero rows;
-        # saying so is clearer than an empty page.
-        raise HTTPException(
-            status_code=403,
-            detail="Access denied by MCP token scope",
-        )
-
-    if not is_admin and ids:
-        # Refuse a project the caller cannot see rather than returning an
-        # empty page. This is a narrowing filter, not an authorization
-        # boundary — the visibility OR-clause already bounds the result — so
-        # it must NOT run for admins, who legitimately filter by any project
-        # in the fleet, and it is deliberately not `require_project_member`:
-        # that gate is bypassed wholesale for X-Internal-Key callers and
-        # would relabel these endpoints' security classification as
-        # membership-gated, which they are not.
-        #
-        # Known gap: a caller who owns a job in a project they are not a
-        # member of cannot filter by that project id. The OR-clause still
-        # shows the job in the unfiltered list.
-        unauthorized = sorted(set(ids) - set(visible_project_ids or []))
-        if unauthorized:
-            raise HTTPException(
-                status_code=403,
-                detail=(
-                    f"Not authorized to filter by project(s): {', '.join(unauthorized)}"
-                ),
-            )
-
-    return _JobProjectFilters(project_ids=ids, has_project=effective_has_project)
+    store = postgres_db
+    audit = audit_reader
+    queries = job_queries.JobQueryDependencies(
+        query_jobs=lambda **kwargs: store.query_jobs(**kwargs),
+        get_job_statistics=lambda **kwargs: store.get_job_statistics(**kwargs),
+        visible_project_ids=lambda actor: user_visible_project_ids(actor, store),
+        scope_project_id=mcp_scope_project_id,
+        audit_available=lambda: audit.is_available,
+        audit_counts=lambda ids: audit.get_audit_counts(ids),
+        project_job=lambda job: _with_cloud_review_mode(
+            _redact_job_config_override(job)
+        ),
+        now=lambda: datetime.now(timezone.utc),
+        status_filter_values=JOB_STATUS_FILTER_VALUES,
+        known_origins=KNOWN_JOB_ORIGINS,
+    )
+    reads = job_reads.JobReadDependencies(
+        store=store,
+        audit_reader=audit,
+        redact_job=_redact_job_config_override,
+        with_cloud_review_mode=_with_cloud_review_mode,
+        status_filter_values=JOB_STATUS_FILTER_VALUES,
+    )
+    return job_reads_routes.JobReadsDependencies(
+        store=store,
+        queries=queries,
+        reads=reads,
+        require_approved_user=require_approved_user,
+        require_job_access=require_job_access,
+        require_project_member=require_project_member,
+    )
 
 
-#: Repeated UUIDs run into nginx's ~4k URL ceiling around 40 values, where the
-#: failure mode is a truncated request rather than a clear error.
-JOBS_MAX_PROJECT_FILTERS = 40
-
-
-@app.get(
-    "/api/jobs",
-    operation_id="list_jobs_api_jobs_get",
-    responses=JOB_LIST_RESPONSES,
-)
 async def list_jobs(
     request: Request,
     status: list[str] | None = Query(
@@ -18422,325 +18359,56 @@ async def list_jobs(
         description="Compute the capped total. Pass false when paging.",
     ),
 ) -> dict[str, Any]:
-    """List jobs visible to the caller.
-
-    Visibility model (G1):
-        * Admins see the full fleet, optionally narrowed by ``?user_id=`` or
-          by an MCP ``project:<uuid>`` token scope.
-        * Non-admins see jobs they own OR jobs in projects they're a member
-          of, additionally narrowed by any MCP project scope.
-        * A non-admin passing ``?user_id=`` for anyone other than themselves
-          is rejected (403). Self-query (``?user_id=<self>``) is accepted and
-          then ignored — AND-ing it onto the OR-clause would narrow the view
-          to own-jobs-only and silently drop the caller's project rows.
-
-    Returns an envelope, not a bare array::
-
-        {"jobs": [...], "total": 806, "total_is_capped": false,
-         "has_more": true, "limit": 100, "offset": 0, "as_of": "...",
-         "filters": {...}}
-
-    ``total`` is exact up to 10,000 and reported as capped beyond it; an
-    exact filtered count cannot be made cheap, and bounding it is what keeps
-    page 1 fast at a million rows. ``has_more`` is exact regardless.
-
-    The ``filters`` echo exists for MCP callers: it makes a server-side
-    default like ``include_archived_projects: false`` visible to a model that
-    never read the docs, so an agent that finds nothing knows to widen its
-    query rather than concluding the job does not exist.
-    """
-    user = await require_approved_user(request, postgres_db)
-    is_admin = bool(user.get("is_admin"))
-    scope_pid = mcp_scope_project_id(user)
-
-    if user_id is not None and not is_admin and str(user_id) != str(user["id"]):
-        raise HTTPException(
-            status_code=403,
-            detail="Not authorized to query other users' jobs",
-        )
-
-    statuses = list(dict.fromkeys(status or []))
-    unknown = [value for value in statuses if value not in JOB_STATUS_FILTER_VALUES]
-    if unknown:
-        # 422 rather than an empty page: a typo that silently returns zero
-        # rows gets reported as data loss.
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"Unknown job status(es): {', '.join(sorted(unknown))}. "
-                f"Valid values: {', '.join(JOB_STATUS_FILTER_VALUES)}"
-            ),
-        )
-
-    origins = list(dict.fromkeys(origin or []))
-    unknown_origins = [value for value in origins if value not in KNOWN_JOB_ORIGINS]
-    if unknown_origins:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"Unknown job origin(s): {', '.join(sorted(unknown_origins))}. "
-                f"Valid values: {', '.join(sorted(KNOWN_JOB_ORIGINS))}"
-            ),
-        )
-
-    if offset > JOBS_MAX_OFFSET:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"offset exceeds the maximum of {JOBS_MAX_OFFSET}. "
-                "Narrow the filters instead of paging further."
-            ),
-        )
-
-    if is_admin:
-        owner_user_id = None
-        visible_ids = None
-    else:
-        visible = await user_visible_project_ids(user, postgres_db)
-        # Non-admin always lands on a concrete set (never "all").
-        owner_user_id = str(user["id"])
-        visible_ids = [str(p) for p in visible] if visible != "all" else []
-
-    filters = _parse_job_project_filters(
+    """Compatibility entry point for existing direct callers of main."""
+    return await job_reads_routes.list_jobs(
+        request,
+        status=status,
+        origin=origin,
         project_id=project_id,
         has_project=has_project,
-        is_admin=is_admin,
-        visible_project_ids=visible_ids,
-        scope_project_id=str(scope_pid) if scope_pid else None,
+        include_archived_projects=include_archived_projects,
+        search=search,
+        as_of=as_of,
+        user_id=user_id,
+        limit=limit,
+        offset=offset,
+        include_total=include_total,
+        dependencies=_job_reads_dependencies(),
     )
-
-    # Freeze the window on first page so later pages see the same set. The
-    # client carries it back; a shared "page 3" link therefore shows the
-    # recipient what the sender saw.
-    effective_as_of = as_of or datetime.now(timezone.utc)
-    # Emit Zulu, not "+00:00". The offset form round-trips through a properly
-    # encoded query string but breaks the moment anything concatenates it
-    # naively, because '+' decodes as a space and the parse then 422s. The
-    # value is meant to be pasted back verbatim, so hand out the form that
-    # survives that.
-    as_of_wire = effective_as_of.isoformat().replace("+00:00", "Z")
-
-    try:
-        result = await postgres_db.query_jobs(
-            owner_user_id=owner_user_id,
-            visible_project_ids=visible_ids,
-            scope_project_id=str(scope_pid) if scope_pid else None,
-            statuses=statuses or None,
-            origins=origins or None,
-            project_ids=filters.project_ids or None,
-            has_project=filters.has_project,
-            include_archived_projects=include_archived_projects,
-            search=search or None,
-            as_of=effective_as_of,
-            # Admin-only cross-user filter. A non-admin's ?user_id= is
-            # validated above but deliberately NOT forwarded: the OR-clause
-            # already bounds them, and AND-ing it on would *narrow* the
-            # result to own-jobs-only, dropping their project rows.
-            user_id=user_id if is_admin else None,
-            limit=limit,
-            offset=offset,
-            include_total=include_total,
-        )
-        jobs = result.jobs
-
-        if audit_reader.is_available:
-            counts = await audit_reader.get_audit_counts(
-                [str(job["id"]) for job in jobs]
-            )
-            for job in jobs:
-                job["audit_count"] = counts.get(str(job["id"]), 0)
-        else:
-            for job in jobs:
-                job["audit_count"] = None
-
-        return {
-            "jobs": [
-                _with_cloud_review_mode(_redact_job_config_override(job))
-                for job in jobs
-            ],
-            "total": result.total,
-            "total_is_capped": result.total_is_capped,
-            "has_more": result.has_more,
-            "limit": limit,
-            "offset": offset,
-            "as_of": as_of_wire,
-            "filters": {
-                "status": statuses,
-                "origin": origins,
-                "project_id": filters.project_ids,
-                "has_project": filters.has_project,
-                "include_archived_projects": include_archived_projects,
-                "search": search,
-                "user_id": user_id if is_admin else None,
-            },
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 def _redact_job_config_override(job: dict[str, Any]) -> dict[str, Any]:
-    """Strip credentials and private workspace lease identity from a job."""
-
-    job = dict(job)
-    if (
-        not isinstance(job.get("workspace_contract"), dict)
-        or "state" not in job["workspace_contract"]
-    ):
-        job["workspace_contract"] = workspace_contract_projection(
-            job, vm_mode=vm_provisioner.mode
-        )
-    job = _redact_nested_workspace_state(job, field="context")
-    context = job.get("context")
-    context_was_str = isinstance(context, str)
-    if context_was_str:
-        try:
-            context = json.loads(context)
-        except (json.JSONDecodeError, TypeError):
-            context = None
-    if isinstance(context, dict):
-        # The coordinate-free workspace_contract projection above is the
-        # public contract. Provisioner branches contain SSH hosts, pod/service
-        # coordinates and generation authority needed only by server and
-        # worker paths; never return them from the user-facing job API.
-        public_context = dict(context)
-        for key in (
-            "vm",
-            "workspace_container",
-            WORKSPACE_CONTRACT_CONTEXT_KEY,
-            WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY,
-            WORKSPACE_RUNTIME_CONTEXT_KEY,
-            "workspace_backend",
-        ):
-            public_context.pop(key, None)
-        job["context"] = (
-            json.dumps(public_context) if context_was_str else public_context
-        )
-    co = job.get("config_override")
-    if co is None:
-        return job
-    was_str = isinstance(co, str)
-    if was_str:
-        try:
-            co = json.loads(co)
-        except (json.JSONDecodeError, TypeError):
-            # Opaque/garbage — drop it rather than risk returning a raw secret.
-            job = dict(job)
-            job["config_override"] = None
-            return job
-    job = dict(job)
-    cleaned = redact_config_override(co)
-    if isinstance(cleaned, dict) and isinstance(cleaned.get("workspace"), dict):
-        workspace = dict(cleaned["workspace"])
-        workspace.pop("remote", None)
-        cleaned = {**cleaned, "workspace": workspace}
-    job["config_override"] = json.dumps(cleaned) if was_str else cleaned
-    return job
+    """Compatibility projection for admission and other existing job callers."""
+    return job_projection.redact_job_config_override(
+        job,
+        vm_mode=lambda: vm_provisioner.mode,
+        runtime_incarnation_key=WORKSPACE_RUNTIME_INCARNATION_KEY,
+        redact_config_override=redact_config_override,
+    )
 
 
 def _redact_nested_workspace_state(
     record: dict[str, Any], *, field: str
 ) -> dict[str, Any]:
-    """Remove provisioner-only lease fields while preserving JSONB shape."""
-
-    value = record.get(field)
-    was_str = isinstance(value, str)
-    if was_str:
-        try:
-            value = json.loads(value)
-        except (json.JSONDecodeError, TypeError):
-            return record
-    if not isinstance(value, dict):
-        return record
-
-    cleaned = value
-    changed = False
-    for context_key in ("workspace_container", "vm"):
-        context = cleaned.get(context_key)
-        if not isinstance(context, dict) or not any(
-            key in context
-            for key in (
-                "_canvas_workspace_generation",
-                WORKSPACE_RUNTIME_INCARNATION_KEY,
-                "_docker_workspace_lease_id",
-                "_docker_workspace_trust_mode",
-                "_docker_workspace_attested",
-                "_docker_workspace_host_key_fingerprint",
-                "quarantine_reason",
-            )
-        ):
-            continue
-        if not changed:
-            cleaned = dict(cleaned)
-            changed = True
-        context = dict(context)
-        context.pop("_canvas_workspace_generation", None)
-        context.pop(WORKSPACE_RUNTIME_INCARNATION_KEY, None)
-        context.pop("_docker_workspace_lease_id", None)
-        context.pop("_docker_workspace_trust_mode", None)
-        context.pop("_docker_workspace_attested", None)
-        context.pop("_docker_workspace_host_key_fingerprint", None)
-        context.pop("quarantine_reason", None)
-        cleaned[context_key] = context
-    if not changed:
-        return record
-    result = dict(record)
-    result[field] = json.dumps(cleaned) if was_str else cleaned
-    return result
+    """Shared thread/job redaction; policy lives in job_projection."""
+    return job_projection.redact_nested_workspace_state(
+        record, field=field, runtime_incarnation_key=WORKSPACE_RUNTIME_INCARNATION_KEY
+    )
 
 
 def _resolve_exported_folder_url(handle_str: str | None) -> Optional[str]:
-    """Browser URL for a job's Mode B export folder, or None.
-
-    The job row stores only the opaque handle, so without this the cockpit has
-    no way to re-open the folder after the export response is gone (a reload,
-    or a popup the browser blocked). Jobs carry no per-row backend column —
-    unlike threads, which is why this doesn't reuse
-    :func:`_resolve_cloud_session_url` — so the discriminator comes from the
-    serialized handle itself, falling back to the active backend for the bare
-    legacy form. Pure URL construction, no I/O.
-    """
-    if not handle_str:
-        return None
-    backend = main_cloud_router.for_backend(None)
-    if not backend.is_initialized:
-        return None
-    try:
-        handle = SessionFolderHandle.from_db(handle_str, backend=backend.backend_id)
-        if handle.backend != backend.backend_id:
-            backend = main_cloud_router.for_backend(handle.backend)
-            if not backend.is_initialized:
-                return None
-        return backend.get_session_folder_browser_url(handle)
-    except Exception:
-        return None
+    """Resolve export URLs through the application-owned cloud router."""
+    return job_projection.resolve_exported_folder_url(
+        handle_str,
+        resolve_backend=lambda backend_id: main_cloud_router.for_backend(backend_id),
+    )
 
 
 def _with_cloud_review_mode(job: dict[str, Any]) -> dict[str, Any]:
-    """Attach the computed ``cloud_review_mode`` and drop the raw join column.
-
-    Routing signal for the cockpit's job-review UI: a job whose project has a
-    main-cloud folder goes through the Mode A diff-review flow (``'diff'``);
-    everything else — loose jobs and projects without a cloud folder, including
-    the auto-assigned default project — gets the Mode B "Open cloud folder"
-    affordance (``'open_folder'``). Mirrors the seed-time gate in
-    ``services/job_cloud_baseline.py``. ``project_has_cloud_folder`` is computed
-    by the ``LEFT JOIN projects`` in the postgres read queries; we pop it so the
-    raw column never leaves over REST.
-
-    Also resolves ``exported_folder_handle`` into a ready-to-open
-    ``exported_folder_url`` for the same reason: handles are opaque to
-    everything outside the owning backend, so the cockpit can't derive it.
-    """
-    job = dict(job)
-    job["cloud_review_mode"] = (
-        "diff" if job.pop("project_has_cloud_folder", False) else "open_folder"
+    """Compatibility projection for existing job and admission callers."""
+    return job_projection.with_cloud_review_mode(
+        job, resolve_folder_url=_resolve_exported_folder_url
     )
-    job["exported_folder_url"] = _resolve_exported_folder_url(
-        job.get("exported_folder_handle")
-    )
-    return job
 
 
 def _job_admission_scope_dependencies(
@@ -19044,20 +18712,13 @@ def _redact_thread_metadata(thread: dict[str, Any]) -> dict[str, Any]:
     return thread
 
 
-@app.get("/api/jobs/{job_id}")
 async def get_job(request: Request, job_id: str) -> dict[str, Any]:
-    """Get a single job by ID."""
-    _, job = await require_job_access(request, postgres_db, job_id)
-    try:
-        if audit_reader.is_available:
-            job["audit_count"] = await audit_reader.get_audit_count(job_id)
-        else:
-            job["audit_count"] = None
-        return _with_cloud_review_mode(_redact_job_config_override(job))
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
+    """Compatibility entry point for existing direct callers of main."""
+    return await job_reads_routes.get_job(
+        request,
+        job_id=job_id,
+        dependencies=_job_reads_dependencies(),
+    )
 
 
 @app.post("/api/jobs", operation_id="create_job_api_jobs_post")
@@ -39036,27 +38697,14 @@ async def test_datasource(request: Request, datasource_id: str) -> dict[str, Any
 
 
 async def _visibility_kwargs_for_stats(user: dict[str, Any]) -> dict[str, Any]:
-    """Build the visibility kwargs G5 passes through to postgres stats methods.
-
-    Admin without an MCP project: scope → empty dict (full fleet view).
-    Admin with project scope → just ``scope_project_id`` (AND-narrowed).
-    Non-admin → owner_user_id + visible_project_ids (+ scope_project_id).
-    """
-    scope_pid = mcp_scope_project_id(user)
-    if user.get("is_admin"):
-        if scope_pid is None:
-            return {}
-        return {"scope_project_id": str(scope_pid)}
-    visible = await user_visible_project_ids(user, postgres_db)
-    project_ids = [str(p) for p in visible] if visible != "all" else []
-    return {
-        "owner_user_id": str(user["id"]),
-        "visible_project_ids": project_ids,
-        "scope_project_id": str(scope_pid) if scope_pid else None,
-    }
+    """Shared visibility policy for remaining non-job statistics routes."""
+    return await job_queries.visibility_kwargs_for_stats(
+        user,
+        visible_project_ids=lambda actor: user_visible_project_ids(actor, postgres_db),
+        scope_project_id=mcp_scope_project_id,
+    )
 
 
-@app.get("/api/stats/jobs")
 async def get_job_statistics(
     request: Request,
     origin: list[str] | None = Query(
@@ -39075,54 +38723,17 @@ async def get_job_statistics(
         description="Count against the same watermark the list is paging.",
     ),
 ) -> dict[str, Any]:
-    """Per-status job counts scoped to the caller's visibility (G5).
-
-    Admins see the full fleet (optionally narrowed by an MCP
-    ``project:<uuid>`` scope). Non-admins see only jobs they own or are
-    project members of.
-
-    Takes the same filters as ``GET /api/jobs`` **except ``status``**. That
-    is deliberate: these are disjunctive facet counts, so the status
-    selection must not narrow them, or selecting one status drops every
-    other chip to zero. Pass the rest of the list's filters — including
-    ``as_of`` — and the chips will agree with the list's ``total``.
-
-    Returns ``total_jobs`` (the "All" chip), one key per known status, and
-    ``by_status`` for anything outside that vocabulary.
-    """
-    user = await require_approved_user(request, postgres_db)
-    origins = list(dict.fromkeys(origin or []))
-    unknown_origins = [value for value in origins if value not in KNOWN_JOB_ORIGINS]
-    if unknown_origins:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"Unknown job origin(s): {', '.join(sorted(unknown_origins))}. "
-                f"Valid values: {', '.join(sorted(KNOWN_JOB_ORIGINS))}"
-            ),
-        )
-    vis = await _visibility_kwargs_for_stats(user)
-    filters = _parse_job_project_filters(
+    """Compatibility entry point for existing direct callers of main."""
+    return await job_reads_routes.get_job_statistics(
+        request,
+        origin=origin,
         project_id=project_id,
         has_project=has_project,
-        is_admin=bool(user.get("is_admin")),
-        visible_project_ids=vis.get("visible_project_ids"),
-        scope_project_id=vis.get("scope_project_id"),
+        include_archived_projects=include_archived_projects,
+        search=search,
+        as_of=as_of,
+        dependencies=_job_reads_dependencies(),
     )
-    try:
-        return await postgres_db.get_job_statistics(
-            **vis,
-            origins=origins or None,
-            project_ids=filters.project_ids or None,
-            has_project=filters.has_project,
-            include_archived_projects=include_archived_projects,
-            search=search or None,
-            as_of=as_of,
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.get("/api/stats/session-wakes")
@@ -69507,81 +69118,20 @@ async def create_project_job(
     return await create_job(request, job)
 
 
-@app.get("/api/projects/{project_id}/jobs")
 async def list_project_jobs(
     request: Request,
     project_id: str,
     status: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
 ) -> list[dict[str, Any]]:
-    """List jobs belonging to a project."""
-    await require_project_member(request, postgres_db, project_id)
-    # Direct service-level callers in the existing test/control seam omit the
-    # FastAPI-injected value and therefore receive the Query marker itself.
-    # HTTP requests are always a string or None.
-    status = status if isinstance(status, str) else None
-    if status is not None and status not in JOB_STATUS_FILTER_VALUES:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"Unknown job status/outcome: {status}. Valid values: "
-                f"{', '.join(JOB_STATUS_FILTER_VALUES)}"
-            ),
-        )
-    try:
-        async with postgres_db.acquire() as conn:
-            query = (
-                "SELECT js.*, jcr.delivery_status, jcr.delivery_ref, "
-                "jcr.delivery_sha, jcr.record_type AS change_record_type "
-                "FROM job_summary js "
-                "LEFT JOIN job_change_records jcr ON jcr.job_id = js.id "
-                "WHERE js.project_id = $1"
-            )
-            params: list = [project_id]
-            if status:
-                params.append(status)
-                if status == "blocked_undelivered":
-                    query += " AND js.completion_outcome_kind = $2"
-                elif status == "cancelled":
-                    query += (
-                        " AND js.status = $2 AND "
-                        "js.completion_outcome_kind IS DISTINCT FROM "
-                        "'blocked_undelivered'"
-                    )
-                else:
-                    query += " AND js.status = $2"
-            query += " ORDER BY js.created_at DESC LIMIT $" + str(len(params) + 1)
-            params.append(limit)
-            rows = await conn.fetch(query, *params)
-
-        jobs = [dict(r) for r in rows]
-
-        # cloud_review_mode: all rows share one project, so resolve its
-        # cloud-folder state once (the job_summary view has no projects JOIN).
-        project = await postgres_db.get_project(project_id)
-        has_cloud_folder = bool(project and project.get("main_cloud_folder_handle"))
-
-        # Enrich with audit counts (single batched query, not N+1)
-        if audit_reader.is_available:
-            counts = await audit_reader.get_audit_counts(
-                [str(job["id"]) for job in jobs]
-            )
-            for job in jobs:
-                job["audit_count"] = counts.get(str(job["id"]), 0)
-        else:
-            for job in jobs:
-                job["audit_count"] = None
-
-        result = []
-        for job in jobs:
-            job = _redact_job_config_override(job)
-            job["project_has_cloud_folder"] = has_cloud_folder
-            result.append(_with_cloud_review_mode(job))
-        return result
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
+    """Compatibility entry point for existing direct callers of main."""
+    return await job_reads_routes.list_project_jobs(
+        request,
+        project_id=project_id,
+        status=status,
+        limit=limit,
+        dependencies=_job_reads_dependencies(),
+    )
 
 
 @app.get("/api/projects/{project_id}/job-records")

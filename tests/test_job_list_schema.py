@@ -47,11 +47,11 @@ def document():
 def test_composed_list_operation_documents_models_without_filtering_runtime_response(
     document,
 ):
-    from orchestrator.main import app
+    from orchestrator.routers.job_reads import router
 
     route = next(
         r
-        for r in app.routes
+        for r in router.routes
         if getattr(r, "path", None) == "/api/jobs"
         and "GET" in getattr(r, "methods", ())
     )

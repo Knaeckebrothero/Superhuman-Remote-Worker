@@ -39,6 +39,10 @@ def boundary_tree(tmp_path):
         "orchestrator/routers/contacts.py": "from shared.value import VALUE\n",
         "orchestrator/routers/tables.py": "from shared.value import VALUE\n",
         "orchestrator/routers/preferences.py": "from shared.value import VALUE\n",
+        "orchestrator/routers/job_reads.py": "from shared.value import VALUE\n",
+        "orchestrator/services/job_queries.py": "from shared.value import VALUE\n",
+        "orchestrator/services/job_projection.py": "from shared.value import VALUE\n",
+        "orchestrator/services/job_reads.py": "from shared.value import VALUE\n",
         "orchestrator/schemas/job_create.py": "from orchestrator.services.job_create_ingress import VALUE\n",
         "orchestrator/services/job_create_ingress.py": "from shared.value import VALUE\n",
         "orchestrator/services/job_admission_scope.py": "from shared.value import VALUE\n",
@@ -80,7 +84,7 @@ def lint_boundaries(root):
 def test_allowed_runtime_and_lightweight_dependencies_pass(boundary_tree):
     result = lint_boundaries(boundary_tree)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "Contracts: 10 kept, 0 broken" in result.stdout
+    assert "Contracts: 12 kept, 0 broken" in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -103,6 +107,10 @@ def test_allowed_runtime_and_lightweight_dependencies_pass(boundary_tree):
         ("orchestrator/routers/contacts.py", "orchestrator.main"),
         ("orchestrator/routers/tables.py", "orchestrator.main"),
         ("orchestrator/routers/preferences.py", "orchestrator.main"),
+        ("orchestrator/routers/job_reads.py", "orchestrator.main"),
+        ("orchestrator/services/job_queries.py", "orchestrator.main"),
+        ("orchestrator/services/job_projection.py", "orchestrator.main"),
+        ("orchestrator/services/job_reads.py", "orchestrator.main"),
         ("orchestrator/services/preference_defaults.py", "orchestrator.main"),
         ("orchestrator/services/session_workspace_policy.py", "orchestrator.main"),
         ("orchestrator/schemas/job_create.py", "orchestrator.main"),
@@ -161,3 +169,23 @@ def test_job_create_boundary_rejects_indirect_startup_dependencies(
         "Job creation schemas and ingress policy do not import application startup BROKEN"
         in result.stdout
     )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "orchestrator/services/job_queries.py",
+        "orchestrator/services/job_projection.py",
+        "orchestrator/services/job_reads.py",
+    ],
+)
+def test_job_read_services_reject_indirect_startup_dependencies(boundary_tree, source):
+    (boundary_tree / "src/orchestrator/services/bridge.py").write_text(
+        "from orchestrator.main import VALUE\n"
+    )
+    (boundary_tree / "src" / source).write_text(
+        "from orchestrator.services.bridge import VALUE\n"
+    )
+    result = lint_boundaries(boundary_tree)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "Job read services do not import application startup BROKEN" in result.stdout

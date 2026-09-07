@@ -107,6 +107,24 @@ source_modules = ["orchestrator.schemas.job_create", "orchestrator.services.job_
 forbidden_modules = ["orchestrator.main"]
 
 [[tool.importlinter.contracts]]
+name = "Job read router does not import application startup"
+type = "forbidden"
+source_modules = ["orchestrator.routers.job_reads"]
+forbidden_modules = ["orchestrator.main"]
+# Existing authorization helpers retain indirect composition lookups.
+allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
+name = "Job read services do not import application startup"
+type = "forbidden"
+source_modules = [
+    "orchestrator.services.job_queries",
+    "orchestrator.services.job_projection",
+    "orchestrator.services.job_reads",
+]
+forbidden_modules = ["orchestrator.main"]
+
+[[tool.importlinter.contracts]]
 name = "Shared initializer stays lightweight"
 type = "forbidden"
 # Check the root initializer separately without including its child packages.

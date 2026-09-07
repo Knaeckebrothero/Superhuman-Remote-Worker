@@ -18,6 +18,7 @@ import pytest
 from fastapi import FastAPI, HTTPException
 
 from orchestrator import main
+from orchestrator.routers.job_reads import router as job_reads_router
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -92,15 +93,10 @@ def wire(monkeypatch):
     monkeypatch.setattr(main, "require_approved_user", approved)
     monkeypatch.setattr(main, "user_visible_project_ids", visible)
     monkeypatch.setattr(main, "audit_reader", audit)
-    # Mount the registered route itself, retaining decorator response metadata.
-    route = next(
-        r
-        for r in main.app.routes
-        if getattr(r, "path", None) == "/api/jobs"
-        and "GET" in getattr(r, "methods", ())
-    )
-    app = FastAPI()
-    app.router.routes.append(route)
+    # Mount the production read router, retaining decorator response metadata.
+    app = FastAPI(default_response_class=main.CustomJSONResponse)
+    app.state.job_reads_dependencies_factory = main._job_reads_dependencies
+    app.include_router(job_reads_router)
     return SimpleNamespace(
         app=app, user=user, db=db, visible=visible, audit=audit, result=result
     )
