@@ -1,9 +1,11 @@
 """Unit tests for stale-agent background sweeps."""
 
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 
 import pytest
+from fastapi import HTTPException
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import orchestrator.main as main
@@ -815,3 +817,205 @@ async def test_lease_recovery_survives_orphan_recovery_failure():
         completion_commands_enabled=main.COMPLETION_COMMANDS_ENABLED
     )
     db.gc_offline_agents.assert_awaited_once()
+
+
+def _lite_retirement(*, backend="none", permanent=False):
+    """A retired pinned lite-tier actor: agent Pod, no workspace, no binding."""
+
+    thread_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2"
+    generation = "11111111-1111-4111-8111-111111111112"
+    token = "22222222-2222-4222-8222-222222222223"
+    agent_id = "33333333-3333-4333-8333-333333333334"
+    attach_token = "44444444-4444-4444-8444-444444444445"
+    context = {
+        "thread_id": thread_id,
+        "generation": generation,
+        "settle_status": "ended",
+        "runtime_authority_exposed": True,
+        "agent_id": agent_id,
+        "runtime_attach_token": attach_token,
+        "agent_pod": {
+            "pod_name": "persistent-lite",
+            "pod_uid": "lite-pod-uid",
+            "namespace": "agents-a",
+            "protection_protocol": "finalizer_v1",
+        },
+        "workspace_backend": backend,
+        "workspace_container": None,
+        "workspace_binding": None,
+    }
+    retirement = {
+        "generation": generation,
+        "token": token,
+        "permanent": permanent,
+        "context": context,
+    }
+    current = {
+        "id": thread_id,
+        "runtime_generation": generation,
+        "runtime_retirement_token": token,
+        "runtime_retirement_local_quiescence": None,
+        "metadata": {},
+    }
+    return retirement, current
+
+
+def _lite_recovery_mocks(current):
+    db = AsyncMock()
+    db.get_thread = AsyncMock(return_value=current)
+    db.acknowledge_pinned_thread_local_quiescence = AsyncMock(
+        return_value={"version": 1}
+    )
+
+    @asynccontextmanager
+    async def lifecycle_lock(_thread_id):
+        yield True
+
+    db.try_thread_advisory_lock = MagicMock(side_effect=lifecycle_lock)
+    provisioner = MagicMock(is_available=True)
+    provisioner.delete_agent_pod_exact = AsyncMock(return_value=True)
+    provisioner.release_agent_pod_finalizer_exact = AsyncMock(return_value=True)
+    provisioner.agent_pod_authority = AsyncMock(
+        side_effect=["exact_terminal", "exact_absent"]
+    )
+    return db, provisioner
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("permanent", [False, True])
+async def test_lite_backend_retirement_recovers_through_agent_runtime_zero(
+    monkeypatch, permanent
+):
+    """A `none`-backend pinned actor is process-zero once its exact Pod is gone.
+
+    Officers and conferences run on the lite tier: an agent Pod and no
+    workspace at all. The design names their proof `agent_runtime_zero_v1`
+    and the receipt trigger already accepts it for backend `none`; only the
+    Python recovery gate refused everything but `sandbox`/`virtual`, so every
+    lite retirement whose agent stopped answering stayed pending forever.
+    """
+    retirement, current = _lite_retirement(permanent=permanent)
+    db, provisioner = _lite_recovery_mocks(current)
+    original_wait = main._wait_for_captured_agent_pod_retired
+
+    async def immediate_observation(*args, **kwargs):
+        return await original_wait(*args, **kwargs, timeout_s=0)
+
+    monkeypatch.setattr(
+        main, "_wait_for_captured_agent_pod_retired", immediate_observation
+    )
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "agent_provisioner", provisioner),
+    ):
+        assert await main._recover_captured_sandbox_process_zero(retirement)
+
+    provisioner.delete_agent_pod_exact.assert_awaited_once_with(
+        "persistent-lite", expected_pod_uid="lite-pod-uid", namespace="agents-a"
+    )
+    db.acknowledge_pinned_thread_local_quiescence.assert_awaited_once_with(
+        retirement["context"]["thread_id"],
+        expected_runtime_generation=retirement["generation"],
+        expected_retirement_token=retirement["token"],
+        expected_agent_id=retirement["context"]["agent_id"],
+        expected_attach_token=retirement["context"]["runtime_attach_token"],
+        expected_settle_status="ended",
+        expected_quiescence_protocol="agent_runtime_zero_v1",
+        expected_workspace_generation=None,
+        expected_workspace_runtime_incarnation=None,
+        quiescence_actor="orchestrator",
+        expected_agent_pod_uid="lite-pod-uid",
+        require_zero_admission=True,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["vm", "remote"])
+async def test_unactuated_backend_recovery_refusal_is_logged(
+    monkeypatch, caplog, backend
+):
+    """A backend with no crash-recovery actuator must say so, not go quiet."""
+    retirement, current = _lite_retirement(backend=backend)
+    db, provisioner = _lite_recovery_mocks(current)
+    caplog.set_level(logging.WARNING)
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "agent_provisioner", provisioner),
+    ):
+        assert not await main._recover_captured_sandbox_process_zero(retirement)
+
+    provisioner.delete_agent_pod_exact.assert_not_awaited()
+    db.acknowledge_pinned_thread_local_quiescence.assert_not_awaited()
+    refusals = [
+        r for r in caplog.records if "no process-zero actuator" in r.getMessage()
+    ]
+    assert len(refusals) == 1
+    assert backend in refusals[0].getMessage()
+    assert retirement["context"]["thread_id"] in refusals[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_pending_retirement_retry_refusal_is_logged(monkeypatch, caplog):
+    """A 409/503 refusal is a retry outcome, not silence.
+
+    Before this, a retirement that could never finish retried every sweep
+    with zero log output: the refusal was swallowed into `False`, and the
+    caller only logged successes. Fourteen hours of that on dev looked
+    exactly like nothing being wrong.
+    """
+    thread_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3"
+    generation = "11111111-1111-4111-8111-111111111113"
+    token = "22222222-2222-4222-8222-222222222224"
+    candidate = {
+        "id": thread_id,
+        "runtime_generation": generation,
+        "runtime_retirement_token": token,
+        "runtime_retirement_permanent": False,
+        "runtime_retirement_context": {
+            "thread_id": thread_id,
+            "generation": generation,
+            "settle_status": "ended",
+            "runtime_authority_exposed": False,
+        },
+    }
+    db = AsyncMock()
+    db.get_thread = AsyncMock(return_value={"id": thread_id})
+    refused = HTTPException(
+        status_code=409, detail={"code": "pinned_runtime_identity_mismatch"}
+    )
+    caplog.set_level(logging.WARNING)
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "_end_thread_flow", AsyncMock(side_effect=refused)),
+    ):
+        assert await main._retry_pending_pinned_retirement(candidate) is False
+
+    refusals = [r for r in caplog.records if thread_id in r.getMessage()]
+    assert len(refusals) == 1
+    assert "409" in refusals[0].getMessage()
+    assert "pinned_runtime_identity_mismatch" in refusals[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_sweep_reports_unresolved_pinned_retirements(caplog):
+    """An all-failing retry pass must leave a trace in the log."""
+    shutdown_event = asyncio.Event()
+    db = _mock_db(shutdown_event)
+    db.list_retryable_pinned_retirements = AsyncMock(
+        return_value=[{"id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa4"}]
+    )
+    caplog.set_level(logging.WARNING)
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "_trigger_dispatch", MagicMock()),
+        patch.object(main, "_release_thread_resources", AsyncMock()),
+        patch.object(main, "_suspend_thread_resources", AsyncMock()),
+        patch.object(
+            main, "_retry_pending_pinned_retirement", AsyncMock(return_value=False)
+        ),
+    ):
+        await main.stale_agent_detector(shutdown_event)
+
+    unresolved = [r for r in caplog.records if "remain unresolved" in r.getMessage()]
+    assert len(unresolved) == 1
+    assert unresolved[0].getMessage().startswith("1 ")

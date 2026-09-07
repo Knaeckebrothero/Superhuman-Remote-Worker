@@ -90,6 +90,7 @@ DECLARE
     context jsonb;
     marker jsonb;
     binding jsonb;
+    backend text;
     receipt jsonb;
     input_count bigint;
     input_digest text;
@@ -113,20 +114,37 @@ BEGIN
     context := owner_row.runtime_retirement_context;
     marker := context->'agent_pod';
     binding := context->'workspace_binding';
+    backend := context->>'workspace_backend';
+    IF backend IS DISTINCT FROM 'virtual' AND backend IS DISTINCT FROM 'none' THEN
+        RETURN NULL;
+    END IF;
+    -- A virtual actor owns exactly its rclone backing; a lite actor owns no
+    -- backing at all. Either way the captured binding must match what the
+    -- live row still advertises.
+    IF backend = 'virtual' AND (
+           jsonb_typeof(binding) IS DISTINCT FROM 'object'
+        OR binding->>'kind' IS DISTINCT FROM 'virtual'
+        OR COALESCE(binding->>'backing_id', '') !~ '^rclone:[0-9a-f]{64}$'
+        OR COALESCE(binding->>'generation', '') !~
+           '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+        OR binding->'ssh_host_key_fingerprint' IS DISTINCT FROM 'null'::jsonb
+        OR binding - ARRAY['generation','kind','backing_id','ssh_host_key_fingerprint']
+           IS DISTINCT FROM '{}'::jsonb
+        OR owner_row.metadata->'_workspace_binding' IS DISTINCT FROM binding
+    ) THEN
+        RETURN NULL;
+    END IF;
+    IF backend = 'none' AND (
+           COALESCE(binding, 'null'::jsonb) NOT IN ('null'::jsonb, '{}'::jsonb)
+        OR COALESCE(owner_row.metadata->'_workspace_binding', 'null'::jsonb)
+           NOT IN ('null'::jsonb, '{}'::jsonb)
+    ) THEN
+        RETURN NULL;
+    END IF;
     IF context->>'generation' IS DISTINCT FROM generation_id::text
        OR context->>'agent_id' IS DISTINCT FROM actor_id::text
        OR context->>'runtime_attach_token' IS DISTINCT FROM attach_id::text
-       OR context->>'workspace_backend' IS DISTINCT FROM 'virtual'
        OR context->>'settle_status' IS DISTINCT FROM 'ended'
-       OR jsonb_typeof(binding) IS DISTINCT FROM 'object'
-       OR binding->>'kind' IS DISTINCT FROM 'virtual'
-       OR COALESCE(binding->>'backing_id', '') !~ '^rclone:[0-9a-f]{64}$'
-       OR COALESCE(binding->>'generation', '') !~
-          '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
-       OR binding->'ssh_host_key_fingerprint' IS DISTINCT FROM 'null'::jsonb
-       OR binding - ARRAY['generation','kind','backing_id','ssh_host_key_fingerprint']
-          IS DISTINCT FROM '{}'::jsonb
-       OR owner_row.metadata->'_workspace_binding' IS DISTINCT FROM binding
        OR owner_row.metadata->'agent_pod' IS DISTINCT FROM marker
        OR COALESCE(owner_row.metadata->'protected_cloud', 'false'::jsonb)
           IS DISTINCT FROM 'false'::jsonb
@@ -227,7 +245,9 @@ BEGIN
         'quiescence_actor', 'orchestrator',
         'workspace_generation', NULL,
         'workspace_runtime_incarnation', NULL,
-        'recovery_protocol', 'settled_virtual_actor_exit_v1',
+        'recovery_protocol', CASE WHEN backend = 'virtual'
+                                  THEN 'settled_virtual_actor_exit_v1'
+                                  ELSE 'settled_lite_actor_exit_v1' END,
         'agent_pod_uid', stopped_pod_uid,
         'settled_input_count', input_count,
         'settled_input_ids_digest', input_digest

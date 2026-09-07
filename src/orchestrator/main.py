@@ -1961,7 +1961,15 @@ async def _retry_pending_pinned_retirement(candidate: Mapping[str, Any]) -> bool
     except HTTPException as exc:
         # Exact authority loss is a successful refusal; a retryable cleanup
         # failure remains represented by the durable marker for a later pass.
+        # Either way it is worth a line — an all-refusing sweep used to be
+        # indistinguishable from an idle one.
         if exc.status_code in {409, 503}:
+            logger.warning(
+                "Durable pinned retirement retry refused for thread %s (HTTP %s): %s",
+                thread_id,
+                exc.status_code,
+                exc.detail,
+            )
             return False
         raise
     return str(result.get("status") or "") in {
@@ -2234,6 +2242,13 @@ async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
                 if retired:
                     logger.info(
                         "Completed %d durable pinned retirement retry(s)", retired
+                    )
+                unresolved = len(pending_retirements) - retired
+                if unresolved:
+                    logger.warning(
+                        "%d durable pinned retirement(s) remain unresolved after "
+                        "this pass; each refusal is logged above",
+                        unresolved,
                     )
 
             # Static Docker containers survive owner termination.  Their
@@ -12751,6 +12766,29 @@ def _captured_virtual_binding_agent_zero_only(
     )
 
 
+def _captured_lite_backend_agent_zero_only(
+    context: Mapping[str, Any],
+    workspace: Mapping[str, Any],
+    binding: Mapping[str, Any],
+) -> bool:
+    """Return whether the captured lite tier owns nothing but its agent Pod.
+
+    Officers and their conferences run here: ``workspace.backend`` is
+    ``none``, so there is no workspace container, binding, VM, or provision
+    intent — the agent runtime is the only process, and its exact Pod stop is
+    the whole zero proof (``agent_runtime_zero_v1``, which the receipt trigger
+    has accepted for this backend all along).
+    """
+
+    return bool(
+        str(context.get("workspace_backend") or "") == "none"
+        and not workspace
+        and not binding
+        and context.get("vm") in (None, {})
+        and context.get("workspace_provision_intent") in (None, {})
+    )
+
+
 async def _recover_captured_sandbox_process_zero(
     retirement: Mapping[str, Any],
 ) -> bool:
@@ -12797,7 +12835,22 @@ async def _recover_captured_sandbox_process_zero(
     virtual_binding_agent_zero_only = _captured_virtual_binding_agent_zero_only(
         context, captured_workspace, captured_binding
     )
-    if workspace_backend != "sandbox" and not virtual_binding_agent_zero_only:
+    lite_agent_zero_only = _captured_lite_backend_agent_zero_only(
+        context, captured_workspace, captured_binding
+    )
+    if (
+        workspace_backend != "sandbox"
+        and not virtual_binding_agent_zero_only
+        and not lite_agent_zero_only
+    ):
+        # Every other backend still owes its own actuator. Say so: this
+        # refusal retried every sweep for days on dev without a trace.
+        logger.warning(
+            "Pinned retirement recovery has no process-zero actuator for "
+            "backend %r on thread %s; the durable marker stays pending",
+            workspace_backend,
+            thread_id,
+        )
         return False
     captured_pods = _captured_retirement_agent_pods(retirement)
     if not captured_pods or any(
@@ -12887,7 +12940,11 @@ async def _recover_captured_sandbox_process_zero(
                 expected_agent_pod_uid=next(iter(captured_pods))[1],
                 require_zero_admission=True,
             )
-            if receipt is None and virtual_binding_agent_zero_only:
+            if receipt is None and (
+                virtual_binding_agent_zero_only or lite_agent_zero_only
+            ):
+                # A used life (inputs were admitted) cannot be zero-admission.
+                # Its settled-work receipt is the DB's separate contract.
                 receipt = await postgres_db.acknowledge_settled_virtual_actor_exit(
                     thread_id,
                     runtime_generation=generation,
@@ -45777,6 +45834,11 @@ async def _find_open_conference_thread(project_id: str) -> Optional[dict]:
 
     One open conference per project is the single-writer rule (§2): the
     create path reattaches to this instead of minting a rival embodiment.
+
+    An authorized retirement is irrevocable — the thread admits no further
+    input — so it no longer counts, whatever its status column still says.
+    Otherwise a retirement that cannot settle (a stuck runtime) would lock
+    the project out of conferences for as long as it stays stuck.
     """
     async with postgres_db.acquire() as conn:
         row = await conn.fetchrow(
@@ -45784,6 +45846,7 @@ async def _find_open_conference_thread(project_id: str) -> Optional[dict]:
             SELECT id, status, title, created_at FROM threads
              WHERE project_id = $1
                AND status <> 'ended'
+               AND runtime_retirement_authorized_at IS NULL
                AND COALESCE(metadata->'config_override'
                             ->'officer'->>'conference','false') = 'true'
              ORDER BY created_at DESC
