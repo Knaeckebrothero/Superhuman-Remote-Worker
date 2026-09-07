@@ -6,6 +6,7 @@ No application startup, dispatch, provider or database connection is started.
 """
 
 import copy
+import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -35,6 +36,7 @@ PROJECT_PATH = f"/api/projects/{PROJECT}/jobs"
 @pytest.fixture
 def wire(monkeypatch):
     user = {"id": USER, "is_admin": False, "is_approved": True}
+    enforce_grants = main._enforce_job_create_grants
 
     async def approved(request, _db):
         if not request.headers.get("x-test-user"):
@@ -119,6 +121,7 @@ def wire(monkeypatch):
         expert=expert,
         provision=provision,
         dispatch=dispatch,
+        enforce_grants=enforce_grants,
     )
 
 
@@ -133,6 +136,382 @@ async def submit(wire, payload, path=PATH, **headers):
 
 def body(**fields):
     return {"description": "controlled HTTP fixture", "project_id": PROJECT, **fields}
+
+
+@pytest.fixture
+def workspace_wire(wire, monkeypatch):
+    """Exercise real workspace/lane and VM policy with controlled capabilities."""
+    monkeypatch.setattr(main, "STATELESS_WORKER_DEFAULT_ENABLED", True)
+    monkeypatch.setattr(main, "STATELESS_WORKER_ENABLED", True)
+    monkeypatch.setattr(
+        main,
+        "container_provisioner",
+        SimpleNamespace(is_available=True, in_cluster=True),
+    )
+    monkeypatch.setattr(main, "vm_workspaces_on_pod_network", lambda: False)
+    wire.db.get_system_setting = AsyncMock(return_value=None)
+    wire.db.user_can_use_vm = AsyncMock(return_value=True)
+    return wire
+
+
+def assert_no_workspace_admission_effects(wire):
+    wire.authorize.assert_not_awaited()
+    wire.defaults.assert_not_awaited()
+    wire.db.create_job.assert_not_awaited()
+    wire.provision.assert_not_awaited()
+    wire.dispatch.assert_not_called()
+
+
+def test_workspace_dependency_factory_binds_without_reads_and_defers_flags(monkeypatch):
+    class UnreadProvisioner:
+        @property
+        def is_available(self):
+            pytest.fail("dependency construction must not read availability")
+
+        @property
+        def in_cluster(self):
+            pytest.fail("dependency construction must not read cluster capabilities")
+
+    first_store = SimpleNamespace(get_user=AsyncMock())
+    second_store = SimpleNamespace(get_user=AsyncMock())
+    first_provisioner, second_provisioner = UnreadProvisioner(), UnreadProvisioner()
+    callbacks = {
+        "needs_vm": ("_job_needs_vm", Mock()),
+        "needs_sandbox": ("_job_needs_sandbox", Mock()),
+        "check_vm_permission": ("_check_vm_permission", AsyncMock()),
+        "resolve_execution_lane": ("_resolve_requested_job_execution_lane", Mock()),
+        "vm_workspaces_on_pod_network": ("vm_workspaces_on_pod_network", Mock()),
+        "enforce_grants": ("_enforce_job_create_grants", AsyncMock()),
+    }
+    for attribute, callback in callbacks.values():
+        monkeypatch.setattr(main, attribute, callback)
+    monkeypatch.setattr(main, "postgres_db", first_store)
+    monkeypatch.setattr(main, "container_provisioner", first_provisioner)
+    monkeypatch.setattr(main, "STATELESS_WORKER_DEFAULT_ENABLED", False)
+    monkeypatch.setattr(main, "STATELESS_WORKER_ENABLED", False)
+    first = main._job_admission_workspace_dependencies()
+    monkeypatch.setattr(main, "postgres_db", second_store)
+    monkeypatch.setattr(main, "container_provisioner", second_provisioner)
+    second = main._job_admission_workspace_dependencies()
+    assert first.store is first_store and second.store is second_store
+    assert first.provisioner is first_provisioner
+    assert second.provisioner is second_provisioner
+    first_store.get_user.assert_not_awaited()
+    second_store.get_user.assert_not_awaited()
+    for field, (_, callback) in callbacks.items():
+        assert getattr(first, field) is callback
+        callback.assert_not_called()
+    assert first.stateless_default_enabled() is False
+    assert first.stateless_enabled() is False
+    monkeypatch.setattr(main, "STATELESS_WORKER_DEFAULT_ENABLED", True)
+    monkeypatch.setattr(main, "STATELESS_WORKER_ENABLED", True)
+    assert first.stateless_default_enabled() is True
+    assert first.stateless_enabled() is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure,detail",
+    [
+        ("creator_missing", "User is not permitted to use VM workspaces"),
+        ("creator_read", "User is not permitted to use VM workspaces"),
+        ("grant", "User is not permitted to use VM workspaces"),
+        (
+            "global",
+            "VM workspaces are globally disabled by the administrator",
+        ),
+    ],
+)
+async def test_vm_refusal_precedes_lane_grants_and_later_effects(
+    workspace_wire, monkeypatch, failure, detail
+):
+    wire = workspace_wire
+    if failure == "creator_missing":
+        wire.db.get_user.return_value = None
+    elif failure == "creator_read":
+        wire.db.get_user.side_effect = RuntimeError("unavailable")
+    elif failure == "grant":
+        wire.db.user_can_use_vm.return_value = False
+    else:
+        wire.db.get_system_setting.return_value = {"value": {"enabled": False}}
+    sandbox = Mock(wraps=main._job_needs_sandbox)
+    lane = Mock(wraps=main._resolve_requested_job_execution_lane)
+    monkeypatch.setattr(main, "_job_needs_sandbox", sandbox)
+    monkeypatch.setattr(main, "_resolve_requested_job_execution_lane", lane)
+    response = await submit(
+        wire,
+        body(
+            config_override={"workspace": {"backend": "vm"}},
+            execution_lane="stateless",
+        ),
+    )
+    assert response.status_code == 403, response.text
+    assert response.json() == {"detail": detail}
+    wire.db.get_user.assert_awaited_once_with(USER)
+    sandbox.assert_not_called()
+    lane.assert_not_called()
+    main._enforce_job_create_grants.assert_not_awaited()
+    assert_no_workspace_admission_effects(wire)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "child,requested,default_enabled,expected,logged_default",
+    [
+        (False, None, True, "stateless", True),
+        (True, None, True, None, False),
+        (False, None, False, None, False),
+        (False, "pinned", True, "pinned", False),
+    ],
+)
+async def test_create_lane_default_keeps_omission_and_parent_authority(
+    workspace_wire,
+    monkeypatch,
+    caplog,
+    child,
+    requested,
+    default_enabled,
+    expected,
+    logged_default,
+):
+    wire = workspace_wire
+    monkeypatch.setattr(main, "STATELESS_WORKER_DEFAULT_ENABLED", default_enabled)
+    caplog.set_level(logging.DEBUG)
+    fields = {"config_override": {"workspace": {"backend": "sandbox"}}}
+    if requested is not None:
+        fields["execution_lane"] = requested
+    if child:
+        fields.update(parent_job_id=PARENT, datasource_ids=[])
+    response = await submit(
+        wire, body(**fields), **({"x-test-internal": "1"} if child else {})
+    )
+    assert response.status_code == 200, response.text
+    assert wire.db.create_job.await_args.kwargs["execution_lane"] == expected
+    assert (
+        "Job create: worker execution lane defaulted to stateless for a capable root job"
+        in caplog.messages
+    ) is logged_default
+    assert not any("default fell back" in message for message in caplog.messages)
+    wire.db.user_can_use_vm.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure,backend,expected,reason",
+    [
+        (
+            "disabled",
+            "sandbox",
+            None,
+            "stateless worker admission is disabled",
+        ),
+        (
+            "unavailable",
+            "sandbox",
+            None,
+            "the Kubernetes workspace provisioner is unavailable",
+        ),
+        (
+            "outside_cluster",
+            "sandbox",
+            None,
+            "the workspace provisioner is not in-cluster",
+        ),
+        (
+            "no_sandbox",
+            "none",
+            None,
+            "the job does not require a Kubernetes sandbox",
+        ),
+        (
+            "external_vm",
+            "vm",
+            "pinned",
+            "external VM jobs require pinned workers",
+        ),
+    ],
+)
+async def test_omitted_root_lane_keeps_fallback_diagnostic_and_insert_value(
+    workspace_wire, monkeypatch, caplog, failure, backend, expected, reason
+):
+    wire = workspace_wire
+    if failure == "disabled":
+        monkeypatch.setattr(main, "STATELESS_WORKER_ENABLED", False)
+    elif failure == "unavailable":
+        main.container_provisioner.is_available = False
+    elif failure == "outside_cluster":
+        main.container_provisioner.in_cluster = False
+    caplog.set_level(logging.DEBUG)
+    response = await submit(
+        wire, body(config_override={"workspace": {"backend": backend}})
+    )
+    assert response.status_code == 200, response.text
+    assert wire.db.create_job.await_args.kwargs["execution_lane"] == expected
+    assert (
+        caplog.messages.count(
+            f"Job create: stateless worker lane default fell back to pinned ({reason})"
+        )
+        == 1
+    )
+    main._enforce_job_create_grants.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_fallback_diagnostic_rereads_provisioner_after_lane_resolution(
+    workspace_wire, monkeypatch, caplog
+):
+    wire = workspace_wire
+
+    class RecoveringProvisioner:
+        is_available = True
+
+        def __init__(self):
+            self.cluster_reads = 0
+
+        @property
+        def in_cluster(self):
+            self.cluster_reads += 1
+            return self.cluster_reads > 1
+
+    provisioner = RecoveringProvisioner()
+    monkeypatch.setattr(main, "container_provisioner", provisioner)
+    caplog.set_level(logging.DEBUG)
+    response = await submit(
+        wire, body(config_override={"workspace": {"backend": "sandbox"}})
+    )
+    assert response.status_code == 200, response.text
+    assert wire.db.create_job.await_args.kwargs["execution_lane"] is None
+    assert provisioner.cluster_reads == 2
+    assert (
+        "Job create: stateless worker lane default fell back to pinned "
+        "(the worker capability check declined stateless)"
+    ) in caplog.messages
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "enabled,available,backend,status,detail",
+    [
+        (False, True, "sandbox", 409, "Stateless worker admission is disabled"),
+        (
+            True,
+            False,
+            "sandbox",
+            503,
+            "Stateless workers require an in-cluster Kubernetes workspace provisioner",
+        ),
+        (
+            True,
+            True,
+            "none",
+            422,
+            "Stateless workers currently require a Kubernetes sandbox or same-cluster VM workspace",
+        ),
+    ],
+)
+async def test_explicit_stateless_refusals_keep_exact_http_and_no_later_effects(
+    workspace_wire, monkeypatch, enabled, available, backend, status, detail
+):
+    wire = workspace_wire
+    monkeypatch.setattr(main, "STATELESS_WORKER_ENABLED", enabled)
+    main.container_provisioner.is_available = available
+    response = await submit(
+        wire,
+        body(
+            execution_lane="stateless",
+            config_override={"workspace": {"backend": backend}},
+        ),
+    )
+    assert response.status_code == status, response.text
+    assert response.json() == {"detail": detail}
+    main._enforce_job_create_grants.assert_not_awaited()
+    assert_no_workspace_admission_effects(wire)
+
+
+@pytest.mark.asyncio
+async def test_external_vm_lane_override_keeps_permission_and_merged_grant_order(
+    workspace_wire, monkeypatch, caplog
+):
+    wire = workspace_wire
+    wire.db.get_project.return_value["default_config_override"] = {
+        "workspace": {"backend": "vm"},
+        "autonomy": "review",
+    }
+    caplog.set_level(logging.DEBUG)
+    order = Mock()
+    permission = AsyncMock(wraps=main._check_vm_permission)
+    sandbox = Mock(wraps=main._job_needs_sandbox)
+    lane = Mock(wraps=main._resolve_requested_job_execution_lane)
+    monkeypatch.setattr(main, "_check_vm_permission", permission)
+    monkeypatch.setattr(main, "_job_needs_sandbox", sandbox)
+    monkeypatch.setattr(main, "_resolve_requested_job_execution_lane", lane)
+    for name, collaborator in (
+        ("creator", wire.db.get_user),
+        ("permission", permission),
+        ("sandbox", sandbox),
+        ("lane", lane),
+        ("grants", main._enforce_job_create_grants),
+        ("datasources", wire.authorize),
+        ("insert", wire.db.create_job),
+        ("provision", wire.provision),
+    ):
+        order.attach_mock(collaborator, name)
+    response = await submit(
+        wire,
+        body(
+            execution_lane="stateless",
+            config_override={"autonomy": "partial"},
+            datasource_ids=[],
+        ),
+    )
+    assert response.status_code == 200, response.text
+    assert [call[0] for call in order.mock_calls] == [
+        "creator",
+        "permission",
+        "sandbox",
+        "lane",
+        "grants",
+        "datasources",
+        "insert",
+        "provision",
+    ]
+    permission.assert_awaited_once_with(
+        wire.db.get_user.return_value, job_needs_vm=True
+    )
+    main._enforce_job_create_grants.assert_awaited_once_with(
+        {"workspace": {"backend": "vm"}, "autonomy": "partial"},
+        user_id=USER,
+        project_ids=[PROJECT],
+    )
+    assert wire.db.create_job.await_args.kwargs["execution_lane"] == "pinned"
+    assert (
+        "Job create: external VM request keeps job on pinned lane "
+        "(stateless worker opt-in ignored)"
+    ) in caplog.messages
+
+
+@pytest.mark.asyncio
+async def test_real_merged_capability_denial_is_refused_before_datasources_or_insert(
+    workspace_wire, monkeypatch
+):
+    wire = workspace_wire
+    monkeypatch.setattr(main, "_enforce_job_create_grants", wire.enforce_grants)
+    wire.db.get_project.return_value["default_config_override"] = {"autonomy": "full"}
+    wire.db.list_grants_for_scopes = AsyncMock(
+        return_value={"user": [], "project": [], "global": []}
+    )
+    response = await submit(
+        wire,
+        body(
+            config_override={"workspace": {"backend": "none"}},
+            datasource_ids=[CONNECTOR],
+        ),
+    )
+    assert response.status_code == 422, response.text
+    assert response.json() == {
+        "detail": "config exceeds your capability grants: autonomy_ceiling: autonomy 'full' exceeds the ceiling"
+    }
+    assert_no_workspace_admission_effects(wire)
 
 
 @pytest.fixture

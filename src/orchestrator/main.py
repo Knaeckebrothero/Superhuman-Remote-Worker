@@ -10547,6 +10547,10 @@ from orchestrator.services.job_admission_config import (  # noqa: E402
     JobAdmissionConfigDependencies,
     prepare_job_admission_config,
 )
+from orchestrator.services.job_admission_workspace import (  # noqa: E402
+    JobAdmissionWorkspaceDependencies,
+    prepare_job_admission_workspace,
+)
 from orchestrator.services.job_admission_officer import (  # noqa: E402
     JobAdmissionOfficerDependencies,
     compose_category_kickoff as _compose_category_kickoff,  # noqa: F401 -- compatibility export
@@ -18796,6 +18800,22 @@ def _job_admission_officer_dependencies() -> JobAdmissionOfficerDependencies:
     )
 
 
+def _job_admission_workspace_dependencies() -> JobAdmissionWorkspaceDependencies:
+    """Bind existing policy owners without evaluating flags or capabilities."""
+    return JobAdmissionWorkspaceDependencies(
+        store=postgres_db,
+        needs_vm=_job_needs_vm,
+        needs_sandbox=_job_needs_sandbox,
+        check_vm_permission=_check_vm_permission,
+        resolve_execution_lane=_resolve_requested_job_execution_lane,
+        stateless_default_enabled=lambda: STATELESS_WORKER_DEFAULT_ENABLED,
+        stateless_enabled=lambda: STATELESS_WORKER_ENABLED,
+        vm_workspaces_on_pod_network=vm_workspaces_on_pod_network,
+        provisioner=container_provisioner,
+        enforce_grants=_enforce_job_create_grants,
+    )
+
+
 async def _require_job_project_access(
     principal: dict[str, Any] | None,
     project_id: str | None,
@@ -18995,79 +19015,14 @@ async def create_job(request: Request, job: PublicJobCreateBody) -> dict[str, An
         officer_admission_preparation = prepared_officer.preparation
         officer_ticket_ready_at = prepared_officer.ticket_ready_at
 
-        # VM permission gate: refuse at submit time so the user gets a clear
-        # 403 instead of a silent failure later in the dispatcher. The
-        # dispatcher re-checks too (in case the grant is revoked after
-        # submission) — defense in depth.
-        needs_vm = _job_needs_vm(
-            {"context": context, "config_override": config_override}
-        )
-        if needs_vm:
-            creator = None
-            if effective_user_id:
-                try:
-                    creator = await postgres_db.get_user(effective_user_id)
-                except Exception:
-                    creator = None
-            await _check_vm_permission(creator, job_needs_vm=True)
-
-        # Stateless worker admission is independently gated. Explicit requests
-        # keep their fail-closed admission errors; an omitted root lane may try
-        # the stateless default and silently fall back to pinned when any
-        # capability is absent. Omitted children do not enter that default:
-        # PostgresDB.create_job resolves them from the authoritative parent.
-        needs_sandbox = _job_needs_sandbox(
-            {"context": context, "config_override": config_override}
-        )
-        execution_lane = _resolve_requested_job_execution_lane(
-            job.execution_lane,
-            default_stateless=STATELESS_WORKER_DEFAULT_ENABLED and root_creation,
-            needs_vm=needs_vm,
-            needs_sandbox=needs_sandbox,
-        )
-        if (
-            job.execution_lane is None
-            and STATELESS_WORKER_DEFAULT_ENABLED
-            and root_creation
-        ):
-            if execution_lane == "stateless":
-                logger.info(
-                    "Job create: worker execution lane defaulted to stateless "
-                    "for a capable root job"
-                )
-            else:
-                if needs_vm and not vm_workspaces_on_pod_network():
-                    fallback_reason = "external VM jobs require pinned workers"
-                elif not STATELESS_WORKER_ENABLED:
-                    fallback_reason = "stateless worker admission is disabled"
-                elif not container_provisioner.is_available:
-                    fallback_reason = (
-                        "the Kubernetes workspace provisioner is unavailable"
-                    )
-                elif not container_provisioner.in_cluster:
-                    fallback_reason = "the workspace provisioner is not in-cluster"
-                elif not needs_sandbox:
-                    fallback_reason = "the job does not require a Kubernetes sandbox"
-                else:
-                    fallback_reason = "the worker capability check declined stateless"
-                logger.debug(
-                    "Job create: stateless worker lane default fell back to pinned (%s)",
-                    fallback_reason,
-                )
-        if job.execution_lane == "stateless" and execution_lane == "pinned":
-            logger.info(
-                "Job create: external VM request keeps job on pinned lane "
-                "(stateless worker opt-in ignored)"
-            )
-
-        # Capability PEP on the merged override — same fail-fast rationale as
-        # the VM gate above, so an over-reaching override is refused here
-        # instead of dying at dispatch. See the helper for what it deliberately
-        # does not cover.
-        await _enforce_job_create_grants(
-            config_override,
-            user_id=str(effective_user_id) if effective_user_id else None,
-            project_ids=[project_id] if project_id else [],
+        execution_lane = await prepare_job_admission_workspace(
+            context=context,
+            config_override=config_override,
+            effective_user_id=effective_user_id,
+            project_id=project_id,
+            requested_lane=job.execution_lane,
+            root_creation=root_creation,
+            dependencies=_job_admission_workspace_dependencies(),
         )
 
         # Resolve one complete attachment set before persistence. Presence —
