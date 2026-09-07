@@ -43,6 +43,8 @@ def boundary_tree(tmp_path):
         "orchestrator/services/job_create_ingress.py": "from shared.value import VALUE\n",
         "orchestrator/services/job_admission_scope.py": "from shared.value import VALUE\n",
         "orchestrator/services/job_admission_config.py": "from shared.value import VALUE\n",
+        "orchestrator/services/job_admission_officer.py": "from shared.value import VALUE\n",
+        "orchestrator/services/officer_metadata.py": "from shared.value import VALUE\n",
         "orchestrator/services/preference_defaults.py": "from shared.value import VALUE\n",
         "orchestrator/services/session_workspace_policy.py": "from shared.value import VALUE\n",
         "mcp_server/app.py": "from shared.contracts.item import VALUE\n",
@@ -100,6 +102,8 @@ def test_allowed_runtime_and_lightweight_dependencies_pass(boundary_tree):
         ("orchestrator/services/job_create_ingress.py", "orchestrator.main"),
         ("orchestrator/services/job_admission_scope.py", "orchestrator.main"),
         ("orchestrator/services/job_admission_config.py", "orchestrator.main"),
+        ("orchestrator/services/job_admission_officer.py", "orchestrator.main"),
+        ("orchestrator/services/officer_metadata.py", "orchestrator.main"),
         ("vm_controller/app.py", "headscale_client"),
     ],
 )
@@ -117,6 +121,8 @@ def test_forbidden_dependency_fails_the_gate(boundary_tree, source, target):
         "orchestrator/services/job_create_ingress.py",
         "orchestrator/services/job_admission_scope.py",
         "orchestrator/services/job_admission_config.py",
+        "orchestrator/services/job_admission_officer.py",
+        "orchestrator/services/officer_metadata.py",
     ],
 )
 def test_job_create_boundary_rejects_indirect_startup_dependencies(

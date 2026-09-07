@@ -10547,6 +10547,15 @@ from orchestrator.services.job_admission_config import (  # noqa: E402
     JobAdmissionConfigDependencies,
     prepare_job_admission_config,
 )
+from orchestrator.services.job_admission_officer import (  # noqa: E402
+    JobAdmissionOfficerDependencies,
+    compose_category_kickoff as _compose_category_kickoff,  # noqa: F401 -- compatibility export
+    prepare_job_admission_officer,
+)
+from orchestrator.services.officer_metadata import (  # noqa: E402
+    officer_meta_enabled as _officer_meta_enabled,
+    thread_officer_meta as _thread_officer_meta,
+)
 from orchestrator.services.job_admission_scope import (  # noqa: E402
     JobAdmissionActor,
     JobAdmissionScopeDependencies,
@@ -18766,6 +18775,27 @@ def _job_admission_config_dependencies() -> JobAdmissionConfigDependencies:
     )
 
 
+def _job_admission_officer_dependencies() -> JobAdmissionOfficerDependencies:
+    """Capture application stores; defer ticket imports and reads until needed."""
+    from functools import partial
+
+    from orchestrator.services.officer_admission import prepare_officer_admission
+
+    db = postgres_db
+    ticket_db = vector_db
+
+    async def fetch_ticket(project_id: str, note_id: str) -> dict[str, Any] | None:
+        from orchestrator.services.project_backlog import fetch_ticket_state
+
+        return await fetch_ticket_state(ticket_db, project_id, note_id)
+
+    return JobAdmissionOfficerDependencies(
+        store=db,
+        prepare_officer=partial(prepare_officer_admission, db),
+        fetch_ticket=fetch_ticket,
+    )
+
+
 async def _require_job_project_access(
     principal: dict[str, Any] | None,
     project_id: str | None,
@@ -18952,193 +18982,18 @@ async def create_job(request: Request, job: PublicJobCreateBody) -> dict[str, An
         config_name = prepared_config.config_name
         config_override = prepared_config.config_override
         resolved_expert_id = prepared_config.expert_id
-        request_config_override = prepared_config.request_config_override
         requested_workspace_backend = prepared_config.requested_workspace_backend
         root_creation = prepared_config.root_creation
 
-        # Officer admission preparation (BP-02/BP-03/BP-04). Expensive grant,
-        # datasource and provisioning inputs are resolved after this snapshot
-        # but before the authoritative transaction. The final INSERT below
-        # locks project_officers -> current thread, revalidates this exact
-        # incarnation/config/lineage, recomputes all-non-terminal capacity and
-        # writes the job on that same connection. Ordinary sessions never take
-        # the post lock.
-        officer_slot_name: str | None = None
-        officer_admission_preparation = None
-        officer_ticket_ready_at: datetime | None = None
-        _officer_admit_thread_id = (
-            str(job.thread_id) if (job.thread_id and root_creation) else None
+        prepared_officer = await prepare_job_admission_officer(
+            command=job,
+            config=prepared_config,
+            dependencies=_job_admission_officer_dependencies(),
         )
-        if _officer_admit_thread_id:
-            try:
-                _admit_thread = await postgres_db.get_thread(_officer_admit_thread_id)
-            except Exception:
-                _admit_thread = None
-            officer_meta = _thread_officer_meta(_admit_thread or {})
-
-            # Every ordinary session materializes officer.enabled=false, so
-            # that flag alone cannot distinguish a retired officer from a
-            # plain session. The durable post lineage can. Enabled orphan /
-            # duplicate threads are also candidates so the authoritative
-            # post check refuses them instead of letting them dispatch as an
-            # ordinary session.
-            _officer_lineage_member = False
-            if project_id:
-                try:
-                    _officer_lineage_member = _officer_admit_thread_id in set(
-                        await postgres_db.get_project_officer_lineage(project_id)
-                    )
-                except Exception:
-                    _officer_lineage_member = False
-            if _officer_meta_enabled(officer_meta) or _officer_lineage_member:
-                from orchestrator.services.officer_admission import (
-                    OfficerAdmissionConflict,
-                    SlotAdmissionError,
-                    apply_prepared_slot_config,
-                    prepare_officer_admission,
-                )
-
-                if not project_id:
-                    raise HTTPException(
-                        status_code=409,
-                        detail="Officer dispatch requires its durable project post.",
-                    )
-                requested_slot = context.get("officer_slot")
-                try:
-                    officer_admission_preparation = await prepare_officer_admission(
-                        postgres_db,
-                        project_id=project_id,
-                        thread_id=_officer_admit_thread_id,
-                        requested_slot=str(requested_slot) if requested_slot else None,
-                        requested_config_override=request_config_override,
-                    )
-                except OfficerAdmissionConflict as exc:
-                    raise HTTPException(
-                        status_code=409,
-                        detail={
-                            "code": exc.code,
-                            "message": exc.detail,
-                            **exc.fields,
-                        },
-                    ) from exc
-                except SlotAdmissionError as exc:
-                    raise HTTPException(status_code=409, detail=str(exc)) from exc
-                officer_slot_name = officer_admission_preparation.slot_name
-                if officer_slot_name:
-                    context["officer_slot"] = officer_slot_name
-                config_override = apply_prepared_slot_config(
-                    config_override, officer_admission_preparation
-                )
-                # One claim ledger for both dispatch paths. Without this the
-                # officer manually working the top ready ticket races his own
-                # tick into double-work on the very next cycle
-                # (officer_backlog_pools.md §5.3).
-                if job.ticket:
-                    context["ticket_note_id"] = str(job.ticket)
-
-                    # ``ticket=`` selects a current ready backlog note; it
-                    # never supplies dispatch authority. Resolve the exact
-                    # project-scoped row and its database-owned generation
-                    # before the short app-Postgres transaction. The final
-                    # post lock consumes this value atomically with the claim
-                    # and job INSERTs. No ready_at field is model-selectable.
-                    from orchestrator.services.project_backlog import (
-                        BACKLOG_NOTE_TYPES,
-                        fetch_ticket_state,
-                    )
-                    from orchestrator.services.work_categories import classify_ticket
-
-                    try:
-                        ticket_state = await fetch_ticket_state(
-                            vector_db,
-                            str(project_id),
-                            str(job.ticket),
-                        )
-                    except Exception as exc:
-                        raise HTTPException(
-                            status_code=503,
-                            detail=(
-                                "Backlog ticket authority is unavailable; "
-                                "no claim or job was created."
-                            ),
-                        ) from exc
-                    if ticket_state is None:
-                        raise HTTPException(
-                            status_code=409,
-                            detail=(
-                                f"Backlog ticket '{job.ticket}' does not exist "
-                                "in this Officer Post's project."
-                            ),
-                        )
-                    if str(ticket_state.get("project_id") or "") != str(project_id):
-                        raise HTTPException(
-                            status_code=409,
-                            detail="Backlog ticket belongs to a different project.",
-                        )
-                    if (
-                        str(ticket_state.get("status") or "") != "active"
-                        or str(ticket_state.get("note_type") or "")
-                        not in BACKLOG_NOTE_TYPES
-                    ):
-                        raise HTTPException(
-                            status_code=409,
-                            detail=(
-                                f"Backlog ticket '{job.ticket}' is not an "
-                                "active backlog ticket."
-                            ),
-                        )
-                    classification = classify_ticket(ticket_state.get("tags"))
-                    if classification.problems:
-                        raise HTTPException(
-                            status_code=409,
-                            detail=(
-                                f"Backlog ticket '{job.ticket}' is ambiguous: "
-                                + "; ".join(classification.problems)
-                            ),
-                        )
-                    ready_value = ticket_state.get("ready_at")
-                    if not classification.ready or not isinstance(
-                        ready_value, datetime
-                    ):
-                        raise HTTPException(
-                            status_code=409,
-                            detail=(
-                                f"Backlog ticket '{job.ticket}' is not ready "
-                                "with trusted Officer provenance."
-                            ),
-                        )
-                    officer_ticket_ready_at = (
-                        ready_value
-                        if ready_value.tzinfo
-                        else ready_value.replace(tzinfo=timezone.utc)
-                    )
-
-                # Precedence law (§6): the SLOT's category decides the contract
-                # this worker is held to. Explicit model/backend choices must
-                # match the slot (validated above and again under the Post
-                # lock); they are never silently replaced. A cross-category
-                # dispatch — sending a slot into work its category does not
-                # describe — remains warn-not-forbid and is named in the
-                # kickoff instead.
-                _slot_category = officer_admission_preparation.category
-                if _slot_category:
-                    context.setdefault("work_category", _slot_category)
-                    context["kickoff_message"] = _compose_category_kickoff(
-                        _slot_category,
-                        context.get("kickoff_message"),
-                        requested_category=job.work_category,
-                        slot=officer_slot_name,
-                        thread_id=_officer_admit_thread_id,
-                    )
-
-        if job.ticket and officer_admission_preparation is None:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "Backlog ticket claims require the exact current commissioned "
-                    "Officer Post incarnation. Ad-hoc jobs must omit ticket."
-                ),
-            )
+        context = prepared_officer.context
+        config_override = prepared_officer.config_override
+        officer_admission_preparation = prepared_officer.preparation
+        officer_ticket_ready_at = prepared_officer.ticket_ready_at
 
         # VM permission gate: refuse at submit time so the user gets a clear
         # 403 instead of a silent failure later in the dispatcher. The
@@ -28657,50 +28512,6 @@ def _officer_slot_category(
     roster = roster_from_meta(officer_meta) or {}
     spec = roster.get(slot_name) or {}
     return normalize_category(spec.get("category")) if isinstance(spec, dict) else None
-
-
-def _compose_category_kickoff(
-    category: str,
-    existing_kickoff: str | None,
-    *,
-    requested_category: str | None = None,
-    slot: str | None = None,
-    thread_id: str | None = None,
-) -> str:
-    """Prepend the slot's category contract to an officer-authored kickoff.
-
-    The contract goes in the KICKOFF, never in ``instructions`` — that
-    parameter replaces the rendered instructions.md template wholesale, which
-    would cost the worker everything else it needs to operate.
-
-    A mismatch between what the officer asked for and what the slot pins is
-    stated in the text rather than refused (§6 warn-not-forbid). Silence would
-    be the bad outcome: the worker would read an executor's delivery contract
-    while sitting in a researcher slot and have no way to know which one the
-    officer meant.
-    """
-    from orchestrator.services.work_categories import category_block, normalize_category
-
-    parts = [category_block(category)]
-    asked = normalize_category(requested_category)
-    if asked and asked != category:
-        note = (
-            f"NOTE: the officer dispatched this as {asked} work into the "
-            f"{slot or category} slot, whose contract is {category} — the "
-            "contract above is the one you are held to. If that reads as a "
-            "mistake, say so in your completion report rather than guessing."
-        )
-        parts.append(note)
-        logger.info(
-            "officer=%s slot=%s cross-category dispatch: asked=%s slot_contract=%s",
-            str(thread_id or "")[:8],
-            slot,
-            asked,
-            category,
-        )
-    if existing_kickoff:
-        parts.append(str(existing_kickoff))
-    return "\n\n".join(parts)
 
 
 async def _enforce_officer_ticket_grants(
@@ -45765,22 +45576,6 @@ class OfficerNotifyRequest(BaseModel):
     message: str
     urgency: str = "log"  # log | digest | page
     subject: str = ""
-
-
-def _thread_officer_meta(thread: dict) -> dict:
-    """The officer block from a thread row's metadata.config_override, or {}."""
-    metadata = thread.get("metadata") or {}
-    if isinstance(metadata, str):
-        try:
-            metadata = json.loads(metadata)
-        except (json.JSONDecodeError, TypeError):
-            metadata = {}
-    officer_meta = (metadata.get("config_override") or {}).get("officer") or {}
-    return officer_meta if isinstance(officer_meta, dict) else {}
-
-
-def _officer_meta_enabled(officer_meta: dict) -> bool:
-    return officer_meta.get("enabled") in (True, "true", "True", 1)
 
 
 _CONFERENCE_BRAIN_KEYS = ("model", "reasoning_level")

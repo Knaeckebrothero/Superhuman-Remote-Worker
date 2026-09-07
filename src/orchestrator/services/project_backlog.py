@@ -29,6 +29,7 @@ from datetime import datetime
 from typing import Any
 
 from orchestrator.services.kb_git_source import GiteaKnowledgeGitSource
+from orchestrator.services.work_categories import BACKLOG_NOTE_TYPES
 from shared.backlog_tags import READY_TAG, category_tag
 
 logger = logging.getLogger(__name__)
@@ -36,8 +37,6 @@ logger = logging.getLogger(__name__)
 # Canonical copy: src/services/knowledge_graph.py (not importable here — the
 # orchestrator image has no agent deps; see kb_reindex.py for the same pattern).
 PRIORITY_WORDS: dict[int, str] = {0: "high", 1: "normal", 2: "low"}
-
-BACKLOG_NOTE_TYPES: tuple[str, ...] = ("feature", "issue", "idea")
 
 # The note-type filter, pre-rendered as a SQL literal `IN (...)` list rather
 # than bound as `= ANY($n::text[])`. Fix round 1, Finding 1: measured on

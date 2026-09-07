@@ -18,6 +18,7 @@ import json
 import time
 from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -30,6 +31,12 @@ from testcontainers.postgres import PostgresContainer
 
 import orchestrator.main as orch_main
 from orchestrator.database.postgres import OfficerPostLifecycleConflict, PostgresDB
+from orchestrator.schemas.job_create import JobCreate
+from orchestrator.services.job_admission_config import JobAdmissionConfig
+from orchestrator.services.job_admission_officer import (
+    JobAdmissionOfficerDependencies,
+    prepare_job_admission_officer,
+)
 from orchestrator.services.officer_admission import (
     OfficerAdmissionConflict,
     SlotAdmissionError,
@@ -2269,6 +2276,99 @@ async def _race(*calls):
     tasks = [asyncio.create_task(_run(call)) for call in calls]
     ready.set()
     return await asyncio.gather(*tasks)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hold_during_ticket_read", [False, True])
+async def test_manual_preparation_reads_ticket_outside_final_admission_transaction(
+    db, hold_during_ticket_read
+):
+    seed = await _seed_post(db)
+    ticket_entered, release_ticket = asyncio.Event(), asyncio.Event()
+
+    async def fetch_ticket(project_id, note_id):
+        assert (project_id, note_id) == (seed["project_id"], "prepared-ticket")
+        ticket_entered.set()
+        await release_ticket.wait()
+        return {
+            "project_id": project_id,
+            "status": "active",
+            "note_type": "feature",
+            "tags": ["ready", "category:executor"],
+            "ready_at": READY_GENERATION,
+        }
+
+    config = JobAdmissionConfig(
+        context={"officer_slot": "line"},
+        project_id=seed["project_id"],
+        config_name="worker_base",
+        config_override=None,
+        expert_id=None,
+        request_config_override=None,
+        requested_workspace_backend=None,
+        root_creation=True,
+    )
+    pending = asyncio.create_task(
+        prepare_job_admission_officer(
+            command=JobCreate(
+                description="prepared dispatch",
+                thread_id=seed["thread_id"],
+                ticket="prepared-ticket",
+            ),
+            config=config,
+            dependencies=JobAdmissionOfficerDependencies(
+                store=db,
+                prepare_officer=partial(prepare_officer_admission, db),
+                fetch_ticket=fetch_ticket,
+            ),
+        )
+    )
+    try:
+        await asyncio.wait_for(ticket_entered.wait(), 5)
+        assert await _job_count(db) == 0
+        assert await _claim_rows(db, seed["project_id"]) == []
+        if hold_during_ticket_read:
+            # This writer takes the durable post lock. It must complete while
+            # vector lookup is suspended, then fence the stale preparation.
+            await asyncio.wait_for(
+                db.set_project_officer_hold(
+                    seed["project_id"],
+                    expected_thread_id=seed["thread_id"],
+                    hold={"kind": "maintenance", "since": "now", "note": "proof"},
+                ),
+                5,
+            )
+    finally:
+        release_ticket.set()
+        prepared = await asyncio.wait_for(pending, 5)
+
+    async def insert():
+        return await admit_and_create_job(
+            db,
+            preparation=prepared.preparation,
+            job_kwargs={
+                **_job_kwargs("prepared dispatch"),
+                "context": prepared.context,
+                "config_override": prepared.config_override,
+            },
+            ticket_note_id="prepared-ticket",
+            ticket_ready_at=prepared.ticket_ready_at,
+            ticket_claim_source="manual",
+        )
+
+    if hold_during_ticket_read:
+        with pytest.raises(OfficerAdmissionConflict) as exc:
+            await insert()
+        assert exc.value.code == "officer_held"
+        assert await _job_count(db) == 0
+        assert await _claim_rows(db, seed["project_id"]) == []
+    else:
+        job = await insert()
+        claims = await _claim_rows(db, seed["project_id"], "prepared-ticket")
+        assert await _job_count(db) == 1 and len(claims) == 1
+        assert claims[0]["job_id"] == job["id"]
+        assert claims[0]["ready_generation_at"] == READY_GENERATION
+        assert claims[0]["source"] == "manual"
 
 
 @pytest.mark.asyncio

@@ -6,6 +6,7 @@ No application startup, dispatch, provider or database connection is started.
 """
 
 import copy
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -26,6 +27,7 @@ EXPERT = "44444444-4444-4444-8444-444444444444"
 PARENT = "55555555-5555-4555-8555-555555555555"
 CONNECTOR = "66666666-6666-4666-8666-666666666666"
 STAMP = datetime(2026, 9, 6, 8, 0, tzinfo=timezone.utc)
+THREAD = "77777777-7777-4777-8777-777777777777"
 PATH = "/api/jobs"
 PROJECT_PATH = f"/api/projects/{PROJECT}/jobs"
 
@@ -131,6 +133,369 @@ async def submit(wire, payload, path=PATH, **headers):
 
 def body(**fields):
     return {"description": "controlled HTTP fixture", "project_id": PROJECT, **fields}
+
+
+@pytest.fixture
+def officer_wire(wire, monkeypatch):
+    """Run real Officer snapshot/slot policy; control reads and the final write."""
+    metadata = {"config_override": {"officer": {"enabled": True}}}
+    thread = {
+        "id": THREAD,
+        "user_id": USER,
+        "project_id": PROJECT,
+        "status": "active",
+        "metadata": metadata,
+    }
+    wire.db.get_thread = AsyncMock(return_value=thread)
+    wire.db.get_project_officer_lineage = AsyncMock(return_value=[THREAD])
+    snapshot = {
+        "project_id": PROJECT,
+        "thread_id": THREAD,
+        "config_override": {},
+        "incarnations": [],
+        "post_updated_at": STAMP,
+        "current_thread_id": THREAD,
+        "thread_project_id": PROJECT,
+        "thread_status": "active",
+        "thread_metadata": metadata,
+        "thread_user_id": USER,
+        "thread_created_at": STAMP,
+    }
+    read_snapshot = AsyncMock(return_value=snapshot)
+
+    @asynccontextmanager
+    async def acquire():
+        # No transaction or write methods: preparation must only read.
+        yield SimpleNamespace(fetchrow=read_snapshot)
+
+    wire.db.acquire = acquire
+    monkeypatch.setattr(main, "_thread_project_ids", AsyncMock(return_value=[PROJECT]))
+    monkeypatch.setattr(
+        main, "_revalidate_thread_project_ids", AsyncMock(return_value=[PROJECT])
+    )
+    ticket = AsyncMock(
+        return_value={
+            "project_id": PROJECT,
+            "status": "active",
+            "note_type": "feature",
+            "tags": ["ready", "category:researcher"],
+            "ready_at": STAMP,
+        }
+    )
+    monkeypatch.setattr(
+        "orchestrator.services.project_backlog.fetch_ticket_state", ticket
+    )
+
+    async def insert(_db, *, job_kwargs, **kwargs):
+        return await wire.db.create_job(**job_kwargs)
+
+    admit = AsyncMock(side_effect=insert)
+    monkeypatch.setattr(
+        "orchestrator.services.officer_admission.admit_and_create_job", admit
+    )
+    preflight = AsyncMock(
+        return_value=SimpleNamespace(
+            activated=True, state="ready", retryable=False, phase="ready", error=None
+        )
+    )
+    monkeypatch.setattr(
+        "orchestrator.services.officer_preflight.ensure_officer_job_activated",
+        preflight,
+    )
+    wire.officer = SimpleNamespace(
+        thread=thread,
+        snapshot=snapshot,
+        read_snapshot=read_snapshot,
+        ticket=ticket,
+        admit=admit,
+        preflight=preflight,
+    )
+    return wire
+
+
+def assert_no_admission_effects(wire):
+    wire.authorize.assert_not_awaited()
+    main._enforce_job_create_grants.assert_not_awaited()
+    wire.db.create_job.assert_not_awaited()
+    wire.officer.admit.assert_not_awaited()
+    wire.officer.preflight.assert_not_awaited()
+    wire.provision.assert_not_awaited()
+    wire.dispatch.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_officer_dependency_factory_captures_stores_without_reading_them(
+    wire, monkeypatch
+):
+    from orchestrator.services import officer_admission, project_backlog
+
+    snapshot = AsyncMock()
+    ticket = AsyncMock()
+    monkeypatch.setattr(officer_admission, "prepare_officer_admission", snapshot)
+    monkeypatch.setattr(project_backlog, "fetch_ticket_state", ticket)
+    first_store, first_vector = object(), object()
+    second_store, second_vector = object(), object()
+    monkeypatch.setattr(main, "postgres_db", first_store)
+    monkeypatch.setattr(main, "vector_db", first_vector)
+    first = main._job_admission_officer_dependencies()
+    monkeypatch.setattr(main, "postgres_db", second_store)
+    monkeypatch.setattr(main, "vector_db", second_vector)
+    second = main._job_admission_officer_dependencies()
+    snapshot.assert_not_called()
+    ticket.assert_not_called()
+    assert first.store is first_store and second.store is second_store
+    kwargs = dict(
+        project_id=PROJECT,
+        thread_id=THREAD,
+        requested_slot=None,
+        requested_config_override=None,
+    )
+    await first.prepare_officer(**kwargs)
+    snapshot.assert_awaited_once_with(first_store, **kwargs)
+    await first.fetch_ticket(PROJECT, "first")
+    ticket.assert_awaited_once_with(first_vector, PROJECT, "first")
+    await second.prepare_officer(**kwargs)
+    assert snapshot.await_args.args == (second_store,)
+    await second.fetch_ticket(PROJECT, "second")
+    assert ticket.await_args.args == (second_vector, PROJECT, "second")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure,code",
+    [
+        ("retired", "officer_disabled"),
+        ("orphan", "post_missing"),
+        ("duplicate", "stale_incarnation"),
+        ("held", "officer_held"),
+        ("wrong_project", "project_mismatch"),
+    ],
+)
+async def test_officer_candidate_refusals_precede_ticket_and_all_effects(
+    officer_wire, failure, code
+):
+    wire = officer_wire
+    meta = wire.officer.thread["metadata"]["config_override"]["officer"]
+    if failure == "retired":
+        meta["enabled"] = False
+    elif failure == "orphan":
+        wire.db.get_project_officer_lineage.return_value = []
+        wire.officer.read_snapshot.return_value = None
+    elif failure == "duplicate":
+        wire.db.get_project_officer_lineage.return_value = []
+        wire.officer.snapshot["thread_id"] = PARENT
+    elif failure == "held":
+        meta["hold"] = {"reason": "conference"}
+    else:
+        wire.officer.snapshot["thread_project_id"] = PARENT
+    response = await submit(
+        wire, body(thread_id=THREAD, ticket="fixture"), **{"x-test-internal": "1"}
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == code
+    wire.officer.ticket.assert_not_awaited()
+    assert_no_admission_effects(wire)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["thread", "lineage", "both", "neither"])
+async def test_ordinary_session_candidate_lookup_failures_keep_existing_behavior(
+    officer_wire, failure
+):
+    wire = officer_wire
+    thread = wire.officer.thread
+    thread["metadata"]["config_override"]["officer"]["enabled"] = False
+    # The first thread read is scope authorization; only the later Officer
+    # candidate read has historical best-effort behavior.
+    wire.db.get_thread.side_effect = [
+        thread,
+        RuntimeError("unavailable") if failure in {"thread", "both"} else thread,
+        thread,  # the later datasource-inheritance read
+    ]
+    wire.db.get_project_officer_lineage.return_value = []
+    if failure in {"lineage", "both"}:
+        wire.db.get_project_officer_lineage.side_effect = RuntimeError("unavailable")
+    response = await submit(wire, body(thread_id=THREAD), **{"x-test-internal": "1"})
+    assert response.status_code == 200, response.text
+    wire.officer.read_snapshot.assert_not_awaited()
+    wire.officer.ticket.assert_not_awaited()
+    wire.officer.admit.assert_not_awaited()
+    wire.db.create_job.assert_awaited_once()
+    wire.provision.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lookup", ["thread", "lineage"])
+async def test_either_candidate_signal_still_requires_authoritative_snapshot(
+    officer_wire, lookup
+):
+    wire = officer_wire
+    if lookup == "thread":
+        wire.db.get_thread.side_effect = [
+            wire.officer.thread,
+            RuntimeError("unavailable"),
+        ]
+    else:
+        wire.db.get_project_officer_lineage.side_effect = RuntimeError("unavailable")
+    wire.officer.read_snapshot.return_value = None
+    response = await submit(wire, body(thread_id=THREAD), **{"x-test-internal": "1"})
+    assert response.status_code == 409, response.text
+    assert response.json() == {
+        "detail": {"code": "post_missing", "message": "Officer Post does not exist."}
+    }
+    wire.officer.read_snapshot.assert_awaited_once()
+    assert_no_admission_effects(wire)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ticket_change,status,detail",
+    [
+        (
+            "unavailable",
+            503,
+            "Backlog ticket authority is unavailable; no claim or job was created.",
+        ),
+        (
+            None,
+            409,
+            "Backlog ticket 'fixture' does not exist in this Officer Post's project.",
+        ),
+        ({"project_id": PARENT}, 409, "Backlog ticket belongs to a different project."),
+        (
+            {"status": "archived"},
+            409,
+            "Backlog ticket 'fixture' is not an active backlog ticket.",
+        ),
+        (
+            {"note_type": "reference"},
+            409,
+            "Backlog ticket 'fixture' is not an active backlog ticket.",
+        ),
+        (
+            {"tags": ["category:researcher"]},
+            409,
+            "Backlog ticket 'fixture' is not ready with trusted Officer provenance.",
+        ),
+        (
+            {"ready_at": STAMP.isoformat()},
+            409,
+            "Backlog ticket 'fixture' is not ready with trusted Officer provenance.",
+        ),
+    ],
+)
+async def test_officer_ticket_error_json_and_no_effects(
+    officer_wire, ticket_change, status, detail
+):
+    wire = officer_wire
+    if ticket_change == "unavailable":
+        wire.officer.ticket.side_effect = RuntimeError("unavailable")
+    elif ticket_change is None:
+        wire.officer.ticket.return_value = None
+    else:
+        wire.officer.ticket.return_value.update(ticket_change)
+    response = await submit(
+        wire, body(thread_id=THREAD, ticket="fixture"), **{"x-test-internal": "1"}
+    )
+    assert response.status_code == status, response.text
+    assert response.json() == {"detail": detail}
+    assert_no_admission_effects(wire)
+
+
+@pytest.mark.asyncio
+async def test_non_officer_ticket_refused_without_vector_or_write(officer_wire):
+    wire = officer_wire
+    wire.officer.thread["metadata"]["config_override"]["officer"]["enabled"] = False
+    wire.db.get_project_officer_lineage.return_value = []
+    response = await submit(
+        wire, body(thread_id=THREAD, ticket="fixture"), **{"x-test-internal": "1"}
+    )
+    assert response.status_code == 409, response.text
+    assert response.json() == {
+        "detail": "Backlog ticket claims require the exact current commissioned Officer Post incarnation. Ad-hoc jobs must omit ticket."
+    }
+    wire.officer.ticket.assert_not_awaited()
+    assert_no_admission_effects(wire)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("naive", [False, True])
+async def test_officer_slot_ticket_preparation_reaches_final_admission_in_order(
+    officer_wire, monkeypatch, naive
+):
+    wire = officer_wire
+    meta = wire.officer.thread["metadata"]["config_override"]["officer"]
+    meta["slots"] = {
+        "researchers": {
+            "count": 1,
+            "model": "fixture-model",
+            "backend": "none",
+            "category": "researcher",
+        }
+    }
+    wire.officer.ticket.return_value["ready_at"] = (
+        STAMP.replace(tzinfo=None) if naive else STAMP
+    )
+    order = Mock()
+    vm_check = Mock(wraps=main._job_needs_vm)
+    monkeypatch.setattr(main, "_job_needs_vm", vm_check)
+    for name, collaborator in (
+        ("snapshot", wire.officer.read_snapshot),
+        ("ticket", wire.officer.ticket),
+        ("vm", vm_check),
+        ("datasources", wire.authorize),
+        ("grants", main._enforce_job_create_grants),
+        ("admit", wire.officer.admit),
+        ("preflight", wire.officer.preflight),
+    ):
+        order.attach_mock(collaborator, name)
+    response = await submit(
+        wire,
+        body(
+            thread_id=THREAD,
+            ticket="fixture",
+            work_category="executor",
+            context={
+                "kickoff_message": "Existing brief",
+                "instructions": "Keep instructions",
+            },
+        ),
+        **{"x-test-internal": "1"},
+    )
+    assert response.status_code == 200, response.text
+    assert [call[0] for call in order.mock_calls] == [
+        "snapshot",
+        "ticket",
+        "vm",
+        "grants",
+        "datasources",
+        "admit",
+        "preflight",
+    ]
+    args = wire.officer.admit.await_args.kwargs
+    assert args["ticket_ready_at"] == STAMP
+    assert (
+        args["ticket_claim_source"] == "manual" and args["strict_provisioning"] is True
+    )
+    assert args["preparation"].thread_id == THREAD
+    assert args["preparation"].slot_name == "researchers"
+    assert args["job_kwargs"]["config_override"]["llm"]["model"] == "fixture-model"
+    context = args["job_kwargs"]["context"]
+    assert (
+        context["officer_slot"] == "researchers"
+        and context["ticket_note_id"] == "fixture"
+    )
+    assert context["work_category"] == "researcher"
+    assert context["instructions"] == "Keep instructions"
+    assert context["kickoff_message"].startswith("Your deliverable is an ANSWER")
+    assert (
+        "dispatched this as executor work into the researchers slot"
+        in context["kickoff_message"]
+    )
+    assert context["kickoff_message"].endswith("Existing brief")
+    wire.officer.ticket.assert_awaited_once_with(main.vector_db, PROJECT, "fixture")
+    wire.provision.assert_not_awaited()
+    wire.dispatch.assert_not_called()
 
 
 @pytest.mark.asyncio

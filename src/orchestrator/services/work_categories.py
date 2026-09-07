@@ -49,6 +49,10 @@ from shared.backlog_tags import (
     has_tag,
 )
 
+# Note types that can carry a backlog ticket. Keep the read query and manual
+# admission on the same vocabulary without importing backlog storage/lifecycle.
+BACKLOG_NOTE_TYPES: tuple[str, ...] = ("feature", "issue", "idea")
+
 RESEARCHER = "researcher"
 TESTER = "tester"
 EXECUTOR = "executor"
