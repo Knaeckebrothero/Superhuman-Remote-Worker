@@ -512,11 +512,20 @@ are insert-only; later admin changes are not repaired or overwritten at boot.
 Crawl4AI is available with `crawl4ai.enabled=true`, but remains off by default
 because its browser service has a 4 GiB memory limit. Before enabling it, add a
 strong `CRAWL4AI_API_TOKEN` to the Secret selected by
-`crawl4ai.apiTokenSecret`. Registering a Crawl4AI catalog endpoint is an
-explicit admin action; its `api_key` carries this bearer credential. In the
-catalog model, select the `crawl4ai` adapter and its `extract` and/or `crawl`
-operations. The chart also uses the same high-entropy value as Crawl4AI's
-stable JWT signing key.
+`crawl4ai.apiTokenSecret`; the chart uses the same high-entropy value as
+Crawl4AI's stable JWT signing key.
+
+Enabling it also registers it: the same post-install hook seeds a `crawl4ai`
+catalog row (adapter `crawl4ai`, operations `extract` and `crawl`, `api_key`
+carrying the bearer credential) and fills the **fetch** slot when that slot is
+empty. SearXNG cannot serve `fetch` at all, so on a keyless install this is
+what gives experts a provider-backed way to read the pages they find. A keyed
+provider that already holds `fetch` (Tavily, Firecrawl) keeps it — there is no
+fetch fallback slot — and Crawl4AI stays in the catalog for an admin to select
+under Admin → Providers. If the token key is missing the hook logs a warning
+and registers nothing rather than failing the release. Like the SearXNG and
+Tavily seeds, catalog and default writes are insert-only: later admin changes
+are never repaired or overwritten at boot.
 
 Both workloads always render an egress NetworkPolicy. They may resolve DNS and
 reach public HTTP(S), but RFC1918, cluster/service, link-local/metadata, and

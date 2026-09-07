@@ -114,6 +114,12 @@ def test_default_enables_searxng_and_disables_crawl4ai() -> None:
     assert "TAVILY_API_KEY" in {item["name"] for item in env}
     searxng_url = next(item for item in env if item["name"] == "SEARXNG_BASE_URL")
     assert searxng_url["value"].endswith("-searxng:8080")
+    # No component, no credential and no catalog row: the seeder must not be
+    # told about a Crawl4AI this release never deployed.
+    assert not {item["name"] for item in env} & {
+        "CRAWL4AI_BASE_URL",
+        "CRAWL4AI_API_TOKEN",
+    }
 
 
 def test_flags_disable_searxng_and_enable_confined_crawl4ai() -> None:
@@ -151,6 +157,15 @@ def test_flags_disable_searxng_and_enable_confined_crawl4ai() -> None:
     seed = _one(objects, "research-provider-seed", "Job")
     env = seed["spec"]["template"]["spec"]["containers"][0]["env"]
     assert "SEARXNG_BASE_URL" not in {item["name"] for item in env}
+    # Deploying the component must also register it, or the fetch slot stays
+    # empty and the pod is 4 GiB of unreachable service.
+    crawl_url = next(item for item in env if item["name"] == "CRAWL4AI_BASE_URL")
+    assert crawl_url["value"].endswith("-crawl4ai:11235")
+    seed_token = next(item for item in env if item["name"] == "CRAWL4AI_API_TOKEN")
+    assert seed_token["valueFrom"]["secretKeyRef"]["key"] == "CRAWL4AI_API_TOKEN"
+    # Optional on purpose: a missing key degrades to an unregistered provider
+    # instead of failing the hook and wedging the release.
+    assert seed_token["valueFrom"]["secretKeyRef"]["optional"] is True
 
 
 def test_research_seed_hook_does_not_render_while_orchestrator_is_quiesced() -> None:

@@ -127,6 +127,13 @@ _TAVILY_BASE_URL = "https://api.tavily.com"
 SEARXNG_ENDPOINT_LABEL = "SearXNG"
 SEARXNG_MODEL_ID = "searxng"
 
+# Bundled off-pod fetch service. Same contract as SearXNG — the Helm seed Job
+# supplies the Service URL — but it fills the ``fetch`` slot, which SearXNG
+# cannot serve at all: an install with search alone finds pages it has no
+# provider-backed way to read.
+CRAWL4AI_ENDPOINT_LABEL = "Crawl4AI"
+CRAWL4AI_MODEL_ID = "crawl4ai"
+
 # Fallback used when CODEX_PROXY_URL is unset. Mirrors the runtime fallback
 # in ``orchestrator.main._get_codex_subscription_models`` so login flows that
 # work without the env var also wire up a transport row.
@@ -764,6 +771,72 @@ async def run(payload_path: Path) -> SeedReport:
     return report
 
 
+async def ensure_crawl4ai_fetch_endpoint(
+    db: PostgresDB, *, base_url: str | None = None, api_token: str | None = None
+) -> bool:
+    """Register the bundled Crawl4AI service and fill an empty fetch slot.
+
+    Mirrors :func:`ensure_searxng_search_endpoint` for the other half of web
+    research. The Helm hook passes the in-cluster Service URL and the bearer
+    token only when ``crawl4ai.enabled``; without either this is a no-op, so
+    an install that does not deploy the component never grows a dead catalog
+    row. Crawl4AI has no ``search`` op, so it only ever touches ``fetch``, and
+    ``fetch`` has no fallback slot — a keyed provider that already claimed it
+    (Tavily, Firecrawl) keeps it, and Crawl4AI stays in the catalog for an
+    admin to select. Writes are insert-only: an admin's later choice is never
+    repaired or overwritten at boot.
+    """
+
+    url = (base_url or os.environ.get("CRAWL4AI_BASE_URL") or "").strip().rstrip("/")
+    if not url:
+        return False
+    token = (api_token or os.environ.get("CRAWL4AI_API_TOKEN") or "").strip()
+    if not token:
+        # The service refuses every request without its bearer token, so a
+        # tokenless row would be a provider that fails on first use.
+        logger.warning(
+            "ensure_crawl4ai_fetch_endpoint: %s is deployed but no "
+            "CRAWL4AI_API_TOKEN reached the seed; skipping registration",
+            url,
+        )
+        return False
+    try:
+        for endpoint in await db.list_system_llm_endpoints():
+            if endpoint.get("label") == CRAWL4AI_ENDPOINT_LABEL:
+                return False
+
+        endpoint = await db.create_system_llm_endpoint(
+            label=CRAWL4AI_ENDPOINT_LABEL,
+            base_url=url,
+            api_key=token,
+            key_prefix=token[:8],
+        )
+        inserted = await db.create_model(
+            provider_kind="endpoint",
+            provider_ref=str(endpoint["id"]),
+            model_id=CRAWL4AI_MODEL_ID,
+            display_label="Crawl4AI (self-hosted)",
+            capabilities=["fetch"],
+            family="crawl4ai",
+            params_json={"provider": "crawl4ai", "ops": ["extract", "crawl"]},
+            enabled=True,
+            seeded_from="helm:crawl4ai",
+            on_conflict_do_nothing=True,
+        )
+        if inserted is None:
+            return False
+
+        if not await db.get_default_llm_model("fetch"):
+            await db.set_default_llm_model("fetch", CRAWL4AI_MODEL_ID)
+        logger.info(
+            "ensure_crawl4ai_fetch_endpoint: registered bundled Crawl4AI provider"
+        )
+        return True
+    except Exception:
+        logger.exception("ensure_crawl4ai_fetch_endpoint: wiring failed")
+        return False
+
+
 async def run_research_provider_seed() -> None:
     """Run deployment-provided research seeders in their required order."""
 
@@ -771,9 +844,11 @@ async def run_research_provider_seed() -> None:
     await db.connect()
     try:
         # The legacy key must claim an empty primary before bundled SearXNG is
-        # allowed to fill either slot.
+        # allowed to fill either slot. Tavily also serves ``fetch``, so it runs
+        # before Crawl4AI for the same reason.
         await ensure_tavily_search_endpoint(db)
         await ensure_searxng_search_endpoint(db)
+        await ensure_crawl4ai_fetch_endpoint(db)
     finally:
         await db.close()
 
@@ -794,7 +869,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--research-providers-only",
         action="store_true",
-        help="Run only the Tavily/SearXNG boot seeders (no payload required).",
+        help=(
+            "Run only the Tavily/SearXNG/Crawl4AI boot seeders (no payload required)."
+        ),
     )
     args = parser.parse_args(argv)
 

@@ -1,13 +1,18 @@
 {{- /*
 Boot-only promotion for deployment-provided research providers. This is
-separate from llm.seed.enabled: a fresh chart must register bundled SearXNG,
-and a legacy TAVILY_API_KEY must be promoted even when the operator intentionally
+separate from llm.seed.enabled: a fresh chart must register the bundled
+components — SearXNG for the search slot, Crawl4AI for the fetch slot — and a
+legacy TAVILY_API_KEY must be promoted even when the operator intentionally
 disabled custom LLM catalog seeding.
 
-The Job is the only runtime consumer of TAVILY_API_KEY. It runs Tavily before
-SearXNG, then exits; neither the orchestrator Deployment nor agent pods receive
-the deployment-wide key. Like the LLM seed hook, it must not render while the
-orchestrator is quiesced because its health wait would deadlock the release.
+The Job is the only runtime consumer of TAVILY_API_KEY. It runs Tavily first
+(it serves both slots), then SearXNG, then Crawl4AI, and exits; neither the
+orchestrator Deployment nor agent pods receive the deployment-wide key.
+CRAWL4AI_API_TOKEN is optional here on purpose: the same value is required by
+the Crawl4AI Deployment, and a missing key must degrade to an unregistered
+provider rather than wedge the release on a failed hook. Like the LLM seed
+hook, this must not render while the orchestrator is quiesced because its
+health wait would deadlock the release.
 */ -}}
 {{- if gt (int .Values.orchestrator.replicas) 0 }}
 apiVersion: batch/v1
@@ -104,6 +109,16 @@ spec:
             {{- if .Values.searxng.enabled }}
             - name: SEARXNG_BASE_URL
               value: "http://{{ include "srw.serviceName" (dict "context" . "component" "searxng") }}:{{ .Values.searxng.service.port }}"
+            {{- end }}
+            {{- if .Values.crawl4ai.enabled }}
+            - name: CRAWL4AI_BASE_URL
+              value: "http://{{ include "srw.serviceName" (dict "context" . "component" "crawl4ai") }}:{{ .Values.crawl4ai.service.port }}"
+            - name: CRAWL4AI_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ default (include "srw.secretName" .) .Values.crawl4ai.apiTokenSecret.name | quote }}
+                  key: {{ .Values.crawl4ai.apiTokenSecret.key | quote }}
+                  optional: true
             {{- end }}
           resources:
             {{- toYaml .Values.llm.seed.resources | nindent 12 }}
