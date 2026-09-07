@@ -284,6 +284,29 @@ class TestTranscribeService:
 # ---------------------------------------------------------------------------
 
 
+def _voice_route_deps(*, db=None, ledger=None):
+    """Route dependencies for the extracted voice router.
+
+    The transcribe endpoint moved out of ``main`` into
+    ``orchestrator.routers.voice`` (R1.B02); its collaborators arrive injected
+    rather than as patched module globals. The STT service is still reached by
+    patching ``orchestrator.services.transcribe``, exactly as before.
+    """
+    from orchestrator.routers.voice import VoiceDependencies as _RouteDeps
+    from orchestrator.services.voice import VoiceDependencies as _OpDeps
+
+    store = db if db is not None else MagicMock()
+
+    async def _owner(_request, _store, _thread_id):
+        return {"id": "u1"}, {"id": "t1"}
+
+    return _RouteDeps(
+        store=store,
+        operations=_OpDeps(store=store, logger=MagicMock(), ledger=ledger),
+        require_thread_owner=_owner,
+    )
+
+
 def _upload(data: bytes):
     from fastapi import UploadFile
 
@@ -306,101 +329,87 @@ class TestTranscribeEndpoint:
 
     @pytest.mark.asyncio
     async def test_returns_text(self):
-        import orchestrator.main
+        from orchestrator.routers import voice as voice_routes
 
-        with (
-            patch.object(
-                orchestrator.main,
-                "require_thread_owner",
-                AsyncMock(return_value=({"id": "u1"}, {"id": "t1"})),
-            ),
-            patch(
-                "orchestrator.services.transcribe.transcribe_thread_audio",
-                AsyncMock(return_value="hello world"),
-            ),
+        with patch(
+            "orchestrator.services.transcribe.transcribe_thread_audio",
+            AsyncMock(return_value="hello world"),
         ):
-            resp = await orchestrator.main.transcribe_thread_audio_endpoint(
-                thread_id="t1", request=MagicMock(), audio=_upload(b"\x00\x01\x02")
+            resp = await voice_routes.transcribe_thread_audio_endpoint(
+                thread_id="t1",
+                request=MagicMock(),
+                audio=_upload(b"\x00\x01\x02"),
+                dependencies=_voice_route_deps(),
             )
         assert resp.status_code == 200
         assert json.loads(resp.body) == {"text": "hello world"}
 
     @pytest.mark.asyncio
     async def test_204_when_unavailable(self):
-        import orchestrator.main
+        from orchestrator.routers import voice as voice_routes
 
-        with (
-            patch.object(
-                orchestrator.main,
-                "require_thread_owner",
-                AsyncMock(return_value=({"id": "u1"}, {"id": "t1"})),
-            ),
-            patch(
-                "orchestrator.services.transcribe.transcribe_thread_audio",
-                AsyncMock(return_value=None),
-            ),
+        with patch(
+            "orchestrator.services.transcribe.transcribe_thread_audio",
+            AsyncMock(return_value=None),
         ):
-            resp = await orchestrator.main.transcribe_thread_audio_endpoint(
-                thread_id="t1", request=MagicMock(), audio=_upload(b"\x00\x01")
+            resp = await voice_routes.transcribe_thread_audio_endpoint(
+                thread_id="t1",
+                request=MagicMock(),
+                audio=_upload(b"\x00\x01"),
+                dependencies=_voice_route_deps(),
             )
         assert resp.status_code == 204
 
     @pytest.mark.asyncio
     async def test_502_on_transcription_error(self):
         """A configured model that fails → 502 (honest error), not a silent 204."""
-        import orchestrator.main
         from fastapi import HTTPException
 
+        from orchestrator.routers import voice as voice_routes
         from orchestrator.services.transcribe import TranscriptionError
 
-        with (
-            patch.object(
-                orchestrator.main,
-                "require_thread_owner",
-                AsyncMock(return_value=({"id": "u1"}, {"id": "t1"})),
-            ),
-            patch(
-                "orchestrator.services.transcribe.transcribe_thread_audio",
-                AsyncMock(side_effect=TranscriptionError("down")),
-            ),
+        with patch(
+            "orchestrator.services.transcribe.transcribe_thread_audio",
+            AsyncMock(side_effect=TranscriptionError("down")),
         ):
             with pytest.raises(HTTPException) as exc:
-                await orchestrator.main.transcribe_thread_audio_endpoint(
-                    thread_id="t1", request=MagicMock(), audio=_upload(b"\x00\x01")
+                await voice_routes.transcribe_thread_audio_endpoint(
+                    thread_id="t1",
+                    request=MagicMock(),
+                    audio=_upload(b"\x00\x01"),
+                    dependencies=_voice_route_deps(),
                 )
         assert exc.value.status_code == 502
 
     @pytest.mark.asyncio
     async def test_400_on_empty_audio(self):
-        import orchestrator.main
         from fastapi import HTTPException
 
-        with patch.object(
-            orchestrator.main,
-            "require_thread_owner",
-            AsyncMock(return_value=({"id": "u1"}, {"id": "t1"})),
-        ):
-            with pytest.raises(HTTPException) as exc:
-                await orchestrator.main.transcribe_thread_audio_endpoint(
-                    thread_id="t1", request=MagicMock(), audio=_upload(b"")
-                )
+        from orchestrator.routers import voice as voice_routes
+
+        with pytest.raises(HTTPException) as exc:
+            await voice_routes.transcribe_thread_audio_endpoint(
+                thread_id="t1",
+                request=MagicMock(),
+                audio=_upload(b""),
+                dependencies=_voice_route_deps(),
+            )
         assert exc.value.status_code == 400
 
     @pytest.mark.asyncio
     async def test_413_when_too_large(self):
-        import orchestrator.main
         from fastapi import HTTPException
 
+        from orchestrator.routers import voice as voice_routes
+
         big = _upload(b"\x00" * (25 * 1024 * 1024 + 1))
-        with patch.object(
-            orchestrator.main,
-            "require_thread_owner",
-            AsyncMock(return_value=({"id": "u1"}, {"id": "t1"})),
-        ):
-            with pytest.raises(HTTPException) as exc:
-                await orchestrator.main.transcribe_thread_audio_endpoint(
-                    thread_id="t1", request=MagicMock(), audio=big
-                )
+        with pytest.raises(HTTPException) as exc:
+            await voice_routes.transcribe_thread_audio_endpoint(
+                thread_id="t1",
+                request=MagicMock(),
+                audio=big,
+                dependencies=_voice_route_deps(),
+            )
         assert exc.value.status_code == 413
 
 

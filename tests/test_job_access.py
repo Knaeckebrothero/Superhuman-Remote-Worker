@@ -672,14 +672,19 @@ class TestGatedReadEndpoints:
     async def test_get_job_llm_requests_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import get_job_llm_requests
+        from orchestrator.main import _job_diagnostics_dependencies
+        from orchestrator.routers.job_diagnostics import get_job_llm_requests
 
         with (
             _patch_caller_and_db(user_b, fake_db),
             patch("orchestrator.main.audit_reader", _make_dud("audit_reader")),
         ):
             with pytest.raises(HTTPException) as exc:
-                await get_job_llm_requests(fake_request, str(job_a["id"]))
+                await get_job_llm_requests(
+                    fake_request,
+                    str(job_a["id"]),
+                    dependencies=_job_diagnostics_dependencies(),
+                )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
@@ -904,14 +909,19 @@ class TestGatedReadEndpoints:
     async def test_get_job_shell_state_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import get_job_shell_state
+        from orchestrator.main import _job_diagnostics_dependencies
+        from orchestrator.routers.job_diagnostics import get_job_shell_state
 
         # Mark the job as not-processing — if the gate let through, we'd
         # see 400 from the status check instead of 403.
         fake_db.get_job = AsyncMock(return_value={**job_a, "status": "completed"})
         with _patch_caller_and_db(user_b, fake_db):
             with pytest.raises(HTTPException) as exc:
-                await get_job_shell_state(fake_request, str(job_a["id"]))
+                await get_job_shell_state(
+                    fake_request,
+                    str(job_a["id"]),
+                    dependencies=_job_diagnostics_dependencies(),
+                )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
@@ -1229,7 +1239,8 @@ class TestJobMutationGates:
     async def test_get_job_logs_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import get_job_logs
+        from orchestrator.main import _job_diagnostics_dependencies
+        from orchestrator.routers.job_diagnostics import get_job_logs
 
         with (
             _patch_caller_and_db(user_b, fake_db),
@@ -1238,7 +1249,11 @@ class TestJobMutationGates:
             ),
         ):
             with pytest.raises(HTTPException) as exc:
-                await get_job_logs(fake_request, str(job_a["id"]))
+                await get_job_logs(
+                    fake_request,
+                    str(job_a["id"]),
+                    dependencies=_job_diagnostics_dependencies(),
+                )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio

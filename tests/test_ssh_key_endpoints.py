@@ -37,9 +37,15 @@ when_secret_is_empty`` / ``test_verify_returns_false_when_secret_is_empty``);
 a malformed ``key_id`` on delete folded into the existing 404
 (``test_delete_ssh_key_malformed_id_is_404_not_500``); and wiring tests
 distinct from logic tests — route registration, the previously-untested GET,
-the delete happy path, both branches of ``_serialize_ssh_key_row``'s
+the delete happy path, both branches of ``serialize_ssh_key_row``'s
 ``.isoformat()`` calls, and pinned arguments into ``verify_possession`` and
 the delete store call.
+
+These cases first passed against the original handlers in ``main`` and now
+exercise ``orchestrator.routers.ssh_access`` over
+``orchestrator.services.ssh_access``. The session secret is a *dependency
+value* rather than a module global, so the fail-closed cases set
+``harness.secret = ""`` instead of monkeypatching an import-time binding.
 """
 
 import json
@@ -50,7 +56,10 @@ import pytest
 from fastapi import HTTPException
 
 import orchestrator.main
+from orchestrator.routers import ssh_access as ssh_access_routes
+from orchestrator.services import ssh_access as ssh_access_operations
 from orchestrator.services.ssh_public_keys import SshKeyRejected
+from tests._ssh_access_harness import SECRET, SshAccessHarness
 from tests._route_inventory import mounted_routes
 
 
@@ -59,34 +68,32 @@ class _Body:
         self.__dict__.update(kw)
 
 
-@pytest.fixture(autouse=True)
-def _ssh_challenge_secret(monkeypatch):
-    """Every test gets a non-empty SESSION_JWT_SECRET by default.
+def _parsed(fingerprint="SHA256:" + "A" * 43, public_key=None):
+    def _parse(text):
+        return _Body(
+            key_type="ssh-ed25519",
+            public_key=public_key if public_key is not None else text,
+            fingerprint_sha256=fingerprint,
+            comment="",
+        )
 
-    ``main._session_jwt_secret`` is bound once at import time from the
-    environment, so setting the env var mid-test has no effect — tests that
-    want the empty-secret (fail-closed) behavior override this directly with
-    ``monkeypatch.setattr(main, "_session_jwt_secret", "")``.
-    """
-    monkeypatch.setattr(
-        orchestrator.main, "_session_jwt_secret", "test-only-ssh-challenge-secret"
-    )
+    return _parse
 
 
 @pytest.fixture
-def approved_user(monkeypatch):
-    user = {"id": "00000000-0000-0000-0000-000000000001", "is_approved": True}
+def harness():
+    return SshAccessHarness()
 
-    async def _require(request, db):
-        return user
 
-    monkeypatch.setattr(orchestrator.main, "require_approved_user", _require)
-    return user
+@pytest.fixture
+def approved_user(harness):
+    harness.user = {"id": "00000000-0000-0000-0000-000000000001", "is_approved": True}
+    return harness.user
 
 
 @pytest.mark.asyncio
 async def test_challenge_is_reusable_but_duplicate_key_is_rejected_by_fingerprint(
-    approved_user, monkeypatch
+    harness, approved_user, monkeypatch
 ):
     """Not single-use at the token layer, by design (ruling F24).
 
@@ -99,25 +106,20 @@ async def test_challenge_is_reusable_but_duplicate_key_is_rejected_by_fingerprin
     constraint rejects — surfaced as 409 here, not the 400 "unknown
     challenge" a dict-backed single-use store would have produced on the
     second call. If this starts asserting 400, someone put the nonce store
-    back — see the comment on ``_mint_ssh_key_challenge``.
+    back — see the comment on ``mint_ssh_key_challenge``.
     """
     from orchestrator.database.postgres import SshKeyAlreadyRegistered
 
-    challenge = await orchestrator.main.create_ssh_key_challenge(request=object())
+    challenge = await ssh_access_routes.create_ssh_key_challenge(
+        request=object(), dependencies=harness.dependencies
+    )
     assert challenge["namespace"]
     assert len(challenge["challenge"]) >= 32
 
+    monkeypatch.setattr(ssh_access_operations, "parse_public_key", _parsed())
     monkeypatch.setattr(
-        orchestrator.main,
-        "parse_public_key",
-        lambda text: _Body(
-            key_type="ssh-ed25519",
-            public_key=text,
-            fingerprint_sha256="SHA256:" + "A" * 43,
-            comment="",
-        ),
+        ssh_access_operations, "verify_possession", lambda *a, **k: True
     )
-    monkeypatch.setattr(orchestrator.main, "verify_possession", lambda *a, **k: True)
 
     calls = {"n": 0}
 
@@ -135,7 +137,7 @@ async def test_challenge_is_reusable_but_duplicate_key_is_rejected_by_fingerprin
             }
         raise SshKeyAlreadyRegistered("SHA256:" + "A" * 43)
 
-    monkeypatch.setattr(orchestrator.main.postgres_db, "create_user_ssh_key", _create)
+    harness.store.set("create_user_ssh_key", _create)
 
     body = _Body(
         name="laptop",
@@ -143,47 +145,41 @@ async def test_challenge_is_reusable_but_duplicate_key_is_rejected_by_fingerprin
         challenge=challenge["challenge"],
         signature="-----BEGIN SSH SIGNATURE-----",
     )
-    first = await orchestrator.main.create_ssh_key(request=object(), body=body)
+    first = await ssh_access_routes.create_ssh_key(
+        request=object(), body=body, dependencies=harness.dependencies
+    )
     assert first["id"] == "k1"
 
     with pytest.raises(HTTPException) as excinfo:
-        await orchestrator.main.create_ssh_key(request=object(), body=body)
+        await ssh_access_routes.create_ssh_key(
+            request=object(), body=body, dependencies=harness.dependencies
+        )
     assert excinfo.value.status_code == 409
     assert calls["n"] == 2
 
 
 @pytest.mark.asyncio
-async def test_challenge_minted_for_one_user_is_rejected_for_another(monkeypatch):
+async def test_challenge_minted_for_one_user_is_rejected_for_another(
+    harness, monkeypatch
+):
     """The exact lockout attack the possession check exists to prevent:
     replaying a captured (challenge, signature) pair to register a key under
     a *different* account. A stateless token only carries this property if
     the embedded user id is checked against the authenticated caller, not
     just the signature — this pins that check.
     """
-    user_a = {"id": "00000000-0000-0000-0000-0000000000aa", "is_approved": True}
-    user_b = {"id": "00000000-0000-0000-0000-0000000000bb", "is_approved": True}
-
-    async def _require_a(request, db):
-        return user_a
-
-    monkeypatch.setattr(orchestrator.main, "require_approved_user", _require_a)
-    challenge = await orchestrator.main.create_ssh_key_challenge(request=object())
-
-    async def _require_b(request, db):
-        return user_b
-
-    monkeypatch.setattr(orchestrator.main, "require_approved_user", _require_b)
-    monkeypatch.setattr(
-        orchestrator.main,
-        "parse_public_key",
-        lambda text: _Body(
-            key_type="ssh-ed25519",
-            public_key=text,
-            fingerprint_sha256="SHA256:" + "B" * 43,
-            comment="",
-        ),
+    harness.user = {"id": "00000000-0000-0000-0000-0000000000aa", "is_approved": True}
+    challenge = await ssh_access_routes.create_ssh_key_challenge(
+        request=object(), dependencies=harness.dependencies
     )
-    monkeypatch.setattr(orchestrator.main, "verify_possession", lambda *a, **k: True)
+
+    harness.user = {"id": "00000000-0000-0000-0000-0000000000bb", "is_approved": True}
+    monkeypatch.setattr(
+        ssh_access_operations, "parse_public_key", _parsed("SHA256:" + "B" * 43)
+    )
+    monkeypatch.setattr(
+        ssh_access_operations, "verify_possession", lambda *a, **k: True
+    )
 
     body = _Body(
         name="stolen",
@@ -192,7 +188,9 @@ async def test_challenge_minted_for_one_user_is_rejected_for_another(monkeypatch
         signature="sig",
     )
     with pytest.raises(HTTPException) as excinfo:
-        await orchestrator.main.create_ssh_key(request=object(), body=body)
+        await ssh_access_routes.create_ssh_key(
+            request=object(), body=body, dependencies=harness.dependencies
+        )
     assert excinfo.value.status_code == 400
 
 
@@ -202,9 +200,13 @@ def test_expired_challenge_is_rejected():
     """
     user_id = "00000000-0000-0000-0000-000000000042"
     past = time.time() - 10_000
-    token, expires_at = orchestrator.main._mint_ssh_key_challenge(user_id, now=past)
+    token, expires_at = ssh_access_operations.mint_ssh_key_challenge(
+        user_id, now=past, secret=SECRET
+    )
     assert expires_at <= time.time()
-    assert not orchestrator.main._verify_ssh_key_challenge(token, user_id)
+    assert not ssh_access_operations.verify_ssh_key_challenge(
+        token, user_id, secret=SECRET
+    )
 
 
 def test_tampered_challenge_is_rejected():
@@ -212,31 +214,28 @@ def test_tampered_challenge_is_rejected():
     HMAC — this is what makes the embedded user id and expiry trustworthy.
     """
     user_id = "00000000-0000-0000-0000-000000000042"
-    token, _ = orchestrator.main._mint_ssh_key_challenge(user_id)
+    token, _ = ssh_access_operations.mint_ssh_key_challenge(user_id, secret=SECRET)
     tampered = token[:-1] + ("0" if token[-1] != "0" else "1")
     assert tampered != token
-    assert not orchestrator.main._verify_ssh_key_challenge(tampered, user_id)
+    assert not ssh_access_operations.verify_ssh_key_challenge(
+        tampered, user_id, secret=SECRET
+    )
 
 
 @pytest.mark.asyncio
 async def test_tampered_challenge_is_rejected_through_the_endpoint(
-    approved_user, monkeypatch
+    harness, approved_user, monkeypatch
 ):
-    challenge = await orchestrator.main.create_ssh_key_challenge(request=object())
+    challenge = await ssh_access_routes.create_ssh_key_challenge(
+        request=object(), dependencies=harness.dependencies
+    )
     original = challenge["challenge"]
     tampered = original[:-1] + ("0" if original[-1] != "0" else "1")
 
+    monkeypatch.setattr(ssh_access_operations, "parse_public_key", _parsed())
     monkeypatch.setattr(
-        orchestrator.main,
-        "parse_public_key",
-        lambda text: _Body(
-            key_type="ssh-ed25519",
-            public_key=text,
-            fingerprint_sha256="SHA256:" + "A" * 43,
-            comment="",
-        ),
+        ssh_access_operations, "verify_possession", lambda *a, **k: True
     )
-    monkeypatch.setattr(orchestrator.main, "verify_possession", lambda *a, **k: True)
     body = _Body(
         name="laptop",
         public_key="ssh-ed25519 AAAA",
@@ -244,31 +243,37 @@ async def test_tampered_challenge_is_rejected_through_the_endpoint(
         signature="sig",
     )
     with pytest.raises(HTTPException) as excinfo:
-        await orchestrator.main.create_ssh_key(request=object(), body=body)
+        await ssh_access_routes.create_ssh_key(
+            request=object(), body=body, dependencies=harness.dependencies
+        )
     assert excinfo.value.status_code == 400
 
 
 @pytest.mark.asyncio
-async def test_challenge_endpoint_503_when_secret_is_empty(approved_user, monkeypatch):
-    """Fail closed: main.py:1403 only logs a warning for an empty
+async def test_challenge_endpoint_503_when_secret_is_empty(harness, approved_user):
+    """Fail closed: application startup only logs a warning for an empty
     SESSION_JWT_SECRET today. The challenge endpoint must not rely on that —
     an empty secret is a well-known HMAC key, so every replica would sign
     forgeable tokens.
     """
-    monkeypatch.setattr(orchestrator.main, "_session_jwt_secret", "")
+    harness.secret = ""
     with pytest.raises(HTTPException) as excinfo:
-        await orchestrator.main.create_ssh_key_challenge(request=object())
+        await ssh_access_routes.create_ssh_key_challenge(
+            request=object(), dependencies=harness.dependencies
+        )
     assert excinfo.value.status_code == 503
 
 
 @pytest.mark.asyncio
-async def test_create_ssh_key_503_when_secret_is_empty(approved_user, monkeypatch):
+async def test_create_ssh_key_503_when_secret_is_empty(harness, approved_user):
     """Same fail-closed guard on the redemption side: if the secret goes
     empty between mint and redeem, verifying the challenge would be
     meaningless, so refuse outright rather than accept.
     """
-    challenge = await orchestrator.main.create_ssh_key_challenge(request=object())
-    monkeypatch.setattr(orchestrator.main, "_session_jwt_secret", "")
+    challenge = await ssh_access_routes.create_ssh_key_challenge(
+        request=object(), dependencies=harness.dependencies
+    )
+    harness.secret = ""
     body = _Body(
         name="laptop",
         public_key="ssh-ed25519 AAAA",
@@ -276,24 +281,21 @@ async def test_create_ssh_key_503_when_secret_is_empty(approved_user, monkeypatc
         signature="sig",
     )
     with pytest.raises(HTTPException) as excinfo:
-        await orchestrator.main.create_ssh_key(request=object(), body=body)
+        await ssh_access_routes.create_ssh_key(
+            request=object(), body=body, dependencies=harness.dependencies
+        )
     assert excinfo.value.status_code == 503
 
 
 @pytest.mark.asyncio
-async def test_rejects_unproven_key(approved_user, monkeypatch):
-    challenge = await orchestrator.main.create_ssh_key_challenge(request=object())
-    monkeypatch.setattr(
-        orchestrator.main,
-        "parse_public_key",
-        lambda text: _Body(
-            key_type="ssh-ed25519",
-            public_key=text,
-            fingerprint_sha256="SHA256:" + "A" * 43,
-            comment="",
-        ),
+async def test_rejects_unproven_key(harness, approved_user, monkeypatch):
+    challenge = await ssh_access_routes.create_ssh_key_challenge(
+        request=object(), dependencies=harness.dependencies
     )
-    monkeypatch.setattr(orchestrator.main, "verify_possession", lambda *a, **k: False)
+    monkeypatch.setattr(ssh_access_operations, "parse_public_key", _parsed())
+    monkeypatch.setattr(
+        ssh_access_operations, "verify_possession", lambda *a, **k: False
+    )
     body = _Body(
         name="laptop",
         public_key="ssh-ed25519 AAAA",
@@ -301,19 +303,23 @@ async def test_rejects_unproven_key(approved_user, monkeypatch):
         signature="bogus",
     )
     with pytest.raises(HTTPException) as excinfo:
-        await orchestrator.main.create_ssh_key(request=object(), body=body)
+        await ssh_access_routes.create_ssh_key(
+            request=object(), body=body, dependencies=harness.dependencies
+        )
     assert excinfo.value.status_code == 400
     assert "possession" in excinfo.value.detail.lower()
 
 
 @pytest.mark.asyncio
-async def test_rejects_bad_key_with_its_reason(approved_user, monkeypatch):
-    challenge = await orchestrator.main.create_ssh_key_challenge(request=object())
+async def test_rejects_bad_key_with_its_reason(harness, approved_user, monkeypatch):
+    challenge = await ssh_access_routes.create_ssh_key_challenge(
+        request=object(), dependencies=harness.dependencies
+    )
 
     def _reject(text):
         raise SshKeyRejected("RSA keys must be at least 3072 bits; this one is 2048.")
 
-    monkeypatch.setattr(orchestrator.main, "parse_public_key", _reject)
+    monkeypatch.setattr(ssh_access_operations, "parse_public_key", _reject)
     body = _Body(
         name="old",
         public_key="ssh-rsa AAAA",
@@ -321,34 +327,31 @@ async def test_rejects_bad_key_with_its_reason(approved_user, monkeypatch):
         signature="x",
     )
     with pytest.raises(HTTPException) as excinfo:
-        await orchestrator.main.create_ssh_key(request=object(), body=body)
+        await ssh_access_routes.create_ssh_key(
+            request=object(), body=body, dependencies=harness.dependencies
+        )
     assert excinfo.value.status_code == 400
     assert "3072" in excinfo.value.detail
 
 
 @pytest.mark.asyncio
 async def test_duplicate_fingerprint_is_409_with_a_recovery_path(
-    approved_user, monkeypatch
+    harness, approved_user, monkeypatch
 ):
     from orchestrator.database.postgres import SshKeyAlreadyRegistered
 
-    challenge = await orchestrator.main.create_ssh_key_challenge(request=object())
-    monkeypatch.setattr(
-        orchestrator.main,
-        "parse_public_key",
-        lambda text: _Body(
-            key_type="ssh-ed25519",
-            public_key=text,
-            fingerprint_sha256="SHA256:" + "A" * 43,
-            comment="",
-        ),
+    challenge = await ssh_access_routes.create_ssh_key_challenge(
+        request=object(), dependencies=harness.dependencies
     )
-    monkeypatch.setattr(orchestrator.main, "verify_possession", lambda *a, **k: True)
+    monkeypatch.setattr(ssh_access_operations, "parse_public_key", _parsed())
+    monkeypatch.setattr(
+        ssh_access_operations, "verify_possession", lambda *a, **k: True
+    )
 
     async def _boom(**kwargs):
         raise SshKeyAlreadyRegistered("SHA256:" + "A" * 43)
 
-    monkeypatch.setattr(orchestrator.main.postgres_db, "create_user_ssh_key", _boom)
+    harness.store.set("create_user_ssh_key", _boom)
     body = _Body(
         name="laptop",
         public_key="ssh-ed25519 AAAA",
@@ -356,13 +359,15 @@ async def test_duplicate_fingerprint_is_409_with_a_recovery_path(
         signature="x",
     )
     with pytest.raises(HTTPException) as excinfo:
-        await orchestrator.main.create_ssh_key(request=object(), body=body)
+        await ssh_access_routes.create_ssh_key(
+            request=object(), body=body, dependencies=harness.dependencies
+        )
     assert excinfo.value.status_code == 409
     assert "support" in excinfo.value.detail.lower()
 
 
 @pytest.mark.asyncio
-async def test_key_cap_is_409_naming_the_cap(approved_user, monkeypatch):
+async def test_key_cap_is_409_naming_the_cap(harness, approved_user, monkeypatch):
     """Spec §4.1 caps registrations at ``MAX_SSH_KEYS_PER_USER``.
 
     Also 409, like the duplicate above, but a different recovery path — this
@@ -371,23 +376,20 @@ async def test_key_cap_is_409_naming_the_cap(approved_user, monkeypatch):
     """
     from orchestrator.database.postgres import MAX_SSH_KEYS_PER_USER, SshKeyLimitReached
 
-    challenge = await orchestrator.main.create_ssh_key_challenge(request=object())
-    monkeypatch.setattr(
-        orchestrator.main,
-        "parse_public_key",
-        lambda text: _Body(
-            key_type="ssh-ed25519",
-            public_key=text,
-            fingerprint_sha256="SHA256:" + "B" * 43,
-            comment="",
-        ),
+    challenge = await ssh_access_routes.create_ssh_key_challenge(
+        request=object(), dependencies=harness.dependencies
     )
-    monkeypatch.setattr(orchestrator.main, "verify_possession", lambda *a, **k: True)
+    monkeypatch.setattr(
+        ssh_access_operations, "parse_public_key", _parsed("SHA256:" + "B" * 43)
+    )
+    monkeypatch.setattr(
+        ssh_access_operations, "verify_possession", lambda *a, **k: True
+    )
 
     async def _capped(**kwargs):
         raise SshKeyLimitReached(MAX_SSH_KEYS_PER_USER)
 
-    monkeypatch.setattr(orchestrator.main.postgres_db, "create_user_ssh_key", _capped)
+    harness.store.set("create_user_ssh_key", _capped)
     body = _Body(
         name="laptop",
         public_key="ssh-ed25519 AAAA",
@@ -395,7 +397,9 @@ async def test_key_cap_is_409_naming_the_cap(approved_user, monkeypatch):
         signature="x",
     )
     with pytest.raises(HTTPException) as excinfo:
-        await orchestrator.main.create_ssh_key(request=object(), body=body)
+        await ssh_access_routes.create_ssh_key(
+            request=object(), body=body, dependencies=harness.dependencies
+        )
     assert excinfo.value.status_code == 409
     assert str(MAX_SSH_KEYS_PER_USER) in excinfo.value.detail
     # Not the duplicate-fingerprint message, which points at support.
@@ -403,13 +407,15 @@ async def test_key_cap_is_409_naming_the_cap(approved_user, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_delete_reports_miss(approved_user, monkeypatch):
+async def test_delete_reports_miss(harness, approved_user):
     async def _delete(key_id, user_id):
         return False
 
-    monkeypatch.setattr(orchestrator.main.postgres_db, "delete_user_ssh_key", _delete)
+    harness.store.set("delete_user_ssh_key", _delete)
     with pytest.raises(HTTPException) as excinfo:
-        await orchestrator.main.delete_ssh_key(request=object(), key_id="k1")
+        await ssh_access_routes.delete_ssh_key(
+            request=object(), key_id="k1", dependencies=harness.dependencies
+        )
     assert excinfo.value.status_code == 404
 
 
@@ -420,26 +426,25 @@ async def test_delete_reports_miss(approved_user, monkeypatch):
 
 
 @pytest.fixture
-def project_scoped_user(monkeypatch):
+def project_scoped_user(harness):
     """An approved user authenticated by a legacy ``project:<uuid>``-scoped
     MCP token. ``user_can_access_job_or_thread`` denies this principal every
-    thread — the IDE included — via ``_scope_permits_personal``."""
+    thread — the IDE included — via ``_scope_permits_personal``.
+
+    The real ``require_personal_scope`` runs (the harness default), so its
+    denial audit write has to land somewhere: the store answers it.
+    """
     user = {
         "id": "00000000-0000-0000-0000-000000000001",
         "is_approved": True,
         "scopes": ["project:11111111-1111-1111-1111-111111111111"],
     }
 
-    async def _require(request, db):
-        return user
-
     async def _no_audit(**kwargs):
         return None
 
-    monkeypatch.setattr(orchestrator.main, "require_approved_user", _require)
-    monkeypatch.setattr(
-        orchestrator.main.postgres_db, "record_security_event", _no_audit
-    )
+    harness.user = user
+    harness.store.set("record_security_event", _no_audit)
     return user
 
 
@@ -456,7 +461,7 @@ def test_the_scope_helper_actually_denies_this_principal(project_scoped_user):
 
 @pytest.mark.asyncio
 async def test_project_scoped_token_cannot_register_a_key(
-    project_scoped_user, monkeypatch
+    harness, project_scoped_user, monkeypatch
 ):
     """Registration composes with resolution into something neither is alone:
     an SSH key authenticates by fingerprint, so the token's scope is gone by
@@ -465,7 +470,7 @@ async def test_project_scoped_token_cannot_register_a_key(
     def _tripwire(*a, **k):
         raise AssertionError("must refuse before parsing the key")
 
-    monkeypatch.setattr(orchestrator.main, "parse_public_key", _tripwire)
+    monkeypatch.setattr(ssh_access_operations, "parse_public_key", _tripwire)
     body = _Body(
         name="laptop",
         public_key="ssh-ed25519 AAAA",
@@ -473,12 +478,14 @@ async def test_project_scoped_token_cannot_register_a_key(
         signature="x",
     )
     with pytest.raises(HTTPException) as excinfo:
-        await orchestrator.main.create_ssh_key(request=object(), body=body)
+        await ssh_access_routes.create_ssh_key(
+            request=object(), body=body, dependencies=harness.dependencies
+        )
     assert excinfo.value.status_code == 403
 
 
 @pytest.mark.asyncio
-async def test_project_scoped_token_cannot_list_keys(project_scoped_user, monkeypatch):
+async def test_project_scoped_token_cannot_list_keys(harness, project_scoped_user):
     """Listing is read-only and leaks no id the token could act on, so this is
     the weakest of the three gates. It exists for contract consistency:
     _scope_permits_personal's own docstring says such a token "shouldn't be
@@ -488,16 +495,16 @@ async def test_project_scoped_token_cannot_list_keys(project_scoped_user, monkey
     async def _tripwire(user_id):
         raise AssertionError("must refuse before reaching the store")
 
-    monkeypatch.setattr(orchestrator.main.postgres_db, "list_user_ssh_keys", _tripwire)
+    harness.store.set("list_user_ssh_keys", _tripwire)
     with pytest.raises(HTTPException) as excinfo:
-        await orchestrator.main.list_ssh_keys(request=object())
+        await ssh_access_routes.list_ssh_keys(
+            request=object(), dependencies=harness.dependencies
+        )
     assert excinfo.value.status_code == 403
 
 
 @pytest.mark.asyncio
-async def test_project_scoped_token_cannot_delete_a_key(
-    project_scoped_user, monkeypatch
-):
+async def test_project_scoped_token_cannot_delete_a_key(harness, project_scoped_user):
     """Deletion is the only revocation this feature has, so leaving it open
     while gating create would let a project-scoped token strip its owner's
     access."""
@@ -505,10 +512,26 @@ async def test_project_scoped_token_cannot_delete_a_key(
     async def _tripwire(key_id, user_id):
         raise AssertionError("must refuse before reaching the store")
 
-    monkeypatch.setattr(orchestrator.main.postgres_db, "delete_user_ssh_key", _tripwire)
+    harness.store.set("delete_user_ssh_key", _tripwire)
     with pytest.raises(HTTPException) as excinfo:
-        await orchestrator.main.delete_ssh_key(
-            request=object(), key_id="00000000-0000-0000-0000-0000000000aa"
+        await ssh_access_routes.delete_ssh_key(
+            request=object(),
+            key_id="00000000-0000-0000-0000-0000000000aa",
+            dependencies=harness.dependencies,
+        )
+    assert excinfo.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_project_scoped_token_cannot_mint_an_attach_token(
+    harness, project_scoped_user
+):
+    """The attach token opens a transport into every workspace its holder's
+    registered keys reach, and the SSH layer authorizes by fingerprint — by
+    which point the MCP token's scope no longer exists to check."""
+    with pytest.raises(HTTPException) as excinfo:
+        await ssh_access_routes.create_ssh_attach_token(
+            request=object(), dependencies=harness.dependencies
         )
     assert excinfo.value.status_code == 403
 
@@ -532,7 +555,7 @@ def test_ssh_key_routes_are_mounted():
 
 
 @pytest.mark.asyncio
-async def test_list_ssh_keys(approved_user, monkeypatch):
+async def test_list_ssh_keys(harness, approved_user):
     """No test exercised GET /api/ssh-keys at all before this."""
 
     async def _list(user_id):
@@ -549,8 +572,10 @@ async def test_list_ssh_keys(approved_user, monkeypatch):
             }
         ]
 
-    monkeypatch.setattr(orchestrator.main.postgres_db, "list_user_ssh_keys", _list)
-    result = await orchestrator.main.list_ssh_keys(request=object())
+    harness.store.set("list_user_ssh_keys", _list)
+    result = await ssh_access_routes.list_ssh_keys(
+        request=object(), dependencies=harness.dependencies
+    )
     assert result == [
         {
             "id": "k1",
@@ -565,7 +590,7 @@ async def test_list_ssh_keys(approved_user, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_delete_ssh_key_happy_path(approved_user, monkeypatch):
+async def test_delete_ssh_key_happy_path(harness, approved_user):
     """The delete happy path, including its response body, plus argument
     pinning: the user_id that reaches the store must be the authenticated
     caller's, not something derived from the path or body.
@@ -577,14 +602,16 @@ async def test_delete_ssh_key_happy_path(approved_user, monkeypatch):
         captured["user_id"] = user_id
         return True
 
-    monkeypatch.setattr(orchestrator.main.postgres_db, "delete_user_ssh_key", _delete)
-    result = await orchestrator.main.delete_ssh_key(request=object(), key_id="k1")
+    harness.store.set("delete_user_ssh_key", _delete)
+    result = await ssh_access_routes.delete_ssh_key(
+        request=object(), key_id="k1", dependencies=harness.dependencies
+    )
     assert result == {"status": "deleted"}
     assert captured == {"key_id": "k1", "user_id": approved_user["id"]}
 
 
 @pytest.mark.asyncio
-async def test_delete_ssh_key_malformed_id_is_404_not_500(approved_user, monkeypatch):
+async def test_delete_ssh_key_malformed_id_is_404_not_500(harness, approved_user):
     """Review Minor 3: the store's ``UUID(key_id)`` raises ``ValueError`` on
     a malformed id. That must fold into the existing "not found" outcome,
     not surface as an unhandled 500.
@@ -593,9 +620,11 @@ async def test_delete_ssh_key_malformed_id_is_404_not_500(approved_user, monkeyp
     async def _delete(key_id, user_id):
         raise ValueError("badly formed hexadecimal UUID string")
 
-    monkeypatch.setattr(orchestrator.main.postgres_db, "delete_user_ssh_key", _delete)
+    harness.store.set("delete_user_ssh_key", _delete)
     with pytest.raises(HTTPException) as excinfo:
-        await orchestrator.main.delete_ssh_key(request=object(), key_id="not-a-uuid")
+        await ssh_access_routes.delete_ssh_key(
+            request=object(), key_id="not-a-uuid", dependencies=harness.dependencies
+        )
     assert excinfo.value.status_code == 404
 
 
@@ -614,7 +643,7 @@ def test_serialize_ssh_key_row_with_timestamps():
         "last_used_at": used,
         "disabled_at": None,
     }
-    result = orchestrator.main._serialize_ssh_key_row(row)
+    result = ssh_access_operations.serialize_ssh_key_row(row)
     assert result["created_at"] == created.isoformat()
     assert result["last_used_at"] == used.isoformat()
     assert result["disabled"] is False
@@ -630,32 +659,58 @@ def test_serialize_ssh_key_row_without_timestamps():
         "last_used_at": None,
         "disabled_at": datetime(2026, 1, 1, tzinfo=timezone.utc),
     }
-    result = orchestrator.main._serialize_ssh_key_row(row)
+    result = ssh_access_operations.serialize_ssh_key_row(row)
     assert result["created_at"] is None
     assert result["last_used_at"] is None
     assert result["disabled"] is True
 
 
+def test_serialized_key_row_never_carries_the_public_key_material():
+    """The projection is an allowlist, and it must stay one: the store row
+    carries ``public_key`` (and could grow more columns), none of which the
+    key list has any reason to hand back.
+    """
+    row = {
+        "id": "k1",
+        "name": "laptop",
+        "key_type": "ssh-ed25519",
+        "public_key": "ssh-ed25519 AAAA secret-comment",
+        "fingerprint_sha256": "SHA256:" + "A" * 43,
+        "created_at": None,
+        "last_used_at": None,
+        "disabled_at": None,
+        "user_id": "00000000-0000-0000-0000-000000000001",
+    }
+    result = ssh_access_operations.serialize_ssh_key_row(row)
+    assert set(result) == {
+        "id",
+        "name",
+        "key_type",
+        "fingerprint",
+        "created_at",
+        "last_used_at",
+        "disabled",
+    }
+    assert "ssh-ed25519 AAAA secret-comment" not in json.dumps(result)
+
+
 @pytest.mark.asyncio
 async def test_verify_possession_receives_parsed_key_namespace_and_challenge(
-    approved_user, monkeypatch
+    harness, approved_user, monkeypatch
 ):
     """Argument pinning on verify_possession: the PARSED (normalized)
     public key — not the raw request body string — the module's
     SIGNATURE_NAMESPACE, and the challenge string (encoded) as the signed
     payload, plus the signature verbatim.
     """
-    challenge = await orchestrator.main.create_ssh_key_challenge(request=object())
+    challenge = await ssh_access_routes.create_ssh_key_challenge(
+        request=object(), dependencies=harness.dependencies
+    )
 
     monkeypatch.setattr(
-        orchestrator.main,
+        ssh_access_operations,
         "parse_public_key",
-        lambda text: _Body(
-            key_type="ssh-ed25519",
-            public_key="ssh-ed25519 AAAA-normalized comment",
-            fingerprint_sha256="SHA256:" + "A" * 43,
-            comment="comment",
-        ),
+        _parsed(public_key="ssh-ed25519 AAAA-normalized comment"),
     )
 
     captured = {}
@@ -667,7 +722,7 @@ async def test_verify_possession_receives_parsed_key_namespace_and_challenge(
         captured["signature"] = signature
         return True
 
-    monkeypatch.setattr(orchestrator.main, "verify_possession", _verify)
+    monkeypatch.setattr(ssh_access_operations, "verify_possession", _verify)
 
     async def _create(**kwargs):
         return {
@@ -680,7 +735,7 @@ async def test_verify_possession_receives_parsed_key_namespace_and_challenge(
             "disabled_at": None,
         }
 
-    monkeypatch.setattr(orchestrator.main.postgres_db, "create_user_ssh_key", _create)
+    harness.store.set("create_user_ssh_key", _create)
 
     body = _Body(
         name="laptop",
@@ -688,10 +743,12 @@ async def test_verify_possession_receives_parsed_key_namespace_and_challenge(
         challenge=challenge["challenge"],
         signature="the-signature",
     )
-    await orchestrator.main.create_ssh_key(request=object(), body=body)
+    await ssh_access_routes.create_ssh_key(
+        request=object(), body=body, dependencies=harness.dependencies
+    )
 
     assert captured["public_key"] == "ssh-ed25519 AAAA-normalized comment"
-    assert captured["namespace"] == orchestrator.main.SIGNATURE_NAMESPACE
+    assert captured["namespace"] == ssh_access_operations.SIGNATURE_NAMESPACE
     assert captured["payload"] == challenge["challenge"].encode("utf-8")
     assert captured["signature"] == "the-signature"
 
@@ -706,10 +763,13 @@ def test_verify_ssh_key_challenge_rejects_non_ascii_without_raising():
     raises ``TypeError`` on a non-ASCII ``str`` argument, reachable
     pre-authentication since the raw signature field is compared before its
     validity is known. Before the ``isascii()`` guard this token would have
-    raised out of ``_verify_ssh_key_challenge`` instead of returning False.
+    raised out of ``verify_ssh_key_challenge`` instead of returning False.
     """
     token = "srw-ssh1:a:b:c:d:\u00e9"
-    assert orchestrator.main._verify_ssh_key_challenge(token, "b") is False
+    assert (
+        ssh_access_operations.verify_ssh_key_challenge(token, "b", secret=SECRET)
+        is False
+    )
 
 
 def test_verify_ssh_key_challenge_rejects_lone_surrogate():
@@ -723,7 +783,10 @@ def test_verify_ssh_key_challenge_rejects_lone_surrogate():
     token = json.loads('{"c": "srw-ssh1:a:b:c:d:\\udcff"}')["c"]
     with pytest.raises(UnicodeEncodeError):
         token.encode("utf-8")  # documents why encode-first is not the fix
-    assert orchestrator.main._verify_ssh_key_challenge(token, "b") is False
+    assert (
+        ssh_access_operations.verify_ssh_key_challenge(token, "b", secret=SECRET)
+        is False
+    )
 
 
 @pytest.mark.asyncio
@@ -740,22 +803,13 @@ def test_verify_ssh_key_challenge_rejects_lone_surrogate():
     ],
 )
 async def test_non_ascii_challenge_is_rejected_not_raised_through_endpoint(
-    approved_user, monkeypatch, bad_challenge
+    harness, approved_user, monkeypatch, bad_challenge
 ):
     """End-to-end: a non-ASCII challenge in the request body must come back
     as a 4xx HTTPException, never an unhandled exception an authenticated
     caller could loop to produce logged 500s.
     """
-    monkeypatch.setattr(
-        orchestrator.main,
-        "parse_public_key",
-        lambda text: _Body(
-            key_type="ssh-ed25519",
-            public_key=text,
-            fingerprint_sha256="SHA256:" + "A" * 43,
-            comment="",
-        ),
-    )
+    monkeypatch.setattr(ssh_access_operations, "parse_public_key", _parsed())
     body = _Body(
         name="laptop",
         public_key="ssh-ed25519 AAAA",
@@ -763,7 +817,9 @@ async def test_non_ascii_challenge_is_rejected_not_raised_through_endpoint(
         signature="sig",
     )
     with pytest.raises(HTTPException) as excinfo:
-        await orchestrator.main.create_ssh_key(request=object(), body=body)
+        await ssh_access_routes.create_ssh_key(
+            request=object(), body=body, dependencies=harness.dependencies
+        )
     assert excinfo.value.status_code == 400
 
 
@@ -772,21 +828,30 @@ async def test_non_ascii_challenge_is_rejected_not_raised_through_endpoint(
 # =============================================================================
 
 
-def test_minted_token_contains_the_identity_clause():
-    token, _ = orchestrator.main._mint_ssh_key_challenge(
-        "user-a-id", "alice@example.com"
+def _mint(user_id, identity=None):
+    token, _ = ssh_access_operations.mint_ssh_key_challenge(
+        user_id, identity, secret=SECRET
     )
+    return token
+
+
+def _verify(token, user_id):
+    return ssh_access_operations.verify_ssh_key_challenge(token, user_id, secret=SECRET)
+
+
+def test_minted_token_contains_the_identity_clause():
+    token = _mint("user-a-id", "alice@example.com")
     assert "alice@example.com" in token.split(":")
 
 
 def test_identity_label_is_covered_by_the_mac():
     """Flipping the identity clause after minting must invalidate the token
     — otherwise the label wouldn't actually be trustworthy to a signer."""
-    token, _ = orchestrator.main._mint_ssh_key_challenge("user-a-id", "alice")
-    assert orchestrator.main._verify_ssh_key_challenge(token, "user-a-id") is True
+    token = _mint("user-a-id", "alice")
+    assert _verify(token, "user-a-id") is True
     tampered = token.replace(":alice:", ":mallory:")
     assert tampered != token
-    assert orchestrator.main._verify_ssh_key_challenge(tampered, "user-a-id") is False
+    assert _verify(tampered, "user-a-id") is False
 
 
 def test_identity_label_is_never_consulted_for_authorization():
@@ -795,31 +860,27 @@ def test_identity_label_is_never_consulted_for_authorization():
     happens to name a different account must still authorize ONLY
     ``user-a-id`` — never the account the label names.
     """
-    token, _ = orchestrator.main._mint_ssh_key_challenge(
-        "user-a-id", "looks-like-user-b"
-    )
-    assert orchestrator.main._verify_ssh_key_challenge(token, "user-a-id") is True
-    assert (
-        orchestrator.main._verify_ssh_key_challenge(token, "looks-like-user-b") is False
-    )
+    token = _mint("user-a-id", "looks-like-user-b")
+    assert _verify(token, "user-a-id") is True
+    assert _verify(token, "looks-like-user-b") is False
 
 
 def test_identity_with_whitespace_falls_back_to_user_id():
-    token, _ = orchestrator.main._mint_ssh_key_challenge("user-a-id", "alice smith")
+    token = _mint("user-a-id", "alice smith")
     assert "alice smith" not in token
     assert "user-a-id" in token.split(":")
 
 
 def test_non_ascii_identity_falls_back_to_user_id():
-    token, _ = orchestrator.main._mint_ssh_key_challenge("user-a-id", "\u00c9tienne")
+    token = _mint("user-a-id", "\u00c9tienne")
     assert "\u00c9tienne" not in token
     assert token.isascii()
     assert "user-a-id" in token.split(":")
 
 
 def test_overlong_identity_falls_back_to_user_id():
-    long_label = "x" * (orchestrator.main._SSH_CHALLENGE_IDENTITY_MAX_LEN + 1)
-    token, _ = orchestrator.main._mint_ssh_key_challenge("user-a-id", long_label)
+    long_label = "x" * (ssh_access_operations.SSH_CHALLENGE_IDENTITY_MAX_LEN + 1)
+    token = _mint("user-a-id", long_label)
     assert long_label not in token
     assert "user-a-id" in token.split(":")
 
@@ -842,15 +903,47 @@ def test_control_character_identity_falls_back_to_user_id(label):
     the label does not help — the label is authentic, it just does not render
     as what it is.
     """
-    token, _ = orchestrator.main._mint_ssh_key_challenge("user-a-id", label)
+    token = _mint("user-a-id", label)
     assert label not in token
     assert token.isprintable()
     assert "user-a-id" in token.split(":")
 
 
 def test_empty_identity_falls_back_to_user_id():
-    token, _ = orchestrator.main._mint_ssh_key_challenge("user-a-id", None)
+    token = _mint("user-a-id", None)
     assert "user-a-id" in token.split(":")
+
+
+@pytest.mark.asyncio
+async def test_challenge_endpoint_labels_the_token_with_the_caller_identity(harness):
+    """The label source, pinned at the endpoint: ``preferred_username`` is
+    preferred over ``email``, and the fallback is the user id — the whole
+    anti-phishing property depends on the label naming the signer's account.
+    """
+    harness.user = {
+        "id": "00000000-0000-0000-0000-0000000000aa",
+        "preferred_username": "alice",
+        "email": "alice@example.com",
+    }
+    named = await ssh_access_routes.create_ssh_key_challenge(
+        request=object(), dependencies=harness.dependencies
+    )
+    assert "alice" in named["challenge"].split(":")
+
+    harness.user = {
+        "id": "00000000-0000-0000-0000-0000000000bb",
+        "email": "bob@example.com",
+    }
+    by_email = await ssh_access_routes.create_ssh_key_challenge(
+        request=object(), dependencies=harness.dependencies
+    )
+    assert "bob@example.com" in by_email["challenge"].split(":")
+
+    harness.user = {"id": "00000000-0000-0000-0000-0000000000cc"}
+    bare = await ssh_access_routes.create_ssh_key_challenge(
+        request=object(), dependencies=harness.dependencies
+    )
+    assert "00000000-0000-0000-0000-0000000000cc" in bare["challenge"].split(":")
 
 
 # =============================================================================
@@ -858,45 +951,41 @@ def test_empty_identity_falls_back_to_user_id():
 # =============================================================================
 
 
-def test_mint_raises_when_secret_is_empty(monkeypatch):
-    monkeypatch.setattr(orchestrator.main, "_session_jwt_secret", "")
+def test_mint_raises_when_secret_is_empty():
     with pytest.raises(RuntimeError):
-        orchestrator.main._mint_ssh_key_challenge("user-a-id", "alice")
+        ssh_access_operations.mint_ssh_key_challenge("user-a-id", "alice", secret="")
 
 
-def test_verify_returns_false_when_secret_is_empty(monkeypatch):
-    token, _ = orchestrator.main._mint_ssh_key_challenge("user-a-id", "alice")
-    monkeypatch.setattr(orchestrator.main, "_session_jwt_secret", "")
-    assert orchestrator.main._verify_ssh_key_challenge(token, "user-a-id") is False
+def test_verify_returns_false_when_secret_is_empty():
+    token = _mint("user-a-id", "alice")
+    assert (
+        ssh_access_operations.verify_ssh_key_challenge(token, "user-a-id", secret="")
+        is False
+    )
 
 
 # ---------------------------------------------------------------------------
 # §6.3 account-security notification (workspace_ssh_access.md): a key added
 # by someone else — a stolen session, a shared account — must stay visible
-# to its owner. Best-effort (main.py wraps the call in try/except), so these
-# pin the happy-path call, not failure handling — a broken notify path
+# to its owner. Best-effort (the service wraps the call in try/except), so
+# these pin the happy-path call, not failure handling — a broken notify path
 # already can't fail registration (see the wrapping try/except itself).
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_adding_a_key_records_exactly_one_notification(
-    approved_user, monkeypatch
+    harness, approved_user, monkeypatch
 ):
-    from unittest.mock import AsyncMock
-
-    challenge = await orchestrator.main.create_ssh_key_challenge(request=object())
-    monkeypatch.setattr(
-        orchestrator.main,
-        "parse_public_key",
-        lambda text: _Body(
-            key_type="ssh-ed25519",
-            public_key=text,
-            fingerprint_sha256="SHA256:" + "C" * 43,
-            comment="",
-        ),
+    challenge = await ssh_access_routes.create_ssh_key_challenge(
+        request=object(), dependencies=harness.dependencies
     )
-    monkeypatch.setattr(orchestrator.main, "verify_possession", lambda *a, **k: True)
+    monkeypatch.setattr(
+        ssh_access_operations, "parse_public_key", _parsed("SHA256:" + "C" * 43)
+    )
+    monkeypatch.setattr(
+        ssh_access_operations, "verify_possession", lambda *a, **k: True
+    )
 
     async def _create(**kwargs):
         return {
@@ -909,10 +998,7 @@ async def test_adding_a_key_records_exactly_one_notification(
             "disabled_at": None,
         }
 
-    monkeypatch.setattr(orchestrator.main.postgres_db, "create_user_ssh_key", _create)
-
-    record = AsyncMock()
-    monkeypatch.setattr(orchestrator.main.notification_service, "record", record)
+    harness.store.set("create_user_ssh_key", _create)
 
     body = _Body(
         name="laptop",
@@ -920,10 +1006,12 @@ async def test_adding_a_key_records_exactly_one_notification(
         challenge=challenge["challenge"],
         signature="-----BEGIN SSH SIGNATURE-----",
     )
-    await orchestrator.main.create_ssh_key(request=object(), body=body)
+    await ssh_access_routes.create_ssh_key(
+        request=object(), body=body, dependencies=harness.dependencies
+    )
 
-    record.assert_awaited_once()
-    kwargs = record.await_args.kwargs
+    assert len(harness.notifier.records) == 1
+    kwargs = harness.notifier.records[0]
     assert kwargs["category"] == "ssh_key_added"
     assert kwargs["recipient_id"] == approved_user["id"]
     assert kwargs["dedup_key"] == "ssh_key_added:k-notify-1"
@@ -931,28 +1019,23 @@ async def test_adding_a_key_records_exactly_one_notification(
 
 @pytest.mark.asyncio
 async def test_adding_the_same_key_twice_does_not_record_two_notifications(
-    approved_user, monkeypatch
+    harness, approved_user, monkeypatch
 ):
     """The second attempt never reaches the notify call at all: the store's
     fingerprint-uniqueness constraint rejects it first (409, same as
     ``test_challenge_is_reusable_but_duplicate_key_is_rejected_by_fingerprint``),
     so there is only ever one row to notify about."""
-    from unittest.mock import AsyncMock
-
     from orchestrator.database.postgres import SshKeyAlreadyRegistered
 
-    challenge = await orchestrator.main.create_ssh_key_challenge(request=object())
-    monkeypatch.setattr(
-        orchestrator.main,
-        "parse_public_key",
-        lambda text: _Body(
-            key_type="ssh-ed25519",
-            public_key=text,
-            fingerprint_sha256="SHA256:" + "D" * 43,
-            comment="",
-        ),
+    challenge = await ssh_access_routes.create_ssh_key_challenge(
+        request=object(), dependencies=harness.dependencies
     )
-    monkeypatch.setattr(orchestrator.main, "verify_possession", lambda *a, **k: True)
+    monkeypatch.setattr(
+        ssh_access_operations, "parse_public_key", _parsed("SHA256:" + "D" * 43)
+    )
+    monkeypatch.setattr(
+        ssh_access_operations, "verify_possession", lambda *a, **k: True
+    )
 
     calls = {"n": 0}
 
@@ -970,10 +1053,7 @@ async def test_adding_the_same_key_twice_does_not_record_two_notifications(
             }
         raise SshKeyAlreadyRegistered("SHA256:" + "D" * 43)
 
-    monkeypatch.setattr(orchestrator.main.postgres_db, "create_user_ssh_key", _create)
-
-    record = AsyncMock()
-    monkeypatch.setattr(orchestrator.main.notification_service, "record", record)
+    harness.store.set("create_user_ssh_key", _create)
 
     body = _Body(
         name="laptop",
@@ -981,12 +1061,16 @@ async def test_adding_the_same_key_twice_does_not_record_two_notifications(
         challenge=challenge["challenge"],
         signature="-----BEGIN SSH SIGNATURE-----",
     )
-    await orchestrator.main.create_ssh_key(request=object(), body=body)
+    await ssh_access_routes.create_ssh_key(
+        request=object(), body=body, dependencies=harness.dependencies
+    )
     with pytest.raises(HTTPException) as excinfo:
-        await orchestrator.main.create_ssh_key(request=object(), body=body)
+        await ssh_access_routes.create_ssh_key(
+            request=object(), body=body, dependencies=harness.dependencies
+        )
     assert excinfo.value.status_code == 409
 
-    record.assert_awaited_once()
+    assert len(harness.notifier.records) == 1
 
 
 @pytest.mark.asyncio
@@ -1022,23 +1106,20 @@ async def test_ssh_key_added_open_action_navigates_and_resolves():
 
 @pytest.mark.asyncio
 async def test_ssh_key_notification_failure_does_not_fail_registration(
-    approved_user, monkeypatch
+    harness, approved_user, monkeypatch
 ):
     """Best-effort: the key is already durably written by the time this
     runs, so a notify-path exception must never surface as a failed
     registration."""
-    challenge = await orchestrator.main.create_ssh_key_challenge(request=object())
-    monkeypatch.setattr(
-        orchestrator.main,
-        "parse_public_key",
-        lambda text: _Body(
-            key_type="ssh-ed25519",
-            public_key=text,
-            fingerprint_sha256="SHA256:" + "E" * 43,
-            comment="",
-        ),
+    challenge = await ssh_access_routes.create_ssh_key_challenge(
+        request=object(), dependencies=harness.dependencies
     )
-    monkeypatch.setattr(orchestrator.main, "verify_possession", lambda *a, **k: True)
+    monkeypatch.setattr(
+        ssh_access_operations, "parse_public_key", _parsed("SHA256:" + "E" * 43)
+    )
+    monkeypatch.setattr(
+        ssh_access_operations, "verify_possession", lambda *a, **k: True
+    )
 
     async def _create(**kwargs):
         return {
@@ -1051,12 +1132,13 @@ async def test_ssh_key_notification_failure_does_not_fail_registration(
             "disabled_at": None,
         }
 
-    monkeypatch.setattr(orchestrator.main.postgres_db, "create_user_ssh_key", _create)
+    harness.store.set("create_user_ssh_key", _create)
 
-    async def _boom(**kwargs):
-        raise RuntimeError("notification service unavailable")
+    class _BrokenNotifier:
+        async def record(self, **kwargs):
+            raise RuntimeError("notification service unavailable")
 
-    monkeypatch.setattr(orchestrator.main.notification_service, "record", _boom)
+    harness.notifier = _BrokenNotifier()
 
     body = _Body(
         name="laptop",
@@ -1064,5 +1146,7 @@ async def test_ssh_key_notification_failure_does_not_fail_registration(
         challenge=challenge["challenge"],
         signature="-----BEGIN SSH SIGNATURE-----",
     )
-    result = await orchestrator.main.create_ssh_key(request=object(), body=body)
+    result = await ssh_access_routes.create_ssh_key(
+        request=object(), body=body, dependencies=harness.dependencies
+    )
     assert result["id"] == "k-notify-3"

@@ -27,7 +27,6 @@ src/orchestrator/main.py  _detach_agent_session  http  client.post  5e8b40a94fa6
 src/orchestrator/main.py  _dispatch_job_to_agent  http  client.post  d2ec1a50b42e  #1  exact-runtime-recipient
 src/orchestrator/main.py  _forward_to_agent  http  client.post  354d7ac9ee96  #1  exact-runtime-recipient
 src/orchestrator/main.py  _initiate_pause  http  client.post  c40208b4763b  #1  exact-runtime-recipient
-src/orchestrator/main.py  _parse_ssh_gateway_host_keys  ssh  asyncssh.import_public_key  4fe182bafd50  #1  local-only
 src/orchestrator/main.py  _prepare_pinned_job_mutation_target  http  client.get  8c74982a3556  #1  read-only-probe
 src/orchestrator/main.py  _prepare_pinned_session_mutation_target  http  client.get  8c74982a3556  #1  read-only-probe
 src/orchestrator/main.py  _recover_captured_sandbox_process_zero  remote-effect  RemoteBackend  0ff44667792a  #1  contained-k8s
@@ -39,7 +38,6 @@ src/orchestrator/main.py  _send_session_attach_locked  http  client.post  ac47f8
 src/orchestrator/main.py  _thread_turn_in_flight  http  client.post  5e8b40a94fa6  #1  exact-runtime-recipient
 src/orchestrator/main.py  cancel_job  http  client.post  b81e2e9fccf9  #1  exact-runtime-recipient
 src/orchestrator/main.py  get_agent_system_info  http  client.get  7e0ff1b83a17  #1  read-only-probe
-src/orchestrator/main.py  get_job_shell_state  http  client.post  bf6f92151082  #1  exact-runtime-recipient
 src/orchestrator/main.py  pause_job  http  client.post  c40208b4763b  #1  exact-runtime-recipient
 src/orchestrator/main.py  upload_files_to_thread  remote-effect  upload_files_to_attested_vm_workspace  8f1a01b30667  #1  fresh-k8s-attestation
 src/orchestrator/services/canvas_ssh.py  resolve_remote_workspace_target  remote-effect  RemoteWorkspaceTarget  2c2ece0ea102  #1  pinned-host-key
@@ -81,6 +79,7 @@ src/orchestrator/services/ide_settings.py  _ssh_tar_to_file  remote-effect  crea
 src/orchestrator/services/ide_settings.py  _ssh_tar_to_file  ssh  build_agent_ssh_cmd  f8767f86b8ea  #1  local-only
 src/orchestrator/services/ide_settings.py  _ssh_untar_from_file  ssh  build_agent_ssh_cmd  08a92c9f4009  #1  pinned-host-key
 src/orchestrator/services/ide_settings.py  _ssh_untar_from_file  ssh  pinned_agent_ssh_command  7205bc5e3833  #1  pinned-host-key
+src/orchestrator/services/job_diagnostics.py  get_job_shell_state  http  client.post  bf6f92151082  #1  exact-runtime-recipient
 src/orchestrator/services/lifecycle/vm_manager.py  VMInstanceManager._snapshot_owned  remote-effect  self._snapshot.capture_vm_snapshot  c2b31557f45b  #1  vm-authority
 src/orchestrator/services/lifecycle/workspace_manager.py  WorkspaceInstanceManager._snapshot_owned  remote-effect  self._snapshot.capture_vm_snapshot  051a85b779a1  #1  contained-k8s
 src/orchestrator/services/nats_bridge.py  NatsBridge._notify_vm_ready  remote-effect  self._seed_vm_ide_config  b288ac12ec39  #1  vm-authority
@@ -91,6 +90,7 @@ src/orchestrator/services/snapshot_service.py  SnapshotService._collect_environm
 src/orchestrator/services/snapshot_service.py  SnapshotService.capture_vm_snapshot  remote-effect  create_owned_subprocess_exec  48e3950913b3  #1  vm-authority
 src/orchestrator/services/snapshot_service.py  SnapshotService.capture_vm_snapshot  remote-effect  create_owned_subprocess_exec  a2b4f48f9bae  #1  vm-authority
 src/orchestrator/services/snapshot_service.py  SnapshotService.capture_vm_snapshot  remote-effect  self.upload_snapshot  8d7e90952645  #1  vm-authority
+src/orchestrator/services/ssh_access.py  parse_ssh_gateway_host_keys  ssh  asyncssh.import_public_key  4fe182bafd50  #1  local-only
 src/orchestrator/services/ssh_gateway_client.py  resolve_target  ssh  SshTarget  2d5328ea1c45  #1  pinned-host-key
 src/orchestrator/services/ssh_gateway_server.py  connect_upstream  socket  asyncssh.connect  463ff14e685e  #1  pinned-host-key
 src/orchestrator/services/ssh_helpers.py  _scan_pinned_host_key  remote-effect  create_owned_subprocess_exec  5aba5e03ae48  #1  pinned-host-key

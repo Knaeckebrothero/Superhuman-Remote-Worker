@@ -1,7 +1,7 @@
 """Tests for the job log archive read path (knowledge-base/knowledge/features/job_log_archive.md).
 
 Covers the pure helpers behind GET /api/jobs/{id}/logs and
-GET /api/persistent/threads/{id}/logs:
+GET /api/persistent/threads/{id}/logs (``orchestrator/services/job_diagnostics.py``):
   - _scope_archived_lines(): disaggregate a shared pod log by id-tagged lines
   - _filter_log_lines(): level/grep filtering across text + JSON formats
   - _read_archived_agent_log(): stitch S3 blobs referenced by a row
@@ -10,20 +10,44 @@ GET /api/persistent/threads/{id}/logs:
 The capture side (_archive_pod_logs) is covered in test_agent_provisioner.py.
 """
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import HTTPException
 
-from orchestrator.main import (
-    _filter_log_lines,
-    _read_archived_agent_log,
-    _scope_archived_lines,
+from orchestrator.services.job_diagnostics import (
+    JobDiagnosticsDependencies,
+    filter_log_lines as _filter_log_lines,
+    scope_archived_lines as _scope_archived_lines,
+)
+from orchestrator.services.job_diagnostics import (
+    read_archived_agent_log as _read_archived_log,
 )
 from shared.orch_surface.formatters import format_job_log, format_thread_log
 
 JOB_ID = "11111111-2222-3333-4444-555555555555"
 OTHER_ID = "99999999-8888-7777-6666-555555555555"
+
+
+def _deps(get_blob=None):
+    """Diagnostics dependencies with only the archive store wired.
+
+    The reader moved from ``main`` into ``orchestrator.services.job_diagnostics``
+    (R1.B02) and now takes its blob store injected, so the cases below hand it a
+    double instead of patching ``main.snapshot_service``.
+    """
+    from types import SimpleNamespace
+
+    return JobDiagnosticsDependencies(
+        workspace=SimpleNamespace(),
+        snapshots=SimpleNamespace(get_blob=get_blob or AsyncMock(return_value=None)),
+        audit_reader=SimpleNamespace(),
+        prepare_pinned_job_mutation_target=AsyncMock(),
+    )
+
+
+async def _read_archived_agent_log(meta, *, get_blob=None):
+    return await _read_archived_log(meta, dependencies=_deps(get_blob))
 
 
 class TestScopeArchivedLines:
@@ -88,21 +112,18 @@ class TestReadArchivedAgentLog:
     async def test_stitches_blobs_in_key_order(self):
         meta = {"log_archive_keys": ["agent_logs/p/1.log", "agent_logs/p/2.log"]}
         blobs = {"agent_logs/p/1.log": b"first", "agent_logs/p/2.log": b"second"}
-        with patch(
-            "orchestrator.main.snapshot_service.get_blob",
-            new=AsyncMock(side_effect=lambda k: blobs.get(k)),
-        ):
-            text = await _read_archived_agent_log(meta)
+        text = await _read_archived_agent_log(
+            meta, get_blob=AsyncMock(side_effect=lambda k: blobs.get(k))
+        )
         assert text == "first\nsecond"
 
     @pytest.mark.asyncio
     async def test_json_string_metadata_is_parsed(self):
         meta = '{"log_archive_keys": ["agent_logs/p/1.log"]}'
-        with patch(
-            "orchestrator.main.snapshot_service.get_blob",
-            new=AsyncMock(return_value=b"content"),
-        ):
-            assert await _read_archived_agent_log(meta) == "content"
+        text = await _read_archived_agent_log(
+            meta, get_blob=AsyncMock(return_value=b"content")
+        )
+        assert text == "content"
 
     @pytest.mark.asyncio
     async def test_none_when_no_keys(self):
@@ -113,11 +134,10 @@ class TestReadArchivedAgentLog:
     @pytest.mark.asyncio
     async def test_none_when_store_has_nothing(self):
         meta = {"log_archive_keys": ["agent_logs/p/1.log"]}
-        with patch(
-            "orchestrator.main.snapshot_service.get_blob",
-            new=AsyncMock(return_value=None),
-        ):
-            assert await _read_archived_agent_log(meta) is None
+        assert (
+            await _read_archived_agent_log(meta, get_blob=AsyncMock(return_value=None))
+            is None
+        )
 
 
 class TestLogFormatters:

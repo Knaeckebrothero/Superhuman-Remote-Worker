@@ -211,6 +211,24 @@ class TestRequireAdminContract:
 #      ``real_is_admin``, not the shadowed ``is_admin``.
 
 
+def _operation_body(source: str, marker: str) -> str:
+    """Source text of one top-level operation, up to the next top-level def.
+
+    These are deliberately source-pattern guards, not behavioral tests: they
+    exist so a revert of the ``real_is_admin`` gate to ``is_admin`` cannot pass
+    silently. Bounding on the next top-level ``def``/``async def`` keeps them
+    working now that the operations live in a service module rather than behind
+    ``@app.`` route decorators in main.py.
+    """
+    # Anchor at column 0: the same name also appears indented inside the store
+    # Protocol, whose body carries no gate.
+    top_level = "\n" + marker
+    assert top_level in source, "Operation is no longer a top-level definition"
+    body = source[source.index(top_level) + 1 :]
+    ends = [i for i in (body.find("\ndef "), body.find("\nasync def ")) if i > 0]
+    return body[: min(ends)] if ends else body
+
+
 class TestInlinePrivilegeGates:
     """Inline admin gates inside non-admin endpoints must use real_is_admin."""
 
@@ -236,19 +254,19 @@ class TestInlinePrivilegeGates:
         the dev-cluster regression (admin in view-as=user can't create
         full-access tokens) returns silently. This test catches that.
         """
-        main_py = (
+        source = (
             pathlib.Path(__file__).resolve().parents[1]
             / "src"
             / "orchestrator"
-            / "main.py"
+            / "services"
+            / "access_tokens.py"
         ).read_text()
 
-        # Locate the endpoint body
+        # Locate the operation body. R1.B02 moved this out of main.py into the
+        # access-token service; the gate itself is unchanged.
         marker = "async def create_mcp_token("
-        assert marker in main_py, "Endpoint signature changed — update test"
-        body = main_py[main_py.index(marker) :]
-        # The privilege gate sits within the first ~50 lines
-        gate_window = body[: body.index("\n@app.")]
+        assert marker in source, "Operation signature changed — update test"
+        gate_window = _operation_body(source, marker)
 
         gate_line = next(
             (line for line in gate_window.splitlines() if 'scope == "all"' in line),
@@ -269,17 +287,17 @@ class TestInlinePrivilegeGates:
         Same bug pattern as create_mcp_token — kept as a separate test so
         a partial revert (one fixed, one not) is caught.
         """
-        main_py = (
+        source = (
             pathlib.Path(__file__).resolve().parents[1]
             / "src"
             / "orchestrator"
-            / "main.py"
+            / "services"
+            / "access_tokens.py"
         ).read_text()
 
         marker = "async def create_api_key("
-        assert marker in main_py, "Endpoint signature changed — update test"
-        body = main_py[main_py.index(marker) :]
-        gate_window = body[: body.index("\n@app.")]
+        assert marker in source, "Operation signature changed — update test"
+        gate_window = _operation_body(source, marker)
 
         gate_line = next(
             (

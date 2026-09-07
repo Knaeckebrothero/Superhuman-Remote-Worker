@@ -18,7 +18,9 @@ import asyncio
 import hashlib
 import logging
 import os
+from collections.abc import Callable
 from datetime import datetime, timedelta, UTC
+from typing import Any
 
 from fastapi import HTTPException, Request
 from orchestrator.security.account_approval import require_account_approved
@@ -540,6 +542,45 @@ def _client_ip(request: Request) -> str | None:
     return client.host if client else None
 
 
+# Optional provisioning backends, bound once by application composition
+# (``orchestrator.main``). Two named callables, deliberately not a context
+# object: these helpers run as detached ``asyncio`` tasks with no request scope,
+# so they cannot receive the collaborators through a dependency the way the
+# request-path adapters do.
+#
+# Unbound means "no backend configured", which is the same observable outcome as
+# an uninitialised client and is exactly how a deployment without cloud/forge
+# behaves. A warning is emitted because unbound in a real application is a
+# composition bug, not a deployment shape.
+_cloud_router_provider: Callable[[], Any] | None = None
+_forge_provider: Callable[[], Any] | None = None
+
+
+def set_provisioning_backends(
+    *,
+    cloud_router: Callable[[], Any] | None,
+    forge: Callable[[], Any] | None,
+) -> None:
+    """Bind the optional cloud/forge provisioning backends."""
+    global _cloud_router_provider, _forge_provider
+    _cloud_router_provider = cloud_router
+    _forge_provider = forge
+
+
+def _resolve_provisioning_backend(
+    provider: Callable[[], Any] | None, label: str
+) -> Any | None:
+    if provider is None:
+        logger.warning(
+            "%s provisioning backend is unbound; skipping background "
+            "provisioning (application composition did not call "
+            "set_provisioning_backends)",
+            label,
+        )
+        return None
+    return provider()
+
+
 async def _ensure_cloud_user(
     *,
     sub: str,
@@ -550,11 +591,15 @@ async def _ensure_cloud_user(
 ) -> None:
     """Background call to the active main-cloud backend's ensure_user.
 
-    Imported lazily to avoid a circular import between ``main`` and this
-    module (``main`` imports ``get_current_user`` from here).
+    The router arrives through ``set_provisioning_backends`` rather than an
+    import of the application module (R1.B02 caller-boundary closure).
     """
     try:
-        from orchestrator.main import main_cloud_router  # noqa: PLC0415
+        main_cloud_router = _resolve_provisioning_backend(
+            _cloud_router_provider, "main-cloud"
+        )
+        if main_cloud_router is None:
+            return
 
         # Fresh per-owner provisioning — resolve via the owner seam, not
         # ``.active`` directly (Issue 16, knowledge-base/knowledge/issues/main_cloud.md).
@@ -593,10 +638,13 @@ async def _ensure_gitea_user(
     key Gitea matches on during later direct OIDC login, preventing
     duplicate accounts.
 
-    Imported lazily to avoid a circular import with main.
+    The client arrives through ``set_provisioning_backends`` rather than an
+    import of the application module (R1.B02 caller-boundary closure).
     """
     try:
-        from orchestrator.main import gitea_client  # noqa: PLC0415
+        gitea_client = _resolve_provisioning_backend(_forge_provider, "forge")
+        if gitea_client is None:
+            return
 
         if not gitea_client.is_initialized:
             return

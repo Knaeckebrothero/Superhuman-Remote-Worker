@@ -1,4 +1,10 @@
-"""HTTP adapters for job artifacts with per-app dependencies."""
+"""HTTP adapters for job artifacts with per-app dependencies.
+
+Access on every route goes through ``require_job_access``, which enforces both
+user visibility AND the MCP/officer ``project:<uuid>`` scope
+(``_scope_permits_project``) — an opaque evidence ID alone conveys no access,
+and a guessed ID from another project 403s before the manifest is touched.
+"""
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass

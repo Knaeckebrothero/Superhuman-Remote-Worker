@@ -43628,7 +43628,7 @@ class PostgresDB:
         ``user_ssh_keys.id``) so a caller that later proves possession can
         mark it used without a second fingerprint lookup. ``id`` remains the
         USER id — every consumer (``user_can_access_ide_entity``,
-        ``_ssh_target_response``) reads it as such.
+        ``ssh_access.ssh_target_response``) reads it as such.
         """
         async with self.acquire() as conn:
             # One statement, deliberately. Two reasons:

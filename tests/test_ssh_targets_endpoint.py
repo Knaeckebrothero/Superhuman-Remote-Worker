@@ -17,11 +17,18 @@ into a routable workspace target. It is the seam plan 1's design rests on:
   predicate).
 * Liveness is three independent axes — session status, lane +
   its retirement marker, and workspace_container/vm status — collapsed by
-  ``resolve_workspace_state``. The idle sweeper's own query keys on exactly
+  ``resolve_workspace_state``.  The idle sweeper's own query keys on exactly
   "session ended, workspace still ready", so that combination is the common
   case this must get right, not an edge case.
+
+These cases first passed against the original handler in ``main``. The
+identity resolution now lives in ``orchestrator.routers.ssh_access`` (where
+its opaque 404 is readable next to the lookups it protects) and the target
+projection in ``orchestrator.services.ssh_access``; the source-scan cases at
+the bottom therefore read BOTH.
 """
 
+import inspect
 import json
 from uuid import UUID
 
@@ -29,8 +36,12 @@ import pytest
 from fastapi import HTTPException
 
 import orchestrator.main
+from orchestrator.routers import ssh_access as ssh_access_routes
+from orchestrator.services import ssh_access as ssh_access_operations
 from orchestrator.services.canvas_ssh import RemoteWorkspaceTarget
 from orchestrator.services.ssh_gateway_targets import resolve_workspace_state
+from orchestrator.services.workspace_suspension import _thread_is_vm_tier
+from tests._ssh_access_harness import SshAccessHarness
 from tests._route_inventory import mounted_routes
 
 USER = "00000000-0000-0000-0000-000000000001"
@@ -166,35 +177,42 @@ def test_session_suspended_is_not_workspace_suspended():
 
 
 @pytest.fixture
-def internal(monkeypatch):
-    async def _allow(request):
-        return None
+def harness():
+    """The application's own composition, with the real VM-tier predicate."""
+    built = SshAccessHarness()
+    built.thread_is_vm_tier = _thread_is_vm_tier
+    return built
 
-    monkeypatch.setattr(orchestrator.main, "require_internal", _allow)
+
+async def _get_target(harness, *, handle="s-7f3a91c2", fingerprint=FINGERPRINT):
+    return await ssh_access_routes.get_ssh_target(
+        request=object(),
+        handle=handle,
+        fingerprint=fingerprint,
+        dependencies=harness.dependencies,
+    )
 
 
 @pytest.mark.asyncio
-async def test_requires_internal_key(monkeypatch):
+async def test_requires_internal_key(harness):
     async def _deny(request):
         raise HTTPException(status_code=401, detail="Invalid internal key")
 
-    monkeypatch.setattr(orchestrator.main, "require_internal", _deny)
+    harness.require_internal = _deny
     with pytest.raises(HTTPException) as excinfo:
-        await orchestrator.main.get_ssh_target(
-            request=object(), handle="s-7f3a91c2", fingerprint=FINGERPRINT
-        )
+        await _get_target(harness)
     assert excinfo.value.status_code == 401
 
 
 @pytest.mark.asyncio
-async def test_unknown_handle_and_unauthorized_are_identical(internal, monkeypatch):
+async def test_unknown_handle_and_unauthorized_are_identical(harness):
     """Anti-enumeration: an attacker must not learn which handles exist.
 
-    ``resolve_user_by_ssh_fingerprint`` is patched up front and reused for
-    both calls (fix round 1 / Important 1): the handler now calls it
-    unconditionally, even on an unknown handle, so leaving it unpatched for
-    the first call would hit a real, unconnected DB pool here instead of
-    exercising the anti-enumeration property this test is named for.
+    ``resolve_user_by_ssh_fingerprint`` is wired up front and reused for
+    both calls (fix round 1 / Important 1): the handler calls it
+    unconditionally, even on an unknown handle, so leaving it unwired for
+    the first call would trip the harness's unexpected-call tripwire instead
+    of exercising the anti-enumeration property this test is named for.
     """
 
     async def _no_thread(handle):
@@ -203,16 +221,10 @@ async def test_unknown_handle_and_unauthorized_are_identical(internal, monkeypat
     async def _user(fp):
         return {"id": "00000000-0000-0000-0000-000000000009"}
 
-    monkeypatch.setattr(
-        orchestrator.main.postgres_db, "get_thread_id_by_ssh_handle", _no_thread
-    )
-    monkeypatch.setattr(
-        orchestrator.main.postgres_db, "resolve_user_by_ssh_fingerprint", _user
-    )
+    harness.store.set("get_thread_id_by_ssh_handle", _no_thread)
+    harness.store.set("resolve_user_by_ssh_fingerprint", _user)
     with pytest.raises(HTTPException) as unknown:
-        await orchestrator.main.get_ssh_target(
-            request=object(), handle="s-aaaaaaaa", fingerprint=FINGERPRINT
-        )
+        await _get_target(harness, handle="s-aaaaaaaa")
 
     async def _thread_ok(handle):
         return THREAD
@@ -220,21 +232,17 @@ async def test_unknown_handle_and_unauthorized_are_identical(internal, monkeypat
     async def _no_access(user, db, entity_id):
         return False
 
-    monkeypatch.setattr(
-        orchestrator.main.postgres_db, "get_thread_id_by_ssh_handle", _thread_ok
-    )
-    monkeypatch.setattr(orchestrator.main, "user_can_access_ide_entity", _no_access)
+    harness.store.set("get_thread_id_by_ssh_handle", _thread_ok)
+    harness.user_can_access_ide_entity = _no_access
     with pytest.raises(HTTPException) as denied:
-        await orchestrator.main.get_ssh_target(
-            request=object(), handle="s-7f3a91c2", fingerprint=FINGERPRINT
-        )
+        await _get_target(harness)
 
     assert unknown.value.status_code == denied.value.status_code == 404
     assert unknown.value.detail == denied.value.detail
 
 
 @pytest.mark.asyncio
-async def test_unknown_key_is_the_same_404_as_the_other_two(internal, monkeypatch):
+async def test_unknown_key_is_the_same_404_as_the_other_two(harness):
     """The third state this module's docstring says must be indistinguishable.
 
     ``test_unknown_handle_and_unauthorized_are_identical`` covers unknown
@@ -259,40 +267,28 @@ async def test_unknown_key_is_the_same_404_as_the_other_two(internal, monkeypatc
     async def _access(user, db, entity_id):
         raise AssertionError("authorization must not run without an identity")
 
-    monkeypatch.setattr(
-        orchestrator.main.postgres_db, "get_thread_id_by_ssh_handle", _thread_ok
-    )
-    monkeypatch.setattr(
-        orchestrator.main.postgres_db, "resolve_user_by_ssh_fingerprint", _no_user
-    )
-    monkeypatch.setattr(orchestrator.main, "user_can_access_ide_entity", _access)
+    harness.store.set("get_thread_id_by_ssh_handle", _thread_ok)
+    harness.store.set("resolve_user_by_ssh_fingerprint", _no_user)
+    harness.user_can_access_ide_entity = _access
 
     with pytest.raises(HTTPException) as unknown_key:
-        await orchestrator.main.get_ssh_target(
-            request=object(), handle="s-7f3a91c2", fingerprint=FINGERPRINT
-        )
+        await _get_target(harness)
 
     # Compare against a genuinely different failure resolved the same request,
     # rather than against a hardcoded string that could drift with the handler.
     async def _no_thread(handle):
         return None
 
-    monkeypatch.setattr(
-        orchestrator.main.postgres_db, "get_thread_id_by_ssh_handle", _no_thread
-    )
+    harness.store.set("get_thread_id_by_ssh_handle", _no_thread)
     with pytest.raises(HTTPException) as unknown_handle:
-        await orchestrator.main.get_ssh_target(
-            request=object(), handle="s-aaaaaaaa", fingerprint=FINGERPRINT
-        )
+        await _get_target(harness, handle="s-aaaaaaaa")
 
     assert unknown_key.value.status_code == unknown_handle.value.status_code == 404
     assert unknown_key.value.detail == unknown_handle.value.detail
 
 
 @pytest.mark.asyncio
-async def test_unknown_handle_still_reaches_the_fingerprint_resolver(
-    internal, monkeypatch
-):
+async def test_unknown_handle_still_reaches_the_fingerprint_resolver(harness):
     """The resolver must run even for a handle already known to be unknown.
 
     HISTORY: this pin was written when resolve_user_by_ssh_fingerprint was a
@@ -322,25 +318,17 @@ async def test_unknown_handle_still_reaches_the_fingerprint_resolver(
         called_with.append(fp)
         return {"id": USER}
 
-    monkeypatch.setattr(
-        orchestrator.main.postgres_db, "get_thread_id_by_ssh_handle", _no_thread
-    )
-    monkeypatch.setattr(
-        orchestrator.main.postgres_db, "resolve_user_by_ssh_fingerprint", _user
-    )
+    harness.store.set("get_thread_id_by_ssh_handle", _no_thread)
+    harness.store.set("resolve_user_by_ssh_fingerprint", _user)
 
     with pytest.raises(HTTPException):
-        await orchestrator.main.get_ssh_target(
-            request=object(), handle="s-aaaaaaaa", fingerprint=FINGERPRINT
-        )
+        await _get_target(harness, handle="s-aaaaaaaa")
 
     assert called_with == [FINGERPRINT]
 
 
 @pytest.mark.asyncio
-async def test_rejects_a_malformed_handle_before_touching_the_database(
-    internal, monkeypatch
-):
+async def test_rejects_a_malformed_handle_before_touching_the_database(harness):
     called = False
 
     async def _tripwire(handle):
@@ -348,18 +336,14 @@ async def test_rejects_a_malformed_handle_before_touching_the_database(
         called = True
         return None
 
-    monkeypatch.setattr(
-        orchestrator.main.postgres_db, "get_thread_id_by_ssh_handle", _tripwire
-    )
+    harness.store.set("get_thread_id_by_ssh_handle", _tripwire)
     with pytest.raises(HTTPException):
-        await orchestrator.main.get_ssh_target(
-            request=object(), handle="s-abc\nProxyCommand x", fingerprint=FINGERPRINT
-        )
+        await _get_target(harness, handle="s-abc\nProxyCommand x")
     assert called is False
 
 
 @pytest.mark.asyncio
-async def test_missing_fingerprint_is_opaque_404_not_a_422(internal, monkeypatch):
+async def test_missing_fingerprint_is_opaque_404_not_a_422(harness):
     """Fix round 1 / Minor 6: ``fingerprint`` became an Optional query param
     so a request omitting it still reaches ``require_internal`` first — a
     required param would make FastAPI 422 before any auth check runs,
@@ -374,56 +358,51 @@ async def test_missing_fingerprint_is_opaque_404_not_a_422(internal, monkeypatch
         called = True
         return None
 
-    monkeypatch.setattr(
-        orchestrator.main.postgres_db, "get_thread_id_by_ssh_handle", _tripwire
-    )
+    harness.store.set("get_thread_id_by_ssh_handle", _tripwire)
     with pytest.raises(HTTPException) as excinfo:
-        await orchestrator.main.get_ssh_target(
-            request=object(), handle="s-7f3a91c2", fingerprint=None
-        )
+        await _get_target(harness, fingerprint=None)
     assert excinfo.value.status_code == 404
     assert called is False
 
 
-@pytest.mark.asyncio
-async def test_non_live_state_returns_200_with_no_pod_ip(internal, monkeypatch):
-    """The gateway needs a readable reason, so this is not an error response."""
+def _resolve_to(harness, *, thread, user=None):
+    """Wire the three lookups the handler performs, then hand back the thread."""
 
     async def _thread_id(handle):
         return THREAD
 
     async def _user(fp):
-        return {"id": USER}
+        return user if user is not None else {"id": USER}
 
-    async def _access(user, db, entity_id):
+    async def _access(u, db, entity_id):
         return True
 
     async def _get_thread(tid):
-        return _thread(status="active")
+        return thread
 
+    harness.store.set("get_thread_id_by_ssh_handle", _thread_id)
+    harness.store.set("resolve_user_by_ssh_fingerprint", _user)
+    harness.store.set("get_thread", _get_thread)
+    harness.user_can_access_ide_entity = _access
+
+
+@pytest.mark.asyncio
+async def test_non_live_state_returns_200_with_no_pod_ip(harness, monkeypatch):
+    """The gateway needs a readable reason, so this is not an error response."""
+    _resolve_to(harness, thread=_thread(status="active"))
     monkeypatch.setattr(
-        orchestrator.main.postgres_db, "get_thread_id_by_ssh_handle", _thread_id
-    )
-    monkeypatch.setattr(
-        orchestrator.main.postgres_db, "resolve_user_by_ssh_fingerprint", _user
-    )
-    monkeypatch.setattr(orchestrator.main, "user_can_access_ide_entity", _access)
-    monkeypatch.setattr(orchestrator.main.postgres_db, "get_thread", _get_thread)
-    monkeypatch.setattr(
-        orchestrator.main,
+        ssh_access_operations,
         "thread_metadata_object",
         lambda t: {"workspace_container": {"status": "suspended"}},
     )
 
-    result = await orchestrator.main.get_ssh_target(
-        request=object(), handle="s-7f3a91c2", fingerprint=FINGERPRINT
-    )
+    result = await _get_target(harness)
     assert result["state"] == "suspended"
     assert result["pod_ip"] is None
 
 
 @pytest.mark.asyncio
-async def test_live_state_maps_target_fields(internal, monkeypatch):
+async def test_live_state_maps_target_fields(harness, monkeypatch):
     """Important 2 (fix round 1): the one branch that hands out a routable
     target had zero coverage. Stubs the canvas_ssh resolver rather than
     constructing a real ``_workspace_binding`` — that resolver's own
@@ -431,20 +410,12 @@ async def test_live_state_maps_target_fields(internal, monkeypatch):
     endpoint's field mapping (``pod_ip``/``pod_port``/``host_key_fingerprint``
     <- target.host/.port/.fingerprint), which nothing else exercises.
     """
-
-    async def _thread_id(handle):
-        return THREAD
-
-    async def _user(fp):
-        return {"id": USER}
-
-    async def _access(user, db, entity_id):
-        return True
-
-    async def _get_thread(tid):
-        return _thread(
+    _resolve_to(
+        harness,
+        thread=_thread(
             status="active", metadata={"workspace_container": {"status": "ready"}}
-        )
+        ),
+    )
 
     generation = UUID("11111111-1111-1111-1111-111111111111")
 
@@ -461,19 +432,13 @@ async def test_live_state_maps_target_fields(internal, monkeypatch):
         )
 
     monkeypatch.setattr(
-        orchestrator.main.postgres_db, "get_thread_id_by_ssh_handle", _thread_id
+        ssh_access_operations, "bound_workspace_generation", _generation
     )
     monkeypatch.setattr(
-        orchestrator.main.postgres_db, "resolve_user_by_ssh_fingerprint", _user
+        ssh_access_operations, "resolve_remote_workspace_target", _target
     )
-    monkeypatch.setattr(orchestrator.main, "user_can_access_ide_entity", _access)
-    monkeypatch.setattr(orchestrator.main.postgres_db, "get_thread", _get_thread)
-    monkeypatch.setattr(orchestrator.main, "bound_workspace_generation", _generation)
-    monkeypatch.setattr(orchestrator.main, "resolve_remote_workspace_target", _target)
 
-    result = await orchestrator.main.get_ssh_target(
-        request=object(), handle="s-7f3a91c2", fingerprint=FINGERPRINT
-    )
+    result = await _get_target(harness)
     assert result["state"] == "live"
     assert result["pod_ip"] == "10.0.0.5"
     assert result["pod_port"] == 2222
@@ -481,41 +446,22 @@ async def test_live_state_maps_target_fields(internal, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_vm_tier_state_from_json_string_metadata(internal, monkeypatch):
+async def test_vm_tier_state_from_json_string_metadata(harness):
     """Important 2 (fix round 1): exercises the real JSONB-as-str seam end
     to end. asyncpg returns ``threads.metadata`` as a JSON string, not a
-    dict; this passes one, does NOT monkeypatch ``thread_metadata_object``
+    dict; this passes one, does NOT stub ``thread_metadata_object``
     (unlike the other tests here), and lets the real parser and the real
     ``_thread_is_vm_tier`` run against the result — both were previously
     only exercised through a mocked ``thread_metadata_object``.
     """
-
-    async def _thread_id(handle):
-        return THREAD
-
-    async def _user(fp):
-        return {"id": USER}
-
-    async def _access(user, db, entity_id):
-        return True
-
-    metadata_json = json.dumps({"vm": {"status": "ready"}})
-
-    async def _get_thread(tid):
-        return _thread(status="active", metadata=metadata_json)
-
-    monkeypatch.setattr(
-        orchestrator.main.postgres_db, "get_thread_id_by_ssh_handle", _thread_id
+    _resolve_to(
+        harness,
+        thread=_thread(
+            status="active", metadata=json.dumps({"vm": {"status": "ready"}})
+        ),
     )
-    monkeypatch.setattr(
-        orchestrator.main.postgres_db, "resolve_user_by_ssh_fingerprint", _user
-    )
-    monkeypatch.setattr(orchestrator.main, "user_can_access_ide_entity", _access)
-    monkeypatch.setattr(orchestrator.main.postgres_db, "get_thread", _get_thread)
 
-    result = await orchestrator.main.get_ssh_target(
-        request=object(), handle="s-7f3a91c2", fingerprint=FINGERPRINT
-    )
+    result = await _get_target(harness)
     assert result["state"] == "vm_unsupported"
     assert result["pod_ip"] is None
 
@@ -559,7 +505,6 @@ def test_the_resolver_really_would_hand_back_the_vm_endpoint():
         bound_workspace_generation,
         resolve_remote_workspace_target,
     )
-    from orchestrator.services.workspace_suspension import _thread_is_vm_tier
 
     metadata = _both_ready_stale_backend_metadata()
     thread = _thread(status="active", metadata=metadata)
@@ -574,84 +519,74 @@ def test_the_resolver_really_would_hand_back_the_vm_endpoint():
 
 
 @pytest.mark.asyncio
-async def test_vm_endpoint_is_refused_even_when_the_guard_passes(internal, monkeypatch):
+async def test_vm_endpoint_is_refused_even_when_the_guard_passes(harness):
     """Final review, Important 4: v1 does not support VM workspaces, so a
     thread that slips past ``_thread_is_vm_tier`` must still not be handed the
-    VM's host and port. Nothing is mocked below ``get_thread`` — the real
+    VM's host and port. Nothing is stubbed below ``get_thread`` — the real
     parser, the real guard and the real resolver all run."""
-
-    async def _thread_id(handle):
-        return THREAD
-
-    async def _user(fp):
-        return {"id": USER}
-
-    async def _access(user, db, entity_id):
-        return True
-
-    async def _get_thread(tid):
-        return _thread(
+    _resolve_to(
+        harness,
+        thread=_thread(
             status="active", metadata=json.dumps(_both_ready_stale_backend_metadata())
-        )
+        ),
+    )
 
-    monkeypatch.setattr(
-        orchestrator.main.postgres_db, "get_thread_id_by_ssh_handle", _thread_id
-    )
-    monkeypatch.setattr(
-        orchestrator.main.postgres_db, "resolve_user_by_ssh_fingerprint", _user
-    )
-    monkeypatch.setattr(orchestrator.main, "user_can_access_ide_entity", _access)
-    monkeypatch.setattr(orchestrator.main.postgres_db, "get_thread", _get_thread)
-
-    result = await orchestrator.main.get_ssh_target(
-        request=object(), handle="s-7f3a91c2", fingerprint=FINGERPRINT
-    )
+    result = await _get_target(harness)
     assert result["state"] == "vm_unsupported"
     assert result["pod_ip"] is None
     assert result["pod_port"] is None
 
 
 @pytest.mark.asyncio
-async def test_stale_binding_state_on_canvas_ssh_error(internal, monkeypatch):
+async def test_stale_binding_state_on_canvas_ssh_error(harness):
     """Important 2 + Minor 3 (fix round 1): a workspace_container that IS
     ready but carries no provisioner-attested ``_workspace_binding`` must
     report ``stale_binding``, not ``never_provisioned`` — the workspace
     really is provisioned, just not SSH-attested. Runs the real
     ``bound_workspace_generation``/``resolve_remote_workspace_target``
-    (neither mocked): with no ``_workspace_binding`` in metadata,
+    (neither stubbed): with no ``_workspace_binding`` in metadata,
     ``bound_workspace_generation`` itself raises ``CanvasSSHError`` while
-    being evaluated as that call's argument, which the endpoint's ``try``
+    being evaluated as that call's argument, which the service's ``try``
     still catches.
     """
-
-    async def _thread_id(handle):
-        return THREAD
-
-    async def _user(fp):
-        return {"id": USER}
-
-    async def _access(user, db, entity_id):
-        return True
-
-    async def _get_thread(tid):
-        return _thread(
+    _resolve_to(
+        harness,
+        thread=_thread(
             status="active", metadata={"workspace_container": {"status": "ready"}}
-        )
+        ),
+    )
 
-    monkeypatch.setattr(
-        orchestrator.main.postgres_db, "get_thread_id_by_ssh_handle", _thread_id
-    )
-    monkeypatch.setattr(
-        orchestrator.main.postgres_db, "resolve_user_by_ssh_fingerprint", _user
-    )
-    monkeypatch.setattr(orchestrator.main, "user_can_access_ide_entity", _access)
-    monkeypatch.setattr(orchestrator.main.postgres_db, "get_thread", _get_thread)
-
-    result = await orchestrator.main.get_ssh_target(
-        request=object(), handle="s-7f3a91c2", fingerprint=FINGERPRINT
-    )
+    result = await _get_target(harness)
     assert result["state"] == "stale_binding"
     assert result["pod_ip"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_thread_that_vanished_between_lookups_is_the_same_opaque_404(harness):
+    """The resolution above proved the handle maps to a thread id; a row
+    deleted between that lookup and ``get_thread`` must not become a
+    distinguishable failure — it reuses the identical opaque 404.
+    """
+    _resolve_to(harness, thread=None)
+    with pytest.raises(HTTPException) as vanished:
+        await _get_target(harness)
+
+    async def _no_thread(handle):
+        return None
+
+    harness.store.set("get_thread_id_by_ssh_handle", _no_thread)
+    with pytest.raises(HTTPException) as unknown:
+        await _get_target(harness, handle="s-aaaaaaaa")
+
+    assert vanished.value.status_code == unknown.value.status_code == 404
+    assert vanished.value.detail == unknown.value.detail
+
+
+def _target_resolution_source() -> str:
+    """Both halves of what used to be one handler, scanned as one body."""
+    return inspect.getsource(ssh_access_routes.get_ssh_target) + inspect.getsource(
+        ssh_access_operations.resolve_target
+    )
 
 
 def test_endpoint_does_not_use_the_restoring_resolver():
@@ -659,18 +594,16 @@ def test_endpoint_does_not_use_the_restoring_resolver():
     effect. Using it here would silently implement wake-on-connect, which the
     design rules out.
 
-    Scope note (fix round 1 / Minor 7): this inspects only
-    ``get_ssh_target``'s own source, not transitively through the helpers it
-    calls (``resolve_workspace_state``, ``_thread_is_vm_tier``,
+    Scope note (fix round 1 / Minor 7): this inspects only the endpoint's own
+    two source bodies, not transitively through the helpers they call
+    (``resolve_workspace_state``, ``_thread_is_vm_tier``,
     ``resolve_remote_workspace_target``, ...). A prohibited helper
     introduced one level down would not trip this guard — it was checked by
     hand against current source when this endpoint was written and is clean
     today, but a future change to those helpers is outside what this test
     can see.
     """
-    import inspect
-
-    source = inspect.getsource(orchestrator.main.get_ssh_target)
+    source = _target_resolution_source()
     for forbidden in (
         "_resolve_thread_for_forwarding",
         "thread_runtime_is_preparable",
@@ -694,10 +627,7 @@ def test_endpoint_does_not_mark_a_key_used():
     Matches the CALL form, not the bare name: the endpoint's docstring names
     the method in order to prohibit it.
     """
-    import inspect
-
-    source = inspect.getsource(orchestrator.main.get_ssh_target)
-    assert "mark_ssh_key_used(" not in source
+    assert "mark_ssh_key_used(" not in _target_resolution_source()
 
 
 def test_ssh_target_route_is_mounted():

@@ -1,5 +1,6 @@
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+import logging
 from decimal import Decimal
 import inspect
 from unittest.mock import AsyncMock, MagicMock
@@ -46,6 +47,34 @@ from orchestrator.services.infrastructure_metering.types import (
     decimal_text,
     ledger_cost,
 )
+from orchestrator.schemas.infrastructure_admin import (
+    InfrastructureComputeActivationRequest,
+    InfrastructureComputeActivationScheduleRequest,
+    InfrastructureCorrectionDeltaRequest,
+    InfrastructureCorrectionRequest,
+    InfrastructureCoverageWaiverRequest,
+    InfrastructureCutoverPrepareRequest,
+    InfrastructureStorageActivationRequest,
+    InfrastructureStorageActivationScheduleRequest,
+    InfrastructureStorageDestructionRequest,
+)
+from orchestrator.routers import infrastructure_admin as infrastructure_admin_routes
+from orchestrator.routers import usage_reporting as usage_reporting_routes
+from orchestrator.services import infrastructure_activation_policy as activation_policy
+from orchestrator.services import infrastructure_admin as infrastructure_admin_service
+from orchestrator.services import usage_reporting as usage_reporting_service
+from orchestrator.services.infrastructure_metering.compute_activation import (
+    ComputeActivation,
+)
+from orchestrator.services.infrastructure_metering.materializer import (
+    StoragePublicationAuthority,
+    StoragePublicationPolicy,
+)
+from orchestrator.services.infrastructure_metering.storage_assets import (
+    StorageActivation,
+    StorageSourceActivation,
+    StorageSourceRequirementSpec,
+)
 from orchestrator.services.usage_ledger import UsageLedger, UsageRates
 
 
@@ -61,6 +90,69 @@ def _read_capabilities() -> MeteringSchemaCapabilities:
     )
 
 
+def _admin_dependencies(
+    *,
+    settings: InfrastructureMeteringSettings | None = None,
+    admin: dict | None = None,
+    audit: AsyncMock | None = None,
+    require_admin: AsyncMock | None = None,
+    leader_generation=None,
+    scope_project_id=None,
+    store=None,
+    **operations,
+) -> infrastructure_admin_routes.InfrastructureAdminDependencies:
+    """Build the router bundle over explicit doubles, never module globals."""
+    resolved = infrastructure_admin_service.InfrastructureAdminDependencies(
+        store=MagicMock() if store is None else store,
+        logger=logging.getLogger("test-infrastructure-admin"),
+        settings=settings if settings is not None else InfrastructureMeteringSettings(),
+        audit=audit if audit is not None else AsyncMock(),
+        leader_generation=leader_generation or (lambda: 1),
+        scope_project_id=scope_project_id or (lambda _user: None),
+        **operations,
+    )
+    if require_admin is None:
+        require_admin = AsyncMock(
+            return_value=admin
+            if admin is not None
+            else {"id": str(uuid4()), "is_admin": True}
+        )
+    return infrastructure_admin_routes.InfrastructureAdminDependencies(
+        operations=resolved,
+        require_admin=require_admin,
+    )
+
+
+def _usage_dependencies(
+    *,
+    settings: InfrastructureMeteringSettings | None = None,
+    require_approved_user: AsyncMock | None = None,
+    scope_project_id=None,
+    store=None,
+    **reports,
+) -> usage_reporting_routes.UsageReportingDependencies:
+    """Build the usage router bundle over explicit doubles."""
+    resolved_store = MagicMock() if store is None else store
+    resolved = usage_reporting_service.UsageReportingDependencies(
+        store=resolved_store,
+        audit_reader=MagicMock(),
+        logger=logging.getLogger("test-usage-reporting"),
+        visible_project_ids=AsyncMock(return_value=[]),
+        scope_project_id=scope_project_id or (lambda _user: None),
+        **reports,
+    )
+    return usage_reporting_routes.UsageReportingDependencies(
+        store=resolved_store,
+        reports=resolved,
+        require_admin=AsyncMock(),
+        metering_settings=(
+            settings if settings is not None else InfrastructureMeteringSettings()
+        ),
+        scope_project_id=scope_project_id or (lambda _user: None),
+        require_approved_user=require_approved_user or AsyncMock(),
+    )
+
+
 def test_cutover_wiring_uses_configured_inventory_freshness() -> None:
     import orchestrator.main as orchestrator_main
 
@@ -72,7 +164,6 @@ def test_cutover_wiring_uses_configured_inventory_freshness() -> None:
 
 
 def test_storage_publication_resources_require_effective_activation() -> None:
-    import orchestrator.main as orchestrator_main
     from orchestrator.services.infrastructure_metering.storage_assets import (
         StorageActivation,
     )
@@ -116,7 +207,7 @@ def test_storage_publication_resources_require_effective_activation() -> None:
         activated_at=boundary,
         database_time=boundary + timedelta(hours=1),
     )
-    before_source = orchestrator_main.StorageSourceActivation(
+    before_source = StorageSourceActivation(
         measurement_basis="claim-requested",
         collector_id="kubernetes-pods",
         source_cluster="dev-cluster",
@@ -124,7 +215,7 @@ def test_storage_publication_resources_require_effective_activation() -> None:
         activated_at=boundary,
         database_time=boundary - timedelta(microseconds=1),
     )
-    effective_claim_source = orchestrator_main.StorageSourceActivation(
+    effective_claim_source = StorageSourceActivation(
         measurement_basis="claim-requested",
         collector_id="kubernetes-pods",
         source_cluster="dev-cluster",
@@ -132,7 +223,7 @@ def test_storage_publication_resources_require_effective_activation() -> None:
         activated_at=boundary,
         database_time=boundary,
     )
-    effective_volume_source = orchestrator_main.StorageSourceActivation(
+    effective_volume_source = StorageSourceActivation(
         measurement_basis="volume-provisioned",
         collector_id="kubernetes-pods",
         source_cluster="dev-cluster",
@@ -140,9 +231,9 @@ def test_storage_publication_resources_require_effective_activation() -> None:
         activated_at=boundary,
         database_time=boundary + timedelta(hours=1),
     )
-    requested_policy = orchestrator_main._requested_storage_publication_policy(settings)
+    requested_policy = activation_policy.requested_storage_publication_policy(settings)
 
-    before_policy = orchestrator_main._capability_gated_storage_publication_policy(
+    before_policy = activation_policy.capability_gated_storage_publication_policy(
         requested_policy,
         capabilities,
         claim_activation=before,
@@ -154,7 +245,7 @@ def test_storage_publication_resources_require_effective_activation() -> None:
         volume_identity_key_matches=True,
     )
     assert before_policy.authorities == ()
-    enabled_policy = orchestrator_main._capability_gated_storage_publication_policy(
+    enabled_policy = activation_policy.capability_gated_storage_publication_policy(
         requested_policy,
         capabilities,
         claim_activation=effective_claim,
@@ -174,7 +265,7 @@ def test_storage_publication_resources_require_effective_activation() -> None:
         volume_mapping_ready=True,
         volume_identity_key_matches=True,
     )
-    enabled = orchestrator_main._capability_gated_infrastructure_publication_resources(
+    enabled = activation_policy.capability_gated_infrastructure_publication_resources(
         settings,
         capabilities,
         mapped_volume_resources=("block_volume_longhorn_ephemeral",),
@@ -182,38 +273,36 @@ def test_storage_publication_resources_require_effective_activation() -> None:
     )
     assert enabled == (
         "workspace_pod",
-        *orchestrator_main._INFRASTRUCTURE_PVC_RESOURCES,
-        *orchestrator_main._INFRASTRUCTURE_PV_RESOURCES,
+        *activation_policy.INFRASTRUCTURE_PVC_RESOURCES,
+        *activation_policy.INFRASTRUCTURE_PV_RESOURCES,
         "block_volume_longhorn_ephemeral",
     )
     capabilities.storage_identity_key_version = "another-key"
-    assert orchestrator_main._capability_gated_infrastructure_publication_resources(
+    assert activation_policy.capability_gated_infrastructure_publication_resources(
         settings,
         capabilities,
         mapped_volume_resources=("block_volume_longhorn_ephemeral",),
         storage_publication_policy=enabled_policy,
-    ) == ("workspace_pod", *orchestrator_main._INFRASTRUCTURE_PVC_RESOURCES)
+    ) == ("workspace_pod", *activation_policy.INFRASTRUCTURE_PVC_RESOURCES)
 
 
 def test_durable_reporting_policy_survives_write_gate_and_auth_loss() -> None:
-    import orchestrator.main as orchestrator_main
-
     boundary = datetime(2026, 8, 8, tzinfo=timezone.utc)
     before_boundary = boundary - timedelta(hours=1)
-    claim = orchestrator_main.StorageActivation(
+    claim = StorageActivation(
         measurement_basis="claim-requested",
         state="active",
         activated_at=boundary,
         database_time=before_boundary,
     )
-    volume = orchestrator_main.StorageActivation(
+    volume = StorageActivation(
         measurement_basis="volume-provisioned",
         state="active",
         activated_at=boundary,
         database_time=before_boundary,
     )
     sources = (
-        orchestrator_main.StorageSourceActivation(
+        StorageSourceActivation(
             measurement_basis="claim-requested",
             collector_id="kubernetes-pods",
             source_cluster="main-dev",
@@ -221,7 +310,7 @@ def test_durable_reporting_policy_survives_write_gate_and_auth_loss() -> None:
             activated_at=boundary,
             database_time=before_boundary,
         ),
-        orchestrator_main.StorageSourceActivation(
+        StorageSourceActivation(
             measurement_basis="volume-provisioned",
             collector_id="kubevirt-storage",
             source_cluster="vm-cluster",
@@ -230,22 +319,20 @@ def test_durable_reporting_policy_survives_write_gate_and_auth_loss() -> None:
             database_time=before_boundary,
         ),
     )
-    storage_policy = orchestrator_main._durable_storage_reporting_policy(
+    storage_policy = activation_policy.durable_storage_reporting_policy(
         claim_activation=claim,
         volume_activation=volume,
         source_activations=sources,
     )
     assert storage_policy.authorities == (
-        orchestrator_main.StoragePublicationAuthority(
-            "claim-requested", "kubernetes-pods", "main-dev"
-        ),
-        orchestrator_main.StoragePublicationAuthority(
+        StoragePublicationAuthority("claim-requested", "kubernetes-pods", "main-dev"),
+        StoragePublicationAuthority(
             "volume-provisioned", "kubevirt-storage", "vm-cluster"
         ),
     )
 
     compute = {
-        key: orchestrator_main.ComputeActivation(
+        key: ComputeActivation(
             activation_key=key,
             state="active",
             activated_at=boundary,
@@ -258,7 +345,7 @@ def test_durable_reporting_policy_survives_write_gate_and_auth_loss() -> None:
         slice3_storage_lifecycle_ready=True,
         slice2_volume_inventory_ready=True,
     )
-    resources = orchestrator_main._durable_infrastructure_reporting_resources(
+    resources = activation_policy.durable_infrastructure_reporting_resources(
         capabilities,
         mapped_volume_resources=("block_volume_stackit",),
         compute_activations=compute,
@@ -268,22 +355,20 @@ def test_durable_reporting_policy_survives_write_gate_and_auth_loss() -> None:
         "workspace_pod",
         "agent_pod",
         "workspace_vm",
-        *orchestrator_main._INFRASTRUCTURE_PVC_RESOURCES,
-        *orchestrator_main._INFRASTRUCTURE_PV_RESOURCES,
+        *activation_policy.INFRASTRUCTURE_PVC_RESOURCES,
+        *activation_policy.INFRASTRUCTURE_PV_RESOURCES,
         "block_volume_stackit",
     )
-    assert orchestrator_main._compute_activation_is_durable(
-        compute["ide_workspace_pod"]
-    )
+    assert activation_policy.compute_activation_is_durable(compute["ide_workspace_pod"])
 
     # Current write controls remain independently dark and unauthenticated.
     settings = InfrastructureMeteringSettings()
-    assert orchestrator_main._enabled_infrastructure_publication_resources(
+    assert activation_policy.enabled_infrastructure_publication_resources(
         settings,
         mapped_volume_resources=("block_volume_stackit",),
     ) == ("workspace_pod",)
     assert (
-        orchestrator_main._requested_storage_publication_policy(
+        activation_policy.requested_storage_publication_policy(
             settings,
             vm_lifecycle_authenticated=False,
         ).authorities
@@ -292,22 +377,20 @@ def test_durable_reporting_policy_survives_write_gate_and_auth_loss() -> None:
 
 
 def test_durable_volume_reporting_fails_closed_without_mapping_registry() -> None:
-    import orchestrator.main as orchestrator_main
-
     capabilities = MagicMock(
         slice3_compute_inventory_ready=True,
         slice3_storage_lifecycle_ready=True,
         slice2_volume_inventory_ready=True,
     )
-    policy = orchestrator_main.StoragePublicationPolicy(
+    policy = StoragePublicationPolicy(
         (
-            orchestrator_main.StoragePublicationAuthority(
+            StoragePublicationAuthority(
                 "volume-provisioned", "kubernetes-pods", "main-dev"
             ),
         )
     )
     with pytest.raises(ValueError, match="mapping registry"):
-        orchestrator_main._durable_infrastructure_reporting_resources(
+        activation_policy.durable_infrastructure_reporting_resources(
             capabilities,
             volume_mapping_ready=False,
             storage_reporting_policy=policy,
@@ -315,7 +398,6 @@ def test_durable_volume_reporting_fails_closed_without_mapping_registry() -> Non
 
 
 def test_storage_shadow_configuration_must_match_frozen_source_scopes() -> None:
-    import orchestrator.main as orchestrator_main
     from orchestrator.services.infrastructure_metering.storage_assets import (
         StorageSourceRequirement,
     )
@@ -328,11 +410,11 @@ def test_storage_shadow_configuration_must_match_frozen_source_scopes() -> None:
         stable_cluster_id="dev-cluster",
         namespace_allowlist=("srw",),
     )
-    assert orchestrator_main._storage_source_configuration_errors(settings, ()) == (
+    assert activation_policy.storage_source_configuration_errors(settings, ()) == (
         "primary/claim-requested durable source shadow activation",
     )
 
-    activation = orchestrator_main.StorageSourceActivation(
+    activation = StorageSourceActivation(
         measurement_basis="claim-requested",
         collector_id="kubernetes-pods",
         source_cluster="dev-cluster",
@@ -349,7 +431,7 @@ def test_storage_shadow_configuration_must_match_frozen_source_scopes() -> None:
         database_time=datetime(2026, 8, 7, tzinfo=timezone.utc),
     )
     assert (
-        orchestrator_main._storage_source_configuration_errors(
+        activation_policy.storage_source_configuration_errors(
             settings,
             (activation,),
         )
@@ -357,7 +439,7 @@ def test_storage_shadow_configuration_must_match_frozen_source_scopes() -> None:
     )
 
     expanded = replace(settings, namespace_allowlist=("srw", "new-namespace"))
-    assert orchestrator_main._storage_source_configuration_errors(
+    assert activation_policy.storage_source_configuration_errors(
         expanded,
         (activation,),
     ) == ("primary/claim-requested frozen inventory scope set",)
@@ -791,9 +873,7 @@ def test_slice2_storage_gates_are_independent_and_fail_closed():
         )
 
 
-def test_vm_storage_dark_gates_are_independent_and_cannot_activate(monkeypatch):
-    import orchestrator.main as orchestrator_main
-
+def test_vm_storage_dark_gates_are_independent_and_cannot_activate():
     defaults = InfrastructureMeteringSettings.from_env({})
     assert defaults.vm_pvc_inventory_enabled is False
     assert defaults.vm_pv_inventory_enabled is False
@@ -857,15 +937,20 @@ def test_vm_storage_dark_gates_are_independent_and_cannot_activate(monkeypatch):
             "INFRASTRUCTURE_METERING_VOLUME_IDENTITY_KEY_VERSION": "storage-v1",
         }
     )
-    monkeypatch.setattr(orchestrator_main, "infrastructure_metering_settings", settings)
+    dependencies = _admin_dependencies(settings=settings).operations
 
     # The existing activation API intentionally remains local-cluster-only.
     # Remote dark gates cannot make either measurement basis schedulable.
     assert (
-        orchestrator_main._storage_basis_inventory_enabled("claim-requested") is False
+        infrastructure_admin_service.storage_basis_inventory_enabled(
+            "claim-requested", dependencies=dependencies
+        )
+        is False
     )
     assert (
-        orchestrator_main._storage_basis_inventory_enabled("volume-provisioned")
+        infrastructure_admin_service.storage_basis_inventory_enabled(
+            "volume-provisioned", dependencies=dependencies
+        )
         is False
     )
     assert settings.pvc_publication_enabled is False
@@ -1399,25 +1484,22 @@ def test_legacy_v2_readiness_is_unchanged_while_source_aware_gate_is_off():
 
 
 @pytest.mark.asyncio
-async def test_usage_v2_route_is_hidden_while_its_gate_is_off(monkeypatch):
-    import orchestrator.main as orchestrator_main
-
-    monkeypatch.setattr(
-        orchestrator_main,
-        "infrastructure_metering_settings",
-        orchestrator_main.InfrastructureMeteringSettings(),
-    )
+async def test_usage_v2_route_is_hidden_while_its_gate_is_off():
     auth = AsyncMock()
-    monkeypatch.setattr(orchestrator_main, "require_approved_user", auth)
+    dependencies = _usage_dependencies(
+        settings=InfrastructureMeteringSettings(),
+        require_approved_user=auth,
+    )
 
     with pytest.raises(HTTPException) as raised:
-        await orchestrator_main.get_usage_v2(
+        await usage_reporting_routes.get_usage_v2(
             MagicMock(),
             days=30,
             from_date=None,
             to_date=None,
             ref_id=None,
             include_non_customer=False,
+            dependencies=dependencies,
         )
 
     assert raised.value.status_code == 404
@@ -1425,37 +1507,30 @@ async def test_usage_v2_route_is_hidden_while_its_gate_is_off(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_usage_v2_restricts_non_customer_rows_to_fleet_admin(monkeypatch):
-    import orchestrator.main as orchestrator_main
-
-    monkeypatch.setattr(
-        orchestrator_main,
-        "infrastructure_metering_settings",
-        orchestrator_main.InfrastructureMeteringSettings(v2_reads_enabled=True),
-    )
-    monkeypatch.setattr(
-        orchestrator_main,
-        "require_approved_user",
-        AsyncMock(return_value={"id": str(uuid4()), "is_admin": False, "scopes": []}),
+async def test_usage_v2_restricts_non_customer_rows_to_fleet_admin():
+    dependencies = _usage_dependencies(
+        settings=InfrastructureMeteringSettings(v2_reads_enabled=True),
+        require_approved_user=AsyncMock(
+            return_value={"id": str(uuid4()), "is_admin": False, "scopes": []}
+        ),
     )
 
     with pytest.raises(HTTPException) as raised:
-        await orchestrator_main.get_usage_v2(
+        await usage_reporting_routes.get_usage_v2(
             MagicMock(),
             days=30,
             from_date=None,
             to_date=None,
             ref_id=None,
             include_non_customer=True,
+            dependencies=dependencies,
         )
 
     assert raised.value.status_code == 403
 
 
 @pytest.mark.asyncio
-async def test_usage_v2_fleet_admin_passes_explicit_visibility(monkeypatch):
-    import orchestrator.main as orchestrator_main
-
+async def test_usage_v2_fleet_admin_passes_explicit_visibility():
     now = datetime(2026, 8, 6, tzinfo=timezone.utc)
     response = UsageV2QueryService._row(
         {
@@ -1511,31 +1586,23 @@ async def test_usage_v2_fleet_admin_passes_explicit_visibility(monkeypatch):
         async def bootstrap_state(self):
             return MagicMock(read_ready=True)
 
-    monkeypatch.setattr(
-        orchestrator_main,
-        "infrastructure_metering_settings",
-        orchestrator_main.InfrastructureMeteringSettings(v2_reads_enabled=True),
-    )
-    monkeypatch.setattr(orchestrator_main, "infrastructure_usage_v2", service)
-    monkeypatch.setattr(orchestrator_main, "infrastructure_usage_rollup", _Rollup())
-    monkeypatch.setattr(
-        orchestrator_main,
-        "require_approved_user",
-        AsyncMock(return_value={"id": str(uuid4()), "is_admin": True, "scopes": []}),
-    )
-    monkeypatch.setattr(
-        orchestrator_main,
-        "_visibility_kwargs_for_stats",
-        AsyncMock(return_value={}),
+    dependencies = _usage_dependencies(
+        settings=InfrastructureMeteringSettings(v2_reads_enabled=True),
+        infrastructure_usage_v2=service,
+        infrastructure_usage_rollup=_Rollup(),
+        require_approved_user=AsyncMock(
+            return_value={"id": str(uuid4()), "is_admin": True, "scopes": []}
+        ),
     )
 
-    result = await orchestrator_main.get_usage_v2(
+    result = await usage_reporting_routes.get_usage_v2(
         MagicMock(),
         days=1,
         from_date="2026-08-05T00:00:00Z",
         to_date="2026-08-06T00:00:00Z",
         ref_id=None,
         include_non_customer=True,
+        dependencies=dependencies,
     )
 
     assert result == summary
@@ -1543,9 +1610,7 @@ async def test_usage_v2_fleet_admin_passes_explicit_visibility(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_usage_v2_refuses_reads_until_bootstrap_is_complete(monkeypatch):
-    import orchestrator.main as orchestrator_main
-
+async def test_usage_v2_refuses_reads_until_bootstrap_is_complete():
     class _Service:
         is_available = True
 
@@ -1553,27 +1618,24 @@ async def test_usage_v2_refuses_reads_until_bootstrap_is_complete(monkeypatch):
         async def bootstrap_state(self):
             return MagicMock(read_ready=False)
 
-    monkeypatch.setattr(
-        orchestrator_main,
-        "infrastructure_metering_settings",
-        orchestrator_main.InfrastructureMeteringSettings(v2_reads_enabled=True),
-    )
-    monkeypatch.setattr(orchestrator_main, "infrastructure_usage_v2", _Service())
-    monkeypatch.setattr(orchestrator_main, "infrastructure_usage_rollup", _Rollup())
-    monkeypatch.setattr(
-        orchestrator_main,
-        "require_approved_user",
-        AsyncMock(return_value={"id": str(uuid4()), "is_admin": True, "scopes": []}),
+    dependencies = _usage_dependencies(
+        settings=InfrastructureMeteringSettings(v2_reads_enabled=True),
+        infrastructure_usage_v2=_Service(),
+        infrastructure_usage_rollup=_Rollup(),
+        require_approved_user=AsyncMock(
+            return_value={"id": str(uuid4()), "is_admin": True, "scopes": []}
+        ),
     )
 
     with pytest.raises(HTTPException) as raised:
-        await orchestrator_main.get_usage_v2(
+        await usage_reporting_routes.get_usage_v2(
             MagicMock(),
             days=1,
             from_date="2026-08-05T00:00:00Z",
             to_date="2026-08-06T00:00:00Z",
             ref_id=None,
             include_non_customer=False,
+            dependencies=dependencies,
         )
 
     assert raised.value.status_code == 503
@@ -1581,11 +1643,7 @@ async def test_usage_v2_refuses_reads_until_bootstrap_is_complete(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_usage_v2_does_not_echo_server_contract_failures_as_client_errors(
-    monkeypatch,
-):
-    import orchestrator.main as orchestrator_main
-
+async def test_usage_v2_does_not_echo_server_contract_failures_as_client_errors():
     class _Service:
         is_available = True
 
@@ -1596,32 +1654,24 @@ async def test_usage_v2_does_not_echo_server_contract_failures_as_client_errors(
         async def bootstrap_state(self):
             return MagicMock(read_ready=True)
 
-    monkeypatch.setattr(
-        orchestrator_main,
-        "infrastructure_metering_settings",
-        orchestrator_main.InfrastructureMeteringSettings(v2_reads_enabled=True),
-    )
-    monkeypatch.setattr(orchestrator_main, "infrastructure_usage_v2", _Service())
-    monkeypatch.setattr(orchestrator_main, "infrastructure_usage_rollup", _Rollup())
-    monkeypatch.setattr(
-        orchestrator_main,
-        "require_approved_user",
-        AsyncMock(return_value={"id": str(uuid4()), "is_admin": True, "scopes": []}),
-    )
-    monkeypatch.setattr(
-        orchestrator_main,
-        "_visibility_kwargs_for_stats",
-        AsyncMock(return_value={}),
+    dependencies = _usage_dependencies(
+        settings=InfrastructureMeteringSettings(v2_reads_enabled=True),
+        infrastructure_usage_v2=_Service(),
+        infrastructure_usage_rollup=_Rollup(),
+        require_approved_user=AsyncMock(
+            return_value={"id": str(uuid4()), "is_admin": True, "scopes": []}
+        ),
     )
 
     with pytest.raises(HTTPException) as raised:
-        await orchestrator_main.get_usage_v2(
+        await usage_reporting_routes.get_usage_v2(
             MagicMock(),
             days=1,
             from_date="2026-08-05T00:00:00Z",
             to_date="2026-08-06T00:00:00Z",
             ref_id=None,
             include_non_customer=False,
+            dependencies=dependencies,
         )
 
     assert raised.value.status_code == 500
@@ -1652,56 +1702,40 @@ def test_internal_inventory_ingestion_routes_are_hidden_from_openapi():
 
 
 @pytest.mark.asyncio
-async def test_infrastructure_admin_operations_require_real_fleet_view(monkeypatch):
-    import orchestrator.main as orchestrator_main
+async def test_infrastructure_admin_operations_require_real_fleet_view():
+    """A view-as-user admin and a project-scoped MCP admin are both refused."""
 
     request = MagicMock()
     request.url.path = "/api/admin/usage/v2/infrastructure-cutover"
     audit = AsyncMock()
-    monkeypatch.setattr(orchestrator_main, "log_security_event", audit)
-    monkeypatch.setattr(
-        orchestrator_main,
-        "_require_admin",
-        AsyncMock(
-            return_value={
-                "id": str(uuid4()),
-                "real_is_admin": True,
-                "is_admin": False,
-            }
-        ),
-    )
 
+    shadowed = _admin_dependencies(
+        audit=audit,
+        admin={"id": str(uuid4()), "real_is_admin": True, "is_admin": False},
+    )
     with pytest.raises(HTTPException) as raised:
-        await orchestrator_main._require_infrastructure_fleet_admin(request)
+        await infrastructure_admin_routes._require_infrastructure_fleet_admin(
+            request, shadowed
+        )
 
     assert raised.value.status_code == 403
     assert audit.await_args.kwargs["event_type"] == "admin_denied"
 
-    monkeypatch.setattr(
-        orchestrator_main,
-        "_require_admin",
-        AsyncMock(
-            return_value={
-                "id": str(uuid4()),
-                "real_is_admin": True,
-                "is_admin": True,
-            }
-        ),
-    )
-    monkeypatch.setattr(
-        orchestrator_main, "mcp_scope_project_id", lambda _user: uuid4()
+    scoped_admin = _admin_dependencies(
+        audit=audit,
+        admin={"id": str(uuid4()), "real_is_admin": True, "is_admin": True},
+        scope_project_id=lambda _user: uuid4(),
     )
     with pytest.raises(HTTPException) as scoped:
-        await orchestrator_main._require_infrastructure_fleet_admin(request)
+        await infrastructure_admin_routes._require_infrastructure_fleet_admin(
+            request, scoped_admin
+        )
     assert scoped.value.status_code == 403
     assert audit.await_count == 2
 
 
 @pytest.mark.asyncio
-async def test_cutover_prepare_is_explicit_gated_idempotent_admin_operation(
-    monkeypatch,
-):
-    import orchestrator.main as orchestrator_main
+async def test_cutover_prepare_is_explicit_gated_idempotent_admin_operation():
     from orchestrator.services.infrastructure_metering.cutover import (
         CutoverPhase,
         CutoverStatus,
@@ -1710,24 +1744,6 @@ async def test_cutover_prepare_is_explicit_gated_idempotent_admin_operation(
     actor_id, request_id = uuid4(), uuid4()
     request = MagicMock()
     request.url.path = "/api/admin/usage/v2/infrastructure-cutover/prepare"
-    monkeypatch.setattr(
-        orchestrator_main,
-        "_require_infrastructure_fleet_admin",
-        AsyncMock(return_value={"id": str(actor_id), "is_admin": True}),
-    )
-    monkeypatch.setattr(
-        orchestrator_main,
-        "infrastructure_metering_settings",
-        InfrastructureMeteringSettings(cutover_enabled=True),
-    )
-    monkeypatch.setattr(
-        orchestrator_main,
-        "infrastructure_durable_reporting_policy_ready",
-        True,
-    )
-    monkeypatch.setattr(
-        orchestrator_main, "_infrastructure_leader_generation", lambda: 9
-    )
     status = CutoverStatus(
         state="preparing",
         phase=CutoverPhase.LEGACY_DRAINING,
@@ -1745,18 +1761,23 @@ async def test_cutover_prepare_is_explicit_gated_idempotent_admin_operation(
     )
     coordinator = MagicMock()
     coordinator.prepare = AsyncMock(return_value=status)
-    monkeypatch.setattr(
-        orchestrator_main, "infrastructure_workspace_cutover", coordinator
-    )
     audit = AsyncMock()
-    monkeypatch.setattr(orchestrator_main, "log_security_event", audit)
+    dependencies = _admin_dependencies(
+        settings=InfrastructureMeteringSettings(cutover_enabled=True),
+        admin={"id": str(actor_id), "is_admin": True},
+        audit=audit,
+        leader_generation=lambda: 9,
+        durable_reporting_policy_ready=True,
+        workspace_cutover=coordinator,
+    )
 
-    result = await orchestrator_main.prepare_infrastructure_metering_cutover(
+    result = await infrastructure_admin_routes.prepare_infrastructure_metering_cutover(
         request,
-        orchestrator_main.InfrastructureCutoverPrepareRequest(
+        InfrastructureCutoverPrepareRequest(
             idempotency_key=request_id,
             reason="reviewed shadow window",
         ),
+        dependencies=dependencies,
     )
 
     coordinator.prepare.assert_awaited_once_with(
@@ -1773,8 +1794,7 @@ async def test_cutover_prepare_is_explicit_gated_idempotent_admin_operation(
 
 
 @pytest.mark.asyncio
-async def test_coverage_waiver_route_maps_result_and_audits(monkeypatch):
-    import orchestrator.main as orchestrator_main
+async def test_coverage_waiver_route_maps_result_and_audits():
     from orchestrator.services.infrastructure_metering.coverage import (
         CoverageDayDegradation,
         CoverageGapWaiverResult,
@@ -1784,11 +1804,6 @@ async def test_coverage_waiver_route_maps_result_and_audits(monkeypatch):
     resolved_at = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)
     request = MagicMock()
     request.url.path = f"/api/admin/usage/v2/coverage-gaps/{gap_id}/waive"
-    monkeypatch.setattr(
-        orchestrator_main,
-        "_require_infrastructure_fleet_admin",
-        AsyncMock(return_value={"id": str(actor_id), "is_admin": True}),
-    )
     service = MagicMock()
     service.waive = AsyncMock(
         return_value=CoverageGapWaiverResult(
@@ -1808,17 +1823,22 @@ async def test_coverage_waiver_route_maps_result_and_audits(monkeypatch):
             ),
         )
     )
-    monkeypatch.setattr(orchestrator_main, "infrastructure_coverage_waivers", service)
     audit = AsyncMock()
-    monkeypatch.setattr(orchestrator_main, "log_security_event", audit)
+    dependencies = _admin_dependencies(
+        admin={"id": str(actor_id), "is_admin": True},
+        audit=audit,
+        coverage_waivers=service,
+    )
 
-    result = await orchestrator_main.waive_infrastructure_metering_coverage_gap(
+    route = infrastructure_admin_routes.waive_infrastructure_metering_coverage_gap
+    result = await route(
         request,
         gap_id,
-        orchestrator_main.InfrastructureCoverageWaiverRequest(
+        InfrastructureCoverageWaiverRequest(
             idempotency_key=request_id,
             reason="durable journal unavailable",
         ),
+        dependencies=dependencies,
     )
 
     service.waive.assert_awaited_once_with(
@@ -1834,33 +1854,12 @@ async def test_coverage_waiver_route_maps_result_and_audits(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_correction_route_is_idempotent_fleet_admin_operation(monkeypatch):
-    import orchestrator.main as orchestrator_main
-
+async def test_correction_route_is_idempotent_fleet_admin_operation():
     actor_id, correction_id = uuid4(), uuid4()
     period_start = datetime(2026, 8, 5, tzinfo=timezone.utc)
     period_end = period_start + timedelta(hours=1)
     request = MagicMock()
     request.url.path = "/api/admin/usage/v2/infrastructure-corrections"
-    monkeypatch.setattr(
-        orchestrator_main,
-        "_require_infrastructure_fleet_admin",
-        AsyncMock(return_value={"id": str(actor_id), "is_admin": True}),
-    )
-    monkeypatch.setattr(
-        orchestrator_main,
-        "infrastructure_metering_settings",
-        InfrastructureMeteringSettings(
-            collector_enabled=True,
-            shadow_enabled=True,
-            publication_enabled=True,
-            stable_cluster_id="dev-cluster",
-            namespace_allowlist=("srw",),
-        ),
-    )
-    monkeypatch.setattr(
-        orchestrator_main, "_infrastructure_leader_generation", lambda: 11
-    )
     plan = MagicMock(
         id=correction_id,
         correction_group_id=correction_id,
@@ -1874,20 +1873,30 @@ async def test_correction_route_is_idempotent_fleet_admin_operation(monkeypatch)
     )
     materializer = MagicMock()
     materializer.create_correction = AsyncMock(return_value=plan)
-    monkeypatch.setattr(
-        orchestrator_main, "infrastructure_usage_materializer", materializer
-    )
     audit = AsyncMock()
-    monkeypatch.setattr(orchestrator_main, "log_security_event", audit)
+    dependencies = _admin_dependencies(
+        settings=InfrastructureMeteringSettings(
+            collector_enabled=True,
+            shadow_enabled=True,
+            publication_enabled=True,
+            stable_cluster_id="dev-cluster",
+            namespace_allowlist=("srw",),
+        ),
+        admin={"id": str(actor_id), "is_admin": True},
+        audit=audit,
+        leader_generation=lambda: 11,
+        usage_materializer=materializer,
+    )
     original_ts = datetime(2026, 8, 5, tzinfo=timezone.utc)
 
-    result = await orchestrator_main.create_infrastructure_metering_correction(
+    route = infrastructure_admin_routes.create_infrastructure_metering_correction
+    result = await route(
         request,
-        orchestrator_main.InfrastructureCorrectionRequest(
+        InfrastructureCorrectionRequest(
             idempotency_key=correction_id,
             reason="reviewed attribution repair",
             deltas=[
-                orchestrator_main.InfrastructureCorrectionDeltaRequest(
+                InfrastructureCorrectionDeltaRequest(
                     source="infra-allocation-v2",
                     source_id="original-source-id",
                     unit="vcpu-hour",
@@ -1895,7 +1904,7 @@ async def test_correction_route_is_idempotent_fleet_admin_operation(monkeypatch)
                     expected_payload_hash="c" * 64,
                     quantity=Decimal("-4"),
                 ),
-                orchestrator_main.InfrastructureCorrectionDeltaRequest(
+                InfrastructureCorrectionDeltaRequest(
                     source="infra-allocation-v2",
                     source_id="original-source-id",
                     unit="vcpu-hour",
@@ -1906,6 +1915,7 @@ async def test_correction_route_is_idempotent_fleet_admin_operation(monkeypatch)
                 ),
             ],
         ),
+        dependencies=dependencies,
     )
 
     call = materializer.create_correction.await_args
@@ -1957,31 +1967,10 @@ def test_infrastructure_admin_routes_are_explicit_and_publicly_documented():
 
 
 @pytest.mark.asyncio
-async def test_storage_activation_routes_are_explicit_and_audited(monkeypatch):
-    import orchestrator.main as orchestrator_main
-    from orchestrator.services.infrastructure_metering.storage_assets import (
-        StorageActivation,
-        StorageSourceActivation,
-    )
-
+async def test_storage_activation_routes_are_explicit_and_audited():
     actor_id = uuid4()
     request = MagicMock()
     request.url.path = "/api/admin/usage/v2/storage-activation/claim-requested/shadow"
-    monkeypatch.setattr(
-        orchestrator_main,
-        "_require_infrastructure_fleet_admin",
-        AsyncMock(return_value={"id": str(actor_id), "is_admin": True}),
-    )
-    monkeypatch.setattr(
-        orchestrator_main,
-        "infrastructure_metering_settings",
-        InfrastructureMeteringSettings(
-            collector_enabled=True,
-            pvc_inventory_enabled=True,
-            stable_cluster_id="dev-cluster",
-            namespace_allowlist=("srw",),
-        ),
-    )
     now = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)
     store = MagicMock()
     store.enter_source_shadow = AsyncMock(
@@ -2000,21 +1989,25 @@ async def test_storage_activation_routes_are_explicit_and_audited(monkeypatch):
             StorageActivation("volume-provisioned", "disabled", None, now),
         )
     )
-    monkeypatch.setattr(orchestrator_main, "infrastructure_storage_assets", store)
-    monkeypatch.setattr(
-        orchestrator_main,
-        "infrastructure_storage_source_activation_ready",
-        True,
-    )
     audit = AsyncMock()
-    monkeypatch.setattr(orchestrator_main, "log_security_event", audit)
+    dependencies = _admin_dependencies(
+        settings=InfrastructureMeteringSettings(
+            collector_enabled=True,
+            pvc_inventory_enabled=True,
+            stable_cluster_id="dev-cluster",
+            namespace_allowlist=("srw",),
+        ),
+        admin={"id": str(actor_id), "is_admin": True},
+        audit=audit,
+        storage_assets=store,
+        storage_source_activation_ready=True,
+    )
 
-    result = await orchestrator_main.enter_infrastructure_storage_shadow(
+    result = await infrastructure_admin_routes.enter_infrastructure_storage_shadow(
         request,
         "claim-requested",
-        orchestrator_main.InfrastructureStorageActivationRequest(
-            reason="inventory soak is healthy"
-        ),
+        InfrastructureStorageActivationRequest(reason="inventory soak is healthy"),
+        dependencies=dependencies,
     )
 
     store.enter_source_shadow.assert_awaited_once_with(
@@ -2022,7 +2015,7 @@ async def test_storage_activation_routes_are_explicit_and_audited(monkeypatch):
         collector_id="kubernetes-pods",
         source_cluster="dev-cluster",
         requirements=(
-            orchestrator_main.StorageSourceRequirementSpec(
+            StorageSourceRequirementSpec(
                 api_resource="core/v1/persistentvolumeclaims",
                 namespace="srw",
                 requirement_role="quantity",
@@ -2037,38 +2030,10 @@ async def test_storage_activation_routes_are_explicit_and_audited(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_storage_activation_schedule_is_generation_fenced(monkeypatch):
-    import orchestrator.main as orchestrator_main
-    from orchestrator.services.infrastructure_metering.storage_assets import (
-        StorageActivation,
-        StorageSourceActivation,
-    )
-
+async def test_storage_activation_schedule_is_generation_fenced():
     actor_id = uuid4()
     request = MagicMock()
     request.url.path = "/api/admin/usage/v2/storage-activation/claim-requested/schedule"
-    monkeypatch.setattr(
-        orchestrator_main,
-        "_require_infrastructure_fleet_admin",
-        AsyncMock(return_value={"id": str(actor_id), "is_admin": True}),
-    )
-    monkeypatch.setattr(
-        orchestrator_main,
-        "_infrastructure_leader_generation",
-        MagicMock(return_value=9),
-    )
-    monkeypatch.setattr(
-        orchestrator_main,
-        "infrastructure_metering_settings",
-        InfrastructureMeteringSettings(
-            collector_enabled=True,
-            shadow_enabled=True,
-            pvc_inventory_enabled=True,
-            pvc_shadow_enabled=True,
-            stable_cluster_id="dev-cluster",
-            namespace_allowlist=("srw",),
-        ),
-    )
     boundary = datetime(2026, 8, 7, tzinfo=timezone.utc)
     store = MagicMock()
     store.schedule_source_activation = AsyncMock(
@@ -2097,21 +2062,30 @@ async def test_storage_activation_schedule_is_generation_fenced(monkeypatch):
             ),
         )
     )
-    monkeypatch.setattr(orchestrator_main, "infrastructure_storage_assets", store)
-    monkeypatch.setattr(
-        orchestrator_main,
-        "infrastructure_storage_source_activation_ready",
-        True,
+    dependencies = _admin_dependencies(
+        settings=InfrastructureMeteringSettings(
+            collector_enabled=True,
+            shadow_enabled=True,
+            pvc_inventory_enabled=True,
+            pvc_shadow_enabled=True,
+            stable_cluster_id="dev-cluster",
+            namespace_allowlist=("srw",),
+        ),
+        admin={"id": str(actor_id), "is_admin": True},
+        leader_generation=MagicMock(return_value=9),
+        storage_assets=store,
+        storage_source_activation_ready=True,
     )
-    monkeypatch.setattr(orchestrator_main, "log_security_event", AsyncMock())
 
-    await orchestrator_main.schedule_infrastructure_storage_activation(
+    route = infrastructure_admin_routes.schedule_infrastructure_storage_activation
+    await route(
         request,
         "claim-requested",
-        orchestrator_main.InfrastructureStorageActivationScheduleRequest(
+        InfrastructureStorageActivationScheduleRequest(
             reason="shadow proof reviewed",
             activated_at=boundary,
         ),
+        dependencies=dependencies,
     )
 
     store.schedule_source_activation.assert_awaited_once_with(
@@ -2126,34 +2100,10 @@ async def test_storage_activation_schedule_is_generation_fenced(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_vm_volume_source_shadow_freezes_quantity_and_attribution_scopes(
-    monkeypatch,
-):
-    import orchestrator.main as orchestrator_main
-    from orchestrator.services.infrastructure_metering.storage_assets import (
-        StorageActivation,
-        StorageSourceActivation,
-    )
-
+async def test_vm_volume_source_shadow_freezes_quantity_and_attribution_scopes():
     request = MagicMock()
     request.url.path = (
         "/api/admin/usage/v2/storage-source-activation/vm/volume-provisioned/shadow"
-    )
-    monkeypatch.setattr(
-        orchestrator_main,
-        "_require_infrastructure_fleet_admin",
-        AsyncMock(return_value={"id": str(uuid4()), "is_admin": True}),
-    )
-    monkeypatch.setattr(
-        orchestrator_main,
-        "infrastructure_metering_settings",
-        InfrastructureMeteringSettings(
-            collector_enabled=True,
-            vm_pvc_inventory_enabled=True,
-            vm_pv_inventory_enabled=True,
-            vm_stable_cluster_id="vm-dev-cluster",
-            vm_namespace="srw-vms",
-        ),
     )
     now = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)
     store = MagicMock()
@@ -2173,22 +2123,29 @@ async def test_vm_volume_source_shadow_freezes_quantity_and_attribution_scopes(
             StorageActivation("volume-provisioned", "shadow", None, now),
         )
     )
-    monkeypatch.setattr(orchestrator_main, "infrastructure_storage_assets", store)
-    monkeypatch.setattr(
-        orchestrator_main,
-        "infrastructure_storage_source_activation_ready",
-        True,
-    )
     audit = AsyncMock()
-    monkeypatch.setattr(orchestrator_main, "log_security_event", audit)
+    dependencies = _admin_dependencies(
+        settings=InfrastructureMeteringSettings(
+            collector_enabled=True,
+            vm_pvc_inventory_enabled=True,
+            vm_pv_inventory_enabled=True,
+            vm_stable_cluster_id="vm-dev-cluster",
+            vm_namespace="srw-vms",
+        ),
+        audit=audit,
+        storage_assets=store,
+        storage_source_activation_ready=True,
+    )
 
-    result = await orchestrator_main.enter_infrastructure_storage_source_shadow(
+    route = infrastructure_admin_routes.enter_infrastructure_storage_source_shadow
+    result = await route(
         request,
         "vm",
         "volume-provisioned",
-        orchestrator_main.InfrastructureStorageActivationRequest(
+        InfrastructureStorageActivationRequest(
             reason="remote inventory proof reviewed"
         ),
+        dependencies=dependencies,
     )
 
     store.enter_source_shadow.assert_awaited_once_with(
@@ -2196,12 +2153,12 @@ async def test_vm_volume_source_shadow_freezes_quantity_and_attribution_scopes(
         collector_id="kubevirt-storage",
         source_cluster="vm-dev-cluster",
         requirements=(
-            orchestrator_main.StorageSourceRequirementSpec(
+            StorageSourceRequirementSpec(
                 api_resource="core/v1/persistentvolumes",
                 namespace=None,
                 requirement_role="quantity",
             ),
-            orchestrator_main.StorageSourceRequirementSpec(
+            StorageSourceRequirementSpec(
                 api_resource="core/v1/persistentvolumeclaims",
                 namespace="srw-vms",
                 requirement_role="attribution",
@@ -2214,29 +2171,10 @@ async def test_vm_volume_source_shadow_freezes_quantity_and_attribution_scopes(
 
 
 @pytest.mark.asyncio
-async def test_compute_activation_shadow_is_class_gated_and_audited(monkeypatch):
-    import orchestrator.main as orchestrator_main
-    from orchestrator.services.infrastructure_metering.compute_activation import (
-        ComputeActivation,
-    )
-
+async def test_compute_activation_shadow_is_class_gated_and_audited():
     actor_id = uuid4()
     request = MagicMock()
     request.url.path = "/api/admin/usage/v2/compute-activation/agent_pod/shadow"
-    monkeypatch.setattr(
-        orchestrator_main,
-        "_require_infrastructure_fleet_admin",
-        AsyncMock(return_value={"id": str(actor_id), "is_admin": True}),
-    )
-    monkeypatch.setattr(
-        orchestrator_main,
-        "infrastructure_metering_settings",
-        InfrastructureMeteringSettings(
-            collector_enabled=True,
-            stable_cluster_id="dev-cluster",
-            namespace_allowlist=("srw",),
-        ),
-    )
     now = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)
     store = MagicMock()
     store.enter_shadow = AsyncMock(
@@ -2247,16 +2185,23 @@ async def test_compute_activation_shadow_is_class_gated_and_audited(monkeypatch)
             database_time=now,
         )
     )
-    monkeypatch.setattr(orchestrator_main, "infrastructure_compute_activation", store)
     audit = AsyncMock()
-    monkeypatch.setattr(orchestrator_main, "log_security_event", audit)
+    dependencies = _admin_dependencies(
+        settings=InfrastructureMeteringSettings(
+            collector_enabled=True,
+            stable_cluster_id="dev-cluster",
+            namespace_allowlist=("srw",),
+        ),
+        admin={"id": str(actor_id), "is_admin": True},
+        audit=audit,
+        compute_activation=store,
+    )
 
-    result = await orchestrator_main.enter_infrastructure_compute_shadow(
+    result = await infrastructure_admin_routes.enter_infrastructure_compute_shadow(
         request,
         "agent_pod",
-        orchestrator_main.InfrastructureComputeActivationRequest(
-            reason="agent shadow soak approved"
-        ),
+        InfrastructureComputeActivationRequest(reason="agent shadow soak approved"),
+        dependencies=dependencies,
     )
 
     store.enter_shadow.assert_awaited_once_with("agent_pod")
@@ -2268,22 +2213,10 @@ async def test_compute_activation_shadow_is_class_gated_and_audited(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_vm_compute_shadow_transition_requires_inventory_not_shadow_config(
-    monkeypatch,
-):
-    import orchestrator.main as orchestrator_main
-    from orchestrator.services.infrastructure_metering.compute_activation import (
-        ComputeActivation,
-    )
-
+async def test_vm_compute_shadow_transition_requires_inventory_not_shadow_config():
     request = MagicMock()
     request.url.path = "/api/admin/usage/v2/compute-activation/workspace_vm/shadow"
     actor_id = uuid4()
-    monkeypatch.setattr(
-        orchestrator_main,
-        "_require_infrastructure_fleet_admin",
-        AsyncMock(return_value={"id": str(actor_id), "is_admin": True}),
-    )
     store = MagicMock()
     store.enter_shadow = AsyncMock(
         return_value=ComputeActivation(
@@ -2293,52 +2226,50 @@ async def test_vm_compute_shadow_transition_requires_inventory_not_shadow_config
             database_time=datetime(2026, 8, 6, 12, tzinfo=timezone.utc),
         )
     )
-    monkeypatch.setattr(orchestrator_main, "infrastructure_compute_activation", store)
-    monkeypatch.setattr(orchestrator_main, "log_security_event", AsyncMock())
-
     base = InfrastructureMeteringSettings(
         collector_enabled=True,
         stable_cluster_id="dev-cluster",
         namespace_allowlist=("srw",),
     )
-    monkeypatch.setattr(orchestrator_main, "infrastructure_metering_settings", base)
+    admin = {"id": str(actor_id), "is_admin": True}
+    dark = _admin_dependencies(settings=base, admin=admin, compute_activation=store)
     with pytest.raises(HTTPException) as missing_inventory:
-        await orchestrator_main.enter_infrastructure_compute_shadow(
+        await infrastructure_admin_routes.enter_infrastructure_compute_shadow(
             request,
             "workspace_vm",
-            orchestrator_main.InfrastructureComputeActivationRequest(
+            InfrastructureComputeActivationRequest(
                 reason="inventory must precede durable shadow"
             ),
+            dependencies=dark,
         )
     assert missing_inventory.value.status_code == 404
     store.enter_shadow.assert_not_awaited()
 
-    monkeypatch.setattr(
-        orchestrator_main,
-        "infrastructure_metering_settings",
-        replace(
+    enabled = _admin_dependencies(
+        settings=replace(
             base,
             vm_inventory_enabled=True,
             vm_stable_cluster_id="vm-cluster",
             vm_namespace="agent-vms",
         ),
+        admin=admin,
+        compute_activation=store,
     )
-    result = await orchestrator_main.enter_infrastructure_compute_shadow(
+    result = await infrastructure_admin_routes.enter_infrastructure_compute_shadow(
         request,
         "workspace_vm",
-        orchestrator_main.InfrastructureComputeActivationRequest(
+        InfrastructureComputeActivationRequest(
             reason="inventory verified before enabling shadow config"
         ),
+        dependencies=enabled,
     )
     assert result["state"] == "shadow"
     store.enter_shadow.assert_awaited_once_with("workspace_vm")
 
 
 @pytest.mark.asyncio
-async def test_vm_compute_activation_uses_remote_scope_and_collector(monkeypatch):
-    import orchestrator.main as orchestrator_main
+async def test_vm_compute_activation_uses_remote_scope_and_collector():
     from orchestrator.services.infrastructure_metering.compute_activation import (
-        ComputeActivation,
         ComputeActivationScheduleResult,
         ComputeEpochPromotion,
     )
@@ -2346,30 +2277,6 @@ async def test_vm_compute_activation_uses_remote_scope_and_collector(monkeypatch
     request = MagicMock()
     request.url.path = "/api/admin/usage/v2/compute-activation/workspace_vm/schedule"
     actor_id = uuid4()
-    monkeypatch.setattr(
-        orchestrator_main,
-        "_require_infrastructure_fleet_admin",
-        AsyncMock(return_value={"id": str(actor_id), "is_admin": True}),
-    )
-    monkeypatch.setattr(
-        orchestrator_main,
-        "_infrastructure_leader_generation",
-        MagicMock(return_value=11),
-    )
-    monkeypatch.setattr(
-        orchestrator_main,
-        "infrastructure_metering_settings",
-        InfrastructureMeteringSettings(
-            collector_enabled=True,
-            shadow_enabled=True,
-            vm_inventory_enabled=True,
-            vm_shadow_enabled=True,
-            stable_cluster_id="dev-cluster",
-            namespace_allowlist=("srw",),
-            vm_stable_cluster_id="vm-cluster",
-            vm_namespace="agent-vms",
-        ),
-    )
     boundary = datetime(2026, 8, 8, tzinfo=timezone.utc)
     request_id = uuid4()
     store = MagicMock()
@@ -2393,17 +2300,32 @@ async def test_vm_compute_activation_uses_remote_scope_and_collector(monkeypatch
             ),
         )
     )
-    monkeypatch.setattr(orchestrator_main, "infrastructure_compute_activation", store)
-    monkeypatch.setattr(orchestrator_main, "log_security_event", AsyncMock())
+    dependencies = _admin_dependencies(
+        settings=InfrastructureMeteringSettings(
+            collector_enabled=True,
+            shadow_enabled=True,
+            vm_inventory_enabled=True,
+            vm_shadow_enabled=True,
+            stable_cluster_id="dev-cluster",
+            namespace_allowlist=("srw",),
+            vm_stable_cluster_id="vm-cluster",
+            vm_namespace="agent-vms",
+        ),
+        admin={"id": str(actor_id), "is_admin": True},
+        leader_generation=MagicMock(return_value=11),
+        compute_activation=store,
+    )
 
-    await orchestrator_main.schedule_infrastructure_compute_activation(
+    route = infrastructure_admin_routes.schedule_infrastructure_compute_activation
+    await route(
         request,
         "workspace_vm",
-        orchestrator_main.InfrastructureComputeActivationScheduleRequest(
+        InfrastructureComputeActivationScheduleRequest(
             idempotency_key=request_id,
             reason="remote VMI shadow proof reviewed",
             activated_at=boundary,
         ),
+        dependencies=dependencies,
     )
 
     store.schedule_activation.assert_awaited_once_with(
@@ -2421,8 +2343,7 @@ async def test_vm_compute_activation_uses_remote_scope_and_collector(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_storage_destruction_assertion_is_idempotent_and_audited(monkeypatch):
-    import orchestrator.main as orchestrator_main
+async def test_storage_destruction_assertion_is_idempotent_and_audited():
     from orchestrator.services.infrastructure_metering.storage_assets import (
         BackendDestructionResult,
     )
@@ -2436,11 +2357,6 @@ async def test_storage_destruction_assertion_is_idempotent_and_audited(monkeypat
     effective_at = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)
     request = MagicMock()
     request.url.path = f"/api/admin/usage/v2/storage-assets/{asset_id}/destroy"
-    monkeypatch.setattr(
-        orchestrator_main,
-        "_require_infrastructure_fleet_admin",
-        AsyncMock(return_value={"id": str(actor_id), "is_admin": True}),
-    )
     store = MagicMock()
     store.assert_destroyed = AsyncMock(
         return_value=BackendDestructionResult(
@@ -2452,11 +2368,14 @@ async def test_storage_destruction_assertion_is_idempotent_and_audited(monkeypat
             replayed=True,
         )
     )
-    monkeypatch.setattr(orchestrator_main, "infrastructure_storage_assets", store)
     audit = AsyncMock()
-    monkeypatch.setattr(orchestrator_main, "log_security_event", audit)
+    dependencies = _admin_dependencies(
+        admin={"id": str(actor_id), "is_admin": True},
+        audit=audit,
+        storage_assets=store,
+    )
 
-    body = orchestrator_main.InfrastructureStorageDestructionRequest(
+    body = InfrastructureStorageDestructionRequest(
         idempotency_key=request_id,
         effective_at=effective_at,
         evidence_kind="operator-attested",
@@ -2464,10 +2383,12 @@ async def test_storage_destruction_assertion_is_idempotent_and_audited(monkeypat
         reason_code="provider-console-review",
         reason="reviewed by the fleet operator",
     )
-    result = await orchestrator_main.assert_infrastructure_storage_asset_destroyed(
+    route = infrastructure_admin_routes.assert_infrastructure_storage_asset_destroyed
+    result = await route(
         request,
         asset_id,
         body,
+        dependencies=dependencies,
     )
 
     store.assert_destroyed.assert_awaited_once_with(
@@ -2487,10 +2408,7 @@ async def test_storage_destruction_assertion_is_idempotent_and_audited(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_storage_asset_operator_list_and_detail_are_safe_and_bounded(
-    monkeypatch,
-):
-    import orchestrator.main as orchestrator_main
+async def test_storage_asset_operator_list_and_detail_are_safe_and_bounded():
     from orchestrator.services.infrastructure_metering.storage_assets import (
         BackendUnverifiedAssetPage,
         BackendUnverifiedAssetRecord,
@@ -2504,11 +2422,6 @@ async def test_storage_asset_operator_list_and_detail_are_safe_and_bounded(
     request = MagicMock()
     request.url.path = "/api/admin/usage/v2/storage-assets/backend-unverified"
     require_admin = AsyncMock(return_value={"id": str(uuid4()), "is_admin": True})
-    monkeypatch.setattr(
-        orchestrator_main,
-        "_require_infrastructure_fleet_admin",
-        require_admin,
-    )
     record = BackendUnverifiedAssetRecord(
         asset_id=asset_id,
         source_cluster="dev-cluster",
@@ -2573,19 +2486,23 @@ async def test_storage_asset_operator_list_and_detail_are_safe_and_bounded(
         return_value=BackendUnverifiedAssetPage(items=(record,), next_cursor=asset_id)
     )
     store.read_asset_detail = AsyncMock(return_value=detail)
-    monkeypatch.setattr(orchestrator_main, "infrastructure_storage_assets", store)
-
-    listed = (
-        await orchestrator_main.list_infrastructure_backend_unverified_storage_assets(
-            request,
-            limit=25,
-            cursor=None,
-        )
+    dependencies = _admin_dependencies(
+        require_admin=require_admin,
+        storage_assets=store,
     )
-    rendered = await orchestrator_main.get_infrastructure_storage_asset_detail(
+
+    routes = infrastructure_admin_routes
+    listed = await routes.list_infrastructure_backend_unverified_storage_assets(
+        request,
+        limit=25,
+        cursor=None,
+        dependencies=dependencies,
+    )
+    rendered = await routes.get_infrastructure_storage_asset_detail(
         request,
         asset_id,
         history_limit=25,
+        dependencies=dependencies,
     )
 
     store.list_backend_unverified.assert_awaited_once_with(

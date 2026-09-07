@@ -155,6 +155,36 @@ source_modules = [
 forbidden_modules = ["orchestrator.main"]
 
 [[tool.importlinter.contracts]]
+name = "Reporting, identity and operational administration do not import application startup"
+type = "forbidden"
+source_modules = [
+    "orchestrator.services.infrastructure_activation_policy",
+    "orchestrator.services.usage_reporting",
+    "orchestrator.services.infrastructure_admin",
+    "orchestrator.services.identity",
+    "orchestrator.services.access_tokens",
+    "orchestrator.services.ssh_access",
+    "orchestrator.services.provider_credentials",
+    "orchestrator.services.subscription_management",
+    "orchestrator.services.voice",
+    "orchestrator.services.system_settings",
+    "orchestrator.services.user_administration",
+    "orchestrator.services.job_diagnostics",
+    "orchestrator.routers.usage_reporting",
+    "orchestrator.routers.infrastructure_admin",
+    "orchestrator.routers.identity",
+    "orchestrator.routers.access_tokens",
+    "orchestrator.routers.ssh_access",
+    "orchestrator.routers.provider_credentials",
+    "orchestrator.routers.subscription_management",
+    "orchestrator.routers.voice",
+    "orchestrator.routers.system_settings",
+    "orchestrator.routers.user_administration",
+    "orchestrator.routers.job_diagnostics",
+]
+forbidden_modules = ["orchestrator.main"]
+
+[[tool.importlinter.contracts]]
 name = "Shared initializer stays lightweight"
 type = "forbidden"
 # Check the root initializer separately without including its child packages.

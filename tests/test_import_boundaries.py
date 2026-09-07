@@ -98,7 +98,7 @@ def lint_boundaries(root):
 def test_allowed_runtime_and_lightweight_dependencies_pass(boundary_tree):
     result = lint_boundaries(boundary_tree)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "Contracts: 13 kept, 0 broken" in result.stdout
+    assert "Contracts: 14 kept, 0 broken" in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -144,6 +144,32 @@ def test_allowed_runtime_and_lightweight_dependencies_pass(boundary_tree):
         ("orchestrator/services/job_admission_creator.py", "orchestrator.main"),
         ("orchestrator/services/datasource_policy_errors.py", "orchestrator.main"),
         ("orchestrator/services/officer_metadata.py", "orchestrator.main"),
+        (
+            "orchestrator/services/infrastructure_activation_policy.py",
+            "orchestrator.main",
+        ),
+        ("orchestrator/services/usage_reporting.py", "orchestrator.main"),
+        ("orchestrator/services/infrastructure_admin.py", "orchestrator.main"),
+        ("orchestrator/services/identity.py", "orchestrator.main"),
+        ("orchestrator/services/access_tokens.py", "orchestrator.main"),
+        ("orchestrator/services/ssh_access.py", "orchestrator.main"),
+        ("orchestrator/services/provider_credentials.py", "orchestrator.main"),
+        ("orchestrator/services/subscription_management.py", "orchestrator.main"),
+        ("orchestrator/services/voice.py", "orchestrator.main"),
+        ("orchestrator/services/system_settings.py", "orchestrator.main"),
+        ("orchestrator/services/user_administration.py", "orchestrator.main"),
+        ("orchestrator/services/job_diagnostics.py", "orchestrator.main"),
+        ("orchestrator/routers/usage_reporting.py", "orchestrator.main"),
+        ("orchestrator/routers/infrastructure_admin.py", "orchestrator.main"),
+        ("orchestrator/routers/identity.py", "orchestrator.main"),
+        ("orchestrator/routers/access_tokens.py", "orchestrator.main"),
+        ("orchestrator/routers/ssh_access.py", "orchestrator.main"),
+        ("orchestrator/routers/provider_credentials.py", "orchestrator.main"),
+        ("orchestrator/routers/subscription_management.py", "orchestrator.main"),
+        ("orchestrator/routers/voice.py", "orchestrator.main"),
+        ("orchestrator/routers/system_settings.py", "orchestrator.main"),
+        ("orchestrator/routers/user_administration.py", "orchestrator.main"),
+        ("orchestrator/routers/job_diagnostics.py", "orchestrator.main"),
         ("vm_controller/app.py", "headscale_client"),
     ],
 )

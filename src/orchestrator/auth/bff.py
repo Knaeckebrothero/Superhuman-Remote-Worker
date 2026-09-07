@@ -39,6 +39,17 @@ PRE_AUTH_COOKIE = "srw_pre_auth"
 # Env knobs ---------------------------------------------------------------
 
 
+def _store(request: Request):
+    """The application's database, from the app the router is mounted on.
+
+    R1.B02 replaced a function-local ``from orchestrator.main import
+    postgres_db`` in each handler with this. The late import existed only to
+    dodge a circular import; reading the mounted application's own state keeps
+    the dependency explicit and lets a test mount this router standalone.
+    """
+    return request.app.state.store
+
+
 def _cookie_domain() -> str | None:
     """Cookie Domain attribute. None = host-only (right for localhost dev).
 
@@ -167,7 +178,7 @@ async def login(
     We generate state + a PKCE verifier, park them in ``srw_pre_auth_states``
     and a short-lived cookie, then 302 to Keycloak's /authorize endpoint.
     """
-    from orchestrator.main import postgres_db  # late import: avoid circular
+    postgres_db = _store(request)
 
     if not kc_bff_client.redirect_uri:
         raise HTTPException(
@@ -225,7 +236,7 @@ async def callback(
     provisions the local user row, opens a new BFF session, sets the
     session cookie, and redirects to the cockpit's intended URL.
     """
-    from orchestrator.main import postgres_db  # late import: avoid circular
+    postgres_db = _store(request)
 
     if error:
         logger.warning("KC callback returned error %s: %s", error, error_description)
@@ -327,7 +338,7 @@ async def me(request: Request) -> dict:
     No CSRF needed (GET). Cookie path runs first inside ``get_current_user``;
     a Bearer caller hits this fine too (transitional support).
     """
-    from orchestrator.main import postgres_db  # late import: avoid circular
+    postgres_db = _store(request)
 
     user = await get_current_user(request, postgres_db)
     # Mirror the shape of the existing /api/auth/me — id, email, display name,
@@ -353,7 +364,7 @@ async def refresh(request: Request) -> dict:
     only legit caller is the cockpit when it wants to proactively pull
     fresh claims (e.g. after an admin granted a new role).
     """
-    from orchestrator.main import postgres_db  # late import: avoid circular
+    postgres_db = _store(request)
 
     session_id = request.cookies.get(SESSION_COOKIE)
     if not session_id:
@@ -376,7 +387,7 @@ async def logout(request: Request) -> JSONResponse:
     KC clears its SSO cookie too. ``id_token_hint`` is included so KC 19+
     skips the confirmation screen.
     """
-    from orchestrator.main import postgres_db  # late import: avoid circular
+    postgres_db = _store(request)
 
     session_id = request.cookies.get(SESSION_COOKIE)
     kc_logout_url: str | None = None
@@ -415,7 +426,7 @@ async def backchannel_logout(request: Request) -> Response:
     field. We verify the JWT, then delete every BFF session row tied to
     the matching KC SID.
     """
-    from orchestrator.main import postgres_db  # late import: avoid circular
+    postgres_db = _store(request)
 
     form = await request.form()
     logout_token = form.get("logout_token")

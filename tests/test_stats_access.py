@@ -18,10 +18,21 @@ uses.
 """
 
 from contextlib import ExitStack
+import logging
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
+
+from orchestrator.routers import usage_reporting as usage_reporting_routes
+from orchestrator.security.access import (
+    log_security_event,
+    mcp_scope_project_id,
+    require_admin as require_admin_gate,
+    user_visible_project_ids,
+)
+from orchestrator.services import usage_reporting as usage_reporting_service
 
 
 def _patch_caller_and_db(user: dict, db):
@@ -37,6 +48,37 @@ def _patch_caller_and_db(user: dict, db):
     )
     stack.enter_context(patch("orchestrator.main.postgres_db", db))
     return stack
+
+
+def _usage_dependencies(
+    user: dict, db
+) -> usage_reporting_routes.UsageReportingDependencies:
+    """Compose the stats router's ports over the fixture graph.
+
+    The visibility ports are the real ones bound to the fake store, because the
+    behavior under test is exactly which narrowing kwargs reach postgres — a
+    stubbed resolver would assert the stub.
+    """
+    resolve_user = AsyncMock(return_value=user)
+
+    async def require_admin(request):
+        return await require_admin_gate(
+            request, db, resolve_user=resolve_user, audit=log_security_event
+        )
+
+    return usage_reporting_routes.UsageReportingDependencies(
+        store=db,
+        reports=usage_reporting_service.UsageReportingDependencies(
+            store=db,
+            audit_reader=SimpleNamespace(is_available=False),
+            logger=logging.getLogger("test-stats-access"),
+            visible_project_ids=lambda actor: user_visible_project_ids(actor, db),
+            scope_project_id=mcp_scope_project_id,
+        ),
+        require_admin=require_admin,
+        metering_settings=SimpleNamespace(v2_reads_enabled=False),
+        require_approved_user=resolve_user,
+    )
 
 
 def _scoped(user: dict, scope: str) -> dict:
@@ -64,10 +106,13 @@ _STATS_JOBS_DEFAULTS: dict = {
 
 
 async def _stats_jobs(fake_request, **overrides):
-    from orchestrator.main import get_job_statistics
+    from orchestrator.main import _job_reads_dependencies
+    from orchestrator.routers.job_reads import get_job_statistics
 
     return await get_job_statistics(
-        fake_request, **{**_STATS_JOBS_DEFAULTS, **overrides}
+        fake_request,
+        **{**_STATS_JOBS_DEFAULTS, **overrides},
+        dependencies=_job_reads_dependencies(),
     )
 
 
@@ -128,7 +173,7 @@ class TestStatsJobs:
         counts, or selecting one status drops every other chip to zero."""
         import inspect
 
-        from orchestrator.main import get_job_statistics
+        from orchestrator.routers.job_reads import get_job_statistics
 
         assert "status" not in inspect.signature(get_job_statistics).parameters
         fake_db.get_job_statistics = AsyncMock(return_value={})
@@ -174,7 +219,8 @@ class TestStatsJobs:
 
     @pytest.mark.asyncio
     async def test_unauthenticated_baseline(self, fake_db, fake_request):
-        from orchestrator.main import get_job_statistics
+        from orchestrator.main import _job_reads_dependencies
+        from orchestrator.routers.job_reads import get_job_statistics
 
         with (
             patch(
@@ -184,7 +230,11 @@ class TestStatsJobs:
             patch("orchestrator.main.postgres_db", fake_db),
         ):
             with pytest.raises(HTTPException) as exc:
-                await get_job_statistics(fake_request)
+                await get_job_statistics(
+                    fake_request,
+                    **_STATS_JOBS_DEFAULTS,
+                    dependencies=_job_reads_dependencies(),
+                )
         assert exc.value.status_code == 401
 
 
@@ -196,22 +246,20 @@ class TestStatsJobs:
 class TestStatsDaily:
     @pytest.mark.asyncio
     async def test_non_admin_passes_visibility(self, user_a, fake_db, fake_request):
-        from orchestrator.main import get_daily_statistics
-
         fake_db.get_daily_statistics = AsyncMock(return_value=[])
-        with _patch_caller_and_db(user_a, fake_db):
-            await get_daily_statistics(fake_request, days=7)
+        await usage_reporting_routes.get_daily_statistics(
+            fake_request, days=7, dependencies=_usage_dependencies(user_a, fake_db)
+        )
         kwargs = fake_db.get_daily_statistics.call_args.kwargs
         assert kwargs["days"] == 7
         assert kwargs["owner_user_id"] == str(user_a["id"])
 
     @pytest.mark.asyncio
     async def test_admin_no_visibility_args(self, user_admin, fake_db, fake_request):
-        from orchestrator.main import get_daily_statistics
-
         fake_db.get_daily_statistics = AsyncMock(return_value=[])
-        with _patch_caller_and_db(user_admin, fake_db):
-            await get_daily_statistics(fake_request, days=30)
+        await usage_reporting_routes.get_daily_statistics(
+            fake_request, days=30, dependencies=_usage_dependencies(user_admin, fake_db)
+        )
         kwargs = fake_db.get_daily_statistics.call_args.kwargs
         assert kwargs == {"days": 30}
 
@@ -228,21 +276,23 @@ class TestStatsStuck:
 
     @pytest.mark.asyncio
     async def test_non_admin_passes_visibility(self, user_a, fake_db, fake_request):
-        from orchestrator.main import get_stuck_jobs
-
         fake_db.get_processing_jobs = AsyncMock(return_value=[])
-        with _patch_caller_and_db(user_a, fake_db):
-            await get_stuck_jobs(fake_request, threshold_minutes=60)
+        await usage_reporting_routes.get_stuck_jobs(
+            fake_request,
+            threshold_minutes=60,
+            dependencies=_usage_dependencies(user_a, fake_db),
+        )
         kwargs = fake_db.get_processing_jobs.call_args.kwargs
         assert kwargs["owner_user_id"] == str(user_a["id"])
 
     @pytest.mark.asyncio
     async def test_admin_no_visibility_args(self, user_admin, fake_db, fake_request):
-        from orchestrator.main import get_stuck_jobs
-
         fake_db.get_processing_jobs = AsyncMock(return_value=[])
-        with _patch_caller_and_db(user_admin, fake_db):
-            await get_stuck_jobs(fake_request, threshold_minutes=60)
+        await usage_reporting_routes.get_stuck_jobs(
+            fake_request,
+            threshold_minutes=60,
+            dependencies=_usage_dependencies(user_admin, fake_db),
+        )
         kwargs = fake_db.get_processing_jobs.call_args.kwargs
         assert "owner_user_id" not in kwargs
 
@@ -250,12 +300,13 @@ class TestStatsStuck:
     async def test_default_threshold_is_server_owned_and_reported(
         self, user_a, fake_db, fake_request, monkeypatch
     ):
-        from orchestrator.main import get_stuck_jobs
-
         monkeypatch.setenv("JOB_LIVENESS_STALL_MINUTES", "47")
         fake_db.get_processing_jobs = AsyncMock(return_value=[])
-        with _patch_caller_and_db(user_a, fake_db):
-            result = await get_stuck_jobs(fake_request, threshold_minutes=None)
+        result = await usage_reporting_routes.get_stuck_jobs(
+            fake_request,
+            threshold_minutes=None,
+            dependencies=_usage_dependencies(user_a, fake_db),
+        )
         assert result == {
             "jobs": [],
             "threshold_minutes": 47,
@@ -267,11 +318,12 @@ class TestStatsStuck:
     async def test_explicit_override_is_reported(
         self, threshold, user_a, fake_db, fake_request
     ):
-        from orchestrator.main import get_stuck_jobs
-
         fake_db.get_processing_jobs = AsyncMock(return_value=[])
-        with _patch_caller_and_db(user_a, fake_db):
-            result = await get_stuck_jobs(fake_request, threshold_minutes=threshold)
+        result = await usage_reporting_routes.get_stuck_jobs(
+            fake_request,
+            threshold_minutes=threshold,
+            dependencies=_usage_dependencies(user_a, fake_db),
+        )
         assert result["threshold_minutes"] == threshold
         assert result["threshold_source"] == "request_override"
 
@@ -284,25 +336,23 @@ class TestStatsStuck:
 class TestStatsAdminOnly:
     @pytest.mark.asyncio
     async def test_agents_stats_non_admin_403(self, user_a, fake_db, fake_request):
-        from orchestrator.main import get_agent_statistics
-
         fake_db.list_agents = AsyncMock(
             side_effect=AssertionError("list_agents called past gate")
         )
-        with _patch_caller_and_db(user_a, fake_db):
-            with pytest.raises(HTTPException) as exc:
-                await get_agent_statistics(fake_request)
+        with pytest.raises(HTTPException) as exc:
+            await usage_reporting_routes.get_agent_statistics(
+                fake_request, dependencies=_usage_dependencies(user_a, fake_db)
+            )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
     async def test_agents_stats_admin_passes(self, user_admin, fake_db, fake_request):
-        from orchestrator.main import get_agent_statistics
-
         fake_db.list_agents = AsyncMock(
             return_value=[{"status": "ready"}, {"status": "working"}]
         )
-        with _patch_caller_and_db(user_admin, fake_db):
-            result = await get_agent_statistics(fake_request)
+        result = await usage_reporting_routes.get_agent_statistics(
+            fake_request, dependencies=_usage_dependencies(user_admin, fake_db)
+        )
         assert result["total"] == 2
         assert result["ready"] == 1
         assert result["working"] == 1

@@ -39,12 +39,15 @@ router = APIRouter(
 )
 
 
-def _get_db() -> Any:
-    """Late-resolve the application DB singleton to avoid an import cycle."""
+def _get_db(request: Request) -> Any:
+    """The application's database, from the app this router is mounted on.
 
-    from orchestrator.main import postgres_db  # type: ignore
+    R1.B02 replaced a late ``from orchestrator.main import postgres_db`` with
+    this. The late import existed only to dodge an import cycle; reading the
+    mounted application's own state keeps the dependency explicit.
+    """
 
-    return postgres_db
+    return request.app.state.store
 
 
 def _get_service(postgres_db: Any) -> ProductCapabilityService:
@@ -109,7 +112,7 @@ async def get_product_capabilities(
 ) -> JSONResponse:
     """Return a bounded advisory observation for the authenticated caller."""
 
-    postgres_db = _get_db()
+    postgres_db = _get_db(request)
     if not product_capabilities_endpoint_enabled():
         await require_approved_user(request, postgres_db)
         return _unavailable_response()

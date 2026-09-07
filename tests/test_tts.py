@@ -1,11 +1,12 @@
 """Tests for the persistent-chat text-to-speech path.
 
 Covers the TTS service (``orchestrator/services/tts.py``) and the
-``POST /api/persistent/threads/{id}/tts`` endpoint wiring in main.py.
+``POST /api/persistent/threads/{id}/tts`` endpoint wiring in
+``orchestrator/routers/voice.py``.
 
 Mirrors ``tests/test_transcribe.py``: the service is tested in isolation by
 patching the shared credential resolver and ``AsyncOpenAI``; the endpoint is
-exercised by calling the handler directly with mocked auth + service (the
+exercised by calling the handler directly with injected dependencies (the
 orchestrator main app is too heavy for a full TestClient).
 """
 
@@ -43,6 +44,37 @@ def _clear_tts_caches():
     tts._formulation_cache.clear()
     tts._plan_cache.clear()
     yield
+
+
+def _voice_route_deps(*, db=None, ledger=None, user=None, thread=None):
+    """Route dependencies for the extracted voice router.
+
+    The voice endpoints moved out of ``main`` into
+    ``orchestrator.routers.voice`` (R1.B02), so their collaborators arrive
+    injected: the tests hand them a store, a ledger and stub gates instead of
+    patching module globals. The TTS/STT services themselves are still reached
+    by patching ``orchestrator.services.tts`` / ``.transcribe``, exactly as
+    before.
+    """
+    from orchestrator.routers.voice import VoiceDependencies as _RouteDeps
+    from orchestrator.services.voice import VoiceDependencies as _OpDeps
+
+    store = db if db is not None else MagicMock()
+    resolved_user = user or {"id": "u1"}
+    resolved_thread = thread or {"id": "t1"}
+
+    async def _approved(_request, _store):
+        return resolved_user
+
+    async def _owner(_request, _store, _thread_id):
+        return resolved_user, resolved_thread
+
+    return _RouteDeps(
+        store=store,
+        operations=_OpDeps(store=store, logger=MagicMock(), ledger=ledger),
+        require_approved_user=_approved,
+        require_thread_owner=_owner,
+    )
 
 
 def _mock_db() -> MagicMock:
@@ -638,21 +670,17 @@ class TestTtsEndpoint:
 
     @pytest.mark.asyncio
     async def test_returns_json_text_and_audio(self):
-        import orchestrator.main
+        from orchestrator.routers import voice as voice_routes
 
-        with (
-            patch.object(
-                orchestrator.main,
-                "require_thread_owner",
-                AsyncMock(return_value=({"id": "u1"}, {"id": "t1"})),
-            ),
-            patch(
-                "orchestrator.services.tts.generate_message_tts",
-                AsyncMock(return_value=("spoken words", b"\x00\x01\x02")),
-            ),
+        with patch(
+            "orchestrator.services.tts.generate_message_tts",
+            AsyncMock(return_value=("spoken words", b"\x00\x01\x02")),
         ):
-            resp = await orchestrator.main.synthesize_thread_message_tts(
-                thread_id="t1", request=MagicMock(), body={"content": "hello"}
+            resp = await voice_routes.synthesize_thread_message_tts(
+                thread_id="t1",
+                request=MagicMock(),
+                body={"content": "hello"},
+                dependencies=_voice_route_deps(),
             )
         assert resp.status_code == 200
         payload = json.loads(resp.body)
@@ -661,63 +689,83 @@ class TestTtsEndpoint:
 
     @pytest.mark.asyncio
     async def test_204_when_not_configured(self):
-        import orchestrator.main
+        from orchestrator.routers import voice as voice_routes
 
-        with (
-            patch.object(
-                orchestrator.main,
-                "require_thread_owner",
-                AsyncMock(return_value=({"id": "u1"}, {"id": "t1"})),
-            ),
-            patch(
-                "orchestrator.services.tts.generate_message_tts",
-                AsyncMock(return_value=None),
-            ),
+        with patch(
+            "orchestrator.services.tts.generate_message_tts",
+            AsyncMock(return_value=None),
         ):
-            resp = await orchestrator.main.synthesize_thread_message_tts(
-                thread_id="t1", request=MagicMock(), body={"content": "hello"}
+            resp = await voice_routes.synthesize_thread_message_tts(
+                thread_id="t1",
+                request=MagicMock(),
+                body={"content": "hello"},
+                dependencies=_voice_route_deps(),
             )
         assert resp.status_code == 204
 
     @pytest.mark.asyncio
     async def test_502_on_synthesis_failure(self):
-        import orchestrator.main
         from fastapi import HTTPException
 
+        from orchestrator.routers import voice as voice_routes
         from orchestrator.services.tts import TtsSynthesisError
 
-        with (
-            patch.object(
-                orchestrator.main,
-                "require_thread_owner",
-                AsyncMock(return_value=({"id": "u1"}, {"id": "t1"})),
-            ),
-            patch(
-                "orchestrator.services.tts.generate_message_tts",
-                AsyncMock(side_effect=TtsSynthesisError("down")),
-            ),
+        with patch(
+            "orchestrator.services.tts.generate_message_tts",
+            AsyncMock(side_effect=TtsSynthesisError("down")),
         ):
             with pytest.raises(HTTPException) as exc:
-                await orchestrator.main.synthesize_thread_message_tts(
-                    thread_id="t1", request=MagicMock(), body={"content": "hello"}
+                await voice_routes.synthesize_thread_message_tts(
+                    thread_id="t1",
+                    request=MagicMock(),
+                    body={"content": "hello"},
+                    dependencies=_voice_route_deps(),
                 )
         assert exc.value.status_code == 502
 
     @pytest.mark.asyncio
     async def test_400_on_empty_content(self):
-        import orchestrator.main
         from fastapi import HTTPException
 
-        with patch.object(
-            orchestrator.main,
-            "require_thread_owner",
-            AsyncMock(return_value=({"id": "u1"}, {"id": "t1"})),
-        ):
-            with pytest.raises(HTTPException) as exc:
-                await orchestrator.main.synthesize_thread_message_tts(
-                    thread_id="t1", request=MagicMock(), body={"content": "   "}
-                )
+        from orchestrator.routers import voice as voice_routes
+
+        with pytest.raises(HTTPException) as exc:
+            await voice_routes.synthesize_thread_message_tts(
+                thread_id="t1",
+                request=MagicMock(),
+                body={"content": "   "},
+                dependencies=_voice_route_deps(),
+            )
         assert exc.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_thread_ownership_is_checked_before_synthesis(self):
+        """The gate runs first: a refused owner never reaches the TTS service."""
+        from fastapi import HTTPException
+
+        from orchestrator.routers import voice as voice_routes
+        from orchestrator.routers.voice import VoiceDependencies
+        from orchestrator.services.voice import VoiceDependencies as OpDeps
+
+        async def deny(_request, _store, _thread_id):
+            raise HTTPException(status_code=403, detail="Not your session")
+
+        generate = AsyncMock()
+        deps = VoiceDependencies(
+            store=MagicMock(),
+            operations=OpDeps(store=MagicMock(), logger=MagicMock()),
+            require_thread_owner=deny,
+        )
+        with patch("orchestrator.services.tts.generate_message_tts", generate):
+            with pytest.raises(HTTPException) as exc:
+                await voice_routes.synthesize_thread_message_tts(
+                    thread_id="t1",
+                    request=MagicMock(),
+                    body={"content": "hello"},
+                    dependencies=deps,
+                )
+        assert exc.value.status_code == 403
+        generate.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -1177,8 +1225,10 @@ class TestTtsSynthesisHttpError:
     provider-key problem must not look like the user's own session expiring."""
 
     def test_status_by_code(self):
-        from orchestrator.main import _tts_synthesis_http_error
         from orchestrator.services.tts import TtsSynthesisError
+        from orchestrator.services.voice import (
+            tts_synthesis_http_error as _tts_synthesis_http_error,
+        )
 
         assert (
             _tts_synthesis_http_error(
@@ -1205,8 +1255,10 @@ class TestTtsSynthesisHttpError:
         )
 
     def test_detail_is_machine_readable(self):
-        from orchestrator.main import _tts_synthesis_http_error
         from orchestrator.services.tts import TtsSynthesisError
+        from orchestrator.services.voice import (
+            tts_synthesis_http_error as _tts_synthesis_http_error,
+        )
 
         exc = _tts_synthesis_http_error(
             TtsSynthesisError("needs a paid plan", code="payment_required")
@@ -1230,26 +1282,22 @@ class TestTtsPlanEndpoint:
 
     @pytest.mark.asyncio
     async def test_returns_chunks(self):
-        import orchestrator.main
+        from orchestrator.routers import voice as voice_routes
 
-        with (
-            patch.object(
-                orchestrator.main,
-                "require_thread_owner",
-                AsyncMock(return_value=({"id": "u1"}, {"id": "t1"})),
-            ),
-            patch(
-                "orchestrator.services.tts.plan_tts_chunks",
-                AsyncMock(
-                    return_value={
-                        "chunks": ["chunk one", "chunk two"],
-                        "rewritten": True,
-                    }
-                ),
+        with patch(
+            "orchestrator.services.tts.plan_tts_chunks",
+            AsyncMock(
+                return_value={
+                    "chunks": ["chunk one", "chunk two"],
+                    "rewritten": True,
+                }
             ),
         ):
-            resp = await orchestrator.main.plan_thread_message_tts(
-                thread_id="t1", request=MagicMock(), body={"content": "long message"}
+            resp = await voice_routes.plan_thread_message_tts(
+                thread_id="t1",
+                request=MagicMock(),
+                body={"content": "long message"},
+                dependencies=_voice_route_deps(),
             )
         assert resp.status_code == 200
         assert json.loads(resp.body) == {
@@ -1259,39 +1307,56 @@ class TestTtsPlanEndpoint:
 
     @pytest.mark.asyncio
     async def test_204_when_not_configured(self):
-        import orchestrator.main
+        from orchestrator.routers import voice as voice_routes
 
-        with (
-            patch.object(
-                orchestrator.main,
-                "require_thread_owner",
-                AsyncMock(return_value=({"id": "u1"}, {"id": "t1"})),
-            ),
-            patch(
-                "orchestrator.services.tts.plan_tts_chunks",
-                AsyncMock(return_value=None),
-            ),
+        with patch(
+            "orchestrator.services.tts.plan_tts_chunks",
+            AsyncMock(return_value=None),
         ):
-            resp = await orchestrator.main.plan_thread_message_tts(
-                thread_id="t1", request=MagicMock(), body={"content": "hello"}
+            resp = await voice_routes.plan_thread_message_tts(
+                thread_id="t1",
+                request=MagicMock(),
+                body={"content": "hello"},
+                dependencies=_voice_route_deps(),
             )
         assert resp.status_code == 204
 
     @pytest.mark.asyncio
     async def test_400_on_empty_content(self):
-        import orchestrator.main
         from fastapi import HTTPException
 
-        with patch.object(
-            orchestrator.main,
-            "require_thread_owner",
-            AsyncMock(return_value=({"id": "u1"}, {"id": "t1"})),
+        from orchestrator.routers import voice as voice_routes
+
+        with pytest.raises(HTTPException) as exc:
+            await voice_routes.plan_thread_message_tts(
+                thread_id="t1",
+                request=MagicMock(),
+                body={"content": ""},
+                dependencies=_voice_route_deps(),
+            )
+        assert exc.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_502_on_unexpected_planner_error(self):
+        from fastapi import HTTPException
+
+        from orchestrator.routers import voice as voice_routes
+
+        deps = _voice_route_deps()
+        with patch(
+            "orchestrator.services.tts.plan_tts_chunks",
+            AsyncMock(side_effect=RuntimeError("planner blew up")),
         ):
             with pytest.raises(HTTPException) as exc:
-                await orchestrator.main.plan_thread_message_tts(
-                    thread_id="t1", request=MagicMock(), body={"content": ""}
+                await voice_routes.plan_thread_message_tts(
+                    thread_id="t1",
+                    request=MagicMock(),
+                    body={"content": "hello"},
+                    dependencies=deps,
                 )
-        assert exc.value.status_code == 400
+        assert exc.value.status_code == 502
+        assert exc.value.detail == "TTS planning failed"
+        deps.operations.logger.exception.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -1413,25 +1478,19 @@ class TestVoiceCapabilitiesEndpoint:
 
     @pytest.mark.asyncio
     async def test_available_from_user_setting(self):
-        import orchestrator.main
+        from orchestrator.routers import voice as voice_routes
 
         db = MagicMock()
         db.get_user_settings = AsyncMock(return_value={"default_tts_model": "kokoro"})
         db.resolve_default_for_capability = AsyncMock(return_value=None)
-        with (
-            patch.object(
-                orchestrator.main,
-                "require_approved_user",
-                AsyncMock(return_value={"id": "u1"}),
-            ),
-            patch.object(orchestrator.main, "postgres_db", db),
-        ):
-            result = await orchestrator.main.voice_capabilities(MagicMock())
+        result = await voice_routes.voice_capabilities(
+            MagicMock(), dependencies=_voice_route_deps(db=db)
+        )
         assert result == {"tts": True, "stt": False}
 
     @pytest.mark.asyncio
     async def test_available_from_system_default(self):
-        import orchestrator.main
+        from orchestrator.routers import voice as voice_routes
 
         db = MagicMock()
         db.get_user_settings = AsyncMock(return_value={})
@@ -1440,15 +1499,9 @@ class TestVoiceCapabilitiesEndpoint:
             return "whisper-1" if cap == "whisper" else None
 
         db.resolve_default_for_capability = AsyncMock(side_effect=_resolve)
-        with (
-            patch.object(
-                orchestrator.main,
-                "require_approved_user",
-                AsyncMock(return_value={"id": "u1"}),
-            ),
-            patch.object(orchestrator.main, "postgres_db", db),
-        ):
-            result = await orchestrator.main.voice_capabilities(MagicMock())
+        result = await voice_routes.voice_capabilities(
+            MagicMock(), dependencies=_voice_route_deps(db=db)
+        )
         assert result == {"tts": False, "stt": True}
 
 
@@ -1460,20 +1513,14 @@ class TestVoiceCapabilitiesEndpoint:
 class TestPreviewEndpoint:
     @pytest.mark.asyncio
     async def test_passes_custom_text_and_returns_audio(self):
-        import orchestrator.main
+        from orchestrator.routers import voice as voice_routes
 
         preview = AsyncMock(return_value=b"AUD")
-        with (
-            patch.object(
-                orchestrator.main,
-                "require_approved_user",
-                AsyncMock(return_value={"id": "u1"}),
-            ),
-            patch("orchestrator.services.tts.synthesize_voice_preview", preview),
-        ):
-            resp = await orchestrator.main.preview_tts_voice(
+        with patch("orchestrator.services.tts.synthesize_voice_preview", preview):
+            resp = await voice_routes.preview_tts_voice(
                 request=MagicMock(),
                 body={"voice": "af_nova", "text": "hello there"},
+                dependencies=_voice_route_deps(),
             )
         assert resp.status_code == 200
         assert base64.b64decode(json.loads(resp.body)["audio"]) == b"AUD"
@@ -1481,22 +1528,36 @@ class TestPreviewEndpoint:
 
     @pytest.mark.asyncio
     async def test_422_on_overlength_text(self):
-        import orchestrator.main
         from fastapi import HTTPException
 
+        from orchestrator.routers import voice as voice_routes
         from orchestrator.services.tts import _PREVIEW_TEXT_MAX
 
-        with patch.object(
-            orchestrator.main,
-            "require_approved_user",
-            AsyncMock(return_value={"id": "u1"}),
-        ):
+        preview = AsyncMock()
+        with patch("orchestrator.services.tts.synthesize_voice_preview", preview):
             with pytest.raises(HTTPException) as exc:
-                await orchestrator.main.preview_tts_voice(
+                await voice_routes.preview_tts_voice(
                     request=MagicMock(),
                     body={"text": "x" * (_PREVIEW_TEXT_MAX + 1)},
+                    dependencies=_voice_route_deps(),
                 )
         assert exc.value.status_code == 422
+        preview.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_204_when_no_tts_model_is_configured(self):
+        from orchestrator.routers import voice as voice_routes
+
+        with patch(
+            "orchestrator.services.tts.synthesize_voice_preview",
+            AsyncMock(return_value=None),
+        ):
+            resp = await voice_routes.preview_tts_voice(
+                request=MagicMock(),
+                body={},
+                dependencies=_voice_route_deps(),
+            )
+        assert resp.status_code == 204
 
 
 # ---------------------------------------------------------------------------
@@ -2585,25 +2646,23 @@ class TestTtsPlanStreamEndpoint:
     async def test_emits_sse_frames(self):
         """The handler must wrap the service generator into the house SSE wire
         format: a kickstart comment, `event: chunk` frames, then `event: done`."""
-        import orchestrator.main
+        from orchestrator.routers import voice as voice_routes
 
         async def _fake_stream(**_):
             yield {"type": "chunk", "index": 0, "text": "Hello.", "rewritten": True}
             yield {"type": "chunk", "index": 1, "text": "World.", "rewritten": True}
             yield {"type": "done", "total": 2, "rewritten": True}
 
-        with (
-            patch.object(
-                orchestrator.main,
-                "require_thread_owner",
-                AsyncMock(return_value=({"id": "u1"}, {"id": "t1"})),
-            ),
-            patch("orchestrator.services.tts.stream_tts_chunks", _fake_stream),
-        ):
-            resp = await orchestrator.main.stream_thread_message_tts_plan(
-                thread_id="t1", request=MagicMock(), body={"content": "hi"}
+        with patch("orchestrator.services.tts.stream_tts_chunks", _fake_stream):
+            resp = await voice_routes.stream_thread_message_tts_plan(
+                thread_id="t1",
+                request=MagicMock(),
+                body={"content": "hi"},
+                dependencies=_voice_route_deps(),
             )
             assert resp.media_type == "text/event-stream"
+            assert resp.headers["cache-control"] == "no-cache"
+            assert resp.headers["x-accel-buffering"] == "no"
             frames = "".join([chunk async for chunk in resp.body_iterator])
 
         assert frames.startswith(": open")  # kickstart comment
@@ -2613,38 +2672,57 @@ class TestTtsPlanStreamEndpoint:
 
     @pytest.mark.asyncio
     async def test_maps_unavailable_event(self):
-        import orchestrator.main
+        from orchestrator.routers import voice as voice_routes
 
         async def _fake_stream(**_):
             yield {"type": "unavailable"}
 
-        with (
-            patch.object(
-                orchestrator.main,
-                "require_thread_owner",
-                AsyncMock(return_value=({"id": "u1"}, {"id": "t1"})),
-            ),
-            patch("orchestrator.services.tts.stream_tts_chunks", _fake_stream),
-        ):
-            resp = await orchestrator.main.stream_thread_message_tts_plan(
-                thread_id="t1", request=MagicMock(), body={"content": "hi"}
+        with patch("orchestrator.services.tts.stream_tts_chunks", _fake_stream):
+            resp = await voice_routes.stream_thread_message_tts_plan(
+                thread_id="t1",
+                request=MagicMock(),
+                body={"content": "hi"},
+                dependencies=_voice_route_deps(),
             )
             frames = "".join([chunk async for chunk in resp.body_iterator])
         assert "event: unavailable" in frames
         assert "event: chunk" not in frames
 
     @pytest.mark.asyncio
+    async def test_stream_failure_becomes_an_error_frame_not_a_5xx(self):
+        """The response has already started; a mid-stream failure can only be
+        reported in-band."""
+        from orchestrator.routers import voice as voice_routes
+
+        async def _fake_stream(**_):
+            yield {"type": "chunk", "index": 0, "text": "Hello.", "rewritten": True}
+            raise RuntimeError("upstream died")
+
+        deps = _voice_route_deps()
+        with patch("orchestrator.services.tts.stream_tts_chunks", _fake_stream):
+            resp = await voice_routes.stream_thread_message_tts_plan(
+                thread_id="t1",
+                request=MagicMock(),
+                body={"content": "hi"},
+                dependencies=deps,
+            )
+            frames = "".join([chunk async for chunk in resp.body_iterator])
+        assert "event: error" in frames
+        assert '"message": "stream failed"' in frames
+        assert "upstream died" not in frames
+        deps.operations.logger.exception.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_400_on_empty_content(self):
-        import orchestrator.main
         from fastapi import HTTPException
 
-        with patch.object(
-            orchestrator.main,
-            "require_thread_owner",
-            AsyncMock(return_value=({"id": "u1"}, {"id": "t1"})),
-        ):
-            with pytest.raises(HTTPException) as exc:
-                await orchestrator.main.stream_thread_message_tts_plan(
-                    thread_id="t1", request=MagicMock(), body={"content": "  "}
-                )
+        from orchestrator.routers import voice as voice_routes
+
+        with pytest.raises(HTTPException) as exc:
+            await voice_routes.stream_thread_message_tts_plan(
+                thread_id="t1",
+                request=MagicMock(),
+                body={"content": "  "},
+                dependencies=_voice_route_deps(),
+            )
         assert exc.value.status_code == 400

@@ -21,7 +21,8 @@ from fastapi import HTTPException
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
 import orchestrator.main as orch_main  # noqa: E402
-from orchestrator.main import AdminUserUpdate, app  # noqa: E402
+from orchestrator.main import app  # noqa: E402
+from orchestrator.schemas.users import AdminUserUpdate  # noqa: E402
 
 MODULE = "orchestrator.main"
 

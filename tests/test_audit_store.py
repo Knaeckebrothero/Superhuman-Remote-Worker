@@ -1538,10 +1538,17 @@ class TestWorkspaceMetering:
 
 
 class TestBreakdownFold:
-    """Pure (key, unit) → per-key folding + label merge used by /api/usage/breakdown."""
+    """Pure (key, unit) → per-key folding + label merge used by /api/usage/breakdown.
 
-    def test_fold_groups_units_under_key(self):
-        from orchestrator.main import _fold_breakdown
+    The folding these cover is synchronous, but the module applies
+    ``pytestmark = pytest.mark.asyncio`` to every test and pytest-asyncio warns
+    on a sync function carrying that mark. Keeping the bodies ``async`` (they
+    simply never await) is the least surprising way to satisfy the module-wide
+    mark without special-casing this class.
+    """
+
+    async def test_fold_groups_units_under_key(self):
+        from orchestrator.services.usage_reporting import fold_breakdown
 
         rows = [
             {
@@ -1573,16 +1580,19 @@ class TestBreakdownFold:
                 "events": 1,
             },
         ]
-        folded = _fold_breakdown(rows)
+        folded = fold_breakdown(rows)
         assert folded["u1"]["units"]["prompt-token"]["quantity"] == 100.0
         assert folded["u1"]["events"] == 5  # summed across units
         assert folded["u1"]["cache_hit_ratio"] == 0.2
         assert folded["u2"]["units"]["prompt-token"]["events"] == 1
 
-    def test_merge_labels_falls_back_to_key(self):
-        from orchestrator.main import _fold_breakdown, _merge_labels
+    async def test_merge_labels_falls_back_to_key(self):
+        from orchestrator.services.usage_reporting import (
+            fold_breakdown,
+            merge_labels,
+        )
 
-        folded = _fold_breakdown(
+        folded = fold_breakdown(
             [
                 {
                     "key": "u1",
@@ -1600,13 +1610,13 @@ class TestBreakdownFold:
                 },
             ]
         )
-        out = _merge_labels(folded, {"u1": {"label": "Alice", "is_admin": True}})
+        out = merge_labels(folded, {"u1": {"label": "Alice", "is_admin": True}})
         by_key = {r["key"]: r for r in out}
         assert by_key["u1"]["label"] == "Alice" and by_key["u1"]["is_admin"] is True
         assert by_key["u2"]["label"] == "u2"  # unknown id → key as label
 
-    def test_build_timeseries_pivots_and_orders(self):
-        from orchestrator.main import _build_timeseries
+    async def test_build_timeseries_pivots_and_orders(self):
+        from orchestrator.services.usage_reporting import build_timeseries
 
         rows = [
             {
@@ -1631,7 +1641,7 @@ class TestBreakdownFold:
                 "events": 3,
             },
         ]
-        out = _build_timeseries(rows, {"opus": {"label": "Opus 4"}})
+        out = build_timeseries(rows, {"opus": {"label": "Opus 4"}})
         assert out["days"] == ["2026-06-01", "2026-06-02"]  # sorted union of buckets
         # gemma leads despite fewer tokens — series order is total events desc (3 > 2)
         assert [s["key"] for s in out["series"]] == ["gemma", "opus"]
