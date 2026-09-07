@@ -147,3 +147,53 @@ def test_new_bench_tasks_are_pinned_to_the_engineer_and_self_describing():
         assert "output/" in " ".join(task["required_deliverables"]), task["id"]
     assert tasks["D5-clone-and-extend"]["family"] == "dev-repo"
     assert tasks["O1-install-and-report"]["family"] == "ops"
+
+
+def test_submit_server_payload_assigns_per_arm_projects_when_given():
+    submit = _load_script("bench_submit_isolate_test", "submit.py")
+    tasks = submit.load_tasks(BENCH_DIR / "tasks.yaml", {"D3-ledger-refactor"})
+    args = argparse.Namespace(
+        arm="baseline",
+        arms="developer,engineer",
+        model="MiniMax-M3",
+        config_name=None,
+        expert_id=None,
+        run_id="dev-vs-eng-01",
+        replicates=3,
+        max_in_flight=2,
+        project_id=None,
+    )
+    projects = {
+        "developer": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "engineer": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    }
+    payload = submit.server_payload(tasks, args, arm_projects=projects)
+    assert [a["project_id"] for a in payload["arms"]] == [
+        projects["developer"],
+        projects["engineer"],
+    ]
+    # Without the mapping no arm carries a project (they inherit the run's).
+    plain = submit.server_payload(tasks, args)
+    assert all("project_id" not in a for a in plain["arms"])
+
+
+def test_create_arm_projects_makes_one_throwaway_project_per_arm(monkeypatch):
+    submit = _load_script("bench_submit_projects_test", "submit.py")
+    calls: list[tuple[str, dict]] = []
+
+    def fake_post(path, payload):
+        calls.append((path, payload))
+        return {"id": f"pid-{payload['name']}"}
+
+    monkeypatch.setattr(submit, "post", fake_post)
+    projects = submit.create_arm_projects(
+        "dev-vs-eng-01", ["developer", "engineer"], "uid-1"
+    )
+    assert projects == {
+        "developer": "pid-bench-dev-vs-eng-01-developer",
+        "engineer": "pid-bench-dev-vs-eng-01-engineer",
+    }
+    assert [c[0] for c in calls] == ["/api/projects", "/api/projects"]
+    for _path, payload in calls:
+        assert payload["user_id"] == "uid-1"
+        assert "dev-vs-eng-01" in payload["goal"]
