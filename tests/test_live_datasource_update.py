@@ -528,6 +528,40 @@ class TestOwnerConfigPatch:
         db.record_security_event.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_delegation_gate_rides_the_patch_validated(self, patched_owner):
+        """The pane's Delegation tick sends the names AND the gate; the gate
+        must persist (the factory needs both) and a malformed block is a 400,
+        never a silent drop."""
+        main, db, _ = patched_owner
+        row = _thread_row(backend="virtual")
+        row.update(execution_lane="stateless", agent_id=None, status="active")
+        db.get_thread.return_value = row
+
+        result = await main.update_thread_config(
+            THREAD_ID,
+            _patch_body(
+                main,
+                {
+                    "tools": {"delegation": ["delegate_agent"]},
+                    "delegation": {"enabled": True, "mode": "light"},
+                },
+            ),
+            MagicMock(),
+        )
+        assert result["config_override"]["delegation"] == {"enabled": True}
+        merged = db.merge_thread_config_override.await_args.args[1]
+        assert merged["delegation"] == {"enabled": True}
+        assert merged["tools"]["delegation"] == ["delegate_agent"]
+
+        with pytest.raises(main.HTTPException) as exc:
+            await main.update_thread_config(
+                THREAD_ID,
+                _patch_body(main, {"delegation": {"enabled": "yes"}}),
+                MagicMock(),
+            )
+        assert exc.value.status_code == 400
+
+    @pytest.mark.asyncio
     async def test_response_and_persist_redacted_with_transport_sentinels(
         self, patched_owner
     ):

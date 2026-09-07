@@ -87,6 +87,91 @@ def bridge_nested_llm_override(
     return bridged
 
 
+#: The live ``delegation`` keys after U3 (loader.normalize_delegation_block).
+DELEGATION_KEYS: frozenset[str] = frozenset(
+    {"enabled", "max_concurrent", "run_in_background_default"}
+)
+#: Pre-U3 keys the loader drops with a deprecation warning; tolerated here for
+#: the same reason (a stored layer may still carry them), never persisted. One
+#: source of truth: the loader's own list, so the two boundaries cannot drift.
+try:
+    from shared.runtime.core.loader import _LEGACY_DELEGATION_KEYS as _LOADER_LEGACY
+
+    LEGACY_DELEGATION_KEYS: frozenset[str] = frozenset(_LOADER_LEGACY)
+except ImportError:  # pragma: no cover - the loader is always importable here
+    LEGACY_DELEGATION_KEYS = frozenset(
+        {
+            "max_depth",
+            "default_timeout",
+            "max_timeout",
+            "allowed_configs",
+            "mode",
+            "light",
+        }
+    )
+
+
+def validate_delegation_override(value: Any) -> dict[str, Any]:
+    """The ``delegation`` block a session request may carry, validated.
+
+    ``delegate_agent`` and its control plane are ``grant: explicit``: the
+    factory builds them only when ``tools.delegation`` names them AND
+    ``delegation.enabled`` is true. The Cockpit's Delegation toggle therefore
+    writes BOTH (tools-group.component.ts ``getOverrides``), and this is the
+    boundary that must carry the second half — the create rebuild dropped it,
+    so a ticked "Delegation" produced five names the agent then refused to
+    bind ("11 configured tool(s) did not bind"). Malformed values are a
+    :class:`SessionOverrideError`, never a silent drop.
+    """
+    if not isinstance(value, dict):
+        raise SessionOverrideError("config_override.delegation must be an object")
+    out: dict[str, Any] = {}
+    for key, raw in value.items():
+        if key in LEGACY_DELEGATION_KEYS:
+            continue
+        if key not in DELEGATION_KEYS:
+            raise SessionOverrideError(
+                f"config_override.delegation.{key} is not a session delegation setting"
+            )
+        if key in ("enabled", "run_in_background_default"):
+            if not isinstance(raw, bool):
+                raise SessionOverrideError(
+                    f"config_override.delegation.{key} must be a boolean"
+                )
+            out[key] = raw
+        else:
+            if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
+                raise SessionOverrideError(
+                    "config_override.delegation.max_concurrent must be a positive integer"
+                )
+            out[key] = raw
+    return out
+
+
+def bridge_nested_delegation_override(
+    request_override: dict[str, Any] | None,
+    config_override: dict[str, Any],
+) -> list[str]:
+    """Fold a validated ``request_override["delegation"]`` into the rebuilt
+    override. Returns the bridged key paths; ``[]`` when nothing was sent."""
+    raw = _as_dict(request_override).get("delegation")
+    if raw is None:
+        return []
+    validated = validate_delegation_override(raw)
+    if not validated:
+        return []
+    target = config_override.setdefault("delegation", {})
+    if not isinstance(target, dict):
+        return []
+    bridged: list[str] = []
+    for key, val in validated.items():
+        if key in target:
+            continue
+        target[key] = val
+        bridged.append(f"delegation.{key}")
+    return bridged
+
+
 def ignored_override_paths(
     request_override: dict[str, Any] | None,
     config_override: dict[str, Any],

@@ -516,3 +516,91 @@ class TestAcknowledgedGrantDriftReportedNotJustEnforced:
 
         assert result["categories"]["catalog_authoring"]["state"] == "on"
         assert result["tool_groups"]["catalog_authoring"] is True
+
+
+# =============================================================================
+# The explicit-grant gate — names alone are not a binding
+# =============================================================================
+class TestDelegationGate:
+    """``delegate_agent`` + control plane bind only when ``tools.delegation``
+    names them AND ``delegation.enabled`` is true (the factory returns ``[]``
+    otherwise). The prediction used to report the names regardless — "5
+    predicted" for a tick that changed nothing (main-dev thread 54e31e45:
+    "11 configured tool(s) did not bind"). It must report the category as the
+    factory will bind it, and leave it settable so the tick (which now writes
+    the gate too) is a promise the runtime keeps."""
+
+    _NAMES = [
+        "delegate_agent",
+        "list_agents",
+        "message_agent",
+        "stop_agent",
+        "wait_agent",
+    ]
+
+    @pytest.mark.asyncio
+    async def test_names_without_the_gate_predict_off_and_settable(
+        self, user_a, fake_db, fake_request
+    ):
+        result = await _call(
+            user_a,
+            fake_db,
+            _thread(
+                metadata={"config_override": {"tools": {"delegation": self._NAMES}}}
+            ),
+            fake_request,
+        )
+        entry = result["categories"]["delegation"]
+        assert entry["state"] == "off"
+        assert entry["tools"] == []
+        assert entry["settable"] is True
+
+    @pytest.mark.asyncio
+    async def test_names_with_the_gate_predict_on(self, user_a, fake_db, fake_request):
+        result = await _call(
+            user_a,
+            fake_db,
+            _thread(
+                metadata={
+                    "config_override": {
+                        "tools": {"delegation": self._NAMES},
+                        "delegation": {"enabled": True},
+                    }
+                }
+            ),
+            fake_request,
+        )
+        entry = result["categories"]["delegation"]
+        assert entry["state"] == "on"
+        assert sorted(entry["tools"]) == sorted(self._NAMES)
+
+    @pytest.mark.asyncio
+    async def test_gate_applies_on_the_legacy_path_too(
+        self, user_a, fake_db, fake_request
+    ):
+        result = await _call(
+            user_a,
+            fake_db,
+            _thread(
+                metadata={"config_override": {"tools": {"delegation": self._NAMES}}}
+            ),
+            fake_request,
+            experts=False,
+        )
+        assert result["source"] == "legacy"
+        assert result["categories"]["delegation"]["tools"] == []
+        on = await _call(
+            user_a,
+            fake_db,
+            _thread(
+                metadata={
+                    "config_override": {
+                        "tools": {"delegation": self._NAMES},
+                        "delegation": {"enabled": True},
+                    }
+                }
+            ),
+            fake_request,
+            experts=False,
+        )
+        assert sorted(on["categories"]["delegation"]["tools"]) == sorted(self._NAMES)

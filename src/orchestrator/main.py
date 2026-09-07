@@ -4044,6 +4044,13 @@ def _merged_session_tool_policy(
     merged_fragment = capture.get("merged_fragment") or {}
     merged = merged_fragment.get("tools")
     merged = merged if isinstance(merged, dict) else {}
+    # ``delegate_agent`` and its control plane are ``grant: explicit`` twice
+    # over: the factory needs the names in ``tools.delegation`` AND
+    # ``delegation.enabled`` true. A prediction that reports the names while
+    # the gate is off is "5 predicted" for tools the agent will refuse to bind
+    # — the pane then offers a tick that changes nothing. Report the category
+    # as it will bind: empty (off, settable — ticking now writes the gate too).
+    _apply_delegation_gate(merged, merged_fragment.get("delegation"))
 
     base_fragment: dict[str, Any] = {}
     try:
@@ -4149,9 +4156,12 @@ def _legacy_session_tool_policy(
     statement of that rule; this reuses it rather than restating it.
     """
     base_tools: dict[str, Any] = {}
+    base_delegation: Any = None
     try:
         base_path, _ = resolve_config_path(base_config_name)
-        base_tools = (load_and_merge_config(base_path) or {}).get("tools") or {}
+        base_config = load_and_merge_config(base_path) or {}
+        base_tools = base_config.get("tools") or {}
+        base_delegation = base_config.get("delegation")
     except Exception:
         logger.warning(
             "Legacy tool-policy probe could not load base config '%s'", base_config_name
@@ -4178,7 +4188,30 @@ def _legacy_session_tool_policy(
     )
     for group in SESSION_TOOL_OVERRIDE_NAMES:
         provenance.setdefault(group, "runtime")
+    # Same explicit-grant gate as the resolved path; the request layer's
+    # ``delegation`` block wins over the base's, as deep_merge would have it.
+    request_delegation = (request_override or {}).get("delegation")
+    _apply_delegation_gate(
+        merged,
+        request_delegation if isinstance(request_delegation, dict) else base_delegation,
+    )
     return merged, provenance
+
+
+def _apply_delegation_gate(
+    merged_tools: dict[str, list[str]], delegation_block: Any
+) -> None:
+    """Empty ``merged_tools["delegation"]`` unless ``delegation.enabled`` is
+    true — the binding rule of ``agent.tools.delegation.create_delegation_tools``,
+    restated for the prediction so the pane never shows names the factory
+    will not build. Mutates in place; no-op when nothing is named."""
+    if not merged_tools.get("delegation"):
+        return
+    enabled = (
+        delegation_block.get("enabled") if isinstance(delegation_block, dict) else None
+    )
+    if enabled is not True:
+        merged_tools["delegation"] = []
 
 
 class _Measurement(NamedTuple):
@@ -48004,6 +48037,26 @@ async def _apply_thread_config_update(
             # honour and nothing to report as changed.
             config_override.pop("tools", None)
 
+    if "delegation" in config_override:
+        # The gate half of the Delegation toggle (see create_thread). Same
+        # validator as create, so the two write paths cannot disagree about
+        # what the block means; malformed is a 400, never a silent drop.
+        from orchestrator.services.session_create_overrides import (
+            SessionOverrideError,
+            validate_delegation_override,
+        )
+
+        try:
+            accepted_delegation = validate_delegation_override(
+                config_override["delegation"]
+            )
+        except SessionOverrideError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if accepted_delegation:
+            config_override["delegation"] = accepted_delegation
+        else:
+            config_override.pop("delegation", None)
+
     # Audit summary is computed PRE-enrichment so it names only the keys the
     # caller actually sent (enrichment adds llm.api_key/base_url internally).
     change_summary = _config_change_summary(config_override, datasource_ids)
@@ -49794,6 +49847,7 @@ async def create_thread(
         # nested value is a 400 here, never a silent drop.
         from orchestrator.services.session_create_overrides import (
             SessionOverrideError,
+            bridge_nested_delegation_override,
             bridge_nested_llm_override,
             ignored_override_paths,
         )
@@ -49803,6 +49857,13 @@ async def create_thread(
                 request_body.config_override,
                 config_override,
                 validate_reasoning_level=_validated_reasoning_level,
+            )
+            # The Delegation toggle writes `tools.delegation` (names) AND
+            # `delegation.enabled` (the explicit-grant gate); the tools half
+            # is bridged below, this carries the gate — without it the agent
+            # logs "configured tool(s) did not bind" for all five.
+            bridge_nested_delegation_override(
+                request_body.config_override, config_override
             )
         except SessionOverrideError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc

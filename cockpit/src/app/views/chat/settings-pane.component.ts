@@ -556,6 +556,13 @@ export class SettingsPaneComponent {
                 state[`${TOOL_ADDITIONS_PREFIX}${key}`] = (additions[key] ?? []).join(',');
             }
         }
+        // The delegation concurrency knob rides beside the Delegation row and
+        // is the only non-tools key the tools group writes (besides the gate,
+        // which is derived at dispatch from the row's own switch position).
+        state['delegation.max_concurrent'] =
+            readConfigPath(overrides, 'delegation.max_concurrent')
+            ?? readConfigPath(config, 'delegation.max_concurrent')
+            ?? null;
         // Canonical joined form so the diff is a plain string compare. The
         // picker's untouched default IS the attached set, so this holds the
         // baseline value until the user actually toggles a datasource.
@@ -617,6 +624,25 @@ export class SettingsPaneComponent {
         }
         if (Object.keys(llm).length) fragment['llm'] = llm;
         if (Object.keys(tools).length) fragment['tools'] = tools;
+        // The Delegation row is ONE switch over TWO config facts: the names
+        // in `tools.delegation` (membership) and `delegation.enabled` (the
+        // explicit-grant gate the factory checks). The tools group already
+        // emits both from getOverrides(); this pane used to forward only the
+        // names, so a ticked box produced five tools the agent refused to
+        // bind. The gate follows the membership decision made just above.
+        if ('delegation' in tools) {
+            fragment['delegation'] = {enabled: !!desired['tools.delegation']};
+        }
+        const maxConcurrent = desired['delegation.max_concurrent'];
+        if (
+            maxConcurrent !== previous['delegation.max_concurrent']
+            && typeof maxConcurrent === 'number'
+        ) {
+            fragment['delegation'] = {
+                ...((fragment['delegation'] as Record<string, unknown>) ?? {}),
+                max_concurrent: maxConcurrent,
+            };
+        }
 
         // Permission + narration ride their dedicated verbs — they broadcast
         // mode.changed/narration.changed and persist server-side; duplicating

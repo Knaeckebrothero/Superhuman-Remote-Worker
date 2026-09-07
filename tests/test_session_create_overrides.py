@@ -153,3 +153,87 @@ class TestIgnoredOverridePaths:
     def test_empty_and_none_inputs(self):
         assert ignored_override_paths(None, {"llm": {}}) == []
         assert ignored_override_paths({}, {}) == []
+
+
+class TestDelegationOverride:
+    """The gate half of the Delegation toggle. ``delegate_agent`` is
+    ``grant: explicit``: names in ``tools.delegation`` AND ``delegation.enabled``
+    — the create rebuild carried only the names, so a ticked Delegation box
+    produced "configured tool(s) did not bind" for all five."""
+
+    def test_live_keys_pass_and_are_typed(self):
+        from orchestrator.services.session_create_overrides import (
+            validate_delegation_override,
+        )
+
+        assert validate_delegation_override(
+            {"enabled": True, "max_concurrent": 3, "run_in_background_default": False}
+        ) == {"enabled": True, "max_concurrent": 3, "run_in_background_default": False}
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            {"enabled": "yes"},
+            {"enabled": 1},
+            {"max_concurrent": 0},
+            {"max_concurrent": True},
+            {"max_concurrent": "4"},
+            {"run_in_background_default": "no"},
+            {"something_else": 1},
+            "enabled",
+        ],
+    )
+    def test_malformed_is_refused_not_dropped(self, bad):
+        from orchestrator.services.session_create_overrides import (
+            validate_delegation_override,
+        )
+
+        with pytest.raises(SessionOverrideError):
+            validate_delegation_override(bad)
+
+    def test_legacy_keys_are_tolerated_and_dropped(self):
+        # The loader drops these with a deprecation warning; a stored layer may
+        # still carry them, so they must not turn a valid request into a 400.
+        from orchestrator.services.session_create_overrides import (
+            validate_delegation_override,
+        )
+
+        assert validate_delegation_override(
+            {"enabled": True, "mode": "light", "default_timeout": 30}
+        ) == {"enabled": True}
+
+    def test_bridge_folds_the_block_and_reports_paths(self):
+        from orchestrator.services.session_create_overrides import (
+            bridge_nested_delegation_override,
+        )
+
+        rebuilt: dict = {"tools": {"delegation": ["delegate_agent"]}}
+        bridged = bridge_nested_delegation_override(
+            {"delegation": {"enabled": True, "max_concurrent": 2}}, rebuilt
+        )
+        assert rebuilt["delegation"] == {"enabled": True, "max_concurrent": 2}
+        assert bridged == ["delegation.enabled", "delegation.max_concurrent"]
+
+    def test_bridge_is_a_no_op_without_the_block(self):
+        from orchestrator.services.session_create_overrides import (
+            bridge_nested_delegation_override,
+        )
+
+        rebuilt: dict = {}
+        assert bridge_nested_delegation_override(None, rebuilt) == []
+        assert bridge_nested_delegation_override({"llm": {}}, rebuilt) == []
+        assert bridge_nested_delegation_override({"delegation": {}}, rebuilt) == []
+        assert rebuilt == {}
+
+    def test_bridge_never_clobbers_a_key_the_caller_already_set(self):
+        from orchestrator.services.session_create_overrides import (
+            bridge_nested_delegation_override,
+        )
+
+        rebuilt: dict = {"delegation": {"enabled": False}}
+        bridge_nested_delegation_override({"delegation": {"enabled": True}}, rebuilt)
+        assert rebuilt["delegation"] == {"enabled": False}
+
+    def test_ignored_paths_no_longer_report_a_bridged_delegation_block(self):
+        rebuilt: dict = {"delegation": {"enabled": True}}
+        assert ignored_override_paths({"delegation": {"enabled": True}}, rebuilt) == []

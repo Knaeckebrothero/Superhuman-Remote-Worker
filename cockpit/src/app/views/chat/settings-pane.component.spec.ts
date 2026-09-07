@@ -1054,3 +1054,66 @@ describe('SettingsPaneComponent settlement (speculative apply, authoritative set
     expect(fakeSettings.prefillFromConfig).toHaveBeenCalledTimes(prefills);
   });
 });
+
+describe('SettingsPaneComponent delegation gate', () => {
+  // `delegate_agent` and its control plane are `grant: explicit` twice over:
+  // the factory needs the names in `tools.delegation` AND `delegation.enabled`.
+  // The tools group emits both; the pane used to forward only the names, so a
+  // ticked Delegation row on main-dev produced "11 configured tool(s) did not
+  // bind". The gate now follows the row's switch position in the same batch.
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => {
+    vi.useRealTimers();
+    TestBed.resetTestingModule();
+  });
+  const NAMES = ['delegate_agent', 'list_agents', 'message_agent', 'stop_agent', 'wait_agent'];
+
+  it('ticking Delegation dispatches the names AND delegation.enabled: true', () => {
+    const {component, chat, fakeSettings} = createPane({
+      toolGroups: toolsetAnswer({delegation: 'off'}, {enumerate_only: {delegation: NAMES}}),
+    });
+    fakeSettings.getOverrides.mockReturnValue({
+      tools: {delegation: true},
+      delegation: {enabled: true},
+    });
+    component.onSettingsChange();
+    vi.runAllTimers();
+
+    expect(chat.updateConfig).toHaveBeenCalledTimes(1);
+    const sent = chat.updateConfig.mock.calls[0][0] as Record<string, any>;
+    expect(sent['tools']['delegation']).toBeTruthy();
+    expect(sent['delegation']).toEqual({enabled: true});
+  });
+
+  it('unticking Delegation dispatches [] AND delegation.enabled: false', () => {
+    const {component, chat, fakeSettings} = createPane({
+      toolGroups: toolsetAnswer({delegation: 'on'}, {enumerate_only: {delegation: NAMES}}),
+    });
+    fakeSettings.getOverrides.mockReturnValue({tools: {delegation: []}});
+    component.onSettingsChange();
+    vi.runAllTimers();
+
+    expect(chat.updateConfig).toHaveBeenCalledExactlyOnceWith({
+      tools: {delegation: []},
+      delegation: {enabled: false},
+    });
+  });
+
+  it('the concurrency knob rides the delegation block; other edits never carry it', () => {
+    const {component, chat, fakeSettings} = createPane({
+      toolGroups: toolsetAnswer({delegation: 'on', canvas: 'on'}, {enumerate_only: {delegation: NAMES}}),
+    });
+    fakeSettings.getOverrides.mockReturnValue({delegation: {max_concurrent: 2}});
+    component.onSettingsChange();
+    vi.runAllTimers();
+    expect(chat.updateConfig).toHaveBeenCalledExactlyOnceWith({
+      delegation: {max_concurrent: 2},
+    });
+
+    // A later, unrelated edit (canvas off) does not re-send the knob.
+    fakeSettings.getOverrides.mockReturnValue({delegation: {max_concurrent: 2}, tools: {canvas: []}});
+    component.onSettingsChange();
+    vi.runAllTimers();
+    expect(chat.updateConfig).toHaveBeenLastCalledWith({tools: {canvas: []}});
+  });
+});
