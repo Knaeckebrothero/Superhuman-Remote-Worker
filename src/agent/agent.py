@@ -626,6 +626,7 @@ class UniversalAgent:
                 base_url=aux_config.base_url,
                 api_key=aux_config.api_key,
                 provider=aux_config.provider,
+                extra_headers=aux_config.extra_headers,
                 temperature=aux_config.temperature,
                 top_p=model_settings.get("top_p"),
                 top_k=model_settings.get("top_k"),

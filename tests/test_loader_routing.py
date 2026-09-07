@@ -36,6 +36,9 @@ def _make_config(**overrides):
     config.max_output_tokens = overrides.get("max_output_tokens", None)
     config.model_max_context_tokens = overrides.get("model_max_context_tokens", None)
     config.extra_body = overrides.get("extra_body", None)
+    # Real value, not MagicMock truthiness — the factory's header arm gates on
+    # `if config.extra_headers`.
+    config.extra_headers = overrides.get("extra_headers", None)
     # Real attribute, not MagicMock truthiness — the factory's cache-key arm
     # gates on `if config.prompt_cache_key`.
     config.prompt_cache_key = overrides.get("prompt_cache_key", None)
@@ -749,7 +752,7 @@ class TestFamilyCenteredReasoning:
         assert reasoning_capability("gpt-5.2-pro")["method"] == "effort_enum"
         assert reasoning_capability("openai/gpt-oss-120b")["delivery"] == "prompt"
         assert reasoning_capability("minimax-m2.7")["method"] == "none"
-        assert reasoning_capability("claude-opus-4-8")["method"] == "none"
+        assert reasoning_capability("claude-opus-4-8")["method"] == "effort_enum"
         # Unknown family falls through to the `default` block (effort_enum).
         assert reasoning_capability("some-unknown-model")["method"] == "effort_enum"
 
@@ -757,9 +760,75 @@ class TestFamilyCenteredReasoning:
         assert detect_reasoning_method("gpt-5.2-pro") == "api"
         assert detect_reasoning_method("openai/gpt-oss-120b") == "prompt"
         assert detect_reasoning_method("gemma-4-moe") == "none"
-        assert detect_reasoning_method("claude-opus-4-8") == "none"
+        assert detect_reasoning_method("claude-opus-4-8") == "api"
         # Explicit override still wins.
         assert detect_reasoning_method("gemma-4-moe", explicit_method="api") == "api"
+
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_claude_requests_an_effort_level(self, mock_chat):
+        """Claude reaches adaptive thinking via `reasoning_effort`.
+
+        Sending nothing is not "provider default": it leaves `thinking.type`
+        unset, so the subscription proxy never asks for a visible summary and
+        Claude reasons invisibly (thinking_tokens billed, empty blocks
+        returned). Verified live 2026-09-07 — see
+        knowledge-base/knowledge/features/subscription_proxy.md §13.
+        """
+        mock_chat.return_value = MagicMock()
+        config = _make_config(
+            model="claude-opus-5",
+            base_url="http://srw-codex-proxy:8317/v1",
+            reasoning_level="high",
+        )
+
+        _create_openai_llm(config, limits=None)
+
+        assert mock_chat.call_args[1]["model_kwargs"]["reasoning_effort"] == "high"
+
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_claude_unset_level_injects_nothing(self, mock_chat):
+        """Shared effort_enum contract: an unset level is not re-defaulted here,
+        so a caller that never asked for reasoning does not silently start
+        paying for it. Claude then behaves as it does today — it still thinks,
+        just invisibly."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(
+            model="claude-opus-5",
+            base_url="http://srw-codex-proxy:8317/v1",
+            reasoning_level=None,
+        )
+
+        _create_openai_llm(config, limits=None)
+
+        assert "reasoning_effort" not in (
+            mock_chat.call_args[1].get("model_kwargs") or {}
+        )
+
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_route_headers_reach_the_client(self, mock_chat):
+        """Dispatch-injected transport headers become the client's
+        default_headers — the other half of the Claude reasoning fix."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(
+            model="claude-opus-5",
+            base_url="http://srw-codex-proxy:8317/v1",
+            extra_headers={"Anthropic-Beta": "claude-code-20250219"},
+        )
+
+        _create_openai_llm(config, limits=None)
+
+        assert mock_chat.call_args[1]["default_headers"] == {
+            "Anthropic-Beta": "claude-code-20250219"
+        }
+
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_no_route_headers_leaves_the_client_untouched(self, mock_chat):
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="gpt-5.6-sol", base_url="http://proxy/v1")
+
+        _create_openai_llm(config, limits=None)
+
+        assert "default_headers" not in mock_chat.call_args[1]
 
     @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_gemma_enables_thinking_no_effort(self, mock_chat):

@@ -261,8 +261,18 @@ gemini:
     image_tokens: { mode: flat, flat: 2304 }
 
 claude-opus:
-  # Phase 2 → token_budget (thinking.budget_tokens; min 1024; no temp/top_p/top_k).
-  reasoning: { method: none }
+  # Anthropic moved from a raw thinking budget to *adaptive* thinking driven by
+  # an effort level, and that is what an OpenAI-shaped client can actually
+  # reach: CLIProxyAPI maps `reasoning_effort` onto `thinking` +
+  # `output_config.effort` (or a legacy budget for models without adaptive
+  # support). Sending nothing is not "provider default" — it leaves
+  # `thinking.type` unset, which stops the proxy from asking for a *visible*
+  # summary, so Claude still reasons (thinking_tokens are billed) and returns
+  # signature-only blocks. Verified end-to-end against a live Claude Code
+  # account on 2026-09-07: effort low ⇒ short summary, high ⇒ longer one.
+  # The native Anthropic factory ignores this block (it injects no reasoning
+  # control), so this changes the proxied/OpenRouter paths only.
+  reasoning: { method: effort_enum, delivery: native, default: high, options: [low, medium, high] }
   settings:
     shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
     temperature: 1.0  # Anthropic: just use temperature, leave top_p/top_k at defaults
@@ -278,7 +288,8 @@ claude-opus:
 # main model never counted images and compacted at the 128k default window.
 # Vision = 28px patches at the legacy cap (1568px edge / 1568 tok).
 claude-sonnet:
-  reasoning: { method: none }   # Phase 2 → token_budget
+  # Effort-driven adaptive thinking — see the claude-opus note above.
+  reasoning: { method: effort_enum, delivery: native, default: high, options: [low, medium, high] }
   settings:
     shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
     temperature: 1.0
@@ -294,7 +305,8 @@ claude-sonnet:
     pdf_render_dpi: 130
 
 claude-haiku:
-  reasoning: { method: none }   # Phase 2 → token_budget
+  # Effort-driven adaptive thinking — see the claude-opus note above.
+  reasoning: { method: effort_enum, delivery: native, default: high, options: [low, medium, high] }
   settings:
     shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
     temperature: 1.0

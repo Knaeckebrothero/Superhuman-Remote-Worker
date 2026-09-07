@@ -104,9 +104,12 @@ class TestDetectReasoningMethod:
     def test_groq_gpt_oss_returns_prompt(self):
         assert detect_reasoning_method("groq/gpt-oss-120b") == "prompt"
 
-    def test_claude_returns_none(self):
-        assert detect_reasoning_method("claude-opus-4-6") == "none"
-        assert detect_reasoning_method("claude-sonnet-4-5-20250929") == "none"
+    def test_claude_returns_api(self):
+        # Claude reaches adaptive thinking through `reasoning_effort` on the
+        # OpenAI-shaped paths (subscription proxy / OpenRouter); the native
+        # Anthropic factory injects nothing either way.
+        assert detect_reasoning_method("claude-opus-4-6") == "api"
+        assert detect_reasoning_method("claude-sonnet-4-5-20250929") == "api"
 
     def test_gemini_returns_none(self):
         assert detect_reasoning_method("gemini-2.5-flash") == "none"

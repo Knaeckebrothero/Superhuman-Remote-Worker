@@ -346,3 +346,73 @@ def applies_codex_context_cap(
     if channels:
         return False
     return (provider or "").strip().lower() == "codex"
+
+
+# ---------------------------------------------------------------------------
+# Claude thinking visibility
+# ---------------------------------------------------------------------------
+#
+# CLIProxyAPI's Claude executor sends a fixed ``Anthropic-Beta`` list on every
+# upstream call, and that list contains ``redact-thinking-2026-02-12``. With
+# that beta on, Anthropic returns **signature-only thinking blocks** — a
+# ``thinking`` block whose text is empty — so a reasoning turn is billed
+# (``usage.output_tokens_details.thinking_tokens`` is non-zero) but nothing
+# readable ever reaches SRW. The executor's own ``ensureClaudeThinkingDisplay``
+# tries to counteract this by defaulting ``thinking.display`` to
+# ``"summarized"``; measured against a live Claude Code account on 2026-09-07
+# that does NOT defeat the beta.
+#
+# The one lever a client has is the request's own ``Anthropic-Beta`` header:
+# the executor *replaces* its default list with an inbound header (re-adding
+# ``oauth-*`` and ``interleaved-thinking-*`` if absent), while ``betas`` in the
+# body can only ever add. So SRW restates the pinned executor list minus the
+# redaction beta and changes exactly one thing.
+#
+# This is a pin on an upstream implementation detail: it is copied from
+# ``internal/runtime/executor/claude_executor_request.go`` at
+# ``docker.io/eceasy/cli-proxy-api:v7.2.110``. Re-check it when the proxy pin
+# moves — a beta added upstream is one this header would suppress.
+CLAUDE_VISIBLE_THINKING_BETAS: tuple[str, ...] = (
+    "claude-code-20250219",
+    "oauth-2025-04-20",
+    "interleaved-thinking-2025-05-14",
+    "context-management-2025-06-27",
+    "prompt-caching-scope-2026-01-05",
+    "structured-outputs-2025-12-15",
+    "fast-mode-2026-02-01",
+    "token-efficient-tools-2026-03-28",
+)
+
+#: Beta the list above deliberately omits (kept named so a drift check can
+#: assert its absence rather than matching the whole string).
+CLAUDE_REDACT_THINKING_BETA = "redact-thinking-2026-02-12"
+
+ANTHROPIC_BETA_HEADER = "Anthropic-Beta"
+
+
+def subscription_request_headers(
+    *,
+    transport_kind: Optional[str] = None,
+    label: Optional[str] = None,
+    base_url: Optional[str] = None,
+    subscription_sources: Iterable[str] = (),
+) -> dict[str, str]:
+    """Transport headers a subscription-proxy route needs, if any.
+
+    Today that is exactly one case: a route served by a Claude Code credential
+    needs an ``Anthropic-Beta`` header that omits the redaction beta, or its
+    reasoning comes back as empty thinking blocks. Everything else gets ``{}``
+    — a Codex/Grok/Kimi/Antigravity route must not carry Anthropic headers, and
+    neither must a model on an ordinary endpoint.
+
+    Fails closed: an unknown source, an empty source list, or a non-subscription
+    endpoint all yield no headers, so a row that predates routing metadata keeps
+    its current behaviour instead of inheriting Anthropic's.
+    """
+    if CHANNEL_CLAUDE not in normalize_channels(subscription_sources):
+        return {}
+    if not is_subscription_endpoint(
+        transport_kind=transport_kind, label=label, base_url=base_url
+    ):
+        return {}
+    return {ANTHROPIC_BETA_HEADER: ",".join(CLAUDE_VISIBLE_THINKING_BETAS)}

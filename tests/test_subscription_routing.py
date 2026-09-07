@@ -19,10 +19,14 @@ from shared.runtime.core.model_registry import (
     _endpoint_factory_provider,
 )
 from shared.subscription_routing import (
+    ANTHROPIC_BETA_HEADER,
+    CLAUDE_REDACT_THINKING_BETA,
+    CLAUDE_VISIBLE_THINKING_BETAS,
     PROTOCOL_OPENAI_CHAT,
     PROTOCOL_OPENAI_RESPONSES,
     SUBSCRIPTION_PROXY_TRANSPORT,
     is_subscription_endpoint,
+    subscription_request_headers,
     merge_routing_into_params,
     normalize_channel,
     routing_from_params,
@@ -300,3 +304,87 @@ class TestChannelNormalization:
 def test_module_still_exports_the_legacy_label():
     """Older imports (and the cockpit's legacy branch) still resolve."""
     assert model_registry.CODEX_PROXY_ENDPOINT_LABEL == "codex-proxy"
+
+
+class TestClaudeThinkingVisibilityHeaders:
+    """A Claude Code route needs its own ``Anthropic-Beta`` list.
+
+    CLIProxyAPI's Claude executor always sends ``redact-thinking-…`` upstream
+    unless the inbound request carries a beta list of its own, and under that
+    beta Anthropic returns signature-only thinking blocks — reasoning that is
+    billed (``thinking_tokens`` > 0) but arrives empty. Measured against a live
+    Claude Code account on 2026-09-07: with the beta, 0 characters of
+    reasoning; without it, a real summary at every effort level.
+    """
+
+    def test_claude_route_gets_a_beta_list_without_the_redaction_beta(self):
+        headers = subscription_request_headers(
+            transport_kind=SUBSCRIPTION_PROXY_TRANSPORT,
+            subscription_sources=["claude"],
+        )
+        assert CLAUDE_REDACT_THINKING_BETA not in headers[ANTHROPIC_BETA_HEADER]
+        # …and still carries the betas the executor would otherwise have sent,
+        # because an inbound header REPLACES the executor's list rather than
+        # extending it.
+        assert "claude-code-20250219" in headers[ANTHROPIC_BETA_HEADER]
+        assert "prompt-caching-scope-2026-01-05" in headers[ANTHROPIC_BETA_HEADER]
+
+    def test_the_pinned_list_never_contains_the_redaction_beta(self):
+        """Drift guard for the constant itself, independent of the resolver."""
+        assert CLAUDE_REDACT_THINKING_BETA not in CLAUDE_VISIBLE_THINKING_BETAS
+
+    @pytest.mark.parametrize("channel", ["codex", "xai", "kimi", "antigravity"])
+    def test_other_accounts_on_the_same_endpoint_get_nothing(self, channel):
+        """One transport, many accounts: an Anthropic header on a Codex route
+        is exactly the label-inference bug this feature removed."""
+        assert (
+            subscription_request_headers(
+                transport_kind=SUBSCRIPTION_PROXY_TRANSPORT,
+                subscription_sources=[channel],
+            )
+            == {}
+        )
+
+    def test_alias_spelling_is_resolved(self):
+        """The login provider is ``anthropic``; the credential channel is
+        ``claude``. Either spelling must reach the same route."""
+        assert subscription_request_headers(
+            transport_kind=SUBSCRIPTION_PROXY_TRANSPORT,
+            subscription_sources=["anthropic"],
+        )
+
+    def test_pooled_route_including_claude_still_gets_it(self):
+        assert subscription_request_headers(
+            transport_kind=SUBSCRIPTION_PROXY_TRANSPORT,
+            subscription_sources=["xai", "claude"],
+        )
+
+    def test_unattributed_row_gets_nothing(self):
+        """Fails closed — a row imported before routing metadata existed keeps
+        the behaviour it has today rather than inheriting Anthropic's."""
+        assert (
+            subscription_request_headers(
+                transport_kind=SUBSCRIPTION_PROXY_TRANSPORT, subscription_sources=[]
+            )
+            == {}
+        )
+
+    def test_claude_on_an_ordinary_endpoint_gets_nothing(self):
+        """The header describes the *proxy*, not the vendor: a Claude model on
+        some other OpenAI-compatible gateway must not receive it."""
+        assert (
+            subscription_request_headers(
+                transport_kind=None,
+                label="Local Router",
+                base_url="https://ai.example.test/v1",
+                subscription_sources=["claude"],
+            )
+            == {}
+        )
+
+    def test_legacy_label_still_resolves(self):
+        """A pre-migration row (label only, no transport marker) is still the
+        subscription proxy."""
+        assert subscription_request_headers(
+            label="codex-proxy", subscription_sources=["claude"]
+        )

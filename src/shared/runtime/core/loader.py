@@ -1959,6 +1959,8 @@ class PhaseLLMOverride:
     # Provider-specific request-body params (merged into the factory's
     # extra_body; family settings-matrix `extra_body` resolves here per phase).
     extra_body: Optional[Dict[str, Any]] = None
+    # Transport headers for this phase's route (see LLMConfig.extra_headers).
+    extra_headers: Optional[Dict[str, str]] = None
 
 
 @dataclass
@@ -2011,6 +2013,13 @@ class LLMConfig:
     # settings matrix (`settings.extra_body`) or explicit config; declared
     # values win over factory-computed extra_body entries.
     extra_body: Optional[Dict[str, Any]] = None
+    # Transport headers for the resolved route, injected at DISPATCH from the
+    # model's routing metadata — never set from YAML. Today only the
+    # subscription proxy uses it: a Claude-Code-served model needs an
+    # `Anthropic-Beta` list without the redaction beta or its reasoning comes
+    # back as empty thinking blocks (shared.subscription_routing). Honoured by
+    # the OpenAI-compatible factories; other providers ignore it.
+    extra_headers: Optional[Dict[str, str]] = None
     # OpenAI cache-routing hint, injected at RUNTIME by callers that own a
     # stable conversation identity (the session paths pass a per-thread key so
     # the provider-side prefix cache survives pod rotation on the stateless
@@ -2085,6 +2094,9 @@ class LLMConfig:
             extra_body=override.extra_body
             if override.extra_body is not None
             else self.extra_body,
+            extra_headers=override.extra_headers
+            if override.extra_headers is not None
+            else self.extra_headers,
             # Phase overrides not inherited to resolved config
             summarization=None,
         )
@@ -2584,6 +2596,12 @@ class AuxiliaryConfig:
     # be threaded through to create_llm or an OpenRouter aux misroutes to
     # api.openai.com (knowledge-base/knowledge/issues/openrouter_auxiliary_misrouted_to_openai.md).
     provider: Optional[str] = None
+    # Route transport headers, injected at dispatch alongside base_url/api_key
+    # (LLMConfig.extra_headers). Threaded for the same reason `provider` is: an
+    # aux model on a subscription-proxy Claude account needs its Anthropic-Beta
+    # list, and rebuilding the LLMConfig without it silently drops the route's
+    # header.
+    extra_headers: Optional[Dict[str, str]] = None
     temperature: float = 0.0
     max_iterations: int = 15  # Cap for agent mode loops
     timeout: float = 120.0  # Seconds per LLM call (quick interactive tasks)
@@ -2811,6 +2829,7 @@ def _parse_phase_override(data: Optional[Dict[str, Any]]) -> Optional[PhaseLLMOv
         max_output_tokens=data.get("max_output_tokens"),
         model_max_context_tokens=data.get("model_max_context_tokens"),
         extra_body=data.get("extra_body"),
+        extra_headers=data.get("extra_headers"),
     )
 
 
@@ -2849,6 +2868,7 @@ def _parse_llm_config(llm_data: Dict[str, Any]) -> LLMConfig:
         max_output_tokens=llm_data.get("max_output_tokens"),
         model_max_context_tokens=llm_data.get("model_max_context_tokens"),
         extra_body=llm_data.get("extra_body"),
+        extra_headers=llm_data.get("extra_headers"),
         summarization=_parse_phase_override(llm_data.get("summarization")),
     )
 
@@ -3073,6 +3093,7 @@ def _parse_auxiliary_config(data: Dict[str, Any]) -> AuxiliaryConfig:
         base_url=data.get("base_url"),
         api_key=data.get("api_key"),
         provider=data.get("provider"),
+        extra_headers=data.get("extra_headers"),
         temperature=data.get("temperature", 0.0),
         max_iterations=data.get("max_iterations", 15),
         timeout=data.get("timeout", 120.0),
@@ -4299,6 +4320,13 @@ def _create_openai_llm(
     if extra_body:
         llm_kwargs["extra_body"] = extra_body
 
+    # Route-level transport headers injected at dispatch (LLMConfig.extra_headers).
+    # The subscription proxy's Claude executor decides thinking visibility from
+    # the inbound Anthropic-Beta header, so this is the difference between a
+    # readable reasoning summary and an empty thinking block.
+    if config.extra_headers:
+        llm_kwargs["default_headers"] = dict(config.extra_headers)
+
     max_tokens = _resolve_max_output_tokens(config, limits)
     llm_kwargs["max_tokens"] = max_tokens
 
@@ -4327,7 +4355,8 @@ def _create_openai_llm(
         f"Created OpenAI LLM: model={config.model}, temp={config.temperature}, "
         f"base_url={base_url or 'default'}, timeout={llm_kwargs.get('timeout')}s, "
         f"max_retries={config.max_retries}, max_context_tokens={max_context_tokens or 'default'}, "
-        f"max_tokens={max_tokens}, reasoning={reasoning_mode}, keys={key_info}"
+        f"max_tokens={max_tokens}, reasoning={reasoning_mode}, keys={key_info}, "
+        f"headers={sorted(config.extra_headers) if config.extra_headers else 'none'}"
     )
 
     return llm
@@ -4639,6 +4668,11 @@ def _create_openrouter_llm(
         default_headers["HTTP-Referer"] = referer
     if title:
         default_headers["X-Title"] = title
+    # Dispatch-injected route headers (LLMConfig.extra_headers) win over the
+    # attribution headers above — they are the ones that change provider
+    # behaviour, not just the leaderboard entry.
+    if config.extra_headers:
+        default_headers.update(config.extra_headers)
     if default_headers:
         llm_kwargs["default_headers"] = default_headers
 

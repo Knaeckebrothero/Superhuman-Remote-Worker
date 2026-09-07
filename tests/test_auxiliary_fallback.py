@@ -65,6 +65,22 @@ class TestAuxiliaryProviderParsing:
         # Regression: the field must exist so an injected provider survives parse.
         assert "provider" in AuxiliaryConfig.__dataclass_fields__
 
+    def test_route_headers_survive_the_parse(self):
+        """Same threading rule as `provider`: dispatch injects the route's
+        transport headers into the auxiliary section, and the aux rebuild has
+        to carry them or a Claude aux model loses its Anthropic-Beta list and
+        reasons invisibly."""
+        cfg = _parse_auxiliary_config(
+            {
+                "model": "claude-opus-5",
+                "extra_headers": {"Anthropic-Beta": "claude-code-20250219"},
+            }
+        )
+        assert cfg.extra_headers == {"Anthropic-Beta": "claude-code-20250219"}
+
+    def test_route_headers_default_to_none(self):
+        assert _parse_auxiliary_config({"model": "gemma-4-moe"}).extra_headers is None
+
 
 class TestCreateLLMProviderRouting:
     """create_llm must route by provider, and auto-detect openrouter/ prefix."""

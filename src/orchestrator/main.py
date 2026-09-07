@@ -597,6 +597,7 @@ from orchestrator.services.subscriptions import (  # noqa: E402
 from shared.subscription_routing import (  # noqa: E402
     CHANNEL_CODEX,
     SUBSCRIPTION_PROXY_TRANSPORT,
+    subscription_request_headers,
 )
 
 # SRW provider key of the ChatGPT/Codex connection — the one the legacy
@@ -4920,6 +4921,18 @@ async def _inject_dispatch_credentials(
     # settings-matrix re-run and overrides the family settings.max_output_tokens.
     if meta is not None and meta.max_output_tokens:
         llm_over.setdefault("max_output_tokens", meta.max_output_tokens)
+    # Route transport headers — same contract as the nested slots below
+    # (`_inject_model_credentials`), restated here because the top-level model
+    # is credentialed by this branch rather than by that helper. Written on
+    # every dispatch, `{}` included, so a re-dispatch after a model change
+    # cannot leave the previous route's headers behind.
+    if meta is not None:
+        _llm_headers = subscription_request_headers(
+            transport_kind=meta.transport_kind,
+            subscription_sources=meta.subscription_sources,
+        )
+        _llm_headers.update(llm_over.get("extra_headers") or {})
+        llm_over["extra_headers"] = _llm_headers or None
 
     if resolved_keys:
         _ENV_KEY_MAP = {"vision": "VISION_API_KEY"}
@@ -13904,6 +13917,26 @@ async def _inject_model_credentials(
     # gpt-5.5 endpoint row kept routing through _create_openrouter_llm).
     if meta is not None and meta.provider:
         section["provider"] = meta.provider
+
+    # Transport headers the resolved route needs. Only the subscription proxy
+    # uses this today: its Claude executor decides thinking visibility from the
+    # inbound Anthropic-Beta header, so a Claude-Code-served model without it
+    # returns empty thinking blocks (billed, unreadable). Written on every
+    # injection — including as `{}` — for the same reason `provider` is: a
+    # session hot-swap deep-merges this section over the previous model's, and
+    # a header left behind would describe the model that is no longer running.
+    # Caller-pinned values still win.
+    if meta is not None:
+        _route_headers = subscription_request_headers(
+            transport_kind=meta.transport_kind,
+            subscription_sources=meta.subscription_sources,
+        )
+        _route_headers.update(section.get("extra_headers") or {})
+        # `None`, not `{}`, when nothing applies: the agent-side deep_merge
+        # treats None as "clear this field", so a swap away from a Claude
+        # account actually drops the header instead of inheriting it. Same
+        # sentinel the provider/base_url/api_key swap path uses.
+        section["extra_headers"] = _route_headers or None
 
     if transport_complete and not (meta is not None and meta.endpoint_id):
         return

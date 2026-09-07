@@ -1308,3 +1308,173 @@ class TestRosterPrefetch:
         )
 
         assert set(out) == {self.OVERRIDE_REF}
+
+
+# ---------------------------------------------------------------------------
+# Route transport headers (subscription proxy → Claude Code)
+#
+# CLIProxyAPI's Claude executor sends `redact-thinking-…` on every upstream
+# call unless the *inbound* request carries its own Anthropic-Beta list, and
+# with that beta on Anthropic returns signature-only thinking blocks: the turn
+# is billed for reasoning nobody can read. Dispatch is where the route is
+# known, so dispatch is where the header is decided — from the model's
+# `subscription_sources`, never from its name.
+# ---------------------------------------------------------------------------
+
+SUBS_ENDPOINT_ID = "33333333-3333-3333-3333-333333333333"
+SUBS_BASE_URL = "http://srw-codex-proxy:8317/v1"
+
+
+@pytest.fixture
+def patched_main_subs(monkeypatch):
+    """Two models on the *same* subscription endpoint, differing only in the
+    upstream account that serves them."""
+
+    sources = {
+        "claude-opus-5": ("claude",),
+        "gpt-5.6-sol": ("codex",),
+        "legacy-row": (),  # imported before routing metadata existed
+    }
+
+    async def fake_resolve(model_id, user_id=None, capability="chat"):
+        if model_id in sources:
+            return ModelMeta(
+                model_id=model_id,
+                provider="openai",
+                family="default",
+                display_name=model_id,
+                origin="system",
+                endpoint_id=SUBS_ENDPOINT_ID,
+                api_key_ref="openai",
+                transport_kind="subscription-proxy",
+                subscription_sources=sources[model_id],
+            )
+        if model_id == "plain-endpoint-claude":
+            # Same name shape, ordinary endpoint: must NOT get the header.
+            return ModelMeta(
+                model_id=model_id,
+                provider="openai",
+                family="claude-opus",
+                display_name=model_id,
+                origin="custom",
+                endpoint_id=CTX_ENDPOINT_ID,
+                api_key_ref="openai",
+                subscription_sources=("claude",),
+            )
+        return None
+
+    monkeypatch.setattr(
+        orchestrator.main,
+        "_resolve_model",
+        AsyncMock(side_effect=fake_resolve),
+        raising=True,
+    )
+
+    async def fake_get_endpoint(endpoint_id):
+        return {
+            "id": endpoint_id,
+            "label": "subscription-proxy",
+            "base_url": SUBS_BASE_URL,
+            "api_key": "sk-subs-test",
+        }
+
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db,
+        "get_user_llm_endpoint",
+        AsyncMock(side_effect=fake_get_endpoint),
+    )
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db,
+        "resolve_api_keys_for_job",
+        AsyncMock(return_value={}),
+    )
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db, "get_user_settings", AsyncMock(return_value={})
+    )
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db,
+        "resolve_default_for_capability",
+        AsyncMock(return_value=None),
+    )
+
+
+class TestRouteHeaderInjection:
+    @pytest.mark.asyncio
+    async def test_claude_sourced_model_gets_visible_thinking_betas(
+        self, patched_main_subs
+    ):
+        result = await orchestrator.main._inject_dispatch_credentials(
+            _job(), {"llm": {"model": "claude-opus-5"}}
+        )
+        betas = result["llm"]["extra_headers"]["Anthropic-Beta"]
+        assert "claude-code-20250219" in betas
+        # The whole point: the redaction beta must be absent.
+        assert "redact-thinking" not in betas
+
+    @pytest.mark.asyncio
+    async def test_codex_sourced_model_on_the_same_endpoint_gets_no_betas(
+        self, patched_main_subs
+    ):
+        """One endpoint, many accounts — the header follows the account."""
+        result = await orchestrator.main._inject_dispatch_credentials(
+            _job(), {"llm": {"model": "gpt-5.6-sol"}}
+        )
+        assert result["llm"]["extra_headers"] is None
+
+    @pytest.mark.asyncio
+    async def test_row_without_routing_metadata_gets_no_betas(self, patched_main_subs):
+        """Fails closed: an un-attributed row keeps its current behaviour."""
+        result = await orchestrator.main._inject_dispatch_credentials(
+            _job(), {"llm": {"model": "legacy-row"}}
+        )
+        assert result["llm"]["extra_headers"] is None
+
+    @pytest.mark.asyncio
+    async def test_claude_on_an_ordinary_endpoint_gets_no_betas(
+        self, patched_main_subs
+    ):
+        """The header is a property of the proxy transport, not of Anthropic."""
+        result = await orchestrator.main._inject_dispatch_credentials(
+            _job(), {"llm": {"model": "plain-endpoint-claude"}}
+        )
+        assert result["llm"]["extra_headers"] is None
+
+    @pytest.mark.asyncio
+    async def test_headers_are_cleared_on_a_model_swap(self, patched_main_subs):
+        """Swapping off a Claude account must CLEAR the header, not leave it —
+        hence the explicit None sentinel the agent-side deep_merge acts on,
+        the same contract provider/base_url/api_key already use."""
+        result = await orchestrator.main._inject_dispatch_credentials(
+            _job(),
+            {"llm": {"model": "gpt-5.6-sol", "extra_headers": {"Anthropic-Beta": "x"}}},
+        )
+        # A caller-pinned value still wins; a *stale* one is what this guards,
+        # so assert the shape the swap path produces from a clean section.
+        result2 = await orchestrator.main._inject_dispatch_credentials(
+            _job(), {"llm": {"model": "gpt-5.6-sol"}}
+        )
+        assert result2["llm"]["extra_headers"] is None
+        assert result["llm"]["extra_headers"] == {"Anthropic-Beta": "x"}
+
+    @pytest.mark.asyncio
+    async def test_caller_pinned_header_wins(self, patched_main_subs):
+        result = await orchestrator.main._inject_dispatch_credentials(
+            _job(),
+            {
+                "llm": {
+                    "model": "claude-opus-5",
+                    "extra_headers": {"Anthropic-Beta": "operator-pinned"},
+                }
+            },
+        )
+        assert result["llm"]["extra_headers"]["Anthropic-Beta"] == "operator-pinned"
+
+    @pytest.mark.asyncio
+    async def test_nested_slot_gets_the_header_too(self, patched_main_subs):
+        """A summarization/roster slot on a Claude account needs it as much as
+        the main model does."""
+        result = await orchestrator.main._inject_dispatch_credentials(
+            _job(), {"llm": {"summarization": {"model": "claude-opus-5"}}}
+        )
+        betas = result["llm"]["summarization"]["extra_headers"]["Anthropic-Beta"]
+        assert "redact-thinking" not in betas
