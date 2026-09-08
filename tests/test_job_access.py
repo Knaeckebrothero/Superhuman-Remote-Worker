@@ -768,7 +768,8 @@ class TestGatedReadEndpoints:
     async def test_list_repo_contents_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import list_repo_contents
+        from orchestrator.main import _job_repo_dependencies
+        from orchestrator.routers.job_repo import list_repo_contents
 
         with (
             _patch_caller_and_db(user_b, fake_db),
@@ -776,7 +777,11 @@ class TestGatedReadEndpoints:
         ):
             with pytest.raises(HTTPException) as exc:
                 await list_repo_contents(
-                    fake_request, str(job_a["id"]), path="", ref=None
+                    fake_request,
+                    str(job_a["id"]),
+                    path="",
+                    ref=None,
+                    dependencies=_job_repo_dependencies(),
                 )
         assert exc.value.status_code == 403
 
@@ -784,7 +789,8 @@ class TestGatedReadEndpoints:
     async def test_get_repo_file_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import get_repo_file
+        from orchestrator.main import _job_repo_dependencies
+        from orchestrator.routers.job_repo import get_repo_file
 
         with (
             _patch_caller_and_db(user_b, fake_db),
@@ -792,7 +798,11 @@ class TestGatedReadEndpoints:
         ):
             with pytest.raises(HTTPException) as exc:
                 await get_repo_file(
-                    fake_request, str(job_a["id"]), path="README.md", ref=None
+                    fake_request,
+                    str(job_a["id"]),
+                    path="README.md",
+                    ref=None,
+                    dependencies=_job_repo_dependencies(),
                 )
         assert exc.value.status_code == 403
 
@@ -911,14 +921,19 @@ class TestGatedReadEndpoints:
     async def test_get_job_snapshot_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import get_job_snapshot
+        from orchestrator.main import _workspace_access_dependencies
+        from orchestrator.routers.workspace_access import get_job_snapshot
 
         with (
             _patch_caller_and_db(user_b, fake_db),
             patch("orchestrator.main.snapshot_service", _make_dud("snapshot_service")),
         ):
             with pytest.raises(HTTPException) as exc:
-                await get_job_snapshot(fake_request, str(job_a["id"]))
+                await get_job_snapshot(
+                    fake_request,
+                    str(job_a["id"]),
+                    dependencies=_workspace_access_dependencies(),
+                )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
@@ -944,11 +959,16 @@ class TestGatedReadEndpoints:
     async def test_get_frozen_job_data_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import get_frozen_job_data
+        from orchestrator.main import _workspace_access_dependencies
+        from orchestrator.routers.workspace_access import get_frozen_job_data
 
         with _patch_caller_and_db(user_b, fake_db):
             with pytest.raises(HTTPException) as exc:
-                await get_frozen_job_data(fake_request, str(job_a["id"]))
+                await get_frozen_job_data(
+                    fake_request,
+                    str(job_a["id"]),
+                    dependencies=_workspace_access_dependencies(),
+                )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
@@ -1148,35 +1168,46 @@ class TestJobMutationGates:
     async def test_delete_job_snapshot_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import delete_job_snapshot
+        from orchestrator.main import _workspace_access_dependencies
+        from orchestrator.routers.workspace_access import delete_job_snapshot
 
         with (
             _patch_caller_and_db(user_b, fake_db),
             patch("orchestrator.main.snapshot_service", _make_dud("snapshot_service")),
         ):
             with pytest.raises(HTTPException) as exc:
-                await delete_job_snapshot(fake_request, str(job_a["id"]))
+                await delete_job_snapshot(
+                    fake_request,
+                    str(job_a["id"]),
+                    dependencies=_workspace_access_dependencies(),
+                )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
     async def test_toggle_snapshot_pin_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import toggle_snapshot_pin
+        from orchestrator.main import _workspace_access_dependencies
+        from orchestrator.routers.workspace_access import toggle_snapshot_pin
 
         with (
             _patch_caller_and_db(user_b, fake_db),
             patch("orchestrator.main.snapshot_service", _make_dud("snapshot_service")),
         ):
             with pytest.raises(HTTPException) as exc:
-                await toggle_snapshot_pin(fake_request, str(job_a["id"]))
+                await toggle_snapshot_pin(
+                    fake_request,
+                    str(job_a["id"]),
+                    dependencies=_workspace_access_dependencies(),
+                )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
     async def test_start_ide_session_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import start_ide_session
+        from orchestrator.main import _ide_dependencies
+        from orchestrator.routers.ide import start_ide_session
 
         with (
             _patch_caller_and_db(user_b, fake_db),
@@ -1186,14 +1217,19 @@ class TestJobMutationGates:
             ),
         ):
             with pytest.raises(HTTPException) as exc:
-                await start_ide_session(fake_request, str(job_a["id"]))
+                await start_ide_session(
+                    fake_request,
+                    str(job_a["id"]),
+                    dependencies=_ide_dependencies(),
+                )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
     async def test_get_ide_session_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import get_ide_session
+        from orchestrator.main import _ide_dependencies
+        from orchestrator.routers.ide import get_ide_session
 
         with (
             _patch_caller_and_db(user_b, fake_db),
@@ -1203,14 +1239,19 @@ class TestJobMutationGates:
             ),
         ):
             with pytest.raises(HTTPException) as exc:
-                await get_ide_session(fake_request, str(job_a["id"]))
+                await get_ide_session(
+                    fake_request,
+                    str(job_a["id"]),
+                    dependencies=_ide_dependencies(),
+                )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
     async def test_stop_ide_session_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import stop_ide_session
+        from orchestrator.main import _ide_dependencies
+        from orchestrator.routers.ide import stop_ide_session
 
         with (
             _patch_caller_and_db(user_b, fake_db),
@@ -1220,7 +1261,11 @@ class TestJobMutationGates:
             ),
         ):
             with pytest.raises(HTTPException) as exc:
-                await stop_ide_session(fake_request, str(job_a["id"]))
+                await stop_ide_session(
+                    fake_request,
+                    str(job_a["id"]),
+                    dependencies=_ide_dependencies(),
+                )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio

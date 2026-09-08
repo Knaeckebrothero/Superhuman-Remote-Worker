@@ -21,6 +21,7 @@ tests/test_export_to_cloud_endpoint.py).
 from __future__ import annotations
 
 import base64
+import dataclasses
 import re
 import uuid
 from contextlib import ExitStack
@@ -29,6 +30,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import orchestrator.main
+from orchestrator.routers import job_diff as job_diff_routes
 from orchestrator.services.completion import (
     apply_terminal_job_side_effects,
     job_has_file_contract,
@@ -730,16 +732,17 @@ class TestRejectStaysMergeFree:
         db = _FakeDB(job)
 
         with ExitStack() as stack:
-            stack.enter_context(
-                patch(
-                    "orchestrator.main.require_job_access",
-                    AsyncMock(return_value=({}, job)),
-                )
-            )
             stack.enter_context(patch("orchestrator.main.postgres_db", db))
             stack.enter_context(patch("orchestrator.main.gitea_client", g))
             stack.enter_context(patch("orchestrator.main.vector_db", None))
-            result = await orchestrator.main.reject_job_diff(MagicMock(), str(JOB_ID))
+            result = await job_diff_routes.reject_job_diff(
+                MagicMock(),
+                str(JOB_ID),
+                dependencies=dataclasses.replace(
+                    orchestrator.main._job_diff_dependencies(),
+                    require_job_access=AsyncMock(return_value=({}, job)),
+                ),
+            )
 
         assert result["diff_status"] == "rejected"
         g.get_compare.assert_not_called()

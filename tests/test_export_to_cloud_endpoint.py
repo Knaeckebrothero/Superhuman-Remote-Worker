@@ -18,6 +18,7 @@ Follows the house pattern in tests/test_job_access.py: import ``main`` (conftest
 puts orchestrator/ on sys.path) and patch its module globals.
 """
 
+import dataclasses
 import json
 import re
 from contextlib import ExitStack
@@ -27,6 +28,8 @@ import pytest
 from fastapi import HTTPException
 
 import orchestrator.main
+from orchestrator.routers import job_review as job_review_routes
+from orchestrator.services import job_export
 from tests.cloud.fake import FakeMainCloudBackend
 
 
@@ -67,13 +70,11 @@ def _patch_endpoint(*, user, job, backend, gitea_files, repo=("job-682baab8", "m
     ``gitea_files`` maps repo-relative path -> bytes; it backs both
     ``get_file_bytes`` (deliverables path) and ``list_contents`` (output/
     fallback). Returns (ExitStack, backend, db_mock).
+
+    ``user``/``job`` are the pair the caller hands to ``_deps`` — the access
+    gate lives on the route dependencies, not on a patchable global.
     """
     stack = ExitStack()
-    stack.enter_context(
-        patch(
-            "orchestrator.main.require_job_access", AsyncMock(return_value=(user, job))
-        )
-    )
 
     router = MagicMock()
     router.for_owner = MagicMock(return_value=backend)
@@ -117,6 +118,20 @@ def _patch_endpoint(*, user, job, backend, gitea_files, repo=("job-682baab8", "m
     stack.enter_context(patch("orchestrator.main.postgres_db", db))
 
     return stack, backend, db
+
+
+def _deps(user: dict, job: dict):
+    """Route dependencies built from the patched globals, auth short-circuited.
+
+    ``require_job_access`` is a field default on ``JobReviewDependencies``, so
+    the gate is replaced here rather than patched on a module the router never
+    reads. Call inside the ``_patch_endpoint`` stack — the factory reads
+    ``main``'s globals when it runs.
+    """
+    return dataclasses.replace(
+        orchestrator.main._job_review_dependencies(),
+        require_job_access=AsyncMock(return_value=(user, job)),
+    )
 
 
 def _copied_paths(backend: FakeMainCloudBackend) -> set[str]:
@@ -170,7 +185,9 @@ class TestExportRoutingGate:
             user=user, job=job, backend=FakeMainCloudBackend(), gitea_files={}
         )
         with stack, pytest.raises(HTTPException) as ei:
-            await orchestrator.main.export_job_to_shared_folder(fake_request, job["id"])
+            await job_review_routes.export_job_to_shared_folder(
+                fake_request, job["id"], dependencies=_deps(user, job)
+            )
         assert ei.value.status_code == 409
         assert "diff-review" in ei.value.detail
 
@@ -182,7 +199,9 @@ class TestExportRoutingGate:
             user=user, job=job, backend=FakeMainCloudBackend(), gitea_files={}
         )
         with stack, pytest.raises(HTTPException) as ei:
-            await orchestrator.main.export_job_to_shared_folder(fake_request, job["id"])
+            await job_review_routes.export_job_to_shared_folder(
+                fake_request, job["id"], dependencies=_deps(user, job)
+            )
         assert ei.value.status_code == 409
 
     @pytest.mark.asyncio
@@ -203,8 +222,8 @@ class TestExportRoutingGate:
             gitea_files={"spec.yaml": b"feature: x\n"},
         )
         with stack:
-            result = await orchestrator.main.export_job_to_shared_folder(
-                fake_request, job["id"]
+            result = await job_review_routes.export_job_to_shared_folder(
+                fake_request, job["id"], dependencies=_deps(user, job)
             )
         assert result["files_copied"] == 1
         assert db.update_job_exported_folder.await_count == 1
@@ -223,8 +242,8 @@ class TestExportRoutingGate:
             gitea_files={"spec.yaml": b"x"},
         )
         with stack:
-            result = await orchestrator.main.export_job_to_shared_folder(
-                fake_request, job["id"]
+            result = await job_review_routes.export_job_to_shared_folder(
+                fake_request, job["id"], dependencies=_deps(user, job)
             )
         assert result["files_copied"] == 1
 
@@ -257,8 +276,8 @@ class TestDeliverablesCopy:
             user=user, job=job, backend=backend, gitea_files=gitea_files
         )
         with stack:
-            result = await orchestrator.main.export_job_to_shared_folder(
-                fake_request, job["id"]
+            result = await job_review_routes.export_job_to_shared_folder(
+                fake_request, job["id"], dependencies=_deps(user, job)
             )
 
         assert result["files_copied"] == 5
@@ -279,8 +298,8 @@ class TestDeliverablesCopy:
             user=user, job=job, backend=backend, gitea_files=gitea_files
         )
         with stack:
-            result = await orchestrator.main.export_job_to_shared_folder(
-                fake_request, job["id"]
+            result = await job_review_routes.export_job_to_shared_folder(
+                fake_request, job["id"], dependencies=_deps(user, job)
             )
         assert result["files_copied"] == 1
         # `output/` is NOT collapsed here: the prefix is computed over the
@@ -298,8 +317,8 @@ class TestDeliverablesCopy:
             user=user, job=job, backend=backend, gitea_files=gitea_files
         )
         with stack:
-            result = await orchestrator.main.export_job_to_shared_folder(
-                fake_request, job["id"]
+            result = await job_review_routes.export_job_to_shared_folder(
+                fake_request, job["id"], dependencies=_deps(user, job)
             )
         assert result["files_copied"] == 1
         assert _copied_paths(backend) == {"ok.md"}
@@ -314,8 +333,8 @@ class TestDeliverablesCopy:
             user=user, job=job, backend=backend, gitea_files=gitea_files
         )
         with stack:
-            result = await orchestrator.main.export_job_to_shared_folder(
-                fake_request, job["id"]
+            result = await job_review_routes.export_job_to_shared_folder(
+                fake_request, job["id"], dependencies=_deps(user, job)
             )
         assert result["files_copied"] == 2
         # `output/` is the shared wrapper and gets collapsed; `sub/` survives
@@ -332,8 +351,8 @@ class TestDeliverablesCopy:
             user=user, job=job, backend=backend, gitea_files={"spec.yaml": b"x"}
         )
         with stack:
-            result = await orchestrator.main.export_job_to_shared_folder(
-                fake_request, job["id"]
+            result = await job_review_routes.export_job_to_shared_folder(
+                fake_request, job["id"], dependencies=_deps(user, job)
             )
         assert result["files_copied"] == 1
         assert _copied_paths(backend) == {"spec.yaml"}
@@ -362,8 +381,8 @@ class TestExportSharing:
             user=user, job=job, backend=backend, gitea_files={"spec.yaml": b"x"}
         )
         with stack:
-            result = await orchestrator.main.export_job_to_shared_folder(
-                fake_request, job["id"]
+            result = await job_review_routes.export_job_to_shared_folder(
+                fake_request, job["id"], dependencies=_deps(user, job)
             )
         assert result["shared"] is True
         assert [c[0] for c in backend.calls].count("share_session_folder") == 1
@@ -379,8 +398,8 @@ class TestExportSharing:
             user=user, job=job, backend=backend, gitea_files={"spec.yaml": b"x"}
         )
         with stack:
-            result = await orchestrator.main.export_job_to_shared_folder(
-                fake_request, job["id"]
+            result = await job_review_routes.export_job_to_shared_folder(
+                fake_request, job["id"], dependencies=_deps(user, job)
             )
         assert result["shared"] is False
         assert "share_session_folder" not in [c[0] for c in backend.calls]
@@ -398,32 +417,32 @@ class TestExportSharing:
 
 class TestCommonDirPrefix:
     def test_single_file_in_a_directory(self):
-        assert orchestrator.main._common_dir_prefix(["output/digest.md"]) == "output"
+        assert job_export._common_dir_prefix(["output/digest.md"]) == "output"
 
     def test_single_file_at_root(self):
-        assert orchestrator.main._common_dir_prefix(["done.txt"]) == ""
+        assert job_export._common_dir_prefix(["done.txt"]) == ""
 
     def test_shared_head_only(self):
         assert (
-            orchestrator.main._common_dir_prefix(["repo/src/a.py", "repo/tests/b.py"])
+            job_export._common_dir_prefix(["repo/src/a.py", "repo/tests/b.py"])
             == "repo"
         )
 
     def test_nothing_shared(self):
-        assert orchestrator.main._common_dir_prefix(["spec.yaml", "repo/a.py"]) == ""
+        assert job_export._common_dir_prefix(["spec.yaml", "repo/a.py"]) == ""
 
     def test_whole_shared_path(self):
         assert (
-            orchestrator.main._common_dir_prefix(["out/deep/a.md", "out/deep/b.md"])
+            job_export._common_dir_prefix(["out/deep/a.md", "out/deep/b.md"])
             == "out/deep"
         )
 
     def test_matches_whole_segments_not_string_prefixes(self):
         # "out" is a string prefix of "output" but a different directory.
-        assert orchestrator.main._common_dir_prefix(["out/a.md", "output/b.md"]) == ""
+        assert job_export._common_dir_prefix(["out/a.md", "output/b.md"]) == ""
 
     def test_empty(self):
-        assert orchestrator.main._common_dir_prefix([]) == ""
+        assert job_export._common_dir_prefix([]) == ""
 
 
 class TestWrapperCollapse:
@@ -443,8 +462,8 @@ class TestWrapperCollapse:
             gitea_files={"output/digest.md": b"# digest"},
         )
         with stack:
-            result = await orchestrator.main.export_job_to_shared_folder(
-                fake_request, job["id"]
+            result = await job_review_routes.export_job_to_shared_folder(
+                fake_request, job["id"], dependencies=_deps(user, job)
             )
         assert result["files_copied"] == 1
         assert _copied_paths(backend) == {"digest.md"}
@@ -461,7 +480,9 @@ class TestWrapperCollapse:
             gitea_files={"output/reports/q1.md": b"q1"},
         )
         with stack:
-            await orchestrator.main.export_job_to_shared_folder(fake_request, job["id"])
+            await job_review_routes.export_job_to_shared_folder(
+                fake_request, job["id"], dependencies=_deps(user, job)
+            )
         assert _copied_paths(backend) == {"q1.md"}
 
     @pytest.mark.asyncio
@@ -477,7 +498,9 @@ class TestWrapperCollapse:
             gitea_files={p: b"x" for p in deliverables},
         )
         with stack:
-            await orchestrator.main.export_job_to_shared_folder(fake_request, job["id"])
+            await job_review_routes.export_job_to_shared_folder(
+                fake_request, job["id"], dependencies=_deps(user, job)
+            )
         # Only the shared `repo/` head comes off.
         assert _copied_paths(backend) == {"src/app.py", "tests/test_app.py"}
 
@@ -494,7 +517,9 @@ class TestWrapperCollapse:
             gitea_files={p: b"x" for p in deliverables},
         )
         with stack:
-            await orchestrator.main.export_job_to_shared_folder(fake_request, job["id"])
+            await job_review_routes.export_job_to_shared_folder(
+                fake_request, job["id"], dependencies=_deps(user, job)
+            )
         assert _copied_paths(backend) == {"spec.yaml", "output/report.md"}
 
 
@@ -512,25 +537,23 @@ class TestExportFolderName:
 
     def test_slugs_the_description_and_keeps_an_id_suffix(self):
         assert (
-            orchestrator.main._job_export_folder_name(
-                self.JOB, "You maintain a daily digest."
-            )
+            job_export._job_export_folder_name(self.JOB, "You maintain a daily digest.")
             == "you-maintain-a-daily-digest-a6fa6f2a"
         )
 
     def test_deterministic(self):
-        a = orchestrator.main._job_export_folder_name(self.JOB, "Same prompt")
-        b = orchestrator.main._job_export_folder_name(self.JOB, "Same prompt")
+        a = job_export._job_export_folder_name(self.JOB, "Same prompt")
+        b = job_export._job_export_folder_name(self.JOB, "Same prompt")
         assert a == b
 
     def test_same_description_different_jobs_do_not_collide(self):
         other = "11111111-2222-3333-4444-555555555555"
-        assert orchestrator.main._job_export_folder_name(
+        assert job_export._job_export_folder_name(
             self.JOB, "Shared prompt"
-        ) != orchestrator.main._job_export_folder_name(other, "Shared prompt")
+        ) != job_export._job_export_folder_name(other, "Shared prompt")
 
     def test_truncates_on_a_word_boundary(self):
-        name = orchestrator.main._job_export_folder_name(
+        name = job_export._job_export_folder_name(
             self.JOB,
             "Implement a small Python CLI tool in this workspace, test first",
         )
@@ -540,18 +563,16 @@ class TestExportFolderName:
         assert slug == "implement-a-small-python-cli-tool-in"
 
     def test_only_uses_the_first_line(self):
-        name = orchestrator.main._job_export_folder_name(
-            self.JOB, "Daily digest\nSecond line"
-        )
+        name = job_export._job_export_folder_name(self.JOB, "Daily digest\nSecond line")
         assert name == "daily-digest-a6fa6f2a"
 
     def test_folds_accents_rather_than_dropping_them(self):
-        assert orchestrator.main._job_export_folder_name(
+        assert job_export._job_export_folder_name(
             self.JOB, "Führe die Prüfung durch"
         ) == ("fuhre-die-prufung-durch-a6fa6f2a")
 
     def test_path_safe_charset(self):
-        name = orchestrator.main._job_export_folder_name(
+        name = job_export._job_export_folder_name(
             self.JOB, "../../etc/passwd & <script> 100% done"
         )
         assert re.fullmatch(r"[a-z0-9-]+", name), name
@@ -559,8 +580,7 @@ class TestExportFolderName:
     def test_falls_back_when_nothing_slugs(self):
         for desc in ("", "   ", "!!! ???", None):
             assert (
-                orchestrator.main._job_export_folder_name(self.JOB, desc)
-                == "job-a6fa6f2a9101"
+                job_export._job_export_folder_name(self.JOB, desc) == "job-a6fa6f2a9101"
             )
 
 
@@ -580,8 +600,8 @@ class TestExportFolderReuse:
             user=user, job=job, backend=backend, gitea_files={"spec.yaml": b"x"}
         )
         with stack:
-            result = await orchestrator.main.export_job_to_shared_folder(
-                fake_request, job["id"]
+            result = await job_review_routes.export_job_to_shared_folder(
+                fake_request, job["id"], dependencies=_deps(user, job)
             )
         assert result["folder"]["name"] == "job-682baab87864"
         assert result["folder"]["path"] == "/job-682baab87864"
@@ -598,8 +618,8 @@ class TestExportFolderReuse:
             user=user, job=job, backend=backend, gitea_files={"spec.yaml": b"x"}
         )
         with stack:
-            result = await orchestrator.main.export_job_to_shared_folder(
-                fake_request, job["id"]
+            result = await job_review_routes.export_job_to_shared_folder(
+                fake_request, job["id"], dependencies=_deps(user, job)
             )
         assert result["folder"]["name"] == "write-the-quarterly-report-682baab8"
         assert result["folder"]["path"] == "/write-the-quarterly-report-682baab8"

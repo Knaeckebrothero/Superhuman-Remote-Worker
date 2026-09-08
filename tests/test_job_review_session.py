@@ -6,7 +6,9 @@ from contextlib import ExitStack
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from fastapi import HTTPException
+from fastapi import HTTPException, params
+
+import orchestrator.main
 
 
 JOB_ID = "29c28492-df7c-4eb3-847f-38892557ac4e"
@@ -92,7 +94,7 @@ class TestReviewSessionEndpoint:
     async def test_real_job_shape_derives_the_session_without_a_request_body(
         self, user_a, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import create_job_review_session
+        from orchestrator.routers.job_review import create_job_review_session
 
         job = _job(job_a)
         fake_db.get_job = AsyncMock(return_value=job)
@@ -105,7 +107,11 @@ class TestReviewSessionEndpoint:
             _authorized(user_a, fake_db),
             patch("orchestrator.main.create_thread", created),
         ):
-            result = await create_job_review_session(fake_request, JOB_ID)
+            result = await create_job_review_session(
+                fake_request,
+                JOB_ID,
+                dependencies=orchestrator.main._job_review_dependencies(),
+            )
 
         body, forwarded_request = created.await_args.args
         assert forwarded_request is fake_request
@@ -157,7 +163,7 @@ class TestReviewSessionEndpoint:
     async def test_requires_a_recorded_pr_instead_of_guessing_from_model_prose(
         self, user_a, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import create_job_review_session
+        from orchestrator.routers.job_review import create_job_review_session
 
         fake_db.get_job = AsyncMock(
             return_value={**_job(job_a), "context": {"notes": "PR #1 is open"}}
@@ -170,7 +176,11 @@ class TestReviewSessionEndpoint:
             patch("orchestrator.main.create_thread", created),
         ):
             with pytest.raises(HTTPException) as exc:
-                await create_job_review_session(fake_request, JOB_ID)
+                await create_job_review_session(
+                    fake_request,
+                    JOB_ID,
+                    dependencies=orchestrator.main._job_review_dependencies(),
+                )
 
         assert exc.value.status_code == 409
         fake_db.resolve_datasources_for_job.assert_not_awaited()
@@ -180,7 +190,7 @@ class TestReviewSessionEndpoint:
     async def test_cross_user_is_rejected_before_connectors_or_creation(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import create_job_review_session
+        from orchestrator.routers.job_review import create_job_review_session
 
         fake_db.get_job = AsyncMock(return_value=_job(job_a))
         fake_db.resolve_datasources_for_job = AsyncMock()
@@ -191,7 +201,11 @@ class TestReviewSessionEndpoint:
             patch("orchestrator.main.create_thread", created),
         ):
             with pytest.raises(HTTPException) as exc:
-                await create_job_review_session(fake_request, JOB_ID)
+                await create_job_review_session(
+                    fake_request,
+                    JOB_ID,
+                    dependencies=orchestrator.main._job_review_dependencies(),
+                )
 
         assert exc.value.status_code == 403
         fake_db.resolve_datasources_for_job.assert_not_awaited()
@@ -201,7 +215,7 @@ class TestReviewSessionEndpoint:
     async def test_refuses_a_detached_delivery_repository(
         self, user_a, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import create_job_review_session
+        from orchestrator.routers.job_review import create_job_review_session
 
         wrong = _repository()
         wrong["connection_url"] = "https://github.com/acme/not-the-delivery.git"
@@ -214,7 +228,11 @@ class TestReviewSessionEndpoint:
             patch("orchestrator.main.create_thread", created),
         ):
             with pytest.raises(HTTPException) as exc:
-                await create_job_review_session(fake_request, JOB_ID)
+                await create_job_review_session(
+                    fake_request,
+                    JOB_ID,
+                    dependencies=orchestrator.main._job_review_dependencies(),
+                )
 
         assert exc.value.status_code == 409
         created.assert_not_awaited()
@@ -223,7 +241,7 @@ class TestReviewSessionEndpoint:
     async def test_refuses_same_repo_name_on_a_different_forge_host(
         self, user_a, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import create_job_review_session
+        from orchestrator.routers.job_review import create_job_review_session
 
         lookalike = _repository()
         lookalike["connection_url"] = (
@@ -237,15 +255,28 @@ class TestReviewSessionEndpoint:
             patch("orchestrator.main.create_thread", AsyncMock()) as created,
         ):
             with pytest.raises(HTTPException) as exc:
-                await create_job_review_session(fake_request, JOB_ID)
+                await create_job_review_session(
+                    fake_request,
+                    JOB_ID,
+                    dependencies=orchestrator.main._job_review_dependencies(),
+                )
 
         assert exc.value.status_code == 409
         created.assert_not_awaited()
 
     def test_public_contract_accepts_only_request_and_job_id(self):
-        from orchestrator.main import create_job_review_session
+        from orchestrator.routers.job_review import create_job_review_session
 
-        assert list(inspect.signature(create_job_review_session).parameters) == [
+        # ``dependencies`` is server-injected via ``Depends`` and is not part
+        # of the wire contract, so it is excluded here: what must stay pinned
+        # is that nothing else — a body least of all — is accepted.
+        assert [
+            name
+            for name, parameter in inspect.signature(
+                create_job_review_session
+            ).parameters.items()
+            if not isinstance(parameter.default, params.Depends)
+        ] == [
             "request",
             "job_id",
         ]
@@ -265,7 +296,9 @@ class TestReviewSessionEndpoint:
         assert body._trusted_seed is None
 
     def test_opening_event_is_bounded_for_large_job_deliverable_lists(self, job_a):
-        from orchestrator.main import _review_session_opening_event
+        from orchestrator.services.job_review_session import (
+            _review_session_opening_event,
+        )
         from orchestrator.services.job_delivery import parse_job_pull_request
 
         job = _job(job_a)

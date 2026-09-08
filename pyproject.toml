@@ -247,6 +247,51 @@ ignore_imports = [
 unmatched_ignore_imports_alerting = "warn"
 
 [[tool.importlinter.contracts]]
+name = "Workspace access, files, IDE proxy and cloud do not import application startup"
+type = "forbidden"
+source_modules = [
+    "orchestrator.services.ide_proxy_gateway",
+    "orchestrator.services.workspace_access",
+    "orchestrator.services.thread_files",
+    "orchestrator.services.job_repo_reads",
+    "orchestrator.services.job_diff_review",
+    "orchestrator.services.job_export",
+    "orchestrator.services.job_review_session",
+    "orchestrator.services.cloud_stage_authority",
+    "orchestrator.services.cloud_task_registry",
+    "orchestrator.services.agent_cloud_mounts",
+    "orchestrator.services.protected_cloud_engage",
+    "orchestrator.services.thread_cloud_diff",
+    "orchestrator.services.main_cloud_settings",
+    "orchestrator.routers.ide",
+    "orchestrator.routers.workspace_access",
+    "orchestrator.routers.thread_files",
+    "orchestrator.routers.job_repo",
+    "orchestrator.routers.job_diff",
+    "orchestrator.routers.job_review",
+    "orchestrator.routers.agent_cloud_stage",
+    "orchestrator.routers.thread_cloud_diff",
+    "orchestrator.routers.main_cloud_settings",
+    "orchestrator.schemas.workspace_access",
+]
+forbidden_modules = ["orchestrator.main"]
+# No B04 module imports main directly. The indirect edges below are the same
+# ones B02/B03 recorded, reached from every router through
+# orchestrator.security.access -> services.sudo_gate. Each exact edge is ignored
+# rather than setting `allow_indirect_imports`, so any NEW transitive path to
+# main would still break this contract.
+ignore_imports = [
+    # B10 owns this one (services/session_wake.py, a lazy import in a function).
+    "orchestrator.services.session_wake -> orchestrator.main",
+    # B06 owns this one (services/session_lifecycle.py).
+    "orchestrator.services.session_lifecycle -> orchestrator.main",
+    # B07 owns these two.
+    "orchestrator.services.project_backlog -> orchestrator.main",
+    "orchestrator.services.sitrep -> orchestrator.main",
+]
+unmatched_ignore_imports_alerting = "warn"
+
+[[tool.importlinter.contracts]]
 name = "Shared initializer stays lightweight"
 type = "forbidden"
 # Check the root initializer separately without including its child packages.

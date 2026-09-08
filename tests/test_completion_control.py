@@ -1,5 +1,6 @@
 """Focused M2 command-aware control admission proofs."""
 
+import dataclasses
 import json
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
@@ -16,6 +17,7 @@ from fastapi import HTTPException
 from unittest.mock import MagicMock, patch
 
 import orchestrator.main as main
+from orchestrator.routers import job_diff as job_diff_routes
 
 
 def test_control_marker_expiry_and_malformed_fail_closed():
@@ -175,8 +177,8 @@ async def test_flag_off_guard_never_builds_completion_service():
     [
         (main.resume_job, "require_internal_or_job_access"),
         (main.approve_job, "require_internal_or_job_access"),
-        (main.accept_job_diff, "require_job_access"),
-        (main.reject_job_diff, "require_job_access"),
+        (job_diff_routes.accept_job_diff, "require_job_access"),
+        (job_diff_routes.reject_job_diff, "require_job_access"),
     ],
 )
 async def test_public_control_endpoints_return_exact_409_before_mutation(
@@ -185,11 +187,12 @@ async def test_public_control_endpoints_return_exact_409_before_mutation(
     job_id = str(uuid4())
     job = {"id": job_id, "status": "pending_review", "context": {}}
     guard = AsyncMock(side_effect=HTTPException(409, "completion finalizing"))
+    authorized = AsyncMock(return_value=({}, job))
     db = MagicMock()
     db.queue_job_for_resume = AsyncMock()
     db.queue_stateless_job_for_resume = AsyncMock()
     with (
-        patch.object(main, auth_name, AsyncMock(return_value=({}, job))),
+        patch.object(main, auth_name, authorized),
         patch.object(main, "_guard_completion_control", guard),
         patch.object(main, "postgres_db", db),
     ):
@@ -199,7 +202,16 @@ async def test_public_control_endpoints_return_exact_409_before_mutation(
             elif endpoint is main.approve_job:
                 await endpoint(MagicMock(), job_id, None)
             else:
-                await endpoint(MagicMock(), job_id)
+                # The diff routes carry ``auth_name`` as a field default on
+                # their route dependencies, so the same gate is short-circuited
+                # there rather than on ``main``.
+                await endpoint(
+                    MagicMock(),
+                    job_id,
+                    dependencies=dataclasses.replace(
+                        main._job_diff_dependencies(), **{auth_name: authorized}
+                    ),
+                )
 
     assert exc.value.status_code == 409
     assert exc.value.detail == "completion finalizing"

@@ -98,7 +98,7 @@ def lint_boundaries(root):
 def test_allowed_runtime_and_lightweight_dependencies_pass(boundary_tree):
     result = lint_boundaries(boundary_tree)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "Contracts: 15 kept, 0 broken" in result.stdout
+    assert "Contracts: 16 kept, 0 broken" in result.stdout
 
 
 @pytest.mark.parametrize(

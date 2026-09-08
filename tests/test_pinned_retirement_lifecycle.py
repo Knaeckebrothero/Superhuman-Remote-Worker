@@ -1,5 +1,6 @@
 """Exact agent lifecycle projection for an authorized pinned retirement."""
 
+import dataclasses
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -12,6 +13,7 @@ from fastapi import FastAPI
 from agent.api.orchestrator_client import OrchestratorClient
 
 import orchestrator.main as main
+from orchestrator.routers import agent_cloud_stage as agent_cloud_stage_routes
 
 
 THREAD_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1"
@@ -60,12 +62,22 @@ async def test_authorized_lifecycle_projects_exact_permanent_intent(permanent):
         "X-Session-Runtime-Generation": RUNTIME_GENERATION,
         "X-Session-Runtime-Attach-Token": ATTACH_TOKEN,
     }
+    internal = AsyncMock()
     with (
-        patch.object(main, "require_internal", AsyncMock()),
         patch.object(main.postgres_db, "get_thread", AsyncMock(return_value=initial)),
         patch.object(main.postgres_db, "acquire", side_effect=acquire),
     ):
-        response = await main.agent_get_thread_lifecycle(request, THREAD_ID)
+        # ``require_internal`` is a dataclass FIELD DEFAULT on
+        # AgentCloudStageDependencies, bound at class-creation time, so
+        # patching a module attribute would never be seen. Inject it.
+        response = await agent_cloud_stage_routes.agent_get_thread_lifecycle(
+            request,
+            THREAD_ID,
+            dependencies=dataclasses.replace(
+                main._agent_cloud_stage_dependencies(), require_internal=internal
+            ),
+        )
+    internal.assert_awaited()
 
     query = " ".join(conn.fetchrow.await_args.args[0].split())
     assert "t.runtime_retirement_permanent" in query
@@ -103,12 +115,22 @@ async def test_hidden_preflight_does_not_advertise_permanent_end_intent():
         "X-Session-Runtime-Generation": RUNTIME_GENERATION,
         "X-Session-Runtime-Attach-Token": ATTACH_TOKEN,
     }
+    internal = AsyncMock()
     with (
-        patch.object(main, "require_internal", AsyncMock()),
         patch.object(main.postgres_db, "get_thread", AsyncMock(return_value=initial)),
         patch.object(main.postgres_db, "acquire", side_effect=acquire),
     ):
-        response = await main.agent_get_thread_lifecycle(request, THREAD_ID)
+        # ``require_internal`` is a dataclass FIELD DEFAULT on
+        # AgentCloudStageDependencies, bound at class-creation time, so
+        # patching a module attribute would never be seen. Inject it.
+        response = await agent_cloud_stage_routes.agent_get_thread_lifecycle(
+            request,
+            THREAD_ID,
+            dependencies=dataclasses.replace(
+                main._agent_cloud_stage_dependencies(), require_internal=internal
+            ),
+        )
+    internal.assert_awaited()
 
     assert response["status"] == "active"
     assert response["runtime_retirement_preflight"] is True

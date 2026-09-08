@@ -359,7 +359,8 @@ class TestStatsAdminOnly:
 
     @pytest.mark.asyncio
     async def test_snapshot_stats_non_admin_403(self, user_a, fake_db, fake_request):
-        from orchestrator.main import get_snapshot_stats
+        from orchestrator.main import _workspace_access_dependencies
+        from orchestrator.routers.workspace_access import get_snapshot_stats
 
         sentinel = MagicMock(side_effect=AssertionError("snapshot called past gate"))
         with (
@@ -367,12 +368,15 @@ class TestStatsAdminOnly:
             patch("orchestrator.main.snapshot_service", sentinel),
         ):
             with pytest.raises(HTTPException) as exc:
-                await get_snapshot_stats(fake_request)
+                await get_snapshot_stats(
+                    fake_request, dependencies=_workspace_access_dependencies()
+                )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
     async def test_snapshot_stats_admin_passes(self, user_admin, fake_db, fake_request):
-        from orchestrator.main import get_snapshot_stats
+        from orchestrator.main import _workspace_access_dependencies
+        from orchestrator.routers.workspace_access import get_snapshot_stats
 
         fake_svc = MagicMock()
         fake_svc.get_storage_stats = AsyncMock(return_value={"total_bytes": 0})
@@ -380,7 +384,9 @@ class TestStatsAdminOnly:
             _patch_caller_and_db(user_admin, fake_db),
             patch("orchestrator.main.snapshot_service", fake_svc),
         ):
-            result = await get_snapshot_stats(fake_request)
+            result = await get_snapshot_stats(
+                fake_request, dependencies=_workspace_access_dependencies()
+            )
         assert result == {"total_bytes": 0}
 
 

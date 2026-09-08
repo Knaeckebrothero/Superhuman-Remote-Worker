@@ -13,6 +13,7 @@ The client runs over a real ``httpx.MockTransport`` so the assertion is on
 the bytes that would hit the wire, not on a string handed to a mock.
 """
 
+import dataclasses
 import importlib
 import json
 import os
@@ -23,6 +24,7 @@ import pytest
 
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
+from orchestrator.routers import job_repo as job_repo_routes  # noqa: E402
 from orchestrator.services import gitea as gitea_mod  # noqa: E402
 from orchestrator.services.gitea import (  # noqa: E402
     GiteaPathError,
@@ -321,28 +323,35 @@ class TestProxyRoutes:
         with (
             patch.object(orch_main, "gitea_client", gc),
             patch.object(
-                orch_main,
-                "require_job_access",
-                AsyncMock(return_value=(admin, {"id": "job-1"})),
-            ),
-            patch.object(
                 orch_main, "resolve_job_repo", AsyncMock(return_value=(REPO, None))
             ),
         ):
+            # ``require_job_access`` is a field default on the route
+            # dependencies, so the gate is replaced there rather than patched
+            # on a module the router never reads.
+            deps = dataclasses.replace(
+                orch_main._job_repo_dependencies(),
+                require_job_access=AsyncMock(return_value=(admin, {"id": "job-1"})),
+            )
             with pytest.raises(GiteaPathError):
-                await orch_main.get_repo_file(
+                await job_repo_routes.get_repo_file(
                     _request(),
                     "job-1",
                     path="../../other/repo/contents/README.md",
                     ref=None,
+                    dependencies=deps,
                 )
             with pytest.raises(GiteaPathError):
-                await orch_main.list_repo_contents(
-                    _request(), "job-1", path="..%2F..%2Fother", ref=None
+                await job_repo_routes.list_repo_contents(
+                    _request(),
+                    "job-1",
+                    path="..%2F..%2Fother",
+                    ref=None,
+                    dependencies=deps,
                 )
             with pytest.raises(GiteaPathError):
-                await orch_main.get_repo_diff(
-                    _request(), "job-1", base="../../x", head="HEAD"
+                await job_repo_routes.get_repo_diff(
+                    _request(), "job-1", base="../../x", head="HEAD", dependencies=deps
                 )
         assert seen == []
 

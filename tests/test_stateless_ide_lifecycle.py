@@ -36,10 +36,29 @@ def _valid_sandbox_thread(**metadata_overrides):
     }
 
 
+def _ide_dependencies(db, proxy, **gates):
+    """Bind the IDE router's collaborators the way the application does.
+
+    ``store`` and ``ide_proxy`` used to be ``main`` globals these tests
+    patched; they are dataclass fields now, and the auth gates are fields too
+    rather than module attributes, so an override has to be passed in.
+    """
+    from orchestrator.routers.ide import IdeDependencies
+
+    return IdeDependencies(
+        store=db,
+        ide_sessions=MagicMock(),
+        ide_proxy=proxy,
+        **gates,
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["suspended", "ended"])
 async def test_stale_ready_stateless_ide_refuses_nonactive_lifecycle(status):
-    from orchestrator import main
+    from orchestrator.services.ide_proxy_gateway import (
+        _require_stateless_ide_lifecycle,
+    )
 
     thread = {
         "id": "thread-a",
@@ -49,12 +68,9 @@ async def test_stale_ready_stateless_ide_refuses_nonactive_lifecycle(status):
     }
     db = MagicMock()
     db.get_thread = AsyncMock(return_value=thread)
-    with (
-        patch.object(main, "postgres_db", db),
-        patch.object(main, "ide_proxy_service", MagicMock()) as proxy,
-        pytest.raises(HTTPException) as exc,
-    ):
-        await main._require_stateless_ide_lifecycle("thread-a")
+    proxy = MagicMock()
+    with pytest.raises(HTTPException) as exc:
+        await _require_stateless_ide_lifecycle("thread-a", store=db, ide_proxy=proxy)
 
     assert exc.value.status_code == 409
     proxy.evict.assert_called_once_with("thread-a")
@@ -72,7 +88,9 @@ async def test_stale_ready_stateless_ide_refuses_nonactive_lifecycle(status):
 )
 @pytest.mark.parametrize("value", [None, False, 0, "", [], {}])
 async def test_present_falsey_stop_marker_refuses_ide(marker_key, value):
-    from orchestrator import main
+    from orchestrator.services.ide_proxy_gateway import (
+        _require_stateless_ide_lifecycle,
+    )
 
     thread = {
         "id": "thread-a",
@@ -82,12 +100,10 @@ async def test_present_falsey_stop_marker_refuses_ide(marker_key, value):
     }
     db = MagicMock()
     db.get_thread = AsyncMock(return_value=thread)
-    with (
-        patch.object(main, "postgres_db", db),
-        patch.object(main, "ide_proxy_service", MagicMock()),
-        pytest.raises(HTTPException) as exc,
-    ):
-        await main._require_stateless_ide_lifecycle("thread-a")
+    with pytest.raises(HTTPException) as exc:
+        await _require_stateless_ide_lifecycle(
+            "thread-a", store=db, ide_proxy=MagicMock()
+        )
 
     assert exc.value.status_code == 409
 
@@ -112,17 +128,16 @@ async def test_present_falsey_stop_marker_refuses_ide(marker_key, value):
 async def test_stateless_ide_refuses_unsupported_session_class_or_workspace(
     config_override,
 ):
-    from orchestrator import main
+    from orchestrator.services.ide_proxy_gateway import (
+        _require_stateless_ide_lifecycle,
+    )
 
     thread = _valid_sandbox_thread(config_override=config_override)
     db = MagicMock()
     db.get_thread = AsyncMock(return_value=thread)
-    with (
-        patch.object(main, "postgres_db", db),
-        patch.object(main, "ide_proxy_service", MagicMock()) as proxy,
-        pytest.raises(HTTPException) as exc,
-    ):
-        await main._require_stateless_ide_lifecycle("thread-a")
+    proxy = MagicMock()
+    with pytest.raises(HTTPException) as exc:
+        await _require_stateless_ide_lifecycle("thread-a", store=db, ide_proxy=proxy)
 
     assert exc.value.status_code == 409
     proxy.evict.assert_called_once_with("thread-a")
@@ -130,7 +145,9 @@ async def test_stateless_ide_refuses_unsupported_session_class_or_workspace(
 
 @pytest.mark.asyncio
 async def test_valid_stateless_sandbox_ide_is_admitted_and_pinned_is_unchanged():
-    from orchestrator import main
+    from orchestrator.services.ide_proxy_gateway import (
+        _require_stateless_ide_lifecycle,
+    )
 
     db = MagicMock()
     db.get_thread = AsyncMock(
@@ -144,19 +161,16 @@ async def test_valid_stateless_sandbox_ide_is_admitted_and_pinned_is_unchanged()
             },
         ]
     )
-    with (
-        patch.object(main, "postgres_db", db),
-        patch.object(main, "ide_proxy_service", MagicMock()) as proxy,
-    ):
-        await main._require_stateless_ide_lifecycle("thread-a")
-        await main._require_stateless_ide_lifecycle("thread-pinned")
+    proxy = MagicMock()
+    await _require_stateless_ide_lifecycle("thread-a", store=db, ide_proxy=proxy)
+    await _require_stateless_ide_lifecycle("thread-pinned", store=db, ide_proxy=proxy)
 
     proxy.evict.assert_called_once_with("thread-a")
 
 
 @pytest.mark.asyncio
 async def test_http_virtual_stateless_ide_refuses_before_proxy_resolution():
-    from orchestrator import main
+    from orchestrator.routers.ide import ide_proxy_http
 
     thread = _valid_sandbox_thread(
         config_override={"workspace": {"backend": "virtual"}}
@@ -168,16 +182,18 @@ async def test_http_virtual_stateless_ide_refuses_before_proxy_resolution():
     request = MagicMock()
     request.headers = {}
     request.method = "GET"
-    with (
-        patch.object(main, "postgres_db", db),
-        patch.object(main, "ide_proxy_service", proxy),
-        patch.object(
-            main, "require_approved_user", AsyncMock(return_value={"id": "u"})
-        ),
-        patch.object(main, "user_can_access_ide_entity", AsyncMock(return_value=True)),
-        pytest.raises(HTTPException) as exc,
-    ):
-        await main.ide_proxy_http(request, "thread-a", "")
+    with pytest.raises(HTTPException) as exc:
+        await ide_proxy_http(
+            request,
+            "thread-a",
+            "",
+            dependencies=_ide_dependencies(
+                db,
+                proxy,
+                require_approved_user=AsyncMock(return_value={"id": "u"}),
+                user_can_access_ide_entity=AsyncMock(return_value=True),
+            ),
+        )
 
     assert exc.value.status_code == 409
     proxy.resolve_pod_ip.assert_not_awaited()
@@ -185,7 +201,7 @@ async def test_http_virtual_stateless_ide_refuses_before_proxy_resolution():
 
 @pytest.mark.asyncio
 async def test_ws_malformed_stateless_class_refuses_before_proxy_resolution():
-    from orchestrator import main
+    from orchestrator.routers.ide import ide_proxy_ws
 
     thread = _valid_sandbox_thread(
         config_override={
@@ -199,17 +215,17 @@ async def test_ws_malformed_stateless_class_refuses_before_proxy_resolution():
     proxy.resolve_pod_ip = AsyncMock()
     ws = MagicMock()
     ws.close = AsyncMock()
-    with (
-        patch.object(main, "postgres_db", db),
-        patch.object(main, "ide_proxy_service", proxy),
-        patch.object(
-            main,
-            "resolve_ws_user",
-            AsyncMock(return_value={"id": "u", "is_approved": True}),
+    await ide_proxy_ws(
+        ws,
+        "thread-a",
+        "",
+        dependencies=_ide_dependencies(
+            db,
+            proxy,
+            resolve_ws_user=AsyncMock(return_value={"id": "u", "is_approved": True}),
+            user_can_access_ide_entity=AsyncMock(return_value=True),
         ),
-        patch.object(main, "user_can_access_ide_entity", AsyncMock(return_value=True)),
-    ):
-        await main.ide_proxy_ws(ws, "thread-a", "")
+    )
 
     ws.close.assert_awaited_once_with(
         code=4409,
@@ -220,7 +236,7 @@ async def test_ws_malformed_stateless_class_refuses_before_proxy_resolution():
 
 @pytest.mark.asyncio
 async def test_http_stateless_remote_is_contained_before_network_connect():
-    from orchestrator import main
+    from orchestrator.routers.ide import ide_proxy_http
 
     db = MagicMock()
     db.get_thread = AsyncMock(return_value=_valid_sandbox_thread())
@@ -240,12 +256,6 @@ async def test_http_stateless_remote_is_contained_before_network_connect():
     request.url.query = ""
     request.client = None
     with (
-        patch.object(main, "postgres_db", db),
-        patch.object(main, "ide_proxy_service", proxy),
-        patch.object(
-            main, "require_approved_user", AsyncMock(return_value={"id": "u"})
-        ),
-        patch.object(main, "user_can_access_ide_entity", AsyncMock(return_value=True)),
         patch(
             "orchestrator.services.ssh_helpers.orchestrator_can_reach",
             return_value=True,
@@ -253,7 +263,17 @@ async def test_http_stateless_remote_is_contained_before_network_connect():
         patch("httpx.AsyncClient") as client,
         pytest.raises(HTTPException) as exc,
     ):
-        await main.ide_proxy_http(request, "thread-a", "workspace")
+        await ide_proxy_http(
+            request,
+            "thread-a",
+            "workspace",
+            dependencies=_ide_dependencies(
+                db,
+                proxy,
+                require_approved_user=AsyncMock(return_value={"id": "u"}),
+                user_can_access_ide_entity=AsyncMock(return_value=True),
+            ),
+        )
 
     assert exc.value.status_code == 503
     assert exc.value.detail["code"] == "ide_remote_transport_unavailable"
@@ -270,7 +290,7 @@ async def test_ws_stateless_remote_without_a_credential_is_refused():
     still decided before `accept()` and before any upstream handshake, so a
     browser never gets an open socket it cannot use.
     """
-    from orchestrator import main
+    from orchestrator.routers.ide import ide_proxy_ws
 
     db = MagicMock()
     db.get_thread = AsyncMock(return_value=_valid_sandbox_thread())
@@ -315,21 +335,25 @@ async def test_ws_stateless_remote_without_a_credential_is_refused():
         return _Connection()
 
     with (
-        patch.object(main, "postgres_db", db),
-        patch.object(main, "ide_proxy_service", proxy),
-        patch.object(
-            main,
-            "resolve_ws_user",
-            AsyncMock(return_value={"id": "u", "is_approved": True}),
-        ),
-        patch.object(main, "user_can_access_ide_entity", AsyncMock(return_value=True)),
         patch(
             "orchestrator.services.ssh_helpers.orchestrator_can_reach",
             return_value=True,
         ),
         patch("websockets.connect", side_effect=connect),
     ):
-        await main.ide_proxy_ws(ws, "thread-a", "workspace")
+        await ide_proxy_ws(
+            ws,
+            "thread-a",
+            "workspace",
+            dependencies=_ide_dependencies(
+                db,
+                proxy,
+                resolve_ws_user=AsyncMock(
+                    return_value={"id": "u", "is_approved": True}
+                ),
+                user_can_access_ide_entity=AsyncMock(return_value=True),
+            ),
+        )
 
     assert connected_urls == []
     ws.accept.assert_not_awaited()

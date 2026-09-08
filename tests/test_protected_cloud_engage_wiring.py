@@ -4,6 +4,22 @@ Task B8 ties Slice A's fail-closed ``engage_ro_mount`` gate to thread create:
 a protected thread with a Nextcloud project mount gets engaged once, and a
 refusal is recorded on the thread's metadata WITHOUT raising — the session
 must still boot (with no cloud mount), never fall back to a live mount.
+
+R1.B04 moved the engage machinery to ``services.protected_cloud_engage`` and
+the mount builders to ``services.agent_cloud_mounts``; ``main`` keeps thin
+wrappers for the callers it still owns. So a patch target here is chosen by
+who resolves the name:
+
+* names still resolved *inside* ``main`` (``_schedule_protected_engage`` as
+  ``resume_thread`` calls it, ``_reserve_session_attach_binding``) stay
+  patched on ``main``;
+* names a moved function resolves in its own module (``engage_ro_mount``,
+  ``_protected_cloud_delivery_state``, ``_record_protected_error``,
+  ``_engage_protected_cloud_for_thread``) are patched on that module —
+  patching them on ``main`` would silently not intercept;
+* collaborators main's dependency factories read live (``postgres_db``,
+  ``main_cloud_router``, ``_is_protected_cloud_mode_enabled``) stay patched on
+  ``main``, and the dependencies object is built inside the patch stack.
 """
 
 from __future__ import annotations
@@ -27,6 +43,7 @@ import orchestrator.main
 # here made ``except RoEngageRefused`` in main.py never match the instance this
 # test's side_effect raises, silently mis-testing the refusal path (it fell
 # through to the generic ``except Exception`` branch instead).
+from orchestrator.services import protected_cloud_engage as engage_service
 from orchestrator.services.cloud.ro_engage import RoEngageRefused
 from orchestrator.services.cloud.protected_reader_authority import (
     ProtectedNextcloudReaderGrantPlan,
@@ -82,6 +99,17 @@ _PROTECTED_MOUNT_ROWS = [
         ),
     }
 ]
+
+
+def _engage_task_registry() -> dict:
+    """The live protected-engage slot table.
+
+    R1.B04 replaced main's ``_protected_engage_tasks`` module dict with the
+    ``protected_engage`` half of the application-owned ``CloudTaskRegistry``.
+    The property hands back the *same* dict the code reads, so seeding a
+    sentinel and asserting eviction both still work.
+    """
+    return orchestrator.main.cloud_task_registry.protected_engage_tasks
 
 
 def _engage_runtime_thread() -> dict:
@@ -176,7 +204,7 @@ async def test_runtime_ready_probe_rechecks_lifecycle_after_reader_await():
     delivery_started = asyncio.Event()
     release_delivery = asyncio.Event()
 
-    async def delayed_delivery(_thread, _metadata):
+    async def delayed_delivery(_thread, _metadata, **_kwargs):
         delivery_started.set()
         await release_delivery.wait()
         return "ready", None
@@ -185,11 +213,14 @@ async def test_runtime_ready_probe_rechecks_lifecycle_after_reader_await():
     get_thread = AsyncMock(side_effect=[live, live, ended])
     with (
         patch.object(orchestrator.main.postgres_db, "get_thread", get_thread),
+        # The probe body lives in the service now and resolves the delivery
+        # helper in its own namespace; patching main's wrapper would leave the
+        # real probe running and this test waiting on an event nobody sets.
         patch.object(
-            orchestrator.main,
+            engage_service,
             "_protected_cloud_delivery_state",
             side_effect=delayed_delivery,
-        ),
+        ) as delivery,
     ):
         probe = asyncio.create_task(
             orchestrator.main._await_protected_cloud_runtime_ready(
@@ -201,6 +232,7 @@ async def test_runtime_ready_probe_rechecks_lifecycle_after_reader_await():
         assert await probe is False
 
     assert get_thread.await_count == 3
+    delivery.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -227,11 +259,13 @@ async def test_attach_inner_reader_flip_fails_without_scheduling_engage():
             orchestrator.main.postgres_db, "get_thread", AsyncMock(return_value=thread)
         ),
         patch.object(
-            orchestrator.main,
+            engage_service,
             "_protected_cloud_delivery_state",
             AsyncMock(return_value=("engaging", None)),
-        ),
-        patch.object(orchestrator.main, "_schedule_protected_engage") as schedule,
+        ) as delivery,
+        # The scheduler this gate must NOT reach is the one the probe would
+        # resolve — in the service module, not main's wrapper.
+        patch.object(engage_service, "_schedule_protected_engage") as schedule,
         patch.object(orchestrator.main, "_reserve_session_attach_binding", reserve),
     ):
         result = await asyncio.wait_for(
@@ -244,6 +278,9 @@ async def test_attach_inner_reader_flip_fails_without_scheduling_engage():
         )
 
     assert result is False
+    # The stub really is the one the probe consulted: the refusal below is its
+    # "engaging" verdict, and the real helper would have hit the mocked store.
+    delivery.assert_awaited_once()
     schedule.assert_not_called()
     reserve.assert_not_awaited()
 
@@ -276,7 +313,7 @@ async def test_engage_called_for_protected_thread_with_project_mount():
             "get_ro_mount_by_thread",
             AsyncMock(return_value=None),
         ),
-        patch.object(orchestrator.main, "engage_ro_mount", new=AsyncMock()) as engage,
+        patch.object(engage_service, "engage_ro_mount", new=AsyncMock()) as engage,
         patch.object(
             orchestrator.main.main_cloud_router, "for_backend_instance"
         ) as for_backend,
@@ -285,12 +322,13 @@ async def test_engage_called_for_protected_thread_with_project_mount():
         ),
     ):
         for_backend.return_value = object()
-        await orchestrator.main._engage_protected_cloud_for_thread(
+        await engage_service._engage_protected_cloud_for_thread(
             _ENGAGE_THREAD_ID,
             user_id="user-1",
             mount_rows=mount_rows,
             metadata={},
             runtime_generation=_ENGAGE_GENERATION,
+            dependencies=orchestrator.main._protected_cloud_engage_dependencies(),
         )
     engage.assert_awaited_once()
 
@@ -326,7 +364,7 @@ async def test_engage_success_clears_stale_protected_cloud_error():
             "get_ro_mount_by_thread",
             AsyncMock(return_value=None),
         ),
-        patch.object(orchestrator.main, "engage_ro_mount", new=AsyncMock()),
+        patch.object(engage_service, "engage_ro_mount", new=AsyncMock()),
         patch.object(
             orchestrator.main.main_cloud_router, "for_backend_instance"
         ) as for_backend,
@@ -335,12 +373,13 @@ async def test_engage_success_clears_stale_protected_cloud_error():
         ),
     ):
         for_backend.return_value = object()
-        await orchestrator.main._engage_protected_cloud_for_thread(
+        await engage_service._engage_protected_cloud_for_thread(
             _ENGAGE_THREAD_ID,
             user_id="user-1",
             mount_rows=mount_rows,
             metadata={},
             runtime_generation=_ENGAGE_GENERATION,
+            dependencies=orchestrator.main._protected_cloud_engage_dependencies(),
         )
 
     # Verify the metadata-key-delete statement was executed
@@ -374,7 +413,7 @@ async def test_engage_refusal_records_error_and_does_not_raise():
             AsyncMock(return_value=None),
         ),
         patch.object(
-            orchestrator.main,
+            engage_service,
             "engage_ro_mount",
             new=AsyncMock(side_effect=RoEngageRefused("floor")),
         ),
@@ -384,18 +423,19 @@ async def test_engage_refusal_records_error_and_does_not_raise():
             return_value=object(),
         ),
         patch.object(
-            orchestrator.main,
+            engage_service,
             "_record_protected_error",
             new=AsyncMock(side_effect=lambda tid, msg, **_kwargs: recorded.append(msg)),
         ),
     ):
         # must NOT raise — a refusal is recorded, the session boots with no mount
-        await orchestrator.main._engage_protected_cloud_for_thread(
+        await engage_service._engage_protected_cloud_for_thread(
             _ENGAGE_THREAD_ID,
             user_id="user-1",
             mount_rows=mount_rows,
             metadata={},
             runtime_generation=_ENGAGE_GENERATION,
+            dependencies=orchestrator.main._protected_cloud_engage_dependencies(),
         )
     assert recorded and "refused" in recorded[0]
 
@@ -416,13 +456,15 @@ _ACTIVE_NC_ROW = {
 
 @pytest.mark.asyncio
 async def test_schedule_protected_engage_registers_and_clears_task():
-    """_schedule_protected_engage must register the task in
-    _protected_engage_tasks immediately (before it runs) and clear the slot
+    """_schedule_protected_engage must register the task in the
+    protected-engage registry immediately (before it runs) and clear the slot
     once it completes — the GC hazard + registry lookup this whole wave
     depends on."""
     with (
+        # ``_schedule_protected_engage``'s task body resolves the engage
+        # coroutine in the service module; main has no such attribute.
         patch.object(
-            orchestrator.main, "_engage_protected_cloud_for_thread", new=AsyncMock()
+            engage_service, "_engage_protected_cloud_for_thread", new=AsyncMock()
         ) as engage,
         patch.object(
             orchestrator.main.postgres_db,
@@ -436,9 +478,9 @@ async def test_schedule_protected_engage_registers_and_clears_task():
             mount_rows=[],
             runtime_generation=_ENGAGE_GENERATION,
         )
-        assert orchestrator.main._protected_engage_tasks.get(_ENGAGE_TASK_KEY) is task
+        assert _engage_task_registry().get(_ENGAGE_TASK_KEY) is task
         await task
-    assert _ENGAGE_TASK_KEY not in orchestrator.main._protected_engage_tasks
+    assert _ENGAGE_TASK_KEY not in _engage_task_registry()
     engage.assert_awaited_once()
 
 
@@ -497,7 +539,7 @@ async def test_cross_replica_same_generation_engage_mints_only_once():
             "get_ro_mount_by_thread",
             AsyncMock(side_effect=lambda _tid: state["row"]),
         ),
-        patch.object(orchestrator.main, "engage_ro_mount", engage),
+        patch.object(engage_service, "engage_ro_mount", engage),
         patch.object(
             orchestrator.main.main_cloud_router,
             "for_backend_instance",
@@ -545,7 +587,7 @@ async def test_build_agent_cloud_mount_awaits_inflight_engage_task_then_returns_
         return None
 
     task = asyncio.create_task(_noop())
-    orchestrator.main._protected_engage_tasks[_ENGAGE_TASK_KEY] = task
+    _engage_task_registry()[_ENGAGE_TASK_KEY] = task
 
     calls = {"n": 0}
 
@@ -573,7 +615,7 @@ async def test_build_agent_cloud_mount_awaits_inflight_engage_task_then_returns_
                 },
             )
     finally:
-        orchestrator.main._protected_engage_tasks.pop(_ENGAGE_TASK_KEY, None)
+        _engage_task_registry().pop(_ENGAGE_TASK_KEY, None)
         if not task.done():
             task.cancel()
 
@@ -598,7 +640,7 @@ async def test_build_agent_cloud_mount_inflight_task_timeout_still_fails_closed(
         await asyncio.Event().wait()  # never completes on its own
 
     task = asyncio.create_task(_hang())
-    orchestrator.main._protected_engage_tasks[_ENGAGE_TASK_KEY] = task
+    _engage_task_registry()[_ENGAGE_TASK_KEY] = task
 
     try:
         with (
@@ -608,11 +650,11 @@ async def test_build_agent_cloud_mount_inflight_task_timeout_still_fails_closed(
             patch(
                 "orchestrator.main.postgres_db.get_ro_mount_by_thread",
                 new=AsyncMock(return_value=None),
-            ),
+            ) as get_row,
             patch(
-                "orchestrator.main.asyncio.wait_for",
+                "orchestrator.services.agent_cloud_mounts.asyncio.wait_for",
                 new=AsyncMock(side_effect=asyncio.TimeoutError()),
-            ),
+            ) as wait_for,
         ):
             payload = await _build_agent_cloud_mount(
                 _engage_runtime_thread(),
@@ -622,8 +664,14 @@ async def test_build_agent_cloud_mount_inflight_task_timeout_still_fails_closed(
                     "workspace_container": {"status": "ready", "pod_ip": "10.42.0.10"},
                 },
             )
+            # The bounded wait really was the patched one (the real one would
+            # have blocked on ``_hang`` for its full 30s), and the flag patch
+            # really did open the protected branch — otherwise the row lookup
+            # would never have run at all.
+            wait_for.assert_awaited_once()
+            assert get_row.await_count == 2
     finally:
-        orchestrator.main._protected_engage_tasks.pop(_ENGAGE_TASK_KEY, None)
+        _engage_task_registry().pop(_ENGAGE_TASK_KEY, None)
         task.cancel()
 
     assert payload is None
@@ -642,7 +690,7 @@ async def test_build_agent_cloud_mount_skips_poll_when_error_already_recorded(
 
     monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
     monkeypatch.delenv("CLOUD_RCLONE_ALLOW_CONTAINER", raising=False)
-    orchestrator.main._protected_engage_tasks.pop(_ENGAGE_TASK_KEY, None)
+    _engage_task_registry().pop(_ENGAGE_TASK_KEY, None)
 
     with (
         patch("orchestrator.main._is_protected_cloud_mode_enabled", return_value=True),
@@ -650,7 +698,9 @@ async def test_build_agent_cloud_mount_skips_poll_when_error_already_recorded(
             "orchestrator.main.postgres_db.get_ro_mount_by_thread",
             new=AsyncMock(return_value=None),
         ) as get_row,
-        patch("orchestrator.main.asyncio.sleep", new=AsyncMock()) as sleep,
+        patch(
+            "orchestrator.services.agent_cloud_mounts.asyncio.sleep", new=AsyncMock()
+        ) as sleep,
     ):
         payload = await _build_agent_cloud_mount(
             _engage_runtime_thread(),
@@ -676,7 +726,7 @@ async def test_build_agent_cloud_mount_poll_finds_row_before_cap(monkeypatch):
 
     monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
     monkeypatch.delenv("CLOUD_RCLONE_ALLOW_CONTAINER", raising=False)
-    orchestrator.main._protected_engage_tasks.pop(_ENGAGE_TASK_KEY, None)
+    _engage_task_registry().pop(_ENGAGE_TASK_KEY, None)
 
     calls = {"n": 0}
 
@@ -690,7 +740,9 @@ async def test_build_agent_cloud_mount_poll_finds_row_before_cap(monkeypatch):
             "orchestrator.main.postgres_db.get_ro_mount_by_thread",
             new=AsyncMock(side_effect=_get_row),
         ),
-        patch("orchestrator.main.asyncio.sleep", new=AsyncMock()) as sleep,
+        patch(
+            "orchestrator.services.agent_cloud_mounts.asyncio.sleep", new=AsyncMock()
+        ) as sleep,
     ):
         payload = await _build_agent_cloud_mount(
             _engage_runtime_thread(),

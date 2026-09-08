@@ -1243,7 +1243,8 @@ async def test_build_agent_cloud_mount_protected_marker_no_row_returns_none(
 ):
     """(d) marker + flag ON + container runtime + no active row -> None.
 
-    No task is registered in ``_protected_engage_tasks`` for this thread_id
+    No task is registered in ``cloud_task_registry.protected_engage_tasks``
+    for this thread_id
     and no ``protected_cloud_error`` is recorded, so this exercises F-I1's
     poll-exhaustion path (3x get_ro_mount_by_thread, sleep(3) between) —
     ``asyncio.sleep`` is patched so the 9s worst case doesn't slow the suite.
@@ -1256,7 +1257,7 @@ async def test_build_agent_cloud_mount_protected_marker_no_row_returns_none(
     # Defensive: no in-flight engage task registered for this thread_id (a
     # leaked registration from another test would take the await-task branch
     # instead of the poll branch this test targets).
-    orchestrator.main._protected_engage_tasks.pop(
+    orchestrator.main.cloud_task_registry.protected_engage_tasks.pop(
         (_THREAD_ID, _RUNTIME_GENERATION), None
     )
     with (

@@ -8,6 +8,7 @@ disposition, and the live endpoints select the right freeze behavior.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from contextlib import ExitStack, asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -18,6 +19,7 @@ from fastapi import HTTPException
 
 import orchestrator.main
 from orchestrator.database.postgres import PostgresDB
+from orchestrator.routers import job_diff as job_diff_routes
 
 JOB_ID = "11111111-1111-1111-1111-111111111111"
 AGENT_ID = "22222222-2222-2222-2222-222222222222"
@@ -896,12 +898,6 @@ class TestDiffDecisionClassA:
         router.for_backend.return_value = backend
 
         with ExitStack() as stack:
-            stack.enter_context(
-                patch(
-                    "orchestrator.main.require_job_access",
-                    AsyncMock(return_value=({}, job)),
-                )
-            )
             stack.enter_context(patch("orchestrator.main.postgres_db", db))
             stack.enter_context(patch("orchestrator.main.gitea_client", gitea))
             stack.enter_context(patch("orchestrator.main.main_cloud_router", router))
@@ -941,7 +937,14 @@ class TestDiffDecisionClassA:
                     AsyncMock(return_value={"actions": []}),
                 )
             )
-            result = await orchestrator.main.accept_job_diff(MagicMock(), JOB_ID)
+            result = await job_diff_routes.accept_job_diff(
+                MagicMock(),
+                JOB_ID,
+                dependencies=dataclasses.replace(
+                    orchestrator.main._job_diff_dependencies(),
+                    require_job_access=AsyncMock(return_value=({}, job)),
+                ),
+            )
 
         [(sql, _args)] = db.class_a_statements()
         assert (
@@ -963,12 +966,6 @@ class TestDiffDecisionClassA:
         gitea = MagicMock()
 
         with ExitStack() as stack:
-            stack.enter_context(
-                patch(
-                    "orchestrator.main.require_job_access",
-                    AsyncMock(return_value=({}, job)),
-                )
-            )
             stack.enter_context(patch("orchestrator.main.postgres_db", db))
             stack.enter_context(patch("orchestrator.main.gitea_client", gitea))
             stack.enter_context(patch("orchestrator.main.vector_db", None))
@@ -978,7 +975,14 @@ class TestDiffDecisionClassA:
                     AsyncMock(return_value={"actions": []}),
                 )
             )
-            result = await orchestrator.main.reject_job_diff(MagicMock(), JOB_ID)
+            result = await job_diff_routes.reject_job_diff(
+                MagicMock(),
+                JOB_ID,
+                dependencies=dataclasses.replace(
+                    orchestrator.main._job_diff_dependencies(),
+                    require_job_access=AsyncMock(return_value=({}, job)),
+                ),
+            )
 
         [(sql, _args)] = db.class_a_statements()
         assert (
