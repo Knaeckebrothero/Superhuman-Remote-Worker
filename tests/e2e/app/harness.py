@@ -193,7 +193,11 @@ APPLICATION_E2E_PROFILES: Final = {
         execution_lane="stateless",
         include_workspace_image=True,
         additional_deployments=("srw-e2e-agent-stateless", "srw-e2e-nextcloud"),
-        additional_statefulsets=("srw-e2e-gitea",),
+        # Garage is the bundled object store. It is waited on here, not merely
+        # deployed: staging a captured overlay writes a tar through
+        # `snapshot_service.upload_blob_file`, so a protected session whose
+        # store is not up yet stages nothing and reports an empty diff.
+        additional_statefulsets=("srw-e2e-gitea", "srw-e2e-garage"),
         stateless_agents=True,
         forge_enabled=True,
         cloud_enabled=True,
@@ -302,6 +306,18 @@ class SecretBundle:
     #: workspace. It is minted into its own Secret, named by the cloud profile's
     #: ``nextcloud.protectedEffect.hmacSecretName``.
     protected_effect_hmac_key: str = dataclasses.field(repr=False)
+    #: The bundled object store's credentials. Garage's `key/import` accepts
+    #: only its native format, and `secret.yaml` refuses anything else rather
+    #: than generating a replacement, so these are not free-form tokens:
+    #: the RPC secret and each S3 secret are 64 hex characters, and an access
+    #: key id is "GK" followed by 24. An id and its secret are one credential
+    #: and are minted together.
+    garage_rpc_secret: str = dataclasses.field(repr=False)
+    garage_admin_token: str = dataclasses.field(repr=False)
+    snapshot_s3_access_key_id: str = dataclasses.field(repr=False)
+    snapshot_s3_secret_access_key: str = dataclasses.field(repr=False)
+    virtual_workspace_s3_access_key_id: str = dataclasses.field(repr=False)
+    virtual_workspace_s3_secret_access_key: str = dataclasses.field(repr=False)
 
     @classmethod
     def generate(cls, run_id: str) -> SecretBundle:
@@ -333,6 +349,12 @@ class SecretBundle:
             gitea_admin_password=token(36),
             # The chart floor is 32 bytes; 48 matches its own randAlphaNum(48).
             protected_effect_hmac_key=token(48),
+            garage_rpc_secret=secrets.token_hex(32),
+            garage_admin_token=token(24),
+            snapshot_s3_access_key_id=f"GK{secrets.token_hex(12)}",
+            snapshot_s3_secret_access_key=secrets.token_hex(32),
+            virtual_workspace_s3_access_key_id=f"GK{secrets.token_hex(12)}",
+            virtual_workspace_s3_secret_access_key=secrets.token_hex(32),
         )
 
     @classmethod
@@ -384,6 +406,19 @@ class SecretBundle:
             # mount. Nextcloud's setup hook creates `agent-service` with this
             # exact value, so the two sides must agree.
             "NEXTCLOUD_AGENT_PASSWORD": self.nextcloud_agent_password,
+            # Minted unconditionally like the rest: the profile that enables
+            # the bundled object store pulls these in, and a key the harness
+            # does not mint is a pod that never starts.
+            "GARAGE_RPC_SECRET": self.garage_rpc_secret,
+            "GARAGE_ADMIN_TOKEN": self.garage_admin_token,
+            "SNAPSHOT_S3_ACCESS_KEY_ID": self.snapshot_s3_access_key_id,
+            "SNAPSHOT_S3_SECRET_ACCESS_KEY": self.snapshot_s3_secret_access_key,
+            "VIRTUAL_WORKSPACE_S3_ACCESS_KEY_ID": (
+                self.virtual_workspace_s3_access_key_id
+            ),
+            "VIRTUAL_WORKSPACE_S3_SECRET_ACCESS_KEY": (
+                self.virtual_workspace_s3_secret_access_key
+            ),
             # Minted unconditionally, like the Gitea one above: the Keycloak
             # bootstrap job mounts NEXTCLOUD_OIDC_CLIENT_SECRET by key whenever
             # `nextcloud.enabled`, and a missing key is a

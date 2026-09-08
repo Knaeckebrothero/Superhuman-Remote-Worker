@@ -75,3 +75,21 @@ agent:
   # protected-effect lane's fpm/nginx sidecars, because the chart derives that
   # lane from this flag.
   protectedCloudModeEnabled: "true"
+
+garage:
+  # The shared baseline turns the bundled object store off and runs the virtual
+  # tier on the in-process `memory` store, which is right for a profile that
+  # never needs a durable blob. Protected cloud does: staging a captured
+  # overlay writes a tar through `snapshot_service.upload_blob_file`, and with
+  # no store that call returns False and the stage ends as
+  # "stage: tar upload failed" — a scheduled restage that produces an empty
+  # diff, with the review surface answering 200 and nothing to review.
+  #
+  # Sized for a disposable cluster: one replica, one small PVC, capacity
+  # advertised strictly below it because meta and data share the volume.
+  enabled: true
+  dataStorageSize: 4Gi
+  capacityBytes: 2147483648
+  resources:
+    requests: {memory: 128Mi, cpu: 50m}
+    limits: {memory: 512Mi, cpu: 500m}

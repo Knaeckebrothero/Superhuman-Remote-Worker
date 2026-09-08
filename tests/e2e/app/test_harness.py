@@ -1394,7 +1394,11 @@ def test_cloud_sandbox_extends_forge_sandbox_without_replacing_it() -> None:
     assert cloud.protected_cloud_enabled is True
     for name in ("pinned-virtual", "stateless-sandbox", "forge-sandbox"):
         assert harness.resolve_profile(name).protected_cloud_enabled is False
-    assert cloud.additional_statefulsets == forge.additional_statefulsets
+    # The forge StatefulSet is inherited and the object store is added: without
+    # a blob store a protected session stages nothing and the review surface
+    # answers 200 with an empty diff.
+    assert set(forge.additional_statefulsets) < set(cloud.additional_statefulsets)
+    assert "srw-e2e-garage" in cloud.additional_statefulsets
     # The backend is a Deployment, so it must be waited on as one.
     assert "srw-e2e-nextcloud" in cloud.additional_deployments
     assert set(forge.additional_deployments) <= set(cloud.additional_deployments)
@@ -1536,6 +1540,9 @@ def test_cloud_sandbox_renders_the_protected_effect_lane(tmp_path: Path) -> None
         for document in documents
     }
     assert ("Service", harness.PROTECTED_EFFECT_SECRET_NAME) in kinds
+    # The bundled object store, and the endpoint the chart derives from it.
+    assert ("StatefulSet", "srw-e2e-garage") in kinds
+    assert config["data"]["S3_ENDPOINT"] == "http://srw-e2e-garage:3900"
     assert ("NetworkPolicy", harness.PROTECTED_EFFECT_SECRET_NAME) in kinds
     # The chart must not create the effect Secret here: `secrets.create` is
     # false on this stack, so the overlay names one and the harness mints it.
