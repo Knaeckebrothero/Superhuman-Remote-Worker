@@ -113,7 +113,7 @@ async def reconcile_once(
                 name,
                 pod_namespace,
                 {"metadata": {"annotations": {DELETION_COST_ANNOTATION: desired}}},
-                _request_timeout=K8S_PATCH_REQUEST_TIMEOUT,
+                request_timeout=K8S_PATCH_REQUEST_TIMEOUT,
             )
             patched += 1
             logger.info(

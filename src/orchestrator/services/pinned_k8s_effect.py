@@ -37,10 +37,24 @@ _T = TypeVar("_T")
 
 
 async def run_bounded_k8s_call(
-    function: Callable[..., _T], /, *args: Any, **kwargs: Any
+    function: Callable[..., _T],
+    /,
+    *args: Any,
+    request_timeout: Any | None = None,
+    **kwargs: Any,
 ) -> _T:
-    """Run one sync Kubernetes call and join it before propagating cancel."""
+    """Run one sync Kubernetes call and join it before propagating cancel.
 
+    ``request_timeout`` is the public spelling of the generated client's
+    ``_request_timeout``. Call sites must not name ``_``-prefixed kwargs --
+    a client generation that rejects one raises ``ApiTypeError`` only in a
+    deployed orchestrator, never against the fakes unit tests inject, so
+    tests/test_k8s_patch_kwargs_contract.py bans them at the call site. This
+    wrapper is the one place that spelling is allowed to exist.
+    """
+
+    if request_timeout is not None:
+        kwargs["_request_timeout"] = request_timeout
     kwargs.setdefault("_request_timeout", K8S_MUTATION_REQUEST_TIMEOUT)
     worker = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
     cancelled = False
