@@ -30,6 +30,7 @@ from orchestrator.routers.job_repo import (
 )
 from orchestrator.services import job_repo_reads
 from tests._mounted_router import mount_router
+from tests._route_inventory import mounted_route_objects
 
 
 JOB_ID = "a6fa6f2a-9101-4c1e-9b9e-0000000000c1"
@@ -418,10 +419,14 @@ class TestListRepoTags:
 class TestJobRepoWire:
     def test_routes_keep_their_paths_and_methods(self):
         app = mount_router(job_repo_router)
+        # ``app.routes`` is not the API on FastAPI >= 0.139: an include is one
+        # ``_IncludedRouter`` wrapper with no path or methods of its own, so the
+        # obvious comprehension silently sees zero of these routes. The pin is
+        # ``fastapi>=0.109.0``, so a fresh install resolves the new shape while a
+        # long-lived venv sits on the old one — read it through the helper.
         declared = {
             (route.path, tuple(sorted(route.methods)))
-            for route in app.routes
-            if getattr(route, "methods", None)
+            for route in mounted_route_objects(app)
         }
 
         assert ("/api/jobs/{job_id}/repo/contents", ("GET",)) in declared
