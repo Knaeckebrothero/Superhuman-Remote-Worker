@@ -72,10 +72,6 @@ from orchestrator.services.email_datasource import (
     validate_email_credentials,
 )
 from shared.runtime.core.datasource_catalog import DATASOURCE_TYPES
-from shared.credential_connectors import (
-    CredentialConnectorAttachedError,
-    normalize_credential_env,
-)
 from shared.runtime.utils.ssh_key import (
     generate_ed25519_keypair as _generate_ed25519_keypair,
 )
@@ -459,19 +455,6 @@ async def create_datasource(
         datasource_config = dict(body.config or {})
 
     credentials = normalize_datasource_credentials(body.credentials)
-    if body.type == "credentials":
-        if body.is_global:
-            raise HTTPException(
-                status_code=400, detail="Credential connectors cannot be published"
-            )
-        try:
-            credentials = {
-                "env_vars": normalize_credential_env(
-                    (credentials or {}).get("env_vars", {}), required=True
-                )
-            }
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
     try:
         credentials = normalize_credential_files(body.type, body.name, credentials)
     except CredentialFileValidationError as exc:
@@ -597,24 +580,6 @@ async def update_datasource(
     # didn't re-enter; passing that through would clobber the secret.
     raw_creds = normalize_datasource_credentials(body.credentials)
     credentials = raw_creds if raw_creds else None
-    if existing_ds.get("type") == "credentials":
-        if body.is_global is True:
-            raise HTTPException(
-                status_code=400, detail="Credential connectors cannot be published"
-            )
-        if credentials is not None:
-            try:
-                values = normalize_credential_env(
-                    credentials.get("env_vars", {}), required=True
-                )
-                previous = (existing_ds.get("credentials") or {}).get("env_vars", {})
-                credentials = {
-                    "env_vars": normalize_credential_env(
-                        {**previous, **values}, required=True
-                    )
-                }
-            except ValueError as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
     if credentials is not None and existing_ds.get("type") in CREDENTIAL_FILE_TYPES:
         try:
             credentials = normalize_credential_files(
@@ -965,8 +930,6 @@ async def delete_datasource(
                 status_code=404, detail=f"Connector '{datasource_id}' not found"
             )
         return {"status": "deleted"}
-    except CredentialConnectorAttachedError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except HTTPException:
         raise
     except DatasourceScopeAuthorizationError as exc:
@@ -1378,12 +1341,6 @@ async def test_datasource(
         elif ds_type == "repository":
             return await test_repository_datasource(ds, url, creds)
 
-        elif ds_type == "credentials":
-            normalize_credential_env(creds.get("env_vars", {}), required=True)
-            return {
-                "status": "ok",
-                "message": "Credential variables are valid; provider access is tested in the workspace",
-            }
         elif ds_type == "generic":
             return {
                 "status": "ok",
