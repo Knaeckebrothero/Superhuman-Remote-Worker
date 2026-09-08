@@ -263,9 +263,12 @@ def patched_main(monkeypatch):
     db.datasource_policy_rows = policy_rows
     monkeypatch.setattr(main, "postgres_db", db)
     monkeypatch.setattr(main, "require_internal", AsyncMock())
-    monkeypatch.setattr(
-        main, "user_can_access_datasource", AsyncMock(return_value=True)
-    )
+    # `user_can_access_datasource` used to be stubbed here. R1.B03 moved the
+    # connector surface out of `main`, and `main` no longer re-exports the
+    # helper — but the stub was already inert on this path: the thread-config
+    # PATCH authorizes through `services.datasource_policy`, which reads
+    # `is_global` from the policy rows inline. `policy_rows` above is what
+    # actually decides these cases.
     monkeypatch.setattr(main, "_thread_project_ids", AsyncMock(return_value=[]))
     grants = AsyncMock()
     monkeypatch.setattr(main, "_enforce_session_create_grants", grants)
