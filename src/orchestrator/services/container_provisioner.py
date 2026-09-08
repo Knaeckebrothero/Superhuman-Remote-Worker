@@ -5862,6 +5862,40 @@ class ContainerProvisioner:
                 service_absent = service_outcome.captured_absent
             if not service_absent:
                 return _WORKSPACE_CLEANUP_RETRYABLE
+        else:
+            # The headless Service goes on EVERY settled cleanup, not only a
+            # terminal reclaim. ``release_workspace`` rules on this in its own
+            # docstring — it is 409-idempotent to recreate on the next
+            # ``create_workspace``, so unlike the volume it costs nothing to
+            # lose — and both sibling teardown paths already honour it
+            # (``release_absent_workspace`` unconditionally,
+            # ``_release_pinned_retirement_workspace`` on the captured uid
+            # alone). Keeping it only here left a Service outliving its Pod
+            # after every non-permanent End, and a Service that survives its
+            # Pod is a stale selector waiting to name a successor.
+            #
+            # The volume is the opposite case and stays gated: an ``ended``
+            # thread is resumable, so its PVC is reclaimed only once the thread
+            # row itself is gone (``workspace_manager._is_volume_reclaimable``).
+            #
+            # Fences, in order: the Pod for this exact incarnation is already
+            # proven gone (``deletion.current_deleted`` above came from a
+            # ``wait_for_exact_absence`` delete), the mutation guard is held,
+            # and the delete names the captured Service uid so a successor's
+            # Service is never touched. ``_delete_service`` — not the stricter
+            # ``captured_absent`` the terminal branch needs — is deliberate and
+            # matches ``_release_pinned_retirement_workspace``: a same-name
+            # replacement means our captured Service is already gone, which is
+            # success here, while a refused API call still fails closed. The
+            # terminal branch must instead prove exact absence, because settling
+            # a reclaim is irreversible.
+            service_uid = intent.get("service_uid")
+            if service_uid is not None and not await self._delete_service(
+                owner,
+                require_exact_owner=True,
+                expected_uid=str(service_uid),
+            ):
+                return _WORKSPACE_CLEANUP_RETRYABLE
 
         if not await self._cleanup_claim_is_current(intent, claimant=claimant):
             return _WORKSPACE_CLEANUP_RETRYABLE

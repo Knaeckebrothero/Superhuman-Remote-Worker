@@ -26,7 +26,14 @@ from uuid import uuid4
 
 import pytest
 
-from orchestrator.services.container_provisioner import WorkspaceOwner
+from orchestrator.services.container_provisioner import (
+    SharedResourceDeletionOutcome,
+    WorkspaceOwner,
+)
+
+_ABSENT = SharedResourceDeletionOutcome("captured_absent")
+_REPLACED = SharedResourceDeletionOutcome("replacement_present")
+_REFUSED = SharedResourceDeletionOutcome("refused")
 
 
 THREAD_ID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
@@ -97,7 +104,7 @@ def _provisioner(db):
     return p
 
 
-async def _reconcile(*, reclaim: bool, resource_policy: str):
+async def _reconcile(*, reclaim: bool, resource_policy: str, service_outcome=None):
     """Drive one settled reconcile and report which shared deletes happened."""
     from orchestrator.services.container_provisioner import RuntimeDeletionOutcome
 
@@ -107,11 +114,9 @@ async def _reconcile(*, reclaim: bool, resource_policy: str):
         return_value=RuntimeDeletionOutcome("current_deleted")
     )
     p.workspace_pod_authority = AsyncMock(return_value="exact_absent")
-    p._delete_pvc_outcome = AsyncMock(
-        return_value=type("O", (), {"captured_absent": True})()
-    )
+    p._delete_pvc_outcome = AsyncMock(return_value=_ABSENT)
     p._delete_service_outcome = AsyncMock(
-        return_value=type("O", (), {"captured_absent": True})()
+        return_value=_ABSENT if service_outcome is None else service_outcome
     )
     with patch(
         "orchestrator.services.container_provisioner.workspace_metering.close_interval",
@@ -142,28 +147,89 @@ class TestNonPermanentEndSharedResources:
         p._delete_pvc_outcome.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_the_headless_service_is_retained_too(self):
-        """CHARACTERIZATION of the defect, not an endorsement.
+    async def test_the_headless_service_is_dropped_anyway(self):
+        """CORRECTED. Was: the Service survived a non-permanent End.
 
-        The Service delete sits inside the same ``reclaim_shared_resources``
-        gate as the PVC delete, so a non-permanent End settles as ``deleted``
-        while the Service is still Bound to nothing on the cluster. This is
-        what the live inventory in
-        ``session_workspace_service_and_pvc_survive_end`` recorded, 18 minutes
-        after a normal End.
+        The characterization commit pinned the defect — the Service delete sat
+        inside the same ``reclaim_shared_resources`` gate as the PVC delete, so
+        a normal End settled as ``deleted`` while the Service stayed on the
+        cluster (observed still present 18 minutes later in
+        ``session_workspace_service_and_pvc_survive_end``). It now goes on every
+        settled cleanup, named by its captured uid.
         """
         outcome, p, _db = await _reconcile(reclaim=False, resource_policy="preserve")
+
+        assert outcome.settled
+        p._delete_service_outcome.assert_awaited_once()
+        kwargs = p._delete_service_outcome.await_args.kwargs
+        assert kwargs["expected_uid"] == SERVICE_UID
+        assert kwargs["require_exact_owner"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_replacement_service_is_success_not_a_wedge(self):
+        """A same-name successor means OUR captured Service is already gone.
+
+        The terminal branch must prove exact absence because settling a reclaim
+        is irreversible. A preserve cleanup must not be wedged forever by a
+        legitimately resumed successor, so it uses ``_delete_service``, which
+        accepts ``replacement_present`` — the same call
+        ``_release_pinned_retirement_workspace`` makes.
+        """
+        outcome, _p, _db = await _reconcile(
+            reclaim=False, resource_policy="preserve", service_outcome=_REPLACED
+        )
+
+        assert outcome.settled
+
+    @pytest.mark.asyncio
+    async def test_a_refused_service_delete_still_fails_closed(self):
+        """An API error is not absence; the cleanup stays retryable."""
+        outcome, _p, db = await _reconcile(
+            reclaim=False, resource_policy="preserve", service_outcome=_REFUSED
+        )
+
+        assert not outcome.settled
+        assert db.settled is False
+
+    @pytest.mark.asyncio
+    async def test_an_uncaptured_service_is_not_invented(self):
+        """No captured uid means there is nothing this cleanup owns to delete.
+
+        Deleting a Service by name alone would be exactly the successor-
+        isolation hole the captured uid exists to close.
+        """
+        db = _CleanupIntentDB(reclaim=False, resource_policy="preserve")
+        db.intent["service_uid"] = None
+        p = _provisioner(db)
+        from orchestrator.services.container_provisioner import RuntimeDeletionOutcome
+
+        p.delete_workspace_with_outcome = AsyncMock(
+            return_value=RuntimeDeletionOutcome("current_deleted")
+        )
+        p.workspace_pod_authority = AsyncMock(return_value="exact_absent")
+        p._delete_service_outcome = AsyncMock(return_value=_ABSENT)
+        with patch(
+            "orchestrator.services.container_provisioner."
+            "workspace_metering.close_interval",
+            new=AsyncMock(return_value=None),
+        ):
+            outcome = await p._reconcile_workspace_cleanup_intent_guarded(
+                _owner(),
+                expected_runtime_incarnation=RUNTIME,
+                intent_generation=1,
+            )
 
         assert outcome.settled
         p._delete_service_outcome.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_the_intent_still_reports_the_workspace_deleted(self):
-        """``target_disposition`` is ``deleted`` regardless of reclaim.
+        """``target_disposition`` stays ``deleted`` regardless of reclaim.
 
-        The projection therefore records ``workspace_container.status =
-        "deleted"`` while Kubernetes still holds the volume — the state that
-        makes a later reclaim nobody's job.
+        Unchanged on purpose: clearing the retired UID on a preserve-policy End
+        is what lets Resume mint a successor. What changed is that the
+        projection now also carries ``volume_reclaimed``, so the row says the
+        container is gone AND the volume was kept, rather than implying both.
         """
         _outcome, _p, db = await _reconcile(reclaim=False, resource_policy="preserve")
 

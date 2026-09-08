@@ -284,7 +284,13 @@ async def test_absent_soft_cleanup_settles_intent_before_clearing_projection(db)
         metadata = json.loads(metadata)
     assert metadata["workspace_container"]["_runtime_incarnation"] is None
     assert metadata["workspace_container"]["status"] == "deleted"
-    assert set(resources) == {"pvc", "service"}
+    # The volume is deliberately kept for the resume window; the headless
+    # Service is not — it is 409-idempotent to recreate and a Service that
+    # outlives its Pod is a stale selector. Previously BOTH survived here,
+    # because this soft path settles through the durable intent and the
+    # Service delete sat inside the reclaim gate. See
+    # knowledge-base/knowledge/issues/session_workspace_service_and_pvc_survive_end.md
+    assert set(resources) == {"pvc"}
     async with db.acquire() as conn:
         assert (
             await conn.fetchval(
@@ -293,15 +299,19 @@ async def test_absent_soft_cleanup_settles_intent_before_clearing_projection(db)
             )
             == "settled"
         )
+    # Replay: the settled intent is idempotent, so a second pass repeats no
+    # Kubernetes mutation. The Service delete the first pass performed is not
+    # repeated and the retained volume is still not touched.
+    service_deletes = p._core_api.delete_namespaced_service.call_count
     assert await p.release_absent_workspace(
         owner,
         expected_runtime_incarnation=str(runtime),
         reclaim_volume=False,
         strict=True,
     )
-    assert set(resources) == {"pvc", "service"}
+    assert set(resources) == {"pvc"}
     p._core_api.delete_namespaced_persistent_volume_claim.assert_not_called()
-    p._core_api.delete_namespaced_service.assert_not_called()
+    assert p._core_api.delete_namespaced_service.call_count == service_deletes
 
 
 @pytest.mark.asyncio

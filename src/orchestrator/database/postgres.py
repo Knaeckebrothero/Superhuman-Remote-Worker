@@ -37074,6 +37074,17 @@ class PostgresDB:
                         settled = {**settled, "permanent": True}
                         metadata = dict(metadata)
                         metadata["_stateless_workspace_retirement_settled"] = settled
+                        # Upgrading a resumable End to a permanent one reclaims
+                        # the volume, so the retention record set by
+                        # ``finish_stateless_thread_workspace_retirement`` stops
+                        # being true and is corrected here rather than left to
+                        # contradict the intent.
+                        upgraded = metadata.get("workspace_container")
+                        if isinstance(upgraded, dict):
+                            metadata["workspace_container"] = {
+                                **upgraded,
+                                "volume_reclaimed": True,
+                            }
                         updated = await conn.fetchval(
                             "UPDATE threads SET metadata = $2::jsonb "
                             "WHERE id = $1::uuid AND execution_lane = 'stateless' "
@@ -38074,6 +38085,29 @@ class PostgresDB:
                 ):
                     next_metadata.pop(key, None)
                 next_metadata["_stateless_workspace_retirement_settled"] = settled
+                # Say out loud that the volume survived this End. The cleanup
+                # projection has already written status "deleted" — which is
+                # true of the *pod* — while a resumable End deliberately keeps
+                # the PVC so Resume reattaches the real working tree. Without
+                # this the row reads as "the whole workspace is gone", which is
+                # the state that makes a later reclaim nobody's job.
+                # ``ssh_gateway_targets.resolve_workspace_state`` has always
+                # read this key and nothing ever wrote it.
+                #
+                # Written here, in the retirement settlement, and NOT in the
+                # cleanup projection: that projection is compared for exact
+                # equality by
+                # ``managed_repo_workspace_cleanup_projection_authorized_now``,
+                # so a new key there needs the retirement-authority contract
+                # widened. This UPDATE only has to leave the authority envelope
+                # (a fixed key set that does not include ``volume_reclaimed``)
+                # unchanged, which it does.
+                container = next_metadata.get("workspace_container")
+                if isinstance(container, dict):
+                    next_metadata["workspace_container"] = {
+                        **container,
+                        "volume_reclaimed": False,
+                    }
                 row = await conn.fetchval(
                     "UPDATE threads SET metadata = $2::jsonb "
                     "WHERE id = $1::uuid AND execution_lane = 'stateless' "

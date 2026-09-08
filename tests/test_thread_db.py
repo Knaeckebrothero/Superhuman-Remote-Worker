@@ -1375,6 +1375,11 @@ class TestEndThread:
         assert settled["terminal_token"] == 8
         assert settled["snapshot_restore_required"] is True
         assert "_stateless_workspace_retirement_pending" not in stored
+        # A resumable End keeps the PVC on purpose. Say so, rather than leaving
+        # a row whose only workspace statement is the cleanup projection's
+        # "deleted" — which is true of the pod and false of the volume.
+        assert settled["permanent"] is False
+        assert stored["workspace_container"]["volume_reclaimed"] is False
 
     @pytest.mark.asyncio
     async def test_finish_refuses_to_erase_in_progress_creation_authority(self):
