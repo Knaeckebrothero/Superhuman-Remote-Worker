@@ -311,6 +311,24 @@ export function isStartupBannerVisible(isStartingSession: boolean, turnCount: nu
     return isStartingSession && turnCount > 0;
 }
 
+/** Queued-turn bubble escalation: NN/g's 10 s attention limit, then an
+ *  elapsed counter from 60 s. Time-based only — never a queue position. */
+export const QUEUE_BUSY_AFTER_MS = 10_000;
+export const QUEUE_ELAPSED_AFTER_MS = 60_000;
+export type QueueWaitTier = 'fresh' | 'busy' | 'long';
+
+export function queueWaitTier(elapsedMs: number): QueueWaitTier {
+    if (elapsedMs >= QUEUE_ELAPSED_AFTER_MS) return 'long';
+    if (elapsedMs >= QUEUE_BUSY_AFTER_MS) return 'busy';
+    return 'fresh';
+}
+
+/** m:ss for the queued-turn elapsed counter. */
+export function formatQueueWait(elapsedMs: number): string {
+    const s = Math.max(0, Math.floor(elapsedMs / 1000));
+    return `${Math.floor(s / 60)}:${(s % 60).toString().padStart(2, '0')}`;
+}
+
 /**
  * Whether the composer should accept input: while connected OR while the
  * session is still starting (so the user can type from t=0 and have the
@@ -1804,21 +1822,25 @@ export function clearDraft(threadId: string | null): void {
           }
         }
 
-        <!-- Accepted-but-not-yet-started turn: the agent queued the input
-             (e.g. the previous turn's cloud push is still flushing). Shown
-             standalone because no turn object exists until turn.started —
-             without it the queued send reads as swallowed. -->
+        <!-- Accepted-but-not-yet-started turn: the input is durably queued
+             but no agent has claimed it yet (pool busy, or the previous
+             turn's cloud push still flushing). Shown standalone because no
+             turn object exists until turn.started, and deliberately NOT the
+             thinking dots: queued is not working. Escalates after 10 s /
+             60 s; never shows a queue position. -->
         @if (chat.isAwaitingTurn()) {
-          <div class="message message-assistant turn-bubble">
+          <div class="message message-assistant turn-bubble queued-turn" role="status" aria-live="polite">
             <div class="avatar">
-              <app-icon size="sm" class="avatar-icon">smart_toy</app-icon>
+              <app-icon size="sm" class="avatar-icon queued-icon">hourglass_top</app-icon>
             </div>
-            <div class="message-body turn-body">
-              <div class="thinking">
-                <span class="thinking-dot"></span>
-                <span class="thinking-dot"></span>
-                <span class="thinking-dot"></span>
-              </div>
+            <div class="message-body turn-body queued-body">
+              <div class="queued-line">{{ 'chat.queue.waiting' | transloco }}</div>
+              @if (queuedTier() !== 'fresh') {
+                <div class="queued-busy">{{ 'chat.queue.busy' | transloco }}</div>
+              }
+              @if (queuedTier() === 'long') {
+                <div class="queued-elapsed">{{ 'chat.queue.elapsed' | transloco: {time: queuedWaitLabel()} }}</div>
+              }
             </div>
           </div>
         }
@@ -2523,6 +2545,10 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
 
     // --- Live compaction progress (knowledge-base/knowledge/features/context_summarization_rework.md S3)
     /** 1s tick driving the elapsed timer; interval runs only mid-compaction. */
+    /** Escalation tier + m:ss label for the queued-turn bubble. */
+    readonly queuedTier = computed(() => queueWaitTier(this.chat.awaitingElapsedMs()));
+    readonly queuedWaitLabel = computed(() => formatQueueWait(this.chat.awaitingElapsedMs()));
+
     private readonly compactionNow = signal(Date.now());
     private compactionTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -3182,12 +3208,11 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         if (this.chat.isStartingSession()) return this.transloco.translate('chat.input.sessionStarting');
         if (!this.chat.isConnected()) return this.transloco.translate('chat.input.connect');
         if (this.chat.isInterrupting()) return this.transloco.translate('chat.input.stopping');
-        // isAwaitingTurn: the send is accepted but its turn hasn't started
-        // (agent still flushing the previous turn) — same "working" surface,
-        // or the queued message reads as swallowed.
-        if (this.chat.isStreaming() || this.chat.isAwaitingTurn()) {
-            return this.transloco.translate('chat.input.working');
-        }
+        if (this.chat.isStreaming()) return this.transloco.translate('chat.input.working');
+        // isAwaitingTurn: the send is accepted but no agent has picked it up
+        // yet — say "waiting", not "working"; the queued bubble carries the
+        // escalation copy.
+        if (this.chat.isAwaitingTurn()) return this.transloco.translate('chat.input.queued');
         // Mobile keyboards send newline on Enter, so the desktop key hints are wrong there.
         return this.transloco.translate(
             this.viewport.isMobile() ? 'chat.input.defaultMobile' : 'chat.input.default',

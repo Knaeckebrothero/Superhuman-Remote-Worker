@@ -1704,6 +1704,11 @@
       "foldFailed": "⚠ {{count}} failed",
       "parked": "This turn stopped after repeated executor failures and needs operator intervention."
     },
+    "queue": {
+      "waiting": "Waiting for an available agent…",
+      "busy": "Our systems are busier than usual — this may take a few minutes. You can leave this page; the reply will be here when you return.",
+      "elapsed": "Waiting for {{time}}"
+    },
     "queued": {
       "notSent": "Not sent",
       "waiting": "Queued — waiting to send",
@@ -1913,6 +1918,7 @@
       "sessionStarting": "Type your message while the session starts...",
       "stopping": "Stopping...",
       "working": "Agent is working...",
+      "queued": "Waiting for an available agent…",
       "reconnecting": "Disconnected — reconnecting…",
       "uploading": "Uploading attachments…",
       "default": "Type a message... (Enter to send, Shift+Enter for newline)",

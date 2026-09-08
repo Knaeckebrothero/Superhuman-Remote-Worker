@@ -18,6 +18,10 @@ import {
     HEADER_LEFT_RESERVE_PX,
     isMicMode,
     isNearBottom,
+    formatQueueWait,
+    queueWaitTier,
+    QUEUE_BUSY_AFTER_MS,
+    QUEUE_ELAPSED_AFTER_MS,
     isRewindCommand,
     isStartupBannerVisible,
     loadDraft,
@@ -85,6 +89,29 @@ describe('isStartupBannerVisible', () => {
     it('hides the banner once the session is no longer starting', () => {
         expect(isStartupBannerVisible(false, 3)).toBe(false);
         expect(isStartupBannerVisible(false, 0)).toBe(false);
+    });
+});
+
+describe('queueWaitTier', () => {
+    it('is fresh under the 10 s attention limit', () => {
+        expect(queueWaitTier(0)).toBe('fresh');
+        expect(queueWaitTier(QUEUE_BUSY_AFTER_MS - 1)).toBe('fresh');
+    });
+
+    it('escalates to busy at 10 s and long at 60 s', () => {
+        expect(queueWaitTier(QUEUE_BUSY_AFTER_MS)).toBe('busy');
+        expect(queueWaitTier(QUEUE_ELAPSED_AFTER_MS - 1)).toBe('busy');
+        expect(queueWaitTier(QUEUE_ELAPSED_AFTER_MS)).toBe('long');
+        expect(queueWaitTier(10 * 60_000)).toBe('long');
+    });
+});
+
+describe('formatQueueWait', () => {
+    it('renders m:ss and clamps negatives', () => {
+        expect(formatQueueWait(0)).toBe('0:00');
+        expect(formatQueueWait(83_400)).toBe('1:23');
+        expect(formatQueueWait(-5)).toBe('0:00');
+        expect(formatQueueWait(3_599_000)).toBe('59:59');
     });
 });
 

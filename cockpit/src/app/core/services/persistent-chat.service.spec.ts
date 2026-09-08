@@ -10039,6 +10039,64 @@ describe('PersistentChatService — awaiting-turn state (queued input visibility
     expect(ctx.service.isAwaitingTurn()).toBe(false);
   });
 
+  // The queued bubble escalates on time alone ("busier than usual" at 10 s,
+  // elapsed counter at 60 s) — never on a queue position. The clock lives in
+  // the service, keyed off isAwaitingTurn, so every pendingTurnCount reset
+  // ends it without each site knowing.
+  it('stamps awaitingSince and advances awaitingElapsedMs once a second while queued', async () => {
+    const ctx = await readySession();
+    vi.useFakeTimers();
+    try {
+      await ctx.service.sendMessage('queued behind a busy pool');
+      await Promise.resolve();
+      TestBed.tick();
+      expect(ctx.service.awaitingSince()).not.toBeNull();
+      expect(ctx.service.awaitingElapsedMs()).toBe(0);
+
+      vi.advanceTimersByTime(10_000);
+      expect(ctx.service.awaitingElapsedMs()).toBe(10_000);
+      vi.advanceTimersByTime(55_000);
+      expect(ctx.service.awaitingElapsedMs()).toBe(65_000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('turn.started ends the awaiting stretch and stops the clock', async () => {
+    const ctx = await readySession();
+    vi.useFakeTimers();
+    try {
+      await ctx.service.sendMessage('hello');
+      await Promise.resolve();
+      TestBed.tick();
+      vi.advanceTimersByTime(3_000);
+      expect(ctx.service.awaitingElapsedMs()).toBe(3_000);
+
+      fireSseMessage(ctx.sseInstances[0], { method: 'turn.started', params: { turn_id: 1 } }, '1:2');
+      TestBed.tick();
+      expect(ctx.service.awaitingSince()).toBeNull();
+      expect(ctx.service.awaitingElapsedMs()).toBe(0);
+      vi.advanceTimersByTime(5_000);
+      expect(ctx.service.awaitingElapsedMs()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a thread switch ends the awaiting stretch (accounting is per thread)', async () => {
+    const ctx = await readySession();
+    await ctx.service.sendMessage('first thread');
+    await Promise.resolve();
+    TestBed.tick();
+    expect(ctx.service.awaitingSince()).not.toBeNull();
+
+    await ctx.service.connect('thread-x');
+    TestBed.tick();
+    expect(ctx.service.pendingTurnCount()).toBe(0);
+    expect(ctx.service.awaitingSince()).toBeNull();
+    expect(ctx.service.awaitingElapsedMs()).toBe(0);
+  });
+
   it('an unstarted turn can never decrement below zero', async () => {
     const ctx = await readySession();
     // turn.started with no tracked accept (other tab / injected input).

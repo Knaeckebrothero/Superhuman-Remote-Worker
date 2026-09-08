@@ -1704,6 +1704,11 @@
       "foldFailed": "⚠ {{count}} fehlgeschlagen",
       "parked": "Dieser Zug wurde nach wiederholten Executor-Fehlern angehalten und erfordert einen Eingriff durch den Administrator."
     },
+    "queue": {
+      "waiting": "Warten auf einen verfügbaren Agenten…",
+      "busy": "Unsere Systeme sind stärker ausgelastet als üblich – das kann einige Minuten dauern. Sie können die Seite verlassen; die Antwort wartet hier auf Sie.",
+      "elapsed": "Wartezeit {{time}}"
+    },
     "queued": {
       "notSent": "Nicht gesendet",
       "waiting": "In Warteschlange – wird gesendet",
@@ -1913,6 +1918,7 @@
       "sessionStarting": "Schreiben Sie Ihre Nachricht, während die Sitzung startet...",
       "stopping": "Wird gestoppt...",
       "working": "Agent arbeitet...",
+      "queued": "Warten auf einen verfügbaren Agenten…",
       "reconnecting": "Getrennt — verbinde erneut…",
       "uploading": "Anhänge werden hochgeladen…",
       "default": "Nachricht eingeben... (Eingabe zum Senden, Umschalt+Eingabe für neue Zeile)",

@@ -709,6 +709,26 @@ export class PersistentChatService {
       this.threadTransport.setAgentTurnActive(this.isStreaming());
     });
 
+    // Stamp the start of an awaiting stretch and tick a 1 s clock while it
+    // lasts. Keyed off isAwaitingTurn so every path that zeroes
+    // pendingTurnCount also ends the stretch; the ticker never runs idle.
+    effect(() => {
+      const awaiting = this.isAwaitingTurn();
+      untracked(() => {
+        if (!awaiting) {
+          this._stopAwaitingClock();
+          return;
+        }
+        const now = Date.now();
+        if (this.awaitingSince() === null) this.awaitingSince.set(now);
+        this.awaitingNow.set(now);
+        if (this.awaitingTicker === null) {
+          this.awaitingTicker = setInterval(() => this.awaitingNow.set(Date.now()), 1000);
+        }
+      });
+    });
+    this.destroyRef.onDestroy(() => this._stopAwaitingClock());
+
     // Invariant: "Stopping…" (isInterrupting) only makes sense while a turn
     // is actually streaming. Whenever streaming ends — turn completed, the
     // turn closed on disconnect, or a reconnect re-synced past it — clear
@@ -1076,6 +1096,31 @@ export class PersistentChatService {
    *  working placeholder, spinner and dots so a queued input is visibly
    *  alive instead of apparently swallowed. */
   readonly isAwaitingTurn = computed(() => this.pendingTurnCount() > 0 && !this.isStreaming());
+  /**
+   * When the current awaiting stretch began (ms epoch); null while not
+   * awaiting. Derived from isAwaitingTurn by a constructor effect, so every
+   * pendingTurnCount reset (turn.started, terminal frames, teardown, thread
+   * switch) ends the stretch without each site knowing. Feeds the queued
+   * bubble's "busier than usual" escalation and elapsed counter — never a
+   * queue position (deliberate: depth is not user-facing information).
+   */
+  readonly awaitingSince = signal<number | null>(null);
+  private readonly awaitingNow = signal(Date.now());
+  private awaitingTicker: ReturnType<typeof setInterval> | null = null;
+  /** Milliseconds spent in the current awaiting stretch; 0 when not awaiting.
+   *  Advances once a second, and only while awaiting. */
+  readonly awaitingElapsedMs = computed(() => {
+    const since = this.awaitingSince();
+    return since === null ? 0 : Math.max(0, this.awaitingNow() - since);
+  });
+
+  private _stopAwaitingClock(): void {
+    if (this.awaitingTicker !== null) {
+      clearInterval(this.awaitingTicker);
+      this.awaitingTicker = null;
+    }
+    if (this.awaitingSince() !== null) this.awaitingSince.set(null);
+  }
   /**
    * Single-flight guard for _flushOutbox — one POST in flight **per thread**,
    * not per tab. `turn_id` is per-thread, so two different threads can never
