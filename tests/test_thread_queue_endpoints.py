@@ -1,0 +1,288 @@
+"""Owner queue endpoints + the shared ``queue`` block
+(stateless_turn_resilience.md step 2 API contract).
+
+``GET /api/persistent/threads/{id}/queue`` and ``POST …/queue/retry`` are
+main-module routes gated by ``require_thread_owner``; ``/connection`` (sessions
+router) and ``/input`` carry the same block. The handlers are driven directly
+with fakes for the DB and the gate; the route inventory proves they are
+mounted and gated.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import uuid
+from datetime import datetime, timezone
+from unittest.mock import AsyncMock
+
+import pytest
+from fastapi import HTTPException
+
+from orchestrator import main
+from orchestrator.routers import sessions as sessions_routes
+from orchestrator.services import stateless_queue_state as sqs
+from shared.run_queue import PARK_REASON_ATTACH_FAILED, PARK_REASON_CLAIM_LOSS_HOLD
+from shared.session_retirement import CLAIM_LOSS_HOLD_KEY
+
+THREAD = str(uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"))
+NOW = datetime(2026, 9, 8, 15, 0, tzinfo=timezone.utc)
+USER = {"id": "u1", "is_admin": False}
+
+
+class _Conn:
+    def __init__(self, authority=None):
+        self.authority = authority
+        self.fetchrow_calls = 0
+
+    @contextlib.asynccontextmanager
+    async def transaction(self):
+        yield
+
+    async def fetchrow(self, query, *args):
+        self.fetchrow_calls += 1
+        return self.authority
+
+
+class _Db:
+    def __init__(self, conn):
+        self.conn = conn
+
+    @contextlib.asynccontextmanager
+    async def acquire(self):
+        yield self.conn
+
+
+def _parked(reason=PARK_REASON_ATTACH_FAILED, attempts=3):
+    return {
+        "state": "parked",
+        "park_reason": reason,
+        "parked_at": NOW,
+        "last_error": "boom",
+        "attempts": attempts,
+        "max_attempts": 5,
+        "attach_failures": 3,
+        "pending_input": True,
+        "run_after": NOW,
+    }
+
+
+@pytest.fixture
+def owner(monkeypatch):
+    thread = {"id": THREAD, "user_id": "u1", "metadata": {}}
+    gate = AsyncMock(return_value=(USER, thread))
+    monkeypatch.setattr(main, "require_thread_owner", gate)
+    monkeypatch.setattr(main, "log_security_event", AsyncMock())
+    return gate
+
+
+def _wire(monkeypatch, *, state, authority, unpark=True):
+    import shared.run_queue as rq
+
+    conn = _Conn(authority=authority)
+    monkeypatch.setattr(main, "postgres_db", _Db(conn))
+    # The retry handler imports the statement at call time (shared.run_queue);
+    # the block builder bound it at import (stateless_queue_state). Patch both.
+    reader = AsyncMock(return_value=state)
+    monkeypatch.setattr(rq, "queue_state_for", reader)
+    monkeypatch.setattr(sqs, "queue_state_for", reader)
+    unpark_mock = AsyncMock(return_value=unpark)
+    monkeypatch.setattr(rq, "unpark_unit", unpark_mock)
+    return conn, unpark_mock
+
+
+# ---------------------------------------------------------------------------
+# GET …/queue
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_queue_state_returns_the_block_for_the_owner(owner, monkeypatch):
+    _wire(monkeypatch, state=_parked(), authority=None)
+    body = await main.thread_queue_state(THREAD, request=object())
+    assert body["thread_id"] == THREAD
+    assert body["queue"] == {
+        "state": "parked",
+        "park_reason": PARK_REASON_ATTACH_FAILED,
+        "parked_at": NOW.isoformat(),
+        "retryable": True,
+        "attempts": 3,
+        "pending_input": True,
+    }
+    owner.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_queue_state_reports_none_when_never_enqueued(owner, monkeypatch):
+    _wire(monkeypatch, state=None, authority=None)
+    body = await main.thread_queue_state(THREAD, request=object())
+    assert body["queue"]["state"] == "none" and body["queue"]["retryable"] is False
+
+
+@pytest.mark.asyncio
+async def test_queue_state_rejects_a_non_uuid_before_the_gate(owner):
+    with pytest.raises(HTTPException) as err:
+        await main.thread_queue_state("ad7eb761", request=object())
+    assert err.value.status_code == 404
+    owner.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_queue_state_gate_denial_propagates(monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "require_thread_owner",
+        AsyncMock(side_effect=HTTPException(status_code=403, detail="no")),
+    )
+    with pytest.raises(HTTPException) as err:
+        await main.thread_queue_state(THREAD, request=object())
+    assert err.value.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# POST …/queue/retry
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_retry_unparks_a_retryable_park_and_audits(owner, monkeypatch):
+    conn, unpark = _wire(
+        monkeypatch,
+        state=_parked(),
+        authority={"execution_lane": "stateless", "metadata": {}},
+    )
+    body = await main.thread_queue_retry(THREAD, request=object())
+    assert body == {
+        "thread_id": THREAD,
+        "unit_id": THREAD,
+        "state": "queued",
+        "park_reason": PARK_REASON_ATTACH_FAILED,
+    }
+    unpark.assert_awaited_once()
+    assert unpark.await_args.kwargs["unit_id"] == THREAD
+    assert conn.fetchrow_calls == 1  # the FOR UPDATE authority read
+    audit = main.log_security_event
+    audit.assert_awaited_once()
+    assert audit.await_args.kwargs["event_type"] == "queue_retry"
+    assert audit.await_args.kwargs["resource_id"] == THREAD
+
+
+@pytest.mark.asyncio
+async def test_retry_404_when_not_parked(owner, monkeypatch):
+    _, unpark = _wire(
+        monkeypatch,
+        state={**_parked(), "state": "queued"},
+        authority={"execution_lane": "stateless", "metadata": {}},
+    )
+    with pytest.raises(HTTPException) as err:
+        await main.thread_queue_retry(THREAD, request=object())
+    assert err.value.status_code == 404
+    unpark.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_retry_404_when_no_queue_row_or_thread(owner, monkeypatch):
+    _wire(
+        monkeypatch,
+        state=None,
+        authority={"execution_lane": "stateless", "metadata": {}},
+    )
+    with pytest.raises(HTTPException) as err:
+        await main.thread_queue_retry(THREAD, request=object())
+    assert err.value.status_code == 404
+    _wire(monkeypatch, state=_parked(), authority=None)
+    with pytest.raises(HTTPException) as err:
+        await main.thread_queue_retry(THREAD, request=object())
+    assert err.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_retry_409_codes(owner, monkeypatch):
+    # claim-loss hold marker on the thread
+    _, unpark = _wire(
+        monkeypatch,
+        state=_parked(),
+        authority={
+            "execution_lane": "stateless",
+            "metadata": {CLAIM_LOSS_HOLD_KEY: {}},
+        },
+    )
+    with pytest.raises(HTTPException) as err:
+        await main.thread_queue_retry(THREAD, request=object())
+    assert err.value.status_code == 409
+    assert err.value.detail["code"] == sqs.RETRY_REFUSAL_CLAIM_LOSS_HOLD
+    unpark.assert_not_awaited()
+    # hold by reason alone
+    _, unpark = _wire(
+        monkeypatch,
+        state=_parked(reason=PARK_REASON_CLAIM_LOSS_HOLD),
+        authority={"execution_lane": "stateless", "metadata": {}},
+    )
+    with pytest.raises(HTTPException) as err:
+        await main.thread_queue_retry(THREAD, request=object())
+    assert err.value.detail["code"] == sqs.RETRY_REFUSAL_CLAIM_LOSS_HOLD
+    # non-retryable free-form reason
+    _, unpark = _wire(
+        monkeypatch,
+        state=_parked(reason="loop_died_interrupt_drain_failed"),
+        authority={"execution_lane": "stateless", "metadata": {}},
+    )
+    with pytest.raises(HTTPException) as err:
+        await main.thread_queue_retry(THREAD, request=object())
+    assert err.value.detail == {
+        "code": sqs.RETRY_REFUSAL_NOT_RETRYABLE,
+        "park_reason": "loop_died_interrupt_drain_failed",
+    }
+    unpark.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_retry_gate_denial_never_reads_the_queue(monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "require_thread_owner",
+        AsyncMock(side_effect=HTTPException(status_code=403, detail="no")),
+    )
+    _, unpark = _wire(monkeypatch, state=_parked(), authority=None)
+    with pytest.raises(HTTPException):
+        await main.thread_queue_retry(THREAD, request=object())
+    unpark.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# /connection carries the same block; a read failure never blocks readiness
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_connection_queue_block_reads_and_degrades(monkeypatch):
+    monkeypatch.setattr(sqs, "queue_state_for", AsyncMock(return_value=_parked()))
+    block = await sessions_routes._read_queue_block(
+        _Db(_Conn()), {"id": THREAD, "metadata": {}}
+    )
+    assert block["state"] == "parked" and block["retryable"] is True
+    # no acquire() on the db → None, never an error
+    assert await sessions_routes._read_queue_block(object(), {"id": THREAD}) is None
+    monkeypatch.setattr(
+        sqs, "queue_state_for", AsyncMock(side_effect=RuntimeError("db"))
+    )
+    assert (
+        await sessions_routes._read_queue_block(
+            _Db(_Conn()), {"id": THREAD, "metadata": {}}
+        )
+        is None
+    )
+    assert "queue" in sessions_routes.StatelessConnectionResponse.model_fields
+    assert "queue" in sessions_routes.PinnedConnectionResponse.model_fields
+
+
+# ---------------------------------------------------------------------------
+# Mounted + gated
+# ---------------------------------------------------------------------------
+
+
+def test_queue_routes_are_mounted():
+    from tests._route_inventory import mounted_routes
+
+    routes = mounted_routes(main.app)
+    assert ("GET", "/api/persistent/threads/{thread_id}/queue") in routes
+    assert ("POST", "/api/persistent/threads/{thread_id}/queue/retry") in routes

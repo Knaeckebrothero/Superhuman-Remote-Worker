@@ -30,6 +30,7 @@ from datetime import datetime
 from typing import Any, AsyncIterator, Callable
 
 from orchestrator.services.pinned_k8s_effect import run_bounded_k8s_call
+from shared.run_queue import list_parked
 
 logger = logging.getLogger(__name__)
 
@@ -234,11 +235,14 @@ async def capacity_snapshot(
     core_api_factory: Callable[[], Any | None] = load_core_api,
     params: CapacityParams | None = None,
     pod_namespace: str | None = None,
+    parked_limit: int = 50,
 ) -> dict[str, Any]:
-    """The admin payload: what the scaler sees, plus the pool it is sizing."""
+    """The admin payload: what the scaler sees, plus the pool it is sizing,
+    plus the parked worklist (stateless_turn_resilience.md step 2)."""
     params = params or CapacityParams.from_env()
     async with _connection(db) as conn:
         demand = await read_demand(conn)
+        parked_rows = await list_parked(conn, limit=parked_limit)
     inventory: ExecutorInventory | None = None
     try:
         core_api = await asyncio.to_thread(core_api_factory)
@@ -265,6 +269,29 @@ async def capacity_snapshot(
         "oldest_queued_age_s": demand.oldest_queued_age_s,
         "desired": desired_replicas(demand, params),
         "params": {"min_replicas": params.min_replicas, "reserve": params.reserve},
+        "parked": [parked_entry(row) for row in parked_rows],
+    }
+
+
+def parked_entry(row: dict[str, Any]) -> dict[str, Any]:
+    """One parked unit for the admin list; ids and times as strings."""
+
+    def _text(value: Any) -> str | None:
+        return None if value is None else str(value)
+
+    parked_at = row.get("parked_at")
+    return {
+        "unit_id": _text(row.get("unit_id")),
+        "unit_kind": row.get("unit_kind"),
+        "thread_id": _text(row.get("thread_id")),
+        "title": row.get("title"),
+        "owner": row.get("owner"),
+        "park_reason": row.get("park_reason"),
+        "parked_at": parked_at.isoformat() if hasattr(parked_at, "isoformat") else None,
+        "attempts": int(row.get("attempts_since_completion") or 0),
+        "attach_failures": int(row.get("attach_failures") or 0),
+        "last_error": row.get("last_error"),
+        "pending_input": bool(row.get("pending_input")),
     }
 
 
@@ -283,6 +310,7 @@ __all__ = [
     "list_stateless_pods",
     "load_core_api",
     "namespace",
+    "parked_entry",
     "read_demand",
     "read_inventory",
 ]

@@ -66,6 +66,30 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/sessions", tags=["Sessions"])
 
 
+async def _read_queue_block(db: Any, thread: dict[str, Any]) -> dict[str, Any] | None:
+    """The connection's ``queue`` block, or ``None`` if it cannot be read.
+
+    Diagnostics must never make a ready session unreachable, so a database
+    fault here is logged and the block is omitted; the cockpit treats a
+    missing block as "unknown", not as "idle".
+    """
+    from orchestrator.services.stateless_queue_state import queue_block_for_thread
+
+    acquire = getattr(db, "acquire", None)
+    if acquire is None:
+        return None
+    try:
+        async with acquire() as conn:
+            return await queue_block_for_thread(conn, thread)
+    except Exception as exc:
+        logger.warning(
+            "connection queue block unavailable for thread %s: %s",
+            thread.get("id"),
+            exc,
+        )
+        return None
+
+
 def _get_db() -> Any:
     """Late-resolve the postgres_db singleton from main.
 
@@ -753,6 +777,9 @@ class PinnedConnectionResponse(BaseModel):
     controls: dict[str, ControlTransport] = Field(
         default_factory=lambda: dict(PINNED_CONTROLS)
     )
+    # Queue lifecycle block (stateless_turn_resilience.md step 2). Always
+    # None on the pinned lane: a pinned session has no run_queue unit.
+    queue: dict[str, Any] | None = None
 
 
 class StatelessConnectionResponse(BaseModel):
@@ -768,6 +795,11 @@ class StatelessConnectionResponse(BaseModel):
     controls: dict[str, ControlTransport] = Field(
         default_factory=lambda: dict(STATELESS_CONTROLS)
     )
+    # Queue lifecycle block (stateless_turn_resilience.md step 2): the same
+    # shape POST …/input and GET …/queue return, so a reload can re-derive a
+    # queued or parked turn instead of erasing it. None only when the read
+    # itself failed — never a reason to refuse the connection.
+    queue: dict[str, Any] | None = None
 
 
 ConnectionResponse = Annotated[
@@ -843,6 +875,7 @@ async def get_connection(
             token=None,
             expires_at=None,
             session_runtime_generation=runtime_authority.generation,
+            queue=await _read_queue_block(db, thread),
         )
     if execution_lane != LANE_PINNED:
         raise HTTPException(

@@ -46576,10 +46576,12 @@ async def _thread_input_stateless(thread: dict, content: str) -> dict[str, Any]:
     queued, leased-with-watermark, or deliberately parked.
     """
     from shared.row_identity import _coerce_row_id
+    from orchestrator.services.stateless_queue_state import queue_block
     from shared.run_queue import (
         LANE_STATELESS,
         UNIT_KIND_SESSION_TURN,
         queue_depth_for,
+        queue_state_for,
         record_input_seq,
     )
 
@@ -46693,8 +46695,13 @@ async def _thread_input_stateless(thread: dict, content: str) -> dict[str, Any]:
         # Post-commit watermark read (same conn): §5.3.1 response parity —
         # queue_depth comes from unconsumed watermarks, not a process queue.
         wm = await queue_depth_for(conn, unit_id=thread_id)
+        queue_state = await queue_state_for(conn, unit_id=thread_id)
 
     queue_depth = 1 if (wm is not None and wm.has_pending_input) else 0
+    # Lifecycle block (stateless_turn_resilience.md step 2): the SAME shape
+    # /connection and GET …/queue return, so a parked unit is never mistaken
+    # for a busy pool by the client.
+    lifecycle = queue_block(queue_state, thread.get("metadata"))
     logger.info(
         "run_queue enqueue: thread=%s turn=%d input_seq=%d state=%s",
         thread_id,
@@ -46710,6 +46717,11 @@ async def _thread_input_stateless(thread: dict, content: str) -> dict[str, Any]:
             "queue_depth": queue_depth,
             "message_id": raw_msg_id,
             "input_seq": int(seq),
+            "park_reason": lifecycle["park_reason"],
+            "parked_at": lifecycle["parked_at"],
+            "retryable": lifecycle["retryable"],
+            "attempts": lifecycle["attempts"],
+            "pending_input": lifecycle["pending_input"],
         },
     }
 
@@ -46794,6 +46806,90 @@ async def thread_input(
         "accepted": True,
         "turn_id": turn_id,
         "agent": result,
+    }
+
+
+@app.get("/api/persistent/threads/{thread_id}/queue")
+async def thread_queue_state(thread_id: str, request: Request) -> dict[str, Any]:
+    """Owner read of the unit's queue lifecycle
+    (stateless_turn_resilience.md step 2) — the same ``queue`` block that
+    ``/input`` and ``/connection`` carry, for polling while a turn is awaited.
+    A thread that never enqueued (pinned lane, or no turn yet) reports
+    ``state='none'``.
+    """
+    from orchestrator.services.stateless_queue_state import queue_block_for_thread
+
+    try:
+        UUID(str(thread_id))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=404, detail="Thread not found") from None
+    _user, thread = await require_thread_owner(request, postgres_db, thread_id)
+    async with postgres_db.acquire() as conn:
+        block = await queue_block_for_thread(conn, thread)
+    return {"thread_id": thread_id, "queue": block}
+
+
+@app.post("/api/persistent/threads/{thread_id}/queue/retry")
+async def thread_queue_retry(thread_id: str, request: Request) -> dict[str, Any]:
+    """Owner verb: revive a parked, retryable unit
+    (stateless_turn_resilience.md step 2). ``parked`` + retryable →
+    ``unpark_unit`` (attempts reset, park_reason cleared) → 200
+    ``{state:'queued'}``; 409 ``{code}`` under stop markers / a claim-loss
+    hold / a non-retryable reason; 404 when not parked. Audited. The admin
+    verb ``POST /api/admin/run-queue/{unit_id}/unpark`` remains the
+    operator path for the non-retryable reasons.
+    """
+    from orchestrator.services.stateless_queue_state import park_retry_refusal
+    from shared.run_queue import STATE_PARKED, queue_state_for, unpark_unit
+
+    try:
+        UUID(str(thread_id))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=404, detail="Thread not found") from None
+    user, _thread = await require_thread_owner(request, postgres_db, thread_id)
+    async with postgres_db.acquire() as conn:
+        async with conn.transaction():
+            authority = await conn.fetchrow(
+                "SELECT execution_lane, metadata FROM threads "
+                "WHERE id = $1::uuid FOR UPDATE",
+                thread_id,
+            )
+            if authority is None:
+                raise HTTPException(status_code=404, detail="Thread not found")
+            queue_state = await queue_state_for(conn, unit_id=thread_id)
+            if queue_state is None or queue_state.get("state") != STATE_PARKED:
+                raise HTTPException(status_code=404, detail="Unit is not parked")
+            park_reason = queue_state.get("park_reason")
+            refusal = park_retry_refusal(park_reason, authority["metadata"])
+            if refusal is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": refusal, "park_reason": park_reason},
+                )
+            ok = await unpark_unit(conn, unit_id=thread_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Unit is not parked")
+    attempts = int(queue_state.get("attempts") or 0)
+    logger.info(
+        "run_queue retry (owner): unit=%s park_reason=%s attempts=%d",
+        thread_id,
+        park_reason,
+        attempts,
+    )
+    await log_security_event(
+        postgres_db,
+        resource_type="thread",
+        event_type="queue_retry",
+        user=user,
+        resource_id=thread_id,
+        detail=f"owner unpark park_reason={park_reason} attempts={attempts}",
+        request=request,
+    )
+    return {
+        "thread_id": thread_id,
+        "unit_id": thread_id,
+        "state": "queued",
+        "park_reason": park_reason,
     }
 
 

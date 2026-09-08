@@ -119,6 +119,10 @@ UPDATE run_queue SET
     lease_token = lease_token + 1,
     state = CASE WHEN attempts_since_completion >= max_attempts
                  THEN 'parked' ELSE 'queued' END,
+    park_reason = CASE WHEN attempts_since_completion >= max_attempts
+                       THEN 'reaper_max_attempts' ELSE park_reason END,
+    parked_at = CASE WHEN attempts_since_completion >= max_attempts
+                     THEN now() ELSE parked_at END,
     leased_by = NULL,
     last_leased_by = NULL,
     leased_until = NULL,
@@ -148,6 +152,8 @@ RETURNING id
 _PARK_CLAIM_LOSS_HOLD_SQL = """
 UPDATE run_queue
 SET state = 'parked',
+    park_reason = 'claim_loss_hold',
+    parked_at = now(),
     leased_by = NULL, last_leased_by = NULL, leased_until = NULL
 WHERE unit_id = $1::uuid
   AND unit_kind = 'session_turn'

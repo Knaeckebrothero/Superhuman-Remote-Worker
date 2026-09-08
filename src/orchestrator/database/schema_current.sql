@@ -17504,6 +17504,11 @@ CREATE TABLE public.run_queue (
     interrupt_admission_lease_token bigint,
     interrupt_admission_turn_id integer,
     input_delivery_capable_lease_token bigint,
+    park_reason text,
+    parked_at timestamp with time zone,
+    last_error text,
+    last_error_signature text,
+    attach_failures integer DEFAULT 0 NOT NULL,
     CONSTRAINT run_queue_interrupt_admission_shape CHECK ((((interrupt_admission_lease_token IS NULL) AND (interrupt_admission_turn_id IS NULL)) OR ((interrupt_admission_lease_token IS NOT NULL) AND (interrupt_admission_turn_id IS NOT NULL) AND (unit_kind = 'session_turn'::text) AND (state = 'leased'::text) AND (interrupt_admission_lease_token = lease_token) AND (interrupt_admission_lease_token > 0) AND (interrupt_admission_turn_id > 0))))
 );
 
@@ -17639,6 +17644,41 @@ COMMENT ON COLUMN public.run_queue.interrupt_admission_turn_id IS 'Concrete acti
 --
 
 COMMENT ON COLUMN public.run_queue.input_delivery_capable_lease_token IS '0185 rolling-upgrade marker. A session claim with pending event input must stamp the newly allocated lease token in the same UPDATE.';
+
+
+--
+-- Name: COLUMN run_queue.park_reason; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.run_queue.park_reason IS 'Why the unit is parked: attach_failed | shutdown_cancelled | completion_cas_failed | reaper_max_attempts | claim_loss_hold | a free-form executor reason. NULL while not parked. Cleared by unpark.';
+
+
+--
+-- Name: COLUMN run_queue.parked_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.run_queue.parked_at IS 'When the current park was recorded. NULL while not parked.';
+
+
+--
+-- Name: COLUMN run_queue.last_error; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.run_queue.last_error IS 'Message of the most recent attach failure (bounded by the executor). Cleared by completion and unpark.';
+
+
+--
+-- Name: COLUMN run_queue.last_error_signature; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.run_queue.last_error_signature IS 'Normalised class+message signature of the most recent attach failure; consecutive identical signatures are what park a poison attach.';
+
+
+--
+-- Name: COLUMN run_queue.attach_failures; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.run_queue.attach_failures IS 'Consecutive attach failures with the same signature since the last completion or unpark; reset to 1 when the signature changes.';
 
 
 --

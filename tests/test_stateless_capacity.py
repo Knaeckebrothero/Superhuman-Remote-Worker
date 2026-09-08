@@ -51,9 +51,10 @@ def _demand_row(**overrides):
 
 
 class _Conn:
-    def __init__(self, row=None, busy_rows=()):
+    def __init__(self, row=None, busy_rows=(), parked_rows=()):
         self.row = row if row is not None else _demand_row()
         self.busy_rows = list(busy_rows)
+        self.parked_rows = list(parked_rows)
         self.queries: list[str] = []
 
     async def fetchrow(self, query, *_args):
@@ -62,6 +63,10 @@ class _Conn:
 
     async def fetch(self, query, *_args):
         self.queries.append(query)
+        # The snapshot reads two lists on one connection: live leases (busy
+        # pods) and the parked worklist. Dispatch on the statement.
+        if "state = 'parked'" in query:
+            return self.parked_rows
         return self.busy_rows
 
 
@@ -498,3 +503,59 @@ def test_capacity_route_is_mounted():
 
     assert ("GET", "/api/admin/capacity") in mounted_routes(main.app)
     assert callable(main.app.state.capacity_dependencies_factory)
+
+
+@pytest.mark.asyncio
+async def test_snapshot_lists_parked_units_newest_first_with_owner():
+    import uuid as _uuid
+
+    unit = _uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+    conn = _Conn(
+        parked_rows=[
+            {
+                "unit_id": unit,
+                "unit_kind": "session_turn",
+                "park_reason": "attach_failed",
+                "parked_at": NOW,
+                "attempts_since_completion": 5,
+                "max_attempts": 5,
+                "attach_failures": 3,
+                "last_error": "subagent session-terminalize failed (HTTP 400)",
+                "queued_at": NOW,
+                "pending_input": True,
+                "thread_id": unit,
+                "title": "Comparing Take-Home Pay",
+                "user_id": _uuid.uuid4(),
+                "owner": "knaeckebrothero",
+            }
+        ]
+    )
+    payload = await cap.capacity_snapshot(
+        conn, core_api_factory=lambda: None, params=cap.CapacityParams(2, 1)
+    )
+    assert payload["parked"] == [
+        {
+            "unit_id": str(unit),
+            "unit_kind": "session_turn",
+            "thread_id": str(unit),
+            "title": "Comparing Take-Home Pay",
+            "owner": "knaeckebrothero",
+            "park_reason": "attach_failed",
+            "parked_at": NOW.isoformat(),
+            "attempts": 5,
+            "attach_failures": 3,
+            "last_error": "subagent session-terminalize failed (HTTP 400)",
+            "pending_input": True,
+        }
+    ]
+    # The parked read is the LIST statement, bounded, on the same connection.
+    parked_queries = [q for q in conn.queries if "state = 'parked'" in q]
+    assert len(parked_queries) == 1 and "LIMIT $1::int" in parked_queries[0]
+
+
+@pytest.mark.asyncio
+async def test_snapshot_parked_is_empty_when_nothing_is_parked():
+    payload = await cap.capacity_snapshot(
+        _Conn(), core_api_factory=lambda: None, params=cap.CapacityParams(2, 1)
+    )
+    assert payload["parked"] == []

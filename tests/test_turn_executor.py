@@ -127,6 +127,8 @@ class Harness:
             "heartbeat": [],
             "park": [],
             "release": [],
+            "attach_failure": [],
+            "journal": [],
             "bundle": [],
             "attach": [],
             "terminate": [],
@@ -155,6 +157,8 @@ class Harness:
         self.sessions: List[FakeSession] = []
         self._fake_loop_tasks: List[asyncio.Task] = []
         self.disposition_order: List[str] = []
+        self.park_reasons: List[Any] = []
+        self.attach_failure_state = "queued"
 
         pa._agent = SimpleNamespace(postgres_conn=self.db)
         pa._session = None
@@ -202,7 +206,7 @@ class Harness:
             )
             return "queued"
 
-        async def fake_park(db, *, unit_id, lease_token):
+        async def fake_park(db, *, unit_id, lease_token, reason=None):
             harness.disposition_order.append("park")
             harness.calls["park"].append(
                 {
@@ -210,7 +214,41 @@ class Harness:
                     "lease_token": lease_token,
                 }
             )
+            harness.park_reasons.append(reason)
             return "parked"
+
+        async def fake_record_attach_failure(
+            db, *, unit_id, lease_token, error, signature, backoff_seconds, **_kw
+        ):
+            # The attach path's release (stateless_turn_resilience.md step 2):
+            # counted + backed off in one CAS instead of a plain error release.
+            harness.disposition_order.append("release")
+            harness.calls["attach_failure"].append(
+                {
+                    "unit_id": unit_id,
+                    "lease_token": lease_token,
+                    "error": error,
+                    "signature": signature,
+                    "backoff_seconds": backoff_seconds,
+                }
+            )
+            return {
+                "state": harness.attach_failure_state,
+                "attempts_since_completion": 1,
+                "attach_failures": 1,
+                "park_reason": (
+                    "attach_failed"
+                    if harness.attach_failure_state == "parked"
+                    else None
+                ),
+                "run_after": None,
+            }
+
+        async def fake_journal(db, *, thread_id, kind, payload, **_kw):
+            harness.calls["journal"].append(
+                {"thread_id": thread_id, "kind": kind, "payload": payload}
+            )
+            return (0, len(harness.calls["journal"]))
 
         async def fake_heartbeat(db, *, unit_id, lease_token, lease_ttl_seconds=60.0):
             harness.calls["heartbeat"].append(
@@ -221,6 +259,8 @@ class Harness:
         monkeypatch.setattr(te, "complete_unit", fake_complete)
         monkeypatch.setattr(te, "park_unit", fake_park)
         monkeypatch.setattr(te, "release_unit", fake_release)
+        monkeypatch.setattr(te, "record_attach_failure", fake_record_attach_failure)
+        monkeypatch.setattr(te, "append_system_frame", fake_journal)
         monkeypatch.setattr(te, "heartbeat_unit", fake_heartbeat)
 
         async def fake_open_interrupt(db, *, unit_id, lease_token, turn_id):
@@ -1763,6 +1803,7 @@ class TestShutdownCancellation:
             harness.db,
             unit_id=claim.unit_id,
             lease_token=48,
+            reason="test_exhaustion",
         )
         release_belt.assert_not_awaited()
         assert harness.executor._stop.is_set()
@@ -1954,10 +1995,51 @@ class TestShutdownCancellation:
         await harness.executor._serve_claim(claim)
         await _finish(harness)
 
-        assert len(harness.calls["release"]) == 1
-        assert harness.calls["release"][0]["error"] is True
+        # Step 2: the attach path releases through record_attach_failure
+        # (counted, signed, backed off), never the plain error release.
+        assert not harness.calls["release"]
+        assert len(harness.calls["attach_failure"]) == 1
+        failure = harness.calls["attach_failure"][0]
+        assert (
+            failure["unit_id"] == unit and failure["lease_token"] == claim.lease_token
+        )
+        assert failure["signature"].startswith("RuntimeError:workspace exploded")
+        assert failure["error"] == "workspace exploded"
+        assert failure["backoff_seconds"] == te.attach_failure_backoff_seconds(
+            claim.attempts_since_completion
+        )
+        assert not harness.calls["journal"]  # re-queued: nothing to tell the user
         assert pa._thread_id is None
         assert not harness.calls["complete"]
+
+    @pytest.mark.asyncio
+    async def test_attach_failure_park_journals_turn_parked(self, harness):
+        harness.attach_error = RuntimeError(
+            "subagent session-terminalize failed (HTTP 400)"
+        )
+        harness.attach_failure_state = "parked"
+        unit = uuid4()
+        harness.db.pending_rows = [{"id": str(uuid4()), "seq": 1, "content": "x"}]
+        claim = make_claim(unit_id=unit, input_seq=1)
+
+        await harness.executor._serve_claim(claim)
+        await _finish(harness)
+
+        assert len(harness.calls["attach_failure"]) == 1
+        assert harness.calls["journal"] == [
+            {
+                "thread_id": str(unit),
+                "kind": "turn.parked",
+                "payload": {
+                    "reason": "attach_failed",
+                    "attempts": 1,
+                    "retryable": True,
+                    "parked_by": "test-pod",
+                    "error": "subagent session-terminalize failed (HTTP 400)",
+                },
+            }
+        ]
+        assert pa._thread_id is None
 
 
 # ---------------------------------------------------------------------------

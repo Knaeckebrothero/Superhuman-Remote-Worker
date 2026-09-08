@@ -120,6 +120,50 @@ _OLD_STATE_TO_STATUS = {
 
 _RELEASE_BACKOFF_BASE_SECONDS = 5.0
 
+# Park lifecycle (stateless_turn_resilience.md step 2). `park_reason` names the
+# disposition an operator or owner sees; the retryable set is the one an owner
+# may revive through /queue/retry without an operator (no unledgered effect
+# debt is implied by any of them — attach never crossed a tool boundary, a
+# shutdown/CAS park is a completion that was cut, a reaper park is exhausted
+# claims). `claim_loss_hold` and free-form executor reasons stay admin-only.
+PARK_REASON_ATTACH_FAILED = "attach_failed"
+PARK_REASON_SHUTDOWN_CANCELLED = "shutdown_cancelled"
+PARK_REASON_COMPLETION_CAS_FAILED = "completion_cas_failed"
+PARK_REASON_REAPER_MAX_ATTEMPTS = "reaper_max_attempts"
+PARK_REASON_CLAIM_LOSS_HOLD = "claim_loss_hold"
+RETRYABLE_PARK_REASONS = frozenset(
+    {
+        PARK_REASON_ATTACH_FAILED,
+        PARK_REASON_SHUTDOWN_CANCELLED,
+        PARK_REASON_COMPLETION_CAS_FAILED,
+        PARK_REASON_REAPER_MAX_ATTEMPTS,
+    }
+)
+# Attach-failure backoff: indexed by the claim's own attempt count (the claim
+# already counted this attempt), capped. A same-signature failure parks on the
+# third consecutive occurrence regardless of max_attempts.
+ATTACH_FAILURE_BACKOFF_SECONDS: tuple[float, ...] = (5.0, 15.0, 45.0, 135.0)
+ATTACH_FAILURE_BACKOFF_CAP_SECONDS = 300.0
+ATTACH_FAILURE_SIGNATURE_PARK_THRESHOLD = 3
+
+
+def attach_failure_backoff_seconds(
+    attempts: int,
+    *,
+    schedule: tuple[float, ...] = ATTACH_FAILURE_BACKOFF_SECONDS,
+    cap: float = ATTACH_FAILURE_BACKOFF_CAP_SECONDS,
+) -> float:
+    """Backoff before the next claim after the ``attempts``-th failed attach.
+
+    ``attempts`` is ``attempts_since_completion`` as the claim recorded it
+    (1 on the first attempt). Walks the schedule, holds its last step, caps.
+    """
+    if not schedule:
+        return min(cap, 0.0)
+    index = max(0, min(int(attempts) - 1, len(schedule) - 1))
+    return float(min(schedule[index], cap))
+
+
 # =============================================================================
 # SQL
 # =============================================================================
@@ -401,6 +445,9 @@ UPDATE run_queue SET
         ELSE GREATEST(COALESCE(consumed_seq, $3::bigint), $3::bigint)
     END,
     attempts_since_completion = 0,
+    attach_failures = 0,
+    last_error = NULL,
+    last_error_signature = NULL,
     queued_at = now(),
     state = CASE WHEN (input_seq IS NOT NULL
                        AND (
@@ -463,6 +510,8 @@ RETURNING state
 _PARK_SQL = """
 UPDATE run_queue SET
     state = 'parked',
+    park_reason = COALESCE($3::text, park_reason),
+    parked_at = now(),
     leased_by = NULL,
     last_leased_by = NULL,
     leased_until = NULL,
@@ -626,6 +675,10 @@ UPDATE run_queue AS queue SET
     lease_token = queue.lease_token + 1,
     state = CASE WHEN queue.attempts_since_completion >= queue.max_attempts
                  THEN 'parked' ELSE 'queued' END,
+    park_reason = CASE WHEN queue.attempts_since_completion >= queue.max_attempts
+                       THEN 'reaper_max_attempts' ELSE queue.park_reason END,
+    parked_at = CASE WHEN queue.attempts_since_completion >= queue.max_attempts
+                     THEN now() ELSE queue.parked_at END,
     leased_by = NULL,
     -- The holder missed its heartbeats: it is dead, wedged, or partitioned.
     -- Clearing the affinity hint keeps the grace window from delaying the
@@ -648,10 +701,85 @@ _UNPARK_SQL = """
 UPDATE run_queue SET
     state = 'queued',
     attempts_since_completion = 0,
+    attach_failures = 0,
+    park_reason = NULL,
+    parked_at = NULL,
+    last_error = NULL,
+    last_error_signature = NULL,
     run_after = now(),
     queued_at = now()
 WHERE unit_id = $1::uuid AND state = 'parked'
 RETURNING state
+"""
+
+# Attach-failed release (stateless_turn_resilience.md step 2). The claim
+# already counted this attempt in attempts_since_completion, so this does not
+# increment it again (same convention as _RELEASE_SQL); it records the failure,
+# advances the consecutive same-signature counter, applies the executor-chosen
+# backoff, and parks — with a reason — when the claim count reached
+# max_attempts or the same signature is failing for the $6-th time in a row.
+# One fenced CAS: a stale token or a stolen lease changes nothing.
+_RECORD_ATTACH_FAILURE_SQL = """
+WITH cur AS (
+    SELECT unit_id,
+           attempts_since_completion AS attempts,
+           max_attempts,
+           CASE WHEN last_error_signature IS NOT DISTINCT FROM $3::text
+                THEN attach_failures + 1 ELSE 1 END AS next_attach_failures
+    FROM run_queue
+    WHERE unit_id = $1::uuid AND lease_token = $2::bigint AND state = 'leased'
+    FOR UPDATE
+), verdict AS (
+    SELECT unit_id, attempts, next_attach_failures,
+           (attempts >= max_attempts OR next_attach_failures >= $6::int) AS will_park
+    FROM cur
+)
+UPDATE run_queue AS queue SET
+    attach_failures = verdict.next_attach_failures,
+    last_error = $4::text,
+    last_error_signature = $3::text,
+    state = CASE WHEN verdict.will_park THEN 'parked' ELSE 'queued' END,
+    park_reason = CASE WHEN verdict.will_park THEN 'attach_failed'
+                       ELSE queue.park_reason END,
+    parked_at = CASE WHEN verdict.will_park THEN now() ELSE queue.parked_at END,
+    leased_by = NULL,
+    last_leased_by = NULL,
+    leased_until = NULL,
+    interrupt_admission_lease_token = NULL,
+    interrupt_admission_turn_id = NULL,
+    queued_at = now(),
+    run_after = now() + make_interval(secs => $5::float8)
+FROM verdict
+WHERE queue.unit_id = verdict.unit_id
+RETURNING queue.state, queue.attempts_since_completion, queue.attach_failures,
+          queue.park_reason, queue.run_after
+"""
+
+_QUEUE_STATE_SQL = """
+SELECT state, park_reason, parked_at, last_error,
+       attempts_since_completion, max_attempts, attach_failures,
+       input_seq, consumed_seq, run_after
+FROM run_queue WHERE unit_id = $1::uuid
+"""
+
+# Operator worklist: parked units newest first, with the owning thread (session
+# units only; worker_batch rows carry no thread) for the admin capacity page.
+_LIST_PARKED_DETAIL_SQL = """
+SELECT queue.unit_id, queue.unit_kind, queue.park_reason, queue.parked_at,
+       queue.attempts_since_completion, queue.max_attempts,
+       queue.attach_failures, queue.last_error, queue.queued_at,
+       (queue.input_seq IS NOT NULL
+        AND (queue.consumed_seq IS NULL OR queue.input_seq > queue.consumed_seq))
+           AS pending_input,
+       thread.id AS thread_id, thread.title, thread.user_id,
+       owner.preferred_username AS owner
+FROM run_queue AS queue
+LEFT JOIN threads AS thread
+       ON thread.id = queue.unit_id AND queue.unit_kind = 'session_turn'
+LEFT JOIN users AS owner ON owner.id = thread.user_id
+WHERE queue.state = 'parked'
+ORDER BY COALESCE(queue.parked_at, queue.queued_at) DESC, queue.unit_id
+LIMIT $1::int
 """
 
 _LIST_LEASED_SQL = """
@@ -1048,6 +1176,7 @@ async def park_unit(
     *,
     unit_id: UUID | str,
     lease_token: int,
+    reason: str | None = None,
 ) -> str | None:
     """Fail closed: exact leased claim -> ``'parked'`` without consumption.
 
@@ -1060,8 +1189,46 @@ async def park_unit(
     Returns ``'parked'`` on success or ``None`` when the exact token no longer
     owns a leased row. Callers must quiesce every local writer before calling
     this function, just as they must before release/complete.
+
+    ``reason`` is recorded as ``park_reason`` (with ``parked_at``) so an owner
+    or operator can see why; ``None`` keeps whatever reason the row carries.
     """
-    return await conn.fetchval(_PARK_SQL, _uuid(unit_id), lease_token)
+    return await conn.fetchval(_PARK_SQL, _uuid(unit_id), lease_token, reason)
+
+
+async def record_attach_failure(
+    conn: Executor,
+    *,
+    unit_id: UUID | str,
+    lease_token: int,
+    error: str,
+    signature: str,
+    backoff_seconds: float,
+    signature_park_threshold: int = ATTACH_FAILURE_SIGNATURE_PARK_THRESHOLD,
+) -> dict[str, Any] | None:
+    """Release after a failed attach: count it, back off, park when bounded.
+
+    The claim already counted this attempt in ``attempts_since_completion``
+    (same convention as :func:`release_unit`), so the statement does not
+    increment it again. It records ``last_error`` / ``last_error_signature``,
+    advances ``attach_failures`` (reset to 1 when the signature changes), moves
+    ``run_after`` by ``backoff_seconds``, and parks with
+    ``park_reason='attach_failed'`` when the claim count already reached
+    ``max_attempts`` or this is the ``signature_park_threshold``-th consecutive
+    failure with the same signature. Returns the resulting row slice
+    (``state``, ``attempts_since_completion``, ``attach_failures``,
+    ``park_reason``, ``run_after``) or ``None`` when fenced out.
+    """
+    row = await conn.fetchrow(
+        _RECORD_ATTACH_FAILURE_SQL,
+        _uuid(unit_id),
+        lease_token,
+        signature,
+        error,
+        float(backoff_seconds),
+        int(signature_park_threshold),
+    )
+    return dict(row) if row is not None else None
 
 
 async def fence_lease(
@@ -1254,3 +1421,43 @@ async def queue_depth_for(
         control_consumed_seq=control_consumed_seq,
         has_pending_control=control_input_seq > control_consumed_seq,
     )
+
+
+async def queue_state_for(
+    conn: Executor, *, unit_id: UUID | str
+) -> dict[str, Any] | None:
+    """Owner/operator read model of one unit's lifecycle; ``None`` if no row.
+
+    Plain dict: ``state``, ``park_reason``, ``parked_at`` (datetime or None),
+    ``last_error``, ``attempts``, ``max_attempts``, ``attach_failures``,
+    ``pending_input`` (the same NULL-safe watermark comparison as
+    :func:`queue_depth_for`), ``run_after``. Whether a park is *retryable* is
+    decided by the orchestrator (it needs the thread's stop markers), not here.
+    """
+    row = await conn.fetchrow(_QUEUE_STATE_SQL, _uuid(unit_id))
+    if row is None:
+        return None
+    input_seq = row["input_seq"]
+    consumed_seq = row["consumed_seq"]
+    return {
+        "state": row["state"],
+        "park_reason": row["park_reason"],
+        "parked_at": row["parked_at"],
+        "last_error": row["last_error"],
+        "attempts": int(row["attempts_since_completion"] or 0),
+        "max_attempts": int(row["max_attempts"] or 0),
+        "attach_failures": int(row["attach_failures"] or 0),
+        "pending_input": input_seq is not None
+        and (consumed_seq is None or input_seq > consumed_seq),
+        "run_after": row["run_after"],
+    }
+
+
+async def list_parked(conn: Executor, *, limit: int = 50) -> list[dict[str, Any]]:
+    """Parked units newest first, joined to their session thread and owner.
+
+    The admin capacity page's unpark worklist. Diagnostics only.
+    """
+    bounded = max(1, min(int(limit), 500))
+    rows = await conn.fetch(_LIST_PARKED_DETAIL_SQL, bounded)
+    return [dict(row) for row in rows]

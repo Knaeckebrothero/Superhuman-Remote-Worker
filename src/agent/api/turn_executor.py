@@ -75,20 +75,27 @@ from agent.api.orchestrator_client import (
     ClaimBundleError,
     CompletionNonTerminalReportError,
 )
+from shared.event_journal import append_system_frame
 from shared.job_freeze_types import (
     AUTO_CONTINUE_FREEZE_TYPES,
     FREEZE_TYPE_BATCH_BOUNDARY,
 )
 from shared.run_queue import (
     HEARTBEAT_INTERVAL_SECONDS,
+    PARK_REASON_ATTACH_FAILED,
+    PARK_REASON_COMPLETION_CAS_FAILED,
+    PARK_REASON_SHUTDOWN_CANCELLED,
+    RETRYABLE_PARK_REASONS,
     UNIT_KIND_SESSION_TURN,
     ClaimedUnit,
+    attach_failure_backoff_seconds,
     claim_unit,
     close_interrupt_admission,
     complete_unit,
     heartbeat_unit,
     open_interrupt_admission,
     park_unit,
+    record_attach_failure,
     release_unit,
 )
 from shared.session_retirement import acknowledge_session_claim_quiesced
@@ -450,6 +457,45 @@ def strip_restored_pending_humans(
         messages.pop()
         removed += 1
     return removed
+
+
+_UUID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+_HEX_RE = re.compile(r"\b[0-9a-f]{12,}\b")
+_DIGITS_RE = re.compile(r"\d+")
+_ERROR_SIGNATURE_MESSAGE_CHARS = 80
+_LAST_ERROR_CHARS = 2000
+
+
+def _error_signature(exc: BaseException) -> str:
+    """Stable class+message signature of an attach failure.
+
+    The signature is what parks a poison attach (the same failure three times
+    in a row), so it must not change between retries just because an id or a
+    counter in the message did: UUIDs, long hex tokens and digit runs are
+    folded, whitespace collapsed, then the message is cut to 80 chars.
+    """
+    message = " ".join(str(exc).split())
+    message = _UUID_RE.sub("<uuid>", message)
+    message = _HEX_RE.sub("<hex>", message)
+    message = _DIGITS_RE.sub("#", message)
+    return f"{type(exc).__name__}:{message[:_ERROR_SIGNATURE_MESSAGE_CHARS]}"
+
+
+# Executor-internal park reasons → the recorded park_reason vocabulary
+# (stateless_turn_resilience.md step 2). Anything not named here is recorded
+# verbatim: it is still a reason, just not an owner-retryable one.
+_PARK_REASON_MAP = {
+    "uncooperative_shutdown": PARK_REASON_SHUTDOWN_CANCELLED,
+    "shutdown_cancelled": PARK_REASON_SHUTDOWN_CANCELLED,
+    "completion_cas_failed": PARK_REASON_COMPLETION_CAS_FAILED,
+    "completion_cas_failed_pre_effect": PARK_REASON_COMPLETION_CAS_FAILED,
+}
+
+
+def _park_reason_for(executor_reason: str) -> str:
+    return _PARK_REASON_MAP.get(executor_reason, executor_reason)
 
 
 class StatelessTurnExecutor:
@@ -2673,7 +2719,7 @@ class StatelessTurnExecutor:
                     "attach failed for unit %s: %s", unit_id, e, exc_info=True
                 )
                 await self._detach_cached_session("attach_failed")
-                await self._release(claim, reason="attach_failed")
+                await self._release_attach_failure(claim, e)
                 return
             self._attached_fingerprint = fingerprint
             self._attached_bundle = attach
@@ -3743,12 +3789,14 @@ class StatelessTurnExecutor:
         """CAS an already-quiesced post-effect claim to manual recovery."""
 
         last_error: BaseException | None = None
+        park_reason = _park_reason_for(reason)
         for attempt in range(1, COMPLETE_RETRY_ATTEMPTS + 1):
             try:
                 state = await park_unit(
                     self._db,
                     unit_id=claim.unit_id,
                     lease_token=claim.lease_token,
+                    reason=park_reason,
                 )
                 if state is None:
                     logger.critical(
@@ -3765,12 +3813,19 @@ class StatelessTurnExecutor:
                 self._clear_claim_tool_effect(pa, claim)
                 logger.critical(
                     "run_queue parked after post-effect claim could not "
-                    "complete: unit=%s token=%d reason=%s state=%s; manual "
-                    "reconciliation and explicit unpark required",
+                    "complete: unit=%s token=%d reason=%s park_reason=%s "
+                    "state=%s; reconciliation and explicit unpark required",
                     claim.unit_id,
                     claim.lease_token,
                     reason,
+                    park_reason,
                     state,
+                )
+                await self._journal_parked(
+                    claim,
+                    reason=park_reason,
+                    error=None,
+                    attempts=claim.attempts_since_completion,
                 )
                 return state
             except asyncio.CancelledError:
@@ -3971,6 +4026,128 @@ class StatelessTurnExecutor:
                 state,
             )
             self._clear_claim_tool_effect(pa, claim)
+
+    async def _release_attach_failure(
+        self, claim: ClaimedUnit, exc: BaseException
+    ) -> None:
+        """Attach failed: count it, back off, park when bounded, tell the user.
+
+        Replaces the plain error release for the attach path
+        (stateless_turn_resilience.md step 2). The claim already counted this
+        attempt; ``record_attach_failure`` records the failure signature and
+        either re-queues with a growing backoff or parks with
+        ``park_reason='attach_failed'`` — and a park is journaled as a
+        ``turn.parked`` frame so a queued message never turns into silence.
+        """
+        pa = _pa()
+        await self._quiesce_claim_before_transition(
+            pa,
+            reason="release_attach_failed",
+        )
+        if self._lease.lost.is_set():
+            logger.info(
+                "run_queue release: unit=%s token=%d reason=attach_failed "
+                "skipped after local ownership loss",
+                claim.unit_id,
+                claim.lease_token,
+            )
+            if self._exact_claim_handle_lost(claim):
+                await self._ack_terminal_claim_loss(claim)
+            return
+        signature = _error_signature(exc)
+        error_text = str(exc)[:_LAST_ERROR_CHARS]
+        backoff = attach_failure_backoff_seconds(claim.attempts_since_completion)
+        try:
+            row = await record_attach_failure(
+                self._db,
+                unit_id=claim.unit_id,
+                lease_token=claim.lease_token,
+                error=error_text,
+                signature=signature,
+                backoff_seconds=backoff,
+            )
+        except Exception:
+            logger.warning(
+                "run_queue attach-failure release failed for unit %s — the "
+                "lease will expire instead",
+                claim.unit_id,
+                exc_info=True,
+            )
+            return
+        if row is None:
+            logger.info(
+                "run_queue release: unit=%s token=%d reason=attach_failed "
+                "(already fenced out — nothing to release)",
+                claim.unit_id,
+                claim.lease_token,
+            )
+            await self._ack_terminal_claim_loss(claim)
+            self._clear_claim_tool_effect(pa, claim)
+            return
+        self._clear_claim_tool_effect(pa, claim)
+        state = str(row.get("state") or "")
+        attempts = int(row.get("attempts_since_completion") or 0)
+        logger.warning(
+            "run_queue release: unit=%s token=%d reason=attach_failed state=%s "
+            "attempts=%d attach_failures=%d backoff=%.0fs signature=%s",
+            claim.unit_id,
+            claim.lease_token,
+            state,
+            attempts,
+            int(row.get("attach_failures") or 0),
+            backoff,
+            signature,
+        )
+        if state == "parked":
+            await self._journal_parked(
+                claim,
+                reason=PARK_REASON_ATTACH_FAILED,
+                error=error_text,
+                attempts=attempts,
+            )
+
+    async def _journal_parked(
+        self,
+        claim: ClaimedUnit,
+        *,
+        reason: str,
+        error: Optional[str],
+        attempts: int,
+    ) -> None:
+        """Append the ``turn.parked`` system frame for a park this pod made.
+
+        Post-park is a sanctioned system-writer context
+        (``shared.event_journal.append_system_frame``): the local journal
+        writer was detached by the quiescence that precedes every park. Only
+        session units have a journal; a failure to write it is logged, never
+        raised — the queue disposition is already durable.
+        """
+        if str(claim.unit_kind) != UNIT_KIND_SESSION_TURN:
+            return
+        payload: dict[str, Any] = {
+            "reason": reason,
+            "attempts": int(attempts),
+            "retryable": reason in RETRYABLE_PARK_REASONS,
+            "parked_by": self._pod_name,
+        }
+        if error:
+            payload["error"] = error[: _ERROR_SIGNATURE_MESSAGE_CHARS * 4]
+        try:
+            await append_system_frame(
+                self._db,
+                thread_id=str(claim.unit_id),
+                kind="turn.parked",
+                payload=payload,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "turn.parked journal frame failed for unit %s (reason=%s)",
+                claim.unit_id,
+                reason,
+                exc_info=True,
+            )
 
     async def _detach_physical_before_transition(self, reason: str) -> None:
         """Retire physical owner state while this claim is still exclusive."""
