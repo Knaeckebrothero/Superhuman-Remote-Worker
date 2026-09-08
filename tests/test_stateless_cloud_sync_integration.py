@@ -148,6 +148,10 @@ async def test_stateless_start_recovers_then_strict_pulls_then_arms(monkeypatch)
                 AsyncMock(return_value=True),
             ),
             patch(
+                "shared.cloud_sync_generations.adopt_push_ownership",
+                AsyncMock(return_value={}),
+            ),
+            patch(
                 "shared.cloud_sync_generations.load_cloud_sync_requirements",
                 AsyncMock(return_value={}),
             ),
@@ -201,6 +205,10 @@ async def test_stateless_pull_failure_blocks_arm_and_turn_start(monkeypatch):
             patch(
                 "shared.cloud_sync_generations.cloud_sync_lease_is_current",
                 AsyncMock(return_value=True),
+            ),
+            patch(
+                "shared.cloud_sync_generations.adopt_push_ownership",
+                AsyncMock(return_value={}),
             ),
             patch(
                 "shared.cloud_sync_generations.load_cloud_sync_requirements",
@@ -308,7 +316,10 @@ async def test_turn_end_task_captures_token_and_requirement_snapshot(monkeypatch
         overlay_mount_manager=None,
     )
 
-    async def record_task(_sync, _turn_id, *, requirements=None, claim=None) -> None:
+    async def record_task(
+        _sync, _turn_id, *, requirements=None, claim=None, staged_event=None
+    ) -> None:
+        del staged_event
         await release.wait()
         observed.append((requirements, claim))
 

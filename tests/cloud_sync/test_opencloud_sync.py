@@ -17,6 +17,10 @@ from agent.services.cloud_sync.opencloud_sync import (
 SECRET = "super-secret-client-secret"
 
 
+class _FakeResponse:
+    headers = {"ETag": '"fake-etag"'}
+
+
 class _FakeDav:
     def __init__(self):
         self.uploads: list = []
@@ -29,6 +33,19 @@ class _FakeDav:
         if self.should_raise:
             raise self.should_raise
         self.uploads.append(kwargs)
+
+    # Conditional writes (step 4a) go through execute_request, not
+    # upload_sync: the PUT has to carry If-Match / If-None-Match and
+    # webdav3's upload_sync has no header hook. Tests that stub
+    # `upload_sync` to fail keep working because this delegates to it.
+    def execute_request(self, action, path, data=None, headers_ext=None):
+        if action == "upload":
+            self.upload_sync(remote_path=path, local_path=data, headers_ext=headers_ext)
+        elif action == "clean":
+            self.clean(path)
+        else:  # pragma: no cover - unused actions
+            raise AssertionError(f"unexpected action {action}")
+        return _FakeResponse()
 
     def mkdir(self, path):
         if self.should_raise:
@@ -45,6 +62,13 @@ class _FakeDav:
 
     def list(self, _path, get_info=False):
         return self.list_returns
+
+
+def _local_file(tmp_path, name="a.txt", body=b"payload"):
+    """A real file on disk: the conditional PUT streams the handle itself."""
+    path = tmp_path / name
+    path.write_bytes(body)
+    return str(path)
 
 
 def _token_response(token="abc123", expires_in=300):
@@ -127,7 +151,7 @@ async def test_token_refresh_after_expiry(sync_with_mocks, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_401_retry_forces_refresh(sync_with_mocks):
+async def test_401_retry_forces_refresh(sync_with_mocks, tmp_path):
     sync, fake_dav, fake_httpx = sync_with_mocks
 
     class UnauthorizedError(Exception):
@@ -145,7 +169,7 @@ async def test_401_retry_forces_refresh(sync_with_mocks):
 
     fake_dav.upload_sync = upload_once_401
 
-    await sync._upload_file("a.txt", "/tmp/x")
+    await sync._upload_file("a.txt", _local_file(tmp_path))
     # Token fetched twice: once initial, once after 401 force-refresh
     assert fake_httpx.post.call_count == 2
     assert fake_dav.uploads  # eventual success
@@ -169,12 +193,15 @@ async def test_generation_delete_is_idempotent_when_resource_already_missing(
 
     await sync._delete_remote_file("deleted.txt", before_write=before_write)
 
-    assert fake_dav.deletes == ["deleted.txt"]
+    # Urn-quoted, like webdav3's own Client.clean: the conditional delete
+    # mirrors it exactly and only adds the precondition header, so the
+    # request on the wire is unchanged.
+    assert [d.lstrip("/") for d in fake_dav.deletes] == ["deleted.txt"]
     assert before_write_calls == 1
 
 
 @pytest.mark.asyncio
-async def test_401_mutation_retry_rechecks_generation_owner(sync_with_mocks):
+async def test_401_mutation_retry_rechecks_generation_owner(sync_with_mocks, tmp_path):
     """A lease lost during token refresh must block the second PUT attempt."""
 
     sync, fake_dav, _fake_httpx = sync_with_mocks
@@ -195,7 +222,9 @@ async def test_401_mutation_retry_rechecks_generation_owner(sync_with_mocks):
             raise RuntimeError("lease stolen during token refresh")
 
     with pytest.raises(RuntimeError, match="lease stolen"):
-        await sync._upload_file("a.txt", "/tmp/x", before_write=before_write)
+        await sync._upload_file(
+            "a.txt", _local_file(tmp_path), before_write=before_write
+        )
 
     assert checks == 2
     assert fake_dav.uploads == []
@@ -355,7 +384,7 @@ async def test_service_account_repr_marks_mode(sync_with_mocks):
 
 
 @pytest.mark.asyncio
-async def test_impersonation_401_retry_redoes_full_chain(impersonation_sync):
+async def test_impersonation_401_retry_redoes_full_chain(impersonation_sync, tmp_path):
     """A 401 during WebDAV forces a fresh service token AND a fresh exchange."""
     sync, fake_dav, fake_httpx = impersonation_sync
 
@@ -372,7 +401,7 @@ async def test_impersonation_401_retry_redoes_full_chain(impersonation_sync):
         return original_upload(**kwargs)
 
     fake_dav.upload_sync = upload_once_401
-    await sync._upload_file("a.txt", "/tmp/x")
+    await sync._upload_file("a.txt", _local_file(tmp_path))
     # After 401: re-fetch service token + re-exchange. Total 4 POSTs.
     assert fake_httpx.post.call_count == 4
     assert fake_dav.uploads  # eventual success

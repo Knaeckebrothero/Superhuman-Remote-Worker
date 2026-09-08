@@ -101,13 +101,45 @@ def queue_block(state: dict[str, Any] | None, metadata: Any) -> dict[str, Any]:
     }
 
 
+async def cloud_push_block(conn: Any, thread_id: str) -> dict[str, Any] | None:
+    """The ``cloud_push`` view of a thread's pending turn-end push.
+
+    Commit-then-effects (stateless_turn_resilience.md step 4a): after the
+    unit completes, the push continues off-slot and this is the only place a
+    client can see it — no journal frames are written after release.
+    ``None`` when nothing is pending or the read fails (diagnostics only).
+    """
+    from shared.cloud_sync_generations import pending_push_state
+
+    try:
+        state = await pending_push_state(conn, thread_id=thread_id)
+    except Exception:
+        return None
+    if not state.get("pending"):
+        return None
+    return {
+        "pending": int(state.get("pending") or 0),
+        "uploaded": int(state.get("uploaded") or 0),
+        "total": state.get("total"),
+        "owner_alive": bool(state.get("owner_alive")),
+        "failed": bool(state.get("failed")),
+    }
+
+
 async def queue_block_for_thread(conn: Any, thread: dict[str, Any]) -> dict[str, Any]:
-    """Read + shape the ``queue`` block for a thread row on ``conn``."""
+    """Read + shape the ``queue`` block for a thread row on ``conn``.
+
+    Carries ``cloud_push`` (or ``None``) so ``/input``, ``/connection`` and
+    ``GET …/queue`` all expose the off-slot push the same way.
+    """
     state = await queue_state_for(conn, unit_id=str(thread["id"]))
-    return queue_block(state, thread.get("metadata"))
+    block = queue_block(state, thread.get("metadata"))
+    block["cloud_push"] = await cloud_push_block(conn, str(thread["id"]))
+    return block
 
 
 __all__ = [
+    "cloud_push_block",
     "RETRY_REFUSAL_CLAIM_LOSS_HOLD",
     "RETRY_REFUSAL_NOT_RETRYABLE",
     "RETRY_REFUSAL_STOP_MARKERS",

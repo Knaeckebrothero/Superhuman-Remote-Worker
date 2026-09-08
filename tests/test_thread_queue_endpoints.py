@@ -107,6 +107,7 @@ async def test_queue_state_returns_the_block_for_the_owner(owner, monkeypatch):
         "retryable": True,
         "attempts": 3,
         "pending_input": True,
+        "cloud_push": None,
     }
     owner.assert_awaited_once()
 
@@ -286,3 +287,63 @@ def test_queue_routes_are_mounted():
     routes = mounted_routes(main.app)
     assert ("GET", "/api/persistent/threads/{thread_id}/queue") in routes
     assert ("POST", "/api/persistent/threads/{thread_id}/queue/retry") in routes
+
+
+# ---------------------------------------------------------------------------
+# cloud_push (commit-then-effects, step 4a)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_queue_block_reports_no_cloud_push_when_nothing_pending(
+    owner, monkeypatch
+):
+    conn, _ = _wire(monkeypatch, state=_parked(), authority=None)
+    conn.fetch = AsyncMock(return_value=[])  # pending_push_state → no rows
+    body = await main.thread_queue_state(THREAD, request=object())
+    assert body["queue"]["cloud_push"] is None
+
+
+@pytest.mark.asyncio
+async def test_queue_block_reports_the_off_slot_push(owner, monkeypatch):
+    conn, _ = _wire(monkeypatch, state={**_parked(), "state": "done"}, authority=None)
+    conn.fetch = AsyncMock(
+        return_value=[
+            {
+                "mount_id": "legacy-session",
+                "push_progress": {
+                    "planned": 17,
+                    "files": {
+                        "a.md": {
+                            "sha256": "a" * 64,
+                            "size": 3,
+                            "remote_etag": "e",
+                            "state": "uploaded",
+                        }
+                    },
+                },
+                "push_heartbeat_at": NOW,
+                "push_owner_pod": "srw-agent-stateless-x",
+                "push_failed_at": None,
+                "push_error": None,
+                "owner_alive": True,
+            }
+        ]
+    )
+    body = await main.thread_queue_state(THREAD, request=object())
+    assert body["queue"]["cloud_push"] == {
+        "pending": 1,
+        "uploaded": 1,
+        "total": 17,
+        "owner_alive": True,
+        "failed": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_queue_block_survives_a_cloud_push_read_failure(owner, monkeypatch):
+    conn, _ = _wire(monkeypatch, state=_parked(), authority=None)
+    conn.fetch = AsyncMock(side_effect=RuntimeError("db down"))
+    body = await main.thread_queue_state(THREAD, request=object())
+    assert body["queue"]["state"] == "parked"
+    assert body["queue"]["cloud_push"] is None

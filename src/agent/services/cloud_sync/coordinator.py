@@ -25,10 +25,11 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Sequence
+from typing import Any, Awaitable, Callable, Optional, Sequence
 
 from shared.cloud_sync_generations import encode_cloud_sync_baseline
 from agent.services.cloud_sync.base import (
+    StagedGenerationDelta,
     CloudSyncMarker,
     CloudSyncMarkerError,
     WorkspaceSyncBase,
@@ -56,6 +57,19 @@ class MountSync:
     @property
     def generation_id(self) -> str:
         return self.generation_key or self.mount_id
+
+
+@dataclass
+class StagedMountGeneration:
+    """One mount's generation, staged (workspace read) but not yet transmitted.
+
+    ``staged`` is ``None`` when the cloud-side marker already commits the
+    requirement — the transmit then only mirrors the acknowledgement.
+    """
+
+    mount: MountSync
+    requirement: Any
+    staged: Optional[StagedGenerationDelta]
 
 
 class CloudSyncError(RuntimeError):
@@ -237,18 +251,22 @@ class WorkspaceSyncCoordinator:
         """Push every mount concurrently. Raise if any mount failed."""
         return await self._run_all("push")
 
-    async def push_generation(
+    async def stage_generation(
         self,
         requirements: dict[str, Any],
         *,
-        before_write: Callable[[], Awaitable[None]],
-        acknowledge: Callable[[str, Any], Awaitable[None]],
-    ) -> dict[str, list[str]]:
-        """Commit each armed generation from its durable content baseline."""
+        progress: Optional[dict[str, Any]] = None,
+    ) -> list[StagedMountGeneration]:
+        """Read every mount's workspace delta; no cloud writes yet.
+
+        Runs while the run_queue unit is still leased (the workspace SSH
+        backend is alive). ``progress`` maps mount id → a predecessor's
+        durable push progress (adoption); absent for a fresh turn-end push.
+        """
 
         self.validate_requirements(requirements)
 
-        async def _one(mount: MountSync) -> list[str]:
+        async def _one(mount: MountSync) -> StagedMountGeneration:
             generation_id = mount.generation_id
             requirement = requirements[generation_id]
             mount.sync.install_generation_baseline(requirement.baseline_manifest)
@@ -259,15 +277,71 @@ class WorkspaceSyncCoordinator:
             if self._marker_commits_requirement(
                 mount, requirement=requirement, marker=existing
             ):
+                return StagedMountGeneration(mount, requirement, None)
+            staged = await mount.sync.stage_generation_delta(
+                requirement.baseline_manifest,
+                progress=(progress or {}).get(generation_id),
+            )
+            return StagedMountGeneration(mount, requirement, staged)
+
+        results = await asyncio.gather(
+            *(_one(mount) for mount in self._mounts), return_exceptions=True
+        )
+        failures: list[tuple[str, str, BaseException]] = []
+        staged_all: list[StagedMountGeneration] = []
+        for mount, result in zip(self._mounts, results):
+            if isinstance(result, BaseException):
+                failures.append((mount.mount_id, mount.target_path, result))
+            else:
+                staged_all.append(result)
+        if failures:
+            for item in staged_all:
+                if item.staged is not None:
+                    item.staged.cleanup()
+            raise CloudSyncError("generation_stage", failures)
+        return staged_all
+
+    async def transmit_generation(
+        self,
+        staged: list[StagedMountGeneration],
+        *,
+        before_write: Callable[[], Awaitable[None]],
+        acknowledge: Callable[[str, Any], Awaitable[None]],
+        progress: Optional[
+            Callable[[str, str, dict[str, object]], Awaitable[None]]
+        ] = None,
+        planned: Optional[Callable[[str, int], Awaitable[None]]] = None,
+    ) -> dict[str, list[str]]:
+        """Land every staged mount: writes, marker, acknowledgement.
+
+        Needs only the cloud transport and the writer fence (``before_write``)
+        — the workspace may already be detached. ``progress(mount_id, path,
+        entry)`` is called after each landed write; ``planned(mount_id, n)``
+        once per mount before its first write.
+        """
+
+        async def _one(item: StagedMountGeneration) -> list[str]:
+            mount = item.mount
+            requirement = item.requirement
+            generation_id = mount.generation_id
+            if item.staged is None:
                 # A previous whole-operation or multi-mount retry got this far.
                 # Mirror the resource truth into DB, but never replay the delta
                 # over a cloud-side edit that arrived after the marker.
                 await acknowledge(generation_id, requirement)
                 return []
+            if planned is not None:
+                await planned(generation_id, item.staged.planned)
+
+            async def _progress(path: str, entry: dict[str, object]) -> None:
+                if progress is not None:
+                    await progress(generation_id, path, entry)
+
             await before_write()
-            commit = await mount.sync.push_generation_delta(
-                requirement.baseline_manifest,
+            commit = await mount.sync.transmit_generation_delta(
+                item.staged,
                 before_write=before_write,
+                progress_cb=_progress,
             )
             marker = CloudSyncMarker(
                 thread_id=self.thread_id,
@@ -288,7 +362,40 @@ class WorkspaceSyncCoordinator:
             mount.sync.install_generation_baseline(commit.manifest)
             return commit.paths
 
-        return await self._run_generation_all("generation_push", _one)
+        results = await asyncio.gather(
+            *(_one(item) for item in staged), return_exceptions=True
+        )
+        ok: dict[str, list[str]] = {}
+        failures: list[tuple[str, str, BaseException]] = []
+        for item, result in zip(staged, results):
+            if isinstance(result, BaseException):
+                failures.append((item.mount.mount_id, item.mount.target_path, result))
+            else:
+                ok[item.mount.mount_id] = result
+        if failures:
+            raise CloudSyncError("generation_push", failures)
+        return ok
+
+    async def push_generation(
+        self,
+        requirements: dict[str, Any],
+        *,
+        before_write: Callable[[], Awaitable[None]],
+        acknowledge: Callable[[str, Any], Awaitable[None]],
+        progress: Optional[
+            Callable[[str, str, dict[str, object]], Awaitable[None]]
+        ] = None,
+    ) -> dict[str, list[str]]:
+        """Commit each armed generation from its durable content baseline."""
+
+        await before_write()
+        staged = await self.stage_generation(requirements)
+        return await self.transmit_generation(
+            staged,
+            before_write=before_write,
+            acknowledge=acknowledge,
+            progress=progress,
+        )
 
     async def reconcile_before_pull(
         self,
@@ -296,8 +403,16 @@ class WorkspaceSyncCoordinator:
         *,
         before_write: Callable[[], Awaitable[None]],
         acknowledge: Callable[[str, Any], Awaitable[None]],
+        adopt: Optional[Callable[[], Awaitable[dict[str, Any]]]] = None,
     ) -> dict[str, list[str]]:
-        """Repair/validate the prior generation before pull(N+1)."""
+        """Repair/validate the prior generation before pull(N+1).
+
+        ``adopt`` (commit-then-effects, step 4a) is called once when any
+        requirement is still pending: it bumps the push owner token so a
+        predecessor still transmitting off-slot stops at its next write, and
+        returns that predecessor's durable progress per mount so the replay
+        below resumes instead of re-uploading.
+        """
 
         # Fail before any resource read/write when two payload entries collapse
         # to one durable logical key.
@@ -315,6 +430,12 @@ class WorkspaceSyncCoordinator:
                 "pending cloud generation belongs to absent mount(s): "
                 + ", ".join(pending_unknown)
             )
+        progress_by_mount: dict[str, Any] = {}
+        if adopt is not None and any(
+            requirement.acknowledged_generation < requirement.required_generation
+            for requirement in requirements.values()
+        ):
+            progress_by_mount = dict(await adopt() or {})
 
         async def _one(mount: MountSync) -> list[str]:
             generation_id = mount.generation_id
@@ -376,11 +497,14 @@ class WorkspaceSyncCoordinator:
                 return []
 
             # Crash/resource rollback recovery: replay only the paths changed
-            # from the durable post-pull baseline. Untouched cloud edits survive.
+            # from the durable post-pull baseline. Untouched cloud edits survive,
+            # and everything the predecessor already landed (adopted progress)
+            # is skipped rather than re-uploaded.
             await before_write()
             commit = await mount.sync.push_generation_delta(
                 requirement.baseline_manifest,
                 before_write=before_write,
+                progress=progress_by_mount.get(generation_id),
             )
             repaired = CloudSyncMarker(
                 thread_id=self.thread_id,

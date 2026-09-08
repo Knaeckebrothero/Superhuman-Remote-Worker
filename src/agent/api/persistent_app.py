@@ -13,11 +13,13 @@ import hmac
 import inspect
 import json
 import logging
+import contextlib
 import os
+import socket
 import re
 import time
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import (
@@ -802,6 +804,19 @@ _cloud_sync_retry_pending: bool = False
 # runs after the previous turn's task was awaited.
 # knowledge-base/knowledge/issues/session_turn_end_cloud_push_blocks_queued_input.md
 _pending_cloud_push_task: Optional[asyncio.Task] = None
+
+# Commit-then-effects (stateless_turn_resilience.md step 4a). The stateless
+# turn-end push is STAGED (workspace read into temp files) while the unit is
+# still leased — `_pending_cloud_push_staged` is set at that point — and then
+# handed its own fence by the executor before complete_unit: the task moves
+# from `_pending_cloud_push_task` into `_background_cloud_pushes` (keyed by
+# thread), keeps the coordinator it transmits through, and the session may be
+# detached. No journal frames are written after that hand-off; push state is
+# read from thread_cloud_sync_generations by /connection instead.
+_pending_cloud_push_staged: Optional[asyncio.Event] = None
+_pending_cloud_push_claim: Optional["_CloudGenerationClaim"] = None
+_pending_cloud_push_sync: Any = None
+_background_cloud_pushes: Dict[str, "_BackgroundCloudPush"] = {}
 
 # M3 full-turn-settlement seam for the stateless executor (turn_executor.py): a
 # synchronous callable invoked by ``_loop_on_turn_settled`` only after the
@@ -5640,10 +5655,19 @@ async def _terminate_session_inner(
                 await _session.workspace_sync.pull_all()
         except Exception as e:
             logger.warning(f"Final cloud sync failed (non-fatal): {e}")
-        try:
-            await _session.workspace_sync.aclose()
-        except Exception as e:
-            logger.debug(f"Cloud sync aclose failed (non-fatal): {e}")
+        if _background_push_owns(_session.workspace_sync):
+            # Step 4a: a handed-off push still transmits through this
+            # coordinator; its done-callback closes it. Closing here would
+            # yank the WebDAV client from under the off-slot transmit.
+            logger.info(
+                "cloud sync coordinator left open for the handed-off push (thread %s)",
+                thread_id,
+            )
+        else:
+            try:
+                await _session.workspace_sync.aclose()
+            except Exception as e:
+                logger.debug(f"Cloud sync aclose failed (non-fatal): {e}")
 
     # Final git commit + push
     if _session.workspace_manager:
@@ -12606,7 +12630,13 @@ async def _loop_permission_check(
         _gates_in_flight.discard(tool_call_id)
 
 
-async def _resilient_cloud_sync(op: str, runner, turn_id: int) -> bool:
+async def _resilient_cloud_sync(
+    op: str,
+    runner,
+    turn_id: int,
+    *,
+    broadcast_errors: Optional[Callable[[], bool]] = None,
+) -> bool:
     """Run a cloud_sync op with retry+backoff; surface failure without crashing.
 
     Retries the bound coroutine factory ``runner`` up to three times with
@@ -12645,15 +12675,30 @@ async def _resilient_cloud_sync(op: str, runner, turn_id: int) -> bool:
         turn_id,
         last_error,
     )
-    _broadcast(
-        "workspace_sync.error",
-        {
-            "op": op,
-            "turn_id": turn_id,
-            "message": str(last_error) if last_error else "unknown error",
-        },
-    )
+    if broadcast_errors is None or broadcast_errors():
+        _broadcast(
+            "workspace_sync.error",
+            {
+                "op": op,
+                "turn_id": turn_id,
+                "message": str(last_error) if last_error else "unknown error",
+            },
+        )
     return False
+
+
+@dataclass
+class _CloudWriterFence:
+    """Which fence guards this writer's remote writes right now.
+
+    ``lease`` while the run_queue unit is leased; ``push`` once the executor
+    handed the push its own ``push_owner_token`` (step 4a). Mutable on
+    purpose: the push task captured its claim before the hand-off and must
+    see the flip on its next ``before_write``.
+    """
+
+    kind: str = "lease"
+    push_owner_token: int = 0
 
 
 @dataclass(frozen=True)
@@ -12663,6 +12708,24 @@ class _CloudGenerationClaim:
     workspace_generation: str
     postgres: Any
     lease_handle: Any
+    fence: _CloudWriterFence = field(default_factory=_CloudWriterFence)
+
+
+@dataclass
+class _BackgroundCloudPush:
+    thread_id: str
+    task: asyncio.Task
+    claim: _CloudGenerationClaim
+    sync: Any
+    heartbeat_task: Optional[asyncio.Task] = None
+    started_at: float = field(default_factory=time.monotonic)
+
+
+def _pod_identity() -> tuple[str, str]:
+    return (
+        str(os.getenv("POD_NAME") or os.getenv("HOSTNAME") or socket.gethostname()),
+        str(os.getenv("POD_UID") or ""),
+    )
 
 
 def _capture_cloud_generation_claim(sync: Any) -> _CloudGenerationClaim:
@@ -12691,10 +12754,32 @@ def _capture_cloud_generation_claim(sync: Any) -> _CloudGenerationClaim:
 
 
 async def _assert_cloud_generation_owner(claim: _CloudGenerationClaim) -> None:
-    """Recheck queue token + workspace incarnation before an external write."""
+    """Recheck the writer's fence + workspace incarnation before a remote write.
 
-    from shared.cloud_sync_generations import cloud_sync_lease_is_current
+    Under the lease: queue token + workspace generation (S2). After the
+    hand-off: the row's exact push_owner_token (step 4a) — a successor's
+    adoption bumps it and this writer stops at its next write.
+    """
 
+    from shared.cloud_sync_generations import (
+        cloud_sync_lease_is_current,
+        cloud_sync_writer_is_current,
+    )
+
+    fence = claim.fence
+    if fence.kind == "push":
+        current = await cloud_sync_writer_is_current(
+            claim.postgres,
+            kind="push",
+            thread_id=claim.thread_id,
+            workspace_generation=claim.workspace_generation,
+            push_owner_token=fence.push_owner_token,
+        )
+        if current:
+            return
+        raise LeaseLostError("cloud push write rejected by push-owner fence")
+    # The lease kind keeps its S2 entry point (the alias) so existing seams
+    # that patch ``cloud_sync_lease_is_current`` still fence this path.
     current = await cloud_sync_lease_is_current(
         claim.postgres,
         thread_id=claim.thread_id,
@@ -12714,6 +12799,7 @@ async def _ack_cloud_generation(
 ) -> None:
     from shared.cloud_sync_generations import acknowledge_cloud_sync_generation
 
+    fence = claim.fence
     acknowledged = await acknowledge_cloud_sync_generation(
         claim.postgres,
         thread_id=claim.thread_id,
@@ -12723,10 +12809,12 @@ async def _ack_cloud_generation(
         workspace_generation=requirement.workspace_generation,
         sync_scope_sha256=requirement.sync_scope_sha256,
         baseline_sha256=requirement.baseline_sha256,
+        push_owner_token=(fence.push_owner_token if fence.kind == "push" else None),
     )
     if acknowledged:
         return
-    claim.lease_handle.mark_lost()
+    if fence.kind != "push":
+        claim.lease_handle.mark_lost()
     raise LeaseLostError(
         f"cloud generation acknowledgement fenced for mount {mount_id}"
     )
@@ -12759,6 +12847,31 @@ async def _prepare_stateless_cloud_sync(sync: Any, turn_id: int) -> None:
     async def before_write() -> None:
         await _assert_cloud_generation_owner(claim)
 
+    async def adopt() -> Dict[str, Any]:
+        # Step 4a: this claim is the thread's authority now. Bump the push
+        # owner token so a predecessor still transmitting off-slot (any pod,
+        # including this one) stops at its next write, and take its durable
+        # progress so the replay below resumes instead of re-uploading.
+        from shared.cloud_sync_generations import adopt_push_ownership
+
+        pod_name, pod_uid = _pod_identity()
+        adopted = await adopt_push_ownership(
+            claim.postgres,
+            thread_id=claim.thread_id,
+            lease_token=claim.lease_token,
+            workspace_generation=claim.workspace_generation,
+            pod_name=pod_name,
+            pod_uid=pod_uid,
+        )
+        if adopted:
+            logger.info(
+                "cloud push adopted: thread=%s mounts=%d resumed_files=%d",
+                claim.thread_id,
+                len(adopted),
+                sum(len(p.get("files") or {}) for p in adopted.values()),
+            )
+        return adopted
+
     _broadcast("workspace_sync.reconciling", {"turn_id": turn_id})
     recovered = await _resilient_cloud_sync(
         "generation_recovery",
@@ -12766,6 +12879,7 @@ async def _prepare_stateless_cloud_sync(sync: Any, turn_id: int) -> None:
             requirements,
             before_write=before_write,
             acknowledge=acknowledge,
+            adopt=adopt,
         ),
         turn_id,
     )
@@ -12851,26 +12965,104 @@ async def _assert_no_pending_stateless_cloud_generation() -> None:
         )
 
 
+class _PushProgressRecorder:
+    """Batch landed-file progress into thread_cloud_sync_generations.
+
+    Writes happen only under the push fence (after the hand-off); before it
+    the entries accumulate and land on the first flush after the flip, so a
+    successor never sees progress a lease-fenced writer could still lose.
+    Every 8 files or 5 s, whichever first; the final flush is unconditional.
+    """
+
+    def __init__(self, claim: _CloudGenerationClaim) -> None:
+        self._claim = claim
+        self._pending: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        self._planned: Dict[str, int] = {}
+        self._planned_written: set[str] = set()
+        self._count = 0
+        self._last_flush = time.monotonic()
+
+    async def planned(self, mount_id: str, count: int) -> None:
+        self._planned[mount_id] = int(count)
+        await self._maybe_flush()
+
+    async def record(self, mount_id: str, path: str, entry: Dict[str, Any]) -> None:
+        self._pending.setdefault(mount_id, {})[path] = dict(entry)
+        self._count += 1
+        await self._maybe_flush()
+
+    async def _maybe_flush(self) -> None:
+        if self._count >= 8 or time.monotonic() - self._last_flush >= 5.0:
+            await self.flush()
+
+    async def flush(self) -> None:
+        fence = self._claim.fence
+        if fence.kind != "push" or fence.push_owner_token <= 0:
+            return
+        from shared.cloud_sync_generations import record_push_progress
+
+        mounts = set(self._pending) | (set(self._planned) - self._planned_written)
+        for mount_id in sorted(mounts):
+            files = self._pending.pop(mount_id, {})
+            planned = None
+            if mount_id in self._planned and mount_id not in self._planned_written:
+                planned = self._planned[mount_id]
+            try:
+                owned = await record_push_progress(
+                    self._claim.postgres,
+                    thread_id=self._claim.thread_id,
+                    mount_id=mount_id,
+                    push_owner_token=fence.push_owner_token,
+                    files=files,
+                    planned=planned,
+                )
+            except Exception:
+                logger.warning(
+                    "cloud push progress write failed (non-fatal): thread=%s mount=%s",
+                    self._claim.thread_id,
+                    mount_id,
+                    exc_info=True,
+                )
+                self._pending.setdefault(mount_id, {}).update(files)
+                continue
+            if planned is not None and owned:
+                self._planned_written.add(mount_id)
+            if not owned:
+                logger.info(
+                    "cloud push progress refused: token no longer owns thread=%s mount=%s",
+                    self._claim.thread_id,
+                    mount_id,
+                )
+        self._count = 0
+        self._last_flush = time.monotonic()
+
+
 async def _run_turn_end_cloud_push(
     sync: Any,
     turn_id: int,
     *,
     requirements: Optional[Dict[str, Any]] = None,
     claim: Optional[_CloudGenerationClaim] = None,
+    staged_event: Optional[asyncio.Event] = None,
 ) -> None:
     """Body of the background turn-end push task.
 
-    Same retry/backoff and the same ``workspace_sync.pushing/pushed/error``
-    broadcasts as the old inline await — only the scheduling changed. Takes
-    the coordinator as an argument (not via ``_session``) so a teardown that
-    nulls the session mid-flight can't turn this into an AttributeError.
+    Pinned lane: unchanged (push_all, same retry/backoff and broadcasts).
+    Stateless lane (step 4a): stage every mount while the unit is leased,
+    signal ``staged_event`` so the executor may hand off and complete, then
+    transmit — recording durable progress and heartbeating once the fence has
+    flipped to the push token. Broadcasts only while still under the lease:
+    nothing is journaled after the hand-off.
     """
-    _broadcast("workspace_sync.pushing", {"turn_id": turn_id})
+    if claim is None or claim.fence.kind == "lease":
+        _broadcast("workspace_sync.pushing", {"turn_id": turn_id})
     runner = sync.push_all
     op = "push"
+    recorder: Optional[_PushProgressRecorder] = None
     if requirements is not None:
         if claim is None:
             raise LeaseLostError("generation push lacks a captured claim")
+        recorder = _PushProgressRecorder(claim)
 
         async def before_write() -> None:
             await _assert_cloud_generation_owner(claim)
@@ -12879,16 +13071,241 @@ async def _run_turn_end_cloud_push(
             await _ack_cloud_generation(claim, mount_id, requirement)
 
         async def generation_runner() -> Any:
-            return await sync.push_generation(
-                requirements,
-                before_write=before_write,
-                acknowledge=acknowledge,
-            )
+            staged = await sync.stage_generation(requirements)
+            if staged_event is not None:
+                staged_event.set()
+            try:
+                return await sync.transmit_generation(
+                    staged,
+                    before_write=before_write,
+                    acknowledge=acknowledge,
+                    progress=recorder.record,
+                    planned=recorder.planned,
+                )
+            finally:
+                await recorder.flush()
 
         runner = generation_runner
         op = "generation_push"
-    if await _resilient_cloud_sync(op, runner, turn_id):
-        _broadcast("workspace_sync.pushed", {"turn_id": turn_id})
+    try:
+        ok = await _resilient_cloud_sync(
+            op,
+            runner,
+            turn_id,
+            broadcast_errors=lambda: claim is None or claim.fence.kind == "lease",
+        )
+    finally:
+        if staged_event is not None:
+            staged_event.set()
+    if ok:
+        if claim is None or claim.fence.kind == "lease":
+            _broadcast("workspace_sync.pushed", {"turn_id": turn_id})
+        return
+    if claim is not None and claim.fence.kind == "push":
+        from shared.cloud_sync_generations import record_push_failure
+
+        try:
+            await record_push_failure(
+                claim.postgres,
+                thread_id=claim.thread_id,
+                push_owner_token=claim.fence.push_owner_token,
+                error=f"{op} failed after retries (turn {turn_id})",
+            )
+        except Exception:
+            logger.debug("cloud push failure record skipped", exc_info=True)
+
+
+async def _hand_off_cloud_push(
+    db: Any,
+    *,
+    thread_id: str,
+    lease_token: int,
+    pod_name: str,
+    pod_uid: str,
+) -> bool:
+    """Executor seam (step 4a): give the pending push its own fence.
+
+    Runs under the still-live lease, before ``complete_unit``. One UPDATE
+    stamps every pending generation row with a fresh ``push_owner_token``;
+    the captured claim's fence flips to that token, the task moves into the
+    background registry (so no teardown awaits it and no detach closes its
+    coordinator), and a heartbeat starts. Returns False when nothing is
+    pending — the push already acknowledged every mount — or when the
+    pending task is not this claim's; the executor then waits it out as before.
+    """
+
+    global _pending_cloud_push_task, _pending_cloud_push_claim
+    global _pending_cloud_push_sync, _pending_cloud_push_staged
+    task = _pending_cloud_push_task
+    claim = _pending_cloud_push_claim
+    sync = _pending_cloud_push_sync
+    if task is None:
+        return False
+    if task.done():
+        _pending_cloud_push_task = None
+        _pending_cloud_push_claim = None
+        _pending_cloud_push_sync = None
+        _pending_cloud_push_staged = None
+        return False
+    if (
+        claim is None
+        or str(claim.thread_id) != str(thread_id)
+        or int(claim.lease_token) != int(lease_token)
+    ):
+        return False
+    from shared.cloud_sync_generations import hand_off_push_ownership
+
+    token = await hand_off_push_ownership(
+        db,
+        thread_id=thread_id,
+        lease_token=lease_token,
+        workspace_generation=claim.workspace_generation,
+        pod_name=pod_name,
+        pod_uid=pod_uid,
+    )
+    if token is None:
+        # Nothing pending in the database: the transmit already acknowledged
+        # everything (or had nothing to write). The task is finishing; let the
+        # executor's ordinary wait collect it.
+        return False
+    claim.fence.push_owner_token = int(token)
+    claim.fence.kind = "push"
+    entry = _BackgroundCloudPush(
+        thread_id=str(thread_id), task=task, claim=claim, sync=sync
+    )
+    entry.heartbeat_task = asyncio.create_task(
+        _push_owner_heartbeat_loop(claim),
+        name=f"cloud-push-heartbeat-{str(thread_id)[:8]}",
+    )
+    _background_cloud_pushes[str(thread_id)] = entry
+    task.add_done_callback(lambda _t, e=entry: _on_background_push_done(e))
+    _pending_cloud_push_task = None
+    _pending_cloud_push_claim = None
+    _pending_cloud_push_sync = None
+    _pending_cloud_push_staged = None
+    logger.info(
+        "cloud push handed off: thread=%s lease=%d push_owner_token=%d pod=%s",
+        thread_id,
+        lease_token,
+        int(token),
+        pod_name,
+    )
+    return True
+
+
+async def _push_owner_heartbeat_loop(claim: _CloudGenerationClaim) -> None:
+    from shared.cloud_sync_generations import heartbeat_push_owner
+
+    try:
+        while True:
+            await asyncio.sleep(20.0)
+            if claim.fence.kind != "push":
+                return
+            try:
+                alive = await heartbeat_push_owner(
+                    claim.postgres,
+                    thread_id=claim.thread_id,
+                    push_owner_token=claim.fence.push_owner_token,
+                )
+            except Exception:
+                logger.debug("cloud push heartbeat failed", exc_info=True)
+                continue
+            if not alive:
+                return
+    except asyncio.CancelledError:
+        raise
+
+
+def _background_push_owns(sync: Any) -> bool:
+    """True when a handed-off push still transmits through ``sync``."""
+
+    if sync is None:
+        return False
+    return any(
+        entry.sync is sync and not entry.task.done()
+        for entry in _background_cloud_pushes.values()
+    )
+
+
+def _on_background_push_done(entry: _BackgroundCloudPush) -> None:
+    """Registry cleanup when a handed-off push ends (any outcome)."""
+
+    if entry.heartbeat_task is not None and not entry.heartbeat_task.done():
+        entry.heartbeat_task.cancel()
+    if _background_cloud_pushes.get(entry.thread_id) is entry:
+        _background_cloud_pushes.pop(entry.thread_id, None)
+    task = entry.task
+    outcome = (
+        "cancelled"
+        if task.cancelled()
+        else ("failed" if task.exception() is not None else "done")
+    )
+    logger.info(
+        "cloud push background task %s: thread=%s push_owner_token=%d after %.1fs",
+        outcome,
+        entry.thread_id,
+        entry.claim.fence.push_owner_token,
+        time.monotonic() - entry.started_at,
+    )
+    # The coordinator belongs to the push once handed off; close it unless a
+    # live session still uses the very same object (warm reuse / adoption on
+    # this pod), in which case the session's teardown owns it.
+    session = _session
+    if session is not None and getattr(session, "workspace_sync", None) is entry.sync:
+        return
+    close = getattr(entry.sync, "aclose", None)
+    if close is not None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(_aclose_quietly(entry.sync))
+
+
+async def _aclose_quietly(sync: Any) -> None:
+    try:
+        await sync.aclose()
+    except Exception:
+        logger.debug("cloud sync aclose after background push failed", exc_info=True)
+
+
+async def _cancel_background_cloud_push(thread_id: str) -> None:
+    """A new claim of this thread on this pod supersedes its own old push.
+
+    Adoption bumps the DB token anyway; cancelling first avoids a needless
+    fenced write and lets the recovery resume from the durable progress.
+    """
+
+    entry = _background_cloud_pushes.get(str(thread_id))
+    if entry is None or entry.task.done():
+        return
+    entry.task.cancel()
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await asyncio.wait_for(asyncio.shield(entry.task), timeout=15.0)
+
+
+async def _await_background_cloud_pushes(timeout: float) -> None:
+    """Executor shutdown seam: wait (bounded) for handed-off pushes."""
+
+    tasks = [
+        entry.task
+        for entry in list(_background_cloud_pushes.values())
+        if not entry.task.done()
+    ]
+    if not tasks:
+        return
+    logger.info(
+        "waiting up to %.0fs for %d handed-off cloud push(es) before exit",
+        timeout,
+        len(tasks),
+    )
+    done, pending = await asyncio.wait(tasks, timeout=max(0.0, timeout))
+    if pending:
+        logger.warning(
+            "%d handed-off cloud push(es) still running at exit; progress is "
+            "durable and the thread's next claim adopts the rest",
+            len(pending),
+        )
 
 
 async def _await_pending_cloud_push() -> None:
@@ -12899,9 +13316,13 @@ async def _await_pending_cloud_push() -> None:
     push must delay the next pull, not kill the turn or the teardown that
     called us.
     """
-    global _pending_cloud_push_task
+    global _pending_cloud_push_task, _pending_cloud_push_claim
+    global _pending_cloud_push_sync, _pending_cloud_push_staged
     task = _pending_cloud_push_task
     _pending_cloud_push_task = None
+    _pending_cloud_push_claim = None
+    _pending_cloud_push_sync = None
+    _pending_cloud_push_staged = None
     if task is None:
         return
     try:
@@ -13036,6 +13457,10 @@ async def _loop_on_turn_start(turn_id: int) -> None:
     # ordering (and the pull's remote listing reflects the last turn's
     # writes). This is where a too-fast reply pays the push cost: inside a
     # started turn, visibly, instead of in an invisible pre-turn queue.
+    if _stateless_mode() and _thread_id:
+        # Step 4a: a push this pod handed off for THIS thread is superseded by
+        # the new claim — cancel it and let generation recovery adopt+resume.
+        await _cancel_background_cloud_push(str(_thread_id))
     await _await_pending_cloud_push()
 
     # Phase 1 of cloud_collaboration_model.md §9: pull cloud-side edits
@@ -13409,12 +13834,19 @@ async def _loop_on_turn_complete_body(
                     "stateless turn completed without an armed cloud generation"
                 )
             claim = _capture_cloud_generation_claim(_session.workspace_sync)
+            global _pending_cloud_push_claim, _pending_cloud_push_sync
+            global _pending_cloud_push_staged
+            staged_event = asyncio.Event()
+            _pending_cloud_push_claim = claim
+            _pending_cloud_push_sync = _session.workspace_sync
+            _pending_cloud_push_staged = staged_event
             _pending_cloud_push_task = asyncio.create_task(
                 _run_turn_end_cloud_push(
                     _session.workspace_sync,
                     turn_id,
                     requirements=requirements,
                     claim=claim,
+                    staged_event=staged_event,
                 ),
                 name=f"cloud-generation-push-turn-{turn_id}",
             )

@@ -72,6 +72,9 @@ class FakeDB:
         # Transcript leg of skip-if-answered: the seq the transcript proves
         # answered, or None (the ordinary claim path).
         self.transcript_answered_seq: Optional[int] = None
+        # Step 4a shutdown classification: do all persisted tool calls of the
+        # pending turn have their ToolMessage? (None = query fails → park)
+        self.tool_effects_durable: Optional[bool] = None
 
     async def fetch(self, sql: str, *args):
         self.fetch_calls.append((sql, args))
@@ -93,6 +96,10 @@ class FakeDB:
             return any(row.get("delivery_id") for row in self.pending_rows)
         if sql == te._ANSWERED_BY_TRANSCRIPT_SQL:
             return self.transcript_answered_seq
+        if sql == te._TOOL_EFFECTS_DURABLE_SQL:
+            if self.tool_effects_durable is None:
+                raise RuntimeError("durability probe unavailable")
+            return self.tool_effects_durable
         return None
 
 
@@ -179,6 +186,10 @@ class Harness:
         pa._hard_interrupt_event = asyncio.Event()
         pa._turn_event_open = False
         pa._pending_cloud_push_task = None
+        pa._pending_cloud_push_staged = None
+        pa._pending_cloud_push_claim = None
+        pa._pending_cloud_push_sync = None
+        pa._background_cloud_pushes = {}
 
         harness = self
 
@@ -561,6 +572,10 @@ _PA_SAVED_ATTRS = (
     "_hard_interrupt_event",
     "_turn_event_open",
     "_pending_cloud_push_task",
+    "_pending_cloud_push_staged",
+    "_pending_cloud_push_claim",
+    "_pending_cloud_push_sync",
+    "_background_cloud_pushes",
 )
 
 
@@ -1567,9 +1582,14 @@ class TestShutdownCancellation:
         assert not harness.calls["release"]
 
     @pytest.mark.asyncio
-    async def test_non_warm_post_effect_cancel_parks_after_pa_identity_is_gone(
-        self, harness
+    async def test_non_warm_post_effect_cancel_releases_when_completion_hangs(
+        self, harness, monkeypatch
     ):
+        """Step 4a branch (1): the turn settled (answer durable, consumed_seq
+        checkpointed by the interrupt close), so a forced shutdown re-attempts
+        the completion CAS — bounded — and, when the DB hangs, releases under
+        the checkpoint instead of parking an already-answered turn. The
+        successor finds nothing left to consume (skip-if-answered)."""
         harness.loop_behavior = "settled_effect"
         harness.stateless_warm_reuse_safe = False
         harness.db.pending_rows = [
@@ -1577,12 +1597,16 @@ class TestShutdownCancellation:
         ]
         claim = make_claim(token=452, input_seq=4)
         complete_entered = asyncio.Event()
+        complete_calls = 0
 
         async def _uncooperative_complete(db, *, unit_id, lease_token, consumed_seq):
+            nonlocal complete_calls
             del db, unit_id, lease_token, consumed_seq
+            complete_calls += 1
             complete_entered.set()
             await asyncio.sleep(3600)
 
+        monkeypatch.setattr(te, "SHUTDOWN_COMPLETE_TIMEOUT_SECONDS", 0.2)
         with patch.object(te, "complete_unit", _uncooperative_complete):
             serving = asyncio.create_task(harness.executor._serve_claim(claim))
             harness.executor._task = serving
@@ -1592,22 +1616,25 @@ class TestShutdownCancellation:
             assert not harness.has_tool_effect(claim)
             assert harness.executor._claim_crossed_tool_effect(pa, claim=claim)
 
-            # Keep completion blocked beyond abort grace. Forced cancellation
-            # must classify from the executor-owned identity and park, never
-            # publish the unanswered/effect-bearing input for replay.
+            # Completion stays blocked beyond abort grace. Forced cancellation
+            # re-attempts it once, bounded, then releases: the checkpoint
+            # already protects the answer, so a replay is impossible.
             await harness.executor.stop(timeout=0)
 
         await _finish(harness)
-        assert harness.calls["park"] == [
+        assert complete_calls == 2  # serve-path attempt + one bounded shutdown retry
+        assert harness.calls["release"] == [
             {
                 "unit_id": claim.unit_id,
                 "lease_token": 452,
+                "backoff_seconds": 0.0,
+                "error": True,
             }
         ]
+        assert not harness.calls["park"]
         assert not harness.calls["complete"]
-        assert not harness.calls["release"]
         assert harness.executor._tool_effect_identity is None
-        assert harness.disposition_order[-2:] == ["terminate", "park"]
+        assert harness.disposition_order[-2:] == ["terminate", "release"]
 
     @pytest.mark.asyncio
     async def test_uncooperative_post_effect_shutdown_parks_without_retry(
@@ -2901,3 +2928,186 @@ class TestWriterLeaseFence:
         sql, args = recorded[0]
         assert "run_queue" not in sql
         assert len(args) == 3  # thread_id, rows_json, epoch
+
+
+# ---------------------------------------------------------------------------
+# Commit-then-effects (stateless_turn_resilience.md step 4a)
+# ---------------------------------------------------------------------------
+
+
+class TestCommitThenEffects:
+    @pytest.fixture
+    def harness(self, monkeypatch):
+        return Harness(monkeypatch)
+
+    def test_answered_by_transcript_accepts_a_turn_completed_frame(self):
+        # Carry-over from step 3: a final assistant message that carried a
+        # tool call has no zero-tool-call row; the turn.completed frame for
+        # that turn is the settled boundary.
+        assert "turn.completed" in te._ANSWERED_BY_TRANSCRIPT_SQL
+        assert "frame.payload ->> 'turn_id' = input.turn_number::text" in (
+            te._ANSWERED_BY_TRANSCRIPT_SQL
+        )
+
+    @pytest.mark.asyncio
+    async def test_hand_off_precedes_complete_and_the_push_is_not_awaited(
+        self, harness, monkeypatch
+    ):
+        harness.loop_behavior = "complete"
+        harness.stateless_warm_reuse_safe = True
+        harness.db.pending_rows = [{"id": str(uuid4()), "seq": 4, "content": "hi"}]
+        claim = make_claim(token=91, input_seq=4)
+        push_task = asyncio.create_task(asyncio.sleep(3600))
+        staged = asyncio.Event()
+        staged.set()
+        pa._pending_cloud_push_task = push_task
+        pa._pending_cloud_push_staged = staged
+        order: List[str] = []
+
+        async def fake_hand_off(db, *, thread_id, lease_token, pod_name, pod_uid):
+            # The consumed watermark is already checkpointed when the push is
+            # handed its own fence — the answer is durable before any
+            # off-slot writer exists.
+            assert harness.calls["interrupt_close"][-1]["completed_input_seq"] == 4
+            assert thread_id == str(claim.unit_id) and lease_token == 91
+            order.append("handoff")
+            # what persistent_app does: the task leaves the pending slot
+            pa._pending_cloud_push_task = None
+            pa._pending_cloud_push_staged = None
+            return True
+
+        original_complete = te.complete_unit
+
+        async def ordered_complete(db, **kwargs):
+            order.append("complete")
+            return await original_complete(db, **kwargs)
+
+        monkeypatch.setattr(pa, "_hand_off_cloud_push", fake_hand_off, raising=False)
+        monkeypatch.setattr(te, "complete_unit", ordered_complete)
+        try:
+            await asyncio.wait_for(harness.executor._serve_claim(claim), timeout=2)
+            assert order == ["handoff", "complete"]
+            # the slot is released while the transmit is still running
+            assert not push_task.done()
+            assert harness.calls["complete"][-1]["consumed_seq"] == 4
+            assert not harness.calls["park"] and not harness.calls["release"]
+        finally:
+            push_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await push_task
+        await _finish(harness)
+
+    @pytest.mark.asyncio
+    async def test_failed_hand_off_falls_back_to_waiting_the_push_out(
+        self, harness, monkeypatch
+    ):
+        harness.loop_behavior = "complete"
+        harness.stateless_warm_reuse_safe = True
+        harness.db.pending_rows = [{"id": str(uuid4()), "seq": 4, "content": "hi"}]
+        claim = make_claim(token=92, input_seq=4)
+        push_done = asyncio.Event()
+
+        async def _push():
+            await push_done.wait()
+
+        push_task = asyncio.create_task(_push())
+        staged = asyncio.Event()
+        staged.set()
+        pa._pending_cloud_push_task = push_task
+        pa._pending_cloud_push_staged = staged
+
+        async def broken_hand_off(db, **kwargs):
+            raise RuntimeError("database unavailable")
+
+        monkeypatch.setattr(pa, "_hand_off_cloud_push", broken_hand_off, raising=False)
+        serving = asyncio.create_task(harness.executor._serve_claim(claim))
+        await asyncio.sleep(0.1)
+        # completion must NOT have happened: the push is still under the lease
+        assert not harness.calls["complete"]
+        assert not serving.done()
+        push_done.set()
+        await asyncio.wait_for(serving, timeout=2)
+        assert harness.calls["complete"][-1]["consumed_seq"] == 4
+        await _finish(harness)
+
+    @pytest.mark.asyncio
+    async def test_cancel_after_settle_completes_instead_of_parking(
+        self, harness, monkeypatch
+    ):
+        harness.loop_behavior = "settled_effect"
+        harness.db.pending_rows = [
+            {"id": str(uuid4()), "seq": 4, "content": "settled, then killed"}
+        ]
+        claim = make_claim(token=93, input_seq=4)
+        entered = asyncio.Event()
+        calls = 0
+
+        async def complete_blocks_once(db, *, unit_id, lease_token, consumed_seq):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                entered.set()
+                await asyncio.sleep(3600)  # cancelled by shutdown
+            harness.calls["complete"].append(
+                {
+                    "unit_id": unit_id,
+                    "lease_token": lease_token,
+                    "consumed_seq": consumed_seq,
+                }
+            )
+            return "done"
+
+        monkeypatch.setattr(te, "complete_unit", complete_blocks_once)
+        harness.executor._abort_grace_seconds = 0.05
+        serving = asyncio.create_task(harness.executor._serve_claim(claim))
+        harness.executor._task = serving
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        assert harness.has_tool_effect(claim)
+        await asyncio.wait_for(harness.executor.stop(timeout=0), timeout=5)
+        await _finish(harness)
+        # Branch (1): settled → the idempotent completion CAS, never a park.
+        assert harness.calls["complete"] == [
+            {"unit_id": claim.unit_id, "lease_token": 93, "consumed_seq": None}
+        ]
+        assert not harness.calls["park"]
+        assert not harness.calls["release"]
+        assert not harness.has_tool_effect(claim)
+
+    @pytest.mark.asyncio
+    async def test_cancel_mid_turn_with_durable_tool_results_releases(
+        self, harness, monkeypatch
+    ):
+        harness.loop_behavior = "hang"
+        harness.db.pending_rows = [{"id": str(uuid4()), "seq": 4, "content": "mid"}]
+        harness.db.tool_effects_durable = True
+        claim = make_claim(token=94, input_seq=4)
+        serving = asyncio.create_task(harness.executor._serve_claim(claim))
+        harness.executor._task = serving
+        await asyncio.sleep(0.1)
+        harness.executor._tool_effect_identity = (str(claim.unit_id), 94, 1)
+        harness.executor._abort_grace_seconds = 0.05
+        await asyncio.wait_for(harness.executor.stop(timeout=0), timeout=5)
+        await _finish(harness)
+        # Branch (3): every persisted tool call has its ToolMessage → release.
+        assert harness.calls["release"]
+        assert not harness.calls["park"]
+
+    @pytest.mark.asyncio
+    async def test_cancel_mid_turn_with_an_inflight_tool_still_parks(
+        self, harness, monkeypatch
+    ):
+        harness.loop_behavior = "hang"
+        harness.db.pending_rows = [{"id": str(uuid4()), "seq": 4, "content": "mid"}]
+        harness.db.tool_effects_durable = False
+        claim = make_claim(token=95, input_seq=4)
+        serving = asyncio.create_task(harness.executor._serve_claim(claim))
+        harness.executor._task = serving
+        await asyncio.sleep(0.1)
+        harness.executor._tool_effect_identity = (str(claim.unit_id), 95, 1)
+        harness.executor._abort_grace_seconds = 0.05
+        await asyncio.wait_for(harness.executor.stop(timeout=0), timeout=5)
+        await _finish(harness)
+        # Branch (4): a persisted call with no result row is the only park left.
+        assert harness.calls["park"]
+        assert harness.park_reasons[-1] == "shutdown_cancelled"
+        assert not harness.calls["release"]

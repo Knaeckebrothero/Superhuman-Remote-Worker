@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Awaitable, Callable, Optional
 
 from agent.core.backends.overlay import unwrap_backend
 from shared.cloud_sync_generations import (
+    normalize_push_progress,
     EMPTY_BASELINE_SHA256,
     encode_cloud_sync_baseline,
     normalize_cloud_sync_baseline,
@@ -78,6 +79,59 @@ class CloudSyncGenerationCommit:
     paths: list[str]
     manifest: dict[str, dict[str, str]]
     manifest_sha256: str
+
+
+class CloudSyncFenceLost(RuntimeError):
+    """A conditional remote write was refused (HTTP 412) by a writer that is
+    no longer the owner. Commit-then-effects
+    (stateless_turn_resilience.md step 4a): the DB fence stops a stale owner
+    at its next write; this is the hard stop for the one write already in
+    flight when the fence flipped."""
+
+
+@dataclass
+class StagedUpload:
+    path: str
+    tmp_path: str
+    sha256: str
+    size: int
+    if_match: Optional[str] = None
+    if_none_match: bool = False
+
+
+@dataclass
+class StagedDelete:
+    path: str
+    if_match: Optional[str] = None
+
+
+@dataclass
+class StagedGenerationDelta:
+    """Everything a transmit needs that only the workspace could provide.
+
+    Staging reads and hashes the durable workspace (SFTP) and copies every
+    changed file into a local temp file; transmitting then needs only the
+    cloud transport and the DB fence. That split is what lets the run_queue
+    unit complete — and the pod detach its workspace — while the (slow)
+    WebDAV writes continue off-slot, or resume on another pod from
+    ``push_progress``.
+    """
+
+    uploads: list[StagedUpload]
+    deletes: list[StagedDelete]
+    manifest: dict[str, dict[str, str]]
+    planned: int
+    skipped_by_progress: int = 0
+    files_walked: int = 0
+    stage_seconds: float = 0.0
+
+    def cleanup(self) -> None:
+        for upload in self.uploads:
+            try:
+                os.unlink(upload.tmp_path)
+            except OSError:
+                pass
+        self.uploads = []
 
 
 def _sync_generation_marker_path(thread_id: str, sync_scope_sha256: str) -> str:
@@ -244,14 +298,24 @@ class WorkspaceSyncBase(abc.ABC):
         local_path: str,
         *,
         before_write: Optional[Callable[[], Awaitable[None]]] = None,
-    ) -> None:
-        """Upload ``local_path`` to remote ``rel_path``. Parent dirs already exist."""
+        if_match: Optional[str] = None,
+        if_none_match: bool = False,
+    ) -> Optional[str]:
+        """Upload ``local_path`` to remote ``rel_path``. Parent dirs already exist.
+
+        ``if_match`` / ``if_none_match`` are RFC 4918 preconditions: a
+        transport that supports them must send them and raise
+        :class:`CloudSyncFenceLost` on a 412; one that cannot must ignore them
+        (the DB fence still stops a stale owner at its next write). Returns
+        the new ETag when the server reports one, else ``None``.
+        """
 
     async def _delete_remote_file(
         self,
         rel_path: str,
         *,
         before_write: Optional[Callable[[], Awaitable[None]]] = None,
+        if_match: Optional[str] = None,
     ) -> None:
         """Delete one remote file for a generation delta.
 
@@ -259,10 +323,29 @@ class WorkspaceSyncBase(abc.ABC):
         commits do so only for a path that existed in the armed baseline and
         disappeared from the durable workspace.  A transport that cannot
         implement deletion must fail closed rather than acknowledge a partial
-        mirror generation.
+        mirror generation. ``if_match`` follows ``_upload_file``.
         """
 
         raise NotImplementedError("cloud transport does not support fenced deletes")
+
+    async def _remote_etag(self, rel_path: str) -> Optional[str]:
+        """Current ETag of one remote file, ``None`` when absent or unknown.
+
+        Used once, after a 412 that the DB fence says is not ours: the remote
+        moved under us (a user edit, or a predecessor's identical bytes) and
+        the retry needs a fresh precondition. Default: a parent listing.
+        """
+
+        parent = str(Path(rel_path).parent)
+        try:
+            items = await self._list_remote_files("" if parent == "." else parent)
+        except Exception:
+            return None
+        for item in items:
+            if item.get("path") == rel_path and not item.get("isdir"):
+                etag = item.get("etag")
+                return str(etag) if etag else None
+        return None
 
     @abc.abstractmethod
     async def _list_remote_files(self, rel_dir: str = "") -> list[dict]:
@@ -543,25 +626,35 @@ class WorkspaceSyncBase(abc.ABC):
             if entry["remote_etag"]:
                 self._remote_state[path] = entry["remote_etag"]
 
-    async def push_generation_delta(
+    async def stage_generation_delta(
         self,
         baseline: object,
         *,
-        before_write: Callable[[], Awaitable[None]],
-    ) -> CloudSyncGenerationCommit:
-        """Commit only paths changed since the durable turn-start baseline.
+        progress: object = None,
+    ) -> StagedGenerationDelta:
+        """Read the workspace once and decide every write of this generation.
 
-        New and content-changed files are uploaded. Baseline membership is the
-        proof that a path existed remotely; an empty ETag is valid and does not
-        by itself make an unchanged path dirty. Deletions of baseline files use
-        the transport delete primitive; a transport that cannot prove that
-        delete fails the generation instead of writing a lying marker.
+        New and content-changed files (vs the durable turn-start baseline)
+        are copied to local temp files; baseline files missing locally become
+        deletes. ``progress`` — a predecessor's durable ``push_progress`` —
+        overlays the baseline: a path whose recorded upload matches the
+        current bytes is already remote and is skipped; a recorded delete is
+        not re-issued. No remote I/O happens here.
         """
 
         started = _time.perf_counter()
         normalized = normalize_cloud_sync_baseline(baseline)
         _reject_ignored_generation_paths(normalized)
+        done = normalize_push_progress(progress)["files"] if progress else {}
         committed_manifest = {path: dict(entry) for path, entry in normalized.items()}
+        for path, entry in done.items():
+            if entry["state"] == "uploaded":
+                committed_manifest[path] = {
+                    "sha256": entry["sha256"],
+                    "remote_etag": entry["remote_etag"],
+                }
+            else:
+                committed_manifest.pop(path, None)
         if self._backend is None:
             raise CloudSyncMarkerError(
                 "stateless cloud generation requires a durable workspace backend"
@@ -574,11 +667,21 @@ class WorkspaceSyncBase(abc.ABC):
             }
         )
         walked = _time.perf_counter()
-        deletes = sorted(path for path in normalized if path not in current_paths)
-
-        await before_write()
-        await self._ensure_ready()
-        pushed: list[str] = []
+        deletes: list[StagedDelete] = []
+        skipped = 0
+        for path in normalized:
+            if path in current_paths:
+                continue
+            recorded = done.get(path)
+            if recorded is not None and recorded["state"] == "deleted":
+                skipped += 1
+                continue
+            deletes.append(
+                StagedDelete(
+                    path=path, if_match=normalized[path]["remote_etag"] or None
+                )
+            )
+        uploads: list[StagedUpload] = []
         for path in current_paths:
             content = await asyncio.to_thread(
                 self._backend.read_file,  # type: ignore[union-attr]
@@ -588,63 +691,233 @@ class WorkspaceSyncBase(abc.ABC):
             if isinstance(content, str):
                 content = content.encode("utf-8")
             current_digest = hashlib.sha256(content).hexdigest()
+            recorded = done.get(path)
+            if (
+                recorded is not None
+                and recorded["state"] == "uploaded"
+                and recorded["sha256"] == current_digest
+            ):
+                skipped += 1
+                continue
             previous = normalized.get(path)
-            if previous is not None and previous["sha256"] == current_digest:
+            if (
+                previous is not None
+                and previous["sha256"] == current_digest
+                and recorded is None
+            ):
                 continue
             fd, tmp_path = tempfile.mkstemp()
             try:
                 _write_all(fd, content)
+            finally:
                 os.close(fd)
+            if_match: Optional[str] = None
+            if_none_match = False
+            if previous is not None and previous["remote_etag"]:
+                if_match = previous["remote_etag"]
+            elif recorded is not None and recorded["remote_etag"]:
+                if_match = recorded["remote_etag"]
+            elif previous is None and recorded is None:
+                if_none_match = True
+            uploads.append(
+                StagedUpload(
+                    path=path,
+                    tmp_path=tmp_path,
+                    sha256=current_digest,
+                    size=len(content),
+                    if_match=if_match,
+                    if_none_match=if_none_match,
+                )
+            )
+        return StagedGenerationDelta(
+            uploads=uploads,
+            deletes=deletes,
+            manifest=committed_manifest,
+            planned=len(uploads) + len(deletes) + skipped,
+            skipped_by_progress=skipped,
+            files_walked=len(current_paths),
+            stage_seconds=walked - started,
+        )
+
+    async def _write_conditionally(
+        self,
+        upload: StagedUpload,
+        *,
+        before_write: Callable[[], Awaitable[None]],
+    ) -> Optional[str]:
+        """One PUT with its precondition; the 412 policy in one place.
+
+        A 412 means the remote moved under us. If the DB fence says we are no
+        longer the owner, that is the stale-writer case the precondition
+        exists for — stop. If we still own the push, the mover was a user edit
+        or a predecessor's identical bytes: refresh the precondition from the
+        remote once and retry; a second 412 is treated as fence loss.
+        """
+
+        try:
+            return await self._upload_file(
+                upload.path,
+                upload.tmp_path,
+                before_write=before_write,
+                if_match=upload.if_match,
+                if_none_match=upload.if_none_match,
+            )
+        except CloudSyncFenceLost:
+            await before_write()  # raises if the DB says we are stale
+            fresh = await self._remote_etag(upload.path)
+            logger.warning(
+                "cloud push precondition failed for %s (remote moved); retrying "
+                "with the current remote etag",
+                upload.path,
+            )
+            return await self._upload_file(
+                upload.path,
+                upload.tmp_path,
+                before_write=before_write,
+                if_match=fresh,
+                if_none_match=fresh is None,
+            )
+
+    async def _delete_conditionally(
+        self,
+        delete: StagedDelete,
+        *,
+        before_write: Callable[[], Awaitable[None]],
+    ) -> None:
+        try:
+            await self._delete_remote_file(
+                delete.path, before_write=before_write, if_match=delete.if_match
+            )
+        except CloudSyncFenceLost:
+            await before_write()
+            fresh = await self._remote_etag(delete.path)
+            if fresh is None:
+                return  # already gone
+            await self._delete_remote_file(
+                delete.path, before_write=before_write, if_match=fresh
+            )
+
+    async def transmit_generation_delta(
+        self,
+        staged: StagedGenerationDelta,
+        *,
+        before_write: Callable[[], Awaitable[None]],
+        progress_cb: Optional[
+            Callable[[str, dict[str, object]], Awaitable[None]]
+        ] = None,
+    ) -> CloudSyncGenerationCommit:
+        """Land a staged delta on the cloud: only transport + fence, no workspace.
+
+        Every write is preceded by ``before_write`` (the DB fence) and carries
+        its precondition; ``progress_cb`` is told after each write lands so
+        the durable progress lets a successor resume. Temp files are removed
+        whether or not the transmit completes.
+        """
+
+        started = _time.perf_counter()
+        committed_manifest = {
+            path: dict(entry) for path, entry in staged.manifest.items()
+        }
+        pushed: list[str] = []
+        try:
+            await before_write()
+            await self._ensure_ready()
+            for upload in staged.uploads:
                 await before_write()
                 await self._ensure_remote_dirs(
-                    str(Path(path).parent), before_write=before_write
+                    str(Path(upload.path).parent), before_write=before_write
                 )
                 await before_write()
-                await self._upload_file(path, tmp_path, before_write=before_write)
-                self._pushed_sizes[path] = len(content)
-                self._remote_known_paths.add(path)
-                self._remote_content_hashes[path] = current_digest
-                self._remote_state.pop(path, None)
-                committed_manifest[path] = {
-                    "sha256": current_digest,
-                    "remote_etag": "",
+                etag = await self._write_conditionally(
+                    upload, before_write=before_write
+                )
+                self._pushed_sizes[upload.path] = upload.size
+                self._remote_known_paths.add(upload.path)
+                self._remote_content_hashes[upload.path] = upload.sha256
+                if etag:
+                    self._remote_state[upload.path] = etag
+                else:
+                    self._remote_state.pop(upload.path, None)
+                committed_manifest[upload.path] = {
+                    "sha256": upload.sha256,
+                    "remote_etag": etag or "",
                 }
-                pushed.append(path)
-            finally:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
-        for path in deletes:
-            await before_write()
-            await self._delete_remote_file(path, before_write=before_write)
-            self._remote_state.pop(path, None)
-            self._remote_known_paths.discard(path)
-            self._remote_content_hashes.pop(path, None)
-            self._pushed_sizes.pop(path, None)
-            committed_manifest.pop(path, None)
-            pushed.append(path)
+                pushed.append(upload.path)
+                if progress_cb is not None:
+                    await progress_cb(
+                        upload.path,
+                        {
+                            "sha256": upload.sha256,
+                            "size": upload.size,
+                            "remote_etag": etag or "",
+                            "state": "uploaded",
+                        },
+                    )
+            for delete in staged.deletes:
+                await before_write()
+                await self._delete_conditionally(delete, before_write=before_write)
+                self._remote_state.pop(delete.path, None)
+                self._remote_known_paths.discard(delete.path)
+                self._remote_content_hashes.pop(delete.path, None)
+                self._pushed_sizes.pop(delete.path, None)
+                committed_manifest.pop(delete.path, None)
+                pushed.append(delete.path)
+                if progress_cb is not None:
+                    await progress_cb(
+                        delete.path,
+                        {
+                            "sha256": "",
+                            "size": 0,
+                            "remote_etag": "",
+                            "state": "deleted",
+                        },
+                    )
+        finally:
+            staged.cleanup()
         committed_manifest, _encoded, committed_manifest_sha256 = (
             encode_cloud_sync_baseline(committed_manifest)
         )
         logger.info(
             "cloud generation push detail: mount=%s walk=%.2fs files=%d "
-            "uploads=%d deletes=%d total=%.2fs",
+            "uploads=%d deletes=%d resumed=%d total=%.2fs",
             self._mount_subdir or "<root>",
-            walked - started,
-            len(current_paths),
-            len(pushed) - len(deletes),
-            len(deletes),
-            _time.perf_counter() - started,
+            staged.stage_seconds,
+            staged.files_walked,
+            len(pushed) - len(staged.deletes),
+            len(staged.deletes),
+            staged.skipped_by_progress,
+            _time.perf_counter() - started + staged.stage_seconds,
         )
         return CloudSyncGenerationCommit(
             paths=pushed,
             manifest=committed_manifest,
             manifest_sha256=committed_manifest_sha256,
+        )
+
+    async def push_generation_delta(
+        self,
+        baseline: object,
+        *,
+        before_write: Callable[[], Awaitable[None]],
+        progress: object = None,
+        progress_cb: Optional[
+            Callable[[str, dict[str, object]], Awaitable[None]]
+        ] = None,
+    ) -> CloudSyncGenerationCommit:
+        """Commit only paths changed since the durable turn-start baseline.
+
+        Stage (workspace) then transmit (cloud); see both halves. Baseline
+        membership is the proof that a path existed remotely; an empty ETag is
+        valid and does not by itself make an unchanged path dirty. Deletions
+        of baseline files use the transport delete primitive; a transport that
+        cannot prove that delete fails the generation instead of writing a
+        lying marker.
+        """
+
+        await before_write()
+        staged = await self.stage_generation_delta(baseline, progress=progress)
+        return await self.transmit_generation_delta(
+            staged, before_write=before_write, progress_cb=progress_cb
         )
 
     # --------------------------------------------------------------- Algorithm

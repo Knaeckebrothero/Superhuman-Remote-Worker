@@ -18577,6 +18577,14 @@ CREATE TABLE public.thread_cloud_sync_generations (
     acknowledged_at timestamp with time zone,
     baseline_manifest jsonb DEFAULT '{}'::jsonb NOT NULL,
     baseline_sha256 character(64) DEFAULT '44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a'::bpchar NOT NULL,
+    push_owner_token bigint DEFAULT 0 NOT NULL,
+    push_owner_pod text,
+    push_owner_pod_uid text,
+    push_heartbeat_at timestamp with time zone,
+    push_progress jsonb DEFAULT '{}'::jsonb NOT NULL,
+    push_started_at timestamp with time zone,
+    push_failed_at timestamp with time zone,
+    push_error text,
     CONSTRAINT thread_cloud_sync_baseline_digest_shape CHECK ((baseline_sha256 ~ '^[0-9a-f]{64}$'::text)),
     CONSTRAINT thread_cloud_sync_baseline_manifest_shape CHECK (((jsonb_typeof(baseline_manifest) = 'object'::text) AND (octet_length((baseline_manifest)::text) <= 4194304))),
     CONSTRAINT thread_cloud_sync_generation_shape CHECK (((required_generation >= 0) AND (acknowledged_generation >= 0) AND (acknowledged_generation <= required_generation) AND (required_lease_token >= 0) AND ((required_generation = 0) OR (required_lease_token > 0)))),
@@ -18647,6 +18655,62 @@ COMMENT ON COLUMN public.thread_cloud_sync_generations.baseline_manifest IS 'Que
 --
 
 COMMENT ON COLUMN public.thread_cloud_sync_generations.baseline_sha256 IS 'SHA-256 of the canonical compact JSON baseline. The resource commit marker binds this digest so marker-write/DB-ack recovery can acknowledge without replaying the already committed delta.';
+
+
+--
+-- Name: COLUMN thread_cloud_sync_generations.push_owner_token; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_cloud_sync_generations.push_owner_token IS 'Fencing token for the turn-end push once the run_queue unit has completed. Bumped (max over the thread + 1) by every hand-off and by every adoption; the writer re-checks it before each remote write, so a stale owner stops at its next write. 0 = no push has ever been handed off.';
+
+
+--
+-- Name: COLUMN thread_cloud_sync_generations.push_owner_pod; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_cloud_sync_generations.push_owner_pod IS 'Pod that currently owns the pending push (diagnostics).';
+
+
+--
+-- Name: COLUMN thread_cloud_sync_generations.push_owner_pod_uid; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_cloud_sync_generations.push_owner_pod_uid IS 'UID of that pod, so a same-named replacement cannot be mistaken for it.';
+
+
+--
+-- Name: COLUMN thread_cloud_sync_generations.push_heartbeat_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_cloud_sync_generations.push_heartbeat_at IS 'Renewed by the push owner while transmitting; stale (> 90 s) means the owner died and the pending generation waits for adoption by the next claim.';
+
+
+--
+-- Name: COLUMN thread_cloud_sync_generations.push_progress; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_cloud_sync_generations.push_progress IS 'Durable per-file progress of the PENDING generation: {"planned": N, "files": {path: {sha256, size, remote_etag, state}}} where state is uploaded | deleted. A successor seeds its delta from these entries and re-transmits only what is missing. Reset when a new generation is armed.';
+
+
+--
+-- Name: COLUMN thread_cloud_sync_generations.push_started_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_cloud_sync_generations.push_started_at IS 'When the pending push was first handed off (diagnostics).';
+
+
+--
+-- Name: COLUMN thread_cloud_sync_generations.push_failed_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_cloud_sync_generations.push_failed_at IS 'When the current owner last reported a terminal push failure; success is still acknowledged_generation + the cloud-side marker.';
+
+
+--
+-- Name: COLUMN thread_cloud_sync_generations.push_error; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_cloud_sync_generations.push_error IS 'The failure message that goes with push_failed_at (bounded).';
 
 
 --
