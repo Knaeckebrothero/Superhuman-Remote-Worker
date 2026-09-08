@@ -241,7 +241,8 @@ RUN chmod +x /usr/local/bin/check-browser-stream /usr/local/bin/assert-browser-s
 # ---------------------------------------------------------------------------
 # 3. code-server (IDE)
 # ---------------------------------------------------------------------------
-RUN curl -fsSL "https://github.com/coder/code-server/releases/download/v${CODE_SERVER_VERSION}/code-server_${CODE_SERVER_VERSION}_amd64.deb" \
+RUN curl --http1.1 --retry 3 --retry-all-errors --connect-timeout 15 --max-time 180 \
+        -fsSL "https://github.com/coder/code-server/releases/download/v${CODE_SERVER_VERSION}/code-server_${CODE_SERVER_VERSION}_amd64.deb" \
         -o /tmp/code-server.deb \
     && dpkg -i /tmp/code-server.deb \
     && rm /tmp/code-server.deb
