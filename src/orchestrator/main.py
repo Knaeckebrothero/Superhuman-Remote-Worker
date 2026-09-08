@@ -498,6 +498,7 @@ from orchestrator.services.keycloak_admin import KeycloakGroupSync  # noqa: E402
 from orchestrator.services.cloud import (  # noqa: E402
     CloudBackendError,
     CloudMountSubject,
+    FeatureNotAvailable,
     MainCloudRouter,
     ProjectFolderHandle,
     SessionFolderHandle,
@@ -57088,7 +57089,26 @@ async def _ensure_project_cloud_resources(
             )
             return project
     else:
-        backend = main_cloud_router.for_owner()
+        try:
+            backend = main_cloud_router.for_owner()
+        except FeatureNotAvailable as e:
+            # No active backend instance is bound — an installation with no
+            # main cloud configured at all. `for_owner` is right to refuse
+            # rather than guess an installation, but this helper is optional
+            # provisioning, not a primary write: `create_project` has already
+            # committed the project and its owner membership by the time it
+            # gets here, and the only caller that treats a raise as fatal is
+            # its blanket 500. Degrade exactly as the `for_project_optional`
+            # branch above does, and as every remote effect below already
+            # does. A cloudless installation gets a project without cloud
+            # resources, which is the whole point of the optional tier.
+            logger.info(
+                "Project %s: skipping cloud resource provisioning — no active "
+                "main-cloud backend instance (%s).",
+                project_id_str,
+                e,
+            )
+            return project
 
     handle_str = project.get("main_cloud_folder_handle")
     legacy_folder_id = project.get("nextcloud_folder_id")
