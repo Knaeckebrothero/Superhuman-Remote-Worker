@@ -29,6 +29,23 @@ pending and exercises administrator approval. A later `test` against the same
 owned stack is recorded as a rerun and may reuse that now-approved identity;
 this iteration path never relaxes the first-attempt assertion used by `run`.
 
+## Profiles
+
+`up`, `run` and `test` take `--profile`. Each profile is the shared baseline
+plus zero or more overlays; the baseline is never edited to suit one batch.
+
+| profile | values | what it adds | use it for |
+|---|---|---|---|
+| `pinned-virtual` (default) | `values-e2e.yaml` | nothing — the cheap baseline: pinned execution lane, virtual workspace, no workspace image built | the browser journey and anything that does not touch a workspace or a forge |
+| `stateless-sandbox` | + `values-stateless-sandbox.yaml` | stateless executor Deployment, sandbox workspace backend, a `local-path` workspace PVC, and the current-source workspace image | workspace-backed sessions, SSH attach, real worker jobs, retirement/reclaim inventories |
+| `forge-sandbox` | + `values-forge-sandbox.yaml` | the bundled Gitea StatefulSet on sqlite3 (no second Postgres) | project provisioning, project repositories, knowledge-vault materialisation — anything that goes through the forge |
+
+`forge-sandbox` *composes* `stateless-sandbox`, it does not replace it: forge
+work still needs a workspace-backed session. Adding a dependency to the shared
+`values-e2e.yaml` is what broke the journey's determinism contract when SearXNG
+was tried there — the browser asserts exactly one provider endpoint and exactly
+two enabled models — so a new dependency belongs in an overlay.
+
 State lives below `cockpit/test-results/app-harness/` (already ignored). The
 harness creates a private ownership marker and publishes `active.json` with an
 exclusive claim, so concurrent runners cannot replace one another's deletion

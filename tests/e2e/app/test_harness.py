@@ -1297,7 +1297,9 @@ def test_stateless_sandbox_profile_renders_current_executor_and_workspace_images
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
-@pytest.mark.parametrize("profile_name", ["pinned-virtual", "stateless-sandbox"])
+@pytest.mark.parametrize(
+    "profile_name", ["pinned-virtual", "stateless-sandbox", "forge-sandbox"]
+)
 def test_session_profiles_do_not_render_an_extra_catalog_provider(
     profile_name: str,
 ) -> None:
@@ -1332,6 +1334,99 @@ def test_session_profiles_do_not_render_an_extra_catalog_provider(
     # catalogue check, even if its service were omitted from the chart.
     environment = research_seed["spec"]["template"]["spec"]["containers"][0]["env"]
     assert "SEARXNG_BASE_URL" not in {item["name"] for item in environment}
+
+
+def test_forge_sandbox_profile_composes_the_sandbox_overlay_and_adds_the_forge() -> (
+    None
+):
+    """The forge profile *extends* stateless-sandbox; it never replaces it.
+
+    B03's central lifecycle needs the forge, but its knowledge and citation
+    work still needs a workspace-backed session, so both overlays apply and the
+    shared baseline is the first file in the list.
+    """
+    sandbox = harness.resolve_profile("stateless-sandbox")
+    forge = harness.resolve_profile("forge-sandbox")
+
+    assert forge.values_files[: len(sandbox.values_files)] == sandbox.values_files
+    assert forge.values_files[-1] == harness.FORGE_SANDBOX_VALUES_FILE
+    assert forge.values_files[0] == harness.VALUES_FILE
+    assert forge.workspace_backend == sandbox.workspace_backend == "sandbox"
+    assert forge.execution_lane == sandbox.execution_lane == "stateless"
+    assert forge.include_workspace_image is True
+    assert forge.stateless_agents is True
+    assert forge.forge_enabled is True
+    assert forge.additional_deployments == sandbox.additional_deployments
+    assert forge.additional_statefulsets == ("srw-e2e-gitea",)
+    # The cheap baseline and the sandbox overlay must not have acquired a forge.
+    assert harness.resolve_profile("pinned-virtual").forge_enabled is False
+    assert sandbox.forge_enabled is False
+    assert sandbox.additional_statefulsets == ()
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+def test_forge_sandbox_renders_the_bundled_forge_without_a_second_database(
+    tmp_path: Path,
+) -> None:
+    """Gitea renders, on sqlite3, with no `srw-giteadb` StatefulSet."""
+    sha = "a" * 40
+    run_id = "20260824-123456-ab12cd34"
+    profile = harness.resolve_profile("forge-sandbox")
+    images, _commands = harness.build_image_commands(
+        sha, run_id, include_workspace=True
+    )
+    image_values = tmp_path / "images.yaml"
+    image_values.write_text(
+        harness._image_values(images, sha, run_id), encoding="utf-8"
+    )
+    command = [
+        "helm",
+        "template",
+        "srw-e2e",
+        str(harness.REPO_ROOT / "helm"),
+        "-n",
+        harness.NAMESPACE,
+    ]
+    for values_file in profile.values_files:
+        command.extend(("-f", str(values_file)))
+    command.extend(("-f", str(image_values)))
+    rendered = subprocess.run(
+        command, check=True, capture_output=True, text=True, timeout=120
+    ).stdout
+    documents = [document for document in yaml.safe_load_all(rendered) if document]
+    names = {
+        (document.get("kind"), document.get("metadata", {}).get("name"))
+        for document in documents
+    }
+    assert ("StatefulSet", "srw-e2e-gitea") in names
+    assert ("Service", "srw-e2e-gitea") in names
+    assert not any(
+        kind == "StatefulSet" and (name or "").endswith("giteadb")
+        for kind, name in names
+    )
+    forge = next(
+        document
+        for document in documents
+        if document.get("kind") == "StatefulSet"
+        and document.get("metadata", {}).get("name") == "srw-e2e-gitea"
+    )
+    environment = {
+        item["name"]: item.get("value")
+        for item in forge["spec"]["template"]["spec"]["containers"][0]["env"]
+    }
+    assert environment["GITEA__database__DB_TYPE"] == "sqlite3"
+    config = next(
+        document
+        for document in documents
+        if document.get("kind") == "ConfigMap"
+        and document.get("metadata", {}).get("name") == "srw-e2e-config"
+    )
+    # The orchestrator reaches the forge in-cluster; without this the client
+    # reports `Gitea not reachable` and every project falls back.
+    assert config["data"]["GITEA_INTERNAL_URL"] == "http://srw-e2e-gitea:3000"
+    # Composition is real, not just declared: the sandbox overlay still applies.
+    assert config["data"]["STATELESS_SESSION_ENABLED"] == "true"
+    assert config["data"]["WORKSPACE_IMAGE"] == images["workspace"]
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")

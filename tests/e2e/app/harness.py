@@ -38,6 +38,7 @@ ASSET_ROOT: Final = REPO_ROOT / "tests/e2e/app"
 K3D_TEMPLATE: Final = ASSET_ROOT / "k3d.yaml"
 VALUES_FILE: Final = ASSET_ROOT / "values-e2e.yaml"
 STATELESS_SANDBOX_VALUES_FILE: Final = ASSET_ROOT / "values-stateless-sandbox.yaml"
+FORGE_SANDBOX_VALUES_FILE: Final = ASSET_ROOT / "values-forge-sandbox.yaml"
 PROVIDER_MANIFEST: Final = ASSET_ROOT / "deterministic_provider/kubernetes.yaml"
 PROVIDER_DOCKERFILE: Final = ASSET_ROOT / "deterministic_provider/Dockerfile"
 PLAYWRIGHT_RUNNER_DOCKERFILE: Final = ASSET_ROOT / "Dockerfile.playwright"
@@ -117,6 +118,17 @@ class ApplicationE2EProfile:
     execution_lane: str
     include_workspace_image: bool = False
     additional_deployments: tuple[str, ...] = ()
+    #: Extra StatefulSets whose rollout must settle before the journey runs.
+    #: Deployments and StatefulSets are separate `kubectl rollout status`
+    #: resource kinds, so a forge cannot be waited on through the field above.
+    additional_statefulsets: tuple[str, ...] = ()
+    #: This profile runs the stateless executor Deployment. A behavioural flag
+    #: rather than a name comparison so that adding a profile which composes
+    #: the stateless overlay cannot silently skip the executor image check.
+    stateless_agents: bool = False
+    #: This profile deploys the bundled forge. Project provisioning, project
+    #: repositories and knowledge-vault materialisation all go through it.
+    forge_enabled: bool = False
 
 
 APPLICATION_E2E_PROFILES: Final = {
@@ -133,6 +145,22 @@ APPLICATION_E2E_PROFILES: Final = {
         execution_lane="stateless",
         include_workspace_image=True,
         additional_deployments=("srw-e2e-agent-stateless",),
+        stateless_agents=True,
+    ),
+    "forge-sandbox": ApplicationE2EProfile(
+        name="forge-sandbox",
+        values_files=(
+            VALUES_FILE,
+            STATELESS_SANDBOX_VALUES_FILE,
+            FORGE_SANDBOX_VALUES_FILE,
+        ),
+        workspace_backend="sandbox",
+        execution_lane="stateless",
+        include_workspace_image=True,
+        additional_deployments=("srw-e2e-agent-stateless",),
+        additional_statefulsets=("srw-e2e-gitea",),
+        stateless_agents=True,
+        forge_enabled=True,
     ),
 }
 
@@ -2025,12 +2053,19 @@ class ApplicationE2EHarness:
                 "E2E Helm install must preserve failed state for diagnostics"
             )
         self.runner.run(command, timeout=960, label="E2E Helm deployment")
-        for deployment in (
-            "srw-e2e-orchestrator",
-            "srw-e2e-cockpit",
-            "srw-e2e-keycloak",
-            *profile.additional_deployments,
-        ):
+        workloads = [
+            f"deployment/{name}"
+            for name in (
+                "srw-e2e-orchestrator",
+                "srw-e2e-cockpit",
+                "srw-e2e-keycloak",
+                *profile.additional_deployments,
+            )
+        ]
+        workloads.extend(
+            f"statefulset/{name}" for name in profile.additional_statefulsets
+        )
+        for workload in workloads:
             self.runner.run(
                 self._kubectl(
                     ledger,
@@ -2038,11 +2073,11 @@ class ApplicationE2EHarness:
                     NAMESPACE,
                     "rollout",
                     "status",
-                    f"deployment/{deployment}",
+                    workload,
                     "--timeout=300s",
                 ),
                 timeout=310,
-                label=f"{deployment} rollout readiness",
+                label=f"{workload} rollout readiness",
             )
         self._verify_deployed_images(ledger)
         self._mark_layer(ledger, "helm-workloads")
@@ -2054,7 +2089,7 @@ class ApplicationE2EHarness:
             "deployment/srw-e2e-cockpit": str(ledger["images"]["cockpit"]),
             "deployment/srw-e2e-model-fixture": str(ledger["images"]["provider"]),
         }
-        if profile.name == "stateless-sandbox":
+        if profile.stateless_agents:
             checks["deployment/srw-e2e-agent-stateless"] = str(
                 ledger["images"]["agent"]
             )
