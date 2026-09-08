@@ -605,6 +605,47 @@ agent:
     # -- Pod resources for the stateless class. Empty = inherit
     # agent.resources.
     resources: {}
+    # -- Seconds the executor lets an in-flight unit finish after SIGTERM before
+    # it interrupts the turn (STATELESS_SHUTDOWN_TIMEOUT_S). The pod's
+    # terminationGracePeriodSeconds is this + 60. 120 is the historical value;
+    # an autoscaled pool, where a scale-down may SIGTERM a busy pod, should set
+    # this to cover one whole unit (session turns measured 100–220 s on dev,
+    # worker batches run at least worker.batchMinWallSeconds).
+    shutdownTimeoutSeconds: 120
+    # -- Queue-driven autoscaling of the executor pool via KEDA
+    # (templates/agent/stateless-scaledobject.yaml;
+    # knowledge-base/knowledge/features/capacity_ux_and_queue_autoscaling.md).
+    # Replicas follow run_queue demand: busy + runnable + reserve, clamped to
+    # [minReplicas, maxReplicas]. KEDA itself is a cluster-level prerequisite
+    # the chart does NOT install (HomeLab deployments_managed/keda/ on dev,
+    # scripts/local-dev-up.sh on k3d); enabling this without it fails the
+    # upgrade at apply time on the unknown ScaledObject kind.
+    autoscaling:
+      # -- DEFAULT OFF (prod-safe). On: renders the ScaledObject +
+      # TriggerAuthentication and drops the Deployment's static `replicas`
+      # (the HPA owns it). Off again: the Deployment re-emits `replicas`
+      # and KEDA restores the pre-autoscaling count.
+      enabled: false
+      # -- Warm floor. Also the floor inside the scaler query. §5.8 asks for an
+      # interactive floor ≥ 2.
+      minReplicas: 2
+      # -- Ceiling. Size against node capacity: each executor requests
+      # agent.stateless.resources (or agent.resources).
+      maxReplicas: 10
+      # -- Idle executors kept beyond current demand so an arriving turn is
+      # claimed without waiting for a pod to schedule and boot (~30–60 s).
+      reserve: 1
+      # -- Seconds between scaler queries. The query is two cheap COUNTs.
+      pollingInterval: 15
+      # -- HPA scale-down stabilization: replicas only drop to the LOWEST
+      # desired count observed over this window, one pod per minute. Smooths
+      # a demand drop-then-rise so a pod is not removed the moment a turn
+      # ends. Also the KEDA cooldownPeriod, which only matters at minReplicas 0.
+      scaleDownStabilizationSeconds: 300
+      # -- Namespace the KEDA operator runs in. The main Postgres
+      # NetworkPolicy admits the operator from here so the scaler can run its
+      # query; wrong value = the pool silently sits at the floor.
+      kedaNamespace: "keda"
     # -- Worker-job admission on the stateless executor plane. This is
     # independent from `stateless.enabled`: the shared pool may serve session
     # turns while every new worker job continues to use the pinned lane.

@@ -49,7 +49,12 @@ metadata:
     reloader.stakater.com/auto: "true"
   {{- end }}
 spec:
+  {{- if not .Values.agent.stateless.autoscaling.enabled }}
+  # Static pool size. Omitted entirely under autoscaling: the KEDA-managed HPA
+  # owns .spec.replicas then, and a value here would reset the pool to this
+  # number on every helm upgrade (stateless-scaledobject.yaml).
   replicas: {{ .Values.agent.stateless.replicas }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "srw.componentSelectorLabels" (dict "context" . "component" "agent-stateless") | nindent 6 }}
@@ -77,11 +82,14 @@ spec:
       # turn/batch → release the lease. The executor implements this on
       # SIGTERM itself, so there is no preStop exec hook — just a grace
       # period generous enough to finish + persist + release one unit.
-      # Executor shutdown allows 120s for the in-flight unit, then a 15s
-      # interrupt/unwind window. Keep additional room for authoritative
-      # backend/task drain and the exact claimant-quiescence acknowledgement;
-      # Kubernetes must not SIGKILL the process before that proof is durable.
-      terminationGracePeriodSeconds: 180
+      # Executor shutdown allows shutdownTimeoutSeconds (default 120s) for the
+      # in-flight unit, then a 15s interrupt/unwind window. The grace period is
+      # that timeout + 60s: room for authoritative backend/task drain and the
+      # exact claimant-quiescence acknowledgement; Kubernetes must not SIGKILL
+      # the process before that proof is durable. An autoscaled pool (where a
+      # scale-down can SIGTERM a busy pod) raises the timeout to cover one
+      # whole unit — see agent.stateless.shutdownTimeoutSeconds.
+      terminationGracePeriodSeconds: {{ add (int .Values.agent.stateless.shutdownTimeoutSeconds) 60 }}
       securityContext:
         seccompProfile:
           type: RuntimeDefault
@@ -128,6 +136,11 @@ spec:
               value: {{ .Values.agent.stateless.config | quote }}
             - name: AGENT_PORT
               value: {{ .Values.agent.port | quote }}
+            # SIGTERM drain budget for the in-flight unit
+            # (src/agent/api/turn_executor.py TurnExecutor.stop); paired with
+            # terminationGracePeriodSeconds above.
+            - name: STATELESS_SHUTDOWN_TIMEOUT_S
+              value: {{ .Values.agent.stateless.shutdownTimeoutSeconds | quote }}
             - name: MCP_INTERNAL_KEY
               valueFrom:
                 secretKeyRef:

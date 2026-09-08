@@ -760,6 +760,27 @@ engine entirely: that hostname belongs to someone else.
 {{- end -}}
 {{- end }}
 
+{{/*
+Read-only-tolerant hostname for the main Postgres — for consumers that only
+ever SELECT (today: the KEDA `postgresql` scaler in
+agent/stateless-scaledobject.yaml). Same resolution as srw.postgresHost, but at
+engine `cnpg` it names the "-r" Service: any instance, primary included. NOT
+"-ro" — that Service selects replicas only and has NO endpoints on a
+single-instance cluster (the non-HA profile), so a scaler pointed at it would
+fail to connect and the pool would sit at its floor without a visible error.
+*/}}
+{{- define "srw.postgresReadHost" -}}
+{{- if .Values.databases.postgres.internal -}}
+{{- $suffix := "" -}}
+{{- if eq (include "srw.dbEngine" (dict "context" . "db" .Values.databases.postgres)) "cnpg" -}}
+{{- $suffix = "-r" -}}
+{{- end -}}
+{{- printf "%s-postgres%s" (include "srw.fullname" .) $suffix -}}
+{{- else -}}
+{{- required "databases.postgres.externalHost is required when internal=false" .Values.databases.postgres.externalHost -}}
+{{- end -}}
+{{- end }}
+
 {{- define "srw.postgresPort" -}}
 {{- if .Values.databases.postgres.internal -}}
 5432

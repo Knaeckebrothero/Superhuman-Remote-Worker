@@ -229,6 +229,18 @@ agent:
   stateless:
     worker:
       defaultEnabled: false
+    # Queue-driven autoscaling of the executor pool (KEDA; installed on k3d by
+    # scripts/local-dev-up.sh step 2b). Replicas follow run_queue demand
+    # between the floor and the ceiling. Flip `enabled` in values-local.yaml —
+    # Tilt re-applies the chart on values edits — then watch
+    # `kubectl -n srw get scaledobject,hpa`.
+    # autoscaling:
+    #   enabled: true
+    #   minReplicas: 2
+    #   maxReplicas: 6
+    #   reserve: 1
+    #   pollingInterval: 15
+    #   scaleDownStabilizationSeconds: 120
   pool:
     minAgents: "0"
     buffer: "0"

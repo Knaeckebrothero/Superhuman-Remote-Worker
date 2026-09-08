@@ -119,6 +119,24 @@ spec:
         - port: 8000
           protocol: TCP
     {{- end }}
+    {{- if and .Values.agent.stateless.enabled .Values.agent.stateless.autoscaling.enabled }}
+    # The KEDA operator runs the stateless pool's scaler query
+    # (agent/stateless-scaledobject.yaml) from ITS namespace. Both selectors in
+    # one `from` entry: only the operator pod, only from that namespace, only
+    # 5432. Without this the query times out, KEDA logs a scaler error, and the
+    # pool silently stays at its floor — the failure mode reads like "the
+    # autoscaler does nothing", never like a policy denial.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.agent.stateless.autoscaling.kedaNamespace | quote }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: keda-operator
+      ports:
+        - port: 5432
+          protocol: TCP
+    {{- end }}
 ---
 {{- end }}
 
