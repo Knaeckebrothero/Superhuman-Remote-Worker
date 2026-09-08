@@ -803,6 +803,55 @@ async def test_terminal_foreground_gap_preserves_child_outcome(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_terminal_foreground_row_sends_the_child_status_not_the_thread_status(
+    tmp_path,
+):
+    """The durable listing row (``_SUBAGENT_THREAD_COLUMNS``) carries the
+    THREAD status ``ended`` under ``status`` and the child's own terminal
+    status under ``subagent_status``. Recovery must send the latter: the
+    orchestrator refuses a terminal retry whose status differs from the stored
+    one, which is what looped dev thread ``ad7eb761`` on every attach."""
+
+    ctx, _ = make_parent(tmp_path)
+    ledger = StrictLedger()
+    child = "dddddddd-1111-4222-8333-555555555555"
+    ledger.live = [
+        {
+            "id": child,
+            "thread_id": child,
+            "runtime_generation": "aaaaaaaa-1111-4222-8333-555555555555",
+            "parent_thread_id": "parent-job",
+            "handle": "reader-307f",
+            "subagent_type": "reader",
+            "parent_tool_call_id": "completed-call",
+            "run_in_background": False,
+            "status": "ended",
+            "subagent_status": "completed",
+            "subagent_outcome": "completed",
+            "subagent_error": None,
+            "report_path": ".subagents/reader-307f/report.md",
+            "recovery_kind": "terminal_foreground",
+            "total_turns": 8,
+            "total_tokens": 61474,
+        }
+    ]
+    ledger.messages.append((child, AIMessage(content="final durable report"), 8))
+    runtime = runtime_for(
+        ctx, factory=lambda *_: pytest.fail("provider ran"), ledger=ledger
+    )
+    runtime.host.delivery_channel = "event"
+
+    recovered = await runtime.recover_orphans()
+
+    assert recovered[0]["status"] == "completed"
+    _, fields = ledger.foreground_terminal_calls[0]
+    assert fields["status"] == "completed"
+    assert fields["outcome"] == "completed"
+    assert fields["report_path"] == ".subagents/reader-307f/report.md"
+    assert fields["error"] is None
+
+
+@pytest.mark.asyncio
 async def test_quiesce_adopts_inflight_durable_create_and_settles_without_provider(
     tmp_path,
 ):

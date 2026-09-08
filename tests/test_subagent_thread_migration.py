@@ -1806,14 +1806,6 @@ async def test_replay_onto_seeded_rows_and_the_child_lifecycle(
                 finalized_parent_id,
             )
             await conn.execute(
-                "INSERT INTO thread_messages "
-                "(id, thread_id, role, content, tool_call_id, turn_number) "
-                "VALUES ($1, $2, 'tool', 'child result', $3, 1)",
-                uuid4(),
-                finalized_parent_id,
-                finalized_call,
-            )
-            await conn.execute(
                 "INSERT INTO completion_effects "
                 "(producer_kind, producer_id, scope_id, effect_name, "
                 "effect_group, state, detail) "
@@ -1885,13 +1877,26 @@ async def test_replay_onto_seeded_rows_and_the_child_lifecycle(
                 )
                 == int(finalized_source_seq) - 1
             )
+            # Reconciliation may restore the missing ToolMessage after the
+            # final AI row. Sequence order is physical persistence order, not
+            # the logical LangGraph message order. Once it is durable it is
+            # the child's delivery fact: the malformed effect no longer
+            # matters to the CHILD verdict, and the watermark is left to the
+            # executor's skip-if-answered check plus its own completion CAS.
             await conn.execute(
-                "UPDATE completion_effects "
-                "SET detail = jsonb_set(detail, '{end_seq}', $2::jsonb) "
-                "WHERE producer_kind='session_turn' AND producer_id=$1",
-                finalized_execution_id,
-                json.dumps(int(finalized_end_seq)),
+                "INSERT INTO thread_messages "
+                "(id, thread_id, role, content, tool_call_id, turn_number) "
+                "VALUES ($1, $2, 'tool', 'child result', $3, 1)",
+                uuid4(),
+                finalized_parent_id,
+                finalized_call,
             )
+        assert (
+            await orchestrator.list_live_session_subagent_threads(
+                str(finalized_parent_id), parent_authority=finalized_authority
+            )
+            == []
+        )
         finalized_recovery = await orchestrator.terminalize_session_subagent_thread(
             parent_thread_id=str(finalized_parent_id),
             parent_authority=finalized_authority,
@@ -1905,12 +1910,21 @@ async def test_replay_onto_seeded_rows_and_the_child_lifecycle(
         assert finalized_recovery["result"] == "already_delivered"
         assert finalized_recovery["delivery_id"] is None
         async with pool.acquire() as conn:
+            # The zero-tool-call final answer is the executor's own "answered"
+            # evidence, so the delivered-child verdict consumes the input.
             assert (
                 await conn.fetchval(
                     "SELECT consumed_seq FROM run_queue WHERE unit_id=$1",
                     finalized_parent_id,
                 )
                 == finalized_source_seq
+            )
+            await conn.execute(
+                "UPDATE completion_effects "
+                "SET detail = jsonb_set(detail, '{end_seq}', $2::jsonb) "
+                "WHERE producer_kind='session_turn' AND producer_id=$1",
+                finalized_execution_id,
+                json.dumps(int(finalized_end_seq)),
             )
             assert finalized_later_seq > finalized_source_seq
             assert (

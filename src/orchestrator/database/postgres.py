@@ -30837,7 +30837,11 @@ class PostgresDB:
         Besides live predecessors, include a terminal foreground child whose
         parent AI tool call is durable but whose matching ToolMessage is not.
         That is the narrow crash seam after child terminalization and before
-        the parent persisted the synchronous result.
+        the parent persisted the synchronous result. The ToolMessage itself is
+        the delivery fact: once it is durable the child is never a candidate,
+        whatever its recovery stamp says (dev thread ``ad7eb761``, 2026-09-08:
+        a completed, delivered child was offered on every re-attach and each
+        recovery attempt was refused, so the unit bounced between pods forever).
         """
 
         try:
@@ -30880,6 +30884,18 @@ class PostgresDB:
                                    metadata->>
                                        'subagent_foreground_recovery_generation'
                                ) IS DISTINCT FROM runtime_generation::text
+                               -- The ToolMessage is the delivery fact: a child
+                               -- whose synchronous result is durable in the
+                               -- parent transcript has nothing to recover.
+                               AND NOT EXISTS (
+                                   SELECT 1
+                                     FROM thread_messages AS parent_result
+                                    WHERE parent_result.thread_id = $1
+                                      AND parent_result.role = 'tool'
+                                      AND parent_result.tool_call_id =
+                                          threads.parent_tool_call_id
+                                      AND parent_result.rewound_at IS NULL
+                               )
                                AND EXISTS (
                                    SELECT 1
                                      FROM thread_messages AS parent_call
@@ -31248,9 +31264,131 @@ class PostgresDB:
                         queue_consumed = None
                         source_already_complete = source_delivery_state == "settled"
 
+                    # Recovery from facts. The parent's ToolMessage for this
+                    # call IS the child's delivery: when it is durable, an ended
+                    # child is already delivered — decided here, before any
+                    # watermark side effect and before the terminal-retry field
+                    # checks, and regardless of whether a zero-tool-call final
+                    # AI row exists (a final answer that carries its own tool
+                    # call is the parent turn's business, not the child's). A
+                    # continuation event an earlier recovery already committed
+                    # stays canonical, and a still-live child keeps the
+                    # existing crash-seam path below.
+                    call_id = str(child.get("parent_tool_call_id") or "").strip()
+                    if not call_id:
+                        raise ValueError("foreground recovery has no parent tool call")
+                    durable_call_count = await conn.fetchval(
+                        """
+                        SELECT count(*)
+                          FROM thread_messages AS parent_call
+                          CROSS JOIN LATERAL jsonb_array_elements(
+                              COALESCE(parent_call.tool_calls, '[]'::jsonb)
+                          ) AS tool_call
+                         WHERE parent_call.id = $1
+                           AND parent_call.thread_id = $2
+                           AND parent_call.role = 'ai'
+                           AND parent_call.rewound_at IS NULL
+                           AND tool_call->>'id' = $3
+                           AND parent_call.turn_number = $4
+                        """,
+                        parent_ai_message_id,
+                        parent_uuid,
+                        call_id,
+                        parent_iteration,
+                    )
+                    if durable_call_count != 1:
+                        raise ValueError(
+                            "foreground recovery needs one exact durable parent call"
+                        )
+                    parent_ai_seq = await conn.fetchval(
+                        "SELECT seq FROM thread_messages WHERE id=$1",
+                        parent_ai_message_id,
+                    )
+                    parent_result_seq = await conn.fetchval(
+                        """
+                        SELECT CASE WHEN count(*) = 1 THEN min(result.seq) END
+                          FROM thread_messages AS result
+                         WHERE result.thread_id = $1
+                           AND result.role = 'tool'
+                           AND result.tool_call_id = $2
+                           AND result.turn_number = $3
+                           AND result.seq > $4
+                           AND result.rewound_at IS NULL
+                        """,
+                        parent_uuid,
+                        call_id,
+                        parent_iteration,
+                        int(parent_ai_seq),
+                    )
+                    delivered_by_tool_message = False
+                    parent_turn_completed = False
+                    if parent_result_seq is not None and child["status"] == "ended":
+                        delivered_by_tool_message = not await conn.fetchval(
+                            """
+                            SELECT EXISTS (
+                                SELECT 1 FROM thread_input_deliveries
+                                 WHERE delivery_id = $1
+                            )
+                            """,
+                            session_subagent_delivery_id(
+                                child_uuid, expected_generation
+                            ),
+                        )
+                    if delivered_by_tool_message:
+                        # Whether the parent INPUT is consumed is a turn-level
+                        # fact. Two durable proofs that the turn answered it:
+                        # the loop's own ``turn.completed`` frame for that
+                        # turn, journaled after the delegating AI row (the
+                        # only evidence when the final answer carries its own
+                        # tool call — ad7eb761), or the turn's own final answer
+                        # row — same turn_number, after the delegating call,
+                        # no tool calls — which is the evidence the
+                        # already_delivered verdict always used. With
+                        # either, the watermark advances below so the next
+                        # claim cannot answer the input twice; without both,
+                        # the turn may still owe its answer and the watermark
+                        # is left alone — the next claim replays with the
+                        # ToolMessage in the transcript.
+                        parent_turn_completed = bool(
+                            await conn.fetchval(
+                                """
+                                SELECT EXISTS (
+                                    SELECT 1
+                                      FROM thread_events AS frame
+                                     WHERE frame.thread_id = $1
+                                       AND frame.kind = 'turn.completed'
+                                       AND (frame.payload->>'turn_id') = $2::text
+                                       AND frame.created_at >= (
+                                           SELECT created_at
+                                             FROM thread_messages
+                                            WHERE id = $3
+                                       )
+                                )
+                                OR EXISTS (
+                                    SELECT 1
+                                      FROM thread_messages AS answer
+                                     WHERE answer.thread_id = $1
+                                       AND answer.role = 'ai'
+                                       AND answer.turn_number = $5
+                                       AND answer.seq > $4
+                                       AND answer.rewound_at IS NULL
+                                       AND jsonb_array_length(
+                                           COALESCE(answer.tool_calls, '[]'::jsonb)
+                                       ) = 0
+                                )
+                                """,
+                                parent_uuid,
+                                str(int(parent_iteration)),
+                                parent_ai_message_id,
+                                int(parent_ai_seq),
+                                int(parent_iteration),
+                            )
+                        )
+
                     if (
                         parsed.execution_lane == "stateless"
                         and not source_already_complete
+                        and (not delivered_by_tool_message or parent_turn_completed)
                     ):
                         oldest_pending = await conn.fetchval(
                             """
@@ -31332,6 +31470,28 @@ class PostgresDB:
                             raise ValueError(
                                 "foreground recovery lost source input authority"
                             )
+                    if delivered_by_tool_message:
+                        await conn.execute(
+                            """
+                            UPDATE threads
+                               SET metadata = jsonb_set(
+                                   COALESCE(metadata, '{}'::jsonb),
+                                   '{subagent_foreground_recovery_generation}',
+                                   to_jsonb($2::text),
+                                   true
+                               )
+                             WHERE id = $1
+                            """,
+                            child_uuid,
+                            str(expected_generation),
+                        )
+                        return {
+                            "result": "already_delivered",
+                            "thread_id": str(child_uuid),
+                            "runtime_generation": str(expected_generation),
+                            "delivery_id": None,
+                            "delivery_state": None,
+                        }
                 expected_delivery = session_subagent_delivery_id(
                     child_uuid, expected_generation
                 )
@@ -31343,36 +31503,8 @@ class PostgresDB:
                     )
                 parent_result_already_durable = False
                 if foreground_orphan_recovery:
-                    call_id = str(child.get("parent_tool_call_id") or "").strip()
-                    if not call_id:
-                        raise ValueError("foreground recovery has no parent tool call")
-                    durable_call_count = await conn.fetchval(
-                        """
-                        SELECT count(*)
-                          FROM thread_messages AS parent_call
-                          CROSS JOIN LATERAL jsonb_array_elements(
-                              COALESCE(parent_call.tool_calls, '[]'::jsonb)
-                          ) AS tool_call
-                         WHERE parent_call.id = $1
-                           AND parent_call.thread_id = $2
-                           AND parent_call.role = 'ai'
-                           AND parent_call.rewound_at IS NULL
-                           AND tool_call->>'id' = $3
-                           AND parent_call.turn_number = $4
-                        """,
-                        parent_ai_message_id,
-                        parent_uuid,
-                        call_id,
-                        parent_iteration,
-                    )
-                    if durable_call_count != 1:
-                        raise ValueError(
-                            "foreground recovery needs one exact durable parent call"
-                        )
-                    parent_ai_seq = await conn.fetchval(
-                        "SELECT seq FROM thread_messages WHERE id=$1",
-                        parent_ai_message_id,
-                    )
+                    # call_id, parent_ai_seq and parent_result_seq were settled
+                    # above, before the watermark side effects.
                     stateless_finalized_end_seq: int | None = None
                     stateless_completion_effect_present = False
                     if parsed.execution_lane == "stateless":
@@ -31430,22 +31562,6 @@ class PostgresDB:
                             supersedes_input_seq,
                             parent_iteration,
                         )
-                    parent_result_seq = await conn.fetchval(
-                        """
-                        SELECT CASE WHEN count(*) = 1 THEN min(result.seq) END
-                          FROM thread_messages AS result
-                         WHERE result.thread_id = $1
-                           AND result.role = 'tool'
-                           AND result.tool_call_id = $2
-                           AND result.turn_number = $3
-                           AND result.seq > $4
-                           AND result.rewound_at IS NULL
-                        """,
-                        parent_uuid,
-                        call_id,
-                        parent_iteration,
-                        int(parent_ai_seq),
-                    )
                     final_parent_response_seq = await conn.fetchval(
                         """
                                 SELECT min(response.seq)
