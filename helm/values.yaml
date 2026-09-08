@@ -631,7 +631,7 @@ agent:
       minReplicas: 2
       # -- Ceiling. Size against node capacity: each executor requests
       # agent.stateless.resources (or agent.resources).
-      maxReplicas: 10
+      maxReplicas: 6
       # -- Idle executors kept beyond current demand so an arriving turn is
       # claimed without waiting for a pod to schedule and boot (~30–60 s).
       reserve: 1
