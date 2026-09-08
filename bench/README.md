@@ -144,12 +144,21 @@ absent from v1 — they change as the repo changes, which breaks pinning.
   overrides each task's), e.g. the developer-vs-engineer campaign
   (`knowledge-base/knowledge/features/engineer_expert.md` §6):
   `python bench/submit.py --server --run-id dev-vs-eng-01 --replicates 3 --model MiniMax-M3 --arms developer,engineer --only D1-wordfreq-kata,D2-inventory-bugfix,D3-ledger-refactor,D4-static-page,D5-clone-and-extend,O1-install-and-report`.
-  Its ceremony metric is `bench/queries/first_command_latency.sql` (attach → first
-  shell command, audit rows before it) over the member job ids. For arms that
-  need distinct `config_override`s or `project_id`s, build the spec yourself (tasks from `tasks.yaml`, `arms: [{name, model,
-  config_override, project_id}, ...]`) and POST `/api/bench/runs` directly.
-  Give each arm its own `project_id` when memory coupling could leak the
-  treatment; an arm without one inherits the run-level project. The sweeper
+  Add **`--isolate-arms`** whenever the variable under test could be carried by
+  project-scoped state: it creates one throwaway `bench-<run-id>-<arm>` project
+  per arm and stamps `project_id` on each, so Memory-Light recall and KB notes
+  cannot couple the treatments. Without it every arm inherits the run project and
+  the second arm to reach a task can recall the first's memories of it.
+  `bench/queries/first_command_latency.sql` reports attach → first shell command
+  and the audit rows before it, over the member job ids. **Read it only for ops
+  tasks:** on dev tasks it does not measure ceremony, because a strategic phase
+  that opens with `git log`/`git tag` reaches its "first command" within a minute
+  on any expert (dev-vs-eng-01: developer 1.0 min vs engineer 2.8 min, while the
+  developer took 3–7× the requests). Time-to-first-*edit* and request count are
+  the ceremony signals there.
+  For arms that need distinct `config_override`s, build the spec yourself (tasks
+  from `tasks.yaml`, `arms: [{name, model, config_override, project_id}, ...]`)
+  and POST `/api/bench/runs` directly. The sweeper
   schedules arms adjacent within each replicate's shuffled wave — that
   adjacency is what neutralizes time-varying confounds (pool growth,
   contention), so never split arms across runs or clusters.
