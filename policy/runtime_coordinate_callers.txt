@@ -17,8 +17,6 @@ src/orchestrator/main.py  _agent_get_thread_workspace_locked  remote-effect  rem
 src/orchestrator/main.py  _agent_get_thread_workspace_locked  remote-effect  remote_canvas_presentation_available  f40229a0ebf2  #2  fresh-k8s-attestation
 src/orchestrator/main.py  _agent_toolset_from_status  http  client.get  8d7b711c0959  #1  read-only-probe
 src/orchestrator/main.py  _agent_toolset_probe  http  client.get  8d7b711c0959  #1  read-only-probe
-src/orchestrator/main.py  _build_agent_cloud_mount  remote-effect  _build_rclone_mount_from_row  f439c958baa3  #1  local-only
-src/orchestrator/main.py  _build_agent_cloud_mount  remote-effect  _build_rclone_session_mount  19bd9aa52fce  #1  local-only
 src/orchestrator/main.py  _capture_workspace_snapshot_for_freeze  remote-effect  snapshot_service.capture_vm_snapshot  a8d60e53ae92  #1  contained-k8s
 src/orchestrator/main.py  _capture_workspace_snapshot_for_freeze  remote-effect  snapshot_service.capture_vm_snapshot  aeab2fb0c8df  #1  vm-authority
 src/orchestrator/main.py  _cascade_cancel_to_children._signal_cancel  http  client.post  e095cc0a7a8c  #1  exact-runtime-recipient
@@ -30,7 +28,6 @@ src/orchestrator/main.py  _initiate_pause  http  client.post  c40208b4763b  #1  
 src/orchestrator/main.py  _prepare_pinned_job_mutation_target  http  client.get  8c74982a3556  #1  read-only-probe
 src/orchestrator/main.py  _prepare_pinned_session_mutation_target  http  client.get  8c74982a3556  #1  read-only-probe
 src/orchestrator/main.py  _recover_captured_sandbox_process_zero  remote-effect  RemoteBackend  0ff44667792a  #1  contained-k8s
-src/orchestrator/main.py  _reset_thread_overlay  http  client.post  92db99489add  #1  exact-runtime-recipient
 src/orchestrator/main.py  _resume_job_internal  remote-effect  ide_session_service.restore_snapshot_for_resume  7d64b6d27fe7  #1  fresh-k8s-attestation
 src/orchestrator/main.py  _resume_job_on_agent  http  client.get  8c74982a3556  #1  exact-runtime-recipient
 src/orchestrator/main.py  _resume_job_on_agent  http  client.post  d1bd7131e5e1  #1  exact-runtime-recipient
@@ -39,7 +36,9 @@ src/orchestrator/main.py  _thread_turn_in_flight  http  client.post  5e8b40a94fa
 src/orchestrator/main.py  cancel_job  http  client.post  b81e2e9fccf9  #1  exact-runtime-recipient
 src/orchestrator/main.py  get_agent_system_info  http  client.get  7e0ff1b83a17  #1  read-only-probe
 src/orchestrator/main.py  pause_job  http  client.post  c40208b4763b  #1  exact-runtime-recipient
-src/orchestrator/main.py  upload_files_to_thread  remote-effect  upload_files_to_attested_vm_workspace  8f1a01b30667  #1  fresh-k8s-attestation
+src/orchestrator/routers/thread_files.py  upload_files_to_thread  remote-effect  upload_files_to_attested_vm_workspace  8f1a01b30667  #1  fresh-k8s-attestation
+src/orchestrator/services/agent_cloud_mounts.py  _build_agent_cloud_mount  remote-effect  _build_rclone_mount_from_row  0e83b668f377  #1  local-only
+src/orchestrator/services/agent_cloud_mounts.py  _build_agent_cloud_mount  remote-effect  _build_rclone_session_mount  ee81a67b673b  #1  local-only
 src/orchestrator/services/canvas_ssh.py  resolve_remote_workspace_target  remote-effect  RemoteWorkspaceTarget  2c2ece0ea102  #1  pinned-host-key
 src/orchestrator/services/cloud_staging/stage.py  _run_authorized_ssh_capture  ssh  _run_ssh_capture  3f83ac72f00a  #1  vm-authority
 src/orchestrator/services/cloud_staging/stage.py  _run_authorized_ssh_capture  ssh  _run_ssh_capture  8161a3ff0171  #1  vm-authority
@@ -100,6 +99,7 @@ src/orchestrator/services/ssh_helpers.py  stream_extract_snapshot  remote-effect
 src/orchestrator/services/ssh_helpers.py  stream_extract_snapshot  ssh  build_agent_ssh_cmd  4a8f49923e31  #1  pinned-host-key
 src/orchestrator/services/ssh_helpers.py  wait_for_agent_ssh  remote-effect  create_owned_subprocess_exec  48e3950913b3  #1  pinned-host-key
 src/orchestrator/services/ssh_helpers.py  wait_for_agent_ssh  ssh  build_agent_ssh_cmd  03995d101f31  #1  pinned-host-key
+src/orchestrator/services/thread_cloud_diff.py  _reset_thread_overlay  http  client.post  92db99489add  #1  exact-runtime-recipient
 src/orchestrator/services/thread_uploads.py  resolve_thread_upload_destination  ssh  _SshTarget  edfd95d5f2d1  #1  pinned-host-key
 src/orchestrator/services/vm_provisioner.py  VMProvisioner.release_vm_captured  remote-effect  self._snapshot_service.capture_vm_snapshot  22b821d81a7c  #1  vm-authority
 src/orchestrator/services/vm_readiness.py  VMReadinessService._probe  remote-effect  seed_ide_config_for_user  2ab90cdbc684  #1  vm-authority
