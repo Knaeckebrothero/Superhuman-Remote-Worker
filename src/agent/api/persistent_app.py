@@ -12636,6 +12636,7 @@ async def _resilient_cloud_sync(
     turn_id: int,
     *,
     broadcast_errors: Optional[Callable[[], bool]] = None,
+    retry_allowed: Optional[Callable[[], bool]] = None,
 ) -> bool:
     """Run a cloud_sync op with retry+backoff; surface failure without crashing.
 
@@ -12657,6 +12658,8 @@ async def _resilient_cloud_sync(
             return True
         except CloudSyncError as e:
             last_error = e
+            if retry_allowed is not None and not retry_allowed():
+                break
             if attempt < attempts:
                 logger.warning(
                     "workspace_sync %s attempt %d/%d failed; retrying in %.0fs: %s",
@@ -12671,7 +12674,7 @@ async def _resilient_cloud_sync(
     logger.warning(
         "workspace_sync %s failed after %d attempts (turn %s): %s",
         op,
-        attempts,
+        attempt,
         turn_id,
         last_error,
     )
@@ -13059,6 +13062,7 @@ async def _run_turn_end_cloud_push(
     runner = sync.push_all
     op = "push"
     recorder: Optional[_PushProgressRecorder] = None
+    generation_staged = False
     if requirements is not None:
         if claim is None:
             raise LeaseLostError("generation push lacks a captured claim")
@@ -13071,7 +13075,9 @@ async def _run_turn_end_cloud_push(
             await _ack_cloud_generation(claim, mount_id, requirement)
 
         async def generation_runner() -> Any:
+            nonlocal generation_staged
             staged = await sync.stage_generation(requirements)
+            generation_staged = True
             if staged_event is not None:
                 staged_event.set()
             try:
@@ -13093,6 +13099,10 @@ async def _run_turn_end_cloud_push(
             runner,
             turn_id,
             broadcast_errors=lambda: claim is None or claim.fence.kind == "lease",
+            # Once staging succeeds the executor can detach at any await.
+            # A failed transmit has durable progress; recovery must rebuild
+            # under a new owner instead of re-reading this old workspace.
+            retry_allowed=lambda: not generation_staged,
         )
     finally:
         if staged_event is not None:

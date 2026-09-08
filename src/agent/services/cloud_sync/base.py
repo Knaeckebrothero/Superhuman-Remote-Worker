@@ -484,7 +484,7 @@ class WorkspaceSyncBase(abc.ABC):
         *,
         before_write: Optional[Callable[[], Awaitable[None]]] = None,
     ) -> None:
-        """PUT the marker only after every generation byte has landed."""
+        """Commit the marker last, without overwriting a successor's marker."""
 
         marker_path = _sync_generation_marker_path(
             marker.thread_id, marker.sync_scope_sha256
@@ -525,9 +525,20 @@ class WorkspaceSyncBase(abc.ABC):
             ).encode("utf-8")
             _write_all(fd, payload)
             os.close(fd)
+            fd = -1  # The transport may reuse this descriptor across the awaits.
+            # The final DB check and PUT are separate operations. Capture the
+            # marker's ETag before that check so an old in-flight request
+            # cannot regress the commit record after another owner advances it.
+            etag = await self._remote_etag(marker_path)
             if before_write is not None:
                 await before_write()
-            await self._upload_file(marker_path, tmp_path, before_write=before_write)
+            await self._upload_file(
+                marker_path,
+                tmp_path,
+                before_write=before_write,
+                if_match=etag,
+                if_none_match=etag is None,
+            )
         finally:
             try:
                 os.close(fd)
@@ -659,13 +670,13 @@ class WorkspaceSyncBase(abc.ABC):
             raise CloudSyncMarkerError(
                 "stateless cloud generation requires a durable workspace backend"
             )
-        current_paths = sorted(
-            {
-                path
-                for path in await self._walk_backend_files_async(strict=True)
-                if not _should_ignore(path)
-            }
+        index = await self._backend_file_index()
+        listed = (
+            index
+            if index is not None
+            else await self._walk_backend_files_async(strict=True)
         )
+        current_paths = sorted({path for path in listed if not _should_ignore(path)})
         walked = _time.perf_counter()
         deletes: list[StagedDelete] = []
         skipped = 0
@@ -682,7 +693,9 @@ class WorkspaceSyncBase(abc.ABC):
                 )
             )
         uploads: list[StagedUpload] = []
-        for path in current_paths:
+
+        async def stage_one(path: str) -> None:
+            nonlocal skipped
             content = await asyncio.to_thread(
                 self._backend.read_file,  # type: ignore[union-attr]
                 self._backend_path(path),
@@ -698,17 +711,20 @@ class WorkspaceSyncBase(abc.ABC):
                 and recorded["sha256"] == current_digest
             ):
                 skipped += 1
-                continue
+                return
             previous = normalized.get(path)
             if (
                 previous is not None
                 and previous["sha256"] == current_digest
                 and recorded is None
             ):
-                continue
+                return
             fd, tmp_path = tempfile.mkstemp()
             try:
                 _write_all(fd, content)
+            except BaseException:
+                os.unlink(tmp_path)
+                raise
             finally:
                 os.close(fd)
             if_match: Optional[str] = None
@@ -729,6 +745,60 @@ class WorkspaceSyncBase(abc.ABC):
                     if_none_match=if_none_match,
                 )
             )
+
+        # Four readers amortize object-store process/round-trip costs while
+        # bounding resident file bytes. SFTP backends retain their own lock.
+        remaining = iter(current_paths)
+        stopping = False
+
+        async def worker() -> None:
+            nonlocal stopping
+            try:
+                while not stopping:
+                    path = next(remaining, None)
+                    if path is None:
+                        return
+                    await stage_one(path)
+            except BaseException:
+                stopping = True
+                raise
+
+        readers = asyncio.gather(
+            *(worker() for _ in range(min(4, len(current_paths)))),
+            return_exceptions=True,
+        )
+        try:
+            # Cancelling to_thread does not stop its read. Drain the workers
+            # before cleaning staged files or letting the caller detach.
+            results = await asyncio.shield(readers)
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
+        except BaseException:
+            stopping = True
+            while not readers.done():
+                try:
+                    await asyncio.shield(readers)
+                except asyncio.CancelledError:
+                    # A second shutdown signal must not cancel an in-flight
+                    # synchronous backend read either.
+                    continue
+            for upload in uploads:
+                try:
+                    os.unlink(upload.tmp_path)
+                except OSError:
+                    pass
+            raise
+        uploads.sort(key=lambda upload: upload.path)
+        logger.info(
+            "cloud generation staged: mount=%s walk=%.2fs read=%.2fs files=%d uploads=%d deletes=%d",
+            self._mount_subdir or "<root>",
+            walked - started,
+            _time.perf_counter() - walked,
+            len(current_paths),
+            len(uploads),
+            len(deletes),
+        )
         return StagedGenerationDelta(
             uploads=uploads,
             deletes=deletes,

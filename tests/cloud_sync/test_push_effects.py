@@ -10,14 +10,16 @@ as a WebDAV server would.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 from pathlib import Path
+import threading
 from typing import Any
 
 import pytest
 
-from agent.services.cloud_sync.base import CloudSyncMarker
+from agent.services.cloud_sync.base import CloudSyncFenceLost, CloudSyncMarker
 from agent.services.cloud_sync.coordinator import (
     CloudSyncError,
     MountSync,
@@ -89,6 +91,112 @@ def _coordinator(sync: LocalFsWorkspaceSync) -> WorkspaceSyncCoordinator:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("bulk_fails", [False, True])
+async def test_stage_uses_one_bulk_listing_and_falls_back_strictly(
+    tmp_path, bulk_fails
+):
+    sync, ws, _remote = _sync(tmp_path)
+    (ws / "nested").mkdir()
+    (ws / "nested" / "a.txt").write_bytes(b"alpha")
+    sync._mount_subdir = "nested"
+
+    def bulk(path):
+        assert path == "nested"
+        if bulk_fails:
+            raise OSError("bulk listing failed")
+        return [("nested/a.txt", 5), ("nested/.srw/ignored.txt", 4)]
+
+    def list_dir(path):
+        raise OSError("strict listing failed")
+
+    sync._backend.list_files_with_sizes = bulk
+    sync._backend.list_dir = list_dir
+    if bulk_fails:
+        with pytest.raises(OSError, match="strict listing failed"):
+            await sync.stage_generation_delta({})
+    else:
+        staged = await sync.stage_generation_delta({})
+        try:
+            assert [u.path for u in staged.uploads] == ["a.txt"]
+            assert Path(staged.uploads[0].tmp_path).read_bytes() == b"alpha"
+        finally:
+            staged.cleanup()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["success", "failure", "cancel"])
+async def test_stage_bounds_reads_and_drains_them_before_cleanup(
+    tmp_path, monkeypatch, outcome
+):
+    sync, ws, _remote = _sync(tmp_path)
+    for index in range(12):
+        (ws / f"{index:02}.txt").write_bytes(str(index).encode())
+    backend_read = sync._backend.read_file
+    active = 0
+    peak = 0
+    calls = 0
+    lock = threading.Lock()
+    release = threading.Event()
+    started = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    temp = tmp_path / "staged"
+    temp.mkdir()
+    monkeypatch.setattr("tempfile.tempdir", str(temp))
+
+    def read(path, binary):
+        nonlocal active, peak, calls
+        with lock:
+            active += 1
+            calls += 1
+            peak = max(peak, active)
+            if active == 4:
+                loop.call_soon_threadsafe(started.set)
+        try:
+            assert release.wait(5), "staging did not overlap four reads"
+            if outcome == "failure" and path.endswith("00.txt"):
+                raise OSError("workspace read failed")
+            return backend_read(path, binary)
+        finally:
+            with lock:
+                active -= 1
+
+    sync._backend.read_file = read
+    task = asyncio.create_task(sync.stage_generation_delta({}))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+        if outcome == "cancel":
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done(), "cancellation must wait for active backend reads"
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done(), "repeated cancellation must also drain reads"
+        release.set()
+        if outcome == "success":
+            staged = await task
+            assert [u.path for u in staged.uploads] == [
+                f"{i:02}.txt" for i in range(12)
+            ]
+            assert all(
+                Path(u.tmp_path).read_bytes() == str(i).encode()
+                for i, u in enumerate(staged.uploads)
+            )
+            staged.cleanup()
+        elif outcome == "failure":
+            with pytest.raises(OSError, match="workspace read failed"):
+                await task
+        else:
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert calls == 4
+        assert peak == 4 and active == 0
+        assert list(temp.iterdir()) == []
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_stage_then_transmit_uses_preconditions_and_cleans_temp_files(
     tmp_path: Path,
 ):
@@ -142,6 +250,89 @@ async def test_changed_baseline_file_is_written_with_if_match(tmp_path: Path):
     ]
     await sync.transmit_generation_delta(staged, before_write=_ok)
     assert (remote / "a.txt").read_bytes() == b"new"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("existing", [False, True])
+async def test_delayed_marker_cannot_replace_successor_commit(tmp_path, existing):
+    old, _workspace, remote = _sync(tmp_path)
+    successor = LocalFsWorkspaceSync(tmp_path / "successor", remote_root=remote)
+
+    def marker(generation):
+        manifest, _encoded, digest = encode_cloud_sync_baseline(
+            {"a.txt": {"sha256": _sha(str(generation).encode()), "remote_etag": "e"}}
+        )
+        return CloudSyncMarker(
+            thread_id=THREAD,
+            mount_id="mount-a",
+            generation=generation,
+            lease_token=generation,
+            workspace_generation=WORKSPACE,
+            sync_scope_sha256=SCOPE,
+            committed_manifest=manifest,
+            committed_manifest_sha256=digest,
+        )
+
+    if existing:
+        await old.write_sync_generation_marker(marker(1), before_write=_ok)
+    ready = asyncio.Event()
+    release = asyncio.Event()
+    upload = old._upload_file
+
+    async def delayed_upload(path, local_path, *, before_write=None, **kwargs):
+        if before_write is not None:
+            await before_write()
+        ready.set()
+        await release.wait()  # the request passed its last DB check
+        return await upload(path, local_path, **kwargs)
+
+    old._upload_file = delayed_upload
+    writer = asyncio.create_task(
+        old.write_sync_generation_marker(marker(2), before_write=_ok)
+    )
+    try:
+        await asyncio.wait_for(ready.wait(), timeout=2)
+        await successor.write_sync_generation_marker(marker(3), before_write=_ok)
+        release.set()
+        with pytest.raises(CloudSyncFenceLost):
+            await writer
+        persisted = await successor.read_sync_generation_marker(
+            thread_id=THREAD, sync_scope_sha256=SCOPE
+        )
+        assert persisted == marker(3)
+    finally:
+        release.set()
+        await asyncio.gather(writer, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_marker_cleanup_does_not_close_reused_transport_descriptor(tmp_path):
+    sync, ws, _remote = _sync(tmp_path)
+    sentinel = ws / "transport.txt"
+    sentinel.write_bytes(b"still open")
+    opened = []
+
+    async def upload(*args, **kwargs):
+        opened.append(os.open(sentinel, os.O_RDONLY))
+
+    sync._upload_file = upload
+    marker = CloudSyncMarker(
+        thread_id=THREAD,
+        mount_id="mount-a",
+        generation=1,
+        lease_token=1,
+        workspace_generation=WORKSPACE,
+        sync_scope_sha256=SCOPE,
+    )
+    try:
+        await sync.write_sync_generation_marker(marker, before_write=_ok)
+        assert os.read(opened[0], 20) == b"still open"
+    finally:
+        for fd in opened:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 @pytest.mark.asyncio
@@ -242,6 +433,69 @@ async def test_deletes_carry_if_match_and_report_progress(tmp_path: Path):
 
 
 # ---------------------------------------------------------------- coordinator
+
+
+@pytest.mark.asyncio
+async def test_stage_needs_no_cloud_io_and_transmit_needs_no_workspace(tmp_path):
+    sync, ws, remote = _sync(tmp_path)
+    (ws / "a.txt").write_bytes(b"alpha")
+    coordinator = _coordinator(sync)
+    read_marker = sync.read_sync_generation_marker
+
+    async def unavailable(**kwargs):
+        raise AssertionError("cloud marker read must happen off-slot")
+
+    sync.read_sync_generation_marker = unavailable
+    staged = await coordinator.stage_generation({"mount-a": _requirement({})})
+    sync.read_sync_generation_marker = read_marker
+    sync._backend = None  # A detached workspace is unavailable to transmit.
+
+    async def acknowledge(*args):
+        pass
+
+    await coordinator.transmit_generation(
+        staged, before_write=_ok, acknowledge=acknowledge
+    )
+    assert (remote / "a.txt").read_bytes() == b"alpha"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("marker_failure", [False, True])
+async def test_off_slot_marker_check_cleans_staging_and_preserves_later_cloud_edits(
+    tmp_path, marker_failure
+):
+    sync, ws, remote = _sync(tmp_path)
+    (ws / "a.txt").write_bytes(b"alpha")
+    coordinator = _coordinator(sync)
+    requirement = _requirement({})
+
+    async def acknowledge(*args):
+        pass
+
+    await coordinator.push_generation(
+        {"mount-a": requirement}, before_write=_ok, acknowledge=acknowledge
+    )
+    (ws / "a.txt").write_bytes(b"stale retry")
+    (remote / "a.txt").write_bytes(b"later cloud edit")
+    staged = await coordinator.stage_generation({"mount-a": requirement})
+    paths = [u.tmp_path for u in staged[0].staged.uploads]
+    assert paths
+    if marker_failure:
+
+        async def failed(**kwargs):
+            raise OSError("marker unavailable")
+
+        sync.read_sync_generation_marker = failed
+        with pytest.raises(CloudSyncError):
+            await coordinator.transmit_generation(
+                staged, before_write=_ok, acknowledge=acknowledge
+            )
+    else:
+        assert await coordinator.transmit_generation(
+            staged, before_write=_ok, acknowledge=acknowledge
+        ) == {"mount-a": []}
+    assert (remote / "a.txt").read_bytes() == b"later cloud edit"
+    assert not any(os.path.exists(path) for path in paths)
 
 
 @pytest.mark.asyncio

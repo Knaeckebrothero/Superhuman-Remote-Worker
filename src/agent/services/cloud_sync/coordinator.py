@@ -257,7 +257,7 @@ class WorkspaceSyncCoordinator:
         *,
         progress: Optional[dict[str, Any]] = None,
     ) -> list[StagedMountGeneration]:
-        """Read every mount's workspace delta; no cloud writes yet.
+        """Read every mount's workspace delta, without cloud I/O.
 
         Runs while the run_queue unit is still leased (the workspace SSH
         backend is alive). ``progress`` maps mount id → a predecessor's
@@ -270,14 +270,6 @@ class WorkspaceSyncCoordinator:
             generation_id = mount.generation_id
             requirement = requirements[generation_id]
             mount.sync.install_generation_baseline(requirement.baseline_manifest)
-            existing = await mount.sync.read_sync_generation_marker(
-                thread_id=self.thread_id,
-                sync_scope_sha256=requirement.sync_scope_sha256,
-            )
-            if self._marker_commits_requirement(
-                mount, requirement=requirement, marker=existing
-            ):
-                return StagedMountGeneration(mount, requirement, None)
             staged = await mount.sync.stage_generation_delta(
                 requirement.baseline_manifest,
                 progress=(progress or {}).get(generation_id),
@@ -329,6 +321,25 @@ class WorkspaceSyncCoordinator:
                 # Mirror the resource truth into DB, but never replay the delta
                 # over a cloud-side edit that arrived after the marker.
                 await acknowledge(generation_id, requirement)
+                return []
+            # This WebDAV read can queue behind minutes of other uploads.
+            # Keep it off the slot just like the writes. A marker committed
+            # before an ACK failure still makes the retry strictly ACK-only.
+            try:
+                existing = await mount.sync.read_sync_generation_marker(
+                    thread_id=self.thread_id,
+                    sync_scope_sha256=requirement.sync_scope_sha256,
+                )
+                committed = self._marker_commits_requirement(
+                    mount, requirement=requirement, marker=existing
+                )
+            except BaseException:
+                item.staged.cleanup()
+                raise
+            if committed:
+                item.staged.cleanup()
+                await acknowledge(generation_id, requirement)
+                mount.sync.install_generation_baseline(existing.committed_manifest)
                 return []
             if planned is not None:
                 await planned(generation_id, item.staged.planned)

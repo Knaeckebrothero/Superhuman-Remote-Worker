@@ -123,7 +123,12 @@ def converged(value, recovery=None):
 
 def current_runtime(*, recovery=False):
     """Check actual Pod files; a green Tilt resource can retain an old image."""
-    agent_files = ["src/agent/api/turn_executor.py"]
+    agent_files = [
+        "src/agent/api/turn_executor.py",
+        "src/agent/api/persistent_app.py",
+        "src/agent/services/cloud_sync/base.py",
+        "src/agent/services/cloud_sync/coordinator.py",
+    ]
     if recovery:
         agent_files += [
             "src/agent/api/cloud_push_task.py",
