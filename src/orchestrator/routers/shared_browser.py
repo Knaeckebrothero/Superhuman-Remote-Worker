@@ -26,17 +26,24 @@ router = APIRouter(
 )
 
 
-def _get_db() -> Any:
-    """Late-resolve the application DB singleton to avoid an import cycle."""
+def _get_db(request: Request) -> Any:
+    """Resolve the store of the application handling *this* request.
 
-    from orchestrator.main import postgres_db  # type: ignore
+    Composition publishes it as ``app.state.store``; reading it here rather
+    than importing ``orchestrator.main`` keeps this module free of the
+    application module while still resolving per call, never at import, so
+    two applications in one process each keep their own store (R1.B04
+    caller-boundary closure, same shape as ``uploads.py`` in B03).
+    """
 
-    return postgres_db
+    return request.app.state.store
 
 
 def _kick_workspace_provisioning(thread_id: str, db: Any) -> None:
     """Fire-and-forget the idempotent session workspace reconcile."""
 
+    # Not R1.B04's: these three application collaborators keep their
+    # `orchestrator.main` lookup until their own caller-boundary batch moves them.
     from orchestrator.main import (  # type: ignore
         container_provisioner,
         ensure_session_workspace,
@@ -85,7 +92,7 @@ async def get_browser_capability(
 ) -> BrowserCapabilityResponse:
     """Return the closed pre-source capability only after owner admission."""
 
-    db = _get_db()
+    db = _get_db(request)
     _, thread = await require_thread_owner(request, db, thread_id)
     return browser_capability(thread)
 
@@ -98,7 +105,7 @@ async def open_shared_browser(
 ) -> Any:
     """Provision/reuse a browser and return ordinary redacted Canvas state."""
 
-    db = _get_db()
+    db = _get_db(request)
     _, thread = await require_thread_owner(request, db, thread_id)
     capability = browser_capability(thread)
     _require_openable(capability, require_ready=False)

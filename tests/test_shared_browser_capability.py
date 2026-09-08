@@ -213,8 +213,8 @@ def test_capability_route_authorizes_before_disclosing_disabled_flag(monkeypatch
 
     db = object()
     monkeypatch.setattr(browser_routes, "require_thread_owner", owner)
-    monkeypatch.setattr(browser_routes, "_get_db", lambda: db)
     app = FastAPI()
+    app.state.store = db
     app.include_router(browser_routes.router)
 
     response = TestClient(app).get(
@@ -242,8 +242,8 @@ def test_capability_route_does_not_distinguish_absent_from_unauthorized(
         raise HTTPException(status_code=404, detail="Thread not found")
 
     monkeypatch.setattr(browser_routes, "require_thread_owner", hidden)
-    monkeypatch.setattr(browser_routes, "_get_db", lambda: object())
     app = FastAPI()
+    app.state.store = object()
     app.include_router(browser_routes.router)
 
     response = TestClient(app).get(

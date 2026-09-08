@@ -148,13 +148,13 @@ def route(monkeypatch):
             ),
         )
 
-    monkeypatch.setattr(canvases, "_get_db", lambda: db)
     monkeypatch.setattr(canvases, "_require_delegated_owner", delegated_owner)
     monkeypatch.setattr(canvases, "browser_capability", lambda thread: _capability())
     monkeypatch.setattr(canvases, "prepare_browser_canvas", prepare)
     monkeypatch.setattr(canvases, "commit_browser_canvas", commit)
     monkeypatch.setattr(canvases, "_represent", represent)
     app = FastAPI()
+    app.state.store = db
     app.include_router(canvases.internal_router)
     state.client = TestClient(app)
     state.db = db

@@ -332,12 +332,12 @@ def _wopi_client(monkeypatch, *, write_flag: bool = True):
     tokens = _RouteTokens(write_flag=write_flag)
     gateway = _RouteGateway()
     service = _RouteCanvasService(gateway)
-    monkeypatch.setattr(wopi, "_get_db", lambda: object())
-    monkeypatch.setattr(wopi, "_get_token_service", lambda: tokens)
+    monkeypatch.setattr(wopi, "_get_token_service", lambda *args, **kwargs: tokens)
     monkeypatch.setattr(wopi, "_get_file_gateway", lambda *args, **kwargs: gateway)
     monkeypatch.setattr(wopi, "_get_canvas_service", lambda *args, **kwargs: service)
     monkeypatch.setattr(wopi, "_get_collabora_config", _config)
     app = FastAPI()
+    app.state.store = object()
     app.include_router(wopi.router)
     return TestClient(app), tokens, gateway, service
 

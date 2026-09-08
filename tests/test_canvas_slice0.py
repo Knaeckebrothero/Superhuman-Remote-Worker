@@ -619,9 +619,9 @@ def _route_app(monkeypatch, db: _FakeCanvasDB):
         owner_calls.append((received_db, thread_id))
         return {"id": "user-1"}, {"id": thread_id, "user_id": "user-1"}
 
-    monkeypatch.setattr(canvases_router_module, "_get_db", lambda: db)
     monkeypatch.setattr(canvases_router_module, "require_thread_owner", owner)
     app = FastAPI()
+    app.state.store = db
     app.include_router(canvases_router_module.router)
     return app, owner_calls
 
@@ -854,9 +854,9 @@ def test_routes_fail_at_owner_gate_before_canvas_access(monkeypatch) -> None:
     async def denied(request, received_db, thread_id):
         raise HTTPException(status_code=403, detail="Not your thread")
 
-    monkeypatch.setattr(canvases_router_module, "_get_db", lambda: db)
     monkeypatch.setattr(canvases_router_module, "require_thread_owner", denied)
     app = FastAPI()
+    app.state.store = db
     app.include_router(canvases_router_module.router)
     response = TestClient(app).get(
         f"/api/persistent/threads/{_THREAD_ID}/canvases/main"
@@ -895,7 +895,7 @@ def test_main_cors_exposes_canvas_etag_to_local_cockpit(monkeypatch) -> None:
     async def owner(request, received_db, thread_id):
         return {"id": "user-1"}, {"id": thread_id, "user_id": "user-1"}
 
-    monkeypatch.setattr(canvases_router_module, "_get_db", lambda: db)
+    monkeypatch.setattr(app.state, "store", db)
     monkeypatch.setattr(canvases_router_module, "require_thread_owner", owner)
     response = TestClient(app).get(
         f"/api/persistent/threads/{_THREAD_ID}/canvases/main",

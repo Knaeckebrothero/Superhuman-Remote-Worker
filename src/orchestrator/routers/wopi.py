@@ -31,7 +31,6 @@ from orchestrator.services.canvas_office import (
 
 router = APIRouter(prefix="/wopi", tags=["WOPI"])
 logger = logging.getLogger(__name__)
-_DEFAULT_GATEWAY_DB = object()
 
 
 class _LeasedWopiResponse(Response):
@@ -48,21 +47,24 @@ class _LeasedWopiResponse(Response):
             self._canvas_lease.release()
 
 
-def _get_db() -> Any:
-    from orchestrator.main import postgres_db  # type: ignore
+def _get_db(request: Request) -> Any:
+    """Resolve the store of the application handling *this* request.
 
-    return postgres_db
+    Composition publishes it as ``app.state.store``; reading it here rather
+    than importing ``orchestrator.main`` keeps this module free of the
+    application module while still resolving per call, never at import, so
+    two applications in one process each keep their own store (R1.B04
+    caller-boundary closure, same shape as ``uploads.py`` in B03).
+    """
+
+    return request.app.state.store
 
 
-def _get_token_service():
-    return create_wopi_token_service(_get_db())
+def _get_token_service(db: Any):
+    return create_wopi_token_service(db)
 
 
-def _get_file_gateway(
-    db: Any | None | object = _DEFAULT_GATEWAY_DB,
-) -> ThreadWorkspaceFileGateway:
-    if db is _DEFAULT_GATEWAY_DB:
-        db = _get_db()
+def _get_file_gateway(db: Any | None) -> ThreadWorkspaceFileGateway:
     return ThreadWorkspaceFileGateway(
         thread_loader=getattr(db, "get_thread", None) if db is not None else None
     )
@@ -139,7 +141,7 @@ async def _authenticate(
     require_write: bool = False,
 ) -> WopiAccess:
     token = _access_token(request, access_token)
-    return await _get_token_service().authenticate(
+    return await _get_token_service(_get_db(request)).authenticate(
         token,
         file_id=file_id,
         require_write=require_write,
@@ -260,7 +262,7 @@ async def check_file_info(
         config = _get_collabora_config().require_enabled()
         access = await _authenticate(request, file_id, access_token)
         response_lease = await acquire_canvas_response_lease()
-        file = await _get_file_gateway().materialize_binary(
+        file = await _get_file_gateway(_get_db(request)).materialize_binary(
             access.thread,
             access.record,
         )
@@ -329,7 +331,7 @@ async def put_file(
             access_token,
             require_write=True,
         )
-        db = _get_db()
+        db = _get_db(request)
         gateway = _get_file_gateway(db)
         if not gateway.supports_editing(access.thread, access.record):
             raise CanvasOfficeError(
@@ -429,7 +431,7 @@ async def get_file(
         _get_collabora_config().require_enabled()
         access = await _authenticate(request, file_id, access_token)
         response_lease = await acquire_canvas_response_lease()
-        file = await _get_file_gateway().materialize_binary(
+        file = await _get_file_gateway(_get_db(request)).materialize_binary(
             access.thread,
             access.record,
         )

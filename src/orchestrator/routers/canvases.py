@@ -245,12 +245,17 @@ class CanvasAwarenessResponse(BaseModel):
     expires_at: datetime
 
 
-def _get_db() -> Any:
-    """Late-resolve the main app DB singleton and avoid an import cycle."""
+def _get_db(request: Request) -> Any:
+    """Resolve the store of the application handling *this* request.
 
-    from orchestrator.main import postgres_db  # type: ignore
+    Composition publishes it as ``app.state.store``; reading it here rather
+    than importing ``orchestrator.main`` keeps this module free of the
+    application module while still resolving per call, never at import, so
+    two applications in one process each keep their own store (R1.B04
+    caller-boundary closure, same shape as ``uploads.py`` in B03).
+    """
 
-    return postgres_db
+    return request.app.state.store
 
 
 def _get_canvas_service(db: Any) -> CanvasService:
@@ -735,7 +740,7 @@ async def _require_delegated_owner(
     },
 )
 async def get_main_canvas(thread_id: str, request: Request) -> Response:
-    db = _get_db()
+    db = _get_db(request)
     _, thread = await require_thread_owner(request, db, thread_id)
     record = await _get_canvas_service(db).get(thread_id)
     if record is None:
@@ -799,7 +804,7 @@ async def put_main_canvas_awareness(
                 "message": "Canvas editing session id is invalid",
             },
         )
-    db = _get_db()
+    db = _get_db(request)
     await require_thread_owner(request, db, thread_id)
     try:
         mutation = await mutate_canvas_awareness(
@@ -839,7 +844,7 @@ async def stream_main_canvas_awareness(
     cursor or session-journal sequence allocation is involved.
     """
 
-    db = _get_db()
+    db = _get_db(request)
     await require_thread_owner(request, db, thread_id)
 
     async def event_stream():
@@ -918,7 +923,7 @@ async def stream_main_canvas_awareness(
     responses={204: {"description": "Absent/already cleared"}, 412: {}, 428: {}},
 )
 async def clear_main_canvas(thread_id: str, request: Request) -> Response:
-    db = _get_db()
+    db = _get_db(request)
     _, thread = await require_thread_owner(request, db, thread_id)
     service = _get_canvas_service(db)
     current = await service.get(thread_id)
@@ -983,7 +988,7 @@ async def create_main_canvas_view_attachment(
         await _require_empty_refresh_body(request)
     except CanvasFileError as exc:
         _raise_file_error(exc)
-    db = _get_db()
+    db = _get_db(request)
     user, thread = await require_thread_owner(request, db, thread_id)
     record = await _get_canvas_service(db).get(thread_id)
     if record is None or not isinstance(record.source, WorkspaceAppSource):
@@ -1051,7 +1056,7 @@ async def authorize_main_canvas_view_attachment(
     """Bind one gateway challenge to this exact authenticated BFF session."""
 
     parent_session_id = _required_parent_session_id(request)
-    db = _get_db()
+    db = _get_db(request)
     user, _ = await require_thread_owner(request, db, thread_id)
     try:
         authorization = await _get_viewer_service(db).authorize_bootstrap(
@@ -1084,7 +1089,7 @@ async def renew_main_canvas_view_attachment(
         await _require_empty_refresh_body(request)
     except CanvasFileError as exc:
         _raise_file_error(exc)
-    db = _get_db()
+    db = _get_db(request)
     user, _ = await require_thread_owner(request, db, thread_id)
     try:
         renewal = await _get_viewer_service(db).renew_attachment(
@@ -1113,7 +1118,7 @@ async def close_main_canvas_view_attachment(
         await _require_empty_refresh_body(request)
     except CanvasFileError as exc:
         _raise_file_error(exc)
-    db = _get_db()
+    db = _get_db(request)
     user, _ = await require_thread_owner(request, db, thread_id)
     try:
         await _get_viewer_service(db).close_attachment(
@@ -1147,7 +1152,7 @@ async def create_main_canvas_office_session(
     except CanvasOfficeError as exc:
         _raise_office_error(exc)
 
-    db = _get_db()
+    db = _get_db(request)
     user, thread = await require_thread_owner(request, db, thread_id)
     service = _get_canvas_service(db)
     record = await service.get(thread_id)
@@ -1493,7 +1498,7 @@ async def get_main_canvas_content(
     source_version: str = Query(pattern=r"^sha256:[0-9a-f]{64}$"),
     ngsw_bypass: Literal["true"] = Query(alias="ngsw-bypass"),
 ) -> Response:
-    db = _get_db()
+    db = _get_db(request)
     _, thread = await require_thread_owner(request, db, thread_id)
     response_lease: CanvasResponseLease | None = None
     content_origin = "workspace"
@@ -1617,7 +1622,7 @@ async def put_main_canvas_content(
     """Conditionally replace one editable text Canvas source."""
 
     del ngsw_bypass
-    db = _get_db()
+    db = _get_db(request)
     _, thread = await require_thread_owner(request, db, thread_id)
     try:
         expected_source_version, expected_revision = _required_edit_preconditions(
@@ -1724,7 +1729,7 @@ async def put_main_canvas_content(
 async def refresh_main_canvas(thread_id: str, request: Request) -> Response:
     """Validate and adopt the current bytes of the selected workspace file."""
 
-    db = _get_db()
+    db = _get_db(request)
     _, thread = await require_thread_owner(request, db, thread_id)
     expected_etag = request.headers.get("If-Match")
     if expected_etag is None:
@@ -1832,7 +1837,7 @@ async def refresh_main_canvas(thread_id: str, request: Request) -> Response:
 async def reset_main_canvas_origin(thread_id: str, request: Request) -> Response:
     """Rotate the current live application's isolated browser origin."""
 
-    db = _get_db()
+    db = _get_db(request)
     _, thread = await require_thread_owner(request, db, thread_id)
     expected_etag = request.headers.get("If-Match")
     if expected_etag is None:
@@ -1912,7 +1917,7 @@ async def reset_main_canvas_origin(thread_id: str, request: Request) -> Response
 
 @internal_router.get("/main", response_model=CanvasPublicState)
 async def internal_get_main_canvas(thread_id: str, request: Request) -> Response:
-    db = _get_db()
+    db = _get_db(request)
     _, thread = await _require_delegated_owner(request, db, thread_id)
     record = await _get_canvas_service(db).get(thread_id)
     if record is None:
@@ -1937,7 +1942,7 @@ async def internal_get_main_canvas(thread_id: str, request: Request) -> Response
 async def internal_set_main_canvas(
     thread_id: str, request: Request, body: CanvasSetRequest
 ) -> Response:
-    db = _get_db()
+    db = _get_db(request)
     _, thread = await _require_delegated_owner(request, db, thread_id)
 
     if body.source_type == "browser":
@@ -2132,7 +2137,7 @@ async def internal_set_main_canvas(
 
 @internal_router.delete("/main", response_model=CanvasPublicState)
 async def internal_clear_main_canvas(thread_id: str, request: Request) -> Response:
-    db = _get_db()
+    db = _get_db(request)
     await _require_delegated_owner(request, db, thread_id)
     mutation = await _get_canvas_service(db).clear(
         thread_id,
