@@ -286,6 +286,15 @@ class SecretBundle:
     gitea_oidc_secret: str = dataclasses.field(repr=False)
     nextcloud_oidc_secret: str = dataclasses.field(repr=False)
     nextcloud_admin_password: str = dataclasses.field(repr=False)
+    #: The `agent-service` account's password. Required, not decorative: the
+    #: orchestrator's main-cloud loader lists `agent_password` in
+    #: `_REQUIRED_SECRET_ENVS["nextcloud"]`, and without it the installation
+    #: authority never initialises -- so the backend is *bound* but every cloud
+    #: effect refuses with "does not support durable active backend-instance
+    #: authority". Nextcloud's own setup hook creates `agent-service` with this
+    #: value, so both halves must read the same key or the orchestrator
+    #: authenticates as an account whose password only Nextcloud knows.
+    nextcloud_agent_password: str = dataclasses.field(repr=False)
     gitea_admin_password: str = dataclasses.field(repr=False)
     #: The protected-effect lane's adoption-once HMAC root. Deliberately NOT a
     #: member of ``app_secret_data()``: dynamic agent Pods consume that bundle
@@ -320,6 +329,7 @@ class SecretBundle:
             gitea_oidc_secret=token(48),
             nextcloud_oidc_secret=token(48),
             nextcloud_admin_password=token(24),
+            nextcloud_agent_password=token(24),
             gitea_admin_password=token(36),
             # The chart floor is 32 bytes; 48 matches its own randAlphaNum(48).
             protected_effect_hmac_key=token(48),
@@ -363,6 +373,17 @@ class SecretBundle:
             "NEXTCLOUD_OIDC_CLIENT_SECRET": self.nextcloud_oidc_secret,
             "NEXTCLOUD_ADMIN_USER": "admin",
             "NEXTCLOUD_ADMIN_PASSWORD": self.nextcloud_admin_password,
+            # Not optional in any sense that matters. The orchestrator's
+            # `secretKeyRef` for it is `optional: true`, so a render check
+            # cannot see it missing -- but `services/cloud/config.py` lists
+            # `agent_password` as a REQUIRED secret for the nextcloud backend,
+            # and an unset one leaves the installation authority uninitialised.
+            # The backend then reports itself bound while refusing every effect
+            # with "does not support 'durable active backend-instance
+            # authority'": no project cloud folder, no user home, no protected
+            # mount. Nextcloud's setup hook creates `agent-service` with this
+            # exact value, so the two sides must agree.
+            "NEXTCLOUD_AGENT_PASSWORD": self.nextcloud_agent_password,
             # Minted unconditionally, like the Gitea one above: the Keycloak
             # bootstrap job mounts NEXTCLOUD_OIDC_CLIENT_SECRET by key whenever
             # `nextcloud.enabled`, and a missing key is a

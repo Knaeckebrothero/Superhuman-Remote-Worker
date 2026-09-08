@@ -1568,6 +1568,49 @@ def test_cloud_sandbox_renders_the_protected_effect_lane(tmp_path: Path) -> None
     }
 
 
+@pytest.mark.parametrize("profile_name", sorted(harness.APPLICATION_E2E_PROFILES))
+def test_generated_app_secret_covers_the_backend_required_secrets(
+    profile_name: str,
+) -> None:
+    """A cloud profile must mint every secret the *application* requires.
+
+    The render check above reads Kubernetes: it can only see a `secretKeyRef`
+    the chart marks non-optional. `NEXTCLOUD_AGENT_PASSWORD` is not one of
+    those — the orchestrator mounts it `optional: true` — and yet
+    `services/cloud/config.py` lists `agent_password` in
+    `_REQUIRED_SECRET_ENVS["nextcloud"]`. Without it the main-cloud
+    installation authority never initialises, and the backend then reports
+    itself *bound* while refusing every effect with "does not support 'durable
+    active backend-instance authority'". Nothing fails; project cloud folders,
+    user homes and protected mounts simply never exist.
+
+    That is what B04's cloud acceptance actually ran against, so this reads the
+    application's own table rather than restating the key by hand.
+    """
+    profile = harness.resolve_profile(profile_name)
+    if not profile.cloud_enabled:
+        pytest.skip("profile binds no main-cloud backend")
+
+    from orchestrator.services.cloud.config import _REQUIRED_SECRET_ENVS
+
+    minted = set(
+        harness.SecretBundle.generate("20260824-123456-ab12cd34").app_secret_data()
+    )
+    # The cloud overlay selects the bundled Nextcloud; assert against that
+    # backend's own required set rather than a copy of it.
+    required = _REQUIRED_SECRET_ENVS["nextcloud"]
+    missing = sorted(
+        field
+        for field, env_vars in required.items()
+        if not any(env_var in minted for env_var in env_vars)
+    )
+    assert not missing, (
+        f"profile {profile_name!r} binds nextcloud but mints no secret for "
+        f"{missing}; the backend will report itself bound and refuse every "
+        "cloud effect"
+    )
+
+
 def test_profile_overlays_have_no_duplicate_top_level_keys() -> None:
     """A repeated top-level key in an overlay silently drops the first block.
 
