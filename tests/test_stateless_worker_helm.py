@@ -52,7 +52,19 @@ def _stateless_agent_container(deployment: dict) -> dict:
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
 def test_stateless_worker_gate_is_independent_and_default_off() -> None:
-    config_map = _only_kind(_render(show_only="templates/configmap.yaml"), "ConfigMap")
+    # The default-off claim is read from the chart itself. Renders here carry
+    # helm/ci/test-values.yaml, which enables the stateless pool so CI can
+    # validate the KEDA ScaledObject against its CRD schema -- a rendering
+    # convenience, not the product default -- so that overlay can no longer
+    # answer "what does a stock install do?".
+    defaults = yaml.safe_load((CHART / "values.yaml").read_text())
+    assert defaults["agent"]["stateless"]["enabled"] is False
+    assert defaults["agent"]["stateless"]["autoscaling"]["enabled"] is False
+
+    config_map = _only_kind(
+        _render("agent.stateless.enabled=false", show_only="templates/configmap.yaml"),
+        "ConfigMap",
+    )
 
     assert config_map["data"]["STATELESS_SESSION_ENABLED"] == "false"
     assert config_map["data"]["STATELESS_WORKER_ENABLED"] == "false"
