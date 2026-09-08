@@ -197,6 +197,7 @@ from orchestrator.routers import (  # noqa: E402
 )
 from orchestrator.routers import voice as voice_routes  # noqa: E402
 from orchestrator.routers import system_settings as system_settings_routes  # noqa: E402
+from orchestrator.routers import capacity as capacity_routes  # noqa: E402
 from orchestrator.routers import (  # noqa: E402
     user_administration as user_administration_routes,
 )
@@ -15918,6 +15919,23 @@ async def lifespan(app: FastAPI):
     run_queue_reaper_task = asyncio.create_task(
         run_queue_reaper_loop(postgres_db, _shutdown_event)
     )
+    # Pod-deletion-cost reconciler (capacity_ux_and_queue_autoscaling.md §2):
+    # leader-gated on its OWN advisory lock (STATELESS_DELETION_COST_ID), it
+    # stamps lease-holding stateless pods expensive-to-delete so an HPA
+    # scale-down removes idle executors first. Off-cluster it idles.
+    from orchestrator.services.stateless_pod_deletion_cost import (
+        reconciler_enabled as _deletion_cost_reconciler_enabled,
+        stateless_pod_deletion_cost_loop,
+    )
+
+    stateless_deletion_cost_task = (
+        asyncio.create_task(
+            stateless_pod_deletion_cost_loop(postgres_db, _shutdown_event),
+            name="stateless-pod-deletion-cost",
+        )
+        if _deletion_cost_reconciler_enabled()
+        else None
+    )
     # Stateless turn memory is its own transactional-outbox ownership domain.
     # It is always resident and never hidden behind completion-command flags or
     # advisory leadership: row leases serialize replicas and survive handover.
@@ -16293,6 +16311,8 @@ async def lifespan(app: FastAPI):
     await sudo_sweeper_task
     await thread_events_prune_task
     await run_queue_reaper_task
+    if stateless_deletion_cost_task is not None:
+        await stateless_deletion_cost_task
     await session_memory_effect_task
     if completion_finalizer_task is not None:
         await completion_finalizer_task
@@ -16396,6 +16416,7 @@ app.state.job_inspection_dependencies_factory = lambda: _job_inspection_dependen
 app.state.job_audit_dependencies_factory = lambda: _job_audit_dependencies()
 app.state.job_artifacts_dependencies_factory = lambda: _job_artifacts_dependencies()
 app.state.diagnostics_dependencies_factory = lambda: _diagnostics_dependencies()
+app.state.capacity_dependencies_factory = lambda: _capacity_dependencies()
 app.state.identity_dependencies_factory = lambda: _identity_dependencies()
 app.state.access_token_dependencies_factory = lambda: _access_token_dependencies()
 app.state.ssh_access_dependencies_factory = lambda: _ssh_access_dependencies()
@@ -16684,6 +16705,7 @@ app.include_router(provider_credentials_routes.router)
 app.include_router(subscription_management_routes.router)
 app.include_router(voice_routes.router)
 app.include_router(system_settings_routes.router)
+app.include_router(capacity_routes.router)
 app.include_router(user_administration_routes.router)
 app.include_router(job_diagnostics_routes.router)
 app.include_router(expert_catalog_routes.router)
@@ -16823,6 +16845,16 @@ def _system_settings_dependencies() -> (
         operations=system_settings_operations.SystemSettingsDependencies(
             store=postgres_db
         ),
+        require_admin=_require_admin,
+    )
+
+
+def _capacity_dependencies() -> capacity_routes.CapacityDependencies:
+    """Admin capacity read (capacity_ux_and_queue_autoscaling.md §2)."""
+    from orchestrator.services.stateless_capacity import capacity_snapshot
+
+    return capacity_routes.CapacityDependencies(
+        snapshot=lambda: capacity_snapshot(postgres_db),
         require_admin=_require_admin,
     )
 
@@ -29654,6 +29686,9 @@ def _get_completion_monitor() -> Any:
             postgres_db,
             _completion_monitor_operator_alert,
             completion_commands_enabled=COMPLETION_COMMANDS_ENABLED,
+            max_queued_session_age_seconds=float(
+                os.getenv("STATELESS_SESSION_QUEUED_AGE_ALARM_S", "60") or "60"
+            ),
         )
     return _completion_monitor_instance
 

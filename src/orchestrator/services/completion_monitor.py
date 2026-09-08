@@ -21,12 +21,16 @@ logger = logging.getLogger(__name__)
 ZERO_FINALIZER_LEADER_DEDUP_KEY = "completion.finalizer.zero_leader"
 OLDEST_UNFINALIZED_COMMAND_DEDUP_KEY = "completion.command.oldest_unfinalized"
 OLDEST_QUEUED_WORKER_BATCH_DEDUP_KEY = "run_queue.worker_batch.oldest_runnable"
+# Interactive twin (capacity_ux_and_queue_autoscaling.md §2): a runnable
+# session turn nobody claims is a user staring at "waiting for an agent".
+OLDEST_QUEUED_SESSION_TURN_DEDUP_KEY = "run_queue.session_turn.oldest_runnable"
 FINALIZER_LEASE_NAME = "job_completion"
 
 MonitorAlertKind = Literal[
     "zero_finalizer_leader",
     "oldest_unfinalized_command",
     "oldest_queued_worker_batch",
+    "oldest_queued_session_turn",
 ]
 
 
@@ -43,6 +47,10 @@ class CompletionMonitorSample:
     oldest_worker_state: str | None = None
     oldest_worker_runnable_at: datetime | None = None
     oldest_worker_age_seconds: float | None = None
+    oldest_session_unit_id: str | None = None
+    oldest_session_state: str | None = None
+    oldest_session_runnable_at: datetime | None = None
+    oldest_session_age_seconds: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +92,7 @@ class CompletionMonitor:
         completion_commands_enabled: bool = True,
         max_unfinalized_age_seconds: float = 30 * 60,
         max_queued_worker_age_seconds: float = 5 * 60,
+        max_queued_session_age_seconds: float = 60,
         startup_grace_seconds: float = 30,
         poll_seconds: float = 30,
         clock: Callable[[], float] = time.monotonic,
@@ -94,6 +103,8 @@ class CompletionMonitor:
             raise ValueError("max_unfinalized_age_seconds must be positive")
         if float(max_queued_worker_age_seconds) <= 0:
             raise ValueError("max_queued_worker_age_seconds must be positive")
+        if float(max_queued_session_age_seconds) <= 0:
+            raise ValueError("max_queued_session_age_seconds must be positive")
         if float(startup_grace_seconds) < 0:
             raise ValueError("startup_grace_seconds cannot be negative")
         if float(poll_seconds) <= 0:
@@ -106,6 +117,9 @@ class CompletionMonitor:
         # not the normal claim latency. A runnable unit older than this is a
         # bounded availability alarm without paging on deliberate backoff.
         self.max_queued_worker_age_seconds = float(max_queued_worker_age_seconds)
+        # One minute is the interactive tolerance: past it the pool is short of
+        # executors (or KEDA is not scaling), not merely busy.
+        self.max_queued_session_age_seconds = float(max_queued_session_age_seconds)
         self.startup_grace_seconds = float(startup_grace_seconds)
         self.poll_seconds = float(poll_seconds)
         self.clock = clock
@@ -133,7 +147,18 @@ class CompletionMonitor:
                                     observed.at-oldest.runnable_at
                                 ))
                             )::float8
-                       END AS oldest_worker_age_seconds
+                       END AS oldest_worker_age_seconds,
+                       oldest_session.unit_id AS oldest_session_unit_id,
+                       oldest_session.state AS oldest_session_state,
+                       oldest_session.runnable_at AS oldest_session_runnable_at,
+                       CASE WHEN oldest_session.runnable_at IS NULL THEN NULL
+                            ELSE GREATEST(
+                                0.0,
+                                extract(epoch FROM (
+                                    observed.at-oldest_session.runnable_at
+                                ))
+                            )::float8
+                       END AS oldest_session_age_seconds
                 FROM observed
                 LEFT JOIN LATERAL (
                     SELECT queue.unit_id, queue.state, queue.enqueue_ord,
@@ -146,6 +171,17 @@ class CompletionMonitor:
                              queue.enqueue_ord
                     LIMIT 1
                 ) AS oldest ON true
+                LEFT JOIN LATERAL (
+                    SELECT queue.unit_id, queue.state, queue.enqueue_ord,
+                           GREATEST(queue.queued_at, queue.run_after) AS runnable_at
+                    FROM run_queue AS queue
+                    WHERE queue.unit_kind='session_turn'
+                      AND queue.state='queued'
+                      AND queue.run_after <= observed.at
+                    ORDER BY GREATEST(queue.queued_at, queue.run_after),
+                             queue.enqueue_ord
+                    LIMIT 1
+                ) AS oldest_session ON true
                 """
             )
             if self.completion_commands_enabled:
@@ -231,6 +267,22 @@ class CompletionMonitor:
                 if queue_row["oldest_worker_age_seconds"] is not None
                 else None
             ),
+            oldest_session_unit_id=(
+                str(queue_row["oldest_session_unit_id"])
+                if queue_row["oldest_session_unit_id"] is not None
+                else None
+            ),
+            oldest_session_state=(
+                str(queue_row["oldest_session_state"])
+                if queue_row["oldest_session_state"] is not None
+                else None
+            ),
+            oldest_session_runnable_at=queue_row["oldest_session_runnable_at"],
+            oldest_session_age_seconds=(
+                float(queue_row["oldest_session_age_seconds"])
+                if queue_row["oldest_session_age_seconds"] is not None
+                else None
+            ),
         )
 
     def alerts_for(
@@ -288,6 +340,25 @@ class CompletionMonitor:
                     runnable_at=sample.oldest_worker_runnable_at,
                 )
             )
+        if (
+            sample.oldest_session_age_seconds is not None
+            and sample.oldest_session_age_seconds >= self.max_queued_session_age_seconds
+        ):
+            alerts.append(
+                CompletionMonitorAlert(
+                    kind="oldest_queued_session_turn",
+                    dedup_key=OLDEST_QUEUED_SESSION_TURN_DEDUP_KEY,
+                    message=(
+                        "oldest runnable stateless session turn is "
+                        f"{sample.oldest_session_age_seconds:.1f}s old"
+                    ),
+                    observed_at=sample.observed_at,
+                    age_seconds=sample.oldest_session_age_seconds,
+                    unit_id=sample.oldest_session_unit_id,
+                    queue_state=sample.oldest_session_state,
+                    runnable_at=sample.oldest_session_runnable_at,
+                )
+            )
         return tuple(alerts)
 
     async def run_once(self) -> tuple[CompletionMonitorAlert, ...]:
@@ -320,6 +391,7 @@ __all__ = [
     "CompletionMonitorAlert",
     "CompletionMonitorSample",
     "FINALIZER_LEASE_NAME",
+    "OLDEST_QUEUED_SESSION_TURN_DEDUP_KEY",
     "OLDEST_QUEUED_WORKER_BATCH_DEDUP_KEY",
     "OLDEST_UNFINALIZED_COMMAND_DEDUP_KEY",
     "ZERO_FINALIZER_LEADER_DEDUP_KEY",
