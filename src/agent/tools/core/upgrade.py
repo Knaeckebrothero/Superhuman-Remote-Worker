@@ -55,9 +55,11 @@ def create_workspace_upgrade_tools(context: ToolContext) -> List[Any]:
         over; they may then ask you to continue, or simply pick the conversation
         back up themselves. If they decline, they will tell you why.
 
-        Do not assume approval, and do not promise to do the work "once
-        approved" — you have no way to know whether you will be resumed. Ask,
-        then finish your turn with whatever you CAN do right now.
+        This request does not provision a workspace or automatically resume
+        the task. Explain what the upgrade enables, tell the user to send a
+        follow-up message after it completes, and continue useful preparation
+        with the tools currently available. Check the new tools when the user
+        returns; approval alone is not proof that provisioning succeeded.
 
         Args:
             reason: A short, concrete explanation of why a real workspace is
@@ -77,11 +79,11 @@ def create_workspace_upgrade_tools(context: ToolContext) -> List[Any]:
         logger.info("request_workspace_upgrade requested: reason=%r", reason)
         return (
             "Recorded your request for a sandbox workspace — a human will see "
-            "it and decide. You may or may not be resumed once they do, so "
-            "don't promise to continue this work yourself: finish this turn "
-            "with whatever you can do without a shell. If the request is "
-            "approved your files carry over; if it's declined, you'll be told "
-            "why."
+            "it and decide. The request has not started a workspace or added "
+            "tools. Explain what it enables and continue useful preparation. "
+            "After an approved upgrade completes, the user can send a "
+            "follow-up message to continue the task; check the newly available "
+            "tools then. Existing files carry over during the upgrade."
         )
 
     return [request_workspace_upgrade]

@@ -3964,6 +3964,7 @@ class UniversalAgent:
         from agent.core.datasource_setup import (
             clone_repository_datasources,
             inject_workspace_facts,
+            install_workspace_credentials,
             process_credential_files,
             process_datasources,
         )
@@ -3972,6 +3973,7 @@ class UniversalAgent:
             self._job_metadata.get("datasources", []) if self._job_metadata else []
         )
         ws = self._workspace_manager
+        install_workspace_credentials(ds_configs, ws)
 
         # Repository datasources clone onto the workspace backend — never
         # locally in the agent pod (the subprocess git-clone branch was

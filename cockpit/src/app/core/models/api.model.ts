@@ -325,6 +325,7 @@ export interface SkillUpdateRequest {
  */
 export type DatasourceType =
   | 'generic'
+  | 'credentials'
   | 'repository'
   | 'kb'
   | 'postgresql'
@@ -449,6 +450,8 @@ export interface Datasource {
    * "leave blank to keep existing" UX.
    */
   credentials?: Record<string, unknown>;
+  /** Configured names only; values are never returned by connector reads. */
+  env_var_names?: string[];
   cli_hint: string | null;
   default_branch: string | null;
   config?: DatasourceConfig;

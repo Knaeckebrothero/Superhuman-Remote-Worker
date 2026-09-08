@@ -225,6 +225,33 @@ describe('DatasourceListComponent OKF Knowledge Base support', () => {
   });
 });
 
+describe('Credentials connector', () => {
+  it('creates an ENV connector without requiring a URL or description', () => {
+    const {component, api} = createComponent(false);
+    component.openCreateForm();
+    component.formData.name = 'My API key';
+    component.formData.type = 'credentials';
+    component.envVars = [{key: 'API_KEY', value: 'synthetic-key'}];
+    expect(component.canSave()).toBe(true);
+    component.saveForm();
+    expect(api.createDatasource).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'credentials',
+      credentials: {env_vars: {API_KEY: 'synthetic-key'}},
+    }));
+  });
+
+  it('keeps stored credentials on an edit without replacement values', () => {
+    const {component, api} = createComponent(false);
+    component.openEditForm(emailDatasource({type: 'credentials', env_var_names: ['API_KEY']}));
+    expect(component.envVars).toEqual([{key: 'API_KEY', value: ''}]);
+    component.formData.name = 'Renamed credentials';
+    component.saveForm();
+    expect(api.updateDatasource).toHaveBeenCalledWith('email-1', expect.objectContaining({
+      name: 'Renamed credentials', credentials: undefined,
+    }));
+  });
+});
+
 describe('DatasourceListComponent email support', () => {
   it('creates a draft-tier mailbox with imap credentials and email config, no smtp', () => {
     const {api, component} = createComponent();

@@ -88,6 +88,13 @@ def managed_product_guide_system_floor(
         "relevant turn. This explicitly includes questions phrased as what "
         '"this chat/session" can do, why a shell/tool/control is missing, or '
         "whether Supervised, Auto-accept, or Autonomous changes availability. "
+        "Also use the guide when a user's task needs tools or access that are "
+        "missing: find the setup path instead of ending at a limitation. "
+        "Explain the smallest useful change and the next step, continue "
+        "authorized preparation, and distinguish current access from what "
+        "could work after setup. An undocumented built-in route may still "
+        "have external alternatives to investigate; do not invent SRW "
+        "features or bypass grants. "
         "Choose the topic from the actual user request, not from examples in "
         'this control; use `topic_id="index"` when the exact topic is '
         "uncertain. Earlier messages, summaries, memories, prior tool results, "
@@ -130,6 +137,8 @@ def managed_product_guide_turn_boundary(
         "SRW product documentation. Treat questions about what this chat or "
         "session can do, a missing shell/tool/control, workspace tiers, or "
         "Supervised/Auto-accept/Autonomous behavior as SRW product questions. "
+        "When missing tools or access block the user's task, find and explain "
+        "a setup path or an alternative; do not stop at what is unavailable. "
         "For an SRW product question, use a current-digest "
         "`read_product_guide` result from this same user turn if one is already "
         "present; otherwise you must call `read_product_guide` now before "

@@ -3483,6 +3483,39 @@ class TestShellOwnerLifecycle:
 
 
 class TestSwapBackend:
+    @pytest.mark.parametrize("delivery_fails", [False, True])
+    def test_installs_credentials_before_retiring_old_workspace(self, delivery_fails):
+        session = _make_session()
+        session.datasource_configs = [
+            {
+                "type": "credentials",
+                "credentials": {"env_vars": {"API_KEY": "synthetic"}},
+            }
+        ]
+        old_backend = MagicMock()
+        session.workspace_manager = MagicMock(backend=old_backend)
+        new_backend = MagicMock()
+        new_backend.is_connected.return_value = True
+        events = []
+
+        def install(values):
+            assert values == {"API_KEY": "synthetic"}
+            events.append("install")
+            if delivery_fails:
+                raise RuntimeError("SSH delivery failed")
+
+        new_backend.install_credential_environment.side_effect = install
+        old_backend.retire.side_effect = lambda: events.append("retire")
+        with patch.object(session, "_setup_shell_manager"):
+            if delivery_fails:
+                with pytest.raises(RuntimeError, match="SSH delivery failed"):
+                    session.swap_backend(new_backend)
+                session.workspace_manager.swap_backend.assert_not_called()
+                assert events == ["install"]
+            else:
+                session.swap_backend(new_backend)
+                assert events == ["install", "retire"]
+
     def test_raises_when_workspace_manager_none(self):
         """RuntimeError raised when workspace_manager is None."""
         session = _make_session()

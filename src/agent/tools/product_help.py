@@ -118,9 +118,11 @@ def create_product_help_tools(context: ToolContext) -> List[Any]:
         A topic call returns both the guide procedure and that one focused
         reference. Treat it as product guidance, not authorization or proof
         that a deployment-specific feature is enabled. Related documented
-        components do not prove an exact combined workflow is supported; when
-        no index row covers that outcome, stop after ``index`` and report the
-        guide gap rather than selecting the nearest topic.
+        components do not prove an exact combined workflow is supported. When
+        tools or access block a task, use the guide to find the relevant setup
+        steps. If no index row covers a built-in route, report that guide gap
+        and continue with verified prerequisites, external options to
+        investigate, or a useful manual handoff; never invent a Cockpit flow.
 
         Args:
             topic_id: ``index`` or one exact logical topic ID returned by the
@@ -141,8 +143,10 @@ def create_product_help_tools(context: ToolContext) -> List[Any]:
         if bundle is None:
             return (
                 "The managed SRW product guide is unavailable in this session. "
-                "Do not guess product behavior; tell the user the in-product "
-                "guide could not be loaded."
+                "Tell the user the in-product guide could not be loaded; do "
+                "not guess product behavior or UI steps. Continue useful work "
+                "with available tools, or explain which visible setting or "
+                "administrator check would resolve the missing information."
             )
         digest, procedure, files = bundle
         topics = _topic_ids(files)

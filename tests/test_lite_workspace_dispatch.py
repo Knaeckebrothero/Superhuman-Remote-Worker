@@ -183,8 +183,12 @@ class TestRepositoryDatasourceNames:
         ds = [
             {"type": "postgresql", "name": "pg"},
             {"type": "repository", "name": "repo1"},
+            {"type": "credentials", "name": "api-key"},
         ]
-        assert orchestrator.main._repository_datasource_names(ds) == ["repo1"]
+        assert orchestrator.main._repository_datasource_names(ds) == [
+            "repo1",
+            "api-key",
+        ]
 
     def test_case_insensitive(self):
         assert orchestrator.main._repository_datasource_names(

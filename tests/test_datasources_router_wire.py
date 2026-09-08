@@ -164,6 +164,82 @@ def _refusing(status: int, detail: str):
     return gate
 
 
+def test_credentials_create_validates_env_and_returns_only_names():
+    row = {
+        **SECRET_ROW,
+        "type": "credentials",
+        "connection_url": None,
+        "credentials": {"env_vars": {"API_KEY": "synthetic-key"}},
+    }
+    wire = _wire(store=_store(create_datasource=AsyncMock(return_value=row)))
+    response = wire.client.post(
+        "/api/datasources",
+        json={
+            "name": "My key",
+            "type": "credentials",
+            "credentials": row["credentials"],
+        },
+    )
+    assert response.status_code == 200
+    assert "synthetic-key" not in response.text
+    assert response.json()["env_var_names"] == ["API_KEY"]
+    assert (
+        wire.store.create_datasource.await_args.kwargs["credentials"]
+        == row["credentials"]
+    )
+
+
+def test_credentials_reject_reserved_env_before_storage():
+    wire = _wire()
+    response = wire.client.post(
+        "/api/datasources",
+        json={
+            "name": "Bad key",
+            "type": "credentials",
+            "credentials": {"env_vars": {"PATH": "synthetic-key"}},
+        },
+    )
+    assert response.status_code == 400
+    assert "synthetic-key" not in response.text
+    wire.store.create_datasource.assert_not_awaited()
+
+
+def test_credentials_update_preserves_existing_fields():
+    row = {
+        **SECRET_ROW,
+        "type": "credentials",
+        "connection_url": None,
+        "credentials": {"env_vars": {"USERNAME": "user", "PASSWORD": "previous"}},
+    }
+    wire = _wire(datasource=row)
+    response = wire.client.put(
+        f"/api/datasources/{DATASOURCE_ID}",
+        json={
+            "credentials": {"env_vars": {"PASSWORD": "replacement"}},
+        },
+    )
+    assert response.status_code == 200
+    call = wire.store.update_datasource.await_args
+    assert call.kwargs["credentials"] == {
+        "env_vars": {"USERNAME": "user", "PASSWORD": "replacement"}
+    }
+
+
+def test_credentials_delete_reports_active_attachment_conflict():
+    from shared.credential_connectors import CredentialConnectorAttachedError
+
+    wire = _wire(
+        datasource={**SECRET_ROW, "type": "credentials"},
+        store=_store(
+            delete_datasource=AsyncMock(
+                side_effect=CredentialConnectorAttachedError("End the session first")
+            )
+        ),
+    )
+    response = wire.client.delete(f"/api/datasources/{DATASOURCE_ID}")
+    assert response.status_code == 409
+
+
 # =============================================================================
 # Gate tiers — one refusal per tier, so no route can quietly downgrade
 # =============================================================================

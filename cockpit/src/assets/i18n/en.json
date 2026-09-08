@@ -2294,7 +2294,8 @@
       "mcp": "MCP Server",
       "kubeconfig": "Kubeconfig",
       "ssh_key": "SSH Key",
-      "generic_file": "File"
+      "generic_file": "File",
+      "credentials": "Credentials"
     },
     "catalog": {
       "search": "Search connectors…",
@@ -2502,7 +2503,9 @@
       "emailUnattendedSendLabel": "Send approval",
       "emailUnattendedSendToggle": "Send without human approval",
       "emailUnattendedSendHint": "Requires the admin-granted email_autonomous_send permission — the server rejects this otherwise. When off, direct sending is refused; the planned human-approval queue is not available yet, so use Draft.",
-      "emailNotPublishableHint": "Email connectors cannot be published — mailboxes stay private to their owner."
+      "emailNotPublishableHint": "Email connectors cannot be published — mailboxes stay private to their owner.",
+      "optCredentials": "Credentials (environment variables)",
+      "credentialsEnvHint": "Available to workspace scripts and browser login forms. Add or replace variables; blank values keep existing credentials. Once attached, this connector stays for the session. Agent output is not filtered. Expiration is controlled by your provider."
     },
     "publishDialog": {
       "title": "Publish connector?",
@@ -3076,7 +3079,9 @@
       "unavailableLive": "This attached connector is no longer authorized or in scope. Detach it before continuing.",
       "unavailableBadge": "Unavailable",
       "notReady": "Not fully indexed yet — the agent may see incomplete results.",
-      "lockedLive": "Knowledge bases can't be changed during a session"
+      "lockedLive": "Knowledge bases can't be changed during a session",
+      "credentialsLocked": "Credentials stay attached for this session",
+      "credentialsUnavailable": "This credential connector is no longer available. End this session and start another to change its connectors."
     },
     "execution": {
       "group": "Execution",

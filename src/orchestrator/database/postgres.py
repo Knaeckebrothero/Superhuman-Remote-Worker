@@ -37,6 +37,8 @@ from typing import (
 )
 from uuid import UUID, uuid4
 
+from shared.credential_connectors import CredentialConnectorAttachedError
+
 try:
     import asyncpg
 except ImportError:
@@ -19928,6 +19930,21 @@ class PostgresDB:
         async with self.thread_datasource_lock(thread_id):
             async with self.acquire() as conn:
                 async with conn.transaction():
+                    retained = await conn.fetch(
+                        """
+                        SELECT d.id, d.type FROM threads t
+                        JOIN datasources d ON
+                            COALESCE(t.metadata->'datasource_ids', '[]'::jsonb) ? d.id::text
+                        WHERE t.id = $1 AND d.type = 'credentials'
+                            AND NOT (d.id = ANY($2::uuid[]))
+                        """,
+                        thread_uuid,
+                        datasource_uuids,
+                    )
+                    if any(row.get("type") == "credentials" for row in retained):
+                        raise CredentialConnectorAttachedError(
+                            "Credential connectors stay attached for the lifetime of the session"
+                        )
                     # Serialize every replacement, including A -> [], with the
                     # credential-delivery boundary. Once this transaction
                     # commits, an in-flight attach can no longer deliver the
@@ -41574,9 +41591,29 @@ class PostgresDB:
                 # dangling thread references behind.
                 async with _transaction_if(conn, authority_scope_uuid is None):
                     doomed = await conn.fetchrow(
-                        "SELECT name FROM datasources WHERE id = $1",
+                        "SELECT name, type FROM datasources WHERE id = $1 FOR UPDATE",
                         uuid_val,
                     )
+                    if doomed and doomed.get("type") == "credentials":
+                        in_use = await conn.fetchval(
+                            """
+                            SELECT EXISTS (
+                                SELECT 1 FROM threads
+                                WHERE status <> 'ended'
+                                  AND COALESCE(metadata->'datasource_ids', '[]'::jsonb) ? $1::text
+                            ) OR EXISTS (
+                                SELECT 1 FROM job_datasources jd
+                                JOIN jobs j ON j.id = jd.job_id
+                                WHERE jd.datasource_id = $1::uuid
+                                  AND j.status IN ('created', 'processing', 'paused', 'pending_review')
+                            )
+                            """,
+                            str(uuid_val),
+                        )
+                        if in_use:
+                            raise CredentialConnectorAttachedError(
+                                "End the sessions and jobs using this credential connector before deleting it"
+                            )
                     result = await conn.execute(
                         "DELETE FROM datasources WHERE id = $1",
                         uuid_val,

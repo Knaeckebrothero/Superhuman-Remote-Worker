@@ -2,10 +2,13 @@
 
 This standalone harness has two held-out suites:
 
-- `routing` is the 30-case M1 release corpus. It measures whether a fresh SRW
+- `routing` extends the 30-case M1 release corpus with browser-enablement and
+  external-hosting scenarios (32 cases). It measures whether a fresh SRW
   session model routes product questions to `read_product_guide`, avoids that
   reader for near misses, selects the focused topic, and stays inside
-  deterministic fact boundaries.
+  deterministic fact boundaries while giving concrete setup paths. The two
+  added cases require actionable next steps, so a bare capability denial does
+  not pass. They have not yet received live-model acceptance.
 - `capability` is the eight-case M2 matrix. It distinguishes stable and
   capability-near-miss guide-only answers from dynamic guide →
   `get_product_capabilities` trajectories, checks per-layer partial/mixed

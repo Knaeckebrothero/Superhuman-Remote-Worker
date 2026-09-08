@@ -20,6 +20,10 @@ from orchestrator.services.default_experts import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
+SETUP_GUIDANCE_MIGRATION = (
+    ROOT / "src/orchestrator/database/migrations/app/0229_assistant_setup_guidance.sql"
+)
+PREVIOUS_PERSONA = (ROOT / "tests/fixtures/assistant_persona_v3.txt").read_text()
 KEY = "application-default-session-seed"
 SPEC = next(spec for spec in MANAGED_SEEDS if spec["managed_key"] == KEY)
 OLD_ROSTER = {
@@ -65,11 +69,13 @@ def _bundle():
     )
 
 
-async def _legacy(db, *, roster=None, seed_version=2):
+async def _legacy(db, *, roster=None, seed_version=2, prompts=None):
     bundle = _bundle()
     bundle["config"]["subagents"] = deepcopy(OLD_ROSTER if roster is None else roster)
     bundle["config"]["operator_extra"] = {"enabled": True}
-    bundle["prompts"] = {"persona": "Operator-authored persona"}
+    bundle["prompts"] = (
+        {"persona": "Operator-authored persona"} if prompts is None else prompts
+    )
     bundle["display_name"] = "Operator label"
     row, created = await db.upsert_managed_expert(
         managed_key=KEY, seed_version=seed_version, **bundle
@@ -80,6 +86,97 @@ async def _legacy(db, *, roster=None, seed_version=2):
 
 def _config(row):
     return json.loads(row["config"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("seed_version", [1, 2, 3])
+async def test_setup_guidance_updates_unchanged_persona_once(db, seed_version):
+    before = await _legacy(
+        db,
+        seed_version=seed_version,
+        prompts={"persona": PREVIOUS_PERSONA, "instructions": "Keep my instructions"},
+    )
+    alternative = _bundle()
+    alternative["name"] = "operator-choice"
+    alternative["prompts"]["persona"] = PREVIOUS_PERSONA
+    selected, _ = await db.upsert_managed_expert(
+        managed_key="operator-alternative", seed_version=3, **alternative
+    )
+    await db.ensure_application_expert_default(
+        expert_type="session", expert_id=str(selected["id"])
+    )
+
+    await db.execute(SETUP_GUIDANCE_MIGRATION.read_text())
+
+    after = await db.get_expert_by_managed_key(KEY)
+    assert json.loads(after["prompts"]) == {
+        "persona": _bundle()["prompts"]["persona"],
+        "instructions": "Keep my instructions",
+    }
+    assert after["version"] == before["version"] + 1
+    for key in before.keys() - {"prompts", "version", "updated_at"}:
+        assert after[key] == before[key], key
+    assert await db.get_expert_by_managed_key("operator-alternative") == selected
+    assert (await db.get_application_expert_default("session"))["id"] == selected["id"]
+
+    await db.execute(SETUP_GUIDANCE_MIGRATION.read_text())
+    assert await db.get_expert_by_managed_key(KEY) == after
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "prompts",
+    [
+        {"persona": PREVIOUS_PERSONA + "\n"},
+        {"persona": "Operator-authored persona"},
+        {"persona": None},
+        {"persona": {"text": PREVIOUS_PERSONA}},
+        {"instructions": "No persona override"},
+    ],
+)
+async def test_setup_guidance_preserves_operator_and_nontext_personas(db, prompts):
+    before = await _legacy(db, prompts=prompts)
+
+    await db.execute(SETUP_GUIDANCE_MIGRATION.read_text())
+
+    assert await db.get_expert_by_managed_key(KEY) == before
+
+
+@pytest.mark.asyncio
+async def test_setup_guidance_rechecks_concurrent_persona_edit(db):
+    await _legacy(db, prompts={"persona": PREVIOUS_PERSONA})
+    async with db.acquire() as editor:
+        blocker = await editor.fetchval("SELECT pg_backend_pid()")
+        async with editor.transaction():
+            await editor.execute(
+                """UPDATE experts SET prompts = jsonb_set(
+                       prompts, '{persona}', '"Concurrent operator persona"'::jsonb
+                   ), version = version + 1 WHERE managed_key = $1""",
+                KEY,
+            )
+            operator_row = dict(
+                await editor.fetchrow(
+                    "SELECT * FROM experts WHERE managed_key = $1", KEY
+                )
+            )
+            task = asyncio.create_task(db.execute(SETUP_GUIDANCE_MIGRATION.read_text()))
+            try:
+                async with asyncio.timeout(4):
+                    while not await db.fetchval(
+                        """SELECT EXISTS (
+                               SELECT 1 FROM pg_stat_activity
+                               WHERE $1 = ANY(pg_blocking_pids(pid))
+                           )""",
+                        blocker,
+                    ):
+                        await asyncio.sleep(0.01)
+            except BaseException:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                raise
+
+    await asyncio.wait_for(task, timeout=10)
+    assert await db.get_expert_by_managed_key(KEY) == operator_row
 
 
 @pytest.mark.asyncio

@@ -82,7 +82,7 @@ def build_datasource_note_content(ds: dict[str, Any]) -> str:
     desc = ds.get("description") or ""
     is_read_only = ds.get("project_read_only", False)
 
-    if ds_type == "generic":
+    if ds_type in {"generic", "credentials"}:
         return build_generic_note(ds_name, desc, ds)
     elif ds_type == "repository":
         return build_repository_note(ds_name, desc, ds)
@@ -286,7 +286,7 @@ async def sync_datasource_knowledge(
             f"Search {ds_name} with the KB tools",
             "available OKF knowledge bases",
         ]
-    elif ds_type == "generic":
+    elif ds_type in {"generic", "credentials"}:
         retrieval_messages = [
             f"{ds_name} connection",
             f"How to access {ds_name}",

@@ -52,11 +52,12 @@ because an earlier capability snapshot said `can_execute`.
   markers you can click.
 - **Read and write project knowledge** when the project and Knowledge tools are
   attached; read git history only on a git-capable workspace.
-- **Create and manage jobs for you when Fleet Management is enabled** — the
+- **Create and manage jobs for you when Job Control is enabled** — the
   agent can hand heavy work to the autonomous worker pool (create, check,
   approve, resume, pause, cancel jobs) while you keep chatting. The guide does
-  not grant those tools; enable the group in Agent Settings and check the
-  current session's actual tool list.
+  not grant those tools; enable **Job Control** in Settings → Tools, and
+  **Job Inspection** for the available status and supervision reads. Check
+  the current session's actual tool list.
 - **Use skills** — bundled how-to procedures it loads when relevant.
 
 ## Permission modes — how much it asks first
@@ -97,10 +98,36 @@ deployment authorization.
   folder is available), and workspace-dependent **Git**, **IDE**, **Canvas**,
   or shared-browser actions.
 
-Changes in the current session's **Settings** panel apply with the next
-response. Only Canvas, Fleet Management, Experts & Skills, and Automations &
-Loops can be toggled as live tool groups. Workspace changes are upgrade-only;
-use a new session to move down to Virtual or None.
+## Change this session while keeping the conversation
+
+1. While connected, open **Settings** using the sliders icon in the chat
+   header. On a narrow screen, open the header's three-dot menu and choose
+   **Settings**. This opens **Session settings** beside the conversation.
+2. In its **Settings** tab, change **Workspace**, permission mode, narration,
+   model, temperature, or the model's supported reasoning level. The **Tools**
+   and **Connectors** sections are in the same tab. The live pane has no
+   Advanced tab.
+3. Enable the tool category the task needs, such as **Browser**, **Shell**,
+   **Canvas**, or **Job Control**. The panel shows the session's resolved
+   categories and a reason for unavailable or locked choices. Browser and
+   Shell are workspace- and grant-dependent; an upgrade may be needed first.
+4. Changes apply automatically starting with the **next response**; there is
+   no separate Save button. A change during a response does not add tools to
+   that response. Check any reported error, wait for a workspace upgrade to
+   complete if requested, then send the agent a follow-up to continue.
+
+For a Virtual session that needs a browser or shell, choose **Container** in
+**Workspace** and confirm **Upgrade**. Existing files carry over; then check
+the needed tool category under **Tools**. Use the focused
+`permissions-and-availability` guide for grants, other tiers, and locked
+controls, and `canvas-and-browser` for browser setup and shared login.
+
+Workspace changes are upgrade-only; use a new session to move down to Virtual
+or None. Expert, projects, and Protected Cloud mode are set at creation.
+Most eligible connectors can be added or removed live; some attachments are
+fixed for the session. Read `datasources` for attachment limits. Session
+Settings changes this conversation; account defaults for future sessions
+live under **Settings → Persistent Agent**.
 
 ## Session lifecycle
 

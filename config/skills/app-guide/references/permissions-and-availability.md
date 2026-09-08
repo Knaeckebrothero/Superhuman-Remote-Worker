@@ -103,7 +103,7 @@ provisioning, dispatch, and individual actions recheck the applicable policy.
 
 The account default is under
 **Settings → Persistent Agent → Default Workspace**. A new session can override
-it under **Sessions → New Session → Agent Settings → Advanced → Workspace**.
+it under **Sessions → New Session → Agent Settings → Settings → Workspace**.
 The platform default is Virtual.
 
 | Workspace | What it provides | Important limits |
@@ -113,11 +113,21 @@ The platform default is Virtual.
 | **None** | Chat with no workspace | No workspace file, shell, direct browser, git, or repository tools. Web research, databases, and knowledge may still work when independently configured and attached. |
 | **VM** | A full per-session virtual machine for work that needs VM isolation or sudo/root access | Per-session opt-in only; never a saved default. Requires the `vm_workspace` grant, operator enablement, and an available VM provisioner. Current file Canvas and shared-browser VM support are not promised. |
 
-A running session's header **Settings** panel shows its current workspace and
-only the supported upgrade buttons. Virtual can upgrade to Container; Virtual
-or Container can offer VM when allowed. Workspace changes are upgrade-only:
-to move down to Virtual or None, start a new session. A workspace upgrade does
-not automatically enable a missing tool category.
+A running session's header **Settings** panel shows **Workspace** in its main
+**Settings** tab. On narrow screens, use the header's three-dot menu →
+**Settings**. Choose **Container** to upgrade a Virtual session, then confirm
+**Upgrade**. The session keeps its conversation and carries existing files
+over. Wait for provisioning to complete before checking the newly available
+tools. Virtual or Container can offer VM when allowed. None currently shows
+a fixed workspace value in this selector; start a new Container session when
+no upgrade action is offered.
+
+Workspace changes are upgrade-only: to move down to Virtual or None, start a
+new session. A workspace upgrade does not automatically enable a missing tool
+category. If `request_workspace_upgrade` is currently visible, the agent can
+use it to present an upgrade request for the user's decision. It does not
+provision the workspace or automatically resume work; the user can send a
+follow-up message after the upgrade completes.
 
 ## Tool selection and live changes
 
@@ -125,19 +135,30 @@ At session creation, **Agent Settings** shows the tool categories allowed by
 the selected expert and workspace. Direct Browser, Shell, Git, connectors, and
 other categories can still be removed by backend or grant checks.
 
-For an already-running session, header **Settings** can change only four
-closed tool groups live:
+For an already-running session, open header **Settings → Tools**. The list
+reflects the session's resolved tool categories, including **Browser**,
+**Shell**, **Research**, **Git**, **Canvas**, **Job Control**, **Job Inspection**,
+**Experts & Skills**, and **Automations & Loops** where applicable. Live editing
+is not limited to the older four application groups. **Author Experts &
+Automations** is a separate category with its own grant.
 
-- **Canvas**;
-- **Fleet Management**;
-- **Experts & Skills**; and
-- **Automations & Loops**.
+Rows can be on, off, or unavailable with a reason. Some tools are supplied by
+the runtime or a connector and cannot be switched off through the category
+checkbox. Use the row's explanation; a locked checked row is not a disabled
+capability. If the panel cannot obtain a current resolved inventory, its
+fallback list does not prove the tools are loaded.
 
-Model, permission mode, narration, those groups, and supported connector
-changes apply starting with the next response. Changing the model, tools, or
-connectors can reset the conversation's prompt cache, making the next response
-slower. A checked group is a request to load its known tools, not proof that
-every underlying capability became available.
+Model, temperature, supported reasoning level, permission mode, narration,
+tool selection, delegation settings, and eligible connector changes apply
+automatically starting with the **next response**. There is no Save button.
+Read any error instead of assuming the change succeeded. A current response
+keeps its original tool list; send a follow-up after the change to continue
+with the updated tools. Changing the model, tools, or connectors can reset the
+conversation's prompt cache, making the next response slower. A checked group
+is a request to load its tools, not proof that every operation is ready.
+
+Expert, attached projects, and Protected Cloud mode remain creation-time
+choices. Connector-specific live limits are in `datasources`.
 
 ## Diagnose a missing capability
 
@@ -148,7 +169,8 @@ Use the narrowest observable check:
    preserve partial or unknown layers.
 2. **Look for the actual operation or Cockpit action.** A capability snapshot
    does not authorize an operation. If the exact operation tool is not
-   currently visible, the agent must not offer to perform it.
+   currently visible, explain how to enable it or give the user the reviewed
+   UI steps; do not claim to execute it now.
 3. **Read the control's reason.** A grant tooltip, workspace-required message,
    connector readiness state, or deployment-disabled message identifies a
    specific layer.
@@ -164,3 +186,9 @@ Use the narrowest observable check:
 
 Do not recommend switching to Autonomous as a cure for a missing tool or grant.
 It changes approval prompts only.
+
+Finish the diagnosis with the smallest actionable next step: a workspace
+upgrade, a named tool toggle, a connector attachment, or an administrator
+checking a specific grant or service. Keep useful preparation moving while
+that step is pending. A permission restriction is not a reason to route
+around the same restriction through another tool.

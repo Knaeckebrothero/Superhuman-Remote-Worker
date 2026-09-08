@@ -457,6 +457,7 @@ class RemoteBackend(WorkspaceBackend):
         self._key_path = key_path
         self._remote_root = workspace_path.rstrip("/")
         self._job_id = job_id
+        self._credential_env_path: str | None = None
         self._scrollback_limit = scrollback_limit
         self._default_timeout = default_timeout
         self._no_change_timeout = no_change_timeout
@@ -1167,7 +1168,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
             inner = (
                 self._stateless_tmux_fence_shell()
                 + (process_tag + "\n" if process_tag else "")
-                + command
+                + self._with_credential_environment(command)
             )
             output, exit_code = self._exec_with_status(
                 self._tmux_lock_command(inner, shell="bash"),
@@ -1324,7 +1325,42 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         Public wrapper around _exec for use by tools that need to run
         commands on the workspace host (e.g., starting Chromium for CDP).
         """
-        return self._exec(command, timeout=timeout)
+        return self._exec(self._with_credential_environment(command), timeout=timeout)
+
+    def _with_credential_environment(self, command: str) -> str:
+        path = getattr(self, "_credential_env_path", None)
+        if not path:
+            return command
+        return f". {shlex.quote(path)}; {command}"
+
+    def install_credential_environment(self, values: Dict[str, str]) -> None:
+        """Retain credentials in this session and source them for new commands.
+
+        Existing processes keep their environment. Removed field names remain
+        in the workspace; this method intentionally does not promise scrubbing.
+        """
+        import hashlib
+        import json
+
+        from shared.credential_connectors import normalize_credential_env
+        from shared.runtime.core.credential_env import INSTALL_CREDENTIAL_ENV
+
+        values = normalize_credential_env(values)
+        if not values:
+            return
+        self._init_shell()
+        identity = hashlib.sha256(
+            (self._job_id or self._session_name).encode("utf-8")
+        ).hexdigest()
+        path = self._resolve_home_path(f".srw-credentials/{identity}.sh")
+        command = (
+            f"python3 -c {shlex.quote(INSTALL_CREDENTIAL_ENV)} {shlex.quote(path)}"
+        )
+        if not self.execute_claim_resource_with_secret_stdin(
+            command, json.dumps(values), timeout=30
+        ):
+            raise WorkspaceUnavailableError("Could not install workspace credentials")
+        self._credential_env_path = path
 
     def open_forward_channel(self, dest_host: str = "127.0.0.1", dest_port: int = 8080):
         """Open a ``direct-tcpip`` channel to a loopback port on the workspace.
@@ -3749,7 +3785,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                 # settle so the preamble doesn't fold into the first command's
                 # output. Only the creator runs it: reattach must preserve cwd,
                 # exported variables and foreground/background processes.
-                setup = NONINTERACTIVE_ENV_EXPORT
+                setup = self._with_credential_environment(NONINTERACTIVE_ENV_EXPORT)
                 if self.workspace_incarnation_fenced:
                     process_env = self._stateless_process_env_export()
                     setup = f"{process_env}; {setup}"
@@ -3914,6 +3950,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         working_dir: Optional[str],
     ) -> Tuple[str, Optional[str]]:
         """Build one command whose sentinel follows any requested cwd restore."""
+        command = self._with_credential_environment(command)
         if not working_dir:
             return build_sentinel_command(command, sentinel)
 
@@ -4490,7 +4527,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
 
             # Non-interactive env + working directory (shell/process tabs only).
             if tab_type in ("shell", "process"):
-                setup = NONINTERACTIVE_ENV_EXPORT
+                setup = self._with_credential_environment(NONINTERACTIVE_ENV_EXPORT)
                 if self.workspace_incarnation_fenced:
                     process_env = self._stateless_process_env_export()
                     setup = f"{process_env}; {setup}"
@@ -4543,7 +4580,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                     name,
                     expected=None,
                     sentinel=_INHERITED_BUSY_SENTINEL,
-                    command=command,
+                    command=self._with_credential_environment(command),
                 )
 
         logger.info(f"Opened remote tab '{name}' (type={tab_type})")

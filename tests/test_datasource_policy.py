@@ -102,6 +102,16 @@ async def test_owner_all_scope_can_explicitly_select_projectless_connector():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["none", "virtual"])
+async def test_credentials_require_shell_workspace(backend):
+    db = _db([_row(DS_OWNED, ds_type="credentials")])
+    with pytest.raises(DatasourceWorkspaceTierError):
+        await authorize_datasource_ids(
+            db, {"id": OWNER}, OWNER, [DS_OWNED], [], backend
+        )
+
+
+@pytest.mark.asyncio
 async def test_explicit_selection_returns_revision_from_authorization_rows():
     db = _db([_row(DS_OWNED, revision=9)])
 

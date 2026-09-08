@@ -6,6 +6,7 @@ import {
   datasourceSetKey,
   isRepositoryDatasource,
   selectedDatasourceIds,
+  DatasourcesGroupComponent,
 } from './datasources-group.component';
 import {DatasourceType, EligibleDatasource} from '../../core/models/api.model';
 
@@ -33,6 +34,21 @@ function makeDs(id: string, type: string, defaultSelected = false): EligibleData
 }
 
 describe('datasources-group selection logic', () => {
+  it('excludes credentials from workspaces without a shell', () => {
+    const ds = [makeDs('key', 'credentials'), makeDs('kb', 'kb')];
+    const selection = {key: datasourceSetKey(ds), ids: new Set(['key', 'kb'])};
+    expect(selectedDatasourceIds(ds, selection, true)).toEqual(['kb']);
+    expect(selectedDatasourceIds(ds, selection, false)).toEqual(['key', 'kb']);
+  });
+
+  it('locks existing session credentials but permits selecting new ones', () => {
+    const component = Object.create(DatasourcesGroupComponent.prototype);
+    component.lockedIds = () => [];
+    component.initialSelectedIds = () => ['attached'];
+    expect(component.isLocked(makeDs('attached', 'credentials'))).toBe(true);
+    expect(component.isLocked(makeDs('new', 'credentials'))).toBe(false);
+    expect(component.isLocked(makeDs('attached', 'postgresql'))).toBe(false);
+  });
   it('defaults only server-selected eligible rows when untouched', () => {
     const ds = [makeDs('a', 'postgresql', true), makeDs('b', 'webdav')];
     expect(selectedDatasourceIds(ds, null, false, undefined, true)).toEqual(['a']);

@@ -4824,6 +4824,12 @@ async def _attach_session_inner(
         _session.cloud_mount_manager and _session.cloud_mount_manager.active
     )
 
+    from agent.core.datasource_setup import install_workspace_credentials
+
+    await asyncio.to_thread(
+        install_workspace_credentials, datasources or [], _session.workspace_manager
+    )
+
     # Clone repository datasources into the workspace (deferred from above).
     # All clone/auth operations run on the workspace backend — there is no
     # agent-local clone path (knowledge-base/knowledge/features/no_workspace_agent_mode.md §9.4).

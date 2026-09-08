@@ -4790,9 +4790,9 @@ async def _build_job_start_request(
             if repo_names:
                 msg = (
                     "workspace.backend is a lite tier (virtual/none) but a "
-                    f"repository connector is attached ({', '.join(repo_names)}). "
-                    "Repository connectors need a full workspace — use "
-                    "backend='sandbox' or 'vm', or detach the repository."
+                    f"connector requiring a shell is attached ({', '.join(repo_names)}). "
+                    "Repository and credential connectors need a full workspace — use "
+                    "backend='sandbox' or 'vm'."
                 )
                 logger.error("Dispatch: job %s rejected — %s", job_id, msg)
                 if persist_dispatch_state:
@@ -5577,9 +5577,9 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
             if repo_names:
                 msg = (
                     "workspace.backend is a lite tier (virtual/none) but a "
-                    f"repository connector is attached ({', '.join(repo_names)}). "
-                    "Repository connectors need a full workspace — use "
-                    "backend='sandbox' or 'vm', or detach the repository."
+                    f"connector requiring a shell is attached ({', '.join(repo_names)}). "
+                    "Repository and credential connectors need a full workspace — use "
+                    "backend='sandbox' or 'vm'."
                 )
                 logger.error("Resume dispatch: job %s rejected — %s", job_id, msg)
                 if not COMPLETION_COMMANDS_ENABLED:
@@ -8678,17 +8678,17 @@ def _inject_lite_workspace_config(
 
 
 def _repository_datasource_names(datasources: Any) -> list[str]:
-    """Names of any ``repository``-type datasources in a resolved list.
+    """Names of repository and credential sources requiring a shell workspace.
 
-    Repository datasources require a shell-capable workspace to clone into;
-    the lite tiers have none (§4/§7), so their presence is the tier boundary.
+    Repositories need a clone target and credentials need a command environment;
+    the lite tiers provide neither (§4/§7).
     Returns a (possibly empty) list of human-readable names for the error.
     """
     names: list[str] = []
     for ds in datasources or []:
         if not isinstance(ds, dict):
             continue
-        if (ds.get("type") or "").lower() == "repository":
+        if (ds.get("type") or "").lower() in {"repository", "credentials"}:
             names.append(str(ds.get("name") or ds.get("id") or "?"))
     return names
 
@@ -8731,11 +8731,11 @@ async def _inherit_parent_datasource_ids(
 async def _filter_implicit_lite_datasource_ids(
     datasource_ids: list[str], workspace_backend: str | None
 ) -> list[str]:
-    """Drop clone-based repositories from an implicit/default selection.
+    """Drop sources requiring a shell from an implicit/default lite selection.
 
     Explicit selections fail loudly in the central policy service. Inherited
     and automatic choices are creation-time seeds, so lite tiers keep the
-    usable connectors while omitting repositories they cannot materialize.
+    usable connectors while omitting repositories and credential environments.
     Missing IDs remain in the list and therefore still fail closed when the
     complete set is authorized.
     """
@@ -8745,7 +8745,7 @@ async def _filter_implicit_lite_datasource_ids(
     repositories = {
         str(row["id"])
         for row in rows
-        if str(row.get("type") or "").lower() == "repository"
+        if str(row.get("type") or "").lower() in {"repository", "credentials"}
     }
     return [value for value in datasource_ids if str(value) not in repositories]
 
@@ -41885,6 +41885,26 @@ async def _apply_thread_config_update(
         if thread_row is None:
             raise HTTPException(status_code=404, detail="Thread not found")
         requested_ids = [str(v) for v in datasource_ids]
+        current_metadata = thread_metadata_object(thread_row)
+        try:
+            canonical_requested = {str(UUID(value)) for value in requested_ids}
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=403,
+                detail="One or more selected connectors are unavailable",
+            ) from exc
+        removed_ids = (
+            set(current_metadata.get("datasource_ids") or []) - canonical_requested
+        )
+        if removed_ids:
+            removed_rows = await postgres_db.get_datasource_policy_rows(
+                list(removed_ids)
+            )
+            if any(row.get("type") == "credentials" for row in removed_rows):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Credential connectors stay attached for the lifetime of the session",
+                )
         target_project_ids = await _thread_project_ids(thread_id)
         if thread_row.get("user_id"):
             owner = await postgres_db.get_user(str(thread_row["user_id"]))
@@ -42040,6 +42060,8 @@ async def _apply_thread_config_update(
     # directly to its live session config, and every attach path re-derives
     # them from metadata.datasource_ids.
     if selected_ds_ids is not None:
+        from shared.credential_connectors import CredentialConnectorAttachedError
+
         try:
             updated = await postgres_db.set_thread_datasource_ids(
                 thread_id,
@@ -42047,6 +42069,8 @@ async def _apply_thread_config_update(
                 datasource_policy_revisions=selected_ds_revisions,
                 datasource_selection_provenance=datasource_selection_provenance,
             )
+        except CredentialConnectorAttachedError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except DatasourcePolicyConflictError as exc:
             raise HTTPException(
                 status_code=409,

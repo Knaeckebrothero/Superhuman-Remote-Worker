@@ -76,6 +76,16 @@ def _make_db(update_result="UPDATE 1"):
 
 class TestSetThreadDatasourceIds:
     @pytest.mark.asyncio
+    async def test_credential_connector_cannot_be_removed_from_selection(self):
+        from shared.credential_connectors import CredentialConnectorAttachedError
+
+        db, conn = _make_db()
+        conn.fetch.return_value = [{"id": DATASOURCE_A_ID, "type": "credentials"}]
+        with pytest.raises(CredentialConnectorAttachedError, match="lifetime"):
+            await db.set_thread_datasource_ids(THREAD_ID, [])
+        conn.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_replaces_ids_and_policy_provenance_atomically(self):
         db, conn = _make_db()
         conn.fetch.return_value = [
@@ -124,7 +134,8 @@ class TestSetThreadDatasourceIds:
         patch = json.loads(conn.execute.call_args.args[1])
         assert patch["datasource_ids"] == []
         assert patch["datasource_selection"]["policy_revisions"] == {}
-        conn.fetch.assert_not_awaited()
+        conn.fetch.assert_awaited_once()
+        assert "d.type = 'credentials'" in conn.fetch.await_args.args[0]
         assert db._test_datasource_lock_keys
         conn.transaction.assert_called_once()
 
@@ -263,12 +274,6 @@ def patched_main(monkeypatch):
     db.datasource_policy_rows = policy_rows
     monkeypatch.setattr(main, "postgres_db", db)
     monkeypatch.setattr(main, "require_internal", AsyncMock())
-    # `user_can_access_datasource` used to be stubbed here. R1.B03 moved the
-    # connector surface out of `main`, and `main` no longer re-exports the
-    # helper — but the stub was already inert on this path: the thread-config
-    # PATCH authorizes through `services.datasource_policy`, which reads
-    # `is_global` from the policy rows inline. `policy_rows` above is what
-    # actually decides these cases.
     monkeypatch.setattr(main, "_thread_project_ids", AsyncMock(return_value=[]))
     grants = AsyncMock()
     monkeypatch.setattr(main, "_enforce_session_create_grants", grants)
@@ -282,6 +287,22 @@ def _body(main, config_override=None, datasource_ids=None):
 
 
 class TestAgentPatchDatasourceIds:
+    @pytest.mark.asyncio
+    async def test_credential_detach_fails_before_config_is_written(self, patched_main):
+        main, db, _ = patched_main
+        db.datasource_policy_rows[DATASOURCE_A_ID]["type"] = "credentials"
+        db.get_thread.return_value = _thread_row(
+            metadata_extra={"datasource_ids": [DATASOURCE_A_ID]}
+        )
+        with pytest.raises(main.HTTPException) as caught:
+            await main.agent_update_thread_config(
+                MagicMock(), THREAD_ID, _body(main, datasource_ids=[])
+            )
+        assert caught.value.status_code == 409
+        assert "stay attached" in caught.value.detail
+        db.merge_thread_config_override.assert_not_awaited()
+        db.set_thread_datasource_ids.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_authorizes_against_current_workspace_backend(self, patched_main):
         """A live add is create-like: unlike attach revalidation (which

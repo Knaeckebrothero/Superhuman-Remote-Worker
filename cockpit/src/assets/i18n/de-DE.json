@@ -2294,7 +2294,8 @@
       "mcp": "MCP-Server",
       "kubeconfig": "Kubeconfig",
       "ssh_key": "SSH-Schlüssel",
-      "generic_file": "Datei"
+      "generic_file": "Datei",
+      "credentials": "Zugangsdaten"
     },
     "catalog": {
       "search": "Konnektoren durchsuchen…",
@@ -2502,7 +2503,9 @@
       "emailUnattendedSendLabel": "Versand-Freigabe",
       "emailUnattendedSendToggle": "Ohne menschliche Freigabe senden",
       "emailUnattendedSendHint": "Erfordert die vom Admin vergebene Berechtigung email_autonomous_send — andernfalls lehnt der Server dies ab. Ist die Option aus, wird der Direktversand abgelehnt; die geplante Freigabe-Warteschlange ist noch nicht verfügbar, daher sollte ein Entwurf verwendet werden.",
-      "emailNotPublishableHint": "E-Mail-Konnektoren können nicht veröffentlicht werden — Postfächer bleiben privat."
+      "emailNotPublishableHint": "E-Mail-Konnektoren können nicht veröffentlicht werden — Postfächer bleiben privat.",
+      "optCredentials": "Zugangsdaten (Umgebungsvariablen)",
+      "credentialsEnvHint": "Für Skripte im Workspace und Browser-Anmeldungen. Variablen hinzufügen oder ersetzen; leere Werte behalten vorhandene Zugangsdaten. Nach dem Anhängen bleibt dieser Connector für die Sitzung verbunden. Agent-Ausgaben werden nicht gefiltert. Die Gültigkeitsdauer bestimmt dein Anbieter."
     },
     "publishDialog": {
       "title": "Konnektor veröffentlichen?",
@@ -3076,7 +3079,9 @@
       "unavailableLive": "Dieser angehängte Konnektor ist nicht mehr autorisiert oder im Geltungsbereich. Entfernen Sie ihn, bevor Sie fortfahren.",
       "unavailableBadge": "Nicht verfügbar",
       "notReady": "Noch nicht vollständig indiziert — der Agent sieht möglicherweise unvollständige Ergebnisse.",
-      "lockedLive": "Wissensdatenbanken können während einer Session nicht geändert werden"
+      "lockedLive": "Wissensdatenbanken können während einer Session nicht geändert werden",
+      "credentialsLocked": "Zugangsdaten bleiben für diese Sitzung verbunden",
+      "credentialsUnavailable": "Dieser Zugangsdaten-Konnektor ist nicht mehr verfügbar. Beende diese Sitzung und starte eine neue, um ihre Konnektoren zu ändern."
     },
     "execution": {
       "group": "Ausführung",

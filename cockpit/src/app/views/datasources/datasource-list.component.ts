@@ -211,6 +211,7 @@ type KeyValueRow = {key: string; value: string};
                   [disabled]="isSaving() || !!editingId()"
                 >
                   <optgroup [label]="'datasources.form.typeGroupCli' | transloco">
+                    <option value="credentials">{{ 'datasources.form.optCredentials' | transloco }}</option>
                     <option value="generic">{{ 'datasources.form.optGeneric' | transloco }}</option>
                   </optgroup>
                   <optgroup [label]="'datasources.form.typeGroupKnowledge' | transloco">
@@ -255,7 +256,7 @@ type KeyValueRow = {key: string; value: string};
             }
 
             <!-- Connection URL (required for non-generic, non-credential-file types) -->
-            @if (hasConnectionUrl() && formData.type !== 'generic') {
+            @if (hasConnectionUrl() && !isEnvType()) {
               <app-form-field
                 [label]="(isGitBackedType() ? 'datasources.form.repoUrlLabel' : 'datasources.form.connectionUrlLabel') | transloco"
                 [required]="true"
@@ -272,7 +273,7 @@ type KeyValueRow = {key: string; value: string};
             }
 
             <!-- Generic: optional connection URL -->
-            @if (formData.type === 'generic') {
+            @if (isEnvType()) {
               <app-form-field [label]="'datasources.form.connectionUrlLabel' | transloco" [optional]="'datasources.form.optional' | transloco">
                 <app-input
                   size="sm"
@@ -458,7 +459,7 @@ type KeyValueRow = {key: string; value: string};
             }
 
             <!-- Generic: CLI hint -->
-            @if (formData.type === 'generic') {
+            @if (isEnvType()) {
               <app-form-field [label]="'datasources.form.cliHintLabel' | transloco" [optional]="'datasources.form.optional' | transloco">
                 <app-input
                   size="sm"
@@ -472,8 +473,8 @@ type KeyValueRow = {key: string; value: string};
             }
 
             <!-- Generic: Environment Variables -->
-            @if (formData.type === 'generic') {
-              <app-form-field [label]="'datasources.form.envVarsLabel' | transloco" [hint]="'datasources.form.envHint' | transloco">
+            @if (isEnvType()) {
+              <app-form-field [label]="'datasources.form.envVarsLabel' | transloco" [hint]="(formData.type === 'credentials' ? 'datasources.form.credentialsEnvHint' : 'datasources.form.envHint') | transloco">
                 <div class="env-vars-editor">
                   @for (envVar of envVars; track $index) {
                     <div class="env-var-row">
@@ -1245,7 +1246,7 @@ type KeyValueRow = {key: string; value: string};
                 {{ 'datasources.form.emailNotPublishableHint' | transloco }}
               </div>
             }
-            @if (capabilities.canPublishDatasources() && formData.type !== 'email') {
+            @if (capabilities.canPublishDatasources() && formData.type !== 'email' && formData.type !== 'credentials') {
               <div class="form-row">
                 <app-form-field
                   [label]="'datasources.form.visibilityLabel' | transloco"
@@ -1291,7 +1292,7 @@ type KeyValueRow = {key: string; value: string};
 
           <div class="form-footer-bar">
             <div class="form-actions">
-              @if (formData.type !== 'generic' && formData.type !== 'repository' && !isCredentialFileType()) {
+              @if (!isEnvType() && formData.type !== 'repository' && !isCredentialFileType()) {
                 <app-button
                   variant="secondary"
                   size="sm"
@@ -2547,6 +2548,7 @@ export class DatasourceListComponent implements OnInit {
   // Filter options
   readonly typeFilters = [
     { labelKey: 'datasources.filter.all', value: 'all' },
+    { labelKey: 'datasources.filter.credentials', value: 'credentials' },
     { labelKey: 'datasources.filter.generic', value: 'generic' },
     { labelKey: 'datasources.filter.repository', value: 'repository' },
     { labelKey: 'datasources.filter.kb', value: 'kb' },
@@ -2564,6 +2566,10 @@ export class DatasourceListComponent implements OnInit {
   // Types whose credentials are materialized as files on the agent (rather
   // than env vars or live connections). No connection URL, no test button.
   readonly credentialFileTypes: DatasourceType[] = ['kubeconfig', 'ssh_key', 'generic_file'];
+
+  isEnvType(): boolean {
+    return this.formData.type === 'generic' || this.formData.type === 'credentials';
+  }
 
   isCredentialFileType(type: DatasourceType | string = this.formData.type): boolean {
     return this.credentialFileTypes.includes(type as DatasourceType);
@@ -2649,6 +2655,9 @@ export class DatasourceListComponent implements OnInit {
       if (this.formData.scope_mode === 'projects' && this.formProjectIds().size === 0) {
         return false;
       }
+    }
+    if (this.formData.type === 'credentials') {
+      return this.editingId() !== null || this.envVars.some(row => row.key.trim() && row.value);
     }
     if (this.formData.type === 'generic') {
       return !!(this.formData.description);
@@ -3173,8 +3182,10 @@ export class DatasourceListComponent implements OnInit {
       this.gitAuthMethod = 'token';
       this.gitSshKey = '';
     }
-    // Generic env vars also live in credentials; keep editing UX consistent.
-    this.envVars = [];
+    // ENV names can round-trip; blank values preserve the saved credentials.
+    this.envVars = ds.type === 'credentials'
+      ? (ds.env_var_names ?? []).map(key => ({key, value: ''}))
+      : [];
     // Credential-file types: contents never come back from the API (F3
     // redaction), so the textareas stay blank. The user re-pastes only
     // if they want to replace the stored value.
@@ -3936,6 +3947,7 @@ export class DatasourceListComponent implements OnInit {
 
   getTypeIcon(type: DatasourceType | string): string {
     const icons: Record<string, string> = {
+      credentials: 'key',
       generic: 'settings_input_component',
       repository: 'code',
       kb: 'menu_book',
@@ -4093,10 +4105,10 @@ export class DatasourceListComponent implements OnInit {
     // back). Returning undefined skips the credentials column in the
     // PUT body so the orchestrator preserves the stored secret.
     const isEditing = this.editingId() !== null;
-    if (this.formData.type === 'generic') {
+    if (this.isEnvType()) {
       const envVarsObj: Record<string, string> = {};
       for (const ev of this.envVars) {
-        if (ev.key.trim()) {
+        if (ev.key.trim() && (this.formData.type !== 'credentials' || ev.value !== '')) {
           envVarsObj[ev.key.trim()] = ev.value;
         }
       }

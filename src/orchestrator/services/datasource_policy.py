@@ -84,7 +84,7 @@ def _scope_matches(row: dict[str, Any], target_project_ids: set[str]) -> bool:
 
 def _is_lite_repository(row: dict[str, Any], workspace_backend: str | None) -> bool:
     return (
-        str(row.get("type") or "").lower() == "repository"
+        str(row.get("type") or "").lower() in {"repository", "credentials"}
         and str(workspace_backend or "").lower() in LITE_WORKSPACE_BACKENDS
     )
 
@@ -279,7 +279,7 @@ async def authorize_datasource_selection(
             continue
         if verdict.reason == "workspace_tier":
             raise DatasourceWorkspaceTierError(
-                "Repository connectors require a workspace with filesystem support"
+                "Repository and credential connectors require a sandbox or VM workspace"
             )
         raise DatasourceUnavailableError()
     return [v.datasource_id for v in verdicts], revisions
