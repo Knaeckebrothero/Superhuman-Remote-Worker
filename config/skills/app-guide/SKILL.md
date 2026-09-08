@@ -4,13 +4,14 @@ description: >-
   Explain SRW features and help users enable what their task needs. Use for
   product questions, live session settings, and tasks blocked by missing
   tools, browser access, workspace, connectors, permissions, or a deployment
-  destination. Read current managed guidance with read_product_guide and check
-  get_product_capabilities when current availability matters and it is
-  visible. Give concrete setup steps or clearly identified external options
-  to investigate; a missing tool or undocumented built-in route is not proof
-  that the goal is impossible. Do not invent SRW workflows. Do not use for
-  repository orientation, code questions, or generic advice merely because
-  they mention a worker, job, canvas, loop, memory, SQL, or email.
+  destination. Load the current managed guide and focused reference with
+  read_product_guide, and check get_product_capabilities when current
+  availability matters and it is visible. Give concrete setup steps or
+  clearly identified external options to investigate; a missing tool or
+  undocumented built-in route is not proof that the goal is impossible. Do
+  not invent SRW workflows. Do not use for repository orientation,
+  application/code questions, or generic advice merely because they mention a
+  worker, job, canvas, loop, memory, SQL, or email.
 display_name: App Guide
 icon: help
 color: "#f9e2af"
