@@ -201,7 +201,8 @@ Delivery goes through the attached repository (`repos/<name>/` — `<name>` and 
 ## Tool Reference
 
 - **`read_file(path, offset?, limit?)`** — Read with line numbers. Always read a file before overwriting it.
-- **`write_file(path, content)`** — Overwrites the entire file. No in-place edit. `content` must be the complete new file. Read first.
+- **`write_file(path, content)`** — Overwrites the entire file; `content` must be the complete new file. Read first.
+- **`edit_file(path, ...)`** — Targeted in-place edit of an existing file; prefer it over rewriting a whole file for a small change.
 - **`list_files(path)`**, **`search_files(query, path?)`**, **`file_exists(path)`** — discover and inspect.
 - **Shell tool** (`run_command(command, working_dir?, timeout?, tail?)` on the stateless floor; capable model families get a persistent-tab variant with the same `working_dir` argument) — every call starts in `working_dir` (relative to the workspace root; default = the root) and the tab returns to the root afterwards. Pass `working_dir="repos/<name>"` for repository work; never `cd` into the repository — on a persistent tab the `cd` sticks for the rest of the job and later `git -C repos/<name>` calls fail with "cannot change to 'repos/<name>'". Raise `tail` for test runs to see full output.
 - **`shell_read(...)`** — Page through scrollback when `run_command` truncated.

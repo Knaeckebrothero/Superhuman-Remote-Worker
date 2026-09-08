@@ -25,8 +25,8 @@ expert cannot start a session, and a session expert cannot run a job.
 | **Centurion** | Session | The standing officer of a project: supervises its worker jobs, owns the backlog, and briefs the user. Runs as an always-on wake/sleep session when a project enables its officer; the same profile dresses interactive conferences with him. |
 | **Scholar** | Worker | Broad exploration: web/codebase research, experiments, and high-volume findings for later evaluation. |
 | **Critic** | Worker | Evidence-based review of diffs, proposals, tests, and quality. It is also used by the optional job verification workflow. |
-| **Developer** | Worker | Test-driven implementation using specification, red, green, and refactor phases. |
-| **Engineer** | Worker | Hands-on software and terminal work without the test-first ceremony: features, fixes, refactors, scripts, frontend and backend code, installs and ops chores, verified with the project's own tests, build and lint. |
+| **Developer** | Worker | Strict test-first implementation (specification, red, green, refactor phases) for briefs that explicitly ask for TDD. Several times slower than Engineer on ordinary work. |
+| **Engineer** | Worker | The default for code and terminal work: features, fixes, refactors, scripts, frontend and backend code, installs and ops chores, verified with the project's own tests, build and lint. |
 | **Curator** | Worker | Extracting structured, reusable notes from job artifacts into project knowledge. It may be launched by curation workflows when configured; it does not run beside every job. |
 | **Designer** | Worker | UI/UX analysis, self-contained HTML/CSS mockups, and implementation specifications. |
 | **Design Studio** | Session | Interactive iteration on mockups and design specifications. |

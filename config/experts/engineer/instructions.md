@@ -32,7 +32,7 @@ You take a technical task from brief to verified result: code, scripts, installs
 {% else %}
 - Repository changes stay committed in the checkout under `repos/<name>/`; name the branch and the commits in your report.
 {% endif %}
-- The completion note states what changed, which commands verified it, and what was not verified.
+- The completion note states what changed, which commands verified it, and what was not verified. "Verbatim" means the captured bytes; if you re-ran a command, say so and remove superseded logs. Never commit `__pycache__/` or other build litter.
 {% if has_shell %}
 
 ## 5. Shell, installs and ops
@@ -41,6 +41,7 @@ You take a technical task from brief to verified result: code, scripts, installs
 - Git runs through the shell (`git status`, `git diff`, `git log` with `working_dir="repos/<name>"`). Commit only the files you changed.
 - Installs: prefer the project's own manifest (`pip install -e .`, `npm ci`). A `sudo` call pauses the job for a human decision, so install without root where you can.
 - Give long-running commands an explicit `timeout`. Do not write your own SSH or subprocess wrappers.
+- Tools that read stdin (`http`, `ssh`, interactive installers) will swallow the rest of a script: run them one per call, or with their no-stdin flag or `< /dev/null`.
 {% endif %}
 {% if has_tool("delegate_agent") %}
 

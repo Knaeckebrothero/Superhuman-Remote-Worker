@@ -5,10 +5,12 @@ $extends: worker_base
 agent_id: developer
 display_name: Developer
 description: |
-  Test-driven implementation engine. Defines EARS acceptance criteria up front,
-  writes failing tests, then writes the minimum code that makes them pass.
-  Operates in a spec → red → green → refactor cycle, with phase-typed todos
-  and strict file-scope discipline (no source edits in red, no test edits in green).
+  Strict test-first implementation for briefs that explicitly ask for TDD.
+  Defines EARS acceptance criteria up front, writes failing tests, then writes
+  the minimum code that makes them pass, in a spec → red → green → refactor
+  cycle with phase-typed todos and strict file-scope discipline. Costs several
+  times the wall time of the engineer on ordinary work — for everyday code,
+  scripts and terminal tasks pick the engineer instead.
 icon: code
 color: "#89b4fa"
 tags:
@@ -57,6 +59,7 @@ tools:
   workspace:
     - read_file
     - write_file
+    - edit_file
     - list_files
     - search_files
     - file_exists

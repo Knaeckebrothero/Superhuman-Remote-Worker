@@ -66,20 +66,27 @@ WORK_CATEGORIES: tuple[str, ...] = (RESEARCHER, TESTER, EXECUTOR)
 # Every config here extends ``worker_base`` — session-only experts
 # (designer-interactive, assistant, centurion) are correctly absent.
 CATEGORY_EXPERTS: dict[str, frozenset[str]] = {
-    RESEARCHER: frozenset({"scholar", "designer", "developer", "general-worker"}),
+    RESEARCHER: frozenset(
+        {"scholar", "designer", "developer", "engineer", "general-worker"}
+    ),
     TESTER: frozenset({"product-qa", "bughunter", "critic"}),
     # ``writer`` is executor-only: user-facing prose is a shipped artifact under
     # ``projects/<slug>/``, not an answer written to the KB. A writer sent to
     # investigate would be a researcher whose deliverable happens to read well —
     # which is exactly the confusion the category/expert split exists to prevent.
-    EXECUTOR: frozenset({"developer", "designer", "general-worker", "writer"}),
+    EXECUTOR: frozenset(
+        {"developer", "engineer", "designer", "general-worker", "writer"}
+    ),
 }
 
-# Used when a ticket carries no ``expert:`` pin.
+# Used when a ticket carries no ``expert:`` pin. Executor default is the
+# engineer since the dev-vs-eng-01 bench (2026-09-08, engineer_expert.md §6):
+# equal completion at 0.1-0.2x the wall time; the developer stays the pick
+# for briefs that ask for strict test-first TDD.
 CATEGORY_DEFAULT_EXPERT: dict[str, str] = {
     RESEARCHER: "scholar",
     TESTER: "product-qa",
-    EXECUTOR: "developer",
+    EXECUTOR: "engineer",
 }
 
 # Every expert an ``expert:`` tag may name. The tick validates against this

@@ -374,6 +374,7 @@
     "cancel_command",
     "crawl_website",
     "delegate_agent",
+    "edit_file",
     "extract_webpage",
     "file_exists",
     "get_document_info",
