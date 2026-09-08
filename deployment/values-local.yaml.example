@@ -229,6 +229,9 @@ agent:
   stateless:
     worker:
       defaultEnabled: false
+    # Drain budget for an in-flight unit on SIGTERM (chart default 300 s; the
+    # pod grace period is +60). Lower it locally only for quick rollout tests.
+    # shutdownTimeoutSeconds: 300
     # Queue-driven autoscaling of the executor pool (KEDA; installed on k3d by
     # scripts/local-dev-up.sh step 2b). Replicas follow run_queue demand
     # between the floor and the ceiling. Flip `enabled` in values-local.yaml —

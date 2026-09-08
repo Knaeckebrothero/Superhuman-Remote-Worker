@@ -43,12 +43,25 @@ metadata:
   labels:
     {{- include "srw.componentLabels" (dict "context" . "component" "agent-stateless") | nindent 4 }}
   {{- if .Values.reloader.enabled }}
-  # envFrom the shared ConfigMap/Secret: roll the pool when platform config
-  # changes, same freshness the provisioner plane gets by recycling pods.
+  # Deliberately NOT reloaded on ConfigMap/Secret changes (explicit "false",
+  # which also holds under Reloader's --auto-reload-all): the executor
+  # re-resolves config, credentials and model routing per claim from the
+  # orchestrator's claim bundle, so a config change needs no pod restart —
+  # only an image change should roll the pool. A Reloader bounce on a
+  # srw-config edit SIGTERMs busy executors mid-unit
+  # (stateless_turn_resilience.md step 1; the ad7eb761 park on dev, 2026-09-08).
   annotations:
-    reloader.stakater.com/auto: "true"
+    reloader.stakater.com/auto: "false"
   {{- end }}
 spec:
+  # Replacements come up and start claiming before any old pod is asked to
+  # drain (maxUnavailable 0); ReplicaSet scale-down then honours the
+  # pod-deletion-cost the orchestrator stamps, so idle executors go first.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: {{ .Values.agent.stateless.rollingUpdate.maxUnavailable | toYaml }}
+      maxSurge: {{ .Values.agent.stateless.rollingUpdate.maxSurge | toYaml }}
   {{- if not .Values.agent.stateless.autoscaling.enabled }}
   # Static pool size. Omitted entirely under autoscaling: the KEDA-managed HPA
   # owns .spec.replicas then, and a value here would reset the pool to this
@@ -82,13 +95,14 @@ spec:
       # turn/batch → release the lease. The executor implements this on
       # SIGTERM itself, so there is no preStop exec hook — just a grace
       # period generous enough to finish + persist + release one unit.
-      # Executor shutdown allows shutdownTimeoutSeconds (default 120s) for the
-      # in-flight unit, then a 15s interrupt/unwind window. The grace period is
-      # that timeout + 60s: room for authoritative backend/task drain and the
-      # exact claimant-quiescence acknowledgement; Kubernetes must not SIGKILL
-      # the process before that proof is durable. An autoscaled pool (where a
-      # scale-down can SIGTERM a busy pod) raises the timeout to cover one
-      # whole unit — see agent.stateless.shutdownTimeoutSeconds.
+      # Executor shutdown allows shutdownTimeoutSeconds (default 300s: a
+      # measured turn-end cloud push runs 100–500 s, and the unit is held until
+      # it settles — until commit-then-effects makes the drain budget a single
+      # model call) for the in-flight unit, then a 15s interrupt/unwind window.
+      # The grace period is that timeout + 60s: room for authoritative
+      # backend/task drain and the exact claimant-quiescence acknowledgement;
+      # Kubernetes must not SIGKILL the process before that proof is durable.
+      # See agent.stateless.shutdownTimeoutSeconds.
       terminationGracePeriodSeconds: {{ add (int .Values.agent.stateless.shutdownTimeoutSeconds) 60 }}
       securityContext:
         seccompProfile:

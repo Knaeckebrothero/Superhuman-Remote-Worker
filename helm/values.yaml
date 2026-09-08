@@ -607,11 +607,22 @@ agent:
     resources: {}
     # -- Seconds the executor lets an in-flight unit finish after SIGTERM before
     # it interrupts the turn (STATELESS_SHUTDOWN_TIMEOUT_S). The pod's
-    # terminationGracePeriodSeconds is this + 60. 120 is the historical value;
-    # an autoscaled pool, where a scale-down may SIGTERM a busy pod, should set
-    # this to cover one whole unit (session turns measured 100–220 s on dev,
-    # worker batches run at least worker.batchMinWallSeconds).
-    shutdownTimeoutSeconds: 120
+    # terminationGracePeriodSeconds is this + 60. 300 covers a measured
+    # turn-end cloud push (100–500 s on dev/k3d) — the unit is held until the
+    # push settles, and an interrupted post-turn push is what parks a finished
+    # turn. Drops back to a single model call once commit-then-effects lands
+    # (stateless_turn_resilience.md). Worker batches run at least
+    # worker.batchMinWallSeconds and rotate at the batch edge regardless.
+    shutdownTimeoutSeconds: 300
+    # -- Rolling-update shape for the executor Deployment. maxUnavailable 0:
+    # a replacement pod boots and starts claiming before any old pod is asked
+    # to drain; ReplicaSet scale-down then removes idle pods first via the
+    # pod-deletion-cost the orchestrator stamps. The Deployment is also opted
+    # OUT of Stakater Reloader (config is re-resolved per claim), so only an
+    # image change rolls the pool.
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: "25%"
     # -- Queue-driven autoscaling of the executor pool via KEDA
     # (templates/agent/stateless-scaledobject.yaml;
     # knowledge-base/knowledge/features/capacity_ux_and_queue_autoscaling.md).
