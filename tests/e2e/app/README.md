@@ -39,12 +39,23 @@ plus zero or more overlays; the baseline is never edited to suit one batch.
 | `pinned-virtual` (default) | `values-e2e.yaml` | nothing — the cheap baseline: pinned execution lane, virtual workspace, no workspace image built | the browser journey and anything that does not touch a workspace or a forge |
 | `stateless-sandbox` | + `values-stateless-sandbox.yaml` | stateless executor Deployment, sandbox workspace backend, a `local-path` workspace PVC, and the current-source workspace image | workspace-backed sessions, SSH attach, real worker jobs, retirement/reclaim inventories |
 | `forge-sandbox` | + `values-forge-sandbox.yaml` | the bundled Gitea StatefulSet on sqlite3 (no second Postgres) | project provisioning, project repositories, knowledge-vault materialisation — anything that goes through the forge |
+| `cloud-sandbox` | + `values-cloud-sandbox.yaml` | the bundled Nextcloud on SQLite + filesystem storage (OpenCloud off), `rclone_mount` as the workspace driver, and **protected cloud mode** with the chart-derived protected-effect lane | cloud mounts, protected-cloud engage/await, staged cloud-diff review, main-cloud configuration/reload — anything that needs a real backend rather than "no backend bound" |
 
-`forge-sandbox` *composes* `stateless-sandbox`, it does not replace it: forge
-work still needs a workspace-backed session. Adding a dependency to the shared
-`values-e2e.yaml` is what broke the journey's determinism contract when SearXNG
-was tried there — the browser asserts exactly one provider endpoint and exactly
-two enabled models — so a new dependency belongs in an overlay.
+Each profile *composes* the one above it, it does not replace it:
+`forge-sandbox` work still needs a workspace-backed session, and `cloud-sandbox`
+needs both. Adding a dependency to the shared `values-e2e.yaml` is what broke
+the journey's determinism contract when SearXNG was tried there — the browser
+asserts exactly one provider endpoint and exactly two enabled models — so a new
+dependency belongs in an overlay.
+
+`cloud-sandbox` turns `agent.protectedCloudModeEnabled` on, which is a separate
+decision from binding a backend: with a backend but no mode, every protected
+route answers the "disabled" refusal and the mount builders are never asked for
+a payload. The chart derives `nextcloud.protectedEffect` from that flag, so the
+overlay only has to name the dedicated HMAC Secret — `secrets.create` is false
+on this stack, so the harness mints every Secret itself, including that one.
+That root is deliberately *not* a key in `srw-e2e-app-secrets`: agent Pods mount
+that bundle wholesale through `envFrom`.
 
 State lives below `cockpit/test-results/app-harness/` (already ignored). The
 harness creates a private ownership marker and publishes `active.json` with an

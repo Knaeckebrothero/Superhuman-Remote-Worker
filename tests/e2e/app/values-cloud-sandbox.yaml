@@ -32,6 +32,19 @@ nextcloud:
   resources:
     requests: {memory: 256Mi, cpu: 100m}
     limits: {memory: 1Gi, cpu: 1}
+  protectedEffect:
+    # `enabled` stays unset on purpose: the chart derives the lane from
+    # `agent.protectedCloudModeEnabled` below on a bundled, internal Nextcloud,
+    # and asserting the same decision twice is what its tri-state exists to
+    # avoid. Only the Secret needs naming — `secrets.create` is false on this
+    # stack (the harness mints every Secret itself), so the chart cannot
+    # generate the adoption-once effect root and requires a dedicated name.
+    # The harness mints it unconditionally, with the same reasoning as the
+    # Gitea/Nextcloud keys: an identical secret topology on every profile, so a
+    # profile that needs a key never stalls on one nothing created. It is a
+    # dedicated Secret rather than a key in the application bundle because
+    # dynamic agent Pods mount that bundle wholesale through `envFrom`.
+    hmacSecretName: srw-e2e-protected-effect
 
 # The chart default is opencloud:enabled=true, and the configmap prefers
 # opencloud over nextcloud, so this override is what makes the bundled
@@ -52,3 +65,13 @@ cloud:
   workspaceDriver: "rclone_mount"
   rcloneMount:
     allowContainer: true
+
+agent:
+  # Protected cloud mode is the half of B04's cloud surface that a bound
+  # backend alone does not reach: with the mode off every protected route
+  # answers the "disabled" refusal, no RO reader is ever provisioned, and
+  # `_build_protected_cloud_mount` is never asked for a payload — which is
+  # exactly the gap B04's acceptance recorded. Turning it on also stands up the
+  # protected-effect lane's fpm/nginx sidecars, because the chart derives that
+  # lane from this flag.
+  protectedCloudModeEnabled: "true"

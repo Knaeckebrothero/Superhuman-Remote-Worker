@@ -1388,6 +1388,12 @@ def test_cloud_sandbox_extends_forge_sandbox_without_replacing_it() -> None:
     assert cloud.stateless_agents is True
     assert cloud.forge_enabled is True
     assert cloud.cloud_enabled is True
+    # A bound backend is not protected cloud mode. Without the flag every
+    # protected route answers "disabled" and the mount builders are never asked
+    # for a payload, which is the gap B04's acceptance recorded.
+    assert cloud.protected_cloud_enabled is True
+    for name in ("pinned-virtual", "stateless-sandbox", "forge-sandbox"):
+        assert harness.resolve_profile(name).protected_cloud_enabled is False
     assert cloud.additional_statefulsets == forge.additional_statefulsets
     # The backend is a Deployment, so it must be waited on as one.
     assert "srw-e2e-nextcloud" in cloud.additional_deployments
@@ -1459,6 +1465,136 @@ def test_cloud_sandbox_renders_exactly_one_bundled_backend(tmp_path: Path) -> No
     }
     assert "SQLITE_DATABASE" in environment
     assert not any(key.startswith("OBJECTSTORE_S3") for key in environment)
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+def test_cloud_sandbox_renders_the_protected_effect_lane(tmp_path: Path) -> None:
+    """Protected cloud mode is on, and the server lane it needs is deployed.
+
+    ``agent.protectedCloudModeEnabled`` alone is inert: ``nextcloud.py`` answers
+    NOT_SUPPORTED on every capability request unless the effect lane is running,
+    so the chart derives the lane from the flag on a bundled, internal Nextcloud.
+    This asserts the derivation actually happened rather than trusting it, and
+    that the effect root is reachable by the orchestrator and by nothing in a
+    workspace.
+    """
+    sha = "a" * 40
+    run_id = "20260824-123456-ab12cd34"
+    profile = harness.resolve_profile("cloud-sandbox")
+    images, _commands = harness.build_image_commands(
+        sha, run_id, include_workspace=True
+    )
+    image_values = tmp_path / "images.yaml"
+    image_values.write_text(
+        harness._image_values(images, sha, run_id), encoding="utf-8"
+    )
+    command = [
+        "helm",
+        "template",
+        "srw-e2e",
+        str(harness.REPO_ROOT / "helm"),
+        "-n",
+        harness.NAMESPACE,
+    ]
+    for values_file in profile.values_files:
+        command.extend(("-f", str(values_file)))
+    command.extend(("-f", str(image_values)))
+    rendered = subprocess.run(
+        command, check=True, capture_output=True, text=True, timeout=120
+    ).stdout
+    documents = [document for document in yaml.safe_load_all(rendered) if document]
+
+    config = next(
+        document
+        for document in documents
+        if document.get("kind") == "ConfigMap"
+        and document.get("metadata", {}).get("name") == "srw-e2e-config"
+    )
+    assert config["data"]["PROTECTED_CLOUD_MODE_ENABLED"] == "true"
+    assert config["data"]["NEXTCLOUD_PROTECTED_EFFECT_URL"] == (
+        f"http://{harness.PROTECTED_EFFECT_SECRET_NAME}"
+    )
+
+    backend = next(
+        document
+        for document in documents
+        if document.get("kind") == "Deployment"
+        and document.get("metadata", {}).get("name") == "srw-e2e-nextcloud"
+    )
+    containers = [
+        container["name"]
+        for container in backend["spec"]["template"]["spec"]["containers"]
+    ]
+    assert containers == [
+        "nextcloud",
+        "nextcloud-protected-effect-fpm",
+        "nextcloud-protected-effect-nginx",
+    ]
+
+    kinds = {
+        (document.get("kind"), document.get("metadata", {}).get("name"))
+        for document in documents
+    }
+    assert ("Service", harness.PROTECTED_EFFECT_SECRET_NAME) in kinds
+    assert ("NetworkPolicy", harness.PROTECTED_EFFECT_SECRET_NAME) in kinds
+    # The chart must not create the effect Secret here: `secrets.create` is
+    # false on this stack, so the overlay names one and the harness mints it.
+    assert ("Secret", harness.PROTECTED_EFFECT_SECRET_NAME) not in kinds
+
+    orchestrator = next(
+        document
+        for document in documents
+        if document.get("kind") == "Deployment"
+        and document.get("metadata", {}).get("name") == "srw-e2e-orchestrator"
+    )
+    environment = {
+        item["name"]: item
+        for item in orchestrator["spec"]["template"]["spec"]["containers"][0]["env"]
+    }
+    hmac = environment["NEXTCLOUD_PROTECTED_EFFECT_HMAC_KEY"]["valueFrom"][
+        "secretKeyRef"
+    ]
+    assert hmac["name"] == harness.PROTECTED_EFFECT_SECRET_NAME
+    assert hmac["optional"] is False
+    # The effect root must never travel in the bundle agent Pods mount whole.
+    minted = harness.generated_secret_data(
+        harness.SecretBundle.generate(run_id),
+        vm_private_key="unused",
+        vm_public_key="unused",
+    )
+    assert "NEXTCLOUD_PROTECTED_EFFECT_HMAC_KEY" not in minted["srw-e2e-app-secrets"]
+    assert set(minted[harness.PROTECTED_EFFECT_SECRET_NAME]) == {
+        "NEXTCLOUD_PROTECTED_EFFECT_HMAC_KEY"
+    }
+
+
+def test_profile_overlays_have_no_duplicate_top_level_keys() -> None:
+    """A repeated top-level key in an overlay silently drops the first block.
+
+    PyYAML — and Helm — keep the last mapping entry, so appending a second
+    ``nextcloud:`` to an overlay that already had one deletes
+    ``nextcloud.enabled`` without a word. Nothing else in this suite would
+    notice: the render still succeeds, it just deploys the wrong thing.
+    """
+
+    for profile in harness.APPLICATION_E2E_PROFILES.values():
+        for values_file in profile.values_files:
+            document = yaml.safe_load(values_file.read_text(encoding="utf-8"))
+            assert isinstance(document, dict)
+            text = values_file.read_text(encoding="utf-8")
+            top_level = [
+                line.split(":", 1)[0]
+                for line in text.splitlines()
+                if line
+                and not line[0].isspace()
+                and not line.startswith("#")
+                and ":" in line
+            ]
+            duplicates = sorted({key for key in top_level if top_level.count(key) > 1})
+            assert not duplicates, (
+                f"{values_file.name} repeats top-level key(s) {duplicates}; "
+                "the later block silently replaces the earlier one"
+            )
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
@@ -1574,20 +1710,31 @@ def test_generated_app_secret_covers_every_required_rendered_key(
 
     for document in documents:
         walk(document)
+    minted = harness.generated_secret_data(
+        harness.SecretBundle.generate("20260824-123456-ab12cd34"),
+        vm_private_key="unused",
+        vm_public_key="unused",
+    )
     required_app_keys = {
         ref["key"]
         for ref in refs
         if ref.get("name") == "srw-e2e-app-secrets"
         and ref.get("optional", False) is not True
     }
-    generated_keys = set(
-        harness.SecretBundle.generate("20260824-123456-ab12cd34").app_secret_data()
-    )
 
-    missing = required_app_keys - generated_keys
+    # Every required reference, not only the ones aimed at the application
+    # bundle. A component whose key lives in a Secret of its own -- the
+    # protected-effect root, say -- fails exactly the same way, and filtering on
+    # one Secret name cannot see it.
+    missing = sorted(
+        f"{ref['name']}/{ref['key']}"
+        for ref in refs
+        if ref.get("optional", False) is not True
+        and ref["key"] not in minted.get(ref.get("name"), ())
+    )
     assert not missing, (
         f"profile {profile_name!r} renders secret keys the harness never mints: "
-        f"{sorted(missing)}"
+        f"{missing}"
     )
     assert {"GITEA_ADMIN_USER", "GITEA_ADMIN_PASSWORD"} <= required_app_keys
     if profile.cloud_enabled:

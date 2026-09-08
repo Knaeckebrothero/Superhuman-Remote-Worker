@@ -69,6 +69,11 @@ RELEASE: Final = "srw-e2e"
 BASE_HOST: Final = "srw-e2e.test"
 BASE_URL: Final = f"http://{BASE_HOST}"
 PROVIDER_IMAGE_PLACEHOLDER: Final = "srw-e2e-model-fixture:local"
+# The protected-effect lane's dedicated HMAC Secret. The cloud profile names
+# it through `nextcloud.protectedEffect.hmacSecretName`; the chart then does
+# not create one, which is what lets the lane render under `secrets.create:
+# false`.
+PROTECTED_EFFECT_SECRET_NAME: Final = "srw-e2e-protected-effect"
 PROVIDER_SERVICE_BASE: Final = (
     "http://srw-e2e-model-fixture.srw-e2e.svc.cluster.local:8000/v1"
 )
@@ -136,6 +141,13 @@ class ApplicationE2EProfile:
     #: comparison, so a later profile composing this overlay cannot silently
     #: skip the backend check.
     cloud_enabled: bool = False
+    #: This profile turns protected cloud mode on, so a marked session is
+    #: actually admitted: an RO reader is provisioned, the capture overlay is
+    #: built, and ``cloud_mount`` reaches the workspace runtime. A bound backend
+    #: alone does not do this -- with the mode off every protected route answers
+    #: the "disabled" refusal and the mount builders are never asked for a
+    #: payload. Behavioural, for the same reason as the flag above.
+    protected_cloud_enabled: bool = False
 
 
 APPLICATION_E2E_PROFILES: Final = {
@@ -185,6 +197,7 @@ APPLICATION_E2E_PROFILES: Final = {
         stateless_agents=True,
         forge_enabled=True,
         cloud_enabled=True,
+        protected_cloud_enabled=True,
     ),
 }
 
@@ -274,6 +287,12 @@ class SecretBundle:
     nextcloud_oidc_secret: str = dataclasses.field(repr=False)
     nextcloud_admin_password: str = dataclasses.field(repr=False)
     gitea_admin_password: str = dataclasses.field(repr=False)
+    #: The protected-effect lane's adoption-once HMAC root. Deliberately NOT a
+    #: member of ``app_secret_data()``: dynamic agent Pods consume that bundle
+    #: through ``envFrom``, and the effect root must never be readable from a
+    #: workspace. It is minted into its own Secret, named by the cloud profile's
+    #: ``nextcloud.protectedEffect.hmacSecretName``.
+    protected_effect_hmac_key: str = dataclasses.field(repr=False)
 
     @classmethod
     def generate(cls, run_id: str) -> SecretBundle:
@@ -302,6 +321,8 @@ class SecretBundle:
             nextcloud_oidc_secret=token(48),
             nextcloud_admin_password=token(24),
             gitea_admin_password=token(36),
+            # The chart floor is 32 bytes; 48 matches its own randAlphaNum(48).
+            protected_effect_hmac_key=token(48),
         )
 
     @classmethod
@@ -371,6 +392,41 @@ class SecretBundle:
             "APP_E2E_CHAT_MODEL": "e2e-chat",
             "APP_E2E_EMBEDDING_MODEL": "e2e-embedding",
         }
+
+
+def generated_secret_data(
+    bundle: SecretBundle, *, vm_private_key: str, vm_public_key: str
+) -> dict[str, dict[str, str]]:
+    """Every Kubernetes Secret this harness mints, keyed by name.
+
+    One source of truth. ``create_secrets_and_fixture`` applies exactly these
+    manifests, and ``test_harness.py`` checks every non-optional
+    ``secretKeyRef`` in every profile's render against them. A required key
+    nothing mints is a ``CreateContainerConfigError``, and for anything a
+    Keycloak-adjacent pod mounts that stalls every pod which waits on Keycloak
+    — a deploy that never finishes rather than a failure that says so.
+
+    All four are minted on every profile, so the secret topology does not vary
+    with the overlay set. ``srw-e2e-protected-effect`` is deliberately its own
+    Secret rather than a key in the application bundle: dynamic agent Pods
+    consume that bundle wholesale through ``envFrom``, and the protected-effect
+    root must never be readable from a workspace.
+    """
+
+    return {
+        "srw-e2e-app-secrets": bundle.app_secret_data(),
+        "srw-e2e-vm-ssh-key": {
+            "ssh-privatekey": vm_private_key,
+            "ssh-publickey": vm_public_key,
+        },
+        "srw-e2e-model-fixture": {
+            "control-token": bundle.provider_control_token,
+            "inference-api-key": bundle.provider_api_key,
+        },
+        PROTECTED_EFFECT_SECRET_NAME: {
+            "NEXTCLOUD_PROTECTED_EFFECT_HMAC_KEY": bundle.protected_effect_hmac_key,
+        },
+    }
 
 
 def utc_now() -> str:
@@ -1986,32 +2042,15 @@ class ApplicationE2EHarness:
             {
                 "apiVersion": "v1",
                 "kind": "Secret",
-                "metadata": {"name": "srw-e2e-app-secrets", "namespace": NAMESPACE},
+                "metadata": {"name": name, "namespace": NAMESPACE},
                 "type": "Opaque",
-                "stringData": bundle.app_secret_data(),
-            },
-            {
-                "apiVersion": "v1",
-                "kind": "Secret",
-                "metadata": {"name": "srw-e2e-vm-ssh-key", "namespace": NAMESPACE},
-                "type": "Opaque",
-                "stringData": {
-                    "ssh-privatekey": private_key.read_text(encoding="utf-8"),
-                    "ssh-publickey": (run_dir / "vm-ssh-key.pub").read_text(
-                        encoding="utf-8"
-                    ),
-                },
-            },
-            {
-                "apiVersion": "v1",
-                "kind": "Secret",
-                "metadata": {"name": "srw-e2e-model-fixture", "namespace": NAMESPACE},
-                "type": "Opaque",
-                "stringData": {
-                    "control-token": bundle.provider_control_token,
-                    "inference-api-key": bundle.provider_api_key,
-                },
-            },
+                "stringData": data,
+            }
+            for name, data in generated_secret_data(
+                bundle,
+                vm_private_key=private_key.read_text(encoding="utf-8"),
+                vm_public_key=(run_dir / "vm-ssh-key.pub").read_text(encoding="utf-8"),
+            ).items()
         ]
         # Secret values travel over stdin, never process argv or harness output.
         for index, manifest in enumerate(manifests, start=1):
