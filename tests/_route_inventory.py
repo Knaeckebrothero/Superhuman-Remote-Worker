@@ -30,20 +30,17 @@ from collections.abc import Iterator
 from typing import Any
 
 
-def iter_mounted_routes(routes: Any) -> Iterator[tuple[str, str]]:
-    """Yield ``(method, path)`` for every route reachable from ``routes``."""
+def iter_mounted_route_objects(routes: Any) -> Iterator[Any]:
+    """Yield every endpoint route object reachable from ``routes``."""
     seen: set[int] = set()
 
-    def walk(current: Any) -> Iterator[tuple[str, str]]:
+    def walk(current: Any) -> Iterator[Any]:
         if id(current) in seen:
             return
         seen.add(id(current))
         for route in current:
-            path = getattr(route, "path", None)
-            methods = getattr(route, "methods", None)
-            if path and methods:
-                for method in methods:
-                    yield method, path
+            if getattr(route, "path", None) and getattr(route, "methods", None):
+                yield route
             included = getattr(route, "original_router", None)
             if included is not None:
                 yield from walk(included.routes)
@@ -54,6 +51,22 @@ def iter_mounted_routes(routes: Any) -> Iterator[tuple[str, str]]:
     yield from walk(routes)
 
 
+def iter_mounted_routes(routes: Any) -> Iterator[tuple[str, str]]:
+    """Yield ``(method, path)`` for every route reachable from ``routes``."""
+    for route in iter_mounted_route_objects(routes):
+        for method in route.methods:
+            yield method, route.path
+
+
 def mounted_routes(app: Any) -> set[tuple[str, str]]:
     """``(method, path)`` pairs an app actually serves, mounted routers included."""
     return set(iter_mounted_routes(app.routes))
+
+
+def mounted_route_objects(app: Any) -> list[Any]:
+    """Route objects an app actually serves, mounted routers included.
+
+    Use this over :func:`mounted_routes` when a case needs more than the method
+    and path — ``include_in_schema``, ``methods``, the endpoint itself.
+    """
+    return list(iter_mounted_route_objects(app.routes))

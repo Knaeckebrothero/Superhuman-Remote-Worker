@@ -660,12 +660,9 @@ class TestVoiceSelectionAndInstructions:
 class TestTtsEndpoint:
     def test_route_is_registered(self):
         from orchestrator.main import app
+        from tests._route_inventory import mounted_routes
 
-        routes = {
-            (m, getattr(r, "path", ""))
-            for r in app.routes
-            for m in (getattr(r, "methods", None) or set())
-        }
+        routes = mounted_routes(app)
         assert ("POST", "/api/persistent/threads/{thread_id}/tts") in routes
 
     @pytest.mark.asyncio
@@ -1272,12 +1269,9 @@ class TestTtsSynthesisHttpError:
 class TestTtsPlanEndpoint:
     def test_route_is_registered(self):
         from orchestrator.main import app
+        from tests._route_inventory import mounted_routes
 
-        routes = {
-            (m, getattr(r, "path", ""))
-            for r in app.routes
-            for m in (getattr(r, "methods", None) or set())
-        }
+        routes = mounted_routes(app)
         assert ("POST", "/api/persistent/threads/{thread_id}/tts/plan") in routes
 
     @pytest.mark.asyncio
@@ -1468,12 +1462,9 @@ class TestTtsMetering:
 class TestVoiceCapabilitiesEndpoint:
     def test_route_is_registered(self):
         from orchestrator.main import app
+        from tests._route_inventory import mounted_routes
 
-        routes = {
-            (m, getattr(r, "path", ""))
-            for r in app.routes
-            for m in (getattr(r, "methods", None) or set())
-        }
+        routes = mounted_routes(app)
         assert ("GET", "/api/voice/capabilities") in routes
 
     @pytest.mark.asyncio
@@ -2631,12 +2622,9 @@ class TestPlanRawMode:
 class TestTtsPlanStreamEndpoint:
     def test_route_is_registered(self):
         from orchestrator.main import app
+        from tests._route_inventory import mounted_routes
 
-        routes = {
-            (m, getattr(r, "path", ""))
-            for r in app.routes
-            for m in (getattr(r, "methods", None) or set())
-        }
+        routes = mounted_routes(app)
         assert (
             "POST",
             "/api/persistent/threads/{thread_id}/tts/plan/stream",

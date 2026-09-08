@@ -1680,6 +1680,7 @@ async def test_usage_v2_does_not_echo_server_contract_failures_as_client_errors(
 
 def test_internal_inventory_ingestion_routes_are_hidden_from_openapi():
     import orchestrator.main as orchestrator_main
+    from tests._route_inventory import mounted_route_objects
 
     prefix = "/api/internal/infrastructure-metering/v1"
     expected = {
@@ -1692,8 +1693,8 @@ def test_internal_inventory_ingestion_routes_are_hidden_from_openapi():
     }
     routes = {
         route.path: route
-        for route in orchestrator_main.app.routes
-        if getattr(route, "path", "") in expected
+        for route in mounted_route_objects(orchestrator_main.app)
+        if route.path in expected
     }
 
     assert set(routes) == expected
@@ -1935,6 +1936,7 @@ async def test_correction_route_is_idempotent_fleet_admin_operation():
 
 def test_infrastructure_admin_routes_are_explicit_and_publicly_documented():
     import orchestrator.main as orchestrator_main
+    from tests._route_inventory import mounted_route_objects
 
     expected = {
         "/api/admin/usage/v2/infrastructure-cutover": {"GET"},
@@ -1960,8 +1962,8 @@ def test_infrastructure_admin_routes_are_explicit_and_publicly_documented():
     }
     routes = {
         route.path: route.methods
-        for route in orchestrator_main.app.routes
-        if getattr(route, "path", "") in expected
+        for route in mounted_route_objects(orchestrator_main.app)
+        if route.path in expected
     }
     assert routes == expected
 

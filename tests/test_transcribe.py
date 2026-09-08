@@ -316,12 +316,9 @@ def _upload(data: bytes):
 class TestTranscribeEndpoint:
     def test_route_is_registered(self):
         from orchestrator.main import app
+        from tests._route_inventory import mounted_routes
 
-        routes = {
-            (m, getattr(r, "path", ""))
-            for r in app.routes
-            for m in (getattr(r, "methods", None) or set())
-        }
+        routes = mounted_routes(app)
         assert (
             "POST",
             "/api/persistent/threads/{thread_id}/transcribe",

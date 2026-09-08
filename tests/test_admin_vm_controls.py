@@ -23,6 +23,7 @@ os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 import orchestrator.main as orch_main  # noqa: E402
 from orchestrator.main import app  # noqa: E402
 from orchestrator.schemas.users import AdminUserUpdate  # noqa: E402
+from tests._route_inventory import mounted_routes  # noqa: E402
 
 MODULE = "orchestrator.main"
 
@@ -41,13 +42,7 @@ ADMIN_VM_ROUTES = {
 
 
 def _registered_routes() -> set[tuple[str, str]]:
-    out: set[tuple[str, str]] = set()
-    for route in app.routes:
-        methods = getattr(route, "methods", None) or set()
-        path = getattr(route, "path", "")
-        for m in methods:
-            out.add((m, path))
-    return out
+    return mounted_routes(app)
 
 
 class TestAdminVmRoutesRegistered:
