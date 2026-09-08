@@ -271,6 +271,8 @@ class SecretBundle:
     session_jwt_secret: str = dataclasses.field(repr=False)
     mcp_internal_key: str = dataclasses.field(repr=False)
     gitea_oidc_secret: str = dataclasses.field(repr=False)
+    nextcloud_oidc_secret: str = dataclasses.field(repr=False)
+    nextcloud_admin_password: str = dataclasses.field(repr=False)
     gitea_admin_password: str = dataclasses.field(repr=False)
 
     @classmethod
@@ -297,6 +299,8 @@ class SecretBundle:
             session_jwt_secret=token(48),
             mcp_internal_key=token(48),
             gitea_oidc_secret=token(48),
+            nextcloud_oidc_secret=token(48),
+            nextcloud_admin_password=token(24),
             gitea_admin_password=token(36),
         )
 
@@ -335,6 +339,15 @@ class SecretBundle:
             "KC_REALM_ADMIN_PASSWORD": self.realm_test_password,
             "KC_CLIENT_SECRET": self.keycloak_client_secret,
             "GITEA_OIDC_CLIENT_SECRET": self.gitea_oidc_secret,
+            "NEXTCLOUD_OIDC_CLIENT_SECRET": self.nextcloud_oidc_secret,
+            "NEXTCLOUD_ADMIN_USER": "admin",
+            "NEXTCLOUD_ADMIN_PASSWORD": self.nextcloud_admin_password,
+            # Minted unconditionally, like the Gitea one above: the Keycloak
+            # bootstrap job mounts NEXTCLOUD_OIDC_CLIENT_SECRET by key whenever
+            # `nextcloud.enabled`, and a missing key is a
+            # CreateContainerConfigError that stalls every pod waiting on
+            # Keycloak — which is every pod. Minting it always keeps the secret
+            # shape identical across profiles.
             # The orchestrator keeps non-optional bootstrap refs for these
             # even when the bundled Gitea workload is disabled.
             "GITEA_ADMIN_USER": "e2e-gitea-admin",

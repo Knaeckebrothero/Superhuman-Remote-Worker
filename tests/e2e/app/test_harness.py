@@ -1527,18 +1527,33 @@ def test_forge_sandbox_renders_the_bundled_forge_without_a_second_database(
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
-def test_generated_app_secret_covers_every_required_rendered_key() -> None:
+@pytest.mark.parametrize("profile_name", sorted(harness.APPLICATION_E2E_PROFILES))
+def test_generated_app_secret_covers_every_required_rendered_key(
+    profile_name: str,
+) -> None:
+    """Every profile's non-optional secret refs must be keys the harness mints.
+
+    Parametrized over all profiles, not just the baseline. A profile that
+    enables a component pulls in that component's `secretKeyRef`s, and a key the
+    bundle does not mint is a `CreateContainerConfigError` — which, for anything
+    Keycloak-adjacent, stalls every pod that waits on Keycloak, i.e. every pod.
+    That is exactly how `cloud-sandbox` first failed: enabling the bundled
+    Nextcloud made the Keycloak bootstrap require `NEXTCLOUD_OIDC_CLIENT_SECRET`,
+    and the baseline-only render here could not see it.
+    """
+    profile = harness.resolve_profile(profile_name)
+    command = [
+        "helm",
+        "template",
+        "srw-e2e",
+        str(harness.REPO_ROOT / "helm"),
+        "-n",
+        harness.NAMESPACE,
+    ]
+    for values_file in profile.values_files:
+        command.extend(("-f", str(values_file)))
     rendered = subprocess.run(
-        [
-            "helm",
-            "template",
-            "srw-e2e",
-            str(harness.REPO_ROOT / "helm"),
-            "-n",
-            harness.NAMESPACE,
-            "-f",
-            str(harness.VALUES_FILE),
-        ],
+        command,
         check=True,
         capture_output=True,
         text=True,
@@ -1569,8 +1584,16 @@ def test_generated_app_secret_covers_every_required_rendered_key() -> None:
         harness.SecretBundle.generate("20260824-123456-ab12cd34").app_secret_data()
     )
 
-    assert required_app_keys <= generated_keys
+    missing = required_app_keys - generated_keys
+    assert not missing, (
+        f"profile {profile_name!r} renders secret keys the harness never mints: "
+        f"{sorted(missing)}"
+    )
     assert {"GITEA_ADMIN_USER", "GITEA_ADMIN_PASSWORD"} <= required_app_keys
+    if profile.cloud_enabled:
+        assert "NEXTCLOUD_OIDC_CLIENT_SECRET" in required_app_keys
+    if profile_name != harness.DEFAULT_PROFILE_NAME:
+        return
 
     shared_config = next(
         document
