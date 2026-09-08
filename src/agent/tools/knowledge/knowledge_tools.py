@@ -2939,7 +2939,9 @@ def create_kb_tools(
                   string (that is one tag).
         Each hit shows which angles matched it, e.g. ⟨dense+exact⟩. For every
         occurrence with surrounding lines use `kb_grep`.
-        Plain `kb_search(query=...)` is unchanged.
+        If embeddings are unavailable, query falls back to full-text and
+        literal matching over indexed content, with a notice. Notes that have
+        not reached the index cannot be searched yet.
         """
         bindings, error = _select_bindings(context, kb)
         if error:
@@ -2963,7 +2965,7 @@ def create_kb_tools(
         # `exact` is left alone: it's a literal-text search, not a tag lookup.
         tag_terms = normalize_tags(_as_list(tags))
 
-        if not (query or exact_terms or tag_terms):
+        if not ((query or "").strip() or exact_terms or tag_terms):
             return "Error: give at least one of query, exact, or tags."
 
         extra_angles = bool(exact_terms or tag_terms)
@@ -2999,6 +3001,9 @@ def create_kb_tools(
                 search_kwargs["tags"] = tag_terms
 
             results = _run_async(ks.search_chunks(**search_kwargs))
+            search_notice = getattr(results, "notice", "")
+            if not isinstance(search_notice, str):
+                search_notice = ""
 
             if not results:
                 base = (
@@ -3007,7 +3012,9 @@ def create_kb_tools(
                     else f"No knowledge notes match '{query}'."
                 )
                 notice = _index_readiness_notice(bindings)
-                return f"{base}\n\n{notice}" if notice else base
+                return "\n\n".join(
+                    part for part in (base, search_notice, notice) if part
+                )
 
             header = (
                 f"**Search Results** ({len(results)} matches — {angle_desc})"
@@ -3027,6 +3034,8 @@ def create_kb_tools(
                     logger.debug(f"kb_search watermark lookup skipped: {e}")
 
             lines = [f"{header}:", ""]
+            if search_notice:
+                lines.extend([search_notice, ""])
 
             for i, note in enumerate(results, 1):
                 meta_parts = [note.note_type]
@@ -3113,7 +3122,11 @@ def create_kb_tools(
 
         except Exception as e:
             logger.error(f"kb_search failed: {e}")
-            return f"Error searching knowledge base: {e}"
+            return (
+                f"Error searching knowledge base: {e}\n"
+                "Try kb_grep(pattern=...) for literal lines or "
+                "kb_search(exact=...) for literal note matches."
+            )
 
     @tool
     def kb_grep(

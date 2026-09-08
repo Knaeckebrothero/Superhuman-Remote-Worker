@@ -1113,6 +1113,12 @@ class TestKbSearchChunkCutover:
         kwargs = ctx.knowledge_store.search_chunks.call_args.kwargs
         assert kwargs.get("exact") in (None, []) and kwargs.get("tags") in (None, [])
 
+    def test_plain_query_preserves_embedding_input_including_whitespace(self):
+        ctx = self._ctx_with_store([])
+        tools, _ = _make_tools(ctx)
+        _invoke(_get_tool(tools, "kb_search"), {"query": " auth "})
+        assert ctx.knowledge_store.search_chunks.call_args.kwargs["query"] == " auth "
+
     def test_exact_and_tags_are_normalised_to_lists_and_attributed(self):
         rec = _srec("n1")
         rec.matched_arms = ["exact", "tag"]
@@ -1163,6 +1169,60 @@ class TestKbSearchChunkCutover:
         _invoke(_get_tool(tools, "kb_search"), {"query": "q", "tags": "sales"})
         kwargs = ctx.knowledge_store.search_chunks.call_args.kwargs
         assert kwargs["tags"] == ["sales"]
+
+    @pytest.mark.parametrize("has_hits", [False, True])
+    def test_lexical_fallback_notice_is_visible_with_or_without_hits(self, has_hits):
+        from shared.runtime.services.knowledge_store import KnowledgeSearchResults
+
+        rec = _srec("n1")
+        rec.matched_arms = ["sparse", "exact"]
+        results = KnowledgeSearchResults(
+            [rec] if has_hits else [], lexical_fallback=True
+        )
+        ctx = self._ctx_with_store(results)
+        tools, _ = _make_tools(ctx)
+
+        out = _invoke(_get_tool(tools, "kb_search"), {"query": "auth"})
+
+        assert "Embeddings unavailable" in out and "lexical fallback" in out
+        assert "kb_grep(pattern=...)" in out
+        if has_hits:
+            assert "⟨sparse+exact⟩" in out
+            assert "dense" not in out
+        else:
+            assert "No knowledge notes match" in out
+
+    def test_fallback_no_hits_preserves_partial_index_advisory(self):
+        from shared.runtime.services.knowledge_store import (
+            KbWatermark,
+            KnowledgeSearchResults,
+        )
+
+        ctx = self._ctx_with_store(
+            KnowledgeSearchResults(lexical_fallback=True),
+            watermark=KbWatermark(status="partial"),
+        )
+        tools, _ = _make_tools(ctx)
+        out = _invoke(_get_tool(tools, "kb_search"), {"query": "auth"})
+        assert "lexical fallback" in out
+        assert "Still indexing" in out
+
+    def test_unrecoverable_search_error_signposts_lexical_tools(self):
+        ctx = self._ctx_with_store([])
+        ctx.knowledge_store.search_chunks.side_effect = RuntimeError(
+            "search unavailable"
+        )
+        tools, _ = _make_tools(ctx)
+        out = _invoke(_get_tool(tools, "kb_search"), {"query": "auth"})
+        assert "Error searching knowledge base: search unavailable" in out
+        assert "kb_grep(pattern=...)" in out and "kb_search(exact=...)" in out
+
+    def test_whitespace_query_is_rejected_before_search(self):
+        ctx = self._ctx_with_store([])
+        tools, _ = _make_tools(ctx)
+        out = _invoke(_get_tool(tools, "kb_search"), {"query": "  "})
+        assert out.startswith("Error:")
+        ctx.knowledge_store.search_chunks.assert_not_awaited()
 
 
 # =============================================================================

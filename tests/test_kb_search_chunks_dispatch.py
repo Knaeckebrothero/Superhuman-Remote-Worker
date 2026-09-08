@@ -5,14 +5,15 @@
 ranking change for existing callers") either holds or silently breaks. These
 tests are the H6 proof: a plain ``search_chunks(kb_ids, query)`` must issue
 *exactly* the old ``knowledge_chunk_hybrid_search`` call with *exactly* its nine
-positional parameters and must never mention the new function; only a call
-carrying a non-empty ``exact`` or ``tags`` takes the new path.
+positional parameters while embeddings are healthy. Explicit ``exact``/``tags``
+and embedding failures take the multi-angle path.
 
 Everything here runs against a mocked ``db``/``embedding_service`` — this file
 asserts on which SQL is issued and with what, not on ranking. Ranking lives in
 tests/test_kb_multi_angle_real_postgres.py, which needs a real server.
 """
 
+import asyncio
 import uuid
 from unittest.mock import AsyncMock
 
@@ -299,3 +300,110 @@ def test_matched_arms_defaults_empty_and_is_not_read_from_a_row():
         ).matched_arms
         == []
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [ConnectionError, TimeoutError, RuntimeError])
+@pytest.mark.parametrize("angles", [{}, {"exact": ["known_id"]}, {"tags": ["hot"]}])
+async def test_embedding_failure_returns_lexical_hits(failure, angles, caplog):
+    store, db, svc = _store()
+    svc.embed.side_effect = failure("provider details must not enter the notice")
+    kb_ids = [uuid.uuid4(), uuid.uuid4()]
+    first, second, unrelated = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    db.fetch.side_effect = [
+        [
+            {"note_row": first, "arms": ["sparse", "recency"]},
+            {"note_row": unrelated, "arms": ["recency"]},
+            {"note_row": second, "arms": ["exact"]},
+        ],
+        [_row(second, "second"), _row(first, "first")],
+    ]
+
+    results = await store.search_chunks(
+        kb_ids,
+        "auth",
+        embedding_version="unavailable-model",
+        match_count=1,
+        **angles,
+    )
+
+    assert [note.note_id for note in results] == ["first"]
+    assert results[0].matched_arms == ["sparse", "recency"]
+    assert results.lexical_fallback is True
+    assert "lexical fallback" in results.notice
+    assert "provider details" not in results.notice + caplog.text
+    svc.embed.assert_awaited_once_with("auth")
+    sql, *params = db.fetch.call_args_list[0].args
+    assert "knowledge_chunk_multi_angle_search(" in sql
+    assert params[0:5] == ["auth", None, kb_ids, None, 50]
+    assert params[8] == (["known\\_id", "auth"] if "exact" in angles else ["auth"])
+    assert params[10] == angles.get("tags", [])
+    body_sql, body_ids, body_kbs = db.fetch.call_args_list[1].args
+    assert body_ids == [first, second]
+    assert body_kbs == kb_ids
+    assert "status = 'active'" in body_sql and "kb_id = ANY($2)" in body_sql
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ranked", [[], [{"note_row": uuid.uuid4(), "arms": ["recency"]}]]
+)
+async def test_no_embedding_service_reports_fallback_even_without_hits(ranked):
+    store, db, _ = _store(embedding_service=False)
+    db.fetch.return_value = ranked
+
+    results = await store.search_chunks([uuid.uuid4()], "auth", embedding_version="v2")
+
+    assert results == []
+    assert results.lexical_fallback is True
+    assert "Embeddings unavailable" in results.notice
+    db.fetch.assert_awaited_once()
+    assert db.fetch.call_args.args[2] is None
+    assert db.fetch.call_args.args[4] is None
+
+
+@pytest.mark.asyncio
+async def test_fallback_literal_query_is_escaped_and_not_duplicated():
+    store, db, _ = _store(embedding_service=False)
+    await store.search_chunks([uuid.uuid4()], r"a_b%\c.*", exact=[r"a_b%\c.*"])
+    assert db.fetch.call_args.args[9] == [r"a\_b\%\\c.*"]
+
+
+@pytest.mark.asyncio
+async def test_embedding_cancellation_does_not_trigger_fallback():
+    store, db, svc = _store()
+    svc.embed.side_effect = asyncio.CancelledError()
+    with pytest.raises(asyncio.CancelledError):
+        await store.search_chunks([uuid.uuid4()], "auth")
+    db.fetch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("embed_fails", [False, True])
+async def test_database_failure_is_not_swallowed_or_retried(embed_fails):
+    store, db, svc = _store()
+    if embed_fails:
+        svc.embed.side_effect = ConnectionError("offline")
+    db.fetch.side_effect = RuntimeError("database unavailable")
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        await store.search_chunks([uuid.uuid4()], "auth")
+    db.fetch.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_fallback_metadata_does_not_leak_into_recovered_search():
+    store, db, svc = _store()
+    svc.embed.side_effect = [ConnectionError("offline"), [0.1] * 8]
+    first = await store.search_chunks([uuid.uuid4()], "auth")
+    second = await store.search_chunks([uuid.uuid4()], "auth")
+    assert first.lexical_fallback is True
+    assert not getattr(second, "lexical_fallback", False)
+    assert "knowledge_chunk_hybrid_search(" in db.fetch.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_blank_query_without_filters_does_not_search_or_embed():
+    store, db, svc = _store()
+    assert await store.search_chunks([uuid.uuid4()], "  ") == []
+    db.fetch.assert_not_awaited()
+    svc.embed.assert_not_awaited()

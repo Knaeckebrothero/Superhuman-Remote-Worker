@@ -43,7 +43,7 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 from shared.backlog_tags import strip_machine_tags
 
@@ -147,6 +147,33 @@ class KnowledgeRecord:
             modified_at=row.get("modified_at"),
             indexed_at=row.get("indexed_at"),
             content_hash=row.get("content_hash"),
+        )
+
+
+class KnowledgeSearchResults(list[KnowledgeRecord]):
+    """List-compatible search results with per-call degradation metadata.
+
+    Keep the notice even for zero hits, without mutable state on a store shared
+    by concurrent tool calls and automatic context retrieval.
+    """
+
+    def __init__(
+        self,
+        records: Iterable[KnowledgeRecord] = (),
+        *,
+        lexical_fallback: bool = False,
+    ):
+        super().__init__(records)
+        self.lexical_fallback = lexical_fallback
+
+    @property
+    def notice(self) -> str:
+        if not self.lexical_fallback:
+            return ""
+        return (
+            "⚠️ Embeddings unavailable — using lexical fallback (full-text and "
+            "literal matching). Semantic matches may be missed. "
+            "Use kb_grep(pattern=...) for matching lines."
         )
 
 
@@ -2637,6 +2664,13 @@ class KnowledgeStore:
         ``knowledge_chunk_multi_angle_search`` (migration 0025) instead, which
         returns per-note attribution the results carry back in
         ``KnowledgeRecord.matched_arms``.
+
+        If query embedding fails or the service is absent, use that same
+        multi-angle function with no vector or embedding-version filter. Add
+        the query as a literal substring arm so materialised notes without
+        chunks remain searchable, and omit recency-only hits. Healthy searches
+        retain their existing ranking. The returned list carries a ``notice``
+        on fallback, including when no notes match.
         """
         if not kb_ids:
             return []
@@ -2655,12 +2689,29 @@ class KnowledgeStore:
         ]
         tag_terms = [t.strip() for t in (tags or []) if t and t.strip()]
 
-        if not exact_terms and not tag_terms:
-            # H6: the pre-existing path, byte-for-byte. Every caller that does
-            # not ask for the new arms — kb_search without exact/tags, memory
-            # injection — must keep today's ranking exactly. Do not touch this
-            # branch; the multi-angle path below is strictly additive.
-            query_embedding = await self.embedding_service.embed(query)
+        query_embedding = None
+        lexical_fallback = False
+        if query.strip():
+            if self.embedding_service is None:
+                lexical_fallback = True
+                logger.warning("KB embeddings unavailable; using lexical fallback")
+            else:
+                try:
+                    query_embedding = await self.embedding_service.embed(query)
+                except Exception as exc:
+                    # Only embedding failures degrade. Database errors still
+                    # propagate, and task cancellation must not start more work.
+                    lexical_fallback = True
+                    logger.warning(
+                        "KB query embedding failed (%s); using lexical fallback",
+                        type(exc).__name__,
+                    )
+        elif not exact_terms and not tag_terms:
+            return []
+
+        if not exact_terms and not tag_terms and not lexical_fallback:
+            # H6: preserve the healthy plain query's SQL, parameters, ranking,
+            # and return shape. Only an embedding failure takes the new path.
 
             rows = await self.db.fetch(
                 """
@@ -2682,14 +2733,14 @@ class KnowledgeStore:
             records = [KnowledgeRecord.from_row(dict(row)) for row in rows]
             return self._rerank_chunks(records)[:match_count]
 
-        # Multi-angle path. The dense arm is optional here: a filter-only call
-        # ("find the notes mentioning this identifier") carries no query text,
-        # and a store can legitimately hold no embedding service — in both cases
-        # pass a NULL embedding and let the lexical arms decide, rather than
-        # paying for (or crashing on) an embedding nobody asked for.
-        query_embedding = None
-        if query.strip() and self.embedding_service is not None:
-            query_embedding = await self.embedding_service.embed(query)
+        if lexical_fallback:
+            # Text remains usable across model/profile changes. This filter
+            # also gates sparse chunks, so retaining it would hide old content
+            # precisely when a model is missing or misconfigured.
+            embedding_version = None
+            literal_query = _escape_like(query.strip())
+            if literal_query not in exact_terms:
+                exact_terms.append(literal_query)
 
         ranked = await self.db.fetch(
             """
@@ -2711,8 +2762,16 @@ class KnowledgeStore:
             tag_weight,
             rrf_k,
         )
+        if lexical_fallback:
+            # Recency may boost a text/tag match, but freshness alone is not a
+            # lexical match. Do not report unrelated notes as fallback hits.
+            ranked = [
+                row
+                for row in ranked
+                if {"sparse", "exact", "tag"}.intersection(row["arms"] or [])
+            ]
         if not ranked:
-            return []
+            return KnowledgeSearchResults(lexical_fallback=lexical_fallback)
 
         # The function returns (note_row, rrf_score, arms) already ordered by
         # score; the note bodies come from a second query whose row order is
@@ -2746,7 +2805,10 @@ class KnowledgeStore:
             record.matched_arms = arms.get(note_row, [])
             records.append(record)
 
-        return self._rerank_chunks(records)[:match_count]
+        return KnowledgeSearchResults(
+            self._rerank_chunks(records)[:match_count],
+            lexical_fallback=lexical_fallback,
+        )
 
     @staticmethod
     def _rerank_chunks(records: List[KnowledgeRecord]) -> List[KnowledgeRecord]:
@@ -2907,6 +2969,9 @@ class KnowledgeStore:
         links = ""
         if note.tags:
             links = " Tags: " + ", ".join(note.tags)
+        arms = getattr(note, "matched_arms", None)
+        if isinstance(arms, list) and arms:
+            links += f" ⟨{'+'.join(arms)}⟩"
 
         # Truncate content for injection
         content = note.content
@@ -2973,4 +3038,4 @@ class KnowledgeStore:
         return "\n".join(lines)
 
 
-__all__ = ["KnowledgeStore", "KnowledgeRecord"]
+__all__ = ["KnowledgeStore", "KnowledgeRecord", "KnowledgeSearchResults"]
